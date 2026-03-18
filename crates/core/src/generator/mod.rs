@@ -259,14 +259,16 @@ impl SqlGenerator {
     }
 
     fn gen_tail(&self, t: &Tail) -> Result<String> {
-        // DuckDB doesn't have TAIL; simulate with subquery + ORDER BY rowid DESC + LIMIT
+        // Assign stable row numbers, take the last N in reverse, restore original order.
+        // rowid is unreliable on subquery results; ROW_NUMBER() is the correct approach.
         let inner = self.gen_from(&t.input)?;
         let n = self.gen_expr(&t.limit)?;
-        // Wrap as: SELECT * FROM (SELECT *, row_number() OVER () AS _rn FROM ...)
-        // ORDER BY _rn DESC LIMIT n — then re-sort ascending.
-        // Simplest correct approach: reverse using rowid trick.
         Ok(format!(
-            "SELECT * FROM (\n  SELECT * FROM {inner} ORDER BY rowid DESC LIMIT {n}\n) ORDER BY rowid ASC"
+            "SELECT * EXCLUDE (\"__rn\") FROM (\n  \
+             SELECT * FROM (\n    \
+             SELECT *, ROW_NUMBER() OVER () AS \"__rn\" FROM {inner}\n  \
+             ) ORDER BY \"__rn\" DESC LIMIT {n}\n\
+             ) ORDER BY \"__rn\" ASC"
         ))
     }
 
@@ -406,25 +408,19 @@ impl SqlGenerator {
     }
 
     fn gen_to_dataframe(&self, t: &ToDataFrame) -> Result<String> {
-        // Wrap inner in SELECT with renamed columns by position
         let inner = self.gen_plan(&t.input)?;
         let schema = t.input.infer_schema();
-        let cols = if schema.fields.is_empty() {
-            // Can't infer columns; emit raw rename via positional workaround
-            t.column_names.iter()
-                .enumerate()
-                .map(|(i, name)| format!("col{i} AS {}", quote_ident(name)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        } else {
-            schema.fields.iter()
-                .zip(t.column_names.iter())
-                .map(|(f, new_name)| {
-                    format!("{} AS {}", quote_ident(&f.name), quote_ident(new_name))
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
+        if schema.fields.is_empty() {
+            // Schema unresolvable at generation time (e.g. SqlRelation, TableScan).
+            // The converter (Phase 3) must attach a resolved schema before reaching here;
+            // until then, pass through and let DuckDB resolve column names at runtime.
+            return Ok(format!("SELECT *\nFROM ({inner})"));
+        }
+        let cols = schema.fields.iter()
+            .zip(t.column_names.iter())
+            .map(|(f, new_name)| format!("{} AS {}", quote_ident(&f.name), quote_ident(new_name)))
+            .collect::<Vec<_>>()
+            .join(", ");
         Ok(format!("SELECT {cols}\nFROM ({inner})"))
     }
 
@@ -542,12 +538,7 @@ impl SqlGenerator {
     fn gen_binary(&self, b: &BinaryExpression) -> Result<String> {
         let left = self.gen_expr_paren(&b.left, b.op.precedence())?;
         let right = self.gen_expr_paren(&b.right, b.op.precedence())?;
-        let sym = b.op.symbol();
-        if b.op.needs_spaces() {
-            Ok(format!("{left} {sym} {right}"))
-        } else {
-            Ok(format!("{left} {sym} {right}"))
-        }
+        Ok(format!("{left} {} {right}", b.op.symbol()))
     }
 
     /// Generate an expression, wrapping in parens if its precedence is lower than `parent_prec`.
@@ -1000,5 +991,46 @@ mod tests {
         let sql = gen().generate(&plan).unwrap();
         assert!(sql.contains("range(0, 10, 1)"), "got: {sql}");
         assert!(sql.contains("id"), "got: {sql}");
+    }
+
+    // ── Bug regression tests ───────────────────────────────────────────────────
+
+    /// Bug: gen_tail uses `rowid` which is not a stable row-order index on
+    /// arbitrary subqueries. Fix: use ROW_NUMBER() OVER ().
+    #[test]
+    fn tail_no_rowid() {
+        use crate::logical::Tail;
+        let plan = LogicalPlan::Tail(Tail {
+            input: Box::new(table("orders")),
+            limit: int(5),
+        });
+        let sql = gen().generate(&plan).unwrap();
+        assert!(
+            !sql.to_lowercase().contains("rowid"),
+            "tail SQL must not use rowid (unreliable on subqueries): {sql}"
+        );
+        assert!(
+            sql.to_lowercase().contains("row_number"),
+            "tail SQL must use row_number() for stable ordering: {sql}"
+        );
+    }
+
+    /// Bug: gen_to_dataframe falls back to `col0`, `col1`, … references when
+    /// input schema cannot be inferred (e.g. SqlRelation). Those column names
+    /// do not exist in the query and produce invalid SQL.
+    #[test]
+    fn to_dataframe_empty_schema_no_phantom_cols() {
+        use crate::logical::{SqlRelation, ToDataFrame};
+        let plan = LogicalPlan::ToDataFrame(ToDataFrame {
+            input: Box::new(LogicalPlan::SqlRelation(SqlRelation {
+                sql: "SELECT 1 AS a, 2 AS b".to_string(),
+            })),
+            column_names: vec!["x".to_string(), "y".to_string()],
+        });
+        let sql = gen().generate(&plan).unwrap();
+        assert!(
+            !sql.contains("col0"),
+            "fallback must not emit phantom col0 reference: {sql}"
+        );
     }
 }

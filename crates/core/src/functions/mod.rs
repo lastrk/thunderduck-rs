@@ -246,6 +246,7 @@ impl FunctionRegistry {
         }
 
         // ── Array / List functions ──────────────────────────────────────────────
+        // array_compact and array_union require lambdas — handled in custom below.
         let array_direct: &[(&str, &str)] = &[
             ("array_contains", "LIST_CONTAINS"),
             ("array_distinct", "LIST_DISTINCT"),
@@ -255,8 +256,6 @@ impl FunctionRegistry {
             ("array_min", "LIST_MIN"),
             ("array_reverse", "LIST_REVERSE"),
             ("flatten", "FLATTEN"),
-            ("array_compact", "LIST_FILTER"), // needs custom lambda, but name is right
-            ("array_union", "LIST_DISTINCT"),  // wraps LIST_CONCAT
             ("array_intersect", "LIST_INTERSECT"),
             ("array_except", "LIST_EXCEPT"),
             ("arrays_overlap", "LIST_HAS_ANY"),
@@ -273,13 +272,12 @@ impl FunctionRegistry {
         }
 
         // ── Conditional ────────────────────────────────────────────────────────
+        // greatest/least are already in math_direct; not duplicated here.
         let cond_direct: &[(&str, &str)] = &[
             ("coalesce", "COALESCE"),
             ("nullif", "NULLIF"),
             ("ifnull", "IFNULL"),
             ("nvl", "COALESCE"),
-            ("greatest", "GREATEST"),
-            ("least", "LEAST"),
         ];
         for (s, d) in cond_direct {
             direct.insert(s, d);
@@ -696,9 +694,14 @@ impl FunctionRegistry {
             format!("(LIST_FILTER({}) <> [])", args.join(", "))
         });
 
-        // forall(arr, lambda) → NOT(LIST_FILTER(arr, x -> NOT cond) <> [])
+        // forall(arr, pred) → list_bool_and(list_transform(arr, pred))
+        // args[1] is already-rendered lambda SQL, e.g. "x -> x > 0"
         custom.insert("forall", |args, _mode| {
-            format!("(LIST_FILTER(LIST_TRANSFORM({0}, x -> NOT ({1}(x))), x -> x) = [])", args[0], "")
+            if args.len() >= 2 {
+                format!("list_bool_and(list_transform({}, {}))", args[0], args[1])
+            } else {
+                "FALSE".to_string()
+            }
         });
 
         // explode(arr) → UNNEST
@@ -995,9 +998,8 @@ pub fn convert_spark_date_format(spark_fmt: &str) -> String {
                 }
             }
             'd' => {
-                let mut count = 1usize;
-                while chars.peek() == Some(&'d') { chars.next(); count += 1; }
-                if count <= 2 { result.push_str("%d"); } else { result.push_str("%d"); }
+                while chars.peek() == Some(&'d') { chars.next(); }
+                result.push_str("%d");
             }
             'H' => { while chars.peek() == Some(&'H') { chars.next(); } result.push_str("%H"); }
             'h' => { while chars.peek() == Some(&'h') { chars.next(); } result.push_str("%I"); }
@@ -1076,6 +1078,47 @@ mod tests {
     fn unknown_passthrough() {
         let sql = FunctionRegistry::translate("my_custom_udf", &["a", "b"], CompatMode::Relaxed);
         assert_eq!(sql, "my_custom_udf(a, b)");
+    }
+
+    // ── Bug regression tests ───────────────────────────────────────────────────
+
+    /// Bug: forall translator interpolates "" as the lambda body, producing
+    /// `NOT ((x))` with an empty function name — completely broken SQL.
+    #[test]
+    fn forall_lambda_body_preserved() {
+        let sql = FunctionRegistry::translate("forall", &["arr", "x -> x > 0"], CompatMode::Relaxed);
+        // The broken implementation produces "NOT ((x))" (empty string interpolated)
+        assert!(
+            !sql.contains("NOT ((x))"),
+            "forall must not emit broken empty-function pattern: {sql}"
+        );
+        assert!(sql.contains("arr"), "array arg must appear: {sql}");
+        assert!(sql.contains("x > 0"), "lambda body must appear: {sql}");
+    }
+
+    /// Bug: greatest/least appear in both math_direct and cond_direct; the
+    /// second insert silently overwrites, making the first a wasted allocation.
+    /// Verify the function still resolves correctly after dedup.
+    #[test]
+    fn greatest_least_still_mapped() {
+        let g = FunctionRegistry::translate("greatest", &["a", "b", "c"], CompatMode::Relaxed);
+        let l = FunctionRegistry::translate("least", &["a", "b"], CompatMode::Relaxed);
+        assert_eq!(g, "GREATEST(a, b, c)");
+        assert_eq!(l, "LEAST(a, b)");
+    }
+
+    /// Bug: array_compact and array_union appear in array_direct with incorrect
+    /// DuckDB mappings but are overridden by custom translators. The direct
+    /// entries are unreachable dead weight.
+    /// Verify correct (custom) translation is used.
+    #[test]
+    fn array_compact_uses_list_filter() {
+        let sql = FunctionRegistry::translate("array_compact", &["arr"], CompatMode::Relaxed);
+        // Must use LIST_FILTER with null-check lambda, NOT bare LIST_FILTER (direct entry)
+        assert!(
+            sql.contains("IS NOT NULL"),
+            "array_compact must filter nulls via lambda: {sql}"
+        );
     }
 
     #[test]

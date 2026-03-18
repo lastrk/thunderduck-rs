@@ -314,17 +314,53 @@ Three issues found and fixed during the senior review pass:
 | 2 | `generator/mod.rs` | `crate::expression::Expression::Literal` / `crate::expression::LiteralValue::String` in `gen_extract_value()` | Shortened to `Expression::Literal` / `LiteralValue::String` — both already in scope |
 | 3 | `generator/mod.rs` | Dead `if parts.is_empty()` guard in `gen_interval()` calendar branch | Removed — unreachable because the all-zero case is caught by the earlier `!has_months && !has_days` early-return |
 
-### Test count
+### Test count after first gap pass
 
 | Milestone | Tests |
 |-----------|------:|
 | Phase 1 complete | 47 |
 | Phase 2 complete | 51 |
-| Gap closure (this pass) | **62** |
+| Gap closure — expressions + session init | **62** |
 
-16 new unit tests added: 3 for new expression types in `expression/mod.rs`, 1 for
+16 new unit tests: 3 for new expression types in `expression/mod.rs`, 1 for
 `SingleRow` schema in `logical/mod.rs`, 12 generator tests covering all new
 expression variants and the no-FROM `SingleRow` path.
+
+---
+
+### Polymorphic Function Resolution (`functions/mod.rs`, `generator/mod.rs`)
+
+The reference `resolvePolymorphicFunctions()` pass dispatches overloaded Spark functions
+to type-specific DuckDB equivalents based on the child schema. The Rust registry had no
+schema context — `reverse(array_col)` was incorrectly emitting `REVERSE(...)` (the string
+function) instead of `LIST_REVERSE(...)`.
+
+**Fix**: `FunctionRegistry::translate_typed(name, args, arg_types, mode)` added alongside
+the existing `translate()`. `SqlGenerator::gen_function_call` now infers argument types via
+`expr.data_type(&StructType::empty())` and calls `translate_typed`. Resolved
+`ColumnReference` nodes carry their embedded `DataType`; unresolved references produce
+`DataType::Unresolved`, which falls through to the original non-polymorphic path.
+
+| Spark call | Array/Map arg | String arg | Unresolved |
+|---|---|---|---|
+| `reverse(x)` | `LIST_REVERSE(x)` ✓ | `REVERSE(x)` | `REVERSE(x)` (fallback) |
+| `size(x)` | `LEN(x)` (existing) | `LENGTH(x)` ✓ | `LEN(x)` (fallback) |
+| `sort_array(x)` | `LIST_SORT(x)` ✓ | — | `LIST_SORT(x)` (fallback) |
+
+**Code review** collapsed the three nested dual-arm no-op matches
+(`Unresolved => {}` + `_ => {}`) into single `if matches!(...)` guards — cleaner and
+removes the redundant comment-only arms.
+
+9 new unit tests in `functions/mod.rs` covering all dispatch branches.
+
+### Final test count
+
+| Milestone | Tests |
+|-----------|------:|
+| Phase 1 complete | 47 |
+| Phase 2 complete | 51 |
+| Gap closure pass 1 (expressions + session init) | 62 |
+| Gap closure pass 2 (polymorphic functions) | **71** |
 
 ---
 
@@ -334,7 +370,8 @@ expression variants and the no-FROM `SingleRow` path.
 |------|---------|
 | `35153f0` | docs: Phase 1 dev journal entry |
 | `6bff5c2` | feat: Phase 2 complete — DuckDB runtime + Arrow streaming (51 tests pass) |
-| *(pending)* | feat: close Phase 1/2 gaps — session init, 5 expression variants, SingleRowRelation (62 tests) |
+| `be552f9` | feat: close Phase 1/2 gaps — session init, 5 expression variants, SingleRowRelation (62 tests) |
+| `e4ddc24` | feat: polymorphic function resolution — reverse/size/sort_array dispatch by arg type (71 tests) |
 
 ---
 

@@ -15,6 +15,15 @@ pub enum ThunderduckError {
 
     #[error("Schema error: {0}")]
     Schema(String),
+
+    #[error("DuckDB error: {0}")]
+    DuckDb(String),
+}
+
+impl From<duckdb::Error> for ThunderduckError {
+    fn from(e: duckdb::Error) -> Self {
+        ThunderduckError::DuckDb(e.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ThunderduckError>;

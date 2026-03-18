@@ -3,6 +3,7 @@ pub mod expression;
 pub mod functions;
 pub mod generator;
 pub mod logical;
+pub mod runtime;
 pub mod types;
 
 pub use error::{Result, ThunderduckError};

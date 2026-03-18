@@ -354,10 +354,10 @@ impl SqlGenerator {
     }
 
     fn gen_range_relation(&self, rr: &RangeRelation) -> Result<String> {
-        // DuckDB: range(start, end, step) returns a table with column range_value
-        // We alias it as `id`
+        // DuckDB ≥1.1.5: range(start, end, step) returns a table with column "range"
+        // We alias it as `id` to match Spark's range relation schema.
         Ok(format!(
-            "(SELECT range_value AS id FROM range({}, {}, {}))",
+            "(SELECT \"range\" AS id FROM range({}, {}, {}))",
             rr.start, rr.end, rr.step
         ))
     }

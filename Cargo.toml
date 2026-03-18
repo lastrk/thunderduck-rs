@@ -8,3 +8,8 @@ edition = "2021"
 
 [workspace.dependencies]
 thiserror = "2"
+duckdb   = { version = "1.10500.0", features = ["bundled"] }
+arrow    = "57"
+dashmap  = "6"
+tokio    = { version = "1", features = ["full"] }
+anyhow   = "1"

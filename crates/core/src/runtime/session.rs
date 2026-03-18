@@ -7,6 +7,36 @@ use crate::error::{Result, ThunderduckError};
 use crate::runtime::compat_mode::{self, RuntimeCompatMode};
 use crate::runtime::config::{HardwareProfile, StreamingConfig};
 
+// ── Timezone detection ─────────────────────────────────────────────────────────
+
+/// Detect the system local timezone string.
+///
+/// Resolution order:
+/// 1. `TZ` environment variable
+/// 2. `/etc/timezone` file (Linux)
+/// 3. Fall back to `"UTC"`
+fn detect_timezone() -> String {
+    // 1. TZ env var
+    if let Ok(tz) = std::env::var("TZ") {
+        let tz = tz.trim().to_string();
+        if !tz.is_empty() {
+            return tz;
+        }
+    }
+
+    // 2. /etc/timezone (Linux/Debian-based)
+    #[cfg(target_os = "linux")]
+    if let Ok(contents) = std::fs::read_to_string("/etc/timezone") {
+        let tz = contents.trim().to_string();
+        if !tz.is_empty() {
+            return tz;
+        }
+    }
+
+    // 3. Fall back to UTC
+    "UTC".to_string()
+}
+
 // ── Channel types ──────────────────────────────────────────────────────────────
 
 pub(crate) enum SessionCommand {
@@ -66,17 +96,48 @@ impl DuckDbSession {
 
                 // Apply hardware profile settings.
                 let hw = HardwareProfile::detect();
+                let timezone = detect_timezone();
                 let init_sql = format!(
                     "SET threads = {threads};\
                      SET memory_limit = '{mem}GB';\
                      SET default_null_order = 'NULLS FIRST';\
-                     SET TimeZone = 'UTC';",
+                     SET TimeZone = '{tz}';\
+                     SET enable_progress_bar = false;\
+                     SET preserve_insertion_order = true;",
                     threads = hw.cpu_threads,
                     mem = hw.memory_limit_gb,
+                    tz = timezone,
                 );
                 if let Err(e) = conn.execute_batch(&init_sql) {
                     let _ = ready_tx
                         .send(Err(ThunderduckError::DuckDb(format!("session init failed: {e}"))));
+                    return;
+                }
+
+                // Enable jemalloc background threads on Linux with 8+ cores.
+                // This allows background threads to handle memory purging without
+                // blocking foreground operations.
+                #[cfg(target_os = "linux")]
+                if hw.cpu_threads >= 8 {
+                    if let Err(e) = conn.execute_batch("SET allocator_background_threads = true;") {
+                        let _ = ready_tx.send(Err(ThunderduckError::DuckDb(format!(
+                            "jemalloc background threads init failed: {e}"
+                        ))));
+                        return;
+                    }
+                }
+
+                // Register Spark-compatible SQL macros.
+                // initcap: capitalize first letter of each whitespace-delimited word.
+                // Spark treats only whitespace as word boundaries (not punctuation).
+                let macro_sql = concat!(
+                    "CREATE OR REPLACE MACRO initcap(s) AS ",
+                    "regexp_replace(lower(s), '(^|\\s)(\\S)', '\\1' || upper('\\2'), 'g')",
+                );
+                if let Err(e) = conn.execute_batch(macro_sql) {
+                    let _ = ready_tx.send(Err(ThunderduckError::DuckDb(format!(
+                        "macro registration failed: {e}"
+                    ))));
                     return;
                 }
 

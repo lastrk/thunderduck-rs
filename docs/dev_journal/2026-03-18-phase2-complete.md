@@ -263,6 +263,81 @@ pipeline is set up in Phase 3.
 
 ---
 
+## Post-Commit Additions — Reference Gap Closure
+
+After the initial Phase 2 commit, a gap analysis against the Java reference
+(`docs/reference-gap-analysis.md`) identified critical omissions. All critical and important
+items from Phase 1/2 scope were addressed in a follow-up pass.
+
+### Session init gaps (`runtime/session.rs`)
+
+Five settings present in `DuckDBRuntime.configureConnection()` were missing from the Rust port:
+
+| Setting | Fix |
+|---------|-----|
+| `SET TimeZone` hardcoded `'UTC'` | Added `detect_timezone()`: TZ env → `/etc/timezone` → `"UTC"` |
+| `SET enable_progress_bar = false` | Added to init SQL |
+| `SET preserve_insertion_order = true` | Added to init SQL |
+| `SET allocator_background_threads = true` | Added, gated on `#[cfg(target_os = "linux")]` and `hw.cpu_threads >= 8` |
+| `initcap` macro | Added `CREATE OR REPLACE MACRO initcap(s) AS regexp_replace(...)` — whitespace-only word boundaries matching Spark semantics |
+
+The timezone bug was a correctness issue: `hour()`, `date_trunc()`, and similar timestamp
+functions returned wrong results in any non-UTC environment.
+
+### Missing Expression variants and LogicalPlan
+
+Six constructs from `expression/` and `logical/` in the reference had no Rust equivalent:
+
+| Type | SQL produced | Notes |
+|------|-------------|-------|
+| `LikeExpression` | `(val [NOT] [I]LIKE pattern)` | Critical — ubiquitous in filters |
+| `IntervalExpression` | Composite `INTERVAL 'n' DAY + ...` | Three sub-types: year-month, day-time, calendar |
+| `IsDistinctFromExpression` | `left IS [NOT] DISTINCT FROM right` | Null-safe equality; always non-nullable |
+| `ExtractValueExpression` | `child['key']` / `child[idx]` | String keys use single-quoted bracket form |
+| `RowConstructorExpression` | `(a, b, c)` | Tuple comparisons: `WHERE (x, y) IN (...)` |
+| `SingleRowRelation` | *(no FROM clause)* | `SELECT 1`, `SELECT now()`, scalar UDFs |
+
+`gen_project()` detects `SingleRow` input and omits the `FROM` clause entirely.
+
+`gen_interval()` ports the Java three-path decomposition faithfully:
+- Year-month only → `INTERVAL 'n' MONTH`
+- Day-time (microseconds only) → decompose into DAY/HOUR/MINUTE/SECOND parts, sign on first non-zero
+- Calendar (mixed) → join month + day + second components with ` + `
+
+### Code review findings (post-agent)
+
+Three issues found and fixed during the senior review pass:
+
+| # | Location | Issue | Fix |
+|---|----------|-------|-----|
+| 1 | `expression/mod.rs` | `let func_type = match {...}; func_type` in `Window` arm of `data_type()` | Collapsed to direct match arm — intermediate binding added nothing |
+| 2 | `generator/mod.rs` | `crate::expression::Expression::Literal` / `crate::expression::LiteralValue::String` in `gen_extract_value()` | Shortened to `Expression::Literal` / `LiteralValue::String` — both already in scope |
+| 3 | `generator/mod.rs` | Dead `if parts.is_empty()` guard in `gen_interval()` calendar branch | Removed — unreachable because the all-zero case is caught by the earlier `!has_months && !has_days` early-return |
+
+### Test count
+
+| Milestone | Tests |
+|-----------|------:|
+| Phase 1 complete | 47 |
+| Phase 2 complete | 51 |
+| Gap closure (this pass) | **62** |
+
+16 new unit tests added: 3 for new expression types in `expression/mod.rs`, 1 for
+`SingleRow` schema in `logical/mod.rs`, 12 generator tests covering all new
+expression variants and the no-FROM `SingleRow` path.
+
+---
+
+## Commits
+
+| Hash | Message |
+|------|---------|
+| `35153f0` | docs: Phase 1 dev journal entry |
+| `6bff5c2` | feat: Phase 2 complete — DuckDB runtime + Arrow streaming (51 tests pass) |
+| *(pending)* | feat: close Phase 1/2 gaps — session init, 5 expression variants, SingleRowRelation (62 tests) |
+
+---
+
 ## Phase 3 Preview
 
 Phase 3 wires in the gRPC layer (`crates/connect-server`): a `tonic`-based Spark Connect

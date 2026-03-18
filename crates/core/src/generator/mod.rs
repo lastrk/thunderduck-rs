@@ -7,16 +7,17 @@
 use crate::error::Result;
 use crate::expression::{
     AliasExpression, ArrayLiteralExpression, BetweenExpression, BinaryExpression, BinaryOp,
-    CaseWhenExpression, CastExpression, Expression, ExistsSubquery, FrameBoundary, FrameUnit,
-    FunctionCall, InListExpression, InSubquery, LambdaExpression, LiteralValue, MapLiteralExpression,
-    ScalarSubquery, SortOrder, StructLiteralExpression, UnaryExpression, UnaryOp,
-    WindowFunction,
+    CaseWhenExpression, CastExpression, Expression, ExistsSubquery, ExtractValueExpression,
+    FrameBoundary, FrameUnit, FunctionCall, InListExpression, InSubquery, IntervalExpression,
+    IsDistinctFromExpression, LambdaExpression, LikeExpression, LiteralValue,
+    MapLiteralExpression, RowConstructorExpression, ScalarSubquery, SortOrder,
+    StructLiteralExpression, UnaryExpression, UnaryOp, WindowFunction,
 };
 use crate::functions::{CompatMode, FunctionRegistry};
 use crate::logical::{
     Aggregate, AliasedRelation, Distinct, Except, Filter, GroupingSets, InMemoryRelation,
     Intersect, Join, Limit, LocalDataRelation, LocalRelation, LogicalPlan, Project,
-    RangeRelation, Sample, SelectEntry, Sort, SqlRelation, TableScan, Tail,
+    RangeRelation, Sample, SelectEntry, SingleRowRelation, Sort, SqlRelation, TableScan, Tail,
     ToDataFrame, Union, WithColumns, WithCte,
 };
 use crate::types::TypeMapper;
@@ -75,11 +76,16 @@ impl SqlGenerator {
             LogicalPlan::AliasedRelation(ar) => self.gen_aliased_relation(ar),
             LogicalPlan::RawDdlStatement(r) => Ok(r.sql.clone()),
             LogicalPlan::ToDataFrame(t) => self.gen_to_dataframe(t),
+            LogicalPlan::SingleRow(sr) => self.gen_single_row(sr),
         }
     }
 
     fn gen_project(&self, p: &Project) -> Result<String> {
         let cols = self.gen_projection_list(&p.projections)?;
+        // SingleRow means no FROM clause (e.g. SELECT 1, SELECT now())
+        if matches!(p.input.as_ref(), LogicalPlan::SingleRow(_)) {
+            return Ok(format!("SELECT {cols}"));
+        }
         let from = self.gen_from(&p.input)?;
         Ok(format!("SELECT {cols}\nFROM {from}"))
     }
@@ -424,6 +430,12 @@ impl SqlGenerator {
         Ok(format!("SELECT {cols}\nFROM ({inner})"))
     }
 
+    fn gen_single_row(&self, _sr: &SingleRowRelation) -> Result<String> {
+        // SingleRow is used as an input to Project (no FROM needed).
+        // If somehow generated standalone, emit a no-op that produces one row.
+        Ok("SELECT 1".to_string())
+    }
+
     // ── FROM clause helpers ────────────────────────────────────────────────────
 
     /// Generate a FROM-clause fragment: either bare table/subquery or wrapped subquery.
@@ -532,6 +544,12 @@ impl SqlGenerator {
             Expression::StructLiteral(s) => self.gen_struct_literal(s),
             Expression::Between(b) => self.gen_between(b),
             Expression::InList(il) => self.gen_in_list(il),
+            // New expression variants
+            Expression::Like(l) => self.gen_like(l),
+            Expression::Interval(i) => self.gen_interval(i),
+            Expression::IsDistinctFrom(idf) => self.gen_is_distinct_from(idf),
+            Expression::ExtractValue(ev) => self.gen_extract_value(ev),
+            Expression::RowConstructor(rc) => self.gen_row_constructor(rc),
         }
     }
 
@@ -752,6 +770,128 @@ impl SqlGenerator {
         let not = if il.negated { "NOT " } else { "" };
         Ok(format!("{expr} {not}IN ({list})"))
     }
+
+    /// Generate SQL for a LIKE / NOT LIKE / ILIKE / NOT ILIKE expression.
+    ///
+    /// DuckDB supports ILIKE natively for case-insensitive matching.
+    fn gen_like(&self, l: &LikeExpression) -> Result<String> {
+        let value = self.gen_expr(&l.value)?;
+        let pattern = self.gen_expr(&l.pattern)?;
+        let not = if l.negated { "NOT " } else { "" };
+        let op = if l.case_insensitive { "ILIKE" } else { "LIKE" };
+        Ok(format!("({value} {not}{op} {pattern})"))
+    }
+
+    /// Generate SQL for an interval literal.
+    ///
+    /// Ported from `IntervalExpression.toSQL()` in the Java reference.
+    /// Handles year-month, day-time (microsecond decomposition), and calendar intervals.
+    fn gen_interval(&self, i: &IntervalExpression) -> Result<String> {
+        const MICROS_PER_SECOND: i64 = 1_000_000;
+        const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
+        const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
+        const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
+
+        // Determine which type of interval this is
+        let has_months = i.months != 0;
+        let has_days = i.days != 0;
+        let has_micros = i.microseconds != 0;
+
+        if has_months && !has_days && !has_micros {
+            // Pure year-month interval
+            return Ok(format!("INTERVAL '{}' MONTH", i.months));
+        }
+
+        if !has_months && has_days && !has_micros {
+            // Pure day interval
+            return Ok(format!("INTERVAL '{}' DAY", i.days));
+        }
+
+        if !has_months && !has_days {
+            // Day-time interval: decompose microseconds
+            let negative = i.microseconds < 0;
+            let abs_micros = i.microseconds.unsigned_abs() as i64;
+
+            let days_part = abs_micros / MICROS_PER_DAY;
+            let remaining = abs_micros % MICROS_PER_DAY;
+            let hours_part = remaining / MICROS_PER_HOUR;
+            let remaining = remaining % MICROS_PER_HOUR;
+            let minutes_part = remaining / MICROS_PER_MINUTE;
+            let remaining = remaining % MICROS_PER_MINUTE;
+            let seconds_part = remaining as f64 / MICROS_PER_SECOND as f64;
+
+            let mut parts: Vec<String> = Vec::new();
+
+            if days_part != 0 {
+                let sign = if negative { "-" } else { "" };
+                parts.push(format!("INTERVAL '{sign}{days_part}' DAY"));
+            }
+            if hours_part != 0 {
+                // Sign goes on the first non-zero component only
+                let sign = if negative && parts.is_empty() { "-" } else { "" };
+                parts.push(format!("INTERVAL '{sign}{hours_part}' HOUR"));
+            }
+            if minutes_part != 0 {
+                let sign = if negative && parts.is_empty() { "-" } else { "" };
+                parts.push(format!("INTERVAL '{sign}{minutes_part}' MINUTE"));
+            }
+            if seconds_part != 0.0 || parts.is_empty() {
+                let sign = if negative && parts.is_empty() { "-" } else { "" };
+                parts.push(format!("INTERVAL '{sign}{seconds_part:.6}' SECOND"));
+            }
+
+            return Ok(parts.join(" + "));
+        }
+
+        // Calendar interval: months + days + microseconds
+        let mut parts: Vec<String> = Vec::new();
+
+        if has_months {
+            parts.push(format!("INTERVAL '{}' MONTH", i.months));
+        }
+        if has_days {
+            parts.push(format!("INTERVAL '{}' DAY", i.days));
+        }
+        if has_micros {
+            let seconds = i.microseconds as f64 / MICROS_PER_SECOND as f64;
+            parts.push(format!("INTERVAL '{seconds:.6}' SECOND"));
+        }
+
+        Ok(parts.join(" + "))
+    }
+
+    /// Generate SQL for IS [NOT] DISTINCT FROM.
+    fn gen_is_distinct_from(&self, idf: &IsDistinctFromExpression) -> Result<String> {
+        let left = self.gen_expr(&idf.left)?;
+        let right = self.gen_expr(&idf.right)?;
+        let not = if idf.negated { "NOT " } else { "" };
+        Ok(format!("{left} IS {not}DISTINCT FROM {right}"))
+    }
+
+    /// Generate SQL for struct/array/map value extraction.
+    ///
+    /// Ported from `ExtractValueExpression.toSQL()` in the Java reference.
+    /// String literal keys use `child['key']`; all other extractions use `child[expr]`.
+    fn gen_extract_value(&self, ev: &ExtractValueExpression) -> Result<String> {
+        let child = self.gen_expr(&ev.child)?;
+        // Check if extraction is a string literal — use bracket-quoted form
+        if let Expression::Literal(lit) = ev.extraction.as_ref() {
+            if let LiteralValue::String(s) = &lit.value {
+                return Ok(format!("{child}['{}']", s.replace('\'', "''")));
+            }
+        }
+        let extraction = self.gen_expr(&ev.extraction)?;
+        Ok(format!("{child}[{extraction}]"))
+    }
+
+    /// Generate SQL for a row constructor: `(a, b, c)`.
+    fn gen_row_constructor(&self, rc: &RowConstructorExpression) -> Result<String> {
+        let fields = rc.fields.iter()
+            .map(|e| self.gen_expr(e))
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        Ok(format!("({fields})"))
+    }
 }
 
 // ── Literal generation ─────────────────────────────────────────────────────────
@@ -859,8 +999,14 @@ impl BinaryOpExt for BinaryOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expression::{Literal, ColumnReference, AliasExpression, BinaryExpression};
-    use crate::logical::{LogicalPlan, TableScan, Project, Filter, Sort, Limit};
+    use crate::expression::{
+        AliasExpression, BinaryExpression, ColumnReference, ExtractValueExpression,
+        IntervalExpression, IsDistinctFromExpression, LikeExpression, Literal,
+        RowConstructorExpression,
+    };
+    use crate::logical::{
+        Filter, Limit, LogicalPlan, Project, SingleRowRelation, Sort, TableScan, Union,
+    };
 
     fn gen() -> SqlGenerator {
         SqlGenerator::relaxed()
@@ -1032,5 +1178,158 @@ mod tests {
             !sql.contains("col0"),
             "fallback must not emit phantom col0 reference: {sql}"
         );
+    }
+
+    // ── New expression tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn like_generates_correct_sql() {
+        let expr = Expression::Like(LikeExpression {
+            value: Box::new(col("name")),
+            pattern: Box::new(Literal::string("%smith%")),
+            negated: false,
+            case_insensitive: false,
+        });
+        let sql = gen().gen_expr(&expr).unwrap();
+        assert_eq!(sql, r#"("name" LIKE '%smith%')"#, "got: {sql}");
+    }
+
+    #[test]
+    fn like_negated_and_ilike() {
+        let not_like = Expression::Like(LikeExpression {
+            value: Box::new(col("name")),
+            pattern: Box::new(Literal::string("A%")),
+            negated: true,
+            case_insensitive: false,
+        });
+        let sql = gen().gen_expr(&not_like).unwrap();
+        assert!(sql.contains("NOT LIKE"), "expected NOT LIKE, got: {sql}");
+
+        let ilike = Expression::Like(LikeExpression {
+            value: Box::new(col("name")),
+            pattern: Box::new(Literal::string("%SMITH%")),
+            negated: false,
+            case_insensitive: true,
+        });
+        let sql = gen().gen_expr(&ilike).unwrap();
+        assert!(sql.contains("ILIKE"), "expected ILIKE, got: {sql}");
+        assert!(!sql.contains("NOT"), "ILIKE should not contain NOT: {sql}");
+
+        let not_ilike = Expression::Like(LikeExpression {
+            value: Box::new(col("name")),
+            pattern: Box::new(Literal::string("%SMITH%")),
+            negated: true,
+            case_insensitive: true,
+        });
+        let sql = gen().gen_expr(&not_ilike).unwrap();
+        assert!(sql.contains("NOT ILIKE"), "expected NOT ILIKE, got: {sql}");
+    }
+
+    #[test]
+    fn interval_year_month() {
+        let expr = Expression::Interval(IntervalExpression {
+            months: 3,
+            days: 0,
+            microseconds: 0,
+        });
+        let sql = gen().gen_expr(&expr).unwrap();
+        assert_eq!(sql, "INTERVAL '3' MONTH", "got: {sql}");
+    }
+
+    #[test]
+    fn interval_day_time_decomposition() {
+        // 1 day + 2 hours in microseconds
+        const MICROS_PER_HOUR: i64 = 60 * 60 * 1_000_000;
+        const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
+        let micros = MICROS_PER_DAY + 2 * MICROS_PER_HOUR;
+        let expr = Expression::Interval(IntervalExpression {
+            months: 0,
+            days: 0,
+            microseconds: micros,
+        });
+        let sql = gen().gen_expr(&expr).unwrap();
+        assert!(sql.contains("DAY"), "expected DAY in: {sql}");
+        assert!(sql.contains("HOUR"), "expected HOUR in: {sql}");
+    }
+
+    #[test]
+    fn interval_zero_microseconds() {
+        // Zero microseconds in day-time form should still produce a valid interval
+        let expr = Expression::Interval(IntervalExpression {
+            months: 0,
+            days: 0,
+            microseconds: 0,
+        });
+        let sql = gen().gen_expr(&expr).unwrap();
+        assert!(sql.contains("INTERVAL"), "expected INTERVAL in: {sql}");
+        assert!(sql.contains("SECOND"), "expected SECOND fallback in: {sql}");
+    }
+
+    #[test]
+    fn is_distinct_from() {
+        let expr = Expression::IsDistinctFrom(IsDistinctFromExpression {
+            left: Box::new(col("a")),
+            right: Box::new(Literal::null()),
+            negated: false,
+        });
+        let sql = gen().gen_expr(&expr).unwrap();
+        assert!(sql.contains("IS DISTINCT FROM"), "got: {sql}");
+        assert!(!sql.contains("NOT"), "should not have NOT: {sql}");
+
+        let negated = Expression::IsDistinctFrom(IsDistinctFromExpression {
+            left: Box::new(col("a")),
+            right: Box::new(col("b")),
+            negated: true,
+        });
+        let sql = gen().gen_expr(&negated).unwrap();
+        assert!(sql.contains("IS NOT DISTINCT FROM"), "got: {sql}");
+    }
+
+    #[test]
+    fn extract_value_string_key() {
+        let expr = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(col("person")),
+            extraction: Box::new(Literal::string("name")),
+        });
+        let sql = gen().gen_expr(&expr).unwrap();
+        assert_eq!(sql, r#""person"['name']"#, "got: {sql}");
+    }
+
+    #[test]
+    fn extract_value_numeric_index() {
+        let expr = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(col("arr")),
+            extraction: Box::new(int(1)),
+        });
+        let sql = gen().gen_expr(&expr).unwrap();
+        assert_eq!(sql, r#""arr"[1]"#, "got: {sql}");
+    }
+
+    #[test]
+    fn row_constructor_generates_tuple() {
+        let expr = Expression::RowConstructor(RowConstructorExpression {
+            fields: vec![int(1), int(2), int(3)],
+        });
+        let sql = gen().gen_expr(&expr).unwrap();
+        assert_eq!(sql, "(1, 2, 3)", "got: {sql}");
+    }
+
+    #[test]
+    fn single_row_relation_no_from_clause() {
+        // SELECT 1 → SELECT 1  (no FROM)
+        let plan = LogicalPlan::Project(Project {
+            input: Box::new(LogicalPlan::SingleRow(SingleRowRelation)),
+            projections: vec![int(1)],
+        });
+        let sql = gen().generate(&plan).unwrap();
+        assert_eq!(sql, "SELECT 1", "expected no FROM clause, got: {sql}");
+    }
+
+    #[test]
+    fn single_row_relation_standalone() {
+        // SingleRow standalone produces a single-row result
+        let plan = LogicalPlan::SingleRow(SingleRowRelation);
+        let sql = gen().generate(&plan).unwrap();
+        assert!(sql.contains("SELECT"), "got: {sql}");
     }
 }

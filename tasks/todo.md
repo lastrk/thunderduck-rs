@@ -1,30 +1,34 @@
-# Phase 2 Code Review — Bug Fixes
+# Gap Analysis — Implementation Tasks
 
-All bugs from the senior Rust review are resolved.
+From `/workspace/docs/reference-gap-analysis.md`. Ordered by severity.
 
-## Bugs with observable test failures
+## Critical
 
-- [x] **Bug 6 — TOCTOU race in `SessionManager::get_or_create`**
-  Fixed: replaced get → spawn → insert with DashMap `entry` API (atomic check-and-insert).
-  Test `get_or_create_is_race_free` failed before fix, passes after.
+- [x] **session-init** — Fix 5 session init gaps + initcap macro
+  - Timezone: replace hardcoded `'UTC'` with system timezone
+  - Add: `SET enable_progress_bar=false`
+  - Add: `SET preserve_insertion_order=true`
+  - Add: `SET allocator_background_threads=true` (Linux, 8+ cores only)
+  - Add: `initcap` Spark-compatible macro
+  - File: `crates/core/src/runtime/session.rs`
 
-## Code fixes (no meaningful failing test)
+- [x] **expressions-and-plans** — Add missing Expression variants + SingleRowRelation
+  - `Like { value, pattern, negated, case_insensitive }` → `(val [NOT] [I]LIKE pat)`
+  - `Interval { months, days, microseconds }` → composite `INTERVAL '...' DAY + ...`
+  - `IsDistinctFrom { left, right, negated }` → `left IS [NOT] DISTINCT FROM right`
+  - `ExtractValue { child, extraction }` → `child[extraction]` / `child['field']`
+  - `RowConstructor { fields }` → `(field1, field2, ...)`
+  - `SingleRowRelation` LogicalPlan → no FROM clause in generator
+  - Generator dispatch + unit tests for each
+  - Files: `expression/mod.rs`, `logical/mod.rs`, `generator/mod.rs`
 
-- [x] **Bug 1 — extension_loader: 5 identical `cfg` blocks**
-  Collapsed to a single `const EXTENSION_BYTES: &[u8] = &[];`.
+## Important (follow-up)
 
-- [x] **Bug 2 — `_batch_size` dead code in `session.rs`**
-  Removed. Parameter renamed to `_config` (kept for future wiring; not yet used).
+- [ ] **polymorphic-functions** — Schema-aware function resolution in generator
+  - `reverse(array_col)` → `list_reverse(...)` not `reverse(...)`
+  - `size(array)` → `len(...)`, `size(string)` → `length(...)`
+  - Requires child schema context in SqlGenerator
+  - Files: `generator/mod.rs`, `functions/mod.rs`
 
-- [x] **Bug 3 — `SessionCommand`/`SessionResult` over-exposed**
-  Changed from `pub` to `pub(crate)`.
-
-- [x] **Bug 4 — impossible `Batches(_)` arm in `create_temp_view`**
-  Changed from silent `Ok(())` to `unreachable!("CreateView never returns batches")`.
-
-- [x] **Bug 7 — `from_env` temporary borrow chain**
-  Extracted owned `String` before matching; two-line form is clear and safe.
-
-- [x] **Bug 9 — `ThunderduckError::Arrow` variant is dead code**
-  Removed `Arrow` variant and `From<ArrowError>` impl. Arrow errors surface via
-  duckdb::Error at `query_arrow` time, mapped through the existing `DuckDb` variant.
+- [ ] **arrow-schema-fixup** — Phase 3 (needs gRPC layer first)
+- [ ] **spark-connect-converters** — Phase 3 (DROP_NA, FILL_NA, UNPIVOT, etc.)

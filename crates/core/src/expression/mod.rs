@@ -133,8 +133,8 @@ pub enum LiteralValue {
     Double(f64),
     Decimal(String), // stored as string to avoid precision loss
     String(String),
-    Date(i32),            // days since epoch
-    Timestamp(i64),       // microseconds since epoch
+    Date(i32),       // days since epoch
+    Timestamp(i64),  // microseconds since epoch
     TimestampNtz(i64),
     Binary(Vec<u8>),
 }
@@ -170,6 +170,11 @@ pub enum Expression {
     StructLiteral(StructLiteralExpression),
     Between(BetweenExpression),
     InList(InListExpression),
+    Like(LikeExpression),
+    Interval(IntervalExpression),
+    IsDistinctFrom(IsDistinctFromExpression),
+    ExtractValue(ExtractValueExpression),
+    RowConstructor(RowConstructorExpression),
 }
 
 // ── Expression inner types ────────────────────────────────────────────────────
@@ -365,6 +370,59 @@ pub struct InListExpression {
     pub negated: bool,
 }
 
+/// LIKE / NOT LIKE / ILIKE / NOT ILIKE predicate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LikeExpression {
+    pub value: Box<Expression>,
+    pub pattern: Box<Expression>,
+    /// When true, generates NOT LIKE / NOT ILIKE.
+    pub negated: bool,
+    /// When true, uses ILIKE (case-insensitive). DuckDB supports ILIKE natively.
+    pub case_insensitive: bool,
+}
+
+/// An interval literal decomposed into month / day / microsecond components.
+///
+/// Three sub-types:
+/// - Year-month: only `months` is set (days and microseconds are 0)
+/// - Day-time: only `microseconds` is set (months and days are 0)
+/// - Calendar: any combination of the three
+#[derive(Debug, Clone, PartialEq)]
+pub struct IntervalExpression {
+    pub months: i32,
+    pub days: i32,
+    pub microseconds: i64,
+}
+
+/// IS [NOT] DISTINCT FROM — null-safe equality comparison.
+///
+/// Unlike `=`, this always returns a non-null boolean even when operands are NULL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsDistinctFromExpression {
+    pub left: Box<Expression>,
+    pub right: Box<Expression>,
+    /// When true, generates IS NOT DISTINCT FROM.
+    pub negated: bool,
+}
+
+/// Extracts a value from a complex type (struct field, array element, map key).
+///
+/// The SQL form is `child[extraction]`. String-literal extractions use bracket
+/// notation: `child['field']`. Numeric extractions use `child[idx]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractValueExpression {
+    pub child: Box<Expression>,
+    pub extraction: Box<Expression>,
+}
+
+/// Row / tuple constructor: `(a, b, c)`.
+///
+/// Used in tuple comparisons such as `WHERE (x, y) IN ((1, 2), (3, 4))`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowConstructorExpression {
+    pub fields: Vec<Expression>,
+}
+
 // ── Type inference on Expression ──────────────────────────────────────────────
 
 impl Expression {
@@ -415,19 +473,13 @@ impl Expression {
                     .map(|(_, r)| r.data_type(schema))
                     .unwrap_or(DataType::Unresolved)
             }
-            Expression::Window(w) => {
-                let func_type = match w.func.as_ref() {
-                    Expression::FunctionCall(f) => {
-                        let arg_types: Vec<_> = f.args.iter().map(|a| a.data_type(schema)).collect();
-                        TypeInferenceEngine::window_return_type(
-                            &f.name,
-                            arg_types.first(),
-                        )
-                    }
-                    other => other.data_type(schema),
-                };
-                func_type
-            }
+            Expression::Window(w) => match w.func.as_ref() {
+                Expression::FunctionCall(f) => {
+                    let arg_types: Vec<_> = f.args.iter().map(|a| a.data_type(schema)).collect();
+                    TypeInferenceEngine::window_return_type(&f.name, arg_types.first())
+                }
+                other => other.data_type(schema),
+            },
             Expression::Alias(a) => a.expr.data_type(schema),
             Expression::Star(_) => DataType::Unresolved,
             Expression::InSubquery(_) | Expression::ExistsSubquery(_) => DataType::Boolean,
@@ -444,6 +496,10 @@ impl Expression {
             },
             Expression::StructLiteral(_) => DataType::Unresolved,
             Expression::Between(_) => DataType::Boolean,
+            // New variants
+            Expression::Like(_) | Expression::IsDistinctFrom(_) => DataType::Boolean,
+            Expression::Interval(_) => DataType::String, // TODO: proper IntervalType
+            Expression::ExtractValue(_) | Expression::RowConstructor(_) => DataType::Unresolved,
         }
     }
 
@@ -479,6 +535,12 @@ impl Expression {
             Expression::RawSql(_) => true,
             Expression::ArrayLiteral(_) | Expression::MapLiteral(_) | Expression::StructLiteral(_) => false,
             Expression::Between(_) => false,
+            // New variants
+            Expression::Like(l) => l.value.nullable(schema) || l.pattern.nullable(schema),
+            Expression::IsDistinctFrom(_) => false,
+            Expression::Interval(_) => false,
+            Expression::ExtractValue(_) => true,
+            Expression::RowConstructor(_) => false,
         }
     }
 }
@@ -539,5 +601,37 @@ mod tests {
             try_cast: false,
         });
         assert_eq!(expr.data_type(&StructType::empty()), DataType::String);
+    }
+
+    #[test]
+    fn like_data_type_is_boolean() {
+        let expr = Expression::Like(LikeExpression {
+            value: Box::new(ColumnReference::untyped("name")),
+            pattern: Box::new(Literal::string("%smith%")),
+            negated: false,
+            case_insensitive: false,
+        });
+        assert_eq!(expr.data_type(&StructType::empty()), DataType::Boolean);
+    }
+
+    #[test]
+    fn interval_data_type_is_string() {
+        let expr = Expression::Interval(IntervalExpression {
+            months: 1,
+            days: 0,
+            microseconds: 0,
+        });
+        assert_eq!(expr.data_type(&StructType::empty()), DataType::String);
+    }
+
+    #[test]
+    fn is_distinct_from_data_type_and_nullability() {
+        let expr = Expression::IsDistinctFrom(IsDistinctFromExpression {
+            left: Box::new(ColumnReference::untyped("a")),
+            right: Box::new(Literal::null()),
+            negated: false,
+        });
+        assert_eq!(expr.data_type(&StructType::empty()), DataType::Boolean);
+        assert!(!expr.nullable(&StructType::empty()));
     }
 }

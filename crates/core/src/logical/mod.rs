@@ -97,6 +97,7 @@ pub enum LogicalPlan {
     AliasedRelation(AliasedRelation),
     RawDdlStatement(RawDdlStatement),
     ToDataFrame(ToDataFrame),
+    SingleRow(SingleRowRelation),
 }
 
 // ── Plan node structs ─────────────────────────────────────────────────────────
@@ -265,6 +266,13 @@ pub struct ToDataFrame {
     pub column_names: Vec<String>,
 }
 
+/// A relation that produces a single row with no columns.
+///
+/// Used for expressions that don't require an input table,
+/// e.g. `SELECT 1` or `SELECT ABS(-1)` — no FROM clause needed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SingleRowRelation;
+
 // ── Schema inference ──────────────────────────────────────────────────────────
 
 impl LogicalPlan {
@@ -302,6 +310,7 @@ impl LogicalPlan {
             LogicalPlan::AliasedRelation(a) => a.input.infer_schema(),
             LogicalPlan::RawDdlStatement(_) => StructType::empty(),
             LogicalPlan::ToDataFrame(t) => infer_to_dataframe_schema(t),
+            LogicalPlan::SingleRow(_) => StructType::empty(),
         }
     }
 }
@@ -513,5 +522,12 @@ mod tests {
         let schema = plan.infer_schema();
         assert_eq!(schema.fields[0].name, "user_id");
         assert_eq!(schema.fields[0].data_type, DataType::Long);
+    }
+
+    #[test]
+    fn single_row_schema_is_empty() {
+        let plan = LogicalPlan::SingleRow(SingleRowRelation);
+        let schema = plan.infer_schema();
+        assert!(schema.is_empty());
     }
 }

@@ -15,10 +15,10 @@ use crate::expression::{
 };
 use crate::functions::{CompatMode, FunctionRegistry};
 use crate::logical::{
-    Aggregate, AliasedRelation, Distinct, Except, Filter, GroupingSets, InMemoryRelation,
-    Intersect, Join, Limit, LocalDataRelation, LocalRelation, LogicalPlan, Project,
-    RangeRelation, Sample, SelectEntry, SingleRowRelation, Sort, SqlRelation, TableScan, Tail,
-    ToDataFrame, Union, WithColumns, WithCte,
+    Aggregate, AliasedRelation, Distinct, DropColumns, Except, Filter, GroupingSets,
+    InMemoryRelation, Intersect, Join, Limit, LocalDataRelation, LocalRelation, LogicalPlan,
+    Project, RangeRelation, Sample, SelectEntry, ShowString, SingleRowRelation, Sort, SqlRelation,
+    TableScan, Tail, ToDataFrame, Union, WithColumns, WithCte,
 };
 use crate::types::{DataType, StructType, TypeMapper};
 
@@ -77,6 +77,8 @@ impl SqlGenerator {
             LogicalPlan::RawDdlStatement(r) => Ok(r.sql.clone()),
             LogicalPlan::ToDataFrame(t) => self.gen_to_dataframe(t),
             LogicalPlan::SingleRow(sr) => self.gen_single_row(sr),
+            LogicalPlan::DropColumns(d) => self.gen_drop_columns(d),
+            LogicalPlan::ShowString(s) => self.gen_show_string(s),
         }
     }
 
@@ -434,6 +436,24 @@ impl SqlGenerator {
         // SingleRow is used as an input to Project (no FROM needed).
         // If somehow generated standalone, emit a no-op that produces one row.
         Ok("SELECT 1".to_string())
+    }
+
+    fn gen_drop_columns(&self, d: &DropColumns) -> Result<String> {
+        let from = self.gen_from(&d.input)?;
+        let excluded = d
+            .column_names
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!("SELECT * EXCLUDE ({excluded})\nFROM {from}"))
+    }
+
+    fn gen_show_string(&self, s: &ShowString) -> Result<String> {
+        // Phase 3 stub: just delegate to the input with an optional LIMIT.
+        // PySpark formats the ASCII table client-side from the returned rows.
+        let inner = self.gen_plan(&s.input)?;
+        Ok(format!("SELECT *\nFROM ({inner})\nLIMIT {}", s.num_rows))
     }
 
     // ── FROM clause helpers ────────────────────────────────────────────────────

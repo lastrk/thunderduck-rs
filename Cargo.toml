@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core"]
+members = ["crates/core", "crates/connect-server"]
 resolver = "2"
 
 [workspace.package]
@@ -7,9 +7,16 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
-thiserror = "2"
-duckdb   = { version = "1.10500.0", features = ["bundled"] }
-arrow    = "57"
-dashmap  = "6"
-tokio    = { version = "1", features = ["full"] }
-anyhow   = "1"
+thiserror  = "2"
+duckdb     = { version = "1.10500.0", features = ["bundled"] }
+arrow      = "57"
+arrow-ipc  = "57"
+dashmap    = "6"
+tokio      = { version = "1", features = ["full"] }
+anyhow     = "1"
+tonic      = { version = "0.12", features = ["transport"] }
+prost      = "0.13"
+prost-types = "0.13"
+clap       = { version = "4", features = ["derive"] }
+uuid       = { version = "1", features = ["v4"] }
+futures    = "0.3"

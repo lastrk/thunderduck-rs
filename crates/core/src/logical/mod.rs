@@ -98,6 +98,8 @@ pub enum LogicalPlan {
     RawDdlStatement(RawDdlStatement),
     ToDataFrame(ToDataFrame),
     SingleRow(SingleRowRelation),
+    DropColumns(DropColumns),
+    ShowString(ShowString),
 }
 
 // ── Plan node structs ─────────────────────────────────────────────────────────
@@ -273,6 +275,23 @@ pub struct ToDataFrame {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SingleRowRelation;
 
+/// Drop named columns from the input relation.
+/// Generates: `SELECT * EXCLUDE ("col1", "col2") FROM input`
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropColumns {
+    pub input: Box<LogicalPlan>,
+    pub column_names: Vec<String>,
+}
+
+/// Phase 3 stub for `df.show()` — delegates to input plan; PySpark formats client-side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowString {
+    pub input: Box<LogicalPlan>,
+    pub num_rows: i32,
+    pub truncate: i32,
+    pub vertical: bool,
+}
+
 // ── Schema inference ──────────────────────────────────────────────────────────
 
 impl LogicalPlan {
@@ -311,6 +330,15 @@ impl LogicalPlan {
             LogicalPlan::RawDdlStatement(_) => StructType::empty(),
             LogicalPlan::ToDataFrame(t) => infer_to_dataframe_schema(t),
             LogicalPlan::SingleRow(_) => StructType::empty(),
+            LogicalPlan::DropColumns(d) => {
+                let child = d.input.infer_schema();
+                let excluded: std::collections::HashSet<&str> =
+                    d.column_names.iter().map(String::as_str).collect();
+                StructType::new(
+                    child.fields.into_iter().filter(|f| !excluded.contains(f.name.as_str())).collect(),
+                )
+            }
+            LogicalPlan::ShowString(s) => s.input.infer_schema(),
         }
     }
 }

@@ -27,7 +27,7 @@ fn detect_timezone() -> String {
     // 2. /etc/timezone (Linux/Debian-based)
     #[cfg(target_os = "linux")]
     if let Ok(contents) = std::fs::read_to_string("/etc/timezone") {
-        let tz = contents.trim().to_string();
+        let tz = contents.trim().trim_start_matches('/').to_string();
         if !tz.is_empty() {
             return tz;
         }

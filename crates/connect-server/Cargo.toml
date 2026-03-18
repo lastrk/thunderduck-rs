@@ -1,0 +1,25 @@
+[package]
+name = "thunderduck-connect-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "thunderduck-connect-server"
+path = "src/main.rs"
+
+[dependencies]
+thunderduck-core = { path = "../core" }
+tonic.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+tokio.workspace = true
+arrow-ipc.workspace = true
+arrow.workspace = true
+dashmap.workspace = true
+clap.workspace = true
+uuid.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+tonic-build = "0.12"

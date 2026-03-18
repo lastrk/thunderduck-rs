@@ -1,0 +1,23 @@
+
+# Claude Code authentication (auto-generated, keep secret)
+.devcontainer/.claude-auth-token
+.devcontainer/.claude-base-url
+.devcontainer/.claude-custom-headers
+.reference/
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+tests/integration/logs/
+tests/integration/tpch_sf001/
+tests/integration/tpcds_sf001/
+tests/integration/.env
+
+# DuckDB extension binaries (large, platform-specific — added per-platform when available)
+extensions/

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use crate::types::DataType;
+
 /// Compatibility mode — affects which function implementations are selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompatMode {
@@ -53,6 +55,45 @@ impl FunctionRegistry {
 
         // 3. Pass-through: emit as-is (function name unchanged)
         format!("{}({})", spark_name, args.join(", "))
+    }
+
+    /// Translate a Spark function name to DuckDB SQL, dispatching polymorphic
+    /// functions based on the inferred argument types.
+    ///
+    /// When `arg_types` is non-empty and the first argument type is known
+    /// (i.e. not `DataType::Unresolved`), this method selects the correct
+    /// DuckDB equivalent for overloaded Spark functions like `reverse`,
+    /// `size`, and `sort_array`. All other functions fall through to
+    /// [`translate`][Self::translate].
+    pub fn translate_typed(
+        spark_name: &str,
+        args: &[&str],
+        arg_types: &[DataType],
+        mode: CompatMode,
+    ) -> String {
+        let first_type = arg_types.first().unwrap_or(&DataType::Unresolved);
+
+        let arg0 = args.first().copied().unwrap_or("");
+        match spark_name.to_lowercase().as_str() {
+            "reverse" => {
+                if matches!(first_type, DataType::Array(_)) {
+                    return format!("LIST_REVERSE({arg0})");
+                }
+            }
+            "size" => {
+                if matches!(first_type, DataType::String) {
+                    return format!("LENGTH({arg0})");
+                }
+            }
+            "sort_array" => {
+                if matches!(first_type, DataType::Array(_)) {
+                    return format!("LIST_SORT({arg0})");
+                }
+            }
+            _ => {}
+        }
+
+        Self::translate(spark_name, args, mode)
     }
 
     /// Check if a function name is explicitly mapped (direct or custom).
@@ -1125,5 +1166,128 @@ mod tests {
     fn spark_date_format_conversion() {
         assert_eq!(convert_spark_date_format("'yyyy-MM-dd'"), "%Y-%m-%d");
         assert_eq!(convert_spark_date_format("'yyyy-MM-dd HH:mm:ss'"), "%Y-%m-%d %H:%M:%S");
+    }
+
+    // ── Polymorphic dispatch tests ─────────────────────────────────────────────
+
+    /// reverse(array_col) → LIST_REVERSE when first arg is Array type.
+    #[test]
+    fn reverse_array_dispatches_to_list_reverse() {
+        let arg_types = [DataType::Array(Box::new(DataType::Integer))];
+        let sql = FunctionRegistry::translate_typed(
+            "reverse",
+            &["arr"],
+            &arg_types,
+            CompatMode::Relaxed,
+        );
+        assert_eq!(sql, "LIST_REVERSE(arr)");
+    }
+
+    /// reverse(str_col) → REVERSE (string variant) when first arg is String.
+    #[test]
+    fn reverse_string_dispatches_to_reverse() {
+        let arg_types = [DataType::String];
+        let sql = FunctionRegistry::translate_typed(
+            "reverse",
+            &["s"],
+            &arg_types,
+            CompatMode::Relaxed,
+        );
+        assert_eq!(sql, "REVERSE(s)");
+    }
+
+    /// reverse(unresolved) → REVERSE (fall-through to existing direct mapping).
+    #[test]
+    fn reverse_unresolved_falls_through_to_reverse() {
+        let arg_types = [DataType::Unresolved];
+        let sql = FunctionRegistry::translate_typed(
+            "reverse",
+            &["x"],
+            &arg_types,
+            CompatMode::Relaxed,
+        );
+        assert_eq!(sql, "REVERSE(x)");
+    }
+
+    /// size(array_col) → LEN when first arg is Array type.
+    #[test]
+    fn size_array_dispatches_to_len() {
+        let arg_types = [DataType::Array(Box::new(DataType::Long))];
+        let sql = FunctionRegistry::translate_typed(
+            "size",
+            &["arr"],
+            &arg_types,
+            CompatMode::Relaxed,
+        );
+        assert_eq!(sql, "LEN(arr)");
+    }
+
+    /// size(map_col) → LEN when first arg is Map type.
+    #[test]
+    fn size_map_dispatches_to_len() {
+        let arg_types = [DataType::Map {
+            key: Box::new(DataType::String),
+            value: Box::new(DataType::Integer),
+            value_nullable: true,
+        }];
+        let sql = FunctionRegistry::translate_typed(
+            "size",
+            &["m"],
+            &arg_types,
+            CompatMode::Relaxed,
+        );
+        assert_eq!(sql, "LEN(m)");
+    }
+
+    /// size(str_col) → LENGTH when first arg is String.
+    #[test]
+    fn size_string_dispatches_to_length() {
+        let arg_types = [DataType::String];
+        let sql = FunctionRegistry::translate_typed(
+            "size",
+            &["s"],
+            &arg_types,
+            CompatMode::Relaxed,
+        );
+        assert_eq!(sql, "LENGTH(s)");
+    }
+
+    /// sort_array(array_col) → LIST_SORT when first arg is Array type.
+    #[test]
+    fn sort_array_array_dispatches_to_list_sort() {
+        let arg_types = [DataType::Array(Box::new(DataType::String))];
+        let sql = FunctionRegistry::translate_typed(
+            "sort_array",
+            &["arr"],
+            &arg_types,
+            CompatMode::Relaxed,
+        );
+        assert_eq!(sql, "LIST_SORT(arr)");
+    }
+
+    /// sort_array(unresolved) → LIST_SORT (fall-through to existing direct mapping).
+    #[test]
+    fn sort_array_unresolved_falls_through_to_list_sort() {
+        let arg_types = [DataType::Unresolved];
+        let sql = FunctionRegistry::translate_typed(
+            "sort_array",
+            &["x"],
+            &arg_types,
+            CompatMode::Relaxed,
+        );
+        assert_eq!(sql, "LIST_SORT(x)");
+    }
+
+    /// Non-polymorphic functions delegate to translate unchanged.
+    #[test]
+    fn translate_typed_delegates_non_polymorphic_functions() {
+        let arg_types = [DataType::String];
+        let sql = FunctionRegistry::translate_typed(
+            "upper",
+            &["col"],
+            &arg_types,
+            CompatMode::Relaxed,
+        );
+        assert_eq!(sql, "UPPER(col)");
     }
 }

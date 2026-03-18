@@ -20,7 +20,7 @@ use crate::logical::{
     RangeRelation, Sample, SelectEntry, SingleRowRelation, Sort, SqlRelation, TableScan, Tail,
     ToDataFrame, Union, WithColumns, WithCte,
 };
-use crate::types::TypeMapper;
+use crate::types::{DataType, StructType, TypeMapper};
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 
@@ -590,8 +590,18 @@ impl SqlGenerator {
 
         let arg_refs: Vec<&str> = arg_sqls.iter().map(|s| s.as_str()).collect();
 
+        // Infer argument types for polymorphic dispatch.
+        // We use an empty schema as a sentinel: ColumnReferences that carry
+        // an embedded DataType (i.e. already resolved) will return their type
+        // directly; unresolved references fall back to DataType::Unresolved,
+        // which causes translate_typed to fall through to the non-polymorphic path.
+        let empty_schema = StructType::empty();
+        let arg_types: Vec<DataType> =
+            f.args.iter().map(|a| a.data_type(&empty_schema)).collect();
+
         // Route through FunctionRegistry for Spark→DuckDB translation
-        let translated = FunctionRegistry::translate(&f.name, &arg_refs, self.mode);
+        let translated =
+            FunctionRegistry::translate_typed(&f.name, &arg_refs, &arg_types, self.mode);
 
         if f.distinct {
             // Inject DISTINCT inside the outermost function call

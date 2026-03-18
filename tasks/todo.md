@@ -24,7 +24,7 @@ From `/workspace/docs/reference-gap-analysis.md`. Ordered by severity.
 
 ## Important (follow-up)
 
-- [ ] **polymorphic-functions** — Schema-aware function resolution in generator
+- [x] **polymorphic-functions** — Schema-aware function resolution in generator
   - `reverse(array_col)` → `list_reverse(...)` not `reverse(...)`
   - `size(array)` → `len(...)`, `size(string)` → `length(...)`
   - Requires child schema context in SqlGenerator

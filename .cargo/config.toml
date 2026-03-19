@@ -1,0 +1,5 @@
+[build]
+# Limit parallel C++ compilation jobs to prevent OOM when building libduckdb-sys.
+# DuckDB's amalgamation is large (~2GB of C++ source); compiling more than 2
+# units in parallel exhausts available RAM on this machine.
+jobs = 2

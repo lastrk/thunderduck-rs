@@ -58,8 +58,9 @@ impl SparkConnectService for ThunderduckService {
 
         let responses: Vec<proto::ExecutePlanResponse> = match plan.op_type {
             Some(proto::plan::OpType::Root(relation)) => {
-                let logical_plan = PlanConverter::convert_relation(&relation)
-                    .map_err(|e| Status::from(e))?;
+                let logical_plan =
+                    PlanConverter::convert_relation_with_session(&relation, Arc::clone(&session))
+                        .map_err(Status::from)?;
 
                 let sql = SqlGenerator::relaxed()
                     .generate(&logical_plan)
@@ -258,6 +259,46 @@ async fn handle_command(
                 .await
                 .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
             batches_to_responses(session_id, operation_id, &batches).map_err(Status::from)
+        }
+        Some(CommandType::WriteOperation(write_cmd)) => {
+            use proto::write_operation::SaveType;
+            let input_rel = write_cmd
+                .input
+                .ok_or_else(|| Status::invalid_argument("WriteOperation missing input"))?;
+            let logical_plan =
+                PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
+            let select_sql = SqlGenerator::relaxed()
+                .generate(&logical_plan)
+                .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
+
+            let path = match write_cmd.save_type {
+                Some(SaveType::Path(p)) => p,
+                _ => return Err(Status::invalid_argument("WriteOperation requires a path destination")),
+            };
+
+            // Determine format from the source proto field
+            let format = match write_cmd.source.as_deref() {
+                Some("parquet") => "PARQUET",
+                Some("csv") => "CSV",
+                Some("json") => "JSON",
+                _ => "PARQUET",
+            };
+
+            let copy_sql = if format == "CSV" {
+                format!("COPY ({select_sql}) TO '{path}' (FORMAT CSV, HEADER)")
+            } else {
+                format!("COPY ({select_sql}) TO '{path}' (FORMAT {format})")
+            };
+
+            session
+                .execute(&copy_sql)
+                .await
+                .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
+
+            Ok(vec![
+                sql_command_result_response(session_id, operation_id),
+                result_complete_response(session_id, operation_id),
+            ])
         }
         _ => Err(Status::unimplemented("Unsupported command type")),
     }

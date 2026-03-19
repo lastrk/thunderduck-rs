@@ -1,10 +1,15 @@
-use thunderduck_core::expression::{Expression, Literal, SortOrder, UnresolvedColumn};
+use std::sync::Arc;
+
+use thunderduck_core::expression::{Expression, Literal, LiteralValue, SortOrder, UnresolvedColumn};
+use thunderduck_core::generator::SqlGenerator;
 use thunderduck_core::logical::{
     Aggregate, AggregateExpr, AliasedRelation, Distinct, DropColumns, Except, Filter,
-    GroupingSets, Intersect, Join, JoinType, Limit, LocalDataRelation, LogicalPlan, RangeRelation,
-    Sample, SelectEntry, ShowString, SingleRowRelation, Sort, SqlRelation, TableScan, Tail,
-    ToDataFrame, Union, WithColumns,
+    GroupingSets, Intersect, Join, JoinType, Limit, LocalDataRelation, LogicalPlan, NADrop,
+    NADropHow, NAFill, NAReplace, RangeRelation, Sample, SelectEntry, ShowString,
+    SingleRowRelation, Sort, SqlRelation, TableScan, Tail, ToDataFrame, Union, Unpivot,
+    WithColumns,
 };
+use thunderduck_core::runtime::{DuckDbSession, SchemaInferrer};
 use thunderduck_core::types::{DataType, StructField, StructType};
 
 use crate::converter::expression_converter::ExpressionConverter;
@@ -14,11 +19,17 @@ use crate::proto::spark::connect as proto;
 /// Converts proto Relation messages to the core LogicalPlan AST.
 pub struct RelationConverter<'a> {
     expr_conv: &'a mut ExpressionConverter,
+    /// Optional session for schema inference (used by NADrop/NAFill/NAReplace/Unpivot).
+    session: Option<Arc<DuckDbSession>>,
 }
 
 impl<'a> RelationConverter<'a> {
     pub fn new(expr_conv: &'a mut ExpressionConverter) -> Self {
-        Self { expr_conv }
+        Self { expr_conv, session: None }
+    }
+
+    pub fn with_session(expr_conv: &'a mut ExpressionConverter, session: Arc<DuckDbSession>) -> Self {
+        Self { expr_conv, session: Some(session) }
     }
 
     pub fn convert(&mut self, relation: &proto::Relation) -> Result<LogicalPlan> {
@@ -69,30 +80,22 @@ impl<'a> RelationConverter<'a> {
                 self.convert(input)
             }
             Some(RelType::ShowString(ss)) => self.convert_show_string(ss),
-            Some(RelType::FillNa(_)) => {
-                Err(ConnectError::Unsupported("NAFill not supported (Phase 4)".into()))
-            }
-            Some(RelType::DropNa(_)) => {
-                Err(ConnectError::Unsupported("NADrop not supported (Phase 4)".into()))
-            }
-            Some(RelType::Replace(_)) => {
-                Err(ConnectError::Unsupported("NAReplace not supported (Phase 4)".into()))
-            }
+            Some(RelType::FillNa(f)) => self.convert_fill_na(f),
+            Some(RelType::DropNa(d)) => self.convert_drop_na(d),
+            Some(RelType::Replace(r)) => self.convert_replace(r),
             Some(RelType::Summary(_)) => {
-                Err(ConnectError::Unsupported("Summary not supported (Phase 4)".into()))
+                Err(ConnectError::Unsupported("Summary not supported (Phase 5)".into()))
             }
             Some(RelType::Describe(_)) => {
-                Err(ConnectError::Unsupported("Describe not supported (Phase 4)".into()))
+                Err(ConnectError::Unsupported("Describe not supported (Phase 5)".into()))
             }
             Some(RelType::Cov(_)) => {
-                Err(ConnectError::Unsupported("Cov not supported (Phase 4)".into()))
+                Err(ConnectError::Unsupported("Cov not supported (Phase 5)".into()))
             }
             Some(RelType::Corr(_)) => {
-                Err(ConnectError::Unsupported("Corr not supported (Phase 4)".into()))
+                Err(ConnectError::Unsupported("Corr not supported (Phase 5)".into()))
             }
-            Some(RelType::Unpivot(_)) => {
-                Err(ConnectError::Unsupported("Unpivot not supported (Phase 4)".into()))
-            }
+            Some(RelType::Unpivot(u)) => self.convert_unpivot(u),
             _ => Err(ConnectError::Unsupported(format!(
                 "Unsupported relation type: {:?}",
                 std::mem::discriminant(relation.rel_type.as_ref().unwrap())
@@ -491,6 +494,157 @@ impl<'a> RelationConverter<'a> {
             vertical: ss.vertical,
         }))
     }
+
+    fn convert_drop_na(&mut self, d: &proto::NaDrop) -> Result<LogicalPlan> {
+        let input = d
+            .input
+            .as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("NADrop missing input".into()))?;
+        let input_plan = self.convert(input)?;
+
+        // min_non_nulls unset → "any" (all must be non-null); set → threshold
+        let (how, threshold) = if let Some(min) = d.min_non_nulls {
+            (NADropHow::Any, Some(min)) // threshold = keep rows with >= min non-nulls
+        } else {
+            (NADropHow::Any, None) // drop row if ANY column is null
+        };
+
+        let cols = if d.cols.is_empty() {
+            self.infer_columns(&input_plan)?
+        } else {
+            d.cols.clone()
+        };
+
+        Ok(LogicalPlan::NADrop(NADrop { input: Box::new(input_plan), how, threshold, cols }))
+    }
+
+    fn convert_fill_na(&mut self, f: &proto::NaFill) -> Result<LogicalPlan> {
+        let input = f
+            .input
+            .as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("NAFill missing input".into()))?;
+        let input_plan = self.convert(input)?;
+
+        // Convert proto literals to core Literals
+        let fill_literals: Result<Vec<Literal>> =
+            f.values.iter().map(|v| proto_literal_to_core(v)).collect();
+        let fill_literals = fill_literals?;
+
+        let all_columns = self.infer_columns(&input_plan)?;
+
+        let values: Vec<(String, Literal)> = if f.cols.is_empty() {
+            // Apply single fill value to all type-compatible columns
+            if let Some(lit) = fill_literals.first() {
+                all_columns.iter().map(|c| (c.clone(), lit.clone())).collect()
+            } else {
+                vec![]
+            }
+        } else if fill_literals.len() == 1 {
+            // Apply single fill value to specified columns
+            f.cols.iter().map(|c| (c.clone(), fill_literals[0].clone())).collect()
+        } else {
+            // Each column paired with its own value
+            f.cols.iter().zip(fill_literals.iter()).map(|(c, l)| (c.clone(), l.clone())).collect()
+        };
+
+        Ok(LogicalPlan::NAFill(NAFill {
+            input: Box::new(input_plan),
+            values,
+            all_columns,
+        }))
+    }
+
+    fn convert_replace(&mut self, r: &proto::NaReplace) -> Result<LogicalPlan> {
+        let input = r
+            .input
+            .as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("NAReplace missing input".into()))?;
+        let input_plan = self.convert(input)?;
+        let all_columns = self.infer_columns(&input_plan)?;
+
+        let target_cols = if r.cols.is_empty() { all_columns.clone() } else { r.cols.clone() };
+
+        let mut replacements: Vec<(String, Literal, Literal)> = Vec::new();
+        for repl in &r.replacements {
+            let old = repl
+                .old_value
+                .as_ref()
+                .ok_or_else(|| ConnectError::PlanConversion("NAReplace missing old_value".into()))?;
+            let new = repl
+                .new_value
+                .as_ref()
+                .ok_or_else(|| ConnectError::PlanConversion("NAReplace missing new_value".into()))?;
+            let old_lit = proto_literal_to_core(old)?;
+            let new_lit = proto_literal_to_core(new)?;
+            for col in &target_cols {
+                replacements.push((col.clone(), old_lit.clone(), new_lit.clone()));
+            }
+        }
+
+        Ok(LogicalPlan::NAReplace(NAReplace {
+            input: Box::new(input_plan),
+            replacements,
+            all_columns,
+        }))
+    }
+
+    fn convert_unpivot(&mut self, u: &proto::Unpivot) -> Result<LogicalPlan> {
+        let input = u
+            .input
+            .as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("Unpivot missing input".into()))?;
+        let input_plan = self.convert(input)?;
+
+        // Extract id column names from expressions
+        let ids: Vec<String> = u
+            .ids
+            .iter()
+            .filter_map(|e| extract_column_name(e))
+            .collect();
+
+        // Extract value column names
+        let values: Vec<String> = u
+            .values
+            .as_ref()
+            .map(|v| v.values.iter().filter_map(|e| extract_column_name(e)).collect())
+            .unwrap_or_default();
+
+        Ok(LogicalPlan::Unpivot(Unpivot {
+            input: Box::new(input_plan),
+            ids,
+            values,
+            variable_column_name: u.variable_column_name.clone(),
+            value_column_name: u.value_column_name.clone(),
+            include_nulls: false,
+        }))
+    }
+
+    /// Infer column names of a plan using SchemaInferrer (requires session).
+    fn infer_columns(&self, plan: &LogicalPlan) -> Result<Vec<String>> {
+        // Fast path: plan-level schema inference (works for many plan types)
+        let schema = plan.infer_schema();
+        if !schema.is_empty() {
+            return Ok(schema.fields.into_iter().map(|f| f.name).collect());
+        }
+        // Slow path: execute a LIMIT 0 query via DuckDB
+        if let Some(session) = &self.session {
+            let sql = SqlGenerator::relaxed()
+                .generate(plan)
+                .map_err(|e| ConnectError::PlanConversion(format!("schema inference SQL gen: {e}")))?;
+            let session = Arc::clone(session);
+            let struct_type = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    SchemaInferrer::new(&session).infer_sql(&sql).await
+                })
+            })
+            .map_err(|e| ConnectError::PlanConversion(format!("schema inference: {e}")))?;
+            Ok(struct_type.fields.into_iter().map(|f| f.name).collect())
+        } else {
+            Err(ConnectError::Unsupported(
+                "Schema inference required but no session available".into(),
+            ))
+        }
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -536,4 +690,31 @@ fn arrow_field_to_data_type(dt: &arrow::datatypes::DataType) -> DataType {
         ArrowDT::List(f) => DataType::Array(Box::new(arrow_field_to_data_type(f.data_type()))),
         _ => DataType::Unresolved,
     }
+}
+
+/// Extract a column name from a proto Expression (UnresolvedAttribute only).
+fn extract_column_name(expr: &proto::Expression) -> Option<String> {
+    if let Some(proto::expression::ExprType::UnresolvedAttribute(attr)) = &expr.expr_type {
+        Some(attr.unparsed_identifier.clone())
+    } else {
+        None
+    }
+}
+
+/// Convert a proto literal to a core Literal.
+fn proto_literal_to_core(lit: &proto::expression::Literal) -> Result<Literal> {
+    use proto::expression::literal::LiteralType;
+    let value = match &lit.literal_type {
+        Some(LiteralType::Null(_)) => LiteralValue::Null,
+        Some(LiteralType::Boolean(b)) => LiteralValue::Boolean(*b),
+        Some(LiteralType::Byte(i)) => LiteralValue::Int(*i),
+        Some(LiteralType::Short(i)) => LiteralValue::Int(*i),
+        Some(LiteralType::Integer(i)) => LiteralValue::Int(*i),
+        Some(LiteralType::Long(l)) => LiteralValue::Long(*l),
+        Some(LiteralType::Float(f)) => LiteralValue::Float(*f),
+        Some(LiteralType::Double(d)) => LiteralValue::Double(*d),
+        Some(LiteralType::String(s)) => LiteralValue::String(s.clone()),
+        _ => LiteralValue::Null,
+    };
+    Ok(Literal { value, data_type: DataType::Unresolved })
 }

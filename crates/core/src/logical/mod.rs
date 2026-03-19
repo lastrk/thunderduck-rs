@@ -100,6 +100,10 @@ pub enum LogicalPlan {
     SingleRow(SingleRowRelation),
     DropColumns(DropColumns),
     ShowString(ShowString),
+    NADrop(NADrop),
+    NAFill(NAFill),
+    NAReplace(NAReplace),
+    Unpivot(Unpivot),
 }
 
 // ── Plan node structs ─────────────────────────────────────────────────────────
@@ -292,6 +296,58 @@ pub struct ShowString {
     pub vertical: bool,
 }
 
+/// `df.dropna()` — drop rows containing null values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NADrop {
+    pub input: Box<LogicalPlan>,
+    pub how: NADropHow,
+    pub threshold: Option<i32>,
+    /// Resolved column names to check (empty = all columns from schema).
+    pub cols: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NADropHow {
+    Any,
+    All,
+}
+
+/// `df.fillna()` — replace null values with constants.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NAFill {
+    pub input: Box<LogicalPlan>,
+    /// (column_name, fill_value) pairs for columns that should be filled.
+    pub values: Vec<(String, crate::expression::Literal)>,
+    /// All column names in the schema (used to construct SELECT list).
+    pub all_columns: Vec<String>,
+}
+
+/// `df.replace()` — replace specific values with other values.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NAReplace {
+    pub input: Box<LogicalPlan>,
+    /// (column_name, from_value, to_value) triples.
+    pub replacements: Vec<(String, crate::expression::Literal, crate::expression::Literal)>,
+    /// All column names in the schema.
+    pub all_columns: Vec<String>,
+}
+
+/// `df.unpivot()` / `df.melt()` — reshape wide to long format.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unpivot {
+    pub input: Box<LogicalPlan>,
+    /// Column names to keep as-is (id columns).
+    pub ids: Vec<String>,
+    /// Column names to unpivot (value columns).
+    pub values: Vec<String>,
+    /// Name for the new "variable" column.
+    pub variable_column_name: String,
+    /// Name for the new "value" column.
+    pub value_column_name: String,
+    /// Whether to include rows where the value is null.
+    pub include_nulls: bool,
+}
+
 // ── Schema inference ──────────────────────────────────────────────────────────
 
 impl LogicalPlan {
@@ -339,6 +395,25 @@ impl LogicalPlan {
                 )
             }
             LogicalPlan::ShowString(s) => s.input.infer_schema(),
+            LogicalPlan::NADrop(n) => n.input.infer_schema(),
+            LogicalPlan::NAFill(n) => n.input.infer_schema(),
+            LogicalPlan::NAReplace(n) => n.input.infer_schema(),
+            LogicalPlan::Unpivot(u) => {
+                let mut fields: Vec<StructField> = u
+                    .ids
+                    .iter()
+                    .map(|name| StructField::nullable(name.clone(), DataType::Unresolved))
+                    .collect();
+                fields.push(StructField::nullable(
+                    u.variable_column_name.clone(),
+                    DataType::String,
+                ));
+                fields.push(StructField::nullable(
+                    u.value_column_name.clone(),
+                    DataType::Unresolved,
+                ));
+                StructType::new(fields)
+            }
         }
     }
 }

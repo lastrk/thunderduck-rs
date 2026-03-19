@@ -17,8 +17,9 @@ use crate::functions::{CompatMode, FunctionRegistry};
 use crate::logical::{
     Aggregate, AliasedRelation, Distinct, DropColumns, Except, Filter, GroupingSets,
     InMemoryRelation, Intersect, Join, Limit, LocalDataRelation, LocalRelation, LogicalPlan,
-    Project, RangeRelation, Sample, SelectEntry, ShowString, SingleRowRelation, Sort, SqlRelation,
-    TableScan, Tail, ToDataFrame, Union, WithColumns, WithCte,
+    NADrop, NADropHow, NAFill, NAReplace, Project, RangeRelation, Sample, SelectEntry, ShowString,
+    SingleRowRelation, Sort, SqlRelation, TableScan, Tail, ToDataFrame, Union, Unpivot,
+    WithColumns, WithCte,
 };
 use crate::types::{DataType, StructType, TypeMapper};
 
@@ -79,6 +80,10 @@ impl SqlGenerator {
             LogicalPlan::SingleRow(sr) => self.gen_single_row(sr),
             LogicalPlan::DropColumns(d) => self.gen_drop_columns(d),
             LogicalPlan::ShowString(s) => self.gen_show_string(s),
+            LogicalPlan::NADrop(n) => self.gen_na_drop(n),
+            LogicalPlan::NAFill(n) => self.gen_na_fill(n),
+            LogicalPlan::NAReplace(n) => self.gen_na_replace(n),
+            LogicalPlan::Unpivot(u) => self.gen_unpivot(u),
         }
     }
 
@@ -454,6 +459,106 @@ impl SqlGenerator {
         // PySpark formats the ASCII table client-side from the returned rows.
         let inner = self.gen_plan(&s.input)?;
         Ok(format!("SELECT *\nFROM ({inner})\nLIMIT {}", s.num_rows))
+    }
+
+    fn gen_na_drop(&self, n: &NADrop) -> Result<String> {
+        let from = self.gen_from(&n.input)?;
+        if n.cols.is_empty() {
+            return Ok(format!("SELECT *\nFROM {from}"));
+        }
+        let cond = if let Some(thresh) = n.threshold {
+            // Keep rows where the count of non-null values meets the threshold
+            let sum_parts: Vec<String> = n
+                .cols
+                .iter()
+                .map(|c| format!("CASE WHEN {} IS NOT NULL THEN 1 ELSE 0 END", quote_ident(c)))
+                .collect();
+            format!("({}) >= {}", sum_parts.join(" + "), thresh)
+        } else {
+            match n.how {
+                NADropHow::Any => n
+                    .cols
+                    .iter()
+                    .map(|c| format!("{} IS NOT NULL", quote_ident(c)))
+                    .collect::<Vec<_>>()
+                    .join(" AND "),
+                NADropHow::All => {
+                    let nulls = n
+                        .cols
+                        .iter()
+                        .map(|c| format!("{} IS NULL", quote_ident(c)))
+                        .collect::<Vec<_>>()
+                        .join(" AND ");
+                    format!("NOT ({nulls})")
+                }
+            }
+        };
+        Ok(format!("SELECT *\nFROM {from}\nWHERE {cond}"))
+    }
+
+    fn gen_na_fill(&self, n: &NAFill) -> Result<String> {
+        let from = self.gen_from(&n.input)?;
+        // Build a map of col_name → fill_literal for fast lookup
+        let fill_map: std::collections::HashMap<&str, &crate::expression::Literal> =
+            n.values.iter().map(|(col, lit)| (col.as_str(), lit)).collect();
+        let select_parts: Vec<String> = n
+            .all_columns
+            .iter()
+            .map(|col| {
+                let qname = quote_ident(col);
+                if let Some(lit) = fill_map.get(col.as_str()) {
+                    let lit_sql = self.gen_expr(&crate::expression::Expression::Literal((*lit).clone())).unwrap_or_else(|_| "NULL".to_string());
+                    format!("COALESCE({qname}, {lit_sql}) AS {qname}")
+                } else {
+                    qname
+                }
+            })
+            .collect();
+        Ok(format!("SELECT {}\nFROM {from}", select_parts.join(", ")))
+    }
+
+    fn gen_na_replace(&self, n: &NAReplace) -> Result<String> {
+        let from = self.gen_from(&n.input)?;
+        // Group replacements by column
+        let mut col_replacements: std::collections::HashMap<&str, Vec<(&crate::expression::Literal, &crate::expression::Literal)>> = std::collections::HashMap::new();
+        for (col, from_val, to_val) in &n.replacements {
+            col_replacements.entry(col.as_str()).or_default().push((from_val, to_val));
+        }
+        let replacement_cols: std::collections::HashSet<&str> = col_replacements.keys().copied().collect();
+        let select_parts: Vec<String> = n
+            .all_columns
+            .iter()
+            .map(|col| {
+                let qname = quote_ident(col);
+                if let Some(repls) = col_replacements.get(col.as_str()) {
+                    // Build CASE WHEN col = from THEN to ... ELSE col END
+                    let when_clauses: Vec<String> = repls
+                        .iter()
+                        .map(|(from_lit, to_lit)| {
+                            let from_sql = self.gen_expr(&crate::expression::Expression::Literal((*from_lit).clone())).unwrap_or_else(|_| "NULL".to_string());
+                            let to_sql = self.gen_expr(&crate::expression::Expression::Literal((*to_lit).clone())).unwrap_or_else(|_| "NULL".to_string());
+                            format!("WHEN {qname} = {from_sql} THEN {to_sql}")
+                        })
+                        .collect();
+                    format!("CASE {} ELSE {qname} END AS {qname}", when_clauses.join(" "))
+                } else {
+                    qname
+                }
+            })
+            .collect();
+        let _ = replacement_cols; // suppress unused warning
+        Ok(format!("SELECT {}\nFROM {from}", select_parts.join(", ")))
+    }
+
+    fn gen_unpivot(&self, u: &Unpivot) -> Result<String> {
+        let inner = self.gen_plan(&u.input)?;
+        let value_cols = u.values.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        let var_col = quote_ident(&u.variable_column_name);
+        let val_col = quote_ident(&u.value_column_name);
+        let include = if u.include_nulls { " INCLUDE NULLS" } else { "" };
+        Ok(format!(
+            "UNPIVOT{include} (\n{inner}\n)\nON {value_cols}\nINTO NAME {var_col} VALUE {val_col}"
+        ))
     }
 
     // ── FROM clause helpers ────────────────────────────────────────────────────

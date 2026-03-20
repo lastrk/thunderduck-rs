@@ -4,3 +4,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+# Allow up to 3 minutes for server startup (session fixtures are excluded from
+# per-test timeouts via timeout_func_only).
+timeout = 180
+# Apply per-test @pytest.mark.timeout to the test function only, NOT fixture setup.
+# This prevents Spark JVM startup (60-120s) from triggering the 30s test timeout.
+timeout_func_only = true

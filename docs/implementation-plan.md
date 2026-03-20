@@ -11,14 +11,14 @@
 
 ## Phase Overview
 
-| Phase | Deliverable | Acceptance Criteria |
-|-------|-------------|---------------------|
-| **1** | Core types + SQL generation | All unit tests pass; SQL generator produces correct DuckDB SQL for all 29 plan node types |
-| **2** | DuckDB runtime + Arrow streaming | DuckDB queries execute; Arrow batches stream correctly; relaxed-mode integration test server starts |
-| **3** | gRPC server + protobuf converter | PySpark client connects; TPC-H DataFrame path tests pass (target: 30+ tests) |
-| **4** | Differential test parity (relaxed) | TPC-H 100% pass in relaxed mode; TPC-DS 95%+ pass |
-| **5** | SparkSQL parser | Raw `spark.sql()` path works; SQL-based differential tests pass |
-| **6** | Strict mode + extension integration | `thdck_spark_funcs` extension loaded; strict mode TPC-H/TPC-DS 100% pass |
+| Phase | Deliverable | Status | Acceptance Criteria |
+|-------|-------------|--------|---------------------|
+| **1** | Core types + SQL generation | **COMPLETE** (2026-03-18) | All unit tests pass; SQL generator produces correct DuckDB SQL for all 29 plan node types |
+| **2** | DuckDB runtime + Arrow streaming | **COMPLETE** (2026-03-18) | DuckDB queries execute; Arrow batches stream correctly; relaxed-mode integration test server starts |
+| **3** | gRPC server + protobuf converter | **COMPLETE** (2026-03-18) | PySpark client connects; TPC-H DataFrame path tests pass (target: 30+ tests) |
+| **4** | Differential test parity (relaxed) | **IN PROGRESS** (2026-03-20) | TPC-H 100% pass in relaxed mode; TPC-DS 95%+ pass |
+| **5** | SparkSQL parser | Not started | Raw `spark.sql()` path works; SQL-based differential tests pass |
+| **6** | Strict mode + extension integration | Not started | `thdck_spark_funcs` extension loaded; strict mode TPC-H/TPC-DS 100% pass |
 
 ---
 
@@ -81,16 +81,34 @@
 
 **Goal**: Pass the full TPC-H and TPC-DS differential test suites in relaxed mode.
 
-**Deliverables**:
-- Close all gaps discovered during Phase 3 testing: missing relation types, expression types, function mappings
-- Complete `FunctionRegistry` coverage for all functions exercised by TPC-H / TPC-DS
-- `SchemaInferrer`: fallback schema inference via DuckDB `DESCRIBE` when plan-level inference is unavailable
-- Temp view support (`CREATE TEMPORARY VIEW`, `createOrReplaceTempView`)
-- `WriteOperation` support: local Parquet write
-- All join types correct (INNER, LEFT, RIGHT, FULL, CROSS, SEMI, ANTI)
-- Window functions correct
-- Aggregation with ROLLUP / CUBE / GROUPING SETS
+**Status**: In progress. Core expression/plan gaps closed; differential baseline run pending.
+
+**Delivered so far** (as of 2026-03-20):
+- `NADrop`, `NAFill`, `NAReplace`, `Unpivot` plan nodes + SQL generation
+- `Pivot` plan node (DuckDB native PIVOT syntax)
+- `StatCov`, `StatCorr`, `ApproxQuantile` plan nodes
+- `UpdateFields` expression (struct `withField` / `dropFields`)
+- Complex literals: `Array`, `Map`, `Struct`, `SpecializedArray` fully converted
+- `SchemaInferrer` via `LIMIT 0` probe; `ExecDdl` + `SchemaOf` session commands
+- `WriteOperation` command: Parquet / CSV / JSON via `COPY ... TO`
+- Join plan_id qualification: eliminates `ambiguous column reference` errors in self-joins
+- Window frame boundary sign-decoding (preceding/following from literal sign)
+- `unionByName` column reordering with `allow_missing_columns`
+- `parse_type_str()` for cast-as-type-string conversion
+- 20+ new session macros bridging Spark→DuckDB function name gaps
+- Arrow IPC: zero-row schema batches no longer dropped (fixes empty-result PySpark errors)
+- `--port` CLI flag; `spark_config_default()` for integer/boolean config keys
+- Deterministic ordering in window function differential tests
+- `kurtosis` tests skip in relaxed mode with formula-mismatch note
+- `pytest-timeout` with `timeout_func_only` to isolate Spark JVM startup from test timeouts
+
+**Remaining**:
+- Run baseline differential test suite (41 test files)
+- Fix failures found in baseline
 - CTE (`WITH`) support
+- `Describe` / `Summary` operations
+- Full `ToSchema` column-cast projection
+- Additional `Catalog` operation coverage
 
 **Acceptance criteria**:
 - TPC-H: 100% pass (relaxed mode)

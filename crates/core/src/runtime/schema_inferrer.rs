@@ -17,13 +17,9 @@ impl<'a> SchemaInferrer<'a> {
 
     /// Infer the schema of the given SQL query.
     pub async fn infer_sql(&self, sql: &str) -> crate::error::Result<StructType> {
-        let probe_sql = format!("SELECT * FROM ({sql}) __schema_probe__ LIMIT 0");
-        let batches = self.session.execute(&probe_sql).await?;
-        if let Some(batch) = batches.first() {
-            Ok(arrow_schema_to_struct_type(batch.schema_ref()))
-        } else {
-            Ok(StructType::empty())
-        }
+        // schema_of wraps the SQL in LIMIT 0 internally
+        let schema = self.session.schema_of(sql).await?;
+        Ok(arrow_schema_to_struct_type(&schema))
     }
 }
 

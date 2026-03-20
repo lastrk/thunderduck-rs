@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use futures::stream;
 use thunderduck_core::generator::SqlGenerator;
-use thunderduck_core::runtime::{RuntimeCompatMode, SessionManager};
+use thunderduck_core::runtime::{RuntimeCompatMode, SchemaInferrer, SessionManager};
 use thunderduck_core::types::DataType;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -62,17 +62,58 @@ impl SparkConnectService for ThunderduckService {
                     PlanConverter::convert_relation_with_session(&relation, Arc::clone(&session))
                         .map_err(Status::from)?;
 
+                // Special case: ApproxQuantile needs a ListArray response.
+                if let thunderduck_core::logical::LogicalPlan::ApproxQuantile(ref aq) = logical_plan {
+                    let batch = execute_approx_quantile(&session, aq)
+                        .await
+                        .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
+                    let responses = batches_to_responses(&session_id, &operation_id, &[batch])
+                        .map_err(|e| Status::from(e))?;
+                    let stream = stream::iter(responses.into_iter().map(Ok));
+                    return Ok(Response::new(Box::pin(stream)));
+                }
+
                 let sql = SqlGenerator::relaxed()
                     .generate(&logical_plan)
                     .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
 
-                let batches = session
-                    .execute(&sql)
-                    .await
-                    .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-
-                batches_to_responses(&session_id, &operation_id, &batches)
-                    .map_err(|e| Status::from(e))?
+                // Special case: DDL statements (DROP VIEW, etc.) return 0 rows.
+                // Execute as DDL and synthesize a single boolean result row so that
+                // PySpark's _execute_and_fetch gets a non-null table back.
+                // For DROP VIEW, the bool indicates whether the view existed.
+                let upper = sql.trim_start().to_uppercase();
+                if upper.starts_with("DROP VIEW IF EXISTS ") {
+                    // Extract view name — everything after "DROP VIEW IF EXISTS "
+                    let view_name = sql.trim_start()[20..].trim().trim_matches('"');
+                    // Check existence before dropping
+                    let exists = session
+                        .execute(&format!(
+                            "SELECT COUNT(*) > 0 AS existed \
+                             FROM information_schema.views \
+                             WHERE table_name = '{}' AND table_schema = 'main'",
+                            view_name.replace('\'', "''")
+                        ))
+                        .await
+                        .ok()
+                        .and_then(|b| {
+                            use arrow::array::{Array, BooleanArray};
+                            b.into_iter()
+                                .next()
+                                .and_then(|rb| rb.column(0).as_any().downcast_ref::<BooleanArray>()
+                                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0))))
+                        })
+                        .unwrap_or(false);
+                    session.exec_ddl(&sql).await.ok();
+                    bool_batch_responses(&session_id, &operation_id, exists)
+                        .map_err(|e| Status::from(e))?
+                } else {
+                    let batches = session
+                        .execute(&sql)
+                        .await
+                        .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
+                    batches_to_responses(&session_id, &operation_id, &batches)
+                        .map_err(|e| Status::from(e))?
+                }
             }
             Some(proto::plan::OpType::Command(cmd)) => {
                 handle_command(&session, &session_id, &operation_id, cmd).await?
@@ -105,9 +146,27 @@ impl SparkConnectService for ThunderduckService {
                         return Err(Status::invalid_argument("Schema analyze requires root plan"));
                     }
                 };
+                let session = self
+                    .session_manager
+                    .get_or_create(&session_id)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
                 let logical_plan =
-                    PlanConverter::convert_relation(&relation).map_err(Status::from)?;
-                let struct_type = logical_plan.infer_schema();
+                    PlanConverter::convert_relation_with_session(&relation, Arc::clone(&session))
+                        .map_err(Status::from)?;
+                let mut struct_type = logical_plan.infer_schema();
+                let has_unresolved = struct_type.fields.iter()
+                    .any(|f| f.data_type == thunderduck_core::types::DataType::Unresolved);
+                if struct_type.is_empty() || has_unresolved {
+                    // Static inference failed or produced Unresolved types — ask DuckDB
+                    let sql = SqlGenerator::relaxed()
+                        .generate(&logical_plan)
+                        .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
+                    struct_type = SchemaInferrer::new(&session)
+                        .infer_sql(&sql)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
                 let schema_proto = data_type_to_proto(&DataType::Struct(struct_type));
 
                 let resp = proto::AnalyzePlanResponse {
@@ -131,8 +190,12 @@ impl SparkConnectService for ThunderduckService {
         use proto::config_request::operation::OpType;
         let pairs = match req.operation.and_then(|op| op.op_type) {
             Some(OpType::Get(g)) => {
-                // Return empty string for any unknown key so PySpark conf.get() doesn't crash
-                g.keys.into_iter().map(|k| proto::KeyValue { key: k, value: Some(String::new()) }).collect()
+                // Return Spark defaults for known integer/boolean configs that PySpark
+                // calls int() or bool() on. Unknown keys get empty string (safe for str usage).
+                g.keys.into_iter().map(|k| {
+                    let v = spark_config_default(&k).to_string();
+                    proto::KeyValue { key: k, value: Some(v) }
+                }).collect()
             }
             Some(OpType::GetWithDefault(gd)) => {
                 // Return the provided default for each key
@@ -246,14 +309,20 @@ async fn handle_command(
             ])
         }
         Some(CommandType::SqlCommand(sql_cmd)) => {
-            let input_rel = sql_cmd
-                .input
-                .ok_or_else(|| Status::unimplemented("SqlCommand without input relation"))?;
-            let logical_plan =
-                PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
-            let sql = SqlGenerator::relaxed()
-                .generate(&logical_plan)
-                .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
+            let sql = if let Some(input_rel) = sql_cmd.input {
+                let logical_plan =
+                    PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
+                SqlGenerator::relaxed()
+                    .generate(&logical_plan)
+                    .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?
+            } else if !sql_cmd.sql.is_empty() {
+                // PySpark 4.x sends spark.sql() via the deprecated sql text field
+                sql_cmd.sql.clone()
+            } else {
+                return Err(Status::invalid_argument(
+                    "SqlCommand missing both input relation and sql text",
+                ));
+            };
             let batches = session
                 .execute(&sql)
                 .await
@@ -306,6 +375,80 @@ async fn handle_command(
 
 /// Convert DuckDB record batches to a complete `ExecutePlanResponse` sequence,
 /// including the mandatory trailing `ResultComplete` frame.
+/// Execute an ApproxQuantile plan: for each column, compute approx_quantile for each
+/// probability, then build a RecordBatch with schema `list<list<double>>`, 1 row.
+///
+/// PySpark Connect client reads: `table[0][0]` (first cell) = ListScalar of N inner lists,
+/// where N = number of input columns and each inner list has M doubles (one per probability).
+async fn execute_approx_quantile(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    aq: &thunderduck_core::logical::ApproxQuantile,
+) -> Result<arrow::record_batch::RecordBatch, String> {
+    use arrow::array::{Float64Array, ListArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    // Generate SQL for the input sub-plan.
+    let gen = SqlGenerator::relaxed();
+    let input_sql = gen
+        .generate(&aq.input)
+        .map_err(|e| format!("approx_quantile input gen: {e}"))?;
+
+    let n_probs = aq.probabilities.len();
+    let n_cols = aq.cols.len();
+
+    // Collect quantile values: layout = [col0_p0, col0_p1, ..., col1_p0, col1_p1, ...]
+    let mut all_values: Vec<f64> = Vec::with_capacity(n_cols * n_probs);
+    for col in &aq.cols {
+        let quoted = format!("\"{}\"", col.replace('"', "\"\""));
+        for p in &aq.probabilities {
+            let sql = format!(
+                "SELECT approx_quantile({quoted}, {p:.17}) AS __q FROM ({input_sql}) __aq_input__"
+            );
+            let batches = session.execute(&sql).await.map_err(|e| e.to_string())?;
+            let val = batches
+                .iter()
+                .flat_map(|b| b.columns())
+                .next()
+                .and_then(|col| {
+                    use arrow::array::{Array, Float64Array};
+                    col.as_any()
+                        .downcast_ref::<Float64Array>()
+                        .and_then(|a| if a.len() > 0 { Some(a.value(0)) } else { None })
+                })
+                .unwrap_or(f64::NAN);
+            all_values.push(val);
+        }
+    }
+
+    // Build inner ListArray: N entries (one per column), each with M doubles.
+    let values_array = Arc::new(Float64Array::from(all_values));
+    let inner_offsets: Vec<i32> = (0..=(n_cols as i32))
+        .map(|i| i * n_probs as i32)
+        .collect();
+    let inner_offsets_buf = OffsetBuffer::new(inner_offsets.into());
+    let float_field = Arc::new(Field::new("item", ArrowDataType::Float64, true));
+    let inner_list_array = ListArray::new(float_field.clone(), inner_offsets_buf, values_array, None);
+
+    // Build outer ListArray: 1 entry containing all N inner lists.
+    // This is the single-row table cell the PySpark client expects.
+    let outer_offsets: Vec<i32> = vec![0, n_cols as i32];
+    let outer_offsets_buf = OffsetBuffer::new(outer_offsets.into());
+    let inner_list_type = ArrowDataType::List(float_field);
+    let inner_field = Arc::new(Field::new("item", inner_list_type.clone(), true));
+    let outer_list_array =
+        ListArray::new(inner_field.clone(), outer_offsets_buf, Arc::new(inner_list_array), None);
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "quantiles",
+        ArrowDataType::List(inner_field),
+        true,
+    )]));
+    RecordBatch::try_new(schema, vec![Arc::new(outer_list_array)])
+        .map_err(|e| format!("approx_quantile batch: {e}"))
+}
+
 fn batches_to_responses(
     session_id: &str,
     operation_id: &str,
@@ -324,11 +467,30 @@ fn batches_to_responses(
             ..Default::default()
         })
         .collect();
-    if responses.is_empty() {
-        responses.push(empty_result_response(session_id, operation_id));
-    }
+    // Send ResultComplete even when there are no batches (0 rows).
+    // Do NOT push an empty ArrowBatch (data: vec![]) — empty bytes are invalid Arrow IPC
+    // and PySpark raises ArrowInvalid when it tries to deserialize them.
     responses.push(result_complete_response(session_id, operation_id));
     Ok(responses)
+}
+
+/// Create an ArrowBatch response with a single boolean `value` column = `val`.
+/// Used for DDL operations (DropTempView etc.) that must return a non-null table.
+fn bool_batch_responses(
+    session_id: &str,
+    operation_id: &str,
+    val: bool,
+) -> crate::error::Result<Vec<proto::ExecutePlanResponse>> {
+    use arrow::array::BooleanArray;
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+    let schema = Arc::new(Schema::new(vec![Field::new("value", arrow::datatypes::DataType::Boolean, false)]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(BooleanArray::from(vec![val]))],
+    ).map_err(|e| crate::error::ConnectError::Arrow(e.to_string()))?;
+    batches_to_responses(session_id, operation_id, &[batch])
 }
 
 fn empty_result_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {
@@ -372,5 +534,37 @@ fn sql_command_result_response(
             ),
         ),
         ..Default::default()
+    }
+}
+
+/// Return the Spark default value for well-known config keys.
+///
+/// PySpark calls `int()` or `bool()` on some config values, so we must return
+/// valid strings for integer and boolean configs rather than empty strings.
+fn spark_config_default(key: &str) -> &'static str {
+    match key {
+        // Integer configs — PySpark calls int() on these
+        "spark.sql.session.localRelationCacheThreshold" => "67108864",
+        "spark.sql.session.localRelationChunkSizeRows" => "1000",
+        "spark.sql.session.localRelationChunkSizeBytes" => "4194304",
+        "spark.sql.session.localRelationBatchOfChunksSizeBytes" => "67108864",
+        "spark.sql.execution.arrow.maxRecordsPerBatch" => "10000",
+        "spark.sql.shuffle.partitions" => "200",
+        "spark.default.parallelism" => "8",
+        "spark.sql.autoBroadcastJoinThreshold" => "10485760",
+        "spark.sql.broadcastTimeout" => "300",
+        "spark.network.timeout" => "120",
+        "spark.reducer.maxSizeInFlight" => "50331648",
+        // Boolean configs — PySpark calls bool() on these
+        "spark.sql.execution.arrow.enabled" => "true",
+        "spark.sql.execution.arrow.pyspark.enabled" => "true",
+        "spark.sql.execution.arrow.pyspark.fallback.enabled" => "true",
+        "spark.sql.execution.pandas.convertToArrowArraySafely" => "false",
+        "spark.sql.execution.arrow.pyspark.selfDestructEnabled" => "false",
+        "spark.sql.repl.eagerEval.enabled" => "false",
+        "spark.sql.adaptive.enabled" => "true",
+        "spark.sql.ansi.enabled" => "false",
+        // Unknown keys — return empty string (safe for plain string usage)
+        _ => "",
     }
 }

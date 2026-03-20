@@ -1,13 +1,14 @@
 use thunderduck_core::expression::{
-    AliasExpression, BinaryExpression, BinaryOp, CastExpression, Expression,
-    ExtractValueExpression, FunctionCall, FrameBoundary, FrameUnit, LambdaExpression,
-    LambdaVariableExpression, Literal, LiteralValue, NullOrdering as CoreNullOrdering,
-    RawSqlExpression, SortDirection, SortOrder, StarExpression, UnaryExpression, UnaryOp,
-    UnresolvedColumn, WindowFrame, WindowFunction,
+    AliasExpression, ArrayLiteralExpression, BinaryExpression, BinaryOp, CastExpression,
+    Expression, ExtractValueExpression, FunctionCall, FrameBoundary, FrameUnit, LambdaExpression,
+    LambdaVariableExpression, Literal, LiteralValue, MapLiteralExpression,
+    NullOrdering as CoreNullOrdering, RawSqlExpression, SortDirection, SortOrder, StarExpression,
+    StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UpdateFieldsExpression,
+    WindowFrame, WindowFunction,
 };
 use thunderduck_core::types::DataType;
 
-use crate::converter::type_converter::proto_to_data_type;
+use crate::converter::type_converter::{parse_type_str, proto_to_data_type};
 use crate::error::{ConnectError, Result};
 use crate::proto::spark::connect as proto;
 
@@ -56,9 +57,7 @@ impl ExpressionConverter {
             Some(ExprType::SortOrder(_)) => Err(ConnectError::PlanConversion(
                 "SortOrder should be handled by RelationConverter".into(),
             )),
-            Some(ExprType::UpdateFields(_)) => {
-                Err(ConnectError::Unsupported("UpdateFields not supported (Phase 4)".into()))
-            }
+            Some(ExprType::UpdateFields(uf)) => self.convert_update_fields(uf),
             Some(ExprType::UnresolvedRegex(r)) => {
                 // Treat as an unresolved column; regex expansion is a server-side concern
                 Ok(Expression::UnresolvedColumn(UnresolvedColumn {
@@ -120,7 +119,7 @@ impl ExpressionConverter {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    fn convert_literal(&self, lit: &proto::expression::Literal) -> Result<Expression> {
+    pub fn convert_literal(&self, lit: &proto::expression::Literal) -> Result<Expression> {
         use proto::expression::literal::LiteralType;
         match &lit.literal_type {
             None => Ok(Literal::null()),
@@ -179,10 +178,81 @@ impl ExpressionConverter {
                     microseconds: ci.microseconds,
                 }))
             }
-            Some(LiteralType::Array(_)) | Some(LiteralType::Map(_)) |
-            Some(LiteralType::Struct(_)) | Some(LiteralType::SpecializedArray(_)) |
+            Some(LiteralType::Array(a)) => {
+                let elements: Result<Vec<Expression>> =
+                    a.elements.iter().map(|e| self.convert_literal(e)).collect();
+                Ok(Expression::ArrayLiteral(ArrayLiteralExpression {
+                    elements: elements?,
+                    element_type: DataType::Unresolved,
+                }))
+            }
+            Some(LiteralType::Map(m)) => {
+                let keys: Result<Vec<Expression>> =
+                    m.keys.iter().map(|e| self.convert_literal(e)).collect();
+                let values: Result<Vec<Expression>> =
+                    m.values.iter().map(|e| self.convert_literal(e)).collect();
+                Ok(Expression::MapLiteral(MapLiteralExpression {
+                    keys: keys?,
+                    values: values?,
+                    key_type: DataType::Unresolved,
+                    value_type: DataType::Unresolved,
+                }))
+            }
+            Some(LiteralType::Struct(s)) => {
+                // Struct elements without field names — use positional names
+                let fields: Result<Vec<(String, Expression)>> = s
+                    .elements
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| self.convert_literal(e).map(|expr| (format!("_{i}"), expr)))
+                    .collect();
+                Ok(Expression::StructLiteral(StructLiteralExpression { fields: fields? }))
+            }
+            Some(LiteralType::SpecializedArray(sa)) => {
+                use proto::expression::literal::specialized_array::ValueType;
+                let elements: Vec<Expression> = match &sa.value_type {
+                    Some(ValueType::Bools(b)) => b
+                        .values
+                        .iter()
+                        .map(|v| Ok(Literal::boolean(*v)))
+                        .collect::<Result<_>>()?,
+                    Some(ValueType::Ints(iv)) => iv
+                        .values
+                        .iter()
+                        .map(|v| Ok(Literal::int(*v)))
+                        .collect::<Result<_>>()?,
+                    Some(ValueType::Longs(lv)) => lv
+                        .values
+                        .iter()
+                        .map(|v| Ok(Literal::long(*v)))
+                        .collect::<Result<_>>()?,
+                    Some(ValueType::Floats(fv)) => fv
+                        .values
+                        .iter()
+                        .map(|v| Ok(Expression::Literal(Literal {
+                            value: LiteralValue::Float(*v),
+                            data_type: DataType::Float,
+                        })))
+                        .collect::<Result<_>>()?,
+                    Some(ValueType::Doubles(dv)) => dv
+                        .values
+                        .iter()
+                        .map(|v| Ok(Literal::double(*v)))
+                        .collect::<Result<_>>()?,
+                    Some(ValueType::Strings(sv)) => sv
+                        .values
+                        .iter()
+                        .map(|v| Ok(Literal::string(v.clone())))
+                        .collect::<Result<_>>()?,
+                    None => vec![],
+                };
+                Ok(Expression::ArrayLiteral(ArrayLiteralExpression {
+                    elements,
+                    element_type: DataType::Unresolved,
+                }))
+            }
             Some(LiteralType::Time(_)) => {
-                // Complex literal: fall back to null with appropriate type info
+                // Time literal not in core DataType — fall back to null
                 Ok(Literal::null())
             }
         }
@@ -193,12 +263,23 @@ impl ExpressionConverter {
         attr: &proto::expression::UnresolvedAttribute,
     ) -> Result<Expression> {
         let name = &attr.unparsed_identifier;
+        // "*" → Star expression (not a quoted column named asterisk)
+        if name == "*" {
+            return Ok(Expression::Star(StarExpression { qualifier: None }));
+        }
         // Split dotted name on '.' to support qualifier.column
         let parts: Vec<&str> = name.splitn(2, '.').collect();
         if parts.len() == 2 {
             Ok(Expression::UnresolvedColumn(UnresolvedColumn {
                 name: parts[1].to_string(),
                 qualifier: Some(parts[0].to_string()),
+            }))
+        } else if let Some(plan_id) = attr.plan_id {
+            // Encode plan_id as a special qualifier so the join converter can qualify this
+            // column reference with the correct subquery alias (left vs right side of join).
+            Ok(Expression::UnresolvedColumn(UnresolvedColumn {
+                name: name.clone(),
+                qualifier: Some(format!("__plan_id_{plan_id}__")),
             }))
         } else {
             Ok(Expression::UnresolvedColumn(UnresolvedColumn {
@@ -292,7 +373,7 @@ impl ExpressionConverter {
         let expr = self.convert(inner)?;
         let to_type = match &cast.cast_to_type {
             Some(CastToType::Type(dt)) => proto_to_data_type(dt)?,
-            Some(CastToType::TypeStr(_)) => DataType::Unresolved,
+            Some(CastToType::TypeStr(s)) => parse_type_str(s),
             None => DataType::Unresolved,
         };
         let try_cast = matches!(
@@ -381,10 +462,30 @@ impl ExpressionConverter {
             }),
             Some(Boundary::Value(e)) => {
                 let expr = self.convert(e)?;
-                if is_lower {
-                    Ok(FrameBoundary::Preceding(Box::new(expr)))
-                } else {
-                    Ok(FrameBoundary::Following(Box::new(expr)))
+                // Spark encodes frame offsets with sign: negative = preceding, positive = following, 0 = current row.
+                // Extract the integer value if it's a literal to determine direction.
+                let int_val = match &expr {
+                    thunderduck_core::expression::Expression::Literal(l) => match &l.value {
+                        LiteralValue::Int(n) => Some(*n as i64),
+                        LiteralValue::Long(n) => Some(*n),
+                        LiteralValue::Short(n) => Some(*n as i64),
+                        LiteralValue::Byte(n) => Some(*n as i64),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match int_val {
+                    Some(0) => Ok(FrameBoundary::CurrentRow),
+                    Some(n) if n < 0 => Ok(FrameBoundary::Preceding(Box::new(Literal::long(-n)))),
+                    Some(n) => Ok(FrameBoundary::Following(Box::new(Literal::long(n)))),
+                    None => {
+                        // Non-literal: fall back to position-based (is_lower → Preceding, else Following)
+                        if is_lower {
+                            Ok(FrameBoundary::Preceding(Box::new(expr)))
+                        } else {
+                            Ok(FrameBoundary::Following(Box::new(expr)))
+                        }
+                    }
                 }
             }
             // Default fallbacks
@@ -458,6 +559,27 @@ impl ExpressionConverter {
         Ok(Expression::ExtractValue(ExtractValueExpression {
             child: Box::new(child_expr),
             extraction: Box::new(key_expr),
+        }))
+    }
+
+    fn convert_update_fields(
+        &mut self,
+        uf: &proto::expression::UpdateFields,
+    ) -> Result<Expression> {
+        let struct_expr = uf
+            .struct_expression
+            .as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("UpdateFields missing struct_expression".into()))?;
+        let struct_expr = self.convert(struct_expr)?;
+        let value = uf.value_expression
+            .as_ref()
+            .map(|v| self.convert(v))
+            .transpose()?;
+        Ok(Expression::UpdateFields(UpdateFieldsExpression {
+            struct_expr: Box::new(struct_expr),
+            field_name: uf.field_name.clone(),
+            value: value.map(Box::new),
+            struct_fields: None, // populated later by RelationConverter when struct type is known
         }))
     }
 }

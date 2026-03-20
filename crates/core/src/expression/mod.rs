@@ -175,6 +175,7 @@ pub enum Expression {
     IsDistinctFrom(IsDistinctFromExpression),
     ExtractValue(ExtractValueExpression),
     RowConstructor(RowConstructorExpression),
+    UpdateFields(UpdateFieldsExpression),
 }
 
 // ── Expression inner types ────────────────────────────────────────────────────
@@ -423,6 +424,20 @@ pub struct RowConstructorExpression {
     pub fields: Vec<Expression>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateFieldsExpression {
+    /// The struct-typed expression to modify.
+    pub struct_expr: Box<Expression>,
+    /// Name of the field to add/update/drop.
+    pub field_name: String,
+    /// Value to set. When `None`, the field is dropped.
+    pub value: Option<Box<Expression>>,
+    /// All field names of the struct (populated at plan-conversion time via schema inference).
+    /// Required for the `dropFields` path (`value = None`) so the generator knows which
+    /// fields to keep when rebuilding the struct with `struct_pack`.
+    pub struct_fields: Option<Vec<String>>,
+}
+
 // ── Type inference on Expression ──────────────────────────────────────────────
 
 impl Expression {
@@ -500,6 +515,7 @@ impl Expression {
             Expression::Like(_) | Expression::IsDistinctFrom(_) => DataType::Boolean,
             Expression::Interval(_) => DataType::String, // TODO: proper IntervalType
             Expression::ExtractValue(_) | Expression::RowConstructor(_) => DataType::Unresolved,
+            Expression::UpdateFields(_) => DataType::Unresolved,
         }
     }
 
@@ -541,6 +557,7 @@ impl Expression {
             Expression::Interval(_) => false,
             Expression::ExtractValue(_) => true,
             Expression::RowConstructor(_) => false,
+            Expression::UpdateFields(u) => u.struct_expr.nullable(schema),
         }
     }
 }

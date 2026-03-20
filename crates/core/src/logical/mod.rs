@@ -104,6 +104,33 @@ pub enum LogicalPlan {
     NAFill(NAFill),
     NAReplace(NAReplace),
     Unpivot(Unpivot),
+    Pivot(Pivot),
+    StatCov(StatCov),
+    StatCorr(StatCorr),
+    ApproxQuantile(ApproxQuantile),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatCov {
+    pub input: Box<LogicalPlan>,
+    pub col1: String,
+    pub col2: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatCorr {
+    pub input: Box<LogicalPlan>,
+    pub col1: String,
+    pub col2: String,
+    pub method: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApproxQuantile {
+    pub input: Box<LogicalPlan>,
+    pub cols: Vec<String>,
+    pub probabilities: Vec<f64>,
+    pub relative_error: f64,
 }
 
 // ── Plan node structs ─────────────────────────────────────────────────────────
@@ -140,6 +167,14 @@ pub struct Join {
     pub condition: Option<Expression>,
     /// Column names for USING clause (empty if using ON condition).
     pub using_columns: Vec<String>,
+    /// When the ON condition has plan_id-qualified columns, these aliases are assigned to
+    /// left/right subqueries so DuckDB can resolve otherwise-ambiguous column names.
+    /// Format: "__plan_id_{N}__" where N is the outermost plan_id of that side.
+    pub left_alias: Option<String>,
+    pub right_alias: Option<String>,
+    /// All plan_ids in the left/right subtrees (used to qualify outer expressions).
+    pub left_plan_ids: Vec<i64>,
+    pub right_plan_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,6 +221,9 @@ pub struct Intersect {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Distinct {
     pub input: Box<LogicalPlan>,
+    /// When non-empty, deduplicate on these columns only (dropDuplicates subset).
+    /// When empty, deduplicate on all columns (SELECT DISTINCT *).
+    pub columns: Vec<Expression>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +244,10 @@ pub struct TableScan {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SqlRelation {
     pub sql: String,
+    /// Optional known schema — populated when the SQL comes from a LocalRelation
+    /// with Arrow IPC data so that type inference (e.g. SUM→BIGINT cast) can
+    /// look up column types without issuing a DESCRIBE query.
+    pub schema: StructType,
 }
 
 /// An empty relation with only a schema (no data rows).
@@ -332,6 +374,20 @@ pub struct NAReplace {
     pub all_columns: Vec<String>,
 }
 
+/// `df.groupBy().pivot().agg()` — rotate rows to columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pivot {
+    pub input: Box<LogicalPlan>,
+    /// Columns to group by (remain as rows).
+    pub grouping: Vec<Expression>,
+    /// The column whose distinct values become new column headers.
+    pub pivot_col: Expression,
+    /// Explicit list of pivot values (empty = auto-discover at query time).
+    pub pivot_values: Vec<Expression>,
+    /// Aggregation function(s) to apply per pivot cell.
+    pub aggregates: Vec<AggregateExpr>,
+}
+
 /// `df.unpivot()` / `df.melt()` — reshape wide to long format.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Unpivot {
@@ -362,7 +418,62 @@ impl LogicalPlan {
             LogicalPlan::Filter(f) => f.input.infer_schema(),
             LogicalPlan::Aggregate(a) => infer_aggregate_schema(a),
             LogicalPlan::Join(j) => {
-                StructType::merge(&j.left.infer_schema(), &j.right.infer_schema())
+                // LeftSemi / LeftAnti return only left-side columns.
+                if j.join_type.is_semi_or_anti() {
+                    return j.left.infer_schema();
+                }
+                let merged = StructType::merge(&j.left.infer_schema(), &j.right.infer_schema());
+                // Deduplicate columns referenced in USING clause (SQL USING keeps one copy).
+                // Also deduplicate for equijoin ON conditions that get converted to USING.
+                // When plan_id aliases are active, the join uses ON (not USING), so no dedup.
+                let using_cols: Vec<String> = if j.left_alias.is_some() {
+                    vec![]
+                } else if !j.using_columns.is_empty() {
+                    j.using_columns.clone()
+                } else if let Some(cond) = &j.condition {
+                    // Mirror equijoin_to_using logic from generator
+                    fn col_name(e: &Expression) -> Option<String> {
+                        match e {
+                            Expression::UnresolvedColumn(u) => Some(u.name.clone()),
+                            Expression::ColumnReference(c) => Some(c.name.clone()),
+                            _ => None,
+                        }
+                    }
+                    fn equijoin_cols(expr: &Expression) -> Option<Vec<String>> {
+                        use crate::expression::BinaryOp;
+                        match expr {
+                            Expression::Binary(b) if b.op == BinaryOp::Eq => {
+                                let l = col_name(&b.left)?;
+                                let r = col_name(&b.right)?;
+                                if l == r { Some(vec![l]) } else { None }
+                            }
+                            Expression::Binary(b) if b.op == BinaryOp::And => {
+                                let mut l = equijoin_cols(&b.left)?;
+                                let r = equijoin_cols(&b.right)?;
+                                l.extend(r);
+                                Some(l)
+                            }
+                            _ => None,
+                        }
+                    }
+                    equijoin_cols(cond).unwrap_or_default()
+                } else {
+                    vec![]
+                };
+                if using_cols.is_empty() {
+                    merged
+                } else {
+                    // Keep only the first occurrence of each using column
+                    let mut seen_using = std::collections::HashSet::new();
+                    let fields = merged.fields.into_iter().filter(|f| {
+                        if using_cols.contains(&f.name) {
+                            seen_using.insert(f.name.clone())
+                        } else {
+                            true
+                        }
+                    }).collect();
+                    StructType::new(fields)
+                }
             }
             LogicalPlan::Sort(s) => s.input.infer_schema(),
             LogicalPlan::Limit(l) => l.input.infer_schema(),
@@ -373,7 +484,7 @@ impl LogicalPlan {
             LogicalPlan::Distinct(d) => d.input.infer_schema(),
             LogicalPlan::Sample(s) => s.input.infer_schema(),
             LogicalPlan::TableScan(_) => StructType::empty(), // resolved at runtime
-            LogicalPlan::SqlRelation(_) => StructType::empty(),
+            LogicalPlan::SqlRelation(r) => r.schema.clone(),
             LogicalPlan::LocalRelation(r) => r.schema.clone(),
             LogicalPlan::LocalDataRelation(r) => r.schema.clone(),
             LogicalPlan::RangeRelation(_) => StructType::new(vec![
@@ -414,17 +525,40 @@ impl LogicalPlan {
                 ));
                 StructType::new(fields)
             }
+            // Pivot schema depends on runtime data (distinct pivot values); return empty.
+            LogicalPlan::Pivot(_) => StructType::empty(),
+            // StatCov/StatCorr return a single DOUBLE column.
+            LogicalPlan::StatCov(s) => StructType::new(vec![
+                StructField::nullable(format!("cov({}, {})", s.col1, s.col2), DataType::Double),
+            ]),
+            LogicalPlan::StatCorr(s) => StructType::new(vec![
+                StructField::nullable(format!("corr({}, {})", s.col1, s.col2), DataType::Double),
+            ]),
+            // ApproxQuantile returns one column of ARRAY<DOUBLE>, one row per input column.
+            LogicalPlan::ApproxQuantile(_) => StructType::new(vec![
+                StructField::nullable("quantiles".to_string(), DataType::Array(Box::new(DataType::Double))),
+            ]),
         }
     }
 }
 
 fn infer_project_schema(p: &Project) -> StructType {
     let child_schema = p.input.infer_schema();
-    let fields = p
-        .projections
-        .iter()
-        .filter_map(|e| projection_to_field(e, &child_schema))
-        .collect();
+    let has_star = p.projections.iter().any(|e| matches!(e, Expression::Star(_)));
+    // If we have a wildcard but can't statically resolve the child schema (e.g. TableScan),
+    // return empty so the caller falls back to DuckDB schema inference.
+    if has_star && child_schema.is_empty() {
+        return StructType::empty();
+    }
+    let mut fields = Vec::new();
+    for expr in &p.projections {
+        if matches!(expr, Expression::Star(_)) {
+            // Expand * to all child schema fields
+            fields.extend(child_schema.fields.iter().cloned());
+        } else if let Some(f) = projection_to_field(expr, &child_schema) {
+            fields.push(f);
+        }
+    }
     StructType::new(fields)
 }
 
@@ -459,6 +593,17 @@ fn infer_aggregate_schema(a: &Aggregate) -> StructType {
     let use_select_order = !a.select_order.is_empty();
 
     if use_select_order {
+        // If no grouping column appears in select_order (e.g. groupBy().count() shorthand),
+        // prepend all grouping columns so the schema matches the actual SELECT output.
+        let has_grouping_in_order = a.select_order.iter()
+            .any(|e| matches!(e, SelectEntry::GroupingExpr(_)));
+        if !has_grouping_in_order {
+            for e in &a.grouping {
+                if let Some(f) = projection_to_field(e, &child_schema) {
+                    fields.push(f);
+                }
+            }
+        }
         for entry in &a.select_order {
             match entry {
                 SelectEntry::GroupingExpr(e) => {
@@ -494,7 +639,18 @@ fn infer_aggregate_schema(a: &Aggregate) -> StructType {
 fn agg_expr_to_field(expr: &Expression, schema: &StructType) -> Option<StructField> {
     match expr {
         Expression::Alias(a) => {
-            let dt = a.expr.data_type(schema);
+            // Use aggregate_return_type for aggregate FunctionCalls inside an alias,
+            // since function_return_type() (scalar) doesn't know about COUNT/SUM/AVG.
+            let dt = match a.expr.as_ref() {
+                Expression::FunctionCall(f) => {
+                    let arg_types: Vec<_> = f.args.iter().map(|e| e.data_type(schema)).collect();
+                    crate::types::TypeInferenceEngine::aggregate_return_type(
+                        &f.name,
+                        arg_types.first().unwrap_or(&DataType::Unresolved),
+                    )
+                }
+                other => other.data_type(schema),
+            };
             Some(StructField::nullable(a.alias.clone(), dt))
         }
         Expression::FunctionCall(f) => {
@@ -510,14 +666,35 @@ fn agg_expr_to_field(expr: &Expression, schema: &StructType) -> Option<StructFie
 }
 
 fn infer_with_columns_schema(w: &WithColumns) -> StructType {
-    let mut schema = w.input.infer_schema();
-    for (name, expr) in &w.columns {
-        let dt = expr.data_type(&schema);
-        // Replace existing field or append
-        if let Some(idx) = schema.field_index(name) {
-            schema.fields[idx] = StructField::nullable(name.clone(), dt);
+    let input_schema = w.input.infer_schema();
+    // If the input schema is unknown (e.g. SqlRelation), return empty so the
+    // DuckDB schema-probe fallback is triggered. Adding only the new columns
+    // would produce an incomplete schema (missing all existing columns).
+    if input_schema.is_empty() {
+        return StructType::empty();
+    }
+    let mut schema = input_schema;
+    for (new_name, expr) in &w.columns {
+        // Detect pure rename: expression is a column ref with a different name.
+        let old_col_name: Option<&str> = match expr {
+            Expression::UnresolvedColumn(uc) if uc.name != *new_name => Some(&uc.name),
+            Expression::ColumnReference(cr) if cr.name != *new_name => Some(&cr.name),
+            _ => None,
+        };
+        if let Some(old_name) = old_col_name {
+            // Rename: find the old column and change its name in-place.
+            if let Some(idx) = schema.field_index(old_name) {
+                let dt = schema.fields[idx].data_type.clone();
+                schema.fields[idx] = StructField::nullable(new_name.clone(), dt);
+            }
         } else {
-            schema.fields.push(StructField::nullable(name.clone(), dt));
+            let dt = expr.data_type(&schema);
+            // Replace existing field or append
+            if let Some(idx) = schema.field_index(new_name) {
+                schema.fields[idx] = StructField::nullable(new_name.clone(), dt);
+            } else {
+                schema.fields.push(StructField::nullable(new_name.clone(), dt));
+            }
         }
     }
     schema

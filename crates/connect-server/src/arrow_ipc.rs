@@ -6,14 +6,12 @@ use crate::proto::spark::connect::execute_plan_response::ArrowBatch;
 
 /// Serialize a slice of `RecordBatch`es into proto `ArrowBatch` messages.
 ///
-/// Empty batches (0 rows) are skipped. Each non-empty batch is written as an
-/// independent Arrow IPC stream so that the client can decode them individually.
+/// Each batch (including 0-row schema-only batches) is written as an independent
+/// Arrow IPC stream so that the client can decode them individually.
+/// A 0-row batch carries the schema, which PySpark requires to build a table.
 pub fn record_batches_to_arrow_batches(batches: &[RecordBatch]) -> Result<Vec<ArrowBatch>> {
     let mut out = Vec::new();
     for batch in batches {
-        if batch.num_rows() == 0 {
-            continue;
-        }
         let mut buf = Vec::new();
         {
             let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())

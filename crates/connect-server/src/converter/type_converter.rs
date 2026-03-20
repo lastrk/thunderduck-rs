@@ -124,6 +124,52 @@ fn struct_field_to_proto(f: &StructField) -> proto::data_type::StructField {
     }
 }
 
+/// Parse a Spark type string (e.g. "int", "bigint", "decimal(10,2)") into a DataType.
+/// Used when Cast arrives as TypeStr rather than a structured proto DataType.
+pub fn parse_type_str(s: &str) -> DataType {
+    let lower = s.trim().to_lowercase();
+    // Strip outer NOT NULL / NULL qualifiers that Spark sometimes appends
+    let lower = lower.trim_end_matches("not null").trim_end_matches("null").trim();
+    // Handle decimal(p,s) or decimal(p)
+    if lower.starts_with("decimal") {
+        if let Some(inner) = lower
+            .strip_prefix("decimal")
+            .and_then(|r| r.strip_prefix('('))
+            .and_then(|r| r.strip_suffix(')'))
+        {
+            let parts: Vec<&str> = inner.split(',').collect();
+            let p = parts.first().and_then(|s| s.trim().parse::<u8>().ok()).unwrap_or(38);
+            let sc = parts.get(1).and_then(|s| s.trim().parse::<u8>().ok()).unwrap_or(18);
+            return DataType::Decimal { precision: p, scale: sc };
+        }
+        return DataType::Decimal { precision: 38, scale: 18 };
+    }
+    // Handle array<element_type>
+    if lower.starts_with("array<") {
+        if let Some(inner) = lower.strip_prefix("array<").and_then(|r| r.strip_suffix('>')) {
+            return DataType::Array(Box::new(parse_type_str(inner)));
+        }
+    }
+    match lower {
+        "boolean" | "bool" => DataType::Boolean,
+        "tinyint" | "byte" | "int8" => DataType::Byte,
+        "smallint" | "short" | "int16" => DataType::Short,
+        "int" | "integer" | "int32" => DataType::Integer,
+        "bigint" | "long" | "int64" => DataType::Long,
+        "float" | "real" | "float32" => DataType::Float,
+        "double" | "float64" => DataType::Double,
+        "string" | "str" | "varchar" | "char" | "text" => DataType::String,
+        "binary" | "bytes" => DataType::Binary,
+        "date" => DataType::Date,
+        "timestamp" | "timestamp_ltz" => DataType::Timestamp,
+        "timestamp_ntz" => DataType::TimestampNtz,
+        "interval year to month" | "yearmonthinterval" => DataType::YearMonthInterval,
+        "interval day to second" | "daytimeinterval" => DataType::DayTimeInterval,
+        "null" | "void" => DataType::Null,
+        _ => DataType::Unresolved,
+    }
+}
+
 /// Convert proto struct fields to a `StructType` (used by both `proto_to_data_type` and callers).
 pub fn proto_struct_to_struct_type(
     s: &proto::data_type::Struct,

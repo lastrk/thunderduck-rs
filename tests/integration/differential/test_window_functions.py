@@ -126,7 +126,8 @@ class TestRankingFunctions:
         """Test row_number() - assigns unique sequential numbers"""
         df_ref, df_td = employee_data
 
-        window = Window.partitionBy("department").orderBy(F.col("salary").desc())
+        # Add name as tiebreaker to make ordering deterministic when salaries are equal
+        window = Window.partitionBy("department").orderBy(F.col("salary").desc(), F.col("name"))
 
         result_ref = (df_ref
             .withColumn("row_num", F.row_number().over(window))
@@ -174,7 +175,8 @@ class TestRankingFunctions:
         """Test ntile() - divides rows into n buckets"""
         df_ref, df_td = employee_data
 
-        window = Window.partitionBy("department").orderBy(F.col("salary").desc())
+        # Add name as tiebreaker to make ordering deterministic when salaries are equal
+        window = Window.partitionBy("department").orderBy(F.col("salary").desc(), F.col("name"))
 
         result_ref = (df_ref
             .withColumn("quartile", F.ntile(4).over(window))
@@ -222,7 +224,8 @@ class TestRankingFunctions:
         """Test multiple ranking functions together"""
         df_ref, df_td = employee_data
 
-        window = Window.partitionBy("department").orderBy(F.col("salary").desc())
+        # Add name as tiebreaker to make ordering deterministic when salaries are equal
+        window = Window.partitionBy("department").orderBy(F.col("salary").desc(), F.col("name"))
 
         result_ref = (df_ref
             .withColumn("row_num", F.row_number().over(window))
@@ -685,19 +688,20 @@ class TestAdvancedWindowFunctions:
         df_ref, df_td = employee_data
 
         dept_window = Window.partitionBy("department")
-        rank_window = Window.partitionBy("department").orderBy(F.col("salary").desc())
+        # Add name as tiebreaker to make ordering deterministic when salaries are equal
+        rank_window = Window.partitionBy("department").orderBy(F.col("salary").desc(), F.col("name"))
 
         result_ref = (df_ref
             .withColumn("dept_avg", F.avg("salary").over(dept_window))
             .withColumn("dept_rank", F.rank().over(rank_window))
             .withColumn("diff_from_avg", F.col("salary") - F.avg("salary").over(dept_window))
-            .orderBy("department", "dept_rank"))
+            .orderBy("department", "dept_rank", "name"))
 
         result_td = (df_td
             .withColumn("dept_avg", F.avg("salary").over(dept_window))
             .withColumn("dept_rank", F.rank().over(rank_window))
             .withColumn("diff_from_avg", F.col("salary") - F.avg("salary").over(dept_window))
-            .orderBy("department", "dept_rank"))
+            .orderBy("department", "dept_rank", "name"))
 
         assert_dataframes_equal(result_ref, result_td, "multiple_windows", epsilon=1e-6)
 
@@ -705,17 +709,18 @@ class TestAdvancedWindowFunctions:
         """Test window functions combined with filter"""
         df_ref, df_td = employee_data
 
-        window = Window.partitionBy("department").orderBy(F.col("salary").desc())
+        # Add name as tiebreaker to make ordering deterministic when salaries are equal
+        window = Window.partitionBy("department").orderBy(F.col("salary").desc(), F.col("name"))
 
         result_ref = (df_ref
             .withColumn("rank", F.rank().over(window))
             .filter(F.col("rank") <= 2)
-            .orderBy("department", "rank"))
+            .orderBy("department", "rank", "name"))
 
         result_td = (df_td
             .withColumn("rank", F.rank().over(window))
             .filter(F.col("rank") <= 2)
-            .orderBy("department", "rank"))
+            .orderBy("department", "rank", "name"))
 
         assert_dataframes_equal(result_ref, result_td, "window_with_filter")
 

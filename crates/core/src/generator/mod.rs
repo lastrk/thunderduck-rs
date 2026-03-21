@@ -20,6 +20,7 @@ use crate::logical::{
     InMemoryRelation, Intersect, Join, Limit, LocalDataRelation, LocalRelation, LogicalPlan,
     NADrop, NADropHow, NAFill, NAReplace, Pivot, Project, RangeRelation, Sample, SelectEntry,
     ApproxQuantile, Describe, ShowString, SingleRowRelation, Sort, SqlRelation, StatCorr, StatCov,
+    StatCrosstab, StatFreqItems, StatSampleBy,
     Summary, TableScan, Tail, ToDataFrame, Union, Unpivot, WithColumns, WithCte,
 };
 use crate::types::{DataType, StructType, TypeMapper};
@@ -111,6 +112,9 @@ impl SqlGenerator {
             LogicalPlan::StatCov(s) => self.gen_stat_cov(s),
             LogicalPlan::StatCorr(s) => self.gen_stat_corr(s),
             LogicalPlan::ApproxQuantile(aq) => self.gen_approx_quantile(aq),
+            LogicalPlan::StatCrosstab(s) => self.gen_stat_crosstab(s),
+            LogicalPlan::StatFreqItems(s) => self.gen_stat_freq_items(s),
+            LogicalPlan::StatSampleBy(s) => self.gen_stat_sample_by(s),
             LogicalPlan::Describe(d) => self.gen_describe(d),
             LogicalPlan::Summary(s) => self.gen_summary(s),
         }
@@ -878,6 +882,67 @@ impl SqlGenerator {
             })
             .collect();
         Ok(selects.join("\nUNION ALL\n"))
+    }
+
+    fn gen_stat_crosstab(&self, s: &StatCrosstab) -> Result<String> {
+        let from = self.gen_from(&s.input)?;
+        let col1 = quote_ident(&s.col1);
+        let col2 = quote_ident(&s.col2);
+        let combined = quote_ident(&format!("{}_{}", s.col1, s.col2));
+        Ok(format!(
+            "SELECT c1 AS {combined}, * EXCLUDE (c1)\n\
+             FROM (\n  \
+               PIVOT (\n    \
+                 SELECT CAST({col1} AS VARCHAR) AS c1, CAST({col2} AS VARCHAR) AS c2\n    \
+                 FROM {from}\n  \
+               ) ON c2 USING COUNT(*) GROUP BY c1\n\
+             ) _crosstab\n\
+             ORDER BY c1"
+        ))
+    }
+
+    fn gen_stat_freq_items(&self, s: &StatFreqItems) -> Result<String> {
+        let from = self.gen_from(&s.input)?;
+        let support = s.support;
+        let subqueries: Vec<String> = s.cols.iter().map(|col| {
+            let qcol = quote_ident(col);
+            let qalias = quote_ident(&format!("{}_freqItems", col));
+            format!(
+                "(SELECT LIST({qcol} ORDER BY {qcol}) FROM (\n  \
+                   SELECT {qcol}, COUNT(*) AS cnt FROM _stat_input AS _inner\n  \
+                   WHERE {qcol} IS NOT NULL GROUP BY {qcol}\n  \
+                   HAVING COUNT(*) >= {support} * (SELECT COUNT(*) FROM _stat_input AS _total)\n\
+                 ) AS _freq) AS {qalias}"
+            )
+        }).collect();
+        Ok(format!(
+            "WITH _stat_input AS (\nSELECT * FROM {from}\n)\nSELECT {}",
+            subqueries.join(",\n")
+        ))
+    }
+
+    fn gen_stat_sample_by(&self, s: &StatSampleBy) -> Result<String> {
+        let from = self.gen_from(&s.input)?;
+        let col_sql = self.gen_expr(&s.col_expr)?;
+
+        if s.fractions.is_empty() {
+            return Ok(format!("SELECT * FROM {from} AS _stat_input WHERE FALSE"));
+        }
+
+        let conditions: Result<Vec<String>> = s.fractions.iter().map(|(lit, frac)| {
+            let lit_sql = self.gen_expr(&crate::expression::Expression::Literal(lit.clone()))?;
+            Ok(format!("({col_sql} = {lit_sql} AND RANDOM() < {frac})"))
+        }).collect();
+        let where_body = conditions?.join(" OR ");
+
+        let where_clause = if let Some(seed) = s.seed {
+            let seed_f = (seed.rem_euclid(1_000_000) as f64) / 1_000_000.0;
+            format!("(SELECT setseed({seed_f:.6})) IS NULL AND ({where_body})")
+        } else {
+            where_body
+        };
+
+        Ok(format!("SELECT * FROM {from} AS _stat_input WHERE {where_clause}"))
     }
 
     fn gen_describe(&self, d: &Describe) -> Result<String> {

@@ -90,6 +90,9 @@ impl<'a> RelationConverter<'a> {
             Some(RelType::Cov(c)) => self.convert_stat_cov(c),
             Some(RelType::Corr(c)) => self.convert_stat_corr(c),
             Some(RelType::ApproxQuantile(aq)) => self.convert_approx_quantile(aq),
+            Some(RelType::Crosstab(c)) => self.convert_stat_crosstab(c),
+            Some(RelType::FreqItems(f)) => self.convert_stat_freq_items(f),
+            Some(RelType::SampleBy(s)) => self.convert_stat_sample_by(s),
             Some(RelType::Unpivot(u)) => self.convert_unpivot(u),
             Some(RelType::ToSchema(ts)) => self.convert_to_schema(ts),
             Some(RelType::Catalog(cat)) => self.convert_catalog(cat),
@@ -875,6 +878,51 @@ impl<'a> RelationConverter<'a> {
             cols: aq.cols.clone(),
             probabilities: aq.probabilities.clone(),
             relative_error: aq.relative_error,
+        }))
+    }
+
+    fn convert_stat_crosstab(&mut self, c: &proto::StatCrosstab) -> Result<LogicalPlan> {
+        let input = c.input.as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("StatCrosstab missing input".into()))?;
+        Ok(LogicalPlan::StatCrosstab(thunderduck_core::logical::StatCrosstab {
+            input: Box::new(self.convert(input)?),
+            col1: c.col1.clone(),
+            col2: c.col2.clone(),
+        }))
+    }
+
+    fn convert_stat_freq_items(&mut self, f: &proto::StatFreqItems) -> Result<LogicalPlan> {
+        let input = f.input.as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("StatFreqItems missing input".into()))?;
+        Ok(LogicalPlan::StatFreqItems(thunderduck_core::logical::StatFreqItems {
+            input: Box::new(self.convert(input)?),
+            cols: f.cols.clone(),
+            support: f.support.unwrap_or(0.01),
+        }))
+    }
+
+    fn convert_stat_sample_by(&mut self, s: &proto::StatSampleBy) -> Result<LogicalPlan> {
+        let input = s.input.as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("StatSampleBy missing input".into()))?;
+        let col_proto = s.col.as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("StatSampleBy missing col".into()))?;
+        let col_expr = self.expr_conv.convert(col_proto)?;
+        let fractions = s.fractions.iter()
+            .map(|frac| {
+                let stratum_proto = frac.stratum.as_ref()
+                    .ok_or_else(|| ConnectError::PlanConversion("SampleBy fraction missing stratum".into()))?;
+                let lit_expr = self.expr_conv.convert_literal(stratum_proto)?;
+                match lit_expr {
+                    thunderduck_core::expression::Expression::Literal(lit) => Ok((lit, frac.fraction)),
+                    _ => Err(ConnectError::PlanConversion("SampleBy stratum not a literal".into())),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(LogicalPlan::StatSampleBy(thunderduck_core::logical::StatSampleBy {
+            input: Box::new(self.convert(input)?),
+            col_expr,
+            fractions,
+            seed: s.seed,
         }))
     }
 

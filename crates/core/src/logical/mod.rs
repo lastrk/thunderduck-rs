@@ -108,6 +108,9 @@ pub enum LogicalPlan {
     StatCov(StatCov),
     StatCorr(StatCorr),
     ApproxQuantile(ApproxQuantile),
+    StatCrosstab(StatCrosstab),
+    StatFreqItems(StatFreqItems),
+    StatSampleBy(StatSampleBy),
     Describe(Describe),
     Summary(Summary),
 }
@@ -133,6 +136,28 @@ pub struct ApproxQuantile {
     pub cols: Vec<String>,
     pub probabilities: Vec<f64>,
     pub relative_error: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatCrosstab {
+    pub input: Box<LogicalPlan>,
+    pub col1: String,
+    pub col2: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatFreqItems {
+    pub input: Box<LogicalPlan>,
+    pub cols: Vec<String>,
+    pub support: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatSampleBy {
+    pub input: Box<LogicalPlan>,
+    pub col_expr: Expression,
+    pub fractions: Vec<(crate::expression::Literal, f64)>,
+    pub seed: Option<i64>,
 }
 
 /// `df.describe(cols...)` — summary statistics as VARCHAR strings (5 fixed stats).
@@ -625,6 +650,19 @@ impl LogicalPlan {
             LogicalPlan::ApproxQuantile(_) => StructType::new(vec![
                 StructField::nullable("quantiles".to_string(), DataType::Array(Box::new(DataType::Double))),
             ]),
+            // Crosstab: pivot columns unknown at plan time → DuckDB fallback.
+            LogicalPlan::StatCrosstab(_) => StructType::empty(),
+            // FreqItems: one Array<String> column per input col, named "{col}_freqItems".
+            LogicalPlan::StatFreqItems(s) => StructType::new(
+                s.cols.iter()
+                    .map(|c| StructField::nullable(
+                        format!("{}_freqItems", c),
+                        DataType::Array(Box::new(DataType::String)),
+                    ))
+                    .collect()
+            ),
+            // SampleBy: same schema as input.
+            LogicalPlan::StatSampleBy(s) => s.input.infer_schema(),
             // Describe/Summary: "summary" VARCHAR + one VARCHAR column per input column.
             LogicalPlan::Describe(d) => {
                 let mut fields = vec![StructField::not_null("summary", DataType::String)];

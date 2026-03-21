@@ -445,6 +445,11 @@ impl LogicalPlan {
                 // Compute schemas once; reused for USING ordering below.
                 let left_schema = j.left.infer_schema();
                 let right_schema = j.right.infer_schema();
+                // If either side's schema is unknown, we cannot statically determine the join
+                // output schema. Return empty so service.rs triggers the DuckDB fallback.
+                if left_schema.is_empty() || right_schema.is_empty() {
+                    return StructType::empty();
+                }
                 let left_len = left_schema.fields.len();
                 let merged = StructType::merge(&left_schema, &right_schema);
 

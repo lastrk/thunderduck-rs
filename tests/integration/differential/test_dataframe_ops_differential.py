@@ -351,6 +351,22 @@ class TestNAFunctions_Differential:
         test_result = run_test(spark_thunderduck)
         assert_dataframes_equal(ref_result, test_result, "na_replace")
 
+    @pytest.mark.timeout(30)
+    def test_na_replace_with_null(self, spark_reference, spark_thunderduck):
+        """Test replacing a value with NULL via na.replace (to_val is NULL literal)"""
+        def run_test(spark):
+            df = spark.createDataFrame([
+                (1, "a", 1.0),
+                (2, "b", 2.0),
+                (3, "c", 3.0),
+                (4, "a", 4.0),
+            ], ["id", "name", "value"])
+            return df.na.replace("a", None, subset=["name"]).orderBy("id")
+
+        ref_result = run_test(spark_reference)
+        test_result = run_test(spark_thunderduck)
+        assert_dataframes_equal(ref_result, test_result, "na_replace_with_null")
+
 
 @pytest.mark.differential
 class TestUnpivot_Differential:

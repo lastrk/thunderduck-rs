@@ -747,9 +747,14 @@ impl SqlGenerator {
                 // Build CASE WHEN col = from THEN to ... ELSE col END
                 let mut when_clauses: Vec<String> = Vec::with_capacity(repls.len());
                 for (from_lit, to_lit) in repls {
-                    let from_sql = self.gen_expr(&crate::expression::Expression::Literal((*from_lit).clone()))?;
                     let to_sql = self.gen_expr(&crate::expression::Expression::Literal((*to_lit).clone()))?;
-                    when_clauses.push(format!("WHEN {qname} = {from_sql} THEN {to_sql}"));
+                    let when = if matches!(from_lit.value, crate::expression::LiteralValue::Null) {
+                        format!("WHEN {qname} IS NULL THEN {to_sql}")
+                    } else {
+                        let from_sql = self.gen_expr(&crate::expression::Expression::Literal((*from_lit).clone()))?;
+                        format!("WHEN {qname} = {from_sql} THEN {to_sql}")
+                    };
+                    when_clauses.push(when);
                 }
                 select_parts.push(format!("CASE {} ELSE {qname} END AS {qname}", when_clauses.join(" ")));
             } else {

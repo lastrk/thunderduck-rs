@@ -66,6 +66,20 @@ impl DataType {
     pub fn is_decimal(&self) -> bool {
         matches!(self, DataType::Decimal { .. })
     }
+
+    /// Returns true if this type or any nested type is `Unresolved`.
+    /// Used to detect when static schema inference is incomplete.
+    pub fn contains_unresolved(&self) -> bool {
+        match self {
+            DataType::Unresolved => true,
+            DataType::Array(elem) => elem.contains_unresolved(),
+            DataType::Map { key, value, .. } => {
+                key.contains_unresolved() || value.contains_unresolved()
+            }
+            DataType::Struct(s) => s.fields.iter().any(|f| f.data_type.contains_unresolved()),
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for DataType {

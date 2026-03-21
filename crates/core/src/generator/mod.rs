@@ -11,15 +11,16 @@ use crate::expression::{
     FrameBoundary, FrameUnit, FunctionCall, InListExpression, InSubquery, IntervalExpression,
     IsDistinctFromExpression, LambdaExpression, LikeExpression, LiteralValue,
     MapLiteralExpression, RowConstructorExpression, ScalarSubquery, SortOrder,
-    StructLiteralExpression, UnaryExpression, UnaryOp, UpdateFieldsExpression, WindowFunction,
+    StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UpdateFieldsExpression,
+    WindowFunction,
 };
 use crate::functions::{CompatMode, FunctionRegistry};
 use crate::logical::{
     Aggregate, AliasedRelation, Distinct, DropColumns, Except, Filter, GroupingSets,
     InMemoryRelation, Intersect, Join, Limit, LocalDataRelation, LocalRelation, LogicalPlan,
     NADrop, NADropHow, NAFill, NAReplace, Pivot, Project, RangeRelation, Sample, SelectEntry,
-    ApproxQuantile, ShowString, SingleRowRelation, Sort, SqlRelation, StatCorr, StatCov, TableScan, Tail,
-    ToDataFrame, Union, Unpivot, WithColumns, WithCte,
+    ApproxQuantile, Describe, ShowString, SingleRowRelation, Sort, SqlRelation, StatCorr, StatCov,
+    Summary, TableScan, Tail, ToDataFrame, Union, Unpivot, WithColumns, WithCte,
 };
 use crate::types::{DataType, StructType, TypeMapper};
 
@@ -65,10 +66,15 @@ impl SqlGenerator {
             LogicalPlan::Filter(f) => self.gen_filter(f),
             LogicalPlan::Aggregate(a) => self.gen_aggregate(a),
             // A bare Join as the top-level plan emits a FROM-clause fragment.
-            // Wrap it in SELECT * so DuckDB receives a complete query.
+            // For USING joins, SELECT key first then * EXCLUDE key (Spark puts key column first).
             LogicalPlan::Join(j) => {
                 let fragment = self.gen_join(j)?;
-                Ok(format!("SELECT *\nFROM {fragment}"))
+                if !j.using_columns.is_empty() {
+                    let select = gen_using_join_select(&j.using_columns);
+                    Ok(format!("{select}\nFROM {fragment}"))
+                } else {
+                    Ok(format!("SELECT *\nFROM {fragment}"))
+                }
             }
             LogicalPlan::Sort(s) => self.gen_sort(s),
             LogicalPlan::Limit(l) => self.gen_limit(l),
@@ -86,7 +92,12 @@ impl SqlGenerator {
             LogicalPlan::InMemoryRelation(imr) => self.gen_in_memory_relation(imr),
             LogicalPlan::WithCte(w) => self.gen_with_cte(w),
             LogicalPlan::WithColumns(wc) => self.gen_with_columns(wc),
-            LogicalPlan::AliasedRelation(ar) => self.gen_aliased_relation(ar),
+            LogicalPlan::AliasedRelation(ar) => {
+                // gen_aliased_relation produces a FROM-clause fragment (inner AS alias).
+                // At top level we need a complete SELECT statement.
+                let fragment = self.gen_aliased_relation(ar)?;
+                Ok(format!("SELECT *\nFROM {fragment}"))
+            }
             LogicalPlan::RawDdlStatement(r) => Ok(r.sql.clone()),
             LogicalPlan::ToDataFrame(t) => self.gen_to_dataframe(t),
             LogicalPlan::SingleRow(sr) => self.gen_single_row(sr),
@@ -100,6 +111,8 @@ impl SqlGenerator {
             LogicalPlan::StatCov(s) => self.gen_stat_cov(s),
             LogicalPlan::StatCorr(s) => self.gen_stat_corr(s),
             LogicalPlan::ApproxQuantile(aq) => self.gen_approx_quantile(aq),
+            LogicalPlan::Describe(d) => self.gen_describe(d),
+            LogicalPlan::Summary(s) => self.gen_summary(s),
         }
     }
 
@@ -112,16 +125,36 @@ impl SqlGenerator {
         if matches!(p.input.as_ref(), LogicalPlan::SingleRow(_)) {
             return Ok(format!("SELECT {cols}"));
         }
-        let from = self.gen_from(&p.input)?;
-        Ok(format!("SELECT {cols}\nFROM {from}"))
+        // Peel any Filter nodes so join table aliases remain in scope in the outer SELECT.
+        // Without this, Filter(Join(n1, n2)) gets wrapped in a subquery and n1/n2 become
+        // inaccessible to the projection's column references.
+        // Use typed_gen for WHERE conditions so schema-based dispatch (e.g. size on MAP) works.
+        let (base, conditions) = Self::extract_filters(&p.input);
+        let from = self.gen_from(base)?;
+        let mut sql = format!("SELECT {cols}\nFROM {from}");
+        if !conditions.is_empty() {
+            let where_parts = conditions.iter()
+                .map(|c| Ok(format!("({})", typed_gen.gen_expr(c)?)))
+                .collect::<Result<Vec<_>>>()?;
+            sql.push_str(&format!("\nWHERE {}", where_parts.join("\nAND ")));
+        }
+        Ok(sql)
     }
 
     fn gen_filter(&self, f: &Filter) -> Result<String> {
-        let from = self.gen_from(&f.input)?;
-        let input_schema = f.input.infer_schema();
+        // Peel any stacked inner filters so join table aliases remain in scope.
+        // Without this, Filter(outer, Filter(inner, Join(l1, ...))) wraps the inner filter in a
+        // subquery, making the l1 alias invisible to the outer condition.
+        let (base, inner_conditions) = Self::extract_filters(&f.input);
+        let from = self.gen_from(base)?;
+        let input_schema = base.infer_schema();
         let typed_gen = self.with_schema(input_schema);
-        let cond = typed_gen.gen_expr(&f.condition)?;
-        Ok(format!("SELECT *\nFROM {from}\nWHERE {cond}"))
+        // Current filter + any peeled inner filters — each wrapped in parens to avoid precedence issues.
+        let all_conditions = std::iter::once(&f.condition)
+            .chain(inner_conditions.into_iter())
+            .map(|c| Ok(format!("({})", typed_gen.gen_expr(c)?)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(format!("SELECT *\nFROM {from}\nWHERE {}", all_conditions.join("\nAND ")))
     }
 
     fn gen_aggregate(&self, a: &Aggregate) -> Result<String> {
@@ -181,8 +214,19 @@ impl SqlGenerator {
             parts.join(", ")
         };
 
-        let from = self.gen_from(&a.input)?;
+        // Peel pre-aggregation filters so join table aliases remain in scope.
+        let (base_input, pre_filters) = Self::extract_filters(&a.input);
+        let from = self.gen_from(base_input)?;
         let mut sql = format!("SELECT {select_list}\nFROM {from}");
+
+        // Pre-aggregation WHERE (from peeled filters) — use input schema for dispatch.
+        if !pre_filters.is_empty() {
+            let filter_gen = self.with_schema(input_schema.clone());
+            let where_parts = pre_filters.iter()
+                .map(|c| Ok(format!("({})", filter_gen.gen_expr(c)?)))
+                .collect::<Result<Vec<_>>>()?;
+            sql.push_str(&format!("\nWHERE {}", where_parts.join("\nAND ")));
+        }
 
         // GROUP BY
         if !a.grouping.is_empty() || a.grouping_sets.is_some() {
@@ -190,7 +234,11 @@ impl SqlGenerator {
                 sql.push_str(&format!("\nGROUP BY {}", self.gen_grouping_sets(gs)?));
             } else {
                 let gb = a.grouping.iter()
-                    .map(|g| self.gen_expr(g))
+                    .map(|g| {
+                        // Strip outer alias — GROUP BY must use bare expressions, not `expr AS alias`
+                        let inner = if let Expression::Alias(a) = g { &*a.expr } else { g };
+                        self.gen_expr(inner)
+                    })
                     .collect::<Result<Vec<_>>>()?
                     .join(", ");
                 sql.push_str(&format!("\nGROUP BY {gb}"));
@@ -268,17 +316,29 @@ impl SqlGenerator {
 
         if j.join_type.is_semi_or_anti() {
             // DuckDB SEMI/ANTI JOIN syntax — returns only left-side columns.
-            // Convert simple equijoin conditions to USING to avoid ambiguous column references
-            // when both sides expose same-named columns without explicit table aliases.
+            // When the left side is a wrapped subquery (no plan_id aliases), table aliases
+            // inside it (like "l1") are not accessible from the ON condition. Strip those
+            // qualifiers so DuckDB can find the columns unqualified from the subquery output.
             let cond = match &j.condition {
                 Some(c) => {
                     if j.left_alias.is_none() {
-                        if let Some(using_cols) = equijoin_to_using(c) {
+                        let mut left_aliases = std::collections::HashSet::new();
+                        collect_plan_aliases(&j.left, &mut left_aliases);
+                        let effective_c;
+                        let c_ref = if !left_aliases.is_empty() {
+                            effective_c = strip_qualifiers_in_expr(c.clone(), &left_aliases);
+                            &effective_c
+                        } else {
+                            c
+                        };
+                        if let Some(using_cols) = equijoin_to_using(c_ref) {
                             let cols = using_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
                             return Ok(format!("{left}\n{kw} {right} USING ({cols})"));
                         }
+                        format!(" ON {}", self.gen_expr(c_ref)?)
+                    } else {
+                        format!(" ON {}", self.gen_expr(c)?)
                     }
-                    format!(" ON {}", self.gen_expr(c)?)
                 }
                 None if !j.using_columns.is_empty() => {
                     let cols = j.using_columns.iter()
@@ -299,7 +359,8 @@ impl SqlGenerator {
                 .join(", ");
             format!(" USING ({cols})")
         } else if let Some(cond) = &j.condition {
-            // When plan_id aliases are active, use ON directly (columns already qualified).
+            // When plan_id aliases are active (including USING joins converted by converter),
+            // use ON directly (columns already qualified).
             // Otherwise, normalise simple same-name equijoin conditions to USING to avoid
             // DuckDB "Ambiguous reference" errors.
             if j.left_alias.is_none() {
@@ -461,18 +522,7 @@ impl SqlGenerator {
     }
 
     fn gen_local_data_relation(&self, ldr: &LocalDataRelation) -> Result<String> {
-        // Phase 1: schema only, no data — produce empty relation
-        if ldr.schema.fields.is_empty() {
-            return Ok("(SELECT 1 WHERE FALSE)".to_string());
-        }
-        let cols = ldr.schema.fields.iter()
-            .map(|f| {
-                let dt = TypeMapper::to_duckdb(&f.data_type);
-                format!("CAST(NULL AS {dt}) AS {}", quote_ident(&f.name))
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        Ok(format!("(SELECT {cols} WHERE FALSE)"))
+        self.gen_local_relation(&LocalRelation { schema: ldr.schema.clone() })
     }
 
     fn gen_range_relation(&self, rr: &RangeRelation) -> Result<String> {
@@ -531,18 +581,49 @@ impl SqlGenerator {
             }
         }
 
-        // Build the star expression: * [RENAME (...)]
-        let star = if renames.is_empty() {
-            "*".to_string()
+        // Build the SELECT list.
+        // For expression-based columns we use COLUMNS(c -> c NOT IN ('col1','col2'))
+        // instead of bare `*` so that an existing column is excluded before being
+        // re-added with the new expression.  If the column doesn't exist the lambda
+        // evaluates true for all columns (nothing excluded) — which is exactly the
+        // "add new column" behaviour.  This gives correct add-OR-replace semantics
+        // without needing to know the input schema at code-generation time.
+        if adds.is_empty() {
+            // Rename-only: use * RENAME which preserves column positions
+            let star = if renames.is_empty() {
+                "*".to_string()
+            } else {
+                format!("* RENAME ({})", renames.join(", "))
+            };
+            return Ok(format!("SELECT {star}\nFROM {from}"));
+        }
+
+        // Collect the names being added/replaced (for the exclusion lambda).
+        let excluded_names: Vec<String> = wc.columns.iter()
+            .filter(|(new_name, expr)| {
+                // Only expression cols (not pure renames) go into `adds`
+                !matches!(expr,
+                    Expression::UnresolvedColumn(uc) if uc.name != *new_name
+                ) && !matches!(expr,
+                    Expression::ColumnReference(cr) if cr.name != *new_name
+                )
+            })
+            .map(|(new_name, _)| format!("'{}'", new_name.replace('\'', "''")))
+            .collect();
+
+        let excl_lambda = if excluded_names.is_empty() {
+            "c -> true".to_string()
         } else {
-            format!("* RENAME ({})", renames.join(", "))
+            format!("c -> c NOT IN ({})", excluded_names.join(", "))
         };
-        let select_list = if adds.is_empty() {
-            star
+
+        let star_part = if renames.is_empty() {
+            format!("COLUMNS({excl_lambda})")
         } else {
-            format!("{star}, {}", adds.join(", "))
+            format!("COLUMNS({excl_lambda}) RENAME ({})", renames.join(", "))
         };
-        Ok(format!("SELECT {select_list}\nFROM {from}"))
+
+        Ok(format!("SELECT {star_part}, {}\nFROM {from}", adds.join(", ")))
     }
 
     fn gen_aliased_relation(&self, ar: &AliasedRelation) -> Result<String> {
@@ -637,55 +718,44 @@ impl SqlGenerator {
 
     fn gen_na_fill(&self, n: &NAFill) -> Result<String> {
         let from = self.gen_from(&n.input)?;
-        // Build a map of col_name → fill_literal for fast lookup
-        let fill_map: std::collections::HashMap<&str, &crate::expression::Literal> =
-            n.values.iter().map(|(col, lit)| (col.as_str(), lit)).collect();
-        let select_parts: Vec<String> = n
-            .all_columns
-            .iter()
-            .map(|col| {
-                let qname = quote_ident(col);
-                if let Some(lit) = fill_map.get(col.as_str()) {
-                    let lit_sql = self.gen_expr(&crate::expression::Expression::Literal((*lit).clone())).unwrap_or_else(|_| "NULL".to_string());
-                    format!("COALESCE({qname}, {lit_sql}) AS {qname}")
-                } else {
-                    qname
-                }
-            })
-            .collect();
+        let mut select_parts: Vec<String> = Vec::with_capacity(n.all_columns.len());
+        for col in &n.all_columns {
+            let qname = quote_ident(col);
+            // Linear scan: column counts are small (typically < 50) so no HashMap needed.
+            if let Some((_, lit)) = n.values.iter().find(|(c, _)| c == col) {
+                let lit_sql = self.gen_expr(&crate::expression::Expression::Literal(lit.clone()))?;
+                select_parts.push(format!("COALESCE({qname}, {lit_sql}) AS {qname}"));
+            } else {
+                select_parts.push(qname);
+            }
+        }
         Ok(format!("SELECT {}\nFROM {from}", select_parts.join(", ")))
     }
 
     fn gen_na_replace(&self, n: &NAReplace) -> Result<String> {
         let from = self.gen_from(&n.input)?;
         // Group replacements by column
-        let mut col_replacements: std::collections::HashMap<&str, Vec<(&crate::expression::Literal, &crate::expression::Literal)>> = std::collections::HashMap::new();
+        let mut col_replacements: std::collections::HashMap<&str, Vec<(&crate::expression::Literal, &crate::expression::Literal)>> =
+            std::collections::HashMap::with_capacity(n.replacements.len());
         for (col, from_val, to_val) in &n.replacements {
             col_replacements.entry(col.as_str()).or_default().push((from_val, to_val));
         }
-        let replacement_cols: std::collections::HashSet<&str> = col_replacements.keys().copied().collect();
-        let select_parts: Vec<String> = n
-            .all_columns
-            .iter()
-            .map(|col| {
-                let qname = quote_ident(col);
-                if let Some(repls) = col_replacements.get(col.as_str()) {
-                    // Build CASE WHEN col = from THEN to ... ELSE col END
-                    let when_clauses: Vec<String> = repls
-                        .iter()
-                        .map(|(from_lit, to_lit)| {
-                            let from_sql = self.gen_expr(&crate::expression::Expression::Literal((*from_lit).clone())).unwrap_or_else(|_| "NULL".to_string());
-                            let to_sql = self.gen_expr(&crate::expression::Expression::Literal((*to_lit).clone())).unwrap_or_else(|_| "NULL".to_string());
-                            format!("WHEN {qname} = {from_sql} THEN {to_sql}")
-                        })
-                        .collect();
-                    format!("CASE {} ELSE {qname} END AS {qname}", when_clauses.join(" "))
-                } else {
-                    qname
+        let mut select_parts: Vec<String> = Vec::with_capacity(n.all_columns.len());
+        for col in &n.all_columns {
+            let qname = quote_ident(col);
+            if let Some(repls) = col_replacements.get(col.as_str()) {
+                // Build CASE WHEN col = from THEN to ... ELSE col END
+                let mut when_clauses: Vec<String> = Vec::with_capacity(repls.len());
+                for (from_lit, to_lit) in repls {
+                    let from_sql = self.gen_expr(&crate::expression::Expression::Literal((*from_lit).clone()))?;
+                    let to_sql = self.gen_expr(&crate::expression::Expression::Literal((*to_lit).clone()))?;
+                    when_clauses.push(format!("WHEN {qname} = {from_sql} THEN {to_sql}"));
                 }
-            })
-            .collect();
-        let _ = replacement_cols; // suppress unused warning
+                select_parts.push(format!("CASE {} ELSE {qname} END AS {qname}", when_clauses.join(" ")));
+            } else {
+                select_parts.push(qname);
+            }
+        }
         Ok(format!("SELECT {}\nFROM {from}", select_parts.join(", ")))
     }
 
@@ -805,7 +875,63 @@ impl SqlGenerator {
         Ok(selects.join("\nUNION ALL\n"))
     }
 
+    fn gen_describe(&self, d: &Describe) -> Result<String> {
+        let input = self.gen_from(&d.input)?;
+        let stats = ["count", "mean", "stddev", "min", "max"];
+        let stats_owned: Vec<String> = stats.iter().map(|s| s.to_string()).collect();
+        self.gen_stats_union(&d.cols, &stats_owned, &input)
+    }
+
+    fn gen_summary(&self, s: &Summary) -> Result<String> {
+        let input = self.gen_from(&s.input)?;
+        let default_stats: Vec<String> = ["count", "mean", "stddev", "min", "25%", "50%", "75%", "max"]
+            .iter().map(|s| s.to_string()).collect();
+        let stats = if s.statistics.is_empty() { &default_stats } else { &s.statistics };
+        self.gen_stats_union(&s.cols, stats, &input)
+    }
+
+    /// Build a UNION ALL of one SELECT row per statistic.
+    /// Uses a CTE so the input is scanned once and each arm can reference it.
+    fn gen_stats_union(&self, cols: &[String], stats: &[String], input: &str) -> Result<String> {
+        let rows: Vec<String> = stats
+            .iter()
+            .map(|stat| {
+                let col_exprs: Vec<String> = cols
+                    .iter()
+                    .map(|col| {
+                        let q = quote_col(col);
+                        format!("{} AS {q}", stat_to_agg_expr(stat, &q))
+                    })
+                    .collect();
+                let summary_lit = format!("'{}'", stat.replace('\'', "''"));
+                let cols_sql = if col_exprs.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", col_exprs.join(", "))
+                };
+                format!("SELECT {summary_lit} AS summary{cols_sql} FROM __stats_input__")
+            })
+            .collect();
+        Ok(format!(
+            "WITH __stats_input__ AS {input}\n{}",
+            rows.join("\nUNION ALL\n")
+        ))
+    }
+
     // ── FROM clause helpers ────────────────────────────────────────────────────
+
+    /// Peel a stack of Filter nodes off the top of `plan`.
+    /// Returns the underlying base plan and the collected filter conditions (outermost first).
+    /// This allows callers to inline the WHERE clause so join table aliases remain in scope.
+    fn extract_filters(plan: &LogicalPlan) -> (&LogicalPlan, Vec<&Expression>) {
+        let mut conditions: Vec<&Expression> = Vec::new();
+        let mut cur = plan;
+        while let LogicalPlan::Filter(f) = cur {
+            conditions.push(&f.condition);
+            cur = &f.input;
+        }
+        (cur, conditions)
+    }
 
     /// Generate a FROM-clause fragment: either bare table/subquery or wrapped subquery.
     fn gen_from(&self, plan: &LogicalPlan) -> Result<String> {
@@ -840,7 +966,17 @@ impl SqlGenerator {
                     Ok(format!("{inner} AS {alias}({cols})"))
                 }
             }
-            LogicalPlan::Join(j) => self.gen_join(j),
+            LogicalPlan::Join(j) => {
+                if !j.using_columns.is_empty() {
+                    // USING join: wrap in a subquery with SELECT key, * EXCLUDE (key)
+                    // so callers (Sort, Limit, Filter, etc.) see key column first (Spark convention).
+                    let select = gen_using_join_select(&j.using_columns);
+                    let chain = self.gen_join(j)?;
+                    Ok(format!("(\n{select}\nFROM {chain}\n)"))
+                } else {
+                    self.gen_join(j)
+                }
+            }
             // All other plans become subqueries
             other => Ok(format!("(\n{}\n)", self.gen_plan(other)?)),
         }
@@ -983,6 +1119,35 @@ impl SqlGenerator {
     }
 
     fn gen_function_call(&self, f: &FunctionCall) -> Result<String> {
+        // SQL operator pseudo-functions: Spark sends these as UnresolvedFunction but
+        // DuckDB requires them as SQL operators (no scalar function of these names exists).
+        match f.name.to_lowercase().as_str() {
+            "like" if f.args.len() == 2 => {
+                let left = self.gen_expr(&f.args[0])?;
+                let right = self.gen_expr(&f.args[1])?;
+                return Ok(format!("{left} LIKE {right}"));
+            }
+            "ilike" if f.args.len() == 2 => {
+                let left = self.gen_expr(&f.args[0])?;
+                let right = self.gen_expr(&f.args[1])?;
+                return Ok(format!("{left} ILIKE {right}"));
+            }
+            "rlike" if f.args.len() == 2 => {
+                let left = self.gen_expr(&f.args[0])?;
+                let right = self.gen_expr(&f.args[1])?;
+                return Ok(format!("regexp_matches({left}, {right})"));
+            }
+            "in" if f.args.len() >= 2 => {
+                let expr = self.gen_expr(&f.args[0])?;
+                let list = f.args[1..].iter()
+                    .map(|a| self.gen_expr(a))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(", ");
+                return Ok(format!("{expr} IN ({list})"));
+            }
+            _ => {}
+        }
+
         let arg_sqls: Vec<String> = f.args.iter()
             .map(|a| self.gen_expr(a))
             .collect::<Result<Vec<_>>>()?;
@@ -1394,6 +1559,41 @@ impl SqlGenerator {
                 }
             }
         }
+    }
+}
+
+// ── Describe/Summary helpers ───────────────────────────────────────────────────
+
+fn quote_col(col: &str) -> String {
+    format!("\"{}\"", col.replace('"', "\"\""))
+}
+
+/// Map a statistic name to the aggregate SQL expression for a single column.
+///
+/// Uses `TRY_CAST(col AS DOUBLE)` for numeric-only aggregates so that string
+/// columns return NULL rather than erroring (matching Spark's behaviour).
+/// Uses `PERCENTILE_DISC` (nearest-rank / discrete) to match Spark's
+/// `approx_percentile` semantics.
+fn stat_to_agg_expr(stat: &str, quoted_col: &str) -> String {
+    match stat {
+        "count" => format!("CAST(COUNT({quoted_col}) AS VARCHAR)"),
+        "mean" => format!("CAST(AVG(TRY_CAST({quoted_col} AS DOUBLE)) AS VARCHAR)"),
+        "stddev" => format!("CAST(STDDEV_SAMP(TRY_CAST({quoted_col} AS DOUBLE)) AS VARCHAR)"),
+        "min" => format!("CAST(MIN({quoted_col}) AS VARCHAR)"),
+        "max" => format!("CAST(MAX({quoted_col}) AS VARCHAR)"),
+        "count_distinct" => format!("CAST(COUNT(DISTINCT {quoted_col}) AS VARCHAR)"),
+        "approx_count_distinct" => format!("CAST(APPROX_COUNT_DISTINCT({quoted_col}) AS VARCHAR)"),
+        s if s.ends_with('%') => {
+            if let Ok(p) = s.trim_end_matches('%').parse::<f64>() {
+                let frac = p / 100.0;
+                // PERCENTILE_DISC matches Spark's approx_percentile nearest-rank semantics.
+                // TRY_CAST so string columns return NULL instead of erroring.
+                format!("CAST(PERCENTILE_DISC({frac:.17}) WITHIN GROUP (ORDER BY TRY_CAST({quoted_col} AS DOUBLE)) AS VARCHAR)")
+            } else {
+                "CAST(NULL AS VARCHAR)".to_string()
+            }
+        }
+        _ => "CAST(NULL AS VARCHAR)".to_string(),
     }
 }
 
@@ -2191,6 +2391,21 @@ fn rewrite_overlay_syntax(sql: &str) -> String {
     result
 }
 
+/// Build `SELECT key1, key2, * EXCLUDE (key1, key2)` for a USING join.
+///
+/// DuckDB's USING deduplicates key columns but places them at their left-table position.
+/// Spark always puts USING key columns first. This SELECT puts keys first without
+/// requiring static schema knowledge.
+fn gen_using_join_select(using_columns: &[String]) -> String {
+    let keys: Vec<String> = using_columns.iter().map(|c| quote_ident(c)).collect();
+    let exclude = if keys.len() == 1 {
+        keys[0].clone()
+    } else {
+        format!("({})", keys.join(", "))
+    };
+    format!("SELECT {}, * EXCLUDE {}", keys.join(", "), exclude)
+}
+
 fn equijoin_to_using(expr: &Expression) -> Option<Vec<String>> {
     match expr {
         Expression::Binary(b) if b.op == BinaryOp::Eq => {
@@ -2222,6 +2437,54 @@ fn col_name_unqualified(expr: &Expression) -> Option<String> {
             Some(c.name.clone())
         }
         _ => None,
+    }
+}
+
+/// Recursively collect all `AliasedRelation` aliases from a plan tree.
+/// Used to identify table qualifiers in SEMI/ANTI join conditions that refer
+/// to relations inside a subquery (where the alias won't be directly accessible).
+fn collect_plan_aliases(plan: &LogicalPlan, aliases: &mut std::collections::HashSet<String>) {
+    match plan {
+        LogicalPlan::AliasedRelation(ar) => { aliases.insert(ar.alias.clone()); }
+        LogicalPlan::Filter(f) => collect_plan_aliases(&f.input, aliases),
+        LogicalPlan::Join(j) => {
+            collect_plan_aliases(&j.left, aliases);
+            collect_plan_aliases(&j.right, aliases);
+        }
+        LogicalPlan::Project(p) => collect_plan_aliases(&p.input, aliases),
+        LogicalPlan::Aggregate(a) => collect_plan_aliases(&a.input, aliases),
+        LogicalPlan::Sort(s) => collect_plan_aliases(&s.input, aliases),
+        LogicalPlan::Limit(l) => collect_plan_aliases(&l.input, aliases),
+        LogicalPlan::Distinct(d) => collect_plan_aliases(&d.input, aliases),
+        _ => {}
+    }
+}
+
+/// Strip table qualifiers from `UnresolvedColumn` references where the qualifier
+/// matches one of the given aliases. Used for SEMI/ANTI join conditions so that
+/// columns from the (wrapped) left subquery are accessible without their qualifier.
+fn strip_qualifiers_in_expr(
+    expr: Expression,
+    aliases: &std::collections::HashSet<String>,
+) -> Expression {
+    match expr {
+        Expression::UnresolvedColumn(u) => {
+            if u.qualifier.as_ref().map_or(false, |q| aliases.contains(q)) {
+                Expression::UnresolvedColumn(UnresolvedColumn { name: u.name, qualifier: None })
+            } else {
+                Expression::UnresolvedColumn(u)
+            }
+        }
+        Expression::Binary(b) => {
+            let left = strip_qualifiers_in_expr(*b.left, aliases);
+            let right = strip_qualifiers_in_expr(*b.right, aliases);
+            Expression::Binary(BinaryExpression { op: b.op, left: Box::new(left), right: Box::new(right) })
+        }
+        Expression::Unary(u) => {
+            let operand = strip_qualifiers_in_expr(*u.operand, aliases);
+            Expression::Unary(UnaryExpression { op: u.op, operand: Box::new(operand) })
+        }
+        other => other,
     }
 }
 

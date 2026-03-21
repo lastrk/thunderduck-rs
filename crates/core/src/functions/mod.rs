@@ -125,8 +125,8 @@ impl FunctionRegistry {
     // ── Builder ───────────────────────────────────────────────────────────────
 
     fn build() -> Self {
-        let mut direct: HashMap<&'static str, &'static str> = HashMap::new();
-        let mut custom: HashMap<&'static str, CustomFn> = HashMap::new();
+        let mut direct: HashMap<&'static str, &'static str> = HashMap::with_capacity(512);
+        let mut custom: HashMap<&'static str, CustomFn> = HashMap::with_capacity(64);
 
         // ── String functions ──────────────────────────────────────────────────
         let string_direct: &[(&str, &str)] = &[

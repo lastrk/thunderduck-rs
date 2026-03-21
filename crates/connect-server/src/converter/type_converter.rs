@@ -109,7 +109,9 @@ pub fn data_type_to_proto(dt: &DataType) -> proto::DataType {
             fields: s.fields.iter().map(struct_field_to_proto).collect(),
             type_variation_reference: 0,
         }),
-        DataType::Unresolved => Kind::String(proto::data_type::String::default()),
+        DataType::Unresolved => Kind::Unparsed(proto::data_type::Unparsed {
+            data_type_string: "unresolved".to_string(),
+        }),
     };
 
     proto::DataType { kind: Some(kind) }

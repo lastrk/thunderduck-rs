@@ -511,7 +511,6 @@ impl Expression {
             },
             Expression::StructLiteral(_) => DataType::Unresolved,
             Expression::Between(_) => DataType::Boolean,
-            // New variants
             Expression::Like(_) | Expression::IsDistinctFrom(_) => DataType::Boolean,
             Expression::Interval(_) => DataType::String, // TODO: proper IntervalType
             Expression::ExtractValue(_) | Expression::RowConstructor(_) => DataType::Unresolved,
@@ -551,7 +550,6 @@ impl Expression {
             Expression::RawSql(_) => true,
             Expression::ArrayLiteral(_) | Expression::MapLiteral(_) | Expression::StructLiteral(_) => false,
             Expression::Between(_) => false,
-            // New variants
             Expression::Like(l) => l.value.nullable(schema) || l.pattern.nullable(schema),
             Expression::IsDistinctFrom(_) => false,
             Expression::Interval(_) => false,

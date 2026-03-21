@@ -108,6 +108,8 @@ pub enum LogicalPlan {
     StatCov(StatCov),
     StatCorr(StatCorr),
     ApproxQuantile(ApproxQuantile),
+    Describe(Describe),
+    Summary(Summary),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,6 +133,24 @@ pub struct ApproxQuantile {
     pub cols: Vec<String>,
     pub probabilities: Vec<f64>,
     pub relative_error: f64,
+}
+
+/// `df.describe(cols...)` — summary statistics as VARCHAR strings (5 fixed stats).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Describe {
+    pub input: Box<LogicalPlan>,
+    /// Resolved column names to describe (empty = all columns).
+    pub cols: Vec<String>,
+}
+
+/// `df.summary(statistics...)` — configurable statistics as VARCHAR strings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Summary {
+    pub input: Box<LogicalPlan>,
+    /// Requested statistics (empty = default set).
+    pub statistics: Vec<String>,
+    /// Resolved column names (empty = all columns).
+    pub cols: Vec<String>,
 }
 
 // ── Plan node structs ─────────────────────────────────────────────────────────
@@ -422,7 +442,28 @@ impl LogicalPlan {
                 if j.join_type.is_semi_or_anti() {
                     return j.left.infer_schema();
                 }
-                let merged = StructType::merge(&j.left.infer_schema(), &j.right.infer_schema());
+                // Compute schemas once; reused for USING ordering below.
+                let left_schema = j.left.infer_schema();
+                let right_schema = j.right.infer_schema();
+                let left_len = left_schema.fields.len();
+                let merged = StructType::merge(&left_schema, &right_schema);
+
+                // Apply outer-join nullability: LEFT makes right-side nullable,
+                // RIGHT makes left-side nullable, FULL makes both nullable.
+                let right_nullable = matches!(j.join_type, JoinType::Left | JoinType::Full);
+                let left_nullable  = matches!(j.join_type, JoinType::Right | JoinType::Full);
+                let merged = if left_nullable || right_nullable {
+                    let fields = merged.fields.into_iter().enumerate().map(|(i, mut f)| {
+                        if (i < left_len && left_nullable) || (i >= left_len && right_nullable) {
+                            f.nullable = true;
+                        }
+                        f
+                    }).collect();
+                    StructType::new(fields)
+                } else {
+                    merged
+                };
+
                 // Deduplicate columns referenced in USING clause (SQL USING keeps one copy).
                 // Also deduplicate for equijoin ON conditions that get converted to USING.
                 // When plan_id aliases are active, the join uses ON (not USING), so no dedup.
@@ -463,22 +504,52 @@ impl LogicalPlan {
                 if using_cols.is_empty() {
                     merged
                 } else {
-                    // Keep only the first occurrence of each using column
-                    let mut seen_using = std::collections::HashSet::new();
-                    let fields = merged.fields.into_iter().filter(|f| {
-                        if using_cols.contains(&f.name) {
-                            seen_using.insert(f.name.clone())
-                        } else {
-                            true
+                    // Rebuild field list with USING keys first, then left non-USING, then right
+                    // non-USING — matching Spark's column ordering convention for USING joins.
+                    let using_set: std::collections::HashSet<&str> =
+                        using_cols.iter().map(|s| s.as_str()).collect();
+                    let mut fields = Vec::new();
+                    // 1. USING columns first (from left schema, in USING order)
+                    for name in &using_cols {
+                        if let Some(f) = left_schema.fields.iter().find(|f| &f.name == name) {
+                            fields.push(f.clone());
                         }
-                    }).collect();
+                    }
+                    // 2. Left non-USING columns
+                    for f in &left_schema.fields {
+                        if !using_set.contains(f.name.as_str()) { fields.push(f.clone()); }
+                    }
+                    // 3. Right non-USING columns
+                    for f in &right_schema.fields {
+                        if !using_set.contains(f.name.as_str()) { fields.push(f.clone()); }
+                    }
                     StructType::new(fields)
                 }
             }
             LogicalPlan::Sort(s) => s.input.infer_schema(),
             LogicalPlan::Limit(l) => l.input.infer_schema(),
             LogicalPlan::Tail(t) => t.input.infer_schema(),
-            LogicalPlan::Union(u) => u.left.infer_schema(),
+            LogicalPlan::Union(u) => {
+                let left = u.left.infer_schema();
+                let right = u.right.infer_schema();
+                if left.is_empty() || right.is_empty() || left.fields.len() != right.fields.len() {
+                    return left;
+                }
+                let fields = left.fields.into_iter().zip(right.fields)
+                    .map(|(mut lf, rf)| {
+                        let promoted = crate::types::TypeInferenceEngine::promote_numeric(
+                            &lf.data_type, &rf.data_type,
+                        );
+                        // promote_numeric returns Double for non-numeric pairs — keep left type
+                        lf.data_type = if promoted == DataType::Double
+                            && !lf.data_type.is_numeric() && !rf.data_type.is_numeric()
+                        { lf.data_type } else { promoted };
+                        lf.nullable = lf.nullable || rf.nullable;
+                        lf
+                    })
+                    .collect();
+                StructType::new(fields)
+            }
             LogicalPlan::Except(e) => e.left.infer_schema(),
             LogicalPlan::Intersect(i) => i.left.infer_schema(),
             LogicalPlan::Distinct(d) => d.input.infer_schema(),
@@ -493,7 +564,18 @@ impl LogicalPlan {
             LogicalPlan::InMemoryRelation(r) => r.schema.clone(),
             LogicalPlan::WithCte(c) => c.input.infer_schema(),
             LogicalPlan::WithColumns(w) => infer_with_columns_schema(w),
-            LogicalPlan::AliasedRelation(a) => a.input.infer_schema(),
+            LogicalPlan::AliasedRelation(a) => {
+                let child = a.input.infer_schema();
+                if !a.column_aliases.is_empty() && a.column_aliases.len() == child.fields.len() {
+                    let fields = child.fields.into_iter()
+                        .zip(&a.column_aliases)
+                        .map(|(mut f, name)| { f.name = name.clone(); f })
+                        .collect();
+                    StructType::new(fields)
+                } else {
+                    child
+                }
+            }
             LogicalPlan::RawDdlStatement(_) => StructType::empty(),
             LogicalPlan::ToDataFrame(t) => infer_to_dataframe_schema(t),
             LogicalPlan::SingleRow(_) => StructType::empty(),
@@ -538,6 +620,21 @@ impl LogicalPlan {
             LogicalPlan::ApproxQuantile(_) => StructType::new(vec![
                 StructField::nullable("quantiles".to_string(), DataType::Array(Box::new(DataType::Double))),
             ]),
+            // Describe/Summary: "summary" VARCHAR + one VARCHAR column per input column.
+            LogicalPlan::Describe(d) => {
+                let mut fields = vec![StructField::not_null("summary", DataType::String)];
+                for col in &d.cols {
+                    fields.push(StructField::nullable(col.clone(), DataType::String));
+                }
+                StructType::new(fields)
+            }
+            LogicalPlan::Summary(s) => {
+                let mut fields = vec![StructField::not_null("summary", DataType::String)];
+                for col in &s.cols {
+                    fields.push(StructField::nullable(col.clone(), DataType::String));
+                }
+                StructType::new(fields)
+            }
         }
     }
 }
@@ -581,8 +678,33 @@ fn projection_to_field(expr: &Expression, schema: &StructType) -> Option<StructF
         Expression::Star(_) => None, // expanded by caller
         other => {
             let dt = other.data_type(schema);
-            Some(StructField::nullable("expr".to_string(), dt))
+            Some(StructField::nullable(spark_column_name(other), dt))
         }
+    }
+}
+
+/// Build a Spark-convention column name for an unaliased expression.
+///
+/// Mirrors Java `buildSparkColumnName()` for the common cases. Used by
+/// `projection_to_field` and `agg_expr_to_field` when there is no explicit alias.
+fn spark_column_name(expr: &Expression) -> String {
+    match expr {
+        Expression::FunctionCall(f) => {
+            // Spark names unaliased count(*) as "count(1)"
+            let is_count_star = f.name.eq_ignore_ascii_case("count")
+                && f.args.iter().any(|a| matches!(a, Expression::Star(_)));
+            if is_count_star { return "count(1)".to_string(); }
+            let args = f.args.iter()
+                .map(spark_column_name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({})", f.name, args)
+        }
+        Expression::Star(_) => "*".to_string(),
+        Expression::UnresolvedColumn(u) => u.name.clone(),
+        Expression::ColumnReference(c) => c.name.clone(),
+        Expression::Alias(a) => spark_column_name(&a.expr),
+        _ => "expr".to_string(),
     }
 }
 
@@ -633,6 +755,13 @@ fn infer_aggregate_schema(a: &Aggregate) -> StructType {
         }
     }
 
+    // ROLLUP/CUBE produce NULL in grouping columns for subtotal/grand-total rows.
+    if a.grouping_sets.is_some() {
+        let n_grouping = a.grouping.len();
+        for f in fields.iter_mut().take(n_grouping) {
+            f.nullable = true;
+        }
+    }
     StructType::new(fields)
 }
 
@@ -659,7 +788,7 @@ fn agg_expr_to_field(expr: &Expression, schema: &StructType) -> Option<StructFie
                 &f.name,
                 arg_types.first().unwrap_or(&DataType::Unresolved),
             );
-            Some(StructField::nullable(f.name.clone(), dt))
+            Some(StructField::nullable(spark_column_name(expr), dt))
         }
         other => projection_to_field(other, schema),
     }
@@ -706,15 +835,15 @@ fn infer_to_dataframe_schema(t: &ToDataFrame) -> StructType {
         // Can't rename if we don't know the child schema
         return child;
     }
-    let fields = child
-        .fields
-        .into_iter()
+    let extra_start = t.column_names.len().min(child.fields.len());
+    let mut fields: Vec<StructField> = child.fields.into_iter()
         .zip(t.column_names.iter())
-        .map(|(mut f, name)| {
-            f.name = name.clone();
-            f
-        })
+        .map(|(mut f, name)| { f.name = name.clone(); f })
         .collect();
+    // Extra names beyond child column count → String fields (matches Java behaviour)
+    for name in t.column_names.iter().skip(extra_start) {
+        fields.push(StructField::nullable(name.clone(), DataType::String));
+    }
     StructType::new(fields)
 }
 

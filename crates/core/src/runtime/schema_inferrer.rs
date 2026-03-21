@@ -53,8 +53,6 @@ fn arrow_type_to_core(dt: &ArrowDataType) -> DataType {
         ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => DataType::String,
         ArrowDataType::Binary | ArrowDataType::LargeBinary => DataType::Binary,
         ArrowDataType::Date32 | ArrowDataType::Date64 => DataType::Date,
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => DataType::Timestamp,
-        ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(_)) => DataType::Timestamp,
         ArrowDataType::Timestamp(_, _) => DataType::Timestamp,
         ArrowDataType::Decimal128(p, s) => DataType::Decimal {
             precision: *p,

@@ -82,9 +82,10 @@ impl SparkConnectService for ThunderduckService {
                 // PySpark's _execute_and_fetch gets a non-null table back.
                 // For DROP VIEW, the bool indicates whether the view existed.
                 let upper = sql.trim_start().to_uppercase();
-                if upper.starts_with("DROP VIEW IF EXISTS ") {
-                    // Extract view name — everything after "DROP VIEW IF EXISTS "
-                    let view_name = sql.trim_start()[20..].trim().trim_matches('"');
+                const DROP_VIEW_PREFIX: &str = "DROP VIEW IF EXISTS ";
+                if upper.starts_with(DROP_VIEW_PREFIX) {
+                    // Extract view name — skip past the prefix (ASCII, same byte length in upper/original)
+                    let view_name = sql.trim_start()[DROP_VIEW_PREFIX.len()..].trim().trim_matches('"');
                     // Check existence before dropping
                     let exists = session
                         .execute(&format!(
@@ -156,7 +157,7 @@ impl SparkConnectService for ThunderduckService {
                         .map_err(Status::from)?;
                 let mut struct_type = logical_plan.infer_schema();
                 let has_unresolved = struct_type.fields.iter()
-                    .any(|f| f.data_type == thunderduck_core::types::DataType::Unresolved);
+                    .any(|f| f.data_type.contains_unresolved());
                 if struct_type.is_empty() || has_unresolved {
                     // Static inference failed or produced Unresolved types — ask DuckDB
                     let sql = SqlGenerator::relaxed()
@@ -491,19 +492,6 @@ fn bool_batch_responses(
         vec![Arc::new(BooleanArray::from(vec![val]))],
     ).map_err(|e| crate::error::ConnectError::Arrow(e.to_string()))?;
     batches_to_responses(session_id, operation_id, &[batch])
-}
-
-fn empty_result_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {
-    proto::ExecutePlanResponse {
-        session_id: session_id.to_string(),
-        server_side_session_id: SERVER_SESSION_ID.to_string(),
-        operation_id: operation_id.to_string(),
-        response_id: format!("{operation_id}-0"),
-        response_type: Some(proto::execute_plan_response::ResponseType::ArrowBatch(
-            proto::execute_plan_response::ArrowBatch { row_count: 0, data: vec![], ..Default::default() },
-        )),
-        ..Default::default()
-    }
 }
 
 fn result_complete_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {

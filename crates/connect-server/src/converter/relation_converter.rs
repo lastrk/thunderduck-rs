@@ -84,12 +84,9 @@ impl<'a> RelationConverter<'a> {
             Some(RelType::FillNa(f)) => self.convert_fill_na(f),
             Some(RelType::DropNa(d)) => self.convert_drop_na(d),
             Some(RelType::Replace(r)) => self.convert_replace(r),
-            Some(RelType::Summary(_)) => {
-                Err(ConnectError::Unsupported("Summary not supported (Phase 5)".into()))
-            }
-            Some(RelType::Describe(_)) => {
-                Err(ConnectError::Unsupported("Describe not supported (Phase 5)".into()))
-            }
+            Some(RelType::Summary(s)) => self.convert_summary(s),
+            Some(RelType::Describe(d)) => self.convert_describe(d),
+            Some(RelType::WithRelations(wr)) => self.convert_with_relations(wr),
             Some(RelType::Cov(c)) => self.convert_stat_cov(c),
             Some(RelType::Corr(c)) => self.convert_stat_corr(c),
             Some(RelType::ApproxQuantile(aq)) => self.convert_approx_quantile(aq),
@@ -333,21 +330,19 @@ impl<'a> RelationConverter<'a> {
             && left_outer_id.is_some()
             && right_outer_id.is_some();
 
-        let left_plan_ids: Vec<i64> = left_ids_set.into_iter().collect();
-        let right_plan_ids: Vec<i64> = right_ids_set.into_iter().collect();
-
         let (condition, left_alias, right_alias) = if needs_aliases {
             // Use a distinct alias format (__td_jl_N__ / __td_jr_M__) so the generator can
             // tell these apart from raw plan_id qualifiers (__plan_id_X__) and not strip them.
             let la = format!("__td_jl_{}__", left_outer_id.unwrap());
             let ra = format!("__td_jr_{}__", right_outer_id.unwrap());
-            let left_set: std::collections::HashSet<i64> = left_plan_ids.iter().copied().collect();
-            let right_set: std::collections::HashSet<i64> = right_plan_ids.iter().copied().collect();
-            let qualified = raw_condition.map(|c| qualify_join_condition(c, &left_set, &right_set, &la, &ra));
+            let qualified = raw_condition.map(|c| qualify_join_condition(c, &left_ids_set, &right_ids_set, &la, &ra));
             (qualified, Some(la), Some(ra))
         } else {
             (raw_condition, None, None)
         };
+
+        let left_plan_ids: Vec<i64> = left_ids_set.into_iter().collect();
+        let right_plan_ids: Vec<i64> = right_ids_set.into_iter().collect();
 
         Ok(LogicalPlan::Join(Join {
             left: Box::new(self.convert(left_proto)?),
@@ -383,17 +378,24 @@ impl<'a> RelationConverter<'a> {
             if !left_schema.is_empty() && !right_schema.is_empty() {
                 // Build a projection that reorders right columns to match left order.
                 let allow_missing = s.allow_missing_columns.unwrap_or(false);
-                let projections: Vec<Expression> = left_schema.fields.iter().map(|lf| {
+                let mut projections: Vec<Expression> = Vec::with_capacity(left_schema.fields.len());
+                for lf in &left_schema.fields {
                     if right_schema.field_index(&lf.name).is_some() {
-                        Expression::UnresolvedColumn(UnresolvedColumn { name: lf.name.clone(), qualifier: None })
+                        projections.push(Expression::UnresolvedColumn(UnresolvedColumn {
+                            name: lf.name.clone(),
+                            qualifier: None,
+                        }));
                     } else if allow_missing {
                         // Missing column in right — fill with NULL
                         use thunderduck_core::expression::Literal;
-                        Literal::null()
+                        projections.push(Literal::null());
                     } else {
-                        Expression::UnresolvedColumn(UnresolvedColumn { name: lf.name.clone(), qualifier: None })
+                        return Err(ConnectError::PlanConversion(format!(
+                            "unionByName: column '{}' missing from right side and allow_missing_columns is false",
+                            lf.name
+                        )));
                     }
-                }).collect();
+                }
                 Box::new(LogicalPlan::Project(thunderduck_core::logical::Project {
                     input: right_plan,
                     projections,
@@ -435,9 +437,37 @@ impl<'a> RelationConverter<'a> {
                 alias: None,
             })),
             Some(ReadType::DataSource(ds)) => {
-                let table =
-                    ds.paths.first().cloned().unwrap_or_else(|| "unknown".to_string());
-                Ok(LogicalPlan::TableScan(TableScan { table, alias: None }))
+                if ds.paths.is_empty() {
+                    return Err(ConnectError::PlanConversion(
+                        "DataSource has no paths".into(),
+                    ));
+                }
+                let format = ds.format.as_deref().unwrap_or("").to_lowercase();
+                let first_path = &ds.paths[0];
+                // Infer DuckDB reader from explicit format or path extension.
+                let reader = match format.as_str() {
+                    "parquet" => "read_parquet",
+                    "csv" | "text" => "read_csv_auto",
+                    "json" => "read_json_auto",
+                    "orc" => "read_orc",
+                    _ => {
+                        let lower = first_path.to_lowercase();
+                        if lower.ends_with(".parquet") { "read_parquet" }
+                        else if lower.ends_with(".csv") || lower.ends_with(".tsv") { "read_csv_auto" }
+                        else if lower.ends_with(".json") || lower.ends_with(".jsonl") || lower.ends_with(".ndjson") { "read_json_auto" }
+                        else { "read_parquet" }
+                    }
+                };
+                let paths_sql = if ds.paths.len() == 1 {
+                    format!("'{}'", first_path.replace('\'', "''"))
+                } else {
+                    let quoted: Vec<String> = ds.paths.iter()
+                        .map(|p| format!("'{}'", p.replace('\'', "''")))
+                        .collect();
+                    format!("[{}]", quoted.join(", "))
+                };
+                let sql = format!("SELECT * FROM {reader}({paths_sql})");
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
             }
             None => Err(ConnectError::PlanConversion("Read missing read_type".into())),
         }
@@ -456,15 +486,10 @@ impl<'a> RelationConverter<'a> {
         }
         // Fallback: schema-only (0 rows).
         // Priority: Arrow IPC schema > DDL schema string > empty.
-        let schema = if let Some(data) = &lr.data {
-            if !data.is_empty() {
-                parse_arrow_schema(data).unwrap_or_default()
-            } else {
-                lr.schema.as_deref().and_then(|s| parse_ddl_schema(s).ok()).unwrap_or_default()
-            }
-        } else {
-            // data is None — schema comes from the DDL string (used for empty DataFrames)
-            lr.schema.as_deref().and_then(|s| parse_ddl_schema(s).ok()).unwrap_or_default()
+        let schema_from_ddl = || lr.schema.as_deref().and_then(|s| parse_ddl_schema(s).ok()).unwrap_or_default();
+        let schema = match &lr.data {
+            Some(data) if !data.is_empty() => parse_arrow_schema(data).unwrap_or_default(),
+            _ => schema_from_ddl(),
         };
         Ok(LogicalPlan::LocalDataRelation(LocalDataRelation { schema }))
     }
@@ -513,6 +538,34 @@ impl<'a> RelationConverter<'a> {
                 alias.name.first().cloned().unwrap_or_else(|| "_col".to_string());
             let col_expr = self.expr_conv.convert(expr)?;
             columns.push((name, col_expr));
+        }
+
+        // Try to expand to an explicit Project to preserve column order.
+        // When we know the input column list, we can place replacement columns
+        // in-place and append new columns at the end — matching Spark's behavior.
+        if let Ok(input_cols) = self.infer_columns(&input_plan) {
+            use thunderduck_core::expression::AliasExpression;
+            let mut projections: Vec<Expression> = input_cols.iter().map(|col_name| {
+                // If this column is being replaced, use the replacement expression.
+                let replacement = columns.iter().find(|(n, _)| n == col_name).map(|(_, e)| e.clone());
+                let expr = replacement.unwrap_or_else(|| {
+                    Expression::UnresolvedColumn(UnresolvedColumn { name: col_name.clone(), qualifier: None })
+                });
+                Expression::Alias(AliasExpression { expr: Box::new(expr), alias: col_name.clone() })
+            }).collect();
+            // Append new columns (those not in input_cols).
+            for (name, expr) in &columns {
+                if !input_cols.iter().any(|c| c == name) {
+                    projections.push(Expression::Alias(AliasExpression {
+                        expr: Box::new(expr.clone()),
+                        alias: name.clone(),
+                    }));
+                }
+            }
+            return Ok(LogicalPlan::Project(Project {
+                input: Box::new(input_plan),
+                projections,
+            }));
         }
 
         Ok(LogicalPlan::WithColumns(WithColumns {
@@ -611,8 +664,44 @@ impl<'a> RelationConverter<'a> {
             .input
             .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("ToDF missing input".into()))?;
+        let input_plan = self.convert(input)?;
+
+        // If the input schema is unknown (e.g. SqlRelation from read.parquet),
+        // resolve column names via DuckDB so the generator can produce the
+        // explicit "old AS new" rename SELECT instead of a pass-through SELECT *.
+        if input_plan.infer_schema().is_empty() && !t.column_names.is_empty() {
+            if let Ok(original_cols) = self.infer_columns(&input_plan) {
+                if original_cols.len() == t.column_names.len() {
+                    // Convert to a Project with explicit renames
+                    let projections = original_cols
+                        .into_iter()
+                        .zip(t.column_names.iter())
+                        .map(|(old, new)| {
+                            thunderduck_core::expression::Expression::Alias(
+                                thunderduck_core::expression::AliasExpression {
+                                    expr: Box::new(thunderduck_core::expression::Expression::UnresolvedColumn(
+                                        thunderduck_core::expression::UnresolvedColumn {
+                                            name: old,
+                                            qualifier: None,
+                                        },
+                                    )),
+                                    alias: new.clone(),
+                                },
+                            )
+                        })
+                        .collect();
+                    return Ok(LogicalPlan::Project(
+                        thunderduck_core::logical::Project {
+                            input: Box::new(input_plan),
+                            projections,
+                        },
+                    ));
+                }
+            }
+        }
+
         Ok(LogicalPlan::ToDataFrame(ToDataFrame {
-            input: Box::new(self.convert(input)?),
+            input: Box::new(input_plan),
             column_names: t.column_names.clone(),
         }))
     }
@@ -637,9 +726,9 @@ impl<'a> RelationConverter<'a> {
             .ok_or_else(|| ConnectError::PlanConversion("NADrop missing input".into()))?;
         let input_plan = self.convert(input)?;
 
-        // min_non_nulls unset → "any" (all must be non-null); set → threshold
+        // Proto encoding: 'any' → min_non_nulls unset; 'all' → min_non_nulls=1; custom thresh → min_non_nulls=N
         let (how, threshold) = if let Some(min) = d.min_non_nulls {
-            (NADropHow::Any, Some(min)) // threshold = keep rows with >= min non-nulls
+            (NADropHow::All, Some(min)) // keep rows with >= min non-null values
         } else {
             (NADropHow::Any, None) // drop row if ANY column is null
         };
@@ -786,6 +875,54 @@ impl<'a> RelationConverter<'a> {
             cols: aq.cols.clone(),
             probabilities: aq.probabilities.clone(),
             relative_error: aq.relative_error,
+        }))
+    }
+
+    fn convert_with_relations(&mut self, wr: &proto::WithRelations) -> Result<LogicalPlan> {
+        let root = wr.root.as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("WithRelations missing root".into()))?;
+        let mut ctes: Vec<(String, Box<LogicalPlan>)> = Vec::with_capacity(wr.references.len());
+        for reference in &wr.references {
+            if let Some(proto::relation::RelType::SubqueryAlias(sa)) = &reference.rel_type {
+                let body = sa.input.as_ref()
+                    .ok_or_else(|| ConnectError::PlanConversion("WithRelations CTE missing body".into()))?;
+                ctes.push((sa.alias.clone(), Box::new(self.convert(body)?)));
+            } else {
+                return Err(ConnectError::PlanConversion(
+                    "WithRelations: expected SubqueryAlias for each CTE reference".into(),
+                ));
+            }
+        }
+        Ok(LogicalPlan::WithCte(thunderduck_core::logical::WithCte {
+            ctes,
+            input: Box::new(self.convert(root)?),
+        }))
+    }
+
+    fn convert_describe(&mut self, d: &proto::StatDescribe) -> Result<LogicalPlan> {
+        let input = d.input.as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("Describe missing input".into()))?;
+        let input_plan = self.convert(input)?;
+        let cols = if d.cols.is_empty() {
+            self.infer_columns(&input_plan)?
+        } else {
+            d.cols.clone()
+        };
+        Ok(LogicalPlan::Describe(thunderduck_core::logical::Describe {
+            input: Box::new(input_plan),
+            cols,
+        }))
+    }
+
+    fn convert_summary(&mut self, s: &proto::StatSummary) -> Result<LogicalPlan> {
+        let input = s.input.as_ref()
+            .ok_or_else(|| ConnectError::PlanConversion("Summary missing input".into()))?;
+        let input_plan = self.convert(input)?;
+        let cols = self.infer_columns(&input_plan)?;
+        Ok(LogicalPlan::Summary(thunderduck_core::logical::Summary {
+            input: Box::new(input_plan),
+            statistics: s.statistics.clone(),
+            cols,
         }))
     }
 
@@ -1639,6 +1776,10 @@ fn collect_relation_plan_ids(rel: &proto::Relation, ids: &mut std::collections::
             if let Some(l) = &s.left_input { collect_relation_plan_ids(l, ids); }
             if let Some(r) = &s.right_input { collect_relation_plan_ids(r, ids); }
         }
+        Some(RelType::WithRelations(wr)) => {
+            if let Some(r) = &wr.root { collect_relation_plan_ids(r, ids); }
+            for ref_ in &wr.references { collect_relation_plan_ids(ref_, ids); }
+        }
         _ => {}
     }
 }
@@ -1662,6 +1803,8 @@ fn condition_has_plan_id(expr: &Expression) -> bool {
     }
 }
 
+/// Build an equijoin ON condition from a list of USING column names.
+///
 /// Walk the join ON condition and set the qualifier on any UnresolvedColumn whose plan_id
 /// (embedded in qualifier field as "__plan_id_<N>__") maps to a join side alias.
 fn qualify_join_condition(

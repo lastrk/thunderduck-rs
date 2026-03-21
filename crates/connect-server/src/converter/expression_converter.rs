@@ -15,6 +15,7 @@ use crate::proto::spark::connect as proto;
 /// Converts proto Expression messages to the core Expression AST.
 ///
 /// Carries a lambda scope stack for nested lambda handling.
+#[derive(Default)]
 pub struct ExpressionConverter {
     /// Stack of lambda scopes; each scope is a list of bound variable names.
     lambda_scopes: Vec<Vec<String>>,
@@ -22,7 +23,7 @@ pub struct ExpressionConverter {
 
 impl ExpressionConverter {
     pub fn new() -> Self {
-        Self { lambda_scopes: Vec::new() }
+        Self::default()
     }
 
     /// Convert a proto Expression to a core Expression.
@@ -267,19 +268,22 @@ impl ExpressionConverter {
         if name == "*" {
             return Ok(Expression::Star(StarExpression { qualifier: None }));
         }
-        // Split dotted name on '.' to support qualifier.column
+        // plan_id takes priority over dot-qualifier: it precisely identifies which
+        // DataFrame/plan a column belongs to, enabling correct join-side disambiguation.
+        if let Some(plan_id) = attr.plan_id {
+            // Use the last dot-separated part as the column name (e.g. "l1.l_suppkey" → "l_suppkey")
+            let col_name = name.split('.').last().unwrap_or(name.as_str()).to_string();
+            return Ok(Expression::UnresolvedColumn(UnresolvedColumn {
+                name: col_name,
+                qualifier: Some(format!("__plan_id_{plan_id}__")),
+            }));
+        }
+        // Split dotted name on '.' to support qualifier.column (for SQL paths without plan_id)
         let parts: Vec<&str> = name.splitn(2, '.').collect();
         if parts.len() == 2 {
             Ok(Expression::UnresolvedColumn(UnresolvedColumn {
                 name: parts[1].to_string(),
                 qualifier: Some(parts[0].to_string()),
-            }))
-        } else if let Some(plan_id) = attr.plan_id {
-            // Encode plan_id as a special qualifier so the join converter can qualify this
-            // column reference with the correct subquery alias (left vs right side of join).
-            Ok(Expression::UnresolvedColumn(UnresolvedColumn {
-                name: name.clone(),
-                qualifier: Some(format!("__plan_id_{plan_id}__")),
             }))
         } else {
             Ok(Expression::UnresolvedColumn(UnresolvedColumn {

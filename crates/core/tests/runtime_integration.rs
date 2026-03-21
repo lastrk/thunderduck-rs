@@ -166,3 +166,60 @@ async fn get_or_create_is_race_free() {
         );
     }
 }
+
+// ── check_parquet_types ────────────────────────────────────────────────────────
+
+/// Quick check: what types does DuckDB return for TPC-H parquet columns?
+#[tokio::test]
+#[ignore]
+async fn check_parquet_types() {
+    let session = DuckDbSession::spawn("parquet-type-check", RuntimeCompatMode::Relaxed, &StreamingConfig::default())
+        .expect("spawn failed");
+
+    // Check supplier schema
+    let batches = session.execute("DESCRIBE SELECT * FROM read_parquet('/workspace/tests/integration/tpch_sf001/supplier.parquet')").await.expect("failed");
+    println!("Supplier schema:");
+    for batch in &batches {
+        for row in 0..batch.num_rows() {
+            let name = batch.column(0).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(row);
+            let dtype = batch.column(1).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(row);
+            println!("  {name}: {dtype}");
+        }
+    }
+    
+    // Check arithmetic type (use LIMIT on FROM to avoid GROUP BY requirement)
+    let batches = session.execute("SELECT typeof(1 - l_discount) AS t1, typeof(l_extendedprice * (1 - l_discount)) AS t2 FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet') LIMIT 1").await.expect("failed");
+    let batches2 = session.execute("SELECT typeof(SUM(l_extendedprice * (1 - l_discount))) AS t3 FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet')").await.expect("failed");
+    let batches = batches;
+    for batch in &batches {
+        let t1 = batch.column(0).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(0);
+        let t2 = batch.column(1).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(0);
+        println!("1-DECIMAL type: {t1}");
+        println!("DECIMAL*DECIMAL type: {t2}");
+    }
+    for batch in &batches2 {
+        let t3 = batch.column(0).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(0);
+        println!("SUM(DECIMAL*DECIMAL) type: {t3}");
+    }
+
+    // Register lineitem view (simulating createOrReplaceTempView)
+    session.create_temp_view("lineitem", "SELECT * FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet')").await.expect("create view failed");
+
+    // Check ARROW schema types via view (like Q1 DataFrame generates)
+    let batches3 = session.execute("SELECT \"l_returnflag\", \"l_linestatus\", SUM(\"l_extendedprice\" * (1 - \"l_discount\")) AS \"sum_disc_price\" FROM (SELECT * FROM \"lineitem\") GROUP BY \"l_returnflag\", \"l_linestatus\" LIMIT 1").await.expect("failed");
+    if let Some(batch) = batches3.first() {
+        let schema = batch.schema();
+        println!("Arrow schema of batch:");
+        for field in schema.fields() {
+            println!("  {}: {:?}", field.name(), field.data_type());
+        }
+    }
+
+    // Check schema_of (the LIMIT 0 path used by analyze_plan)
+    let q1_sql = "SELECT \"l_returnflag\", \"l_linestatus\", SUM(\"l_extendedprice\" * (1 - \"l_discount\")) AS \"sum_disc_price\" FROM (SELECT * FROM \"lineitem\") GROUP BY \"l_returnflag\", \"l_linestatus\"";
+    let schema = session.schema_of(q1_sql).await.expect("schema_of failed");
+    println!("schema_of (LIMIT 0) result:");
+    for field in schema.fields() {
+        println!("  {}: {:?}", field.name(), field.data_type());
+    }
+}

@@ -29,6 +29,9 @@ impl TypeInferenceEngine {
     pub fn promote_numeric(left: &DataType, right: &DataType) -> DataType {
         use DataType::*;
         match (left, right) {
+            // Unresolved propagates — we don't know the type yet
+            (Unresolved, _) | (_, Unresolved) => Unresolved,
+
             // Same type
             (a, b) if a == b => a.clone(),
 

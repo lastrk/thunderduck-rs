@@ -434,7 +434,7 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
                     .map_err(|e| ThunderduckError::DuckDb(e.to_string()));
                 let msg = match result {
                     Ok(()) => SessionResult::Ok,
-                    Err(_) => SessionResult::Ok, // IF EXISTS — ignore errors
+                    Err(e) => SessionResult::Error(e),
                 };
                 let _ = resp.send(msg);
             }

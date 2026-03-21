@@ -1,4 +1,4 @@
-use duckdb::arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
+use duckdb::arrow::datatypes::DataType as ArrowDataType;
 
 use crate::runtime::session::DuckDbSession;
 use crate::types::{DataType, StructField, StructType};

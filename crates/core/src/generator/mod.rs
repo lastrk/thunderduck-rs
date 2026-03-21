@@ -11,7 +11,7 @@ use crate::expression::{
     FrameBoundary, FrameUnit, FunctionCall, InListExpression, InSubquery, IntervalExpression,
     IsDistinctFromExpression, LambdaExpression, LikeExpression, LiteralValue,
     MapLiteralExpression, RowConstructorExpression, ScalarSubquery, SortOrder,
-    StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UpdateFieldsExpression,
+    StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn,
     WindowFunction,
 };
 use crate::functions::{CompatMode, FunctionRegistry};
@@ -161,8 +161,25 @@ impl SqlGenerator {
         Ok(format!("SELECT *\nFROM {from}\nWHERE {}", all_conditions.join("\nAND ")))
     }
 
+    /// Render a single aggregate expression: apply type casts, inject DISTINCT, append FILTER.
+    fn render_agg_expr(
+        &self,
+        ae: &crate::logical::AggregateExpr,
+        input_schema: &StructType,
+    ) -> Result<String> {
+        let func = apply_agg_type_casts(&ae.func, input_schema);
+        let mut s = self.gen_expr(&func)?;
+        if ae.is_distinct {
+            s = inject_distinct(s);
+        }
+        if let Some(filter) = &ae.filter {
+            s = format!("{s} FILTER (WHERE {})", self.gen_expr(filter)?);
+        }
+        Ok(s)
+    }
+
     fn gen_aggregate(&self, a: &Aggregate) -> Result<String> {
-        // Infer input schema once for type-aware SUM→BIGINT wrapping.
+        // Infer input schema once for type-aware aggregate cast wrapping.
         let input_schema = a.input.infer_schema();
 
         // Build SELECT list
@@ -173,17 +190,7 @@ impl SqlGenerator {
                 parts.push(self.gen_expr(g)?);
             }
             for ae in &a.aggregates {
-                let func = cast_integer_sum(&ae.func, &input_schema);
-                let mut s = self.gen_expr(&func)?;
-                if ae.is_distinct {
-                    // Wrap with DISTINCT inside the aggregate
-                    s = inject_distinct(s);
-                }
-                if let Some(filter) = &ae.filter {
-                    let f = self.gen_expr(filter)?;
-                    s = format!("{s} FILTER (WHERE {f})");
-                }
-                parts.push(s);
+                parts.push(self.render_agg_expr(ae, &input_schema)?);
             }
             parts.join(", ")
         } else {
@@ -201,17 +208,7 @@ impl SqlGenerator {
                 match entry {
                     SelectEntry::GroupingExpr(g) => parts.push(self.gen_expr(g)?),
                     SelectEntry::AggregateExpr(idx) => {
-                        let ae = &a.aggregates[*idx];
-                        let func = cast_integer_sum(&ae.func, &input_schema);
-                        let mut s = self.gen_expr(&func)?;
-                        if ae.is_distinct {
-                            s = inject_distinct(s);
-                        }
-                        if let Some(filter) = &ae.filter {
-                            let f = self.gen_expr(filter)?;
-                            s = format!("{s} FILTER (WHERE {f})");
-                        }
-                        parts.push(s);
+                        parts.push(self.render_agg_expr(&a.aggregates[*idx], &input_schema)?);
                     }
                 }
             }
@@ -1251,7 +1248,7 @@ impl SqlGenerator {
     fn gen_function_call(&self, f: &FunctionCall) -> Result<String> {
         // SQL operator pseudo-functions: Spark sends these as UnresolvedFunction but
         // DuckDB requires them as SQL operators (no scalar function of these names exists).
-        match f.name.to_lowercase().as_str() {
+        match f.name.to_ascii_lowercase().as_str() {
             "like" if f.args.len() == 2 => {
                 let left = self.gen_expr(&f.args[0])?;
                 let right = self.gen_expr(&f.args[1])?;
@@ -1808,14 +1805,16 @@ pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Inject DISTINCT into a function call SQL string.
-/// e.g. `COUNT(x)` → `COUNT(DISTINCT x)`
-/// Wrap `SUM(integer_col)` with `CAST(SUM(...) AS BIGINT)` to prevent DuckDB's HUGEINT
-/// return type from leaking to PySpark.  Spark always returns BIGINT for integer SUM.
-fn cast_integer_sum(expr: &Expression, input_schema: &StructType) -> Expression {
+/// Wrap aggregate expressions with CASTs to match Spark's return types:
+/// - `SUM(integer)` → `CAST(SUM(...) AS BIGINT)` (DuckDB returns HUGEINT)
+/// - `SUM(decimal{p,s})` → `CAST(SUM(...) AS DECIMAL(min(p+10,38), s))`
+/// - `AVG(integer)` → `CAST(AVG(...) AS DOUBLE)` (Spark promotes integer AVG to DOUBLE)
+/// - `AVG(decimal{p,s})` → `CAST(AVG(...) AS DECIMAL(min(p+4,38), s+4))`
+/// Passes through aliases transparently so the alias is preserved on the outer Cast.
+fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType) -> Expression {
     match expr {
         Expression::Alias(a) => {
-            let inner = cast_integer_sum(&a.expr, input_schema);
+            let inner = apply_agg_type_casts(&a.expr, input_schema);
             Expression::Alias(AliasExpression { expr: Box::new(inner), alias: a.alias.clone() })
         }
         Expression::FunctionCall(f)
@@ -1875,13 +1874,11 @@ fn cast_integer_sum(expr: &Expression, input_schema: &StructType) -> Expression 
     }
 }
 
-fn inject_distinct(s: String) -> String {
+fn inject_distinct(mut s: String) -> String {
     if let Some(pos) = s.find('(') {
-        let (before, after) = s.split_at(pos + 1);
-        format!("{before}DISTINCT {after}")
-    } else {
-        s
+        s.insert_str(pos + 1, "DISTINCT ");
     }
+    s
 }
 
 // ── Precedence extension on BinaryOp ──────────────────────────────────────────
@@ -1935,10 +1932,9 @@ fn preprocess_spark_sql(sql: &str) -> String {
         ("EXPLODE",          "UNNEST"),
         ("POSEXPLODE",       "UNNEST"),    // positional explode — DuckDB UNNEST handles both
     ];
-    let mut sql = sql.to_string();
+    let mut sql = sql; // already a String from phase 3
     for (from, to) in replacements {
-        let replaced = replace_spark_func(&sql, from, to);
-        sql = replaced;
+        sql = replace_spark_func(&sql, from, to);
     }
     // Phase 5: percentile(col, pct) → PERCENTILE_CONT(pct) WITHIN GROUP (ORDER BY col)
     let sql = rewrite_percentile(&sql);
@@ -2131,36 +2127,33 @@ fn spark_type_str_to_duckdb(spark_type: &str) -> &'static str {
 /// Replace a Spark function name with a DuckDB equivalent.
 /// Respects word boundaries: only replaces when not preceded/followed by word chars.
 fn replace_spark_func(sql: &str, from: &str, to: &str) -> String {
-    let from_upper = from.to_uppercase();
     let from_len = from.len();
     let bytes = sql.as_bytes();
     let mut result = String::with_capacity(sql.len());
     let mut i = 0;
+    let mut slice_start = 0;
     while i < bytes.len() {
-        // Try case-insensitive match
-        if i + from_len <= bytes.len() {
-            let slice = &sql[i..i + from_len];
-            if slice.eq_ignore_ascii_case(&from_upper) {
-                // Check word boundary before
-                let prev_is_word = i > 0 && {
-                    let c = bytes[i - 1] as char;
-                    c.is_alphanumeric() || c == '_'
-                };
-                // Check character after to confirm it's `(` (with optional spaces)
-                let mut j = i + from_len;
-                while j < bytes.len() && bytes[j] == b' ' { j += 1; }
-                let next_is_paren = j < bytes.len() && bytes[j] == b'(';
-                // Only replace if it looks like a function call
-                if !prev_is_word && next_is_paren {
-                    result.push_str(to);
-                    i += from_len;
-                    continue;
-                }
+        if i + from_len <= bytes.len()
+            && sql[i..i + from_len].eq_ignore_ascii_case(from)
+        {
+            let prev_is_word = i > 0 && {
+                let c = bytes[i - 1];
+                c.is_ascii_alphanumeric() || c == b'_'
+            };
+            let mut j = i + from_len;
+            while j < bytes.len() && bytes[j] == b' ' { j += 1; }
+            let next_is_paren = j < bytes.len() && bytes[j] == b'(';
+            if !prev_is_word && next_is_paren {
+                result.push_str(&sql[slice_start..i]);
+                result.push_str(to);
+                i += from_len;
+                slice_start = i;
+                continue;
             }
         }
-        result.push(bytes[i] as char);
         i += 1;
     }
+    result.push_str(&sql[slice_start..]);
     result
 }
 
@@ -2475,21 +2468,6 @@ fn rewrite_percentile(sql: &str) -> String {
     result
 }
 
-/// Try to extract USING column names from a simple equijoin ON condition.
-///
-/// Returns `Some(cols)` when the condition is entirely composed of `col = col`
-/// conjunctions where both sides reference the same column name (regardless of
-/// qualifier).  Returns `None` for any non-equijoin or complex condition so the
-/// caller falls back to emitting an `ON` clause.
-/// Extract the column name from a pure column expression (UnresolvedColumn or ColumnReference).
-fn expr_col_name(expr: &Expression) -> Option<String> {
-    match expr {
-        Expression::UnresolvedColumn(u) => Some(u.name.clone()),
-        Expression::ColumnReference(c) => Some(c.name.clone()),
-        _ => None,
-    }
-}
-
 /// Rewrite `overlay(str PLACING repl FROM pos [FOR len])` SQL standard syntax
 /// to string concat form: `LEFT(str, pos-1) || repl || SUBSTRING(str, pos+len)`.
 /// DuckDB 1.5 has no OVERLAY function.
@@ -2670,38 +2648,10 @@ fn strip_qualifiers_in_expr(
 }
 
 /// Split a SQL argument list by commas, respecting nested parens and quotes.
+///
+/// Delegates to `extract_top_level_args` so the logic lives in exactly one place.
 fn split_sql_args(s: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0usize;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' | b'[' => { depth += 1; current.push(bytes[i] as char); }
-            b')' | b']' => { depth -= 1; current.push(bytes[i] as char); }
-            b'\'' | b'"' => {
-                let quote = bytes[i];
-                current.push(bytes[i] as char);
-                i += 1;
-                while i < bytes.len() && bytes[i] != quote {
-                    current.push(bytes[i] as char);
-                    i += 1;
-                }
-                if i < bytes.len() { current.push(bytes[i] as char); }
-            }
-            b',' if depth == 0 => {
-                args.push(current.trim().to_string());
-                current = String::new();
-            }
-            _ => { current.push(bytes[i] as char); }
-        }
-        i += 1;
-    }
-    if !current.trim().is_empty() {
-        args.push(current.trim().to_string());
-    }
-    args
+    extract_top_level_args(s.as_bytes(), 0).0
 }
 
 /// Rewrite `DATE 'lit' + INTERVAL 'n' YEAR/MONTH` → `CAST(... AS DATE)`.
@@ -2900,55 +2850,45 @@ fn rewrite_hof_func(sql: &str, func_name: &str, rewrite: impl Fn(&[String]) -> S
 /// Extract top-level comma-separated arguments from a function call starting at `start`
 /// (the position right after the opening `(`).
 /// Returns `(args, index_of_closing_paren)`.
+///
+/// Uses slice-based accumulation: no character-by-character push, one `.to_string()` per arg.
 fn extract_top_level_args(bytes: &[u8], start: usize) -> (Vec<String>, usize) {
+    // All callers pass bytes from a valid UTF-8 SQL string.
+    let s = std::str::from_utf8(bytes).unwrap_or("");
     let mut args: Vec<String> = Vec::new();
-    let mut current = String::new();
     let mut depth: i32 = 0;
     let mut i = start;
+    let mut arg_start = start;
 
     while i < bytes.len() {
         match bytes[i] {
-            b'(' | b'[' | b'{' => {
-                depth += 1;
-                current.push(bytes[i] as char);
-            }
-            b')' | b']' | b'}' => {
-                if depth == 0 && bytes[i] == b')' {
-                    let trimmed = current.trim().to_string();
-                    if !trimmed.is_empty() || !args.is_empty() {
-                        args.push(trimmed);
-                    }
-                    return (args, i);
+            b'(' | b'[' | b'{' => { depth += 1; i += 1; }
+            b')' if depth == 0 => {
+                let trimmed = s[arg_start..i].trim();
+                if !trimmed.is_empty() || !args.is_empty() {
+                    args.push(trimmed.to_string());
                 }
-                depth -= 1;
-                current.push(bytes[i] as char);
+                return (args, i);
             }
+            b')' | b']' | b'}' => { depth -= 1; i += 1; }
             b'\'' | b'"' | b'`' => {
                 let q = bytes[i];
-                current.push(q as char);
                 i += 1;
-                while i < bytes.len() && bytes[i] != q {
-                    current.push(bytes[i] as char);
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    current.push(bytes[i] as char);
-                }
+                while i < bytes.len() && bytes[i] != q { i += 1; }
+                if i < bytes.len() { i += 1; } // skip closing quote
             }
             b',' if depth == 0 => {
-                args.push(current.trim().to_string());
-                current = String::new();
+                args.push(s[arg_start..i].trim().to_string());
+                i += 1;
+                arg_start = i;
             }
-            _ => {
-                current.push(bytes[i] as char);
-            }
+            _ => { i += 1; }
         }
-        i += 1;
     }
-    // Unterminated
-    let trimmed = current.trim().to_string();
+    // Unterminated — push whatever remains
+    let trimmed = s[arg_start..i.min(s.len())].trim();
     if !trimmed.is_empty() {
-        args.push(trimmed);
+        args.push(trimmed.to_string());
     }
     (args, i)
 }

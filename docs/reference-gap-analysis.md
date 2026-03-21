@@ -3,13 +3,13 @@
 Verified comparison of the Java reference implementation (`.reference/`) against the Rust port
 (`crates/core/`). All findings are confirmed against actual source files.
 
-**Date**: 2026-03-21
+**Date**: 2026-03-21 (updated after Phase 5)
 **Reference**: 210 Java source files, 4091-line `SQLGenerator.java`, 1776-line `FunctionRegistry.java`
 
-Phases 3 and 4 are now complete. Every item originally classified as **Critical** or **Important**
-in the 2026-03-18 analysis has been implemented. This document reflects the current state:
-665 differential tests passing, 4 failing. The 4 failures break down as 3 unimplemented Phase 5
-stat features and 1 pre-existing empty-relation join bug.
+Phases 3, 4, and 5 are now complete. Every item originally classified as **Critical** or
+**Important** in the 2026-03-18 analysis has been implemented. This document reflects the current
+state: **669 differential tests passing, 0 failing**. Remaining open items are medium/low priority
+generator correctness gaps and optimisations — none cause test failures.
 
 ---
 
@@ -36,42 +36,21 @@ All items from the original 2026-03-18 analysis, now implemented:
 | NADrop / NAFill / NAReplace / Unpivot | Phase 3 | `relation_converter.rs` |
 | Describe / Summary | Phase 4 | `relation_converter.rs` |
 | Pivot / StatCov / StatCorr / ApproxQuantile | Phase 4 | `relation_converter.rs` |
+| StatCrosstab / StatFreqItems / StatSampleBy | Phase 5 | `relation_converter.rs`, `generator/mod.rs`, `logical/mod.rs` |
+| NAReplace NULL literal (`IS NULL` vs `= NULL`) | Phase 5 bugfix | `generator/mod.rs` — `gen_na_replace` |
+| Empty LocalRelation join schema collapse | Phase 5 bugfix | `logical/mod.rs` — `Join` arm of `infer_schema()` |
 | WriteOperation / CTE (WithRelations) | Phase 3/4 | `relation_converter.rs` |
 
 ---
 
-## Section 2 — Active bugs (open, affect test pass rate)
+## Section 2 — Active bugs
 
-### Bug 1 — NAReplace NULL handling
-
-- **File**: `crates/core/src/generator/mod.rs` ~line 752
-- **Problem**: `gen_na_replace` emits `WHEN col = NULL THEN val` — always false in SQL; the `= NULL` comparison never matches any row
-- **Fix needed**: detect NULL old-value literal and emit `WHEN col IS NULL THEN val` instead
-- **Severity**: **High** — `df.replace(None, val)` silently no-ops; no test failure yet but correctness is broken
-
-### Bug 2 — Empty LocalRelation join produces wrong column count
-
-- **Failing test**: `test_join_empty_with_non_empty` (expects 5 columns, gets 2)
-- **File**: `crates/core/src/generator/mod.rs` ~line 508 `gen_local_relation`
-- **Root cause**: needs investigation — likely VALUES clause schema collapse in DuckDB for empty relations; the empty side loses its schema and the join output schema narrows to the non-empty side only
-- **Severity**: **High** — 1 failing differential test; pre-existing regression
+None. All known bugs are resolved. The last two (NAReplace NULL literal and empty
+LocalRelation join schema) were fixed in the Phase 5 session (commit `936f229`).
 
 ---
 
-## Section 3 — Phase 5 unimplemented features (3 failing differential tests)
-
-| Feature | Proto RelType | Failing test |
-|---|---|---|
-| `df.stat.crosstab()` | `StatCrosstab` | `test_crosstab_basic` |
-| `df.stat.freqItems()` | `StatFreqItems` | `test_freqitems_basic` |
-| `df.stat.sampleBy()` | `StatSampleBy` | `test_sampleby_preserves_schema` |
-
-Each requires: new `LogicalPlan` variant, `gen_*` method in `generator/mod.rs`, and
-`convert_*` handler in `crates/connect-server/src/converter/relation_converter.rs`.
-
----
-
-## Section 4 — Generator correctness gaps (medium priority)
+## Section 3 — Generator correctness gaps (medium priority)
 
 | Gap | File / approx line | Severity | Notes |
 |---|---|---|---|
@@ -84,7 +63,7 @@ Each requires: new `LogicalPlan` variant, `gen_*` method in `generator/mod.rs`, 
 
 ---
 
-## Section 5 — Missing optimisations (low priority)
+## Section 4 — Missing optimisations (low priority)
 
 | Gap | Notes |
 |---|---|
@@ -95,13 +74,10 @@ Each requires: new `LogicalPlan` variant, `gen_*` method in `generator/mod.rs`, 
 
 ---
 
-## Section 6 — Priority summary
+## Section 5 — Priority summary
 
 | Item | Severity | Status |
 |---|---|---|
-| NAReplace NULL (`IS NULL` vs `= NULL`) | **High** | Bug — open |
-| Empty LocalRelation join schema | **High** | Bug — open |
-| `StatCrosstab` / `StatFreqItems` / `StatSampleBy` | **High** | Phase 5 — planned |
 | Union type widening (generator CASTs) | **Medium** | Open |
 | ROLLUP/CUBE NULLS FIRST | **Medium** | Open |
 | DECIMAL SUM/AVG precision | **Medium** | Open |

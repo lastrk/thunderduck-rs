@@ -23,7 +23,7 @@ use crate::logical::{
     StatCrosstab, StatFreqItems, StatSampleBy,
     Summary, TableScan, Tail, ToDataFrame, Union, Unpivot, WithColumns, WithCte,
 };
-use crate::types::{DataType, StructType, TypeMapper};
+use crate::types::{DataType, StructType, TypeInferenceEngine, TypeMapper};
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 
@@ -384,12 +384,29 @@ impl SqlGenerator {
     fn gen_sort(&self, s: &Sort) -> Result<String> {
         let from = self.gen_from(&s.input)?;
 
+        // For ROLLUP/CUBE aggregates, Spark always sorts NULL grouping values first
+        // (subtotal rows produced by ROLLUP/CUBE have NULL in the grouping columns).
+        // Force NULLS FIRST for all sort orders in this case.
+        let (base_input, _) = Self::extract_filters(&s.input);
+        let is_rollup_or_cube = matches!(base_input, LogicalPlan::Aggregate(a)
+            if matches!(a.grouping_sets.as_ref(),
+                Some(GroupingSets::Rollup(_)) | Some(GroupingSets::Cube(_))));
+
         // Wrap the input in a subquery that adds a row number for stable tie-breaking.
         // Spark guarantees insertion-order-preserving sorts; DuckDB does not.
         // The __td_rn__ column is added as a secondary sort key to match Spark's behaviour.
         let mut sql = if !s.order.is_empty() {
             let order = s.order.iter()
-                .map(|o| self.gen_sort_order(o))
+                .map(|o| {
+                    if is_rollup_or_cube {
+                        use crate::expression::NullOrdering;
+                        let mut o = o.clone();
+                        o.null_ordering = NullOrdering::NullsFirst;
+                        self.gen_sort_order(&o)
+                    } else {
+                        self.gen_sort_order(o)
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?
                 .join(", ");
             format!(
@@ -433,10 +450,53 @@ impl SqlGenerator {
     }
 
     fn gen_union(&self, u: &Union) -> Result<String> {
-        let left = self.gen_plan(&u.left)?;
-        let right = self.gen_plan(&u.right)?;
+        let left_schema = u.left.infer_schema();
+        let right_schema = u.right.infer_schema();
+        let left_sql = self.gen_plan(&u.left)?;
+        let right_sql = self.gen_plan(&u.right)?;
         let kw = if u.all { "UNION ALL" } else { "UNION" };
-        Ok(format!("({left})\n{kw}\n({right})"))
+
+        // Emit widening CASTs when left/right column types differ so DuckDB column
+        // types match the Spark-promoted schema (e.g. INT + LONG → BIGINT on both sides).
+        if !left_schema.is_empty()
+            && !right_schema.is_empty()
+            && left_schema.fields.len() == right_schema.fields.len()
+        {
+            let needs_cast = left_schema.fields.iter().zip(&right_schema.fields)
+                .any(|(l, r)| l.data_type != r.data_type);
+
+            if needs_cast {
+                let target_types: Vec<DataType> = left_schema.fields.iter()
+                    .zip(&right_schema.fields)
+                    .map(|(l, r)| {
+                        let promoted = TypeInferenceEngine::promote_numeric(&l.data_type, &r.data_type);
+                        // For non-numeric pairs promote_numeric returns Double — keep left type.
+                        if promoted == DataType::Double
+                            && !l.data_type.is_numeric() && !r.data_type.is_numeric()
+                        { l.data_type.clone() } else { promoted }
+                    })
+                    .collect();
+
+                let left_cols = left_schema.fields.iter().zip(&target_types).map(|(f, t)| {
+                    let q = quote_ident(&f.name);
+                    if f.data_type == *t || *t == DataType::Unresolved { q.clone() }
+                    else { format!("CAST({q} AS {}) AS {q}", TypeMapper::to_duckdb(t)) }
+                }).collect::<Vec<_>>().join(", ");
+
+                let right_cols = right_schema.fields.iter().zip(&target_types).map(|(f, t)| {
+                    let q = quote_ident(&f.name);
+                    if f.data_type == *t || *t == DataType::Unresolved { q.clone() }
+                    else { format!("CAST({q} AS {}) AS {q}", TypeMapper::to_duckdb(t)) }
+                }).collect::<Vec<_>>().join(", ");
+
+                return Ok(format!(
+                    "(SELECT {left_cols} FROM ({left_sql}) \"__ul__\")\n{kw}\n\
+                     (SELECT {right_cols} FROM ({right_sql}) \"__ur__\")"
+                ));
+            }
+        }
+
+        Ok(format!("({left_sql})\n{kw}\n({right_sql})"))
     }
 
     fn gen_except(&self, e: &Except) -> Result<String> {
@@ -1215,6 +1275,22 @@ impl SqlGenerator {
                     .join(", ");
                 return Ok(format!("{expr} IN ({list})"));
             }
+            // grouping() returns INTEGER in DuckDB but TINYINT in Spark.
+            "grouping" => {
+                let args = f.args.iter()
+                    .map(|a| self.gen_expr(a))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(", ");
+                return Ok(format!("CAST(grouping({args}) AS TINYINT)"));
+            }
+            // grouping_id() returns INTEGER in DuckDB but BIGINT in Spark.
+            "grouping_id" => {
+                let args = f.args.iter()
+                    .map(|a| self.gen_expr(a))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(", ");
+                return Ok(format!("CAST(grouping_id({args}) AS BIGINT)"));
+            }
             _ => {}
         }
 
@@ -1747,15 +1823,50 @@ fn cast_integer_sum(expr: &Expression, input_schema: &StructType) -> Expression 
         {
             if let Some(arg) = f.args.first() {
                 let arg_type = arg.data_type(input_schema);
-                if matches!(
-                    arg_type,
-                    DataType::Byte | DataType::Short | DataType::Integer | DataType::Long
-                ) {
-                    return Expression::Cast(CastExpression {
-                        expr: Box::new(expr.clone()),
-                        to_type: DataType::Long,
-                        try_cast: false,
-                    });
+                match arg_type {
+                    DataType::Byte | DataType::Short | DataType::Integer | DataType::Long => {
+                        return Expression::Cast(CastExpression {
+                            expr: Box::new(expr.clone()),
+                            to_type: DataType::Long,
+                            try_cast: false,
+                        });
+                    }
+                    DataType::Decimal { precision, scale } => {
+                        let new_p = ((precision as u16) + 10).min(38) as u8;
+                        return Expression::Cast(CastExpression {
+                            expr: Box::new(expr.clone()),
+                            to_type: DataType::Decimal { precision: new_p, scale },
+                            try_cast: false,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            expr.clone()
+        }
+        Expression::FunctionCall(f)
+            if f.name.eq_ignore_ascii_case("avg") || f.name.eq_ignore_ascii_case("mean") =>
+        {
+            if let Some(arg) = f.args.first() {
+                let arg_type = arg.data_type(input_schema);
+                match arg_type {
+                    DataType::Byte | DataType::Short | DataType::Integer | DataType::Long => {
+                        return Expression::Cast(CastExpression {
+                            expr: Box::new(expr.clone()),
+                            to_type: DataType::Double,
+                            try_cast: false,
+                        });
+                    }
+                    DataType::Decimal { precision, scale } => {
+                        let new_p = ((precision as u16) + 4).min(38) as u8;
+                        let new_s = scale + 4;
+                        return Expression::Cast(CastExpression {
+                            expr: Box::new(expr.clone()),
+                            to_type: DataType::Decimal { precision: new_p, scale: new_s },
+                            try_cast: false,
+                        });
+                    }
+                    _ => {}
                 }
             }
             expr.clone()

@@ -3,12 +3,12 @@
 Verified comparison of the Java reference implementation (`.reference/`) against the Rust port
 (`crates/core/`). All findings are confirmed against actual source files.
 
-**Date**: 2026-03-21 (updated after Phase 5)
+**Date**: 2026-03-21 (updated after Phase 5 + Section 3 generator correctness gaps)
 **Reference**: 210 Java source files, 4091-line `SQLGenerator.java`, 1776-line `FunctionRegistry.java`
 
 Phases 3, 4, and 5 are now complete. Every item originally classified as **Critical** or
 **Important** in the 2026-03-18 analysis has been implemented. This document reflects the current
-state: **669 differential tests passing, 0 failing**. Remaining open items are medium/low priority
+state: **669 differential tests passing, 0 failing**. Remaining open items are low-priority
 generator correctness gaps and optimisations — none cause test failures.
 
 ---
@@ -40,6 +40,11 @@ All items from the original 2026-03-18 analysis, now implemented:
 | NAReplace NULL literal (`IS NULL` vs `= NULL`) | Phase 5 bugfix | `generator/mod.rs` — `gen_na_replace` |
 | Empty LocalRelation join schema collapse | Phase 5 bugfix | `logical/mod.rs` — `Join` arm of `infer_schema()` |
 | WriteOperation / CTE (WithRelations) | Phase 3/4 | `relation_converter.rs` |
+| Distinct column subset | Phase 3/4 | `generator/mod.rs` — `gen_distinct` uses `ROW_NUMBER() OVER (PARTITION BY ...)` |
+| GROUPING/GROUPING_ID return type | Section 3 | `generator/mod.rs` — `gen_function_call`; DuckDB INTEGER → CAST to TINYINT/BIGINT |
+| DECIMAL SUM/AVG precision | Section 3 | `generator/mod.rs` — `cast_integer_sum`; decimal SUM/AVG with Spark precision rules |
+| Union type widening CASTs | Section 3 | `generator/mod.rs` — `gen_union`; emits explicit CASTs when left/right types differ |
+| ROLLUP/CUBE NULLS FIRST | Section 3 | `generator/mod.rs` — `gen_sort`; forces `NULLS FIRST` for ROLLUP/CUBE sort orders |
 
 ---
 
@@ -50,16 +55,11 @@ LocalRelation join schema) were fixed in the Phase 5 session (commit `936f229`).
 
 ---
 
-## Section 3 — Generator correctness gaps (medium priority)
+## Section 3 — Generator correctness gaps (low priority)
 
 | Gap | File / approx line | Severity | Notes |
 |---|---|---|---|
-| Union type widening | `generator/mod.rs` ~line 431 | Medium | Schema inferrer widens types; generator does not emit CASTs for mixed INT/BIGINT columns across UNION branches |
-| ROLLUP/CUBE NULLS FIRST | `generator/mod.rs` ~line 380 | Medium | Sort over ROLLUP should force `NULLS FIRST` on grouping columns; currently omitted |
-| DECIMAL SUM/AVG precision | `generator/mod.rs` ~line 1667 | Medium | `cast_integer_sum` handles integer SUM only; decimal SUM/AVG precision and scale rules not implemented |
-| GROUPING/GROUPING_ID return type | `functions/mod.rs` | Medium | Not in registry; DuckDB returns INTEGER, Spark returns TINYINT (GROUPING) / BIGINT (GROUPING_ID) |
-| Auto-alias unaliased expressions | `generator/mod.rs` | Low | Complex expressions in SELECT lack `AS "spark_name"` aliases; column names diverge from Spark |
-| Distinct column subset | `generator/mod.rs` ~line 452 | Low | Should use `ROW_NUMBER() OVER (PARTITION BY ...)` for subset-distinct; currently falls back to plain DISTINCT |
+| Auto-alias unaliased expressions | `generator/mod.rs` | Low | **Deferred** — complex expressions in SELECT lack `AS "spark_name"` aliases; column names diverge from Spark in edge cases. Current behaviour passes all 669 differential tests; risk of regression without dedicated test coverage. Address when test gap is closed. |
 
 ---
 
@@ -78,11 +78,7 @@ LocalRelation join schema) were fixed in the Phase 5 session (commit `936f229`).
 
 | Item | Severity | Status |
 |---|---|---|
-| Union type widening (generator CASTs) | **Medium** | Open |
-| ROLLUP/CUBE NULLS FIRST | **Medium** | Open |
-| DECIMAL SUM/AVG precision | **Medium** | Open |
-| GROUPING/GROUPING_ID return type | **Medium** | Open |
-| Auto-alias complex projections | **Low** | Open |
+| Auto-alias complex projections | **Low** | Open (deferred — no test coverage) |
 | Flat join chain / flat SEMI/ANTI | **Low** | Open |
 | WithColumns strict-mode CAST | **Low** | Open |
 | Sample with replacement error | **Low** | Open |

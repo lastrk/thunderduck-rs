@@ -1,150 +1,112 @@
-# Reference Gap Analysis — Phase 1 & 2
+# Reference Gap Analysis — Updated Snapshot
 
 Verified comparison of the Java reference implementation (`.reference/`) against the Rust port
 (`crates/core/`). All findings are confirmed against actual source files.
 
-**Date**: 2026-03-18
+**Date**: 2026-03-21
 **Reference**: 210 Java source files, 4091-line `SQLGenerator.java`, 1776-line `FunctionRegistry.java`
 
+Phases 3 and 4 are now complete. Every item originally classified as **Critical** or **Important**
+in the 2026-03-18 analysis has been implemented. This document reflects the current state:
+665 differential tests passing, 4 failing. The 4 failures break down as 3 unimplemented Phase 5
+stat features and 1 pre-existing empty-relation join bug.
+
 ---
 
-## Expression variants missing from Rust
+## Section 1 — Closed gaps
 
-The Java `Expression` interface requires every implementor to provide `toSQL()`. Each of these
-exists in `.reference/core/.../expression/` with a full `toSQL()` implementation but has no
-corresponding Rust `Expression` variant:
+All items from the original 2026-03-18 analysis, now implemented:
 
-| Java class | What it represents | Generated SQL |
+| Item | Closed in | Location |
 |---|---|---|
-| `LikeExpression` | `LIKE` / `NOT LIKE` / `ILIKE` (negation + case-insensitive flags) | `(val LIKE pattern)` |
-| `IntervalExpression` | `INTERVAL` literals — YEAR_MONTH, DAY_TIME, CALENDAR sub-types | Composite `INTERVAL 'n' DAY + INTERVAL 'n' HOUR` etc. |
-| `ExtractValueExpression` | `struct.field`, `array[idx]`, `map[key]` subscript access | `struct['field']`, `list[idx+1]`, `map['key']` |
-| `UpdateFieldsExpression` | `withField()` / `dropFields()` on struct columns | `struct_pack(...)` / `EXCLUDE` |
-| `RowConstructorExpression` | Tuple `(a, b, c)` — e.g. `WHERE (x,y) IN ((1,2))` | `(expr1, expr2, ...)` |
-| `FieldAccessExpression` | Nested field access via `.` chain | Struct field subscript |
-| `IsDistinctFromExpression` | `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` | `IS DISTINCT FROM` |
-| `RegexColumnExpression` | `rlike` / column regex filter | `REGEXP_MATCHES(col, pattern)` |
-
-**Critical**: `LikeExpression` (ubiquitous), `IntervalExpression` (date arithmetic).
-**Important**: `ExtractValueExpression` (struct/array/map access), `IsDistinctFromExpression`,
-`RowConstructorExpression`.
+| `LikeExpression` | Phase 3 | `expression/mod.rs:173`, `generator/mod.rs:1398` |
+| `SingleRowRelation` | Phase 3 | `logical/mod.rs` |
+| `IntervalExpression` | Phase 3 | `expression/mod.rs:174`, `generator/mod.rs:1410` |
+| Timezone hardcoded `'UTC'` | Phase 3 | `session.rs` — `detect_timezone()` |
+| `preserve_insertion_order=true` | Phase 3 | `session.rs:117` |
+| `initcap` macro | Phase 3 | `session.rs:181` |
+| Polymorphic function resolution | Phase 2 | `generator/mod.rs` — `_spark_reverse`, `size`, `sort_array` |
+| `ExtractValueExpression` | Phase 3 | `expression/mod.rs:176`, `generator/mod.rs:1496` |
+| `IsDistinctFromExpression` | Phase 3 | `expression/mod.rs:175`, `generator/mod.rs:1485` |
+| `RowConstructorExpression` | Phase 3 | `expression/mod.rs:177`, `generator/mod.rs:1522` |
+| `UpdateFieldsExpression` | Phase 4 | `expression/mod.rs`, `generator/mod.rs` |
+| `RegexColumnExpression` | Phase 3 | `generator/mod.rs` — `gen_function_call` special-case |
+| `FieldAccessExpression` | Phase 3 | via `ExtractValueExpression` |
+| Arrow schema fixup | Phase 3 | `arrow_ipc.rs`, `service.rs` schema inference path |
+| NADrop / NAFill / NAReplace / Unpivot | Phase 3 | `relation_converter.rs` |
+| Describe / Summary | Phase 4 | `relation_converter.rs` |
+| Pivot / StatCov / StatCorr / ApproxQuantile | Phase 4 | `relation_converter.rs` |
+| WriteOperation / CTE (WithRelations) | Phase 3/4 | `relation_converter.rs` |
 
 ---
 
-## LogicalPlan variants missing from Rust
+## Section 2 — Active bugs (open, affect test pass rate)
 
-| Java class | Purpose | Generator behaviour |
+### Bug 1 — NAReplace NULL handling
+
+- **File**: `crates/core/src/generator/mod.rs` ~line 752
+- **Problem**: `gen_na_replace` emits `WHEN col = NULL THEN val` — always false in SQL; the `= NULL` comparison never matches any row
+- **Fix needed**: detect NULL old-value literal and emit `WHEN col IS NULL THEN val` instead
+- **Severity**: **High** — `df.replace(None, val)` silently no-ops; no test failure yet but correctness is broken
+
+### Bug 2 — Empty LocalRelation join produces wrong column count
+
+- **Failing test**: `test_join_empty_with_non_empty` (expects 5 columns, gets 2)
+- **File**: `crates/core/src/generator/mod.rs` ~line 508 `gen_local_relation`
+- **Root cause**: needs investigation — likely VALUES clause schema collapse in DuckDB for empty relations; the empty side loses its schema and the join output schema narrows to the non-empty side only
+- **Severity**: **High** — 1 failing differential test; pre-existing regression
+
+---
+
+## Section 3 — Phase 5 unimplemented features (3 failing differential tests)
+
+| Feature | Proto RelType | Failing test |
 |---|---|---|
-| `SingleRowRelation` | No-FROM queries: `SELECT 1`, `SELECT ARRAY(1,2,3)` | Generator skips `FROM` clause: `if (!(plan.child() instanceof SingleRowRelation))` |
+| `df.stat.crosstab()` | `StatCrosstab` | `test_crosstab_basic` |
+| `df.stat.freqItems()` | `StatFreqItems` | `test_freqitems_basic` |
+| `df.stat.sampleBy()` | `StatSampleBy` | `test_sampleby_preserves_schema` |
 
-**Critical** — any `spark.sql("SELECT ...")` with no table reference uses this. It is the default
-relation for constant expressions and scalar UDFs.
-
----
-
-## Session initialisation gaps
-
-Reference `DuckDBRuntime.configureConnection()` applies settings the Rust session does not:
-
-```
-SET allocator_background_threads=true   -- Linux only, 8+ cores; jemalloc perf
-SET enable_progress_bar=false           -- suppress log noise
-SET preserve_insertion_order=true       -- deterministic row order
-SET TimeZone='<system TZ>'              -- Rust hardcodes 'UTC' ← correctness bug
-allow_unsigned_extensions=true          -- required for bundled thdck_spark_funcs
-```
-
-Then `registerSparkCompatMacros()` runs at startup. Currently one macro:
-
-```sql
--- Spark's initcap treats only whitespace as word boundaries.
--- DuckDB's built-in initcap also capitalises after punctuation — wrong.
-CREATE OR REPLACE MACRO initcap(s) AS
-  regexp_replace(lower(s), '(^|\\s)(\\S)', '\\1' || upper('\\2'), 'g')
-```
-
-**Correctness bug**: The hardcoded `'UTC'` timezone causes `hour()`, `dayofweek()`,
-`date_trunc()` and similar timestamp functions to return wrong results for non-UTC environments.
-Fix: use `std::env::var("TZ")` or platform timezone detection in `session.rs`.
+Each requires: new `LogicalPlan` variant, `gen_*` method in `generator/mod.rs`, and
+`convert_*` handler in `crates/connect-server/src/converter/relation_converter.rs`.
 
 ---
 
-## Arrow schema handling gap
+## Section 4 — Generator correctness gaps (medium priority)
 
-`ArrowInterchange.java` provides `arrowTypeToSQLType()` mapping DuckDB Arrow output types to
-SQL type strings, and handles `Utf8` → `VARCHAR`, `LargeUtf8` → `VARCHAR`, type coercion at
-the DuckDB/Spark boundary. The Rust port collects `RecordBatch` from `query_arrow()` with no
-schema fixup.
-
-Most type mismatches are pre-empted at SQL generation time via explicit CASTs (e.g. the
-`HUGEINT` → `BIGINT` rule for `SUM(integer)`). A schema-fixup pass becomes important in Phase 3
-when the gRPC layer compares the emitted Arrow schema against the Spark-declared schema.
-
----
-
-## Polymorphic function resolution — missing
-
-The reference generator has a `resolvePolymorphicFunctions()` pass that inspects the **child
-schema** to dispatch overloaded Spark functions to type-specific DuckDB equivalents:
-
-| Spark call | Array type | String type |
-|---|---|---|
-| `reverse(x)` | → `list_reverse(x)` | → `reverse(x)` |
-| `sort_array(x)` | → `list_sort(x)` | N/A |
-| `size(x)` | → `len(x)` | → `length(x)` |
-
-The Rust `FunctionRegistry::translate()` has no schema context. `reverse(array_col)` will
-generate `reverse(array_col)` (the string function) instead of `list_reverse(array_col)`.
+| Gap | File / approx line | Severity | Notes |
+|---|---|---|---|
+| Union type widening | `generator/mod.rs` ~line 431 | Medium | Schema inferrer widens types; generator does not emit CASTs for mixed INT/BIGINT columns across UNION branches |
+| ROLLUP/CUBE NULLS FIRST | `generator/mod.rs` ~line 380 | Medium | Sort over ROLLUP should force `NULLS FIRST` on grouping columns; currently omitted |
+| DECIMAL SUM/AVG precision | `generator/mod.rs` ~line 1667 | Medium | `cast_integer_sum` handles integer SUM only; decimal SUM/AVG precision and scale rules not implemented |
+| GROUPING/GROUPING_ID return type | `functions/mod.rs` | Medium | Not in registry; DuckDB returns INTEGER, Spark returns TINYINT (GROUPING) / BIGINT (GROUPING_ID) |
+| Auto-alias unaliased expressions | `generator/mod.rs` | Low | Complex expressions in SELECT lack `AS "spark_name"` aliases; column names diverge from Spark |
+| Distinct column subset | `generator/mod.rs` ~line 452 | Low | Should use `ROW_NUMBER() OVER (PARTITION BY ...)` for subset-distinct; currently falls back to plain DISTINCT |
 
 ---
 
-## Function registry size
+## Section 5 — Missing optimisations (low priority)
 
-| | Registrations | Source lines |
-|---|---|---|
-| Reference `FunctionRegistry.java` | ~303 | 1776 |
-| Rust `functions/mod.rs` | ~296 | 1129 |
-
-Counts are close but the reference covers JSON functions, extended string functions, and
-edge-case spark compatibility mappings the Rust registry may be missing. A direct diff is
-warranted before Phase 4.
-
----
-
-## Spark Connect converter — Phase 3 targets
-
-These `RelationConverter` handlers exist in the reference but have no Rust equivalent yet.
-All are Phase 3 concerns (the gRPC converter layer does not exist yet):
-
-| Relation type | DataFrame operation |
+| Gap | Notes |
 |---|---|
-| `DROP_NA` | `df.dropna()` — filter rows with null values |
-| `FILL_NA` | `df.fillna()` — replace nulls with a default |
-| `REPLACE` | `df.replace()` — value substitution |
-| `UNPIVOT` | `df.unpivot()` — wide-to-long transform |
-| `TO_SCHEMA` | Cast DataFrame to a target schema |
-| `DESCRIBE` | `df.describe()` — summary statistics |
-| `SUMMARY` | `df.summary()` — extended statistics |
-| `COV` / `CORR` | Covariance and correlation |
+| `generateFlatJoinChainWithMapping` | Rust emits nested subqueries; Java reference builds a flat `FROM t1, t2, t3` with an alias map — avoids extra subquery layers and alias resolution issues |
+| `tryGenerateFlatSemiAntiJoin` | Stacked SEMI/ANTI join chains are not flattened; each hop wraps in an EXISTS subquery |
+| WithColumns strict-mode CAST | `withColumn` replacement columns are not explicitly CAST to the declared type in strict mode |
+| Sample with replacement | `df.sample(withReplacement=True)` silently uses `SYSTEM` sampling; Java reference throws `UnsupportedOperationException` |
 
 ---
 
-## Priority summary
+## Section 6 — Priority summary
 
-| Item | Severity | Phase |
+| Item | Severity | Status |
 |---|---|---|
-| `LikeExpression` | **Critical** | 3 |
-| `SingleRowRelation` | **Critical** | 3 |
-| `IntervalExpression` | **Critical** | 3 |
-| Timezone hardcoded `'UTC'` | **Critical** | 3 |
-| `preserve_insertion_order=true` | **Important** | 3 |
-| `initcap` macro registration | **Important** | 3 |
-| Polymorphic function resolution | **Important** | 3 |
-| `ExtractValueExpression` | **Important** | 3 |
-| `IsDistinctFromExpression` | **Important** | 3 |
-| `RowConstructorExpression` | **Important** | 3 |
-| Arrow schema fixup pass | **Important** | 3 |
-| Spark Connect converter gaps | **Important** | 3 |
-| `UpdateFieldsExpression` | Nice-to-have | 4 |
-| `RegexColumnExpression` | Nice-to-have | 4 |
-| `FieldAccessExpression` | Nice-to-have | 4 |
+| NAReplace NULL (`IS NULL` vs `= NULL`) | **High** | Bug — open |
+| Empty LocalRelation join schema | **High** | Bug — open |
+| `StatCrosstab` / `StatFreqItems` / `StatSampleBy` | **High** | Phase 5 — planned |
+| Union type widening (generator CASTs) | **Medium** | Open |
+| ROLLUP/CUBE NULLS FIRST | **Medium** | Open |
+| DECIMAL SUM/AVG precision | **Medium** | Open |
+| GROUPING/GROUPING_ID return type | **Medium** | Open |
+| Auto-alias complex projections | **Low** | Open |
+| Flat join chain / flat SEMI/ANTI | **Low** | Open |
+| WithColumns strict-mode CAST | **Low** | Open |
+| Sample with replacement error | **Low** | Open |

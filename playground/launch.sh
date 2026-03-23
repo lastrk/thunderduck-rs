@@ -269,8 +269,21 @@ build_if_needed() {
     fi
 
     if [ -f "$THUNDERDUCK_BIN" ]; then
-        echo -e "${GREEN}✓ Thunderduck binary found${NC}"
-        return
+        # Verify the binary is for this platform (e.g. Linux ELF won't run on macOS).
+        local bin_type
+        bin_type="$(file "$THUNDERDUCK_BIN" 2>/dev/null)"
+        local platform_ok=true
+        if [[ "$(uname)" == "Darwin" ]] && ! echo "$bin_type" | grep -q "Mach-O"; then
+            platform_ok=false
+        elif [[ "$(uname)" == "Linux" ]] && ! echo "$bin_type" | grep -q "ELF"; then
+            platform_ok=false
+        fi
+
+        if [ "$platform_ok" = true ]; then
+            echo -e "${GREEN}✓ Thunderduck binary found${NC}"
+            return
+        fi
+        echo -e "${YELLOW}! Binary exists but targets a different OS/arch — rebuilding for $(uname)...${NC}"
     fi
 
     if [ "$NO_BUILD" = true ]; then

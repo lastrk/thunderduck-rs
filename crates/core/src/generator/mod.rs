@@ -1907,11 +1907,70 @@ impl BinaryOpExt for BinaryOp {
 
 // ── Spark SQL Preprocessing ────────────────────────────────────────────────────
 
+/// Convert Spark-style backtick-quoted identifiers to DuckDB double-quoted identifiers.
+/// e.g. `count(\`l_orderkey\`)` → `count("l_orderkey")`
+/// Correctly skips single-quoted string literals and already double-quoted identifiers.
+fn rewrite_backtick_identifiers(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            // Skip single-quoted string literals (don't convert backticks inside them)
+            '\'' => {
+                result.push('\'');
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some('\'') => {
+                            result.push('\'');
+                            // Handle escaped quote ''
+                            if chars.peek() == Some(&'\'') {
+                                chars.next();
+                                result.push('\'');
+                            } else {
+                                break;
+                            }
+                        }
+                        Some(c) => result.push(c),
+                    }
+                }
+            }
+            // Pass through already double-quoted identifiers unchanged
+            '"' => {
+                result.push('"');
+                for c in chars.by_ref() {
+                    result.push(c);
+                    if c == '"' { break; }
+                }
+            }
+            // Convert backtick identifier to double-quoted
+            '`' => {
+                result.push('"');
+                for c in chars.by_ref() {
+                    if c == '`' { break; }
+                    if c == '"' {
+                        result.push('"'); // escape embedded double-quote
+                        result.push('"');
+                    } else {
+                        result.push(c);
+                    }
+                }
+                result.push('"');
+            }
+            c => result.push(c),
+        }
+    }
+    result
+}
+
 /// Preprocess Spark SQL to replace Spark-specific constructs with DuckDB equivalents.
 /// Applied to raw SQL strings in SqlRelation before passing to DuckDB.
 fn preprocess_spark_sql(sql: &str) -> String {
+    // Phase 0: Convert backtick-quoted identifiers to double-quoted
+    // DuckDB does not support MySQL-style backtick quoting; Spark SQL uses it freely.
+    let sql = rewrite_backtick_identifiers(sql);
     // Phase 1: ARRAY( → LIST_VALUE(
-    let mut sql = replace_spark_func(sql, "ARRAY", "LIST_VALUE");
+    let mut sql = replace_spark_func(&sql, "ARRAY", "LIST_VALUE");
     // Phase 2: NAMED_STRUCT( → struct literal — loop until stable for nested structs
     loop {
         let new = rewrite_named_struct(&sql);
@@ -3233,6 +3292,30 @@ mod tests {
         let plan = LogicalPlan::SingleRow(SingleRowRelation);
         let sql = gen().generate(&plan).unwrap();
         assert!(sql.contains("SELECT"), "got: {sql}");
+    }
+
+    #[test]
+    fn backtick_identifiers_rewritten_to_double_quote() {
+        // Spark SQL uses backtick quoting; DuckDB requires double quotes.
+        assert_eq!(
+            rewrite_backtick_identifiers("SELECT `l_orderkey` FROM lineitem"),
+            r#"SELECT "l_orderkey" FROM lineitem"#,
+        );
+        // Multiple identifiers in one expression
+        assert_eq!(
+            rewrite_backtick_identifiers("count(`l_orderkey`), count(`l_partkey`)"),
+            r#"count("l_orderkey"), count("l_partkey")"#,
+        );
+        // Backticks inside string literals must NOT be converted
+        assert_eq!(
+            rewrite_backtick_identifiers("SELECT 'hello `world`' AS greeting"),
+            "SELECT 'hello `world`' AS greeting",
+        );
+        // Already double-quoted identifiers pass through unchanged
+        assert_eq!(
+            rewrite_backtick_identifiers(r#"SELECT "col" FROM t"#),
+            r#"SELECT "col" FROM t"#,
+        );
     }
 
 }

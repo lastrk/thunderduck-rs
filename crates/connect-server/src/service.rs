@@ -316,13 +316,17 @@ async fn handle_command(
                 SqlGenerator::relaxed()
                     .generate(&logical_plan)
                     .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?
-            } else if !sql_cmd.sql.is_empty() {
-                // PySpark 4.x sends spark.sql() via the deprecated sql text field
-                sql_cmd.sql.clone()
             } else {
-                return Err(Status::invalid_argument(
-                    "SqlCommand missing both input relation and sql text",
-                ));
+                // Fallback: older clients send spark.sql() via the deprecated `sql` text field
+                // (all SqlCommand text fields are proto-deprecated in favour of `input`)
+                #[allow(deprecated)]
+                let text = sql_cmd.sql.clone();
+                if text.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "SqlCommand missing both input relation and sql text",
+                    ));
+                }
+                text
             };
             let batches = session
                 .execute(&sql)

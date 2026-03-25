@@ -20,7 +20,7 @@ PySpark / Spark Client
 ┌─────────────────────────────────────────────────────┐
 │                 core crate                          │
 │  SqlGenerator  FunctionRegistry  TypeInferenceEngine│
-│  SparkSqlParser (sqlparser-rs)                      │
+│  preprocess_spark_sql (Spark→DuckDB dialect rewrite)│
 └─────────────────────┬───────────────────────────────┘
                       │  DuckDB SQL string
                       ▼
@@ -113,6 +113,7 @@ Rust enums are sealed by definition. A `match` on a non-exhaustive enum is a **c
 
 ```rust
 pub enum LogicalPlan {
+    // Core relational operators
     Project(Project),
     Filter(Filter),
     Aggregate(Aggregate),
@@ -125,17 +126,38 @@ pub enum LogicalPlan {
     Intersect(Intersect),
     Distinct(Distinct),
     Sample(Sample),
+    // Source relations
     TableScan(TableScan),
-    SqlRelation(SqlRelation),
+    SqlRelation(SqlRelation),       // raw SQL passthrough (spark.sql path)
     LocalRelation(LocalRelation),
     LocalDataRelation(LocalDataRelation),
     RangeRelation(RangeRelation),
     InMemoryRelation(InMemoryRelation),
+    SingleRow(SingleRowRelation),
+    // Transformations
     WithCte(WithCte),
     WithColumns(WithColumns),
     AliasedRelation(AliasedRelation),
-    RawDdlStatement(RawDdlStatement),
     ToDataFrame(ToDataFrame),
+    DropColumns(DropColumns),
+    RawDdlStatement(RawDdlStatement),
+    // DataFrame API operations
+    ShowString(ShowString),
+    NADrop(NADrop),
+    NAFill(NAFill),
+    NAReplace(NAReplace),
+    Unpivot(Unpivot),
+    Pivot(Pivot),
+    // Statistical operations
+    StatCov(StatCov),
+    StatCorr(StatCorr),
+    ApproxQuantile(ApproxQuantile),
+    StatCrosstab(StatCrosstab),
+    StatFreqItems(StatFreqItems),
+    StatSampleBy(StatSampleBy),
+    // Summary / describe
+    Describe(Describe),
+    Summary(Summary),
 }
 ```
 
@@ -241,36 +263,64 @@ pub struct SqlGenerator {
 }
 
 impl SqlGenerator {
-    pub fn generate(&mut self, plan: &LogicalPlan) -> String {
+    pub fn generate(&self, plan: &LogicalPlan) -> Result<String> {
         match plan {
-            LogicalPlan::Project(p)    => self.visit_project(p),
-            LogicalPlan::Filter(f)     => self.visit_filter(f),
-            LogicalPlan::Aggregate(a)  => self.visit_aggregate(a),
-            LogicalPlan::Join(j)       => self.visit_join(j),
+            LogicalPlan::Project(p)    => self.gen_project(p),
+            LogicalPlan::Filter(f)     => self.gen_filter(f),
+            LogicalPlan::Aggregate(a)  => self.gen_aggregate(a),
+            LogicalPlan::Join(j)       => self.gen_join(j),
             // ... exhaustive — compiler enforces completeness
         }
     }
 }
 ```
 
+Internal helpers follow the `gen_*` naming convention (`gen_project`, `gen_filter`, `gen_join`, etc.).
+
 **Join dual-path rule (inherited from the Java reference)**:
-- `visit_join()`: primary path, converts SEMI/ANTI to `EXISTS` subqueries.
+- `gen_join()`: primary path, converts SEMI/ANTI to `EXISTS` subqueries.
 - `generate_flat_join_chain()`: optimised flat chain path, **must break at SEMI/ANTI joins** (does not do EXISTS conversion).
 - When modifying join SQL generation, **always check both paths**.
 
-**Aggregate path**: single canonical path through `visit_aggregate()` — no dual-path issue.
+**Aggregate path**: single canonical path through `gen_aggregate()` — no dual-path issue.
+
+**Filter stack handling**: `extract_filters(plan)` peels all stacked `Filter` nodes off the top of
+a plan subtree, returning the base plan + collected conditions. Call this at the start of
+`gen_project`, `gen_aggregate`, and `gen_filter` to avoid double-wrapping in subqueries.
 
 ---
 
-## ADR-10: SparkSQL Parser (Raw SQL Path)
+## ADR-10: SparkSQL Raw SQL Path
 
-**Decision: `sqlparser-rs` as the foundation, with a custom `SparkDialect`; extend incrementally as gaps surface**
+**Decision: Spark→DuckDB SQL preprocessing pass; full parser deferred until differential tests require it**
 
-The DataFrame API path (protobuf → LogicalPlan) does **not** use a SQL parser. The parser is only needed for raw SQL strings passed via `spark.sql("...")`.
+The DataFrame API path (protobuf → LogicalPlan) does **not** use a SQL parser. Raw SQL strings
+passed via `spark.sql("...")` reach the server as a `SQL` relation proto, which
+`RelationConverter::convert_sql()` wraps in a `SqlRelation` node containing the original SQL
+string verbatim.
 
-`sqlparser-rs` handles the majority of ANSI SQL. A custom `SparkDialect` will cover Spark-specific syntax: `TABLESAMPLE`, `LATERAL VIEW EXPLODE`, `DISTRIBUTE BY`, `CLUSTER BY`, `TRANSFORM`, lambda expressions in HOFs, etc.
+`SqlGenerator::gen_sql_relation()` then passes the string through `preprocess_spark_sql()` —
+a pure text transformation pipeline that rewrites Spark SQL dialect differences to DuckDB SQL
+before the string is executed. This handles the large majority of real-world `spark.sql()` calls
+without building a full parser.
 
-Gaps are tracked as issues and filled as differential tests reveal them. A full port of Spark's ANTLR4 grammar (via `antlr4rust`) remains an option for later phases if sqlparser-rs gaps prove too numerous.
+**`preprocess_spark_sql` phases** (in order):
+1. Backtick identifier → double-quote identifier (`` `col` `` → `"col"`)
+2. `ARRAY(...)` → `LIST_VALUE(...)`
+3. `NAMED_STRUCT(...)` → struct literal (looped until stable for nested structs)
+4. `MAP(k, v, ...)` → `MAP([k, ...], [v, ...])`
+5. 1:1 function renames (`SIZE` → `LEN`, `TRANSFORM` → `LIST_TRANSFORM`, etc.)
+6. `percentile(col, pct)` → `PERCENTILE_CONT(pct) WITHIN GROUP (ORDER BY col)`
+7. `overlay(str PLACING repl FROM pos)` → `LEFT/SUBSTRING` concat
+8. Spark angle-bracket type syntax (`ARRAY<T>` → `T[]`)
+9. `split(str, pat, n)` three-arg form
+10. `DATE 'lit' + INTERVAL 'n' YEAR/MONTH` date arithmetic
+11. Higher-order function rewrites (`exists`, `forall`, `aggregate`, `filter`, `zip_with`)
+12. `json_tuple(col, 'k1', ...) AS (a1, ...)` multi-column expansion
+13. `from_json(col, 'Spark DDL schema')` → `json_transform(col, JSON schema)`
+
+A full `sqlparser-rs`-based parser (originally planned in Phase 5) remains an option if a
+differential test gap surfaces that cannot be addressed by the preprocessing pass.
 
 ---
 
@@ -378,7 +428,6 @@ thunderduck-rs/
 │   │   │   ├── types/          # DataType, StructType, TypeInferenceEngine
 │   │   │   ├── generator/      # SqlGenerator
 │   │   │   ├── functions/      # FunctionRegistry
-│   │   │   ├── parser/         # SparkSQL parser (sqlparser-rs based)
 │   │   │   └── runtime/        # DuckDB session, Arrow streaming, extension loading
 │   │   └── Cargo.toml
 │   └── connect-server/         # gRPC server binary
@@ -457,8 +506,8 @@ pub enum ThunderduckError {
 
 These constraints are inherited from the Java reference and are architecture-level invariants:
 
-1. **All SQL and expression snippets must be built from the typed AST.** No string manipulation on SQL text outside of `to_sql()` implementations.
-2. **Zero pre/post-processing of SQL strings.** All transformations happen on the AST nodes.
+1. **All SQL and expression snippets must be built from the typed AST.** No string manipulation on SQL text outside of `to_sql()` implementations. *(Exception: `preprocess_spark_sql` — see ADR-10.)*
+2. **No post-processing of generated SQL strings.** SQL built from the typed AST (DataFrame path) is never mutated after generation. Pre-processing of *incoming* raw SQL strings (the `spark.sql()` pass-through path) is the narrow exception carved out in ADR-10.
 3. **`to_sql()` is for SQL generation only.** `Display` / `Debug` implementations are for human-readable debug output — never used to build SQL strings sent to DuckDB.
 4. **Sealed plan + expression enums enforce exhaustiveness.** All new node types must be handled in `SqlGenerator` — the compiler enforces this.
 5. **Type inference is centralised in `TypeInferenceEngine`.** No ad-hoc type guessing scattered through converters.
@@ -484,4 +533,4 @@ These constraints are inherited from the Java reference and are architecture-lev
 | Memory baseline | ~500MB (JVM heap + metaspace) | ~30MB |
 | GC pauses | Yes (G1GC configured) | None |
 | Arrow JVM flags | `--add-opens` required | Not needed |
-| SQL parser | ANTLR4 (Spark grammar) | sqlparser-rs + SparkDialect |
+| SQL parser | ANTLR4 (Spark grammar) | Preprocessing pass (see ADR-10); full parser deferred |

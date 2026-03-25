@@ -1,0 +1,90 @@
+# Development Journal
+
+Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chronological index.
+
+---
+
+## 2026-03-25 — Build Fixes + Spark SQL Backtick Compatibility
+
+[`dev_journal/2026-03-25-build-fixes-and-sql-compat.md`](dev_journal/2026-03-25-build-fixes-and-sql-compat.md)
+
+macOS protobuf build fix (`protoc-bin-vendored`), deprecated `SqlCommand.sql` warning fix, and
+backtick-to-double-quote rewrite in the raw SQL preprocessing path.
+
+**Tests**: 670 passing / 0 failing · 76 unit tests
+
+---
+
+## 2026-03-21 — Section 3 Generator Correctness Gaps
+
+[`dev_journal/2026-03-21-reference-gap-analysis-rewrite.md`](dev_journal/2026-03-21-reference-gap-analysis-rewrite.md)
+
+Closed four medium-priority generator correctness gaps from `reference-gap-analysis.md` Section 3:
+GROUPING/GROUPING_ID return type CASTs, DECIMAL SUM/AVG precision rules, Union type widening
+CASTs, ROLLUP/CUBE NULLS FIRST sort order. Auto-alias complex projections deferred (no test
+coverage).
+
+**Tests**: 669 → 670 passing / 0 failing · 75 unit tests
+
+---
+
+## 2026-03-21 — Phase 5: StatCrosstab, StatFreqItems, StatSampleBy
+
+[`dev_journal/2026-03-21-phase5-stat-features.md`](dev_journal/2026-03-21-phase5-stat-features.md)
+
+Implemented the final three Phase 5 statistical plan nodes (`StatCrosstab`, `StatFreqItems`,
+`StatSampleBy`). Fixed `NAReplace` NULL literal bug (`= NULL` → `IS NULL`) and empty
+`LocalRelation` join schema collapse. Reached 670/670 differential tests passing.
+
+**Tests**: 666 → 670 passing / 0 failing
+
+---
+
+## 2026-03-21 — Schema Inference Fixes + Generator Correctness
+
+[`dev_journal/2026-03-21-schema-inference-and-generator-fixes.md`](dev_journal/2026-03-21-schema-inference-and-generator-fixes.md)
+
+Eight `infer_schema()` correctness gaps closed (join outer nullability, USING column ordering,
+AliasedRelation column aliases, Union type widening, ROLLUP/CUBE nullability, `spark_column_name`
+for unaliased expressions, `ToDataFrame` extra-name handling). Generator fixes: `extract_filters`
+for filter-stack subquery wrapping, SEMI/ANTI qualifier stripping, USING join column reordering.
+`Describe` and `Summary` plan variants added.
+
+**Tests**: 665 passing / 4 failing (pre-existing) → closing toward 670
+
+---
+
+## 2026-03-20 — Phase 4 Progress
+
+[`dev_journal/2026-03-20-phase4-updates.md`](dev_journal/2026-03-20-phase4-updates.md)
+
+Large batch of Phase 4 gap closures: `Pivot`, `StatCov`, `StatCorr`, `ApproxQuantile`, complex
+literals, `SchemaInferrer`, `WriteOperation`, join plan_id qualification, window frame
+boundaries, `unionByName`, `parse_type_str`, session macros, Arrow IPC zero-row fix, CLI flags.
+
+---
+
+## 2026-03-18 — Phase 3: gRPC Server + Protobuf Converter
+
+[`dev_journal/dev-journal-phase3.md`](dev_journal/dev-journal-phase3.md)
+
+`connect-server` crate: tonic service, `RelationConverter`, `ExpressionConverter`,
+`SparkConnectService`, session routing, Arrow IPC streaming, smoke test passing.
+
+---
+
+## 2026-03-18 — Phase 2: DuckDB Runtime + Arrow Streaming
+
+[`dev_journal/2026-03-18-phase2-complete.md`](dev_journal/2026-03-18-phase2-complete.md)
+
+`DuckDbSession` on a dedicated OS thread, `SessionManager`, Arrow streaming, extension loading,
+`CompatMode`, DuckDB configuration, integration test passing.
+
+---
+
+## 2026-03-18 — Phase 1: Core Types + SQL Generation
+
+[`dev_journal/2026-03-18-phase1-complete.md`](dev_journal/2026-03-18-phase1-complete.md)
+
+`DataType`, `Expression` (21 variants), `LogicalPlan` (29 variants), `TypeInferenceEngine`,
+`SqlGenerator`, `FunctionRegistry` (500+ mappings). All unit tests passing.

@@ -3,12 +3,12 @@
 Verified comparison of the Java reference implementation (`.reference/`) against the Rust port
 (`crates/core/`). All findings are confirmed against actual source files.
 
-**Date**: 2026-03-21 (updated after Phase 5 + Section 3 generator correctness gaps)
+**Date**: 2026-03-25 (updated after build fixes + Spark SQL backtick compatibility)
 **Reference**: 210 Java source files, 4091-line `SQLGenerator.java`, 1776-line `FunctionRegistry.java`
 
 Phases 3, 4, and 5 are now complete. Every item originally classified as **Critical** or
 **Important** in the 2026-03-18 analysis has been implemented. This document reflects the current
-state: **669 differential tests passing, 0 failing**. Remaining open items are low-priority
+state: **670 differential tests passing, 0 failing**. Remaining open items are low-priority
 generator correctness gaps and optimisations — none cause test failures.
 
 ---
@@ -45,6 +45,7 @@ All items from the original 2026-03-18 analysis, now implemented:
 | DECIMAL SUM/AVG precision | Section 3 | `generator/mod.rs` — `cast_integer_sum`; decimal SUM/AVG with Spark precision rules |
 | Union type widening CASTs | Section 3 | `generator/mod.rs` — `gen_union`; emits explicit CASTs when left/right types differ |
 | ROLLUP/CUBE NULLS FIRST | Section 3 | `generator/mod.rs` — `gen_sort`; forces `NULLS FIRST` for ROLLUP/CUBE sort orders |
+| Backtick identifier quoting | 2026-03-25 | `generator/mod.rs` — `rewrite_backtick_identifiers()` in `preprocess_spark_sql`; converts `` `col` `` → `"col"` for DuckDB compatibility |
 
 ---
 
@@ -59,7 +60,7 @@ LocalRelation join schema) were fixed in the Phase 5 session (commit `936f229`).
 
 | Gap | File / approx line | Severity | Notes |
 |---|---|---|---|
-| Auto-alias unaliased expressions | `generator/mod.rs` | Low | **Deferred** — complex expressions in SELECT lack `AS "spark_name"` aliases; column names diverge from Spark in edge cases. Current behaviour passes all 669 differential tests; risk of regression without dedicated test coverage. Address when test gap is closed. |
+| Auto-alias unaliased expressions | `generator/mod.rs` | Low | **Deferred** — complex expressions in SELECT lack `AS "spark_name"` aliases; column names diverge from Spark in edge cases. Current behaviour passes all 670 differential tests; risk of regression without dedicated test coverage. Address when test gap is closed. |
 
 ---
 

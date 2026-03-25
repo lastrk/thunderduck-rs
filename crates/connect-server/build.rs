@@ -1,4 +1,11 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Use vendored protoc so well-known types (google/protobuf/*.proto) are always
+    // available regardless of what protoc version is installed on the host system.
+    // This fixes macOS builds where prost-build 0.13 no longer bundles these itself.
+    if let Ok(protoc) = protoc_bin_vendored::protoc_bin_path() {
+        std::env::set_var("PROTOC", protoc);
+    }
+
     let proto_files = [
         "proto/spark/connect/base.proto",
         "proto/spark/connect/relations.proto",

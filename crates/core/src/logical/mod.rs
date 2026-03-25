@@ -64,6 +64,9 @@ pub enum GroupingSets {
 pub enum SelectEntry {
     GroupingExpr(Expression),
     AggregateExpr(usize),
+    /// SQL path marker: GROUP BY key intentionally not in SELECT list.
+    /// Suppresses the auto-prepend of grouping columns in gen_aggregate but renders nothing.
+    GroupingNotSelected,
 }
 
 // ── LogicalPlan ───────────────────────────────────────────────────────────────
@@ -729,13 +732,18 @@ fn projection_to_field(expr: &Expression, schema: &StructType) -> Option<StructF
 /// Build a Spark-convention column name for an unaliased expression.
 ///
 /// Mirrors Java `buildSparkColumnName()` for the common cases. Used by
-/// `projection_to_field` and `agg_expr_to_field` when there is no explicit alias.
-fn spark_column_name(expr: &Expression) -> String {
+/// `projection_to_field`, `agg_expr_to_field`, and `render_agg_expr` when there is no
+/// explicit alias.
+pub fn spark_column_name(expr: &Expression) -> String {
     match expr {
         Expression::FunctionCall(f) => {
-            // Spark names unaliased count(*) as "count(1)"
+            // Spark names unaliased count(*) as "count(1)".
+            // The sql_converter converts count(*) → count(1) (Literal::int(1)), so match both.
             let is_count_star = f.name.eq_ignore_ascii_case("count")
-                && f.args.iter().any(|a| matches!(a, Expression::Star(_)));
+                && f.args.iter().any(|a| matches!(a,
+                    Expression::Star(_)
+                    | Expression::Literal(crate::expression::Literal { value: crate::expression::LiteralValue::Int(1), .. })
+                ));
             if is_count_star { return "count(1)".to_string(); }
             let args = f.args.iter()
                 .map(spark_column_name)
@@ -747,7 +755,53 @@ fn spark_column_name(expr: &Expression) -> String {
         Expression::UnresolvedColumn(u) => u.name.clone(),
         Expression::ColumnReference(c) => c.name.clone(),
         Expression::Alias(a) => spark_column_name(&a.expr),
+        Expression::Cast(c) => {
+            let inner = spark_column_name(&c.expr);
+            let ty = spark_type_name(&c.to_type);
+            format!("CAST({inner} AS {ty})")
+        }
+        Expression::Binary(b) => {
+            let left = spark_column_name(&b.left);
+            let right = spark_column_name(&b.right);
+            let op = b.op.symbol();
+            format!("({left} {op} {right})")
+        }
+        Expression::Unary(u) => {
+            use crate::expression::UnaryOp;
+            let inner = spark_column_name(&u.operand);
+            match u.op {
+                UnaryOp::Not => format!("(NOT {inner})"),
+                UnaryOp::Negate => format!("(-{inner})"),
+                UnaryOp::IsNull => format!("({inner} IS NULL)"),
+                UnaryOp::IsNotNull => format!("({inner} IS NOT NULL)"),
+                UnaryOp::IsNaN => format!("isnan({inner})"),
+                UnaryOp::IsNotNaN => format!("(NOT isnan({inner}))"),
+            }
+        }
+        Expression::Literal(l) => {
+            use crate::expression::LiteralValue;
+            match &l.value {
+                LiteralValue::Int(i) => i.to_string(),
+                LiteralValue::Long(i) => i.to_string(),
+                LiteralValue::Float(f) => f.to_string(),
+                LiteralValue::Double(d) => d.to_string(),
+                LiteralValue::Boolean(b) => b.to_string(),
+                LiteralValue::Null => "null".to_string(),
+                LiteralValue::String(s) => format!("'{s}'"),
+                _ => "?".to_string(),
+            }
+        }
         _ => "expr".to_string(),
+    }
+}
+
+/// Spark-style SQL type name — no space after comma in DECIMAL(p,s).
+/// Used when building Spark-compatible column names that include type names.
+fn spark_type_name(dt: &crate::types::DataType) -> String {
+    use crate::types::DataType;
+    match dt {
+        DataType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
+        other => crate::types::TypeMapper::to_duckdb(other),
     }
 }
 
@@ -760,8 +814,9 @@ fn infer_aggregate_schema(a: &Aggregate) -> StructType {
     if use_select_order {
         // If no grouping column appears in select_order (e.g. groupBy().count() shorthand),
         // prepend all grouping columns so the schema matches the actual SELECT output.
+        // GroupingNotSelected suppresses the prepend for SQL path (GROUP BY not in SELECT).
         let has_grouping_in_order = a.select_order.iter()
-            .any(|e| matches!(e, SelectEntry::GroupingExpr(_)));
+            .any(|e| matches!(e, SelectEntry::GroupingExpr(_) | SelectEntry::GroupingNotSelected));
         if !has_grouping_in_order {
             for e in &a.grouping {
                 if let Some(f) = projection_to_field(e, &child_schema) {
@@ -783,6 +838,7 @@ fn infer_aggregate_schema(a: &Aggregate) -> StructType {
                         }
                     }
                 }
+                SelectEntry::GroupingNotSelected => {}
             }
         }
     } else {

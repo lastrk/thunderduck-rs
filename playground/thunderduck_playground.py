@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.19.11"
+__generated_with = "0.21.1"
 app = marimo.App(width="full")
 
 
@@ -107,7 +107,7 @@ def _():
     # Uncomment to generate TPC-H data at SF=1 (~1GB)
     # This only needs to be run once - data is persisted to playground/data/
     #
-    # generate_tpch_data(GENERATED_DATA_DIR, scale_factor=20.0)
+    #generate_tpch_data(GENERATED_DATA_DIR, scale_factor=1.0)
     pass
     return
 

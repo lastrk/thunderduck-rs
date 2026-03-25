@@ -460,7 +460,8 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
                 let upper = sql.trim_start().to_uppercase();
                 let needs_subquery_wrap = upper.starts_with("SELECT")
                     || upper.starts_with("WITH")
-                    || upper.starts_with("VALUES");
+                    || upper.starts_with("VALUES")
+                    || upper.starts_with("("); // parenthesized set-ops: ((SELECT...) UNION ...)
                 let probe = if needs_subquery_wrap {
                     format!("SELECT * FROM ({sql}) __probe__ LIMIT 0")
                 } else {

@@ -112,6 +112,10 @@ impl SparkConnectService for ThunderduckService {
                         .execute(&sql)
                         .await
                         .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
+                    // DuckDB deduplicates duplicate column names by appending `_1`, `_2`, etc.
+                    // Spark allows duplicate column names and does not rename them.
+                    // Use the LogicalPlan's infer_schema() to restore Spark-expected column names.
+                    let batches = rename_to_spark_schema(&logical_plan, batches);
                     batches_to_responses(&session_id, &operation_id, &batches)
                         .map_err(|e| Status::from(e))?
                 }
@@ -160,13 +164,33 @@ impl SparkConnectService for ThunderduckService {
                     .any(|f| f.data_type.contains_unresolved());
                 if struct_type.is_empty() || has_unresolved {
                     // Static inference failed or produced Unresolved types — ask DuckDB
+                    // for the actual column types/nullability.
                     let sql = SqlGenerator::relaxed()
                         .generate(&logical_plan)
                         .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
-                    struct_type = SchemaInferrer::new(&session)
+                    let duckdb_schema = SchemaInferrer::new(&session)
                         .infer_sql(&sql)
                         .await
                         .map_err(|e| Status::internal(e.to_string()))?;
+                    // DuckDB auto-renames duplicate column names by appending `_1`, `_2`, etc.
+                    // (e.g. a self-join produces `col`, `col_1`). Spark allows duplicate names.
+                    // When the static inference produced names but not types (has_unresolved),
+                    // use the Spark-expected names with DuckDB's types so the schema is correct.
+                    struct_type = if !has_unresolved || struct_type.fields.len() != duckdb_schema.fields.len() {
+                        duckdb_schema
+                    } else {
+                        // Use Spark names, DuckDB types/nullability.
+                        use thunderduck_core::types::{StructField, StructType};
+                        let fields = struct_type.fields.iter()
+                            .zip(duckdb_schema.fields.iter())
+                            .map(|(spark_f, duck_f)| StructField {
+                                name: spark_f.name.clone(),
+                                data_type: duck_f.data_type.clone(),
+                                nullable: duck_f.nullable,
+                            })
+                            .collect();
+                        StructType::new(fields)
+                    };
                 }
                 let schema_proto = data_type_to_proto(&DataType::Struct(struct_type));
 
@@ -452,6 +476,65 @@ async fn execute_approx_quantile(
     )]));
     RecordBatch::try_new(schema, vec![Arc::new(outer_list_array)])
         .map_err(|e| format!("approx_quantile batch: {e}"))
+}
+
+/// Rename Arrow RecordBatch columns to match Spark's expected output column names.
+///
+/// DuckDB deduplicates identically-named output columns by appending `_1`, `_2`, etc.
+/// (e.g. a self-join of a CTE produces `col`, `col_1`). Spark allows duplicate column names.
+/// This function uses `plan.infer_schema()` to obtain the Spark-expected names and renames
+/// the DuckDB result columns accordingly, but only when the field count matches exactly and
+/// the inferred schema is non-empty (to avoid misidentifying unrelated schema mismatches).
+fn rename_to_spark_schema(
+    plan: &thunderduck_core::logical::LogicalPlan,
+    batches: Vec<arrow::record_batch::RecordBatch>,
+) -> Vec<arrow::record_batch::RecordBatch> {
+    use arrow::datatypes::{Field as ArrowField, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    if batches.is_empty() {
+        return batches;
+    }
+    let expected = plan.infer_schema();
+    let actual_count = batches[0].num_columns();
+    if expected.is_empty() {
+        return batches;
+    }
+    if expected.fields.len() != actual_count {
+        return batches;
+    }
+    // Check whether any column name differs
+    let needs_rename = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .zip(expected.fields.iter())
+        .any(|(actual_f, expected_f)| actual_f.name() != &expected_f.name);
+    if !needs_rename {
+        return batches;
+    }
+    // Rebuild schema with Spark-expected names but DuckDB's actual data types / nullability.
+    let new_fields: Vec<ArrowField> = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .zip(expected.fields.iter())
+        .map(|(actual_f, expected_f)| {
+            ArrowField::new(
+                expected_f.name.as_str(),
+                actual_f.data_type().clone(),
+                actual_f.is_nullable(),
+            )
+        })
+        .collect();
+    let new_schema = Arc::new(Schema::new(new_fields));
+    batches
+        .into_iter()
+        .map(|b| {
+            RecordBatch::try_new(Arc::clone(&new_schema), b.columns().to_vec()).unwrap_or(b)
+        })
+        .collect()
 }
 
 fn batches_to_responses(

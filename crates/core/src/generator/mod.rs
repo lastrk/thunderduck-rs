@@ -7,15 +7,16 @@
 use crate::error::Result;
 use crate::expression::{
     AliasExpression, ArrayLiteralExpression, BetweenExpression, BinaryExpression, BinaryOp,
-    CaseWhenExpression, CastExpression, Expression, ExistsSubquery, ExtractValueExpression,
-    FrameBoundary, FrameUnit, FunctionCall, InListExpression, InSubquery, IntervalExpression,
-    IsDistinctFromExpression, LambdaExpression, LikeExpression, LiteralValue,
+    CaseWhenExpression, CastExpression, Expression, ExistsSubquery,
+    ExtractValueExpression, FrameBoundary, FrameUnit, FunctionCall, InListExpression, InSubquery,
+    IntervalExpression, IsDistinctFromExpression, LambdaExpression, LikeExpression, LiteralValue,
     MapLiteralExpression, RowConstructorExpression, ScalarSubquery, SortOrder,
     StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn,
     WindowFunction,
 };
 use crate::functions::{CompatMode, FunctionRegistry};
 use crate::logical::{
+    spark_column_name,
     Aggregate, AliasedRelation, Distinct, DropColumns, Except, Filter, GroupingSets,
     InMemoryRelation, Intersect, Join, Limit, LocalDataRelation, LocalRelation, LogicalPlan,
     NADrop, NADropHow, NAFill, NAReplace, Pivot, Project, RangeRelation, Sample, SelectEntry,
@@ -54,7 +55,11 @@ impl SqlGenerator {
 
     /// Generate a complete SQL statement from the plan.
     pub fn generate(&self, plan: &LogicalPlan) -> Result<String> {
-        self.gen_plan(plan)
+        let sql = self.gen_plan(plan)?;
+        if std::env::var("TD_DEBUG_SQL").is_ok() {
+            eprintln!("=== TD_DEBUG_SQL ===\n{sql}\n===================");
+        }
+        Ok(sql)
     }
 }
 
@@ -175,6 +180,14 @@ impl SqlGenerator {
         if let Some(filter) = &ae.filter {
             s = format!("{s} FILTER (WHERE {})", self.gen_expr(filter)?);
         }
+        // Always add an explicit Spark-compatible alias for unaliased aggregates.
+        // Without this, DuckDB uses its own naming conventions (e.g., count_star() for COUNT(*),
+        // or "CAST(sum(x) AS BIGINT)" when we wrap with CAST), which don't match Spark output.
+        if !matches!(&ae.func, Expression::Alias(_)) {
+            let spark_name = spark_column_name(&ae.func);
+            let escaped = spark_name.replace('"', "\"\"");
+            s = format!("{s} AS \"{escaped}\"");
+        }
         Ok(s)
     }
 
@@ -195,10 +208,12 @@ impl SqlGenerator {
             parts.join(", ")
         } else {
             let mut parts = Vec::new();
-            // If no grouping columns appear in select_order (e.g. groupBy().count()
-            // shorthand omits groupBy keys from aggregate_expressions), prepend them.
+            // If no grouping columns appear in select_order (DataFrame shorthand where groupBy
+            // keys are not sent in aggregate_expressions), prepend them.
+            // SQL path sets GroupingNotSelected to suppress this prepend when GROUP BY keys
+            // are intentionally excluded from the SQL SELECT list.
             let has_grouping_in_order = a.select_order.iter()
-                .any(|e| matches!(e, SelectEntry::GroupingExpr(_)));
+                .any(|e| matches!(e, SelectEntry::GroupingExpr(_) | SelectEntry::GroupingNotSelected));
             if !has_grouping_in_order {
                 for g in &a.grouping {
                     parts.push(self.gen_expr(g)?);
@@ -209,6 +224,9 @@ impl SqlGenerator {
                     SelectEntry::GroupingExpr(g) => parts.push(self.gen_expr(g)?),
                     SelectEntry::AggregateExpr(idx) => {
                         parts.push(self.render_agg_expr(&a.aggregates[*idx], &input_schema)?);
+                    }
+                    SelectEntry::GroupingNotSelected => {
+                        // Sentinel: GROUP BY key not in SQL SELECT — suppress auto-prepend, render nothing.
                     }
                 }
             }
@@ -379,19 +397,12 @@ impl SqlGenerator {
     }
 
     fn gen_sort(&self, s: &Sort) -> Result<String> {
-        let from = self.gen_from(&s.input)?;
-
-        // For ROLLUP/CUBE aggregates, Spark always sorts NULL grouping values first
-        // (subtotal rows produced by ROLLUP/CUBE have NULL in the grouping columns).
-        // Force NULLS FIRST for all sort orders in this case.
+        // For ROLLUP/CUBE aggregates, Spark always sorts NULL grouping values first.
         let (base_input, _) = Self::extract_filters(&s.input);
         let is_rollup_or_cube = matches!(base_input, LogicalPlan::Aggregate(a)
             if matches!(a.grouping_sets.as_ref(),
                 Some(GroupingSets::Rollup(_)) | Some(GroupingSets::Cube(_))));
 
-        // Wrap the input in a subquery that adds a row number for stable tie-breaking.
-        // Spark guarantees insertion-order-preserving sorts; DuckDB does not.
-        // The __td_rn__ column is added as a secondary sort key to match Spark's behaviour.
         let mut sql = if !s.order.is_empty() {
             let order = s.order.iter()
                 .map(|o| {
@@ -406,10 +417,57 @@ impl SqlGenerator {
                 })
                 .collect::<Result<Vec<_>>>()?
                 .join(", ");
-            format!(
-                "SELECT * EXCLUDE (\"__td_rn__\")\nFROM (\n  SELECT *, ROW_NUMBER() OVER () AS \"__td_rn__\"\n  FROM {from}\n) \"__td_stable__\"\nORDER BY {order}, \"__td_rn__\""
-            )
+
+            // Choose between two ORDER BY strategies:
+            //
+            // 1. ROW_NUMBER wrapper (stable): ORDER BY exprs are all simple unqualified
+            //    column refs → they pass through SELECT * unchanged, so ROW_NUMBER gives
+            //    deterministic tie-breaking matching Spark's insertion-order stability.
+            //
+            // 2. Inline ORDER BY: complex exprs (aggregates, qualified names, window
+            //    functions) that must stay in-scope of the inner plan's CTEs / GROUP BY.
+            //    DuckDB cannot re-evaluate aggregate functions in an outer ORDER BY.
+            let all_simple = s.order.iter().all(|o| {
+                matches!(&o.expr,
+                    Expression::ColumnReference(cr) if cr.qualifier.is_none()
+                ) || matches!(&o.expr,
+                    Expression::UnresolvedColumn(uc) if uc.qualifier.is_none()
+                )
+            });
+
+            // For the ROW_NUMBER wrapper to work, every ORDER BY column must be visible
+            // in the inner plan's OUTPUT schema (post-alias names). If a column was aliased
+            // (e.g. SELECT i_brand_id AS brand_id) and ORDER BY uses the original name
+            // (i_brand_id), the wrapper hides it. Check via infer_schema; if schema is
+            // unavailable (empty) or a column is missing, fall through to inline ORDER BY.
+            let use_stable_wrap = if all_simple {
+                let inner_schema = s.input.infer_schema();
+                !inner_schema.is_empty() && s.order.iter().all(|o| {
+                    let col_name = match &o.expr {
+                        Expression::ColumnReference(cr) => cr.name.as_str(),
+                        Expression::UnresolvedColumn(uc) => uc.name.as_str(),
+                        _ => return false,
+                    };
+                    inner_schema.fields.iter().any(|f| f.name == col_name)
+                })
+            } else {
+                false
+            };
+
+            if use_stable_wrap {
+                // Stable path: wrap inner FROM with ROW_NUMBER for tie-breaking.
+                let from = self.gen_from(&s.input)?;
+                format!(
+                    "SELECT * EXCLUDE (\"__td_rn__\")\nFROM (\n  SELECT *, ROW_NUMBER() OVER () AS \"__td_rn__\"\n  FROM {from}\n) \"__td_stable__\"\nORDER BY {order}, \"__td_rn__\""
+                )
+            } else {
+                // Inline path: append ORDER BY to the full plan SQL so that CTE aliases,
+                // pre-alias column names, and aggregate expressions remain in scope.
+                let inner_sql = self.gen_plan(&s.input)?;
+                format!("{inner_sql}\nORDER BY {order}")
+            }
         } else {
+            let from = self.gen_from(&s.input)?;
             format!("SELECT *\nFROM {from}")
         };
 
@@ -1116,7 +1174,24 @@ impl SqlGenerator {
             return Ok("*".to_string());
         }
         exprs.iter()
-            .map(|e| self.gen_expr(e))
+            .map(|e| {
+                let sql = self.gen_expr(e)?;
+                // DuckDB normalises DECIMAL(p,s) to DECIMAL(p, s) (adds space) in auto-generated
+                // column names. Spark uses no-space formatting. Add explicit Spark-compatible
+                // aliases for any non-trivial expression that contains a CAST to DECIMAL so the
+                // output column names match what Spark would produce.
+                if !matches!(e,
+                    Expression::Alias(_) | Expression::ColumnReference(_)
+                    | Expression::UnresolvedColumn(_) | Expression::Star(_))
+                    && expr_contains_decimal_cast(e)
+                {
+                    let alias = spark_column_name(e);
+                    let escaped = alias.replace('"', "\"\"");
+                    Ok(format!("{sql} AS \"{escaped}\""))
+                } else {
+                    Ok(sql)
+                }
+            })
             .collect::<Result<Vec<_>>>()
             .map(|v| v.join(", "))
     }
@@ -1809,6 +1884,27 @@ pub fn quote_ident(name: &str) -> String {
 /// - `SUM(integer)` → `CAST(SUM(...) AS BIGINT)` (DuckDB returns HUGEINT)
 /// - `SUM(decimal{p,s})` → `CAST(SUM(...) AS DECIMAL(min(p+10,38), s))`
 /// - `AVG(integer)` → `CAST(AVG(...) AS DOUBLE)` (Spark promotes integer AVG to DOUBLE)
+/// Returns true if the expression contains a `Cast` to a `Decimal` type anywhere in the tree.
+/// Used by `gen_projection_list` to detect when DuckDB would normalise `DECIMAL(p,s)` to
+/// `DECIMAL(p, s)` in auto-generated column names.
+fn expr_contains_decimal_cast(expr: &Expression) -> bool {
+    match expr {
+        Expression::Cast(c) => matches!(c.to_type, DataType::Decimal { .. }),
+        Expression::Binary(b) => {
+            expr_contains_decimal_cast(&b.left) || expr_contains_decimal_cast(&b.right)
+        }
+        Expression::Unary(u) => expr_contains_decimal_cast(&u.operand),
+        Expression::Alias(a) => expr_contains_decimal_cast(&a.expr),
+        Expression::FunctionCall(f) => f.args.iter().any(expr_contains_decimal_cast),
+        Expression::CaseWhen(cw) => {
+            cw.branches.iter().any(|(when, then)| {
+                expr_contains_decimal_cast(when) || expr_contains_decimal_cast(then)
+            }) || cw.else_expr.as_ref().map_or(false, |e| expr_contains_decimal_cast(e))
+        }
+        _ => false,
+    }
+}
+
 /// - `AVG(decimal{p,s})` → `CAST(AVG(...) AS DECIMAL(min(p+4,38), s+4))`
 /// Passes through aliases transparently so the alias is preserved on the outer Cast.
 fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType) -> Expression {

@@ -8,3 +8,4 @@ thiserror.workspace = true
 duckdb.workspace    = true
 dashmap.workspace   = true
 tokio.workspace     = true
+sqlparser.workspace = true

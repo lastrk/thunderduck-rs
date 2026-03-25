@@ -507,7 +507,8 @@ impl<'a> RelationConverter<'a> {
     }
 
     fn convert_sql(&self, s: &proto::Sql) -> Result<LogicalPlan> {
-        Ok(LogicalPlan::SqlRelation(SqlRelation { sql: s.query.clone(), schema: StructType::empty() }))
+        use thunderduck_core::parser::SparkSqlParser;
+        SparkSqlParser::parse(&s.query).map_err(ConnectError::from)
     }
 
     fn convert_subquery_alias(&mut self, sa: &proto::SubqueryAlias) -> Result<LogicalPlan> {

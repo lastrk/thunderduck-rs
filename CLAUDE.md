@@ -180,10 +180,12 @@ Extension binaries are bundled in `extensions/` and embedded in the binary via `
 
 ## Documentation Structure
 
-1. **Architecture** (`docs/architecture.md`) — all architectural decisions (ADRs)
+1. **Architecture** (`docs/architecture.md`) — all architectural decisions (ADRs 1–21); links to individual files in `docs/adrs/`
 2. **Implementation Plan** (`docs/implementation-plan.md`) — phased delivery plan
-3. **Phase details** (`docs/phase*.md`) — detailed breakdown per phase
-4. **Task tracking** (`tasks/`) — active work items and lessons learned
+3. **Dev journal** (`docs/dev-journal-toc.md`) — chronological development history; entries in `docs/dev_journal/`
+4. **Gap analysis** (`docs/reference-gap-analysis.md`) — Java reference vs Rust port comparison; HIGH/MEDIUM/LOW items
+5. **Historical plans** (`docs/phase5-parser-plan.md`) — Phase 5 parser plan (superseded; Phase 5 shipped in commit `cb9e81f`)
+6. **Task tracking** (`tasks/`) — active work items and lessons learned
 
 ## Git Commit Workflow
 

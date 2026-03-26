@@ -4,6 +4,19 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-03-26 — TPC-DS Full Pass (126/126) + SparkSQL Parser
+
+[`dev_journal/2026-03-26-tpcds-full-pass-sparksql-parser.md`](dev_journal/2026-03-26-tpcds-full-pass-sparksql-parser.md)
+
+SparkSQL parser (`sqlparser-rs` + `SparkDialect` + `SqlConverter`) replacing the preprocessing
+path. TPC-DS 126-query differential suite added and fixed to 126/126. Four correctness fixes:
+`count(1)` aggregate aliasing, DECIMAL spacing in column names, duplicate column `_1` suffix in
+both execute and analyze paths. Total differential: 796 passing, 0 failing.
+
+**Tests**: 670 → 796 passing / 0 failing · 76 unit tests
+
+---
+
 ## 2026-03-25 — Build Fixes + Spark SQL Backtick Compatibility
 
 [`dev_journal/2026-03-25-build-fixes-and-sql-compat.md`](dev_journal/2026-03-25-build-fixes-and-sql-compat.md)

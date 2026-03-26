@@ -21,3 +21,11 @@ tests/integration/.env
 
 # DuckDB extension binaries (large, platform-specific — added per-platform when available)
 extensions/
+
+# Downloaded build tools
+.tools/
+
+# Playground runtime state and data
+playground/__marimo__/
+playground/data/
+playground/logs/

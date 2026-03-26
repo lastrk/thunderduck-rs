@@ -3,13 +3,14 @@
 Verified comparison of the Java reference implementation (`.reference/`) against the Rust port
 (`crates/core/`). All findings are confirmed against actual source files.
 
-**Date**: 2026-03-25 (updated after build fixes + Spark SQL backtick compatibility)
+**Date**: 2026-03-26 (updated after TPC-DS full pass + SparkSQL parser)
 **Reference**: 210 Java source files, 4091-line `SQLGenerator.java`, 1776-line `FunctionRegistry.java`
 
 Phases 3, 4, and 5 are now complete. Every item originally classified as **Critical** or
 **Important** in the 2026-03-18 analysis has been implemented. This document reflects the current
-state: **670 differential tests passing, 0 failing**. Remaining open items are low-priority
-generator correctness gaps and optimisations — none cause test failures.
+state: **796 differential tests passing, 0 failing** (670 TPC-H/other + 126 TPC-DS).
+Remaining open items are low-priority generator correctness gaps and optimisations — none cause
+test failures.
 
 ---
 
@@ -46,6 +47,10 @@ All items from the original 2026-03-18 analysis, now implemented:
 | Union type widening CASTs | Section 3 | `generator/mod.rs` — `gen_union`; emits explicit CASTs when left/right types differ |
 | ROLLUP/CUBE NULLS FIRST | Section 3 | `generator/mod.rs` — `gen_sort`; forces `NULLS FIRST` for ROLLUP/CUBE sort orders |
 | Backtick identifier quoting | 2026-03-25 | `generator/mod.rs` — `rewrite_backtick_identifiers()` in `preprocess_spark_sql`; converts `` `col` `` → `"col"` for DuckDB compatibility |
+| SparkSQL parser (sqlparser-rs) | 2026-03-26 | `crates/core/src/parser/` — `SparkSqlParser`, `SparkDialect`, `SqlConverter`; replaces text-preprocessing path for `spark.sql()` with a proper parse-and-convert pipeline (ADR-21) |
+| `count(1)` aggregate alias | 2026-03-26 | `generator/mod.rs` — `render_agg_expr()` now always emits an explicit Spark-convention `AS` alias for unaliased aggregates; prevents DuckDB's `count_star()` naming |
+| DECIMAL spacing in column names | 2026-03-26 | `logical/mod.rs` — `spark_column_name()` extended for Cast/Binary/Unary/Literal; `spark_type_name()` formats `DECIMAL(p,s)` without spaces; `generator/mod.rs` — `gen_projection_list()` adds explicit alias for any projection containing a DECIMAL cast |
+| Duplicate column `_1` suffix | 2026-03-26 | `service.rs` — `rename_to_spark_schema()` post-processes Arrow RecordBatch column names to match `plan.infer_schema()`; `analyze_plan` path merges Spark names with DuckDB-inferred types when schema contains CTE references |
 
 ---
 
@@ -60,7 +65,7 @@ LocalRelation join schema) were fixed in the Phase 5 session (commit `936f229`).
 
 | Gap | File / approx line | Severity | Notes |
 |---|---|---|---|
-| Auto-alias unaliased expressions | `generator/mod.rs` | Low | **Deferred** — complex expressions in SELECT lack `AS "spark_name"` aliases; column names diverge from Spark in edge cases. Current behaviour passes all 670 differential tests; risk of regression without dedicated test coverage. Address when test gap is closed. |
+| Auto-alias unaliased expressions | `generator/mod.rs` | Low | **Partially closed** — unaliased aggregates (`render_agg_expr`) and DECIMAL-cast projections (`gen_projection_list`) now emit explicit Spark-convention aliases (2026-03-26). Remaining gap: arbitrary complex non-cast expressions in SELECT still rely on DuckDB's naming. No test failures observed in 796 differential tests; broader fix deferred until a failing test surfaces. |
 
 ---
 
@@ -79,7 +84,7 @@ LocalRelation join schema) were fixed in the Phase 5 session (commit `936f229`).
 
 | Item | Severity | Status |
 |---|---|---|
-| Auto-alias complex projections | **Low** | Open (deferred — no test coverage) |
+| Auto-alias complex projections | **Low** | Partially closed (aggregates + DECIMAL casts done; arbitrary expressions deferred) |
 | Flat join chain / flat SEMI/ANTI | **Low** | Open |
 | WithColumns strict-mode CAST | **Low** | Open |
 | Sample with replacement error | **Low** | Open |

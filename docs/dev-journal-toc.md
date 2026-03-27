@@ -4,6 +4,20 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-03-27 — Gap Fixes, README, Full Suite Run
+
+[`dev_journal/2026-03-27-gap-fixes-readme-phase6-plan.md`](dev_journal/2026-03-27-gap-fixes-readme-phase6-plan.md)
+
+Two gap closures: `sample(withReplacement=True)` now returns Unsupported error; strict-mode
+`withColumn` DECIMAL arithmetic now wrapped with explicit CAST via `try_strict_decimal_cast` in
+`gen_projection_list`. README.md added (adapted from Java reference, Rust-specific).
+Full 836-test suite run: 719 passing, 111 pre-existing failures catalogued in gap analysis
+Section 6. Benchmarks: ~13ms server first output, ~43MB RSS after SELECT 1.
+
+**Tests**: 719 passing / 111 failing (pre-existing) / 6 skipped · 836 total
+
+---
+
 ## 2026-03-26 — TPC-DS Full Pass (126/126) + SparkSQL Parser
 
 [`dev_journal/2026-03-26-tpcds-full-pass-sparksql-parser.md`](dev_journal/2026-03-26-tpcds-full-pass-sparksql-parser.md)

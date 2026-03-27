@@ -77,6 +77,31 @@ class TestColumnOperations_Differential:
         test_result = run_test(spark_thunderduck)
         assert_dataframes_equal(ref_result, test_result, "with_column_renamed")
 
+    @pytest.mark.timeout(30)
+    def test_with_column_decimal_strict_mode(self, spark_reference, spark_thunderduck, tpch_data_dir):
+        """In strict mode, withColumn DECIMAL arithmetic must return DECIMAL (not DOUBLE).
+
+        lineitem has l_extendedprice DECIMAL(15,2) and l_discount DECIMAL(15,2).
+        Multiplying them should return a DECIMAL result in both Spark and strict-mode
+        Thunderduck.  In relaxed mode the column type may differ so the test is skipped.
+        """
+        compat_mode = os.environ.get("THUNDERDUCK_COMPAT_MODE", "auto").lower()
+        if compat_mode != "strict":
+            pytest.skip("strict mode required for exact DECIMAL type matching")
+
+        def run_test(spark):
+            df = spark.read.parquet(str(tpch_data_dir / "lineitem.parquet"))
+            return (
+                df.withColumn("discounted_price", col("l_extendedprice") * col("l_discount"))
+                .select("l_orderkey", "l_linenumber", "discounted_price")
+                .orderBy("l_orderkey", "l_linenumber")
+                .limit(100)
+            )
+
+        ref_result = run_test(spark_reference)
+        test_result = run_test(spark_thunderduck)
+        assert_dataframes_equal(ref_result, test_result, "with_column_decimal_strict_mode")
+
 
 @pytest.mark.differential
 class TestOffsetAndToDF_Differential:
@@ -178,6 +203,17 @@ class TestSample_Differential:
         assert test_count > 0
         assert ref_result.columns == test_result.columns
         print("✓ sample_deterministic: both produce valid samples")
+
+    @pytest.mark.timeout(30)
+    def test_sample_with_replacement_raises(self, spark_thunderduck, tpch_data_dir):
+        """sample(withReplacement=True) must raise an error on Thunderduck.
+
+        DuckDB has no row-level sampling with replacement, so Thunderduck returns
+        Unsupported — matching the Java reference's UnsupportedOperationException.
+        """
+        df = spark_thunderduck.read.parquet(str(tpch_data_dir / "lineitem.parquet"))
+        with pytest.raises(Exception, match="(?i)not supported|unsupported"):
+            df.sample(withReplacement=True, fraction=0.1).collect()
 
 
 @pytest.mark.differential

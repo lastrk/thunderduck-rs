@@ -585,6 +585,13 @@ impl SqlGenerator {
     }
 
     fn gen_sample(&self, s: &Sample) -> Result<String> {
+        if s.with_replacement {
+            return Err(crate::error::ThunderduckError::Unsupported(
+                "df.sample(withReplacement=True) is not supported; \
+                 DuckDB has no row-level sampling with replacement"
+                    .into(),
+            ));
+        }
         let from = self.gen_from(&s.input)?;
         let pct = s.fraction * 100.0;
         // DuckDB: TABLESAMPLE BERNOULLI(pct PERCENT) REPEATABLE(seed)
@@ -592,8 +599,7 @@ impl SqlGenerator {
             Some(seed) => format!(" REPEATABLE({seed})"),
             None => String::new(),
         };
-        let method = if s.with_replacement { "SYSTEM" } else { "BERNOULLI" };
-        Ok(format!("SELECT * FROM {from} TABLESAMPLE {method}({pct:.4} PERCENT){seed_clause}"))
+        Ok(format!("SELECT * FROM {from} TABLESAMPLE BERNOULLI({pct:.4} PERCENT){seed_clause}"))
     }
 
     fn gen_table_scan(&self, ts: &TableScan) -> Result<String> {
@@ -1175,6 +1181,13 @@ impl SqlGenerator {
         }
         exprs.iter()
             .map(|e| {
+                // Strict mode: wrap computed DECIMAL projections with explicit CAST so the
+                // output column type matches Spark exactly (mirrors Java generateExpressionWithCast).
+                if self.mode == CompatMode::Strict {
+                    if let Some(sql) = self.try_strict_decimal_cast(e)? {
+                        return Ok(sql);
+                    }
+                }
                 let sql = self.gen_expr(e)?;
                 // DuckDB normalises DECIMAL(p,s) to DECIMAL(p, s) (adds space) in auto-generated
                 // column names. Spark uses no-space formatting. Add explicit Spark-compatible
@@ -1194,6 +1207,62 @@ impl SqlGenerator {
             })
             .collect::<Result<Vec<_>>>()
             .map(|v| v.join(", "))
+    }
+
+    /// In strict mode, wraps a computed projection expression with `CAST(... AS DECIMAL(p,s))`
+    /// when the schema-resolved type is DECIMAL but the expression's intrinsic type is not.
+    ///
+    /// This matches the Java reference `generateExpressionWithCast` called from `visitWithColumns`.
+    /// The mismatch arises on the DataFrame API path where column operands are `UnresolvedColumn`
+    /// (type unknown until schema lookup), so arithmetic like `a / b` would otherwise produce
+    /// DOUBLE in DuckDB even when `a` and `b` are DECIMAL columns.
+    ///
+    /// Returns `None` when no wrapping is needed (caller falls through to default logic).
+    fn try_strict_decimal_cast(&self, e: &Expression) -> Result<Option<String>> {
+        // Strip Alias wrapper to inspect the actual computed expression.
+        let (inner_expr, alias_opt): (&Expression, Option<&str>) = match e {
+            Expression::Alias(a) => (a.expr.as_ref(), Some(a.alias.as_str())),
+            other => (other, None),
+        };
+
+        // Skip simple passthroughs — CAST is only meaningful for computed expressions.
+        if matches!(
+            inner_expr,
+            Expression::ColumnReference(_)
+                | Expression::UnresolvedColumn(_)
+                | Expression::Cast(_)
+                | Expression::Literal(_)
+                | Expression::Star(_)
+        ) {
+            return Ok(None);
+        }
+
+        // Intrinsic type: what the expression resolves to without any schema context.
+        // Schema type: what it resolves to once column types are known from the input plan.
+        let intrinsic_type = inner_expr.data_type(&StructType::empty());
+        let schema_type = inner_expr.data_type(&self.schema);
+
+        if let DataType::Decimal { precision, scale } = schema_type {
+            if !matches!(intrinsic_type, DataType::Decimal { .. }) {
+                let inner_sql = self.gen_expr(inner_expr)?;
+                let cast_sql = format!("CAST({inner_sql} AS DECIMAL({precision}, {scale}))");
+                let result = match alias_opt {
+                    Some(alias) => {
+                        let escaped = alias.replace('"', "\"\"");
+                        format!("{cast_sql} AS \"{escaped}\"")
+                    }
+                    None => {
+                        // Bare computed expression — add Spark-compatible alias.
+                        let alias = spark_column_name(e);
+                        let escaped = alias.replace('"', "\"\"");
+                        format!("{cast_sql} AS \"{escaped}\"")
+                    }
+                };
+                return Ok(Some(result));
+            }
+        }
+
+        Ok(None)
     }
 
     // ── Sort order ─────────────────────────────────────────────────────────────

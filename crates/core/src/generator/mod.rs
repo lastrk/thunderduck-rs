@@ -3107,7 +3107,7 @@ fn try_date_plus_interval(bytes: &[u8], upper: &[u8], start: usize) -> Option<(S
 ///
 /// This handles the Spark SQL generator-function syntax where `json_tuple` produces
 /// multiple columns and `AS (names)` provides column aliases.
-fn rewrite_json_tuple(sql: &str) -> String {
+pub(crate) fn rewrite_json_tuple(sql: &str) -> String {
     let needle = "json_tuple";
     let bytes = sql.as_bytes();
     let slen = bytes.len();

@@ -800,11 +800,17 @@ pub fn spark_column_name(expr: &Expression) -> String {
             let sql_upper = sql.to_uppercase();
             if let Some(as_pos) = sql_upper.rfind(" AS ") {
                 let candidate = sql[as_pos + 4..].trim();
+                // Strip double-quote wrapping for quoted identifiers (e.g. `"key"` → `key`).
+                let unquoted = if candidate.starts_with('"') && candidate.ends_with('"') && candidate.len() > 2 {
+                    &candidate[1..candidate.len() - 1]
+                } else {
+                    candidate
+                };
                 // Only use if it's a valid simple identifier (no spaces, parens, etc.)
-                let is_simple_ident = !candidate.is_empty()
-                    && candidate.chars().all(|c| c.is_alphanumeric() || c == '_');
+                let is_simple_ident = !unquoted.is_empty()
+                    && unquoted.chars().all(|c| c.is_alphanumeric() || c == '_');
                 if is_simple_ident {
-                    return candidate.to_string();
+                    return unquoted.to_string();
                 }
             }
             // Simple column reference or unknown: use the raw SQL text

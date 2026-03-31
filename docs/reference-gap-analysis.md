@@ -3,15 +3,16 @@
 Verified comparison of the Java reference implementation (`.reference/`) against the Rust port
 (`crates/core/`). All findings are confirmed against actual source files.
 
-**Date**: 2026-03-31 (updated after Phase 6 Wave 1)
+**Date**: 2026-03-31 (updated after Phase 6 Wave 1 + Wave 2)
 **Reference**: 210 Java source files, 4091-line `SQLGenerator.java`, 1776-line `FunctionRegistry.java`
 
-Phases 3, 4, 5, and 6 Wave 1 are complete. Every item originally classified as **Critical** or
-**Important** in the 2026-03-18 analysis has been implemented. Full suite results as of
-2026-03-31: **825 passing, 5 failing, 6 skipped** (836 total). Phase 6 Wave 1 closed +106 tests
-(DDL, HOF/lambdas, complex type accessors, VALUES, bit_get, collect_list/set, string functions,
-TPC-DS Q25/Q29 join alias fix, selectExpr column naming fix). Remaining 5 failures: map key
-access ×3, json_tuple (Wave 2), TPC-DS Q17 (flat join chain).
+Phases 3, 4, 5, and 6 (Wave 1 + Wave 2) are complete. Every item originally classified as
+**Critical** or **Important** in the 2026-03-18 analysis has been implemented. Full suite
+results as of 2026-03-31: **829 passing, 0 reproducible failures, 6 skipped** (836 total; 1
+pre-existing flaky test occasionally fails in full-suite runs but passes in isolation).
+
+Phase 6 Wave 2 closed +4 tests: map key access (×2), map explode, json_tuple.
+TPC-DS Q17 (the final Wave 1 deferred item) was also fixed via flat join chain extension.
 
 ---
 
@@ -109,12 +110,14 @@ implemented. All test files in this group now pass.
 `TRANSFORM`, `FILTER`, `EXISTS`, `FORALL`, `AGGREGATE` HOF syntax is now converted via
 `Expr::Lambda → Expression::Lambda`. SparkDialect now enables lambda parsing. All 22 tests pass.
 
-### 6.3 Complex type constructors and accessors — PARTIALLY CLOSED
+### 6.3 Complex type constructors and accessors — CLOSED
 
-- **Closed**: struct field access (`Expr::CompoundFieldAccess` → chained `ExtractValue`),
-  array index (`Expr::Subscript` → `ExtractValue`)
-- **Remaining (3 failures)**: map key access (`map['key']`) and map explode — DuckDB map
-  subscript semantics differ from Spark; needs investigation in Wave 2
+- struct field access, array index, map key access, map explode all pass.
+- Root cause of map test failures: `preprocess_spark_sql` was double-processing DDL SqlRelations,
+  causing `MAP(['a','b','c'], [1,2,3])` → `MAP([['a','b','c']], [[1,2,3]])`. Fixed by skipping
+  `preprocess_spark_sql` for DDL in `gen_sql_relation`.
+- Map explode column naming fixed: `spark_column_name` now strips double-quote wrapping from
+  `AS "key"` aliases in RawSql expressions.
 
 ### 6.4 Array / explode functions — PARTIALLY CLOSED
 
@@ -122,16 +125,18 @@ implemented. All test files in this group now pass.
 - **Remaining**: `SPLIT`, `EXPLODE`, `SIZE` in the SparkSQL parser path still fail
   (`test_split_function`, `test_explode_function`, `test_size_in_select_expr` etc.)
 
-### 6.5 JSON functions — OPEN (Wave 2)
+### 6.5 JSON functions — CLOSED (Wave 2)
 
-`FROM_JSON`, `JSON_TUPLE` not yet implemented. 1 remaining failure (`test_json_tuple`).
+`json_tuple(col, 'k1', 'k2') AS (name, age)` — Spark generator function syntax that sqlparser-rs
+cannot parse. Fixed with a pre-parse rewrite in `SparkSqlParser::parse` that expands it to
+individual `json_extract_string(col, '$.k') AS col_alias` items before the parser runs.
 
-### 6.6 TPC-DS DataFrame queries 17, 25, 29 — PARTIALLY CLOSED
+### 6.6 TPC-DS DataFrame queries 17, 25, 29 — CLOSED
 
-- **Closed**: Q25 and Q29 — natural flat join fix: user-aliased `AliasedRelation` on right side
-  now uses alias directly instead of `__td_jr_X__` subquery wrapping
-- **Remaining (1 failure)**: Q17 — date_dim aliases applied via `.filter()` after joins; requires
-  flat join chain generation (larger refactor, deferred)
+- Q25/Q29: natural flat join (right `AliasedRelation` uses alias directly)
+- Q17: extended flat join to also cover plain `TableScan`/`InMemoryRelation` on right side when
+  left subtree contains user-facing AliasedRelations. Adds `plan_contains_user_alias()` and
+  `right_plan_natural_name()` helpers in `generator/mod.rs`.
 
 ### 6.7 String function gaps — CLOSED
 
@@ -148,12 +153,9 @@ All four string function gaps resolved:
 
 ---
 
-## Section 7 — Remaining failures (5 as of 2026-03-31)
+## Section 7 — Remaining failures (0 reproducible as of 2026-03-31)
 
-| Test | Root cause | Target |
-|------|-----------|--------|
-| `test_map_string_key` | DuckDB map subscript syntax vs Spark semantics | Wave 2 |
-| `test_map_missing_key` | Same | Wave 2 |
-| `test_explode_map` | `explode(map_col)` lateral expansion for map type | Wave 2 |
-| `test_json_tuple` | `JSON_TUPLE(col, 'k1', 'k2')` lateral expansion | Wave 2 |
-| `test_tpcds_dataframe_query[17]` | Q17: date_dim aliases in `.filter()` after joins | Deferred |
+All previously catalogued failures are now closed. The suite runs at **829 passing / 6 skipped**.
+One test (`test_statistics_differential.py::TestStatSummary_Differential::test_summary_default_stats`)
+occasionally fails in the full suite due to a pre-existing ordering-dependent flakiness; it passes
+in isolation and in sub-suite runs. Not a code regression.

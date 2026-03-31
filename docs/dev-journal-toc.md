@@ -4,6 +4,18 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-03-31 — Phase 6 Wave 2: TPC-DS Q17, Map Key Access, Map Explode, JSON Tuple
+
+[`dev_journal/2026-03-31-phase6-wave2.md`](dev_journal/2026-03-31-phase6-wave2.md)
+
+Q17 flat join chain extension (`plan_contains_user_alias`), DDL double-processing bug fixed
+(skip `preprocess_spark_sql` for DDL SqlRelations), map explode column naming (`spark_column_name`
+quoted alias stripping), json_tuple pre-parse rewrite. All 111 pre-existing failures now closed.
+
+**Tests**: 825 → 829 passing / 0 reproducible failures / 6 skipped · 836 total
+
+---
+
 ## 2026-03-31 — Phase 6 Wave 1: DDL, HOF, Complex Types, String/Collection Functions
 
 [`dev_journal/2026-03-31-phase6-wave1.md`](dev_journal/2026-03-31-phase6-wave1.md)

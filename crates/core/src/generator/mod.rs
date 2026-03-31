@@ -343,15 +343,22 @@ impl SqlGenerator {
         };
 
         let right_natural_alias: Option<(String, String)> = if let Some(ra) = &j.right_alias {
-            if ra.starts_with("__td_jr_") && !left_is_user_alias {
-                if let LogicalPlan::AliasedRelation(ar) = j.right.as_ref() {
-                    if !ar.alias.starts_with("__") && !j.join_type.is_semi_or_anti() {
+            if ra.starts_with("__td_jr_") && !left_is_user_alias && !j.join_type.is_semi_or_anti() {
+                match j.right.as_ref() {
+                    LogicalPlan::AliasedRelation(ar) if !ar.alias.starts_with("__") => {
+                        // Case 1: right is AliasedRelation with user-facing alias (e.g. "d1")
                         Some((ar.alias.clone(), ra.clone()))
-                    } else {
-                        None
                     }
-                } else {
-                    None
+                    right_plan => {
+                        // Case 2: right is a plain table (TableScan, InMemoryRelation).
+                        // Only use flat path if left side contains user-facing AliasedRelations
+                        // that would be buried in a subquery (e.g. d1/d2/d3 in Q17).
+                        if plan_contains_user_alias(&j.left) {
+                            right_plan_natural_name(right_plan).map(|name| (name, ra.clone()))
+                        } else {
+                            None
+                        }
+                    }
                 }
             } else {
                 None
@@ -2927,6 +2934,41 @@ fn strip_qualifiers_in_expr(
             Expression::Unary(UnaryExpression { op: u.op, operand: Box::new(operand) })
         }
         other => other,
+    }
+}
+
+/// Returns the natural table/alias name for a simple leaf-like plan node (TableScan,
+/// InMemoryRelation, AliasedRelation). Used in the flat join path to determine what alias
+/// to use when rewriting __td_jr_X__ qualifiers in join ON conditions.
+fn right_plan_natural_name(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::TableScan(ts) => {
+            Some(ts.alias.clone().unwrap_or_else(|| ts.table.clone()))
+        }
+        LogicalPlan::InMemoryRelation(imr) => Some(imr.view_name.clone()),
+        LogicalPlan::AliasedRelation(ar) => {
+            if !ar.alias.starts_with("__") { Some(ar.alias.clone()) } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// Returns true if the plan tree contains any AliasedRelation with a user-facing alias
+/// (i.e., not starting with "__"). Used to detect when the flat join path is needed
+/// to keep those aliases accessible in outer WHERE/HAVING clauses.
+fn plan_contains_user_alias(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::AliasedRelation(ar) => !ar.alias.starts_with("__"),
+        LogicalPlan::Join(j) => {
+            plan_contains_user_alias(&j.left) || plan_contains_user_alias(&j.right)
+        }
+        LogicalPlan::Filter(f) => plan_contains_user_alias(&f.input),
+        LogicalPlan::Project(p) => plan_contains_user_alias(&p.input),
+        LogicalPlan::Aggregate(a) => plan_contains_user_alias(&a.input),
+        LogicalPlan::Sort(s) => plan_contains_user_alias(&s.input),
+        LogicalPlan::Limit(l) => plan_contains_user_alias(&l.input),
+        LogicalPlan::Distinct(d) => plan_contains_user_alias(&d.input),
+        _ => false,
     }
 }
 

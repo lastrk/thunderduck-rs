@@ -92,76 +92,68 @@ LocalRelation join schema) were fixed in the Phase 5 session (commit `936f229`).
 
 ---
 
-## Section 6 — Pre-existing test failures (2026-03-27 full suite run)
+## Section 6 — Phase 6 Wave 1 closures (2026-03-31)
 
-836 tests total: 719 passing, 111 failing, 6 skipped. All 111 failures are unimplemented
-features — no regressions. Failures are mode-independent (both relaxed and strict) unless noted.
+Phase 6 Wave 1 closed 106 of the 111 pre-existing failures.
 
-### 6.1 DDL via SQL path (~40 failures)
+836 tests total: **825 passing, 5 failing, 6 skipped** (as of 2026-03-31).
 
-**Root cause**: `DROP TABLE`, `CREATE TABLE`, `INSERT INTO`, `TRUNCATE`, `ALTER TABLE` issued
-through `spark.sql()` are not yet handled by the SparkSQL parser.
+### 6.1 DDL via SQL path — CLOSED
 
-**Error**: `Unsupported operation: SQL statement type not yet supported: DROP` (and CREATE, INSERT, TRUNCATE, ALTER)
+All DDL statement types (`DROP TABLE`, `CREATE TABLE`, `CREATE VIEW`, `INSERT INTO`, `TRUNCATE`,
+`ALTER TABLE RENAME COLUMN`) are now handled by `sql_converter.rs`. `VALUES (...)` clause also
+implemented. All test files in this group now pass.
 
-**Affected test files**:
-- `test_dataframe_basic_operations_differential.py` (7)
-- `test_ddl_corrected.py` (2)
-- `test_ddl_operations_differential.py` (13)
-- `test_ddl_parser_differential.py` (14)
-- `test_sql_expressions_differential.py` (10) — fixture uses DROP to clean up
+### 6.2 Lambda / higher-order functions — CLOSED
 
-### 6.2 Lambda / higher-order functions (22 failures)
+`TRANSFORM`, `FILTER`, `EXISTS`, `FORALL`, `AGGREGATE` HOF syntax is now converted via
+`Expr::Lambda → Expression::Lambda`. SparkDialect now enables lambda parsing. All 22 tests pass.
 
-**Root cause**: `TRANSFORM`, `FILTER`, `EXISTS`, `FORALL`, `AGGREGATE` HOF syntax in the SparkSQL
-parser path is not yet converted from the sqlparser-rs AST to Thunderduck expressions.
+### 6.3 Complex type constructors and accessors — PARTIALLY CLOSED
 
-**Error**: `Unsupported operation: expression not yet supported: TRANSFORM(...)` etc.
+- **Closed**: struct field access (`Expr::CompoundFieldAccess` → chained `ExtractValue`),
+  array index (`Expr::Subscript` → `ExtractValue`)
+- **Remaining (3 failures)**: map key access (`map['key']`) and map explode — DuckDB map
+  subscript semantics differ from Spark; needs investigation in Wave 2
 
-**Affected test file**: `test_lambda_differential.py`
+### 6.4 Array / explode functions — PARTIALLY CLOSED
 
-### 6.3 Complex type constructors and accessors (13 failures)
+- **Closed**: `COLLECT_LIST` → `LIST()`, `COLLECT_SET` → `LIST(DISTINCT)` in FunctionRegistry
+- **Remaining**: `SPLIT`, `EXPLODE`, `SIZE` in the SparkSQL parser path still fail
+  (`test_split_function`, `test_explode_function`, `test_size_in_select_expr` etc.)
 
-**Root cause**: Struct field access (`struct_col.field`), array index (`arr[0]`), map key access
-(`map['k']`), `with_field`, `drop_fields` in the SparkSQL path are not yet wired up.
+### 6.5 JSON functions — OPEN (Wave 2)
 
-**Affected test files**: `test_complex_types_differential.py`, `test_type_literals_differential.py`
+`FROM_JSON`, `JSON_TUPLE` not yet implemented. 1 remaining failure (`test_json_tuple`).
 
-### 6.4 Array / explode functions in SparkSQL path (6 failures)
+### 6.6 TPC-DS DataFrame queries 17, 25, 29 — PARTIALLY CLOSED
 
-**Root cause**: `SPLIT`, `COLLECT_LIST`, `COLLECT_SET`, `EXPLODE`, `SIZE` not yet handled by the
-SparkSQL parser → expression converter path (they work on the DataFrame API path).
+- **Closed**: Q25 and Q29 — natural flat join fix: user-aliased `AliasedRelation` on right side
+  now uses alias directly instead of `__td_jr_X__` subquery wrapping
+- **Remaining (1 failure)**: Q17 — date_dim aliases applied via `.filter()` after joins; requires
+  flat join chain generation (larger refactor, deferred)
 
-**Affected test files**: `test_array_functions_differential.py`, `test_dataframe_functions.py`
+### 6.7 String function gaps — CLOSED
 
-### 6.5 JSON functions (5 failures)
+All four string function gaps resolved:
+- `overlay` → DuckDB `OVERLAY` passthrough via `sql_converter.rs`
+- `octet_length` → session macro `octet_length(s) AS MACRO (BIT_LENGTH(s) / 8)`
+- `format_number` → `format('{:,.<d>f}', n)` with thousand-separator
+- `to_char` → `strftime` with Spark→DuckDB format string mapping
 
-**Root cause**: `FROM_JSON`, `JSON_TUPLE` not yet implemented.
+### 6.8 Miscellaneous — CLOSED
 
-**Affected test file**: `test_json_functions_differential.py`
+- `test_select_from_values` — `SetExpr::Values` now handled in `sql_converter.rs`
+- `test_bit_get` — fixed: `((CAST(x AS BIGINT) >> pos) & 1)` (was `GET_BIT` on BIT type, always 0)
 
-### 6.6 TPC-DS DataFrame queries 17, 25, 29 (3 failures)
+---
 
-**Root cause**: Join alias `d1` (from a date-dim self-join) is not found in the outer SELECT.
-Likely an alias scoping bug in the flat join chain or subquery wrapping for multi-hop joins.
-**Both relaxed and strict modes affected.**
+## Section 7 — Remaining failures (5 as of 2026-03-31)
 
-**Error**: `DuckDB error: Referenced table "d1" not found!`
-
-**Affected test file**: `test_tpcds_dataframe_differential.py`
-
-### 6.7 String function gaps (4 failures)
-
-| Test | Mode | Root cause |
-|------|------|------------|
-| `test_overlay` | Both | `OVERLAY(str PLACING x FROM n FOR m)` not implemented |
-| `test_octet_length` | Both | `bit_length(BLOB)` type mismatch — needs CAST to VARCHAR first |
-| `test_format_number` | Both | No thousand-separator formatting (returns `12345.68` not `12,345.68`) |
-| `test_to_char` | Both | Timestamp formatting returns full datetime string instead of date-only |
-
-### 6.8 Miscellaneous (2 failures)
-
-| Test | Root cause |
-|------|------------|
-| `test_select_from_values` | `VALUES (...)` clause in SQL path not yet handled |
-| `test_bit_get` | DuckDB uses `get_bit()`, Spark uses `bit_get()` — FunctionRegistry mapping missing |
+| Test | Root cause | Target |
+|------|-----------|--------|
+| `test_map_string_key` | DuckDB map subscript syntax vs Spark semantics | Wave 2 |
+| `test_map_missing_key` | Same | Wave 2 |
+| `test_explode_map` | `explode(map_col)` lateral expansion for map type | Wave 2 |
+| `test_json_tuple` | `JSON_TUPLE(col, 'k1', 'k2')` lateral expansion | Wave 2 |
+| `test_tpcds_dataframe_query[17]` | Q17: date_dim aliases in `.filter()` after joins | Deferred |

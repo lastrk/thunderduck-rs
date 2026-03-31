@@ -1,5 +1,8 @@
 # Phase 6 Plan — Closing Pre-Existing Test Failures
 
+> **Status**: Wave 1 COMPLETE (2026-03-31). Result: 825 passing / 5 failing / 6 skipped.
+> Wave 2 plan in progress. See `docs/reference-gap-analysis.md` Section 7 for remaining failures.
+
 **Date**: 2026-03-27
 **Starting state**: 719 passing / 111 failing / 6 skipped (836 total)
 **Target**: 830+ passing / ≤6 failing (skipped-only)

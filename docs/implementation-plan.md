@@ -128,7 +128,31 @@ A full `sqlparser-rs`-based parser has not been built.
 
 ---
 
-## Phase 6 — Strict Mode + Extension Integration
+## Phase 6 — SQL Parser Compatibility Waves ✓ Wave 1 complete
+
+**Goal**: Close the 111 pre-existing test failures by implementing missing SQL parser features,
+function mappings, and generator fixes.
+
+### Wave 1 — Complete (2026-03-31) +106 tests
+
+**Implemented**: DDL statements (DROP/CREATE TABLE/VIEW, INSERT, TRUNCATE, ALTER TABLE RENAME
+COLUMN), VALUES clause, Lambda/HOF (transform/filter/exists/forall/aggregate), complex type
+accessors (Subscript → array index, CompoundFieldAccess → struct field), OVERLAY expression,
+bit_get fix, collect_list/set, octet_length, format_number, to_char, natural flat join for
+TPC-DS Q25/Q29, selectExpr column naming fix.
+
+**Result**: 825 passing / 5 failing / 6 skipped (836 total)
+
+### Wave 2 — Planned
+
+**Target**: close remaining 5 failures:
+- Map key access / map explode (3) — DuckDB subscript semantics for maps
+- `JSON_TUPLE` lateral expansion (1)
+- TPC-DS Q17 flat join chain (1, stretch goal)
+
+---
+
+## Phase 7 — Strict Mode + Extension Integration
 
 **Goal**: Exact Spark numeric semantics via the `thdck_spark_funcs` DuckDB extension.
 
@@ -152,8 +176,8 @@ Phase 1 (core types + SQL gen)
     └── Phase 2 (DuckDB runtime + Arrow)
             └── Phase 3 (gRPC server + protobuf converter)
                     └── Phase 4 (differential test parity, relaxed) ✓
-                            ├── Phase 5 (SparkSQL parser — partial)
-                            └── Phase 6 (strict mode — not started)
+                            ├── Phase 5 (SparkSQL parser) ✓
+                            └── Phase 6 Wave 1 (SQL compat fixes) ✓
+                                    └── Phase 6 Wave 2 (map/JSON/Q17)
+                                            └── Phase 7 (strict mode)
 ```
-
-Phases 5 and 6 are independent of each other and can proceed in parallel after Phase 4.

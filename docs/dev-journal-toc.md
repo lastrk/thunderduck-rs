@@ -4,6 +4,20 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-03-31 — Phase 6 Wave 1: DDL, HOF, Complex Types, String/Collection Functions
+
+[`dev_journal/2026-03-31-phase6-wave1.md`](dev_journal/2026-03-31-phase6-wave1.md)
+
+DDL statements (DROP/CREATE TABLE/VIEW, INSERT, TRUNCATE, ALTER TABLE RENAME COLUMN), VALUES
+clause, Lambda/HOF (transform/filter/exists/forall/aggregate), complex type accessors (Subscript,
+CompoundFieldAccess), OVERLAY expression. Functions: bit_get fix, collect_list/set, octet_length,
+format_number, to_char. Generator: natural flat join for TPC-DS Q25/Q29. Logical: selectExpr
+column naming fix. Parallel worktree strategy (WT1+WT2 zero file overlap).
+
+**Tests**: 719 → 825 passing (+106) / 5 failing / 6 skipped · 836 total
+
+---
+
 ## 2026-03-27 — Gap Fixes, README, Full Suite Run
 
 [`dev_journal/2026-03-27-gap-fixes-readme-phase6-plan.md`](dev_journal/2026-03-27-gap-fixes-readme-phase6-plan.md)

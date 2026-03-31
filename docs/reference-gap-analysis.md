@@ -3,13 +3,15 @@
 Verified comparison of the Java reference implementation (`.reference/`) against the Rust port
 (`crates/core/`). All findings are confirmed against actual source files.
 
-**Date**: 2026-03-27 (updated after full 836-test suite run)
+**Date**: 2026-03-31 (updated after Phase 6 Wave 1)
 **Reference**: 210 Java source files, 4091-line `SQLGenerator.java`, 1776-line `FunctionRegistry.java`
 
-Phases 3, 4, and 5 are complete. Every item originally classified as **Critical** or
+Phases 3, 4, 5, and 6 Wave 1 are complete. Every item originally classified as **Critical** or
 **Important** in the 2026-03-18 analysis has been implemented. Full suite results as of
-2026-03-27: **719 passing, 111 failing, 6 skipped** (836 total). The 111 failures are all
-pre-existing unimplemented features documented in Section 6 below — no regressions.
+2026-03-31: **825 passing, 5 failing, 6 skipped** (836 total). Phase 6 Wave 1 closed +106 tests
+(DDL, HOF/lambdas, complex type accessors, VALUES, bit_get, collect_list/set, string functions,
+TPC-DS Q25/Q29 join alias fix, selectExpr column naming fix). Remaining 5 failures: map key
+access ×3, json_tuple (Wave 2), TPC-DS Q17 (flat join chain).
 
 ---
 

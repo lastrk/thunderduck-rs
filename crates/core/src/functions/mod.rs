@@ -565,12 +565,18 @@ impl FunctionRegistry {
             format!("REPEAT(' ', {})", args.first().copied().unwrap_or("0"))
         });
 
-        // format_number(x, d) → PRINTF('%.{d}f', x) — approximation
+        // format_number(x, d) → format with thousand-separator commas and d decimal places.
+        // Spark: format_number(12345.678, 2) = '12,345.68'
+        // DuckDB format() supports Python-style {:,.Xf} format strings.
+        // Build the format string dynamically: '{:,.' || CAST(d AS VARCHAR) || 'f}'
         custom.insert("format_number", |args, _mode| {
             if args.len() >= 2 {
-                format!("PRINTF('%.' || {} || 'f', {})", args[1], args[0])
+                format!(
+                    "format('{{:,.' || CAST(({}) AS VARCHAR) || 'f}}', {})",
+                    args[1], args[0]
+                )
             } else {
-                format!("PRINTF('%f', {})", args.first().copied().unwrap_or(""))
+                format!("CAST({} AS VARCHAR)", args.first().copied().unwrap_or(""))
             }
         });
 
@@ -808,10 +814,12 @@ impl FunctionRegistry {
             }
         });
 
-        // octet_length(str) → OCTET_LENGTH(CAST(str AS BLOB)) — DuckDB only accepts BLOB
+        // octet_length(str): session.rs registers a DuckDB macro `octet_length(s) AS (BIT_LENGTH(s) / 8)`
+        // that handles VARCHAR directly. Do NOT cast to BLOB here — BIT_LENGTH(BLOB) is rejected by DuckDB.
+        // Just pass through the argument; the session macro handles it.
         custom.insert("octet_length", |args, _mode| {
             if let Some(a) = args.first() {
-                format!("OCTET_LENGTH(CAST({a} AS BLOB))")
+                format!("octet_length({a})")
             } else { "0".to_string() }
         });
 
@@ -1192,10 +1200,21 @@ impl FunctionRegistry {
             }
         });
         custom.insert("to_char", |args, _mode| {
-            if args.len() >= 1 {
-                format!("CAST({} AS VARCHAR)", args[0])
+            if args.len() < 2 {
+                if let Some(a) = args.first() { return format!("CAST({a} AS VARCHAR)"); }
+                return "''".to_string();
+            }
+            let val = args[0];
+            let fmt_sql = args[1]; // Already a SQL string literal like 'yyyy-MM-dd'
+            // Strip surrounding single quotes to get the raw Spark format string.
+            let stripped = fmt_sql.trim();
+            if stripped.starts_with('\'') && stripped.ends_with('\'') && stripped.len() >= 2 {
+                let spark_fmt = &stripped[1..stripped.len() - 1];
+                let strftime_fmt = convert_spark_date_format(spark_fmt);
+                format!("strftime({val}, '{strftime_fmt}')")
             } else {
-                "''".to_string()
+                // Dynamic format string — fall back to cast (best effort)
+                format!("CAST({val} AS VARCHAR)")
             }
         });
 
@@ -1264,11 +1283,17 @@ impl FunctionRegistry {
             format!("BIT_COUNT({})", args.first().copied().unwrap_or("0"))
         });
         // bit_get / getbit
+        // Spark: bit_get(x, pos) extracts the bit at position pos (0 = LSB).
+        // DuckDB GET_BIT uses MSB-first BIT type; use bitwise shift instead.
         custom.insert("bit_get", |args, _mode| {
-            if args.len() >= 2 { format!("GET_BIT({}, {})", args[0], args[1]) } else { "0".to_string() }
+            if args.len() >= 2 {
+                format!("((CAST({} AS BIGINT) >> {}) & 1)", args[0], args[1])
+            } else { "0".to_string() }
         });
         custom.insert("getbit", |args, _mode| {
-            if args.len() >= 2 { format!("GET_BIT({}, {})", args[0], args[1]) } else { "0".to_string() }
+            if args.len() >= 2 {
+                format!("((CAST({} AS BIGINT) >> {}) & 1)", args[0], args[1])
+            } else { "0".to_string() }
         });
 
         // make_interval for year_month / day_time intervals

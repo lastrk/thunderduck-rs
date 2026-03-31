@@ -791,6 +791,25 @@ pub fn spark_column_name(expr: &Expression) -> String {
                 _ => "?".to_string(),
             }
         }
+        // RawSql from selectExpr/ExpressionString: extract column name.
+        // If the SQL has an "AS alias" suffix (e.g. "CAST(x AS INT) as foo"), use the alias.
+        // For simple column references (e.g. "name", "salary"), use the text as-is.
+        Expression::RawSql(r) => {
+            let sql = r.sql.trim();
+            // Find last " AS " (case-insensitive) to extract the column alias.
+            let sql_upper = sql.to_uppercase();
+            if let Some(as_pos) = sql_upper.rfind(" AS ") {
+                let candidate = sql[as_pos + 4..].trim();
+                // Only use if it's a valid simple identifier (no spaces, parens, etc.)
+                let is_simple_ident = !candidate.is_empty()
+                    && candidate.chars().all(|c| c.is_alphanumeric() || c == '_');
+                if is_simple_ident {
+                    return candidate.to_string();
+                }
+            }
+            // Simple column reference or unknown: use the raw SQL text
+            sql.to_string()
+        }
         _ => "expr".to_string(),
     }
 }

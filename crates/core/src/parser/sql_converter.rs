@@ -1,17 +1,18 @@
 //! SqlConverter: sqlparser-rs AST → Thunderduck LogicalPlan + Expression.
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, BinaryOperator, CastKind, DataType as SqlDataType, DuplicateTreatment,
-    ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
-    JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByExpr,
-    OrderByKind, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
-    SetQuantifier, Statement, TableFactor, TableWithJoins, UnaryOperator, Value,
-    ValueWithSpan, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
+    AccessExpr, AlterTableOperation, ArrayElemTypeDef, BinaryOperator, CastKind,
+    DataType as SqlDataType, DuplicateTreatment, ExactNumberInfo, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause,
+    ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, SetQuantifier, Statement, Subscript, TableFactor,
+    TableObject, TableWithJoins, UnaryOperator, Value, ValueWithSpan, WindowFrameBound,
+    WindowFrameUnits, WindowSpec, WindowType,
 };
 use crate::error::{Result, ThunderduckError};
 use crate::expression::*;
 use crate::logical::*;
-use crate::types::DataType;
+use crate::types::{DataType, StructType};
 
 pub struct SqlConverter;
 
@@ -21,6 +22,141 @@ impl SqlConverter {
     pub fn convert_statement(&self, stmt: Statement) -> Result<LogicalPlan> {
         match stmt {
             Statement::Query(q) => self.convert_query(*q),
+
+            // ── 6A: DDL statements ────────────────────────────────────────
+
+            Statement::Drop { object_type: ObjectType::Table, if_exists, names, .. } => {
+                let ie = if if_exists { " IF EXISTS" } else { "" };
+                let name = self.object_name_to_quoted_string(&names[0]);
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql: format!("DROP TABLE{} {}", ie, name),
+                    schema: StructType::empty(),
+                }))
+            }
+
+            Statement::Drop { object_type: ObjectType::View, if_exists, names, .. } => {
+                let ie = if if_exists { " IF EXISTS" } else { "" };
+                let name = self.object_name_to_quoted_string(&names[0]);
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql: format!("DROP VIEW{} {}", ie, name),
+                    schema: StructType::empty(),
+                }))
+            }
+
+            // CREATE VIEW / CREATE OR REPLACE [TEMP] VIEW
+            Statement::CreateView(cv) => {
+                let view_name = self.object_name_to_quoted_string(&cv.name);
+                let or_replace = if cv.or_replace { " OR REPLACE" } else { "" };
+                let temp = if cv.temporary { " TEMP" } else { "" };
+                let inner = self.convert_query(*cv.query)?;
+                let inner_sql = self.plan_to_sql(&inner)?;
+                let sql = format!("CREATE{}{} VIEW {} AS {}", or_replace, temp, view_name, inner_sql);
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+            }
+
+            Statement::CreateTable(ct) => {
+                let table_name = self.object_name_to_quoted_string(&ct.name);
+                let if_not_exists = if ct.if_not_exists { " IF NOT EXISTS" } else { "" };
+                let sql = if let Some(query) = ct.query {
+                    // CTAS: CREATE TABLE name AS (SELECT ...)
+                    let inner = self.convert_query(*query)?;
+                    let inner_sql = self.plan_to_sql(&inner)?;
+                    format!("CREATE TABLE{} {} AS ({})", if_not_exists, table_name, inner_sql)
+                } else {
+                    // CREATE TABLE with column definitions — reconstruct DDL
+                    let cols: Vec<String> = ct.columns.iter()
+                        .map(|c| {
+                            let col_name = format!("\"{}\"", c.name.value);
+                            let col_type = self.sql_data_type_to_duckdb_string(&c.data_type);
+                            format!("{} {}", col_name, col_type)
+                        })
+                        .collect();
+                    let or_replace = if ct.or_replace { " OR REPLACE" } else { "" };
+                    format!("CREATE{} TABLE{} {} ({})",
+                        or_replace, if_not_exists, table_name, cols.join(", "))
+                };
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+            }
+
+            Statement::Insert(insert) => {
+                let table_name = match &insert.table {
+                    TableObject::TableName(n) => self.object_name_to_quoted_string(n),
+                    TableObject::TableFunction(f) => f.to_string(),
+                };
+                let cols_clause = if insert.columns.is_empty() {
+                    String::new()
+                } else {
+                    let cols: Vec<String> = insert.columns.iter()
+                        .map(|c| format!("\"{}\"", c.value))
+                        .collect();
+                    format!(" ({})", cols.join(", "))
+                };
+                let sql = if let Some(source) = insert.source {
+                    let inner = self.convert_query(*source)?;
+                    let inner_sql = self.plan_to_sql(&inner)?;
+                    format!("INSERT INTO {}{} {}", table_name, cols_clause, inner_sql)
+                } else {
+                    return Err(ThunderduckError::Unsupported(
+                        "INSERT without source query not supported".to_string()
+                    ));
+                };
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+            }
+
+            Statement::Truncate(truncate) => {
+                // Emit DELETE FROM for each table (DuckDB TRUNCATE also works but DELETE is safer)
+                // For simplicity, handle single table (most common case)
+                if let Some(target) = truncate.table_names.first() {
+                    let table_name = self.object_name_to_quoted_string(&target.name);
+                    Ok(LogicalPlan::SqlRelation(SqlRelation {
+                        sql: format!("DELETE FROM {}", table_name),
+                        schema: StructType::empty(),
+                    }))
+                } else {
+                    Err(ThunderduckError::Unsupported("TRUNCATE with no table".to_string()))
+                }
+            }
+
+            Statement::AlterTable(at) => {
+                let table_name = self.object_name_to_quoted_string(&at.name);
+                // Handle the first operation only (most ALTER TABLE statements have one)
+                if let Some(op) = at.operations.first() {
+                    match op {
+                        AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                            let sql = format!(
+                                "ALTER TABLE {} RENAME COLUMN \"{}\" TO \"{}\"",
+                                table_name,
+                                old_column_name.value,
+                                new_column_name.value,
+                            );
+                            Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                        }
+                        AlterTableOperation::AddColumn { column_def, .. } => {
+                            let col_name = format!("\"{}\"", column_def.name.value);
+                            let col_type = self.sql_data_type_to_duckdb_string(&column_def.data_type);
+                            let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table_name, col_name, col_type);
+                            Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                        }
+                        AlterTableOperation::DropColumn { column_names, if_exists, .. } => {
+                            let ie = if *if_exists { " IF EXISTS" } else { "" };
+                            let cols: Vec<String> = column_names.iter().map(|c| format!("\"{}\"", c.value)).collect();
+                            let sql = format!("ALTER TABLE {} DROP COLUMN{} {}", table_name, ie, cols.join(", "));
+                            Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                        }
+                        AlterTableOperation::RenameTable { table_name: new_name } => {
+                            let new = new_name.to_string();
+                            let sql = format!("ALTER TABLE {} RENAME TO {}", table_name, new);
+                            Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                        }
+                        other => Err(ThunderduckError::Unsupported(
+                            format!("ALTER TABLE operation not supported: {:?}", other)
+                        )),
+                    }
+                } else {
+                    Err(ThunderduckError::Unsupported("ALTER TABLE with no operations".to_string()))
+                }
+            }
+
             other => Err(ThunderduckError::Unsupported(
                 format!("SQL statement type not yet supported: {}", other.to_string().split_whitespace().next().unwrap_or("?"))
             )),
@@ -113,6 +249,14 @@ impl SqlConverter {
                 self.wrap_with_sort_limit(base, order_by.to_vec(), limit, offset)
             }
             SetExpr::Query(q) => self.convert_query(*q),
+            // 6H-a: VALUES clause — pass through using sqlparser Display as DuckDB-compatible SQL
+            SetExpr::Values(values) => {
+                // DuckDB supports standard VALUES syntax, use sqlparser Display directly
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql: format!("{}", values),
+                    schema: StructType::empty(),
+                }))
+            }
             other => Err(ThunderduckError::Unsupported(format!("set expression not supported: {:?}", other))),
         }
     }
@@ -228,6 +372,68 @@ impl SqlConverter {
                     input: Box::new(inner),
                     alias: alias_str,
                     column_aliases,
+                }))
+            }
+            // 6D: LATERAL EXPLODE / table functions → SqlRelation with UNNEST
+            TableFactor::Function { name, args, alias, .. } => {
+                let func_name = self.object_name_to_string(&name).to_lowercase();
+                // Convert function args to SQL
+                let arg_sqls: Result<Vec<String>> = args.iter()
+                    .map(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                            let converted = self.convert_expr(e.clone())?;
+                            SqlConverter::expr_display(&converted)
+                        }
+                        FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. } => {
+                            let converted = self.convert_expr(e.clone())?;
+                            SqlConverter::expr_display(&converted)
+                        }
+                        other => Ok(other.to_string()),
+                    })
+                    .collect();
+                let arg_sqls = arg_sqls?;
+                let alias_str = alias.as_ref().map(|a| {
+                    let col_aliases = a.columns.iter()
+                        .map(|c| format!("\"{}\"", c.name.value))
+                        .collect::<Vec<_>>();
+                    if col_aliases.is_empty() {
+                        format!(" AS \"{}\"", a.name.value)
+                    } else {
+                        format!(" AS \"{}\"({})", a.name.value, col_aliases.join(", "))
+                    }
+                }).unwrap_or_default();
+
+                let duckdb_sql = match func_name.as_str() {
+                    "explode" | "explode_outer" => {
+                        let outer = if func_name == "explode_outer" { " true" } else { "" };
+                        format!("UNNEST([{}]{}){}", arg_sqls.join(", "), outer, alias_str)
+                    }
+                    "posexplode" | "posexplode_outer" => {
+                        format!("UNNEST([{}]) WITH ORDINALITY{}", arg_sqls.join(", "), alias_str)
+                    }
+                    other => {
+                        // Generic table function passthrough
+                        format!("{}({}){}", other, arg_sqls.join(", "), alias_str)
+                    }
+                };
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql: format!("SELECT * FROM {}", duckdb_sql),
+                    schema: StructType::empty(),
+                }))
+            }
+            TableFactor::UNNEST { alias, array_exprs, with_offset, with_ordinality, .. } => {
+                let exprs: Result<Vec<String>> = array_exprs.into_iter()
+                    .map(|e| {
+                        let converted = self.convert_expr(e)?;
+                        SqlConverter::expr_display(&converted)
+                    })
+                    .collect();
+                let alias_str = alias.map(|a| format!(" AS \"{}\"", a.name.value)).unwrap_or_default();
+                let ordinality = if with_offset || with_ordinality { " WITH ORDINALITY" } else { "" };
+                let sql = format!("SELECT * FROM UNNEST({}){}{}", exprs?.join(", "), alias_str, ordinality);
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql,
+                    schema: StructType::empty(),
                 }))
             }
             other => Err(ThunderduckError::Unsupported(format!("table factor not supported: {:?}", other))),
@@ -677,6 +883,60 @@ impl SqlConverter {
                     try_cast: false,
                 }))
             }
+
+            // 6B: Lambda expressions (x -> expr)
+            Expr::Lambda(lambda) => {
+                let params: Vec<String> = lambda.params.iter().map(|p| p.value.clone()).collect();
+                let body = self.convert_expr(*lambda.body)?;
+                Ok(Expression::Lambda(LambdaExpression {
+                    params,
+                    body: Box::new(body),
+                }))
+            }
+
+            // 6C: Array/map subscript arr[0] and struct.field access
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                self.convert_compound_field_access(*root, access_chain)
+            }
+
+            Expr::IsFalse(e) => Ok(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(self.convert_expr(*e)?),
+                right: Box::new(Literal::boolean(false)),
+            })),
+            Expr::IsNotFalse(e) => Ok(Expression::Binary(BinaryExpression {
+                op: BinaryOp::NotEq,
+                left: Box::new(self.convert_expr(*e)?),
+                right: Box::new(Literal::boolean(false)),
+            })),
+            Expr::IsTrue(e) => Ok(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(self.convert_expr(*e)?),
+                right: Box::new(Literal::boolean(true)),
+            })),
+            Expr::IsNotTrue(e) => Ok(Expression::Binary(BinaryExpression {
+                op: BinaryOp::NotEq,
+                left: Box::new(self.convert_expr(*e)?),
+                right: Box::new(Literal::boolean(true)),
+            })),
+
+            // OVERLAY(str PLACING what FROM pos [FOR len]) — standard SQL, DuckDB-compatible
+            Expr::Overlay { expr, overlay_what, overlay_from, overlay_for } => {
+                let expr_sql = SqlConverter::expr_display(&self.convert_expr(*expr)?)?;
+                let what_sql = SqlConverter::expr_display(&self.convert_expr(*overlay_what)?)?;
+                let from_sql = SqlConverter::expr_display(&self.convert_expr(*overlay_from)?)?;
+                let for_clause = if let Some(for_expr) = overlay_for {
+                    let for_sql = SqlConverter::expr_display(&self.convert_expr(*for_expr)?)?;
+                    format!(" FOR {}", for_sql)
+                } else {
+                    String::new()
+                };
+                Ok(Expression::RawSql(RawSqlExpression {
+                    sql: format!("OVERLAY({} PLACING {} FROM {}{})",
+                        expr_sql, what_sql, from_sql, for_clause),
+                }))
+            }
+
             other => Err(ThunderduckError::Unsupported(format!(
                 "expression not yet supported: {}",
                 other.to_string().split_whitespace().take(3).collect::<Vec<_>>().join(" ")
@@ -686,7 +946,39 @@ impl SqlConverter {
 
     fn convert_function(&self, f: Function) -> Result<Expression> {
         let name = self.object_name_to_string(&f.name).to_lowercase();
-        let (is_distinct, mut args) = self.extract_function_args_and_distinct(&f)?;
+        let (is_distinct, mut args) = self.extract_function_args_and_distinct_with_lambda(&f)?;
+
+        // 6C: NAMED_STRUCT / STRUCT constructor → Expression::StructLiteral
+        if name == "named_struct" || name == "struct" {
+            if name == "named_struct" {
+                // named_struct('key1', val1, 'key2', val2, ...)
+                if args.len() % 2 != 0 {
+                    return Err(ThunderduckError::Unsupported(
+                        format!("named_struct requires an even number of arguments, got {}", args.len())
+                    ));
+                }
+                let mut fields: Vec<(String, Expression)> = Vec::with_capacity(args.len() / 2);
+                let mut iter = args.into_iter();
+                while let (Some(key_expr), Some(val_expr)) = (iter.next(), iter.next()) {
+                    let key = match key_expr {
+                        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => s,
+                        other => {
+                            // Fallback: render the expression as a string field name
+                            format!("{:?}", other)
+                        }
+                    };
+                    fields.push((key, val_expr));
+                }
+                return Ok(Expression::StructLiteral(StructLiteralExpression { fields }));
+            } else {
+                // struct(val1, val2, ...) — positional fields with generated names col1, col2...
+                let fields: Vec<(String, Expression)> = args.into_iter()
+                    .enumerate()
+                    .map(|(i, e)| (format!("col{}", i + 1), e))
+                    .collect();
+                return Ok(Expression::StructLiteral(StructLiteralExpression { fields }));
+            }
+        }
 
         // Spark outputs COUNT(*) as column "count(1)" (not "count_star()").
         // Replace COUNT(*) with COUNT(1) for consistent column naming.
@@ -765,6 +1057,11 @@ impl SqlConverter {
 
     /// Extract args and distinct flag from a Function node.
     fn extract_function_args_and_distinct(&self, f: &Function) -> Result<(bool, Vec<Expression>)> {
+        self.extract_function_args_and_distinct_with_lambda(f)
+    }
+
+    /// Extract args and distinct flag, converting Lambda args to Expression::Lambda.
+    fn extract_function_args_and_distinct_with_lambda(&self, f: &Function) -> Result<(bool, Vec<Expression>)> {
         match &f.args {
             FunctionArguments::None => Ok((false, vec![])),
             FunctionArguments::Subquery(_) => {
@@ -777,9 +1074,9 @@ impl SqlConverter {
                     .unwrap_or(false);
                 let args = arg_list.args.iter()
                     .map(|arg| match arg {
-                        FunctionArg::Named { arg, .. } => self.convert_function_arg_expr(arg),
-                        FunctionArg::Unnamed(arg) => self.convert_function_arg_expr(arg),
-                        FunctionArg::ExprNamed { arg, .. } => self.convert_function_arg_expr(arg),
+                        FunctionArg::Named { arg, .. } => self.convert_function_arg_expr_with_lambda(arg),
+                        FunctionArg::Unnamed(arg) => self.convert_function_arg_expr_with_lambda(arg),
+                        FunctionArg::ExprNamed { arg, .. } => self.convert_function_arg_expr_with_lambda(arg),
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok((is_distinct, args))
@@ -787,7 +1084,7 @@ impl SqlConverter {
         }
     }
 
-    fn convert_function_arg_expr(&self, arg: &FunctionArgExpr) -> Result<Expression> {
+    fn convert_function_arg_expr_with_lambda(&self, arg: &FunctionArgExpr) -> Result<Expression> {
         match arg {
             FunctionArgExpr::Expr(e) => self.convert_expr(e.clone()),
             FunctionArgExpr::Wildcard => Ok(Expression::Star(StarExpression { qualifier: None })),
@@ -937,6 +1234,106 @@ impl SqlConverter {
             })
             .collect::<Vec<_>>()
             .join(".")
+    }
+
+    /// Like `object_name_to_string` but double-quotes each identifier part.
+    fn object_name_to_quoted_string(&self, name: &ObjectName) -> String {
+        name.0.iter()
+            .map(|part| match part {
+                ObjectNamePart::Identifier(i) => format!("\"{}\"", i.value),
+                ObjectNamePart::Function(f) => f.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    /// Map a sqlparser DataType to a DuckDB-compatible type string for DDL.
+    fn sql_data_type_to_duckdb_string(&self, dt: &sqlparser::ast::DataType) -> String {
+        match dt {
+            SqlDataType::Boolean | SqlDataType::Bool => "BOOLEAN".to_string(),
+            SqlDataType::TinyInt(_) => "TINYINT".to_string(),
+            SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => "SMALLINT".to_string(),
+            SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => "INTEGER".to_string(),
+            SqlDataType::BigInt(_) | SqlDataType::Int8(_) => "BIGINT".to_string(),
+            SqlDataType::Float(_) | SqlDataType::Real => "FLOAT".to_string(),
+            SqlDataType::Double(_) | SqlDataType::Float8 | SqlDataType::DoublePrecision => "DOUBLE".to_string(),
+            SqlDataType::Decimal(info) | SqlDataType::Numeric(info) => {
+                match info {
+                    sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => format!("DECIMAL({}, {})", p, s),
+                    sqlparser::ast::ExactNumberInfo::Precision(p) => format!("DECIMAL({})", p),
+                    sqlparser::ast::ExactNumberInfo::None => "DECIMAL".to_string(),
+                }
+            }
+            SqlDataType::Varchar(_) | SqlDataType::Char(_) | SqlDataType::Text | SqlDataType::String(_) => "VARCHAR".to_string(),
+            SqlDataType::Binary(_) | SqlDataType::Varbinary(_) | SqlDataType::Blob(_) | SqlDataType::Bytea => "BLOB".to_string(),
+            SqlDataType::Date => "DATE".to_string(),
+            SqlDataType::Timestamp(_, _) | SqlDataType::TimestampNtz(_) => "TIMESTAMP".to_string(),
+            SqlDataType::Array(elem) => {
+                match elem {
+                    sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner)
+                    | sqlparser::ast::ArrayElemTypeDef::SquareBracket(inner, _)
+                    | sqlparser::ast::ArrayElemTypeDef::Parenthesis(inner) => {
+                        format!("{}[]", self.sql_data_type_to_duckdb_string(inner))
+                    }
+                    sqlparser::ast::ArrayElemTypeDef::None => "INTEGER[]".to_string(),
+                }
+            }
+            other => other.to_string(),
+        }
+    }
+
+    /// Convert a LogicalPlan to a SQL string by delegating to SqlGenerator.
+    fn plan_to_sql(&self, plan: &LogicalPlan) -> Result<String> {
+        use crate::generator::SqlGenerator;
+        SqlGenerator::relaxed().generate(plan)
+    }
+
+    /// Convert an Expression to a SQL string using SqlGenerator.
+    fn expr_display(expr: &Expression) -> Result<String> {
+        use crate::generator::SqlGenerator;
+        SqlGenerator::relaxed().gen_expr(expr)
+    }
+
+    /// Convert compound field access (arr[0], struct.field, map['key']) to ExtractValue chain.
+    fn convert_compound_field_access(&self, root: Expr, access_chain: Vec<AccessExpr>) -> Result<Expression> {
+        let mut expr = self.convert_expr(root)?;
+        for access in access_chain {
+            match access {
+                AccessExpr::Dot(field_expr) => {
+                    // Struct dot access: struct_col.field_name
+                    let field_name = match &field_expr {
+                        Expr::Identifier(i) => i.value.clone(),
+                        other => other.to_string(),
+                    };
+                    expr = Expression::ExtractValue(ExtractValueExpression {
+                        child: Box::new(expr),
+                        extraction: Box::new(Expression::Literal(Literal {
+                            value: LiteralValue::String(field_name),
+                            data_type: DataType::String,
+                        })),
+                    });
+                }
+                AccessExpr::Subscript(subscript) => {
+                    // Array/map bracket access: arr[0], map['key']
+                    let index_expr = match subscript {
+                        Subscript::Index { index } => self.convert_expr(index)?,
+                        Subscript::Slice { lower_bound, .. } => {
+                            // Slice: use lower bound as index if available
+                            if let Some(lb) = lower_bound {
+                                self.convert_expr(lb)?
+                            } else {
+                                Literal::int(0)
+                            }
+                        }
+                    };
+                    expr = Expression::ExtractValue(ExtractValueExpression {
+                        child: Box::new(expr),
+                        extraction: Box::new(index_expr),
+                    });
+                }
+            }
+        }
+        Ok(expr)
     }
 }
 

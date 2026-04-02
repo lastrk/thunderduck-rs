@@ -572,13 +572,9 @@ impl LogicalPlan {
                 }
                 let fields = left.fields.into_iter().zip(right.fields)
                     .map(|(mut lf, rf)| {
-                        let promoted = crate::types::TypeInferenceEngine::promote_numeric(
+                        lf.data_type = crate::types::TypeInferenceEngine::unify_types(
                             &lf.data_type, &rf.data_type,
                         );
-                        // promote_numeric returns Double for non-numeric pairs — keep left type
-                        lf.data_type = if promoted == DataType::Double
-                            && !lf.data_type.is_numeric() && !rf.data_type.is_numeric()
-                        { lf.data_type } else { promoted };
                         lf.nullable = lf.nullable || rf.nullable;
                         lf
                     })

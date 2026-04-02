@@ -175,59 +175,124 @@ in isolation and in sub-suite runs. Not a code regression.
 
 ---
 
-## Section 8 — Strict mode failures (327 as of 2026-04-02)
+## Section 8 — Strict mode failures (148 as of 2026-04-02)
 
-Strict mode baseline before nullable fix: **405/836**. After nullable inference overhaul: **508/836**.
-Relaxed mode unaffected: **830/836** (6 skipped, 0 failed).
+**History**: Strict mode baseline **405/836** → nullable inference overhaul **508/836** →
+CaseWhen `unify_types` fix + review fixes **686/836** → decimal precision fixes **687/836**.
 
-### 8.1 Source-column nullable not propagated — ~170 tests
+Relaxed mode: **824/836** (6 skipped, 6 pre-existing map failures, 2 pre-existing TPC-DS).
 
-**Root cause**: DuckDB does not expose `NOT NULL` constraint metadata for Parquet-scanned columns.
-`DESCRIBE` results and Arrow schema from DuckDB both report all scanned columns as `nullable=true`.
-This means `TypeInferenceEngine::column_nullable()` always returns `true` for source columns.
+**Critical finding (2026-04-02)**: The original 8.1 hypothesis — that failures stem from DuckDB
+not exposing Parquet `REQUIRED`/`OPTIONAL` metadata — was **wrong**. Spark's `DataSource.scala`
+calls `dataSchema.asNullable` when building `HadoopFsRelation`, which recursively forces all
+`nullable` flags to `true`, all `ArrayType.containsNull` to `true`, and all
+`MapType.valueContainsNull` to `true`. This means both engines agree on source column
+nullability. The 149 remaining failures are all in the **type derivation layer** — schema
+computation for expressions, functions, and complex types.
 
-Affects: virtually every test that projects source columns — TPC-H, TPC-DS, dataframe functions,
-window functions, joins, aggregations. Spark marks Parquet columns NOT NULL when the Parquet schema
-says `REQUIRED`; Thunderduck cannot recover this without reading Parquet metadata directly.
+DuckDB's `parquet_schema()` table function (which exposes `repetition_type` = REQUIRED/OPTIONAL/
+REPEATED) is available if needed in the future, but is **not the fix** for these failures.
 
-**Specific symptoms** (from test output):
-- `Column 'l_quantity': nullable mismatch - Reference=False, Test=True`
-- `Column 'cnt': nullable mismatch - Reference=False, Test=True` (COUNT result — **FIXED** by nullable overhaul)
-- `Column 'o_orderkey': nullable mismatch - Reference=False, Test=True`
+### 8.1 Decimal precision/scale mismatches — ~40-50 tests (PARTIALLY CLOSED 2026-04-02)
 
-### 8.2 `spark_sum` / `spark_avg` decimal precision wrong — ~40 tests
+**Fixes applied (2026-04-02)**:
+- `decimal_div_type()` wired into expression `data_type()` (was defined but never called)
+- `decimal_mod_type()` added for Spark-correct modulo precision
+- AVG scale cap fixed: `min(s+4, 38)` → `min(min(s+4, 18), precision)` (matches Spark)
+- `integral_to_decimal` promotion for mixed Decimal÷Integer operations
+- Strict mode: `spark_decimal_div()` for decimal division SQL generation
+- Strict mode: `spark_sum()` extension for decimal SUM (was native sum + CAST)
 
-`spark_sum(DECIMAL(p,s))` should return `DECIMAL(min(p+10,38), s)` but DuckDB's extension
-function returns `DECIMAL(38,2)` for TPC-H columns (which are `DECIMAL(15,2)`; expected
-`DECIMAL(25,2)`). `spark_avg(DECIMAL(p,s))` should return `DECIMAL(min(p+4,38), min(s+4,18))`
-but returns `DoubleType`.
+**Remaining**: Complex TPC-DS expressions with multi-step decimal arithmetic still cascade
+precision errors through division, rounding, and nested aggregates. Most decimal-failing tests
+also have nullable mismatches (8.2/8.3), so the precision fix alone doesn't flip them to PASSED.
 
-**Affected tests**: TPC-H Q1 SQL + DataFrame, basic aggregation decimal tests, TPC-DS queries.
+**Affected tests**: TPC-H Q1/Q8/Q11/Q14/Q17 (SQL + DataFrame), TPC-DS Q2/Q5/Q9/Q12/Q20 and
+~35 other TPC-DS queries, basic aggregation decimal tests.
 
-### 8.3 `collect_list` / `collect_set` return scalar — 4 tests
+### 8.2 Struct field nullable — ~35-40 tests
 
-`collect_list(int_col)` returns `IntegerType()` instead of `ArrayType(IntegerType(), False)`.
-The DuckDB `LIST()` aggregate function returns an array but the schema inference path emits the
-element type instead of the array type. `aggregate_return_type("collect_list", IntegerType)`
-returns `ArrayType(IntegerType, false)` — the type is correct but something downstream strips
-the array wrapper.
+**Root cause**: Thunderduck marks all struct fields as `nullable=true` regardless of input
+expression nullability. Spark uses static analysis to determine struct field nullability.
 
-### 8.4 Array element nullability — ~20 tests
+**Example**: `NAMED_STRUCT('field', 123)` — the field should be `nullable=false` (literal
+integer is never null) but Thunderduck marks it `nullable=true`.
 
-`ArrayType(T, True)` (Thunderduck) vs `ArrayType(T, False)` (Spark). The `containsNull` flag
-inside the array type is not tracked. Affects: `split`, array function results, lambda outputs.
+**Affected tests**: `test_type_literals_differential.py` struct tests, complex nested types,
+`test_complex_types_differential.py`.
 
-### 8.5 Type mismatches (not nullable) — ~60 tests
+### 8.3 Simple column nullable propagation — ~30-35 tests
 
-Pre-existing type issues not related to nullable inference:
-- **CaseWhen type**: `StringType` vs `BooleanType` — type inference for CASE WHEN branches
-  not fully resolved (pre-existing, not a nullable issue)
-- **`id` column Integer vs Long**: Range / source schema INTEGER vs Spark's Long preference
-- **Math functions nullable**: functions like `abs`, `round`, `ceil` return `nullable=true`
-  from Thunderduck but Spark marks them non-nullable when input is non-null (blocked on 8.1)
-- **`size()` return type**: returns `LongType` instead of `IntegerType`
+**Root cause**: Pivot, unpivot, and arithmetic operations lose non-nullable constraints that
+Spark's Catalyst optimizer preserves. Thunderduck defaults to `nullable=true` for computed
+columns where Spark can prove non-nullability.
 
-### 8.6 Decimal arithmetic precision — ~30 tests (TPC-DS, TPC-H)
+**Example**: `groupBy('country').pivot()` — the 'country' column should stay `nullable=false`
+after pivot, but Thunderduck marks it nullable.
 
-Complex decimal expressions in TPC-DS produce wrong precision/scale. Related to `spark_sum`
-precision issues (8.2) cascading through multi-step expressions.
+**Affected tests**: `test_multidim_aggregations.py` (pivot, unpivot), timestamp arithmetic,
+window function results.
+
+### 8.4 Array containsNull flag — ~25-30 tests
+
+**Root cause**: Thunderduck defaults `containsNull=true` for all array types. Spark uses static
+analysis on lambda bodies and function semantics to determine this flag.
+
+`ArrayType(IntegerType(), True)` (Thunderduck) vs `ArrayType(IntegerType(), False)` (Spark).
+
+**Example**: `TRANSFORM(arr, lambda x: x + 1)` — if the input array has `containsNull=false`
+and the lambda cannot produce null, Spark sets `containsNull=false` on the result.
+
+**Affected tests**: `test_lambda_differential.py` (TRANSFORM, FILTER, nested operations),
+`split`, array function results. Also `collect_list`/`collect_set` return
+`ArrayType(T, False)` but Thunderduck emits `ArrayType(T, True)`.
+
+### 8.5 HOF function result types — ~15-20 tests (CLOSED: CaseWhen portion)
+
+**CaseWhen type inference**: **CLOSED** (2026-04-02). Added `unify_types()` with proper
+Spark-compatible type unification (Null as bottom type, untyped NULL skipping, Boolean→numeric
+coercion, Date+Timestamp→Timestamp). Resolved +178 strict-mode tests.
+
+**Remaining**: EXISTS/FORALL/AGGREGATE higher-order functions return incorrect types.
+- `EXISTS(arr, lambda x: x > 0)` should return `BooleanType` but returns the input array type
+- `FORALL(arr, lambda x: x > 0)` same issue
+- `AGGREGATE(arr, init, acc)` return type not correctly derived from accumulator
+
+**Affected tests**: `test_lambda_differential.py` HOF tests.
+
+### 8.6 Math function nullable semantics — ~10-15 tests
+
+**Root cause**: Thunderduck's `Expression::nullable()` default rule
+(`f.args.iter().any(|a| a.nullable(schema))`) marks math functions as non-nullable when input
+is non-nullable. But Spark marks most math functions (CEILING, FLOOR, LN, LOG, ROUND, etc.)
+as `nullable=true` unconditionally — because they can produce null on edge cases (e.g.,
+`LN(0)` → null, division by zero).
+
+**Fix direction**: Add these functions to an "always nullable" list in `Expression::nullable()`,
+similar to how `aggregate_is_always_nullable()` works for aggregates.
+
+**Affected tests**: `test_math_bitwise_date_differential.py`, scattered math operations in
+other test files.
+
+### 8.7 Map type construction — ~5-10 tests
+
+**Root cause**: `MAP_FROM_ARRAYS`, `MAP_KEYS`, `MAP_VALUES`, `MAP_ENTRIES` have incomplete
+type handling. Map keys/values get wrapped in extra array layers instead of returning scalars.
+
+**Example**: `MAP_KEYS(map_col)` returns `ArrayType(ArrayType(StringType()))` instead of
+`ArrayType(StringType())`.
+
+**Affected tests**: `test_dataframe_functions.py` map tests (also fail in relaxed mode —
+pre-existing).
+
+### 8.8 Priority summary
+
+| Category | ~Tests | Complexity | Blocked by |
+|----------|--------|------------|------------|
+| 8.1 Decimal precision | 40-50 | High | Extension fix needed for `spark_sum`/`spark_avg` |
+| 8.2 Struct field nullable | 35-40 | Medium | Schema inference changes |
+| 8.3 Column nullable propagation | 30-35 | Medium | Pivot/window schema inference |
+| 8.4 Array containsNull | 25-30 | Medium | Lambda type analysis |
+| 8.5 HOF result types | 15-20 | Low | Function return type fixes |
+| 8.6 Math function nullable | 10-15 | Low | Add "always nullable" function list |
+| 8.7 Map type construction | 5-10 | Medium | Pre-existing, also affects relaxed mode |

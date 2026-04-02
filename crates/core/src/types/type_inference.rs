@@ -75,6 +75,24 @@ impl TypeInferenceEngine {
         }
     }
 
+    /// Spark-compatible type unification (TypeCoercion.findTightestCommonType).
+    /// Used for CaseWhen branches and Union schemas.
+    pub fn unify_types(a: &DataType, b: &DataType) -> DataType {
+        use DataType::*;
+        match (a, b) {
+            (Unresolved, _) => b.clone(),
+            (_, Unresolved) => a.clone(),
+            (Null, _) => b.clone(),
+            (_, Null) => a.clone(),
+            (x, y) if x == y => a.clone(),
+            (x, y) if x.is_numeric() && y.is_numeric() => Self::promote_numeric(a, b),
+            (Boolean, y) if y.is_numeric() => y.clone(),
+            (x, Boolean) if x.is_numeric() => x.clone(),
+            (Date, Timestamp) | (Timestamp, Date) => Timestamp,
+            _ => String,
+        }
+    }
+
     /// Spark's decimal addition/subtraction result type.
     pub fn decimal_add_type(p1: u8, s1: u8, p2: u8, s2: u8) -> DataType {
         let scale = s1.max(s2);
@@ -98,6 +116,15 @@ impl TypeInferenceEngine {
         let precision_raw = p1 as i16 - s1 as i16 + s2 as i16 + scale_raw;
         let (precision, scale) = Self::adjust_precision_scale(precision_raw, scale_raw);
         DataType::Decimal { precision, scale }
+    }
+
+    /// Spark's decimal modulo result type.
+    pub fn decimal_mod_type(p1: u8, s1: u8, p2: u8, s2: u8) -> DataType {
+        let scale = s1.max(s2);
+        let int_digits = (p1 as i16 - s1 as i16).min(p2 as i16 - s2 as i16);
+        let (precision, scale_out) = Self::adjust_precision_scale(
+            int_digits + scale as i16, scale as i16);
+        DataType::Decimal { precision, scale: scale_out }
     }
 
     // ── Aggregate return types ─────────────────────────────────────────────────
@@ -128,7 +155,7 @@ impl TypeInferenceEngine {
                 Float | Double => Double,
                 Decimal { precision, scale } => {
                     let p = (*precision as u16 + 4).min(38) as u8;
-                    let s = (*scale + 4).min(38);
+                    let s = (*scale + 4).min(18).min(p);
                     Decimal { precision: p, scale: s }
                 }
                 _ => arg_type.clone(),
@@ -464,7 +491,7 @@ impl TypeInferenceEngine {
         DataType::Decimal { precision, scale }
     }
 
-    fn integral_to_decimal(dt: &DataType) -> DataType {
+    pub fn integral_to_decimal(dt: &DataType) -> DataType {
         match dt {
             DataType::Byte => DataType::Decimal { precision: 3, scale: 0 },
             DataType::Short => DataType::Decimal { precision: 5, scale: 0 },
@@ -534,6 +561,75 @@ mod tests {
         assert_eq!(TypeInferenceEngine::window_return_type("row_number", None), DataType::Integer);
         assert_eq!(TypeInferenceEngine::window_return_type("rank", None), DataType::Integer);
         assert!(TypeInferenceEngine::window_is_non_nullable("row_number"));
+    }
+
+    #[test]
+    fn unify_types_cases() {
+        use DataType::*;
+        // Same type
+        assert_eq!(TypeInferenceEngine::unify_types(&Integer, &Integer), Integer);
+        assert_eq!(TypeInferenceEngine::unify_types(&String, &String), String);
+        // Numeric promotion
+        assert_eq!(TypeInferenceEngine::unify_types(&Integer, &Long), Long);
+        assert_eq!(TypeInferenceEngine::unify_types(&Float, &Double), Double);
+        // Null is bottom type
+        assert_eq!(TypeInferenceEngine::unify_types(&Null, &Integer), Integer);
+        assert_eq!(TypeInferenceEngine::unify_types(&Integer, &Null), Integer);
+        assert_eq!(TypeInferenceEngine::unify_types(&Null, &String), String);
+        // Unresolved propagation
+        assert_eq!(TypeInferenceEngine::unify_types(&Unresolved, &Long), Long);
+        assert_eq!(TypeInferenceEngine::unify_types(&Long, &Unresolved), Long);
+        // Date + Timestamp
+        assert_eq!(TypeInferenceEngine::unify_types(&Date, &Timestamp), Timestamp);
+        assert_eq!(TypeInferenceEngine::unify_types(&Timestamp, &Date), Timestamp);
+        // Incompatible non-numeric → String
+        assert_eq!(TypeInferenceEngine::unify_types(&Boolean, &Date), String);
+        // Boolean + numeric → numeric (Spark coercion)
+        assert_eq!(TypeInferenceEngine::unify_types(&Boolean, &Integer), Integer);
+        assert_eq!(TypeInferenceEngine::unify_types(&Long, &Boolean), Long);
+    }
+
+    #[test]
+    fn decimal_div_type_cases() {
+        use DataType::*;
+        // Decimal(10,2) / Decimal(5,1) → scale=max(6,2+5+1)=8, prec=10-2+1+8=17
+        assert_eq!(
+            TypeInferenceEngine::decimal_div_type(10, 2, 5, 1),
+            Decimal { precision: 17, scale: 8 }
+        );
+        // Decimal(38,2) / Decimal(38,2) → overflow case
+        let result = TypeInferenceEngine::decimal_div_type(38, 2, 38, 2);
+        assert!(matches!(result, Decimal { precision: 38, .. }));
+    }
+
+    #[test]
+    fn decimal_mod_type_cases() {
+        use DataType::*;
+        // Decimal(10,2) % Decimal(10,2) → scale=2, int=min(8,8)=8, prec=10
+        assert_eq!(
+            TypeInferenceEngine::decimal_mod_type(10, 2, 10, 2),
+            Decimal { precision: 10, scale: 2 }
+        );
+        // Decimal(10,2) % Decimal(5,1) → scale=2, int=min(8,4)=4, prec=6
+        assert_eq!(
+            TypeInferenceEngine::decimal_mod_type(10, 2, 5, 1),
+            Decimal { precision: 6, scale: 2 }
+        );
+    }
+
+    #[test]
+    fn avg_decimal_scale_cap() {
+        use DataType::*;
+        // AVG(Decimal(10,2)) → prec=14, scale=min(min(6,18),14)=6
+        assert_eq!(
+            TypeInferenceEngine::aggregate_return_type("avg", &Decimal { precision: 10, scale: 2 }),
+            Decimal { precision: 14, scale: 6 }
+        );
+        // AVG(Decimal(10,16)) → prec=14, scale=min(min(20,18),14)=14
+        assert_eq!(
+            TypeInferenceEngine::aggregate_return_type("avg", &Decimal { precision: 10, scale: 16 }),
+            Decimal { precision: 14, scale: 14 }
+        );
     }
 
     #[test]

@@ -441,6 +441,14 @@ pub struct UpdateFieldsExpression {
 // ── Type inference on Expression ──────────────────────────────────────────────
 
 impl Expression {
+    /// Check if this expression is an untyped NULL literal (Spark semantics).
+    /// Untyped NULLs (Null, String, or Unresolved type) don't participate in CaseWhen type unification.
+    fn is_untyped_null(&self) -> bool {
+        matches!(self, Expression::Literal(lit)
+            if lit.value == LiteralValue::Null
+            && matches!(lit.data_type, DataType::Null | DataType::Unresolved))
+    }
+
     /// Infer the Spark DataType of this expression in the context of `schema`.
     pub fn data_type(&self, schema: &StructType) -> DataType {
         match self {
@@ -465,12 +473,27 @@ impl Expression {
                     Eq | NotEq | Lt | LtEq | Gt | GtEq | And | Or => DataType::Boolean,
                     Concat => DataType::String,
                     Div => {
-                        // Spark: integer / integer → Double (unlike most languages)
                         let lt = b.left.data_type(schema);
                         let rt = b.right.data_type(schema);
                         use DataType::*;
                         match (&lt, &rt) {
+                            // Spark: integer / integer → Double (unlike most languages)
                             (Byte | Short | Integer | Long, Byte | Short | Integer | Long) => Double,
+                            (Decimal { precision: p1, scale: s1 }, Decimal { precision: p2, scale: s2 }) => {
+                                TypeInferenceEngine::decimal_div_type(*p1, *s1, *p2, *s2)
+                            }
+                            (Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
+                                let dec2 = TypeInferenceEngine::integral_to_decimal(&rt);
+                                if let Decimal { precision: p2, scale: s2 } = dec2 {
+                                    TypeInferenceEngine::decimal_div_type(*p1, *s1, p2, s2)
+                                } else { Double }
+                            }
+                            (i, Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
+                                let dec1 = TypeInferenceEngine::integral_to_decimal(&lt);
+                                if let Decimal { precision: p1, scale: s1 } = dec1 {
+                                    TypeInferenceEngine::decimal_div_type(p1, s1, *p2, *s2)
+                                } else { Double }
+                            }
                             _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
                         }
                     }
@@ -490,6 +513,17 @@ impl Expression {
                         match (&lt, &rt) {
                             (DataType::Decimal { precision: p1, scale: s1 }, DataType::Decimal { precision: p2, scale: s2 }) => {
                                 TypeInferenceEngine::decimal_add_type(*p1, *s1, *p2, *s2)
+                            }
+                            _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
+                        }
+                    }
+                    Mod => {
+                        let lt = b.left.data_type(schema);
+                        let rt = b.right.data_type(schema);
+                        match (&lt, &rt) {
+                            (DataType::Decimal { precision: p1, scale: s1 },
+                             DataType::Decimal { precision: p2, scale: s2 }) => {
+                                TypeInferenceEngine::decimal_mod_type(*p1, *s1, *p2, *s2)
                             }
                             _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
                         }
@@ -524,13 +558,21 @@ impl Expression {
             }
             Expression::Cast(c) => c.to_type.clone(),
             Expression::CaseWhen(cw) => {
-                let branch_types = cw.branches.iter().map(|(_, r)| r.data_type(schema));
-                let else_type = cw.else_expr.as_ref().map(|e| e.data_type(schema));
-                let all_types: Vec<DataType> = branch_types.chain(else_type).collect();
-                all_types.into_iter().reduce(|acc, t| {
-                    use crate::types::TypeInferenceEngine;
-                    TypeInferenceEngine::promote_numeric(&acc, &t)
-                }).unwrap_or(DataType::Unresolved)
+                use crate::types::TypeInferenceEngine;
+                let branch_exprs = cw.branches.iter().map(|(_, r)| r);
+                let else_exprs = cw.else_expr.iter().map(|e| e.as_ref());
+                // Skip untyped NULL literals per Spark semantics
+                let typed: Vec<DataType> = branch_exprs.chain(else_exprs)
+                    .filter(|e| !e.is_untyped_null())
+                    .map(|e| e.data_type(schema))
+                    .collect();
+                if typed.is_empty() {
+                    DataType::String // all branches are untyped NULL → String
+                } else {
+                    typed.into_iter()
+                        .reduce(|acc, t| TypeInferenceEngine::unify_types(&acc, &t))
+                        .unwrap_or(DataType::Unresolved)
+                }
             }
             Expression::Window(w) => match w.func.as_ref() {
                 Expression::FunctionCall(f) => {

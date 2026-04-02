@@ -248,8 +248,12 @@ cargo test -- --nocapture
 # Quick check: TPC-H only
 ./tests/scripts/run-differential-tests.sh tpch
 
-# Strict mode (requires extension)
+# Strict mode (requires extension — must build with bundled-extension feature first)
+# cargo build --release --features bundled-extension
 THUNDERDUCK_COMPAT_MODE=strict ./tests/scripts/run-differential-tests.sh tpch
+
+# Strict mode via pytest (activate venv first)
+cd tests/integration && THUNDERDUCK_COMPAT_MODE=strict python3 -m pytest differential/ -v --tb=short
 
 # Direct pytest (activate venv first)
 cd tests/integration && python3 -m pytest differential/ -v --tb=short

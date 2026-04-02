@@ -4,6 +4,19 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-04-02 — CaseWhen Type Inference, Decimal Precision, Code Review
+
+[`dev_journal/2026-04-02-casewhen-decimal-review.md`](dev_journal/2026-04-02-casewhen-decimal-review.md)
+
+CaseWhen `unify_types()` fix (+178 strict tests), decimal precision fixes (div/mod/AVG/strict
+extension functions), two code review passes (17 findings), 8 performance optimizations.
+Gap analysis reclassified: Parquet nullable hypothesis debunked, all remaining failures in type
+derivation layer.
+
+**Tests**: 84 unit · 822 relaxed · 687 strict
+
+---
+
 ## 2026-04-02 — Agent Pipeline, Code Review, Performance Optimizations
 
 [`dev_journal/2026-04-02-agent-pipeline-review-perf.md`](dev_journal/2026-04-02-agent-pipeline-review-perf.md)

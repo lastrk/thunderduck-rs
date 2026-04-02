@@ -593,13 +593,7 @@ impl SqlGenerator {
             if needs_cast {
                 let target_types: Vec<DataType> = left_schema.fields.iter()
                     .zip(&right_schema.fields)
-                    .map(|(l, r)| {
-                        let promoted = TypeInferenceEngine::promote_numeric(&l.data_type, &r.data_type);
-                        // For non-numeric pairs promote_numeric returns Double — keep left type.
-                        if promoted == DataType::Double
-                            && !l.data_type.is_numeric() && !r.data_type.is_numeric()
-                        { l.data_type.clone() } else { promoted }
-                    })
+                    .map(|(l, r)| TypeInferenceEngine::unify_types(&l.data_type, &r.data_type))
                     .collect();
 
                 let left_cols = left_schema.fields.iter().zip(&target_types).map(|(f, t)| {
@@ -1427,6 +1421,15 @@ impl SqlGenerator {
     }
 
     fn gen_binary(&self, b: &BinaryExpression) -> Result<String> {
+        // Strict mode: decimal division uses spark_decimal_div() extension
+        if matches!(b.op, BinaryOp::Div) && self.mode == CompatMode::Strict {
+            let lt = b.left.data_type(&self.schema);
+            let rt = b.right.data_type(&self.schema);
+            if let Some(sql) = self.gen_strict_decimal_div(b, &lt, &rt)? {
+                return Ok(sql);
+            }
+        }
+
         let left = self.gen_expr_paren(&b.left, b.op.precedence())?;
         let right = self.gen_expr_paren(&b.right, b.op.precedence())?;
         let sql = format!("{left} {} {right}", b.op.symbol());
@@ -1439,6 +1442,39 @@ impl SqlGenerator {
             return Ok(format!("CAST({sql} AS DATE)"));
         }
         Ok(sql)
+    }
+
+    /// Generate strict-mode decimal division using spark_decimal_div() extension.
+    fn gen_strict_decimal_div(
+        &self, b: &BinaryExpression, lt: &DataType, rt: &DataType,
+    ) -> Result<Option<String>> {
+        use DataType::*;
+        let left_sql = self.gen_expr(&b.left)?;
+        let right_sql = self.gen_expr(&b.right)?;
+        match (lt, rt) {
+            (Decimal { .. }, Decimal { .. }) => {
+                Ok(Some(format!("spark_decimal_div({left_sql}, {right_sql})")))
+            }
+            (Decimal { .. }, i) if i.is_integral() => {
+                if let Decimal { precision, .. } = TypeInferenceEngine::integral_to_decimal(rt) {
+                    Ok(Some(format!(
+                        "spark_decimal_div({left_sql}, CAST({right_sql} AS DECIMAL({precision},0)))"
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
+            (i, Decimal { .. }) if i.is_integral() => {
+                if let Decimal { precision, .. } = TypeInferenceEngine::integral_to_decimal(lt) {
+                    Ok(Some(format!(
+                        "spark_decimal_div(CAST({left_sql} AS DECIMAL({precision},0)), {right_sql})"
+                    )))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Generate an expression, wrapping in parens if its precedence is lower than `parent_prec`.
@@ -2090,13 +2126,15 @@ fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType, mode: Comp
                         });
                     }
                     DataType::Decimal { precision, scale } if mode == CompatMode::Strict => {
-                        // Strict only: cast SUM(DECIMAL) to the Spark-bounded precision.
-                        // In relaxed mode, skip this cast — it truncates intermediate results
-                        // when the SUM is used in further arithmetic (e.g. division), causing
-                        // incorrect values (e.g. TPC-DS Q66 jan_sales_per_sq_foot).
+                        // Strict only: use spark_sum extension for DECIMAL inputs.
+                        let spark_sum_call = Expression::FunctionCall(FunctionCall {
+                            name: "spark_sum".to_owned(),
+                            args: f.args.clone(),
+                            distinct: false,
+                        });
                         let new_p = ((precision as u16) + 10).min(38) as u8;
                         return Expression::Cast(CastExpression {
-                            expr: Box::new(expr.clone()),
+                            expr: Box::new(spark_sum_call),
                             to_type: DataType::Decimal { precision: new_p, scale },
                             try_cast: false,
                         });
@@ -2130,7 +2168,7 @@ fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType, mode: Comp
                             distinct: false,
                         });
                         let new_p = ((precision as u16) + 4).min(38) as u8;
-                        let new_s = scale + 4;
+                        let new_s = (scale + 4).min(18).min(new_p);
                         return Expression::Cast(CastExpression {
                             expr: Box::new(spark_avg_call),
                             to_type: DataType::Decimal { precision: new_p, scale: new_s },

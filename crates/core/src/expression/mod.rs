@@ -1,4 +1,4 @@
-use crate::types::{DataType, StructType, TypeInferenceEngine};
+use crate::types::{DataType, StructField, StructType, TypeInferenceEngine};
 
 // ── Supporting types ──────────────────────────────────────────────────────────
 
@@ -541,6 +541,35 @@ impl Expression {
                 UnaryOp::Negate => u.operand.data_type(schema),
             },
             Expression::FunctionCall(f) => {
+                // Struct function special handling: resolve field types and nullable flags
+                if f.name.eq_ignore_ascii_case("named_struct") && f.args.len() >= 2 {
+                    let mut fields = Vec::new();
+                    let mut i = 0;
+                    while i + 1 < f.args.len() {
+                        let name = match &f.args[i] {
+                            Expression::Literal(l) => match &l.value {
+                                LiteralValue::String(s) => s.clone(),
+                                _ => format!("col{}", i / 2),
+                            },
+                            _ => format!("col{}", i / 2),
+                        };
+                        let val = &f.args[i + 1];
+                        fields.push(StructField::new(name, val.data_type(schema), val.nullable(schema)));
+                        i += 2;
+                    }
+                    return DataType::Struct(StructType::new(fields));
+                }
+                if f.name.eq_ignore_ascii_case("struct") {
+                    let fields: Vec<StructField> = f.args.iter().enumerate().map(|(i, arg)| {
+                        let name = match arg {
+                            Expression::Alias(a) => a.alias.clone(),
+                            _ => format!("col{i}"),
+                        };
+                        StructField::new(name, arg.data_type(schema), arg.nullable(schema))
+                    }).collect();
+                    return DataType::Struct(StructType::new(fields));
+                }
+
                 let arg_types: Vec<DataType> =
                     f.args.iter().map(|a| a.data_type(schema)).collect();
                 let dt = TypeInferenceEngine::function_return_type(&f.name, &arg_types);
@@ -601,7 +630,12 @@ impl Expression {
                 value: Box::new(m.value_type.clone()),
                 value_nullable: true,
             },
-            Expression::StructLiteral(_) => DataType::Unresolved,
+            Expression::StructLiteral(s) => {
+                let fields = s.fields.iter().map(|(name, expr)| {
+                    StructField::new(name.clone(), expr.data_type(schema), expr.nullable(schema))
+                }).collect();
+                DataType::Struct(StructType::new(fields))
+            }
             Expression::Between(_) => DataType::Boolean,
             Expression::Like(_) | Expression::IsDistinctFrom(_) => DataType::Boolean,
             Expression::Interval(_) => DataType::String, // TODO: proper IntervalType

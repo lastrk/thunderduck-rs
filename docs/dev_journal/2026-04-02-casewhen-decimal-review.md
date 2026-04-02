@@ -90,10 +90,27 @@ test. The precision logic is correct for when nullable issues are resolved.
 
 Strict mode failures reclassified after investigation showed the original 8.1 hypothesis
 (Parquet REQUIRED/OPTIONAL metadata) was wrong — Spark calls `asNullable` on Parquet reads,
-making all source columns nullable (same as DuckDB). All 148 remaining failures are in the
-type derivation layer: struct nullable (35-40), column nullable propagation (30-35),
-array containsNull (25-30), HOF result types (15-20), math function nullable (10-15),
-map construction (5-10).
+making all source columns nullable (same as DuckDB). All 140 remaining failures are in the
+type derivation layer: column nullable propagation (30-35), array containsNull (25-30),
+HOF result types (15-20), math function nullable (10-15), map construction (5-10),
+remaining struct (residual).
+
+---
+
+## Struct Field Nullable Fix (+8 strict mode tests)
+
+**Problem**: `StructLiteral.data_type()` returned `DataType::Unresolved`, and
+`function_return_type()` returned `String` for struct/named_struct. No code resolved
+per-field types or nullable flags from value expressions.
+
+**Fix**:
+- `StructLiteral.data_type()` iterates `(name, expr)` fields, calls `expr.data_type(schema)`
+  and `expr.nullable(schema)` for each, builds `DataType::Struct(StructType::new(fields))`
+- `named_struct` FunctionCall: parses alternating name/value args, builds StructType
+- `struct` FunctionCall: uses alias names or positional `col{i}`, builds StructType
+- `function_return_type()` returns `Unresolved` for struct/named_struct (was `String`)
+
+**Result**: Strict mode 687 → 695 passed (+8).
 
 ---
 
@@ -101,4 +118,4 @@ map construction (5-10).
 
 - **Unit tests**: 84 passing (3 new decimal tests, 1 new unify_types test)
 - **Relaxed mode**: 822 passing, 8 pre-existing failures (6 map + Q40 + Q66), 6 skipped
-- **Strict mode**: 687 passing, 148 failed, 1 skipped
+- **Strict mode**: 695 passing, 140 failed, 1 skipped

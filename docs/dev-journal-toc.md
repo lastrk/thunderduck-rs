@@ -4,16 +4,16 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
-## 2026-04-02 — CaseWhen Type Inference, Decimal Precision, Code Review
+## 2026-04-02 — CaseWhen, Decimal, Struct Nullable, Code Review, Perf
 
 [`dev_journal/2026-04-02-casewhen-decimal-review.md`](dev_journal/2026-04-02-casewhen-decimal-review.md)
 
 CaseWhen `unify_types()` fix (+178 strict tests), decimal precision fixes (div/mod/AVG/strict
-extension functions), two code review passes (17 findings), 8 performance optimizations.
-Gap analysis reclassified: Parquet nullable hypothesis debunked, all remaining failures in type
-derivation layer.
+extension functions), struct field nullable resolution (+8 strict tests), two code review passes
+(17 findings), 8 performance optimizations. Gap analysis reclassified: Parquet nullable
+hypothesis debunked, all remaining failures in type derivation layer.
 
-**Tests**: 84 unit · 822 relaxed · 687 strict
+**Tests**: 84 unit · 822 relaxed · 695 strict
 
 ---
 

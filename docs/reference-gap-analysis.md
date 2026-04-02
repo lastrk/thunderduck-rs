@@ -175,10 +175,11 @@ in isolation and in sub-suite runs. Not a code regression.
 
 ---
 
-## Section 8 — Strict mode failures (148 as of 2026-04-02)
+## Section 8 — Strict mode failures (140 as of 2026-04-02)
 
 **History**: Strict mode baseline **405/836** → nullable inference overhaul **508/836** →
-CaseWhen `unify_types` fix + review fixes **686/836** → decimal precision fixes **687/836**.
+CaseWhen `unify_types` fix + review fixes **686/836** → decimal precision fixes **687/836** →
+struct field nullable **695/836**.
 
 Relaxed mode: **824/836** (6 skipped, 6 pre-existing map failures, 2 pre-existing TPC-DS).
 
@@ -210,13 +211,18 @@ also have nullable mismatches (8.2/8.3), so the precision fix alone doesn't flip
 **Affected tests**: TPC-H Q1/Q8/Q11/Q14/Q17 (SQL + DataFrame), TPC-DS Q2/Q5/Q9/Q12/Q20 and
 ~35 other TPC-DS queries, basic aggregation decimal tests.
 
-### 8.2 Struct field nullable — ~35-40 tests
+### 8.2 Struct field nullable — ~35-40 tests (PARTIALLY CLOSED 2026-04-02)
 
-**Root cause**: Thunderduck marks all struct fields as `nullable=true` regardless of input
-expression nullability. Spark uses static analysis to determine struct field nullability.
+**Fixes applied (2026-04-02)**:
+- `StructLiteral.data_type()` now resolves field types and nullable flags from value expressions
+  (was returning `DataType::Unresolved`)
+- `named_struct`/`struct` FunctionCall special handling added — parses alternating name/value
+  pairs and builds proper StructType with per-field nullable flags
+- `function_return_type()` returns `Unresolved` for struct/named_struct (was `String`),
+  deferring to the special handling
 
-**Example**: `NAMED_STRUCT('field', 123)` — the field should be `nullable=false` (literal
-integer is never null) but Thunderduck marks it `nullable=true`.
+**Result**: +8 strict mode tests fixed. Remaining struct failures likely involve nested structs
+from other code paths (projections, aggregates) that don't go through StructLiteral.
 
 **Affected tests**: `test_type_literals_differential.py` struct tests, complex nested types,
 `test_complex_types_differential.py`.

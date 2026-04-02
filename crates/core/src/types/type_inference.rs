@@ -420,7 +420,8 @@ impl TypeInferenceEngine {
             "map_entries" => Unresolved, // struct array
 
             // ── Struct ────────────────────────────────────────────────────────
-            "struct" | "named_struct" | "to_csv" => String,
+            "to_csv" => String,
+            "struct" | "named_struct" => Unresolved,
 
             // ── Hash / fingerprint ────────────────────────────────────────────
             "hash" | "xxhash64" | "murmur3" => Integer,

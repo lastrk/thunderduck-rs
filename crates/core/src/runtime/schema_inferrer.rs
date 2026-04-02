@@ -54,12 +54,18 @@ fn arrow_type_to_core(dt: &ArrowDataType) -> DataType {
         ArrowDataType::Binary | ArrowDataType::LargeBinary => DataType::Binary,
         ArrowDataType::Date32 | ArrowDataType::Date64 => DataType::Date,
         ArrowDataType::Timestamp(_, _) => DataType::Timestamp,
-        ArrowDataType::Decimal128(p, s) => DataType::Decimal {
-            precision: *p,
-            scale: (*s).max(0) as u8,
-        },
+        ArrowDataType::Decimal128(p, s) => {
+            // DuckDB represents HUGEINT (the return type of SUM over integer columns) as
+            // Decimal128(38, 0) in Arrow. Spark returns Long (BIGINT) for integer SUM.
+            // Map this specific case to Long so the reported type matches Spark expectations.
+            if *p == 38 && *s == 0 {
+                DataType::Long
+            } else {
+                DataType::Decimal { precision: *p, scale: (*s).max(0) as u8 }
+            }
+        }
         ArrowDataType::List(field) | ArrowDataType::LargeList(field) => {
-            DataType::Array(Box::new(arrow_type_to_core(field.data_type())))
+            DataType::Array(Box::new(arrow_type_to_core(field.data_type())), field.is_nullable())
         }
         ArrowDataType::Map(field, _) => {
             // Arrow Map field is a Struct { key, value }

@@ -55,8 +55,10 @@ impl SqlGenerator {
 
     /// Generate a complete SQL statement from the plan.
     pub fn generate(&self, plan: &LogicalPlan) -> Result<String> {
+        static DEBUG_SQL: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("TD_DEBUG_SQL").is_ok());
         let sql = self.gen_plan(plan)?;
-        if std::env::var("TD_DEBUG_SQL").is_ok() {
+        if *DEBUG_SQL {
             eprintln!("=== TD_DEBUG_SQL ===\n{sql}\n===================");
         }
         Ok(sql)
@@ -172,7 +174,7 @@ impl SqlGenerator {
         ae: &crate::logical::AggregateExpr,
         input_schema: &StructType,
     ) -> Result<String> {
-        let func = apply_agg_type_casts(&ae.func, input_schema);
+        let func = apply_agg_type_casts(&ae.func, input_schema, self.mode);
         let mut s = self.gen_expr(&func)?;
         if ae.is_distinct {
             s = inject_distinct(s);
@@ -223,7 +225,9 @@ impl SqlGenerator {
                 match entry {
                     SelectEntry::GroupingExpr(g) => parts.push(self.gen_expr(g)?),
                     SelectEntry::AggregateExpr(idx) => {
-                        parts.push(self.render_agg_expr(&a.aggregates[*idx], &input_schema)?);
+                        if let Some(agg) = a.aggregates.get(*idx) {
+                            parts.push(self.render_agg_expr(agg, &input_schema)?);
+                        }
                     }
                     SelectEntry::GroupingNotSelected => {
                         // Sentinel: GROUP BY key not in SQL SELECT — suppress auto-prepend, render nothing.
@@ -1201,7 +1205,7 @@ impl SqlGenerator {
         match plan {
             // These are already valid FROM targets without wrapping
             LogicalPlan::TableScan(ts) => self.gen_table_scan(ts),
-            LogicalPlan::SqlRelation(sr) => Ok(format!("({})", sr.sql)),
+            LogicalPlan::SqlRelation(sr) => self.gen_sql_relation(sr),
             LogicalPlan::InMemoryRelation(imr) => self.gen_in_memory_relation(imr),
             LogicalPlan::RangeRelation(rr) => self.gen_range_relation(rr),
             LogicalPlan::LocalRelation(lr) => self.gen_local_relation(lr),
@@ -1581,6 +1585,17 @@ impl SqlGenerator {
     }
 
     fn gen_window(&self, w: &WindowFunction) -> Result<String> {
+        // Extension functions (thdck_avg, spark_sum, etc.) are custom scalar aggregates
+        // that do NOT support the OVER clause. Window function bodies must always use
+        // native DuckDB aggregate names regardless of the outer CompatMode.
+        let relaxed_for_window;
+        let window_func_gen: &SqlGenerator = if self.mode == CompatMode::Strict {
+            relaxed_for_window = SqlGenerator::relaxed();
+            &relaxed_for_window
+        } else {
+            self
+        };
+
         // Handle first/last/nth_value with ignore_nulls argument.
         // Spark: first(col, ignorenulls=True) → DuckDB: first_value(col IGNORE NULLS)
         let func = if let Expression::FunctionCall(f) = &*w.func {
@@ -1597,7 +1612,7 @@ impl SqlGenerator {
                     .unwrap_or(false);
                 let col_args: Vec<String> = f.args.iter()
                     .take(nulls_idx)
-                    .map(|a| self.gen_expr(a))
+                    .map(|a| window_func_gen.gen_expr(a))
                     .collect::<Result<Vec<_>>>()?;
                 let col_str = col_args.join(", ");
                 if ignore_nulls {
@@ -1606,10 +1621,10 @@ impl SqlGenerator {
                     format!("{duckdb_name}({col_str})")
                 }
             } else {
-                self.gen_expr(&w.func)?
+                window_func_gen.gen_expr(&w.func)?
             }
         } else {
-            self.gen_expr(&w.func)?
+            window_func_gen.gen_expr(&w.func)?
         };
 
         let mut over_parts = Vec::new();
@@ -1726,7 +1741,7 @@ impl SqlGenerator {
         let fields = s.fields.iter()
             .map(|(name, expr)| {
                 let e = self.gen_expr(expr)?;
-                Ok(format!("{name}: {e}"))
+                Ok(format!("{}: {e}", quote_ident(name)))
             })
             .collect::<Result<Vec<_>>>()?
             .join(", ");
@@ -1767,10 +1782,10 @@ impl SqlGenerator {
     /// Ported from `IntervalExpression.toSQL()` in the Java reference.
     /// Handles year-month, day-time (microsecond decomposition), and calendar intervals.
     fn gen_interval(&self, i: &IntervalExpression) -> Result<String> {
-        const MICROS_PER_SECOND: i64 = 1_000_000;
-        const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
-        const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
-        const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
+        const MICROS_PER_SECOND: u64 = 1_000_000;
+        const MICROS_PER_MINUTE: u64 = 60 * MICROS_PER_SECOND;
+        const MICROS_PER_HOUR: u64 = 60 * MICROS_PER_MINUTE;
+        const MICROS_PER_DAY: u64 = 24 * MICROS_PER_HOUR;
 
         // Determine which type of interval this is
         let has_months = i.months != 0;
@@ -1790,7 +1805,7 @@ impl SqlGenerator {
         if !has_months && !has_days {
             // Day-time interval: decompose microseconds
             let negative = i.microseconds < 0;
-            let abs_micros = i.microseconds.unsigned_abs() as i64;
+            let abs_micros = i.microseconds.unsigned_abs();
 
             let days_part = abs_micros / MICROS_PER_DAY;
             let remaining = abs_micros % MICROS_PER_DAY;
@@ -2016,9 +2031,15 @@ fn gen_literal(v: &LiteralValue) -> Result<String> {
 
 /// Double-quote an identifier, escaping any embedded double-quotes.
 pub fn quote_ident(name: &str) -> String {
-    // If already a simple ASCII alphanumeric + underscore starting with letter/underscore
-    // and not a reserved word, we could skip quoting, but for safety always quote.
-    format!("\"{}\"", name.replace('"', "\"\""))
+    if !name.contains('"') {
+        let mut s = String::with_capacity(name.len() + 2);
+        s.push('"');
+        s.push_str(name);
+        s.push('"');
+        s
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
 }
 
 /// Wrap aggregate expressions with CASTs to match Spark's return types:
@@ -2048,10 +2069,10 @@ fn expr_contains_decimal_cast(expr: &Expression) -> bool {
 
 /// - `AVG(decimal{p,s})` → `CAST(AVG(...) AS DECIMAL(min(p+4,38), s+4))`
 /// Passes through aliases transparently so the alias is preserved on the outer Cast.
-fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType) -> Expression {
+fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType, mode: CompatMode) -> Expression {
     match expr {
         Expression::Alias(a) => {
-            let inner = apply_agg_type_casts(&a.expr, input_schema);
+            let inner = apply_agg_type_casts(&a.expr, input_schema, mode);
             Expression::Alias(AliasExpression { expr: Box::new(inner), alias: a.alias.clone() })
         }
         Expression::FunctionCall(f)
@@ -2061,13 +2082,18 @@ fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType) -> Express
                 let arg_type = arg.data_type(input_schema);
                 match arg_type {
                     DataType::Byte | DataType::Short | DataType::Integer | DataType::Long => {
+                        // Both modes: cast integer SUM → Long to avoid DuckDB's HUGEINT.
                         return Expression::Cast(CastExpression {
                             expr: Box::new(expr.clone()),
                             to_type: DataType::Long,
                             try_cast: false,
                         });
                     }
-                    DataType::Decimal { precision, scale } => {
+                    DataType::Decimal { precision, scale } if mode == CompatMode::Strict => {
+                        // Strict only: cast SUM(DECIMAL) to the Spark-bounded precision.
+                        // In relaxed mode, skip this cast — it truncates intermediate results
+                        // when the SUM is used in further arithmetic (e.g. division), causing
+                        // incorrect values (e.g. TPC-DS Q66 jan_sales_per_sq_foot).
                         let new_p = ((precision as u16) + 10).min(38) as u8;
                         return Expression::Cast(CastExpression {
                             expr: Box::new(expr.clone()),
@@ -2087,17 +2113,26 @@ fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType) -> Express
                 let arg_type = arg.data_type(input_schema);
                 match arg_type {
                     DataType::Byte | DataType::Short | DataType::Integer | DataType::Long => {
+                        // Both modes: cast integer AVG → Double.
                         return Expression::Cast(CastExpression {
                             expr: Box::new(expr.clone()),
                             to_type: DataType::Double,
                             try_cast: false,
                         });
                     }
-                    DataType::Decimal { precision, scale } => {
+                    DataType::Decimal { precision, scale } if mode == CompatMode::Strict => {
+                        // Strict only: use spark_avg for DECIMAL inputs (the extension only
+                        // supports DECIMAL — integer/double inputs use native AVG above/below).
+                        // spark_avg returns DECIMAL(min(p+4,38), s+4) per Spark semantics.
+                        let spark_avg_call = Expression::FunctionCall(FunctionCall {
+                            name: "spark_avg".to_string(),
+                            args: f.args.clone(),
+                            distinct: false,
+                        });
                         let new_p = ((precision as u16) + 4).min(38) as u8;
                         let new_s = scale + 4;
                         return Expression::Cast(CastExpression {
-                            expr: Box::new(expr.clone()),
+                            expr: Box::new(spark_avg_call),
                             to_type: DataType::Decimal { precision: new_p, scale: new_s },
                             try_cast: false,
                         });
@@ -2111,6 +2146,11 @@ fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType) -> Express
     }
 }
 
+/// Inserts `DISTINCT ` after the first `(` in a SQL function call string.
+///
+/// Precondition: `s` must be a simple `func(args)` call — not a wrapped
+/// expression like `CAST(func(...) AS ...)`. The function locates the first
+/// `(` character and inserts immediately after it.
 fn inject_distinct(mut s: String) -> String {
     if let Some(pos) = s.find('(') {
         s.insert_str(pos + 1, "DISTINCT ");
@@ -2485,7 +2525,16 @@ fn rewrite_named_struct(sql: &str) -> String {
                 b'\'' | b'"' => {
                     let quote = bytes[k];
                     k += 1;
-                    while k < bytes.len() && bytes[k] != quote { k += 1; }
+                    while k < bytes.len() {
+                        if bytes[k] == quote {
+                            if k + 1 < bytes.len() && bytes[k + 1] == quote {
+                                k += 2;
+                                continue;
+                            }
+                            break;
+                        }
+                        k += 1;
+                    }
                 }
                 _ => {}
             }
@@ -2499,7 +2548,7 @@ fn rewrite_named_struct(sql: &str) -> String {
             // Build struct literal: {key: val, ...}
             let fields: Vec<String> = args.chunks(2).map(|pair| {
                 let key = pair[0].trim().trim_matches('\'').trim_matches('"');
-                format!("{}: {}", key, pair[1].trim())
+                format!("\"{}\": {}", key.replace('"', "\"\""), pair[1].trim())
             }).collect();
             result.push_str(&format!("{{{}}}", fields.join(", ")));
         } else {
@@ -3286,7 +3335,7 @@ mod tests {
     }
 
     fn table(name: &str) -> LogicalPlan {
-        LogicalPlan::TableScan(TableScan { table: name.to_string(), alias: None })
+        LogicalPlan::TableScan(TableScan { table: name.to_string(), alias: None, schema: Default::default() })
     }
 
     fn col(name: &str) -> Expression {

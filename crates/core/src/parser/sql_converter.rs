@@ -251,10 +251,24 @@ impl SqlConverter {
             SetExpr::Query(q) => self.convert_query(*q),
             // 6H-a: VALUES clause — pass through using sqlparser Display as DuckDB-compatible SQL
             SetExpr::Values(values) => {
-                // DuckDB supports standard VALUES syntax, use sqlparser Display directly
+                // DuckDB supports standard VALUES syntax, use sqlparser Display directly.
+                // Build a schema from the first row's literal types so that AliasedRelation
+                // can propagate column names + nullable=false to callers (e.g. analyze_plan).
+                let schema = if let Some(first_row) = values.rows.first() {
+                    use crate::types::StructField;
+                    let fields: Vec<StructField> = first_row.iter().enumerate()
+                        .map(|(i, expr)| {
+                            let (dt, nullable) = infer_value_literal_type(expr);
+                            StructField { name: format!("col_{i}"), data_type: dt, nullable }
+                        })
+                        .collect();
+                    StructType::new(fields)
+                } else {
+                    StructType::empty()
+                };
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql: format!("{}", values),
-                    schema: StructType::empty(),
+                    schema,
                 }))
             }
             other => Err(ThunderduckError::Unsupported(format!("set expression not supported: {:?}", other))),
@@ -356,7 +370,7 @@ impl SqlConverter {
             TableFactor::Table { name, alias, .. } => {
                 let table = self.object_name_to_string(&name);
                 let alias_str = alias.map(|a| a.name.value);
-                Ok(LogicalPlan::TableScan(TableScan { table, alias: alias_str }))
+                Ok(LogicalPlan::TableScan(TableScan { table, alias: alias_str, schema: Default::default() }))
             }
             TableFactor::Derived { subquery, alias, .. } => {
                 let inner = self.convert_query(*subquery)?;
@@ -1165,8 +1179,8 @@ impl SqlConverter {
             SqlDataType::Double(_) | SqlDataType::Float8 | SqlDataType::DoublePrecision => Ok(DataType::Double),
             SqlDataType::Decimal(info) | SqlDataType::Numeric(info) => {
                 match info {
-                    ExactNumberInfo::PrecisionAndScale(p, s) => Ok(DataType::Decimal { precision: p as u8, scale: s as u8 }),
-                    ExactNumberInfo::Precision(p) => Ok(DataType::Decimal { precision: p as u8, scale: 0 }),
+                    ExactNumberInfo::PrecisionAndScale(p, s) => Ok(DataType::Decimal { precision: u8::try_from(p).unwrap_or(38), scale: u8::try_from(s).unwrap_or(0) }),
+                    ExactNumberInfo::Precision(p) => Ok(DataType::Decimal { precision: u8::try_from(p).unwrap_or(38), scale: 0 }),
                     ExactNumberInfo::None => Ok(DataType::Decimal { precision: 38, scale: 18 }),
                 }
             }
@@ -1178,9 +1192,9 @@ impl SqlConverter {
                 match elem {
                     ArrayElemTypeDef::AngleBracket(inner) | ArrayElemTypeDef::SquareBracket(inner, _) | ArrayElemTypeDef::Parenthesis(inner) => {
                         let inner_type = self.convert_data_type(*inner)?;
-                        Ok(DataType::Array(Box::new(inner_type)))
+                        Ok(DataType::Array(Box::new(inner_type), true))
                     }
-                    ArrayElemTypeDef::None => Ok(DataType::Array(Box::new(DataType::Unresolved))),
+                    ArrayElemTypeDef::None => Ok(DataType::Array(Box::new(DataType::Unresolved), true)),
                 }
             }
             other => Err(ThunderduckError::Unsupported(format!("data type not supported: {:?}", other))),
@@ -1399,5 +1413,35 @@ mod tests {
             }
             other => panic!("expected Aggregate, got {:?}", other),
         }
+    }
+}
+
+/// Infer the Thunderduck DataType and nullable flag for a VALUES literal expression.
+/// Non-null literals are non-nullable; NULL literals are nullable with unknown type (String).
+fn infer_value_literal_type(expr: &Expr) -> (DataType, bool) {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            Value::Number(s, _) => {
+                if s.contains('.') || s.to_lowercase().contains('e') {
+                    (DataType::Double, false)
+                } else if s.parse::<i32>().is_ok() {
+                    (DataType::Integer, false)
+                } else {
+                    (DataType::Long, false)
+                }
+            }
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) => (DataType::String, false),
+            Value::Boolean(_) => (DataType::Boolean, false),
+            Value::Null => (DataType::String, true),
+            _ => (DataType::String, false),
+        },
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => {
+            let (dt, _nullable) = infer_value_literal_type(inner);
+            (dt, false)
+        }
+        Expr::Cast { .. } => {
+            (DataType::String, false) // rough fallback; cast expressions are non-null
+        }
+        _ => (DataType::String, false),
     }
 }

@@ -98,7 +98,7 @@ impl<'a> RelationConverter<'a> {
             Some(RelType::Catalog(cat)) => self.convert_catalog(cat),
             _ => Err(ConnectError::Unsupported(format!(
                 "Unsupported relation type: {:?}",
-                std::mem::discriminant(relation.rel_type.as_ref().unwrap())
+                relation.rel_type.as_ref().map(|t| std::mem::discriminant(t))
             ))),
         }
     }
@@ -336,8 +336,8 @@ impl<'a> RelationConverter<'a> {
         let (condition, left_alias, right_alias) = if needs_aliases {
             // Use a distinct alias format (__td_jl_N__ / __td_jr_M__) so the generator can
             // tell these apart from raw plan_id qualifiers (__plan_id_X__) and not strip them.
-            let la = format!("__td_jl_{}__", left_outer_id.unwrap());
-            let ra = format!("__td_jr_{}__", right_outer_id.unwrap());
+            let la = format!("__td_jl_{}__", left_outer_id.ok_or_else(|| ConnectError::PlanConversion("join alias: left plan_id missing".into()))?);
+            let ra = format!("__td_jr_{}__", right_outer_id.ok_or_else(|| ConnectError::PlanConversion("join alias: right plan_id missing".into()))?);
             let qualified = raw_condition.map(|c| qualify_join_condition(c, &left_ids_set, &right_ids_set, &la, &ra));
             (qualified, Some(la), Some(ra))
         } else {
@@ -435,10 +435,13 @@ impl<'a> RelationConverter<'a> {
     fn convert_read(&mut self, r: &proto::Read) -> Result<LogicalPlan> {
         use proto::read::ReadType;
         match &r.read_type {
-            Some(ReadType::NamedTable(nt)) => Ok(LogicalPlan::TableScan(TableScan {
-                table: nt.unparsed_identifier.clone(),
-                alias: None,
-            })),
+            Some(ReadType::NamedTable(nt)) => {
+                let table = nt.unparsed_identifier.clone();
+                // Query DuckDB for the registered table/view schema so that aggregate
+                // type inference (SUM/AVG over DECIMAL columns) produces correct Spark types.
+                let schema = self.infer_table_schema(&table).unwrap_or_default();
+                Ok(LogicalPlan::TableScan(TableScan { table, alias: None, schema }))
+            },
             Some(ReadType::DataSource(ds)) => {
                 if ds.paths.is_empty() {
                     return Err(ConnectError::PlanConversion(
@@ -470,7 +473,23 @@ impl<'a> RelationConverter<'a> {
                     format!("[{}]", quoted.join(", "))
                 };
                 let sql = format!("SELECT * FROM {reader}({paths_sql})");
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                // Populate schema: prefer proto `ds.schema` (DDL from PySpark Parquet metadata)
+                // when non-empty, then fall back to querying DuckDB for the file schema.
+                // DuckDB correctly reports DECIMAL(15,2) etc. from Parquet metadata, giving us
+                // the input types needed for Spark-accurate arithmetic type inference.
+                // Note: PySpark sends ds.schema="" (empty string, not None) for unset schema.
+                let schema = match ds.schema.as_deref().filter(|s| !s.trim().is_empty()) {
+                    Some(schema_str) => parse_ddl_schema(schema_str).ok().unwrap_or_default(),
+                    None => {
+                        // Ask DuckDB for the parquet/CSV file schema (LIMIT 0 — no data read).
+                        let placeholder = LogicalPlan::SqlRelation(SqlRelation {
+                            sql: sql.clone(),
+                            schema: StructType::empty(),
+                        });
+                        self.infer_full_schema(&placeholder).unwrap_or_default()
+                    }
+                };
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema }))
             }
             None => Err(ConnectError::PlanConversion("Read missing read_type".into())),
         }
@@ -507,8 +526,82 @@ impl<'a> RelationConverter<'a> {
     }
 
     fn convert_sql(&self, s: &proto::Sql) -> Result<LogicalPlan> {
+        use thunderduck_core::functions::CompatMode;
         use thunderduck_core::parser::SparkSqlParser;
-        SparkSqlParser::parse(&s.query).map_err(ConnectError::from)
+        let plan = SparkSqlParser::parse(&s.query).map_err(ConnectError::from)?;
+        // Enrich TableScan leaves only in strict mode.
+        // In relaxed mode the enriched INTEGER types feed apply_agg_type_casts and add
+        // BIGINT casts that corrupt decimal arithmetic (e.g. TPC-DS Q66/Q12/Q20/Q98).
+        let strict = self.session.as_ref().map(|s| s.mode()) == Some(CompatMode::Strict);
+        if strict {
+            Ok(self.enrich_table_scans(plan))
+        } else {
+            Ok(plan)
+        }
+    }
+
+    /// Recursively walk a plan tree, populating empty `TableScan.schema` fields by
+    /// querying DuckDB. Only enriches when a session is available; otherwise a no-op.
+    fn enrich_table_scans(&self, plan: LogicalPlan) -> LogicalPlan {
+        use thunderduck_core::logical::*;
+        match plan {
+            LogicalPlan::TableScan(mut ts) if ts.schema.is_empty() => {
+                if let Ok(schema) = self.infer_table_schema(&ts.table) {
+                    ts.schema = schema;
+                }
+                LogicalPlan::TableScan(ts)
+            }
+            LogicalPlan::Project(mut p) => {
+                p.input = Box::new(self.enrich_table_scans(*p.input));
+                LogicalPlan::Project(p)
+            }
+            LogicalPlan::Filter(mut f) => {
+                f.input = Box::new(self.enrich_table_scans(*f.input));
+                LogicalPlan::Filter(f)
+            }
+            LogicalPlan::Aggregate(mut a) => {
+                a.input = Box::new(self.enrich_table_scans(*a.input));
+                LogicalPlan::Aggregate(a)
+            }
+            LogicalPlan::Sort(mut s) => {
+                s.input = Box::new(self.enrich_table_scans(*s.input));
+                LogicalPlan::Sort(s)
+            }
+            LogicalPlan::Limit(mut l) => {
+                l.input = Box::new(self.enrich_table_scans(*l.input));
+                LogicalPlan::Limit(l)
+            }
+            LogicalPlan::Join(mut j) => {
+                j.left = Box::new(self.enrich_table_scans(*j.left));
+                j.right = Box::new(self.enrich_table_scans(*j.right));
+                LogicalPlan::Join(j)
+            }
+            LogicalPlan::Union(mut u) => {
+                u.left = Box::new(self.enrich_table_scans(*u.left));
+                u.right = Box::new(self.enrich_table_scans(*u.right));
+                LogicalPlan::Union(u)
+            }
+            LogicalPlan::Except(mut e) => {
+                e.left = Box::new(self.enrich_table_scans(*e.left));
+                e.right = Box::new(self.enrich_table_scans(*e.right));
+                LogicalPlan::Except(e)
+            }
+            LogicalPlan::Intersect(mut i) => {
+                i.left = Box::new(self.enrich_table_scans(*i.left));
+                i.right = Box::new(self.enrich_table_scans(*i.right));
+                LogicalPlan::Intersect(i)
+            }
+            LogicalPlan::Distinct(mut d) => {
+                d.input = Box::new(self.enrich_table_scans(*d.input));
+                LogicalPlan::Distinct(d)
+            }
+            LogicalPlan::AliasedRelation(mut ar) => {
+                ar.input = Box::new(self.enrich_table_scans(*ar.input));
+                LogicalPlan::AliasedRelation(ar)
+            }
+            // All other variants: return unchanged
+            other => other,
+        }
     }
 
     fn convert_subquery_alias(&mut self, sa: &proto::SubqueryAlias) -> Result<LogicalPlan> {
@@ -1136,7 +1229,7 @@ impl<'a> RelationConverter<'a> {
             }
             _ => Err(ConnectError::Unsupported(format!(
                 "Unsupported catalog operation: {:?}",
-                std::mem::discriminant(cat.cat_type.as_ref().unwrap())
+                cat.cat_type.as_ref().map(|t| std::mem::discriminant(t))
             ))),
         }
     }
@@ -1161,6 +1254,25 @@ impl<'a> RelationConverter<'a> {
             })
             .map_err(|e| ConnectError::PlanConversion(format!("schema inference: {e}")))?;
             Ok(struct_type.fields.into_iter().map(|f| f.name).collect())
+        } else {
+            Err(ConnectError::Unsupported(
+                "Schema inference required but no session available".into(),
+            ))
+        }
+    }
+
+    /// Infer the schema of a named table/view using `SELECT * FROM table LIMIT 0`.
+    fn infer_table_schema(&self, table: &str) -> Result<StructType> {
+        if let Some(session) = &self.session {
+            use thunderduck_core::generator::quote_ident;
+            let sql = format!("SELECT * FROM {}", quote_ident(table));
+            let session = Arc::clone(session);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    SchemaInferrer::new(&session).infer_sql(&sql).await
+                })
+            })
+            .map_err(|e| ConnectError::PlanConversion(format!("table schema inference: {e}")))
         } else {
             Err(ConnectError::Unsupported(
                 "Schema inference required but no session available".into(),
@@ -1286,7 +1398,7 @@ fn arrow_field_to_data_type(dt: &arrow::datatypes::DataType) -> DataType {
         ArrowDT::Timestamp(_, _) => DataType::Timestamp,
         ArrowDT::Decimal128(p, s) => DataType::Decimal { precision: *p, scale: *s as u8 },
         ArrowDT::List(f) | ArrowDT::LargeList(f) => {
-            DataType::Array(Box::new(arrow_field_to_data_type(f.data_type())))
+            DataType::Array(Box::new(arrow_field_to_data_type(f.data_type())), f.is_nullable())
         }
         ArrowDT::Map(field, _) => {
             if let ArrowDT::Struct(fields) = field.data_type() {
@@ -1474,7 +1586,7 @@ fn parse_json_type_object(obj: &str) -> DataType {
             let elem = json_string_value(obj, "elementType")
                 .map(|t| parse_type_str(&t))
                 .unwrap_or(DataType::Unresolved);
-            DataType::Array(Box::new(elem))
+            DataType::Array(Box::new(elem), true)
         }
         "map" => {
             let key_dt = json_string_value(obj, "keyType")
@@ -1609,93 +1721,117 @@ fn local_relation_to_values_sql(data: &[u8]) -> Result<String> {
         return Err(ConnectError::PlanConversion("empty arrow data".into()));
     }
 
-    fn val(array: &dyn Array, row: usize) -> String {
+    fn val(array: &dyn Array, row: usize) -> Result<String> {
         if array.is_null(row) {
-            return "NULL".to_string();
+            return Ok("NULL".to_string());
         }
         match array.data_type() {
             ArrowDT::Boolean => {
-                let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-                if a.value(row) { "true".to_string() } else { "false".to_string() }
+                let a = array.as_any().downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?;
+                Ok(if a.value(row) { "true".to_string() } else { "false".to_string() })
             }
             ArrowDT::Int8 => {
-                array.as_any().downcast_ref::<Int8Array>().unwrap().value(row).to_string()
+                let v = array.as_any().downcast_ref::<Int8Array>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                    .value(row);
+                Ok(format!("{v}::TINYINT"))
             }
             ArrowDT::Int16 => {
-                array.as_any().downcast_ref::<Int16Array>().unwrap().value(row).to_string()
+                let v = array.as_any().downcast_ref::<Int16Array>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                    .value(row);
+                Ok(format!("{v}::SMALLINT"))
             }
             ArrowDT::Int32 => {
-                array.as_any().downcast_ref::<Int32Array>().unwrap().value(row).to_string()
+                let v = array.as_any().downcast_ref::<Int32Array>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                    .value(row);
+                Ok(format!("{v}::INTEGER"))
             }
             ArrowDT::Int64 => {
-                array.as_any().downcast_ref::<Int64Array>().unwrap().value(row).to_string()
+                let v = array.as_any().downcast_ref::<Int64Array>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                    .value(row);
+                Ok(format!("{v}::BIGINT"))
             }
             ArrowDT::Float32 => {
-                let v = array.as_any().downcast_ref::<Float32Array>().unwrap().value(row);
-                if v.is_nan() { "'NaN'::FLOAT".to_string() }
+                let v = array.as_any().downcast_ref::<Float32Array>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                    .value(row);
+                Ok(if v.is_nan() { "'NaN'::FLOAT".to_string() }
                 else if v == f32::INFINITY { "'Infinity'::FLOAT".to_string() }
                 else if v == f32::NEG_INFINITY { "'-Infinity'::FLOAT".to_string() }
-                else { format!("{v:.10}::FLOAT") }
+                else { format!("{v:.10}::FLOAT") })
             }
             ArrowDT::Float64 => {
-                let v = array.as_any().downcast_ref::<Float64Array>().unwrap().value(row);
-                if v.is_nan() { "'NaN'::DOUBLE".to_string() }
+                let v = array.as_any().downcast_ref::<Float64Array>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                    .value(row);
+                Ok(if v.is_nan() { "'NaN'::DOUBLE".to_string() }
                 else if v == f64::INFINITY { "'Infinity'::DOUBLE".to_string() }
                 else if v == f64::NEG_INFINITY { "'-Infinity'::DOUBLE".to_string() }
-                else { format!("{v:.17}::DOUBLE") }
+                else { format!("{v:.17}::DOUBLE") })
             }
             ArrowDT::Utf8 => {
-                let s = array.as_any().downcast_ref::<StringArray>().unwrap().value(row);
-                format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+                let s = array.as_any().downcast_ref::<StringArray>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                    .value(row);
+                Ok(format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")))
             }
             ArrowDT::LargeUtf8 => {
-                let s = array.as_any().downcast_ref::<LargeStringArray>().unwrap().value(row);
-                format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+                let s = array.as_any().downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                    .value(row);
+                Ok(format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")))
             }
             ArrowDT::Date32 => {
-                let days = array.as_any().downcast_ref::<Date32Array>().unwrap().value(row);
-                // epoch days → DuckDB date arithmetic
-                format!("(DATE '1970-01-01' + INTERVAL '{days}' DAY)")
+                let days = array.as_any().downcast_ref::<Date32Array>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                    .value(row);
+                Ok(format!("(DATE '1970-01-01' + INTERVAL '{days}' DAY)"))
             }
             ArrowDT::Timestamp(_, _) => {
                 let micros = array
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
-                    .unwrap()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
                     .value(row);
-                format!("(TIMESTAMP '1970-01-01' + INTERVAL '{micros}' MICROSECOND)")
+                Ok(format!("(TIMESTAMP '1970-01-01' + INTERVAL '{micros}' MICROSECOND)"))
             }
             ArrowDT::List(_) => {
-                let a = array.as_any().downcast_ref::<ListArray>().unwrap();
+                let a = array.as_any().downcast_ref::<ListArray>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?;
                 let list = a.value(row);
                 let elements: Vec<String> =
-                    (0..list.len()).map(|i| val(list.as_ref(), i)).collect();
-                format!("[{}]", elements.join(", "))
+                    (0..list.len()).map(|i| val(list.as_ref(), i)).collect::<Result<Vec<_>>>()?;
+                Ok(format!("[{}]", elements.join(", ")))
             }
             ArrowDT::Map(_, _) => {
-                // Arrow Map: entries array is a StructArray with "key" and "value" fields.
-                let a = array.as_any().downcast_ref::<MapArray>().unwrap();
+                let a = array.as_any().downcast_ref::<MapArray>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?;
                 let entries = a.value(row);
-                let sa = entries.as_any().downcast_ref::<StructArray>().unwrap();
+                let sa = entries.as_any().downcast_ref::<StructArray>()
+                    .ok_or_else(|| ConnectError::PlanConversion("downcast failed for map entries struct".into()))?;
                 let keys = sa.column(0);
                 let vals = sa.column(1);
                 if keys.len() == 0 {
-                    return "MAP([], [])".to_string();
+                    return Ok("MAP([], [])".to_string());
                 }
-                let k_sqls: Vec<String> = (0..keys.len()).map(|i| val(keys.as_ref(), i)).collect();
-                let v_sqls: Vec<String> = (0..vals.len()).map(|i| val(vals.as_ref(), i)).collect();
-                format!("MAP([{}], [{}])", k_sqls.join(", "), v_sqls.join(", "))
+                let k_sqls: Vec<String> = (0..keys.len()).map(|i| val(keys.as_ref(), i)).collect::<Result<Vec<_>>>()?;
+                let v_sqls: Vec<String> = (0..vals.len()).map(|i| val(vals.as_ref(), i)).collect::<Result<Vec<_>>>()?;
+                Ok(format!("MAP([{}], [{}])", k_sqls.join(", "), v_sqls.join(", ")))
             }
             ArrowDT::Struct(_) => {
-                // Struct: emit as DuckDB struct_pack syntax
-                let a = array.as_any().downcast_ref::<StructArray>().unwrap();
+                let a = array.as_any().downcast_ref::<StructArray>()
+                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?;
                 let pairs: Vec<String> = a.fields().iter().enumerate().map(|(ci, f)| {
                     let col = a.column(ci);
-                    format!("{}: {}", f.name(), val(col.as_ref(), row))
-                }).collect();
-                format!("{{{}}}", pairs.join(", "))
+                    Ok(format!("{}: {}", f.name(), val(col.as_ref(), row)?))
+                }).collect::<Result<Vec<_>>>()?;
+                Ok(format!("{{{}}}", pairs.join(", ")))
             }
-            _ => "NULL".to_string(),
+            _ => Ok("NULL".to_string()),
         }
     }
 
@@ -1703,7 +1839,7 @@ fn local_relation_to_values_sql(data: &[u8]) -> Result<String> {
     for batch in &batches {
         for row in 0..batch.num_rows() {
             let values: Vec<String> =
-                batch.columns().iter().map(|c| val(c.as_ref(), row)).collect();
+                batch.columns().iter().map(|c| val(c.as_ref(), row)).collect::<Result<Vec<_>>>()?;
             if rows.is_empty() {
                 let pairs: Vec<String> = values
                     .iter()

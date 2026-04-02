@@ -20,7 +20,6 @@ type BoxStream<T> =
 
 pub struct ThunderduckService {
     session_manager: Arc<SessionManager>,
-    #[allow(dead_code)]
     mode: RuntimeCompatMode,
 }
 
@@ -73,7 +72,7 @@ impl SparkConnectService for ThunderduckService {
                     return Ok(Response::new(Box::pin(stream)));
                 }
 
-                let sql = SqlGenerator::relaxed()
+                let sql = SqlGenerator::new(session.mode())
                     .generate(&logical_plan)
                     .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
 
@@ -92,7 +91,7 @@ impl SparkConnectService for ThunderduckService {
                             "SELECT COUNT(*) > 0 AS existed \
                              FROM information_schema.views \
                              WHERE table_name = '{}' AND table_schema = 'main'",
-                            view_name.replace('\'', "''")
+                            view_name.replace('\'', "''").replace('"', "\"\"")
                         ))
                         .await
                         .ok()
@@ -104,7 +103,8 @@ impl SparkConnectService for ThunderduckService {
                                     .and_then(|a| (!a.is_null(0)).then(|| a.value(0))))
                         })
                         .unwrap_or(false);
-                    session.exec_ddl(&sql).await.ok();
+                    session.exec_ddl(&sql).await
+                        .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
                     bool_batch_responses(&session_id, &operation_id, exists)
                         .map_err(|e| Status::from(e))?
                 } else {
@@ -165,7 +165,7 @@ impl SparkConnectService for ThunderduckService {
                 if struct_type.is_empty() || has_unresolved {
                     // Static inference failed or produced Unresolved types — ask DuckDB
                     // for the actual column types/nullability.
-                    let sql = SqlGenerator::relaxed()
+                    let sql = SqlGenerator::new(session.mode())
                         .generate(&logical_plan)
                         .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
                     let duckdb_schema = SchemaInferrer::new(&session)
@@ -176,17 +176,54 @@ impl SparkConnectService for ThunderduckService {
                     // (e.g. a self-join produces `col`, `col_1`). Spark allows duplicate names.
                     // When the static inference produced names but not types (has_unresolved),
                     // use the Spark-expected names with DuckDB's types so the schema is correct.
-                    struct_type = if !has_unresolved || struct_type.fields.len() != duckdb_schema.fields.len() {
+                    use thunderduck_core::types::{StructField, StructType};
+                    struct_type = if struct_type.is_empty() {
+                        // No plan-level schema at all — use DuckDB entirely.
                         duckdb_schema
-                    } else {
-                        // Use Spark names, DuckDB types/nullability.
-                        use thunderduck_core::types::{StructField, StructType};
+                    } else if struct_type.fields.len() == duckdb_schema.fields.len() {
+                        // Same field count: position-based merge.
+                        // Use Spark type/nullability when resolved, DuckDB otherwise.
+                        // This preserves precise Spark semantics (e.g. IntegerType for row_number,
+                        // levenshtein, cardinality) instead of DuckDB's wider types (BIGINT).
                         let fields = struct_type.fields.iter()
                             .zip(duckdb_schema.fields.iter())
-                            .map(|(spark_f, duck_f)| StructField {
-                                name: spark_f.name.clone(),
-                                data_type: duck_f.data_type.clone(),
-                                nullable: duck_f.nullable,
+                            .map(|(spark_f, duck_f)| {
+                                if spark_f.data_type.contains_unresolved() {
+                                    StructField {
+                                        name: spark_f.name.clone(),
+                                        data_type: duck_f.data_type.clone(),
+                                        nullable: duck_f.nullable,
+                                    }
+                                } else {
+                                    StructField {
+                                        name: spark_f.name.clone(),
+                                        data_type: spark_f.data_type.clone(),
+                                        nullable: spark_f.nullable,
+                                    }
+                                }
+                            })
+                            .collect();
+                        StructType::new(fields)
+                    } else {
+                        // Size mismatch (e.g. star expansion with unknown child schema):
+                        // Use DuckDB schema as base, override by name for any explicitly-typed
+                        // Spark fields (e.g. row_number → Integer, not DuckDB's BIGINT).
+                        let spark_map: std::collections::HashMap<String, &StructField> =
+                            struct_type.fields.iter()
+                                .filter(|f| !f.data_type.contains_unresolved())
+                                .map(|f| (f.name.to_lowercase(), f))
+                                .collect();
+                        let fields = duckdb_schema.fields.iter()
+                            .map(|duck_f| {
+                                if let Some(spark_f) = spark_map.get(&duck_f.name.to_lowercase()) {
+                                    StructField {
+                                        name: duck_f.name.clone(),
+                                        data_type: spark_f.data_type.clone(),
+                                        nullable: spark_f.nullable,
+                                    }
+                                } else {
+                                    duck_f.clone()
+                                }
                             })
                             .collect();
                         StructType::new(fields)
@@ -319,8 +356,7 @@ async fn handle_command(
                 .ok_or_else(|| Status::invalid_argument("CreateTempView missing input"))?;
             let logical_plan =
                 PlanConverter::convert_relation(&relation).map_err(Status::from)?;
-            let generator = SqlGenerator::relaxed();
-            let sql = generator
+            let sql = SqlGenerator::new(session.mode())
                 .generate(&logical_plan)
                 .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
             session
@@ -337,7 +373,7 @@ async fn handle_command(
             let sql = if let Some(input_rel) = sql_cmd.input {
                 let logical_plan =
                     PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
-                SqlGenerator::relaxed()
+                SqlGenerator::new(session.mode())
                     .generate(&logical_plan)
                     .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?
             } else {
@@ -365,7 +401,7 @@ async fn handle_command(
                 .ok_or_else(|| Status::invalid_argument("WriteOperation missing input"))?;
             let logical_plan =
                 PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
-            let select_sql = SqlGenerator::relaxed()
+            let select_sql = SqlGenerator::new(session.mode())
                 .generate(&logical_plan)
                 .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
 
@@ -382,10 +418,11 @@ async fn handle_command(
                 _ => "PARQUET",
             };
 
+            let escaped_path = path.replace('\'', "''");
             let copy_sql = if format == "CSV" {
-                format!("COPY ({select_sql}) TO '{path}' (FORMAT CSV, HEADER)")
+                format!("COPY ({select_sql}) TO '{escaped_path}' (FORMAT CSV, HEADER)")
             } else {
-                format!("COPY ({select_sql}) TO '{path}' (FORMAT {format})")
+                format!("COPY ({select_sql}) TO '{escaped_path}' (FORMAT {format})")
             };
 
             session
@@ -419,7 +456,7 @@ async fn execute_approx_quantile(
     use arrow::record_batch::RecordBatch;
 
     // Generate SQL for the input sub-plan.
-    let gen = SqlGenerator::relaxed();
+    let gen = SqlGenerator::new(session.mode());
     let input_sql = gen
         .generate(&aq.input)
         .map_err(|e| format!("approx_quantile input gen: {e}"))?;
@@ -446,15 +483,19 @@ async fn execute_approx_quantile(
                         .downcast_ref::<Float64Array>()
                         .and_then(|a| if a.len() > 0 { Some(a.value(0)) } else { None })
                 })
-                .unwrap_or(f64::NAN);
+                .ok_or_else(|| format!("approx_quantile: no float64 result for column {col} at p={p}"))?;
             all_values.push(val);
         }
     }
 
     // Build inner ListArray: N entries (one per column), each with M doubles.
     let values_array = Arc::new(Float64Array::from(all_values));
-    let inner_offsets: Vec<i32> = (0..=(n_cols as i32))
-        .map(|i| i * n_probs as i32)
+    let n_cols_i32 = i32::try_from(n_cols)
+        .map_err(|_| "too many columns for approx_quantile".to_owned())?;
+    let n_probs_i32 = i32::try_from(n_probs)
+        .map_err(|_| "too many probabilities for approx_quantile".to_owned())?;
+    let inner_offsets: Vec<i32> = (0..=n_cols_i32)
+        .map(|i| i * n_probs_i32)
         .collect();
     let inner_offsets_buf = OffsetBuffer::new(inner_offsets.into());
     let float_field = Arc::new(Field::new("item", ArrowDataType::Float64, true));
@@ -462,7 +503,7 @@ async fn execute_approx_quantile(
 
     // Build outer ListArray: 1 entry containing all N inner lists.
     // This is the single-row table cell the PySpark client expects.
-    let outer_offsets: Vec<i32> = vec![0, n_cols as i32];
+    let outer_offsets: Vec<i32> = vec![0, n_cols_i32];
     let outer_offsets_buf = OffsetBuffer::new(outer_offsets.into());
     let inner_list_type = ArrowDataType::List(float_field);
     let inner_field = Arc::new(Field::new("item", inner_list_type.clone(), true));
@@ -532,7 +573,10 @@ fn rename_to_spark_schema(
     batches
         .into_iter()
         .map(|b| {
-            RecordBatch::try_new(Arc::clone(&new_schema), b.columns().to_vec()).unwrap_or(b)
+            RecordBatch::try_new(Arc::clone(&new_schema), b.columns().to_vec()).unwrap_or_else(|e| {
+                eprintln!("column rename failed: {e}");
+                b
+            })
         })
         .collect()
 }

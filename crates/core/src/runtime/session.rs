@@ -4,6 +4,7 @@ use duckdb::arrow::record_batch::RecordBatch;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Result, ThunderduckError};
+use crate::functions::CompatMode;
 use crate::runtime::compat_mode::{self, RuntimeCompatMode};
 use crate::runtime::config::{HardwareProfile, StreamingConfig};
 
@@ -77,6 +78,7 @@ pub(crate) enum SessionResult {
 /// All communication goes through `tokio::sync::mpsc` + `oneshot` channels.
 pub struct DuckDbSession {
     cmd_tx: mpsc::Sender<SessionCommand>,
+    resolved_mode: CompatMode,
 }
 
 impl DuckDbSession {
@@ -90,14 +92,25 @@ impl DuckDbSession {
         _config: &StreamingConfig,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(32);
-        let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<()>>(1);
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<CompatMode>>(1);
 
         let session_id = session_id.to_string();
 
         std::thread::Builder::new()
             .name(format!("duckdb-session-{session_id}"))
             .spawn(move || {
-                let conn = match duckdb::Connection::open_in_memory() {
+                let config = match duckdb::Config::default()
+                    .with("allow_unsigned_extensions", "true")
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(ThunderduckError::DuckDb(format!(
+                            "failed to build DuckDB config: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                let conn = match duckdb::Connection::open_in_memory_with_flags(config) {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = ready_tx.send(Err(ThunderduckError::DuckDb(e.to_string())));
@@ -107,7 +120,12 @@ impl DuckDbSession {
 
                 // Apply hardware profile settings.
                 let hw = HardwareProfile::detect();
-                let timezone = detect_timezone();
+                let detected_tz = detect_timezone();
+                let timezone = if detected_tz.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_-+: ".contains(&b)) {
+                    detected_tz
+                } else {
+                    "UTC".to_owned()
+                }.replace('\'', "''");
                 let init_sql = format!(
                     "SET threads = {threads};\
                      SET memory_limit = '{mem}GB';\
@@ -301,24 +319,29 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
                 }
 
                 // Resolve compat mode (loads extension if requested).
-                if let Err(e) = compat_mode::resolve(mode, &conn) {
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
+                let resolved_mode = match compat_mode::resolve(mode, &conn) {
+                    Ok(m) => m,
+                    Err(e) => { let _ = ready_tx.send(Err(e)); return; }
+                };
 
-                // Signal ready.
-                let _ = ready_tx.send(Ok(()));
+                // Signal ready with the resolved mode.
+                let _ = ready_tx.send(Ok(resolved_mode));
 
                 // Enter command loop.
                 session_loop(conn, cmd_rx);
             })
             .map_err(|e| ThunderduckError::DuckDb(format!("failed to spawn session thread: {e}")))?;
 
-        ready_rx
+        let resolved_mode = ready_rx
             .recv()
             .map_err(|_| ThunderduckError::DuckDb("session thread exited before ready".into()))??;
 
-        Ok(DuckDbSession { cmd_tx })
+        Ok(DuckDbSession { cmd_tx, resolved_mode })
+    }
+
+    /// Return the resolved compat mode for this session (Strict or Relaxed).
+    pub fn mode(&self) -> CompatMode {
+        self.resolved_mode
     }
 
     /// Execute a SQL statement and collect all result Arrow batches.
@@ -356,7 +379,7 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
         {
             SessionResult::Ok => Ok(()),
             SessionResult::Error(e) => Err(e),
-            _ => Ok(()),
+            _ => unreachable!("ExecDdl never returns batches or schema"),
         }
     }
 
@@ -457,11 +480,11 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
                 // Wrap in LIMIT 0 so DuckDB populates the schema without reading rows.
                 // Only wrap SELECT/WITH/VALUES in parens; table references must not be
                 // wrapped since `("table_name")` is not a valid FROM target in DuckDB.
-                let upper = sql.trim_start().to_uppercase();
-                let needs_subquery_wrap = upper.starts_with("SELECT")
-                    || upper.starts_with("WITH")
-                    || upper.starts_with("VALUES")
-                    || upper.starts_with("("); // parenthesized set-ops: ((SELECT...) UNION ...)
+                let trimmed = sql.trim_start();
+                let needs_subquery_wrap = trimmed.starts_with('(')
+                    || (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("SELECT"))
+                    || (trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("WITH"))
+                    || (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("VALUES"));
                 let probe = if needs_subquery_wrap {
                     format!("SELECT * FROM ({sql}) __probe__ LIMIT 0")
                 } else {
@@ -489,13 +512,13 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
 /// SELECT / WITH / VALUES → `query_arrow`
 /// DDL / DML             → `execute_batch` (returns empty batch list)
 fn run_query(conn: &duckdb::Connection, sql: &str) -> Result<Vec<RecordBatch>> {
-    let upper = sql.trim_start().to_uppercase();
-    let is_query = upper.starts_with("SELECT")
-        || upper.starts_with("WITH")
-        || upper.starts_with("VALUES")
-        || upper.starts_with("FROM")
-        || upper.starts_with("(")
-        || upper.starts_with("UNPIVOT");
+    let trimmed = sql.trim_start();
+    let is_query = trimmed.starts_with('(')
+        || (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("SELECT"))
+        || (trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("WITH"))
+        || (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("VALUES"))
+        || (trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("FROM"))
+        || (trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("UNPIVOT"));
 
     if is_query {
         let mut stmt = conn

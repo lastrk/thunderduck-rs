@@ -3,7 +3,7 @@
 Verified comparison of the Java reference implementation (`.reference/`) against the Rust port
 (`crates/core/`). All findings are confirmed against actual source files.
 
-**Date**: 2026-03-31 (updated after Phase 6 Wave 1 + Wave 2)
+**Date**: 2026-04-02 (updated after strict mode bring-up + nullable inference fix)
 **Reference**: 210 Java source files, 4091-line `SQLGenerator.java`, 1776-line `FunctionRegistry.java`
 
 Phases 3, 4, 5, and 6 (Wave 1 + Wave 2) are complete. Every item originally classified as
@@ -13,6 +13,19 @@ pre-existing flaky test occasionally fails in full-suite runs but passes in isol
 
 Phase 6 Wave 2 closed +4 tests: map key access (×2), map explode, json_tuple.
 TPC-DS Q17 (the final Wave 1 deferred item) was also fixed via flat join chain extension.
+
+**2026-04-02 update — strict mode + nullable inference:**
+
+- DuckDB upgraded to 1.10501.0 (DuckDB 1.5.1); arrow/arrow-ipc bumped to 58.
+- Strict mode fully operational: pre-built extension binary downloaded from
+  [`duckdb1.5.1-ext1`](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/duckdb1.5.1-ext1)
+  at build time via `cargo build --release --features bundled-extension`.
+- Nullable inference overhauled (mode-agnostic, matching Java reference):
+  `projection_to_field`, `agg_expr_to_field`, `infer_with_columns_schema` now call
+  `expr.nullable(schema)`; `Cast` delegates to inner expr; `CaseWhen` analyses branches;
+  `FunctionCall` uses `aggregate_is_always_nullable()` for SUM/AVG/MIN/MAX etc.
+  Result: relaxed suite **830/830** (no regressions); strict suite **508/836** (+103 vs baseline).
+- Remaining strict-mode failures: **327** — see Section 8 for full breakdown.
 
 ---
 
@@ -159,3 +172,62 @@ All previously catalogued failures are now closed. The suite runs at **829 passi
 One test (`test_statistics_differential.py::TestStatSummary_Differential::test_summary_default_stats`)
 occasionally fails in the full suite due to a pre-existing ordering-dependent flakiness; it passes
 in isolation and in sub-suite runs. Not a code regression.
+
+---
+
+## Section 8 — Strict mode failures (327 as of 2026-04-02)
+
+Strict mode baseline before nullable fix: **405/836**. After nullable inference overhaul: **508/836**.
+Relaxed mode unaffected: **830/836** (6 skipped, 0 failed).
+
+### 8.1 Source-column nullable not propagated — ~170 tests
+
+**Root cause**: DuckDB does not expose `NOT NULL` constraint metadata for Parquet-scanned columns.
+`DESCRIBE` results and Arrow schema from DuckDB both report all scanned columns as `nullable=true`.
+This means `TypeInferenceEngine::column_nullable()` always returns `true` for source columns.
+
+Affects: virtually every test that projects source columns — TPC-H, TPC-DS, dataframe functions,
+window functions, joins, aggregations. Spark marks Parquet columns NOT NULL when the Parquet schema
+says `REQUIRED`; Thunderduck cannot recover this without reading Parquet metadata directly.
+
+**Specific symptoms** (from test output):
+- `Column 'l_quantity': nullable mismatch - Reference=False, Test=True`
+- `Column 'cnt': nullable mismatch - Reference=False, Test=True` (COUNT result — **FIXED** by nullable overhaul)
+- `Column 'o_orderkey': nullable mismatch - Reference=False, Test=True`
+
+### 8.2 `spark_sum` / `spark_avg` decimal precision wrong — ~40 tests
+
+`spark_sum(DECIMAL(p,s))` should return `DECIMAL(min(p+10,38), s)` but DuckDB's extension
+function returns `DECIMAL(38,2)` for TPC-H columns (which are `DECIMAL(15,2)`; expected
+`DECIMAL(25,2)`). `spark_avg(DECIMAL(p,s))` should return `DECIMAL(min(p+4,38), min(s+4,18))`
+but returns `DoubleType`.
+
+**Affected tests**: TPC-H Q1 SQL + DataFrame, basic aggregation decimal tests, TPC-DS queries.
+
+### 8.3 `collect_list` / `collect_set` return scalar — 4 tests
+
+`collect_list(int_col)` returns `IntegerType()` instead of `ArrayType(IntegerType(), False)`.
+The DuckDB `LIST()` aggregate function returns an array but the schema inference path emits the
+element type instead of the array type. `aggregate_return_type("collect_list", IntegerType)`
+returns `ArrayType(IntegerType, false)` — the type is correct but something downstream strips
+the array wrapper.
+
+### 8.4 Array element nullability — ~20 tests
+
+`ArrayType(T, True)` (Thunderduck) vs `ArrayType(T, False)` (Spark). The `containsNull` flag
+inside the array type is not tracked. Affects: `split`, array function results, lambda outputs.
+
+### 8.5 Type mismatches (not nullable) — ~60 tests
+
+Pre-existing type issues not related to nullable inference:
+- **CaseWhen type**: `StringType` vs `BooleanType` — type inference for CASE WHEN branches
+  not fully resolved (pre-existing, not a nullable issue)
+- **`id` column Integer vs Long**: Range / source schema INTEGER vs Spark's Long preference
+- **Math functions nullable**: functions like `abs`, `round`, `ceil` return `nullable=true`
+  from Thunderduck but Spark marks them non-nullable when input is non-null (blocked on 8.1)
+- **`size()` return type**: returns `LongType` instead of `IntegerType`
+
+### 8.6 Decimal arithmetic precision — ~30 tests (TPC-DS, TPC-H)
+
+Complex decimal expressions in TPC-DS produce wrong precision/scale. Related to `spark_sum`
+precision issues (8.2) cascading through multi-step expressions.

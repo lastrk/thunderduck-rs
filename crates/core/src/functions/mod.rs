@@ -1,7 +1,30 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::types::DataType;
+
+/// Lowercase an ASCII string into a stack buffer, avoiding heap allocation.
+/// Returns `None` if the string exceeds the buffer or is non-ASCII.
+fn ascii_lowercase<'a>(s: &str, buf: &'a mut [u8; 128]) -> Option<&'a str> {
+    let len = s.len();
+    if len > 128 || !s.is_ascii() {
+        return None;
+    }
+    for (i, b) in s.bytes().enumerate() {
+        buf[i] = b.to_ascii_lowercase();
+    }
+    // SAFETY: input is ASCII, to_ascii_lowercase preserves valid UTF-8 for ASCII bytes.
+    Some(unsafe { std::str::from_utf8_unchecked(&buf[..len]) })
+}
+
+/// Lowercase a Spark function name, preferring a stack buffer over heap allocation.
+fn lowercase_name<'a>(spark_name: &'a str, buf: &'a mut [u8; 128]) -> Cow<'a, str> {
+    match ascii_lowercase(spark_name, buf) {
+        Some(s) => Cow::Borrowed(s),
+        None => Cow::Owned(spark_name.to_lowercase()),
+    }
+}
 
 /// Compatibility mode — affects which function implementations are selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,15 +64,16 @@ impl FunctionRegistry {
     /// (i.e., each `arg.to_sql(gen)` result), not raw values.
     pub fn translate(spark_name: &str, args: &[&str], mode: CompatMode) -> String {
         let r = &*REGISTRY;
-        let lower = spark_name.to_lowercase();
+        let mut buf = [0u8; 128];
+        let lower = lowercase_name(spark_name, &mut buf);
 
         // 1. Custom translator takes priority
-        if let Some(f) = r.custom.get(lower.as_str()) {
+        if let Some(f) = r.custom.get(lower.as_ref()) {
             return f(args, mode);
         }
 
         // 2. Direct mapping
-        if let Some(duckdb_name) = r.direct.get(lower.as_str()) {
+        if let Some(duckdb_name) = r.direct.get(lower.as_ref()) {
             return format!("{}({})", duckdb_name, args.join(", "));
         }
 
@@ -74,9 +98,11 @@ impl FunctionRegistry {
         let first_type = arg_types.first().unwrap_or(&DataType::Unresolved);
 
         let arg0 = args.first().copied().unwrap_or("");
-        match spark_name.to_lowercase().as_str() {
+        let mut buf = [0u8; 128];
+        let lower = lowercase_name(spark_name, &mut buf);
+        match lower.as_ref() {
             "reverse" => {
-                if matches!(first_type, DataType::Array(_)) {
+                if matches!(first_type, DataType::Array(_, _)) {
                     return format!("LIST_REVERSE({arg0})");
                 }
                 if matches!(first_type, DataType::String) {
@@ -91,12 +117,12 @@ impl FunctionRegistry {
                 if matches!(first_type, DataType::String) {
                     return format!("LENGTH({arg0})");
                 }
-                if matches!(first_type, DataType::Array(_)) {
+                if matches!(first_type, DataType::Array(_, _)) {
                     return format!("LEN({arg0})");
                 }
             }
             "sort_array" => {
-                if matches!(first_type, DataType::Array(_)) {
+                if matches!(first_type, DataType::Array(_, _)) {
                     if args.len() >= 2 {
                         let order = if args[1].eq_ignore_ascii_case("true") { "ASC" } else { "DESC" };
                         return format!("LIST_SORT({arg0}, '{order}')");
@@ -113,8 +139,9 @@ impl FunctionRegistry {
     /// Check if a function name is explicitly mapped (direct or custom).
     pub fn is_mapped(spark_name: &str) -> bool {
         let r = &*REGISTRY;
-        let lower = spark_name.to_lowercase();
-        r.direct.contains_key(lower.as_str()) || r.custom.contains_key(lower.as_str())
+        let mut buf = [0u8; 128];
+        let lower = lowercase_name(spark_name, &mut buf);
+        r.direct.contains_key(lower.as_ref()) || r.custom.contains_key(lower.as_ref())
     }
 
     /// Return the list of SQL macros that must be registered at session startup.
@@ -151,6 +178,7 @@ impl FunctionRegistry {
             ("ascii", "ASCII"),
             ("chr", "CHR"),
             ("char", "CHR"),
+            ("bin", "bin"),
             ("hex", "HEX"),
             ("base64", "BASE64"),
             ("unbase64", "DECODE"),
@@ -1307,20 +1335,14 @@ impl FunctionRegistry {
             }
         });
 
-        // window-function modes (strict mode routing placeholder)
-        custom.insert("round", |args, mode| match mode {
-            CompatMode::Strict => {
-                // In strict mode, use the extension's half-up round
-                format!("thdck_round({})", args.join(", "))
-            }
-            CompatMode::Relaxed => format!("ROUND({})", args.join(", ")),
-        });
+        // round: both modes use DuckDB's ROUND (no extension function for half-up rounding).
+        // Minor ROUND_HALF_EVEN vs ROUND_HALF_UP discrepancy accepted for .5 boundary cases.
+        custom.insert("round", |args, _mode| format!("ROUND({})", args.join(", ")));
 
-        // Strict-mode avg for decimal
-        custom.insert("avg", |args, mode| match mode {
-            CompatMode::Strict => format!("thdck_avg({})", args.join(", ")),
-            CompatMode::Relaxed => format!("AVG({})", args.join(", ")),
-        });
+        // avg: native DuckDB AVG in all modes.
+        // For DECIMAL inputs in strict mode, apply_agg_type_casts rewrites avg() → spark_avg()
+        // before SQL generation (spark_avg only supports DECIMAL arguments).
+        custom.insert("avg", |args, _mode| format!("AVG({})", args.join(", ")));
 
         // isnotnull(x) → (x IS NOT NULL) — DuckDB has no ISNOTNULL() function
         custom.insert("isnotnull", |args, _mode| {
@@ -1608,7 +1630,7 @@ mod tests {
         let relaxed = FunctionRegistry::translate("round", &["x", "2"], CompatMode::Relaxed);
         let strict = FunctionRegistry::translate("round", &["x", "2"], CompatMode::Strict);
         assert_eq!(relaxed, "ROUND(x, 2)");
-        assert!(strict.contains("thdck_round"), "expected extension fn in: {strict}");
+        assert_eq!(strict, "ROUND(x, 2)", "round uses DuckDB native in both modes");
     }
 
     #[test]
@@ -1669,7 +1691,7 @@ mod tests {
     /// reverse(array_col) → LIST_REVERSE when first arg is Array type.
     #[test]
     fn reverse_array_dispatches_to_list_reverse() {
-        let arg_types = [DataType::Array(Box::new(DataType::Integer))];
+        let arg_types = [DataType::Array(Box::new(DataType::Integer), true)];
         let sql = FunctionRegistry::translate_typed(
             "reverse",
             &["arr"],
@@ -1709,7 +1731,7 @@ mod tests {
     /// size(array_col) → LEN when first arg is Array type.
     #[test]
     fn size_array_dispatches_to_len() {
-        let arg_types = [DataType::Array(Box::new(DataType::Long))];
+        let arg_types = [DataType::Array(Box::new(DataType::Long), true)];
         let sql = FunctionRegistry::translate_typed(
             "size",
             &["arr"],
@@ -1752,7 +1774,7 @@ mod tests {
     /// sort_array(array_col) → LIST_SORT when first arg is Array type.
     #[test]
     fn sort_array_array_dispatches_to_list_sort() {
-        let arg_types = [DataType::Array(Box::new(DataType::String))];
+        let arg_types = [DataType::Array(Box::new(DataType::String), true)];
         let sql = FunctionRegistry::translate_typed(
             "sort_array",
             &["arr"],

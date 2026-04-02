@@ -12,7 +12,10 @@ use crate::proto::spark::connect::execute_plan_response::ArrowBatch;
 pub fn record_batches_to_arrow_batches(batches: &[RecordBatch]) -> Result<Vec<ArrowBatch>> {
     let mut out = Vec::new();
     for batch in batches {
-        let mut buf = Vec::new();
+        let estimated_size = 128usize.saturating_add(
+            batch.num_rows().saturating_mul(batch.num_columns()).saturating_mul(64),
+        );
+        let mut buf = Vec::with_capacity(estimated_size);
         {
             let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
                 .map_err(|e| ConnectError::Arrow(format!("IPC writer init: {e}")))?;
@@ -24,7 +27,7 @@ pub fn record_batches_to_arrow_batches(batches: &[RecordBatch]) -> Result<Vec<Ar
                 .map_err(|e| ConnectError::Arrow(format!("IPC finish: {e}")))?;
         }
         out.push(ArrowBatch {
-            row_count: batch.num_rows() as i64,
+            row_count: i64::try_from(batch.num_rows()).unwrap_or(i64::MAX),
             data: buf,
             ..Default::default()
         });

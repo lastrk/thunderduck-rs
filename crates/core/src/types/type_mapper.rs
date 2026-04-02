@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::DataType;
 
 /// Maps Spark `DataType` ↔ DuckDB SQL type strings.
@@ -5,30 +7,30 @@ pub struct TypeMapper;
 
 impl TypeMapper {
     /// Convert a Spark `DataType` to the DuckDB SQL type string used in CAST/DDL.
-    pub fn to_duckdb(dt: &DataType) -> std::string::String {
+    pub fn to_duckdb(dt: &DataType) -> Cow<'static, str> {
         match dt {
-            DataType::Boolean => "BOOLEAN".into(),
-            DataType::Byte => "TINYINT".into(),
-            DataType::Short => "SMALLINT".into(),
-            DataType::Integer => "INTEGER".into(),
-            DataType::Long => "BIGINT".into(),
-            DataType::Float => "FLOAT".into(),
-            DataType::Double => "DOUBLE".into(),
-            DataType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
-            DataType::String => "VARCHAR".into(),
-            DataType::Binary => "BLOB".into(),
-            DataType::Date => "DATE".into(),
-            DataType::Timestamp => "TIMESTAMP WITH TIME ZONE".into(),
-            DataType::TimestampNtz => "TIMESTAMP".into(),
-            DataType::YearMonthInterval => "INTERVAL".into(),
-            DataType::DayTimeInterval => "INTERVAL".into(),
-            DataType::Null => "NULL".into(),
-            DataType::Unresolved => "VARCHAR".into(),
-            DataType::Array(elem) => format!("{}[]", Self::to_duckdb(elem)),
+            DataType::Boolean => Cow::Borrowed("BOOLEAN"),
+            DataType::Byte => Cow::Borrowed("TINYINT"),
+            DataType::Short => Cow::Borrowed("SMALLINT"),
+            DataType::Integer => Cow::Borrowed("INTEGER"),
+            DataType::Long => Cow::Borrowed("BIGINT"),
+            DataType::Float => Cow::Borrowed("FLOAT"),
+            DataType::Double => Cow::Borrowed("DOUBLE"),
+            DataType::Decimal { precision, scale } => Cow::Owned(format!("DECIMAL({precision},{scale})")),
+            DataType::String => Cow::Borrowed("VARCHAR"),
+            DataType::Binary => Cow::Borrowed("BLOB"),
+            DataType::Date => Cow::Borrowed("DATE"),
+            DataType::Timestamp => Cow::Borrowed("TIMESTAMP WITH TIME ZONE"),
+            DataType::TimestampNtz => Cow::Borrowed("TIMESTAMP"),
+            DataType::YearMonthInterval => Cow::Borrowed("INTERVAL"),
+            DataType::DayTimeInterval => Cow::Borrowed("INTERVAL"),
+            DataType::Null => Cow::Borrowed("NULL"),
+            DataType::Unresolved => Cow::Borrowed("VARCHAR"),
+            DataType::Array(elem, _) => Cow::Owned(format!("{}[]", Self::to_duckdb(elem))),
             DataType::Map { key, value, .. } => {
-                format!("MAP({}, {})", Self::to_duckdb(key), Self::to_duckdb(value))
+                Cow::Owned(format!("MAP({}, {})", Self::to_duckdb(key), Self::to_duckdb(value)))
             }
-            DataType::Struct(_) => "STRUCT".into(),
+            DataType::Struct(_) => Cow::Borrowed("STRUCT"),
         }
     }
 
@@ -47,11 +49,11 @@ impl TypeMapper {
         // Array: TYPE[] or ARRAY(TYPE) or LIST(TYPE)
         if upper.ends_with("[]") {
             let inner = &s[..s.len() - 2];
-            return DataType::Array(Box::new(Self::from_duckdb(inner)));
+            return DataType::Array(Box::new(Self::from_duckdb(inner)), true);
         }
         if upper.starts_with("LIST(") || upper.starts_with("ARRAY(") {
             let inner = Self::extract_single_type_arg(&upper);
-            return DataType::Array(Box::new(Self::from_duckdb(inner)));
+            return DataType::Array(Box::new(Self::from_duckdb(inner)), true);
         }
 
         // Map: MAP(KeyType, ValueType)
@@ -159,7 +161,7 @@ mod tests {
 
     #[test]
     fn array() {
-        let dt = DataType::Array(Box::new(DataType::Integer));
+        let dt = DataType::Array(Box::new(DataType::Integer), true);
         let s = TypeMapper::to_duckdb(&dt);
         assert_eq!(s, "INTEGER[]");
         assert_eq!(TypeMapper::from_duckdb("INTEGER[]"), dt);

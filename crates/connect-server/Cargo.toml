@@ -7,6 +7,9 @@ edition.workspace = true
 name = "thunderduck-connect-server"
 path = "src/main.rs"
 
+[features]
+bundled-extension = ["thunderduck-core/bundled-extension"]
+
 [dependencies]
 thunderduck-core = { path = "../core" }
 tonic.workspace = true

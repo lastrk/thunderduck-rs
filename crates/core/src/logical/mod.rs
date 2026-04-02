@@ -286,6 +286,8 @@ pub struct Sample {
 pub struct TableScan {
     pub table: String,
     pub alias: Option<String>,
+    /// Pre-populated schema (from DuckDB table metadata). Empty when unknown.
+    pub schema: crate::types::StructType,
 }
 
 /// Wraps a raw SQL string as a sub-relation (e.g., from `spark.sql(...)`).
@@ -587,7 +589,7 @@ impl LogicalPlan {
             LogicalPlan::Intersect(i) => i.left.infer_schema(),
             LogicalPlan::Distinct(d) => d.input.infer_schema(),
             LogicalPlan::Sample(s) => s.input.infer_schema(),
-            LogicalPlan::TableScan(_) => StructType::empty(), // resolved at runtime
+            LogicalPlan::TableScan(t) => t.schema.clone(),
             LogicalPlan::SqlRelation(r) => r.schema.clone(),
             LogicalPlan::LocalRelation(r) => r.schema.clone(),
             LogicalPlan::LocalDataRelation(r) => r.schema.clone(),
@@ -622,7 +624,19 @@ impl LogicalPlan {
             }
             LogicalPlan::ShowString(s) => s.input.infer_schema(),
             LogicalPlan::NADrop(n) => n.input.infer_schema(),
-            LogicalPlan::NAFill(n) => n.input.infer_schema(),
+            LogicalPlan::NAFill(n) => {
+                // na.fill(valueMap) guarantees no NULLs for filled columns → mark them NOT NULL.
+                let mut schema = n.input.infer_schema();
+                let filled_cols: std::collections::HashSet<String> =
+                    n.values.iter().map(|(name, _)| name.to_lowercase()).collect();
+                schema.fields = schema.fields.into_iter().map(|mut f| {
+                    if filled_cols.contains(&f.name.to_lowercase()) {
+                        f.nullable = false;
+                    }
+                    f
+                }).collect();
+                schema
+            }
             LogicalPlan::NAReplace(n) => n.input.infer_schema(),
             LogicalPlan::Unpivot(u) => {
                 let mut fields: Vec<StructField> = u
@@ -630,7 +644,8 @@ impl LogicalPlan {
                     .iter()
                     .map(|name| StructField::nullable(name.clone(), DataType::Unresolved))
                     .collect();
-                fields.push(StructField::nullable(
+                // Variable column is generated from column names → always NOT NULL.
+                fields.push(StructField::not_null(
                     u.variable_column_name.clone(),
                     DataType::String,
                 ));
@@ -651,7 +666,7 @@ impl LogicalPlan {
             ]),
             // ApproxQuantile returns one column of ARRAY<DOUBLE>, one row per input column.
             LogicalPlan::ApproxQuantile(_) => StructType::new(vec![
-                StructField::nullable("quantiles".to_string(), DataType::Array(Box::new(DataType::Double))),
+                StructField::nullable("quantiles".to_string(), DataType::Array(Box::new(DataType::Double), true)),
             ]),
             // Crosstab: pivot columns unknown at plan time → DuckDB fallback.
             LogicalPlan::StatCrosstab(_) => StructType::empty(),
@@ -660,7 +675,7 @@ impl LogicalPlan {
                 s.cols.iter()
                     .map(|c| StructField::nullable(
                         format!("{}_freqItems", c),
-                        DataType::Array(Box::new(DataType::String)),
+                        DataType::Array(Box::new(DataType::String), true),
                     ))
                     .collect()
             ),
@@ -668,14 +683,14 @@ impl LogicalPlan {
             LogicalPlan::StatSampleBy(s) => s.input.infer_schema(),
             // Describe/Summary: "summary" VARCHAR + one VARCHAR column per input column.
             LogicalPlan::Describe(d) => {
-                let mut fields = vec![StructField::not_null("summary", DataType::String)];
+                let mut fields = vec![StructField::nullable("summary", DataType::String)];
                 for col in &d.cols {
                     fields.push(StructField::nullable(col.clone(), DataType::String));
                 }
                 StructType::new(fields)
             }
             LogicalPlan::Summary(s) => {
-                let mut fields = vec![StructField::not_null("summary", DataType::String)];
+                let mut fields = vec![StructField::nullable("summary", DataType::String)];
                 for col in &s.cols {
                     fields.push(StructField::nullable(col.clone(), DataType::String));
                 }
@@ -689,9 +704,28 @@ fn infer_project_schema(p: &Project) -> StructType {
     let child_schema = p.input.infer_schema();
     let has_star = p.projections.iter().any(|e| matches!(e, Expression::Star(_)));
     // If we have a wildcard but can't statically resolve the child schema (e.g. TableScan),
-    // return empty so the caller falls back to DuckDB schema inference.
+    // collect explicitly computed (non-star) projections with known types and return them
+    // alongside a sentinel Unresolved field. The sentinel forces `has_unresolved = true` in
+    // service.rs, triggering DuckDB schema lookup; the name-based merge then overlays the
+    // computed types (e.g. row_number → Integer) onto DuckDB's full expanded schema.
     if has_star && child_schema.is_empty() {
-        return StructType::empty();
+        let mut computed: Vec<StructField> = p.projections.iter()
+            .filter(|e| !matches!(e, Expression::Star(_)))
+            .filter_map(|e| projection_to_field(e, &child_schema))
+            .filter(|f| !f.data_type.contains_unresolved())
+            .collect();
+        if computed.is_empty() {
+            return StructType::empty();
+        }
+        // Sentinel: forces has_unresolved=true so service.rs falls back to DuckDB
+        // and then applies a name-based merge. Filtered from the final result by name-based
+        // merge since it won't match any DuckDB column.
+        computed.push(StructField::new(
+            "__star_expansion_sentinel__".to_string(),
+            DataType::Unresolved,
+            true,
+        ));
+        return StructType::new(computed);
     }
     let mut fields = Vec::new();
     for expr in &p.projections {
@@ -707,24 +741,39 @@ fn infer_project_schema(p: &Project) -> StructType {
 
 fn projection_to_field(expr: &Expression, schema: &StructType) -> Option<StructField> {
     match expr {
-        Expression::Alias(a) => Some(StructField::nullable(
+        Expression::Alias(a) => Some(StructField::new(
             a.alias.clone(),
             a.expr.data_type(schema),
+            a.expr.nullable(schema),
         )),
-        Expression::ColumnReference(c) => Some(StructField::nullable(
+        Expression::ColumnReference(c) => Some(StructField::new(
             c.name.clone(),
             c.data_type.clone().pipe_if_unresolved(|| {
                 crate::types::TypeInferenceEngine::column_type(&c.name, schema)
             }),
+            crate::types::TypeInferenceEngine::column_nullable(&c.name, schema),
         )),
         Expression::UnresolvedColumn(u) => {
             let dt = crate::types::TypeInferenceEngine::column_type(&u.name, schema);
-            Some(StructField::nullable(u.name.clone(), dt))
+            Some(StructField::new(
+                u.name.clone(),
+                dt,
+                crate::types::TypeInferenceEngine::column_nullable(&u.name, schema),
+            ))
         }
         Expression::Star(_) => None, // expanded by caller
+        Expression::RawSql(_) => {
+            // ExpressionString from selectExpr() arrives as RawSql. Its data_type() is always
+            // Unresolved, but the column name may match a child schema field (e.g. "id" →
+            // look up id's type instead of falling back to DuckDB INTEGER literals).
+            let col_name = spark_column_name(expr);
+            let dt = crate::types::TypeInferenceEngine::column_type(&col_name, schema);
+            let nullable = crate::types::TypeInferenceEngine::column_nullable(&col_name, schema);
+            Some(StructField::new(col_name, dt, nullable))
+        }
         other => {
             let dt = other.data_type(schema);
-            Some(StructField::nullable(spark_column_name(other), dt))
+            Some(StructField::new(spark_column_name(other), dt, other.nullable(schema)))
         }
     }
 }
@@ -826,7 +875,7 @@ fn spark_type_name(dt: &crate::types::DataType) -> String {
     use crate::types::DataType;
     match dt {
         DataType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
-        other => crate::types::TypeMapper::to_duckdb(other),
+        other => crate::types::TypeMapper::to_duckdb(other).into_owned(),
     }
 }
 
@@ -894,17 +943,18 @@ fn agg_expr_to_field(expr: &Expression, schema: &StructType) -> Option<StructFie
         Expression::Alias(a) => {
             // Use aggregate_return_type for aggregate FunctionCalls inside an alias,
             // since function_return_type() (scalar) doesn't know about COUNT/SUM/AVG.
-            let dt = match a.expr.as_ref() {
+            let (dt, nullable) = match a.expr.as_ref() {
                 Expression::FunctionCall(f) => {
                     let arg_types: Vec<_> = f.args.iter().map(|e| e.data_type(schema)).collect();
-                    crate::types::TypeInferenceEngine::aggregate_return_type(
+                    let dt = crate::types::TypeInferenceEngine::aggregate_return_type(
                         &f.name,
                         arg_types.first().unwrap_or(&DataType::Unresolved),
-                    )
+                    );
+                    (dt, a.expr.nullable(schema))
                 }
-                other => other.data_type(schema),
+                other => (other.data_type(schema), other.nullable(schema)),
             };
-            Some(StructField::nullable(a.alias.clone(), dt))
+            Some(StructField::new(a.alias.clone(), dt, nullable))
         }
         Expression::FunctionCall(f) => {
             let arg_types: Vec<_> = f.args.iter().map(|a| a.data_type(schema)).collect();
@@ -912,7 +962,7 @@ fn agg_expr_to_field(expr: &Expression, schema: &StructType) -> Option<StructFie
                 &f.name,
                 arg_types.first().unwrap_or(&DataType::Unresolved),
             );
-            Some(StructField::nullable(spark_column_name(expr), dt))
+            Some(StructField::new(spark_column_name(expr), dt, expr.nullable(schema)))
         }
         other => projection_to_field(other, schema),
     }
@@ -935,18 +985,22 @@ fn infer_with_columns_schema(w: &WithColumns) -> StructType {
             _ => None,
         };
         if let Some(old_name) = old_col_name {
-            // Rename: find the old column and change its name in-place.
+            // Rename: find the old column and change its name in-place, preserving nullability.
             if let Some(idx) = schema.field_index(old_name) {
-                let dt = schema.fields[idx].data_type.clone();
-                schema.fields[idx] = StructField::nullable(new_name.clone(), dt);
+                let (dt, old_nullable) = {
+                    let f = &schema.fields[idx];
+                    (f.data_type.clone(), f.nullable)
+                };
+                schema.fields[idx] = StructField::new(new_name.clone(), dt, old_nullable);
             }
         } else {
             let dt = expr.data_type(&schema);
+            let nullable = expr.nullable(&schema);
             // Replace existing field or append
             if let Some(idx) = schema.field_index(new_name) {
-                schema.fields[idx] = StructField::nullable(new_name.clone(), dt);
+                schema.fields[idx] = StructField::new(new_name.clone(), dt, nullable);
             } else {
-                schema.fields.push(StructField::nullable(new_name.clone(), dt));
+                schema.fields.push(StructField::new(new_name.clone(), dt, nullable));
             }
         }
     }
@@ -971,23 +1025,13 @@ fn infer_to_dataframe_schema(t: &ToDataFrame) -> StructType {
     StructType::new(fields)
 }
 
-// ── Small helpers ─────────────────────────────────────────────────────────────
-
-trait PipeIfUnresolved {
-    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self;
-}
-
-impl PipeIfUnresolved for DataType {
-    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self {
-        if self == DataType::Unresolved { f() } else { self }
-    }
-}
+use crate::types::data_type::PipeIfUnresolved;
 
 // ── Constructors ──────────────────────────────────────────────────────────────
 
 impl LogicalPlan {
     pub fn table_scan(table: impl Into<String>) -> Self {
-        LogicalPlan::TableScan(TableScan { table: table.into(), alias: None })
+        LogicalPlan::TableScan(TableScan { table: table.into(), alias: None, schema: Default::default() })
     }
     pub fn filter(input: LogicalPlan, condition: Expression) -> Self {
         LogicalPlan::Filter(Filter { input: Box::new(input), condition })

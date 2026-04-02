@@ -4,6 +4,19 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-04-02 — Agent Pipeline, Code Review, Performance Optimizations
+
+[`dev_journal/2026-04-02-agent-pipeline-review-perf.md`](dev_journal/2026-04-02-agent-pipeline-review-perf.md)
+
+Multi-agent pipeline (architect/coder/reviewer/perf) with `/rust-feature` skill. Two code review
+passes (17 findings fixed: 2 Critical, 6 High, 9 Medium) and 8 performance optimizations across
+hot paths (zero-alloc field lookup, stack-based function registry, `Cow<str>` type mapper, release
+profile tuning).
+
+**Tests**: 80 unit tests passing
+
+---
+
 ## 2026-03-31 — Phase 6 Wave 2: TPC-DS Q17, Map Key Access, Map Explode, JSON Tuple
 
 [`dev_journal/2026-03-31-phase6-wave2.md`](dev_journal/2026-03-31-phase6-wave2.md)

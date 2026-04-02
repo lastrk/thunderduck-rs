@@ -1,9 +1,11 @@
 use crate::error::Result;
 use crate::error::ThunderduckError;
 
-// Real platform binaries are dropped in at Phase 6 via include_bytes!.
-// Until then every platform gets an empty slice and load() returns Ok(false).
-const EXTENSION_BYTES: &[u8] = &[];
+#[cfg(feature = "bundled-extension")]
+static EXTENSION_BYTES: &[u8] = include_bytes!(env!("EXTENSION_BIN_PATH"));
+
+#[cfg(not(feature = "bundled-extension"))]
+static EXTENSION_BYTES: &[u8] = &[];
 
 /// Attempt to load the bundled `thdck_spark_funcs` extension into `conn`.
 ///

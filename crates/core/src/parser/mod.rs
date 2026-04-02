@@ -12,6 +12,24 @@ use dialect::SparkDialect;
 pub struct SparkSqlParser;
 
 impl SparkSqlParser {
+    /// Parse a single SQL expression fragment (e.g. `"size(name) as cnt"` or `"id"`).
+    ///
+    /// Wraps the fragment in `SELECT <fragment>` and extracts the first projection from the
+    /// resulting plan. Returns `Err` if parsing or extraction fails.
+    pub fn parse_single_expr(expr_sql: &str) -> Result<crate::expression::Expression> {
+        let full_sql = format!("SELECT {expr_sql}");
+        match Self::parse(&full_sql)? {
+            LogicalPlan::Project(p) => p
+                .projections
+                .into_iter()
+                .next()
+                .ok_or_else(|| ThunderduckError::Parse("empty projection list".into())),
+            _ => Err(ThunderduckError::Parse(
+                "unexpected plan type from expression parse".into(),
+            )),
+        }
+    }
+
     /// Parse a Spark SQL string and return a typed `LogicalPlan`.
     pub fn parse(sql: &str) -> Result<LogicalPlan> {
         use sqlparser::parser::Parser;

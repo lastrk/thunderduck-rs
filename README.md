@@ -144,6 +144,7 @@ session thread → oneshot::Sender<SessionResult> → tokio task → gRPC stream
 
 - **Rust** 1.75+ (`rustup` recommended)
 - **protoc** — Protocol Buffers compiler
+- **curl** (optional — required to download the extension for strict Spark type parity)
 
 ```bash
 # Install Rust
@@ -156,7 +157,7 @@ brew install protobuf
 apt-get install -y protobuf-compiler
 ```
 
-### Build
+### Build (relaxed mode — default)
 
 ```bash
 # Full build (debug)
@@ -173,7 +174,16 @@ cargo build -p thunderduck-connect-server
 cargo check
 ```
 
-The `extensions/` directory contains pre-built DuckDB extension binaries for strict mode. These are embedded directly in the release binary via `include_bytes!()` — no separate extension build step is needed.
+### Build with Spark Compatibility Extension (strict mode)
+
+```bash
+cargo build --release --features bundled-extension
+```
+
+The extension binary for the current platform is automatically downloaded from the
+[`duckdb1.5.1-ext1` release](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/duckdb1.5.1-ext1)
+and cached under `extensions/` on first build. Subsequent builds reuse the cached file — no
+re-download. The extension is then embedded directly in the binary via `include_bytes!()`.
 
 ### Start the Server
 
@@ -201,14 +211,14 @@ Thunderduck supports two compatibility modes:
 | Mode | Extension | Type Accuracy | Performance |
 |------|-----------|---------------|-------------|
 | **Relaxed** (default) | Not loaded | ~85% — value-equivalent, may differ in output types | Maximum |
-| **Strict** | Loaded from `extensions/` | ~100% — exact Spark type parity | Near-maximum |
+| **Strict** | Embedded at build time | ~100% — exact Spark type parity | Near-maximum |
 
-The bundled `thdck_spark_funcs` DuckDB extension implements Spark-precise numerical semantics:
+The `thdck_spark_funcs` DuckDB extension implements Spark-precise numerical semantics:
 - `spark_decimal_div(a, b)` — decimal division with `ROUND_HALF_UP`
 - `spark_sum(col)` — Spark-compatible SUM return types
 - `spark_avg(col)` — Spark-compatible AVG return types
 
-Extension binaries are embedded in the release binary via `include_bytes!()` and loaded at startup in strict mode. No separate build or installation step is required.
+Strict mode requires building with `--features bundled-extension` (see [Build with Extension](#build-with-spark-compatibility-extension-strict-mode)). The extension is embedded in the binary at compile time and loaded at startup.
 
 ## Testing
 
@@ -241,6 +251,8 @@ cargo test -- --nocapture
 ```
 
 ### Differential Tests — Strict Mode
+
+Requires a binary built with `--features bundled-extension` (see above).
 
 ```bash
 THUNDERDUCK_COMPAT_MODE=strict ./tests/scripts/run-differential-tests.sh tpch

@@ -1,4 +1,4 @@
-mod data_type;
+pub(crate) mod data_type;
 mod struct_type;
 mod type_mapper;
 mod type_inference;

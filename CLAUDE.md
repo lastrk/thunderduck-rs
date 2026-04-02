@@ -144,7 +144,7 @@ Expression (enum)
 
 5. **DuckDB SEMI JOIN syntax**: DuckDB uses `SEMI JOIN` and `ANTI JOIN` (without `LEFT` prefix). `LEFT SEMI JOIN` is a parser error.
 
-6. **Extension version pinning**: The `.duckdb_extension` binary DuckDB version must exactly match the `duckdb` crate version in `Cargo.toml`. Currently targeting DuckDB 1.5.0.
+6. **Extension version pinning**: The `.duckdb_extension` binary DuckDB version must exactly match the `duckdb` crate version in `Cargo.toml`. Currently pinned to `duckdb1.5.1-ext1` (DuckDB 1.5.1, crate `1.10501.0`).
 
 7. **HUGEINT overflow**: DuckDB `SUM()` of integer columns returns `HUGEINT` (i128). Spark returns `BIGINT` (i64). SQL generation must emit explicit `CAST(... AS BIGINT)` for integer SUM.
 
@@ -169,12 +169,22 @@ Differential tests validate: same row count, same column names, **same column ty
 
 Two modes: **Relaxed** (default, no extension, ~85% compat) and **Strict** (extension loaded, ~100% compat).
 
-The `thdck_spark_funcs` DuckDB extension (from `thunderduck-duckdb-extension` repo, v1.5.0 branch) implements Spark-precise numerical semantics:
+```bash
+# Build WITHOUT extension (relaxed mode, default)
+cargo build --release
+
+# Build WITH extension (strict mode — downloads binary on first run)
+cargo build --release --features bundled-extension
+```
+
+The `thdck_spark_funcs` DuckDB extension (release [`duckdb1.5.1-ext1`](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/duckdb1.5.1-ext1)) implements Spark-precise numerical semantics:
 - `spark_decimal_div(a, b)` — decimal division with `ROUND_HALF_UP`
 - `spark_sum(col)` — Spark-compatible SUM return types
 - `spark_avg(col)` — Spark-compatible AVG return types
 
-Extension binaries are bundled in `extensions/` and embedded in the binary via `include_bytes!()`. Platform-specific loading at startup.
+On first `--features bundled-extension` build, `build.rs` downloads the correct platform binary
+from GitHub releases and caches it under `extensions/` (gitignored). The binary is embedded via
+`include_bytes!()` and loaded at startup in strict mode.
 
 > Full details: [docs/architecture.md#adr-13](docs/architecture.md)
 
@@ -201,6 +211,9 @@ cargo build
 
 # Release build (for integration tests)
 cargo build --release
+
+# Release build WITH strict-mode extension (downloads binary on first run)
+cargo build --release --features bundled-extension
 
 # Build a single crate
 cargo build -p thunderduck-core
@@ -276,3 +289,61 @@ pkill -f thunderduck-connect-server
 | DataFrame diff util | `tests/integration/utils/dataframe_diff.py` |
 
 **Last Updated**: 2026-03-18
+
+# Project Guidelines
+
+## Rust Standards
+
+This project follows strict Rust conventions enforced by specialized agents.
+
+### Build & Quality Gates
+- All code must pass: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`
+- No `.unwrap()` in library code. `.expect()` only for proven invariants.
+- All public items must have `///` doc comments.
+- Error types use `thiserror` in library crates, `anyhow` in application crates.
+- No hardcoded secrets. Use environment variables via `dotenvy`.
+
+### Preferred Crates
+- Async runtime: `tokio`
+- HTTP server: `axum` + `tower`
+- HTTP client: `reqwest`
+- Serialization: `serde` + `serde_json`
+- CLI: `clap` (derive)
+- Logging: `tracing`
+- Database: `sqlx`
+
+### Code Style
+- Accept the most general borrow: `&str` not `&String`, `&[T]` not `&Vec<T>`
+- Iterator chains over manual loops when intent is clearer
+- 4 parameters max per function; use config structs beyond that
+- Return early to reduce nesting
+- Derive `Debug` on everything; other derives only when semantically meaningful
+
+## Agent Pipeline
+
+This project uses a multi-agent development pipeline. Invoke with:
+```
+/rust-feature <describe the feature or requirement>
+```
+
+### Pipeline Stages
+1. **Architect** (read-only, Opus) — explores codebase, produces architecture plan
+2. **Coder** (read-write, Sonnet) — implements the plan, runs tests
+3. **Reviewer** (read-only, Opus) — reviews for correctness, style, security
+4. **Coder** (fix loop, max 3 iterations) — addresses Critical/High review findings
+5. **Perf Reviewer** (read-only, Opus) — identifies optimization opportunities
+6. **Perf Optimizer** (read-write, Sonnet) — implements approved optimizations
+7. **Summary** — compiled for human review
+
+### Agent Communication
+Agents communicate through `.agent-output/` markdown files:
+- `001-architecture-plan.md` — Architecture decisions and type skeletons
+- `002-implementation-log.md` — Files changed, tests added, fix iterations
+- `003-review-findings.md` — Review findings with severity and verdicts
+- `004-perf-findings.md` — Performance analysis with hypotheses
+- `005-summary.md` — Final human-readable summary
+
+### Agent Boundaries
+- **Read-only agents** (architect, reviewer, perf-reviewer): CANNOT modify source files
+- **Read-write agents** (coder, perf-optimizer): CAN modify source files and run commands
+- Agents must stay within their designated scope — no architecture changes from the coder, no code fixes from the reviewer

@@ -464,6 +464,36 @@ impl Expression {
                 match &b.op {
                     Eq | NotEq | Lt | LtEq | Gt | GtEq | And | Or => DataType::Boolean,
                     Concat => DataType::String,
+                    Div => {
+                        // Spark: integer / integer → Double (unlike most languages)
+                        let lt = b.left.data_type(schema);
+                        let rt = b.right.data_type(schema);
+                        use DataType::*;
+                        match (&lt, &rt) {
+                            (Byte | Short | Integer | Long, Byte | Short | Integer | Long) => Double,
+                            _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
+                        }
+                    }
+                    Mul => {
+                        let lt = b.left.data_type(schema);
+                        let rt = b.right.data_type(schema);
+                        match (&lt, &rt) {
+                            (DataType::Decimal { precision: p1, scale: s1 }, DataType::Decimal { precision: p2, scale: s2 }) => {
+                                TypeInferenceEngine::decimal_mul_type(*p1, *s1, *p2, *s2)
+                            }
+                            _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
+                        }
+                    }
+                    Add | Sub => {
+                        let lt = b.left.data_type(schema);
+                        let rt = b.right.data_type(schema);
+                        match (&lt, &rt) {
+                            (DataType::Decimal { precision: p1, scale: s1 }, DataType::Decimal { precision: p2, scale: s2 }) => {
+                                TypeInferenceEngine::decimal_add_type(*p1, *s1, *p2, *s2)
+                            }
+                            _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
+                        }
+                    }
                     _ => {
                         let lt = b.left.data_type(schema);
                         let rt = b.right.data_type(schema);
@@ -479,14 +509,28 @@ impl Expression {
             Expression::FunctionCall(f) => {
                 let arg_types: Vec<DataType> =
                     f.args.iter().map(|a| a.data_type(schema)).collect();
-                TypeInferenceEngine::function_return_type(&f.name, &arg_types)
+                let dt = TypeInferenceEngine::function_return_type(&f.name, &arg_types);
+                // For array-constructor functions, set containsNull based on whether any
+                // argument can be null (e.g. array(lit(1), lit(2)) → containsNull=false).
+                match dt {
+                    DataType::Array(elem, _)
+                        if matches!(f.name.to_lowercase().as_str(), "array" | "make_array") =>
+                    {
+                        let contains_null = f.args.iter().any(|a| a.nullable(schema));
+                        DataType::Array(elem, contains_null)
+                    }
+                    other => other,
+                }
             }
             Expression::Cast(c) => c.to_type.clone(),
             Expression::CaseWhen(cw) => {
-                cw.branches
-                    .first()
-                    .map(|(_, r)| r.data_type(schema))
-                    .unwrap_or(DataType::Unresolved)
+                let branch_types = cw.branches.iter().map(|(_, r)| r.data_type(schema));
+                let else_type = cw.else_expr.as_ref().map(|e| e.data_type(schema));
+                let all_types: Vec<DataType> = branch_types.chain(else_type).collect();
+                all_types.into_iter().reduce(|acc, t| {
+                    use crate::types::TypeInferenceEngine;
+                    TypeInferenceEngine::promote_numeric(&acc, &t)
+                }).unwrap_or(DataType::Unresolved)
             }
             Expression::Window(w) => match w.func.as_ref() {
                 Expression::FunctionCall(f) => {
@@ -503,7 +547,13 @@ impl Expression {
             Expression::Lambda(l) => l.body.data_type(schema),
             Expression::LambdaVariable(_) => DataType::Unresolved,
             Expression::RawSql(_) => DataType::Unresolved,
-            Expression::ArrayLiteral(a) => DataType::Array(Box::new(a.element_type.clone())),
+            Expression::ArrayLiteral(a) => {
+                // containsNull=true only if any element is an explicit NULL literal.
+                let contains_null = a.elements.iter().any(|e| {
+                    matches!(e, Expression::Literal(l) if matches!(l.value, LiteralValue::Null))
+                });
+                DataType::Array(Box::new(a.element_type.clone()), contains_null)
+            }
             Expression::MapLiteral(m) => DataType::Map {
                 key: Box::new(m.key_type.clone()),
                 value: Box::new(m.value_type.clone()),
@@ -523,30 +573,64 @@ impl Expression {
         match self {
             Expression::Literal(l) => matches!(l.value, LiteralValue::Null),
             Expression::ColumnReference(c) => TypeInferenceEngine::column_nullable(&c.name, schema),
-            Expression::UnresolvedColumn(_) => true,
+            Expression::UnresolvedColumn(u) => TypeInferenceEngine::column_nullable(&u.name, schema),
             Expression::Binary(b) => b.left.nullable(schema) || b.right.nullable(schema),
             Expression::Unary(u) => match u.op {
                 UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::IsNaN | UnaryOp::IsNotNaN => false,
                 _ => u.operand.nullable(schema),
             },
             Expression::FunctionCall(f) => {
-                match f.name.to_lowercase().as_str() {
-                    "count" | "count_distinct" => false,
-                    "coalesce" => f.args.iter().all(|a| a.nullable(schema)),
-                    _ => f.args.iter().any(|a| a.nullable(schema)),
+                let lower = f.name.to_lowercase();
+                if matches!(lower.as_str(), "count" | "count_distinct") {
+                    false
+                } else if TypeInferenceEngine::aggregate_is_always_nullable(&lower) {
+                    true
+                } else if matches!(lower.as_str(), "coalesce" | "ifnull" | "nvl" | "iif") {
+                    f.args.iter().all(|a| a.nullable(schema))
+                } else if lower.as_str() == "when" {
+                    // args layout: [cond1, val1, cond2, val2, ..., maybe_else]
+                    // - Even total args: no ELSE clause → always nullable (NULL when nothing matches)
+                    // - Odd total args: last arg is the ELSE value
+                    if f.args.len() % 2 == 0 {
+                        // No ELSE clause — always nullable (NULL when nothing matches)
+                        true
+                    } else {
+                        // THEN values at odd indices (1, 3, 5, ...)
+                        let then_nullable = f.args.iter().skip(1).step_by(2)
+                            .any(|a| a.nullable(schema));
+                        // ELSE value is the last arg (even index since total is odd)
+                        let else_nullable = f.args.last()
+                            .map_or(false, |a| a.nullable(schema));
+                        then_nullable || else_nullable
+                    }
+                } else {
+                    f.args.iter().any(|a| a.nullable(schema))
                 }
             }
-            Expression::Cast(_) => true,
-            Expression::CaseWhen(_) => true,
+            Expression::Cast(c) => c.expr.nullable(schema),
+            Expression::CaseWhen(cw) => {
+                cw.else_expr.is_none()
+                    || cw.else_expr.as_ref().is_some_and(|e| e.nullable(schema))
+                    || cw.branches.iter().any(|(_, then)| then.nullable(schema))
+            }
             Expression::Window(w) => match w.func.as_ref() {
-                Expression::FunctionCall(f) => !TypeInferenceEngine::window_is_non_nullable(&f.name),
+                Expression::FunctionCall(f) => {
+                    if TypeInferenceEngine::window_is_non_nullable(&f.name) {
+                        false
+                    } else if matches!(f.name.to_lowercase().as_str(), "lag" | "lead") {
+                        // NOT NULL when 3rd arg (default) is present and non-nullable
+                        f.args.get(2).map_or(true, |default| default.nullable(schema))
+                    } else {
+                        true
+                    }
+                }
                 _ => true,
             },
             Expression::Alias(a) => a.expr.nullable(schema),
             Expression::Star(_) => false,
             Expression::InSubquery(_) | Expression::ExistsSubquery(_) | Expression::InList(_) => false,
             Expression::ScalarSubquery(_) => true,
-            Expression::Lambda(_) | Expression::LambdaVariable(_) => true,
+            Expression::Lambda(_) | Expression::LambdaVariable(_) => false,
             Expression::RawSql(_) => true,
             Expression::ArrayLiteral(_) | Expression::MapLiteral(_) | Expression::StructLiteral(_) => false,
             Expression::Between(_) => false,
@@ -560,17 +644,7 @@ impl Expression {
     }
 }
 
-// ── Small helper trait ────────────────────────────────────────────────────────
-
-trait PipeIfUnresolved {
-    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self;
-}
-
-impl PipeIfUnresolved for DataType {
-    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self {
-        if self == DataType::Unresolved { f() } else { self }
-    }
-}
+use crate::types::data_type::PipeIfUnresolved;
 
 #[cfg(test)]
 mod tests {

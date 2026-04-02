@@ -36,7 +36,7 @@ pub fn proto_to_data_type(dt: &proto::DataType) -> Result<DataType> {
                 .map(proto_to_data_type)
                 .transpose()?
                 .unwrap_or(DataType::Unresolved);
-            Ok(DataType::Array(Box::new(element_type)))
+            Ok(DataType::Array(Box::new(element_type), a.contains_null))
         }
         Some(Kind::Map(m)) => {
             let key_type = m.key_type.as_deref()
@@ -94,9 +94,9 @@ pub fn data_type_to_proto(dt: &DataType) -> proto::DataType {
                 type_variation_reference: 0,
             })
         }
-        DataType::Array(elem) => Kind::Array(Box::new(proto::data_type::Array {
+        DataType::Array(elem, cn) => Kind::Array(Box::new(proto::data_type::Array {
             element_type: Some(Box::new(data_type_to_proto(elem))),
-            contains_null: true,
+            contains_null: *cn,
             type_variation_reference: 0,
         })),
         DataType::Map { key, value, value_nullable } => Kind::Map(Box::new(proto::data_type::Map {
@@ -149,7 +149,7 @@ pub fn parse_type_str(s: &str) -> DataType {
     // Handle array<element_type>
     if lower.starts_with("array<") {
         if let Some(inner) = lower.strip_prefix("array<").and_then(|r| r.strip_suffix('>')) {
-            return DataType::Array(Box::new(parse_type_str(inner)));
+            return DataType::Array(Box::new(parse_type_str(inner)), true);
         }
     }
     match lower {

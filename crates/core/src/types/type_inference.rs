@@ -85,8 +85,10 @@ impl TypeInferenceEngine {
 
     /// Spark's decimal multiplication result type.
     pub fn decimal_mul_type(p1: u8, s1: u8, p2: u8, s2: u8) -> DataType {
-        let scale = (s1 + s2).min(38);
-        let precision = ((p1 as u16 + p2 as u16).min(38)) as u8;
+        // Spark: precision = p1 + p2 + 1, scale = s1 + s2 (with adjust_precision_scale for overflow)
+        let raw_precision = p1 as i16 + p2 as i16 + 1;
+        let raw_scale = s1 as i16 + s2 as i16;
+        let (precision, scale) = Self::adjust_precision_scale(raw_precision, raw_scale);
         DataType::Decimal { precision, scale }
     }
 
@@ -143,8 +145,8 @@ impl TypeInferenceEngine {
             "percentile" | "percentile_approx" | "approx_percentile" => Double,
 
             // collect_list / collect_set → Array
-            "collect_list" => Array(Box::new(arg_type.clone())),
-            "collect_set" => Array(Box::new(arg_type.clone())),
+            "collect_list" => Array(Box::new(arg_type.clone()), false),
+            "collect_set" => Array(Box::new(arg_type.clone()), false),
 
             // approx_count_distinct → Long
             "approx_count_distinct" | "count_approx_distinct" => Long,
@@ -154,6 +156,11 @@ impl TypeInferenceEngine {
 
             // bool aggregates → Boolean
             "bool_and" | "every" | "bool_or" | "any_value" => Boolean,
+
+            // Scalar functions that can appear as wrappers around aggregates.
+            // Without these, agg_expr_to_field would use the default `arg_type.clone()`,
+            // returning the array type of the wrapped aggregate instead of the correct scalar type.
+            "size" | "cardinality" | "map_size" | "array_size" => Integer,
 
             _ => arg_type.clone(),
         }
@@ -179,15 +186,45 @@ impl TypeInferenceEngine {
                 arg_type.cloned().unwrap_or(DataType::Long)
             }
 
-            _ => arg_type.cloned().unwrap_or(DataType::Unresolved),
+            // Aggregate window functions: delegate to aggregate_return_type
+            agg => {
+                let resolved = arg_type.unwrap_or(&DataType::Unresolved);
+                let dt = Self::aggregate_return_type(agg, resolved);
+                if dt == *resolved && matches!(resolved, DataType::Unresolved) {
+                    DataType::Unresolved
+                } else {
+                    dt
+                }
+            }
         }
     }
 
-    /// Is this window function non-nullable (ranking functions are).
+    /// Aggregate functions that always return NULL for an empty group.
+    /// Distinct from COUNT, which returns 0 (non-nullable).
+    pub fn aggregate_is_always_nullable(name: &str) -> bool {
+        matches!(
+            name.to_lowercase().as_str(),
+            "sum" | "sum_distinct" | "avg" | "mean" | "min" | "max"
+            | "first" | "last" | "first_value" | "last_value" | "any_value"
+            | "stddev" | "stddev_samp" | "stddev_pop"
+            | "variance" | "var_samp" | "var_pop"
+            | "percentile" | "percentile_approx" | "approx_percentile"
+            | "collect_list" | "collect_set" | "array_agg"
+            | "kurtosis" | "skewness" | "corr" | "covar_pop" | "covar_samp"
+            | "regr_avgx" | "regr_avgy" | "regr_count" | "regr_r2"
+            | "regr_slope" | "regr_intercept"
+            | "bit_and" | "bit_or" | "bit_xor"
+            | "bool_and" | "bool_or" | "every"
+            | "nth_value"
+        )
+    }
+
+    /// Is this window function non-nullable (ranking functions and COUNT are).
     pub fn window_is_non_nullable(name: &str) -> bool {
         matches!(
             name.to_lowercase().as_str(),
             "row_number" | "rank" | "dense_rank" | "ntile" | "percent_rank" | "cume_dist"
+            | "count" | "count_distinct"
         )
     }
 
@@ -202,8 +239,8 @@ impl TypeInferenceEngine {
             // ── String functions ──────────────────────────────────────────────
             "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "lpad" | "rpad" | "concat"
             | "concat_ws" | "substring" | "substr" | "replace" | "regexp_replace"
-            | "translate" | "repeat" | "reverse" | "space" | "soundex" | "hex" | "unhex"
-            | "base64" | "unbase64" | "encode" | "decode" | "overlay" | "initcap"
+            | "translate" | "repeat" | "reverse" | "space" | "soundex" | "hex"
+            | "base64" | "unbase64" | "decode" | "overlay" | "initcap"
             | "format_string" | "printf" | "from_unixtime" | "date_format" | "to_char"
             | "to_number" | "format_number" | "left" | "right" | "uuid" | "md5"
             | "sha" | "sha1" | "sha2" | "crc32" | "ascii" | "chr" | "char"
@@ -239,19 +276,31 @@ impl TypeInferenceEngine {
             "round" | "bround" => arg_types.first().cloned().unwrap_or(Double),
 
             // ── Math → Integer ────────────────────────────────────────────────
-            "sign" | "signum" | "pmod" | "mod" | "int" | "factorial" => Integer,
+            "sign" | "signum" => Double,
+            "pmod" | "mod" | "int" => Integer,
+            "factorial" => Long,
+            "bit_count" => Integer,
+            "bit_get" | "getbit" => Byte,
 
-            // ── Math → Long ───────────────────────────────────────────────────
-            "shiftleft" | "shiftright" | "shiftrightunsigned" | "bit_count" | "bit_get"
-            | "getbit" => Long,
+            // ── Math → same type as first arg ────────────────────────────────
+            "shiftleft" | "shiftright" | "shiftrightunsigned" => {
+                arg_types.first().cloned().unwrap_or(Long)
+            }
+
+            // ── Binary ────────────────────────────────────────────────────────
+            "unhex" | "decode_binary" | "encode" => Binary,
+
+            // ── Date → String ─────────────────────────────────────────────────
+            "dayname" | "monthname" => String,
 
             // ── Date → Date ───────────────────────────────────────────────────
             "to_date" | "date_add" | "date_sub" | "add_months" | "last_day" | "next_day"
-            | "make_date" | "trunc" | "date_trunc" => Date,
+            | "make_date" | "trunc" => Date,
 
             // ── Date → Timestamp ──────────────────────────────────────────────
-            "to_timestamp" | "to_timestamp_ntz" | "make_timestamp" | "date_trunc_ts"
-            | "now" | "current_timestamp" => Timestamp,
+            // date_trunc(fmt, expr): always returns Timestamp in Spark (unlike trunc which → Date)
+            "date_trunc" | "to_timestamp" | "to_timestamp_ntz" | "make_timestamp"
+            | "date_trunc_ts" | "now" | "current_timestamp" => Timestamp,
 
             "current_date" | "curdate" => Date,
 
@@ -263,40 +312,60 @@ impl TypeInferenceEngine {
             // ── Array functions ────────────────────────────────────────────────
             "array" | "make_array" => {
                 let elem = arg_types.first().cloned().unwrap_or(Unresolved);
-                Array(Box::new(elem))
+                Array(Box::new(elem), true)
             }
             "array_distinct" | "array_sort" | "sort_array" | "array_reverse"
-            | "array_compact" | "flatten" | "slice" => {
-                arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved)))
+            | "flatten" | "slice" => {
+                arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved), true))
+            }
+            // array_append / array_prepend: Spark conservatively sets containsNull=true
+            "array_append" | "array_prepend" | "append_element" | "prepend_element" => {
+                match arg_types.first() {
+                    Some(Array(elem, _)) => Array(elem.clone(), true),
+                    _ => arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved), true)),
+                }
+            }
+            "array_compact" => {
+                // compact removes nulls → elements are not null
+                match arg_types.first() {
+                    Some(Array(elem, _)) => Array(elem.clone(), false),
+                    Some(t) => t.clone(),
+                    None => Array(Box::new(Unresolved), false),
+                }
             }
             "array_union" | "array_intersect" | "array_except" | "array_concat" => {
-                arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved)))
+                arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved), true))
             }
             "transform" => {
                 // transform(array, x -> expr): return type is Array of whatever lambda returns
                 // arg_types[1] is the lambda return type when available
                 let elem = arg_types.get(1).cloned().unwrap_or(Unresolved);
-                Array(Box::new(elem))
+                Array(Box::new(elem), true)
             }
             "filter" | "array_filter" => {
-                arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved)))
+                arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved), true))
+            }
+            "split" => Array(Box::new(String), false),
+            "sequence" => {
+                let elem = arg_types.first().cloned().unwrap_or(Long);
+                Array(Box::new(elem), false)
             }
             "array_join" => String,
             "array_max" | "array_min" => match arg_types.first() {
-                Some(Array(elem)) => *elem.clone(),
+                Some(Array(elem, _)) => *elem.clone(),
                 Some(t) => t.clone(),
                 None => Unresolved,
             },
             "size" | "array_size" | "cardinality" | "map_size" => Integer,
             "array_position" => Long,
             "element_at" => match arg_types.first() {
-                Some(Array(elem)) => *elem.clone(),
+                Some(Array(elem, _)) => *elem.clone(),
                 Some(Map { value, .. }) => *value.clone(),
                 _ => Unresolved,
             },
             "explode" | "explode_outer" | "posexplode" | "posexplode_outer"
             | "inline" | "inline_outer" => match arg_types.first() {
-                Some(Array(elem)) => *elem.clone(),
+                Some(Array(elem, _)) => *elem.clone(),
                 _ => Unresolved,
             },
 
@@ -311,14 +380,14 @@ impl TypeInferenceEngine {
                     Some(Map { key, .. }) => *key.clone(),
                     _ => Unresolved,
                 };
-                Array(Box::new(k))
+                Array(Box::new(k), false)
             }
             "map_values" => {
                 let v = match arg_types.first() {
                     Some(Map { value, .. }) => *value.clone(),
                     _ => Unresolved,
                 };
-                Array(Box::new(v))
+                Array(Box::new(v), true)
             }
             "map_concat" => arg_types.first().cloned().unwrap_or(Unresolved),
             "map_entries" => Unresolved, // struct array
@@ -335,6 +404,17 @@ impl TypeInferenceEngine {
             }
             "nullif" => arg_types.first().cloned().unwrap_or(Unresolved),
             "if" | "iff" | "nvl2" => arg_types.get(1).cloned().unwrap_or(Unresolved),
+            // when(cond1, val1, cond2, val2, ..., [else]): THEN values at odd indices
+            "when" => {
+                let mut i = 1;
+                while i < arg_types.len() {
+                    if !matches!(arg_types[i], Unresolved) {
+                        return arg_types[i].clone();
+                    }
+                    i += 2;
+                }
+                Unresolved
+            }
             "nanvl" => arg_types.first().cloned().unwrap_or(Double),
 
             // ── JSON ─────────────────────────────────────────────────────────
@@ -342,7 +422,8 @@ impl TypeInferenceEngine {
             "from_json" => Unresolved, // struct; caller should provide schema
             "to_json" => String,
             "json_array_length" | "json_object_length" => Integer,
-            "json_object_keys" | "schema_of_json" => String,
+            "json_object_keys" => Array(Box::new(String), true),
+            "schema_of_json" => String,
 
             // ── Misc ──────────────────────────────────────────────────────────
             "rand" | "random" | "randn" => Double,
@@ -353,6 +434,21 @@ impl TypeInferenceEngine {
             "typeof" | "version" => String,
             "assert_true" => Boolean,
             "raise_error" => String,
+
+            // ── Aggregate functions used in scalar context (e.g. sort_array(collect_list(...))) ──
+            "collect_list" | "array_agg" => match arg_types.first() {
+                Some(Array(_, _)) => arg_types[0].clone(), // already an array
+                Some(t) => Array(Box::new(t.clone()), false),
+                None => Array(Box::new(Unresolved), false),
+            },
+            "collect_set" => match arg_types.first() {
+                Some(Array(_, _)) => arg_types[0].clone(),
+                Some(t) => Array(Box::new(t.clone()), false),
+                None => Array(Box::new(Unresolved), false),
+            },
+
+            // ── Count variants ────────────────────────────────────────────────
+            "count_if" => Long,
 
             // Fallback: return first arg type or Unresolved
             _ => arg_types.first().cloned().unwrap_or(Unresolved),
@@ -384,8 +480,8 @@ impl TypeInferenceEngine {
         } else {
             let int_digits = raw_precision - raw_scale;
             let min_scale = raw_scale.min(6);
-            let scale = (38 - int_digits).max(min_scale);
-            let precision = (int_digits + scale).min(38);
+            let scale = ((38i16 - int_digits).max(min_scale)).max(0);
+            let precision = (int_digits + scale).min(38).max(0);
             (precision as u8, scale as u8)
         }
     }

@@ -43,7 +43,13 @@ impl ExpressionConverter {
             Some(ExprType::CallFunction(cf)) => self.convert_call_function(cf),
             Some(ExprType::UnresolvedExtractValue(ev)) => self.convert_extract_value(ev),
             Some(ExprType::ExpressionString(es)) => {
-                Ok(Expression::RawSql(RawSqlExpression { sql: es.expression.clone() }))
+                // Try to parse the expression string into a typed AST node so that
+                // `data_type()` / `nullable()` work correctly (e.g. `size(name) → Integer`
+                // instead of Unresolved). Fall back to RawSql on any parse error.
+                Ok(thunderduck_core::parser::SparkSqlParser::parse_single_expr(&es.expression)
+                    .unwrap_or_else(|_| {
+                        Expression::RawSql(RawSqlExpression { sql: es.expression.clone() })
+                    }))
             }
             Some(ExprType::CommonInlineUserDefinedFunction(udf)) => {
                 // Treat as a regular function call with the UDF name.
@@ -320,9 +326,9 @@ impl ExpressionConverter {
                 _ => None,
             };
             if let Some(op) = op {
-                let mut it = args.into_iter();
-                let left = it.next().unwrap();
-                let right = it.next().unwrap();
+                let mut args = args;
+                let right = args.remove(1);
+                let left = args.remove(0);
                 return Ok(Expression::Binary(BinaryExpression {
                     left: Box::new(left),
                     op,
@@ -339,7 +345,8 @@ impl ExpressionConverter {
                 _ => None,
             };
             if let Some(op) = op {
-                let operand = args.into_iter().next().unwrap();
+                let mut args = args;
+                let operand = args.remove(0);
                 return Ok(Expression::Unary(UnaryExpression {
                     op,
                     operand: Box::new(operand),

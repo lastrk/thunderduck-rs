@@ -25,7 +25,8 @@ pub enum DataType {
     Unresolved,
 
     // ── Compound ─────────────────────────────────────────────────
-    Array(Box<DataType>),
+    /// Array type. Second field is `contains_null` (whether elements may be null).
+    Array(Box<DataType>, bool),
     Map {
         key: Box<DataType>,
         value: Box<DataType>,
@@ -72,13 +73,25 @@ impl DataType {
     pub fn contains_unresolved(&self) -> bool {
         match self {
             DataType::Unresolved => true,
-            DataType::Array(elem) => elem.contains_unresolved(),
+            DataType::Array(elem, _) => elem.contains_unresolved(),
             DataType::Map { key, value, .. } => {
                 key.contains_unresolved() || value.contains_unresolved()
             }
             DataType::Struct(s) => s.fields.iter().any(|f| f.data_type.contains_unresolved()),
             _ => false,
         }
+    }
+}
+
+/// Helper trait for short-circuiting when a type is already resolved.
+/// Returns `self` if resolved, otherwise calls the fallback closure.
+pub(crate) trait PipeIfUnresolved {
+    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self;
+}
+
+impl PipeIfUnresolved for DataType {
+    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self {
+        if self == DataType::Unresolved { f() } else { self }
     }
 }
 
@@ -102,7 +115,7 @@ impl std::fmt::Display for DataType {
             DataType::DayTimeInterval => write!(f, "day_time_interval"),
             DataType::Null => write!(f, "null"),
             DataType::Unresolved => write!(f, "unresolved"),
-            DataType::Array(elem) => write!(f, "array<{elem}>"),
+            DataType::Array(elem, _) => write!(f, "array<{elem}>"),
             DataType::Map { key, value, .. } => write!(f, "map<{key},{value}>"),
             DataType::Struct(st) => write!(f, "struct<{}>", st.field_names().join(",")),
         }
@@ -126,6 +139,6 @@ mod tests {
     fn display() {
         assert_eq!(DataType::Long.to_string(), "long");
         assert_eq!(DataType::Decimal { precision: 18, scale: 4 }.to_string(), "decimal(18,4)");
-        assert_eq!(DataType::Array(Box::new(DataType::Integer)).to_string(), "array<integer>");
+        assert_eq!(DataType::Array(Box::new(DataType::Integer), true).to_string(), "array<integer>");
     }
 }

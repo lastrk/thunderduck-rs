@@ -45,14 +45,12 @@ impl StructType {
 
     /// Lookup a field by name (case-insensitive, matches Spark behaviour).
     pub fn field_by_name(&self, name: &str) -> Option<&StructField> {
-        let lower = name.to_lowercase();
-        self.fields.iter().find(|f| f.name.to_lowercase() == lower)
+        self.fields.iter().find(|f| f.name.eq_ignore_ascii_case(name))
     }
 
     /// Lookup index by name (case-insensitive).
     pub fn field_index(&self, name: &str) -> Option<usize> {
-        let lower = name.to_lowercase();
-        self.fields.iter().position(|f| f.name.to_lowercase() == lower)
+        self.fields.iter().position(|f| f.name.eq_ignore_ascii_case(name))
     }
 
     /// All field names in order.

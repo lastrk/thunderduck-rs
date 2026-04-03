@@ -21,6 +21,39 @@ impl TypeInferenceEngine {
         schema.field_by_name(name).map(|f| f.nullable).unwrap_or(true)
     }
 
+    // ── Lambda schema augmentation ───────────────────────────────────────────
+
+    /// Creates a schema augmented with lambda parameter bindings.
+    /// Binds lambda params to the array element type so lambda body
+    /// expressions can resolve via schema lookup.
+    pub fn augment_schema_with_lambda_params(
+        schema: &StructType,
+        param_names: &[String],
+        element_type: &DataType,
+        element_nullable: bool,
+    ) -> StructType {
+        let mut fields: Vec<crate::types::StructField> = schema.fields
+            .iter()
+            .filter(|f| !param_names.iter().any(|p| f.name.eq_ignore_ascii_case(p)))
+            .cloned()
+            .collect();
+        if let Some(name) = param_names.first() {
+            fields.push(crate::types::StructField::new(
+                name.clone(),
+                element_type.clone(),
+                element_nullable,
+            ));
+        }
+        if param_names.len() > 1 {
+            fields.push(crate::types::StructField::new(
+                param_names[1].clone(),
+                DataType::Integer,
+                false,
+            ));
+        }
+        StructType::new(fields)
+    }
+
     // ── Numeric promotion ──────────────────────────────────────────────────────
 
     /// Promote two numeric types following Spark's rules:
@@ -363,14 +396,19 @@ impl TypeInferenceEngine {
             "array_union" | "array_intersect" | "array_except" | "array_concat" => {
                 arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved), true))
             }
-            "transform" => {
+            "transform" | "list_transform" => {
                 // transform(array, x -> expr): return type is Array of whatever lambda returns
                 // arg_types[1] is the lambda return type when available
                 let elem = arg_types.get(1).cloned().unwrap_or(Unresolved);
                 Array(Box::new(elem), true)
             }
-            "filter" | "array_filter" => {
+            "filter" | "array_filter" | "list_filter" => {
                 arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved), true))
+            }
+            // ── HOF predicates ────────────────────────────────────────────
+            "exists" | "forall" | "list_bool_or" | "list_bool_and" => Boolean,
+            "aggregate" | "reduce" | "list_reduce" => {
+                arg_types.get(1).cloned().unwrap_or(Unresolved)
             }
             "split" => Array(Box::new(String), false),
             "sequence" => {
@@ -644,5 +682,44 @@ mod tests {
         assert_eq!(TypeInferenceEngine::column_type("ID", &schema), DataType::Long);
         assert_eq!(TypeInferenceEngine::column_nullable("code", &schema), false);
         assert_eq!(TypeInferenceEngine::column_type("missing", &schema), DataType::Unresolved);
+    }
+
+    #[test]
+    fn exists_returns_boolean() {
+        use DataType::*;
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("exists", &[Array(Box::new(Integer), false)]),
+            Boolean
+        );
+    }
+
+    #[test]
+    fn aggregate_returns_init_type() {
+        use DataType::*;
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("aggregate", &[Array(Box::new(Integer), false), Long]),
+            Long
+        );
+    }
+
+    #[test]
+    fn augment_schema_adds_lambda_params() {
+        use crate::types::{StructField, StructType};
+        let schema = StructType::new(vec![
+            StructField::nullable("id", DataType::Long),
+        ]);
+        let augmented = TypeInferenceEngine::augment_schema_with_lambda_params(
+            &schema,
+            &["x".to_owned(), "i".to_owned()],
+            &DataType::Integer,
+            false,
+        );
+        assert_eq!(augmented.fields.len(), 3);
+        assert_eq!(augmented.fields[1].name, "x");
+        assert_eq!(augmented.fields[1].data_type, DataType::Integer);
+        assert!(!augmented.fields[1].nullable);
+        assert_eq!(augmented.fields[2].name, "i");
+        assert_eq!(augmented.fields[2].data_type, DataType::Integer);
+        assert!(!augmented.fields[2].nullable);
     }
 }

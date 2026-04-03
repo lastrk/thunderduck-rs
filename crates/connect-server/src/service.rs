@@ -162,7 +162,7 @@ impl SparkConnectService for ThunderduckService {
                 let mut struct_type = logical_plan.infer_schema();
                 let has_unresolved = struct_type.fields.iter()
                     .any(|f| f.data_type.contains_unresolved());
-                if struct_type.is_empty() || has_unresolved {
+                if struct_type.is_empty() || has_unresolved || logical_plan.has_partial_schema() {
                     // Static inference failed or produced Unresolved types — ask DuckDB
                     // for the actual column types/nullability.
                     let sql = SqlGenerator::new(session.mode())

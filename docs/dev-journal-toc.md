@@ -4,6 +4,18 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-04-03 — Array containsNull, HOF Types, CTE Schema Propagation
+
+[`dev_journal/2026-04-03-array-hof-cte-schemas.md`](dev_journal/2026-04-03-array-hof-cte-schemas.md)
+
+Lambda schema augmentation for array containsNull + HOF return types (+9 strict tests),
+Unpivot nullable propagation, CTE schema propagation for decimal precision (+9 strict tests).
+Extension bumped to `duckdb1.5.1-ext2`.
+
+**Tests**: 87 unit · 822 relaxed · 716 strict
+
+---
+
 ## 2026-04-02 — CaseWhen, Decimal, Struct Nullable, Code Review, Perf
 
 [`dev_journal/2026-04-02-casewhen-decimal-review.md`](dev_journal/2026-04-02-casewhen-decimal-review.md)

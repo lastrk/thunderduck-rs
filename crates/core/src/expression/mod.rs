@@ -573,16 +573,61 @@ impl Expression {
                 let arg_types: Vec<DataType> =
                     f.args.iter().map(|a| a.data_type(schema)).collect();
                 let dt = TypeInferenceEngine::function_return_type(&f.name, &arg_types);
-                // For array-constructor functions, set containsNull based on whether any
-                // argument can be null (e.g. array(lit(1), lit(2)) → containsNull=false).
-                match dt {
-                    DataType::Array(elem, _)
-                        if matches!(f.name.to_lowercase().as_str(), "array" | "make_array") =>
-                    {
-                        let contains_null = f.args.iter().any(|a| a.nullable(schema));
-                        DataType::Array(elem, contains_null)
+
+                // HOF-specific return type resolution (needs schema + lambda access)
+                let lower = f.name.to_lowercase();
+                match lower.as_str() {
+                    "transform" | "list_transform" => {
+                        if let Some(arr_type) = f.args.first().map(|a| a.data_type(schema)) {
+                            if let DataType::Array(elem, elem_nullable) = arr_type {
+                                if let Some(Expression::Lambda(lambda)) = f.args.get(1) {
+                                    let augmented =
+                                        TypeInferenceEngine::augment_schema_with_lambda_params(
+                                            schema,
+                                            &lambda.params,
+                                            &elem,
+                                            elem_nullable,
+                                        );
+                                    let body_type = lambda.body.data_type(&augmented);
+                                    let body_nullable = lambda.body.nullable(&augmented);
+                                    return DataType::Array(
+                                        Box::new(body_type),
+                                        body_nullable,
+                                    );
+                                }
+                            }
+                        }
+                        dt
                     }
-                    other => other,
+                    "filter" | "list_filter" | "array_filter" => {
+                        f.args.first().map(|a| a.data_type(schema)).unwrap_or(dt)
+                    }
+                    "aggregate" | "reduce" | "list_reduce" => {
+                        let init_type = f.args.get(1).map(|a| a.data_type(schema)).unwrap_or(dt);
+                        if let Some(Expression::Lambda(finish)) = f.args.get(3) {
+                            let init_nullable = f.args.get(1).map_or(true, |a| a.nullable(schema));
+                            let aug = TypeInferenceEngine::augment_schema_with_lambda_params(
+                                schema, &finish.params, &init_type, init_nullable,
+                            );
+                            finish.body.data_type(&aug)
+                        } else {
+                            init_type
+                        }
+                    }
+                    _ => {
+                        // For array-constructor functions, set containsNull based on whether any
+                        // argument can be null (e.g. array(lit(1), lit(2)) → containsNull=false).
+                        match dt {
+                            DataType::Array(elem, _)
+                                if matches!(lower.as_str(), "array" | "make_array") =>
+                            {
+                                let contains_null =
+                                    f.args.iter().any(|a| a.nullable(schema));
+                                DataType::Array(elem, contains_null)
+                            }
+                            other => other,
+                        }
+                    }
                 }
             }
             Expression::Cast(c) => c.to_type.clone(),
@@ -616,7 +661,9 @@ impl Expression {
             Expression::InList(_) => DataType::Boolean,
             Expression::ScalarSubquery(_) => DataType::Unresolved,
             Expression::Lambda(l) => l.body.data_type(schema),
-            Expression::LambdaVariable(_) => DataType::Unresolved,
+            Expression::LambdaVariable(lv) => {
+                TypeInferenceEngine::column_type(&lv.name, schema)
+            }
             Expression::RawSql(_) => DataType::Unresolved,
             Expression::ArrayLiteral(a) => {
                 // containsNull=true only if any element is an explicit NULL literal.
@@ -679,6 +726,12 @@ impl Expression {
                             .map_or(false, |a| a.nullable(schema));
                         then_nullable || else_nullable
                     }
+                } else if matches!(lower.as_str(), "transform" | "list_transform" | "filter" | "list_filter" | "array_filter") {
+                    f.args.first().map_or(true, |a| a.nullable(schema))
+                } else if matches!(lower.as_str(), "exists" | "forall" | "list_bool_or" | "list_bool_and") {
+                    f.args.first().map_or(true, |a| a.nullable(schema))
+                } else if matches!(lower.as_str(), "aggregate" | "reduce" | "list_reduce") {
+                    true
                 } else {
                     f.args.iter().any(|a| a.nullable(schema))
                 }
@@ -706,7 +759,10 @@ impl Expression {
             Expression::Star(_) => false,
             Expression::InSubquery(_) | Expression::ExistsSubquery(_) | Expression::InList(_) => false,
             Expression::ScalarSubquery(_) => true,
-            Expression::Lambda(_) | Expression::LambdaVariable(_) => false,
+            Expression::Lambda(_) => false,
+            Expression::LambdaVariable(lv) => {
+                TypeInferenceEngine::column_nullable(&lv.name, schema)
+            }
             Expression::RawSql(_) => true,
             Expression::ArrayLiteral(_) | Expression::MapLiteral(_) | Expression::StructLiteral(_) => false,
             Expression::Between(_) => false,

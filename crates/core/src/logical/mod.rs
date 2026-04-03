@@ -635,23 +635,42 @@ impl LogicalPlan {
             }
             LogicalPlan::NAReplace(n) => n.input.infer_schema(),
             LogicalPlan::Unpivot(u) => {
+                let input_schema = u.input.infer_schema();
                 let mut fields: Vec<StructField> = u
                     .ids
                     .iter()
-                    .map(|name| StructField::nullable(name.clone(), DataType::Unresolved))
+                    .map(|name| {
+                        if let Some(f) = input_schema.field_by_name(name) {
+                            StructField::new(name.clone(), f.data_type.clone(), f.nullable)
+                        } else {
+                            StructField::nullable(name.clone(), DataType::Unresolved)
+                        }
+                    })
                     .collect();
                 // Variable column is generated from column names → always NOT NULL.
                 fields.push(StructField::not_null(
                     u.variable_column_name.clone(),
                     DataType::String,
                 ));
-                fields.push(StructField::nullable(
+                // Value column nullable = OR of all input value columns' nullable flags.
+                let value_nullable = u
+                    .values
+                    .iter()
+                    .any(|v| input_schema.field_by_name(v).map_or(true, |f| f.nullable));
+                let value_type = u
+                    .values
+                    .iter()
+                    .find_map(|v| input_schema.field_by_name(v).map(|f| f.data_type.clone()))
+                    .unwrap_or(DataType::Unresolved);
+                fields.push(StructField::new(
                     u.value_column_name.clone(),
-                    DataType::Unresolved,
+                    value_type,
+                    value_nullable,
                 ));
                 StructType::new(fields)
             }
-            // Pivot schema depends on runtime data (distinct pivot values); return empty.
+            // Pivot schema depends on runtime data (distinct pivot values);
+            // full DuckDB fallback in the service layer.
             LogicalPlan::Pivot(_) => StructType::empty(),
             // StatCov/StatCorr return a single DOUBLE column.
             LogicalPlan::StatCov(s) => StructType::new(vec![
@@ -693,6 +712,13 @@ impl LogicalPlan {
                 StructType::new(fields)
             }
         }
+    }
+
+    /// Returns true when `infer_schema()` produces a partial schema
+    /// Returns true when `infer_schema()` produces a partial schema
+    /// that needs DuckDB merge for missing columns.
+    pub fn has_partial_schema(&self) -> bool {
+        false // No plan currently produces partial schemas
     }
 }
 

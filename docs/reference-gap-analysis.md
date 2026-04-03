@@ -18,7 +18,7 @@ TPC-DS Q17 (the final Wave 1 deferred item) was also fixed via flat join chain e
 
 - DuckDB upgraded to 1.10501.0 (DuckDB 1.5.1); arrow/arrow-ipc bumped to 58.
 - Strict mode fully operational: pre-built extension binary downloaded from
-  [`duckdb1.5.1-ext1`](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/duckdb1.5.1-ext1)
+  [`duckdb1.5.1-ext2`](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/duckdb1.5.1-ext2)
   at build time via `cargo build --release --features bundled-extension`.
 - Nullable inference overhauled (mode-agnostic, matching Java reference):
   `projection_to_field`, `agg_expr_to_field`, `infer_with_columns_schema` now call
@@ -175,11 +175,12 @@ in isolation and in sub-suite runs. Not a code regression.
 
 ---
 
-## Section 8 — Strict mode failures (140 as of 2026-04-02)
+## Section 8 — Strict mode failures (119 as of 2026-04-03)
 
 **History**: Strict mode baseline **405/836** → nullable inference overhaul **508/836** →
 CaseWhen `unify_types` fix + review fixes **686/836** → decimal precision fixes **687/836** →
-struct field nullable **695/836**.
+struct field nullable **695/836** → unpivot nullable + array containsNull + HOF types +
+CTE schema propagation **716/836**.
 
 Relaxed mode: **824/836** (6 skipped, 6 pre-existing map failures, 2 pre-existing TPC-DS).
 
@@ -194,7 +195,7 @@ computation for expressions, functions, and complex types.
 DuckDB's `parquet_schema()` table function (which exposes `repetition_type` = REQUIRED/OPTIONAL/
 REPEATED) is available if needed in the future, but is **not the fix** for these failures.
 
-### 8.1 Decimal precision/scale mismatches — ~40-50 tests (PARTIALLY CLOSED 2026-04-02)
+### 8.1 Decimal precision/scale mismatches — ~40-50 tests (PARTIALLY CLOSED 2026-04-03)
 
 **Fixes applied (2026-04-02)**:
 - `decimal_div_type()` wired into expression `data_type()` (was defined but never called)
@@ -204,12 +205,18 @@ REPEATED) is available if needed in the future, but is **not the fix** for these
 - Strict mode: `spark_decimal_div()` for decimal division SQL generation
 - Strict mode: `spark_sum()` extension for decimal SUM (was native sum + CAST)
 
-**Remaining**: Complex TPC-DS expressions with multi-step decimal arithmetic still cascade
-precision errors through division, rounding, and nested aggregates. Most decimal-failing tests
-also have nullable mismatches (8.2/8.3), so the precision fix alone doesn't flip them to PASSED.
+**Fixes applied (2026-04-03)**:
+- CTE schema propagation: `enrich_table_scans()` now traverses `WithCte` nodes;
+  `propagate_cte_schemas()` infers CTE schemas in definition order and populates
+  CTE-referencing TableScan schemas. Handles cascading CTEs (CTE2 → CTE1). (+9 tests)
+- Root cause: CTE-referenced TableScans had empty schemas → `apply_agg_type_casts()` and
+  `gen_strict_decimal_div()` couldn't detect decimal types → no Spark-correct CASTs emitted
 
-**Affected tests**: TPC-H Q1/Q8/Q11/Q14/Q17 (SQL + DataFrame), TPC-DS Q2/Q5/Q9/Q12/Q20 and
-~35 other TPC-DS queries, basic aggregation decimal tests.
+**Remaining**: ~35 TPC-DS/TPC-H queries still have decimal precision mismatches from
+expression-level type inference gaps (ROUND scale, nested division cascades, implicit
+aggregation in Project without GROUP BY) and extension return type mismatches.
+
+**Affected tests**: TPC-H Q8, TPC-DS Q2/Q5/Q9/Q12/Q20 and ~30 other TPC-DS queries.
 
 ### 8.2 Struct field nullable — ~35-40 tests (PARTIALLY CLOSED 2026-04-02)
 
@@ -227,44 +234,48 @@ from other code paths (projections, aggregates) that don't go through StructLite
 **Affected tests**: `test_type_literals_differential.py` struct tests, complex nested types,
 `test_complex_types_differential.py`.
 
-### 8.3 Simple column nullable propagation — ~30-35 tests
+### 8.3 Simple column nullable propagation — ~30-35 tests (PARTIALLY CLOSED 2026-04-03)
 
-**Root cause**: Pivot, unpivot, and arithmetic operations lose non-nullable constraints that
-Spark's Catalyst optimizer preserves. Thunderduck defaults to `nullable=true` for computed
-columns where Spark can prove non-nullability.
+**Fixes applied (2026-04-03)**:
+- Unpivot `infer_schema()` now preserves ID column type + nullable from input schema
+  (was hardcoded `nullable=true`). Value column nullable = OR of all input value columns.
+- Pivot `infer_schema()` investigated but reverted — partial schema approach caused relaxed
+  mode regressions (column count mismatch in rename path). Pivot remains DuckDB fallback.
 
-**Example**: `groupBy('country').pivot()` — the 'country' column should stay `nullable=false`
-after pivot, but Thunderduck marks it nullable.
+**Remaining**: Pivot grouping columns still lose non-nullable. Arithmetic and window function
+results downstream of pivot/unpivot may still propagate incorrect nullable.
 
-**Affected tests**: `test_multidim_aggregations.py` (pivot, unpivot), timestamp arithmetic,
+**Affected tests**: `test_multidim_aggregations.py` (pivot), timestamp arithmetic,
 window function results.
 
-### 8.4 Array containsNull flag — ~25-30 tests
+### 8.4 Array containsNull flag — ~25-30 tests (PARTIALLY CLOSED 2026-04-03)
 
-**Root cause**: Thunderduck defaults `containsNull=true` for all array types. Spark uses static
-analysis on lambda bodies and function semantics to determine this flag.
+**Fixes applied (2026-04-03)**:
+- `augment_schema_with_lambda_params()` helper binds lambda params to array element type,
+  enabling lambda body type/nullable resolution via schema lookup
+- `transform` HOF: `containsNull` derived from `lambda.body.nullable(&augmented_schema)`
+- `filter` HOF: returns first arg's data_type directly (preserves input containsNull)
+- `LambdaVariable.data_type()` resolves from schema (was `Unresolved`)
+- `LambdaVariable.nullable()` resolves from schema (was `false`)
+- Lambda param name collision: existing schema fields filtered before appending bindings
 
-`ArrayType(IntegerType(), True)` (Thunderduck) vs `ArrayType(IntegerType(), False)` (Spark).
+**Result**: +9 strict mode tests (combined with 8.5 HOF fixes).
 
-**Example**: `TRANSFORM(arr, lambda x: x + 1)` — if the input array has `containsNull=false`
-and the lambda cannot produce null, Spark sets `containsNull=false` on the result.
+**Remaining**: ~16 lambda tests still fail — nested transforms, SQL-path lambdas,
+combined operations where lambda body type inference is incomplete.
 
-**Affected tests**: `test_lambda_differential.py` (TRANSFORM, FILTER, nested operations),
-`split`, array function results. Also `collect_list`/`collect_set` return
-`ArrayType(T, False)` but Thunderduck emits `ArrayType(T, True)`.
+**Affected tests**: `test_lambda_differential.py` remaining failures.
 
-### 8.5 HOF function result types — ~15-20 tests (CLOSED: CaseWhen portion)
+### 8.5 HOF function result types — ~15-20 tests (CLOSED 2026-04-03)
 
-**CaseWhen type inference**: **CLOSED** (2026-04-02). Added `unify_types()` with proper
-Spark-compatible type unification (Null as bottom type, untyped NULL skipping, Boolean→numeric
-coercion, Date+Timestamp→Timestamp). Resolved +178 strict-mode tests.
+**CaseWhen type inference**: **CLOSED** (2026-04-02). Added `unify_types()`.
 
-**Remaining**: EXISTS/FORALL/AGGREGATE higher-order functions return incorrect types.
-- `EXISTS(arr, lambda x: x > 0)` should return `BooleanType` but returns the input array type
-- `FORALL(arr, lambda x: x > 0)` same issue
-- `AGGREGATE(arr, init, acc)` return type not correctly derived from accumulator
-
-**Affected tests**: `test_lambda_differential.py` HOF tests.
+**HOF return types**: **CLOSED** (2026-04-03).
+- `exists`/`forall` → `BooleanType` (was returning input array type)
+- `aggregate`/`reduce` → accumulator type from init arg (was returning array type)
+- Finish lambda support: 4th arg to `aggregate` resolved via augmented schema
+- HOF nullable rules: `transform`/`filter` propagate input nullable, `exists`/`forall`
+  propagate input nullable, `aggregate` always nullable
 
 ### 8.6 Math function nullable semantics — ~10-15 tests
 
@@ -293,12 +304,12 @@ pre-existing).
 
 ### 8.8 Priority summary
 
-| Category | ~Tests | Complexity | Blocked by |
-|----------|--------|------------|------------|
-| 8.1 Decimal precision | 40-50 | High | Extension fix needed for `spark_sum`/`spark_avg` |
-| 8.2 Struct field nullable | 35-40 | Medium | Schema inference changes |
-| 8.3 Column nullable propagation | 30-35 | Medium | Pivot/window schema inference |
-| 8.4 Array containsNull | 25-30 | Medium | Lambda type analysis |
-| 8.5 HOF result types | 15-20 | Low | Function return type fixes |
-| 8.6 Math function nullable | 10-15 | Low | Add "always nullable" function list |
-| 8.7 Map type construction | 5-10 | Medium | Pre-existing, also affects relaxed mode |
+| Category | ~Tests | Status | Notes |
+|----------|--------|--------|-------|
+| 8.1 Decimal precision | ~35 remaining | Partially closed | CTE propagation fixed +9; expression-level gaps remain |
+| 8.2 Struct field nullable | ~30 remaining | Partially closed | StructLiteral fixed +8; nested struct paths remain |
+| 8.3 Column nullable propagation | ~25 remaining | Partially closed | Unpivot fixed; Pivot reverted (regression) |
+| 8.4 Array containsNull | ~16 remaining | Partially closed | Lambda augmentation fixed +9; nested/SQL-path remain |
+| 8.5 HOF result types | 0 | **CLOSED** | exists/forall→Boolean, aggregate→accumulator |
+| 8.6 Math function nullable | 10-15 | Open | Add "always nullable" function list |
+| 8.7 Map type construction | 5-10 | Open | Pre-existing, also affects relaxed mode |

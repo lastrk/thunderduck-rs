@@ -7,7 +7,7 @@ fn main() {
 
 #[cfg(feature = "bundled-extension")]
 fn download_extension() {
-    const RELEASE_TAG: &str = "duckdb1.5.1-ext1";
+    const RELEASE_TAG: &str = "duckdb1.5.1-ext2";
     const BASE_URL: &str =
         "https://github.com/lastrk/thunderduck-duckdb-extension/releases/download";
 

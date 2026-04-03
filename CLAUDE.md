@@ -144,7 +144,7 @@ Expression (enum)
 
 5. **DuckDB SEMI JOIN syntax**: DuckDB uses `SEMI JOIN` and `ANTI JOIN` (without `LEFT` prefix). `LEFT SEMI JOIN` is a parser error.
 
-6. **Extension version pinning**: The `.duckdb_extension` binary DuckDB version must exactly match the `duckdb` crate version in `Cargo.toml`. Currently pinned to `duckdb1.5.1-ext1` (DuckDB 1.5.1, crate `1.10501.0`).
+6. **Extension version pinning**: The `.duckdb_extension` binary DuckDB version must exactly match the `duckdb` crate version in `Cargo.toml`. Currently pinned to `duckdb1.5.1-ext2` (DuckDB 1.5.1, crate `1.10501.0`).
 
 7. **HUGEINT overflow**: DuckDB `SUM()` of integer columns returns `HUGEINT` (i128). Spark returns `BIGINT` (i64). SQL generation must emit explicit `CAST(... AS BIGINT)` for integer SUM.
 
@@ -177,7 +177,7 @@ cargo build --release
 cargo build --release --features bundled-extension
 ```
 
-The `thdck_spark_funcs` DuckDB extension (release [`duckdb1.5.1-ext1`](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/duckdb1.5.1-ext1)) implements Spark-precise numerical semantics:
+The `thdck_spark_funcs` DuckDB extension (release [`duckdb1.5.1-ext2`](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/duckdb1.5.1-ext2)) implements Spark-precise numerical semantics:
 - `spark_decimal_div(a, b)` — decimal division with `ROUND_HALF_UP`
 - `spark_sum(col)` — Spark-compatible SUM return types
 - `spark_avg(col)` — Spark-compatible AVG return types

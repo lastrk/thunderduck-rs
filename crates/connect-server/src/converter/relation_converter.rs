@@ -7,7 +7,7 @@ use thunderduck_core::logical::{
     GroupingSets, Intersect, Join, JoinType, Limit, LocalDataRelation, LogicalPlan, NADrop,
     NADropHow, NAFill, NAReplace, Pivot, Project, RangeRelation, Sample, SelectEntry, ShowString,
     SingleRowRelation, Sort, SqlRelation, TableScan, Tail, ToDataFrame, Union, Unpivot,
-    WithColumns,
+    WithColumns, WithCte,
 };
 use thunderduck_core::runtime::{DuckDbSession, SchemaInferrer};
 use thunderduck_core::types::{DataType, StructField, StructType};
@@ -534,7 +534,8 @@ impl<'a> RelationConverter<'a> {
         // BIGINT casts that corrupt decimal arithmetic (e.g. TPC-DS Q66/Q12/Q20/Q98).
         let strict = self.session.as_ref().map(|s| s.mode()) == Some(CompatMode::Strict);
         if strict {
-            Ok(self.enrich_table_scans(plan))
+            let enriched = self.enrich_table_scans(plan);
+            Ok(propagate_cte_schemas(enriched))
         } else {
             Ok(plan)
         }
@@ -598,6 +599,13 @@ impl<'a> RelationConverter<'a> {
             LogicalPlan::AliasedRelation(mut ar) => {
                 ar.input = Box::new(self.enrich_table_scans(*ar.input));
                 LogicalPlan::AliasedRelation(ar)
+            }
+            LogicalPlan::WithCte(mut c) => {
+                c.ctes = c.ctes.into_iter().map(|(name, plan)| {
+                    (name, Box::new(self.enrich_table_scans(*plan)))
+                }).collect();
+                c.input = Box::new(self.enrich_table_scans(*c.input));
+                LogicalPlan::WithCte(c)
             }
             // All other variants: return unchanged
             other => other,
@@ -1035,7 +1043,7 @@ impl<'a> RelationConverter<'a> {
                 ));
             }
         }
-        Ok(LogicalPlan::WithCte(thunderduck_core::logical::WithCte {
+        Ok(LogicalPlan::WithCte(WithCte {
             ctes,
             input: Box::new(self.convert(root)?),
         }))
@@ -1298,6 +1306,128 @@ impl<'a> RelationConverter<'a> {
                 "Schema inference required but no session available".into(),
             ))
         }
+    }
+}
+
+// ── CTE Schema Propagation ───────────────────────────────────────────────────
+
+/// Walk `WithCte` nodes, infer CTE schemas in definition order, and populate
+/// CTE-referencing `TableScan` schemas. Handles cascading CTEs where later
+/// definitions reference earlier ones.
+fn propagate_cte_schemas(plan: LogicalPlan) -> LogicalPlan {
+    match plan {
+        LogicalPlan::WithCte(mut c) => {
+            let mut cte_map: std::collections::HashMap<String, StructType> =
+                std::collections::HashMap::new();
+
+            // Process CTEs in order — later CTEs can reference earlier ones
+            for (name, cte_plan) in &mut c.ctes {
+                // Apply already-known CTE schemas to this CTE's body
+                *cte_plan = Box::new(apply_cte_schemas(*cte_plan.clone(), &cte_map));
+                let schema = cte_plan.infer_schema();
+                if !schema.is_empty() {
+                    cte_map.insert(name.to_lowercase(), schema);
+                }
+            }
+
+            // Apply all CTE schemas to the main body
+            c.input = Box::new(apply_cte_schemas(*c.input, &cte_map));
+            LogicalPlan::WithCte(c)
+        }
+        other => other,
+    }
+}
+
+/// Recursively replace empty `TableScan` schemas with CTE-derived schemas.
+fn apply_cte_schemas(
+    plan: LogicalPlan,
+    cte_schemas: &std::collections::HashMap<String, StructType>,
+) -> LogicalPlan {
+    match plan {
+        LogicalPlan::TableScan(mut ts) if ts.schema.is_empty() => {
+            if let Some(schema) = cte_schemas.get(&ts.table.to_lowercase()) {
+                ts.schema = schema.clone();
+            }
+            LogicalPlan::TableScan(ts)
+        }
+        LogicalPlan::Project(mut p) => {
+            p.input = Box::new(apply_cte_schemas(*p.input, cte_schemas));
+            LogicalPlan::Project(p)
+        }
+        LogicalPlan::Filter(mut f) => {
+            f.input = Box::new(apply_cte_schemas(*f.input, cte_schemas));
+            LogicalPlan::Filter(f)
+        }
+        LogicalPlan::Aggregate(mut a) => {
+            a.input = Box::new(apply_cte_schemas(*a.input, cte_schemas));
+            LogicalPlan::Aggregate(a)
+        }
+        LogicalPlan::Sort(mut s) => {
+            s.input = Box::new(apply_cte_schemas(*s.input, cte_schemas));
+            LogicalPlan::Sort(s)
+        }
+        LogicalPlan::Limit(mut l) => {
+            l.input = Box::new(apply_cte_schemas(*l.input, cte_schemas));
+            LogicalPlan::Limit(l)
+        }
+        LogicalPlan::Tail(mut t) => {
+            t.input = Box::new(apply_cte_schemas(*t.input, cte_schemas));
+            LogicalPlan::Tail(t)
+        }
+        LogicalPlan::Join(mut j) => {
+            j.left = Box::new(apply_cte_schemas(*j.left, cte_schemas));
+            j.right = Box::new(apply_cte_schemas(*j.right, cte_schemas));
+            LogicalPlan::Join(j)
+        }
+        LogicalPlan::Union(mut u) => {
+            u.left = Box::new(apply_cte_schemas(*u.left, cte_schemas));
+            u.right = Box::new(apply_cte_schemas(*u.right, cte_schemas));
+            LogicalPlan::Union(u)
+        }
+        LogicalPlan::Except(mut e) => {
+            e.left = Box::new(apply_cte_schemas(*e.left, cte_schemas));
+            e.right = Box::new(apply_cte_schemas(*e.right, cte_schemas));
+            LogicalPlan::Except(e)
+        }
+        LogicalPlan::Intersect(mut i) => {
+            i.left = Box::new(apply_cte_schemas(*i.left, cte_schemas));
+            i.right = Box::new(apply_cte_schemas(*i.right, cte_schemas));
+            LogicalPlan::Intersect(i)
+        }
+        LogicalPlan::Distinct(mut d) => {
+            d.input = Box::new(apply_cte_schemas(*d.input, cte_schemas));
+            LogicalPlan::Distinct(d)
+        }
+        LogicalPlan::Sample(mut s) => {
+            s.input = Box::new(apply_cte_schemas(*s.input, cte_schemas));
+            LogicalPlan::Sample(s)
+        }
+        LogicalPlan::AliasedRelation(mut a) => {
+            a.input = Box::new(apply_cte_schemas(*a.input, cte_schemas));
+            LogicalPlan::AliasedRelation(a)
+        }
+        LogicalPlan::WithColumns(mut w) => {
+            w.input = Box::new(apply_cte_schemas(*w.input, cte_schemas));
+            LogicalPlan::WithColumns(w)
+        }
+        LogicalPlan::DropColumns(mut d) => {
+            d.input = Box::new(apply_cte_schemas(*d.input, cte_schemas));
+            LogicalPlan::DropColumns(d)
+        }
+        LogicalPlan::Unpivot(mut u) => {
+            u.input = Box::new(apply_cte_schemas(*u.input, cte_schemas));
+            LogicalPlan::Unpivot(u)
+        }
+        LogicalPlan::WithCte(mut c) => {
+            // Nested CTEs: recurse into definitions and body
+            c.ctes = c.ctes.into_iter().map(|(name, p)| {
+                (name, Box::new(apply_cte_schemas(*p, cte_schemas)))
+            }).collect();
+            c.input = Box::new(apply_cte_schemas(*c.input, cte_schemas));
+            LogicalPlan::WithCte(c)
+        }
+        // Leaf nodes and variants without child plans pass through unchanged
+        other => other,
     }
 }
 

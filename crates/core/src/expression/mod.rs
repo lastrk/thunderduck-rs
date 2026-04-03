@@ -614,6 +614,33 @@ impl Expression {
                             init_type
                         }
                     }
+                    // ROUND/BROUND: Spark adjusts decimal precision based on target scale
+                    "round" | "bround" => {
+                        if let Some(DataType::Decimal { precision, scale }) = f.args.first().map(|a| a.data_type(schema)) {
+                            // Extract target scale from second arg (default: 0)
+                            let new_scale = f.args.get(1).and_then(|e| match e {
+                                Expression::Literal(l) => match &l.value {
+                                    LiteralValue::Int(v) => Some(*v as u8),
+                                    LiteralValue::Long(v) => Some(*v as u8),
+                                    LiteralValue::Short(v) => Some(*v as u8),
+                                    LiteralValue::Byte(v) => Some(*v as u8),
+                                    _ => None,
+                                },
+                                _ => None,
+                            }).unwrap_or(0);
+                            if new_scale >= scale {
+                                // Scale not reduced → keep original type
+                                DataType::Decimal { precision, scale }
+                            } else {
+                                // Spark formula: precision = min(38, p - s + newScale + 1)
+                                let int_digits = precision as i16 - scale as i16;
+                                let result_p = ((int_digits + new_scale as i16 + 1).min(38)).max(1) as u8;
+                                DataType::Decimal { precision: result_p, scale: new_scale }
+                            }
+                        } else {
+                            dt
+                        }
+                    }
                     _ => {
                         // For array-constructor functions, set containsNull based on whether any
                         // argument can be null (e.g. array(lit(1), lit(2)) → containsNull=false).

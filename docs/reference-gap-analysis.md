@@ -180,7 +180,7 @@ in isolation and in sub-suite runs. Not a code regression.
 **History**: Strict mode baseline **405/836** → nullable inference overhaul **508/836** →
 CaseWhen `unify_types` fix + review fixes **686/836** → decimal precision fixes **687/836** →
 struct field nullable **695/836** → unpivot nullable + array containsNull + HOF types +
-CTE schema propagation **716/836**.
+CTE schema propagation **716/836** → ROUND decimal precision **717/836**.
 
 Relaxed mode: **824/836** (6 skipped, 6 pre-existing map failures, 2 pre-existing TPC-DS).
 

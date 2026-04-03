@@ -1,23 +1,23 @@
 # Differential Test Failure Tracker
 
 **Date**: 2026-04-03
-**Relaxed mode**: 822 passed, 8 failed, 6 skipped (836 total)
-**Strict mode**: 720 passed, 115 failed, 1 skipped (836 total)
+**Relaxed mode**: 828 passed, 2 failed, 6 skipped (836 total)
+**Strict mode**: 723 passed, 112 failed, 1 skipped (836 total)
 
 ---
 
 ## Relaxed Mode Failures (8)
 
-### Map functions — data value mismatch (6 tests)
+### ~~Map functions — data value mismatch (6 tests)~~ CLOSED
 
-Map keys/values/entries get wrapped in extra array layers. Pre-existing since Phase 6.
+Fixed: `duckdb_ready` flag on SqlRelation prevents double-processing of DuckDB-native MAP syntax.
 
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_keys`
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_values`
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_entries`
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_size_map`
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_element_at_map`
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_explode_map`
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_keys`
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_values`
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_entries`
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_size_map`
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_element_at_map`
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_explode_map`
 
 ### TPC-DS decimal value truncation (2 tests)
 
@@ -48,17 +48,17 @@ Struct fields from DuckDB fallback all marked `nullable=true`. Spark preserves N
 - [ ] `test_dataframe_functions.py::TestArrayFunctions::test_flatten` — `ArrayType(IntegerType(), True)` vs `ArrayType(ArrayType(IntegerType(), True), True)` (extra nesting)
 - [ ] `test_dataframe_functions.py::TestArrayFunctions::test_reverse_array` — `ArrayType(IntegerType(), True)` vs `StringType()` (wrong return type)
 
-### Map functions — type mismatch + data (7 tests)
+### ~~Map functions — type mismatch + data (7 tests)~~ PARTIALLY CLOSED
 
-Map keys/values wrapped in extra array layers. Same root cause as relaxed mode map failures.
+6 of 7 fixed by `duckdb_ready` flag. `map_from_arrays` still fails in strict (different root cause: map type construction in strict mode).
 
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_keys` — `ArrayType(StringType(), True)` vs `ArrayType(StringType(), False)` (containsNull)
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_values` — data mismatch
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_entries` — entries type nested incorrectly
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_size_map` — data mismatch
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_element_at_map` — gRPC error (VARCHAR→VARCHAR[] cast)
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_from_arrays` — map key/value types wrapped in extra array
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_explode_map` — data mismatch
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_keys`
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_values`
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_entries`
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_size_map`
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_element_at_map`
+- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_from_arrays` — strict only: map type construction
+- [x] `test_dataframe_functions.py::TestMapFunctions::test_explode_map`
 
 ### Null functions — nullable mismatch (3 tests)
 
@@ -224,7 +224,7 @@ Interval arithmetic type handling. Map/struct literal type construction.
 
 | Category | Relaxed | Strict | Total Unique |
 |----------|---------|--------|-------------|
-| Map type construction (extra array nesting) | 6 | 7 | 7 |
+| ~~Map type construction (extra array nesting)~~ | ~~6~~ 0 | ~~7~~ 1 | ~~7~~ 1 | CLOSED (duckdb_ready flag) |
 | Decimal precision/scale (SUM/AVG/DIV/ROUND cascades) | 2 | ~40 | ~40 |
 | Nullable: struct fields from DuckDB fallback | 0 | 8 | 8 |
 | Nullable: math functions should be always-nullable | 0 | 5 | 5 |

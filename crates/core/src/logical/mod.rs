@@ -298,6 +298,24 @@ pub struct SqlRelation {
     /// with Arrow IPC data so that type inference (e.g. SUM→BIGINT cast) can
     /// look up column types without issuing a DESCRIBE query.
     pub schema: StructType,
+    /// When true, the SQL is already in DuckDB-native format and must NOT be run
+    /// through `preprocess_spark_sql`. This prevents double-processing of constructs
+    /// like `MAP([keys], [vals])` which would be incorrectly rewritten to
+    /// `MAP([[keys]], [[vals]])`.
+    #[doc(hidden)]
+    pub duckdb_ready: bool,
+}
+
+impl SqlRelation {
+    /// Create a new SqlRelation with raw Spark SQL that needs preprocessing.
+    pub fn new(sql: String, schema: StructType) -> Self {
+        Self { sql, schema, duckdb_ready: false }
+    }
+
+    /// Create a new SqlRelation with DuckDB-ready SQL that must skip preprocessing.
+    pub fn duckdb_native(sql: String, schema: StructType) -> Self {
+        Self { sql, schema, duckdb_ready: true }
+    }
 }
 
 /// An empty relation with only a schema (no data rows).

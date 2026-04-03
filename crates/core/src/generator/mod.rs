@@ -683,6 +683,9 @@ impl SqlGenerator {
         // NOT be run through preprocess_spark_sql again (doing so double-processes things
         // like MAP([keys], [vals]) → MAP([[keys]], [[vals]])).
         //
+        // SqlRelations marked duckdb_ready (e.g. from local_relation_to_values_sql)
+        // are also already DuckDB-native and must skip preprocessing.
+        //
         // Non-DDL SqlRelations may carry raw Spark SQL from legacy paths and need preprocessing.
         let upper = sr.sql.trim_start().to_uppercase();
         let is_ddl = upper.starts_with("CREATE")
@@ -695,6 +698,8 @@ impl SqlGenerator {
             || upper.starts_with("SET");
         if is_ddl {
             Ok(sr.sql.clone())
+        } else if sr.duckdb_ready {
+            Ok(format!("({})", sr.sql))
         } else {
             Ok(format!("({})", preprocess_spark_sql(&sr.sql)))
         }
@@ -3548,6 +3553,7 @@ mod tests {
             input: Box::new(LogicalPlan::SqlRelation(SqlRelation {
                 sql: "SELECT 1 AS a, 2 AS b".to_string(),
                 schema: crate::types::StructType::empty(),
+                duckdb_ready: false,
             })),
             column_names: vec!["x".to_string(), "y".to_string()],
         });

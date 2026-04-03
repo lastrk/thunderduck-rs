@@ -485,11 +485,12 @@ impl<'a> RelationConverter<'a> {
                         let placeholder = LogicalPlan::SqlRelation(SqlRelation {
                             sql: sql.clone(),
                             schema: StructType::empty(),
+                            duckdb_ready: false,
                         });
                         self.infer_full_schema(&placeholder).unwrap_or_default()
                     }
                 };
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema, duckdb_ready: false }))
             }
             None => Err(ConnectError::PlanConversion("Read missing read_type".into())),
         }
@@ -502,7 +503,11 @@ impl<'a> RelationConverter<'a> {
                 // Falls back to schema-only (0 rows) if anything goes wrong.
                 if let Ok(sql) = local_relation_to_values_sql(data) {
                     let schema = parse_arrow_schema(data).unwrap_or_default();
-                    return Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema }));
+                    // Mark as duckdb_ready: local_relation_to_values_sql produces
+                    // DuckDB-native SQL (e.g. MAP([k], [v])) that must NOT be
+                    // reprocessed by preprocess_spark_sql (which would double-wrap
+                    // MAP args into MAP([[k]], [[v]])).
+                    return Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema, duckdb_ready: true }));
                 }
             }
         }
@@ -1141,32 +1146,32 @@ impl<'a> RelationConverter<'a> {
                 let sql = format!(
                     "SELECT COUNT(*) > 0 AS value FROM information_schema.tables WHERE table_name = '{table_name}'"
                 );
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false }))
             }
             Some(CatType::DatabaseExists(de)) => {
                 let db_name = de.db_name.replace('\'', "''");
                 let sql = format!(
                     "SELECT COUNT(*) > 0 AS value FROM information_schema.schemata WHERE schema_name = '{db_name}'"
                 );
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false }))
             }
             Some(CatType::DropTempView(dtv)) => {
                 let view_name = &dtv.view_name;
                 let sql = format!("DROP VIEW IF EXISTS {view_name}");
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false }))
             }
             Some(CatType::CurrentDatabase(_)) => {
                 let sql = "SELECT current_schema() AS value".to_string();
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false }))
             }
             Some(CatType::CurrentCatalog(_)) => {
                 let sql = "SELECT current_catalog() AS value".to_string();
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false }))
             }
             Some(CatType::IsCached(_)) => {
                 // DuckDB has no cache concept — always false
                 let sql = "SELECT false AS value".to_string();
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false }))
             }
             Some(CatType::CacheTable(_))
             | Some(CatType::UncacheTable(_))
@@ -1175,7 +1180,7 @@ impl<'a> RelationConverter<'a> {
             | Some(CatType::RefreshByPath(_)) => {
                 // No-op: DuckDB has no cache to manage — return success
                 let sql = "SELECT true AS value".to_string();
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false }))
             }
             Some(CatType::FunctionExists(fe)) => {
                 let func_name = fe.function_name.to_lowercase().replace('\'', "''");
@@ -1184,7 +1189,7 @@ impl<'a> RelationConverter<'a> {
                      WHERE lower(function_name) = '{func_name}' \
                      AND schema_name NOT IN ('information_schema', 'pg_catalog')) AS value"
                 );
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false }))
             }
             Some(CatType::ListFunctions(lf)) => {
                 let mut conditions =
@@ -1209,7 +1214,7 @@ impl<'a> RelationConverter<'a> {
                      WHERE {conditions} \
                      ORDER BY function_name"
                 );
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false }))
             }
             Some(CatType::GetFunction(gf)) => {
                 let func_name = gf.function_name.to_lowercase().replace('\'', "''");
@@ -1233,7 +1238,7 @@ impl<'a> RelationConverter<'a> {
                      WHERE {conditions} \
                      LIMIT 1"
                 );
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty() }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false }))
             }
             _ => Err(ConnectError::Unsupported(format!(
                 "Unsupported catalog operation: {:?}",

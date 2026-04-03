@@ -1452,23 +1452,40 @@ impl SqlGenerator {
         let left_sql = self.gen_expr(&b.left)?;
         let right_sql = self.gen_expr(&b.right)?;
         match (lt, rt) {
-            (Decimal { .. }, Decimal { .. }) => {
-                Ok(Some(format!("spark_decimal_div({left_sql}, {right_sql})")))
-            }
-            (Decimal { .. }, i) if i.is_integral() => {
-                if let Decimal { precision, .. } = TypeInferenceEngine::integral_to_decimal(rt) {
+            (Decimal { precision: p1, scale: s1 }, Decimal { precision: p2, scale: s2 }) => {
+                let result_type = TypeInferenceEngine::decimal_div_type(*p1, *s1, *p2, *s2);
+                if let Decimal { precision: rp, scale: rs } = result_type {
                     Ok(Some(format!(
-                        "spark_decimal_div({left_sql}, CAST({right_sql} AS DECIMAL({precision},0)))"
+                        "CAST(spark_decimal_div({left_sql}, {right_sql}) AS DECIMAL({rp},{rs}))"
                     )))
+                } else {
+                    Ok(Some(format!("spark_decimal_div({left_sql}, {right_sql})")))
+                }
+            }
+            (Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
+                if let Decimal { precision: p2, scale: s2 } = TypeInferenceEngine::integral_to_decimal(rt) {
+                    let result_type = TypeInferenceEngine::decimal_div_type(*p1, *s1, p2, s2);
+                    if let Decimal { precision: rp, scale: rs } = result_type {
+                        Ok(Some(format!(
+                            "CAST(spark_decimal_div({left_sql}, CAST({right_sql} AS DECIMAL({p2},0))) AS DECIMAL({rp},{rs}))"
+                        )))
+                    } else {
+                        Ok(None)
+                    }
                 } else {
                     Ok(None)
                 }
             }
-            (i, Decimal { .. }) if i.is_integral() => {
-                if let Decimal { precision, .. } = TypeInferenceEngine::integral_to_decimal(lt) {
-                    Ok(Some(format!(
-                        "spark_decimal_div(CAST({left_sql} AS DECIMAL({precision},0)), {right_sql})"
-                    )))
+            (i, Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
+                if let Decimal { precision: p1, scale: s1 } = TypeInferenceEngine::integral_to_decimal(lt) {
+                    let result_type = TypeInferenceEngine::decimal_div_type(p1, s1, *p2, *s2);
+                    if let Decimal { precision: rp, scale: rs } = result_type {
+                        Ok(Some(format!(
+                            "CAST(spark_decimal_div(CAST({left_sql} AS DECIMAL({p1},0)), {right_sql}) AS DECIMAL({rp},{rs}))"
+                        )))
+                    } else {
+                        Ok(None)
+                    }
                 } else {
                     Ok(None)
                 }

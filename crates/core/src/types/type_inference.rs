@@ -465,9 +465,7 @@ impl TypeInferenceEngine {
             "hash" | "xxhash64" | "murmur3" => Integer,
 
             // ── Null / conditional ────────────────────────────────────────────
-            "coalesce" | "nvl" | "ifnull" => {
-                arg_types.first().cloned().unwrap_or(Unresolved)
-            }
+            "coalesce" | "nvl" | "ifnull" => arg_types.first().cloned().unwrap_or(Unresolved),
             "nullif" => arg_types.first().cloned().unwrap_or(Unresolved),
             "if" | "iff" | "nvl2" => arg_types.get(1).cloned().unwrap_or(Unresolved),
             // when(cond1, val1, cond2, val2, ..., [else]): THEN values at odd indices
@@ -515,6 +513,16 @@ impl TypeInferenceEngine {
 
             // ── Count variants ────────────────────────────────────────────────
             "count_if" => Long,
+
+            // Aggregate functions — delegate to aggregate_return_type for correct Spark types
+            "sum" | "sum_distinct" | "avg" | "mean" | "count" | "count_distinct"
+            | "min" | "max" | "first" | "last" | "first_value" | "last_value"
+            | "stddev" | "stddev_samp" | "std" | "stddev_pop" | "variance" | "var_samp"
+            | "var_pop" | "skewness" | "kurtosis"
+            | "approx_count_distinct" | "count_approx_distinct"
+            | "bit_and" | "bit_or" | "bit_xor" => {
+                Self::aggregate_return_type(name_lower.as_str(), arg_types.first().unwrap_or(&Unresolved))
+            }
 
             // Fallback: return first arg type or Unresolved
             _ => arg_types.first().cloned().unwrap_or(Unresolved),

@@ -316,6 +316,55 @@ How to prevent this class of error in the future:
 
 ---
 
+# PROJECT-SPECIFIC DIRECTIVES
+
+## 1. Study Apache Spark as the Specification
+
+When the bug involves Spark compatibility (type inference, nullable semantics,
+decimal precision, function behavior, schema propagation), consult the open-source
+Apache Spark implementation (targeting **4.1.1**) as the authoritative specification.
+Use `WebSearch` or `WebFetch` to find the relevant Spark source code on GitHub
+(e.g., `DecimalPrecision.scala`, `TypeCoercion.scala`, `HiveResult.scala`).
+The Spark implementation defines "correct" — our job is to match it exactly.
+
+## 2. Study the Java Reference Implementation
+
+The `.reference/` directory contains a Java implementation of the same system.
+When diagnosing a bug, check how `.reference/` solves the equivalent problem:
+- Search `.reference/` with Grep/Glob for the relevant function, type, or pattern
+- Compare the Java logic to the Rust implementation step by step
+- Note where the Rust port diverges from the Java reference — this is often the
+  root cause
+
+## 3. Keep Relaxed and Strict Mode Code Paths Common
+
+When prescribing a fix, prefer **shared code paths** for relaxed and strict mode.
+Use `if`/`match` on `CompatMode` only at the specific points where behavior
+diverges (e.g., choosing `spark_decimal_div()` vs native `/`, or wrapping with
+`spark_sum()` vs native `sum()`). Do NOT create parallel code paths, duplicate
+functions, or separate modules for the two modes. The goal is one implementation
+with mode-specific switches at leaf decisions — this keeps the code maintainable
+and ensures correctness improvements benefit both modes.
+
+**Example — GOOD** (shared path, mode switch at leaf):
+```rust
+fn gen_division(&self, left: &str, right: &str, lt: &DataType, rt: &DataType) -> String {
+    if self.mode == CompatMode::Strict && lt.is_decimal() && rt.is_decimal() {
+        format!("spark_decimal_div({left}, {right})")
+    } else {
+        format!("{left} / {right}")
+    }
+}
+```
+
+**Example — BAD** (duplicated paths):
+```rust
+fn gen_division_strict(...) -> String { ... }
+fn gen_division_relaxed(...) -> String { ... }
+```
+
+---
+
 # RULES OF ENGAGEMENT
 
 - **NEVER skip straight to a fix.** The Phase 1→2→3→4→5 sequence is

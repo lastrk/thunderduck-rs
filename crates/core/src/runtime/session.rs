@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
 
 use duckdb::arrow::record_batch::RecordBatch;
@@ -7,6 +8,7 @@ use crate::error::{Result, ThunderduckError};
 use crate::functions::CompatMode;
 use crate::runtime::compat_mode::{self, RuntimeCompatMode};
 use crate::runtime::config::{HardwareProfile, StreamingConfig};
+use crate::types::StructType;
 
 // ── Timezone detection ─────────────────────────────────────────────────────────
 
@@ -54,6 +56,18 @@ pub(crate) enum SessionCommand {
     ExecDdl {
         sql: String,
         resp: oneshot::Sender<SessionResult>,
+    },
+    /// Create a temp view and cache the Spark-declared schema.
+    CreateViewWithSchema {
+        name: String,
+        sql: String,
+        schema: StructType,
+        resp: oneshot::Sender<SessionResult>,
+    },
+    /// Retrieve a cached Spark schema for a temp view.
+    GetViewSchema {
+        name: String,
+        resp: oneshot::Sender<Option<StructType>>,
     },
     /// Infer schema by preparing the SQL without executing it.
     SchemaOf {
@@ -429,6 +443,53 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
             _ => unreachable!("SchemaOf never returns batches or Ok"),
         }
     }
+
+    /// Create a temp view and cache its Spark-declared schema.
+    ///
+    /// The cached schema preserves nullable flags from the original
+    /// `createDataFrame(data, schema)` call, which DuckDB's `CREATE VIEW` loses.
+    pub async fn create_temp_view_with_schema(
+        &self,
+        name: &str,
+        sql: &str,
+        schema: StructType,
+    ) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::CreateViewWithSchema {
+                name: name.to_string(),
+                sql: sql.to_string(),
+                schema,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| ThunderduckError::DuckDb("session channel closed".into()))?;
+
+        match resp_rx
+            .await
+            .map_err(|_| ThunderduckError::DuckDb("session thread died".into()))?
+        {
+            SessionResult::Ok => Ok(()),
+            SessionResult::Error(e) => Err(e),
+            _ => unreachable!("CreateViewWithSchema never returns batches or schema"),
+        }
+    }
+
+    /// Retrieve the cached Spark schema for a temp view.
+    ///
+    /// Returns `None` if no cached schema exists (e.g. the view was created
+    /// via raw DDL rather than `createOrReplaceTempView`).
+    pub async fn get_view_schema(&self, name: &str) -> Option<StructType> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::GetViewSchema {
+                name: name.to_string(),
+                resp: resp_tx,
+            })
+            .await
+            .ok()?;
+        resp_rx.await.ok().flatten()
+    }
 }
 
 impl Drop for DuckDbSession {
@@ -441,6 +502,8 @@ impl Drop for DuckDbSession {
 // ── Session thread ─────────────────────────────────────────────────────────────
 
 fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>) {
+    let mut view_schemas: HashMap<String, StructType> = HashMap::new();
+
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             SessionCommand::Execute { sql, resp } => {
@@ -475,6 +538,28 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
                     Err(e) => SessionResult::Error(e),
                 };
                 let _ = resp.send(msg);
+            }
+            SessionCommand::CreateViewWithSchema { name, sql, schema, resp } => {
+                let ddl = format!(
+                    "CREATE OR REPLACE TEMP VIEW \"{}\" AS {}",
+                    name.replace('"', "\"\""),
+                    sql
+                );
+                let result = conn
+                    .execute_batch(&ddl)
+                    .map_err(|e| ThunderduckError::DuckDb(e.to_string()));
+                let msg = match result {
+                    Ok(()) => {
+                        view_schemas.insert(name.to_lowercase(), schema);
+                        SessionResult::Ok
+                    }
+                    Err(e) => SessionResult::Error(e),
+                };
+                let _ = resp.send(msg);
+            }
+            SessionCommand::GetViewSchema { name, resp } => {
+                let schema = view_schemas.get(&name.to_lowercase()).cloned();
+                let _ = resp.send(schema);
             }
             SessionCommand::SchemaOf { sql, resp } => {
                 // Wrap in LIMIT 0 so DuckDB populates the schema without reading rows.

@@ -1274,9 +1274,24 @@ impl<'a> RelationConverter<'a> {
         }
     }
 
-    /// Infer the schema of a named table/view using `SELECT * FROM table LIMIT 0`.
+    /// Infer the schema of a named table/view.
+    ///
+    /// Checks the session's view schema cache first (preserves Spark-declared
+    /// nullable flags), then falls back to `SELECT * FROM table LIMIT 0`.
     fn infer_table_schema(&self, table: &str) -> Result<StructType> {
         if let Some(session) = &self.session {
+            // Check view schema cache first — preserves nullable flags from
+            // createDataFrame(data, schema) → createOrReplaceTempView().
+            let table_owned = table.to_owned();
+            let session_cloned = Arc::clone(session);
+            let cached = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(session_cloned.get_view_schema(&table_owned))
+            });
+            if let Some(schema) = cached {
+                return Ok(schema);
+            }
+            // Fall back to DuckDB DESCRIBE.
             use thunderduck_core::generator::quote_ident;
             let sql = format!("SELECT * FROM {}", quote_ident(table));
             let session = Arc::clone(session);

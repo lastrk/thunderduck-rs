@@ -192,7 +192,7 @@ impl SparkConnectService for ThunderduckService {
                                     StructField {
                                         name: spark_f.name.clone(),
                                         data_type: duck_f.data_type.clone(),
-                                        nullable: duck_f.nullable,
+                                        nullable: spark_f.nullable,
                                     }
                                 } else {
                                     StructField {
@@ -343,7 +343,7 @@ impl SparkConnectService for ThunderduckService {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 async fn handle_command(
-    session: &thunderduck_core::runtime::DuckDbSession,
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     session_id: &str,
     operation_id: &str,
     cmd: proto::Command,
@@ -355,14 +355,27 @@ async fn handle_command(
                 .input
                 .ok_or_else(|| Status::invalid_argument("CreateTempView missing input"))?;
             let logical_plan =
-                PlanConverter::convert_relation(&relation).map_err(Status::from)?;
+                PlanConverter::convert_relation_with_session(&relation, Arc::clone(session))
+                    .map_err(Status::from)?;
             let sql = SqlGenerator::new(session.mode())
                 .generate(&logical_plan)
                 .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
-            session
-                .create_temp_view(&view_cmd.name, &sql)
-                .await
-                .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
+
+            // Infer schema from the input relation and cache it so downstream
+            // reads preserve Spark-declared nullable flags that DuckDB's
+            // CREATE VIEW loses.
+            let schema = logical_plan.infer_schema();
+            if !schema.is_empty() {
+                session
+                    .create_temp_view_with_schema(&view_cmd.name, &sql, schema)
+                    .await
+                    .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
+            } else {
+                session
+                    .create_temp_view(&view_cmd.name, &sql)
+                    .await
+                    .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
+            }
 
             Ok(vec![
                 sql_command_result_response(session_id, operation_id),

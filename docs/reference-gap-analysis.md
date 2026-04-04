@@ -1,38 +1,27 @@
 # Differential Test Failure Tracker
 
-**Date**: 2026-04-03
+**Date**: 2026-04-04
 **Relaxed mode**: 828 passed, 2 failed, 6 skipped (836 total)
-**Strict mode**: 723 passed, 112 failed, 1 skipped (836 total)
+**Strict mode**: 736 passed, 99 failed, 1 skipped (836 total)
 
 ---
 
-## Relaxed Mode Failures (8)
-
-### ~~Map functions — data value mismatch (6 tests)~~ CLOSED
-
-Fixed: `duckdb_ready` flag on SqlRelation prevents double-processing of DuckDB-native MAP syntax.
-
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_keys`
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_values`
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_entries`
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_size_map`
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_element_at_map`
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_explode_map`
+## Relaxed Mode Failures (2)
 
 ### TPC-DS decimal value truncation (2 tests)
 
-CASE WHEN with decimal/integer branches loses decimal precision in relaxed mode. `Decimal` values returned as `int` (truncated).
+CASE WHEN with decimal/integer branches loses decimal precision. Decimal values returned as `int`.
 
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[40]` — Q40: `sales_before`/`sales_after` Decimal→int
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[40]` — Q40: sales_before/sales_after Decimal→int
 - [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[66]` — Q66: monthly net values Decimal→int
 
 ---
 
-## Strict Mode Failures (115)
+## Strict Mode Failures (99)
 
-### Complex types — struct field nullable (8 tests)
+### Complex types — struct field nullable from DuckDB fallback (8 tests)
 
-Struct fields from DuckDB fallback all marked `nullable=true`. Spark preserves NOT NULL from source columns accessed via struct field access/update.
+Struct fields accessed via dot/bracket notation or withField/dropFields get `nullable=true` from DuckDB fallback. Schema from `createDataFrame` with NOT NULL fields doesn't propagate through the execute/analyze path for struct access.
 
 - [ ] `test_complex_types_differential.py::TestStructFieldAccess_Differential::test_struct_field_dot_notation`
 - [ ] `test_complex_types_differential.py::TestStructFieldAccess_Differential::test_struct_field_bracket_notation`
@@ -45,56 +34,29 @@ Struct fields from DuckDB fallback all marked `nullable=true`. Spark preserves N
 
 ### Array functions — type mismatch (2 tests)
 
-- [ ] `test_dataframe_functions.py::TestArrayFunctions::test_flatten` — `ArrayType(IntegerType(), True)` vs `ArrayType(ArrayType(IntegerType(), True), True)` (extra nesting)
-- [ ] `test_dataframe_functions.py::TestArrayFunctions::test_reverse_array` — `ArrayType(IntegerType(), True)` vs `StringType()` (wrong return type)
+- [ ] `test_dataframe_functions.py::TestArrayFunctions::test_flatten` — `ArrayType(IntegerType())` vs `ArrayType(ArrayType(IntegerType()))` (extra nesting)
+- [ ] `test_dataframe_functions.py::TestArrayFunctions::test_reverse_array` — `ArrayType(IntegerType())` vs `StringType()` (wrong return type)
 
-### ~~Map functions — type mismatch + data (7 tests)~~ PARTIALLY CLOSED
+### Map functions — remaining strict-only (4 tests)
 
-6 of 7 fixed by `duckdb_ready` flag. `map_from_arrays` still fails in strict (different root cause: map type construction in strict mode).
-
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_keys`
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_values`
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_map_entries`
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_size_map`
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_element_at_map`
-- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_from_arrays` — strict only: map type construction
-- [x] `test_dataframe_functions.py::TestMapFunctions::test_explode_map`
-
-### Null functions — nullable mismatch (3 tests)
-
-`isnull`/`isnotnull` result should be non-nullable (always returns true/false). `nvl2` result should be non-nullable when both branches are non-nullable.
-
-- [ ] `test_dataframe_functions.py::TestNullFunctions::test_isnull` — `nullable=False` expected, got `True`
-- [ ] `test_dataframe_functions.py::TestNullFunctions::test_isnotnull` — `nullable=False` expected, got `True`
-- [ ] `test_dataframe_functions.py::TestNullFunctions::test_nvl2` — `nullable=False` expected, got `True`
-
-### String functions — nullable mismatch (1 test)
-
-- [ ] `test_dataframe_functions.py::TestStringFunctions::test_concat_ws` — `nullable=False` expected, got `True`
-
-### Math functions — nullable mismatch (5 tests)
-
-Spark marks math functions as `nullable=True` (edge cases like LN(0)→null). Thunderduck marks them non-nullable.
-
-- [ ] `test_dataframe_functions.py::TestMathFunctions::test_ceil_floor` — `ceiling`/`floored` should be `nullable=True`
-- [ ] `test_dataframe_functions.py::TestMathFunctions::test_round` — `round2`/`round0` should be `nullable=True`
-- [ ] `test_dataframe_functions.py::TestMathFunctions::test_greatest_least` — `max_val`/`min_val` should be `nullable=False` (opposite direction)
-- [ ] `test_dataframe_functions.py::TestMathFunctions::test_log` — `ln`/`log10`/`log2` should be `nullable=True`
-- [ ] `test_dataframe_functions.py::TestMathFunctions::test_exp` — `exp_val` should be `nullable=True`
+- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_keys` — containsNull mismatch
+- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_entries` — entry type structure
+- [ ] `test_dataframe_functions.py::TestMapFunctions::test_map_from_arrays` — strict-only map type
+- [ ] `test_dataframe_functions.py::TestMapFunctions::test_explode_map` — data mismatch
 
 ### TPC-H — decimal precision + type (3 tests)
 
-- [ ] `test_differential_v2.py::TestTPCH_AllQueries_Differential::test_query_differential[11]` — `Decimal(38,2)` vs `Decimal(32,2)` (SUM precision)
-- [ ] `test_differential_v2.py::TestTPCH_AllQueries_Differential::test_query_differential[14]` — `Decimal(38,6)` vs `DoubleType()` (division returning Double)
-- [ ] `test_differential_v2.py::TestTPCH_AllQueries_Differential::test_query_differential[17]` — `Decimal(30,6)` vs `DoubleType()` (AVG returning Double)
+- [ ] `test_differential_v2.py::TestTPCH_AllQueries_Differential::test_query_differential[11]` — Decimal(38,2) vs Decimal(32,2)
+- [ ] `test_differential_v2.py::TestTPCH_AllQueries_Differential::test_query_differential[14]` — Decimal(38,6) vs DoubleType()
+- [ ] `test_differential_v2.py::TestTPCH_AllQueries_Differential::test_query_differential[17]` — Decimal(30,6) vs DoubleType()
 
 ### JSON functions (1 test)
 
-- [ ] `test_json_functions_differential.py::TestJsonConversion_Differential::test_schema_of_json` — schema_of_json return type/nullable
+- [ ] `test_json_functions_differential.py::TestJsonConversion_Differential::test_schema_of_json`
 
 ### Lambda/HOF — containsNull + nullable (16 tests)
 
-Array containsNull and result nullable from HOF operations. Transform/filter/exists/forall results marked nullable=True when should be False.
+Array containsNull and result nullable from DataFrame-path HOF operations.
 
 - [ ] `test_lambda_differential.py::TestTransformFunction_Differential::test_transform_add_one`
 - [ ] `test_lambda_differential.py::TestTransformFunction_Differential::test_transform_multiply`
@@ -115,11 +77,11 @@ Array containsNull and result nullable from HOF operations. Transform/filter/exi
 
 ### Math/bitwise — type mismatch (1 test)
 
-- [ ] `test_math_bitwise_date_differential.py::TestMathFunctions_Differential::test_bin` — `StringType()` vs `IntegerType()` (BIN return type)
+- [ ] `test_math_bitwise_date_differential.py::TestMathFunctions_Differential::test_bin` — StringType() vs IntegerType()
 
-### Pivot — nullable + schema (7 tests)
+### Pivot — nullable from DuckDB fallback (7 tests)
 
-Pivot grouping columns lose non-nullable from DuckDB fallback. Pivot schema is empty → full DuckDB fallback.
+Pivot grouping columns lose non-nullable from DuckDB fallback (pivot schema is empty).
 
 - [ ] `test_multidim_aggregations.py::TestPivotFunctions::test_pivot_simple`
 - [ ] `test_multidim_aggregations.py::TestPivotFunctions::test_pivot_with_values`
@@ -131,77 +93,67 @@ Pivot grouping columns lose non-nullable from DuckDB fallback. Pivot schema is e
 
 ### Cube/Rollup — nullable mismatch (3 tests)
 
-GROUPING/GROUPING_ID nullable semantics differ.
-
 - [ ] `test_multidim_aggregations.py::TestCubeFunctions::test_cube_with_grouping`
 - [ ] `test_multidim_aggregations.py::TestCubeFunctions::test_cube_with_grouping_id`
 - [ ] `test_multidim_aggregations.py::TestRollupFunctions::test_rollup_with_grouping`
 
 ### Statistical aggregates — nullable mismatch (3 tests)
 
-kurtosis/skewness nullable handling.
-
 - [ ] `test_new_aggregates_differential.py::TestStatisticalAggregates_Differential::test_kurtosis`
 - [ ] `test_new_aggregates_differential.py::TestStatisticalAggregates_Differential::test_skewness`
 - [ ] `test_new_aggregates_differential.py::TestGroupedNewAggregates_Differential::test_kurtosis_grouped`
 
-### TPC-DS SQL — decimal precision/scale + nullable (30 tests)
+### TPC-DS SQL — decimal precision/scale + nullable (27 tests)
 
-Decimal precision cascades through CTE-heavy queries. Mix of SUM precision (+10), division scale, ROUND precision, and nullable mismatches.
+Decimal precision cascades through CTE-heavy queries. Mix of SUM precision, division scale, ROUND, and nullable mismatches.
 
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[4]` — Q4
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[5]` — Q5: `channel` nullable, `value` Decimal(38,2) vs Decimal(32,2)
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[9]` — Q9: scalar subquery decimal→Double
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[12]` — Q12
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[14a]` — Q14a
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[14b]` — Q14b
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[20]` — Q20
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[23a]` — Q23a: gRPC error
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[23b]` — Q23b: gRPC error
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[27]` — Q27
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[40]` — Q40: decimal→int
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[47]` — Q47: AVG precision
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[53]` — Q53: ROUND precision
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[57]` — Q57
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[58]` — Q58
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[61]` — Q61
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[63]` — Q63: ROUND precision
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[66]` — Q66: decimal→int
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[67]` — Q67
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[70]` — Q70
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[77]` — Q77
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[80]` — Q80
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[83]` — Q83
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[86]` — Q86
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[89]` — Q89
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[93]` — Q93
-- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[98]` — Q98
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[4]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[5]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[9]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[12]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[20]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[27]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[40]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[47]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[53]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[57]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[58]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[61]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[63]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[66]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[67]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[70]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[77]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[80]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[83]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[86]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[89]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[93]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[98]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[14a]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[14b]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[23a]`
+- [ ] `test_tpcds_differential.py::TestTPCDS_Differential::test_query_differential[23b]`
 
-### TPC-DS DataFrame — decimal precision (10 tests)
-
-DataFrame-path equivalents of SQL queries above. Same decimal precision root causes.
+### TPC-DS DataFrame — decimal precision (11 tests)
 
 - [ ] `test_tpcds_differential.py::TestTPCDS_DataFrame_Differential::test_q12_dataframe`
 - [ ] `test_tpcds_differential.py::TestTPCDS_DataFrame_Differential::test_q20_dataframe`
 - [ ] `test_tpcds_differential.py::TestTPCDS_DataFrame_Differential::test_q62_dataframe`
-- [ ] `test_tpcds_differential.py::TestTPCDS_DataFrame_Differential::test_q84_dataframe`
 - [ ] `test_tpcds_differential.py::TestTPCDS_DataFrame_Differential::test_q98_dataframe`
 - [ ] `test_tpcds_differential.py::TestTPCDS_DataFrame_Differential::test_q99_dataframe`
 - [ ] `test_tpcds_dataframe_differential.py::test_tpcds_dataframe_query[12]`
 - [ ] `test_tpcds_dataframe_differential.py::test_tpcds_dataframe_query[20]`
 - [ ] `test_tpcds_dataframe_differential.py::test_tpcds_dataframe_query[40]`
 - [ ] `test_tpcds_dataframe_differential.py::test_tpcds_dataframe_query[62]`
-- [ ] `test_tpcds_dataframe_differential.py::test_tpcds_dataframe_query[84]`
 - [ ] `test_tpcds_dataframe_differential.py::test_tpcds_dataframe_query[98]`
 - [ ] `test_tpcds_dataframe_differential.py::test_tpcds_dataframe_query[99]`
 
-### TPC-H DataFrame — decimal precision (1 test)
+### TPC-H DataFrame (1 test)
 
-- [ ] `test_tpch_differential.py::TestTPCHDifferential::test_q11_dataframe` — Decimal(38,2) vs Decimal(32,2)
+- [ ] `test_tpch_differential.py::TestTPCHDifferential::test_q11_dataframe`
 
-### Type literals — interval arithmetic + map/struct types (14 tests)
-
-Interval arithmetic type handling. Map/struct literal type construction.
+### Type literals — interval arithmetic + map/struct types (13 tests)
 
 - [ ] `test_type_literals_differential.py::TestTimestampNTZLiterals_Differential::test_timestamp_ntz_arithmetic`
 - [ ] `test_type_literals_differential.py::TestIntervalLiterals_Differential::test_year_month_interval_in_arithmetic`
@@ -210,11 +162,9 @@ Interval arithmetic type handling. Map/struct literal type construction.
 - [ ] `test_type_literals_differential.py::TestIntervalLiterals_Differential::test_day_time_interval_hours_arithmetic`
 - [ ] `test_type_literals_differential.py::TestIntervalLiterals_Differential::test_day_time_interval_compound_arithmetic`
 - [ ] `test_type_literals_differential.py::TestIntervalLiterals_Differential::test_interval_date_arithmetic`
-- [ ] `test_type_literals_differential.py::TestArrayLiterals_Differential::test_array_with_null`
 - [ ] `test_type_literals_differential.py::TestMapLiterals_Differential::test_map_literal_via_sql`
 - [ ] `test_type_literals_differential.py::TestMapLiterals_Differential::test_map_from_arrays`
 - [ ] `test_type_literals_differential.py::TestMapLiterals_Differential::test_map_pyspark_create_map`
-- [ ] `test_type_literals_differential.py::TestStructLiterals_Differential::test_struct_field_access`
 - [ ] `test_type_literals_differential.py::TestComplexNestedTypes_Differential::test_map_with_array_values`
 - [ ] `test_type_literals_differential.py::TestEdgeCases_Differential::test_zero_interval`
 
@@ -222,20 +172,16 @@ Interval arithmetic type handling. Map/struct literal type construction.
 
 ## Summary by Root Cause Category
 
-| Category | Relaxed | Strict | Total Unique |
-|----------|---------|--------|-------------|
-| ~~Map type construction (extra array nesting)~~ | ~~6~~ 0 | ~~7~~ 1 | ~~7~~ 1 | CLOSED (duckdb_ready flag) |
-| Decimal precision/scale (SUM/AVG/DIV/ROUND cascades) | 2 | ~40 | ~40 |
-| Nullable: struct fields from DuckDB fallback | 0 | 8 | 8 |
-| Nullable: math functions should be always-nullable | 0 | 5 | 5 |
-| Nullable: null-checking functions (isnull/isnotnull) | 0 | 3 | 3 |
-| Nullable: HOF/lambda containsNull + result | 0 | 16 | 16 |
-| Nullable: pivot grouping columns | 0 | 7 | 7 |
-| Nullable: cube/rollup grouping | 0 | 3 | 3 |
-| Nullable: statistical aggregates | 0 | 3 | 3 |
-| Type: interval arithmetic | 0 | 7 | 7 |
-| Type: array functions (flatten, reverse) | 0 | 2 | 2 |
-| Type: BIN return type | 0 | 1 | 1 |
-| Type: JSON schema_of_json | 0 | 1 | 1 |
-| Type: string concat_ws nullable | 0 | 1 | 1 |
-| gRPC errors (server crash) | 0 | ~3 | ~3 |
+| Category | Relaxed | Strict | Notes |
+|----------|---------|--------|-------|
+| TPC-DS decimal precision cascades | 2 | ~38 | CTE schema + expression-level type inference gaps |
+| Struct field nullable (DuckDB fallback) | 0 | 8 | createDataFrame NOT NULL not propagated through struct access |
+| Lambda/HOF containsNull + nullable | 0 | 16 | DataFrame-path HOF schema not resolving |
+| Interval arithmetic types | 0 | 8 | DayTimeInterval/YearMonthInterval type handling |
+| Pivot grouping nullable | 0 | 7 | Pivot schema empty → DuckDB fallback |
+| Map type construction (strict) | 0 | 4 | Remaining map type issues in strict mode |
+| Cube/Rollup grouping nullable | 0 | 3 | GROUPING/GROUPING_ID nullable semantics |
+| Statistical aggregate nullable | 0 | 3 | kurtosis/skewness nullable |
+| Array function type | 0 | 2 | flatten extra nesting, reverse wrong type |
+| BIN return type | 0 | 1 | StringType vs IntegerType |
+| JSON schema_of_json | 0 | 1 | Return type/nullable |

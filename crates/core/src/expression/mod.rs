@@ -465,7 +465,7 @@ impl Expression {
                 }
             }
             Expression::UnresolvedColumn(u) => {
-                TypeInferenceEngine::column_type(&u.name, schema)
+                TypeInferenceEngine::qualified_column_type(&u.name, u.qualifier.as_deref(), schema)
             }
             Expression::Binary(b) => {
                 use BinaryOp::*;
@@ -713,8 +713,47 @@ impl Expression {
             Expression::Between(_) => DataType::Boolean,
             Expression::Like(_) | Expression::IsDistinctFrom(_) => DataType::Boolean,
             Expression::Interval(_) => DataType::String, // TODO: proper IntervalType
-            Expression::ExtractValue(_) | Expression::RowConstructor(_) => DataType::Unresolved,
-            Expression::UpdateFields(_) => DataType::Unresolved,
+            Expression::ExtractValue(ev) => {
+                let base_type = ev.child.data_type(schema);
+                let field_name = match ev.extraction.as_ref() {
+                    Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.as_str()),
+                    _ => None,
+                };
+                match (&base_type, field_name) {
+                    (DataType::Struct(st), Some(name)) => {
+                        st.field_by_name(name)
+                            .map(|f| f.data_type.clone())
+                            .unwrap_or(DataType::Unresolved)
+                    }
+                    (DataType::Array(elem, _), _) => elem.as_ref().clone(),
+                    (DataType::Map { value, .. }, _) => value.as_ref().clone(),
+                    _ => DataType::Unresolved,
+                }
+            }
+            Expression::RowConstructor(_) => DataType::Unresolved,
+            Expression::UpdateFields(u) => {
+                let base_type = u.struct_expr.data_type(schema);
+                if let DataType::Struct(st) = &base_type {
+                    let mut fields: Vec<StructField> = st.fields.clone();
+                    if let Some(ref val_expr) = u.value {
+                        // Add or update the field
+                        let new_type = val_expr.data_type(schema);
+                        let new_nullable = val_expr.nullable(schema);
+                        if let Some(existing) = fields.iter_mut().find(|f| f.name.eq_ignore_ascii_case(&u.field_name)) {
+                            existing.data_type = new_type;
+                            existing.nullable = new_nullable;
+                        } else {
+                            fields.push(StructField::new(u.field_name.clone(), new_type, new_nullable));
+                        }
+                    } else {
+                        // Drop the field
+                        fields.retain(|f| !f.name.eq_ignore_ascii_case(&u.field_name));
+                    }
+                    DataType::Struct(StructType::new(fields))
+                } else {
+                    DataType::Unresolved
+                }
+            }
         }
     }
 
@@ -723,7 +762,7 @@ impl Expression {
         match self {
             Expression::Literal(l) => matches!(l.value, LiteralValue::Null),
             Expression::ColumnReference(c) => TypeInferenceEngine::column_nullable(&c.name, schema),
-            Expression::UnresolvedColumn(u) => TypeInferenceEngine::column_nullable(&u.name, schema),
+            Expression::UnresolvedColumn(u) => TypeInferenceEngine::qualified_column_nullable(&u.name, u.qualifier.as_deref(), schema),
             Expression::Binary(b) => b.left.nullable(schema) || b.right.nullable(schema),
             Expression::Unary(u) => match u.op {
                 UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::IsNaN | UnaryOp::IsNotNaN => false,
@@ -796,7 +835,23 @@ impl Expression {
             Expression::Like(l) => l.value.nullable(schema) || l.pattern.nullable(schema),
             Expression::IsDistinctFrom(_) => false,
             Expression::Interval(_) => false,
-            Expression::ExtractValue(_) => true,
+            Expression::ExtractValue(ev) => {
+                let base_nullable = ev.child.nullable(schema);
+                let base_type = ev.child.data_type(schema);
+                let field_name = match ev.extraction.as_ref() {
+                    Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.as_str()),
+                    _ => None,
+                };
+                match (&base_type, field_name) {
+                    (DataType::Struct(st), Some(name)) => {
+                        let field_nullable = st.field_by_name(name)
+                            .map(|f| f.nullable)
+                            .unwrap_or(true);
+                        base_nullable || field_nullable
+                    }
+                    _ => true, // array/map access or unresolved: always nullable
+                }
+            }
             Expression::RowConstructor(_) => false,
             Expression::UpdateFields(u) => u.struct_expr.nullable(schema),
         }
@@ -881,5 +936,133 @@ mod tests {
         });
         assert_eq!(expr.data_type(&StructType::empty()), DataType::Boolean);
         assert!(!expr.nullable(&StructType::empty()));
+    }
+
+    fn struct_schema() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("person", DataType::Struct(StructType::new(vec![
+                StructField::not_null("name", DataType::String),
+                StructField::nullable("age", DataType::Integer),
+            ]))),
+            StructField::nullable("nullable_struct", DataType::Struct(StructType::new(vec![
+                StructField::not_null("street", DataType::String),
+            ]))),
+        ])
+    }
+
+    #[test]
+    fn extract_value_struct_field_type() {
+        let s = struct_schema();
+        let expr = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "person".to_owned(),
+                qualifier: None,
+            })),
+            extraction: Box::new(Literal::string("name")),
+        });
+        assert_eq!(expr.data_type(&s), DataType::String);
+    }
+
+    #[test]
+    fn extract_value_struct_field_nullable_both_not_null() {
+        let s = struct_schema();
+        // person is NOT NULL, person.name is NOT NULL => not nullable
+        let expr = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "person".to_owned(),
+                qualifier: None,
+            })),
+            extraction: Box::new(Literal::string("name")),
+        });
+        assert!(!expr.nullable(&s));
+    }
+
+    #[test]
+    fn extract_value_struct_field_nullable_field_nullable() {
+        let s = struct_schema();
+        // person is NOT NULL, person.age is NULLABLE => nullable
+        let expr = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "person".to_owned(),
+                qualifier: None,
+            })),
+            extraction: Box::new(Literal::string("age")),
+        });
+        assert!(expr.nullable(&s));
+    }
+
+    #[test]
+    fn extract_value_struct_nullable_base() {
+        let s = struct_schema();
+        // nullable_struct IS NULLABLE, street is NOT NULL => nullable
+        let expr = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "nullable_struct".to_owned(),
+                qualifier: None,
+            })),
+            extraction: Box::new(Literal::string("street")),
+        });
+        assert!(expr.nullable(&s));
+    }
+
+    #[test]
+    fn unresolved_column_qualified_struct_field_type() {
+        let s = struct_schema();
+        let expr = Expression::UnresolvedColumn(UnresolvedColumn {
+            name: "name".to_owned(),
+            qualifier: Some("person".to_owned()),
+        });
+        assert_eq!(expr.data_type(&s), DataType::String);
+    }
+
+    #[test]
+    fn unresolved_column_qualified_struct_field_nullable() {
+        let s = struct_schema();
+        // person NOT NULL, name NOT NULL => not nullable
+        let expr = Expression::UnresolvedColumn(UnresolvedColumn {
+            name: "name".to_owned(),
+            qualifier: Some("person".to_owned()),
+        });
+        assert!(!expr.nullable(&s));
+    }
+
+    #[test]
+    fn update_fields_add_field_type() {
+        let s = struct_schema();
+        let expr = Expression::UpdateFields(UpdateFieldsExpression {
+            struct_expr: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "person".to_owned(),
+                qualifier: None,
+            })),
+            field_name: "email".to_owned(),
+            value: Some(Box::new(Literal::string("test@example.com"))),
+            struct_fields: None,
+        });
+        if let DataType::Struct(st) = expr.data_type(&s) {
+            assert_eq!(st.fields.len(), 3); // name, age, email
+            assert_eq!(st.field_by_name("email").unwrap().data_type, DataType::String);
+        } else {
+            panic!("expected Struct type");
+        }
+    }
+
+    #[test]
+    fn update_fields_drop_field_type() {
+        let s = struct_schema();
+        let expr = Expression::UpdateFields(UpdateFieldsExpression {
+            struct_expr: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "person".to_owned(),
+                qualifier: None,
+            })),
+            field_name: "age".to_owned(),
+            value: None,
+            struct_fields: None,
+        });
+        if let DataType::Struct(st) = expr.data_type(&s) {
+            assert_eq!(st.fields.len(), 1); // only name remains
+            assert!(st.field_by_name("age").is_none());
+        } else {
+            panic!("expected Struct type");
+        }
     }
 }

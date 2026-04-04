@@ -11,14 +11,88 @@ impl TypeInferenceEngine {
 
     /// Look up the type of `name` in `schema` (case-insensitive).
     /// Returns `DataType::Unresolved` if the column is not found.
+    ///
+    /// Supports dot-notation for struct fields: `"person.name"` resolves
+    /// to the `name` field within the `person` struct column.
     pub fn column_type(name: &str, schema: &StructType) -> DataType {
-        schema.field_by_name(name).map(|f| f.data_type.clone()).unwrap_or(DataType::Unresolved)
+        if let Some(f) = schema.field_by_name(name) {
+            return f.data_type.clone();
+        }
+        // Dot-notation: "struct_col.field_name"
+        if let Some(dot_pos) = name.find('.') {
+            let struct_name = &name[..dot_pos];
+            let field_name = &name[dot_pos + 1..];
+            if let Some(f) = schema.field_by_name(struct_name) {
+                if let DataType::Struct(st) = &f.data_type {
+                    return st.field_by_name(field_name)
+                        .map(|ff| ff.data_type.clone())
+                        .unwrap_or(DataType::Unresolved);
+                }
+            }
+        }
+        DataType::Unresolved
     }
 
     /// Look up the nullability of `name` in `schema` (case-insensitive).
     /// Returns `true` (nullable) if not found — safe default.
+    ///
+    /// Supports dot-notation for struct fields: `"person.name"` resolves
+    /// to `person.nullable || person.name.nullable` (Spark semantics).
     pub fn column_nullable(name: &str, schema: &StructType) -> bool {
-        schema.field_by_name(name).map(|f| f.nullable).unwrap_or(true)
+        if let Some(f) = schema.field_by_name(name) {
+            return f.nullable;
+        }
+        // Dot-notation: "struct_col.field_name"
+        if let Some(dot_pos) = name.find('.') {
+            let struct_name = &name[..dot_pos];
+            let field_name = &name[dot_pos + 1..];
+            if let Some(f) = schema.field_by_name(struct_name) {
+                if let DataType::Struct(st) = &f.data_type {
+                    let field_nullable = st.field_by_name(field_name)
+                        .map(|ff| ff.nullable)
+                        .unwrap_or(true);
+                    return f.nullable || field_nullable;
+                }
+            }
+        }
+        true
+    }
+
+    /// Look up the type of a qualified column reference in `schema`.
+    ///
+    /// When `qualifier` matches a struct-typed column, resolves `name`
+    /// as a field within that struct. Otherwise falls back to flat lookup.
+    pub fn qualified_column_type(name: &str, qualifier: Option<&str>, schema: &StructType) -> DataType {
+        if let Some(q) = qualifier {
+            // Try qualifier as struct column name
+            if let Some(f) = schema.field_by_name(q) {
+                if let DataType::Struct(st) = &f.data_type {
+                    if let Some(ff) = st.field_by_name(name) {
+                        return ff.data_type.clone();
+                    }
+                }
+            }
+        }
+        // Fall back to flat lookup
+        Self::column_type(name, schema)
+    }
+
+    /// Look up the nullability of a qualified column reference in `schema`.
+    ///
+    /// When `qualifier` matches a struct-typed column, returns
+    /// `struct_col.nullable || field.nullable` (Spark semantics).
+    pub fn qualified_column_nullable(name: &str, qualifier: Option<&str>, schema: &StructType) -> bool {
+        if let Some(q) = qualifier {
+            if let Some(f) = schema.field_by_name(q) {
+                if let DataType::Struct(st) = &f.data_type {
+                    let field_nullable = st.field_by_name(name)
+                        .map(|ff| ff.nullable)
+                        .unwrap_or(true);
+                    return f.nullable || field_nullable;
+                }
+            }
+        }
+        Self::column_nullable(name, schema)
     }
 
     // ── Lambda schema augmentation ───────────────────────────────────────────
@@ -729,5 +803,70 @@ mod tests {
         assert_eq!(augmented.fields[2].name, "i");
         assert_eq!(augmented.fields[2].data_type, DataType::Integer);
         assert!(!augmented.fields[2].nullable);
+    }
+
+    #[test]
+    fn column_type_dot_notation_struct_field() {
+        use crate::types::{StructField, StructType};
+        let schema = StructType::new(vec![
+            StructField::not_null("person", DataType::Struct(StructType::new(vec![
+                StructField::not_null("name", DataType::String),
+                StructField::nullable("age", DataType::Integer),
+            ]))),
+        ]);
+        assert_eq!(TypeInferenceEngine::column_type("person.name", &schema), DataType::String);
+        assert_eq!(TypeInferenceEngine::column_type("person.age", &schema), DataType::Integer);
+        assert_eq!(TypeInferenceEngine::column_type("person.missing", &schema), DataType::Unresolved);
+        assert_eq!(TypeInferenceEngine::column_type("missing.name", &schema), DataType::Unresolved);
+    }
+
+    #[test]
+    fn column_nullable_dot_notation_struct_field() {
+        use crate::types::{StructField, StructType};
+        let schema = StructType::new(vec![
+            StructField::not_null("person", DataType::Struct(StructType::new(vec![
+                StructField::not_null("name", DataType::String),
+                StructField::nullable("age", DataType::Integer),
+            ]))),
+            StructField::nullable("nullable_person", DataType::Struct(StructType::new(vec![
+                StructField::not_null("street", DataType::String),
+            ]))),
+        ]);
+        // person NOT NULL, name NOT NULL => false
+        assert!(!TypeInferenceEngine::column_nullable("person.name", &schema));
+        // person NOT NULL, age NULLABLE => true
+        assert!(TypeInferenceEngine::column_nullable("person.age", &schema));
+        // nullable_person NULLABLE, street NOT NULL => true
+        assert!(TypeInferenceEngine::column_nullable("nullable_person.street", &schema));
+    }
+
+    #[test]
+    fn qualified_column_type_struct_field() {
+        use crate::types::{StructField, StructType};
+        let schema = StructType::new(vec![
+            StructField::not_null("person", DataType::Struct(StructType::new(vec![
+                StructField::not_null("name", DataType::String),
+            ]))),
+        ]);
+        assert_eq!(
+            TypeInferenceEngine::qualified_column_type("name", Some("person"), &schema),
+            DataType::String
+        );
+        // No qualifier -> flat lookup (won't find "name" at top level)
+        assert_eq!(
+            TypeInferenceEngine::qualified_column_type("name", None, &schema),
+            DataType::Unresolved
+        );
+    }
+
+    #[test]
+    fn qualified_column_nullable_struct_field() {
+        use crate::types::{StructField, StructType};
+        let schema = StructType::new(vec![
+            StructField::not_null("person", DataType::Struct(StructType::new(vec![
+                StructField::not_null("name", DataType::String),
+            ]))),
+        ]);
+        assert!(!TypeInferenceEngine::qualified_column_nullable("name", Some("person"), &schema));
     }
 }

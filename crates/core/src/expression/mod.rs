@@ -798,6 +798,34 @@ impl Expression {
                     f.args.first().map_or(true, |a| a.nullable(schema))
                 } else if matches!(lower.as_str(), "aggregate" | "reduce" | "list_reduce") {
                     true
+                } else if matches!(lower.as_str(),
+                    "isnull" | "isnan" | "isnotnull" | "isnotnan"
+                    | "is_nan" | "isinf"
+                ) {
+                    false
+                } else if matches!(lower.as_str(),
+                    "ceil" | "ceiling" | "floor" | "round" | "bround"
+                    | "ln" | "log" | "log10" | "log2" | "log1p"
+                    | "exp" | "expm1" | "pow" | "power" | "sqrt" | "cbrt"
+                    | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
+                    | "sinh" | "cosh" | "tanh" | "degrees" | "radians"
+                    | "signum" | "sign"
+                    | "factorial" | "hex" | "unhex" | "bin"
+                ) {
+                    true
+                } else if lower.as_str() == "concat_ws" {
+                    false
+                } else if matches!(lower.as_str(), "greatest" | "least") {
+                    f.args.iter().all(|a| a.nullable(schema))
+                } else if lower.as_str() == "nvl2" {
+                    f.args.get(1).map_or(true, |a| a.nullable(schema))
+                        || f.args.get(2).map_or(true, |a| a.nullable(schema))
+                } else if matches!(lower.as_str(),
+                    "array" | "make_array" | "create_map" | "map"
+                    | "named_struct" | "struct"
+                    | "map_from_arrays" | "map_from_entries"
+                ) {
+                    false
                 } else {
                     f.args.iter().any(|a| a.nullable(schema))
                 }

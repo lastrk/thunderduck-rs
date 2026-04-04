@@ -2128,6 +2128,14 @@ fn expr_contains_decimal_cast(expr: &Expression) -> bool {
 /// - `AVG(decimal{p,s})` → `CAST(AVG(...) AS DECIMAL(min(p+4,38), s+4))`
 /// Passes through aliases transparently so the alias is preserved on the outer Cast.
 fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType, mode: CompatMode) -> Expression {
+    // When the input schema is empty (e.g. SQL path in relaxed mode without table-scan
+    // enrichment), type inference on aggregate arguments is unreliable — a CaseWhen with
+    // `ELSE 0` can mis-infer as Integer even when THEN branches are Decimal, causing
+    // a spurious CAST(SUM(...) AS BIGINT) that truncates decimal results.
+    // Skip all aggregate type casts in this case and let DuckDB handle natively.
+    if input_schema.is_empty() {
+        return expr.clone();
+    }
     match expr {
         Expression::Alias(a) => {
             let inner = apply_agg_type_casts(&a.expr, input_schema, mode);

@@ -929,6 +929,14 @@ fn spark_type_name(dt: &crate::types::DataType) -> String {
 
 fn infer_aggregate_schema(a: &Aggregate) -> StructType {
     let child_schema = a.input.infer_schema();
+    // When the child schema is empty (e.g. SQL path in relaxed mode without table-scan
+    // enrichment), aggregate output type inference is unreliable — CaseWhen with `ELSE 0`
+    // can mis-infer as Integer even when THEN branches are Decimal. Returning empty here
+    // ensures that downstream consumers (e.g. UNION, outer aggregates) don't propagate
+    // wrong types that would trigger spurious CAST(SUM(...) AS BIGINT).
+    if child_schema.is_empty() {
+        return StructType::empty();
+    }
     let mut fields = Vec::new();
 
     let use_select_order = !a.select_order.is_empty();

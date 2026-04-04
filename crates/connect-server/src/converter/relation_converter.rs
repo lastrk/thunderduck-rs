@@ -2033,11 +2033,18 @@ fn expand_map_explodes(input_schema: &thunderduck_core::types::StructType, proje
                     _ => None,
                 };
                 if let Some(ref name) = col_name {
-                    let is_map = input_schema.fields.iter().any(|f| {
+                    let map_field = input_schema.fields.iter().find(|f| {
                         f.name.eq_ignore_ascii_case(name)
                             && matches!(f.data_type, DataType::Map { .. })
                     });
-                    if is_map {
+                    if let Some(map_f) = map_field {
+                        // Extract key/value types for schema inference
+                        let (key_type, value_type, value_nullable) = match &map_f.data_type {
+                            DataType::Map { key, value, value_nullable } => {
+                                (Some(*key.clone()), Some(*value.clone()), *value_nullable)
+                            }
+                            _ => (None, None, true),
+                        };
                         let col_sql = format!("\"{}\"", name.replace('"', "\"\""));
                         let outer = fname == "explode_outer";
                         if outer {
@@ -2045,18 +2052,28 @@ fn expand_map_explodes(input_schema: &thunderduck_core::types::StructType, proje
                                 sql: format!(
                                     "UNNEST(CASE WHEN {col_sql} IS NULL THEN [NULL] ELSE map_keys({col_sql}) END) AS \"key\""
                                 ),
+                                data_type: key_type.clone(),
+                                // In explode_outer, key can be NULL (for NULL maps)
+                                nullable: Some(true),
                             }));
                             new_proj.push(Expression::RawSql(RawSqlExpression {
                                 sql: format!(
                                     "UNNEST(CASE WHEN {col_sql} IS NULL THEN [NULL] ELSE map_values({col_sql}) END) AS \"value\""
                                 ),
+                                data_type: value_type.clone(),
+                                nullable: Some(true),
                             }));
                         } else {
                             new_proj.push(Expression::RawSql(RawSqlExpression {
                                 sql: format!("UNNEST(map_keys({col_sql})) AS \"key\""),
+                                data_type: key_type.clone(),
+                                // Map keys are never null in Spark
+                                nullable: Some(false),
                             }));
                             new_proj.push(Expression::RawSql(RawSqlExpression {
                                 sql: format!("UNNEST(map_values({col_sql})) AS \"value\""),
+                                data_type: value_type.clone(),
+                                nullable: Some(value_nullable),
                             }));
                         }
                         continue;

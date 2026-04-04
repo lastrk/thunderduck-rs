@@ -48,7 +48,7 @@ impl ExpressionConverter {
                 // instead of Unresolved). Fall back to RawSql on any parse error.
                 Ok(thunderduck_core::parser::SparkSqlParser::parse_single_expr(&es.expression)
                     .unwrap_or_else(|_| {
-                        Expression::RawSql(RawSqlExpression { sql: es.expression.clone() })
+                        Expression::RawSql(RawSqlExpression { sql: es.expression.clone(), data_type: None, nullable: None })
                     }))
             }
             Some(ExprType::CommonInlineUserDefinedFunction(udf)) => {

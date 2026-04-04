@@ -335,6 +335,10 @@ pub struct LambdaVariableExpression {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawSqlExpression {
     pub sql: String,
+    /// Optional type hint for schema inference (avoids DuckDB fallback).
+    pub data_type: Option<DataType>,
+    /// Optional nullable hint for schema inference.
+    pub nullable: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -691,7 +695,7 @@ impl Expression {
             Expression::LambdaVariable(lv) => {
                 TypeInferenceEngine::column_type(&lv.name, schema)
             }
-            Expression::RawSql(_) => DataType::Unresolved,
+            Expression::RawSql(r) => r.data_type.clone().unwrap_or(DataType::Unresolved),
             Expression::ArrayLiteral(a) => {
                 // containsNull=true only if any element is an explicit NULL literal.
                 let contains_null = a.elements.iter().any(|e| {
@@ -823,9 +827,12 @@ impl Expression {
                 } else if matches!(lower.as_str(),
                     "array" | "make_array" | "create_map" | "map"
                     | "named_struct" | "struct"
-                    | "map_from_arrays" | "map_from_entries"
+                    | "map_from_entries"
                 ) {
                     false
+                } else if lower.as_str() == "map_from_arrays" {
+                    // map_from_arrays is nullable when any input array is nullable
+                    f.args.iter().any(|a| a.nullable(schema))
                 } else {
                     f.args.iter().any(|a| a.nullable(schema))
                 }
@@ -857,7 +864,7 @@ impl Expression {
             Expression::LambdaVariable(lv) => {
                 TypeInferenceEngine::column_nullable(&lv.name, schema)
             }
-            Expression::RawSql(_) => true,
+            Expression::RawSql(r) => r.nullable.unwrap_or(true),
             Expression::ArrayLiteral(_) | Expression::MapLiteral(_) | Expression::StructLiteral(_) => false,
             Expression::Between(_) => false,
             Expression::Like(l) => l.value.nullable(schema) || l.pattern.nullable(schema),

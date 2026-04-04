@@ -859,6 +859,8 @@ impl SqlConverter {
                     .unwrap_or_default();
                 Ok(Expression::RawSql(RawSqlExpression {
                     sql: format!("INTERVAL {}{}", interval.value, unit),
+                    data_type: None,
+                    nullable: None,
                 }))
             }
             Expr::Extract { field, expr, .. } => {
@@ -866,7 +868,7 @@ impl SqlConverter {
                 Ok(Expression::FunctionCall(FunctionCall {
                     name: "extract".to_string(),
                     args: vec![
-                        Expression::RawSql(RawSqlExpression { sql: format!("{}", field) }),
+                        Expression::RawSql(RawSqlExpression { sql: format!("{}", field), data_type: None, nullable: None }),
                         inner,
                     ],
                     distinct: false,
@@ -954,6 +956,8 @@ impl SqlConverter {
                 Ok(Expression::RawSql(RawSqlExpression {
                     sql: format!("OVERLAY({} PLACING {} FROM {}{})",
                         expr_sql, what_sql, from_sql, for_clause),
+                    data_type: None,
+                    nullable: None,
                 }))
             }
 

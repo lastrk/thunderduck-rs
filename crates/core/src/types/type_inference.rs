@@ -509,7 +509,24 @@ impl TypeInferenceEngine {
             },
 
             // ── Map functions ─────────────────────────────────────────────────
-            "map" | "create_map" | "map_from_arrays" | "map_from_entries" => {
+            "map" | "create_map" => {
+                let k = arg_types.first().cloned().unwrap_or(Unresolved);
+                let v = arg_types.get(1).cloned().unwrap_or(Unresolved);
+                Map { key: Box::new(k), value: Box::new(v), value_nullable: true }
+            }
+            "map_from_arrays" => {
+                // map_from_arrays(Array<K>, Array<V>) → Map<K, V>
+                let k = match arg_types.first() {
+                    Some(Array(elem, _)) => *elem.clone(),
+                    _ => arg_types.first().cloned().unwrap_or(Unresolved),
+                };
+                let (v, value_nullable) = match arg_types.get(1) {
+                    Some(Array(elem, contains_null)) => (*elem.clone(), *contains_null),
+                    _ => (arg_types.get(1).cloned().unwrap_or(Unresolved), true),
+                };
+                Map { key: Box::new(k), value: Box::new(v), value_nullable }
+            }
+            "map_from_entries" => {
                 let k = arg_types.first().cloned().unwrap_or(Unresolved);
                 let v = arg_types.get(1).cloned().unwrap_or(Unresolved);
                 Map { key: Box::new(k), value: Box::new(v), value_nullable: true }
@@ -519,7 +536,8 @@ impl TypeInferenceEngine {
                     Some(Map { key, .. }) => *key.clone(),
                     _ => Unresolved,
                 };
-                Array(Box::new(k), false)
+                // Spark returns containsNull=true for map_keys
+                Array(Box::new(k), true)
             }
             "map_values" => {
                 let v = match arg_types.first() {
@@ -529,7 +547,18 @@ impl TypeInferenceEngine {
                 Array(Box::new(v), true)
             }
             "map_concat" => arg_types.first().cloned().unwrap_or(Unresolved),
-            "map_entries" => Unresolved, // struct array
+            "map_entries" => match arg_types.first() {
+                Some(Map { key, value, value_nullable }) => {
+                    // Spark: ArrayType(StructType([key: K NOT NULL, value: V nullable]), containsNull=false)
+                    use crate::types::StructField;
+                    let entry_struct = DataType::Struct(crate::types::StructType::new(vec![
+                        StructField::not_null("key", *key.clone()),
+                        StructField::new("value", *value.clone(), *value_nullable),
+                    ]));
+                    Array(Box::new(entry_struct), false)
+                }
+                _ => Unresolved,
+            }
 
             // ── Struct ────────────────────────────────────────────────────────
             "to_csv" => String,

@@ -424,6 +424,9 @@ impl TypeInferenceEngine {
             // ── Binary ────────────────────────────────────────────────────────
             "unhex" | "decode_binary" | "encode" => Binary,
 
+            // ── Integer → String ──────────────────────────────────────────────
+            "bin" => String,
+
             // ── Date → String ─────────────────────────────────────────────────
             "dayname" | "monthname" => String,
 

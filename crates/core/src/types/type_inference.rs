@@ -70,6 +70,11 @@ impl TypeInferenceEngine {
                     if let Some(ff) = st.field_by_name(name) {
                         return ff.data_type.clone();
                     }
+                    // Handle nested dot-notation: name="address.city" →
+                    // traverse struct fields recursively.
+                    if let Some(dt) = Self::resolve_nested_field_type(name, st) {
+                        return dt;
+                    }
                 }
             }
         }
@@ -85,14 +90,61 @@ impl TypeInferenceEngine {
         if let Some(q) = qualifier {
             if let Some(f) = schema.field_by_name(q) {
                 if let DataType::Struct(st) = &f.data_type {
-                    let field_nullable = st.field_by_name(name)
-                        .map(|ff| ff.nullable)
-                        .unwrap_or(true);
-                    return f.nullable || field_nullable;
+                    if let Some(ff) = st.field_by_name(name) {
+                        return f.nullable || ff.nullable;
+                    }
+                    // Handle nested dot-notation: name="address.city" →
+                    // traverse struct fields recursively for nullability.
+                    if let Some(nullable) = Self::resolve_nested_field_nullable(name, st) {
+                        return f.nullable || nullable;
+                    }
                 }
             }
         }
         Self::column_nullable(name, schema)
+    }
+
+    // ── Nested struct field resolution ──────────────────────────────────────
+
+    /// Resolve a dot-separated field path within a struct type.
+    /// e.g. `"address.city"` in `Struct<address: Struct<street: String, city: String>>`
+    /// returns `Some(String)`.
+    fn resolve_nested_field_type(path: &str, st: &StructType) -> Option<DataType> {
+        let dot_pos = path.find('.')?;
+        let head = &path[..dot_pos];
+        let tail = &path[dot_pos + 1..];
+        let field = st.field_by_name(head)?;
+        if let DataType::Struct(inner_st) = &field.data_type {
+            if let Some(ff) = inner_st.field_by_name(tail) {
+                Some(ff.data_type.clone())
+            } else {
+                // Recurse for deeper nesting
+                Self::resolve_nested_field_type(tail, inner_st)
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Resolve the nullability of a dot-separated field path within a struct.
+    /// Returns `Some(combined_nullable)` where combined is the OR of all
+    /// intermediate struct nullabilities along the path.
+    fn resolve_nested_field_nullable(path: &str, st: &StructType) -> Option<bool> {
+        let dot_pos = path.find('.')?;
+        let head = &path[..dot_pos];
+        let tail = &path[dot_pos + 1..];
+        let field = st.field_by_name(head)?;
+        if let DataType::Struct(inner_st) = &field.data_type {
+            if let Some(ff) = inner_st.field_by_name(tail) {
+                Some(field.nullable || ff.nullable)
+            } else {
+                // Recurse for deeper nesting
+                let inner_nullable = Self::resolve_nested_field_nullable(tail, inner_st)?;
+                Some(field.nullable || inner_nullable)
+            }
+        } else {
+            None
+        }
     }
 
     // ── Lambda schema augmentation ───────────────────────────────────────────

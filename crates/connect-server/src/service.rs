@@ -76,6 +76,11 @@ impl SparkConnectService for ThunderduckService {
                     .generate(&logical_plan)
                     .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
 
+                // Special case: CREATE VIEW DDL — cache the inner query's schema
+                // so that subsequent `spark.table()` calls get correct nullable
+                // metadata. DuckDB views lose NOT NULL on all columns.
+                cache_create_view_schema(&session, &logical_plan).await;
+
                 // Special case: DDL statements (DROP VIEW, etc.) return 0 rows.
                 // Execute as DDL and synthesize a single boolean result row so that
                 // PySpark's _execute_and_fetch gets a non-null table back.
@@ -383,12 +388,13 @@ async fn handle_command(
             ])
         }
         Some(CommandType::SqlCommand(sql_cmd)) => {
-            let sql = if let Some(input_rel) = sql_cmd.input {
-                let logical_plan =
+            let (sql, logical_plan) = if let Some(input_rel) = sql_cmd.input {
+                let plan =
                     PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
-                SqlGenerator::new(session.mode())
-                    .generate(&logical_plan)
-                    .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?
+                let sql = SqlGenerator::new(session.mode())
+                    .generate(&plan)
+                    .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
+                (sql, Some(plan))
             } else {
                 // Fallback: older clients send spark.sql() via the deprecated `sql` text field
                 // (all SqlCommand text fields are proto-deprecated in favour of `input`)
@@ -399,8 +405,13 @@ async fn handle_command(
                         "SqlCommand missing both input relation and sql text",
                     ));
                 }
-                text
+                (text, None)
             };
+            // Cache CREATE VIEW schema before execution so subsequent
+            // spark.table() calls get correct nullable metadata.
+            if let Some(ref plan) = logical_plan {
+                cache_create_view_schema(session, plan).await;
+            }
             let batches = session
                 .execute(&sql)
                 .await
@@ -699,4 +710,67 @@ fn spark_config_default(key: &str) -> &'static str {
         // Unknown keys — return empty string (safe for plain string usage)
         _ => "",
     }
+}
+
+/// If `plan` is a `SqlRelation` with a `view_name` (i.e., a CREATE VIEW DDL),
+/// cache the inner query's plan-inferred schema. DuckDB views lose NOT NULL
+/// metadata, so this preserves correct nullable flags for subsequent
+/// `spark.table()` calls.
+async fn cache_create_view_schema(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    plan: &thunderduck_core::logical::LogicalPlan,
+) {
+    let sr = match plan {
+        thunderduck_core::logical::LogicalPlan::SqlRelation(sr) => sr,
+        _ => return,
+    };
+    let view_name = match &sr.view_name {
+        Some(name) => name,
+        None => return,
+    };
+    let schema = &sr.schema;
+    if schema.is_empty() {
+        return;
+    }
+
+    // If schema has unresolved types, merge with DuckDB schema for types
+    // but preserve plan-level nullability where resolved.
+    let final_schema = if schema.fields.iter().any(|f| f.data_type.contains_unresolved()) {
+        use thunderduck_core::types::{StructField, StructType};
+        let duckdb_schema = match SchemaInferrer::new(session)
+            .infer_sql(&format!(
+                "SELECT * FROM \"{}\"",
+                view_name.replace('"', "\"\"")
+            ))
+            .await
+        {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if schema.fields.len() == duckdb_schema.fields.len() {
+            let fields = schema
+                .fields
+                .iter()
+                .zip(duckdb_schema.fields.iter())
+                .map(|(plan_f, duck_f)| {
+                    if plan_f.data_type.contains_unresolved() {
+                        StructField {
+                            name: plan_f.name.clone(),
+                            data_type: duck_f.data_type.clone(),
+                            nullable: duck_f.nullable,
+                        }
+                    } else {
+                        plan_f.clone()
+                    }
+                })
+                .collect();
+            StructType::new(fields)
+        } else {
+            return; // Size mismatch — skip caching
+        }
+    } else {
+        schema.clone()
+    };
+
+    session.cache_view_schema(view_name, final_schema).await;
 }

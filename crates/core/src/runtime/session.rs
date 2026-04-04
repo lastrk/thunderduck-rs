@@ -64,6 +64,13 @@ pub(crate) enum SessionCommand {
         schema: StructType,
         resp: oneshot::Sender<SessionResult>,
     },
+    /// Cache a Spark-declared schema for a temp view without re-creating it.
+    /// Used when a view is created via SQL DDL (e.g. `CREATE TEMP VIEW AS SELECT ...`)
+    /// and we want to preserve correct nullable metadata that DuckDB loses.
+    CacheViewSchema {
+        name: String,
+        schema: StructType,
+    },
     /// Retrieve a cached Spark schema for a temp view.
     GetViewSchema {
         name: String,
@@ -475,6 +482,20 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
         }
     }
 
+    /// Cache a Spark-accurate schema for a temp view created via SQL DDL.
+    ///
+    /// DuckDB views lose NOT NULL metadata for struct fields and literal
+    /// expressions. This method stores the plan-inferred schema so that
+    /// subsequent `get_view_schema` calls return correct nullability.
+    pub async fn cache_view_schema(&self, name: &str, schema: StructType) {
+        let _ = self.cmd_tx
+            .send(SessionCommand::CacheViewSchema {
+                name: name.to_string(),
+                schema,
+            })
+            .await;
+    }
+
     /// Retrieve the cached Spark schema for a temp view.
     ///
     /// Returns `None` if no cached schema exists (e.g. the view was created
@@ -556,6 +577,9 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
                     Err(e) => SessionResult::Error(e),
                 };
                 let _ = resp.send(msg);
+            }
+            SessionCommand::CacheViewSchema { name, schema } => {
+                view_schemas.insert(name.to_lowercase(), schema);
             }
             SessionCommand::GetViewSchema { name, resp } => {
                 let schema = view_schemas.get(&name.to_lowercase()).cloned();

@@ -304,17 +304,22 @@ pub struct SqlRelation {
     /// `MAP([[keys]], [[vals]])`.
     #[doc(hidden)]
     pub duckdb_ready: bool,
+    /// For CREATE VIEW DDL: the unquoted view name. When set, the service layer
+    /// caches `self.schema` as the view's Spark-accurate schema so that
+    /// subsequent `spark.table()` calls get correct nullable metadata.
+    /// DuckDB views lose NOT NULL on all columns, so this preserves it.
+    pub view_name: Option<String>,
 }
 
 impl SqlRelation {
     /// Create a new SqlRelation with raw Spark SQL that needs preprocessing.
     pub fn new(sql: String, schema: StructType) -> Self {
-        Self { sql, schema, duckdb_ready: false }
+        Self { sql, schema, duckdb_ready: false, view_name: None }
     }
 
     /// Create a new SqlRelation with DuckDB-ready SQL that must skip preprocessing.
     pub fn duckdb_native(sql: String, schema: StructType) -> Self {
-        Self { sql, schema, duckdb_ready: true }
+        Self { sql, schema, duckdb_ready: true, view_name: None }
     }
 }
 
@@ -802,13 +807,16 @@ fn projection_to_field(expr: &Expression, schema: &StructType) -> Option<StructF
             ))
         }
         Expression::Star(_) => None, // expanded by caller
-        Expression::RawSql(_) => {
-            // ExpressionString from selectExpr() arrives as RawSql. Its data_type() is always
-            // Unresolved, but the column name may match a child schema field (e.g. "id" →
-            // look up id's type instead of falling back to DuckDB INTEGER literals).
+        Expression::RawSql(r) => {
             let col_name = spark_column_name(expr);
-            let dt = crate::types::TypeInferenceEngine::column_type(&col_name, schema);
-            let nullable = crate::types::TypeInferenceEngine::column_nullable(&col_name, schema);
+            // Use type hints from RawSqlExpression if available (e.g. explode-map expansion).
+            // Otherwise fall back to schema lookup (ExpressionString from selectExpr()).
+            let dt = r.data_type.clone().unwrap_or_else(|| {
+                crate::types::TypeInferenceEngine::column_type(&col_name, schema)
+            });
+            let nullable = r.nullable.unwrap_or_else(|| {
+                crate::types::TypeInferenceEngine::column_nullable(&col_name, schema)
+            });
             Some(StructField::new(col_name, dt, nullable))
         }
         other => {

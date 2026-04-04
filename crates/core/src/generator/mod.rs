@@ -3553,8 +3553,7 @@ mod tests {
             input: Box::new(LogicalPlan::SqlRelation(SqlRelation {
                 sql: "SELECT 1 AS a, 2 AS b".to_string(),
                 schema: crate::types::StructType::empty(),
-                duckdb_ready: false,
-            })),
+                duckdb_ready: false, view_name: None, })),
             column_names: vec!["x".to_string(), "y".to_string()],
         });
         let sql = gen().generate(&plan).unwrap();

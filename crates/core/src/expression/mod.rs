@@ -646,15 +646,22 @@ impl Expression {
                         }
                     }
                     _ => {
-                        // For array-constructor functions, set containsNull based on whether any
-                        // argument can be null (e.g. array(lit(1), lit(2)) → containsNull=false).
                         match dt {
+                            // Array constructors: containsNull from arg nullability
                             DataType::Array(elem, _)
                                 if matches!(lower.as_str(), "array" | "make_array") =>
                             {
                                 let contains_null =
                                     f.args.iter().any(|a| a.nullable(schema));
                                 DataType::Array(elem, contains_null)
+                            }
+                            // Map constructors: value_nullable from odd-indexed args
+                            DataType::Map { key, value, .. }
+                                if matches!(lower.as_str(), "map" | "create_map") =>
+                            {
+                                let val_nullable = f.args.iter().skip(1).step_by(2)
+                                    .any(|a| a.nullable(schema));
+                                DataType::Map { key, value, value_nullable: val_nullable }
                             }
                             other => other,
                         }

@@ -860,7 +860,7 @@ impl SqlConverter {
                 Ok(Expression::RawSql(RawSqlExpression {
                     sql: format!("INTERVAL {}{}", interval.value, unit),
                     data_type: None,
-                    nullable: None,
+                    nullable: Some(false), // interval literals are never null
                 }))
             }
             Expr::Extract { field, expr, .. } => {

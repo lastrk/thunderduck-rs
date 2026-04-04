@@ -373,7 +373,7 @@ impl TypeInferenceEngine {
             // ── String functions ──────────────────────────────────────────────
             "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "lpad" | "rpad" | "concat"
             | "concat_ws" | "substring" | "substr" | "replace" | "regexp_replace"
-            | "translate" | "repeat" | "reverse" | "space" | "soundex" | "hex"
+            | "translate" | "repeat" | "space" | "soundex" | "hex"
             | "base64" | "unbase64" | "decode" | "overlay" | "initcap"
             | "format_string" | "printf" | "from_unixtime" | "date_format" | "to_char"
             | "to_number" | "format_number" | "left" | "right" | "uuid" | "md5"
@@ -449,8 +449,21 @@ impl TypeInferenceEngine {
                 Array(Box::new(elem), true)
             }
             "array_distinct" | "array_sort" | "sort_array" | "array_reverse"
-            | "flatten" | "slice" => {
+            | "slice" => {
                 arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved), true))
+            }
+            // flatten unwraps one nesting level: array<array<T>> → array<T>
+            "flatten" => match arg_types.first() {
+                Some(Array(inner, _)) => match inner.as_ref() {
+                    Array(elem, nullable) => Array(elem.clone(), *nullable),
+                    _ => arg_types[0].clone(),
+                },
+                _ => Array(Box::new(Unresolved), true),
+            }
+            // reverse: polymorphic — array<T> → array<T>, string → string
+            "reverse" => match arg_types.first() {
+                Some(Array(_, _)) => arg_types[0].clone(),
+                _ => String,
             }
             // array_append / array_prepend: Spark conservatively sets containsNull=true
             "array_append" | "array_prepend" | "append_element" | "prepend_element" => {

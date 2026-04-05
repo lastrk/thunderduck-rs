@@ -2,26 +2,27 @@
 
 **Date**: 2026-04-05
 **Relaxed mode**: 830 passed, 0 failed, 6 skipped (836 total) — 100%
-**Strict mode**: 832 passed, 3 failed, 1 skipped (836 total) — 99.6%
+**Strict mode**: 835 passed, 0 failed, 1 skipped (836 total) — 100%
 
 **History**: 508 → 686 → 695 → 716 → 720 → 723 → 736 → 741 → 744 → 755
-→ 779 → 790 → 796 → 802 → 806 → 815 → 819 → 828 → 829 → 832
+→ 779 → 790 → 796 → 802 → 806 → 815 → 819 → 828 → 829 → 832 → 835
 
 ---
 
-## Relaxed Mode: 100% Pass Rate
+## ALL TESTS PASSING
 
-All 830 tests pass. 6 skipped (pre-existing exclusions).
+Both relaxed and strict modes achieve 100% pass rate on the differential test suite.
 
----
+### Key milestones:
+- **+178**: CaseWhen `unify_types()` — Spark-compatible type unification
+- **+24**: SQL view schema cache + nested struct resolution
+- **+11**: Decimal literal precision + mixed arithmetic
+- **+12**: Function nullable categories (math always-nullable, isnull non-nullable)
+- **+9**: Value-based decimal precision for literals + when() parity
+- **+6**: Pivot nullable override in AnalyzePlan
+- **+3**: COALESCE type unification + scalar subquery enrichment
+- **+3**: kurtosis_pop + spark_skewness extension functions
 
-## Strict Mode Failures (3)
-
-All 3 remaining failures require **DuckDB extension functions** — the algorithm
-used by DuckDB for kurtosis/skewness differs from Spark's formula. These cannot
-be fixed in the Rust port without implementing `spark_kurtosis`/`spark_skewness`
-in the C++ DuckDB extension.
-
-- [ ] `test_new_aggregates_differential.py::TestStatisticalAggregates_Differential::test_kurtosis` — value diff: DuckDB excess kurtosis vs Spark sample kurtosis
-- [ ] `test_new_aggregates_differential.py::TestStatisticalAggregates_Differential::test_skewness` — value diff: DuckDB vs Spark sample skewness formula
-- [ ] `test_new_aggregates_differential.py::TestGroupedNewAggregates_Differential::test_kurtosis_grouped` — same as above with GROUP BY
+### Skipped tests:
+- **Relaxed**: 6 tests skipped (pre-existing exclusions, not failures)
+- **Strict**: 1 test skipped (pre-existing exclusion)

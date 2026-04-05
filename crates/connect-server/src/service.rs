@@ -240,6 +240,11 @@ impl SparkConnectService for ThunderduckService {
                             .collect();
                         StructType::new(fields)
                     };
+                    // Post-merge: for Pivot plans, override grouping column nullable
+                    // from input schema (covers both empty and has_unresolved branches)
+                    if let Some(pivot) = find_pivot(&logical_plan) {
+                        struct_type = apply_pivot_grouping_nullable(struct_type, pivot);
+                    }
                 }
                 let schema_proto = data_type_to_proto(&DataType::Struct(struct_type));
 

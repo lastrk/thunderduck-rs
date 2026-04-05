@@ -795,6 +795,8 @@ fn find_pivot(plan: &thunderduck_core::logical::LogicalPlan) -> Option<&thunderd
         LogicalPlan::Tail(t) => find_pivot(&t.input),
         LogicalPlan::Filter(f) => find_pivot(&f.input),
         LogicalPlan::Project(p) => find_pivot(&p.input),
+        LogicalPlan::WithColumns(ref w) => find_pivot(&w.input),
+        LogicalPlan::Aggregate(ref a) => find_pivot(&a.input),
         _ => None,
     }
 }

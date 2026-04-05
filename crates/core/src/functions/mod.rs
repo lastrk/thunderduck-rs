@@ -1125,9 +1125,19 @@ impl FunctionRegistry {
             }
         });
 
-        // schema_of_json(json) → returns a schema string
-        custom.insert("schema_of_json", |_args, _mode| {
-            "'string'".to_string() // simplified — exact type depends on data
+        // schema_of_json(json) → returns a Spark DDL schema string.
+        // Parses the JSON literal at translation time and infers Spark types.
+        custom.insert("schema_of_json", |args, _mode| {
+            let json_literal = args.first().copied().unwrap_or("''");
+            // Strip surrounding SQL single-quotes
+            let json_str = json_literal
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+                .unwrap_or(json_literal);
+            match spark_schema_of_json(json_str) {
+                Some(ddl) => format!("'{ddl}'"),
+                None => "'string'".to_owned(),
+            }
         });
 
         // from_json(col, schema) — convert Spark DDL schema to DuckDB json_transform schema
@@ -1545,6 +1555,201 @@ fn spark_type_to_json_type(spark_type: &str) -> &'static str {
     }
 }
 
+// ── schema_of_json helpers ────────────────────────────────────────────────────
+
+/// Parses a JSON string and returns its Spark DDL schema representation.
+///
+/// Returns `None` if the JSON is not a valid object. For example:
+/// `{"a": 1, "b": "hello"}` → `STRUCT<a: BIGINT, b: STRING>`
+fn spark_schema_of_json(json: &str) -> Option<String> {
+    let trimmed = json.trim();
+    if !trimmed.starts_with('{') {
+        // Top-level must be an object for Spark schema_of_json
+        return None;
+    }
+    let val = parse_json_value(trimmed)?;
+    Some(json_value_to_spark_ddl(&val))
+}
+
+/// Minimal JSON value representation for schema inference.
+#[derive(Debug)]
+enum JsonValue<'a> {
+    Null,
+    Bool,
+    Integer,
+    Float,
+    Str,
+    Array(Vec<JsonValue<'a>>),
+    Object(Vec<(&'a str, JsonValue<'a>)>),
+}
+
+/// Parses a JSON value from a string slice. Returns the parsed value and
+/// the remaining unparsed input, or `None` on parse failure.
+fn parse_json_value(input: &str) -> Option<JsonValue<'_>> {
+    let (val, _) = parse_value(input.trim())?;
+    Some(val)
+}
+
+/// Recursive JSON value parser. Returns `(value, remaining_input)`.
+fn parse_value(s: &str) -> Option<(JsonValue<'_>, &str)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    match s.as_bytes()[0] {
+        b'{' => parse_object(s),
+        b'[' => parse_array(s),
+        b'"' => parse_string(s),
+        b't' | b'f' => parse_bool(s),
+        b'n' => parse_null(s),
+        _ => parse_number(s),
+    }
+}
+
+/// Parses a JSON object: `{ "key": value, ... }`.
+fn parse_object(s: &str) -> Option<(JsonValue<'_>, &str)> {
+    let s = s.strip_prefix('{')?.trim();
+    if let Some(rest) = s.strip_prefix('}') {
+        return Some((JsonValue::Object(Vec::new()), rest));
+    }
+    let mut fields = Vec::new();
+    let mut remaining = s;
+    loop {
+        remaining = remaining.trim();
+        // Parse key
+        remaining = remaining.strip_prefix('"')?;
+        let end_quote = remaining.find('"')?;
+        let key = &remaining[..end_quote];
+        remaining = remaining[end_quote + 1..].trim();
+        remaining = remaining.strip_prefix(':')?;
+        // Parse value
+        let (val, rest) = parse_value(remaining)?;
+        fields.push((key, val));
+        remaining = rest.trim();
+        if let Some(rest) = remaining.strip_prefix('}') {
+            return Some((JsonValue::Object(fields), rest));
+        }
+        remaining = remaining.strip_prefix(',')?;
+    }
+}
+
+/// Parses a JSON array: `[ value, ... ]`.
+fn parse_array(s: &str) -> Option<(JsonValue<'_>, &str)> {
+    let s = s.strip_prefix('[')?.trim();
+    if let Some(rest) = s.strip_prefix(']') {
+        return Some((JsonValue::Array(Vec::new()), rest));
+    }
+    let mut elements = Vec::new();
+    let mut remaining = s;
+    loop {
+        let (val, rest) = parse_value(remaining)?;
+        elements.push(val);
+        remaining = rest.trim();
+        if let Some(rest) = remaining.strip_prefix(']') {
+            return Some((JsonValue::Array(elements), rest));
+        }
+        remaining = remaining.strip_prefix(',')?;
+    }
+}
+
+/// Parses a JSON string value (just skips it for type inference purposes).
+fn parse_string(s: &str) -> Option<(JsonValue<'_>, &str)> {
+    let s = s.strip_prefix('"')?;
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2; // skip escaped char
+        } else if bytes[i] == b'"' {
+            return Some((JsonValue::Str, &s[i + 1..]));
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Parses a JSON boolean.
+fn parse_bool(s: &str) -> Option<(JsonValue<'_>, &str)> {
+    if let Some(rest) = s.strip_prefix("true") {
+        Some((JsonValue::Bool, rest))
+    } else if let Some(rest) = s.strip_prefix("false") {
+        Some((JsonValue::Bool, rest))
+    } else {
+        None
+    }
+}
+
+/// Parses a JSON null.
+fn parse_null(s: &str) -> Option<(JsonValue<'_>, &str)> {
+    s.strip_prefix("null").map(|rest| (JsonValue::Null, rest))
+}
+
+/// Parses a JSON number, distinguishing integers from floats.
+fn parse_number(s: &str) -> Option<(JsonValue<'_>, &str)> {
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    let mut is_float = false;
+    if i < bytes.len() && bytes[i] == b'-' {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        is_float = true;
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        is_float = true;
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    if i == 0 || (i == 1 && bytes[0] == b'-') {
+        return None;
+    }
+    let val = if is_float {
+        JsonValue::Float
+    } else {
+        JsonValue::Integer
+    };
+    Some((val, &s[i..]))
+}
+
+/// Converts a parsed JSON value into its Spark DDL type string.
+fn json_value_to_spark_ddl(val: &JsonValue<'_>) -> String {
+    match val {
+        JsonValue::Null => "STRING".to_owned(),
+        JsonValue::Bool => "BOOLEAN".to_owned(),
+        JsonValue::Integer => "BIGINT".to_owned(),
+        JsonValue::Float => "DOUBLE".to_owned(),
+        JsonValue::Str => "STRING".to_owned(),
+        JsonValue::Array(elements) => {
+            let elem_type = if elements.is_empty() {
+                "STRING".to_owned()
+            } else {
+                json_value_to_spark_ddl(&elements[0])
+            };
+            format!("ARRAY<{elem_type}>")
+        }
+        JsonValue::Object(fields) => {
+            let field_strs: Vec<String> = fields
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, json_value_to_spark_ddl(v)))
+                .collect();
+            format!("STRUCT<{}>", field_strs.join(", "))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1808,5 +2013,53 @@ mod tests {
             CompatMode::Relaxed,
         );
         assert_eq!(sql, "UPPER(col)");
+    }
+
+    // ── schema_of_json tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn schema_of_json_simple_object_returns_struct_ddl() {
+        let result = spark_schema_of_json(r#"{"a": 1, "b": "hello"}"#);
+        assert_eq!(result, Some("STRUCT<a: BIGINT, b: STRING>".to_owned()));
+    }
+
+    #[test]
+    fn schema_of_json_nested_object_returns_nested_struct() {
+        let result = spark_schema_of_json(r#"{"x": {"y": 1}}"#);
+        assert_eq!(result, Some("STRUCT<x: STRUCT<y: BIGINT>>".to_owned()));
+    }
+
+    #[test]
+    fn schema_of_json_array_returns_array_type() {
+        let result = spark_schema_of_json(r#"{"items": [1, 2, 3]}"#);
+        assert_eq!(result, Some("STRUCT<items: ARRAY<BIGINT>>".to_owned()));
+    }
+
+    #[test]
+    fn schema_of_json_boolean_and_null_types() {
+        let result = spark_schema_of_json(r#"{"flag": true, "val": null}"#);
+        assert_eq!(result, Some("STRUCT<flag: BOOLEAN, val: STRING>".to_owned()));
+    }
+
+    #[test]
+    fn schema_of_json_float_type() {
+        let result = spark_schema_of_json(r#"{"price": 1.5}"#);
+        assert_eq!(result, Some("STRUCT<price: DOUBLE>".to_owned()));
+    }
+
+    #[test]
+    fn schema_of_json_non_object_returns_none() {
+        assert_eq!(spark_schema_of_json("[1, 2, 3]"), None);
+        assert_eq!(spark_schema_of_json("42"), None);
+    }
+
+    #[test]
+    fn schema_of_json_translate_produces_literal() {
+        let sql = FunctionRegistry::translate(
+            "schema_of_json",
+            &["'{\"a\": 1, \"b\": \"hello\"}'"],
+            CompatMode::Relaxed,
+        );
+        assert_eq!(sql, "'STRUCT<a: BIGINT, b: STRING>'");
     }
 }

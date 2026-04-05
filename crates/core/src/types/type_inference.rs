@@ -348,6 +348,10 @@ impl TypeInferenceEngine {
             // returning the array type of the wrapped aggregate instead of the correct scalar type.
             "size" | "cardinality" | "map_size" | "array_size" => Integer,
 
+            // GROUPING / GROUPING_ID — bitmask indicators for cube/rollup subtotals
+            "grouping" => Byte,
+            "grouping_id" => Long,
+
             _ => arg_type.clone(),
         }
     }
@@ -989,5 +993,21 @@ mod tests {
             ]))),
         ]);
         assert!(!TypeInferenceEngine::qualified_column_nullable("name", Some("person"), &schema));
+    }
+
+    #[test]
+    fn aggregate_return_type_grouping_returns_byte() {
+        assert_eq!(
+            TypeInferenceEngine::aggregate_return_type("grouping", &DataType::String),
+            DataType::Byte,
+        );
+    }
+
+    #[test]
+    fn aggregate_return_type_grouping_id_returns_long() {
+        assert_eq!(
+            TypeInferenceEngine::aggregate_return_type("grouping_id", &DataType::String),
+            DataType::Long,
+        );
     }
 }

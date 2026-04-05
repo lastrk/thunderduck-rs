@@ -685,6 +685,10 @@ impl TypeInferenceEngine {
             // ── Count variants ────────────────────────────────────────────────
             "count_if" => Long,
 
+            // ── Grouping functions (ROLLUP / CUBE) ──────────────────────────
+            "grouping" => Byte,
+            "grouping_id" => Long,
+
             // Aggregate functions — delegate to aggregate_return_type for correct Spark types
             "sum" | "sum_distinct" | "avg" | "mean" | "count" | "count_distinct"
             | "min" | "max" | "first" | "last" | "first_value" | "last_value"

@@ -801,7 +801,7 @@ impl Expression {
             },
             Expression::FunctionCall(f) => {
                 let lower = f.name.to_lowercase();
-                if matches!(lower.as_str(), "count" | "count_distinct") {
+                if matches!(lower.as_str(), "count" | "count_distinct" | "grouping" | "grouping_id") {
                     false
                 } else if TypeInferenceEngine::aggregate_is_always_nullable(&lower) {
                     true

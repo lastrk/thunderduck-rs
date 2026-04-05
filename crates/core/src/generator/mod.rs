@@ -1459,13 +1459,21 @@ impl SqlGenerator {
         let right_sql = self.gen_expr(&b.right)?;
         match (lt, rt) {
             (Decimal { precision: p1, scale: s1 }, Decimal { precision: p2, scale: s2 }) => {
+                // Defensively cast operands to their inferred DECIMAL types.
+                // DuckDB may return DOUBLE at runtime (e.g. native AVG inside
+                // window functions) even though plan-level inference says DECIMAL.
+                // The explicit CASTs guarantee spark_decimal_div always receives
+                // DECIMAL arguments; when the runtime type is already DECIMAL the
+                // cast is a no-op.
+                let left_cast = format!("CAST({left_sql} AS DECIMAL({p1},{s1}))");
+                let right_cast = format!("CAST({right_sql} AS DECIMAL({p2},{s2}))");
                 let result_type = TypeInferenceEngine::decimal_div_type(*p1, *s1, *p2, *s2);
                 if let Decimal { precision: rp, scale: rs } = result_type {
                     Ok(Some(format!(
-                        "CAST(spark_decimal_div({left_sql}, {right_sql}) AS DECIMAL({rp},{rs}))"
+                        "CAST(spark_decimal_div({left_cast}, {right_cast}) AS DECIMAL({rp},{rs}))"
                     )))
                 } else {
-                    Ok(Some(format!("spark_decimal_div({left_sql}, {right_sql})")))
+                    Ok(Some(format!("spark_decimal_div({left_cast}, {right_cast})")))
                 }
             }
             (Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {

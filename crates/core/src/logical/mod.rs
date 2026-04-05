@@ -58,6 +58,42 @@ pub enum GroupingSets {
     GroupingSets(Vec<Vec<Expression>>),
 }
 
+impl GroupingSets {
+    /// Returns references to the inner set lists for any variant.
+    fn sets(&self) -> &[Vec<Expression>] {
+        match self {
+            GroupingSets::Rollup(s)
+            | GroupingSets::Cube(s)
+            | GroupingSets::GroupingSets(s) => s,
+        }
+    }
+
+    /// Collects the lowercase names of all columns that appear in any grouping
+    /// set.  Used by `infer_aggregate_schema` to mark those columns nullable
+    /// (ROLLUP / CUBE produce NULL super-aggregate rows).
+    fn column_names(&self) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        for set in self.sets() {
+            for expr in set {
+                if let Some(name) = grouping_expr_name(expr) {
+                    names.insert(name.to_lowercase());
+                }
+            }
+        }
+        names
+    }
+}
+
+/// Extract the output column name from a grouping expression.
+fn grouping_expr_name(expr: &Expression) -> Option<&str> {
+    match expr {
+        Expression::UnresolvedColumn(u) => Some(&u.name),
+        Expression::ColumnReference(c) => Some(&c.name),
+        Expression::Alias(a) => Some(&a.alias),
+        _ => None,
+    }
+}
+
 /// Describes a position in an Aggregate's SELECT list — either a grouping
 /// column or an aggregate expression (by index into the aggregates vec).
 #[derive(Debug, Clone, PartialEq)]
@@ -984,11 +1020,23 @@ fn infer_aggregate_schema(a: &Aggregate) -> StructType {
         }
     }
 
-    // ROLLUP/CUBE produce NULL in grouping columns for subtotal/grand-total rows.
-    if a.grouping_sets.is_some() {
-        let n_grouping = a.grouping.len();
-        for f in fields.iter_mut().take(n_grouping) {
-            f.nullable = true;
+    // ROLLUP/CUBE/GROUPING SETS produce NULL in grouping columns for
+    // subtotal/grand-total rows.  Collect ALL grouping column names (from
+    // both `a.grouping` and the grouping-sets specification) and mark any
+    // matching field nullable — regardless of its position in the SELECT list.
+    if let Some(gs) = &a.grouping_sets {
+        let mut gs_names = gs.column_names();
+        // Also include columns from `a.grouping` (plain GROUP BY keys that
+        // accompany ROLLUP, e.g. `GROUP BY a, ROLLUP(b, c)`).
+        for g in &a.grouping {
+            if let Some(name) = grouping_expr_name(g) {
+                gs_names.insert(name.to_lowercase());
+            }
+        }
+        for f in &mut fields {
+            if gs_names.contains(&f.name.to_lowercase()) {
+                f.nullable = true;
+            }
         }
     }
     StructType::new(fields)

@@ -1364,7 +1364,7 @@ impl SqlGenerator {
     /// Generate SQL for an expression. This is the main entry point.
     pub fn gen_expr(&self, expr: &Expression) -> Result<String> {
         match expr {
-            Expression::Literal(l) => gen_literal(&l.value),
+            Expression::Literal(l) => gen_literal_with_type(&l.value, &l.data_type),
             Expression::ColumnReference(c) => {
                 if let Some(q) = &c.qualifier {
                     Ok(format!("{}.{}", quote_ident(q), quote_ident(&c.name)))
@@ -1478,7 +1478,7 @@ impl SqlGenerator {
             }
             (Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
                 // Spark DecimalPrecision: use value-based precision for integer literals
-                if let Decimal { precision: p2, scale: s2 } = b.right.integral_to_decimal_for_arithmetic() {
+                if let Decimal { precision: p2, scale: s2 } = b.right.integral_to_decimal_for_arithmetic(&self.schema) {
                     let result_type = TypeInferenceEngine::decimal_div_type(*p1, *s1, p2, s2);
                     if let Decimal { precision: rp, scale: rs } = result_type {
                         Ok(Some(format!(
@@ -1492,7 +1492,7 @@ impl SqlGenerator {
                 }
             }
             (i, Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
-                if let Decimal { precision: p1, scale: s1 } = b.left.integral_to_decimal_for_arithmetic() {
+                if let Decimal { precision: p1, scale: s1 } = b.left.integral_to_decimal_for_arithmetic(&self.schema) {
                     let result_type = TypeInferenceEngine::decimal_div_type(p1, s1, *p2, *s2);
                     if let Decimal { precision: rp, scale: rs } = result_type {
                         Ok(Some(format!(
@@ -2070,6 +2070,17 @@ fn stat_to_agg_expr(stat: &str, quoted_col: &str) -> String {
 }
 
 // ── Literal generation ─────────────────────────────────────────────────────────
+
+/// Render a literal with type information. For decimal literals, emits an explicit
+/// `::DECIMAL(p,s)` cast to preserve the Spark-inferred precision/scale.  DuckDB's
+/// bare `::DECIMAL` defaults to `DECIMAL(18,3)` which silently truncates values with
+/// higher scale (e.g. `0.0001000000::DECIMAL` → `0.000`).
+fn gen_literal_with_type(v: &LiteralValue, dt: &DataType) -> Result<String> {
+    if let (LiteralValue::Decimal(s), DataType::Decimal { precision, scale }) = (v, dt) {
+        return Ok(format!("{s}::DECIMAL({precision},{scale})"));
+    }
+    gen_literal(v)
+}
 
 fn gen_literal(v: &LiteralValue) -> Result<String> {
     match v {

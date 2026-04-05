@@ -289,8 +289,7 @@ impl FunctionRegistry {
             ("variance", "VAR_SAMP"),
             ("var_samp", "VAR_SAMP"),
             ("var_pop", "VAR_POP"),
-            ("kurtosis", "KURTOSIS"),
-            ("skewness", "SKEWNESS"),
+            // kurtosis/skewness handled in custom (strict mode uses extension functions)
             ("approx_count_distinct", "APPROX_COUNT_DISTINCT"),
             ("percentile_approx", "PERCENTILE_CONT"),
             ("approx_percentile", "PERCENTILE_CONT"),
@@ -430,6 +429,18 @@ impl FunctionRegistry {
         // sum_distinct → SUM(DISTINCT ...)
         custom.insert("sum_distinct", |args, _mode| {
             format!("SUM(DISTINCT {})", args.join(", "))
+        });
+
+        // kurtosis: strict → kurtosis_pop (matches Spark's population excess kurtosis)
+        custom.insert("kurtosis", |args, mode| {
+            let func = if mode == CompatMode::Strict { "KURTOSIS_POP" } else { "KURTOSIS" };
+            format!("{func}({})", args.join(", "))
+        });
+
+        // skewness: strict → spark_skewness (extension, population skewness)
+        custom.insert("skewness", |args, mode| {
+            let func = if mode == CompatMode::Strict { "spark_skewness" } else { "SKEWNESS" };
+            format!("{func}({})", args.join(", "))
         });
 
         // array(...) → list literal [...]

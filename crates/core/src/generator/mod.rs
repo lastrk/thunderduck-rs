@@ -196,16 +196,18 @@ impl SqlGenerator {
     fn gen_aggregate(&self, a: &Aggregate) -> Result<String> {
         // Infer input schema once for type-aware aggregate cast wrapping.
         let input_schema = a.input.infer_schema();
+        // Use a typed generator so gen_strict_decimal_div can see actual types.
+        let typed_gen = self.with_schema(input_schema.clone());
 
         // Build SELECT list
         let select_list = if a.select_order.is_empty() {
             // Default: grouping columns first, then aggregates
             let mut parts = Vec::new();
             for g in &a.grouping {
-                parts.push(self.gen_expr(g)?);
+                parts.push(typed_gen.gen_expr(g)?);
             }
             for ae in &a.aggregates {
-                parts.push(self.render_agg_expr(ae, &input_schema)?);
+                parts.push(typed_gen.render_agg_expr(ae, &input_schema)?);
             }
             parts.join(", ")
         } else {
@@ -218,15 +220,15 @@ impl SqlGenerator {
                 .any(|e| matches!(e, SelectEntry::GroupingExpr(_) | SelectEntry::GroupingNotSelected));
             if !has_grouping_in_order {
                 for g in &a.grouping {
-                    parts.push(self.gen_expr(g)?);
+                    parts.push(typed_gen.gen_expr(g)?);
                 }
             }
             for entry in &a.select_order {
                 match entry {
-                    SelectEntry::GroupingExpr(g) => parts.push(self.gen_expr(g)?),
+                    SelectEntry::GroupingExpr(g) => parts.push(typed_gen.gen_expr(g)?),
                     SelectEntry::AggregateExpr(idx) => {
                         if let Some(agg) = a.aggregates.get(*idx) {
-                            parts.push(self.render_agg_expr(agg, &input_schema)?);
+                            parts.push(typed_gen.render_agg_expr(agg, &input_schema)?);
                         }
                     }
                     SelectEntry::GroupingNotSelected => {
@@ -244,9 +246,8 @@ impl SqlGenerator {
 
         // Pre-aggregation WHERE (from peeled filters) — use input schema for dispatch.
         if !pre_filters.is_empty() {
-            let filter_gen = self.with_schema(input_schema.clone());
             let where_parts = pre_filters.iter()
-                .map(|c| Ok(format!("({})", filter_gen.gen_expr(c)?)))
+                .map(|c| Ok(format!("({})", typed_gen.gen_expr(c)?)))
                 .collect::<Result<Vec<_>>>()?;
             sql.push_str(&format!("\nWHERE {}", where_parts.join("\nAND ")));
         }
@@ -254,13 +255,13 @@ impl SqlGenerator {
         // GROUP BY
         if !a.grouping.is_empty() || a.grouping_sets.is_some() {
             if let Some(gs) = &a.grouping_sets {
-                sql.push_str(&format!("\nGROUP BY {}", self.gen_grouping_sets(gs)?));
+                sql.push_str(&format!("\nGROUP BY {}", typed_gen.gen_grouping_sets(gs)?));
             } else {
                 let gb = a.grouping.iter()
                     .map(|g| {
                         // Strip outer alias — GROUP BY must use bare expressions, not `expr AS alias`
                         let inner = if let Expression::Alias(a) = g { &*a.expr } else { g };
-                        self.gen_expr(inner)
+                        typed_gen.gen_expr(inner)
                     })
                     .collect::<Result<Vec<_>>>()?
                     .join(", ");
@@ -270,7 +271,7 @@ impl SqlGenerator {
 
         // HAVING
         if let Some(having) = &a.having {
-            let h = self.gen_expr(having)?;
+            let h = typed_gen.gen_expr(having)?;
             sql.push_str(&format!("\nHAVING {h}"));
         }
 
@@ -2209,6 +2210,23 @@ fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType, mode: Comp
                 }
             }
             expr.clone()
+        }
+        Expression::Binary(b) => {
+            let new_left = apply_agg_type_casts(&b.left, input_schema, mode);
+            let new_right = apply_agg_type_casts(&b.right, input_schema, mode);
+            Expression::Binary(BinaryExpression {
+                left: Box::new(new_left),
+                right: Box::new(new_right),
+                op: b.op.clone(),
+            })
+        }
+        Expression::Cast(c) => {
+            let inner = apply_agg_type_casts(&c.expr, input_schema, mode);
+            Expression::Cast(CastExpression {
+                expr: Box::new(inner),
+                to_type: c.to_type.clone(),
+                try_cast: c.try_cast,
+            })
         }
         _ => expr.clone(),
     }

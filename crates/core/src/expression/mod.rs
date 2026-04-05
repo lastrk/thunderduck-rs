@@ -508,6 +508,16 @@ impl Expression {
                             (DataType::Decimal { precision: p1, scale: s1 }, DataType::Decimal { precision: p2, scale: s2 }) => {
                                 TypeInferenceEngine::decimal_mul_type(*p1, *s1, *p2, *s2)
                             }
+                            (DataType::Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
+                                if let DataType::Decimal { precision: p2, scale: s2 } = TypeInferenceEngine::integral_to_decimal(&rt) {
+                                    TypeInferenceEngine::decimal_mul_type(*p1, *s1, p2, s2)
+                                } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
+                            }
+                            (i, DataType::Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
+                                if let DataType::Decimal { precision: p1, scale: s1 } = TypeInferenceEngine::integral_to_decimal(&lt) {
+                                    TypeInferenceEngine::decimal_mul_type(p1, s1, *p2, *s2)
+                                } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
+                            }
                             _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
                         }
                     }
@@ -517,6 +527,16 @@ impl Expression {
                         match (&lt, &rt) {
                             (DataType::Decimal { precision: p1, scale: s1 }, DataType::Decimal { precision: p2, scale: s2 }) => {
                                 TypeInferenceEngine::decimal_add_type(*p1, *s1, *p2, *s2)
+                            }
+                            (DataType::Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
+                                if let DataType::Decimal { precision: p2, scale: s2 } = TypeInferenceEngine::integral_to_decimal(&rt) {
+                                    TypeInferenceEngine::decimal_add_type(*p1, *s1, p2, s2)
+                                } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
+                            }
+                            (i, DataType::Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
+                                if let DataType::Decimal { precision: p1, scale: s1 } = TypeInferenceEngine::integral_to_decimal(&lt) {
+                                    TypeInferenceEngine::decimal_add_type(p1, s1, *p2, *s2)
+                                } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
                             }
                             _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
                         }

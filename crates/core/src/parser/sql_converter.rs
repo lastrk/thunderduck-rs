@@ -1147,7 +1147,28 @@ impl SqlConverter {
                     } else {
                         Ok(Literal::long(i))
                     }
+                } else if s.contains('.') && !s.contains('e') && !s.contains('E') {
+                    // Spark treats numeric literals with a decimal point (no exponent) as Decimal.
+                    let parts: Vec<&str> = s.split('.').collect();
+                    if parts.len() == 2 {
+                        let int_part = parts[0].trim_start_matches('-');
+                        let frac_part = parts[1];
+                        let scale = frac_part.len() as u8;
+                        let precision = (int_part.len() + frac_part.len()).max(1) as u8;
+                        Ok(Expression::Literal(Literal {
+                            value: LiteralValue::Decimal(s),
+                            data_type: DataType::Decimal { precision, scale },
+                        }))
+                    } else if let Ok(f) = s.parse::<f64>() {
+                        Ok(Literal::double(f))
+                    } else {
+                        Ok(Expression::Literal(Literal {
+                            value: LiteralValue::Decimal(s),
+                            data_type: DataType::Decimal { precision: 38, scale: 18 },
+                        }))
+                    }
                 } else if let Ok(f) = s.parse::<f64>() {
+                    // Scientific notation (e.g. 1.5e10) remains Double
                     Ok(Literal::double(f))
                 } else {
                     Ok(Expression::Literal(Literal {

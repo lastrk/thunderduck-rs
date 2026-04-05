@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 
+use duckdb::arrow::datatypes::{Field, Schema};
 use duckdb::arrow::record_batch::RecordBatch;
 use tokio::sync::{mpsc, oneshot};
 
@@ -9,6 +11,17 @@ use crate::functions::CompatMode;
 use crate::runtime::compat_mode::{self, RuntimeCompatMode};
 use crate::runtime::config::{HardwareProfile, StreamingConfig};
 use crate::types::StructType;
+
+/// A single item streamed from the DuckDB session thread during query execution.
+#[derive(Debug)]
+pub enum StreamBatch {
+    /// An Arrow batch of results.
+    Batch(RecordBatch),
+    /// All batches sent successfully.
+    Complete,
+    /// An error occurred during execution.
+    Error(String),
+}
 
 // ── Timezone detection ─────────────────────────────────────────────────────────
 
@@ -80,6 +93,12 @@ pub(crate) enum SessionCommand {
     SchemaOf {
         sql: String,
         resp: oneshot::Sender<SessionResult>,
+    },
+    /// Execute a query and stream results batch-by-batch via an mpsc channel.
+    ExecuteStreaming {
+        sql: String,
+        spark_names: Option<Vec<String>>,
+        batch_tx: mpsc::Sender<StreamBatch>,
     },
     Shutdown,
 }
@@ -496,6 +515,30 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
             .await;
     }
 
+    /// Execute a SQL query, streaming results batch-by-batch.
+    ///
+    /// Returns a receiver that yields `StreamBatch` items. The session thread
+    /// iterates DuckDB's Arrow result lazily, applying column renames from
+    /// `spark_names` if provided. Backpressure is achieved via the bounded
+    /// channel: the session thread blocks when the buffer is full.
+    pub async fn execute_streaming(
+        &self,
+        sql: &str,
+        spark_names: Option<Vec<String>>,
+        buffer: usize,
+    ) -> Result<mpsc::Receiver<StreamBatch>> {
+        let (tx, rx) = mpsc::channel(buffer);
+        self.cmd_tx
+            .send(SessionCommand::ExecuteStreaming {
+                sql: sql.to_string(),
+                spark_names,
+                batch_tx: tx,
+            })
+            .await
+            .map_err(|_| ThunderduckError::DuckDb("session channel closed".into()))?;
+        Ok(rx)
+    }
+
     /// Retrieve the cached Spark schema for a temp view.
     ///
     /// Returns `None` if no cached schema exists (e.g. the view was created
@@ -584,6 +627,84 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
             SessionCommand::GetViewSchema { name, resp } => {
                 let schema = view_schemas.get(&name.to_lowercase()).cloned();
                 let _ = resp.send(schema);
+            }
+            SessionCommand::ExecuteStreaming { sql, spark_names, batch_tx } => {
+                let result = (|| -> std::result::Result<(), duckdb::Error> {
+                    let mut stmt = conn.prepare(&sql)?;
+                    let arrow = stmt.query_arrow(duckdb::params![])?;
+                    let duckdb_schema: Arc<Schema> = arrow.get_schema();
+
+                    // Build rename schema if needed (computed once).
+                    let rename_schema = spark_names.as_ref().and_then(|names| {
+                        let duck_fields = duckdb_schema.fields();
+                        if names.len() == duck_fields.len() {
+                            let needs_rename = names
+                                .iter()
+                                .zip(duck_fields.iter())
+                                .any(|(n, f)| n.as_str() != f.name());
+                            if needs_rename {
+                                let fields: Vec<Field> = duck_fields
+                                    .iter()
+                                    .zip(names.iter())
+                                    .map(|(f, name)| {
+                                        Field::new(
+                                            name.as_str(),
+                                            f.data_type().clone(),
+                                            f.is_nullable(),
+                                        )
+                                    })
+                                    .collect();
+                                Some(Arc::new(Schema::new(fields)))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    });
+
+                    // Save schema for the empty-result case.
+                    let schema = if let Some(ref s) = rename_schema {
+                        Arc::clone(s)
+                    } else {
+                        duckdb_schema
+                    };
+
+                    let mut sent_any = false;
+                    for batch in arrow {
+                        sent_any = true;
+                        let batch = if let Some(ref rs) = rename_schema {
+                            RecordBatch::try_new(Arc::clone(rs), batch.columns().to_vec())
+                                .unwrap_or(batch)
+                        } else {
+                            batch
+                        };
+                        if batch_tx.blocking_send(StreamBatch::Batch(batch)).is_err() {
+                            // Receiver dropped — client cancelled.
+                            return Ok(());
+                        }
+                    }
+
+                    // If no batches were produced, send an empty schema-only batch
+                    // so PySpark can build a table from the schema.
+                    if !sent_any {
+                        let empty = RecordBatch::new_empty(schema);
+                        if batch_tx.blocking_send(StreamBatch::Batch(empty)).is_err() {
+                            return Ok(());
+                        }
+                    }
+
+                    Ok(())
+                })();
+
+                match result {
+                    Ok(()) => {
+                        let _ = batch_tx.blocking_send(StreamBatch::Complete);
+                    }
+                    Err(e) => {
+                        let _ = batch_tx.blocking_send(StreamBatch::Error(e.to_string()));
+                    }
+                }
             }
             SessionCommand::SchemaOf { sql, resp } => {
                 // Infer the output schema without reading any rows.

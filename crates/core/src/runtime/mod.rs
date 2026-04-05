@@ -8,5 +8,5 @@ pub mod session_manager;
 pub use compat_mode::RuntimeCompatMode;
 pub use config::StreamingConfig;
 pub use schema_inferrer::SchemaInferrer;
-pub use session::DuckDbSession;
+pub use session::{DuckDbSession, StreamBatch};
 pub use session_manager::SessionManager;

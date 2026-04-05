@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use futures::stream;
 use thunderduck_core::generator::SqlGenerator;
-use thunderduck_core::runtime::{RuntimeCompatMode, SchemaInferrer, SessionManager};
+use thunderduck_core::runtime::{RuntimeCompatMode, SchemaInferrer, SessionManager, StreamBatch};
 use thunderduck_core::types::DataType;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::arrow_ipc::record_batches_to_arrow_batches;
+use crate::arrow_ipc::{record_batch_to_arrow_batch, record_batches_to_arrow_batches};
 use crate::converter::type_converter::data_type_to_proto;
 use crate::converter::PlanConverter;
 use crate::error::ConnectError;
@@ -113,16 +113,87 @@ impl SparkConnectService for ThunderduckService {
                     bool_batch_responses(&session_id, &operation_id, exists)
                         .map_err(|e| Status::from(e))?
                 } else {
-                    let batches = session
-                        .execute(&sql)
+                    // Compute Spark column names for rename (pushed to session thread).
+                    let schema = logical_plan.infer_schema();
+                    let spark_names = if !schema.is_empty() {
+                        Some(
+                            schema
+                                .fields
+                                .iter()
+                                .map(|f| f.name.clone())
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        None
+                    };
+
+                    // Stream results batch-by-batch via bounded channel.
+                    let rx = session
+                        .execute_streaming(&sql, spark_names, 2)
                         .await
                         .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-                    // DuckDB deduplicates duplicate column names by appending `_1`, `_2`, etc.
-                    // Spark allows duplicate column names and does not rename them.
-                    // Use the LogicalPlan's infer_schema() to restore Spark-expected column names.
-                    let batches = rename_to_spark_schema(&logical_plan, batches);
-                    batches_to_responses(&session_id, &operation_id, &batches)
-                        .map_err(|e| Status::from(e))?
+
+                    // State: (receiver, session_id, operation_id, batch_index, done)
+                    let stream = futures::stream::unfold(
+                        (rx, session_id.clone(), operation_id.clone(), 0usize, false),
+                        |(mut rx, sid, oid, idx, done)| async move {
+                            if done {
+                                return None;
+                            }
+                            match rx.recv().await {
+                                Some(StreamBatch::Batch(batch)) => {
+                                    let resp = match record_batch_to_arrow_batch(&batch) {
+                                        Ok(arrow_batch) => Ok(proto::ExecutePlanResponse {
+                                            session_id: sid.clone(),
+                                            server_side_session_id: SERVER_SESSION_ID.to_string(),
+                                            operation_id: oid.clone(),
+                                            response_id: format!("{oid}-{idx}"),
+                                            response_type: Some(
+                                                proto::execute_plan_response::ResponseType::ArrowBatch(
+                                                    arrow_batch,
+                                                ),
+                                            ),
+                                            ..Default::default()
+                                        }),
+                                        Err(e) => Err(Status::internal(format!(
+                                            "IPC serialization: {e}"
+                                        ))),
+                                    };
+                                    Some((resp, (rx, sid, oid, idx + 1, false)))
+                                }
+                                Some(StreamBatch::Complete) => {
+                                    let resp = Ok(proto::ExecutePlanResponse {
+                                        session_id: sid.clone(),
+                                        server_side_session_id: SERVER_SESSION_ID.to_string(),
+                                        operation_id: oid.clone(),
+                                        response_id: format!("{oid}-complete"),
+                                        response_type: Some(
+                                            proto::execute_plan_response::ResponseType::ResultComplete(
+                                                proto::execute_plan_response::ResultComplete::default(),
+                                            ),
+                                        ),
+                                        ..Default::default()
+                                    });
+                                    // Mark done so next poll returns None.
+                                    Some((resp, (rx, sid, oid, idx + 1, true)))
+                                }
+                                Some(StreamBatch::Error(e)) => {
+                                    Some((Err(Status::internal(e)), (rx, sid, oid, idx + 1, true)))
+                                }
+                                None => {
+                                    // Channel closed without Complete — abnormal.
+                                    Some((
+                                        Err(Status::internal(
+                                            "session thread terminated unexpectedly",
+                                        )),
+                                        (rx, sid, oid, idx + 1, true),
+                                    ))
+                                }
+                            }
+                        },
+                    );
+
+                    return Ok(Response::new(Box::pin(stream)));
                 }
             }
             Some(proto::plan::OpType::Command(cmd)) => {
@@ -553,68 +624,6 @@ async fn execute_approx_quantile(
     )]));
     RecordBatch::try_new(schema, vec![Arc::new(outer_list_array)])
         .map_err(|e| format!("approx_quantile batch: {e}"))
-}
-
-/// Rename Arrow RecordBatch columns to match Spark's expected output column names.
-///
-/// DuckDB deduplicates identically-named output columns by appending `_1`, `_2`, etc.
-/// (e.g. a self-join of a CTE produces `col`, `col_1`). Spark allows duplicate column names.
-/// This function uses `plan.infer_schema()` to obtain the Spark-expected names and renames
-/// the DuckDB result columns accordingly, but only when the field count matches exactly and
-/// the inferred schema is non-empty (to avoid misidentifying unrelated schema mismatches).
-fn rename_to_spark_schema(
-    plan: &thunderduck_core::logical::LogicalPlan,
-    batches: Vec<arrow::record_batch::RecordBatch>,
-) -> Vec<arrow::record_batch::RecordBatch> {
-    use arrow::datatypes::{Field as ArrowField, Schema};
-    use arrow::record_batch::RecordBatch;
-    use std::sync::Arc;
-
-    if batches.is_empty() {
-        return batches;
-    }
-    let expected = plan.infer_schema();
-    let actual_count = batches[0].num_columns();
-    if expected.is_empty() {
-        return batches;
-    }
-    if expected.fields.len() != actual_count {
-        return batches;
-    }
-    // Check whether any column name differs
-    let needs_rename = batches[0]
-        .schema()
-        .fields()
-        .iter()
-        .zip(expected.fields.iter())
-        .any(|(actual_f, expected_f)| actual_f.name() != &expected_f.name);
-    if !needs_rename {
-        return batches;
-    }
-    // Rebuild schema with Spark-expected names but DuckDB's actual data types / nullability.
-    let new_fields: Vec<ArrowField> = batches[0]
-        .schema()
-        .fields()
-        .iter()
-        .zip(expected.fields.iter())
-        .map(|(actual_f, expected_f)| {
-            ArrowField::new(
-                expected_f.name.as_str(),
-                actual_f.data_type().clone(),
-                actual_f.is_nullable(),
-            )
-        })
-        .collect();
-    let new_schema = Arc::new(Schema::new(new_fields));
-    batches
-        .into_iter()
-        .map(|b| {
-            RecordBatch::try_new(Arc::clone(&new_schema), b.columns().to_vec()).unwrap_or_else(|e| {
-                eprintln!("column rename failed: {e}");
-                b
-            })
-        })
-        .collect()
 }
 
 fn batches_to_responses(

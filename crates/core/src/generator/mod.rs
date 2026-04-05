@@ -1477,7 +1477,8 @@ impl SqlGenerator {
                 }
             }
             (Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
-                if let Decimal { precision: p2, scale: s2 } = TypeInferenceEngine::integral_to_decimal(rt) {
+                // Spark DecimalPrecision: use value-based precision for integer literals
+                if let Decimal { precision: p2, scale: s2 } = b.right.integral_to_decimal_for_arithmetic() {
                     let result_type = TypeInferenceEngine::decimal_div_type(*p1, *s1, p2, s2);
                     if let Decimal { precision: rp, scale: rs } = result_type {
                         Ok(Some(format!(
@@ -1491,7 +1492,7 @@ impl SqlGenerator {
                 }
             }
             (i, Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
-                if let Decimal { precision: p1, scale: s1 } = TypeInferenceEngine::integral_to_decimal(lt) {
+                if let Decimal { precision: p1, scale: s1 } = b.left.integral_to_decimal_for_arithmetic() {
                     let result_type = TypeInferenceEngine::decimal_div_type(p1, s1, *p2, *s2);
                     if let Decimal { precision: rp, scale: rs } = result_type {
                         Ok(Some(format!(

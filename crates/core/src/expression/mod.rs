@@ -453,6 +453,43 @@ impl Expression {
             && matches!(lit.data_type, DataType::Null | DataType::Unresolved))
     }
 
+    /// For an integer literal expression, return a Decimal type with value-based precision
+    /// (Spark's `DecimalPrecision` catalyst rule). For non-literal or non-integral expressions,
+    /// fall back to type-based `integral_to_decimal`.
+    ///
+    /// Spark narrows integer literals to the minimum decimal precision that fits the value
+    /// when they participate in binary arithmetic with decimals. For example, literal `100`
+    /// becomes `Decimal(3,0)` instead of `Decimal(10,0)`.
+    pub fn integral_to_decimal_for_arithmetic(&self) -> DataType {
+        if let Expression::Literal(lit) = self {
+            match &lit.value {
+                LiteralValue::Byte(v) => {
+                    let p = TypeInferenceEngine::decimal_digits_for_value(*v as i64);
+                    DataType::Decimal { precision: p, scale: 0 }
+                }
+                LiteralValue::Short(v) => {
+                    let p = TypeInferenceEngine::decimal_digits_for_value(*v as i64);
+                    DataType::Decimal { precision: p, scale: 0 }
+                }
+                LiteralValue::Int(v) => {
+                    let p = TypeInferenceEngine::decimal_digits_for_value(*v as i64);
+                    DataType::Decimal { precision: p, scale: 0 }
+                }
+                LiteralValue::Long(v) => {
+                    let p = TypeInferenceEngine::decimal_digits_for_value(*v);
+                    DataType::Decimal { precision: p, scale: 0 }
+                }
+                _ => TypeInferenceEngine::integral_to_decimal(&lit.data_type),
+            }
+        } else {
+            let dt = match self {
+                Expression::ColumnReference(c) => c.data_type.clone(),
+                other => other.data_type(&StructType::empty()),
+            };
+            TypeInferenceEngine::integral_to_decimal(&dt)
+        }
+    }
+
     /// Infer the Spark DataType of this expression in the context of `schema`.
     pub fn data_type(&self, schema: &StructType) -> DataType {
         match self {
@@ -487,14 +524,13 @@ impl Expression {
                                 TypeInferenceEngine::decimal_div_type(*p1, *s1, *p2, *s2)
                             }
                             (Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
-                                let dec2 = TypeInferenceEngine::integral_to_decimal(&rt);
-                                if let Decimal { precision: p2, scale: s2 } = dec2 {
+                                // Spark DecimalPrecision: use value-based precision for literals
+                                if let Decimal { precision: p2, scale: s2 } = b.right.integral_to_decimal_for_arithmetic() {
                                     TypeInferenceEngine::decimal_div_type(*p1, *s1, p2, s2)
                                 } else { Double }
                             }
                             (i, Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
-                                let dec1 = TypeInferenceEngine::integral_to_decimal(&lt);
-                                if let Decimal { precision: p1, scale: s1 } = dec1 {
+                                if let Decimal { precision: p1, scale: s1 } = b.left.integral_to_decimal_for_arithmetic() {
                                     TypeInferenceEngine::decimal_div_type(p1, s1, *p2, *s2)
                                 } else { Double }
                             }
@@ -509,12 +545,13 @@ impl Expression {
                                 TypeInferenceEngine::decimal_mul_type(*p1, *s1, *p2, *s2)
                             }
                             (DataType::Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
-                                if let DataType::Decimal { precision: p2, scale: s2 } = TypeInferenceEngine::integral_to_decimal(&rt) {
+                                // Spark DecimalPrecision: use value-based precision for literals
+                                if let DataType::Decimal { precision: p2, scale: s2 } = b.right.integral_to_decimal_for_arithmetic() {
                                     TypeInferenceEngine::decimal_mul_type(*p1, *s1, p2, s2)
                                 } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
                             }
                             (i, DataType::Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
-                                if let DataType::Decimal { precision: p1, scale: s1 } = TypeInferenceEngine::integral_to_decimal(&lt) {
+                                if let DataType::Decimal { precision: p1, scale: s1 } = b.left.integral_to_decimal_for_arithmetic() {
                                     TypeInferenceEngine::decimal_mul_type(p1, s1, *p2, *s2)
                                 } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
                             }
@@ -529,12 +566,13 @@ impl Expression {
                                 TypeInferenceEngine::decimal_add_type(*p1, *s1, *p2, *s2)
                             }
                             (DataType::Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
-                                if let DataType::Decimal { precision: p2, scale: s2 } = TypeInferenceEngine::integral_to_decimal(&rt) {
+                                // Spark DecimalPrecision: use value-based precision for literals
+                                if let DataType::Decimal { precision: p2, scale: s2 } = b.right.integral_to_decimal_for_arithmetic() {
                                     TypeInferenceEngine::decimal_add_type(*p1, *s1, p2, s2)
                                 } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
                             }
                             (i, DataType::Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
-                                if let DataType::Decimal { precision: p1, scale: s1 } = TypeInferenceEngine::integral_to_decimal(&lt) {
+                                if let DataType::Decimal { precision: p1, scale: s1 } = b.left.integral_to_decimal_for_arithmetic() {
                                     TypeInferenceEngine::decimal_add_type(p1, s1, *p2, *s2)
                                 } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
                             }

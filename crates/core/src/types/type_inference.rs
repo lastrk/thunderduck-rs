@@ -640,9 +640,13 @@ impl TypeInferenceEngine {
             "nullif" => arg_types.first().cloned().unwrap_or(Unresolved),
             "if" | "iff" | "nvl2" => arg_types.get(1).cloned().unwrap_or(Unresolved),
             // when(cond1, val1, cond2, val2, ..., [else]): unify THEN + ELSE values
+            // Even args = no else (c1,v1,c2,v2,...); odd args = has else at end (c1,v1,...,else)
             "when" => {
-                let then_types = arg_types.iter().skip(1).step_by(2);
-                let else_type = if arg_types.len() % 2 == 0 {
+                let has_else = arg_types.len() % 2 == 1;
+                let pair_count = arg_types.len() / 2; // number of (cond, value) pairs
+                // THEN values are at odd indices: 1, 3, 5, ...
+                let then_types = (0..pair_count).map(|i| &arg_types[i * 2 + 1]);
+                let else_type = if has_else {
                     arg_types.last()
                 } else {
                     None
@@ -724,6 +728,19 @@ impl TypeInferenceEngine {
             DataType::Long => DataType::Decimal { precision: 20, scale: 0 },
             other => other.clone(),
         }
+    }
+
+    /// Compute the minimum number of decimal digits needed to represent a value.
+    /// Mirrors Spark's `DecimalType.fromValue()` / `DecimalPrecision` catalyst rule
+    /// which narrows integer literals to the smallest decimal precision for arithmetic.
+    pub fn decimal_digits_for_value(v: i64) -> u8 {
+        if v == 0 {
+            return 1;
+        }
+        let abs = v.unsigned_abs();
+        // floor(log10(abs)) + 1
+        let digits = (abs as f64).log10().floor() as u8 + 1;
+        digits.max(1)
     }
 
     fn adjust_precision_scale(raw_precision: i16, raw_scale: i16) -> (u8, u8) {

@@ -586,19 +586,37 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
                 let _ = resp.send(schema);
             }
             SessionCommand::SchemaOf { sql, resp } => {
-                // Wrap in LIMIT 0 so DuckDB populates the schema without reading rows.
-                // Only wrap SELECT/WITH/VALUES in parens; table references must not be
-                // wrapped since `("table_name")` is not a valid FROM target in DuckDB.
+                // Infer the output schema without reading any rows.
+                //
+                // For SELECT/WITH/VALUES/(subquery) statements we avoid the old
+                // `SELECT * FROM ({sql}) __probe__ LIMIT 0` wrapping.  That subquery
+                // wrapping causes DuckDB to deduplicate duplicate column names
+                // (appending `_1`, `_2`, etc.), but Spark allows and preserves them.
+                //
+                // Instead we strip any trailing `LIMIT <n>` from the SQL and replace
+                // it with `LIMIT 0`, keeping the query flat so duplicate column names
+                // survive into the Arrow schema.
+                //
+                // For bare table references (e.g. `"my_table"`) we keep the
+                // `SELECT * FROM {sql} LIMIT 0` form since a bare name is not valid
+                // standalone SQL.
                 let trimmed = sql.trim_start();
-                let needs_subquery_wrap = trimmed.starts_with('(')
+                let is_complete_statement = trimmed.starts_with('(')
                     || (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("SELECT"))
                     || (trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("WITH"))
                     || (trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("VALUES"));
-                let probe = if needs_subquery_wrap {
-                    format!("SELECT * FROM ({sql}) __probe__ LIMIT 0")
+                let probe = if is_complete_statement {
+                    // Strip trailing LIMIT clause (if any) and replace with LIMIT 0.
+                    // The regex-like approach: find last occurrence of LIMIT <digits>
+                    // at the end of the SQL (after trimming whitespace).
+                    let stripped = sql.trim_end();
+                    // Try to find and replace a trailing LIMIT <n>
+                    if let Some(pos) = find_trailing_limit(stripped) {
+                        format!("{} LIMIT 0", &stripped[..pos])
+                    } else {
+                        format!("{stripped} LIMIT 0")
+                    }
                 } else {
-                    // Table references and join expressions: no alias needed
-                    // (adding __probe__ after USING clauses causes a parse error)
                     format!("SELECT * FROM {sql} LIMIT 0")
                 };
                 let msg = match conn.prepare(&probe) {
@@ -614,6 +632,42 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
         }
     }
     // conn drops here — DuckDB connection closed.
+}
+
+/// Find the byte position just before a trailing `LIMIT <digits>` clause in SQL.
+///
+/// Returns `Some(pos)` where `sql[..pos]` is everything before the LIMIT keyword,
+/// or `None` if no trailing LIMIT is found.
+///
+/// This intentionally only matches the very end of the string to avoid stripping
+/// LIMIT clauses inside subqueries.
+fn find_trailing_limit(sql: &str) -> Option<usize> {
+    // Walk backwards: skip trailing whitespace, then digits, then whitespace, then "LIMIT" (case-insensitive).
+    let bytes = sql.as_bytes();
+    let mut i = bytes.len();
+
+    // Skip trailing whitespace
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    // Must end with digits
+    let end = i;
+    while i > 0 && bytes[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    if i == end {
+        return None; // no digits at end
+    }
+    // Skip whitespace between LIMIT and digits
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    // Check for "LIMIT" keyword (case-insensitive)
+    if i >= 5 && bytes[i - 5..i].eq_ignore_ascii_case(b"LIMIT") {
+        Some(i - 5)
+    } else {
+        None
+    }
 }
 
 /// Run a SQL string against `conn` and return collected Arrow batches.

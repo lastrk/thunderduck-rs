@@ -184,7 +184,14 @@ impl SparkConnectService for ThunderduckService {
                     use thunderduck_core::types::{StructField, StructType};
                     struct_type = if struct_type.is_empty() {
                         // No plan-level schema at all — use DuckDB entirely.
-                        duckdb_schema
+                        // For Pivot plans (possibly wrapped in Sort/Project/Filter):
+                        // DuckDB reports all columns as nullable, but grouping columns
+                        // inherit nullability from the input.
+                        if let Some(pivot) = find_pivot(&logical_plan) {
+                            apply_pivot_grouping_nullable(duckdb_schema, pivot)
+                        } else {
+                            duckdb_schema
+                        }
                     } else if struct_type.fields.len() == duckdb_schema.fields.len() {
                         // Same field count: position-based merge.
                         // Use Spark type/nullability when resolved, DuckDB otherwise.
@@ -773,4 +780,56 @@ async fn cache_create_view_schema(
     };
 
     session.cache_view_schema(view_name, final_schema).await;
+}
+
+/// Find the innermost `Pivot` node in a plan tree.
+///
+/// Plans like `Sort(Project(Pivot(...)))` wrap the Pivot in non-schema-changing
+/// operators. This walks the single-child "passthrough" nodes to find a Pivot.
+fn find_pivot(plan: &thunderduck_core::logical::LogicalPlan) -> Option<&thunderduck_core::logical::Pivot> {
+    use thunderduck_core::logical::LogicalPlan;
+    match plan {
+        LogicalPlan::Pivot(p) => Some(p),
+        LogicalPlan::Sort(s) => find_pivot(&s.input),
+        LogicalPlan::Limit(l) => find_pivot(&l.input),
+        LogicalPlan::Tail(t) => find_pivot(&t.input),
+        LogicalPlan::Filter(f) => find_pivot(&f.input),
+        LogicalPlan::Project(p) => find_pivot(&p.input),
+        _ => None,
+    }
+}
+
+/// Override nullable flags for Pivot grouping columns in a DuckDB-derived schema.
+///
+/// DuckDB reports all columns as `nullable=true`, but grouping columns in a
+/// `GROUP BY` (which Pivot uses internally) preserve the nullability of their
+/// input. This patches the schema to match Spark's behavior.
+fn apply_pivot_grouping_nullable(
+    schema: thunderduck_core::types::StructType,
+    pivot: &thunderduck_core::logical::Pivot,
+) -> thunderduck_core::types::StructType {
+    use thunderduck_core::expression::Expression;
+    use thunderduck_core::types::StructType;
+
+    let input_schema = pivot.input.infer_schema();
+    if input_schema.is_empty() {
+        return schema;
+    }
+    let grouping_names: Vec<String> = pivot.grouping.iter().filter_map(|e| {
+        match e {
+            Expression::ColumnReference(c) => Some(c.name.to_lowercase()),
+            Expression::UnresolvedColumn(u) => Some(u.name.to_lowercase()),
+            Expression::Alias(a) => Some(a.alias.to_lowercase()),
+            _ => None,
+        }
+    }).collect();
+    let fields = schema.fields.into_iter().map(|mut f| {
+        if grouping_names.iter().any(|g| g.eq_ignore_ascii_case(&f.name)) {
+            if let Some(input_f) = input_schema.field_by_name(&f.name) {
+                f.nullable = input_f.nullable;
+            }
+        }
+        f
+    }).collect();
+    StructType::new(fields)
 }

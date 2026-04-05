@@ -640,7 +640,18 @@ impl TypeInferenceEngine {
             "hash" | "xxhash64" | "murmur3" => Integer,
 
             // ── Null / conditional ────────────────────────────────────────────
-            "coalesce" | "nvl" | "ifnull" => arg_types.first().cloned().unwrap_or(Unresolved),
+            "coalesce" | "nvl" | "ifnull" => {
+                // If any arg is Unresolved, we cannot determine the unified type.
+                if arg_types.iter().any(|t| matches!(t, Unresolved)) {
+                    Unresolved
+                } else {
+                    arg_types.iter()
+                        .filter(|t| !matches!(t, Null))
+                        .cloned()
+                        .reduce(|acc, t| Self::unify_types(&acc, &t))
+                        .unwrap_or_else(|| arg_types.first().cloned().unwrap_or(Unresolved))
+                }
+            }
             "nullif" => arg_types.first().cloned().unwrap_or(Unresolved),
             "if" | "iff" | "nvl2" => arg_types.get(1).cloned().unwrap_or(Unresolved),
             // when(cond1, val1, cond2, val2, ..., [else]): unify THEN + ELSE values

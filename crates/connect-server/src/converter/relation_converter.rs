@@ -558,14 +558,30 @@ impl<'a> RelationConverter<'a> {
             }
             LogicalPlan::Project(mut p) => {
                 p.input = Box::new(self.enrich_table_scans(*p.input));
+                for expr in &mut p.projections {
+                    self.enrich_subqueries_in_expr(expr);
+                }
                 LogicalPlan::Project(p)
             }
             LogicalPlan::Filter(mut f) => {
                 f.input = Box::new(self.enrich_table_scans(*f.input));
+                self.enrich_subqueries_in_expr(&mut f.condition);
                 LogicalPlan::Filter(f)
             }
             LogicalPlan::Aggregate(mut a) => {
                 a.input = Box::new(self.enrich_table_scans(*a.input));
+                for expr in &mut a.grouping {
+                    self.enrich_subqueries_in_expr(expr);
+                }
+                for agg in &mut a.aggregates {
+                    self.enrich_subqueries_in_expr(&mut agg.func);
+                    if let Some(ref mut filter) = agg.filter {
+                        self.enrich_subqueries_in_expr(filter);
+                    }
+                }
+                if let Some(ref mut having) = a.having {
+                    self.enrich_subqueries_in_expr(having);
+                }
                 LogicalPlan::Aggregate(a)
             }
             LogicalPlan::Sort(mut s) => {
@@ -579,6 +595,9 @@ impl<'a> RelationConverter<'a> {
             LogicalPlan::Join(mut j) => {
                 j.left = Box::new(self.enrich_table_scans(*j.left));
                 j.right = Box::new(self.enrich_table_scans(*j.right));
+                if let Some(ref mut cond) = j.condition {
+                    self.enrich_subqueries_in_expr(cond);
+                }
                 LogicalPlan::Join(j)
             }
             LogicalPlan::Union(mut u) => {
@@ -613,6 +632,103 @@ impl<'a> RelationConverter<'a> {
             }
             // All other variants: return unchanged
             other => other,
+        }
+    }
+
+    /// Recursively walk an expression tree, enriching any subquery plans found inside
+    /// `ScalarSubquery`, `ExistsSubquery`, or `InSubquery` expressions.
+    fn enrich_subqueries_in_expr(&self, expr: &mut Expression) {
+        use thunderduck_core::expression::*;
+        match expr {
+            Expression::ScalarSubquery(sq) => {
+                let plan = std::mem::replace(
+                    &mut sq.subquery,
+                    Box::new(LogicalPlan::SingleRow(SingleRowRelation)),
+                );
+                sq.subquery = Box::new(self.enrich_table_scans(*plan));
+            }
+            Expression::ExistsSubquery(es) => {
+                let plan = std::mem::replace(
+                    &mut es.subquery,
+                    Box::new(LogicalPlan::SingleRow(SingleRowRelation)),
+                );
+                es.subquery = Box::new(self.enrich_table_scans(*plan));
+            }
+            Expression::InSubquery(is) => {
+                self.enrich_subqueries_in_expr(&mut is.expr);
+                let plan = std::mem::replace(
+                    &mut is.subquery,
+                    Box::new(LogicalPlan::SingleRow(SingleRowRelation)),
+                );
+                is.subquery = Box::new(self.enrich_table_scans(*plan));
+            }
+            Expression::Binary(b) => {
+                self.enrich_subqueries_in_expr(&mut b.left);
+                self.enrich_subqueries_in_expr(&mut b.right);
+            }
+            Expression::Unary(u) => {
+                self.enrich_subqueries_in_expr(&mut u.operand);
+            }
+            Expression::Alias(a) => {
+                self.enrich_subqueries_in_expr(&mut a.expr);
+            }
+            Expression::Cast(c) => {
+                self.enrich_subqueries_in_expr(&mut c.expr);
+            }
+            Expression::CaseWhen(cw) => {
+                if let Some(ref mut base) = cw.base {
+                    self.enrich_subqueries_in_expr(base);
+                }
+                for (cond, then) in &mut cw.branches {
+                    self.enrich_subqueries_in_expr(cond);
+                    self.enrich_subqueries_in_expr(then);
+                }
+                if let Some(ref mut else_expr) = cw.else_expr {
+                    self.enrich_subqueries_in_expr(else_expr);
+                }
+            }
+            Expression::FunctionCall(f) => {
+                for arg in &mut f.args {
+                    self.enrich_subqueries_in_expr(arg);
+                }
+            }
+            Expression::Window(w) => {
+                self.enrich_subqueries_in_expr(&mut w.func);
+                for arg in &mut w.partition_by {
+                    self.enrich_subqueries_in_expr(arg);
+                }
+            }
+            Expression::Between(b) => {
+                self.enrich_subqueries_in_expr(&mut b.expr);
+                self.enrich_subqueries_in_expr(&mut b.low);
+                self.enrich_subqueries_in_expr(&mut b.high);
+            }
+            Expression::InList(il) => {
+                self.enrich_subqueries_in_expr(&mut il.expr);
+                for item in &mut il.list {
+                    self.enrich_subqueries_in_expr(item);
+                }
+            }
+            Expression::Like(l) => {
+                self.enrich_subqueries_in_expr(&mut l.value);
+                self.enrich_subqueries_in_expr(&mut l.pattern);
+            }
+            // Leaf expressions: no subqueries possible
+            Expression::Literal(_)
+            | Expression::ColumnReference(_)
+            | Expression::UnresolvedColumn(_)
+            | Expression::Star(_)
+            | Expression::Lambda(_)
+            | Expression::LambdaVariable(_)
+            | Expression::RawSql(_)
+            | Expression::ArrayLiteral(_)
+            | Expression::MapLiteral(_)
+            | Expression::StructLiteral(_)
+            | Expression::Interval(_)
+            | Expression::IsDistinctFrom(_)
+            | Expression::ExtractValue(_)
+            | Expression::RowConstructor(_)
+            | Expression::UpdateFields(_) => {}
         }
     }
 

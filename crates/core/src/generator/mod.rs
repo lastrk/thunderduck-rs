@@ -1717,7 +1717,37 @@ impl SqlGenerator {
         }
 
         let over = over_parts.join(" ");
-        Ok(format!("{func} OVER ({over})"))
+        let mut result = format!("{func} OVER ({over})");
+
+        // Strict mode: compensate for native DuckDB window aggregate types.
+        // Extension functions (spark_avg, spark_sum) don't support OVER clauses,
+        // so window bodies use native DuckDB aggregates. We add a compensating
+        // CAST to produce the Spark-expected decimal type.
+        if self.mode == CompatMode::Strict {
+            if let Expression::FunctionCall(f) = &*w.func {
+                let lower = f.name.to_lowercase();
+                if matches!(lower.as_str(), "avg" | "mean") {
+                    if let Some(arg) = f.args.first() {
+                        let arg_type = arg.data_type(&self.schema);
+                        if let DataType::Decimal { precision, scale } = arg_type {
+                            let new_p = ((precision as u16) + 4).min(38) as u8;
+                            let new_s = (scale + 4).min(18).min(new_p);
+                            result = format!("CAST({result} AS DECIMAL({new_p},{new_s}))");
+                        }
+                    }
+                } else if matches!(lower.as_str(), "sum" | "sum_distinct") {
+                    if let Some(arg) = f.args.first() {
+                        let arg_type = arg.data_type(&self.schema);
+                        if let DataType::Decimal { precision, scale } = arg_type {
+                            let new_p = ((precision as u16) + 10).min(38) as u8;
+                            result = format!("CAST({result} AS DECIMAL({new_p},{scale}))");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     fn gen_window_frame(&self, frame: &crate::expression::WindowFrame) -> Result<String> {
@@ -3417,8 +3447,8 @@ mod tests {
     use super::*;
     use crate::expression::{
         AliasExpression, BinaryExpression, ColumnReference, ExtractValueExpression,
-        IntervalExpression, IsDistinctFromExpression, LikeExpression, Literal,
-        RowConstructorExpression,
+        FunctionCall, IntervalExpression, IsDistinctFromExpression, LikeExpression, Literal,
+        RowConstructorExpression, WindowFunction,
     };
     use crate::logical::{
         Filter, Limit, LogicalPlan, Project, SingleRowRelation, Sort, TableScan, Union,
@@ -3773,6 +3803,86 @@ mod tests {
         assert_eq!(
             rewrite_backtick_identifiers(r#"SELECT "col" FROM t"#),
             r#"SELECT "col" FROM t"#,
+        );
+    }
+
+    #[test]
+    fn window_avg_decimal_strict_adds_cast() {
+        let gen = SqlGenerator::strict();
+        let arg = Expression::ColumnReference(ColumnReference {
+            name: "amount".to_owned(),
+            qualifier: None,
+            data_type: DataType::Decimal { precision: 17, scale: 2 },
+            nullable: true,
+        });
+        let w = WindowFunction {
+            func: Box::new(Expression::FunctionCall(FunctionCall {
+                name: "avg".to_owned(),
+                args: vec![arg],
+                distinct: false,
+            })),
+            partition_by: vec![col("region")],
+            order_by: vec![],
+            frame: None,
+        };
+        let sql = gen.gen_window(&w).expect("gen_window should succeed");
+        // AVG(Decimal(17,2)) → Decimal(min(17+4,38), min(2+4,18)) = Decimal(21,6)
+        assert!(
+            sql.contains("CAST(") && sql.contains("DECIMAL(21,6)"),
+            "strict-mode window AVG of decimal should produce CAST wrapper, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn window_avg_decimal_relaxed_no_cast() {
+        let gen = SqlGenerator::relaxed();
+        let arg = Expression::ColumnReference(ColumnReference {
+            name: "amount".to_owned(),
+            qualifier: None,
+            data_type: DataType::Decimal { precision: 17, scale: 2 },
+            nullable: true,
+        });
+        let w = WindowFunction {
+            func: Box::new(Expression::FunctionCall(FunctionCall {
+                name: "avg".to_owned(),
+                args: vec![arg],
+                distinct: false,
+            })),
+            partition_by: vec![col("region")],
+            order_by: vec![],
+            frame: None,
+        };
+        let sql = gen.gen_window(&w).expect("gen_window should succeed");
+        assert!(
+            !sql.contains("CAST("),
+            "relaxed-mode window AVG should NOT produce CAST wrapper, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn window_sum_decimal_strict_adds_cast() {
+        let gen = SqlGenerator::strict();
+        let arg = Expression::ColumnReference(ColumnReference {
+            name: "price".to_owned(),
+            qualifier: None,
+            data_type: DataType::Decimal { precision: 12, scale: 2 },
+            nullable: true,
+        });
+        let w = WindowFunction {
+            func: Box::new(Expression::FunctionCall(FunctionCall {
+                name: "sum".to_owned(),
+                args: vec![arg],
+                distinct: false,
+            })),
+            partition_by: vec![],
+            order_by: vec![],
+            frame: None,
+        };
+        let sql = gen.gen_window(&w).expect("gen_window should succeed");
+        // SUM(Decimal(12,2)) → Decimal(min(12+10,38), 2) = Decimal(22,2)
+        assert!(
+            sql.contains("CAST(") && sql.contains("DECIMAL(22,2)"),
+            "strict-mode window SUM of decimal should produce CAST wrapper, got: {sql}"
         );
     }
 

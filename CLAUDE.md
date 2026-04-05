@@ -292,7 +292,7 @@ pkill -f thunderduck-connect-server
 | Test conftest | `tests/integration/conftest.py` |
 | DataFrame diff util | `tests/integration/utils/dataframe_diff.py` |
 
-**Last Updated**: 2026-03-18
+**Last Updated**: 2026-04-05
 
 # Project Guidelines
 

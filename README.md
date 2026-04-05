@@ -6,7 +6,7 @@
 
 > **Alpha Software**: Despite extensive test coverage, Thunderduck is currently alpha quality software and will undergo extensive testing with real-world workloads before production readiness.
 
-**Thunderduck** is an embedded execution engine that translates Spark operations to DuckDB SQL, providing fast single-node query execution as a drop-in replacement for Apache Spark. This is the Rust port: same Spark API compatibility, ~50ms startup (vs ~10s JVM), and ~45MB baseline memory (vs ~500MB JVM). The port is about 85% complete, the gaps are documented in [docs/reference-gap-analysis.md](https://github.com/lastrk/thunderduck-rs/blob/main/docs/reference-gap-analysis.md).
+**Thunderduck** is an embedded execution engine that translates Spark operations to DuckDB SQL, providing fast single-node query execution as a drop-in replacement for Apache Spark. This is the Rust port: same Spark API compatibility, ~50ms startup (vs ~10s JVM), and ~45MB baseline memory (vs ~500MB JVM). Both relaxed and strict compatibility modes achieve **100% pass rate** on the 835-test differential suite against Apache Spark 4.1.1.
 
 ### Key Features
 
@@ -17,7 +17,7 @@
 - **Multi-architecture support**: x86_64 (Intel/AMD) and ARM64 (AWS Graviton, Apple Silicon)
 - **Arrow-native data interchange** with DuckDB's vectorized engine
 - **Format support**: Parquet, Delta Lake (PLANNED), Iceberg (PLANNED)
-- **746 differential tests** against Spark 4.1.1 — TPC-H (100%), TPC-DS (99%), functions, joins, window, aggregations
+- **835 differential tests** against Spark 4.1.1 — TPC-H (100%), TPC-DS (100%), functions, joins, window, aggregations, lambdas, complex types
 - **Two compatibility modes**: Relaxed (vanilla DuckDB, best-effort type matching) and Strict (DuckDB extension, exact Spark type parity)
 - **Query plan introspection** via EXPLAIN statements
 
@@ -181,7 +181,7 @@ cargo build --release --features bundled-extension
 ```
 
 The extension binary for the current platform is automatically downloaded from the
-[`duckdb1.5.1-ext1` release](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/duckdb1.5.1-ext1)
+[`duckdb1.5.1-ext3` release](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/duckdb1.5.1-ext3)
 and cached under `extensions/` on first build. Subsequent builds reuse the cached file — no
 re-download. The extension is then embedded directly in the binary via `include_bytes!()`.
 
@@ -210,13 +210,14 @@ Thunderduck supports two compatibility modes:
 
 | Mode | Extension | Type Accuracy | Performance |
 |------|-----------|---------------|-------------|
-| **Relaxed** (default) | Not loaded | ~85% — value-equivalent, may differ in output types | Maximum |
-| **Strict** | Embedded at build time | ~100% — exact Spark type parity | Near-maximum |
+| **Relaxed** (default) | Not loaded | ~95% — value-equivalent, may differ in output types | Maximum |
+| **Strict** | Embedded at build time | 100% — exact Spark type parity | Near-maximum |
 
 The `thdck_spark_funcs` DuckDB extension implements Spark-precise numerical semantics:
 - `spark_decimal_div(a, b)` — decimal division with `ROUND_HALF_UP`
 - `spark_sum(col)` — Spark-compatible SUM return types
 - `spark_avg(col)` — Spark-compatible AVG return types
+- `spark_skewness(col)` — population skewness (Spark's formula, no bias correction)
 
 Strict mode requires building with `--features bundled-extension` (see [Build with Extension](#build-with-spark-compatibility-extension-strict-mode)). The extension is embedded in the binary at compile time and loaded at startup.
 
@@ -292,7 +293,7 @@ cd tests/integration && python3 -m pytest \
 - **[Architecture](docs/architecture.md)**: All architectural decisions (ADRs 1–21)
 - **[Implementation Plan](docs/implementation-plan.md)**: Phased delivery plan
 - **[Dev Journal](docs/dev-journal-toc.md)**: Chronological development history
-- **[Gap Analysis](docs/reference-gap-analysis.md)**: Java reference vs Rust port comparison (HIGH/MEDIUM/LOW items)
+- **[Test Tracker](docs/reference-gap-analysis.md)**: Differential test status and remaining items
 
 ## Contributing
 

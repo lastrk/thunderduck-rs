@@ -639,16 +639,19 @@ impl TypeInferenceEngine {
             "coalesce" | "nvl" | "ifnull" => arg_types.first().cloned().unwrap_or(Unresolved),
             "nullif" => arg_types.first().cloned().unwrap_or(Unresolved),
             "if" | "iff" | "nvl2" => arg_types.get(1).cloned().unwrap_or(Unresolved),
-            // when(cond1, val1, cond2, val2, ..., [else]): THEN values at odd indices
+            // when(cond1, val1, cond2, val2, ..., [else]): unify THEN + ELSE values
             "when" => {
-                let mut i = 1;
-                while i < arg_types.len() {
-                    if !matches!(arg_types[i], Unresolved) {
-                        return arg_types[i].clone();
-                    }
-                    i += 2;
-                }
-                Unresolved
+                let then_types = arg_types.iter().skip(1).step_by(2);
+                let else_type = if arg_types.len() % 2 == 0 {
+                    arg_types.last()
+                } else {
+                    None
+                };
+                then_types.chain(else_type)
+                    .filter(|t| !matches!(t, Unresolved | Null))
+                    .cloned()
+                    .reduce(|acc, t| Self::unify_types(&acc, &t))
+                    .unwrap_or(Unresolved)
             }
             "nanvl" => arg_types.first().cloned().unwrap_or(Double),
 

@@ -473,7 +473,7 @@ async fn execute_approx_quantile(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     aq: &thunderduck_core::logical::ApproxQuantile,
 ) -> Result<arrow::record_batch::RecordBatch, String> {
-    use arrow::array::{Float64Array, ListArray};
+    use arrow::array::{Array, Float64Array, ListArray};
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -487,28 +487,49 @@ async fn execute_approx_quantile(
     let n_probs = aq.probabilities.len();
     let n_cols = aq.cols.len();
 
-    // Collect quantile values: layout = [col0_p0, col0_p1, ..., col1_p0, col1_p1, ...]
-    let mut all_values: Vec<f64> = Vec::with_capacity(n_cols * n_probs);
-    for col in &aq.cols {
+    // Build a single query with all column×probability combinations.
+    // Layout: col0_p0, col0_p1, ..., col1_p0, col1_p1, ...
+    let mut select_exprs: Vec<String> = Vec::with_capacity(n_cols * n_probs);
+    for (ci, col) in aq.cols.iter().enumerate() {
         let quoted = format!("\"{}\"", col.replace('"', "\"\""));
-        for p in &aq.probabilities {
-            let sql = format!(
-                "SELECT approx_quantile({quoted}, {p:.17}) AS __q FROM ({input_sql}) __aq_input__"
-            );
-            let batches = session.execute(&sql).await.map_err(|e| e.to_string())?;
-            let val = batches
-                .iter()
-                .flat_map(|b| b.columns())
-                .next()
-                .and_then(|col| {
-                    use arrow::array::{Array, Float64Array};
-                    col.as_any()
-                        .downcast_ref::<Float64Array>()
-                        .and_then(|a| if a.len() > 0 { Some(a.value(0)) } else { None })
-                })
-                .ok_or_else(|| format!("approx_quantile: no float64 result for column {col} at p={p}"))?;
-            all_values.push(val);
+        for (pi, p) in aq.probabilities.iter().enumerate() {
+            select_exprs.push(format!(
+                "approx_quantile({quoted}, {p:.17}) AS __q_{ci}_{pi}"
+            ));
         }
+    }
+
+    let sql = format!(
+        "SELECT {} FROM ({input_sql}) __aq_input__",
+        select_exprs.join(", ")
+    );
+    let batches = session.execute(&sql).await.map_err(|e| e.to_string())?;
+
+    // Extract all N×M float64 values from the single-row result.
+    let result_batch = batches
+        .first()
+        .ok_or_else(|| "approx_quantile: empty result".to_owned())?;
+    if result_batch.num_rows() == 0 {
+        return Err("approx_quantile: result has zero rows".to_owned());
+    }
+
+    let total = n_cols * n_probs;
+    let mut all_values: Vec<f64> = Vec::with_capacity(total);
+    for idx in 0..total {
+        let col_arr = result_batch.column(idx);
+        let val = col_arr
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .and_then(|a| if !a.is_empty() { Some(a.value(0)) } else { None })
+            .ok_or_else(|| {
+                let ci = idx / n_probs;
+                let pi = idx % n_probs;
+                format!(
+                    "approx_quantile: no float64 result for column {} at p={}",
+                    aq.cols[ci], aq.probabilities[pi]
+                )
+            })?;
+        all_values.push(val);
     }
 
     // Build inner ListArray: N entries (one per column), each with M doubles.

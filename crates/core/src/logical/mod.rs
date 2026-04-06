@@ -1228,6 +1228,94 @@ impl LogicalPlan {
         use crate::expression::Literal;
         LogicalPlan::Limit(Limit { input: Box::new(input), limit: Literal::long(n) })
     }
+
+    /// Collect pivot grouping column nullable overrides from any `Pivot` node
+    /// in the plan tree. Returns a map of column_name -> nullable derived from
+    /// the Pivot's input schema. Empty if no Pivot is found.
+    ///
+    /// Unlike the old `find_pivot()` in service.rs, this traverses ALL child
+    /// nodes — including multi-child operators like Join and Union.
+    pub fn pivot_grouping_nullable_overrides(&self) -> std::collections::HashMap<String, bool> {
+        match self {
+            LogicalPlan::Pivot(p) => {
+                let input_schema = p.input.infer_schema();
+                if input_schema.is_empty() {
+                    return std::collections::HashMap::new();
+                }
+                p.grouping
+                    .iter()
+                    .filter_map(|expr| {
+                        let name = match expr {
+                            Expression::ColumnReference(c) => Some(c.name.clone()),
+                            Expression::UnresolvedColumn(u) => Some(u.name.clone()),
+                            Expression::Alias(a) => Some(a.alias.clone()),
+                            _ => None,
+                        };
+                        name.and_then(|n| {
+                            input_schema.field_by_name(&n).map(|f| (n, f.nullable))
+                        })
+                    })
+                    .collect()
+            }
+            // Single-child passthrough nodes
+            LogicalPlan::Project(p) => p.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::Filter(f) => f.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::Sort(s) => s.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::Limit(l) => l.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::Tail(t) => t.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::Distinct(d) => d.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::WithColumns(w) => w.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::DropColumns(d) => d.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::Aggregate(a) => a.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::Sample(s) => s.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::AliasedRelation(a) => a.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::Unpivot(u) => u.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::NADrop(n) => n.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::NAFill(n) => n.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::NAReplace(n) => n.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::ShowString(s) => s.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::ToDataFrame(t) => t.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::Describe(d) => d.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::Summary(s) => s.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::StatCov(s) => s.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::StatCorr(s) => s.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::ApproxQuantile(a) => a.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::StatCrosstab(s) => s.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::StatFreqItems(s) => s.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::StatSampleBy(s) => s.input.pivot_grouping_nullable_overrides(),
+            LogicalPlan::WithCte(c) => c.input.pivot_grouping_nullable_overrides(),
+            // Multi-child nodes: merge both sides
+            LogicalPlan::Join(j) => {
+                let mut m = j.left.pivot_grouping_nullable_overrides();
+                m.extend(j.right.pivot_grouping_nullable_overrides());
+                m
+            }
+            LogicalPlan::Union(u) => {
+                let mut m = u.left.pivot_grouping_nullable_overrides();
+                m.extend(u.right.pivot_grouping_nullable_overrides());
+                m
+            }
+            LogicalPlan::Except(e) => {
+                let mut m = e.left.pivot_grouping_nullable_overrides();
+                m.extend(e.right.pivot_grouping_nullable_overrides());
+                m
+            }
+            LogicalPlan::Intersect(i) => {
+                let mut m = i.left.pivot_grouping_nullable_overrides();
+                m.extend(i.right.pivot_grouping_nullable_overrides());
+                m
+            }
+            // Leaf nodes — no pivot possible
+            LogicalPlan::TableScan(_)
+            | LogicalPlan::SqlRelation(_)
+            | LogicalPlan::LocalRelation(_)
+            | LogicalPlan::LocalDataRelation(_)
+            | LogicalPlan::RangeRelation(_)
+            | LogicalPlan::InMemoryRelation(_)
+            | LogicalPlan::SingleRow(_)
+            | LogicalPlan::DdlStatement(_) => std::collections::HashMap::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1343,5 +1431,95 @@ mod tests {
         });
         // join depth = 1 + max(2, 1) = 3
         assert_eq!(join.depth(), 3);
+    }
+
+    // ── pivot_grouping_nullable_overrides tests ──────────────────────────
+
+    fn make_pivot_plan() -> LogicalPlan {
+        use crate::expression::UnresolvedColumn;
+        let input = LogicalPlan::LocalRelation(LocalRelation {
+            schema: StructType::new(vec![
+                StructField::not_null("product", DataType::String),
+                StructField::nullable("region", DataType::String),
+                StructField::nullable("sales", DataType::Double),
+            ]),
+        });
+        LogicalPlan::Pivot(Pivot {
+            input: Box::new(input),
+            grouping: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "product".to_owned(),
+                    qualifier: None,
+                }),
+            ],
+            pivot_col: Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "region".to_owned(),
+                qualifier: None,
+            }),
+            pivot_values: vec![],
+            aggregates: vec![],
+        })
+    }
+
+    #[test]
+    fn pivot_overrides_returns_grouping_nullable() {
+        let plan = make_pivot_plan();
+        let overrides = plan.pivot_grouping_nullable_overrides();
+        assert_eq!(overrides.len(), 1);
+        // "product" is non-nullable in the input schema
+        assert_eq!(overrides.get("product"), Some(&false));
+    }
+
+    #[test]
+    fn pivot_overrides_through_sort_and_project() {
+        let pivot = make_pivot_plan();
+        let sorted = LogicalPlan::Sort(Sort {
+            input: Box::new(pivot),
+            order: vec![],
+            limit: None,
+            offset: None,
+        });
+        let projected = LogicalPlan::project(sorted, vec![]);
+        let overrides = projected.pivot_grouping_nullable_overrides();
+        assert_eq!(overrides.get("product"), Some(&false));
+    }
+
+    #[test]
+    fn pivot_overrides_through_join() {
+        let pivot = make_pivot_plan();
+        let right = LogicalPlan::table_scan("other");
+        let join = LogicalPlan::Join(Join {
+            left: Box::new(pivot),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec![],
+            left_alias: None,
+            right_alias: None,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let overrides = join.pivot_grouping_nullable_overrides();
+        assert_eq!(overrides.get("product"), Some(&false));
+    }
+
+    #[test]
+    fn pivot_overrides_through_union() {
+        let pivot = make_pivot_plan();
+        let other = LogicalPlan::table_scan("other");
+        let union_plan = LogicalPlan::Union(Union {
+            left: Box::new(pivot),
+            right: Box::new(other),
+            all: true,
+        });
+        let overrides = union_plan.pivot_grouping_nullable_overrides();
+        assert_eq!(overrides.get("product"), Some(&false));
+    }
+
+    #[test]
+    fn pivot_overrides_empty_for_leaf() {
+        let leaf = LogicalPlan::table_scan("t");
+        let overrides = leaf.pivot_grouping_nullable_overrides();
+        assert!(overrides.is_empty());
     }
 }

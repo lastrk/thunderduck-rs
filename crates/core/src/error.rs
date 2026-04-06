@@ -1,5 +1,5 @@
 /// All errors produced by the thunderduck-core crate.
-#[derive(thiserror::Error, Debug, Clone, PartialEq)]
+#[derive(thiserror::Error, Debug)]
 pub enum ThunderduckError {
     #[error("SQL generation failed: {0}")]
     SqlGeneration(String),

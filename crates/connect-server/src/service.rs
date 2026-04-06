@@ -34,7 +34,8 @@ impl ThunderduckService {
     }
 }
 
-static SERVER_SESSION_ID: &str = "thunderduck-server-1";
+static SERVER_SESSION_ID: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
 #[tonic::async_trait]
 impl SparkConnectService for ThunderduckService {
@@ -51,6 +52,12 @@ impl SparkConnectService for ThunderduckService {
             .operation_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        tracing::debug!(
+            session_id = %session_id,
+            operation_id = %operation_id,
+            "execute_plan",
+        );
 
         let session = self
             .session_manager
@@ -122,6 +129,11 @@ impl SparkConnectService for ThunderduckService {
     ) -> Result<Response<proto::AnalyzePlanResponse>, Status> {
         let req = request.into_inner();
         let session_id = req.session_id.clone();
+
+        tracing::debug!(
+            session_id = %session_id,
+            "analyze_plan",
+        );
 
         use proto::analyze_plan_request::Analyze;
         match req.analyze {
@@ -263,7 +275,7 @@ impl SparkConnectService for ThunderduckService {
 
                 let resp = proto::AnalyzePlanResponse {
                     session_id,
-                    server_side_session_id: SERVER_SESSION_ID.to_string(),
+                    server_side_session_id: SERVER_SESSION_ID.clone(),
                     result: Some(proto::analyze_plan_response::Result::Schema(
                         proto::analyze_plan_response::Schema { schema: Some(schema_proto) },
                     )),
@@ -302,7 +314,7 @@ impl SparkConnectService for ThunderduckService {
         };
         Ok(Response::new(proto::ConfigResponse {
             session_id: req.session_id,
-            server_side_session_id: SERVER_SESSION_ID.to_string(),
+            server_side_session_id: SERVER_SESSION_ID.clone(),
             pairs,
             warnings: vec![],
         }))
@@ -351,7 +363,7 @@ impl SparkConnectService for ThunderduckService {
         self.session_manager.release(&req.session_id);
         Ok(Response::new(proto::ReleaseSessionResponse {
             session_id: req.session_id,
-            server_side_session_id: SERVER_SESSION_ID.to_string(),
+            server_side_session_id: SERVER_SESSION_ID.clone(),
         }))
     }
 
@@ -600,7 +612,7 @@ fn batches_to_responses(
         .enumerate()
         .map(|(i, ab)| proto::ExecutePlanResponse {
             session_id: session_id.to_string(),
-            server_side_session_id: SERVER_SESSION_ID.to_string(),
+            server_side_session_id: SERVER_SESSION_ID.clone(),
             operation_id: operation_id.to_string(),
             response_id: format!("{operation_id}-{i}"),
             response_type: Some(proto::execute_plan_response::ResponseType::ArrowBatch(ab)),
@@ -636,7 +648,7 @@ fn bool_batch_responses(
 fn result_complete_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {
     proto::ExecutePlanResponse {
         session_id: session_id.to_string(),
-        server_side_session_id: SERVER_SESSION_ID.to_string(),
+        server_side_session_id: SERVER_SESSION_ID.clone(),
         operation_id: operation_id.to_string(),
         response_id: format!("{operation_id}-complete"),
         response_type: Some(proto::execute_plan_response::ResponseType::ResultComplete(
@@ -652,7 +664,7 @@ fn sql_command_result_response(
 ) -> proto::ExecutePlanResponse {
     proto::ExecutePlanResponse {
         session_id: session_id.to_string(),
-        server_side_session_id: SERVER_SESSION_ID.to_string(),
+        server_side_session_id: SERVER_SESSION_ID.clone(),
         operation_id: operation_id.to_string(),
         response_id: format!("{operation_id}-cmd"),
         response_type: Some(
@@ -738,7 +750,10 @@ async fn cache_create_view_schema(
             .await
         {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!(view_name, error = %e, "Failed to cache view schema: DuckDB schema inference failed");
+                return;
+            }
         };
         if schema.fields.len() == duckdb_schema.fields.len() {
             let fields = schema
@@ -759,7 +774,8 @@ async fn cache_create_view_schema(
                 .collect();
             StructType::new(fields)
         } else {
-            return; // Size mismatch — skip caching
+            tracing::warn!(view_name, "Failed to cache view schema: field count mismatch between plan and DuckDB");
+            return;
         }
     } else {
         schema.clone()
@@ -861,7 +877,10 @@ async fn cache_create_view_schema_direct(
                 .await
             {
                 Ok(s) => s,
-                Err(_) => return,
+                Err(e) => {
+                    tracing::warn!(view_name, error = %e, "Failed to cache view schema (direct): DuckDB schema inference failed");
+                    return;
+                }
             };
             if schema.fields.len() == duckdb_schema.fields.len() {
                 let fields = schema
@@ -882,6 +901,7 @@ async fn cache_create_view_schema_direct(
                     .collect();
                 StructType::new(fields)
             } else {
+                tracing::warn!(view_name, "Failed to cache view schema (direct): field count mismatch between plan and DuckDB");
                 return;
             }
         } else {
@@ -932,7 +952,7 @@ async fn execute_streaming_query(
                     let resp = match record_batch_to_arrow_batch(&batch) {
                         Ok(arrow_batch) => Ok(proto::ExecutePlanResponse {
                             session_id: sid.clone(),
-                            server_side_session_id: SERVER_SESSION_ID.to_string(),
+                            server_side_session_id: SERVER_SESSION_ID.clone(),
                             operation_id: oid.clone(),
                             response_id: format!("{oid}-{idx}"),
                             response_type: Some(
@@ -949,7 +969,7 @@ async fn execute_streaming_query(
                 Some(StreamBatch::Complete) => {
                     let resp = Ok(proto::ExecutePlanResponse {
                         session_id: sid.clone(),
-                        server_side_session_id: SERVER_SESSION_ID.to_string(),
+                        server_side_session_id: SERVER_SESSION_ID.clone(),
                         operation_id: oid.clone(),
                         response_id: format!("{oid}-complete"),
                         response_type: Some(

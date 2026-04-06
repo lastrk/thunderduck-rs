@@ -59,7 +59,7 @@ impl SqlGenerator {
             std::sync::LazyLock::new(|| std::env::var("TD_DEBUG_SQL").is_ok());
         let sql = self.gen_plan(plan)?;
         if *DEBUG_SQL {
-            eprintln!("=== TD_DEBUG_SQL ===\n{sql}\n===================");
+            tracing::debug!("=== TD_DEBUG_SQL ===\n{sql}\n===================");
         }
         Ok(sql)
     }

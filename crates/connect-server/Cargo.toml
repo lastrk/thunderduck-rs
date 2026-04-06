@@ -23,6 +23,8 @@ clap.workspace = true
 uuid.workspace = true
 futures.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [build-dependencies]
 tonic-build = "0.12"

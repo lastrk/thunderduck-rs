@@ -88,124 +88,20 @@ impl SparkConnectService for ThunderduckService {
                     .generate(&logical_plan)
                     .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
 
-                // Special case: CREATE VIEW DDL — cache the inner query's schema
-                // so that subsequent `spark.table()` calls get correct nullable
-                // metadata. DuckDB views lose NOT NULL on all columns.
-                cache_create_view_schema(&session, &logical_plan).await;
-
-                // Special case: DDL statements (DROP VIEW, etc.) return 0 rows.
-                // Execute as DDL and synthesize a single boolean result row so that
-                // PySpark's _execute_and_fetch gets a non-null table back.
-                // For DROP VIEW, the bool indicates whether the view existed.
-                let upper = sql.trim_start().to_uppercase();
-                const DROP_VIEW_PREFIX: &str = "DROP VIEW IF EXISTS ";
-                if upper.starts_with(DROP_VIEW_PREFIX) {
-                    // Extract view name — skip past the prefix (ASCII, same byte length in upper/original)
-                    let view_name = sql.trim_start()[DROP_VIEW_PREFIX.len()..].trim().trim_matches('"');
-                    // Check existence before dropping
-                    let exists = session
-                        .execute(&format!(
-                            "SELECT COUNT(*) > 0 AS existed \
-                             FROM information_schema.views \
-                             WHERE table_name = '{}' AND table_schema = 'main'",
-                            view_name.replace('\'', "''").replace('"', "\"\"")
-                        ))
-                        .await
-                        .ok()
-                        .and_then(|b| {
-                            use arrow::array::{Array, BooleanArray};
-                            b.into_iter()
-                                .next()
-                                .and_then(|rb| rb.column(0).as_any().downcast_ref::<BooleanArray>()
-                                    .and_then(|a| (!a.is_null(0)).then(|| a.value(0))))
-                        })
-                        .unwrap_or(false);
-                    session.exec_ddl(&sql).await
-                        .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-                    bool_batch_responses(&session_id, &operation_id, exists)
-                        .map_err(|e| Status::from(e))?
-                } else {
-                    // Compute Spark column names for rename (pushed to session thread).
-                    let schema = logical_plan.infer_schema();
-                    let spark_names = if !schema.is_empty() {
-                        Some(
-                            schema
-                                .fields
-                                .iter()
-                                .map(|f| f.name.clone())
-                                .collect::<Vec<_>>(),
+                match classify_plan(&logical_plan) {
+                    PlanKind::Ddl(ddl) => {
+                        execute_ddl(&session, ddl, &sql, &session_id, &operation_id).await?
+                    }
+                    PlanKind::Query => {
+                        return execute_streaming_query(
+                            &session,
+                            &logical_plan,
+                            &sql,
+                            &session_id,
+                            &operation_id,
                         )
-                    } else {
-                        None
-                    };
-
-                    // Stream results batch-by-batch via bounded channel.
-                    let rx = session
-                        .execute_streaming(&sql, spark_names, 2)
-                        .await
-                        .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-
-                    // State: (receiver, session_id, operation_id, batch_index, done)
-                    let stream = futures::stream::unfold(
-                        (rx, session_id.clone(), operation_id.clone(), 0usize, false),
-                        |(mut rx, sid, oid, idx, done)| async move {
-                            if done {
-                                return None;
-                            }
-                            match rx.recv().await {
-                                Some(StreamBatch::Batch(batch)) => {
-                                    let resp = match record_batch_to_arrow_batch(&batch) {
-                                        Ok(arrow_batch) => Ok(proto::ExecutePlanResponse {
-                                            session_id: sid.clone(),
-                                            server_side_session_id: SERVER_SESSION_ID.to_string(),
-                                            operation_id: oid.clone(),
-                                            response_id: format!("{oid}-{idx}"),
-                                            response_type: Some(
-                                                proto::execute_plan_response::ResponseType::ArrowBatch(
-                                                    arrow_batch,
-                                                ),
-                                            ),
-                                            ..Default::default()
-                                        }),
-                                        Err(e) => Err(Status::internal(format!(
-                                            "IPC serialization: {e}"
-                                        ))),
-                                    };
-                                    Some((resp, (rx, sid, oid, idx + 1, false)))
-                                }
-                                Some(StreamBatch::Complete) => {
-                                    let resp = Ok(proto::ExecutePlanResponse {
-                                        session_id: sid.clone(),
-                                        server_side_session_id: SERVER_SESSION_ID.to_string(),
-                                        operation_id: oid.clone(),
-                                        response_id: format!("{oid}-complete"),
-                                        response_type: Some(
-                                            proto::execute_plan_response::ResponseType::ResultComplete(
-                                                proto::execute_plan_response::ResultComplete::default(),
-                                            ),
-                                        ),
-                                        ..Default::default()
-                                    });
-                                    // Mark done so next poll returns None.
-                                    Some((resp, (rx, sid, oid, idx + 1, true)))
-                                }
-                                Some(StreamBatch::Error(e)) => {
-                                    Some((Err(Status::internal(e)), (rx, sid, oid, idx + 1, true)))
-                                }
-                                None => {
-                                    // Channel closed without Complete — abnormal.
-                                    Some((
-                                        Err(Status::internal(
-                                            "session thread terminated unexpectedly",
-                                        )),
-                                        (rx, sid, oid, idx + 1, true),
-                                    ))
-                                }
-                            }
-                        },
-                    );
-
-                    return Ok(Response::new(Box::pin(stream)));
+                        .await;
+                    }
                 }
             }
             Some(proto::plan::OpType::Command(cmd)) => {
@@ -761,15 +657,24 @@ async fn cache_create_view_schema(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     plan: &thunderduck_core::logical::LogicalPlan,
 ) {
-    let sr = match plan {
-        thunderduck_core::logical::LogicalPlan::SqlRelation(sr) => sr,
+    // Extract view_name and schema from either legacy SqlRelation or new DdlStatement.
+    let (view_name, schema) = match plan {
+        thunderduck_core::logical::LogicalPlan::SqlRelation(sr) => {
+            match (&sr.view_name, &sr.schema) {
+                (Some(name), schema) => (name.as_str(), schema),
+                _ => return,
+            }
+        }
+        thunderduck_core::logical::LogicalPlan::DdlStatement(d) => {
+            match &d.operation {
+                thunderduck_core::logical::DdlOperation::CreateView {
+                    view_name, schema, ..
+                } => (view_name.as_str(), schema),
+                _ => return,
+            }
+        }
         _ => return,
     };
-    let view_name = match &sr.view_name {
-        Some(name) => name,
-        None => return,
-    };
-    let schema = &sr.schema;
     if schema.is_empty() {
         return;
     }
@@ -868,4 +773,210 @@ fn apply_pivot_grouping_nullable(
         f
     }).collect();
     StructType::new(fields)
+}
+
+// ── Plan classification and decomposed execution ──────────────────────────────
+
+/// Classify a logical plan for execution routing.
+enum PlanKind<'a> {
+    /// A DDL/DML statement — execute without result streaming.
+    Ddl(&'a thunderduck_core::logical::DdlStatement),
+    /// A query — stream results back to the client.
+    Query,
+}
+
+/// Classify a plan as DDL or query.
+fn classify_plan(plan: &thunderduck_core::logical::LogicalPlan) -> PlanKind<'_> {
+    match plan {
+        thunderduck_core::logical::LogicalPlan::DdlStatement(d) => PlanKind::Ddl(d),
+        _ => PlanKind::Query,
+    }
+}
+
+/// Execute a DDL statement and return appropriate responses.
+///
+/// For DROP VIEW, synthesizes a boolean result indicating whether the view
+/// existed before the drop. For all other DDL, executes silently and returns
+/// a boolean `true` result.
+async fn execute_ddl(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    ddl: &thunderduck_core::logical::DdlStatement,
+    sql: &str,
+    session_id: &str,
+    operation_id: &str,
+) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
+    use thunderduck_core::logical::DdlOperation;
+
+    // Cache schema for CREATE VIEW before executing.
+    match &ddl.operation {
+        DdlOperation::CreateView {
+            view_name, schema, ..
+        } if !schema.is_empty() => {
+            // Execute DDL first so the view exists when we merge schemas.
+            session
+                .exec_ddl(sql)
+                .await
+                .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
+            cache_create_view_schema_direct(session, view_name, schema).await;
+            return bool_batch_responses(session_id, operation_id, true)
+                .map_err(Status::from);
+        }
+        _ => {}
+    }
+
+    match &ddl.operation {
+        DdlOperation::DropView { view_name, .. } => {
+            let existed = session.view_exists(view_name).await;
+            session
+                .exec_ddl(sql)
+                .await
+                .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
+            bool_batch_responses(session_id, operation_id, existed).map_err(Status::from)
+        }
+        DdlOperation::DropTable { .. }
+        | DdlOperation::CreateView { .. }
+        | DdlOperation::CreateTable { .. }
+        | DdlOperation::AlterTable { .. }
+        | DdlOperation::Truncate { .. }
+        | DdlOperation::Insert { .. }
+        | DdlOperation::Other { .. } => {
+            session
+                .exec_ddl(sql)
+                .await
+                .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
+            bool_batch_responses(session_id, operation_id, true).map_err(Status::from)
+        }
+    }
+}
+
+/// Cache a CREATE VIEW schema, merging with DuckDB when plan types are unresolved.
+async fn cache_create_view_schema_direct(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    view_name: &str,
+    schema: &thunderduck_core::types::StructType,
+) {
+    use thunderduck_core::types::{StructField, StructType};
+
+    let final_schema =
+        if schema.fields.iter().any(|f| f.data_type.contains_unresolved()) {
+            let duckdb_schema = match SchemaInferrer::new(session)
+                .infer_sql(&format!(
+                    "SELECT * FROM \"{}\"",
+                    view_name.replace('"', "\"\"")
+                ))
+                .await
+            {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if schema.fields.len() == duckdb_schema.fields.len() {
+                let fields = schema
+                    .fields
+                    .iter()
+                    .zip(duckdb_schema.fields.iter())
+                    .map(|(plan_f, duck_f)| {
+                        if plan_f.data_type.contains_unresolved() {
+                            StructField {
+                                name: plan_f.name.clone(),
+                                data_type: duck_f.data_type.clone(),
+                                nullable: duck_f.nullable,
+                            }
+                        } else {
+                            plan_f.clone()
+                        }
+                    })
+                    .collect();
+                StructType::new(fields)
+            } else {
+                return;
+            }
+        } else {
+            schema.clone()
+        };
+
+    session.cache_view_schema(view_name, final_schema).await;
+}
+
+/// Execute a query plan and stream results back to the client.
+async fn execute_streaming_query(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    logical_plan: &thunderduck_core::logical::LogicalPlan,
+    sql: &str,
+    session_id: &str,
+    operation_id: &str,
+) -> Result<Response<<ThunderduckService as SparkConnectService>::ExecutePlanStream>, Status> {
+    // Compute Spark column names for rename (pushed to session thread).
+    let schema = logical_plan.infer_schema();
+    let spark_names = if !schema.is_empty() {
+        Some(
+            schema
+                .fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+
+    let rx = session
+        .execute_streaming(sql, spark_names, 2)
+        .await
+        .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
+
+    let sid = session_id.to_string();
+    let oid = operation_id.to_string();
+
+    let stream = futures::stream::unfold(
+        (rx, sid, oid, 0usize, false),
+        |(mut rx, sid, oid, idx, done)| async move {
+            if done {
+                return None;
+            }
+            match rx.recv().await {
+                Some(StreamBatch::Batch(batch)) => {
+                    let resp = match record_batch_to_arrow_batch(&batch) {
+                        Ok(arrow_batch) => Ok(proto::ExecutePlanResponse {
+                            session_id: sid.clone(),
+                            server_side_session_id: SERVER_SESSION_ID.to_string(),
+                            operation_id: oid.clone(),
+                            response_id: format!("{oid}-{idx}"),
+                            response_type: Some(
+                                proto::execute_plan_response::ResponseType::ArrowBatch(
+                                    arrow_batch,
+                                ),
+                            ),
+                            ..Default::default()
+                        }),
+                        Err(e) => Err(Status::internal(format!("IPC serialization: {e}"))),
+                    };
+                    Some((resp, (rx, sid, oid, idx + 1, false)))
+                }
+                Some(StreamBatch::Complete) => {
+                    let resp = Ok(proto::ExecutePlanResponse {
+                        session_id: sid.clone(),
+                        server_side_session_id: SERVER_SESSION_ID.to_string(),
+                        operation_id: oid.clone(),
+                        response_id: format!("{oid}-complete"),
+                        response_type: Some(
+                            proto::execute_plan_response::ResponseType::ResultComplete(
+                                proto::execute_plan_response::ResultComplete::default(),
+                            ),
+                        ),
+                        ..Default::default()
+                    });
+                    Some((resp, (rx, sid, oid, idx + 1, true)))
+                }
+                Some(StreamBatch::Error(e)) => {
+                    Some((Err(Status::internal(e)), (rx, sid, oid, idx + 1, true)))
+                }
+                None => Some((
+                    Err(Status::internal("session thread terminated unexpectedly")),
+                    (rx, sid, oid, idx + 1, true),
+                )),
+            }
+        },
+    );
+
+    Ok(Response::new(Box::pin(stream)))
 }

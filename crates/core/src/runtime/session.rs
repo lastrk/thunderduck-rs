@@ -89,6 +89,11 @@ pub(crate) enum SessionCommand {
         name: String,
         resp: oneshot::Sender<Option<StructType>>,
     },
+    /// Check whether a view exists in the DuckDB catalog.
+    ViewExists {
+        view_name: String,
+        resp: oneshot::Sender<bool>,
+    },
     /// Infer schema by preparing the SQL without executing it.
     SchemaOf {
         sql: String,
@@ -554,6 +559,22 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
             .ok()?;
         resp_rx.await.ok().flatten()
     }
+
+    /// Check whether a view exists in the DuckDB catalog.
+    pub async fn view_exists(&self, name: &str) -> bool {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let sent = self
+            .cmd_tx
+            .send(SessionCommand::ViewExists {
+                view_name: name.to_string(),
+                resp: resp_tx,
+            })
+            .await;
+        if sent.is_err() {
+            return false;
+        }
+        resp_rx.await.unwrap_or(false)
+    }
 }
 
 impl Drop for DuckDbSession {
@@ -627,6 +648,16 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
             SessionCommand::GetViewSchema { name, resp } => {
                 let schema = view_schemas.get(&name.to_lowercase()).cloned();
                 let _ = resp.send(schema);
+            }
+            SessionCommand::ViewExists { view_name, resp } => {
+                let exists = conn
+                    .prepare("SELECT 1 FROM duckdb_views() WHERE view_name = ?")
+                    .and_then(|mut stmt| {
+                        let mut rows = stmt.query(duckdb::params![view_name])?;
+                        Ok(rows.next()?.is_some())
+                    })
+                    .unwrap_or(false);
+                let _ = resp.send(exists);
             }
             SessionCommand::ExecuteStreaming { sql, spark_names, batch_tx } => {
                 let result = (|| -> std::result::Result<(), duckdb::Error> {

@@ -26,45 +26,44 @@ impl SqlConverter {
             // ── 6A: DDL statements ────────────────────────────────────────
 
             Statement::Drop { object_type: ObjectType::Table, if_exists, names, .. } => {
-                let ie = if if_exists { " IF EXISTS" } else { "" };
-                let name = self.object_name_to_quoted_string(&names[0]);
-                Ok(LogicalPlan::SqlRelation(SqlRelation {
-                    sql: format!("DROP TABLE{} {}", ie, name),
-                    schema: StructType::empty(),
-                    duckdb_ready: false,
-                    view_name: None,
+                let name = self.object_name_to_string(&names[0]);
+                Ok(LogicalPlan::DdlStatement(DdlStatement {
+                    operation: DdlOperation::DropTable {
+                        table_name: name,
+                        if_exists,
+                    },
                 }))
             }
 
             Statement::Drop { object_type: ObjectType::View, if_exists, names, .. } => {
-                let ie = if if_exists { " IF EXISTS" } else { "" };
-                let name = self.object_name_to_quoted_string(&names[0]);
-                Ok(LogicalPlan::SqlRelation(SqlRelation {
-                    sql: format!("DROP VIEW{} {}", ie, name),
-                    schema: StructType::empty(),
-                    duckdb_ready: false,
-                    view_name: None,
+                let name = self.object_name_to_string(&names[0]);
+                Ok(LogicalPlan::DdlStatement(DdlStatement {
+                    operation: DdlOperation::DropView {
+                        view_name: name,
+                        if_exists,
+                    },
                 }))
             }
 
             // CREATE VIEW / CREATE OR REPLACE [TEMP] VIEW
             Statement::CreateView(cv) => {
-                let view_name = self.object_name_to_quoted_string(&cv.name);
+                let quoted_name = self.object_name_to_quoted_string(&cv.name);
+                let clean_name = self.object_name_to_string(&cv.name);
                 let or_replace = if cv.or_replace { " OR REPLACE" } else { "" };
                 let temp = if cv.temporary { " TEMP" } else { "" };
                 let inner = self.convert_query(*cv.query)?;
-                // Infer the inner query's schema so the service layer can cache
-                // correct nullable metadata. DuckDB views lose NOT NULL flags.
                 let inner_schema = inner.infer_schema();
                 let inner_sql = self.plan_to_sql(&inner)?;
-                let sql = format!("CREATE{}{} VIEW {} AS {}", or_replace, temp, view_name, inner_sql);
-                // Strip surrounding quotes from the view name for cache lookup.
-                let clean_name = view_name.trim_matches('"').to_string();
-                Ok(LogicalPlan::SqlRelation(SqlRelation {
-                    sql,
-                    schema: inner_schema,
-                    duckdb_ready: false,
-                    view_name: Some(clean_name),
+                let sql = format!(
+                    "CREATE{}{} VIEW {} AS {}",
+                    or_replace, temp, quoted_name, inner_sql
+                );
+                Ok(LogicalPlan::DdlStatement(DdlStatement {
+                    operation: DdlOperation::CreateView {
+                        view_name: clean_name,
+                        sql,
+                        schema: inner_schema,
+                    },
                 }))
             }
 
@@ -72,12 +71,10 @@ impl SqlConverter {
                 let table_name = self.object_name_to_quoted_string(&ct.name);
                 let if_not_exists = if ct.if_not_exists { " IF NOT EXISTS" } else { "" };
                 let sql = if let Some(query) = ct.query {
-                    // CTAS: CREATE TABLE name AS (SELECT ...)
                     let inner = self.convert_query(*query)?;
                     let inner_sql = self.plan_to_sql(&inner)?;
                     format!("CREATE TABLE{} {} AS ({})", if_not_exists, table_name, inner_sql)
                 } else {
-                    // CREATE TABLE with column definitions — reconstruct DDL
                     let cols: Vec<String> = ct.columns.iter()
                         .map(|c| {
                             let col_name = format!("\"{}\"", c.name.value);
@@ -89,7 +86,9 @@ impl SqlConverter {
                     format!("CREATE{} TABLE{} {} ({})",
                         or_replace, if_not_exists, table_name, cols.join(", "))
                 };
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::DdlStatement(DdlStatement {
+                    operation: DdlOperation::CreateTable { sql },
+                }))
             }
 
             Statement::Insert(insert) => {
@@ -114,19 +113,18 @@ impl SqlConverter {
                         "INSERT without source query not supported".to_string()
                     ));
                 };
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::DdlStatement(DdlStatement {
+                    operation: DdlOperation::Insert { sql },
+                }))
             }
 
             Statement::Truncate(truncate) => {
-                // Emit DELETE FROM for each table (DuckDB TRUNCATE also works but DELETE is safer)
-                // For simplicity, handle single table (most common case)
                 if let Some(target) = truncate.table_names.first() {
                     let table_name = self.object_name_to_quoted_string(&target.name);
-                    Ok(LogicalPlan::SqlRelation(SqlRelation {
-                        sql: format!("DELETE FROM {}", table_name),
-                        schema: StructType::empty(),
-                        duckdb_ready: false,
-                        view_name: None,
+                    Ok(LogicalPlan::DdlStatement(DdlStatement {
+                        operation: DdlOperation::Truncate {
+                            sql: format!("DELETE FROM {}", table_name),
+                        },
                     }))
                 } else {
                     Err(ThunderduckError::Unsupported("TRUNCATE with no table".to_string()))
@@ -135,39 +133,39 @@ impl SqlConverter {
 
             Statement::AlterTable(at) => {
                 let table_name = self.object_name_to_quoted_string(&at.name);
-                // Handle the first operation only (most ALTER TABLE statements have one)
                 if let Some(op) = at.operations.first() {
-                    match op {
+                    let sql = match op {
                         AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
-                            let sql = format!(
+                            format!(
                                 "ALTER TABLE {} RENAME COLUMN \"{}\" TO \"{}\"",
                                 table_name,
                                 old_column_name.value,
                                 new_column_name.value,
-                            );
-                            Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                            )
                         }
                         AlterTableOperation::AddColumn { column_def, .. } => {
                             let col_name = format!("\"{}\"", column_def.name.value);
                             let col_type = self.sql_data_type_to_duckdb_string(&column_def.data_type);
-                            let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table_name, col_name, col_type);
-                            Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                            format!("ALTER TABLE {} ADD COLUMN {} {}", table_name, col_name, col_type)
                         }
                         AlterTableOperation::DropColumn { column_names, if_exists, .. } => {
                             let ie = if *if_exists { " IF EXISTS" } else { "" };
                             let cols: Vec<String> = column_names.iter().map(|c| format!("\"{}\"", c.value)).collect();
-                            let sql = format!("ALTER TABLE {} DROP COLUMN{} {}", table_name, ie, cols.join(", "));
-                            Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                            format!("ALTER TABLE {} DROP COLUMN{} {}", table_name, ie, cols.join(", "))
                         }
                         AlterTableOperation::RenameTable { table_name: new_name } => {
                             let new = new_name.to_string();
-                            let sql = format!("ALTER TABLE {} RENAME TO {}", table_name, new);
-                            Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                            format!("ALTER TABLE {} RENAME TO {}", table_name, new)
                         }
-                        other => Err(ThunderduckError::Unsupported(
-                            format!("ALTER TABLE operation not supported: {:?}", other)
-                        )),
-                    }
+                        other => {
+                            return Err(ThunderduckError::Unsupported(
+                                format!("ALTER TABLE operation not supported: {:?}", other)
+                            ));
+                        }
+                    };
+                    Ok(LogicalPlan::DdlStatement(DdlStatement {
+                        operation: DdlOperation::AlterTable { sql },
+                    }))
                 } else {
                     Err(ThunderduckError::Unsupported("ALTER TABLE with no operations".to_string()))
                 }

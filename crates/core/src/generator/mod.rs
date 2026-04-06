@@ -20,8 +20,8 @@ use crate::logical::{
     Aggregate, AliasedRelation, Distinct, DropColumns, Except, Filter, GroupingSets,
     InMemoryRelation, Intersect, Join, Limit, LocalDataRelation, LocalRelation, LogicalPlan,
     NADrop, NADropHow, NAFill, NAReplace, Pivot, Project, RangeRelation, Sample, SelectEntry,
-    ApproxQuantile, Describe, ShowString, SingleRowRelation, Sort, SqlRelation, StatCorr, StatCov,
-    StatCrosstab, StatFreqItems, StatSampleBy,
+    ApproxQuantile, DdlOperation, Describe, ShowString, SingleRowRelation, Sort,
+    SqlRelation, StatCorr, StatCov, StatCrosstab, StatFreqItems, StatSampleBy,
     Summary, TableScan, Tail, ToDataFrame, Union, Unpivot, WithColumns, WithCte,
 };
 use crate::types::{DataType, StructType, TypeInferenceEngine, TypeMapper};
@@ -106,7 +106,7 @@ impl SqlGenerator {
                 let fragment = self.gen_aliased_relation(ar)?;
                 Ok(format!("SELECT *\nFROM {fragment}"))
             }
-            LogicalPlan::RawDdlStatement(r) => Ok(r.sql.clone()),
+            LogicalPlan::DdlStatement(d) => self.gen_ddl(&d.operation),
             LogicalPlan::ToDataFrame(t) => self.gen_to_dataframe(t),
             LogicalPlan::SingleRow(sr) => self.gen_single_row(sr),
             LogicalPlan::DropColumns(d) => self.gen_drop_columns(d),
@@ -672,6 +672,32 @@ impl SqlGenerator {
         match &ts.alias {
             Some(a) => Ok(format!("{tbl} AS {}", quote_ident(a))),
             None => Ok(tbl),
+        }
+    }
+
+    /// Generate SQL for a typed DDL operation.
+    fn gen_ddl(&self, op: &DdlOperation) -> Result<String> {
+        match op {
+            DdlOperation::DropView {
+                view_name,
+                if_exists,
+            } => {
+                let ie = if *if_exists { " IF EXISTS" } else { "" };
+                Ok(format!("DROP VIEW{} {}", ie, quote_ident(view_name)))
+            }
+            DdlOperation::DropTable {
+                table_name,
+                if_exists,
+            } => {
+                let ie = if *if_exists { " IF EXISTS" } else { "" };
+                Ok(format!("DROP TABLE{} {}", ie, quote_ident(table_name)))
+            }
+            DdlOperation::CreateView { sql, .. }
+            | DdlOperation::CreateTable { sql }
+            | DdlOperation::AlterTable { sql }
+            | DdlOperation::Truncate { sql }
+            | DdlOperation::Insert { sql }
+            | DdlOperation::Other { sql } => Ok(sql.clone()),
         }
     }
 

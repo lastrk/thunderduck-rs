@@ -134,7 +134,7 @@ pub enum LogicalPlan {
     WithCte(WithCte),
     WithColumns(WithColumns),
     AliasedRelation(AliasedRelation),
-    RawDdlStatement(RawDdlStatement),
+    DdlStatement(DdlStatement),
     ToDataFrame(ToDataFrame),
     SingleRow(SingleRowRelation),
     DropColumns(DropColumns),
@@ -410,10 +410,36 @@ pub struct AliasedRelation {
     pub column_aliases: Vec<String>,
 }
 
-/// A raw DDL/DML statement passed through directly to DuckDB.
+/// Typed DDL operations — replaces string-based DDL detection.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RawDdlStatement {
-    pub sql: String,
+pub enum DdlOperation {
+    /// DROP VIEW with catalog-lookup-friendly name.
+    DropView { view_name: String, if_exists: bool },
+    /// DROP TABLE.
+    DropTable { table_name: String, if_exists: bool },
+    /// CREATE [OR REPLACE] [TEMP] VIEW ... AS ...
+    CreateView {
+        view_name: String,
+        sql: String,
+        schema: StructType,
+    },
+    /// CREATE TABLE ...
+    CreateTable { sql: String },
+    /// ALTER TABLE ...
+    AlterTable { sql: String },
+    /// TRUNCATE TABLE ...
+    Truncate { sql: String },
+    /// INSERT INTO ...
+    Insert { sql: String },
+    /// Fallback for DDL not yet structured.
+    Other { sql: String },
+}
+
+/// A typed DDL statement with structured operation metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DdlStatement {
+    /// The typed DDL operation.
+    pub operation: DdlOperation,
 }
 
 /// Rename the output columns (from `df.toDF("a", "b", ...)`).
@@ -666,7 +692,7 @@ impl LogicalPlan {
                     child
                 }
             }
-            LogicalPlan::RawDdlStatement(_) => StructType::empty(),
+            LogicalPlan::DdlStatement(_) => StructType::empty(),
             LogicalPlan::ToDataFrame(t) => infer_to_dataframe_schema(t),
             LogicalPlan::SingleRow(_) => StructType::empty(),
             LogicalPlan::DropColumns(d) => {
@@ -823,7 +849,7 @@ impl LogicalPlan {
             | LogicalPlan::LocalDataRelation(_)
             | LogicalPlan::RangeRelation(_)
             | LogicalPlan::InMemoryRelation(_)
-            | LogicalPlan::RawDdlStatement(_)
+            | LogicalPlan::DdlStatement(_)
             | LogicalPlan::SingleRow(_) => 1,
         }
     }

@@ -1271,9 +1271,12 @@ impl<'a> RelationConverter<'a> {
                 Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
             }
             Some(CatType::DropTempView(dtv)) => {
-                let view_name = &dtv.view_name;
-                let sql = format!("DROP VIEW IF EXISTS {view_name}");
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::DdlStatement(thunderduck_core::logical::DdlStatement {
+                    operation: thunderduck_core::logical::DdlOperation::DropView {
+                        view_name: dtv.view_name.clone(),
+                        if_exists: true,
+                    },
+                }))
             }
             Some(CatType::CurrentDatabase(_)) => {
                 let sql = "SELECT current_schema() AS value".to_string();

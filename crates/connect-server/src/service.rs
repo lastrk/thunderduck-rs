@@ -18,6 +18,11 @@ use crate::proto::spark::connect::spark_connect_service_server::SparkConnectServ
 type BoxStream<T> =
     Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
+/// Maximum allowed depth of a logical plan tree. Plans deeper than this are
+/// rejected to prevent stack overflow from deeply nested plans (e.g., from
+/// malicious clients).
+const MAX_PLAN_DEPTH: usize = 256;
+
 pub struct ThunderduckService {
     session_manager: Arc<SessionManager>,
     mode: RuntimeCompatMode,
@@ -60,6 +65,13 @@ impl SparkConnectService for ThunderduckService {
                 let logical_plan =
                     PlanConverter::convert_relation_with_session(&relation, Arc::clone(&session))
                         .map_err(Status::from)?;
+
+                let plan_depth = logical_plan.depth();
+                if plan_depth > MAX_PLAN_DEPTH {
+                    return Err(Status::invalid_argument(format!(
+                        "Plan tree depth {plan_depth} exceeds maximum {MAX_PLAN_DEPTH}"
+                    )));
+                }
 
                 // Special case: ApproxQuantile needs a ListArray response.
                 if let thunderduck_core::logical::LogicalPlan::ApproxQuantile(ref aq) = logical_plan {
@@ -235,6 +247,14 @@ impl SparkConnectService for ThunderduckService {
                 let logical_plan =
                     PlanConverter::convert_relation_with_session(&relation, Arc::clone(&session))
                         .map_err(Status::from)?;
+
+                let plan_depth = logical_plan.depth();
+                if plan_depth > MAX_PLAN_DEPTH {
+                    return Err(Status::invalid_argument(format!(
+                        "Plan tree depth {plan_depth} exceeds maximum {MAX_PLAN_DEPTH}"
+                    )));
+                }
+
                 let mut struct_type = logical_plan.infer_schema();
                 let has_unresolved = struct_type.fields.iter()
                     .any(|f| f.data_type.contains_unresolved());

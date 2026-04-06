@@ -773,6 +773,61 @@ impl LogicalPlan {
         }
     }
 
+    /// Maximum depth of the plan tree.
+    ///
+    /// Used to prevent stack overflow from deeply nested plans
+    /// (e.g., from malicious clients). Leaf nodes have depth 1.
+    pub fn depth(&self) -> usize {
+        match self {
+            // Single-child nodes
+            LogicalPlan::Project(p) => 1 + p.input.depth(),
+            LogicalPlan::Filter(f) => 1 + f.input.depth(),
+            LogicalPlan::Aggregate(a) => 1 + a.input.depth(),
+            LogicalPlan::Sort(s) => 1 + s.input.depth(),
+            LogicalPlan::Limit(l) => 1 + l.input.depth(),
+            LogicalPlan::Tail(t) => 1 + t.input.depth(),
+            LogicalPlan::Distinct(d) => 1 + d.input.depth(),
+            LogicalPlan::WithColumns(w) => 1 + w.input.depth(),
+            LogicalPlan::DropColumns(d) => 1 + d.input.depth(),
+            LogicalPlan::Sample(s) => 1 + s.input.depth(),
+            LogicalPlan::AliasedRelation(a) => 1 + a.input.depth(),
+            LogicalPlan::ToDataFrame(t) => 1 + t.input.depth(),
+            LogicalPlan::ShowString(s) => 1 + s.input.depth(),
+            LogicalPlan::NADrop(n) => 1 + n.input.depth(),
+            LogicalPlan::NAFill(n) => 1 + n.input.depth(),
+            LogicalPlan::NAReplace(n) => 1 + n.input.depth(),
+            LogicalPlan::Unpivot(u) => 1 + u.input.depth(),
+            LogicalPlan::Pivot(p) => 1 + p.input.depth(),
+            LogicalPlan::StatCov(s) => 1 + s.input.depth(),
+            LogicalPlan::StatCorr(s) => 1 + s.input.depth(),
+            LogicalPlan::ApproxQuantile(a) => 1 + a.input.depth(),
+            LogicalPlan::StatCrosstab(s) => 1 + s.input.depth(),
+            LogicalPlan::StatFreqItems(s) => 1 + s.input.depth(),
+            LogicalPlan::StatSampleBy(s) => 1 + s.input.depth(),
+            LogicalPlan::Describe(d) => 1 + d.input.depth(),
+            LogicalPlan::Summary(s) => 1 + s.input.depth(),
+            // Two-child nodes
+            LogicalPlan::Join(j) => 1 + j.left.depth().max(j.right.depth()),
+            LogicalPlan::Union(u) => 1 + u.left.depth().max(u.right.depth()),
+            LogicalPlan::Except(e) => 1 + e.left.depth().max(e.right.depth()),
+            LogicalPlan::Intersect(i) => 1 + i.left.depth().max(i.right.depth()),
+            // CTE: max of input and all CTE definitions
+            LogicalPlan::WithCte(c) => {
+                let cte_depth = c.ctes.iter().map(|(_, p)| p.depth()).max().unwrap_or(0);
+                1 + c.input.depth().max(cte_depth)
+            }
+            // Leaf nodes
+            LogicalPlan::TableScan(_)
+            | LogicalPlan::SqlRelation(_)
+            | LogicalPlan::LocalRelation(_)
+            | LogicalPlan::LocalDataRelation(_)
+            | LogicalPlan::RangeRelation(_)
+            | LogicalPlan::InMemoryRelation(_)
+            | LogicalPlan::RawDdlStatement(_)
+            | LogicalPlan::SingleRow(_) => 1,
+        }
+    }
+
     /// Returns true when `infer_schema()` produces a partial schema
     /// Returns true when `infer_schema()` produces a partial schema
     /// that needs DuckDB merge for missing columns.
@@ -1210,5 +1265,57 @@ mod tests {
         let plan = LogicalPlan::SingleRow(SingleRowRelation);
         let schema = plan.infer_schema();
         assert!(schema.is_empty());
+    }
+
+    #[test]
+    fn depth_leaf_node_is_one() {
+        let leaf = LogicalPlan::TableScan(TableScan {
+            table: "t".into(),
+            alias: None,
+            schema: StructType::empty(),
+        });
+        assert_eq!(leaf.depth(), 1);
+    }
+
+    #[test]
+    fn depth_single_child_chain() {
+        let leaf = LogicalPlan::TableScan(TableScan {
+            table: "t".into(),
+            alias: None,
+            schema: StructType::empty(),
+        });
+        let project = LogicalPlan::project(leaf, vec![]);
+        assert_eq!(project.depth(), 2);
+
+        let filtered = LogicalPlan::filter(
+            project,
+            Literal::boolean(true),
+        );
+        assert_eq!(filtered.depth(), 3);
+    }
+
+    #[test]
+    fn depth_join_takes_max_of_children() {
+        let left = LogicalPlan::project(
+            LogicalPlan::table_scan("a"),
+            vec![],
+        );
+        // left depth = 2
+        let right = LogicalPlan::table_scan("b");
+        // right depth = 1
+
+        let join = LogicalPlan::Join(Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec![],
+            left_alias: None,
+            right_alias: None,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        // join depth = 1 + max(2, 1) = 3
+        assert_eq!(join.depth(), 3);
     }
 }

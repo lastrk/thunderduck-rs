@@ -1455,15 +1455,17 @@ fn propagate_cte_schemas(plan: LogicalPlan) -> LogicalPlan {
             let mut cte_map: std::collections::HashMap<String, StructType> =
                 std::collections::HashMap::new();
 
-            // Process CTEs in order — later CTEs can reference earlier ones
-            for (name, cte_plan) in &mut c.ctes {
-                // Apply already-known CTE schemas to this CTE's body
-                *cte_plan = Box::new(apply_cte_schemas(*cte_plan.clone(), &cte_map));
-                let schema = cte_plan.infer_schema();
+            // Process CTEs in order — later CTEs can reference earlier ones.
+            // Take ownership via std::mem::take to avoid deep-cloning the plan tree.
+            let ctes = std::mem::take(&mut c.ctes);
+            c.ctes = ctes.into_iter().map(|(name, cte_plan)| {
+                let rewritten = Box::new(apply_cte_schemas(*cte_plan, &cte_map));
+                let schema = rewritten.infer_schema();
                 if !schema.is_empty() {
                     cte_map.insert(name.to_lowercase(), schema);
                 }
-            }
+                (name, rewritten)
+            }).collect();
 
             // Apply all CTE schemas to the main body
             c.input = Box::new(apply_cte_schemas(*c.input, &cte_map));

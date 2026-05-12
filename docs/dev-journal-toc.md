@@ -155,6 +155,15 @@ boundaries, `unionByName`, `parse_type_str`, session macros, Arrow IPC zero-row 
 
 ---
 
+## 2026-03-18 — Phase 4: Differential Tests + NA Operations + Unpivot + WriteOperation
+
+[`dev_journal/dev-journal-phase4.md`](dev_journal/dev-journal-phase4.md)
+
+`SchemaInferrer` (DuckDB probe), NA operations (`NADrop`, `NAFill`, `NAReplace`), `Unpivot`
+(DuckDB native), `WriteOperation`, differential test infrastructure (PySpark vs Thunderduck).
+
+---
+
 ## 2026-03-18 — Phase 3: gRPC Server + Protobuf Converter
 
 [`dev_journal/dev-journal-phase3.md`](dev_journal/dev-journal-phase3.md)

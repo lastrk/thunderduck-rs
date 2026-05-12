@@ -1,7 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git clone:*)"
+      "Bash(git clone:*)",
+      "Bash(git remote:*)",
+      "Bash(git push:*)",
+      "Bash(git fetch *)",
+      "Bash(git checkout *)",
+      "Bash(mkdir -p .github)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(gh pr *)"
     ]
   }
 }

@@ -3489,8 +3489,8 @@ mod tests {
         RowConstructorExpression, StarExpression, WindowFunction,
     };
     use crate::logical::{
-        AliasedRelation, Filter, Limit, LogicalPlan, Project, SingleRowRelation, Sort, TableScan,
-        Union,
+        AliasedRelation, Filter, Join, JoinType, Limit, LogicalPlan, Project, SingleRowRelation,
+        Sort, TableScan, Union,
     };
 
     fn gen() -> SqlGenerator {
@@ -3552,6 +3552,102 @@ mod tests {
         let sql = gen().generate(&plan).unwrap();
         assert!(sql.contains("AS \"n1\""), "got: {sql}");
         assert!(!sql.contains("AS subquery"), "got: {sql}");
+    }
+
+    /// Build an inner Join with no plan_id aliases. Matches the shape produced
+    /// by RelationConverter for joins whose ON condition has no plan_id
+    /// qualifiers — exercises gen_join's simple else-branch which calls
+    /// gen_from on each side.
+    fn inner_join(
+        left: LogicalPlan,
+        right: LogicalPlan,
+        condition: Expression,
+    ) -> LogicalPlan {
+        LogicalPlan::Join(Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            condition: Some(condition),
+            using_columns: Vec::new(),
+            left_alias: None,
+            right_alias: None,
+            left_plan_ids: Vec::new(),
+            right_plan_ids: Vec::new(),
+        })
+    }
+
+    fn eq(left: Expression, right: Expression) -> Expression {
+        Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    /// Regression for nubank/thunderduck#39: when joins are chained
+    /// (`supplier.join(n1).join(lineitem)`), the inner Join must NOT be wrapped
+    /// in a subquery — otherwise the user-facing alias `"n1"` gets buried and
+    /// outer references to it fail with "Referenced table 'n1' not found".
+    /// The Java reference patched `visitJoin` to emit the left-side Join
+    /// inline; in the Rust port, `gen_from(Join)` already recurses into
+    /// `gen_join`, producing a flat chain by construction. This test pins
+    /// that behavior.
+    #[test]
+    fn chained_join_preserves_inner_aliased_relation() {
+        // supplier ⋈ (nation AS n1) ON s_nationkey = n1.n_nationkey,
+        // then ⋈ lineitem ON s_suppkey = l_suppkey.
+        let n1 = LogicalPlan::AliasedRelation(AliasedRelation {
+            input: Box::new(table("nation")),
+            alias: "n1".to_string(),
+            column_aliases: Vec::new(),
+        });
+        let inner = inner_join(
+            table("supplier"),
+            n1,
+            eq(col("s_nationkey"), ColumnReference::qualified("n1", "n_nationkey")),
+        );
+        let plan = inner_join(inner, table("lineitem"), eq(col("s_suppkey"), col("l_suppkey")));
+        let sql = gen().generate(&plan).unwrap();
+        assert!(sql.contains("\"n1\""), "alias buried, got: {sql}");
+        assert!(
+            !sql.contains(") AS subquery"),
+            "inner join wrapped in subquery, got: {sql}"
+        );
+    }
+
+    /// Same regression class, longer chain: both `n1` and `n2` (separate
+    /// AliasedRelations of `nation` at different depths) must remain visible.
+    /// Mirrors upstream's TPC-H Q7 / Q8 self-join pattern.
+    #[test]
+    fn chained_join_preserves_both_aliased_relations_at_chain_endpoints() {
+        let n1 = LogicalPlan::AliasedRelation(AliasedRelation {
+            input: Box::new(table("nation")),
+            alias: "n1".to_string(),
+            column_aliases: Vec::new(),
+        });
+        let n2 = LogicalPlan::AliasedRelation(AliasedRelation {
+            input: Box::new(table("nation")),
+            alias: "n2".to_string(),
+            column_aliases: Vec::new(),
+        });
+        let j1 = inner_join(
+            table("supplier"),
+            n1,
+            eq(col("s_nationkey"), ColumnReference::qualified("n1", "n_nationkey")),
+        );
+        let j2 = inner_join(j1, table("customer"), eq(col("o_custkey"), col("c_custkey")));
+        let j3 = inner_join(
+            j2,
+            n2,
+            eq(col("c_nationkey"), ColumnReference::qualified("n2", "n_nationkey")),
+        );
+        let sql = gen().generate(&j3).unwrap();
+        assert!(sql.contains("\"n1\""), "n1 buried, got: {sql}");
+        assert!(sql.contains("\"n2\""), "n2 buried, got: {sql}");
+        assert!(
+            !sql.contains(") AS subquery"),
+            "join chain wrapped in subquery, got: {sql}"
+        );
     }
 
     #[test]

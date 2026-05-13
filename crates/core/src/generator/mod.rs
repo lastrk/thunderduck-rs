@@ -3484,12 +3484,13 @@ fn extract_top_level_args(bytes: &[u8], start: usize) -> (Vec<String>, usize) {
 mod tests {
     use super::*;
     use crate::expression::{
-        AliasExpression, BinaryExpression, ColumnReference, ExtractValueExpression,
-        FunctionCall, IntervalExpression, IsDistinctFromExpression, LikeExpression, Literal,
-        RowConstructorExpression, WindowFunction,
+        AliasExpression, BinaryExpression, ColumnReference, ExtractValueExpression, FunctionCall,
+        IntervalExpression, IsDistinctFromExpression, LikeExpression, Literal,
+        RowConstructorExpression, StarExpression, WindowFunction,
     };
     use crate::logical::{
-        Filter, Limit, LogicalPlan, Project, SingleRowRelation, Sort, TableScan, Union,
+        AliasedRelation, Filter, Limit, LogicalPlan, Project, SingleRowRelation, Sort, TableScan,
+        Union,
     };
 
     fn gen() -> SqlGenerator {
@@ -3528,6 +3529,29 @@ mod tests {
         });
         let sql = gen().generate(&plan).unwrap();
         assert!(sql.contains("\"a\" AS \"x\""), "got: {sql}");
+    }
+
+    /// Regression for nubank/thunderduck#30: when a Project wraps an
+    /// AliasedRelation (e.g. `df.alias("n1").select("*")`), the FROM-fragment
+    /// must use the user-provided alias, not a generic `subquery` name.
+    /// Without this, self-join queries like TPC-H Q7/Q8 fail with
+    /// "Referenced table 'n1' not found". The Java reference had to add an
+    /// explicit AliasedRelation check in Project.toSQL; in the Rust port,
+    /// `gen_from(AliasedRelation)` already emits the alias, so the bug never
+    /// reproduces. This test pins that behavior.
+    #[test]
+    fn project_over_aliased_relation_preserves_alias() {
+        let plan = LogicalPlan::Project(Project {
+            input: Box::new(LogicalPlan::AliasedRelation(AliasedRelation {
+                input: Box::new(table("nation")),
+                alias: "n1".to_string(),
+                column_aliases: Vec::new(),
+            })),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+        let sql = gen().generate(&plan).unwrap();
+        assert!(sql.contains("AS \"n1\""), "got: {sql}");
+        assert!(!sql.contains("AS subquery"), "got: {sql}");
     }
 
     #[test]

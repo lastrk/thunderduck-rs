@@ -1,6 +1,6 @@
 # Bug Report: spark_sum crashes DuckDB optimizer in UNION ALL CTEs
 
-**Target repo**: `lastrk/thunderduck-duckdb-extension`
+**Target repo**: `nubank/thunderduck-duckdb-extension`
 **Title**: `spark_sum crashes DuckDB optimizer in UNION ALL CTEs`
 
 ---

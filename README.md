@@ -181,7 +181,7 @@ cargo build --release --features bundled-extension
 ```
 
 The extension binary for the current platform is automatically downloaded from the
-[`ext4` release](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/ext4)
+[`ext4` release](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext4)
 (which bundles binaries for multiple DuckDB versions — we pull the `v1.5.1` set to match the
 `duckdb` crate at `1.10501.0`) and cached under `extensions/` on first build. Subsequent builds
 reuse the cached file — no re-download. The extension is then embedded directly in the binary

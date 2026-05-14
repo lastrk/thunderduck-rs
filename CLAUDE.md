@@ -177,7 +177,7 @@ cargo build --release
 cargo build --release --features bundled-extension
 ```
 
-The `thdck_spark_funcs` DuckDB extension (release [`ext4`](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/ext4), multi-version — currently pulls the `v1.5.1` binaries) implements Spark-precise numerical semantics:
+The `thdck_spark_funcs` DuckDB extension (release [`ext4`](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext4), multi-version — currently pulls the `v1.5.1` binaries) implements Spark-precise numerical semantics:
 - `spark_hash(c1, ..., cN)` — Spark `hash()` (Murmur3-32, signed INT, seed 42)
 - `spark_xxhash64(c1, ..., cN)` — Spark `xxhash64()` (xxHash64, signed BIGINT, seed 42)
 - `spark_decimal_div(a, b)` — decimal division with `ROUND_HALF_UP`

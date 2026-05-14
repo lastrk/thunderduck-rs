@@ -13,7 +13,7 @@ fn download_extension() {
     const RELEASE_TAG: &str = "ext4";
     const EXT_DUCKDB_VERSION: &str = "v1.5.1";
     const BASE_URL: &str =
-        "https://github.com/lastrk/thunderduck-duckdb-extension/releases/download";
+        "https://github.com/nubank/thunderduck-duckdb-extension/releases/download";
 
     let target = std::env::var("TARGET").expect("TARGET not set by Cargo");
     let platform = detect_platform(&target);

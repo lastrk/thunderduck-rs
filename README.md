@@ -181,9 +181,11 @@ cargo build --release --features bundled-extension
 ```
 
 The extension binary for the current platform is automatically downloaded from the
-[`duckdb1.5.1-ext3` release](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/duckdb1.5.1-ext3)
-and cached under `extensions/` on first build. Subsequent builds reuse the cached file — no
-re-download. The extension is then embedded directly in the binary via `include_bytes!()`.
+[`ext4` release](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/ext4)
+(which bundles binaries for multiple DuckDB versions — we pull the `v1.5.1` set to match the
+`duckdb` crate at `1.10501.0`) and cached under `extensions/` on first build. Subsequent builds
+reuse the cached file — no re-download. The extension is then embedded directly in the binary
+via `include_bytes!()`.
 
 ### Start the Server
 
@@ -214,6 +216,8 @@ Thunderduck supports two compatibility modes:
 | **Strict** | Embedded at build time | 100% — exact Spark type parity | Near-maximum |
 
 The `thdck_spark_funcs` DuckDB extension implements Spark-precise numerical semantics:
+- `spark_hash(c1, ..., cN)` — Spark `hash()` (Murmur3-32, signed INT, seed 42)
+- `spark_xxhash64(c1, ..., cN)` — Spark `xxhash64()` (xxHash64, signed BIGINT, seed 42)
 - `spark_decimal_div(a, b)` — decimal division with `ROUND_HALF_UP`
 - `spark_sum(col)` — Spark-compatible SUM return types
 - `spark_avg(col)` — Spark-compatible AVG return types

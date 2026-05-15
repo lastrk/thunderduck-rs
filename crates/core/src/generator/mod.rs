@@ -1880,21 +1880,13 @@ impl SqlGenerator {
         if self.mode == CompatMode::Strict {
             if let Expression::FunctionCall(f) = &*w.func {
                 let lower = f.name.to_lowercase();
-                if matches!(lower.as_str(), "avg" | "mean") {
-                    if let Some(arg) = f.args.first() {
-                        let arg_type = arg.data_type(&self.schema);
-                        if let DataType::Decimal { precision, scale } = arg_type {
-                            let new_p = ((precision as u16) + 4).min(38) as u8;
-                            let new_s = (scale + 4).min(18).min(new_p);
+                if let Some(arg) = f.args.first() {
+                    let arg_type = arg.data_type(&self.schema);
+                    if let DataType::Decimal { precision, scale } = arg_type {
+                        if let Some((new_p, new_s)) =
+                            spark_decimal_agg_type(&lower, precision, scale)
+                        {
                             result = format!("CAST({result} AS DECIMAL({new_p},{new_s}))");
-                        }
-                    }
-                } else if matches!(lower.as_str(), "sum" | "sum_distinct") {
-                    if let Some(arg) = f.args.first() {
-                        let arg_type = arg.data_type(&self.schema);
-                        if let DataType::Decimal { precision, scale } = arg_type {
-                            let new_p = ((precision as u16) + 10).min(38) as u8;
-                            result = format!("CAST({result} AS DECIMAL({new_p},{scale}))");
                         }
                     }
                 }
@@ -2538,6 +2530,7 @@ fn join_chain_contains_semi_or_anti(plan: &LogicalPlan) -> bool {
 /// - `SUM(integer)` → `CAST(SUM(...) AS BIGINT)` (DuckDB returns HUGEINT)
 /// - `SUM(decimal{p,s})` → `CAST(SUM(...) AS DECIMAL(min(p+10,38), s))`
 /// - `AVG(integer)` → `CAST(AVG(...) AS DOUBLE)` (Spark promotes integer AVG to DOUBLE)
+
 /// Returns true if the expression contains a `Cast` to a `Decimal` type anywhere in the tree.
 /// Used by `gen_projection_list` to detect when DuckDB would normalise `DECIMAL(p,s)` to
 /// `DECIMAL(p, s)` in auto-generated column names.
@@ -2562,7 +2555,32 @@ fn expr_contains_decimal_cast(expr: &Expression) -> bool {
     }
 }
 
-/// - `AVG(decimal{p,s})` → `CAST(AVG(...) AS DECIMAL(min(p+4,38), s+4))`
+/// Compute Spark-compatible result precision/scale for a decimal aggregate.
+///
+/// Returns `Some((precision, scale))` for SUM/AVG aggregates on decimal inputs,
+/// or `None` for non-decimal-aggregate combinations.
+fn spark_decimal_agg_type(agg_name: &str, precision: u8, scale: u8) -> Option<(u8, u8)> {
+    match agg_name {
+        "sum" | "sum_distinct" => {
+            let p = ((precision as u16) + 10).min(38) as u8;
+            Some((p, scale))
+        }
+        "avg" | "mean" => {
+            let new_p = ((precision as u16) + 4).min(38) as u8;
+            let new_s = (scale + 4).min(18).min(new_p);
+            Some((new_p, new_s))
+        }
+        _ => None,
+    }
+}
+
+/// Applies Spark-compatible type casts to aggregate expressions in projection lists.
+///
+/// - `SUM(integer)` → `CAST(SUM(...) AS BIGINT)` (DuckDB returns HUGEINT)
+/// - `SUM(decimal{p,s})` → `CAST(spark_sum(...) AS DECIMAL(min(p+10,38), s))` (strict only)
+/// - `AVG(integer)` → `CAST(AVG(...) AS DOUBLE)` (Spark promotes integer AVG to DOUBLE)
+/// - `AVG(decimal{p,s})` → `CAST(spark_avg(...) AS DECIMAL(min(p+4,38), min(s+4,18)))` (strict only)
+///
 /// Passes through aliases transparently so the alias is preserved on the outer Cast.
 fn apply_agg_type_casts(
     expr: &Expression,
@@ -2607,12 +2625,13 @@ fn apply_agg_type_casts(
                             args: f.args.clone(),
                             distinct: false,
                         });
-                        let new_p = ((precision as u16) + 10).min(38) as u8;
+                        let (new_p, new_s) = spark_decimal_agg_type("sum", precision, scale)
+                            .expect("sum always returns Some for spark_decimal_agg_type");
                         return Expression::Cast(CastExpression {
                             expr: Box::new(spark_sum_call),
                             to_type: DataType::Decimal {
                                 precision: new_p,
-                                scale,
+                                scale: new_s,
                             },
                             try_cast: false,
                         });
@@ -2645,8 +2664,8 @@ fn apply_agg_type_casts(
                             args: f.args.clone(),
                             distinct: false,
                         });
-                        let new_p = ((precision as u16) + 4).min(38) as u8;
-                        let new_s = (scale + 4).min(18).min(new_p);
+                        let (new_p, new_s) = spark_decimal_agg_type("avg", precision, scale)
+                            .expect("avg always returns Some for spark_decimal_agg_type");
                         return Expression::Cast(CastExpression {
                             expr: Box::new(spark_avg_call),
                             to_type: DataType::Decimal {
@@ -4853,5 +4872,60 @@ mod tests {
             sql.contains("GROUP BY"),
             "expected GROUP BY in output: {sql}"
         );
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_sum_basic() {
+        // SUM on DECIMAL(10,2) → DECIMAL(20,2)
+        let result = spark_decimal_agg_type("sum", 10, 2);
+        assert_eq!(result, Some((20, 2)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_sum_clamped_to_38() {
+        // SUM on DECIMAL(35,5) → DECIMAL(38,5) (clamped)
+        let result = spark_decimal_agg_type("sum", 35, 5);
+        assert_eq!(result, Some((38, 5)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_sum_distinct() {
+        let result = spark_decimal_agg_type("sum_distinct", 12, 3);
+        assert_eq!(result, Some((22, 3)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_avg_basic() {
+        // AVG on DECIMAL(10,2) → DECIMAL(14,6)
+        let result = spark_decimal_agg_type("avg", 10, 2);
+        assert_eq!(result, Some((14, 6)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_avg_scale_capped_at_18() {
+        // AVG on DECIMAL(20,16) → scale = min(20, 18, 24) = 18
+        let result = spark_decimal_agg_type("avg", 20, 16);
+        assert_eq!(result, Some((24, 18)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_avg_scale_capped_by_precision() {
+        // AVG on DECIMAL(3,2) → new_p=7, new_s=min(6, 18, 7)=6
+        let result = spark_decimal_agg_type("avg", 3, 2);
+        assert_eq!(result, Some((7, 6)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_mean_same_as_avg() {
+        let avg = spark_decimal_agg_type("avg", 10, 2);
+        let mean = spark_decimal_agg_type("mean", 10, 2);
+        assert_eq!(avg, mean);
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_unknown_returns_none() {
+        assert_eq!(spark_decimal_agg_type("count", 10, 2), None);
+        assert_eq!(spark_decimal_agg_type("max", 10, 2), None);
+        assert_eq!(spark_decimal_agg_type("min", 10, 2), None);
     }
 }

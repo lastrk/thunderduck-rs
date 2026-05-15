@@ -95,11 +95,16 @@ fn grouping_expr_name(expr: &Expression) -> Option<&str> {
 }
 
 /// Describes a position in an Aggregate's SELECT list — either a grouping
-/// column or an aggregate expression (by index into the aggregates vec).
+/// column or an aggregate expression carried inline.
+///
+/// `AggregateExpr` carries the value directly rather than indexing into a
+/// separate vec. The previous index-based design silently dropped entries
+/// when the index was out of range, which is the kind of "default arm
+/// silently drops unknowns" anti-pattern called out in CLAUDE.md.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectEntry {
     GroupingExpr(Expression),
-    AggregateExpr(usize),
+    AggregateExpr(AggregateExpr),
     /// SQL path marker: GROUP BY key intentionally not in SELECT list.
     /// Suppresses the auto-prepend of grouping columns in gen_aggregate but renders nothing.
     GroupingNotSelected,
@@ -1078,11 +1083,9 @@ fn infer_aggregate_schema(a: &Aggregate) -> StructType {
                         fields.push(f);
                     }
                 }
-                SelectEntry::AggregateExpr(idx) => {
-                    if let Some(agg) = a.aggregates.get(*idx) {
-                        if let Some(f) = agg_expr_to_field(&agg.func, &child_schema) {
-                            fields.push(f);
-                        }
+                SelectEntry::AggregateExpr(agg) => {
+                    if let Some(f) = agg_expr_to_field(&agg.func, &child_schema) {
+                        fields.push(f);
                     }
                 }
                 SelectEntry::GroupingNotSelected => {}

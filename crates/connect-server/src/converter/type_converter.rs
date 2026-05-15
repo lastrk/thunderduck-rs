@@ -87,6 +87,9 @@ pub fn data_type_to_proto(dt: &DataType) -> proto::DataType {
         DataType::DayTimeInterval => {
             Kind::DayTimeInterval(proto::data_type::DayTimeInterval::default())
         }
+        DataType::Interval => {
+            Kind::CalendarInterval(proto::data_type::CalendarInterval::default())
+        }
         DataType::Decimal { precision, scale } => {
             Kind::Decimal(proto::data_type::Decimal {
                 precision: Some(*precision as i32),
@@ -167,6 +170,7 @@ pub fn parse_type_str(s: &str) -> DataType {
         "timestamp_ntz" => DataType::TimestampNtz,
         "interval year to month" | "yearmonthinterval" => DataType::YearMonthInterval,
         "interval day to second" | "daytimeinterval" => DataType::DayTimeInterval,
+        "interval" => DataType::Interval,
         "null" | "void" => DataType::Null,
         _ => DataType::Unresolved,
     }

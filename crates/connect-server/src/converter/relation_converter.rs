@@ -196,9 +196,9 @@ impl<'a> RelationConverter<'a> {
             if let Some(grp_idx) = grouping.iter().position(|g| g == &expr) {
                 select_order.push(SelectEntry::GroupingExpr(grouping[grp_idx].clone()));
             } else {
-                let agg_idx = aggregates.len();
-                aggregates.push(AggregateExpr::new(expr));
-                select_order.push(SelectEntry::AggregateExpr(agg_idx));
+                let agg = AggregateExpr::new(expr);
+                aggregates.push(agg.clone());
+                select_order.push(SelectEntry::AggregateExpr(agg));
             }
         }
 
@@ -604,6 +604,22 @@ impl<'a> RelationConverter<'a> {
                 }
                 if let Some(ref mut having) = a.having {
                     self.enrich_subqueries_in_expr(having);
+                }
+                // `select_order` carries independent `AggregateExpr` values when
+                // populated (e.g. from RelationConverter's per-projection walk).
+                // Enrich them too — otherwise subqueries nested inside the
+                // SELECT-list aggregates would skip enrichment.
+                for entry in &mut a.select_order {
+                    match entry {
+                        SelectEntry::GroupingExpr(e) => self.enrich_subqueries_in_expr(e),
+                        SelectEntry::AggregateExpr(agg) => {
+                            self.enrich_subqueries_in_expr(&mut agg.func);
+                            if let Some(ref mut filter) = agg.filter {
+                                self.enrich_subqueries_in_expr(filter);
+                            }
+                        }
+                        SelectEntry::GroupingNotSelected => {}
+                    }
                 }
                 LogicalPlan::Aggregate(a)
             }

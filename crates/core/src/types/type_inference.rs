@@ -248,6 +248,7 @@ impl TypeInferenceEngine {
             (Boolean, y) if y.is_numeric() => y.clone(),
             (x, Boolean) if x.is_numeric() => x.clone(),
             (Date, Timestamp) | (Timestamp, Date) => Timestamp,
+            (x, y) if x.is_interval() && y.is_interval() => Interval,
             _ => String,
         }
     }

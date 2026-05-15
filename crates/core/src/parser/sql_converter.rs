@@ -587,9 +587,8 @@ impl SqlConverter {
 
                     if self.is_aggregate_top_level(expr) {
                         let (agg_expr, _agg_alias) = self.extract_aggregate(expr, alias)?;
-                        let idx = aggregates.len();
-                        aggregates.push(agg_expr);
-                        select_order.push(SelectEntry::AggregateExpr(idx));
+                        aggregates.push(agg_expr.clone());
+                        select_order.push(SelectEntry::AggregateExpr(agg_expr));
                     } else if self.expr_has_aggregate(expr) {
                         // Aggregate embedded in expression (e.g., sum(a) * 1.2)
                         let converted = self.convert_expr(expr.clone())?;
@@ -871,7 +870,11 @@ impl SqlConverter {
                     .unwrap_or_default();
                 Ok(Expression::RawSql(RawSqlExpression {
                     sql: format!("INTERVAL {}{}", interval.value, unit),
-                    data_type: None,
+                    // Tag the data type so downstream type-driven decisions
+                    // (e.g. the `DATE + INTERVAL → CAST AS DATE` gate in
+                    // gen_binary) can recognise the value without inspecting
+                    // the rendered SQL string.
+                    data_type: Some(DataType::Interval),
                     nullable: Some(false), // interval literals are never null
                 }))
             }

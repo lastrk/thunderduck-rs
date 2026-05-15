@@ -788,7 +788,7 @@ impl Expression {
             }
             Expression::Between(_) => DataType::Boolean,
             Expression::Like(_) | Expression::IsDistinctFrom(_) => DataType::Boolean,
-            Expression::Interval(_) => DataType::String, // TODO: proper IntervalType
+            Expression::Interval(_) => DataType::Interval,
             Expression::ExtractValue(ev) => {
                 let base_type = ev.child.data_type(schema);
                 let field_name = match ev.extraction.as_ref() {
@@ -1025,13 +1025,13 @@ mod tests {
     }
 
     #[test]
-    fn interval_data_type_is_string() {
+    fn interval_data_type_is_interval() {
         let expr = Expression::Interval(IntervalExpression {
             months: 1,
             days: 0,
             microseconds: 0,
         });
-        assert_eq!(expr.data_type(&StructType::empty()), DataType::String);
+        assert_eq!(expr.data_type(&StructType::empty()), DataType::Interval);
     }
 
     #[test]

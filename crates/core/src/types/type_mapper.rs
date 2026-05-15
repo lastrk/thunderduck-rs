@@ -24,6 +24,7 @@ impl TypeMapper {
             DataType::TimestampNtz => Cow::Borrowed("TIMESTAMP"),
             DataType::YearMonthInterval => Cow::Borrowed("INTERVAL"),
             DataType::DayTimeInterval => Cow::Borrowed("INTERVAL"),
+            DataType::Interval => Cow::Borrowed("INTERVAL"),
             DataType::Null => Cow::Borrowed("NULL"),
             DataType::Unresolved => Cow::Borrowed("VARCHAR"),
             DataType::Array(elem, _) => Cow::Owned(format!("{}[]", Self::to_duckdb(elem))),

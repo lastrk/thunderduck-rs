@@ -20,6 +20,11 @@ pub enum DataType {
     TimestampNtz,
     YearMonthInterval,
     DayTimeInterval,
+    /// Generic interval — used when the sub-kind (year-month vs day-time) is
+    /// not statically known. Produced by `Expression::Interval` (which can
+    /// carry any combination of months/days/microseconds) and by `INTERVAL`
+    /// literals parsed from raw Spark SQL.
+    Interval,
     Null,
     /// Type could not be statically resolved; treated as VARCHAR at generation time.
     Unresolved,
@@ -61,6 +66,14 @@ impl DataType {
     /// Returns true if this is a floating-point type (Float or Double).
     pub fn is_floating_point(&self) -> bool {
         matches!(self, DataType::Float | DataType::Double)
+    }
+
+    /// Returns true if this is any interval type (generic, year-month, or day-time).
+    pub fn is_interval(&self) -> bool {
+        matches!(
+            self,
+            DataType::Interval | DataType::YearMonthInterval | DataType::DayTimeInterval
+        )
     }
 
     /// Returns true if this is Decimal.
@@ -113,6 +126,7 @@ impl std::fmt::Display for DataType {
             DataType::TimestampNtz => write!(f, "timestamp_ntz"),
             DataType::YearMonthInterval => write!(f, "year_month_interval"),
             DataType::DayTimeInterval => write!(f, "day_time_interval"),
+            DataType::Interval => write!(f, "interval"),
             DataType::Null => write!(f, "null"),
             DataType::Unresolved => write!(f, "unresolved"),
             DataType::Array(elem, _) => write!(f, "array<{elem}>"),

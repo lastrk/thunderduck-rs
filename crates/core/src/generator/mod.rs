@@ -236,10 +236,8 @@ impl SqlGenerator {
             for entry in &a.select_order {
                 match entry {
                     SelectEntry::GroupingExpr(g) => parts.push(typed_gen.gen_expr(g)?),
-                    SelectEntry::AggregateExpr(idx) => {
-                        if let Some(agg) = a.aggregates.get(*idx) {
-                            parts.push(typed_gen.render_agg_expr(agg, &input_schema)?);
-                        }
+                    SelectEntry::AggregateExpr(agg) => {
+                        parts.push(typed_gen.render_agg_expr(agg, &input_schema)?);
                     }
                     SelectEntry::GroupingNotSelected => {
                         // Sentinel: GROUP BY key not in SQL SELECT — suppress auto-prepend, render nothing.
@@ -1478,8 +1476,7 @@ impl SqlGenerator {
         // DATE + INTERVAL → DuckDB promotes to TIMESTAMP; cast back to DATE to match Spark semantics
         if matches!(b.op, BinaryOp::Add | BinaryOp::Sub)
             && b.left.data_type(&self.schema) == DataType::Date
-            && (matches!(&*b.right, Expression::Interval(_))
-                || right.trim_start().to_ascii_uppercase().starts_with("INTERVAL"))
+            && b.right.data_type(&self.schema).is_interval()
         {
             return Ok(format!("CAST({sql} AS DATE)"));
         }
@@ -3700,7 +3697,7 @@ mod tests {
     };
     use crate::logical::{
         Aggregate, AggregateExpr, AliasedRelation, Filter, Join, JoinType, Limit, LogicalPlan,
-        Project, SingleRowRelation, Sort, TableScan, Union, WithColumns,
+        Project, SelectEntry, SingleRowRelation, Sort, TableScan, Union, WithColumns,
     };
 
     fn gen() -> SqlGenerator {
@@ -4506,6 +4503,83 @@ mod tests {
             sql.contains("CAST(") && sql.contains("DECIMAL(22,2)"),
             "strict-mode window SUM of decimal should produce CAST wrapper, got: {sql}"
         );
+    }
+
+    /// `Date + Expression::Interval` must be wrapped in `CAST(... AS DATE)` so
+    /// the result matches Spark's DATE type rather than DuckDB's promoted
+    /// TIMESTAMP. The gate is driven by the typed `data_type()` of the right
+    /// operand — no SQL-string sniffing.
+    #[test]
+    fn date_plus_interval_casts_back_to_date() {
+        use crate::types::{StructField, StructType};
+        let schema = StructType::new(vec![StructField::not_null("d", DataType::Date)]);
+        let expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(col("d")),
+            right: Box::new(Expression::Interval(IntervalExpression {
+                months: 0,
+                days: 7,
+                microseconds: 0,
+            })),
+        });
+        let sql = SqlGenerator::relaxed().with_schema(schema).gen_expr(&expr).unwrap();
+        assert!(sql.starts_with("CAST("), "expected CAST wrap, got: {sql}");
+        assert!(sql.ends_with(" AS DATE)"), "expected AS DATE suffix, got: {sql}");
+    }
+
+    /// A `RawSql` interval (produced by the SparkSQL parser for `INTERVAL N DAY`
+    /// literals) carries `data_type: Some(DataType::Interval)`. The gate must
+    /// recognise it through the typed path — not by string-sniffing the
+    /// already-generated SQL.
+    #[test]
+    fn date_plus_raw_sql_interval_casts_back_to_date() {
+        use crate::expression::RawSqlExpression;
+        use crate::types::{StructField, StructType};
+        let schema = StructType::new(vec![StructField::not_null("d", DataType::Date)]);
+        let raw_interval = Expression::RawSql(RawSqlExpression {
+            sql: "INTERVAL 3 DAY".to_string(),
+            data_type: Some(DataType::Interval),
+            nullable: Some(false),
+        });
+        let expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Sub,
+            left: Box::new(col("d")),
+            right: Box::new(raw_interval),
+        });
+        let sql = SqlGenerator::relaxed().with_schema(schema).gen_expr(&expr).unwrap();
+        assert!(sql.starts_with("CAST("), "expected CAST wrap, got: {sql}");
+        assert!(sql.ends_with(" AS DATE)"), "expected AS DATE suffix, got: {sql}");
+    }
+
+    /// `SelectEntry::AggregateExpr` carries its `AggregateExpr` value
+    /// directly. The previous `(usize)` indirection silently dropped the
+    /// entry when the index was out of range; with the value carried inline,
+    /// every entry renders.
+    #[test]
+    fn select_entry_aggregate_expr_renders_inline_value() {
+        let count_call = Expression::FunctionCall(FunctionCall {
+            name: "count".to_owned(),
+            args: vec![col("id")],
+            distinct: false,
+        });
+        let agg = AggregateExpr::new(count_call);
+        // Note: `aggregates` is intentionally LEFT EMPTY here. With the old
+        // index-based design, this would silently produce no aggregate column.
+        // With the value carried inline in `select_order`, the COUNT renders.
+        let plan = LogicalPlan::Aggregate(Aggregate {
+            input: Box::new(table("t")),
+            grouping: vec![col("dept")],
+            aggregates: vec![],
+            having: None,
+            grouping_sets: None,
+            select_order: vec![
+                SelectEntry::GroupingExpr(col("dept")),
+                SelectEntry::AggregateExpr(agg),
+            ],
+        });
+        let sql = gen().generate(&plan).unwrap();
+        assert!(sql.contains("count("), "expected count(...) in output: {sql}");
+        assert!(sql.contains("GROUP BY"), "expected GROUP BY in output: {sql}");
     }
 
 }

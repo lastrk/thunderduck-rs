@@ -23,7 +23,10 @@ pub mod proto {
 }
 
 #[derive(Parser)]
-#[command(name = "thunderduck-connect-server", about = "Thunderduck Spark Connect Server")]
+#[command(
+    name = "thunderduck-connect-server",
+    about = "Thunderduck Spark Connect Server"
+)]
 struct Args {
     /// Bind address (host:port)
     #[arg(long, default_value = "0.0.0.0:15002")]
@@ -67,7 +70,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RuntimeCompatMode::from_env()
     };
 
-    tracing::info!("Starting Thunderduck Connect Server on {} (mode: {:?})", bind, mode);
+    tracing::info!(
+        "Starting Thunderduck Connect Server on {} (mode: {:?})",
+        bind,
+        mode
+    );
 
     let mgr = Arc::new(SessionManager::new(mode, StreamingConfig::default()));
     let svc = ThunderduckService::new(mgr, mode);

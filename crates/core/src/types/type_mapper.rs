@@ -16,7 +16,9 @@ impl TypeMapper {
             DataType::Long => Cow::Borrowed("BIGINT"),
             DataType::Float => Cow::Borrowed("FLOAT"),
             DataType::Double => Cow::Borrowed("DOUBLE"),
-            DataType::Decimal { precision, scale } => Cow::Owned(format!("DECIMAL({precision},{scale})")),
+            DataType::Decimal { precision, scale } => {
+                Cow::Owned(format!("DECIMAL({precision},{scale})"))
+            }
             DataType::String => Cow::Borrowed("VARCHAR"),
             DataType::Binary => Cow::Borrowed("BLOB"),
             DataType::Date => Cow::Borrowed("DATE"),
@@ -28,9 +30,11 @@ impl TypeMapper {
             DataType::Null => Cow::Borrowed("NULL"),
             DataType::Unresolved => Cow::Borrowed("VARCHAR"),
             DataType::Array(elem, _) => Cow::Owned(format!("{}[]", Self::to_duckdb(elem))),
-            DataType::Map { key, value, .. } => {
-                Cow::Owned(format!("MAP({}, {})", Self::to_duckdb(key), Self::to_duckdb(value)))
-            }
+            DataType::Map { key, value, .. } => Cow::Owned(format!(
+                "MAP({}, {})",
+                Self::to_duckdb(key),
+                Self::to_duckdb(value)
+            )),
             DataType::Struct(_) => Cow::Borrowed("STRUCT"),
         }
     }
@@ -43,7 +47,10 @@ impl TypeMapper {
         // Decimal: DECIMAL(p,s) or NUMERIC(p,s)
         if upper.starts_with("DECIMAL(") || upper.starts_with("NUMERIC(") {
             if let Some((p, sc)) = Self::parse_decimal_params(&upper) {
-                return DataType::Decimal { precision: p, scale: sc };
+                return DataType::Decimal {
+                    precision: p,
+                    scale: sc,
+                };
             }
         }
 
@@ -77,7 +84,10 @@ impl TypeMapper {
             "HUGEINT" | "INT16" => DataType::Long, // lossy but correct mapping
             "FLOAT" | "FLOAT4" | "REAL" => DataType::Float,
             "DOUBLE" | "FLOAT8" | "DOUBLE PRECISION" => DataType::Double,
-            "DECIMAL" | "NUMERIC" => DataType::Decimal { precision: 38, scale: 18 },
+            "DECIMAL" | "NUMERIC" => DataType::Decimal {
+                precision: 38,
+                scale: 18,
+            },
             "VARCHAR" | "TEXT" | "STRING" | "CHAR" | "CHARACTER VARYING" => DataType::String,
             "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => DataType::Binary,
             "DATE" => DataType::Date,
@@ -156,8 +166,20 @@ mod tests {
 
     #[test]
     fn decimal() {
-        assert_eq!(TypeMapper::to_duckdb(&DataType::Decimal { precision: 18, scale: 4 }), "DECIMAL(18,4)");
-        assert_eq!(TypeMapper::from_duckdb("DECIMAL(18,4)"), DataType::Decimal { precision: 18, scale: 4 });
+        assert_eq!(
+            TypeMapper::to_duckdb(&DataType::Decimal {
+                precision: 18,
+                scale: 4
+            }),
+            "DECIMAL(18,4)"
+        );
+        assert_eq!(
+            TypeMapper::from_duckdb("DECIMAL(18,4)"),
+            DataType::Decimal {
+                precision: 18,
+                scale: 4
+            }
+        );
     }
 
     #[test]

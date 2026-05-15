@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use thunderduck_core::runtime::{DuckDbSession, SessionManager, StreamingConfig};
 use thunderduck_core::runtime::compat_mode::RuntimeCompatMode;
+use thunderduck_core::runtime::{DuckDbSession, SessionManager, StreamingConfig};
 
 // ── session_round_trip ─────────────────────────────────────────────────────────
 
@@ -9,16 +9,16 @@ use thunderduck_core::runtime::compat_mode::RuntimeCompatMode;
 #[tokio::test]
 #[ignore]
 async fn session_round_trip() {
-    let session =
-        DuckDbSession::spawn("test-1", RuntimeCompatMode::Relaxed, &StreamingConfig::default())
-            .expect("spawn failed");
+    let session = DuckDbSession::spawn(
+        "test-1",
+        RuntimeCompatMode::Relaxed,
+        &StreamingConfig::default(),
+    )
+    .expect("spawn failed");
 
     // 1. Create a simple view via range().
     session
-        .create_temp_view(
-            "nums",
-            "SELECT \"range\" AS n FROM range(1, 6, 1)",
-        )
+        .create_temp_view("nums", "SELECT \"range\" AS n FROM range(1, 6, 1)")
         .await
         .expect("create_temp_view failed");
 
@@ -68,7 +68,9 @@ async fn session_manager_isolation() {
         .expect("get_or_create session-b failed");
 
     // Create a table in session-a.
-    s1.execute("CREATE TABLE t (x INT)").await.expect("CREATE TABLE failed");
+    s1.execute("CREATE TABLE t (x INT)")
+        .await
+        .expect("CREATE TABLE failed");
 
     // session-b must NOT see table t.
     let result = s2.execute("SELECT * FROM t").await;
@@ -108,9 +110,12 @@ async fn generator_to_duckdb() {
         .generate(&plan)
         .expect("SQL generation failed");
 
-    let session =
-        DuckDbSession::spawn("gen-test", RuntimeCompatMode::Relaxed, &StreamingConfig::default())
-            .expect("spawn failed");
+    let session = DuckDbSession::spawn(
+        "gen-test",
+        RuntimeCompatMode::Relaxed,
+        &StreamingConfig::default(),
+    )
+    .expect("spawn failed");
 
     let batches = session.execute(&sql).await.expect("execute failed");
 
@@ -173,32 +178,61 @@ async fn get_or_create_is_race_free() {
 #[tokio::test]
 #[ignore]
 async fn check_parquet_types() {
-    let session = DuckDbSession::spawn("parquet-type-check", RuntimeCompatMode::Relaxed, &StreamingConfig::default())
-        .expect("spawn failed");
+    let session = DuckDbSession::spawn(
+        "parquet-type-check",
+        RuntimeCompatMode::Relaxed,
+        &StreamingConfig::default(),
+    )
+    .expect("spawn failed");
 
     // Check supplier schema
     let batches = session.execute("DESCRIBE SELECT * FROM read_parquet('/workspace/tests/integration/tpch_sf001/supplier.parquet')").await.expect("failed");
     println!("Supplier schema:");
     for batch in &batches {
         for row in 0..batch.num_rows() {
-            let name = batch.column(0).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(row);
-            let dtype = batch.column(1).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(row);
+            let name = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<duckdb::arrow::array::StringArray>()
+                .unwrap()
+                .value(row);
+            let dtype = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<duckdb::arrow::array::StringArray>()
+                .unwrap()
+                .value(row);
             println!("  {name}: {dtype}");
         }
     }
-    
+
     // Check arithmetic type (use LIMIT on FROM to avoid GROUP BY requirement)
     let batches = session.execute("SELECT typeof(1 - l_discount) AS t1, typeof(l_extendedprice * (1 - l_discount)) AS t2 FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet') LIMIT 1").await.expect("failed");
     let batches2 = session.execute("SELECT typeof(SUM(l_extendedprice * (1 - l_discount))) AS t3 FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet')").await.expect("failed");
     let batches = batches;
     for batch in &batches {
-        let t1 = batch.column(0).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(0);
-        let t2 = batch.column(1).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(0);
+        let t1 = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<duckdb::arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
+        let t2 = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<duckdb::arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
         println!("1-DECIMAL type: {t1}");
         println!("DECIMAL*DECIMAL type: {t2}");
     }
     for batch in &batches2 {
-        let t3 = batch.column(0).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(0);
+        let t3 = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<duckdb::arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
         println!("SUM(DECIMAL*DECIMAL) type: {t3}");
     }
 

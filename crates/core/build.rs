@@ -28,14 +28,11 @@ fn download_extension() {
         .unwrap()
         .parent()
         .unwrap();
-    let cache_dir = workspace_root
-        .join("extensions")
-        .join(RELEASE_TAG);
+    let cache_dir = workspace_root.join("extensions").join(RELEASE_TAG);
     let cache_path = cache_dir.join(&filename);
 
     if !cache_path.exists() {
-        std::fs::create_dir_all(&cache_dir)
-            .expect("failed to create extensions cache directory");
+        std::fs::create_dir_all(&cache_dir).expect("failed to create extensions cache directory");
 
         let url = format!("{BASE_URL}/{RELEASE_TAG}/{filename}");
         println!("cargo:warning=Downloading extension from {url}");
@@ -61,10 +58,7 @@ fn download_extension() {
     let dest = std::path::Path::new(&out_dir).join("thdck_spark_funcs.duckdb_extension");
     std::fs::copy(&cache_path, &dest).expect("failed to copy extension to OUT_DIR");
 
-    println!(
-        "cargo:rustc-env=EXTENSION_BIN_PATH={}",
-        dest.display()
-    );
+    println!("cargo:rustc-env=EXTENSION_BIN_PATH={}", dest.display());
 }
 
 #[cfg(feature = "bundled-extension")]

@@ -88,10 +88,18 @@ pub struct SortOrder {
 
 impl SortOrder {
     pub fn asc(expr: Expression) -> Self {
-        Self { expr, direction: SortDirection::Asc, null_ordering: NullOrdering::NullsFirst }
+        Self {
+            expr,
+            direction: SortDirection::Asc,
+            null_ordering: NullOrdering::NullsFirst,
+        }
     }
     pub fn desc(expr: Expression) -> Self {
-        Self { expr, direction: SortDirection::Desc, null_ordering: NullOrdering::NullsLast }
+        Self {
+            expr,
+            direction: SortDirection::Desc,
+            null_ordering: NullOrdering::NullsLast,
+        }
     }
 }
 
@@ -133,8 +141,8 @@ pub enum LiteralValue {
     Double(f64),
     Decimal(String), // stored as string to avoid precision loss
     String(String),
-    Date(i32),       // days since epoch
-    Timestamp(i64),  // microseconds since epoch
+    Date(i32),      // days since epoch
+    Timestamp(i64), // microseconds since epoch
     TimestampNtz(i64),
     Binary(Vec<u8>),
 }
@@ -188,19 +196,34 @@ pub struct Literal {
 
 impl Literal {
     pub fn null() -> Expression {
-        Expression::Literal(Literal { value: LiteralValue::Null, data_type: DataType::Null })
+        Expression::Literal(Literal {
+            value: LiteralValue::Null,
+            data_type: DataType::Null,
+        })
     }
     pub fn boolean(v: bool) -> Expression {
-        Expression::Literal(Literal { value: LiteralValue::Boolean(v), data_type: DataType::Boolean })
+        Expression::Literal(Literal {
+            value: LiteralValue::Boolean(v),
+            data_type: DataType::Boolean,
+        })
     }
     pub fn int(v: i32) -> Expression {
-        Expression::Literal(Literal { value: LiteralValue::Int(v), data_type: DataType::Integer })
+        Expression::Literal(Literal {
+            value: LiteralValue::Int(v),
+            data_type: DataType::Integer,
+        })
     }
     pub fn long(v: i64) -> Expression {
-        Expression::Literal(Literal { value: LiteralValue::Long(v), data_type: DataType::Long })
+        Expression::Literal(Literal {
+            value: LiteralValue::Long(v),
+            data_type: DataType::Long,
+        })
     }
     pub fn double(v: f64) -> Expression {
-        Expression::Literal(Literal { value: LiteralValue::Double(v), data_type: DataType::Double })
+        Expression::Literal(Literal {
+            value: LiteralValue::Double(v),
+            data_type: DataType::Double,
+        })
     }
     pub fn string(v: impl Into<String>) -> Expression {
         Expression::Literal(Literal {
@@ -465,19 +488,31 @@ impl Expression {
             match &lit.value {
                 LiteralValue::Byte(v) => {
                     let p = TypeInferenceEngine::decimal_digits_for_value(*v as i64);
-                    DataType::Decimal { precision: p, scale: 0 }
+                    DataType::Decimal {
+                        precision: p,
+                        scale: 0,
+                    }
                 }
                 LiteralValue::Short(v) => {
                     let p = TypeInferenceEngine::decimal_digits_for_value(*v as i64);
-                    DataType::Decimal { precision: p, scale: 0 }
+                    DataType::Decimal {
+                        precision: p,
+                        scale: 0,
+                    }
                 }
                 LiteralValue::Int(v) => {
                     let p = TypeInferenceEngine::decimal_digits_for_value(*v as i64);
-                    DataType::Decimal { precision: p, scale: 0 }
+                    DataType::Decimal {
+                        precision: p,
+                        scale: 0,
+                    }
                 }
                 LiteralValue::Long(v) => {
                     let p = TypeInferenceEngine::decimal_digits_for_value(*v);
-                    DataType::Decimal { precision: p, scale: 0 }
+                    DataType::Decimal {
+                        precision: p,
+                        scale: 0,
+                    }
                 }
                 _ => TypeInferenceEngine::integral_to_decimal(&lit.data_type),
             }
@@ -526,20 +561,53 @@ impl Expression {
                         use DataType::*;
                         match (&lt, &rt) {
                             // Spark: integer / integer → Double (unlike most languages)
-                            (Byte | Short | Integer | Long, Byte | Short | Integer | Long) => Double,
-                            (Decimal { precision: p1, scale: s1 }, Decimal { precision: p2, scale: s2 }) => {
-                                TypeInferenceEngine::decimal_div_type(*p1, *s1, *p2, *s2)
+                            (Byte | Short | Integer | Long, Byte | Short | Integer | Long) => {
+                                Double
                             }
-                            (Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
+                            (
+                                Decimal {
+                                    precision: p1,
+                                    scale: s1,
+                                },
+                                Decimal {
+                                    precision: p2,
+                                    scale: s2,
+                                },
+                            ) => TypeInferenceEngine::decimal_div_type(*p1, *s1, *p2, *s2),
+                            (
+                                Decimal {
+                                    precision: p1,
+                                    scale: s1,
+                                },
+                                i,
+                            ) if i.is_integral() => {
                                 // Spark DecimalPrecision: use value-based precision for literals
-                                if let Decimal { precision: p2, scale: s2 } = b.right.integral_to_decimal_for_arithmetic(schema) {
+                                if let Decimal {
+                                    precision: p2,
+                                    scale: s2,
+                                } = b.right.integral_to_decimal_for_arithmetic(schema)
+                                {
                                     TypeInferenceEngine::decimal_div_type(*p1, *s1, p2, s2)
-                                } else { Double }
+                                } else {
+                                    Double
+                                }
                             }
-                            (i, Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
-                                if let Decimal { precision: p1, scale: s1 } = b.left.integral_to_decimal_for_arithmetic(schema) {
+                            (
+                                i,
+                                Decimal {
+                                    precision: p2,
+                                    scale: s2,
+                                },
+                            ) if i.is_integral() => {
+                                if let Decimal {
+                                    precision: p1,
+                                    scale: s1,
+                                } = b.left.integral_to_decimal_for_arithmetic(schema)
+                                {
                                     TypeInferenceEngine::decimal_div_type(p1, s1, *p2, *s2)
-                                } else { Double }
+                                } else {
+                                    Double
+                                }
                             }
                             _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
                         }
@@ -548,19 +616,50 @@ impl Expression {
                         let lt = b.left.data_type(schema);
                         let rt = b.right.data_type(schema);
                         match (&lt, &rt) {
-                            (DataType::Decimal { precision: p1, scale: s1 }, DataType::Decimal { precision: p2, scale: s2 }) => {
-                                TypeInferenceEngine::decimal_mul_type(*p1, *s1, *p2, *s2)
-                            }
-                            (DataType::Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
+                            (
+                                DataType::Decimal {
+                                    precision: p1,
+                                    scale: s1,
+                                },
+                                DataType::Decimal {
+                                    precision: p2,
+                                    scale: s2,
+                                },
+                            ) => TypeInferenceEngine::decimal_mul_type(*p1, *s1, *p2, *s2),
+                            (
+                                DataType::Decimal {
+                                    precision: p1,
+                                    scale: s1,
+                                },
+                                i,
+                            ) if i.is_integral() => {
                                 // Spark DecimalPrecision: use value-based precision for literals
-                                if let DataType::Decimal { precision: p2, scale: s2 } = b.right.integral_to_decimal_for_arithmetic(schema) {
+                                if let DataType::Decimal {
+                                    precision: p2,
+                                    scale: s2,
+                                } = b.right.integral_to_decimal_for_arithmetic(schema)
+                                {
                                     TypeInferenceEngine::decimal_mul_type(*p1, *s1, p2, s2)
-                                } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
+                                } else {
+                                    TypeInferenceEngine::promote_numeric(&lt, &rt)
+                                }
                             }
-                            (i, DataType::Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
-                                if let DataType::Decimal { precision: p1, scale: s1 } = b.left.integral_to_decimal_for_arithmetic(schema) {
+                            (
+                                i,
+                                DataType::Decimal {
+                                    precision: p2,
+                                    scale: s2,
+                                },
+                            ) if i.is_integral() => {
+                                if let DataType::Decimal {
+                                    precision: p1,
+                                    scale: s1,
+                                } = b.left.integral_to_decimal_for_arithmetic(schema)
+                                {
                                     TypeInferenceEngine::decimal_mul_type(p1, s1, *p2, *s2)
-                                } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
+                                } else {
+                                    TypeInferenceEngine::promote_numeric(&lt, &rt)
+                                }
                             }
                             _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
                         }
@@ -569,19 +668,50 @@ impl Expression {
                         let lt = b.left.data_type(schema);
                         let rt = b.right.data_type(schema);
                         match (&lt, &rt) {
-                            (DataType::Decimal { precision: p1, scale: s1 }, DataType::Decimal { precision: p2, scale: s2 }) => {
-                                TypeInferenceEngine::decimal_add_type(*p1, *s1, *p2, *s2)
-                            }
-                            (DataType::Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
+                            (
+                                DataType::Decimal {
+                                    precision: p1,
+                                    scale: s1,
+                                },
+                                DataType::Decimal {
+                                    precision: p2,
+                                    scale: s2,
+                                },
+                            ) => TypeInferenceEngine::decimal_add_type(*p1, *s1, *p2, *s2),
+                            (
+                                DataType::Decimal {
+                                    precision: p1,
+                                    scale: s1,
+                                },
+                                i,
+                            ) if i.is_integral() => {
                                 // Spark DecimalPrecision: use value-based precision for literals
-                                if let DataType::Decimal { precision: p2, scale: s2 } = b.right.integral_to_decimal_for_arithmetic(schema) {
+                                if let DataType::Decimal {
+                                    precision: p2,
+                                    scale: s2,
+                                } = b.right.integral_to_decimal_for_arithmetic(schema)
+                                {
                                     TypeInferenceEngine::decimal_add_type(*p1, *s1, p2, s2)
-                                } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
+                                } else {
+                                    TypeInferenceEngine::promote_numeric(&lt, &rt)
+                                }
                             }
-                            (i, DataType::Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
-                                if let DataType::Decimal { precision: p1, scale: s1 } = b.left.integral_to_decimal_for_arithmetic(schema) {
+                            (
+                                i,
+                                DataType::Decimal {
+                                    precision: p2,
+                                    scale: s2,
+                                },
+                            ) if i.is_integral() => {
+                                if let DataType::Decimal {
+                                    precision: p1,
+                                    scale: s1,
+                                } = b.left.integral_to_decimal_for_arithmetic(schema)
+                                {
                                     TypeInferenceEngine::decimal_add_type(p1, s1, *p2, *s2)
-                                } else { TypeInferenceEngine::promote_numeric(&lt, &rt) }
+                                } else {
+                                    TypeInferenceEngine::promote_numeric(&lt, &rt)
+                                }
                             }
                             _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
                         }
@@ -590,10 +720,16 @@ impl Expression {
                         let lt = b.left.data_type(schema);
                         let rt = b.right.data_type(schema);
                         match (&lt, &rt) {
-                            (DataType::Decimal { precision: p1, scale: s1 },
-                             DataType::Decimal { precision: p2, scale: s2 }) => {
-                                TypeInferenceEngine::decimal_mod_type(*p1, *s1, *p2, *s2)
-                            }
+                            (
+                                DataType::Decimal {
+                                    precision: p1,
+                                    scale: s1,
+                                },
+                                DataType::Decimal {
+                                    precision: p2,
+                                    scale: s2,
+                                },
+                            ) => TypeInferenceEngine::decimal_mod_type(*p1, *s1, *p2, *s2),
                             _ => TypeInferenceEngine::promote_numeric(&lt, &rt),
                         }
                     }
@@ -605,8 +741,11 @@ impl Expression {
                 }
             }
             Expression::Unary(u) => match &u.op {
-                UnaryOp::Not | UnaryOp::IsNull | UnaryOp::IsNotNull
-                | UnaryOp::IsNaN | UnaryOp::IsNotNaN => DataType::Boolean,
+                UnaryOp::Not
+                | UnaryOp::IsNull
+                | UnaryOp::IsNotNull
+                | UnaryOp::IsNaN
+                | UnaryOp::IsNotNaN => DataType::Boolean,
                 UnaryOp::Negate => u.operand.data_type(schema),
             },
             Expression::FunctionCall(f) => {
@@ -623,24 +762,32 @@ impl Expression {
                             _ => format!("col{}", i / 2),
                         };
                         let val = &f.args[i + 1];
-                        fields.push(StructField::new(name, val.data_type(schema), val.nullable(schema)));
+                        fields.push(StructField::new(
+                            name,
+                            val.data_type(schema),
+                            val.nullable(schema),
+                        ));
                         i += 2;
                     }
                     return DataType::Struct(StructType::new(fields));
                 }
                 if f.name.eq_ignore_ascii_case("struct") {
-                    let fields: Vec<StructField> = f.args.iter().enumerate().map(|(i, arg)| {
-                        let name = match arg {
-                            Expression::Alias(a) => a.alias.clone(),
-                            _ => format!("col{i}"),
-                        };
-                        StructField::new(name, arg.data_type(schema), arg.nullable(schema))
-                    }).collect();
+                    let fields: Vec<StructField> = f
+                        .args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, arg)| {
+                            let name = match arg {
+                                Expression::Alias(a) => a.alias.clone(),
+                                _ => format!("col{i}"),
+                            };
+                            StructField::new(name, arg.data_type(schema), arg.nullable(schema))
+                        })
+                        .collect();
                     return DataType::Struct(StructType::new(fields));
                 }
 
-                let arg_types: Vec<DataType> =
-                    f.args.iter().map(|a| a.data_type(schema)).collect();
+                let arg_types: Vec<DataType> = f.args.iter().map(|a| a.data_type(schema)).collect();
                 let dt = TypeInferenceEngine::function_return_type(&f.name, &arg_types);
 
                 // HOF-specific return type resolution (needs schema + lambda access)
@@ -659,10 +806,7 @@ impl Expression {
                                         );
                                     let body_type = lambda.body.data_type(&augmented);
                                     let body_nullable = lambda.body.nullable(&augmented);
-                                    return DataType::Array(
-                                        Box::new(body_type),
-                                        body_nullable,
-                                    );
+                                    return DataType::Array(Box::new(body_type), body_nullable);
                                 }
                             }
                         }
@@ -676,7 +820,10 @@ impl Expression {
                         if let Some(Expression::Lambda(finish)) = f.args.get(3) {
                             let init_nullable = f.args.get(1).map_or(true, |a| a.nullable(schema));
                             let aug = TypeInferenceEngine::augment_schema_with_lambda_params(
-                                schema, &finish.params, &init_type, init_nullable,
+                                schema,
+                                &finish.params,
+                                &init_type,
+                                init_nullable,
                             );
                             finish.body.data_type(&aug)
                         } else {
@@ -685,26 +832,36 @@ impl Expression {
                     }
                     // ROUND/BROUND: Spark adjusts decimal precision based on target scale
                     "round" | "bround" => {
-                        if let Some(DataType::Decimal { precision, scale }) = f.args.first().map(|a| a.data_type(schema)) {
+                        if let Some(DataType::Decimal { precision, scale }) =
+                            f.args.first().map(|a| a.data_type(schema))
+                        {
                             // Extract target scale from second arg (default: 0)
-                            let new_scale = f.args.get(1).and_then(|e| match e {
-                                Expression::Literal(l) => match &l.value {
-                                    LiteralValue::Int(v) => Some(*v as u8),
-                                    LiteralValue::Long(v) => Some(*v as u8),
-                                    LiteralValue::Short(v) => Some(*v as u8),
-                                    LiteralValue::Byte(v) => Some(*v as u8),
+                            let new_scale = f
+                                .args
+                                .get(1)
+                                .and_then(|e| match e {
+                                    Expression::Literal(l) => match &l.value {
+                                        LiteralValue::Int(v) => Some(*v as u8),
+                                        LiteralValue::Long(v) => Some(*v as u8),
+                                        LiteralValue::Short(v) => Some(*v as u8),
+                                        LiteralValue::Byte(v) => Some(*v as u8),
+                                        _ => None,
+                                    },
                                     _ => None,
-                                },
-                                _ => None,
-                            }).unwrap_or(0);
+                                })
+                                .unwrap_or(0);
                             if new_scale >= scale {
                                 // Scale not reduced → keep original type
                                 DataType::Decimal { precision, scale }
                             } else {
                                 // Spark formula: precision = min(38, p - s + newScale + 1)
                                 let int_digits = precision as i16 - scale as i16;
-                                let result_p = ((int_digits + new_scale as i16 + 1).min(38)).max(1) as u8;
-                                DataType::Decimal { precision: result_p, scale: new_scale }
+                                let result_p =
+                                    ((int_digits + new_scale as i16 + 1).min(38)).max(1) as u8;
+                                DataType::Decimal {
+                                    precision: result_p,
+                                    scale: new_scale,
+                                }
                             }
                         } else {
                             dt
@@ -716,17 +873,20 @@ impl Expression {
                             DataType::Array(elem, _)
                                 if matches!(lower.as_str(), "array" | "make_array") =>
                             {
-                                let contains_null =
-                                    f.args.iter().any(|a| a.nullable(schema));
+                                let contains_null = f.args.iter().any(|a| a.nullable(schema));
                                 DataType::Array(elem, contains_null)
                             }
                             // Map constructors: value_nullable from odd-indexed args
                             DataType::Map { key, value, .. }
                                 if matches!(lower.as_str(), "map" | "create_map") =>
                             {
-                                let val_nullable = f.args.iter().skip(1).step_by(2)
-                                    .any(|a| a.nullable(schema));
-                                DataType::Map { key, value, value_nullable: val_nullable }
+                                let val_nullable =
+                                    f.args.iter().skip(1).step_by(2).any(|a| a.nullable(schema));
+                                DataType::Map {
+                                    key,
+                                    value,
+                                    value_nullable: val_nullable,
+                                }
                             }
                             other => other,
                         }
@@ -739,14 +899,16 @@ impl Expression {
                 let branch_exprs = cw.branches.iter().map(|(_, r)| r);
                 let else_exprs = cw.else_expr.iter().map(|e| e.as_ref());
                 // Skip untyped NULL literals per Spark semantics
-                let typed: Vec<DataType> = branch_exprs.chain(else_exprs)
+                let typed: Vec<DataType> = branch_exprs
+                    .chain(else_exprs)
                     .filter(|e| !e.is_untyped_null())
                     .map(|e| e.data_type(schema))
                     .collect();
                 if typed.is_empty() {
                     DataType::String // all branches are untyped NULL → String
                 } else {
-                    typed.into_iter()
+                    typed
+                        .into_iter()
                         .reduce(|acc, t| TypeInferenceEngine::unify_types(&acc, &t))
                         .unwrap_or(DataType::Unresolved)
                 }
@@ -764,9 +926,7 @@ impl Expression {
             Expression::InList(_) => DataType::Boolean,
             Expression::ScalarSubquery(_) => DataType::Unresolved,
             Expression::Lambda(l) => l.body.data_type(schema),
-            Expression::LambdaVariable(lv) => {
-                TypeInferenceEngine::column_type(&lv.name, schema)
-            }
+            Expression::LambdaVariable(lv) => TypeInferenceEngine::column_type(&lv.name, schema),
             Expression::RawSql(r) => r.data_type.clone().unwrap_or(DataType::Unresolved),
             Expression::ArrayLiteral(a) => {
                 // containsNull=true only if any element is an explicit NULL literal.
@@ -781,9 +941,17 @@ impl Expression {
                 value_nullable: true,
             },
             Expression::StructLiteral(s) => {
-                let fields = s.fields.iter().map(|(name, expr)| {
-                    StructField::new(name.clone(), expr.data_type(schema), expr.nullable(schema))
-                }).collect();
+                let fields = s
+                    .fields
+                    .iter()
+                    .map(|(name, expr)| {
+                        StructField::new(
+                            name.clone(),
+                            expr.data_type(schema),
+                            expr.nullable(schema),
+                        )
+                    })
+                    .collect();
                 DataType::Struct(StructType::new(fields))
             }
             Expression::Between(_) => DataType::Boolean,
@@ -792,15 +960,17 @@ impl Expression {
             Expression::ExtractValue(ev) => {
                 let base_type = ev.child.data_type(schema);
                 let field_name = match ev.extraction.as_ref() {
-                    Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.as_str()),
+                    Expression::Literal(Literal {
+                        value: LiteralValue::String(s),
+                        ..
+                    }) => Some(s.as_str()),
                     _ => None,
                 };
                 match (&base_type, field_name) {
-                    (DataType::Struct(st), Some(name)) => {
-                        st.field_by_name(name)
-                            .map(|f| f.data_type.clone())
-                            .unwrap_or(DataType::Unresolved)
-                    }
+                    (DataType::Struct(st), Some(name)) => st
+                        .field_by_name(name)
+                        .map(|f| f.data_type.clone())
+                        .unwrap_or(DataType::Unresolved),
                     (DataType::Array(elem, _), _) => elem.as_ref().clone(),
                     (DataType::Map { value, .. }, _) => value.as_ref().clone(),
                     _ => DataType::Unresolved,
@@ -815,11 +985,18 @@ impl Expression {
                         // Add or update the field
                         let new_type = val_expr.data_type(schema);
                         let new_nullable = val_expr.nullable(schema);
-                        if let Some(existing) = fields.iter_mut().find(|f| f.name.eq_ignore_ascii_case(&u.field_name)) {
+                        if let Some(existing) = fields
+                            .iter_mut()
+                            .find(|f| f.name.eq_ignore_ascii_case(&u.field_name))
+                        {
                             existing.data_type = new_type;
                             existing.nullable = new_nullable;
                         } else {
-                            fields.push(StructField::new(u.field_name.clone(), new_type, new_nullable));
+                            fields.push(StructField::new(
+                                u.field_name.clone(),
+                                new_type,
+                                new_nullable,
+                            ));
                         }
                     } else {
                         // Drop the field
@@ -838,7 +1015,11 @@ impl Expression {
         match self {
             Expression::Literal(l) => matches!(l.value, LiteralValue::Null),
             Expression::ColumnReference(c) => TypeInferenceEngine::column_nullable(&c.name, schema),
-            Expression::UnresolvedColumn(u) => TypeInferenceEngine::qualified_column_nullable(&u.name, u.qualifier.as_deref(), schema),
+            Expression::UnresolvedColumn(u) => TypeInferenceEngine::qualified_column_nullable(
+                &u.name,
+                u.qualifier.as_deref(),
+                schema,
+            ),
             Expression::Binary(b) => b.left.nullable(schema) || b.right.nullable(schema),
             Expression::Unary(u) => match u.op {
                 UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::IsNaN | UnaryOp::IsNotNaN => false,
@@ -846,7 +1027,10 @@ impl Expression {
             },
             Expression::FunctionCall(f) => {
                 let lower = f.name.to_lowercase();
-                if matches!(lower.as_str(), "count" | "count_distinct" | "grouping" | "grouping_id") {
+                if matches!(
+                    lower.as_str(),
+                    "count" | "count_distinct" | "grouping" | "grouping_id"
+                ) {
                     false
                 } else if TypeInferenceEngine::aggregate_is_always_nullable(&lower) {
                     true
@@ -861,32 +1045,65 @@ impl Expression {
                         true
                     } else {
                         // THEN values at odd indices (1, 3, 5, ...)
-                        let then_nullable = f.args.iter().skip(1).step_by(2)
-                            .any(|a| a.nullable(schema));
+                        let then_nullable =
+                            f.args.iter().skip(1).step_by(2).any(|a| a.nullable(schema));
                         // ELSE value is the last arg (even index since total is odd)
-                        let else_nullable = f.args.last()
-                            .map_or(false, |a| a.nullable(schema));
+                        let else_nullable = f.args.last().map_or(false, |a| a.nullable(schema));
                         then_nullable || else_nullable
                     }
-                } else if matches!(lower.as_str(), "transform" | "list_transform" | "filter" | "list_filter" | "array_filter") {
+                } else if matches!(
+                    lower.as_str(),
+                    "transform" | "list_transform" | "filter" | "list_filter" | "array_filter"
+                ) {
                     f.args.first().map_or(true, |a| a.nullable(schema))
-                } else if matches!(lower.as_str(), "exists" | "forall" | "list_bool_or" | "list_bool_and") {
+                } else if matches!(
+                    lower.as_str(),
+                    "exists" | "forall" | "list_bool_or" | "list_bool_and"
+                ) {
                     f.args.first().map_or(true, |a| a.nullable(schema))
                 } else if matches!(lower.as_str(), "aggregate" | "reduce" | "list_reduce") {
                     true
-                } else if matches!(lower.as_str(),
-                    "isnull" | "isnan" | "isnotnull" | "isnotnan"
-                    | "is_nan" | "isinf"
+                } else if matches!(
+                    lower.as_str(),
+                    "isnull" | "isnan" | "isnotnull" | "isnotnan" | "is_nan" | "isinf"
                 ) {
                     false
-                } else if matches!(lower.as_str(),
-                    "ceil" | "ceiling" | "floor" | "round" | "bround"
-                    | "ln" | "log" | "log10" | "log2" | "log1p"
-                    | "exp" | "expm1" | "pow" | "power" | "sqrt" | "cbrt"
-                    | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
-                    | "sinh" | "cosh" | "tanh" | "degrees" | "radians"
-                    | "signum" | "sign"
-                    | "factorial" | "hex" | "unhex" | "bin"
+                } else if matches!(
+                    lower.as_str(),
+                    "ceil"
+                        | "ceiling"
+                        | "floor"
+                        | "round"
+                        | "bround"
+                        | "ln"
+                        | "log"
+                        | "log10"
+                        | "log2"
+                        | "log1p"
+                        | "exp"
+                        | "expm1"
+                        | "pow"
+                        | "power"
+                        | "sqrt"
+                        | "cbrt"
+                        | "sin"
+                        | "cos"
+                        | "tan"
+                        | "asin"
+                        | "acos"
+                        | "atan"
+                        | "atan2"
+                        | "sinh"
+                        | "cosh"
+                        | "tanh"
+                        | "degrees"
+                        | "radians"
+                        | "signum"
+                        | "sign"
+                        | "factorial"
+                        | "hex"
+                        | "unhex"
+                        | "bin"
                 ) {
                     true
                 } else if lower.as_str() == "concat_ws" {
@@ -896,10 +1113,15 @@ impl Expression {
                 } else if lower.as_str() == "nvl2" {
                     f.args.get(1).map_or(true, |a| a.nullable(schema))
                         || f.args.get(2).map_or(true, |a| a.nullable(schema))
-                } else if matches!(lower.as_str(),
-                    "array" | "make_array" | "create_map" | "map"
-                    | "named_struct" | "struct"
-                    | "map_from_entries"
+                } else if matches!(
+                    lower.as_str(),
+                    "array"
+                        | "make_array"
+                        | "create_map"
+                        | "map"
+                        | "named_struct"
+                        | "struct"
+                        | "map_from_entries"
                 ) {
                     false
                 } else if lower.as_str() == "map_from_arrays" {
@@ -921,7 +1143,9 @@ impl Expression {
                         false
                     } else if matches!(f.name.to_lowercase().as_str(), "lag" | "lead") {
                         // NOT NULL when 3rd arg (default) is present and non-nullable
-                        f.args.get(2).map_or(true, |default| default.nullable(schema))
+                        f.args
+                            .get(2)
+                            .map_or(true, |default| default.nullable(schema))
                     } else {
                         true
                     }
@@ -930,14 +1154,18 @@ impl Expression {
             },
             Expression::Alias(a) => a.expr.nullable(schema),
             Expression::Star(_) => false,
-            Expression::InSubquery(_) | Expression::ExistsSubquery(_) | Expression::InList(_) => false,
+            Expression::InSubquery(_) | Expression::ExistsSubquery(_) | Expression::InList(_) => {
+                false
+            }
             Expression::ScalarSubquery(_) => true,
             Expression::Lambda(_) => false,
             Expression::LambdaVariable(lv) => {
                 TypeInferenceEngine::column_nullable(&lv.name, schema)
             }
             Expression::RawSql(r) => r.nullable.unwrap_or(true),
-            Expression::ArrayLiteral(_) | Expression::MapLiteral(_) | Expression::StructLiteral(_) => false,
+            Expression::ArrayLiteral(_)
+            | Expression::MapLiteral(_)
+            | Expression::StructLiteral(_) => false,
             Expression::Between(_) => false,
             Expression::Like(l) => l.value.nullable(schema) || l.pattern.nullable(schema),
             Expression::IsDistinctFrom(_) => false,
@@ -946,14 +1174,16 @@ impl Expression {
                 let base_nullable = ev.child.nullable(schema);
                 let base_type = ev.child.data_type(schema);
                 let field_name = match ev.extraction.as_ref() {
-                    Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => Some(s.as_str()),
+                    Expression::Literal(Literal {
+                        value: LiteralValue::String(s),
+                        ..
+                    }) => Some(s.as_str()),
                     _ => None,
                 };
                 match (&base_type, field_name) {
                     (DataType::Struct(st), Some(name)) => {
-                        let field_nullable = st.field_by_name(name)
-                            .map(|f| f.nullable)
-                            .unwrap_or(true);
+                        let field_nullable =
+                            st.field_by_name(name).map(|f| f.nullable).unwrap_or(true);
                         base_nullable || field_nullable
                     }
                     _ => true, // array/map access or unresolved: always nullable
@@ -975,15 +1205,30 @@ mod tests {
     fn schema() -> StructType {
         StructType::new(vec![
             StructField::nullable("id", DataType::Long),
-            StructField::not_null("price", DataType::Decimal { precision: 10, scale: 2 }),
+            StructField::not_null(
+                "price",
+                DataType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+            ),
         ])
     }
 
     #[test]
     fn literal_types() {
-        assert_eq!(Literal::null().data_type(&StructType::empty()), DataType::Null);
-        assert_eq!(Literal::int(42).data_type(&StructType::empty()), DataType::Integer);
-        assert_eq!(Literal::string("hi").data_type(&StructType::empty()), DataType::String);
+        assert_eq!(
+            Literal::null().data_type(&StructType::empty()),
+            DataType::Null
+        );
+        assert_eq!(
+            Literal::int(42).data_type(&StructType::empty()),
+            DataType::Integer
+        );
+        assert_eq!(
+            Literal::string("hi").data_type(&StructType::empty()),
+            DataType::String
+        );
     }
 
     #[test]
@@ -1047,13 +1292,20 @@ mod tests {
 
     fn struct_schema() -> StructType {
         StructType::new(vec![
-            StructField::not_null("person", DataType::Struct(StructType::new(vec![
-                StructField::not_null("name", DataType::String),
-                StructField::nullable("age", DataType::Integer),
-            ]))),
-            StructField::nullable("nullable_struct", DataType::Struct(StructType::new(vec![
-                StructField::not_null("street", DataType::String),
-            ]))),
+            StructField::not_null(
+                "person",
+                DataType::Struct(StructType::new(vec![
+                    StructField::not_null("name", DataType::String),
+                    StructField::nullable("age", DataType::Integer),
+                ])),
+            ),
+            StructField::nullable(
+                "nullable_struct",
+                DataType::Struct(StructType::new(vec![StructField::not_null(
+                    "street",
+                    DataType::String,
+                )])),
+            ),
         ])
     }
 
@@ -1147,7 +1399,10 @@ mod tests {
         });
         if let DataType::Struct(st) = expr.data_type(&s) {
             assert_eq!(st.fields.len(), 3); // name, age, email
-            assert_eq!(st.field_by_name("email").unwrap().data_type, DataType::String);
+            assert_eq!(
+                st.field_by_name("email").unwrap().data_type,
+                DataType::String
+            );
         } else {
             panic!("expected Struct type");
         }

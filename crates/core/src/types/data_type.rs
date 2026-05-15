@@ -12,7 +12,10 @@ pub enum DataType {
     Long,
     Float,
     Double,
-    Decimal { precision: u8, scale: u8 },
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
     String,
     Binary,
     Date,
@@ -104,7 +107,11 @@ pub(crate) trait PipeIfUnresolved {
 
 impl PipeIfUnresolved for DataType {
     fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self {
-        if self == DataType::Unresolved { f() } else { self }
+        if self == DataType::Unresolved {
+            f()
+        } else {
+            self
+        }
     }
 }
 
@@ -144,7 +151,11 @@ mod tests {
     fn numeric_classification() {
         assert!(DataType::Integer.is_numeric());
         assert!(DataType::Double.is_numeric());
-        assert!(DataType::Decimal { precision: 10, scale: 2 }.is_numeric());
+        assert!(DataType::Decimal {
+            precision: 10,
+            scale: 2
+        }
+        .is_numeric());
         assert!(!DataType::String.is_numeric());
         assert!(!DataType::Boolean.is_numeric());
     }
@@ -152,7 +163,17 @@ mod tests {
     #[test]
     fn display() {
         assert_eq!(DataType::Long.to_string(), "long");
-        assert_eq!(DataType::Decimal { precision: 18, scale: 4 }.to_string(), "decimal(18,4)");
-        assert_eq!(DataType::Array(Box::new(DataType::Integer), true).to_string(), "array<integer>");
+        assert_eq!(
+            DataType::Decimal {
+                precision: 18,
+                scale: 4
+            }
+            .to_string(),
+            "decimal(18,4)"
+        );
+        assert_eq!(
+            DataType::Array(Box::new(DataType::Integer), true).to_string(),
+            "array<integer>"
+        );
     }
 }

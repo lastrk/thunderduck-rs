@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 
 use crate::error::Result;
 use crate::runtime::compat_mode::RuntimeCompatMode;
@@ -49,5 +49,4 @@ impl SessionManager {
     pub fn release(&self, session_id: &str) {
         self.sessions.remove(session_id);
     }
-
 }

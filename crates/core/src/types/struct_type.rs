@@ -10,7 +10,11 @@ pub struct StructField {
 
 impl StructField {
     pub fn new(name: impl Into<std::string::String>, data_type: DataType, nullable: bool) -> Self {
-        Self { name: name.into(), data_type, nullable }
+        Self {
+            name: name.into(),
+            data_type,
+            nullable,
+        }
     }
 
     pub fn nullable(name: impl Into<std::string::String>, data_type: DataType) -> Self {
@@ -40,17 +44,23 @@ impl StructType {
 
     /// Schema whose single column is the given type — convenience for scalars.
     pub fn single(name: impl Into<std::string::String>, data_type: DataType) -> Self {
-        Self { fields: vec![StructField::nullable(name, data_type)] }
+        Self {
+            fields: vec![StructField::nullable(name, data_type)],
+        }
     }
 
     /// Lookup a field by name (case-insensitive, matches Spark behaviour).
     pub fn field_by_name(&self, name: &str) -> Option<&StructField> {
-        self.fields.iter().find(|f| f.name.eq_ignore_ascii_case(name))
+        self.fields
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(name))
     }
 
     /// Lookup index by name (case-insensitive).
     pub fn field_index(&self, name: &str) -> Option<usize> {
-        self.fields.iter().position(|f| f.name.eq_ignore_ascii_case(name))
+        self.fields
+            .iter()
+            .position(|f| f.name.eq_ignore_ascii_case(name))
     }
 
     /// All field names in order.
@@ -83,7 +93,13 @@ mod tests {
         StructType::new(vec![
             StructField::nullable("id", DataType::Long),
             StructField::nullable("Name", DataType::String),
-            StructField::not_null("amount", DataType::Decimal { precision: 10, scale: 2 }),
+            StructField::not_null(
+                "amount",
+                DataType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+            ),
         ])
     }
 

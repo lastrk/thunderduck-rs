@@ -427,7 +427,10 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
             .recv()
             .map_err(|_| ThunderduckError::DuckDb("session thread exited before ready".into()))??;
 
-        Ok(DuckDbSession { cmd_tx, resolved_mode })
+        Ok(DuckDbSession {
+            cmd_tx,
+            resolved_mode,
+        })
     }
 
     /// Return the resolved compat mode for this session (Strict or Relaxed).
@@ -461,7 +464,10 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
     pub async fn exec_ddl(&self, sql: &str) -> Result<()> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.cmd_tx
-            .send(SessionCommand::ExecDdl { sql: sql.to_string(), resp: resp_tx })
+            .send(SessionCommand::ExecDdl {
+                sql: sql.to_string(),
+                resp: resp_tx,
+            })
             .await
             .map_err(|_| ThunderduckError::DuckDb("session channel closed".into()))?;
         match resp_rx
@@ -558,7 +564,8 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
     /// expressions. This method stores the plan-inferred schema so that
     /// subsequent `get_view_schema` calls return correct nullability.
     pub async fn cache_view_schema(&self, name: &str, schema: StructType) {
-        let _ = self.cmd_tx
+        let _ = self
+            .cmd_tx
             .send(SessionCommand::CacheViewSchema {
                 name: name.to_string(),
                 schema,
@@ -670,7 +677,12 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
                 };
                 let _ = resp.send(msg);
             }
-            SessionCommand::CreateViewWithSchema { name, sql, schema, resp } => {
+            SessionCommand::CreateViewWithSchema {
+                name,
+                sql,
+                schema,
+                resp,
+            } => {
                 let ddl = format!(
                     "CREATE OR REPLACE TEMP VIEW \"{}\" AS {}",
                     name.replace('"', "\"\""),
@@ -705,7 +717,11 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
                     .unwrap_or(false);
                 let _ = resp.send(exists);
             }
-            SessionCommand::ExecuteStreaming { sql, spark_names, batch_tx } => {
+            SessionCommand::ExecuteStreaming {
+                sql,
+                spark_names,
+                batch_tx,
+            } => {
                 let result = (|| -> std::result::Result<(), duckdb::Error> {
                     let mut stmt = conn.prepare(&sql)?;
                     let arrow = stmt.query_arrow(duckdb::params![])?;

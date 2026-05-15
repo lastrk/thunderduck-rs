@@ -37,7 +37,10 @@ impl HardwareProfile {
             .map(|n| n.get())
             .unwrap_or(1);
         let memory_limit_gb = Self::detect_memory_gb();
-        Self { cpu_threads, memory_limit_gb }
+        Self {
+            cpu_threads,
+            memory_limit_gb,
+        }
     }
 
     #[cfg(target_os = "linux")]

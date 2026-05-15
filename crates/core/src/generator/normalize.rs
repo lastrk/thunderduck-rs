@@ -8,6 +8,10 @@
 //! - **Filter-stack flattening**: collapses `Filter(Filter(...(base)))` into a
 //!   single `Filter` with conditions ANDed together via
 //!   `Expression::Binary(BinaryExpression { op: BinaryOp::And, .. })`.
+//! - **Natural flat join rewriting**: detects joins with internal `__td_jr_X__` /
+//!   `__td_jl_X__` aliases where the right side has a user-facing alias, and
+//!   rewrites the join to use the natural alias directly. This keeps user-facing
+//!   aliases accessible in outer WHERE/HAVING clauses (e.g. TPC-DS Q17/Q25/Q29).
 //!
 //! **Limitation**: Normalisation recurses into `LogicalPlan` children but does
 //! not recurse into `Expression` fields. Subquery plans embedded in expressions
@@ -15,7 +19,9 @@
 //! practice stacked filters inside subquery expressions are extremely unlikely
 //! and the rendering path handles them correctly (just less optimally).
 
-use crate::expression::{BinaryExpression, BinaryOp, Expression};
+use crate::expression::{
+    BinaryExpression, BinaryOp, Expression, UnaryExpression, UnresolvedColumn,
+};
 use crate::logical::{
     Aggregate, AliasedRelation, ApproxQuantile, Describe, Distinct, DropColumns, Except, Filter,
     Intersect, Join, Limit, LogicalPlan, NADrop, NAFill, NAReplace, Pivot, Project, Sample,
@@ -63,7 +69,11 @@ pub(crate) fn needs_normalization(plan: &LogicalPlan) -> bool {
         LogicalPlan::Summary(s) => needs_normalization(&s.input),
 
         // -- Two-child variants (short-circuit on first match) --
-        LogicalPlan::Join(j) => needs_normalization(&j.left) || needs_normalization(&j.right),
+        LogicalPlan::Join(j) => {
+            join_needs_flat_rewrite(j)
+                || needs_normalization(&j.left)
+                || needs_normalization(&j.right)
+        }
         LogicalPlan::Union(u) => needs_normalization(&u.left) || needs_normalization(&u.right),
         LogicalPlan::Except(e) => needs_normalization(&e.left) || needs_normalization(&e.right),
         LogicalPlan::Intersect(i) => needs_normalization(&i.left) || needs_normalization(&i.right),
@@ -236,17 +246,25 @@ pub(crate) fn normalize(plan: &LogicalPlan) -> LogicalPlan {
         }),
 
         // -- Variants with two children --
-        LogicalPlan::Join(j) => LogicalPlan::Join(Join {
-            left: Box::new(normalize(&j.left)),
-            right: Box::new(normalize(&j.right)),
-            join_type: j.join_type.clone(),
-            condition: j.condition.clone(),
-            using_columns: j.using_columns.clone(),
-            left_alias: j.left_alias.clone(),
-            right_alias: j.right_alias.clone(),
-            left_plan_ids: j.left_plan_ids.clone(),
-            right_plan_ids: j.right_plan_ids.clone(),
-        }),
+        LogicalPlan::Join(j) => {
+            // First recurse into children.
+            let recursed = Join {
+                left: Box::new(normalize(&j.left)),
+                right: Box::new(normalize(&j.right)),
+                join_type: j.join_type.clone(),
+                condition: j.condition.clone(),
+                using_columns: j.using_columns.clone(),
+                left_alias: j.left_alias.clone(),
+                right_alias: j.right_alias.clone(),
+                left_plan_ids: j.left_plan_ids.clone(),
+                right_plan_ids: j.right_plan_ids.clone(),
+            };
+            // Then try the natural flat join rewrite on the recursed join.
+            match normalize_natural_flat_join(&recursed) {
+                Some(rewritten) => LogicalPlan::Join(rewritten),
+                None => LogicalPlan::Join(recursed),
+            }
+        }
         LogicalPlan::Union(u) => LogicalPlan::Union(Union {
             left: Box::new(normalize(&u.left)),
             right: Box::new(normalize(&u.right)),
@@ -284,6 +302,211 @@ pub(crate) fn normalize(plan: &LogicalPlan) -> LogicalPlan {
         | LogicalPlan::SingleRow(_) => plan.clone(),
     }
 }
+
+// ── Natural flat join rewriting ───────────────────────────────────────────────
+
+/// Returns `true` if the join has internal `__td_jr_X__`/`__td_jl_X__` aliases
+/// that can be rewritten to use user-facing aliases directly.
+///
+/// This is a fast check used by [`needs_normalization`] to avoid cloning the
+/// full plan tree when no rewrite is needed.
+fn join_needs_flat_rewrite(j: &Join) -> bool {
+    let Some(ra) = &j.right_alias else {
+        return false;
+    };
+    if !ra.starts_with("__td_jr_") {
+        return false;
+    }
+    if j.join_type.is_semi_or_anti() {
+        return false;
+    }
+    // Check left side is not a user-aliased relation.
+    let left_is_user_alias = if let Some(la) = &j.left_alias {
+        if la.starts_with("__td_jl_") {
+            matches!(j.left.as_ref(), LogicalPlan::AliasedRelation(ar) if !ar.alias.starts_with("__"))
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if left_is_user_alias {
+        return false;
+    }
+    // Check right side has a detectable natural alias.
+    match j.right.as_ref() {
+        LogicalPlan::AliasedRelation(ar) if !ar.alias.starts_with("__") => true,
+        right_plan => {
+            plan_contains_user_alias(&j.left) && right_plan_natural_name(right_plan).is_some()
+        }
+    }
+}
+
+/// Attempt to rewrite a join with internal `__td_jr_X__`/`__td_jl_X__` aliases
+/// into a "natural flat join" that uses the user-facing alias directly.
+///
+/// Returns `Some(rewritten_join)` when the rewrite fires, `None` otherwise.
+///
+/// When the rewrite fires, the returned join has `left_alias` and `right_alias`
+/// cleared to `None`, and the ON condition is rewritten so that:
+/// - `__td_jr_X__` qualifiers become the natural alias (e.g. `"d1"`)
+/// - `__td_jl_X__` qualifiers are stripped (left-side columns are unqualified)
+fn normalize_natural_flat_join(j: &Join) -> Option<Join> {
+    let ra = j.right_alias.as_deref()?;
+    if !ra.starts_with("__td_jr_") {
+        return None;
+    }
+    if j.join_type.is_semi_or_anti() {
+        return None;
+    }
+    // Check left side is not a user-aliased relation.
+    let left_is_user_alias = if let Some(la) = &j.left_alias {
+        if la.starts_with("__td_jl_") {
+            matches!(j.left.as_ref(), LogicalPlan::AliasedRelation(ar) if !ar.alias.starts_with("__"))
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if left_is_user_alias {
+        return None;
+    }
+
+    // Determine the natural alias for the right side.
+    let (nat_alias, td_alias) = match j.right.as_ref() {
+        LogicalPlan::AliasedRelation(ar) if !ar.alias.starts_with("__") => {
+            // Case 1: right is AliasedRelation with user-facing alias (e.g. "d1")
+            (ar.alias.clone(), ra.to_owned())
+        }
+        right_plan => {
+            // Case 2: right is a plain table (TableScan, InMemoryRelation).
+            // Only use flat path if left side contains user-facing AliasedRelations
+            // that would be buried in a subquery (e.g. d1/d2/d3 in Q17).
+            if plan_contains_user_alias(&j.left) {
+                let name = right_plan_natural_name(right_plan)?;
+                (name, ra.to_owned())
+            } else {
+                return None;
+            }
+        }
+    };
+
+    // Rewrite the ON condition.
+    let rewritten_condition = j
+        .condition
+        .as_ref()
+        .map(|c| rewrite_td_join_qualifiers(c.clone(), &td_alias, &nat_alias));
+
+    Some(Join {
+        left: j.left.clone(),
+        right: j.right.clone(),
+        join_type: j.join_type.clone(),
+        condition: rewritten_condition,
+        using_columns: j.using_columns.clone(),
+        left_alias: None,
+        right_alias: None,
+        left_plan_ids: j.left_plan_ids.clone(),
+        right_plan_ids: j.right_plan_ids.clone(),
+    })
+}
+
+/// Returns `true` if the plan tree contains any `AliasedRelation` with a
+/// user-facing alias (i.e., not starting with `"__"`).
+///
+/// Used to detect when the flat join path is needed to keep those aliases
+/// accessible in outer WHERE/HAVING clauses.
+fn plan_contains_user_alias(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::AliasedRelation(ar) => !ar.alias.starts_with("__"),
+        LogicalPlan::Join(j) => {
+            plan_contains_user_alias(&j.left) || plan_contains_user_alias(&j.right)
+        }
+        LogicalPlan::Filter(f) => plan_contains_user_alias(&f.input),
+        LogicalPlan::Project(p) => plan_contains_user_alias(&p.input),
+        LogicalPlan::Aggregate(a) => plan_contains_user_alias(&a.input),
+        LogicalPlan::Sort(s) => plan_contains_user_alias(&s.input),
+        LogicalPlan::Limit(l) => plan_contains_user_alias(&l.input),
+        LogicalPlan::Distinct(d) => plan_contains_user_alias(&d.input),
+        _ => false,
+    }
+}
+
+/// Extracts the natural table/alias name from a leaf-like plan node
+/// (`TableScan`, `InMemoryRelation`, `AliasedRelation`).
+///
+/// Used in the flat join path to determine what alias to use when rewriting
+/// `__td_jr_X__` qualifiers in join ON conditions.
+fn right_plan_natural_name(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::TableScan(ts) => Some(ts.alias.clone().unwrap_or_else(|| ts.table.clone())),
+        LogicalPlan::InMemoryRelation(imr) => Some(imr.view_name.clone()),
+        LogicalPlan::AliasedRelation(ar) => {
+            if !ar.alias.starts_with("__") {
+                Some(ar.alias.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Rewrite qualifiers in a join ON condition for the "natural flat join" path.
+///
+/// When we use an `AliasedRelation`'s natural alias (e.g. `"d1"`) instead of
+/// the generated `__td_jr_X__` alias, we need to:
+/// 1. Replace `__td_jr_X__` qualifier with `nat_alias` (e.g. `"d1"`)
+/// 2. Strip `__td_jl_X__` qualifiers (left-side columns are unqualified in
+///    flat join)
+///
+/// This is applied to the ON condition so DuckDB sees proper column references.
+fn rewrite_td_join_qualifiers(
+    expr: Expression,
+    td_right_alias: &str,
+    nat_alias: &str,
+) -> Expression {
+    match expr {
+        Expression::UnresolvedColumn(u) => {
+            match u.qualifier.as_deref() {
+                Some(q) if q == td_right_alias => {
+                    // Right-side column: use natural alias
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: u.name,
+                        qualifier: Some(nat_alias.to_string()),
+                    })
+                }
+                Some(q) if q.starts_with("__td_jl_") => {
+                    // Left-side column: strip qualifier (accessible unqualified in flat join)
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: u.name,
+                        qualifier: None,
+                    })
+                }
+                _ => Expression::UnresolvedColumn(u),
+            }
+        }
+        Expression::Binary(b) => {
+            let left = rewrite_td_join_qualifiers(*b.left, td_right_alias, nat_alias);
+            let right = rewrite_td_join_qualifiers(*b.right, td_right_alias, nat_alias);
+            Expression::Binary(BinaryExpression {
+                op: b.op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
+        Expression::Unary(u) => {
+            let operand = rewrite_td_join_qualifiers(*u.operand, td_right_alias, nat_alias);
+            Expression::Unary(UnaryExpression {
+                op: u.op,
+                operand: Box::new(operand),
+            })
+        }
+        other => other,
+    }
+}
+
+// ── Filter-stack flattening ──────────────────────────────────────────────────
 
 /// Flatten a stack of `Filter` nodes into a single `Filter` with all
 /// conditions ANDed together.
@@ -619,5 +842,323 @@ mod tests {
     fn needs_normalization_single_row_returns_false() {
         let plan = LogicalPlan::SingleRow(SingleRowRelation);
         assert!(!needs_normalization(&plan));
+    }
+
+    // ── Natural flat join rewriting tests ────────────────────────────────────
+
+    fn unresolved_col(name: &str, qualifier: Option<&str>) -> Expression {
+        Expression::UnresolvedColumn(UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: qualifier.map(|q| q.to_owned()),
+        })
+    }
+
+    fn aliased_relation(input: LogicalPlan, alias: &str) -> LogicalPlan {
+        LogicalPlan::AliasedRelation(AliasedRelation {
+            input: Box::new(input),
+            alias: alias.to_owned(),
+            column_aliases: vec![],
+        })
+    }
+
+    fn inner_join(
+        left: LogicalPlan,
+        right: LogicalPlan,
+        condition: Option<Expression>,
+        left_alias: Option<&str>,
+        right_alias: Option<&str>,
+    ) -> LogicalPlan {
+        LogicalPlan::Join(Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: crate::logical::JoinType::Inner,
+            condition,
+            using_columns: vec![],
+            left_alias: left_alias.map(|s| s.to_owned()),
+            right_alias: right_alias.map(|s| s.to_owned()),
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        })
+    }
+
+    #[test]
+    fn join_needs_flat_rewrite_case1_aliased_relation() {
+        // Right is AliasedRelation("d1"), right_alias is __td_jr_1__
+        let right = aliased_relation(table("date_dim"), "d1");
+        let join = Join {
+            left: Box::new(table("orders")),
+            right: Box::new(right),
+            join_type: crate::logical::JoinType::Inner,
+            condition: Some(eq_expr(
+                unresolved_col("d_date_sk", Some("__td_jl_0__")),
+                unresolved_col("d_date_sk", Some("__td_jr_1__")),
+            )),
+            using_columns: vec![],
+            left_alias: Some("__td_jl_0__".to_owned()),
+            right_alias: Some("__td_jr_1__".to_owned()),
+            left_plan_ids: vec![0],
+            right_plan_ids: vec![1],
+        };
+        assert!(join_needs_flat_rewrite(&join));
+    }
+
+    #[test]
+    fn join_needs_flat_rewrite_skips_semi_join() {
+        let right = aliased_relation(table("date_dim"), "d1");
+        let join = Join {
+            left: Box::new(table("orders")),
+            right: Box::new(right),
+            join_type: crate::logical::JoinType::LeftSemi,
+            condition: None,
+            using_columns: vec![],
+            left_alias: Some("__td_jl_0__".to_owned()),
+            right_alias: Some("__td_jr_1__".to_owned()),
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        };
+        assert!(!join_needs_flat_rewrite(&join));
+    }
+
+    #[test]
+    fn join_needs_flat_rewrite_skips_user_aliased_left() {
+        // Both sides are user-aliased (self-join scenario)
+        let left = aliased_relation(table("t"), "a");
+        let right = aliased_relation(table("t"), "b");
+        let join = Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: crate::logical::JoinType::Inner,
+            condition: None,
+            using_columns: vec![],
+            left_alias: Some("__td_jl_0__".to_owned()),
+            right_alias: Some("__td_jr_1__".to_owned()),
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        };
+        assert!(!join_needs_flat_rewrite(&join));
+    }
+
+    #[test]
+    fn join_needs_flat_rewrite_case2_plain_table_with_user_alias_in_left() {
+        // Left contains a user-aliased relation, right is a plain table
+        let left = inner_join(
+            aliased_relation(table("date_dim"), "d1"),
+            table("orders"),
+            None,
+            None,
+            None,
+        );
+        let join = Join {
+            left: Box::new(left),
+            right: Box::new(table("customer")),
+            join_type: crate::logical::JoinType::Inner,
+            condition: None,
+            using_columns: vec![],
+            left_alias: Some("__td_jl_0__".to_owned()),
+            right_alias: Some("__td_jr_1__".to_owned()),
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        };
+        assert!(join_needs_flat_rewrite(&join));
+    }
+
+    #[test]
+    fn join_needs_flat_rewrite_no_aliases_returns_false() {
+        let join = Join {
+            left: Box::new(table("l")),
+            right: Box::new(table("r")),
+            join_type: crate::logical::JoinType::Inner,
+            condition: None,
+            using_columns: vec![],
+            left_alias: None,
+            right_alias: None,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        };
+        assert!(!join_needs_flat_rewrite(&join));
+    }
+
+    #[test]
+    fn normalize_natural_flat_join_rewrites_condition_case1() {
+        // Case 1: right is AliasedRelation("d1"), internal aliases __td_jr_1__ / __td_jl_0__
+        let right = aliased_relation(table("date_dim"), "d1");
+        let condition = eq_expr(
+            unresolved_col("d_date_sk", Some("__td_jl_0__")),
+            unresolved_col("d_date_sk", Some("__td_jr_1__")),
+        );
+        let join = Join {
+            left: Box::new(table("orders")),
+            right: Box::new(right),
+            join_type: crate::logical::JoinType::Inner,
+            condition: Some(condition),
+            using_columns: vec![],
+            left_alias: Some("__td_jl_0__".to_owned()),
+            right_alias: Some("__td_jr_1__".to_owned()),
+            left_plan_ids: vec![0],
+            right_plan_ids: vec![1],
+        };
+
+        let rewritten = normalize_natural_flat_join(&join).expect("should fire");
+        // Aliases should be cleared.
+        assert!(rewritten.left_alias.is_none());
+        assert!(rewritten.right_alias.is_none());
+        // Condition should be rewritten:
+        // __td_jl_0__.d_date_sk -> d_date_sk (stripped)
+        // __td_jr_1__.d_date_sk -> d1.d_date_sk (natural alias)
+        let expected_cond = eq_expr(
+            unresolved_col("d_date_sk", None),
+            unresolved_col("d_date_sk", Some("d1")),
+        );
+        assert_eq!(rewritten.condition, Some(expected_cond));
+    }
+
+    #[test]
+    fn normalize_natural_flat_join_returns_none_for_plain_join() {
+        let join = Join {
+            left: Box::new(table("l")),
+            right: Box::new(table("r")),
+            join_type: crate::logical::JoinType::Inner,
+            condition: None,
+            using_columns: vec![],
+            left_alias: None,
+            right_alias: None,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        };
+        assert!(normalize_natural_flat_join(&join).is_none());
+    }
+
+    #[test]
+    fn normalize_natural_flat_join_returns_none_for_anti_join() {
+        let right = aliased_relation(table("date_dim"), "d1");
+        let join = Join {
+            left: Box::new(table("orders")),
+            right: Box::new(right),
+            join_type: crate::logical::JoinType::LeftAnti,
+            condition: None,
+            using_columns: vec![],
+            left_alias: Some("__td_jl_0__".to_owned()),
+            right_alias: Some("__td_jr_1__".to_owned()),
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        };
+        assert!(normalize_natural_flat_join(&join).is_none());
+    }
+
+    #[test]
+    fn needs_normalization_join_with_flat_rewrite_returns_true() {
+        let right = aliased_relation(table("date_dim"), "d1");
+        let plan = LogicalPlan::Join(Join {
+            left: Box::new(table("orders")),
+            right: Box::new(right),
+            join_type: crate::logical::JoinType::Inner,
+            condition: None,
+            using_columns: vec![],
+            left_alias: Some("__td_jl_0__".to_owned()),
+            right_alias: Some("__td_jr_1__".to_owned()),
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        assert!(needs_normalization(&plan));
+    }
+
+    #[test]
+    fn normalize_applies_flat_join_rewrite() {
+        // Full normalize() should apply the flat join rewrite.
+        let right = aliased_relation(table("date_dim"), "d1");
+        let condition = eq_expr(
+            unresolved_col("d_date_sk", Some("__td_jl_0__")),
+            unresolved_col("d_date_sk", Some("__td_jr_1__")),
+        );
+        let plan = LogicalPlan::Join(Join {
+            left: Box::new(table("orders")),
+            right: Box::new(right),
+            join_type: crate::logical::JoinType::Inner,
+            condition: Some(condition),
+            using_columns: vec![],
+            left_alias: Some("__td_jl_0__".to_owned()),
+            right_alias: Some("__td_jr_1__".to_owned()),
+            left_plan_ids: vec![0],
+            right_plan_ids: vec![1],
+        });
+
+        let result = normalize(&plan);
+
+        match &result {
+            LogicalPlan::Join(j) => {
+                assert!(j.left_alias.is_none());
+                assert!(j.right_alias.is_none());
+                let expected_cond = eq_expr(
+                    unresolved_col("d_date_sk", None),
+                    unresolved_col("d_date_sk", Some("d1")),
+                );
+                assert_eq!(j.condition, Some(expected_cond));
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_td_join_qualifiers_preserves_non_td_qualifiers() {
+        let expr = unresolved_col("x", Some("other_alias"));
+        let result = rewrite_td_join_qualifiers(expr.clone(), "__td_jr_1__", "d1");
+        assert_eq!(result, expr);
+    }
+
+    #[test]
+    fn rewrite_td_join_qualifiers_rewrites_binary_recursively() {
+        let condition = eq_expr(
+            unresolved_col("a", Some("__td_jl_0__")),
+            unresolved_col("b", Some("__td_jr_1__")),
+        );
+        let result = rewrite_td_join_qualifiers(condition, "__td_jr_1__", "d1");
+        let expected = eq_expr(unresolved_col("a", None), unresolved_col("b", Some("d1")));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn plan_contains_user_alias_finds_nested_alias() {
+        let plan = inner_join(
+            aliased_relation(table("t"), "user_alias"),
+            table("other"),
+            None,
+            None,
+            None,
+        );
+        assert!(plan_contains_user_alias(&plan));
+    }
+
+    #[test]
+    fn plan_contains_user_alias_ignores_internal_alias() {
+        let plan = aliased_relation(table("t"), "__td_something__");
+        assert!(!plan_contains_user_alias(&plan));
+    }
+
+    #[test]
+    fn right_plan_natural_name_table_scan() {
+        let plan = table("my_table");
+        assert_eq!(right_plan_natural_name(&plan), Some("my_table".to_owned()));
+    }
+
+    #[test]
+    fn right_plan_natural_name_aliased_table_scan() {
+        let plan = LogicalPlan::TableScan(TableScan {
+            table: "my_table".to_owned(),
+            alias: Some("t1".to_owned()),
+            schema: Default::default(),
+        });
+        assert_eq!(right_plan_natural_name(&plan), Some("t1".to_owned()));
+    }
+
+    #[test]
+    fn right_plan_natural_name_internal_alias_returns_none() {
+        let plan = aliased_relation(table("t"), "__td_internal__");
+        assert_eq!(right_plan_natural_name(&plan), None);
+    }
+
+    #[test]
+    fn right_plan_natural_name_user_alias_returns_name() {
+        let plan = aliased_relation(table("t"), "d1");
+        assert_eq!(right_plan_natural_name(&plan), Some("d1".to_owned()));
     }
 }

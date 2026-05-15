@@ -342,75 +342,16 @@ impl SqlGenerator {
     }
 
     fn gen_join(&self, j: &Join) -> Result<String> {
-        // When plan_id-based column qualification is active, wrap each side in a named subquery
-        // so DuckDB can unambiguously resolve same-named columns from different sides.
+        // After normalisation, joins that qualify for the "natural flat join" pattern
+        // (internal __td_jr_X__/__td_jl_X__ aliases rewritten to user-facing aliases)
+        // arrive here with left_alias/right_alias cleared to None.
         //
-        // Special case: when the RIGHT side is an AliasedRelation with a user-facing alias
-        // (not a __td_jr__ internal alias), we can use a "natural flat join" pattern:
-        // - Use the AliasedRelation's own alias directly (keeps it accessible in outer WHERE)
-        // - Don't wrap the left side in a subquery either (expose all nested aliases)
-        // - Rewrite ON condition: substitute __td_jr_X__ → natural_alias, strip __td_jl_X__
-        //
-        // This fixes queries like TPC-DS Q17/Q25/Q29 where date_dim.alias("d1") is joined
-        // multiple times and filter conditions reference d1/d2/d3 in the outer WHERE clause.
-        // Detect the natural flat join pattern:
-        // right_alias is a __td_jr_X__ alias AND j.right is an AliasedRelation with a
-        // user-facing alias (e.g. "d1"). In this case we can use the natural alias directly
-        // to keep it accessible in outer WHERE/HAVING clauses.
-        // Check whether the left side is also a user-aliased relation (e.g. self-join with
-        // df.alias("a").join(df.alias("b"), ...)). If so, skip the natural flat join path:
-        // stripping __td_jl_X__ qualifiers would create ambiguous column refs when both sides
-        // share the same column names.
-        let left_is_user_alias = if let Some(la) = &j.left_alias {
-            if la.starts_with("__td_jl_") {
-                matches!(j.left.as_ref(), LogicalPlan::AliasedRelation(ar) if !ar.alias.starts_with("__"))
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        let right_natural_alias: Option<(String, String)> = if let Some(ra) = &j.right_alias {
-            if ra.starts_with("__td_jr_") && !left_is_user_alias && !j.join_type.is_semi_or_anti() {
-                match j.right.as_ref() {
-                    LogicalPlan::AliasedRelation(ar) if !ar.alias.starts_with("__") => {
-                        // Case 1: right is AliasedRelation with user-facing alias (e.g. "d1")
-                        Some((ar.alias.clone(), ra.clone()))
-                    }
-                    right_plan => {
-                        // Case 2: right is a plain table (TableScan, InMemoryRelation).
-                        // Only use flat path if left side contains user-facing AliasedRelations
-                        // that would be buried in a subquery (e.g. d1/d2/d3 in Q17).
-                        if plan_contains_user_alias(&j.left) {
-                            right_plan_natural_name(right_plan).map(|name| (name, ra.clone()))
-                        } else {
-                            None
-                        }
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
+        // Remaining paths:
+        // 1. Aliases present → wrap each side in a named subquery
+        // 2. No aliases → simple flat join (gen_from on each side)
+        // 3. SEMI/ANTI handling is unchanged
         let (left, right, effective_condition) =
-            if let Some((nat_alias, td_alias)) = right_natural_alias {
-                // Natural flat join: use user-facing alias directly.
-                // The right side is an AliasedRelation; generate it without additional wrapping.
-                let right_sql = self.gen_from(&j.right)?; // "table AS natural_alias"
-                                                          // Generate left side as a flat FROM fragment (no subquery wrap).
-                let left_sql = self.gen_from(&j.left)?;
-                // Rewrite ON condition: replace __td_jr_X__ qualifier → natural_alias,
-                // strip __td_jl_X__ qualifiers (left-side columns are unqualified in flat join).
-                let effective_cond = j
-                    .condition
-                    .as_ref()
-                    .map(|c| rewrite_td_join_qualifiers(c.clone(), &td_alias, &nat_alias));
-                (left_sql, right_sql, effective_cond)
-            } else if j.left_alias.is_some() || j.right_alias.is_some() {
+            if j.left_alias.is_some() || j.right_alias.is_some() {
                 let la = j.left_alias.as_deref().unwrap_or("__td_jl__");
                 let ra = j.right_alias.as_deref().unwrap_or("__td_jr__");
                 // Use gen_from to get a valid FROM-clause fragment, then wrap in SELECT * so we
@@ -3707,96 +3648,6 @@ fn strip_qualifiers_in_expr(
         }
         Expression::Unary(u) => {
             let operand = strip_qualifiers_in_expr(*u.operand, aliases);
-            Expression::Unary(UnaryExpression {
-                op: u.op,
-                operand: Box::new(operand),
-            })
-        }
-        other => other,
-    }
-}
-
-/// Returns the natural table/alias name for a simple leaf-like plan node (TableScan,
-/// InMemoryRelation, AliasedRelation). Used in the flat join path to determine what alias
-/// to use when rewriting __td_jr_X__ qualifiers in join ON conditions.
-fn right_plan_natural_name(plan: &LogicalPlan) -> Option<String> {
-    match plan {
-        LogicalPlan::TableScan(ts) => Some(ts.alias.clone().unwrap_or_else(|| ts.table.clone())),
-        LogicalPlan::InMemoryRelation(imr) => Some(imr.view_name.clone()),
-        LogicalPlan::AliasedRelation(ar) => {
-            if !ar.alias.starts_with("__") {
-                Some(ar.alias.clone())
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Returns true if the plan tree contains any AliasedRelation with a user-facing alias
-/// (i.e., not starting with "__"). Used to detect when the flat join path is needed
-/// to keep those aliases accessible in outer WHERE/HAVING clauses.
-fn plan_contains_user_alias(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::AliasedRelation(ar) => !ar.alias.starts_with("__"),
-        LogicalPlan::Join(j) => {
-            plan_contains_user_alias(&j.left) || plan_contains_user_alias(&j.right)
-        }
-        LogicalPlan::Filter(f) => plan_contains_user_alias(&f.input),
-        LogicalPlan::Project(p) => plan_contains_user_alias(&p.input),
-        LogicalPlan::Aggregate(a) => plan_contains_user_alias(&a.input),
-        LogicalPlan::Sort(s) => plan_contains_user_alias(&s.input),
-        LogicalPlan::Limit(l) => plan_contains_user_alias(&l.input),
-        LogicalPlan::Distinct(d) => plan_contains_user_alias(&d.input),
-        _ => false,
-    }
-}
-
-/// Rewrite qualifiers in a join ON condition for the "natural flat join" path.
-///
-/// When we use an AliasedRelation's natural alias (e.g. "d1") instead of the generated
-/// __td_jr_X__ alias, we need to:
-/// 1. Replace __td_jr_X__ qualifier → nat_alias (e.g. "d1")
-/// 2. Strip __td_jl_X__ qualifiers (left-side columns are unqualified in flat join)
-///
-/// This is applied to the ON condition so DuckDB sees proper column references.
-fn rewrite_td_join_qualifiers(
-    expr: Expression,
-    td_right_alias: &str,
-    nat_alias: &str,
-) -> Expression {
-    match expr {
-        Expression::UnresolvedColumn(u) => {
-            match u.qualifier.as_deref() {
-                Some(q) if q == td_right_alias => {
-                    // Right-side column: use natural alias
-                    Expression::UnresolvedColumn(UnresolvedColumn {
-                        name: u.name,
-                        qualifier: Some(nat_alias.to_string()),
-                    })
-                }
-                Some(q) if q.starts_with("__td_jl_") => {
-                    // Left-side column: strip qualifier (accessible unqualified in flat join)
-                    Expression::UnresolvedColumn(UnresolvedColumn {
-                        name: u.name,
-                        qualifier: None,
-                    })
-                }
-                _ => Expression::UnresolvedColumn(u),
-            }
-        }
-        Expression::Binary(b) => {
-            let left = rewrite_td_join_qualifiers(*b.left, td_right_alias, nat_alias);
-            let right = rewrite_td_join_qualifiers(*b.right, td_right_alias, nat_alias);
-            Expression::Binary(BinaryExpression {
-                op: b.op,
-                left: Box::new(left),
-                right: Box::new(right),
-            })
-        }
-        Expression::Unary(u) => {
-            let operand = rewrite_td_join_qualifiers(*u.operand, td_right_alias, nat_alias);
             Expression::Unary(UnaryExpression {
                 op: u.op,
                 operand: Box::new(operand),

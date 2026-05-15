@@ -6,12 +6,12 @@ use crate::logical::*;
 use crate::types::{DataType, StructType};
 use sqlparser::ast::{
     AccessExpr, AlterTableOperation, ArrayElemTypeDef, BinaryOperator, CastKind,
-    DataType as SqlDataType, DuplicateTreatment, ExactNumberInfo, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause,
-    ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, SetQuantifier, Statement, Subscript, TableFactor,
-    TableObject, TableWithJoins, UnaryOperator, Value, ValueWithSpan, WindowFrameBound,
-    WindowFrameUnits, WindowSpec, WindowType,
+    DataType as SqlDataType, DateTimeField, DuplicateTreatment, ExactNumberInfo, Expr, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
+    LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select,
+    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetQuantifier, Statement, Subscript,
+    TableFactor, TableObject, TableWithJoins, UnaryOperator, Value, ValueWithSpan,
+    WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 
 pub struct SqlConverter;
@@ -350,7 +350,7 @@ impl SqlConverter {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql: format!("{}", values),
                     schema,
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
@@ -554,7 +554,7 @@ impl SqlConverter {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql: format!("SELECT * FROM {}", duckdb_sql),
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
@@ -589,7 +589,7 @@ impl SqlConverter {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
@@ -1138,21 +1138,7 @@ impl SqlConverter {
                     distinct: false,
                 }))
             }
-            Expr::Interval(interval) => {
-                let unit = interval
-                    .leading_field
-                    .map(|f| format!(" {}", f))
-                    .unwrap_or_default();
-                Ok(Expression::RawSql(RawSqlExpression {
-                    sql: format!("INTERVAL {}{}", interval.value, unit),
-                    // Tag the data type so downstream type-driven decisions
-                    // (e.g. the `DATE + INTERVAL → CAST AS DATE` gate in
-                    // gen_binary) can recognise the value without inspecting
-                    // the rendered SQL string.
-                    data_type: Some(DataType::Interval),
-                    nullable: Some(false), // interval literals are never null
-                }))
-            }
+            Expr::Interval(interval) => self.convert_interval(interval),
             Expr::Extract { field, expr, .. } => {
                 let inner = self.convert_expr(*expr)?;
                 Ok(Expression::FunctionCall(FunctionCall {
@@ -1526,6 +1512,113 @@ impl SqlConverter {
         }
     }
 
+    /// Convert a sqlparser `Interval` node to a typed `Expression::Interval` when
+    /// the value is a simple integer literal and the unit is one of the six
+    /// calendar/time fields Spark supports. Falls back to `Expression::RawSql`
+    /// for compound intervals or non-literal values.
+    fn convert_interval(&self, interval: sqlparser::ast::Interval) -> Result<Expression> {
+        // Try to extract a simple integer from the value expression.
+        // The parser produces `Expr::Value(Value::SingleQuotedString("3"))` for
+        // `INTERVAL '3' YEAR`, or `Expr::Value(Value::Number("3", false))` for
+        // `INTERVAL 3 YEAR`.
+        let int_value = Self::try_extract_interval_int(&interval.value);
+
+        if let (Some(n), Some(field)) = (int_value, &interval.leading_field) {
+            // Only convert simple single-field intervals; compound (YEAR TO MONTH)
+            // intervals have `last_field` set — fall through to RawSql.
+            if interval.last_field.is_none() {
+                const MICROS_PER_SECOND: i64 = 1_000_000;
+                const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
+                const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
+
+                let interval_expr = match field {
+                    DateTimeField::Year | DateTimeField::Years => Some(IntervalExpression {
+                        months: n.checked_mul(12).ok_or_else(|| {
+                            ThunderduckError::Parse("interval year overflow".to_owned())
+                        })?,
+                        days: 0,
+                        microseconds: 0,
+                    }),
+                    DateTimeField::Month | DateTimeField::Months => Some(IntervalExpression {
+                        months: n,
+                        days: 0,
+                        microseconds: 0,
+                    }),
+                    DateTimeField::Day | DateTimeField::Days => Some(IntervalExpression {
+                        months: 0,
+                        days: n,
+                        microseconds: 0,
+                    }),
+                    DateTimeField::Hour | DateTimeField::Hours => {
+                        let micros =
+                            i64::from(n).checked_mul(MICROS_PER_HOUR).ok_or_else(|| {
+                                ThunderduckError::Parse("interval hour overflow".to_owned())
+                            })?;
+                        Some(IntervalExpression {
+                            months: 0,
+                            days: 0,
+                            microseconds: micros,
+                        })
+                    }
+                    DateTimeField::Minute | DateTimeField::Minutes => {
+                        let micros =
+                            i64::from(n).checked_mul(MICROS_PER_MINUTE).ok_or_else(|| {
+                                ThunderduckError::Parse("interval minute overflow".to_owned())
+                            })?;
+                        Some(IntervalExpression {
+                            months: 0,
+                            days: 0,
+                            microseconds: micros,
+                        })
+                    }
+                    DateTimeField::Second | DateTimeField::Seconds => {
+                        let micros =
+                            i64::from(n).checked_mul(MICROS_PER_SECOND).ok_or_else(|| {
+                                ThunderduckError::Parse("interval second overflow".to_owned())
+                            })?;
+                        Some(IntervalExpression {
+                            months: 0,
+                            days: 0,
+                            microseconds: micros,
+                        })
+                    }
+                    _ => None, // Unsupported field (WEEK, QUARTER, etc.) — fall through
+                };
+
+                if let Some(ie) = interval_expr {
+                    return Ok(Expression::Interval(ie));
+                }
+            }
+        }
+
+        // Fallback: compound intervals, non-literal values, or unsupported fields.
+        let unit = interval
+            .leading_field
+            .map(|f| format!(" {f}"))
+            .unwrap_or_default();
+        Ok(Expression::RawSql(RawSqlExpression {
+            sql: format!("INTERVAL {}{}", interval.value, unit),
+            data_type: Some(DataType::Interval),
+            nullable: Some(false),
+        }))
+    }
+
+    /// Try to extract a plain integer from the value expression of an interval.
+    ///
+    /// Handles both `'3'` (single-quoted string) and `3` (numeric literal).
+    fn try_extract_interval_int(expr: &Expr) -> Option<i32> {
+        match expr {
+            Expr::Value(v) => match &v.value {
+                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+                    s.parse::<i32>().ok()
+                }
+                Value::Number(s, _) => s.parse::<i32>().ok(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn convert_binary_op(&self, op: BinaryOperator) -> Result<BinaryOp> {
         match op {
             BinaryOperator::Plus => Ok(BinaryOp::Add),
@@ -1887,6 +1980,149 @@ mod tests {
             }
             other => panic!("expected Project, got {:?}", other),
         }
+    }
+
+    // ── B1 interval conversion tests ─────────────────────────────────────
+
+    /// Helper: parse `SELECT <expr> AS r FROM t` and return the inner expression
+    /// (unwrapped from Alias).
+    fn parse_select_expr(sql: &str) -> Expression {
+        let plan = SparkSqlParser::parse(sql).unwrap();
+        match plan {
+            LogicalPlan::Project(p) => match p.projections.into_iter().next().unwrap() {
+                Expression::Alias(a) => *a.expr,
+                other => other,
+            },
+            other => panic!("expected Project, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_year_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '3' YEAR AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 36);
+                assert_eq!(ie.days, 0);
+                assert_eq!(ie.microseconds, 0);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_month_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '5' MONTH AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 5);
+                assert_eq!(ie.days, 0);
+                assert_eq!(ie.microseconds, 0);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_day_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '7' DAY AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 0);
+                assert_eq!(ie.days, 7);
+                assert_eq!(ie.microseconds, 0);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_hour_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '2' HOUR AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 0);
+                assert_eq!(ie.days, 0);
+                assert_eq!(ie.microseconds, 2 * 3_600_000_000);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_minute_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '10' MINUTE AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 0);
+                assert_eq!(ie.days, 0);
+                assert_eq!(ie.microseconds, 10 * 60_000_000);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_second_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '30' SECOND AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 0);
+                assert_eq!(ie.days, 0);
+                assert_eq!(ie.microseconds, 30_000_000);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_negative_value_produces_typed_expression() {
+        // Spark parses `INTERVAL '-3' DAY` as value='-3', field=DAY
+        let expr = parse_select_expr("SELECT INTERVAL '-3' DAY AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 0);
+                assert_eq!(ie.days, -3);
+                assert_eq!(ie.microseconds, 0);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_non_integer_falls_back_to_raw_sql() {
+        // A non-integer value (e.g., a float string) should fall back to RawSql
+        let expr = parse_select_expr("SELECT INTERVAL '1.5' DAY AS r FROM t");
+        match expr {
+            Expression::RawSql(r) => {
+                assert_eq!(r.data_type, Some(DataType::Interval));
+            }
+            other => panic!("expected RawSql fallback, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_data_type_is_interval() {
+        let expr = parse_select_expr("SELECT INTERVAL '1' DAY AS r FROM t");
+        assert_eq!(expr.data_type(&StructType::empty()), DataType::Interval);
+    }
+
+    // ── B2 VALUES duckdb_ready tests ────────────────────────────────────
+
+    #[test]
+    fn values_clause_is_duckdb_ready() {
+        // Bare VALUES query maps to SetExpr::Values → SqlRelation.
+        let plan = SparkSqlParser::parse("VALUES (1, 'a'), (2, 'b')").unwrap();
+        fn find_sql_relation(plan: &LogicalPlan) -> Option<&SqlRelation> {
+            match plan {
+                LogicalPlan::SqlRelation(sr) => Some(sr),
+                LogicalPlan::Project(p) => find_sql_relation(&p.input),
+                LogicalPlan::AliasedRelation(a) => find_sql_relation(&a.input),
+                _ => None,
+            }
+        }
+        let sr = find_sql_relation(&plan).expect("should contain SqlRelation");
+        assert!(sr.duckdb_ready, "VALUES SqlRelation should be duckdb_ready");
     }
 }
 

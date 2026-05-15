@@ -1436,7 +1436,7 @@ impl<'a> RelationConverter<'a> {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
@@ -1448,7 +1448,7 @@ impl<'a> RelationConverter<'a> {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
@@ -1465,7 +1465,7 @@ impl<'a> RelationConverter<'a> {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
@@ -1474,7 +1474,7 @@ impl<'a> RelationConverter<'a> {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
@@ -1484,7 +1484,7 @@ impl<'a> RelationConverter<'a> {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
@@ -1498,7 +1498,7 @@ impl<'a> RelationConverter<'a> {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
@@ -1512,7 +1512,7 @@ impl<'a> RelationConverter<'a> {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
@@ -1542,7 +1542,7 @@ impl<'a> RelationConverter<'a> {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
@@ -1571,7 +1571,7 @@ impl<'a> RelationConverter<'a> {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }

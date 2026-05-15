@@ -349,7 +349,10 @@ pub struct SqlRelation {
     /// through `preprocess_spark_sql`. This prevents double-processing of constructs
     /// like `MAP([keys], [vals])` which would be incorrectly rewritten to
     /// `MAP([[keys]], [[vals]])`.
-    #[doc(hidden)]
+    ///
+    /// All current code paths set this to `true` — catalog operations, parsed SQL,
+    /// local relations, and DDL statements all produce DuckDB-native SQL. The `false`
+    /// branch is retained as a defensive fallback for any future SqlRelation source.
     pub duckdb_ready: bool,
     /// For CREATE VIEW DDL: the unquoted view name. When set, the service layer
     /// caches `self.schema` as the view's Spark-accurate schema so that
@@ -359,16 +362,6 @@ pub struct SqlRelation {
 }
 
 impl SqlRelation {
-    /// Create a new SqlRelation with raw Spark SQL that needs preprocessing.
-    pub fn new(sql: String, schema: StructType) -> Self {
-        Self {
-            sql,
-            schema,
-            duckdb_ready: false,
-            view_name: None,
-        }
-    }
-
     /// Create a new SqlRelation with DuckDB-ready SQL that must skip preprocessing.
     pub fn duckdb_native(sql: String, schema: StructType) -> Self {
         Self {

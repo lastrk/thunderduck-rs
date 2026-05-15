@@ -719,32 +719,12 @@ impl SqlGenerator {
     }
 
     fn gen_sql_relation(&self, sr: &SqlRelation) -> Result<String> {
-        // DDL/DML statements (CREATE, DROP, INSERT, UPDATE, DELETE, ALTER, TRUNCATE)
-        // cannot be wrapped in parens — return them verbatim.
-        //
-        // DDL SqlRelations are produced by sql_converter.rs after full FunctionRegistry
-        // translation and plan_to_sql conversion. They are already DuckDB-ready and must
-        // NOT be run through preprocess_spark_sql again (doing so double-processes things
-        // like MAP([keys], [vals]) → MAP([[keys]], [[vals]])).
-        //
-        // SqlRelations marked duckdb_ready (e.g. from local_relation_to_values_sql)
-        // are also already DuckDB-native and must skip preprocessing.
-        //
-        // Non-DDL SqlRelations may carry raw Spark SQL from legacy paths and need preprocessing.
-        let upper = sr.sql.trim_start().to_uppercase();
-        let is_ddl = upper.starts_with("CREATE")
-            || upper.starts_with("DROP")
-            || upper.starts_with("INSERT")
-            || upper.starts_with("UPDATE")
-            || upper.starts_with("DELETE")
-            || upper.starts_with("ALTER")
-            || upper.starts_with("TRUNCATE")
-            || upper.starts_with("SET");
-        if is_ddl {
-            Ok(sr.sql.clone())
-        } else if sr.duckdb_ready {
+        if sr.duckdb_ready {
             Ok(format!("({})", sr.sql))
         } else {
+            // Defensive fallback for any future SqlRelation source that
+            // hasn't been marked duckdb_ready. All current paths are
+            // duckdb_ready after Phase C cleanup.
             Ok(format!("({})", preprocess_spark_sql(&sr.sql)))
         }
     }
@@ -4500,7 +4480,7 @@ mod tests {
             input: Box::new(LogicalPlan::SqlRelation(SqlRelation {
                 sql: "SELECT 1 AS a, 2 AS b".to_string(),
                 schema: crate::types::StructType::empty(),
-                duckdb_ready: false,
+                duckdb_ready: true,
                 view_name: None,
             })),
             column_names: vec!["x".to_string(), "y".to_string()],

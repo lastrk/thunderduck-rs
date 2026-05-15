@@ -1,0 +1,4 @@
+# Multiple owners on a single line are OR'd: a review from EITHER team
+# satisfies the CODEOWNERS requirement. Both teams get auto-requested for
+# visibility, but only one approval is needed to merge.
+* @nubank/data-infra @nubank/batch-compute

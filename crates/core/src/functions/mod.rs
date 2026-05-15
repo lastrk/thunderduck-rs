@@ -374,11 +374,13 @@ impl FunctionRegistry {
         }
 
         // ── Misc ────────────────────────────────────────────────────────────────
+        // Note: `hash` / `xxhash64` are NOT direct-mapped to DuckDB's built-in
+        // HASH() — different algorithm, different return type. Routed through
+        // custom translators below to `spark_hash` / `spark_xxhash64` from the
+        // thdck_spark_funcs ext4 extension (strict mode only).
         let misc_direct: &[(&str, &str)] = &[
             ("rand", "RANDOM"),
             ("random", "RANDOM"),
-            ("hash", "HASH"),
-            ("xxhash64", "HASH"),
             ("typeof", "TYPEOF"),
             ("current_user", "CURRENT_USER"),
             ("current_schema", "CURRENT_SCHEMA"),
@@ -520,6 +522,28 @@ impl FunctionRegistry {
                     format!("CASE WHEN {s} IS NULL THEN NULL WHEN INSTR(SUBSTR({s}, {p}), {sub}) > 0 THEN INSTR(SUBSTR({s}, {p}), {sub}) + ({p}) - 1 ELSE 0 END")
                 }
             }
+        });
+
+        // hash(c1,...,cN) / xxhash64(c1,...,cN) — Spark hashing.
+        //
+        // Strict mode: route to `spark_hash` / `spark_xxhash64` from the
+        // thdck_spark_funcs ext4 extension (bit-for-bit Spark parity:
+        // Murmur3-32 / xxHash64, signed INT / BIGINT return, seed 42,
+        // NaN canonicalization, sign-extension for narrow ints, DECIMAL /
+        // INTERVAL / nested-type handling).
+        //
+        // Relaxed mode: no DuckDB built-in matches Spark's algorithm and
+        // canonicalization, and DuckDB's HASH() returns UBIGINT under a
+        // different MurmurHash3 variant. Rather than silently returning wrong
+        // values, emit a DuckDB `error()` call that surfaces a clear message
+        // at query execution.
+        custom.insert("hash", |args, mode| match mode {
+            CompatMode::Strict => format!("spark_hash({})", args.join(", ")),
+            CompatMode::Relaxed => "error('Spark hash() requires strict mode (set THUNDERDUCK_COMPAT_MODE=strict or build with --features bundled-extension)')".to_string(),
+        });
+        custom.insert("xxhash64", |args, mode| match mode {
+            CompatMode::Strict => format!("spark_xxhash64({})", args.join(", ")),
+            CompatMode::Relaxed => "error('Spark xxhash64() requires strict mode (set THUNDERDUCK_COMPAT_MODE=strict or build with --features bundled-extension)')".to_string(),
         });
 
         // instr(str, substr[, pos]) — DuckDB only supports 2-arg instr
@@ -1853,6 +1877,46 @@ mod tests {
     fn unknown_passthrough() {
         let sql = FunctionRegistry::translate("my_custom_udf", &["a", "b"], CompatMode::Relaxed);
         assert_eq!(sql, "my_custom_udf(a, b)");
+    }
+
+    // ── Spark hash / xxhash64 (ext4 extension wiring) ──────────────────────────
+
+    #[test]
+    fn hash_strict_emits_spark_hash() {
+        let sql = FunctionRegistry::translate("hash", &["id"], CompatMode::Strict);
+        assert_eq!(sql, "spark_hash(id)");
+    }
+
+    #[test]
+    fn hash_variadic_strict_emits_spark_hash() {
+        let sql = FunctionRegistry::translate("hash", &["a", "b", "c"], CompatMode::Strict);
+        assert_eq!(sql, "spark_hash(a, b, c)");
+    }
+
+    #[test]
+    fn hash_relaxed_emits_runtime_error() {
+        let sql = FunctionRegistry::translate("hash", &["id"], CompatMode::Relaxed);
+        assert!(sql.starts_with("error("), "got: {sql}");
+        assert!(sql.contains("strict mode"), "got: {sql}");
+    }
+
+    #[test]
+    fn xxhash64_strict_emits_spark_xxhash64() {
+        let sql = FunctionRegistry::translate("xxhash64", &["id"], CompatMode::Strict);
+        assert_eq!(sql, "spark_xxhash64(id)");
+    }
+
+    #[test]
+    fn xxhash64_variadic_strict_emits_spark_xxhash64() {
+        let sql = FunctionRegistry::translate("xxhash64", &["a", "b"], CompatMode::Strict);
+        assert_eq!(sql, "spark_xxhash64(a, b)");
+    }
+
+    #[test]
+    fn xxhash64_relaxed_emits_runtime_error() {
+        let sql = FunctionRegistry::translate("xxhash64", &["id"], CompatMode::Relaxed);
+        assert!(sql.starts_with("error("), "got: {sql}");
+        assert!(sql.contains("strict mode"), "got: {sql}");
     }
 
     // ── Bug regression tests ───────────────────────────────────────────────────

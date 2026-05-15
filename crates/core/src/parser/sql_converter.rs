@@ -1239,29 +1239,27 @@ impl SqlConverter {
                 right: Box::new(Literal::boolean(true)),
             })),
 
-            // OVERLAY(str PLACING what FROM pos [FOR len]) — standard SQL, DuckDB-compatible
+            // OVERLAY(str PLACING what FROM pos [FOR len])
+            // Convert to FunctionCall so the FunctionRegistry custom handler
+            // translates it to DuckDB-compatible concat+substring.
             Expr::Overlay {
                 expr,
                 overlay_what,
                 overlay_from,
                 overlay_for,
             } => {
-                let expr_sql = SqlConverter::expr_display(&self.convert_expr(*expr)?)?;
-                let what_sql = SqlConverter::expr_display(&self.convert_expr(*overlay_what)?)?;
-                let from_sql = SqlConverter::expr_display(&self.convert_expr(*overlay_from)?)?;
-                let for_clause = if let Some(for_expr) = overlay_for {
-                    let for_sql = SqlConverter::expr_display(&self.convert_expr(*for_expr)?)?;
-                    format!(" FOR {}", for_sql)
-                } else {
-                    String::new()
-                };
-                Ok(Expression::RawSql(RawSqlExpression {
-                    sql: format!(
-                        "OVERLAY({} PLACING {} FROM {}{})",
-                        expr_sql, what_sql, from_sql, for_clause
-                    ),
-                    data_type: None,
-                    nullable: None,
+                let mut args = vec![
+                    self.convert_expr(*expr)?,
+                    self.convert_expr(*overlay_what)?,
+                    self.convert_expr(*overlay_from)?,
+                ];
+                if let Some(for_expr) = overlay_for {
+                    args.push(self.convert_expr(*for_expr)?);
+                }
+                Ok(Expression::FunctionCall(FunctionCall {
+                    name: "overlay".to_owned(),
+                    args,
+                    distinct: false,
                 }))
             }
 
@@ -1843,6 +1841,51 @@ mod tests {
                 assert_eq!(a.aggregates.len(), 1);
             }
             other => panic!("expected Aggregate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn overlay_produces_function_call_3_args() {
+        let sql = "SELECT OVERLAY('abcdef' PLACING 'XY' FROM 3) AS r FROM t";
+        let plan = SparkSqlParser::parse(sql).unwrap();
+        match plan {
+            LogicalPlan::Project(p) => {
+                // Should be Alias(FunctionCall("overlay", 3 args))
+                let expr = &p.projections[0];
+                match expr {
+                    Expression::Alias(a) => match a.expr.as_ref() {
+                        Expression::FunctionCall(f) => {
+                            assert_eq!(f.name, "overlay");
+                            assert_eq!(f.args.len(), 3);
+                        }
+                        other => panic!("expected FunctionCall, got {:?}", other),
+                    },
+                    other => panic!("expected Alias, got {:?}", other),
+                }
+            }
+            other => panic!("expected Project, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn overlay_produces_function_call_4_args() {
+        let sql = "SELECT OVERLAY('abcdef' PLACING 'XY' FROM 3 FOR 2) AS r FROM t";
+        let plan = SparkSqlParser::parse(sql).unwrap();
+        match plan {
+            LogicalPlan::Project(p) => {
+                let expr = &p.projections[0];
+                match expr {
+                    Expression::Alias(a) => match a.expr.as_ref() {
+                        Expression::FunctionCall(f) => {
+                            assert_eq!(f.name, "overlay");
+                            assert_eq!(f.args.len(), 4);
+                        }
+                        other => panic!("expected FunctionCall, got {:?}", other),
+                    },
+                    other => panic!("expected Alias, got {:?}", other),
+                }
+            }
+            other => panic!("expected Project, got {:?}", other),
         }
     }
 }

@@ -535,7 +535,7 @@ impl<'a> RelationConverter<'a> {
                         let placeholder = LogicalPlan::SqlRelation(SqlRelation {
                             sql: sql.clone(),
                             schema: StructType::empty(),
-                            duckdb_ready: false,
+                            duckdb_ready: true,
                             view_name: None,
                         });
                         self.infer_full_schema(&placeholder).unwrap_or_default()
@@ -544,7 +544,7 @@ impl<'a> RelationConverter<'a> {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema,
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }

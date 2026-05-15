@@ -201,6 +201,8 @@ impl FunctionRegistry {
             ("format_string", "PRINTF"),
             ("sentences", "REGEXP_SPLIT_TO_ARRAY"),
             ("luhn_check", "LUHN_CHECK"),
+            ("startswith", "STARTS_WITH"),
+            ("endswith", "ENDS_WITH"),
         ];
         for (s, d) in string_direct {
             direct.insert(s, d);
@@ -2301,5 +2303,40 @@ mod tests {
             CompatMode::Relaxed,
         );
         assert_eq!(sql, "'STRUCT<a: BIGINT, b: STRING>'");
+    }
+
+    #[test]
+    fn startswith_maps_to_starts_with() {
+        let sql = FunctionRegistry::translate("startswith", &["col", "'abc'"], CompatMode::Relaxed);
+        assert_eq!(sql, "STARTS_WITH(col, 'abc')");
+    }
+
+    #[test]
+    fn endswith_maps_to_ends_with() {
+        let sql = FunctionRegistry::translate("endswith", &["col", "'xyz'"], CompatMode::Relaxed);
+        assert_eq!(sql, "ENDS_WITH(col, 'xyz')");
+    }
+
+    #[test]
+    fn overlay_custom_3_args() {
+        let sql =
+            FunctionRegistry::translate("overlay", &["'abcdef'", "'XY'", "3"], CompatMode::Relaxed);
+        assert_eq!(
+            sql,
+            "LEFT('abcdef', (3) - 1) || ('XY') || SUBSTRING('abcdef', (3) + LENGTH('XY'))"
+        );
+    }
+
+    #[test]
+    fn overlay_custom_4_args() {
+        let sql = FunctionRegistry::translate(
+            "overlay",
+            &["'abcdef'", "'XY'", "3", "4"],
+            CompatMode::Relaxed,
+        );
+        assert_eq!(
+            sql,
+            "LEFT('abcdef', (3) - 1) || ('XY') || SUBSTRING('abcdef', (3) + (4))"
+        );
     }
 }

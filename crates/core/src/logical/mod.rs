@@ -345,14 +345,9 @@ pub struct SqlRelation {
     /// with Arrow IPC data so that type inference (e.g. SUM→BIGINT cast) can
     /// look up column types without issuing a DESCRIBE query.
     pub schema: StructType,
-    /// When true, the SQL is already in DuckDB-native format and must NOT be run
-    /// through `preprocess_spark_sql`. This prevents double-processing of constructs
-    /// like `MAP([keys], [vals])` which would be incorrectly rewritten to
-    /// `MAP([[keys]], [[vals]])`.
-    ///
-    /// All current code paths set this to `true` — catalog operations, parsed SQL,
-    /// local relations, and DDL statements all produce DuckDB-native SQL. The `false`
-    /// branch is retained as a defensive fallback for any future SqlRelation source.
+    /// Legacy field: previously controlled whether `preprocess_spark_sql` was
+    /// applied. All SQL is now generated in DuckDB-native format by the typed AST
+    /// pipeline, so this is always `true`. Retained for structural compatibility.
     pub duckdb_ready: bool,
     /// For CREATE VIEW DDL: the unquoted view name. When set, the service layer
     /// caches `self.schema` as the view's Spark-accurate schema so that

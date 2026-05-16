@@ -561,10 +561,7 @@ impl<'a> RelationConverter<'a> {
                 // Falls back to schema-only (0 rows) if anything goes wrong.
                 if let Ok(sql) = local_relation_to_values_sql(data) {
                     let schema = parse_arrow_schema(data).unwrap_or_default();
-                    // Mark as duckdb_ready: local_relation_to_values_sql produces
-                    // DuckDB-native SQL (e.g. MAP([k], [v])) that must NOT be
-                    // reprocessed by preprocess_spark_sql (which would double-wrap
-                    // MAP args into MAP([[k]], [[v]])).
+                    // local_relation_to_values_sql produces DuckDB-native SQL.
                     return Ok(LogicalPlan::SqlRelation(SqlRelation {
                         sql,
                         schema,

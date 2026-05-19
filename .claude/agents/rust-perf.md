@@ -50,6 +50,16 @@ Use the MCP search tools when identifying hot paths and scoping optimization wor
 Use `Read`, `Glob`, `Grep` only for literal text matches (benchmark names,
 attribute strings) or files already identified.
 
+### Sequenced exploration workflow
+
+When hunting for a class of inefficiency rather than a known hot spot, work in this order:
+
+1. `semble.search` for the pattern by intent ("allocations in a loop", "lock held across await", "string concatenation in a hot path").
+2. Inspect the returned chunk first; open the full file only when the chunk is insufficient.
+3. `semble.find_related` on a confirmed bottleneck to surface structurally similar code that would benefit from the same fix.
+4. Hand candidate symbols to `codegraph_callers`/`codegraph_impact` to prioritize by call frequency and blast radius.
+5. Grep is last resort, for exact-string matches the semantic tools missed.
+
 ## Core Principle
 
 **Never optimize without a hypothesis.** Every change you propose must state:

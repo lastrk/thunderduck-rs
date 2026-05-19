@@ -59,6 +59,16 @@ Use `Read`, `Edit`, `Bash`, `Glob`, `Grep` only for: reading a specific file
 you've identified, adding diagnostic assertions, running cargo, or matching
 literal text (error messages, log keys).
 
+### Sequenced investigation workflow
+
+When you don't yet know which symbol holds the bug, work in this order before chasing it by hand:
+
+1. `semble.search` for the buggy behavior by intent ("nullable propagation", "decimal precision", "type coercion mismatch") to surface candidate code.
+2. Inspect the returned chunk first; open the full file only when the chunk is insufficient.
+3. Hand promising symbols to `codegraph_callers`/`codegraph_callees` to trace the data flow chain.
+4. `semble.find_related` on a confirmed buggy chunk to find other instances of the same root cause elsewhere.
+5. Grep is last resort, for exact-string matches the semantic tools missed.
+
 # THE IRON LAW
 
 **NO FIXES WITHOUT ROOT CAUSE INVESTIGATION FIRST.**

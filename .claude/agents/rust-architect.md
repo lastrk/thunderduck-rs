@@ -49,6 +49,16 @@ Fall back to `Read`, `Glob`, or `Grep` only for literal text (string contents,
 comments, log messages) or when you already have a file in hand. Trust codegraph
 results — do not re-verify them with grep.
 
+### Sequenced exploration workflow
+
+When surveying an unfamiliar area or pattern, work in this order — don't jump to grep:
+
+1. `semble.search` for intent ("how does session lifecycle work?", "where do we stream Arrow?").
+2. Inspect the returned chunk first; open the full file only when the chunk is insufficient.
+3. `semble.find_related` on a promising hit to surface structurally similar code elsewhere (catches copy-paste duplicates).
+4. Hand candidate symbols from those hits to `codegraph_*` for precise follow-up (callers, callees, impact, signatures).
+5. Grep is last resort, for exact-string matches the semantic tools missed.
+
 ## Core Philosophy
 
 Think in three cognitive layers before every response:

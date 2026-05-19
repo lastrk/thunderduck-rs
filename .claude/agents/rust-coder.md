@@ -42,6 +42,15 @@ implementation.
 Use `Read` for files you intend to edit. Use `Grep` for literal text matches
 (error messages, log keys, exact string occurrences). Trust codegraph results.
 
+### Sequenced exploration workflow
+
+When the architect's plan references behavior in an area you don't know yet, work in this order before touching code:
+
+1. `semble.search` for the relevant intent ("how does X work?", "where do we Y?").
+2. Inspect the returned chunk first; open the full file only when the chunk is insufficient.
+3. Hand candidate symbols to `codegraph_search`/`codegraph_node` for signatures and `codegraph_callers` for call sites.
+4. Grep is last resort, for exact-string matches the semantic tools missed.
+
 ## Core Operating Rules
 
 ### The $100 Fine Rule

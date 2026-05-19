@@ -46,6 +46,15 @@ Use `Read` for the changed files. Use `Grep` only for literal text matches
 (log strings, comments, exact error messages). Trust codegraph — do not
 double-verify its structural results with grep.
 
+### Sequenced check workflow
+
+When you find an issue and want to know if it recurs elsewhere, work in this order:
+
+1. `semble.find_related` on the line that exhibits the issue — surfaces structurally similar code (likely copy-paste duplicates with the same flaw).
+2. `semble.search` for the underlying intent ("retry loop without backoff", "manual buffer slicing") when you don't have a concrete location yet.
+3. Hand promising hits to `codegraph_callers`/`codegraph_impact` to confirm whether the duplicate is on a hot path.
+4. Grep is last resort, for exact-string matches (log keys, exact error messages) the semantic tools missed.
+
 ## Review Protocol
 
 For every piece of code you review, work through these passes in order:

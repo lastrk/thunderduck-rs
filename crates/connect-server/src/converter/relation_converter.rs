@@ -24,6 +24,21 @@ pub struct RelationConverter<'a> {
     session: Option<Arc<DuckDbSession>>,
 }
 
+/// Expand directory-style parquet paths to a `**/*.parquet` glob so DuckDB's
+/// `read_parquet` discovers files inside the directory.
+///
+/// Spark treats `spark.read.parquet("s3://bucket/dir")` as "read every parquet
+/// file under `dir`". DuckDB requires either an explicit file path or a glob.
+/// Paths already ending in `.parquet` / `.gz.parquet` are returned unchanged.
+pub(crate) fn resolve_parquet_path(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".parquet") || lower.ends_with(".gz.parquet") {
+        return path.to_string();
+    }
+    let sep = if path.ends_with('/') { "" } else { "/" };
+    format!("{path}{sep}**/*.parquet")
+}
+
 impl<'a> RelationConverter<'a> {
     pub fn new(expr_conv: &'a mut ExpressionConverter) -> Self {
         Self { expr_conv, session: None }
@@ -464,10 +479,18 @@ impl<'a> RelationConverter<'a> {
                         else { "read_parquet" }
                     }
                 };
-                let paths_sql = if ds.paths.len() == 1 {
-                    format!("'{}'", first_path.replace('\'', "''"))
+                // Spark accepts `s3://bucket/dir` as "all parquet under this dir"; DuckDB
+                // requires an explicit file path or a glob. Expand directory paths to
+                // `…/**/*.parquet` before schema inference so the probe and SELECT agree.
+                let resolved_paths: Vec<String> = if reader == "read_parquet" {
+                    ds.paths.iter().map(|p| resolve_parquet_path(p)).collect()
                 } else {
-                    let quoted: Vec<String> = ds.paths.iter()
+                    ds.paths.clone()
+                };
+                let paths_sql = if resolved_paths.len() == 1 {
+                    format!("'{}'", resolved_paths[0].replace('\'', "''"))
+                } else {
+                    let quoted: Vec<String> = resolved_paths.iter()
                         .map(|p| format!("'{}'", p.replace('\'', "''")))
                         .collect();
                     format!("[{}]", quoted.join(", "))
@@ -2339,5 +2362,58 @@ fn qualify_join_condition(
             else_expr: cw.else_expr.map(|e| Box::new(qjc(*e))),
         }),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_parquet_path;
+
+    #[test]
+    fn s3_directory_path_gets_glob_appended() {
+        assert_eq!(
+            resolve_parquet_path("s3://bucket/tpch/sf1/customer"),
+            "s3://bucket/tpch/sf1/customer/**/*.parquet"
+        );
+    }
+
+    #[test]
+    fn s3_directory_path_with_trailing_slash_gets_glob_appended() {
+        assert_eq!(
+            resolve_parquet_path("s3://bucket/tpch/sf1/customer/"),
+            "s3://bucket/tpch/sf1/customer/**/*.parquet"
+        );
+    }
+
+    #[test]
+    fn s3a_directory_path_gets_glob_appended() {
+        assert_eq!(
+            resolve_parquet_path("s3a://bucket/dir"),
+            "s3a://bucket/dir/**/*.parquet"
+        );
+    }
+
+    #[test]
+    fn local_directory_path_gets_glob_appended() {
+        assert_eq!(
+            resolve_parquet_path("/data/tpch/customer"),
+            "/data/tpch/customer/**/*.parquet"
+        );
+    }
+
+    #[test]
+    fn explicit_parquet_file_unchanged() {
+        assert_eq!(
+            resolve_parquet_path("s3://bucket/data/file.parquet"),
+            "s3://bucket/data/file.parquet"
+        );
+    }
+
+    #[test]
+    fn gzipped_parquet_file_unchanged() {
+        assert_eq!(
+            resolve_parquet_path("/data/part-00000.gz.parquet"),
+            "/data/part-00000.gz.parquet"
+        );
     }
 }

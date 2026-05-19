@@ -53,6 +53,46 @@ fn detect_timezone() -> String {
     "UTC".to_string()
 }
 
+// ── S3 credential chain ────────────────────────────────────────────────────────
+
+/// Configure DuckDB for S3 access using the credential_chain provider when the
+/// `THUNDERDUCK_S3_CREDENTIAL_CHAIN` environment variable is set to `"true"`.
+///
+/// The credential chain resolves AWS credentials from environment variables,
+/// config files, and instance metadata — including IRSA (IAM Roles for Service
+/// Accounts) on EKS via `AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`. This
+/// avoids the need for a wrapper entrypoint that calls STS and exports
+/// temporary credentials.
+///
+/// Failures are non-fatal: the server logs a warning and continues without S3
+/// access if `httpfs` / `aws` are unavailable. Workloads that don't touch S3
+/// must still start.
+fn configure_s3_credential_chain(conn: &duckdb::Connection, enabled: Option<String>) {
+    let Some(value) = enabled else { return };
+    if !value.eq_ignore_ascii_case("true") {
+        return;
+    }
+
+    let setup = [
+        "INSTALL httpfs",
+        "LOAD httpfs",
+        "INSTALL aws",
+        "LOAD aws",
+        "CREATE SECRET (TYPE S3, PROVIDER credential_chain)",
+    ];
+
+    for sql in setup {
+        if let Err(e) = conn.execute_batch(sql) {
+            tracing::warn!(
+                "S3 credential_chain setup step `{sql}` failed: {e}. S3 reads may not work."
+            );
+            return;
+        }
+        tracing::debug!("S3 credential chain: {sql}");
+    }
+    tracing::info!("S3 credential_chain configured — AWS credentials resolved automatically");
+}
+
 // ── Channel types ──────────────────────────────────────────────────────────────
 
 pub(crate) enum SessionCommand {
@@ -368,6 +408,12 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
                     Ok(m) => m,
                     Err(e) => { let _ = ready_tx.send(Err(e)); return; }
                 };
+
+                // Opt-in S3 credential_chain (IRSA-friendly auth on EKS).
+                configure_s3_credential_chain(
+                    &conn,
+                    std::env::var("THUNDERDUCK_S3_CREDENTIAL_CHAIN").ok(),
+                );
 
                 // Signal ready with the resolved mode.
                 let _ = ready_tx.send(Ok(resolved_mode));
@@ -856,5 +902,47 @@ fn run_query(conn: &duckdb::Connection, sql: &str) -> Result<Vec<RecordBatch>> {
         conn.execute_batch(sql)
             .map_err(|e| ThunderduckError::DuckDb(e.to_string()))?;
         Ok(vec![])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configure_s3_credential_chain;
+
+    fn fresh_conn() -> duckdb::Connection {
+        duckdb::Connection::open_in_memory().expect("in-memory connection")
+    }
+
+    /// Unset env var is a no-op — must not touch the connection.
+    #[test]
+    fn s3_credential_chain_disabled_when_none() {
+        let conn = fresh_conn();
+        configure_s3_credential_chain(&conn, None);
+    }
+
+    /// Empty string is treated as disabled.
+    #[test]
+    fn s3_credential_chain_disabled_when_empty() {
+        let conn = fresh_conn();
+        configure_s3_credential_chain(&conn, Some(String::new()));
+    }
+
+    /// Anything but case-insensitive "true" is disabled.
+    #[test]
+    fn s3_credential_chain_disabled_when_false() {
+        let conn = fresh_conn();
+        configure_s3_credential_chain(&conn, Some("false".into()));
+        configure_s3_credential_chain(&conn, Some("0".into()));
+        configure_s3_credential_chain(&conn, Some("yes".into()));
+    }
+
+    /// Recognised "true" values gracefully degrade when extensions / network
+    /// are unavailable — the function logs a warning but must not panic.
+    #[test]
+    fn s3_credential_chain_enabled_does_not_panic() {
+        let conn = fresh_conn();
+        configure_s3_credential_chain(&conn, Some("true".into()));
+        configure_s3_credential_chain(&conn, Some("TRUE".into()));
+        configure_s3_credential_chain(&conn, Some("True".into()));
     }
 }

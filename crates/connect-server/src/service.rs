@@ -318,38 +318,7 @@ impl SparkConnectService for ThunderduckService {
         request: Request<proto::ConfigRequest>,
     ) -> Result<Response<proto::ConfigResponse>, Status> {
         let req = request.into_inner();
-        use proto::config_request::operation::OpType;
-        let pairs = match req.operation.and_then(|op| op.op_type) {
-            Some(OpType::Get(g)) => {
-                // Return Spark defaults for known integer/boolean configs that PySpark
-                // calls int() or bool() on. Unknown keys get empty string (safe for str usage).
-                g.keys
-                    .into_iter()
-                    .map(|k| {
-                        let v = spark_config_default(&k).to_string();
-                        proto::KeyValue {
-                            key: k,
-                            value: Some(v),
-                        }
-                    })
-                    .collect()
-            }
-            Some(OpType::GetWithDefault(gd)) => {
-                // Return the provided default for each key
-                gd.pairs
-            }
-            Some(OpType::GetOption(_)) | Some(OpType::GetAll(_)) => vec![],
-            Some(OpType::IsModifiable(im)) => im
-                .keys
-                .into_iter()
-                .map(|k| proto::KeyValue {
-                    key: k,
-                    value: Some("true".to_string()),
-                })
-                .collect(),
-            // Set / Unset — acknowledge with empty pairs
-            _ => vec![],
-        };
+        let pairs = build_config_pairs(req.operation);
         Ok(Response::new(proto::ConfigResponse {
             session_id: req.session_id,
             server_side_session_id: SERVER_SESSION_ID.clone(),
@@ -759,6 +728,56 @@ fn spark_config_default(key: &str) -> &'static str {
     }
 }
 
+/// Build the `pairs` payload for a `ConfigRequest`.
+///
+/// Extracted from `config()` so the per-op-type semantics can be unit-tested
+/// without spinning up a `SessionManager`. Critically, `GetOption` MUST emit
+/// exactly one `KeyValue` per requested key (with `value: None` when not
+/// configured), or `spark-connect-client-jvm` 4.1.x's
+/// `executeConfigRequestSinglePair` precondition fails.
+fn build_config_pairs(
+    operation: Option<proto::config_request::Operation>,
+) -> Vec<proto::KeyValue> {
+    use proto::config_request::operation::OpType;
+    match operation.and_then(|op| op.op_type) {
+        Some(OpType::Get(g)) => {
+            // Return Spark defaults for known integer/boolean configs that PySpark
+            // calls int() or bool() on. Unknown keys get empty string (safe for str usage).
+            g.keys
+                .into_iter()
+                .map(|k| {
+                    let v = spark_config_default(&k).to_string();
+                    proto::KeyValue {
+                        key: k,
+                        value: Some(v),
+                    }
+                })
+                .collect()
+        }
+        Some(OpType::GetWithDefault(gd)) => gd.pairs,
+        Some(OpType::GetOption(go)) => {
+            // value=None signals "not configured" → JVM client treats as missing →
+            // `getPlanCompressionOptions` catches `NoSuchElementException` and
+            // disables plan compression locally rather than crashing.
+            go.keys
+                .into_iter()
+                .map(|k| proto::KeyValue { key: k, value: None })
+                .collect()
+        }
+        Some(OpType::GetAll(_)) => vec![],
+        Some(OpType::IsModifiable(im)) => im
+            .keys
+            .into_iter()
+            .map(|k| proto::KeyValue {
+                key: k,
+                value: Some("true".to_string()),
+            })
+            .collect(),
+        // Set / Unset / unspecified — acknowledge with empty pairs
+        _ => vec![],
+    }
+}
+
 /// If `plan` is a `SqlRelation` with a `view_name` (i.e., a CREATE VIEW DDL),
 /// cache the inner query's plan-inferred schema. DuckDB views lose NOT NULL
 /// metadata, so this preserves correct nullable flags for subsequent
@@ -1048,4 +1067,68 @@ async fn execute_streaming_query(
     );
 
     Ok(Response::new(Box::pin(stream)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::spark::connect as proto;
+
+    fn op(
+        op_type: proto::config_request::operation::OpType,
+    ) -> Option<proto::config_request::Operation> {
+        Some(proto::config_request::Operation {
+            op_type: Some(op_type),
+        })
+    }
+
+    /// Regression for nubank/thunderduck#33: GetOption must emit one KeyValue per
+    /// requested key (value=None when not configured). spark-connect-client-jvm
+    /// 4.1.x calls this on every analyze; returning 0 pairs trips its
+    /// `require(pairs.size == 1)` precondition with IllegalArgumentException.
+    #[test]
+    fn get_option_emits_one_pair_per_key_with_unset_value() {
+        use proto::config_request::operation::OpType;
+        let operation = op(OpType::GetOption(proto::config_request::GetOption {
+            keys: vec![
+                "spark.connect.session.planCompression.threshold".into(),
+                "spark.connect.session.planCompression.defaultAlgorithm".into(),
+            ],
+        }));
+        let pairs = build_config_pairs(operation);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(
+            pairs[0].key,
+            "spark.connect.session.planCompression.threshold"
+        );
+        assert!(
+            pairs[0].value.is_none(),
+            "value must be unset → client treats as missing"
+        );
+        assert_eq!(
+            pairs[1].key,
+            "spark.connect.session.planCompression.defaultAlgorithm"
+        );
+        assert!(pairs[1].value.is_none());
+    }
+
+    #[test]
+    fn get_option_with_zero_keys_returns_zero_pairs() {
+        use proto::config_request::operation::OpType;
+        let operation = op(OpType::GetOption(proto::config_request::GetOption {
+            keys: vec![],
+        }));
+        assert!(build_config_pairs(operation).is_empty());
+    }
+
+    #[test]
+    fn get_emits_spark_defaults() {
+        use proto::config_request::operation::OpType;
+        let operation = op(OpType::Get(proto::config_request::Get {
+            keys: vec!["spark.sql.shuffle.partitions".into()],
+        }));
+        let pairs = build_config_pairs(operation);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].value.as_deref(), Some("200"));
+    }
 }

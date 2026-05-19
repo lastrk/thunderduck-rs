@@ -30,6 +30,28 @@ For non-trivial changes: pause and ask "is there a more elegant Rust way?" Skip 
 ### 6. Autonomous Bug Fixing
 When given a bug report: just fix it. Point at logs, errors, failing tests, then resolve them.
 
+## Code Search Tools
+
+Two MCP-backed search tools are preinstalled in the devcontainer. They answer different kinds of questions — pick the right one:
+
+- **codegraph** — structural queries over a parsed AST/symbol graph. Use when you have a symbol name or want to trace relationships.
+  - "Where is `SqlGenerator` defined?" → `codegraph_search`
+  - "What calls `visit_join`?" → `codegraph_callers`
+  - "What does `convert_aggregate` call?" → `codegraph_callees`
+  - "What would break if I change `LogicalPlan`?" → `codegraph_impact`
+  - "Show me the signature / source of `to_sql`" → `codegraph_node`
+  - "Give me focused context for an area" → `codegraph_context`
+  - Exact, deterministic, AST-backed. Answers grep can't give (callers, callees, impact).
+
+- **semble** — semantic / hybrid search over code chunks. Use when you don't know the symbol name yet, just intent.
+  - "How does session lifecycle work?" → `semble.search`
+  - "Where do we stream Arrow back to the client?" → `semble.search`
+  - "Find code similar to this snippet" → `semble.find_related`
+  - Fuzzy, intent-based. Good for unfamiliar areas; can also index remote git URLs.
+  - **Pass the project root as `repo`** (the current working directory, e.g. `/workspace` in this devcontainer) — without it, semble errors with "No repo specified and no default index."
+
+**Rule of thumb**: named symbol or relationship → codegraph; fuzzy intent or unfamiliar area → semble. If semble surfaces a candidate symbol, hand it to codegraph for the precise structural follow-up. Prefer either over raw grep for code questions.
+
 ## Task Management
 **Plan First**: Write plan to `tasks/todo.md` with checkable items. **Track Progress**: Mark items complete as you go. **Capture Lessons**: Update `tasks/lessons.md` after corrections.
 

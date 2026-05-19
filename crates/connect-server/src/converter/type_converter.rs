@@ -32,18 +32,24 @@ pub fn proto_to_data_type(dt: &proto::DataType) -> Result<DataType> {
             Ok(DataType::Decimal { precision, scale })
         }
         Some(Kind::Array(a)) => {
-            let element_type = a.element_type.as_deref()
+            let element_type = a
+                .element_type
+                .as_deref()
                 .map(proto_to_data_type)
                 .transpose()?
                 .unwrap_or(DataType::Unresolved);
             Ok(DataType::Array(Box::new(element_type), a.contains_null))
         }
         Some(Kind::Map(m)) => {
-            let key_type = m.key_type.as_deref()
+            let key_type = m
+                .key_type
+                .as_deref()
                 .map(proto_to_data_type)
                 .transpose()?
                 .unwrap_or(DataType::Unresolved);
-            let value_type = m.value_type.as_deref()
+            let value_type = m
+                .value_type
+                .as_deref()
                 .map(proto_to_data_type)
                 .transpose()?
                 .unwrap_or(DataType::Unresolved);
@@ -87,19 +93,22 @@ pub fn data_type_to_proto(dt: &DataType) -> proto::DataType {
         DataType::DayTimeInterval => {
             Kind::DayTimeInterval(proto::data_type::DayTimeInterval::default())
         }
-        DataType::Decimal { precision, scale } => {
-            Kind::Decimal(proto::data_type::Decimal {
-                precision: Some(*precision as i32),
-                scale: Some(*scale as i32),
-                type_variation_reference: 0,
-            })
-        }
+        DataType::Interval => Kind::CalendarInterval(proto::data_type::CalendarInterval::default()),
+        DataType::Decimal { precision, scale } => Kind::Decimal(proto::data_type::Decimal {
+            precision: Some(*precision as i32),
+            scale: Some(*scale as i32),
+            type_variation_reference: 0,
+        }),
         DataType::Array(elem, cn) => Kind::Array(Box::new(proto::data_type::Array {
             element_type: Some(Box::new(data_type_to_proto(elem))),
             contains_null: *cn,
             type_variation_reference: 0,
         })),
-        DataType::Map { key, value, value_nullable } => Kind::Map(Box::new(proto::data_type::Map {
+        DataType::Map {
+            key,
+            value,
+            value_nullable,
+        } => Kind::Map(Box::new(proto::data_type::Map {
             key_type: Some(Box::new(data_type_to_proto(key))),
             value_type: Some(Box::new(data_type_to_proto(value))),
             value_contains_null: *value_nullable,
@@ -131,7 +140,10 @@ fn struct_field_to_proto(f: &StructField) -> proto::data_type::StructField {
 pub fn parse_type_str(s: &str) -> DataType {
     let lower = s.trim().to_lowercase();
     // Strip outer NOT NULL / NULL qualifiers that Spark sometimes appends
-    let lower = lower.trim_end_matches("not null").trim_end_matches("null").trim();
+    let lower = lower
+        .trim_end_matches("not null")
+        .trim_end_matches("null")
+        .trim();
     // Handle decimal(p,s) or decimal(p)
     if lower.starts_with("decimal") {
         if let Some(inner) = lower
@@ -140,15 +152,30 @@ pub fn parse_type_str(s: &str) -> DataType {
             .and_then(|r| r.strip_suffix(')'))
         {
             let parts: Vec<&str> = inner.split(',').collect();
-            let p = parts.first().and_then(|s| s.trim().parse::<u8>().ok()).unwrap_or(38);
-            let sc = parts.get(1).and_then(|s| s.trim().parse::<u8>().ok()).unwrap_or(18);
-            return DataType::Decimal { precision: p, scale: sc };
+            let p = parts
+                .first()
+                .and_then(|s| s.trim().parse::<u8>().ok())
+                .unwrap_or(38);
+            let sc = parts
+                .get(1)
+                .and_then(|s| s.trim().parse::<u8>().ok())
+                .unwrap_or(18);
+            return DataType::Decimal {
+                precision: p,
+                scale: sc,
+            };
         }
-        return DataType::Decimal { precision: 38, scale: 18 };
+        return DataType::Decimal {
+            precision: 38,
+            scale: 18,
+        };
     }
     // Handle array<element_type>
     if lower.starts_with("array<") {
-        if let Some(inner) = lower.strip_prefix("array<").and_then(|r| r.strip_suffix('>')) {
+        if let Some(inner) = lower
+            .strip_prefix("array<")
+            .and_then(|r| r.strip_suffix('>'))
+        {
             return DataType::Array(Box::new(parse_type_str(inner)), true);
         }
     }
@@ -167,20 +194,21 @@ pub fn parse_type_str(s: &str) -> DataType {
         "timestamp_ntz" => DataType::TimestampNtz,
         "interval year to month" | "yearmonthinterval" => DataType::YearMonthInterval,
         "interval day to second" | "daytimeinterval" => DataType::DayTimeInterval,
+        "interval" => DataType::Interval,
         "null" | "void" => DataType::Null,
         _ => DataType::Unresolved,
     }
 }
 
 /// Convert proto struct fields to a `StructType` (used by both `proto_to_data_type` and callers).
-pub fn proto_struct_to_struct_type(
-    s: &proto::data_type::Struct,
-) -> Result<StructType> {
+pub fn proto_struct_to_struct_type(s: &proto::data_type::Struct) -> Result<StructType> {
     let fields: Result<Vec<StructField>> = s
         .fields
         .iter()
         .map(|f| {
-            let dt = f.data_type.as_ref()
+            let dt = f
+                .data_type
+                .as_ref()
                 .map(proto_to_data_type)
                 .transpose()?
                 .unwrap_or(DataType::Unresolved);

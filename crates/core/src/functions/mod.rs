@@ -124,7 +124,11 @@ impl FunctionRegistry {
             "sort_array" => {
                 if matches!(first_type, DataType::Array(_, _)) {
                     if args.len() >= 2 {
-                        let order = if args[1].eq_ignore_ascii_case("true") { "ASC" } else { "DESC" };
+                        let order = if args[1].eq_ignore_ascii_case("true") {
+                            "ASC"
+                        } else {
+                            "DESC"
+                        };
                         return format!("LIST_SORT({arg0}, '{order}')");
                     }
                     return format!("LIST_SORT({arg0})");
@@ -197,6 +201,8 @@ impl FunctionRegistry {
             ("format_string", "PRINTF"),
             ("sentences", "REGEXP_SPLIT_TO_ARRAY"),
             ("luhn_check", "LUHN_CHECK"),
+            ("startswith", "STARTS_WITH"),
+            ("endswith", "ENDS_WITH"),
         ];
         for (s, d) in string_direct {
             direct.insert(s, d);
@@ -344,7 +350,6 @@ impl FunctionRegistry {
             ("map_values", "MAP_VALUES"),
             ("map_entries", "MAP_ENTRIES"),
             // map_from_arrays handled in custom (DuckDB uses MAP(keys, vals) constructor)
-
             ("map_concat", "MAP_CONCAT"),
         ];
         for (s, d) in array_direct {
@@ -409,9 +414,7 @@ impl FunctionRegistry {
 
         // sum — emit CAST(SUM(x) AS BIGINT) for integer types (avoid HUGEINT)
         // Note: type-aware routing is done in the generator; here we just emit the call
-        custom.insert("sum", |args, _mode| {
-            format!("SUM({})", args.join(", "))
-        });
+        custom.insert("sum", |args, _mode| format!("SUM({})", args.join(", ")));
 
         // count_distinct → COUNT(DISTINCT ...)
         // DuckDB only accepts one argument for COUNT(DISTINCT ...).
@@ -421,9 +424,12 @@ impl FunctionRegistry {
                 format!("COUNT(DISTINCT {})", args[0])
             } else {
                 // Build a struct literal: {f0: col0, f1: col1, ...}
-                let fields: String = args.iter().enumerate()
+                let fields: String = args
+                    .iter()
+                    .enumerate()
                     .map(|(i, a)| format!("'f{i}': {a}"))
-                    .collect::<Vec<_>>().join(", ");
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!("COUNT(DISTINCT {{{fields}}})")
             }
         });
@@ -435,20 +441,26 @@ impl FunctionRegistry {
 
         // kurtosis: strict → kurtosis_pop (matches Spark's population excess kurtosis)
         custom.insert("kurtosis", |args, mode| {
-            let func = if mode == CompatMode::Strict { "KURTOSIS_POP" } else { "KURTOSIS" };
+            let func = if mode == CompatMode::Strict {
+                "KURTOSIS_POP"
+            } else {
+                "KURTOSIS"
+            };
             format!("{func}({})", args.join(", "))
         });
 
         // skewness: strict → spark_skewness (extension, population skewness)
         custom.insert("skewness", |args, mode| {
-            let func = if mode == CompatMode::Strict { "spark_skewness" } else { "SKEWNESS" };
+            let func = if mode == CompatMode::Strict {
+                "spark_skewness"
+            } else {
+                "SKEWNESS"
+            };
             format!("{func}({})", args.join(", "))
         });
 
         // array(...) → list literal [...]
-        custom.insert("array", |args, _mode| {
-            format!("[{}]", args.join(", "))
-        });
+        custom.insert("array", |args, _mode| format!("[{}]", args.join(", ")));
 
         // when(cond1, val1, cond2, val2, ...[, else]) → CASE WHEN ... END
         custom.insert("when", |args, _mode| {
@@ -468,13 +480,17 @@ impl FunctionRegistry {
 
         // get_json_object(json, path) → json_extract_string
         custom.insert("get_json_object", |args, _mode| {
-            if args.len() < 2 { return "NULL".to_string(); }
+            if args.len() < 2 {
+                return "NULL".to_string();
+            }
             format!("json_extract_string({}, {})", args[0], args[1])
         });
 
         // percentile_approx(col, pct) → approx_quantile
         custom.insert("percentile_approx", |args, _mode| {
-            if args.len() < 2 { return "NULL".to_string(); }
+            if args.len() < 2 {
+                return "NULL".to_string();
+            }
             format!("approx_quantile({}, {})", args[0], args[1])
         });
 
@@ -491,15 +507,25 @@ impl FunctionRegistry {
         // percentile(col, pct) → PERCENTILE_CONT(pct) WITHIN GROUP (ORDER BY col)
         custom.insert("percentile", |args, _mode| {
             if args.len() >= 2 {
-                format!("PERCENTILE_CONT({}) WITHIN GROUP (ORDER BY {})", args[1], args[0])
+                format!(
+                    "PERCENTILE_CONT({}) WITHIN GROUP (ORDER BY {})",
+                    args[1], args[0]
+                )
             } else {
-                format!("PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {})", args.first().copied().unwrap_or(""))
+                format!(
+                    "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {})",
+                    args.first().copied().unwrap_or("")
+                )
             }
         });
 
         // substring(str, pos) or substring(str, pos, len) → SUBSTR
-        custom.insert("substring", |args, _mode| format!("SUBSTR({})", args.join(", ")));
-        custom.insert("substr", |args, _mode| format!("SUBSTR({})", args.join(", ")));
+        custom.insert("substring", |args, _mode| {
+            format!("SUBSTR({})", args.join(", "))
+        });
+        custom.insert("substr", |args, _mode| {
+            format!("SUBSTR({})", args.join(", "))
+        });
 
         // unhex(str) → FROM_HEX(str) returns BLOB in DuckDB, matching Spark's BINARY return type
         custom.insert("unhex", |args, _mode| {
@@ -557,20 +583,16 @@ impl FunctionRegistry {
         });
 
         // regexp_replace(str, pattern, replacement) → REGEXP_REPLACE with 'g' flag
-        custom.insert("regexp_replace", |args, _mode| {
-            match args.len() {
-                3 => format!("REGEXP_REPLACE({}, {}, {}, 'g')", args[0], args[1], args[2]),
-                _ => format!("REGEXP_REPLACE({})", args.join(", ")),
-            }
+        custom.insert("regexp_replace", |args, _mode| match args.len() {
+            3 => format!("REGEXP_REPLACE({}, {}, {}, 'g')", args[0], args[1], args[2]),
+            _ => format!("REGEXP_REPLACE({})", args.join(", ")),
         });
 
         // regexp_extract(str, pattern, idx) → REGEXP_EXTRACT
-        custom.insert("regexp_extract", |args, _mode| {
-            match args.len() {
-                2 => format!("REGEXP_EXTRACT({}, {})", args[0], args[1]),
-                3 => format!("REGEXP_EXTRACT({}, {}, {})", args[0], args[1], args[2]),
-                _ => format!("REGEXP_EXTRACT({})", args.join(", ")),
-            }
+        custom.insert("regexp_extract", |args, _mode| match args.len() {
+            2 => format!("REGEXP_EXTRACT({}, {})", args[0], args[1]),
+            3 => format!("REGEXP_EXTRACT({}, {}, {})", args[0], args[1], args[2]),
+            _ => format!("REGEXP_EXTRACT({})", args.join(", ")),
         });
 
         // split(str, pattern[, limit]) → STR_SPLIT_REGEX
@@ -609,18 +631,16 @@ impl FunctionRegistry {
         // overlay(str, repl, pos[, len]) — DuckDB 1.5 has no OVERLAY syntax
         // Spark: overlay(str, repl, pos, len) replaces len chars at pos with repl
         // Default len = length(repl)
-        custom.insert("overlay", |args, _mode| {
-            match args.len() {
-                3 => {
-                    let (s, r, p) = (args[0], args[1], args[2]);
-                    format!("LEFT({s}, ({p}) - 1) || ({r}) || SUBSTRING({s}, ({p}) + LENGTH({r}))")
-                }
-                4 => {
-                    let (s, r, p, l) = (args[0], args[1], args[2], args[3]);
-                    format!("LEFT({s}, ({p}) - 1) || ({r}) || SUBSTRING({s}, ({p}) + ({l}))")
-                }
-                _ => format!("NULL"),
+        custom.insert("overlay", |args, _mode| match args.len() {
+            3 => {
+                let (s, r, p) = (args[0], args[1], args[2]);
+                format!("LEFT({s}, ({p}) - 1) || ({r}) || SUBSTRING({s}, ({p}) + LENGTH({r}))")
             }
+            4 => {
+                let (s, r, p, l) = (args[0], args[1], args[2], args[3]);
+                format!("LEFT({s}, ({p}) - 1) || ({r}) || SUBSTRING({s}, ({p}) + ({l}))")
+            }
+            _ => format!("NULL"),
         });
 
         // space(n) → REPEAT(' ', n)
@@ -670,12 +690,10 @@ impl FunctionRegistry {
         });
 
         // log(base, x) or log(x) → LOG(x) or LOG(base, x)
-        custom.insert("log", |args, _mode| {
-            match args.len() {
-                1 => format!("LN({})", args[0]),
-                2 => format!("LOG({}, {})", args[0], args[1]),
-                _ => "LN(1)".to_string(),
-            }
+        custom.insert("log", |args, _mode| match args.len() {
+            1 => format!("LN({})", args[0]),
+            2 => format!("LOG({}, {})", args[0], args[1]),
+            _ => "LN(1)".to_string(),
         });
 
         // rand(seed) → SETSEED then RANDOM, or just RANDOM()
@@ -692,7 +710,10 @@ impl FunctionRegistry {
             if args.is_empty() {
                 "SQRT(-2 * LN(RANDOM())) * COS(2 * PI() * RANDOM())".to_string()
             } else {
-                format!("(SETSEED({}) + SQRT(-2 * LN(RANDOM())) * COS(2 * PI() * RANDOM()))", args[0])
+                format!(
+                    "(SETSEED({}) + SQRT(-2 * LN(RANDOM())) * COS(2 * PI() * RANDOM()))",
+                    args[0]
+                )
             }
         });
 
@@ -736,7 +757,10 @@ impl FunctionRegistry {
         // datediff(end, start) → DATE_DIFF('day', start, end)
         custom.insert("datediff", |args, _mode| {
             if args.len() >= 2 {
-                format!("DATE_DIFF('day', CAST({} AS DATE), CAST({} AS DATE))", args[1], args[0])
+                format!(
+                    "DATE_DIFF('day', CAST({} AS DATE), CAST({} AS DATE))",
+                    args[1], args[0]
+                )
             } else {
                 "0".to_string()
             }
@@ -773,27 +797,23 @@ impl FunctionRegistry {
         });
 
         // to_date(str[, fmt]) → STRPTIME or CAST
-        custom.insert("to_date", |args, _mode| {
-            match args.len() {
-                1 => format!("CAST({} AS DATE)", args[0]),
-                2 => {
-                    let fmt = convert_spark_date_format(args[1]);
-                    format!("STRPTIME({}, '{}')", args[0], fmt)
-                }
-                _ => format!("CAST({} AS DATE)", args.first().copied().unwrap_or("")),
+        custom.insert("to_date", |args, _mode| match args.len() {
+            1 => format!("CAST({} AS DATE)", args[0]),
+            2 => {
+                let fmt = convert_spark_date_format(args[1]);
+                format!("STRPTIME({}, '{}')", args[0], fmt)
             }
+            _ => format!("CAST({} AS DATE)", args.first().copied().unwrap_or("")),
         });
 
         // to_timestamp(str[, fmt]) → STRPTIME or CAST
-        custom.insert("to_timestamp", |args, _mode| {
-            match args.len() {
-                1 => format!("CAST({} AS TIMESTAMP)", args[0]),
-                2 => {
-                    let fmt = convert_spark_date_format(args[1]);
-                    format!("STRPTIME({}, '{}')", args[0], fmt)
-                }
-                _ => format!("CAST({} AS TIMESTAMP)", args.first().copied().unwrap_or("")),
+        custom.insert("to_timestamp", |args, _mode| match args.len() {
+            1 => format!("CAST({} AS TIMESTAMP)", args[0]),
+            2 => {
+                let fmt = convert_spark_date_format(args[1]);
+                format!("STRPTIME({}, '{}')", args[0], fmt)
             }
+            _ => format!("CAST({} AS TIMESTAMP)", args.first().copied().unwrap_or("")),
         });
 
         // unix_timestamp([str[, fmt]]) → EPOCH / EPOCH_MS
@@ -883,16 +903,16 @@ impl FunctionRegistry {
         custom.insert("octet_length", |args, _mode| {
             if let Some(a) = args.first() {
                 format!("octet_length({a})")
-            } else { "0".to_string() }
+            } else {
+                "0".to_string()
+            }
         });
 
         // btrim(str[, trimStr]) → TRIM(BOTH trimStr FROM str) or TRIM(str)
-        custom.insert("btrim", |args, _mode| {
-            match args.len() {
-                0 => "''".to_string(),
-                1 => format!("TRIM({})", args[0]),
-                _ => format!("TRIM(BOTH {} FROM {})", args[1], args[0]),
-            }
+        custom.insert("btrim", |args, _mode| match args.len() {
+            0 => "''".to_string(),
+            1 => format!("TRIM({})", args[0]),
+            _ => format!("TRIM(BOTH {} FROM {})", args[1], args[0]),
         });
 
         // reverse: polymorphic — LIST_REVERSE for arrays, REVERSE for strings.
@@ -904,14 +924,20 @@ impl FunctionRegistry {
 
         // isnull(x) → x IS NULL (isnull is reserved in DuckDB, can't use as macro)
         custom.insert("isnull", |args, _mode| {
-            if let Some(a) = args.first() { format!("({a} IS NULL)") }
-            else { "FALSE".to_string() }
+            if let Some(a) = args.first() {
+                format!("({a} IS NULL)")
+            } else {
+                "FALSE".to_string()
+            }
         });
 
         // nanvl(a, b) → a if not NaN, else b
         custom.insert("nanvl", |args, _mode| {
             if args.len() >= 2 {
-                format!("CASE WHEN ISNAN({0}) THEN {1} ELSE {0} END", args[0], args[1])
+                format!(
+                    "CASE WHEN ISNAN({0}) THEN {1} ELSE {0} END",
+                    args[0], args[1]
+                )
             } else {
                 args.first().copied().unwrap_or("NULL").to_string()
             }
@@ -920,14 +946,20 @@ impl FunctionRegistry {
         // encode(str, charset) — Spark encodes str to binary; return as blob (best effort)
         custom.insert("encode", |args, _mode| {
             // Spark encode returns binary; cast to BLOB as approximation
-            if let Some(a) = args.first() { format!("CAST({a} AS BLOB)") }
-            else { "NULL".to_string() }
+            if let Some(a) = args.first() {
+                format!("CAST({a} AS BLOB)")
+            } else {
+                "NULL".to_string()
+            }
         });
 
         // decode(bin, charset) — Spark decodes binary to string; cast to varchar
         custom.insert("decode", |args, _mode| {
-            if let Some(a) = args.first() { format!("CAST({a} AS VARCHAR)") }
-            else { "NULL".to_string() }
+            if let Some(a) = args.first() {
+                format!("CAST({a} AS VARCHAR)")
+            } else {
+                "NULL".to_string()
+            }
         });
 
         // element_at(arr, idx): Spark 1-indexed, negative from end
@@ -943,7 +975,10 @@ impl FunctionRegistry {
         // slice(arr, start, length): DuckDB LIST_SLICE(arr, start, start+length-1)
         custom.insert("slice", |args, _mode| {
             if args.len() >= 3 {
-                format!("LIST_SLICE({}, {}, {} + {} - 1)", args[0], args[1], args[1], args[2])
+                format!(
+                    "LIST_SLICE({}, {}, {} + {} - 1)",
+                    args[0], args[1], args[1], args[2]
+                )
             } else if args.len() == 2 {
                 format!("LIST_SLICE({}, {})", args[0], args[1])
             } else {
@@ -974,7 +1009,10 @@ impl FunctionRegistry {
 
         // array_compact(arr) → LIST_FILTER(arr, x -> x IS NOT NULL)
         custom.insert("array_compact", |args, _mode| {
-            format!("LIST_FILTER({}, x -> x IS NOT NULL)", args.first().copied().unwrap_or(""))
+            format!(
+                "LIST_FILTER({}, x -> x IS NOT NULL)",
+                args.first().copied().unwrap_or("")
+            )
         });
 
         // array_union(a, b) → DuckDB macro (order-preserving dedup)
@@ -1001,12 +1039,16 @@ impl FunctionRegistry {
         });
 
         // array_join(arr, delimiter[, nullReplacement]) → ARRAY_TO_STRING
-        custom.insert("array_join", |args, _mode| {
-            match args.len() {
-                2 => format!("ARRAY_TO_STRING({}, {})", args[0], args[1]),
-                3 => format!("ARRAY_TO_STRING(LIST_TRANSFORM({}, x -> COALESCE(CAST(x AS VARCHAR), {})), {})", args[0], args[2], args[1]),
-                _ => format!("ARRAY_TO_STRING({}, ',')", args.first().copied().unwrap_or("")),
-            }
+        custom.insert("array_join", |args, _mode| match args.len() {
+            2 => format!("ARRAY_TO_STRING({}, {})", args[0], args[1]),
+            3 => format!(
+                "ARRAY_TO_STRING(LIST_TRANSFORM({}, x -> COALESCE(CAST(x AS VARCHAR), {})), {})",
+                args[0], args[2], args[1]
+            ),
+            _ => format!(
+                "ARRAY_TO_STRING({}, ',')",
+                args.first().copied().unwrap_or("")
+            ),
         });
 
         // transform(arr, lambda_expr) → LIST_TRANSFORM
@@ -1071,7 +1113,9 @@ impl FunctionRegistry {
 
         // create_map / map: DuckDB uses MAP([k1,k2,...], [v1,v2,...]) constructor
         custom.insert("create_map", |args, _mode| {
-            if args.is_empty() { return "MAP([], [])".to_string(); }
+            if args.is_empty() {
+                return "MAP([], [])".to_string();
+            }
             if args.len() % 2 == 0 {
                 let keys: Vec<&str> = args.iter().step_by(2).map(|s| s.as_ref()).collect();
                 let vals: Vec<&str> = args.iter().skip(1).step_by(2).map(|s| s.as_ref()).collect();
@@ -1109,7 +1153,11 @@ impl FunctionRegistry {
             let arr = &args[0];
             if args.len() >= 2 {
                 // second arg is a boolean literal (true=ASC, false=DESC)
-                let order = if args[1].eq_ignore_ascii_case("true") { "ASC" } else { "DESC" };
+                let order = if args[1].eq_ignore_ascii_case("true") {
+                    "ASC"
+                } else {
+                    "DESC"
+                };
                 format!("LIST_SORT({arr}, '{order}')")
             } else {
                 format!("LIST_SORT({arr})")
@@ -1127,7 +1175,10 @@ impl FunctionRegistry {
         // nvl2(expr, ifNotNull, ifNull) → CASE WHEN expr IS NOT NULL THEN ifNotNull ELSE ifNull END
         custom.insert("nvl2", |args, _mode| {
             if args.len() >= 3 {
-                format!("CASE WHEN {} IS NOT NULL THEN {} ELSE {} END", args[0], args[1], args[2])
+                format!(
+                    "CASE WHEN {} IS NOT NULL THEN {} ELSE {} END",
+                    args[0], args[1], args[2]
+                )
             } else {
                 "NULL".to_string()
             }
@@ -1136,7 +1187,10 @@ impl FunctionRegistry {
         // if(cond, thenVal, elseVal) → CASE WHEN
         custom.insert("if", |args, _mode| {
             if args.len() >= 3 {
-                format!("CASE WHEN {} THEN {} ELSE {} END", args[0], args[1], args[2])
+                format!(
+                    "CASE WHEN {} THEN {} ELSE {} END",
+                    args[0], args[1], args[2]
+                )
             } else if args.len() == 2 {
                 format!("CASE WHEN {} THEN {} END", args[0], args[1])
             } else {
@@ -1184,7 +1238,10 @@ impl FunctionRegistry {
             let schema_arg = args[1];
             // schema_arg is a SQL string literal like 'name STRING, age INT'
             // Strip surrounding single quotes to extract the DDL text.
-            let ddl = if schema_arg.starts_with('\'') && schema_arg.ends_with('\'') && schema_arg.len() >= 2 {
+            let ddl = if schema_arg.starts_with('\'')
+                && schema_arg.ends_with('\'')
+                && schema_arg.len() >= 2
+            {
                 &schema_arg[1..schema_arg.len() - 1]
             } else {
                 // Not a plain string literal — fall back
@@ -1223,44 +1280,59 @@ impl FunctionRegistry {
         custom.insert("struct", |args, _mode| {
             // PySpark struct() passes args as "expr AS alias" when columns are aliased.
             // DuckDB struct literal syntax: {alias: expr, ...}
-            let fields: Vec<String> = args.iter().enumerate().map(|(i, arg)| {
-                let arg = arg.trim();
-                // Find the last " AS " at depth 0 (not inside parens/quotes)
-                let lower = arg.to_lowercase();
-                let bytes = arg.as_bytes();
-                let mut depth = 0i32;
-                let mut last_as: Option<usize> = None;
-                let mut j = 0usize;
-                while j < bytes.len() {
-                    match bytes[j] {
-                        b'(' | b'[' => depth += 1,
-                        b')' | b']' => { if depth > 0 { depth -= 1; } }
-                        b'\'' | b'"' => {
-                            let q = bytes[j];
-                            j += 1;
-                            while j < bytes.len() && bytes[j] != q { j += 1; }
-                        }
-                        _ => {
-                            if depth == 0 && j >= 1 && j + 3 <= bytes.len()
-                                && bytes[j - 1] == b' '
-                                && lower[j..].starts_with("as ")
-                            {
-                                last_as = Some(j);
+            let fields: Vec<String> = args
+                .iter()
+                .enumerate()
+                .map(|(i, arg)| {
+                    let arg = arg.trim();
+                    // Find the last " AS " at depth 0 (not inside parens/quotes)
+                    let lower = arg.to_lowercase();
+                    let bytes = arg.as_bytes();
+                    let mut depth = 0i32;
+                    let mut last_as: Option<usize> = None;
+                    let mut j = 0usize;
+                    while j < bytes.len() {
+                        match bytes[j] {
+                            b'(' | b'[' => depth += 1,
+                            b')' | b']' => {
+                                if depth > 0 {
+                                    depth -= 1;
+                                }
+                            }
+                            b'\'' | b'"' => {
+                                let q = bytes[j];
+                                j += 1;
+                                while j < bytes.len() && bytes[j] != q {
+                                    j += 1;
+                                }
+                            }
+                            _ => {
+                                if depth == 0
+                                    && j >= 1
+                                    && j + 3 <= bytes.len()
+                                    && bytes[j - 1] == b' '
+                                    && lower[j..].starts_with("as ")
+                                {
+                                    last_as = Some(j);
+                                }
                             }
                         }
+                        j += 1;
                     }
-                    j += 1;
-                }
-                if let Some(pos) = last_as {
-                    let expr = arg[..pos - 1].trim(); // before " AS"
-                    let alias_raw = arg[pos + 3..].trim(); // after "AS "
-                    let alias = alias_raw.trim_matches('"').trim_matches('\'').trim_matches('`');
-                    format!("{alias}: {expr}")
-                } else {
-                    // No alias — use positional field name
-                    format!("col{i}: {arg}")
-                }
-            }).collect();
+                    if let Some(pos) = last_as {
+                        let expr = arg[..pos - 1].trim(); // before " AS"
+                        let alias_raw = arg[pos + 3..].trim(); // after "AS "
+                        let alias = alias_raw
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .trim_matches('`');
+                        format!("{alias}: {expr}")
+                    } else {
+                        // No alias — use positional field name
+                        format!("col{i}: {arg}")
+                    }
+                })
+                .collect();
             format!("{{{}}}", fields.join(", "))
         });
 
@@ -1274,12 +1346,14 @@ impl FunctionRegistry {
         });
         custom.insert("to_char", |args, _mode| {
             if args.len() < 2 {
-                if let Some(a) = args.first() { return format!("CAST({a} AS VARCHAR)"); }
+                if let Some(a) = args.first() {
+                    return format!("CAST({a} AS VARCHAR)");
+                }
                 return "''".to_string();
             }
             let val = args[0];
             let fmt_sql = args[1]; // Already a SQL string literal like 'yyyy-MM-dd'
-            // Strip surrounding single quotes to get the raw Spark format string.
+                                   // Strip surrounding single quotes to get the raw Spark format string.
             let stripped = fmt_sql.trim();
             if stripped.starts_with('\'') && stripped.ends_with('\'') && stripped.len() >= 2 {
                 let spark_fmt = &stripped[1..stripped.len() - 1];
@@ -1293,7 +1367,10 @@ impl FunctionRegistry {
 
         // assert_true
         custom.insert("assert_true", |args, _mode| {
-            format!("CASE WHEN {} THEN TRUE ELSE ERROR('assertion failed') END", args.first().copied().unwrap_or("FALSE"))
+            format!(
+                "CASE WHEN {} THEN TRUE ELSE ERROR('assertion failed') END",
+                args.first().copied().unwrap_or("FALSE")
+            )
         });
 
         // raise_error
@@ -1342,13 +1419,25 @@ impl FunctionRegistry {
 
         // shiftleft / shiftright
         custom.insert("shiftleft", |args, _mode| {
-            if args.len() >= 2 { format!("({} << {})", args[0], args[1]) } else { "0".to_string() }
+            if args.len() >= 2 {
+                format!("({} << {})", args[0], args[1])
+            } else {
+                "0".to_string()
+            }
         });
         custom.insert("shiftright", |args, _mode| {
-            if args.len() >= 2 { format!("({} >> {})", args[0], args[1]) } else { "0".to_string() }
+            if args.len() >= 2 {
+                format!("({} >> {})", args[0], args[1])
+            } else {
+                "0".to_string()
+            }
         });
         custom.insert("shiftrightunsigned", |args, _mode| {
-            if args.len() >= 2 { format!("({} >> {})", args[0], args[1]) } else { "0".to_string() }
+            if args.len() >= 2 {
+                format!("({} >> {})", args[0], args[1])
+            } else {
+                "0".to_string()
+            }
         });
 
         // bit_count(x) → BIT_COUNT
@@ -1361,18 +1450,25 @@ impl FunctionRegistry {
         custom.insert("bit_get", |args, _mode| {
             if args.len() >= 2 {
                 format!("((CAST({} AS BIGINT) >> {}) & 1)", args[0], args[1])
-            } else { "0".to_string() }
+            } else {
+                "0".to_string()
+            }
         });
         custom.insert("getbit", |args, _mode| {
             if args.len() >= 2 {
                 format!("((CAST({} AS BIGINT) >> {}) & 1)", args[0], args[1])
-            } else { "0".to_string() }
+            } else {
+                "0".to_string()
+            }
         });
 
         // make_interval for year_month / day_time intervals
         custom.insert("make_ym_interval", |args, _mode| {
             if args.len() >= 2 {
-                format!("(INTERVAL ({}) YEAR + INTERVAL ({}) MONTH)", args[0], args[1])
+                format!(
+                    "(INTERVAL ({}) YEAR + INTERVAL ({}) MONTH)",
+                    args[0], args[1]
+                )
             } else if args.len() == 1 {
                 format!("INTERVAL ({}) YEAR", args[0])
             } else {
@@ -1391,7 +1487,11 @@ impl FunctionRegistry {
 
         // isnotnull(x) → (x IS NOT NULL) — DuckDB has no ISNOTNULL() function
         custom.insert("isnotnull", |args, _mode| {
-            if args.is_empty() { "TRUE".to_string() } else { format!("({} IS NOT NULL)", args[0]) }
+            if args.is_empty() {
+                "TRUE".to_string()
+            } else {
+                format!("({} IS NOT NULL)", args[0])
+            }
         });
 
         // Macros registered at session startup
@@ -1418,7 +1518,11 @@ impl FunctionRegistry {
             )),
         ];
 
-        FunctionRegistry { direct, custom, macros }
+        FunctionRegistry {
+            direct,
+            custom,
+            macros,
+        }
     }
 }
 
@@ -1451,12 +1555,22 @@ pub fn convert_spark_date_format(spark_fmt: &str) -> String {
             'y' | 'Y' => {
                 // Count consecutive y
                 let mut count = 1usize;
-                while chars.peek() == Some(&c) { chars.next(); count += 1; }
-                if count >= 4 { result.push_str("%Y"); } else { result.push_str("%y"); }
+                while chars.peek() == Some(&c) {
+                    chars.next();
+                    count += 1;
+                }
+                if count >= 4 {
+                    result.push_str("%Y");
+                } else {
+                    result.push_str("%y");
+                }
             }
             'M' => {
                 let mut count = 1usize;
-                while chars.peek() == Some(&'M') { chars.next(); count += 1; }
+                while chars.peek() == Some(&'M') {
+                    chars.next();
+                    count += 1;
+                }
                 match count {
                     1 | 2 => result.push_str("%m"),
                     3 => result.push_str("%b"),
@@ -1464,14 +1578,41 @@ pub fn convert_spark_date_format(spark_fmt: &str) -> String {
                 }
             }
             'd' => {
-                while chars.peek() == Some(&'d') { chars.next(); }
+                while chars.peek() == Some(&'d') {
+                    chars.next();
+                }
                 result.push_str("%d");
             }
-            'H' => { while chars.peek() == Some(&'H') { chars.next(); } result.push_str("%H"); }
-            'h' => { while chars.peek() == Some(&'h') { chars.next(); } result.push_str("%I"); }
-            'm' => { while chars.peek() == Some(&'m') { chars.next(); } result.push_str("%M"); }
-            's' => { while chars.peek() == Some(&'s') { chars.next(); } result.push_str("%S"); }
-            'S' => { while chars.peek() == Some(&'S') { chars.next(); } result.push_str("%.f"); }
+            'H' => {
+                while chars.peek() == Some(&'H') {
+                    chars.next();
+                }
+                result.push_str("%H");
+            }
+            'h' => {
+                while chars.peek() == Some(&'h') {
+                    chars.next();
+                }
+                result.push_str("%I");
+            }
+            'm' => {
+                while chars.peek() == Some(&'m') {
+                    chars.next();
+                }
+                result.push_str("%M");
+            }
+            's' => {
+                while chars.peek() == Some(&'s') {
+                    chars.next();
+                }
+                result.push_str("%S");
+            }
+            'S' => {
+                while chars.peek() == Some(&'S') {
+                    chars.next();
+                }
+                result.push_str("%.f");
+            }
             'a' => result.push_str("%p"),
             'D' => result.push_str("%j"),
             'E' | 'e' => result.push_str("%A"),
@@ -1526,7 +1667,9 @@ fn spark_json_schema_to_duckdb_registry(json: &str) -> String {
             while i < bytes.len() {
                 match bytes[i] {
                     b'{' => {
-                        if depth == 0 { field_start = i + 1; }
+                        if depth == 0 {
+                            field_start = i + 1;
+                        }
                         depth += 1;
                     }
                     b'}' => {
@@ -1553,7 +1696,8 @@ fn spark_json_schema_to_duckdb_registry(json: &str) -> String {
 
 fn parse_spark_field_json_registry(field_obj: &str) -> Option<String> {
     let name = extract_json_str_field(field_obj, "name")?;
-    let spark_type = extract_json_str_field(field_obj, "type").unwrap_or_else(|| "string".to_string());
+    let spark_type =
+        extract_json_str_field(field_obj, "type").unwrap_or_else(|| "string".to_string());
     let duckdb_type = spark_type_to_json_type(&spark_type.to_uppercase());
     Some(format!("\"{name}\": \"{duckdb_type}\""))
 }
@@ -1797,26 +1941,55 @@ mod tests {
 
     #[test]
     fn from_json_ddl_schema_translation() {
-        let sql = FunctionRegistry::translate("from_json", &["\"json_col\"", "'name STRING, age INT'"], CompatMode::Relaxed);
-        assert!(sql.contains("json_transform"), "expected json_transform, got: {sql}");
-        assert!(sql.contains("VARCHAR"), "expected VARCHAR type in schema, got: {sql}");
-        assert!(sql.contains("INTEGER") || sql.contains("BIGINT"), "expected INTEGER type in schema, got: {sql}");
+        let sql = FunctionRegistry::translate(
+            "from_json",
+            &["\"json_col\"", "'name STRING, age INT'"],
+            CompatMode::Relaxed,
+        );
+        assert!(
+            sql.contains("json_transform"),
+            "expected json_transform, got: {sql}"
+        );
+        assert!(
+            sql.contains("VARCHAR"),
+            "expected VARCHAR type in schema, got: {sql}"
+        );
+        assert!(
+            sql.contains("INTEGER") || sql.contains("BIGINT"),
+            "expected INTEGER type in schema, got: {sql}"
+        );
     }
 
     #[test]
     fn from_json_struct_type_schema_translation() {
         // Spark StructType.json() format — fields-first ordering (actual PySpark output)
         let spark_schema = r#"'{"fields":[{"metadata":{},"name":"name","nullable":true,"type":"string"},{"metadata":{},"name":"age","nullable":true,"type":"integer"}],"type":"struct"}'"#;
-        let sql = FunctionRegistry::translate("from_json", &["\"json_col\"", spark_schema], CompatMode::Relaxed);
-        assert!(sql.contains("json_transform"), "expected json_transform, got: {sql}");
-        assert!(sql.contains("\"name\": \"VARCHAR\""), "expected name VARCHAR in schema, got: {sql}");
-        assert!(sql.contains("\"age\": \"INTEGER\""), "expected age INTEGER in schema, got: {sql}");
+        let sql = FunctionRegistry::translate(
+            "from_json",
+            &["\"json_col\"", spark_schema],
+            CompatMode::Relaxed,
+        );
+        assert!(
+            sql.contains("json_transform"),
+            "expected json_transform, got: {sql}"
+        );
+        assert!(
+            sql.contains("\"name\": \"VARCHAR\""),
+            "expected name VARCHAR in schema, got: {sql}"
+        );
+        assert!(
+            sql.contains("\"age\": \"INTEGER\""),
+            "expected age INTEGER in schema, got: {sql}"
+        );
     }
 
     #[test]
     fn split_generates_str_split_regex() {
         let sql = FunctionRegistry::translate("split", &["str_col", "','"], CompatMode::Relaxed);
-        assert!(sql.contains("STR_SPLIT_REGEX"), "expected STR_SPLIT_REGEX, got: {sql}");
+        assert!(
+            sql.contains("STR_SPLIT_REGEX"),
+            "expected STR_SPLIT_REGEX, got: {sql}"
+        );
         // No CASE expression wrapping (causes type inference as varchar instead of varchar[])
         assert!(!sql.contains("CASE WHEN"), "unexpected CASE WHEN in: {sql}");
     }
@@ -1824,7 +1997,8 @@ mod tests {
     #[test]
     fn split_3arg_default_limit_no_case() {
         // PySpark sends split(col, pat, -1) — the -1 "no limit" should produce simple STR_SPLIT_REGEX
-        let sql = FunctionRegistry::translate("split", &["str_col", "','", "-1"], CompatMode::Relaxed);
+        let sql =
+            FunctionRegistry::translate("split", &["str_col", "','", "-1"], CompatMode::Relaxed);
         assert_eq!(sql, "STR_SPLIT_REGEX(str_col, ',')");
     }
 
@@ -1844,12 +2018,16 @@ mod tests {
     fn locate_arg_swap() {
         let sql = FunctionRegistry::translate("locate", &["substr", "str"], CompatMode::Relaxed);
         // locate adds a NULL guard so locate(NULL, str) → NULL (matching Spark semantics)
-        assert!(sql.contains("INSTR(str, substr)"), "expected INSTR(str, substr) in: {sql}");
+        assert!(
+            sql.contains("INSTR(str, substr)"),
+            "expected INSTR(str, substr) in: {sql}"
+        );
     }
 
     #[test]
     fn datediff_arg_order() {
-        let sql = FunctionRegistry::translate("datediff", &["end_dt", "start_dt"], CompatMode::Relaxed);
+        let sql =
+            FunctionRegistry::translate("datediff", &["end_dt", "start_dt"], CompatMode::Relaxed);
         assert!(sql.contains("start_dt") && sql.contains("end_dt"));
     }
 
@@ -1861,8 +2039,15 @@ mod tests {
 
     #[test]
     fn regexp_replace_global_flag() {
-        let sql = FunctionRegistry::translate("regexp_replace", &["str", "pat", "rep"], CompatMode::Relaxed);
-        assert!(sql.contains("'g'"), "expected global replace flag in: {sql}");
+        let sql = FunctionRegistry::translate(
+            "regexp_replace",
+            &["str", "pat", "rep"],
+            CompatMode::Relaxed,
+        );
+        assert!(
+            sql.contains("'g'"),
+            "expected global replace flag in: {sql}"
+        );
     }
 
     #[test]
@@ -1870,7 +2055,10 @@ mod tests {
         let relaxed = FunctionRegistry::translate("round", &["x", "2"], CompatMode::Relaxed);
         let strict = FunctionRegistry::translate("round", &["x", "2"], CompatMode::Strict);
         assert_eq!(relaxed, "ROUND(x, 2)");
-        assert_eq!(strict, "ROUND(x, 2)", "round uses DuckDB native in both modes");
+        assert_eq!(
+            strict, "ROUND(x, 2)",
+            "round uses DuckDB native in both modes"
+        );
     }
 
     #[test]
@@ -1925,7 +2113,8 @@ mod tests {
     /// `NOT ((x))` with an empty function name — completely broken SQL.
     #[test]
     fn forall_lambda_body_preserved() {
-        let sql = FunctionRegistry::translate("forall", &["arr", "x -> x > 0"], CompatMode::Relaxed);
+        let sql =
+            FunctionRegistry::translate("forall", &["arr", "x -> x > 0"], CompatMode::Relaxed);
         // The broken implementation produces "NOT ((x))" (empty string interpolated)
         assert!(
             !sql.contains("NOT ((x))"),
@@ -1963,7 +2152,10 @@ mod tests {
     #[test]
     fn spark_date_format_conversion() {
         assert_eq!(convert_spark_date_format("'yyyy-MM-dd'"), "%Y-%m-%d");
-        assert_eq!(convert_spark_date_format("'yyyy-MM-dd HH:mm:ss'"), "%Y-%m-%d %H:%M:%S");
+        assert_eq!(
+            convert_spark_date_format("'yyyy-MM-dd HH:mm:ss'"),
+            "%Y-%m-%d %H:%M:%S"
+        );
     }
 
     // ── Polymorphic dispatch tests ─────────────────────────────────────────────
@@ -1972,12 +2164,8 @@ mod tests {
     #[test]
     fn reverse_array_dispatches_to_list_reverse() {
         let arg_types = [DataType::Array(Box::new(DataType::Integer), true)];
-        let sql = FunctionRegistry::translate_typed(
-            "reverse",
-            &["arr"],
-            &arg_types,
-            CompatMode::Relaxed,
-        );
+        let sql =
+            FunctionRegistry::translate_typed("reverse", &["arr"], &arg_types, CompatMode::Relaxed);
         assert_eq!(sql, "LIST_REVERSE(arr)");
     }
 
@@ -1986,12 +2174,8 @@ mod tests {
     fn reverse_string_dispatches_to_reverse() {
         // For known String type, we dispatch directly to DuckDB's REVERSE().
         let arg_types = [DataType::String];
-        let sql = FunctionRegistry::translate_typed(
-            "reverse",
-            &["s"],
-            &arg_types,
-            CompatMode::Relaxed,
-        );
+        let sql =
+            FunctionRegistry::translate_typed("reverse", &["s"], &arg_types, CompatMode::Relaxed);
         assert_eq!(sql, "REVERSE(s)");
     }
 
@@ -1999,12 +2183,8 @@ mod tests {
     #[test]
     fn reverse_unresolved_falls_through_to_spark_reverse() {
         let arg_types = [DataType::Unresolved];
-        let sql = FunctionRegistry::translate_typed(
-            "reverse",
-            &["x"],
-            &arg_types,
-            CompatMode::Relaxed,
-        );
+        let sql =
+            FunctionRegistry::translate_typed("reverse", &["x"], &arg_types, CompatMode::Relaxed);
         assert_eq!(sql, "_spark_reverse(x)");
     }
 
@@ -2012,12 +2192,8 @@ mod tests {
     #[test]
     fn size_array_dispatches_to_len() {
         let arg_types = [DataType::Array(Box::new(DataType::Long), true)];
-        let sql = FunctionRegistry::translate_typed(
-            "size",
-            &["arr"],
-            &arg_types,
-            CompatMode::Relaxed,
-        );
+        let sql =
+            FunctionRegistry::translate_typed("size", &["arr"], &arg_types, CompatMode::Relaxed);
         assert_eq!(sql, "LEN(arr)");
     }
 
@@ -2029,12 +2205,8 @@ mod tests {
             value: Box::new(DataType::Integer),
             value_nullable: true,
         }];
-        let sql = FunctionRegistry::translate_typed(
-            "size",
-            &["m"],
-            &arg_types,
-            CompatMode::Relaxed,
-        );
+        let sql =
+            FunctionRegistry::translate_typed("size", &["m"], &arg_types, CompatMode::Relaxed);
         assert_eq!(sql, "LEN(MAP_KEYS(m))");
     }
 
@@ -2042,12 +2214,8 @@ mod tests {
     #[test]
     fn size_string_dispatches_to_length() {
         let arg_types = [DataType::String];
-        let sql = FunctionRegistry::translate_typed(
-            "size",
-            &["s"],
-            &arg_types,
-            CompatMode::Relaxed,
-        );
+        let sql =
+            FunctionRegistry::translate_typed("size", &["s"], &arg_types, CompatMode::Relaxed);
         assert_eq!(sql, "LENGTH(s)");
     }
 
@@ -2081,12 +2249,8 @@ mod tests {
     #[test]
     fn translate_typed_delegates_non_polymorphic_functions() {
         let arg_types = [DataType::String];
-        let sql = FunctionRegistry::translate_typed(
-            "upper",
-            &["col"],
-            &arg_types,
-            CompatMode::Relaxed,
-        );
+        let sql =
+            FunctionRegistry::translate_typed("upper", &["col"], &arg_types, CompatMode::Relaxed);
         assert_eq!(sql, "UPPER(col)");
     }
 
@@ -2113,7 +2277,10 @@ mod tests {
     #[test]
     fn schema_of_json_boolean_and_null_types() {
         let result = spark_schema_of_json(r#"{"flag": true, "val": null}"#);
-        assert_eq!(result, Some("STRUCT<flag: BOOLEAN, val: STRING>".to_owned()));
+        assert_eq!(
+            result,
+            Some("STRUCT<flag: BOOLEAN, val: STRING>".to_owned())
+        );
     }
 
     #[test]
@@ -2136,5 +2303,40 @@ mod tests {
             CompatMode::Relaxed,
         );
         assert_eq!(sql, "'STRUCT<a: BIGINT, b: STRING>'");
+    }
+
+    #[test]
+    fn startswith_maps_to_starts_with() {
+        let sql = FunctionRegistry::translate("startswith", &["col", "'abc'"], CompatMode::Relaxed);
+        assert_eq!(sql, "STARTS_WITH(col, 'abc')");
+    }
+
+    #[test]
+    fn endswith_maps_to_ends_with() {
+        let sql = FunctionRegistry::translate("endswith", &["col", "'xyz'"], CompatMode::Relaxed);
+        assert_eq!(sql, "ENDS_WITH(col, 'xyz')");
+    }
+
+    #[test]
+    fn overlay_custom_3_args() {
+        let sql =
+            FunctionRegistry::translate("overlay", &["'abcdef'", "'XY'", "3"], CompatMode::Relaxed);
+        assert_eq!(
+            sql,
+            "LEFT('abcdef', (3) - 1) || ('XY') || SUBSTRING('abcdef', (3) + LENGTH('XY'))"
+        );
+    }
+
+    #[test]
+    fn overlay_custom_4_args() {
+        let sql = FunctionRegistry::translate(
+            "overlay",
+            &["'abcdef'", "'XY'", "3", "4"],
+            CompatMode::Relaxed,
+        );
+        assert_eq!(
+            sql,
+            "LEFT('abcdef', (3) - 1) || ('XY') || SUBSTRING('abcdef', (3) + (4))"
+        );
     }
 }

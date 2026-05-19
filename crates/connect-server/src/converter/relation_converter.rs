@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use thunderduck_core::expression::{Expression, Literal, LiteralValue, SortOrder, UnresolvedColumn};
+use thunderduck_core::expression::{
+    Expression, Literal, LiteralValue, SortOrder, UnresolvedColumn,
+};
 use thunderduck_core::generator::SqlGenerator;
 use thunderduck_core::logical::{
-    Aggregate, AggregateExpr, AliasedRelation, Distinct, DropColumns, Except, Filter,
-    GroupingSets, Intersect, Join, JoinType, Limit, LocalDataRelation, LogicalPlan, NADrop,
-    NADropHow, NAFill, NAReplace, Pivot, Project, RangeRelation, Sample, SelectEntry, ShowString,
-    SingleRowRelation, Sort, SqlRelation, TableScan, Tail, ToDataFrame, Union, Unpivot,
-    WithColumns, WithCte,
+    Aggregate, AggregateExpr, AliasedRelation, Distinct, DropColumns, Except, Filter, GroupingSets,
+    Intersect, Join, JoinType, Limit, LocalDataRelation, LogicalPlan, NADrop, NADropHow, NAFill,
+    NAReplace, Pivot, Project, RangeRelation, Sample, SelectEntry, ShowString, SingleRowRelation,
+    Sort, SqlRelation, TableScan, Tail, ToDataFrame, Union, Unpivot, WithColumns, WithCte,
 };
 use thunderduck_core::runtime::{DuckDbSession, SchemaInferrer};
 use thunderduck_core::types::{DataType, StructField, StructType};
@@ -16,13 +17,6 @@ use crate::converter::expression_converter::ExpressionConverter;
 use crate::converter::type_converter::parse_type_str;
 use crate::error::{ConnectError, Result};
 use crate::proto::spark::connect as proto;
-
-/// Converts proto Relation messages to the core LogicalPlan AST.
-pub struct RelationConverter<'a> {
-    expr_conv: &'a mut ExpressionConverter,
-    /// Optional session for schema inference (used by NADrop/NAFill/NAReplace/Unpivot).
-    session: Option<Arc<DuckDbSession>>,
-}
 
 /// Expand directory-style parquet paths to a `**/*.parquet` glob so DuckDB's
 /// `read_parquet` discovers files inside the directory.
@@ -39,13 +33,29 @@ pub(crate) fn resolve_parquet_path(path: &str) -> String {
     format!("{path}{sep}**/*.parquet")
 }
 
+/// Converts proto Relation messages to the core LogicalPlan AST.
+pub struct RelationConverter<'a> {
+    expr_conv: &'a mut ExpressionConverter,
+    /// Optional session for schema inference (used by NADrop/NAFill/NAReplace/Unpivot).
+    session: Option<Arc<DuckDbSession>>,
+}
+
 impl<'a> RelationConverter<'a> {
     pub fn new(expr_conv: &'a mut ExpressionConverter) -> Self {
-        Self { expr_conv, session: None }
+        Self {
+            expr_conv,
+            session: None,
+        }
     }
 
-    pub fn with_session(expr_conv: &'a mut ExpressionConverter, session: Arc<DuckDbSession>) -> Self {
-        Self { expr_conv, session: Some(session) }
+    pub fn with_session(
+        expr_conv: &'a mut ExpressionConverter,
+        session: Arc<DuckDbSession>,
+    ) -> Self {
+        Self {
+            expr_conv,
+            session: Some(session),
+        }
     }
 
     pub fn convert(&mut self, relation: &proto::Relation) -> Result<LogicalPlan> {
@@ -80,19 +90,15 @@ impl<'a> RelationConverter<'a> {
                 self.convert(input)
             }
             Some(RelType::Repartition(r)) => {
-                let input = r
-                    .input
-                    .as_ref()
-                    .ok_or_else(|| ConnectError::PlanConversion("Repartition missing input".into()))?;
+                let input = r.input.as_ref().ok_or_else(|| {
+                    ConnectError::PlanConversion("Repartition missing input".into())
+                })?;
                 self.convert(input)
             }
             Some(RelType::RepartitionByExpression(r)) => {
-                let input = r
-                    .input
-                    .as_ref()
-                    .ok_or_else(|| {
-                        ConnectError::PlanConversion("RepartitionByExpression missing input".into())
-                    })?;
+                let input = r.input.as_ref().ok_or_else(|| {
+                    ConnectError::PlanConversion("RepartitionByExpression missing input".into())
+                })?;
                 self.convert(input)
             }
             Some(RelType::ShowString(ss)) => self.convert_show_string(ss),
@@ -113,7 +119,10 @@ impl<'a> RelationConverter<'a> {
             Some(RelType::Catalog(cat)) => self.convert_catalog(cat),
             _ => Err(ConnectError::Unsupported(format!(
                 "Unsupported relation type: {:?}",
-                relation.rel_type.as_ref().map(|t| std::mem::discriminant(t))
+                relation
+                    .rel_type
+                    .as_ref()
+                    .map(|t| std::mem::discriminant(t))
             ))),
         }
     }
@@ -126,8 +135,11 @@ impl<'a> RelationConverter<'a> {
         } else {
             LogicalPlan::SingleRow(SingleRowRelation)
         };
-        let projections: Result<Vec<Expression>> =
-            p.expressions.iter().map(|e| self.expr_conv.convert(e)).collect();
+        let projections: Result<Vec<Expression>> = p
+            .expressions
+            .iter()
+            .map(|e| self.expr_conv.convert(e))
+            .collect();
         let mut projections = projections?;
 
         // Expand explode(map_col) → UNNEST(map_keys) AS key + UNNEST(map_values) AS value
@@ -184,8 +196,11 @@ impl<'a> RelationConverter<'a> {
             .ok_or_else(|| ConnectError::PlanConversion("Aggregate missing input".into()))?;
         let input_plan = self.convert(input)?;
 
-        let grouping: Result<Vec<Expression>> =
-            a.grouping_expressions.iter().map(|e| self.expr_conv.convert(e)).collect();
+        let grouping: Result<Vec<Expression>> = a
+            .grouping_expressions
+            .iter()
+            .map(|e| self.expr_conv.convert(e))
+            .collect();
         let grouping = grouping?;
 
         let mut aggregates: Vec<AggregateExpr> = Vec::new();
@@ -196,21 +211,27 @@ impl<'a> RelationConverter<'a> {
             if let Some(grp_idx) = grouping.iter().position(|g| g == &expr) {
                 select_order.push(SelectEntry::GroupingExpr(grouping[grp_idx].clone()));
             } else {
-                let agg_idx = aggregates.len();
-                aggregates.push(AggregateExpr::new(expr));
-                select_order.push(SelectEntry::AggregateExpr(agg_idx));
+                let agg = AggregateExpr::new(expr);
+                aggregates.push(agg.clone());
+                select_order.push(SelectEntry::AggregateExpr(agg));
             }
         }
 
         // Handle PIVOT separately — it becomes a Pivot plan node, not an Aggregate.
         if a.group_type() == GroupType::Pivot {
-            let pivot_proto = a.pivot.as_ref()
+            let pivot_proto = a
+                .pivot
+                .as_ref()
                 .ok_or_else(|| ConnectError::PlanConversion("Pivot missing pivot field".into()))?;
             let pivot_col = self.expr_conv.convert(
-                pivot_proto.col.as_ref()
-                    .ok_or_else(|| ConnectError::PlanConversion("Pivot missing col".into()))?
+                pivot_proto
+                    .col
+                    .as_ref()
+                    .ok_or_else(|| ConnectError::PlanConversion("Pivot missing col".into()))?,
             )?;
-            let pivot_values: Result<Vec<Expression>> = pivot_proto.values.iter()
+            let pivot_values: Result<Vec<Expression>> = pivot_proto
+                .values
+                .iter()
                 .map(|lit| self.expr_conv.convert_literal(lit))
                 .collect();
             return Ok(LogicalPlan::Pivot(Pivot {
@@ -258,8 +279,11 @@ impl<'a> RelationConverter<'a> {
             .input
             .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("Sort missing input".into()))?;
-        let order: Result<Vec<SortOrder>> =
-            s.order.iter().map(|so| self.expr_conv.convert_sort_order(so)).collect();
+        let order: Result<Vec<SortOrder>> = s
+            .order
+            .iter()
+            .map(|so| self.expr_conv.convert_sort_order(so))
+            .collect();
         Ok(LogicalPlan::Sort(Sort {
             input: Box::new(self.convert(input)?),
             order: order?,
@@ -342,7 +366,8 @@ impl<'a> RelationConverter<'a> {
         };
 
         // Determine whether any column in the condition is plan_id-qualified.
-        let needs_aliases = raw_condition.as_ref()
+        let needs_aliases = raw_condition
+            .as_ref()
             .map(|c| condition_has_plan_id(c))
             .unwrap_or(false)
             && left_outer_id.is_some()
@@ -351,9 +376,20 @@ impl<'a> RelationConverter<'a> {
         let (condition, left_alias, right_alias) = if needs_aliases {
             // Use a distinct alias format (__td_jl_N__ / __td_jr_M__) so the generator can
             // tell these apart from raw plan_id qualifiers (__plan_id_X__) and not strip them.
-            let la = format!("__td_jl_{}__", left_outer_id.ok_or_else(|| ConnectError::PlanConversion("join alias: left plan_id missing".into()))?);
-            let ra = format!("__td_jr_{}__", right_outer_id.ok_or_else(|| ConnectError::PlanConversion("join alias: right plan_id missing".into()))?);
-            let qualified = raw_condition.map(|c| qualify_join_condition(c, &left_ids_set, &right_ids_set, &la, &ra));
+            let la = format!(
+                "__td_jl_{}__",
+                left_outer_id.ok_or_else(|| ConnectError::PlanConversion(
+                    "join alias: left plan_id missing".into()
+                ))?
+            );
+            let ra = format!(
+                "__td_jr_{}__",
+                right_outer_id.ok_or_else(|| ConnectError::PlanConversion(
+                    "join alias: right plan_id missing".into()
+                ))?
+            );
+            let qualified = raw_condition
+                .map(|c| qualify_join_condition(c, &left_ids_set, &right_ids_set, &la, &ra));
             (qualified, Some(la), Some(ra))
         } else {
             (raw_condition, None, None)
@@ -441,9 +477,9 @@ impl<'a> RelationConverter<'a> {
                 right: right_plan,
                 all,
             })),
-            SetOpType::Unspecified => {
-                Err(ConnectError::PlanConversion("SetOp type unspecified".into()))
-            }
+            SetOpType::Unspecified => Err(ConnectError::PlanConversion(
+                "SetOp type unspecified".into(),
+            )),
         }
     }
 
@@ -455,8 +491,12 @@ impl<'a> RelationConverter<'a> {
                 // Query DuckDB for the registered table/view schema so that aggregate
                 // type inference (SUM/AVG over DECIMAL columns) produces correct Spark types.
                 let schema = self.infer_table_schema(&table).unwrap_or_default();
-                Ok(LogicalPlan::TableScan(TableScan { table, alias: None, schema }))
-            },
+                Ok(LogicalPlan::TableScan(TableScan {
+                    table,
+                    alias: None,
+                    schema,
+                }))
+            }
             Some(ReadType::DataSource(ds)) => {
                 if ds.paths.is_empty() {
                     return Err(ConnectError::PlanConversion(
@@ -473,10 +513,18 @@ impl<'a> RelationConverter<'a> {
                     "orc" => "read_orc",
                     _ => {
                         let lower = first_path.to_lowercase();
-                        if lower.ends_with(".parquet") { "read_parquet" }
-                        else if lower.ends_with(".csv") || lower.ends_with(".tsv") { "read_csv_auto" }
-                        else if lower.ends_with(".json") || lower.ends_with(".jsonl") || lower.ends_with(".ndjson") { "read_json_auto" }
-                        else { "read_parquet" }
+                        if lower.ends_with(".parquet") {
+                            "read_parquet"
+                        } else if lower.ends_with(".csv") || lower.ends_with(".tsv") {
+                            "read_csv_auto"
+                        } else if lower.ends_with(".json")
+                            || lower.ends_with(".jsonl")
+                            || lower.ends_with(".ndjson")
+                        {
+                            "read_json_auto"
+                        } else {
+                            "read_parquet"
+                        }
                     }
                 };
                 // Spark accepts `s3://bucket/dir` as "all parquet under this dir"; DuckDB
@@ -490,7 +538,8 @@ impl<'a> RelationConverter<'a> {
                 let paths_sql = if resolved_paths.len() == 1 {
                     format!("'{}'", resolved_paths[0].replace('\'', "''"))
                 } else {
-                    let quoted: Vec<String> = resolved_paths.iter()
+                    let quoted: Vec<String> = resolved_paths
+                        .iter()
                         .map(|p| format!("'{}'", p.replace('\'', "''")))
                         .collect();
                     format!("[{}]", quoted.join(", "))
@@ -508,13 +557,22 @@ impl<'a> RelationConverter<'a> {
                         let placeholder = LogicalPlan::SqlRelation(SqlRelation {
                             sql: sql.clone(),
                             schema: StructType::empty(),
-                            duckdb_ready: false, view_name: None, });
+                            duckdb_ready: true,
+                            view_name: None,
+                        });
                         self.infer_full_schema(&placeholder).unwrap_or_default()
                     }
                 };
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema, duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql,
+                    schema,
+                    duckdb_ready: true,
+                    view_name: None,
+                }))
             }
-            None => Err(ConnectError::PlanConversion("Read missing read_type".into())),
+            None => Err(ConnectError::PlanConversion(
+                "Read missing read_type".into(),
+            )),
         }
     }
 
@@ -525,17 +583,24 @@ impl<'a> RelationConverter<'a> {
                 // Falls back to schema-only (0 rows) if anything goes wrong.
                 if let Ok(sql) = local_relation_to_values_sql(data) {
                     let schema = parse_arrow_schema(data).unwrap_or_default();
-                    // Mark as duckdb_ready: local_relation_to_values_sql produces
-                    // DuckDB-native SQL (e.g. MAP([k], [v])) that must NOT be
-                    // reprocessed by preprocess_spark_sql (which would double-wrap
-                    // MAP args into MAP([[k]], [[v]])).
-                    return Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema, duckdb_ready: true, view_name: None }));
+                    // local_relation_to_values_sql produces DuckDB-native SQL.
+                    return Ok(LogicalPlan::SqlRelation(SqlRelation {
+                        sql,
+                        schema,
+                        duckdb_ready: true,
+                        view_name: None,
+                    }));
                 }
             }
         }
         // Fallback: schema-only (0 rows).
         // Priority: Arrow IPC schema > DDL schema string > empty.
-        let schema_from_ddl = || lr.schema.as_deref().and_then(|s| parse_ddl_schema(s).ok()).unwrap_or_default();
+        let schema_from_ddl = || {
+            lr.schema
+                .as_deref()
+                .and_then(|s| parse_ddl_schema(s).ok())
+                .unwrap_or_default()
+        };
         let schema = match &lr.data {
             Some(data) if !data.is_empty() => parse_arrow_schema(data).unwrap_or_default(),
             _ => schema_from_ddl(),
@@ -605,6 +670,22 @@ impl<'a> RelationConverter<'a> {
                 if let Some(ref mut having) = a.having {
                     self.enrich_subqueries_in_expr(having);
                 }
+                // `select_order` carries independent `AggregateExpr` values when
+                // populated (e.g. from RelationConverter's per-projection walk).
+                // Enrich them too — otherwise subqueries nested inside the
+                // SELECT-list aggregates would skip enrichment.
+                for entry in &mut a.select_order {
+                    match entry {
+                        SelectEntry::GroupingExpr(e) => self.enrich_subqueries_in_expr(e),
+                        SelectEntry::AggregateExpr(agg) => {
+                            self.enrich_subqueries_in_expr(&mut agg.func);
+                            if let Some(ref mut filter) = agg.filter {
+                                self.enrich_subqueries_in_expr(filter);
+                            }
+                        }
+                        SelectEntry::GroupingNotSelected => {}
+                    }
+                }
                 LogicalPlan::Aggregate(a)
             }
             LogicalPlan::Sort(mut s) => {
@@ -647,9 +728,11 @@ impl<'a> RelationConverter<'a> {
                 LogicalPlan::AliasedRelation(ar)
             }
             LogicalPlan::WithCte(mut c) => {
-                c.ctes = c.ctes.into_iter().map(|(name, plan)| {
-                    (name, Box::new(self.enrich_table_scans(*plan)))
-                }).collect();
+                c.ctes = c
+                    .ctes
+                    .into_iter()
+                    .map(|(name, plan)| (name, Box::new(self.enrich_table_scans(*plan))))
+                    .collect();
                 c.input = Box::new(self.enrich_table_scans(*c.input));
                 LogicalPlan::WithCte(c)
             }
@@ -776,14 +859,14 @@ impl<'a> RelationConverter<'a> {
 
         let mut columns: Vec<(String, Expression)> = Vec::new();
         for alias in &wc.aliases {
-            let expr = alias
-                .expr
-                .as_ref()
-                .ok_or_else(|| {
-                    ConnectError::PlanConversion("WithColumns alias missing expr".into())
-                })?;
-            let name =
-                alias.name.first().cloned().unwrap_or_else(|| "_col".to_string());
+            let expr = alias.expr.as_ref().ok_or_else(|| {
+                ConnectError::PlanConversion("WithColumns alias missing expr".into())
+            })?;
+            let name = alias
+                .name
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "_col".to_string());
             let col_expr = self.expr_conv.convert(expr)?;
             columns.push((name, col_expr));
         }
@@ -793,14 +876,26 @@ impl<'a> RelationConverter<'a> {
         // in-place and append new columns at the end — matching Spark's behavior.
         if let Ok(input_cols) = self.infer_columns(&input_plan) {
             use thunderduck_core::expression::AliasExpression;
-            let mut projections: Vec<Expression> = input_cols.iter().map(|col_name| {
-                // If this column is being replaced, use the replacement expression.
-                let replacement = columns.iter().find(|(n, _)| n == col_name).map(|(_, e)| e.clone());
-                let expr = replacement.unwrap_or_else(|| {
-                    Expression::UnresolvedColumn(UnresolvedColumn { name: col_name.clone(), qualifier: None })
-                });
-                Expression::Alias(AliasExpression { expr: Box::new(expr), alias: col_name.clone() })
-            }).collect();
+            let mut projections: Vec<Expression> = input_cols
+                .iter()
+                .map(|col_name| {
+                    // If this column is being replaced, use the replacement expression.
+                    let replacement = columns
+                        .iter()
+                        .find(|(n, _)| n == col_name)
+                        .map(|(_, e)| e.clone());
+                    let expr = replacement.unwrap_or_else(|| {
+                        Expression::UnresolvedColumn(UnresolvedColumn {
+                            name: col_name.clone(),
+                            qualifier: None,
+                        })
+                    });
+                    Expression::Alias(AliasExpression {
+                        expr: Box::new(expr),
+                        alias: col_name.clone(),
+                    })
+                })
+                .collect();
             // Append new columns (those not in input_cols).
             for (name, expr) in &columns {
                 if !input_cols.iter().any(|c| c == name) {
@@ -826,12 +921,9 @@ impl<'a> RelationConverter<'a> {
         &mut self,
         wcr: &proto::WithColumnsRenamed,
     ) -> Result<LogicalPlan> {
-        let input = wcr
-            .input
-            .as_ref()
-            .ok_or_else(|| {
-                ConnectError::PlanConversion("WithColumnsRenamed missing input".into())
-            })?;
+        let input = wcr.input.as_ref().ok_or_else(|| {
+            ConnectError::PlanConversion("WithColumnsRenamed missing input".into())
+        })?;
         let input_plan = self.convert(input)?;
 
         let mut columns: Vec<(String, Expression)> = wcr
@@ -868,10 +960,20 @@ impl<'a> RelationConverter<'a> {
             .ok_or_else(|| ConnectError::PlanConversion("Deduplicate missing input".into()))?;
         let input_plan = self.convert(input)?;
         // Convert column subset for dropDuplicates(cols); empty = all columns (SELECT DISTINCT *)
-        let columns: Result<Vec<Expression>> = d.column_names.iter()
-            .map(|name| Ok(Expression::UnresolvedColumn(UnresolvedColumn { name: name.clone(), qualifier: None })))
+        let columns: Result<Vec<Expression>> = d
+            .column_names
+            .iter()
+            .map(|name| {
+                Ok(Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: name.clone(),
+                    qualifier: None,
+                }))
+            })
             .collect();
-        Ok(LogicalPlan::Distinct(Distinct { input: Box::new(input_plan), columns: columns? }))
+        Ok(LogicalPlan::Distinct(Distinct {
+            input: Box::new(input_plan),
+            columns: columns?,
+        }))
     }
 
     fn convert_sample(&mut self, s: &proto::Sample) -> Result<LogicalPlan> {
@@ -927,23 +1029,23 @@ impl<'a> RelationConverter<'a> {
                         .map(|(old, new)| {
                             thunderduck_core::expression::Expression::Alias(
                                 thunderduck_core::expression::AliasExpression {
-                                    expr: Box::new(thunderduck_core::expression::Expression::UnresolvedColumn(
-                                        thunderduck_core::expression::UnresolvedColumn {
-                                            name: old,
-                                            qualifier: None,
-                                        },
-                                    )),
+                                    expr: Box::new(
+                                        thunderduck_core::expression::Expression::UnresolvedColumn(
+                                            thunderduck_core::expression::UnresolvedColumn {
+                                                name: old,
+                                                qualifier: None,
+                                            },
+                                        ),
+                                    ),
                                     alias: new.clone(),
                                 },
                             )
                         })
                         .collect();
-                    return Ok(LogicalPlan::Project(
-                        thunderduck_core::logical::Project {
-                            input: Box::new(input_plan),
-                            projections,
-                        },
-                    ));
+                    return Ok(LogicalPlan::Project(thunderduck_core::logical::Project {
+                        input: Box::new(input_plan),
+                        projections,
+                    }));
                 }
             }
         }
@@ -987,7 +1089,12 @@ impl<'a> RelationConverter<'a> {
             d.cols.clone()
         };
 
-        Ok(LogicalPlan::NADrop(NADrop { input: Box::new(input_plan), how, threshold, cols }))
+        Ok(LogicalPlan::NADrop(NADrop {
+            input: Box::new(input_plan),
+            how,
+            threshold,
+            cols,
+        }))
     }
 
     fn convert_fill_na(&mut self, f: &proto::NaFill) -> Result<LogicalPlan> {
@@ -1007,16 +1114,26 @@ impl<'a> RelationConverter<'a> {
         let values: Vec<(String, Literal)> = if f.cols.is_empty() {
             // Apply single fill value to all type-compatible columns
             if let Some(lit) = fill_literals.first() {
-                all_columns.iter().map(|c| (c.clone(), lit.clone())).collect()
+                all_columns
+                    .iter()
+                    .map(|c| (c.clone(), lit.clone()))
+                    .collect()
             } else {
                 vec![]
             }
         } else if fill_literals.len() == 1 {
             // Apply single fill value to specified columns
-            f.cols.iter().map(|c| (c.clone(), fill_literals[0].clone())).collect()
+            f.cols
+                .iter()
+                .map(|c| (c.clone(), fill_literals[0].clone()))
+                .collect()
         } else {
             // Each column paired with its own value
-            f.cols.iter().zip(fill_literals.iter()).map(|(c, l)| (c.clone(), l.clone())).collect()
+            f.cols
+                .iter()
+                .zip(fill_literals.iter())
+                .map(|(c, l)| (c.clone(), l.clone()))
+                .collect()
         };
 
         Ok(LogicalPlan::NAFill(NAFill {
@@ -1034,18 +1151,20 @@ impl<'a> RelationConverter<'a> {
         let input_plan = self.convert(input)?;
         let all_columns = self.infer_columns(&input_plan)?;
 
-        let target_cols = if r.cols.is_empty() { all_columns.clone() } else { r.cols.clone() };
+        let target_cols = if r.cols.is_empty() {
+            all_columns.clone()
+        } else {
+            r.cols.clone()
+        };
 
         let mut replacements: Vec<(String, Literal, Literal)> = Vec::new();
         for repl in &r.replacements {
-            let old = repl
-                .old_value
-                .as_ref()
-                .ok_or_else(|| ConnectError::PlanConversion("NAReplace missing old_value".into()))?;
-            let new = repl
-                .new_value
-                .as_ref()
-                .ok_or_else(|| ConnectError::PlanConversion("NAReplace missing new_value".into()))?;
+            let old = repl.old_value.as_ref().ok_or_else(|| {
+                ConnectError::PlanConversion("NAReplace missing old_value".into())
+            })?;
+            let new = repl.new_value.as_ref().ok_or_else(|| {
+                ConnectError::PlanConversion("NAReplace missing new_value".into())
+            })?;
             let old_lit = proto_literal_to_core(old)?;
             let new_lit = proto_literal_to_core(new)?;
             for col in &target_cols {
@@ -1078,7 +1197,12 @@ impl<'a> RelationConverter<'a> {
         let values: Vec<String> = u
             .values
             .as_ref()
-            .map(|v| v.values.iter().filter_map(|e| extract_column_name(e)).collect())
+            .map(|v| {
+                v.values
+                    .iter()
+                    .filter_map(|e| extract_column_name(e))
+                    .collect()
+            })
             .unwrap_or_default();
 
         Ok(LogicalPlan::Unpivot(Unpivot {
@@ -1092,7 +1216,9 @@ impl<'a> RelationConverter<'a> {
     }
 
     fn convert_stat_cov(&mut self, c: &proto::StatCov) -> Result<LogicalPlan> {
-        let input = c.input.as_ref()
+        let input = c
+            .input
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("StatCov missing input".into()))?;
         let input_plan = self.convert(input)?;
         Ok(LogicalPlan::StatCov(thunderduck_core::logical::StatCov {
@@ -1103,7 +1229,9 @@ impl<'a> RelationConverter<'a> {
     }
 
     fn convert_stat_corr(&mut self, c: &proto::StatCorr) -> Result<LogicalPlan> {
-        let input = c.input.as_ref()
+        let input = c
+            .input
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("StatCorr missing input".into()))?;
         let input_plan = self.convert(input)?;
         Ok(LogicalPlan::StatCorr(thunderduck_core::logical::StatCorr {
@@ -1115,70 +1243,98 @@ impl<'a> RelationConverter<'a> {
     }
 
     fn convert_approx_quantile(&mut self, aq: &proto::StatApproxQuantile) -> Result<LogicalPlan> {
-        let input = aq.input.as_ref()
+        let input = aq
+            .input
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("ApproxQuantile missing input".into()))?;
         let input_plan = self.convert(input)?;
-        Ok(LogicalPlan::ApproxQuantile(thunderduck_core::logical::ApproxQuantile {
-            input: Box::new(input_plan),
-            cols: aq.cols.clone(),
-            probabilities: aq.probabilities.clone(),
-            relative_error: aq.relative_error,
-        }))
+        Ok(LogicalPlan::ApproxQuantile(
+            thunderduck_core::logical::ApproxQuantile {
+                input: Box::new(input_plan),
+                cols: aq.cols.clone(),
+                probabilities: aq.probabilities.clone(),
+                relative_error: aq.relative_error,
+            },
+        ))
     }
 
     fn convert_stat_crosstab(&mut self, c: &proto::StatCrosstab) -> Result<LogicalPlan> {
-        let input = c.input.as_ref()
+        let input = c
+            .input
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("StatCrosstab missing input".into()))?;
-        Ok(LogicalPlan::StatCrosstab(thunderduck_core::logical::StatCrosstab {
-            input: Box::new(self.convert(input)?),
-            col1: c.col1.clone(),
-            col2: c.col2.clone(),
-        }))
+        Ok(LogicalPlan::StatCrosstab(
+            thunderduck_core::logical::StatCrosstab {
+                input: Box::new(self.convert(input)?),
+                col1: c.col1.clone(),
+                col2: c.col2.clone(),
+            },
+        ))
     }
 
     fn convert_stat_freq_items(&mut self, f: &proto::StatFreqItems) -> Result<LogicalPlan> {
-        let input = f.input.as_ref()
+        let input = f
+            .input
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("StatFreqItems missing input".into()))?;
-        Ok(LogicalPlan::StatFreqItems(thunderduck_core::logical::StatFreqItems {
-            input: Box::new(self.convert(input)?),
-            cols: f.cols.clone(),
-            support: f.support.unwrap_or(0.01),
-        }))
+        Ok(LogicalPlan::StatFreqItems(
+            thunderduck_core::logical::StatFreqItems {
+                input: Box::new(self.convert(input)?),
+                cols: f.cols.clone(),
+                support: f.support.unwrap_or(0.01),
+            },
+        ))
     }
 
     fn convert_stat_sample_by(&mut self, s: &proto::StatSampleBy) -> Result<LogicalPlan> {
-        let input = s.input.as_ref()
+        let input = s
+            .input
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("StatSampleBy missing input".into()))?;
-        let col_proto = s.col.as_ref()
+        let col_proto = s
+            .col
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("StatSampleBy missing col".into()))?;
         let col_expr = self.expr_conv.convert(col_proto)?;
-        let fractions = s.fractions.iter()
+        let fractions = s
+            .fractions
+            .iter()
             .map(|frac| {
-                let stratum_proto = frac.stratum.as_ref()
-                    .ok_or_else(|| ConnectError::PlanConversion("SampleBy fraction missing stratum".into()))?;
+                let stratum_proto = frac.stratum.as_ref().ok_or_else(|| {
+                    ConnectError::PlanConversion("SampleBy fraction missing stratum".into())
+                })?;
                 let lit_expr = self.expr_conv.convert_literal(stratum_proto)?;
                 match lit_expr {
-                    thunderduck_core::expression::Expression::Literal(lit) => Ok((lit, frac.fraction)),
-                    _ => Err(ConnectError::PlanConversion("SampleBy stratum not a literal".into())),
+                    thunderduck_core::expression::Expression::Literal(lit) => {
+                        Ok((lit, frac.fraction))
+                    }
+                    _ => Err(ConnectError::PlanConversion(
+                        "SampleBy stratum not a literal".into(),
+                    )),
                 }
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(LogicalPlan::StatSampleBy(thunderduck_core::logical::StatSampleBy {
-            input: Box::new(self.convert(input)?),
-            col_expr,
-            fractions,
-            seed: s.seed,
-        }))
+        Ok(LogicalPlan::StatSampleBy(
+            thunderduck_core::logical::StatSampleBy {
+                input: Box::new(self.convert(input)?),
+                col_expr,
+                fractions,
+                seed: s.seed,
+            },
+        ))
     }
 
     fn convert_with_relations(&mut self, wr: &proto::WithRelations) -> Result<LogicalPlan> {
-        let root = wr.root.as_ref()
+        let root = wr
+            .root
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("WithRelations missing root".into()))?;
         let mut ctes: Vec<(String, Box<LogicalPlan>)> = Vec::with_capacity(wr.references.len());
         for reference in &wr.references {
             if let Some(proto::relation::RelType::SubqueryAlias(sa)) = &reference.rel_type {
-                let body = sa.input.as_ref()
-                    .ok_or_else(|| ConnectError::PlanConversion("WithRelations CTE missing body".into()))?;
+                let body = sa.input.as_ref().ok_or_else(|| {
+                    ConnectError::PlanConversion("WithRelations CTE missing body".into())
+                })?;
                 ctes.push((sa.alias.clone(), Box::new(self.convert(body)?)));
             } else {
                 return Err(ConnectError::PlanConversion(
@@ -1193,7 +1349,9 @@ impl<'a> RelationConverter<'a> {
     }
 
     fn convert_describe(&mut self, d: &proto::StatDescribe) -> Result<LogicalPlan> {
-        let input = d.input.as_ref()
+        let input = d
+            .input
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("Describe missing input".into()))?;
         let input_plan = self.convert(input)?;
         let cols = if d.cols.is_empty() {
@@ -1208,7 +1366,9 @@ impl<'a> RelationConverter<'a> {
     }
 
     fn convert_summary(&mut self, s: &proto::StatSummary) -> Result<LogicalPlan> {
-        let input = s.input.as_ref()
+        let input = s
+            .input
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("Summary missing input".into()))?;
         let input_plan = self.convert(input)?;
         let cols = self.infer_columns(&input_plan)?;
@@ -1220,16 +1380,22 @@ impl<'a> RelationConverter<'a> {
     }
 
     fn convert_to_schema(&mut self, ts: &proto::ToSchema) -> Result<LogicalPlan> {
-        use crate::converter::type_converter::{proto_to_data_type, proto_struct_to_struct_type};
-        use thunderduck_core::expression::{AliasExpression, CastExpression, Expression, UnresolvedColumn};
+        use crate::converter::type_converter::{proto_struct_to_struct_type, proto_to_data_type};
+        use thunderduck_core::expression::{
+            AliasExpression, CastExpression, Expression, UnresolvedColumn,
+        };
         use thunderduck_core::logical::Project;
 
-        let input = ts.input.as_ref()
+        let input = ts
+            .input
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("ToSchema missing input".into()))?;
         let input_plan = self.convert(input)?;
 
         // Parse the target schema from the DataType proto
-        let target_type_proto = ts.schema.as_ref()
+        let target_type_proto = ts
+            .schema
+            .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("ToSchema missing schema".into()))?;
         let target_data_type = proto_to_data_type(target_type_proto)?;
 
@@ -1249,7 +1415,9 @@ impl<'a> RelationConverter<'a> {
         };
 
         // Build a Project that casts each field to the target type
-        let exprs: Vec<Expression> = struct_type.fields.iter()
+        let exprs: Vec<Expression> = struct_type
+            .fields
+            .iter()
             .map(|field| {
                 let col = Expression::UnresolvedColumn(UnresolvedColumn {
                     name: field.name.clone(),
@@ -1284,35 +1452,60 @@ impl<'a> RelationConverter<'a> {
                 let sql = format!(
                     "SELECT COUNT(*) > 0 AS value FROM information_schema.tables WHERE table_name = '{table_name}'"
                 );
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql,
+                    schema: StructType::empty(),
+                    duckdb_ready: true,
+                    view_name: None,
+                }))
             }
             Some(CatType::DatabaseExists(de)) => {
                 let db_name = de.db_name.replace('\'', "''");
                 let sql = format!(
                     "SELECT COUNT(*) > 0 AS value FROM information_schema.schemata WHERE schema_name = '{db_name}'"
                 );
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql,
+                    schema: StructType::empty(),
+                    duckdb_ready: true,
+                    view_name: None,
+                }))
             }
-            Some(CatType::DropTempView(dtv)) => {
-                Ok(LogicalPlan::DdlStatement(thunderduck_core::logical::DdlStatement {
+            Some(CatType::DropTempView(dtv)) => Ok(LogicalPlan::DdlStatement(
+                thunderduck_core::logical::DdlStatement {
                     operation: thunderduck_core::logical::DdlOperation::DropView {
                         view_name: dtv.view_name.clone(),
                         if_exists: true,
                     },
-                }))
-            }
+                },
+            )),
             Some(CatType::CurrentDatabase(_)) => {
                 let sql = "SELECT current_schema() AS value".to_string();
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql,
+                    schema: StructType::empty(),
+                    duckdb_ready: true,
+                    view_name: None,
+                }))
             }
             Some(CatType::CurrentCatalog(_)) => {
                 let sql = "SELECT current_catalog() AS value".to_string();
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql,
+                    schema: StructType::empty(),
+                    duckdb_ready: true,
+                    view_name: None,
+                }))
             }
             Some(CatType::IsCached(_)) => {
                 // DuckDB has no cache concept — always false
                 let sql = "SELECT false AS value".to_string();
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql,
+                    schema: StructType::empty(),
+                    duckdb_ready: true,
+                    view_name: None,
+                }))
             }
             Some(CatType::CacheTable(_))
             | Some(CatType::UncacheTable(_))
@@ -1321,7 +1514,12 @@ impl<'a> RelationConverter<'a> {
             | Some(CatType::RefreshByPath(_)) => {
                 // No-op: DuckDB has no cache to manage — return success
                 let sql = "SELECT true AS value".to_string();
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql,
+                    schema: StructType::empty(),
+                    duckdb_ready: true,
+                    view_name: None,
+                }))
             }
             Some(CatType::FunctionExists(fe)) => {
                 let func_name = fe.function_name.to_lowercase().replace('\'', "''");
@@ -1330,7 +1528,12 @@ impl<'a> RelationConverter<'a> {
                      WHERE lower(function_name) = '{func_name}' \
                      AND schema_name NOT IN ('information_schema', 'pg_catalog')) AS value"
                 );
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql,
+                    schema: StructType::empty(),
+                    duckdb_ready: true,
+                    view_name: None,
+                }))
             }
             Some(CatType::ListFunctions(lf)) => {
                 let mut conditions =
@@ -1355,7 +1558,12 @@ impl<'a> RelationConverter<'a> {
                      WHERE {conditions} \
                      ORDER BY function_name"
                 );
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql,
+                    schema: StructType::empty(),
+                    duckdb_ready: true,
+                    view_name: None,
+                }))
             }
             Some(CatType::GetFunction(gf)) => {
                 let func_name = gf.function_name.to_lowercase().replace('\'', "''");
@@ -1379,7 +1587,12 @@ impl<'a> RelationConverter<'a> {
                      WHERE {conditions} \
                      LIMIT 1"
                 );
-                Ok(LogicalPlan::SqlRelation(SqlRelation { sql, schema: StructType::empty(), duckdb_ready: false, view_name: None }))
+                Ok(LogicalPlan::SqlRelation(SqlRelation {
+                    sql,
+                    schema: StructType::empty(),
+                    duckdb_ready: true,
+                    view_name: None,
+                }))
             }
             _ => Err(ConnectError::Unsupported(format!(
                 "Unsupported catalog operation: {:?}",
@@ -1397,14 +1610,13 @@ impl<'a> RelationConverter<'a> {
         }
         // Slow path: execute a LIMIT 0 query via DuckDB
         if let Some(session) = &self.session {
-            let sql = SqlGenerator::relaxed()
-                .generate(plan)
-                .map_err(|e| ConnectError::PlanConversion(format!("schema inference SQL gen: {e}")))?;
+            let sql = SqlGenerator::relaxed().generate(plan).map_err(|e| {
+                ConnectError::PlanConversion(format!("schema inference SQL gen: {e}"))
+            })?;
             let session = Arc::clone(session);
             let struct_type = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    SchemaInferrer::new(&session).infer_sql(&sql).await
-                })
+                tokio::runtime::Handle::current()
+                    .block_on(async move { SchemaInferrer::new(&session).infer_sql(&sql).await })
             })
             .map_err(|e| ConnectError::PlanConversion(format!("schema inference: {e}")))?;
             Ok(struct_type.fields.into_iter().map(|f| f.name).collect())
@@ -1437,9 +1649,8 @@ impl<'a> RelationConverter<'a> {
             let sql = format!("SELECT * FROM {}", quote_ident(table));
             let session = Arc::clone(session);
             tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    SchemaInferrer::new(&session).infer_sql(&sql).await
-                })
+                tokio::runtime::Handle::current()
+                    .block_on(async move { SchemaInferrer::new(&session).infer_sql(&sql).await })
             })
             .map_err(|e| ConnectError::PlanConversion(format!("table schema inference: {e}")))
         } else {
@@ -1452,14 +1663,13 @@ impl<'a> RelationConverter<'a> {
     /// Infer the full schema (column names + types) of a plan using DuckDB.
     fn infer_full_schema(&self, plan: &LogicalPlan) -> Result<StructType> {
         if let Some(session) = &self.session {
-            let sql = SqlGenerator::relaxed()
-                .generate(plan)
-                .map_err(|e| ConnectError::PlanConversion(format!("schema inference SQL gen: {e}")))?;
+            let sql = SqlGenerator::relaxed().generate(plan).map_err(|e| {
+                ConnectError::PlanConversion(format!("schema inference SQL gen: {e}"))
+            })?;
             let session = Arc::clone(session);
             tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    SchemaInferrer::new(&session).infer_sql(&sql).await
-                })
+                tokio::runtime::Handle::current()
+                    .block_on(async move { SchemaInferrer::new(&session).infer_sql(&sql).await })
             })
             .map_err(|e| ConnectError::PlanConversion(format!("schema inference: {e}")))
         } else {
@@ -1484,14 +1694,17 @@ fn propagate_cte_schemas(plan: LogicalPlan) -> LogicalPlan {
             // Process CTEs in order — later CTEs can reference earlier ones.
             // Take ownership via std::mem::take to avoid deep-cloning the plan tree.
             let ctes = std::mem::take(&mut c.ctes);
-            c.ctes = ctes.into_iter().map(|(name, cte_plan)| {
-                let rewritten = Box::new(apply_cte_schemas(*cte_plan, &cte_map));
-                let schema = rewritten.infer_schema();
-                if !schema.is_empty() {
-                    cte_map.insert(name.to_lowercase(), schema);
-                }
-                (name, rewritten)
-            }).collect();
+            c.ctes = ctes
+                .into_iter()
+                .map(|(name, cte_plan)| {
+                    let rewritten = Box::new(apply_cte_schemas(*cte_plan, &cte_map));
+                    let schema = rewritten.infer_schema();
+                    if !schema.is_empty() {
+                        cte_map.insert(name.to_lowercase(), schema);
+                    }
+                    (name, rewritten)
+                })
+                .collect();
 
             // Apply all CTE schemas to the main body
             c.input = Box::new(apply_cte_schemas(*c.input, &cte_map));
@@ -1583,9 +1796,11 @@ fn apply_cte_schemas(
         }
         LogicalPlan::WithCte(mut c) => {
             // Nested CTEs: recurse into definitions and body
-            c.ctes = c.ctes.into_iter().map(|(name, p)| {
-                (name, Box::new(apply_cte_schemas(*p, cte_schemas)))
-            }).collect();
+            c.ctes = c
+                .ctes
+                .into_iter()
+                .map(|(name, p)| (name, Box::new(apply_cte_schemas(*p, cte_schemas))))
+                .collect();
             c.input = Box::new(apply_cte_schemas(*c.input, cte_schemas));
             LogicalPlan::WithCte(c)
         }
@@ -1689,35 +1904,52 @@ fn arrow_field_to_data_type(dt: &arrow::datatypes::DataType) -> DataType {
         ArrowDT::Binary | ArrowDT::LargeBinary => DataType::Binary,
         ArrowDT::Date32 => DataType::Date,
         ArrowDT::Timestamp(_, _) => DataType::Timestamp,
-        ArrowDT::Decimal128(p, s) => DataType::Decimal { precision: *p, scale: *s as u8 },
-        ArrowDT::List(f) | ArrowDT::LargeList(f) => {
-            DataType::Array(Box::new(arrow_field_to_data_type(f.data_type())), f.is_nullable())
-        }
+        ArrowDT::Decimal128(p, s) => DataType::Decimal {
+            precision: *p,
+            scale: *s as u8,
+        },
+        ArrowDT::List(f) | ArrowDT::LargeList(f) => DataType::Array(
+            Box::new(arrow_field_to_data_type(f.data_type())),
+            f.is_nullable(),
+        ),
         ArrowDT::Map(field, _) => {
             if let ArrowDT::Struct(fields) = field.data_type() {
-                let key = fields.iter().find(|f| f.name() == "key")
+                let key = fields
+                    .iter()
+                    .find(|f| f.name() == "key")
                     .map(|f| arrow_field_to_data_type(f.data_type()))
                     .unwrap_or(DataType::Unresolved);
-                let value = fields.iter().find(|f| f.name() == "value")
+                let value = fields
+                    .iter()
+                    .find(|f| f.name() == "value")
                     .map(|f| arrow_field_to_data_type(f.data_type()))
                     .unwrap_or(DataType::Unresolved);
-                let value_nullable = fields.iter().find(|f| f.name() == "value")
+                let value_nullable = fields
+                    .iter()
+                    .find(|f| f.name() == "value")
                     .map(|f| f.is_nullable())
                     .unwrap_or(true);
-                DataType::Map { key: Box::new(key), value: Box::new(value), value_nullable }
+                DataType::Map {
+                    key: Box::new(key),
+                    value: Box::new(value),
+                    value_nullable,
+                }
             } else {
                 DataType::Unresolved
             }
         }
         ArrowDT::Struct(fields) => {
-            let struct_fields = fields.iter().map(|f| {
-                let dt = arrow_field_to_data_type(f.data_type());
-                if f.is_nullable() {
-                    StructField::nullable(f.name().clone(), dt)
-                } else {
-                    StructField::not_null(f.name().clone(), dt)
-                }
-            }).collect();
+            let struct_fields = fields
+                .iter()
+                .map(|f| {
+                    let dt = arrow_field_to_data_type(f.data_type());
+                    if f.is_nullable() {
+                        StructField::nullable(f.name().clone(), dt)
+                    } else {
+                        StructField::not_null(f.name().clone(), dt)
+                    }
+                })
+                .collect();
             DataType::Struct(StructType::new(struct_fields))
         }
         _ => DataType::Unresolved,
@@ -1762,7 +1994,9 @@ fn parse_json_schema(json: &str) -> crate::error::Result<StructType> {
     let mut fields = Vec::new();
     for obj in field_jsons {
         let obj = obj.trim();
-        if obj.is_empty() { continue; }
+        if obj.is_empty() {
+            continue;
+        }
         let name = json_string_value(obj, "name").unwrap_or_default();
         let nullable = json_bool_value(obj, "nullable").unwrap_or(true);
         // "type" can be a quoted string or a nested object
@@ -1802,7 +2036,9 @@ fn split_json_objects(s: &str) -> Vec<&str> {
     for (i, c) in s.char_indices() {
         match c {
             '{' => {
-                if depth == 0 { start = Some(i); }
+                if depth == 0 {
+                    start = Some(i);
+                }
                 depth += 1;
             }
             '}' => {
@@ -1827,7 +2063,9 @@ fn json_string_value<'a>(obj: &'a str, key: &str) -> Option<String> {
     let after_key = &obj[pos + needle.len()..];
     // Skip : and whitespace
     let after_colon = after_key.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
-    if !after_colon.starts_with('"') { return None; }
+    if !after_colon.starts_with('"') {
+        return None;
+    }
     let inner = &after_colon[1..];
     let end = inner.find('"')?;
     Some(inner[..end].to_string())
@@ -1839,9 +2077,13 @@ fn json_bool_value(obj: &str, key: &str) -> Option<bool> {
     let pos = obj.find(&needle)?;
     let after_key = &obj[pos + needle.len()..];
     let after_colon = after_key.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
-    if after_colon.starts_with("true") { Some(true) }
-    else if after_colon.starts_with("false") { Some(false) }
-    else { None }
+    if after_colon.starts_with("true") {
+        Some(true)
+    } else if after_colon.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Extract the DataType from the "type" field of a Spark JSON field object.
@@ -1888,7 +2130,11 @@ fn parse_json_type_object(obj: &str) -> DataType {
             let val_dt = json_string_value(obj, "valueType")
                 .map(|t| parse_type_str(&t))
                 .unwrap_or(DataType::Unresolved);
-            DataType::Map { key: Box::new(key_dt), value: Box::new(val_dt), value_nullable: true }
+            DataType::Map {
+                key: Box::new(key_dt),
+                value: Box::new(val_dt),
+                value_nullable: true,
+            }
         }
         "struct" => DataType::Struct(StructType::new(vec![])),
         _ => DataType::Unresolved,
@@ -1911,7 +2157,9 @@ fn parse_ddl_schema_inner(s: &str) -> crate::error::Result<StructType> {
     let mut fields = Vec::new();
     for part in &parts {
         let part = part.trim();
-        if part.is_empty() { continue; }
+        if part.is_empty() {
+            continue;
+        }
         // Each field: name type [NOT NULL]
         // name may be backtick-quoted or bare; first token up to whitespace
         let (name, rest) = match part.find(|c: char| c.is_whitespace() || c == ':') {
@@ -1981,7 +2229,10 @@ fn proto_literal_to_core(lit: &proto::expression::Literal) -> Result<Literal> {
         Some(LiteralType::String(s)) => LiteralValue::String(s.clone()),
         _ => LiteralValue::Null,
     };
-    Ok(Literal { value, data_type: DataType::Unresolved })
+    Ok(Literal {
+        value,
+        data_type: DataType::Unresolved,
+    })
 }
 
 // ── LocalRelation data materialisation ─────────────────────────────────────────
@@ -1990,9 +2241,9 @@ fn proto_literal_to_core(lit: &proto::expression::Literal) -> Result<Literal> {
 /// that can be used as a subquery anywhere a table expression is valid in DuckDB.
 fn local_relation_to_values_sql(data: &[u8]) -> Result<String> {
     use arrow::array::{
-        Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
-        Int32Array, Int64Array, Int8Array, LargeStringArray, ListArray, MapArray,
-        StringArray, StructArray, TimestampMicrosecondArray,
+        Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array,
+        Int64Array, Int8Array, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
+        TimestampMicrosecondArray,
     };
     use arrow::datatypes::DataType as ArrowDT;
     use arrow_ipc::reader::StreamReader;
@@ -2003,7 +2254,11 @@ fn local_relation_to_values_sql(data: &[u8]) -> Result<String> {
     let reader = StreamReader::try_new(cursor, None)
         .map_err(|e| ConnectError::Arrow(format!("Arrow IPC parse: {e}")))?;
     let schema = reader.schema();
-    let col_names: Vec<String> = schema.fields().iter().map(|f| quote_ident(f.name())).collect();
+    let col_names: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| quote_ident(f.name()))
+        .collect();
 
     let batches: Vec<arrow::record_batch::RecordBatch> = reader
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -2020,67 +2275,151 @@ fn local_relation_to_values_sql(data: &[u8]) -> Result<String> {
         }
         match array.data_type() {
             ArrowDT::Boolean => {
-                let a = array.as_any().downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?;
-                Ok(if a.value(row) { "true".to_string() } else { "false".to_string() })
+                let a = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?;
+                Ok(if a.value(row) {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                })
             }
             ArrowDT::Int8 => {
-                let v = array.as_any().downcast_ref::<Int8Array>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                let v = array
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?
                     .value(row);
                 Ok(format!("{v}::TINYINT"))
             }
             ArrowDT::Int16 => {
-                let v = array.as_any().downcast_ref::<Int16Array>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                let v = array
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?
                     .value(row);
                 Ok(format!("{v}::SMALLINT"))
             }
             ArrowDT::Int32 => {
-                let v = array.as_any().downcast_ref::<Int32Array>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                let v = array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?
                     .value(row);
                 Ok(format!("{v}::INTEGER"))
             }
             ArrowDT::Int64 => {
-                let v = array.as_any().downcast_ref::<Int64Array>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                let v = array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?
                     .value(row);
                 Ok(format!("{v}::BIGINT"))
             }
             ArrowDT::Float32 => {
-                let v = array.as_any().downcast_ref::<Float32Array>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                let v = array
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?
                     .value(row);
-                Ok(if v.is_nan() { "'NaN'::FLOAT".to_string() }
-                else if v == f32::INFINITY { "'Infinity'::FLOAT".to_string() }
-                else if v == f32::NEG_INFINITY { "'-Infinity'::FLOAT".to_string() }
-                else { format!("{v:.10}::FLOAT") })
+                Ok(if v.is_nan() {
+                    "'NaN'::FLOAT".to_string()
+                } else if v == f32::INFINITY {
+                    "'Infinity'::FLOAT".to_string()
+                } else if v == f32::NEG_INFINITY {
+                    "'-Infinity'::FLOAT".to_string()
+                } else {
+                    format!("{v:.10}::FLOAT")
+                })
             }
             ArrowDT::Float64 => {
-                let v = array.as_any().downcast_ref::<Float64Array>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                let v = array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?
                     .value(row);
-                Ok(if v.is_nan() { "'NaN'::DOUBLE".to_string() }
-                else if v == f64::INFINITY { "'Infinity'::DOUBLE".to_string() }
-                else if v == f64::NEG_INFINITY { "'-Infinity'::DOUBLE".to_string() }
-                else { format!("{v:.17}::DOUBLE") })
+                Ok(if v.is_nan() {
+                    "'NaN'::DOUBLE".to_string()
+                } else if v == f64::INFINITY {
+                    "'Infinity'::DOUBLE".to_string()
+                } else if v == f64::NEG_INFINITY {
+                    "'-Infinity'::DOUBLE".to_string()
+                } else {
+                    format!("{v:.17}::DOUBLE")
+                })
             }
             ArrowDT::Utf8 => {
-                let s = array.as_any().downcast_ref::<StringArray>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                let s = array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?
                     .value(row);
                 Ok(format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")))
             }
             ArrowDT::LargeUtf8 => {
-                let s = array.as_any().downcast_ref::<LargeStringArray>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                let s = array
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?
                     .value(row);
                 Ok(format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")))
             }
             ArrowDT::Date32 => {
-                let days = array.as_any().downcast_ref::<Date32Array>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                let days = array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?
                     .value(row);
                 Ok(format!("(DATE '1970-01-01' + INTERVAL '{days}' DAY)"))
             }
@@ -2088,40 +2427,82 @@ fn local_relation_to_values_sql(data: &[u8]) -> Result<String> {
                 let micros = array
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?
                     .value(row);
-                Ok(format!("(TIMESTAMP '1970-01-01' + INTERVAL '{micros}' MICROSECOND)"))
+                Ok(format!(
+                    "(TIMESTAMP '1970-01-01' + INTERVAL '{micros}' MICROSECOND)"
+                ))
             }
             ArrowDT::List(_) => {
-                let a = array.as_any().downcast_ref::<ListArray>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?;
+                let a = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                    ConnectError::PlanConversion(format!(
+                        "downcast failed for {:?}",
+                        array.data_type()
+                    ))
+                })?;
                 let list = a.value(row);
-                let elements: Vec<String> =
-                    (0..list.len()).map(|i| val(list.as_ref(), i)).collect::<Result<Vec<_>>>()?;
+                let elements: Vec<String> = (0..list.len())
+                    .map(|i| val(list.as_ref(), i))
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(format!("[{}]", elements.join(", ")))
             }
             ArrowDT::Map(_, _) => {
-                let a = array.as_any().downcast_ref::<MapArray>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?;
+                let a = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                    ConnectError::PlanConversion(format!(
+                        "downcast failed for {:?}",
+                        array.data_type()
+                    ))
+                })?;
                 let entries = a.value(row);
-                let sa = entries.as_any().downcast_ref::<StructArray>()
-                    .ok_or_else(|| ConnectError::PlanConversion("downcast failed for map entries struct".into()))?;
+                let sa = entries
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(
+                            "downcast failed for map entries struct".into(),
+                        )
+                    })?;
                 let keys = sa.column(0);
                 let vals = sa.column(1);
                 if keys.len() == 0 {
                     return Ok("MAP([], [])".to_string());
                 }
-                let k_sqls: Vec<String> = (0..keys.len()).map(|i| val(keys.as_ref(), i)).collect::<Result<Vec<_>>>()?;
-                let v_sqls: Vec<String> = (0..vals.len()).map(|i| val(vals.as_ref(), i)).collect::<Result<Vec<_>>>()?;
-                Ok(format!("MAP([{}], [{}])", k_sqls.join(", "), v_sqls.join(", ")))
+                let k_sqls: Vec<String> = (0..keys.len())
+                    .map(|i| val(keys.as_ref(), i))
+                    .collect::<Result<Vec<_>>>()?;
+                let v_sqls: Vec<String> = (0..vals.len())
+                    .map(|i| val(vals.as_ref(), i))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(format!(
+                    "MAP([{}], [{}])",
+                    k_sqls.join(", "),
+                    v_sqls.join(", ")
+                ))
             }
             ArrowDT::Struct(_) => {
-                let a = array.as_any().downcast_ref::<StructArray>()
-                    .ok_or_else(|| ConnectError::PlanConversion(format!("downcast failed for {:?}", array.data_type())))?;
-                let pairs: Vec<String> = a.fields().iter().enumerate().map(|(ci, f)| {
-                    let col = a.column(ci);
-                    Ok(format!("{}: {}", f.name(), val(col.as_ref(), row)?))
-                }).collect::<Result<Vec<_>>>()?;
+                let a = array
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?;
+                let pairs: Vec<String> = a
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(ci, f)| {
+                        let col = a.column(ci);
+                        Ok(format!("{}: {}", f.name(), val(col.as_ref(), row)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(format!("{{{}}}", pairs.join(", ")))
             }
             _ => Ok("NULL".to_string()),
@@ -2131,8 +2512,11 @@ fn local_relation_to_values_sql(data: &[u8]) -> Result<String> {
     let mut rows: Vec<String> = Vec::with_capacity(total_rows);
     for batch in &batches {
         for row in 0..batch.num_rows() {
-            let values: Vec<String> =
-                batch.columns().iter().map(|c| val(c.as_ref(), row)).collect::<Result<Vec<_>>>()?;
+            let values: Vec<String> = batch
+                .columns()
+                .iter()
+                .map(|c| val(c.as_ref(), row))
+                .collect::<Result<Vec<_>>>()?;
             if rows.is_empty() {
                 let pairs: Vec<String> = values
                     .iter()
@@ -2153,7 +2537,10 @@ fn local_relation_to_values_sql(data: &[u8]) -> Result<String> {
 /// Expand `explode(map_col)` / `explode_outer(map_col)` expressions into two RawSql expressions
 /// (`UNNEST(map_keys(col)) AS "key"` and `UNNEST(map_values(col)) AS "value"`) when the column
 /// is a MAP type. This must be called before SQL generation since DuckDB cannot UNNEST a MAP.
-fn expand_map_explodes(input_schema: &thunderduck_core::types::StructType, projections: &mut Vec<Expression>) {
+fn expand_map_explodes(
+    input_schema: &thunderduck_core::types::StructType,
+    projections: &mut Vec<Expression>,
+) {
     use thunderduck_core::expression::RawSqlExpression;
     let needs_expansion = projections.iter().any(|e| {
         if let Expression::FunctionCall(fc) = e {
@@ -2172,7 +2559,9 @@ fn expand_map_explodes(input_schema: &thunderduck_core::types::StructType, proje
             let fname = fc.name.to_ascii_lowercase();
             if (fname == "explode" || fname == "explode_outer") && fc.args.len() == 1 {
                 let col_name = match &fc.args[0] {
-                    Expression::UnresolvedColumn(u) if u.qualifier.is_none() => Some(u.name.clone()),
+                    Expression::UnresolvedColumn(u) if u.qualifier.is_none() => {
+                        Some(u.name.clone())
+                    }
                     _ => None,
                 };
                 if let Some(ref name) = col_name {
@@ -2183,9 +2572,11 @@ fn expand_map_explodes(input_schema: &thunderduck_core::types::StructType, proje
                     if let Some(map_f) = map_field {
                         // Extract key/value types for schema inference
                         let (key_type, value_type, value_nullable) = match &map_f.data_type {
-                            DataType::Map { key, value, value_nullable } => {
-                                (Some(*key.clone()), Some(*value.clone()), *value_nullable)
-                            }
+                            DataType::Map {
+                                key,
+                                value,
+                                value_nullable,
+                            } => (Some(*key.clone()), Some(*value.clone()), *value_nullable),
                             _ => (None, None, true),
                         };
                         let col_sql = format!("\"{}\"", name.replace('"', "\"\""));
@@ -2235,9 +2626,12 @@ fn expand_map_explodes(input_schema: &thunderduck_core::types::StructType, proje
 fn qualify_exprs_for_join(plan: &LogicalPlan, exprs: &mut Vec<Expression>) {
     if let LogicalPlan::Join(j) = plan {
         if let (Some(la), Some(ra)) = (j.left_alias.clone(), j.right_alias.clone()) {
-            let left_set: std::collections::HashSet<i64> = j.left_plan_ids.iter().copied().collect();
-            let right_set: std::collections::HashSet<i64> = j.right_plan_ids.iter().copied().collect();
-            let qualified: Vec<Expression> = exprs.drain(..)
+            let left_set: std::collections::HashSet<i64> =
+                j.left_plan_ids.iter().copied().collect();
+            let right_set: std::collections::HashSet<i64> =
+                j.right_plan_ids.iter().copied().collect();
+            let qualified: Vec<Expression> = exprs
+                .drain(..)
                 .map(|e| qualify_join_condition(e, &left_set, &right_set, &la, &ra))
                 .collect();
             *exprs = qualified;
@@ -2255,25 +2649,69 @@ fn collect_relation_plan_ids(rel: &proto::Relation, ids: &mut std::collections::
     }
     use proto::relation::RelType;
     match &rel.rel_type {
-        Some(RelType::Filter(f)) => { if let Some(i) = &f.input { collect_relation_plan_ids(i, ids); } }
-        Some(RelType::Project(p)) => { if let Some(i) = &p.input { collect_relation_plan_ids(i, ids); } }
-        Some(RelType::Aggregate(a)) => { if let Some(i) = &a.input { collect_relation_plan_ids(i, ids); } }
-        Some(RelType::Sort(s)) => { if let Some(i) = &s.input { collect_relation_plan_ids(i, ids); } }
-        Some(RelType::Limit(l)) => { if let Some(i) = &l.input { collect_relation_plan_ids(i, ids); } }
-        Some(RelType::Deduplicate(d)) => { if let Some(i) = &d.input { collect_relation_plan_ids(i, ids); } }
-        Some(RelType::SubqueryAlias(sa)) => { if let Some(i) = &sa.input { collect_relation_plan_ids(i, ids); } }
-        Some(RelType::Sample(s)) => { if let Some(i) = &s.input { collect_relation_plan_ids(i, ids); } }
+        Some(RelType::Filter(f)) => {
+            if let Some(i) = &f.input {
+                collect_relation_plan_ids(i, ids);
+            }
+        }
+        Some(RelType::Project(p)) => {
+            if let Some(i) = &p.input {
+                collect_relation_plan_ids(i, ids);
+            }
+        }
+        Some(RelType::Aggregate(a)) => {
+            if let Some(i) = &a.input {
+                collect_relation_plan_ids(i, ids);
+            }
+        }
+        Some(RelType::Sort(s)) => {
+            if let Some(i) = &s.input {
+                collect_relation_plan_ids(i, ids);
+            }
+        }
+        Some(RelType::Limit(l)) => {
+            if let Some(i) = &l.input {
+                collect_relation_plan_ids(i, ids);
+            }
+        }
+        Some(RelType::Deduplicate(d)) => {
+            if let Some(i) = &d.input {
+                collect_relation_plan_ids(i, ids);
+            }
+        }
+        Some(RelType::SubqueryAlias(sa)) => {
+            if let Some(i) = &sa.input {
+                collect_relation_plan_ids(i, ids);
+            }
+        }
+        Some(RelType::Sample(s)) => {
+            if let Some(i) = &s.input {
+                collect_relation_plan_ids(i, ids);
+            }
+        }
         Some(RelType::Join(j)) => {
-            if let Some(l) = &j.left { collect_relation_plan_ids(l, ids); }
-            if let Some(r) = &j.right { collect_relation_plan_ids(r, ids); }
+            if let Some(l) = &j.left {
+                collect_relation_plan_ids(l, ids);
+            }
+            if let Some(r) = &j.right {
+                collect_relation_plan_ids(r, ids);
+            }
         }
         Some(RelType::SetOp(s)) => {
-            if let Some(l) = &s.left_input { collect_relation_plan_ids(l, ids); }
-            if let Some(r) = &s.right_input { collect_relation_plan_ids(r, ids); }
+            if let Some(l) = &s.left_input {
+                collect_relation_plan_ids(l, ids);
+            }
+            if let Some(r) = &s.right_input {
+                collect_relation_plan_ids(r, ids);
+            }
         }
         Some(RelType::WithRelations(wr)) => {
-            if let Some(r) = &wr.root { collect_relation_plan_ids(r, ids); }
-            for ref_ in &wr.references { collect_relation_plan_ids(ref_, ids); }
+            if let Some(r) = &wr.root {
+                collect_relation_plan_ids(r, ids);
+            }
+            for ref_ in &wr.references {
+                collect_relation_plan_ids(ref_, ids);
+            }
         }
         _ => {}
     }
@@ -2283,7 +2721,9 @@ fn collect_relation_plan_ids(rel: &proto::Relation, ids: &mut std::collections::
 fn condition_has_plan_id(expr: &Expression) -> bool {
     use thunderduck_core::expression::Expression as E;
     match expr {
-        E::UnresolvedColumn(u) => u.qualifier.as_ref()
+        E::UnresolvedColumn(u) => u
+            .qualifier
+            .as_ref()
             .map_or(false, |q| q.starts_with("__plan_id_") && q.ends_with("__")),
         E::Binary(b) => condition_has_plan_id(&b.left) || condition_has_plan_id(&b.right),
         E::Unary(u) => condition_has_plan_id(&u.operand),
@@ -2291,8 +2731,13 @@ fn condition_has_plan_id(expr: &Expression) -> bool {
         E::Cast(c) => condition_has_plan_id(&c.expr),
         E::Alias(a) => condition_has_plan_id(&a.expr),
         E::CaseWhen(cw) => {
-            cw.branches.iter().any(|(w, t)| condition_has_plan_id(w) || condition_has_plan_id(t))
-                || cw.else_expr.as_ref().map_or(false, |e| condition_has_plan_id(e))
+            cw.branches
+                .iter()
+                .any(|(w, t)| condition_has_plan_id(w) || condition_has_plan_id(t))
+                || cw
+                    .else_expr
+                    .as_ref()
+                    .map_or(false, |e| condition_has_plan_id(e))
         }
         _ => false,
     }
@@ -2310,7 +2755,7 @@ fn qualify_join_condition(
     right_alias: &str,
 ) -> Expression {
     use thunderduck_core::expression::{
-        AliasExpression, BinaryExpression, CastExpression, CaseWhenExpression, Expression as E,
+        AliasExpression, BinaryExpression, CaseWhenExpression, CastExpression, Expression as E,
         FunctionCall, UnaryExpression, UnresolvedColumn,
     };
     let qjc = |e| qualify_join_condition(e, left_ids, right_ids, left_alias, right_alias);
@@ -2318,7 +2763,10 @@ fn qualify_join_condition(
         E::UnresolvedColumn(u) => {
             // Check if qualifier encodes a plan_id as "__plan_id_<N>__"
             if let Some(q) = &u.qualifier {
-                if let Some(id_str) = q.strip_prefix("__plan_id_").and_then(|s| s.strip_suffix("__")) {
+                if let Some(id_str) = q
+                    .strip_prefix("__plan_id_")
+                    .and_then(|s| s.strip_suffix("__"))
+                {
                     if let Ok(id) = id_str.parse::<i64>() {
                         let new_qualifier = if left_ids.contains(&id) {
                             Some(left_alias.to_string())
@@ -2327,7 +2775,10 @@ fn qualify_join_condition(
                         } else {
                             u.qualifier.clone()
                         };
-                        return E::UnresolvedColumn(UnresolvedColumn { name: u.name, qualifier: new_qualifier });
+                        return E::UnresolvedColumn(UnresolvedColumn {
+                            name: u.name,
+                            qualifier: new_qualifier,
+                        });
                     }
                 }
             }
@@ -2358,7 +2809,11 @@ fn qualify_join_condition(
         }),
         E::CaseWhen(cw) => E::CaseWhen(CaseWhenExpression {
             base: cw.base.map(|b| Box::new(qjc(*b))),
-            branches: cw.branches.into_iter().map(|(w, t)| (qjc(w), qjc(t))).collect(),
+            branches: cw
+                .branches
+                .into_iter()
+                .map(|(w, t)| (qjc(w), qjc(t)))
+                .collect(),
             else_expr: cw.else_expr.map(|e| Box::new(qjc(*e))),
         }),
         other => other,

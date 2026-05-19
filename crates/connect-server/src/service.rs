@@ -15,8 +15,7 @@ use crate::error::ConnectError;
 use crate::proto::spark::connect as proto;
 use crate::proto::spark::connect::spark_connect_service_server::SparkConnectService;
 
-type BoxStream<T> =
-    Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
+type BoxStream<T> = Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 /// Maximum allowed depth of a logical plan tree. Plans deeper than this are
 /// rejected to prevent stack overflow from deeply nested plans (e.g., from
@@ -30,7 +29,10 @@ pub struct ThunderduckService {
 
 impl ThunderduckService {
     pub fn new(session_manager: Arc<SessionManager>, mode: RuntimeCompatMode) -> Self {
-        Self { session_manager, mode }
+        Self {
+            session_manager,
+            mode,
+        }
     }
 }
 
@@ -65,7 +67,9 @@ impl SparkConnectService for ThunderduckService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let plan = req.plan.ok_or_else(|| Status::invalid_argument("missing plan"))?;
+        let plan = req
+            .plan
+            .ok_or_else(|| Status::invalid_argument("missing plan"))?;
 
         let responses: Vec<proto::ExecutePlanResponse> = match plan.op_type {
             Some(proto::plan::OpType::Root(relation)) => {
@@ -81,7 +85,8 @@ impl SparkConnectService for ThunderduckService {
                 }
 
                 // Special case: ApproxQuantile needs a ListArray response.
-                if let thunderduck_core::logical::LogicalPlan::ApproxQuantile(ref aq) = logical_plan {
+                if let thunderduck_core::logical::LogicalPlan::ApproxQuantile(ref aq) = logical_plan
+                {
                     let batch = execute_approx_quantile(&session, aq)
                         .await
                         .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
@@ -144,7 +149,9 @@ impl SparkConnectService for ThunderduckService {
                 let relation = match plan.op_type {
                     Some(proto::plan::OpType::Root(r)) => r,
                     _ => {
-                        return Err(Status::invalid_argument("Schema analyze requires root plan"));
+                        return Err(Status::invalid_argument(
+                            "Schema analyze requires root plan",
+                        ));
                     }
                 };
                 let session = self
@@ -164,7 +171,9 @@ impl SparkConnectService for ThunderduckService {
                 }
 
                 let mut struct_type = logical_plan.infer_schema();
-                let has_unresolved = struct_type.fields.iter()
+                let has_unresolved = struct_type
+                    .fields
+                    .iter()
                     .any(|f| f.data_type.contains_unresolved());
                 if struct_type.is_empty() || has_unresolved || logical_plan.has_partial_schema() {
                     // Static inference failed or produced Unresolved types — ask DuckDB
@@ -192,15 +201,19 @@ impl SparkConnectService for ThunderduckService {
                                 duckdb_schema
                             } else {
                                 StructType::new(
-                                    duckdb_schema.fields.into_iter().map(|mut f| {
-                                        for (name, nullable) in &pivot_overrides {
-                                            if name.eq_ignore_ascii_case(&f.name) {
-                                                f.nullable = *nullable;
-                                                break;
+                                    duckdb_schema
+                                        .fields
+                                        .into_iter()
+                                        .map(|mut f| {
+                                            for (name, nullable) in &pivot_overrides {
+                                                if name.eq_ignore_ascii_case(&f.name) {
+                                                    f.nullable = *nullable;
+                                                    break;
+                                                }
                                             }
-                                        }
-                                        f
-                                    }).collect()
+                                            f
+                                        })
+                                        .collect(),
                                 )
                             }
                         }
@@ -209,7 +222,9 @@ impl SparkConnectService for ThunderduckService {
                         // Use Spark type/nullability when resolved, DuckDB otherwise.
                         // This preserves precise Spark semantics (e.g. IntegerType for row_number,
                         // levenshtein, cardinality) instead of DuckDB's wider types (BIGINT).
-                        let fields = struct_type.fields.iter()
+                        let fields = struct_type
+                            .fields
+                            .iter()
                             .zip(duckdb_schema.fields.iter())
                             .map(|(spark_f, duck_f)| {
                                 if spark_f.data_type.contains_unresolved() {
@@ -233,11 +248,15 @@ impl SparkConnectService for ThunderduckService {
                         // Use DuckDB schema as base, override by name for any explicitly-typed
                         // Spark fields (e.g. row_number → Integer, not DuckDB's BIGINT).
                         let spark_map: std::collections::HashMap<String, &StructField> =
-                            struct_type.fields.iter()
+                            struct_type
+                                .fields
+                                .iter()
                                 .filter(|f| !f.data_type.contains_unresolved())
                                 .map(|f| (f.name.to_lowercase(), f))
                                 .collect();
-                        let fields = duckdb_schema.fields.iter()
+                        let fields = duckdb_schema
+                            .fields
+                            .iter()
                             .map(|duck_f| {
                                 if let Some(spark_f) = spark_map.get(&duck_f.name.to_lowercase()) {
                                     StructField {
@@ -258,15 +277,19 @@ impl SparkConnectService for ThunderduckService {
                         let pivot_overrides = logical_plan.pivot_grouping_nullable_overrides();
                         if !pivot_overrides.is_empty() {
                             struct_type = StructType::new(
-                                struct_type.fields.into_iter().map(|mut f| {
-                                    for (name, nullable) in &pivot_overrides {
-                                        if name.eq_ignore_ascii_case(&f.name) {
-                                            f.nullable = *nullable;
-                                            break;
+                                struct_type
+                                    .fields
+                                    .into_iter()
+                                    .map(|mut f| {
+                                        for (name, nullable) in &pivot_overrides {
+                                            if name.eq_ignore_ascii_case(&f.name) {
+                                                f.nullable = *nullable;
+                                                break;
+                                            }
                                         }
-                                    }
-                                    f
-                                }).collect()
+                                        f
+                                    })
+                                    .collect(),
                             );
                         }
                     }
@@ -277,12 +300,16 @@ impl SparkConnectService for ThunderduckService {
                     session_id,
                     server_side_session_id: SERVER_SESSION_ID.clone(),
                     result: Some(proto::analyze_plan_response::Result::Schema(
-                        proto::analyze_plan_response::Schema { schema: Some(schema_proto) },
+                        proto::analyze_plan_response::Schema {
+                            schema: Some(schema_proto),
+                        },
                     )),
                 };
                 Ok(Response::new(resp))
             }
-            _ => Err(Status::unimplemented("Only Schema analyze_plan is supported")),
+            _ => Err(Status::unimplemented(
+                "Only Schema analyze_plan is supported",
+            )),
         }
     }
 
@@ -406,8 +433,7 @@ async fn handle_command(
         }
         Some(CommandType::SqlCommand(sql_cmd)) => {
             let (sql, logical_plan) = if let Some(input_rel) = sql_cmd.input {
-                let plan =
-                    PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
+                let plan = PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
                 let sql = SqlGenerator::new(session.mode())
                     .generate(&plan)
                     .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
@@ -440,15 +466,18 @@ async fn handle_command(
             let input_rel = write_cmd
                 .input
                 .ok_or_else(|| Status::invalid_argument("WriteOperation missing input"))?;
-            let logical_plan =
-                PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
+            let logical_plan = PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
             let select_sql = SqlGenerator::new(session.mode())
                 .generate(&logical_plan)
                 .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))?;
 
             let path = match write_cmd.save_type {
                 Some(SaveType::Path(p)) => p,
-                _ => return Err(Status::invalid_argument("WriteOperation requires a path destination")),
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "WriteOperation requires a path destination",
+                    ))
+                }
             };
 
             // Determine format from the source proto field
@@ -538,7 +567,13 @@ async fn execute_approx_quantile(
         let val = col_arr
             .as_any()
             .downcast_ref::<Float64Array>()
-            .and_then(|a| if !a.is_empty() { Some(a.value(0)) } else { None })
+            .and_then(|a| {
+                if !a.is_empty() {
+                    Some(a.value(0))
+                } else {
+                    None
+                }
+            })
             .ok_or_else(|| {
                 let ci = idx / n_probs;
                 let pi = idx % n_probs;
@@ -552,16 +587,15 @@ async fn execute_approx_quantile(
 
     // Build inner ListArray: N entries (one per column), each with M doubles.
     let values_array = Arc::new(Float64Array::from(all_values));
-    let n_cols_i32 = i32::try_from(n_cols)
-        .map_err(|_| "too many columns for approx_quantile".to_owned())?;
+    let n_cols_i32 =
+        i32::try_from(n_cols).map_err(|_| "too many columns for approx_quantile".to_owned())?;
     let n_probs_i32 = i32::try_from(n_probs)
         .map_err(|_| "too many probabilities for approx_quantile".to_owned())?;
-    let inner_offsets: Vec<i32> = (0..=n_cols_i32)
-        .map(|i| i * n_probs_i32)
-        .collect();
+    let inner_offsets: Vec<i32> = (0..=n_cols_i32).map(|i| i * n_probs_i32).collect();
     let inner_offsets_buf = OffsetBuffer::new(inner_offsets.into());
     let float_field = Arc::new(Field::new("item", ArrowDataType::Float64, true));
-    let inner_list_array = ListArray::new(float_field.clone(), inner_offsets_buf, values_array, None);
+    let inner_list_array =
+        ListArray::new(float_field.clone(), inner_offsets_buf, values_array, None);
 
     // Build outer ListArray: 1 entry containing all N inner lists.
     // This is the single-row table cell the PySpark client expects.
@@ -569,8 +603,12 @@ async fn execute_approx_quantile(
     let outer_offsets_buf = OffsetBuffer::new(outer_offsets.into());
     let inner_list_type = ArrowDataType::List(float_field);
     let inner_field = Arc::new(Field::new("item", inner_list_type.clone(), true));
-    let outer_list_array =
-        ListArray::new(inner_field.clone(), outer_offsets_buf, Arc::new(inner_list_array), None);
+    let outer_list_array = ListArray::new(
+        inner_field.clone(),
+        outer_offsets_buf,
+        Arc::new(inner_list_array),
+        None,
+    );
 
     let schema = Arc::new(Schema::new(vec![Field::new(
         "quantiles",
@@ -617,11 +655,16 @@ fn bool_batch_responses(
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
-    let schema = Arc::new(Schema::new(vec![Field::new("value", arrow::datatypes::DataType::Boolean, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        arrow::datatypes::DataType::Boolean,
+        false,
+    )]));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![Arc::new(BooleanArray::from(vec![val]))],
-    ).map_err(|e| crate::error::ConnectError::Arrow(e.to_string()))?;
+    )
+    .map_err(|e| crate::error::ConnectError::Arrow(e.to_string()))?;
     batches_to_responses(session_id, operation_id, &[batch])
 }
 
@@ -638,10 +681,7 @@ fn result_complete_response(session_id: &str, operation_id: &str) -> proto::Exec
     }
 }
 
-fn sql_command_result_response(
-    session_id: &str,
-    operation_id: &str,
-) -> proto::ExecutePlanResponse {
+fn sql_command_result_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {
     proto::ExecutePlanResponse {
         session_id: session_id.to_string(),
         server_side_session_id: SERVER_SESSION_ID.clone(),
@@ -695,16 +735,24 @@ fn spark_config_default(key: &str) -> &'static str {
 /// exactly one `KeyValue` per requested key (with `value: None` when not
 /// configured), or `spark-connect-client-jvm` 4.1.x's
 /// `executeConfigRequestSinglePair` precondition fails.
-fn build_config_pairs(operation: Option<proto::config_request::Operation>) -> Vec<proto::KeyValue> {
+fn build_config_pairs(
+    operation: Option<proto::config_request::Operation>,
+) -> Vec<proto::KeyValue> {
     use proto::config_request::operation::OpType;
     match operation.and_then(|op| op.op_type) {
         Some(OpType::Get(g)) => {
             // Return Spark defaults for known integer/boolean configs that PySpark
             // calls int() or bool() on. Unknown keys get empty string (safe for str usage).
-            g.keys.into_iter().map(|k| {
-                let v = spark_config_default(&k).to_string();
-                proto::KeyValue { key: k, value: Some(v) }
-            }).collect()
+            g.keys
+                .into_iter()
+                .map(|k| {
+                    let v = spark_config_default(&k).to_string();
+                    proto::KeyValue {
+                        key: k,
+                        value: Some(v),
+                    }
+                })
+                .collect()
         }
         Some(OpType::GetWithDefault(gd)) => gd.pairs,
         Some(OpType::GetOption(go)) => {
@@ -746,14 +794,12 @@ async fn cache_create_view_schema(
                 _ => return,
             }
         }
-        thunderduck_core::logical::LogicalPlan::DdlStatement(d) => {
-            match &d.operation {
-                thunderduck_core::logical::DdlOperation::CreateView {
-                    view_name, schema, ..
-                } => (view_name.as_str(), schema),
-                _ => return,
-            }
-        }
+        thunderduck_core::logical::LogicalPlan::DdlStatement(d) => match &d.operation {
+            thunderduck_core::logical::DdlOperation::CreateView {
+                view_name, schema, ..
+            } => (view_name.as_str(), schema),
+            _ => return,
+        },
         _ => return,
     };
     if schema.is_empty() {
@@ -762,7 +808,11 @@ async fn cache_create_view_schema(
 
     // If schema has unresolved types, merge with DuckDB schema for types
     // but preserve plan-level nullability where resolved.
-    let final_schema = if schema.fields.iter().any(|f| f.data_type.contains_unresolved()) {
+    let final_schema = if schema
+        .fields
+        .iter()
+        .any(|f| f.data_type.contains_unresolved())
+    {
         use thunderduck_core::types::{StructField, StructType};
         let duckdb_schema = match SchemaInferrer::new(session)
             .infer_sql(&format!(
@@ -796,7 +846,10 @@ async fn cache_create_view_schema(
                 .collect();
             StructType::new(fields)
         } else {
-            tracing::warn!(view_name, "Failed to cache view schema: field count mismatch between plan and DuckDB");
+            tracing::warn!(
+                view_name,
+                "Failed to cache view schema: field count mismatch between plan and DuckDB"
+            );
             return;
         }
     } else {
@@ -805,7 +858,6 @@ async fn cache_create_view_schema(
 
     session.cache_view_schema(view_name, final_schema).await;
 }
-
 
 // ── Plan classification and decomposed execution ──────────────────────────────
 
@@ -850,8 +902,7 @@ async fn execute_ddl(
                 .await
                 .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
             cache_create_view_schema_direct(session, view_name, schema).await;
-            return bool_batch_responses(session_id, operation_id, true)
-                .map_err(Status::from);
+            return bool_batch_responses(session_id, operation_id, true).map_err(Status::from);
         }
         _ => {}
     }
@@ -889,46 +940,49 @@ async fn cache_create_view_schema_direct(
 ) {
     use thunderduck_core::types::{StructField, StructType};
 
-    let final_schema =
-        if schema.fields.iter().any(|f| f.data_type.contains_unresolved()) {
-            let duckdb_schema = match SchemaInferrer::new(session)
-                .infer_sql(&format!(
-                    "SELECT * FROM \"{}\"",
-                    view_name.replace('"', "\"\"")
-                ))
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(view_name, error = %e, "Failed to cache view schema (direct): DuckDB schema inference failed");
-                    return;
-                }
-            };
-            if schema.fields.len() == duckdb_schema.fields.len() {
-                let fields = schema
-                    .fields
-                    .iter()
-                    .zip(duckdb_schema.fields.iter())
-                    .map(|(plan_f, duck_f)| {
-                        if plan_f.data_type.contains_unresolved() {
-                            StructField {
-                                name: plan_f.name.clone(),
-                                data_type: duck_f.data_type.clone(),
-                                nullable: duck_f.nullable,
-                            }
-                        } else {
-                            plan_f.clone()
-                        }
-                    })
-                    .collect();
-                StructType::new(fields)
-            } else {
-                tracing::warn!(view_name, "Failed to cache view schema (direct): field count mismatch between plan and DuckDB");
+    let final_schema = if schema
+        .fields
+        .iter()
+        .any(|f| f.data_type.contains_unresolved())
+    {
+        let duckdb_schema = match SchemaInferrer::new(session)
+            .infer_sql(&format!(
+                "SELECT * FROM \"{}\"",
+                view_name.replace('"', "\"\"")
+            ))
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(view_name, error = %e, "Failed to cache view schema (direct): DuckDB schema inference failed");
                 return;
             }
-        } else {
-            schema.clone()
         };
+        if schema.fields.len() == duckdb_schema.fields.len() {
+            let fields = schema
+                .fields
+                .iter()
+                .zip(duckdb_schema.fields.iter())
+                .map(|(plan_f, duck_f)| {
+                    if plan_f.data_type.contains_unresolved() {
+                        StructField {
+                            name: plan_f.name.clone(),
+                            data_type: duck_f.data_type.clone(),
+                            nullable: duck_f.nullable,
+                        }
+                    } else {
+                        plan_f.clone()
+                    }
+                })
+                .collect();
+            StructType::new(fields)
+        } else {
+            tracing::warn!(view_name, "Failed to cache view schema (direct): field count mismatch between plan and DuckDB");
+            return;
+        }
+    } else {
+        schema.clone()
+    };
 
     session.cache_view_schema(view_name, final_schema).await;
 }
@@ -978,9 +1032,7 @@ async fn execute_streaming_query(
                             operation_id: oid.clone(),
                             response_id: format!("{oid}-{idx}"),
                             response_type: Some(
-                                proto::execute_plan_response::ResponseType::ArrowBatch(
-                                    arrow_batch,
-                                ),
+                                proto::execute_plan_response::ResponseType::ArrowBatch(arrow_batch),
                             ),
                             ..Default::default()
                         }),

@@ -212,7 +212,7 @@ These queries use a pattern where the same `date_dim` table appears multiple tim
 
 **Investigation needed**: Enable `TD_DEBUG_SQL=1` and inspect the generated SQL for Q17 to
 locate where `d1` loses scope. Likely fix: either (a) improve `extract_filters` to handle this
-multi-alias pattern, or (b) improve `generate_flat_join_chain` to not break at the date-dim join.
+multi-alias pattern, or (b) improve the natural-flat-join branch inside `gen_join()` to not break at the date-dim join.
 
 **Estimated test closures**: 3
 **Effort**: Medium — requires root cause investigation; fix may be localized to `generator/mod.rs`.

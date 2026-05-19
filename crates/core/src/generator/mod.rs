@@ -4,25 +4,25 @@
 //! Always call `to_sql()` / `generate()`. Never use `Display` or `Debug` impls
 //! to produce SQL strings sent to DuckDB.
 
+mod normalize;
+
 use crate::error::Result;
 use crate::expression::{
     AliasExpression, ArrayLiteralExpression, BetweenExpression, BinaryExpression, BinaryOp,
-    CaseWhenExpression, CastExpression, Expression, ExistsSubquery,
-    ExtractValueExpression, FrameBoundary, FrameUnit, FunctionCall, InListExpression, InSubquery,
-    IntervalExpression, IsDistinctFromExpression, LambdaExpression, LikeExpression, LiteralValue,
-    MapLiteralExpression, RowConstructorExpression, ScalarSubquery, SortOrder,
-    StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn,
-    WindowFunction,
+    CaseWhenExpression, CastExpression, ExistsSubquery, Expression, ExtractValueExpression,
+    FrameBoundary, FrameUnit, FunctionCall, InListExpression, InSubquery, IntervalExpression,
+    IsDistinctFromExpression, LambdaExpression, LikeExpression, LiteralValue, MapLiteralExpression,
+    RowConstructorExpression, ScalarSubquery, SortOrder, StructLiteralExpression, UnaryExpression,
+    UnaryOp, UnresolvedColumn, WindowFunction,
 };
 use crate::functions::{CompatMode, FunctionRegistry};
 use crate::logical::{
-    spark_column_name,
-    Aggregate, AggregateExpr, AliasedRelation, Distinct, DropColumns, Except, Filter, GroupingSets,
-    InMemoryRelation, Intersect, Join, JoinType, Limit, LocalDataRelation, LocalRelation,
-    LogicalPlan, NADrop, NADropHow, NAFill, NAReplace, Pivot, Project, RangeRelation, Sample,
-    SelectEntry, ApproxQuantile, DdlOperation, Describe, ShowString, SingleRowRelation, Sort,
-    SqlRelation, StatCorr, StatCov, StatCrosstab, StatFreqItems, StatSampleBy,
-    Summary, TableScan, Tail, ToDataFrame, Union, Unpivot, WithColumns, WithCte,
+    spark_column_name, Aggregate, AggregateExpr, AliasedRelation, ApproxQuantile, DdlOperation,
+    Describe, Distinct, DropColumns, Except, Filter, GroupingSets, InMemoryRelation, Intersect,
+    Join, JoinType, Limit, LocalDataRelation, LocalRelation, LogicalPlan, NADrop, NADropHow, NAFill,
+    NAReplace, Pivot, Project, RangeRelation, Sample, SelectEntry, ShowString, SingleRowRelation,
+    Sort, SqlRelation, StatCorr, StatCov, StatCrosstab, StatFreqItems, StatSampleBy, Summary,
+    TableScan, Tail, ToDataFrame, Union, Unpivot, WithColumns, WithCte,
 };
 use crate::types::{DataType, StructType, TypeInferenceEngine, TypeMapper};
 
@@ -37,7 +37,10 @@ pub struct SqlGenerator {
 
 impl SqlGenerator {
     pub fn new(mode: CompatMode) -> Self {
-        Self { mode, schema: StructType::empty() }
+        Self {
+            mode,
+            schema: StructType::empty(),
+        }
     }
 
     pub fn relaxed() -> Self {
@@ -50,14 +53,22 @@ impl SqlGenerator {
 
     /// Return a new generator with the given schema for type-aware dispatch.
     fn with_schema(&self, schema: StructType) -> Self {
-        Self { mode: self.mode, schema }
+        Self {
+            mode: self.mode,
+            schema,
+        }
     }
 
     /// Generate a complete SQL statement from the plan.
     pub fn generate(&self, plan: &LogicalPlan) -> Result<String> {
         static DEBUG_SQL: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var("TD_DEBUG_SQL").is_ok());
-        let sql = self.gen_plan(plan)?;
+        let sql = if normalize::needs_normalization(plan) {
+            let normalised = normalize::normalize(plan);
+            self.gen_plan(&normalised)?
+        } else {
+            self.gen_plan(plan)?
+        };
         if *DEBUG_SQL {
             tracing::debug!("=== TD_DEBUG_SQL ===\n{sql}\n===================");
         }
@@ -136,36 +147,28 @@ impl SqlGenerator {
         if matches!(p.input.as_ref(), LogicalPlan::SingleRow(_)) {
             return Ok(format!("SELECT {cols}"));
         }
-        // Peel any Filter nodes so join table aliases remain in scope in the outer SELECT.
-        // Without this, Filter(Join(n1, n2)) gets wrapped in a subquery and n1/n2 become
-        // inaccessible to the projection's column references.
-        // Use typed_gen for WHERE conditions so schema-based dispatch (e.g. size on MAP) works.
-        let (base, conditions) = Self::extract_filters(&p.input);
-        let from = self.gen_from(base)?;
-        let mut sql = format!("SELECT {cols}\nFROM {from}");
-        if !conditions.is_empty() {
-            let where_parts = conditions.iter()
-                .map(|c| Ok(format!("({})", typed_gen.gen_expr(c)?)))
-                .collect::<Result<Vec<_>>>()?;
-            sql.push_str(&format!("\nWHERE {}", where_parts.join("\nAND ")));
+        // After normalisation, filter stacks are flattened to at most one Filter.
+        // Inline its condition as WHERE so join table aliases remain in scope.
+        if let LogicalPlan::Filter(f) = p.input.as_ref() {
+            let from = self.gen_from(&f.input)?;
+            let where_clause = typed_gen.gen_expr(&f.condition)?;
+            Ok(format!(
+                "SELECT {cols}\nFROM {from}\nWHERE ({where_clause})"
+            ))
+        } else {
+            let from = self.gen_from(&p.input)?;
+            Ok(format!("SELECT {cols}\nFROM {from}"))
         }
-        Ok(sql)
     }
 
     fn gen_filter(&self, f: &Filter) -> Result<String> {
-        // Peel any stacked inner filters so join table aliases remain in scope.
-        // Without this, Filter(outer, Filter(inner, Join(l1, ...))) wraps the inner filter in a
-        // subquery, making the l1 alias invisible to the outer condition.
-        let (base, inner_conditions) = Self::extract_filters(&f.input);
-        let from = self.gen_from(base)?;
-        let input_schema = base.infer_schema();
+        // After normalisation, filter stacks are flattened — this is guaranteed to be
+        // a single Filter node. Emit SELECT * FROM base WHERE condition.
+        let from = self.gen_from(&f.input)?;
+        let input_schema = f.input.infer_schema();
         let typed_gen = self.with_schema(input_schema);
-        // Current filter + any peeled inner filters — each wrapped in parens to avoid precedence issues.
-        let all_conditions = std::iter::once(&f.condition)
-            .chain(inner_conditions.into_iter())
-            .map(|c| Ok(format!("({})", typed_gen.gen_expr(c)?)))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(format!("SELECT *\nFROM {from}\nWHERE {}", all_conditions.join("\nAND ")))
+        let where_clause = typed_gen.gen_expr(&f.condition)?;
+        Ok(format!("SELECT *\nFROM {from}\nWHERE ({where_clause})"))
     }
 
     /// Render a single aggregate expression: apply type casts, inject DISTINCT, append FILTER.
@@ -226,8 +229,12 @@ impl SqlGenerator {
             // keys are not sent in aggregate_expressions), prepend them.
             // SQL path sets GroupingNotSelected to suppress this prepend when GROUP BY keys
             // are intentionally excluded from the SQL SELECT list.
-            let has_grouping_in_order = a.select_order.iter()
-                .any(|e| matches!(e, SelectEntry::GroupingExpr(_) | SelectEntry::GroupingNotSelected));
+            let has_grouping_in_order = a.select_order.iter().any(|e| {
+                matches!(
+                    e,
+                    SelectEntry::GroupingExpr(_) | SelectEntry::GroupingNotSelected
+                )
+            });
             if !has_grouping_in_order {
                 for g in &a.grouping {
                     parts.push(typed_gen.gen_expr(g)?);
@@ -236,10 +243,8 @@ impl SqlGenerator {
             for entry in &a.select_order {
                 match entry {
                     SelectEntry::GroupingExpr(g) => parts.push(typed_gen.gen_expr(g)?),
-                    SelectEntry::AggregateExpr(idx) => {
-                        if let Some(agg) = a.aggregates.get(*idx) {
-                            parts.push(typed_gen.render_agg_expr(agg, &input_schema)?);
-                        }
+                    SelectEntry::AggregateExpr(agg) => {
+                        parts.push(typed_gen.render_agg_expr(agg, &input_schema)?);
                     }
                     SelectEntry::GroupingNotSelected => {
                         // Sentinel: GROUP BY key not in SQL SELECT — suppress auto-prepend, render nothing.
@@ -249,17 +254,17 @@ impl SqlGenerator {
             parts.join(", ")
         };
 
-        // Peel pre-aggregation filters so join table aliases remain in scope.
-        let (base_input, pre_filters) = Self::extract_filters(&a.input);
+        // After normalisation, filter stacks are flattened to at most one Filter.
+        // Inline its condition as a pre-aggregation WHERE so join aliases stay in scope.
+        let (base_input, where_clause) = if let LogicalPlan::Filter(f) = a.input.as_ref() {
+            (&*f.input, Some(typed_gen.gen_expr(&f.condition)?))
+        } else {
+            (a.input.as_ref(), None)
+        };
         let from = self.gen_from(base_input)?;
         let mut sql = format!("SELECT {select_list}\nFROM {from}");
-
-        // Pre-aggregation WHERE (from peeled filters) — use input schema for dispatch.
-        if !pre_filters.is_empty() {
-            let where_parts = pre_filters.iter()
-                .map(|c| Ok(format!("({})", typed_gen.gen_expr(c)?)))
-                .collect::<Result<Vec<_>>>()?;
-            sql.push_str(&format!("\nWHERE {}", where_parts.join("\nAND ")));
+        if let Some(wc) = where_clause {
+            sql.push_str(&format!("\nWHERE ({wc})"));
         }
 
         // GROUP BY
@@ -267,10 +272,16 @@ impl SqlGenerator {
             if let Some(gs) = &a.grouping_sets {
                 sql.push_str(&format!("\nGROUP BY {}", typed_gen.gen_grouping_sets(gs)?));
             } else {
-                let gb = a.grouping.iter()
+                let gb = a
+                    .grouping
+                    .iter()
                     .map(|g| {
                         // Strip outer alias — GROUP BY must use bare expressions, not `expr AS alias`
-                        let inner = if let Expression::Alias(a) = g { &*a.expr } else { g };
+                        let inner = if let Expression::Alias(a) = g {
+                            &*a.expr
+                        } else {
+                            g
+                        };
                         typed_gen.gen_expr(inner)
                     })
                     .collect::<Result<Vec<_>>>()?
@@ -299,9 +310,11 @@ impl SqlGenerator {
                 Ok(format!("CUBE({inner})"))
             }
             GroupingSets::GroupingSets(sets) => {
-                let inner = sets.iter()
+                let inner = sets
+                    .iter()
                     .map(|set| {
-                        let exprs = set.iter()
+                        let exprs = set
+                            .iter()
                             .map(|e| self.gen_expr(e))
                             .collect::<Result<Vec<_>>>()?
                             .join(", ");
@@ -317,7 +330,8 @@ impl SqlGenerator {
     fn gen_grouping_set_list(&self, sets: &[Vec<Expression>]) -> Result<String> {
         sets.iter()
             .map(|set| {
-                let exprs = set.iter()
+                let exprs = set
+                    .iter()
                     .map(|e| self.gen_expr(e))
                     .collect::<Result<Vec<_>>>()?
                     .join(", ");
@@ -328,89 +342,36 @@ impl SqlGenerator {
     }
 
     fn gen_join(&self, j: &Join) -> Result<String> {
-        // When plan_id-based column qualification is active, wrap each side in a named subquery
-        // so DuckDB can unambiguously resolve same-named columns from different sides.
+        // After normalisation, joins that qualify for the "natural flat join" pattern
+        // (internal __td_jr_X__/__td_jl_X__ aliases rewritten to user-facing aliases)
+        // arrive here with left_alias/right_alias cleared to None.
         //
-        // Special case: when the RIGHT side is an AliasedRelation with a user-facing alias
-        // (not a __td_jr__ internal alias), we can use a "natural flat join" pattern:
-        // - Use the AliasedRelation's own alias directly (keeps it accessible in outer WHERE)
-        // - Don't wrap the left side in a subquery either (expose all nested aliases)
-        // - Rewrite ON condition: substitute __td_jr_X__ → natural_alias, strip __td_jl_X__
-        //
-        // This fixes queries like TPC-DS Q17/Q25/Q29 where date_dim.alias("d1") is joined
-        // multiple times and filter conditions reference d1/d2/d3 in the outer WHERE clause.
-        // Detect the natural flat join pattern:
-        // right_alias is a __td_jr_X__ alias AND j.right is an AliasedRelation with a
-        // user-facing alias (e.g. "d1"). In this case we can use the natural alias directly
-        // to keep it accessible in outer WHERE/HAVING clauses.
-        // Check whether the left side is also a user-aliased relation (e.g. self-join with
-        // df.alias("a").join(df.alias("b"), ...)). If so, skip the natural flat join path:
-        // stripping __td_jl_X__ qualifiers would create ambiguous column refs when both sides
-        // share the same column names.
-        let left_is_user_alias = if let Some(la) = &j.left_alias {
-            if la.starts_with("__td_jl_") {
-                matches!(j.left.as_ref(), LogicalPlan::AliasedRelation(ar) if !ar.alias.starts_with("__"))
+        // Remaining paths:
+        // 1. Aliases present → wrap each side in a named subquery
+        // 2. No aliases → simple flat join (gen_from on each side)
+        // 3. SEMI/ANTI handling is unchanged
+        let (left, right, effective_condition) =
+            if j.left_alias.is_some() || j.right_alias.is_some() {
+                let la = j.left_alias.as_deref().unwrap_or("__td_jl__");
+                let ra = j.right_alias.as_deref().unwrap_or("__td_jr__");
+                // Use gen_from to get a valid FROM-clause fragment, then wrap in SELECT * so we
+                // always produce a complete query that can be used as a named subquery.
+                // gen_from handles all plan types correctly (wraps non-leaf plans in parens).
+                let lsql = format!("SELECT *\nFROM {}", self.gen_from(&j.left)?);
+                let rsql = format!("SELECT *\nFROM {}", self.gen_from(&j.right)?);
+                let cond = j.condition.clone();
+                (
+                    format!("(\n{lsql}\n) AS {}", quote_ident(la)),
+                    format!("(\n{rsql}\n) AS {}", quote_ident(ra)),
+                    cond,
+                )
             } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        let right_natural_alias: Option<(String, String)> = if let Some(ra) = &j.right_alias {
-            if ra.starts_with("__td_jr_") && !left_is_user_alias && !j.join_type.is_semi_or_anti() {
-                match j.right.as_ref() {
-                    LogicalPlan::AliasedRelation(ar) if !ar.alias.starts_with("__") => {
-                        // Case 1: right is AliasedRelation with user-facing alias (e.g. "d1")
-                        Some((ar.alias.clone(), ra.clone()))
-                    }
-                    right_plan => {
-                        // Case 2: right is a plain table (TableScan, InMemoryRelation).
-                        // Only use flat path if left side contains user-facing AliasedRelations
-                        // that would be buried in a subquery (e.g. d1/d2/d3 in Q17).
-                        if plan_contains_user_alias(&j.left) {
-                            right_plan_natural_name(right_plan).map(|name| (name, ra.clone()))
-                        } else {
-                            None
-                        }
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let (left, right, effective_condition) = if let Some((nat_alias, td_alias)) = right_natural_alias {
-            // Natural flat join: use user-facing alias directly.
-            // The right side is an AliasedRelation; generate it without additional wrapping.
-            let right_sql = self.gen_from(&j.right)?; // "table AS natural_alias"
-            // Generate left side as a flat FROM fragment (no subquery wrap).
-            let left_sql = self.gen_from(&j.left)?;
-            // Rewrite ON condition: replace __td_jr_X__ qualifier → natural_alias,
-            // strip __td_jl_X__ qualifiers (left-side columns are unqualified in flat join).
-            let effective_cond = j.condition.as_ref().map(|c| {
-                rewrite_td_join_qualifiers(c.clone(), &td_alias, &nat_alias)
-            });
-            (left_sql, right_sql, effective_cond)
-        } else if j.left_alias.is_some() || j.right_alias.is_some() {
-            let la = j.left_alias.as_deref().unwrap_or("__td_jl__");
-            let ra = j.right_alias.as_deref().unwrap_or("__td_jr__");
-            // Use gen_from to get a valid FROM-clause fragment, then wrap in SELECT * so we
-            // always produce a complete query that can be used as a named subquery.
-            // gen_from handles all plan types correctly (wraps non-leaf plans in parens).
-            let lsql = format!("SELECT *\nFROM {}", self.gen_from(&j.left)?);
-            let rsql = format!("SELECT *\nFROM {}", self.gen_from(&j.right)?);
-            let cond = j.condition.clone();
-            (
-                format!("(\n{lsql}\n) AS {}", quote_ident(la)),
-                format!("(\n{rsql}\n) AS {}", quote_ident(ra)),
-                cond,
-            )
-        } else {
-            (self.gen_from(&j.left)?, self.gen_from(&j.right)?, j.condition.clone())
-        };
+                (
+                    self.gen_from(&j.left)?,
+                    self.gen_from(&j.right)?,
+                    j.condition.clone(),
+                )
+            };
 
         let kw = j.join_type.sql_keyword();
 
@@ -432,7 +393,11 @@ impl SqlGenerator {
                             c
                         };
                         if let Some(using_cols) = equijoin_to_using(c_ref) {
-                            let cols = using_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+                            let cols = using_cols
+                                .iter()
+                                .map(|c| quote_ident(c))
+                                .collect::<Vec<_>>()
+                                .join(", ");
                             return Ok(format!("{left}\n{kw} {right} USING ({cols})"));
                         }
                         format!(" ON {}", self.gen_expr(c_ref)?)
@@ -441,7 +406,9 @@ impl SqlGenerator {
                     }
                 }
                 None if !j.using_columns.is_empty() => {
-                    let cols = j.using_columns.iter()
+                    let cols = j
+                        .using_columns
+                        .iter()
                         .map(|c| quote_ident(c))
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -453,7 +420,9 @@ impl SqlGenerator {
         }
 
         let join_clause = if !j.using_columns.is_empty() {
-            let cols = j.using_columns.iter()
+            let cols = j
+                .using_columns
+                .iter()
                 .map(|c| quote_ident(c))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -465,7 +434,11 @@ impl SqlGenerator {
             // DuckDB "Ambiguous reference" errors.
             if j.left_alias.is_none() {
                 if let Some(using_cols) = equijoin_to_using(cond) {
-                    let cols = using_cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+                    let cols = using_cols
+                        .iter()
+                        .map(|c| quote_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     return Ok(format!("{left}\n{kw} {right} USING ({cols})"));
                 }
             }
@@ -479,13 +452,19 @@ impl SqlGenerator {
 
     fn gen_sort(&self, s: &Sort) -> Result<String> {
         // For ROLLUP/CUBE aggregates, Spark always sorts NULL grouping values first.
-        let (base_input, _) = Self::extract_filters(&s.input);
-        let is_rollup_or_cube = matches!(base_input, LogicalPlan::Aggregate(a)
+        // After normalisation, peek through at most one Filter to find the Aggregate.
+        let effective = match s.input.as_ref() {
+            LogicalPlan::Filter(f) => &*f.input,
+            other => other,
+        };
+        let is_rollup_or_cube = matches!(effective, LogicalPlan::Aggregate(a)
             if matches!(a.grouping_sets.as_ref(),
                 Some(GroupingSets::Rollup(_)) | Some(GroupingSets::Cube(_))));
 
         let mut sql = if !s.order.is_empty() {
-            let order = s.order.iter()
+            let order = s
+                .order
+                .iter()
                 .map(|o| {
                     if is_rollup_or_cube {
                         use crate::expression::NullOrdering;
@@ -523,14 +502,15 @@ impl SqlGenerator {
             // unavailable (empty) or a column is missing, fall through to inline ORDER BY.
             let use_stable_wrap = if all_simple {
                 let inner_schema = s.input.infer_schema();
-                !inner_schema.is_empty() && s.order.iter().all(|o| {
-                    let col_name = match &o.expr {
-                        Expression::ColumnReference(cr) => cr.name.as_str(),
-                        Expression::UnresolvedColumn(uc) => uc.name.as_str(),
-                        _ => return false,
-                    };
-                    inner_schema.fields.iter().any(|f| f.name == col_name)
-                })
+                !inner_schema.is_empty()
+                    && s.order.iter().all(|o| {
+                        let col_name = match &o.expr {
+                            Expression::ColumnReference(cr) => cr.name.as_str(),
+                            Expression::UnresolvedColumn(uc) => uc.name.as_str(),
+                            _ => return false,
+                        };
+                        inner_schema.fields.iter().any(|f| f.name == col_name)
+                    })
             } else {
                 false
             };
@@ -598,26 +578,49 @@ impl SqlGenerator {
             && !right_schema.is_empty()
             && left_schema.fields.len() == right_schema.fields.len()
         {
-            let needs_cast = left_schema.fields.iter().zip(&right_schema.fields)
+            let needs_cast = left_schema
+                .fields
+                .iter()
+                .zip(&right_schema.fields)
                 .any(|(l, r)| l.data_type != r.data_type);
 
             if needs_cast {
-                let target_types: Vec<DataType> = left_schema.fields.iter()
+                let target_types: Vec<DataType> = left_schema
+                    .fields
+                    .iter()
                     .zip(&right_schema.fields)
                     .map(|(l, r)| TypeInferenceEngine::unify_types(&l.data_type, &r.data_type))
                     .collect();
 
-                let left_cols = left_schema.fields.iter().zip(&target_types).map(|(f, t)| {
-                    let q = quote_ident(&f.name);
-                    if f.data_type == *t || *t == DataType::Unresolved { q.clone() }
-                    else { format!("CAST({q} AS {}) AS {q}", TypeMapper::to_duckdb(t)) }
-                }).collect::<Vec<_>>().join(", ");
+                let left_cols = left_schema
+                    .fields
+                    .iter()
+                    .zip(&target_types)
+                    .map(|(f, t)| {
+                        let q = quote_ident(&f.name);
+                        if f.data_type == *t || *t == DataType::Unresolved {
+                            q.clone()
+                        } else {
+                            format!("CAST({q} AS {}) AS {q}", TypeMapper::to_duckdb(t))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
 
-                let right_cols = right_schema.fields.iter().zip(&target_types).map(|(f, t)| {
-                    let q = quote_ident(&f.name);
-                    if f.data_type == *t || *t == DataType::Unresolved { q.clone() }
-                    else { format!("CAST({q} AS {}) AS {q}", TypeMapper::to_duckdb(t)) }
-                }).collect::<Vec<_>>().join(", ");
+                let right_cols = right_schema
+                    .fields
+                    .iter()
+                    .zip(&target_types)
+                    .map(|(f, t)| {
+                        let q = quote_ident(&f.name);
+                        if f.data_type == *t || *t == DataType::Unresolved {
+                            q.clone()
+                        } else {
+                            format!("CAST({q} AS {}) AS {q}", TypeMapper::to_duckdb(t))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
 
                 return Ok(format!(
                     "(SELECT {left_cols} FROM ({left_sql}) \"__ul__\")\n{kw}\n\
@@ -650,7 +653,9 @@ impl SqlGenerator {
         }
         // dropDuplicates(cols) — keep one row per distinct group of specified columns.
         // Use ROW_NUMBER() OVER (PARTITION BY cols) to pick one row per group.
-        let partition = d.columns.iter()
+        let partition = d
+            .columns
+            .iter()
             .map(|c| self.gen_expr(c))
             .collect::<Result<Vec<_>>>()?
             .join(", ");
@@ -674,7 +679,9 @@ impl SqlGenerator {
             Some(seed) => format!(" REPEATABLE({seed})"),
             None => String::new(),
         };
-        Ok(format!("SELECT * FROM {from} TABLESAMPLE BERNOULLI({pct:.4} PERCENT){seed_clause}"))
+        Ok(format!(
+            "SELECT * FROM {from} TABLESAMPLE BERNOULLI({pct:.4} PERCENT){seed_clause}"
+        ))
     }
 
     fn gen_table_scan(&self, ts: &TableScan) -> Result<String> {
@@ -712,34 +719,7 @@ impl SqlGenerator {
     }
 
     fn gen_sql_relation(&self, sr: &SqlRelation) -> Result<String> {
-        // DDL/DML statements (CREATE, DROP, INSERT, UPDATE, DELETE, ALTER, TRUNCATE)
-        // cannot be wrapped in parens — return them verbatim.
-        //
-        // DDL SqlRelations are produced by sql_converter.rs after full FunctionRegistry
-        // translation and plan_to_sql conversion. They are already DuckDB-ready and must
-        // NOT be run through preprocess_spark_sql again (doing so double-processes things
-        // like MAP([keys], [vals]) → MAP([[keys]], [[vals]])).
-        //
-        // SqlRelations marked duckdb_ready (e.g. from local_relation_to_values_sql)
-        // are also already DuckDB-native and must skip preprocessing.
-        //
-        // Non-DDL SqlRelations may carry raw Spark SQL from legacy paths and need preprocessing.
-        let upper = sr.sql.trim_start().to_uppercase();
-        let is_ddl = upper.starts_with("CREATE")
-            || upper.starts_with("DROP")
-            || upper.starts_with("INSERT")
-            || upper.starts_with("UPDATE")
-            || upper.starts_with("DELETE")
-            || upper.starts_with("ALTER")
-            || upper.starts_with("TRUNCATE")
-            || upper.starts_with("SET");
-        if is_ddl {
-            Ok(sr.sql.clone())
-        } else if sr.duckdb_ready {
-            Ok(format!("({})", sr.sql))
-        } else {
-            Ok(format!("({})", preprocess_spark_sql(&sr.sql)))
-        }
+        Ok(format!("({})", sr.sql))
     }
 
     fn gen_local_relation(&self, lr: &LocalRelation) -> Result<String> {
@@ -748,7 +728,10 @@ impl SqlGenerator {
         if lr.schema.fields.is_empty() {
             return Ok("(SELECT 1 WHERE FALSE)".to_string());
         }
-        let cols = lr.schema.fields.iter()
+        let cols = lr
+            .schema
+            .fields
+            .iter()
             .map(|f| {
                 let dt = TypeMapper::to_duckdb(&f.data_type);
                 format!("CAST(NULL AS {dt}) AS {}", quote_ident(&f.name))
@@ -759,7 +742,9 @@ impl SqlGenerator {
     }
 
     fn gen_local_data_relation(&self, ldr: &LocalDataRelation) -> Result<String> {
-        self.gen_local_relation(&LocalRelation { schema: ldr.schema.clone() })
+        self.gen_local_relation(&LocalRelation {
+            schema: ldr.schema.clone(),
+        })
     }
 
     fn gen_range_relation(&self, rr: &RangeRelation) -> Result<String> {
@@ -776,7 +761,9 @@ impl SqlGenerator {
     }
 
     fn gen_with_cte(&self, w: &WithCte) -> Result<String> {
-        let cte_parts = w.ctes.iter()
+        let cte_parts = w
+            .ctes
+            .iter()
             .map(|(name, plan)| {
                 let sql = self.gen_plan(plan)?;
                 Ok(format!("{} AS (\n{}\n)", quote_ident(name), sql))
@@ -796,8 +783,8 @@ impl SqlGenerator {
         //   New column:   SELECT *, expr AS "col" FROM input
         let from = self.gen_from(&wc.input)?;
 
-        let mut renames: Vec<String> = Vec::new();  // "old" AS "new" for * RENAME
-        let mut adds: Vec<String> = Vec::new();     // expr AS col to append
+        let mut renames: Vec<String> = Vec::new(); // "old" AS "new" for * RENAME
+        let mut adds: Vec<String> = Vec::new(); // expr AS col to append
 
         for (new_name, expr) in &wc.columns {
             let old_col_name: Option<&str> = match expr {
@@ -807,7 +794,11 @@ impl SqlGenerator {
             };
             if let Some(old_name) = old_col_name {
                 // Pure rename — use * RENAME to preserve column position
-                renames.push(format!("{} AS {}", quote_ident(old_name), quote_ident(new_name)));
+                renames.push(format!(
+                    "{} AS {}",
+                    quote_ident(old_name),
+                    quote_ident(new_name)
+                ));
             } else {
                 // Add new column or replace existing in-place.
                 // We don't have schema info so can't know if col exists; use REPLACE which
@@ -836,7 +827,9 @@ impl SqlGenerator {
         }
 
         // Collect the names being added/replaced (for the exclusion lambda).
-        let excluded_names: Vec<String> = wc.columns.iter()
+        let excluded_names: Vec<String> = wc
+            .columns
+            .iter()
             .filter(|(new_name, expr)| {
                 // Only expression cols (not pure renames) go into `adds`
                 !matches!(expr,
@@ -860,7 +853,10 @@ impl SqlGenerator {
             format!("COLUMNS({excl_lambda}) RENAME ({})", renames.join(", "))
         };
 
-        Ok(format!("SELECT {star_part}, {}\nFROM {from}", adds.join(", ")))
+        Ok(format!(
+            "SELECT {star_part}, {}\nFROM {from}",
+            adds.join(", ")
+        ))
     }
 
     fn gen_aliased_relation(&self, ar: &AliasedRelation) -> Result<String> {
@@ -869,7 +865,9 @@ impl SqlGenerator {
         if ar.column_aliases.is_empty() {
             Ok(format!("{inner} AS {alias}"))
         } else {
-            let cols = ar.column_aliases.iter()
+            let cols = ar
+                .column_aliases
+                .iter()
                 .map(|c| quote_ident(c))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -886,7 +884,9 @@ impl SqlGenerator {
             // until then, pass through and let DuckDB resolve column names at runtime.
             return Ok(format!("SELECT *\nFROM ({inner})"));
         }
-        let cols = schema.fields.iter()
+        let cols = schema
+            .fields
+            .iter()
             .zip(t.column_names.iter())
             .map(|(f, new_name)| format!("{} AS {}", quote_ident(&f.name), quote_ident(new_name)))
             .collect::<Vec<_>>()
@@ -960,7 +960,8 @@ impl SqlGenerator {
             let qname = quote_ident(col);
             // Linear scan: column counts are small (typically < 50) so no HashMap needed.
             if let Some((_, lit)) = n.values.iter().find(|(c, _)| c == col) {
-                let lit_sql = self.gen_expr(&crate::expression::Expression::Literal(lit.clone()))?;
+                let lit_sql =
+                    self.gen_expr(&crate::expression::Expression::Literal(lit.clone()))?;
                 select_parts.push(format!("COALESCE({qname}, {lit_sql}) AS {qname}"));
             } else {
                 select_parts.push(qname);
@@ -972,10 +973,15 @@ impl SqlGenerator {
     fn gen_na_replace(&self, n: &NAReplace) -> Result<String> {
         let from = self.gen_from(&n.input)?;
         // Group replacements by column
-        let mut col_replacements: std::collections::HashMap<&str, Vec<(&crate::expression::Literal, &crate::expression::Literal)>> =
-            std::collections::HashMap::with_capacity(n.replacements.len());
+        let mut col_replacements: std::collections::HashMap<
+            &str,
+            Vec<(&crate::expression::Literal, &crate::expression::Literal)>,
+        > = std::collections::HashMap::with_capacity(n.replacements.len());
         for (col, from_val, to_val) in &n.replacements {
-            col_replacements.entry(col.as_str()).or_default().push((from_val, to_val));
+            col_replacements
+                .entry(col.as_str())
+                .or_default()
+                .push((from_val, to_val));
         }
         let mut select_parts: Vec<String> = Vec::with_capacity(n.all_columns.len());
         for col in &n.all_columns {
@@ -984,16 +990,22 @@ impl SqlGenerator {
                 // Build CASE WHEN col = from THEN to ... ELSE col END
                 let mut when_clauses: Vec<String> = Vec::with_capacity(repls.len());
                 for (from_lit, to_lit) in repls {
-                    let to_sql = self.gen_expr(&crate::expression::Expression::Literal((*to_lit).clone()))?;
+                    let to_sql =
+                        self.gen_expr(&crate::expression::Expression::Literal((*to_lit).clone()))?;
                     let when = if matches!(from_lit.value, crate::expression::LiteralValue::Null) {
                         format!("WHEN {qname} IS NULL THEN {to_sql}")
                     } else {
-                        let from_sql = self.gen_expr(&crate::expression::Expression::Literal((*from_lit).clone()))?;
+                        let from_sql = self.gen_expr(&crate::expression::Expression::Literal(
+                            (*from_lit).clone(),
+                        ))?;
                         format!("WHEN {qname} = {from_sql} THEN {to_sql}")
                     };
                     when_clauses.push(when);
                 }
-                select_parts.push(format!("CASE {} ELSE {qname} END AS {qname}", when_clauses.join(" ")));
+                select_parts.push(format!(
+                    "CASE {} ELSE {qname} END AS {qname}",
+                    when_clauses.join(" ")
+                ));
             } else {
                 select_parts.push(qname);
             }
@@ -1004,15 +1016,27 @@ impl SqlGenerator {
     fn gen_unpivot(&self, u: &Unpivot) -> Result<String> {
         let var_col = quote_ident(&u.variable_column_name);
         let val_col = quote_ident(&u.value_column_name);
-        let include = if u.include_nulls { " INCLUDE NULLS" } else { "" };
+        let include = if u.include_nulls {
+            " INCLUDE NULLS"
+        } else {
+            ""
+        };
 
         // Build the ON column list
-        let value_cols = u.values.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        let value_cols = u
+            .values
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         // Pre-select only id + value columns so DuckDB doesn't include extra columns
         // (DuckDB keeps all non-ON columns as ids, but Spark only keeps the explicit ids).
         if !u.ids.is_empty() || !u.values.is_empty() {
-            let select_cols: Vec<String> = u.ids.iter().chain(u.values.iter())
+            let select_cols: Vec<String> = u
+                .ids
+                .iter()
+                .chain(u.values.iter())
                 .map(|c| quote_ident(c))
                 .collect();
             let select_list = select_cols.join(", ");
@@ -1038,7 +1062,9 @@ impl SqlGenerator {
 
         // IN clause (explicit pivot values)
         let in_clause = if !p.pivot_values.is_empty() {
-            let vals = p.pivot_values.iter()
+            let vals = p
+                .pivot_values
+                .iter()
                 .map(|v| self.gen_expr(v))
                 .collect::<Result<Vec<_>>>()?
                 .join(", ");
@@ -1048,14 +1074,18 @@ impl SqlGenerator {
         };
 
         // USING clause (aggregate functions)
-        let using = p.aggregates.iter()
+        let using = p
+            .aggregates
+            .iter()
             .map(|ae| self.gen_expr(&ae.func))
             .collect::<Result<Vec<_>>>()?
             .join(", ");
 
         // GROUP BY clause
         let group_by = if !p.grouping.is_empty() {
-            let cols = p.grouping.iter()
+            let cols = p
+                .grouping
+                .iter()
                 .map(|g| self.gen_expr(g))
                 .collect::<Result<Vec<_>>>()?
                 .join(", ");
@@ -1137,17 +1167,21 @@ impl SqlGenerator {
     fn gen_stat_freq_items(&self, s: &StatFreqItems) -> Result<String> {
         let from = self.gen_from(&s.input)?;
         let support = s.support;
-        let subqueries: Vec<String> = s.cols.iter().map(|col| {
-            let qcol = quote_ident(col);
-            let qalias = quote_ident(&format!("{}_freqItems", col));
-            format!(
-                "(SELECT LIST({qcol} ORDER BY {qcol}) FROM (\n  \
+        let subqueries: Vec<String> = s
+            .cols
+            .iter()
+            .map(|col| {
+                let qcol = quote_ident(col);
+                let qalias = quote_ident(&format!("{}_freqItems", col));
+                format!(
+                    "(SELECT LIST({qcol} ORDER BY {qcol}) FROM (\n  \
                    SELECT {qcol}, COUNT(*) AS cnt FROM _stat_input AS _inner\n  \
                    WHERE {qcol} IS NOT NULL GROUP BY {qcol}\n  \
                    HAVING COUNT(*) >= {support} * (SELECT COUNT(*) FROM _stat_input AS _total)\n\
                  ) AS _freq) AS {qalias}"
-            )
-        }).collect();
+                )
+            })
+            .collect();
         Ok(format!(
             "WITH _stat_input AS (\nSELECT * FROM {from}\n)\nSELECT {}",
             subqueries.join(",\n")
@@ -1162,10 +1196,15 @@ impl SqlGenerator {
             return Ok(format!("SELECT * FROM {from} AS _stat_input WHERE FALSE"));
         }
 
-        let conditions: Result<Vec<String>> = s.fractions.iter().map(|(lit, frac)| {
-            let lit_sql = self.gen_expr(&crate::expression::Expression::Literal(lit.clone()))?;
-            Ok(format!("({col_sql} = {lit_sql} AND RANDOM() < {frac})"))
-        }).collect();
+        let conditions: Result<Vec<String>> = s
+            .fractions
+            .iter()
+            .map(|(lit, frac)| {
+                let lit_sql =
+                    self.gen_expr(&crate::expression::Expression::Literal(lit.clone()))?;
+                Ok(format!("({col_sql} = {lit_sql} AND RANDOM() < {frac})"))
+            })
+            .collect();
         let where_body = conditions?.join(" OR ");
 
         let where_clause = if let Some(seed) = s.seed {
@@ -1175,7 +1214,9 @@ impl SqlGenerator {
             where_body
         };
 
-        Ok(format!("SELECT * FROM {from} AS _stat_input WHERE {where_clause}"))
+        Ok(format!(
+            "SELECT * FROM {from} AS _stat_input WHERE {where_clause}"
+        ))
     }
 
     fn gen_describe(&self, d: &Describe) -> Result<String> {
@@ -1187,9 +1228,16 @@ impl SqlGenerator {
 
     fn gen_summary(&self, s: &Summary) -> Result<String> {
         let input = self.gen_from(&s.input)?;
-        let default_stats: Vec<String> = ["count", "mean", "stddev", "min", "25%", "50%", "75%", "max"]
-            .iter().map(|s| s.to_string()).collect();
-        let stats = if s.statistics.is_empty() { &default_stats } else { &s.statistics };
+        let default_stats: Vec<String> =
+            ["count", "mean", "stddev", "min", "25%", "50%", "75%", "max"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let stats = if s.statistics.is_empty() {
+            &default_stats
+        } else {
+            &s.statistics
+        };
         self.gen_stats_union(&s.cols, stats, &input)
     }
 
@@ -1223,19 +1271,6 @@ impl SqlGenerator {
 
     // ── FROM clause helpers ────────────────────────────────────────────────────
 
-    /// Peel a stack of Filter nodes off the top of `plan`.
-    /// Returns the underlying base plan and the collected filter conditions (outermost first).
-    /// This allows callers to inline the WHERE clause so join table aliases remain in scope.
-    fn extract_filters(plan: &LogicalPlan) -> (&LogicalPlan, Vec<&Expression>) {
-        let mut conditions: Vec<&Expression> = Vec::new();
-        let mut cur = plan;
-        while let LogicalPlan::Filter(f) = cur {
-            conditions.push(&f.condition);
-            cur = &f.input;
-        }
-        (cur, conditions)
-    }
-
     /// Generate a FROM-clause fragment: either bare table/subquery or wrapped subquery.
     fn gen_from(&self, plan: &LogicalPlan) -> Result<String> {
         match plan {
@@ -1262,7 +1297,9 @@ impl SqlGenerator {
                 if ar.column_aliases.is_empty() {
                     Ok(format!("{inner} AS {alias}"))
                 } else {
-                    let cols = ar.column_aliases.iter()
+                    let cols = ar
+                        .column_aliases
+                        .iter()
                         .map(|c| quote_ident(c))
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -1291,7 +1328,8 @@ impl SqlGenerator {
         if exprs.is_empty() {
             return Ok("*".to_string());
         }
-        exprs.iter()
+        exprs
+            .iter()
             .map(|e| {
                 // Strict mode: wrap computed DECIMAL projections with explicit CAST so the
                 // output column type matches Spark exactly (mirrors Java generateExpressionWithCast).
@@ -1305,10 +1343,13 @@ impl SqlGenerator {
                 // column names. Spark uses no-space formatting. Add explicit Spark-compatible
                 // aliases for any non-trivial expression that contains a CAST to DECIMAL so the
                 // output column names match what Spark would produce.
-                if !matches!(e,
-                    Expression::Alias(_) | Expression::ColumnReference(_)
-                    | Expression::UnresolvedColumn(_) | Expression::Star(_))
-                    && expr_contains_decimal_cast(e)
+                if !matches!(
+                    e,
+                    Expression::Alias(_)
+                        | Expression::ColumnReference(_)
+                        | Expression::UnresolvedColumn(_)
+                        | Expression::Star(_)
+                ) && expr_contains_decimal_cast(e)
                 {
                     let alias = spark_column_name(e);
                     let escaped = alias.replace('"', "\"\"");
@@ -1418,14 +1459,23 @@ impl SqlGenerator {
                     } else if u.name.contains('.') {
                         // Multi-level struct access: "qualifier"."part1"."part2"
                         // e.g. col("person.address.city") → qualifier="person", name="address.city"
-                        let parts: String = u.name.split('.').map(quote_ident).collect::<Vec<_>>().join(".");
+                        let parts: String = u
+                            .name
+                            .split('.')
+                            .map(quote_ident)
+                            .collect::<Vec<_>>()
+                            .join(".");
                         Ok(format!("{}.{}", quote_ident(q), parts))
                     } else {
                         Ok(format!("{}.{}", quote_ident(q), quote_ident(&u.name)))
                     }
                 } else if u.name.contains('.') {
                     // Unqualified multi-part reference (e.g. "a.b.c" without a leading qualifier)
-                    Ok(u.name.split('.').map(quote_ident).collect::<Vec<_>>().join("."))
+                    Ok(u.name
+                        .split('.')
+                        .map(quote_ident)
+                        .collect::<Vec<_>>()
+                        .join("."))
                 } else {
                     Ok(quote_ident(&u.name))
                 }
@@ -1446,7 +1496,7 @@ impl SqlGenerator {
             Expression::ScalarSubquery(s) => self.gen_scalar_subquery(s),
             Expression::Lambda(l) => self.gen_lambda(l),
             Expression::LambdaVariable(lv) => Ok(quote_ident(&lv.name)),
-            Expression::RawSql(r) => Ok(preprocess_spark_sql(&r.sql)),
+            Expression::RawSql(r) => Ok(r.sql.clone()),
             Expression::ArrayLiteral(a) => self.gen_array_literal(a),
             Expression::MapLiteral(m) => self.gen_map_literal(m),
             Expression::StructLiteral(s) => self.gen_struct_literal(s),
@@ -1478,8 +1528,7 @@ impl SqlGenerator {
         // DATE + INTERVAL → DuckDB promotes to TIMESTAMP; cast back to DATE to match Spark semantics
         if matches!(b.op, BinaryOp::Add | BinaryOp::Sub)
             && b.left.data_type(&self.schema) == DataType::Date
-            && (matches!(&*b.right, Expression::Interval(_))
-                || right.trim_start().to_ascii_uppercase().starts_with("INTERVAL"))
+            && b.right.data_type(&self.schema).is_interval()
         {
             return Ok(format!("CAST({sql} AS DATE)"));
         }
@@ -1488,13 +1537,25 @@ impl SqlGenerator {
 
     /// Generate strict-mode decimal division using spark_decimal_div() extension.
     fn gen_strict_decimal_div(
-        &self, b: &BinaryExpression, lt: &DataType, rt: &DataType,
+        &self,
+        b: &BinaryExpression,
+        lt: &DataType,
+        rt: &DataType,
     ) -> Result<Option<String>> {
         use DataType::*;
         let left_sql = self.gen_expr(&b.left)?;
         let right_sql = self.gen_expr(&b.right)?;
         match (lt, rt) {
-            (Decimal { precision: p1, scale: s1 }, Decimal { precision: p2, scale: s2 }) => {
+            (
+                Decimal {
+                    precision: p1,
+                    scale: s1,
+                },
+                Decimal {
+                    precision: p2,
+                    scale: s2,
+                },
+            ) => {
                 // Defensively cast operands to their inferred DECIMAL types.
                 // DuckDB may return DOUBLE at runtime (e.g. native AVG inside
                 // window functions) even though plan-level inference says DECIMAL.
@@ -1504,19 +1565,39 @@ impl SqlGenerator {
                 let left_cast = format!("CAST({left_sql} AS DECIMAL({p1},{s1}))");
                 let right_cast = format!("CAST({right_sql} AS DECIMAL({p2},{s2}))");
                 let result_type = TypeInferenceEngine::decimal_div_type(*p1, *s1, *p2, *s2);
-                if let Decimal { precision: rp, scale: rs } = result_type {
+                if let Decimal {
+                    precision: rp,
+                    scale: rs,
+                } = result_type
+                {
                     Ok(Some(format!(
                         "CAST(spark_decimal_div({left_cast}, {right_cast}) AS DECIMAL({rp},{rs}))"
                     )))
                 } else {
-                    Ok(Some(format!("spark_decimal_div({left_cast}, {right_cast})")))
+                    Ok(Some(format!(
+                        "spark_decimal_div({left_cast}, {right_cast})"
+                    )))
                 }
             }
-            (Decimal { precision: p1, scale: s1 }, i) if i.is_integral() => {
+            (
+                Decimal {
+                    precision: p1,
+                    scale: s1,
+                },
+                i,
+            ) if i.is_integral() => {
                 // Spark DecimalPrecision: use value-based precision for integer literals
-                if let Decimal { precision: p2, scale: s2 } = b.right.integral_to_decimal_for_arithmetic(&self.schema) {
+                if let Decimal {
+                    precision: p2,
+                    scale: s2,
+                } = b.right.integral_to_decimal_for_arithmetic(&self.schema)
+                {
                     let result_type = TypeInferenceEngine::decimal_div_type(*p1, *s1, p2, s2);
-                    if let Decimal { precision: rp, scale: rs } = result_type {
+                    if let Decimal {
+                        precision: rp,
+                        scale: rs,
+                    } = result_type
+                    {
                         Ok(Some(format!(
                             "CAST(spark_decimal_div({left_sql}, CAST({right_sql} AS DECIMAL({p2},0))) AS DECIMAL({rp},{rs}))"
                         )))
@@ -1527,10 +1608,24 @@ impl SqlGenerator {
                     Ok(None)
                 }
             }
-            (i, Decimal { precision: p2, scale: s2 }) if i.is_integral() => {
-                if let Decimal { precision: p1, scale: s1 } = b.left.integral_to_decimal_for_arithmetic(&self.schema) {
+            (
+                i,
+                Decimal {
+                    precision: p2,
+                    scale: s2,
+                },
+            ) if i.is_integral() => {
+                if let Decimal {
+                    precision: p1,
+                    scale: s1,
+                } = b.left.integral_to_decimal_for_arithmetic(&self.schema)
+                {
                     let result_type = TypeInferenceEngine::decimal_div_type(p1, s1, *p2, *s2);
-                    if let Decimal { precision: rp, scale: rs } = result_type {
+                    if let Decimal {
+                        precision: rp,
+                        scale: rs,
+                    } = result_type
+                    {
                         Ok(Some(format!(
                             "CAST(spark_decimal_div(CAST({left_sql} AS DECIMAL({p1},0)), {right_sql}) AS DECIMAL({rp},{rs}))"
                         )))
@@ -1590,7 +1685,8 @@ impl SqlGenerator {
             }
             "in" if f.args.len() >= 2 => {
                 let expr = self.gen_expr(&f.args[0])?;
-                let list = f.args[1..].iter()
+                let list = f.args[1..]
+                    .iter()
                     .map(|a| self.gen_expr(a))
                     .collect::<Result<Vec<_>>>()?
                     .join(", ");
@@ -1598,7 +1694,9 @@ impl SqlGenerator {
             }
             // grouping() returns INTEGER in DuckDB but TINYINT in Spark.
             "grouping" => {
-                let args = f.args.iter()
+                let args = f
+                    .args
+                    .iter()
                     .map(|a| self.gen_expr(a))
                     .collect::<Result<Vec<_>>>()?
                     .join(", ");
@@ -1606,7 +1704,9 @@ impl SqlGenerator {
             }
             // grouping_id() returns INTEGER in DuckDB but BIGINT in Spark.
             "grouping_id" => {
-                let args = f.args.iter()
+                let args = f
+                    .args
+                    .iter()
                     .map(|a| self.gen_expr(a))
                     .collect::<Result<Vec<_>>>()?
                     .join(", ");
@@ -1615,7 +1715,9 @@ impl SqlGenerator {
             _ => {}
         }
 
-        let arg_sqls: Vec<String> = f.args.iter()
+        let arg_sqls: Vec<String> = f
+            .args
+            .iter()
             .map(|a| self.gen_expr(a))
             .collect::<Result<Vec<_>>>()?;
 
@@ -1626,8 +1728,7 @@ impl SqlGenerator {
         // their actual types (e.g. arr1 → Array(Integer)), enabling correct dispatch for
         // functions like reverse(). When schema is empty, unresolved columns fall back to
         // DataType::Unresolved and translate_typed falls through to the non-polymorphic path.
-        let arg_types: Vec<DataType> =
-            f.args.iter().map(|a| a.data_type(&self.schema)).collect();
+        let arg_types: Vec<DataType> = f.args.iter().map(|a| a.data_type(&self.schema)).collect();
 
         // Route through FunctionRegistry for Spark→DuckDB translation
         let translated =
@@ -1638,9 +1739,12 @@ impl SqlGenerator {
             // For multi-column count distinct, wrap all columns in a struct so each
             // unique combination of values is treated as one distinct value.
             if f.name.eq_ignore_ascii_case("count") && arg_sqls.len() > 1 {
-                let fields: String = arg_sqls.iter().enumerate()
+                let fields: String = arg_sqls
+                    .iter()
+                    .enumerate()
                     .map(|(i, a)| format!("'f{i}': {a}"))
-                    .collect::<Vec<_>>().join(", ");
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 return Ok(format!("COUNT(DISTINCT {{{fields}}})"));
             }
             // Inject DISTINCT inside the outermost function call
@@ -1714,7 +1818,9 @@ impl SqlGenerator {
                 let ignore_nulls = f.args.get(nulls_idx)
                     .map(|a| matches!(a, Expression::Literal(l) if l.value == crate::expression::LiteralValue::Boolean(true)))
                     .unwrap_or(false);
-                let col_args: Vec<String> = f.args.iter()
+                let col_args: Vec<String> = f
+                    .args
+                    .iter()
                     .take(nulls_idx)
                     .map(|a| window_func_gen.gen_expr(a))
                     .collect::<Result<Vec<_>>>()?;
@@ -1734,7 +1840,9 @@ impl SqlGenerator {
         let mut over_parts = Vec::new();
 
         if !w.partition_by.is_empty() {
-            let pb = w.partition_by.iter()
+            let pb = w
+                .partition_by
+                .iter()
                 .map(|e| self.gen_expr(e))
                 .collect::<Result<Vec<_>>>()?
                 .join(", ");
@@ -1742,7 +1850,9 @@ impl SqlGenerator {
         }
 
         if !w.order_by.is_empty() {
-            let ob = w.order_by.iter()
+            let ob = w
+                .order_by
+                .iter()
                 .map(|o| self.gen_sort_order(o))
                 .collect::<Result<Vec<_>>>()?
                 .join(", ");
@@ -1763,21 +1873,13 @@ impl SqlGenerator {
         if self.mode == CompatMode::Strict {
             if let Expression::FunctionCall(f) = &*w.func {
                 let lower = f.name.to_lowercase();
-                if matches!(lower.as_str(), "avg" | "mean") {
-                    if let Some(arg) = f.args.first() {
-                        let arg_type = arg.data_type(&self.schema);
-                        if let DataType::Decimal { precision, scale } = arg_type {
-                            let new_p = ((precision as u16) + 4).min(38) as u8;
-                            let new_s = (scale + 4).min(18).min(new_p);
+                if let Some(arg) = f.args.first() {
+                    let arg_type = arg.data_type(&self.schema);
+                    if let DataType::Decimal { precision, scale } = arg_type {
+                        if let Some((new_p, new_s)) =
+                            spark_decimal_agg_type(&lower, precision, scale)
+                        {
                             result = format!("CAST({result} AS DECIMAL({new_p},{new_s}))");
-                        }
-                    }
-                } else if matches!(lower.as_str(), "sum" | "sum_distinct") {
-                    if let Some(arg) = f.args.first() {
-                        let arg_type = arg.data_type(&self.schema);
-                        if let DataType::Decimal { precision, scale } = arg_type {
-                            let new_p = ((precision as u16) + 10).min(38) as u8;
-                            result = format!("CAST({result} AS DECIMAL({new_p},{scale}))");
                         }
                     }
                 }
@@ -1840,7 +1942,12 @@ impl SqlGenerator {
         let params = if l.params.len() == 1 {
             quote_ident(&l.params[0])
         } else {
-            let ps = l.params.iter().map(|p| quote_ident(p)).collect::<Vec<_>>().join(", ");
+            let ps = l
+                .params
+                .iter()
+                .map(|p| quote_ident(p))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!("({ps})")
         };
         let body = self.gen_expr(&l.body)?;
@@ -1848,7 +1955,9 @@ impl SqlGenerator {
     }
 
     fn gen_array_literal(&self, a: &ArrayLiteralExpression) -> Result<String> {
-        let elems = a.elements.iter()
+        let elems = a
+            .elements
+            .iter()
             .map(|e| self.gen_expr(e))
             .collect::<Result<Vec<_>>>()?
             .join(", ");
@@ -1859,11 +1968,15 @@ impl SqlGenerator {
         // DuckDB MAP syntax: MAP {key1: val1, key2: val2}
         // or MAP(KEYS => [...], VALUES => [...])
         // Simplest: MAP(list_of_keys, list_of_values)
-        let keys = m.keys.iter()
+        let keys = m
+            .keys
+            .iter()
             .map(|k| self.gen_expr(k))
             .collect::<Result<Vec<_>>>()?
             .join(", ");
-        let vals = m.values.iter()
+        let vals = m
+            .values
+            .iter()
             .map(|v| self.gen_expr(v))
             .collect::<Result<Vec<_>>>()?
             .join(", ");
@@ -1872,7 +1985,9 @@ impl SqlGenerator {
 
     fn gen_struct_literal(&self, s: &StructLiteralExpression) -> Result<String> {
         // DuckDB struct literal: {field1: expr1, field2: expr2}
-        let fields = s.fields.iter()
+        let fields = s
+            .fields
+            .iter()
             .map(|(name, expr)| {
                 let e = self.gen_expr(expr)?;
                 Ok(format!("{}: {e}", quote_ident(name)))
@@ -1892,7 +2007,9 @@ impl SqlGenerator {
 
     fn gen_in_list(&self, il: &InListExpression) -> Result<String> {
         let expr = self.gen_expr(&il.expr)?;
-        let list = il.list.iter()
+        let list = il
+            .list
+            .iter()
             .map(|e| self.gen_expr(e))
             .collect::<Result<Vec<_>>>()?
             .join(", ");
@@ -1957,15 +2074,27 @@ impl SqlGenerator {
             }
             if hours_part != 0 {
                 // Sign goes on the first non-zero component only
-                let sign = if negative && parts.is_empty() { "-" } else { "" };
+                let sign = if negative && parts.is_empty() {
+                    "-"
+                } else {
+                    ""
+                };
                 parts.push(format!("INTERVAL '{sign}{hours_part}' HOUR"));
             }
             if minutes_part != 0 {
-                let sign = if negative && parts.is_empty() { "-" } else { "" };
+                let sign = if negative && parts.is_empty() {
+                    "-"
+                } else {
+                    ""
+                };
                 parts.push(format!("INTERVAL '{sign}{minutes_part}' MINUTE"));
             }
             if seconds_part != 0.0 || parts.is_empty() {
-                let sign = if negative && parts.is_empty() { "-" } else { "" };
+                let sign = if negative && parts.is_empty() {
+                    "-"
+                } else {
+                    ""
+                };
                 parts.push(format!("INTERVAL '{sign}{seconds_part:.6}' SECOND"));
             }
 
@@ -2028,7 +2157,9 @@ impl SqlGenerator {
 
     /// Generate SQL for a row constructor: `(a, b, c)`.
     fn gen_row_constructor(&self, rc: &RowConstructorExpression) -> Result<String> {
-        let fields = rc.fields.iter()
+        let fields = rc
+            .fields
+            .iter()
             .map(|e| self.gen_expr(e))
             .collect::<Result<Vec<_>>>()?
             .join(", ");
@@ -2061,9 +2192,10 @@ impl SqlGenerator {
                         .collect();
                     Ok(format!("struct_pack({})", kept.join(", ")))
                 } else {
-                    Err(crate::error::ThunderduckError::Unsupported(
-                        format!("dropFields('{}'): schema inference required", uf.field_name)
-                    ))
+                    Err(crate::error::ThunderduckError::Unsupported(format!(
+                        "dropFields('{}'): schema inference required",
+                        uf.field_name
+                    )))
                 }
             }
         }
@@ -2158,12 +2290,12 @@ fn gen_literal(v: &LiteralValue) -> Result<String> {
             // days since epoch → DuckDB date literal
             Ok(format!("(DATE '1970-01-01' + INTERVAL {days} DAY)"))
         }
-        LiteralValue::Timestamp(micros) => {
-            Ok(format!("(TIMESTAMPTZ '1970-01-01 00:00:00+00' + INTERVAL {micros} MICROSECOND)"))
-        }
-        LiteralValue::TimestampNtz(micros) => {
-            Ok(format!("(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL {micros} MICROSECOND)"))
-        }
+        LiteralValue::Timestamp(micros) => Ok(format!(
+            "(TIMESTAMPTZ '1970-01-01 00:00:00+00' + INTERVAL {micros} MICROSECOND)"
+        )),
+        LiteralValue::TimestampNtz(micros) => Ok(format!(
+            "(TIMESTAMP '1970-01-01 00:00:00' + INTERVAL {micros} MICROSECOND)"
+        )),
         LiteralValue::Binary(bytes) => {
             // Hex-encode binary
             let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -2391,6 +2523,7 @@ fn join_chain_contains_semi_or_anti(plan: &LogicalPlan) -> bool {
 /// - `SUM(integer)` → `CAST(SUM(...) AS BIGINT)` (DuckDB returns HUGEINT)
 /// - `SUM(decimal{p,s})` → `CAST(SUM(...) AS DECIMAL(min(p+10,38), s))`
 /// - `AVG(integer)` → `CAST(AVG(...) AS DOUBLE)` (Spark promotes integer AVG to DOUBLE)
+
 /// Returns true if the expression contains a `Cast` to a `Decimal` type anywhere in the tree.
 /// Used by `gen_projection_list` to detect when DuckDB would normalise `DECIMAL(p,s)` to
 /// `DECIMAL(p, s)` in auto-generated column names.
@@ -2406,15 +2539,47 @@ fn expr_contains_decimal_cast(expr: &Expression) -> bool {
         Expression::CaseWhen(cw) => {
             cw.branches.iter().any(|(when, then)| {
                 expr_contains_decimal_cast(when) || expr_contains_decimal_cast(then)
-            }) || cw.else_expr.as_ref().map_or(false, |e| expr_contains_decimal_cast(e))
+            }) || cw
+                .else_expr
+                .as_ref()
+                .map_or(false, |e| expr_contains_decimal_cast(e))
         }
         _ => false,
     }
 }
 
-/// - `AVG(decimal{p,s})` → `CAST(AVG(...) AS DECIMAL(min(p+4,38), s+4))`
+/// Compute Spark-compatible result precision/scale for a decimal aggregate.
+///
+/// Returns `Some((precision, scale))` for SUM/AVG aggregates on decimal inputs,
+/// or `None` for non-decimal-aggregate combinations.
+fn spark_decimal_agg_type(agg_name: &str, precision: u8, scale: u8) -> Option<(u8, u8)> {
+    match agg_name {
+        "sum" | "sum_distinct" => {
+            let p = ((precision as u16) + 10).min(38) as u8;
+            Some((p, scale))
+        }
+        "avg" | "mean" => {
+            let new_p = ((precision as u16) + 4).min(38) as u8;
+            let new_s = (scale + 4).min(18).min(new_p);
+            Some((new_p, new_s))
+        }
+        _ => None,
+    }
+}
+
+/// Applies Spark-compatible type casts to aggregate expressions in projection lists.
+///
+/// - `SUM(integer)` → `CAST(SUM(...) AS BIGINT)` (DuckDB returns HUGEINT)
+/// - `SUM(decimal{p,s})` → `CAST(spark_sum(...) AS DECIMAL(min(p+10,38), s))` (strict only)
+/// - `AVG(integer)` → `CAST(AVG(...) AS DOUBLE)` (Spark promotes integer AVG to DOUBLE)
+/// - `AVG(decimal{p,s})` → `CAST(spark_avg(...) AS DECIMAL(min(p+4,38), min(s+4,18)))` (strict only)
+///
 /// Passes through aliases transparently so the alias is preserved on the outer Cast.
-fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType, mode: CompatMode) -> Expression {
+fn apply_agg_type_casts(
+    expr: &Expression,
+    input_schema: &StructType,
+    mode: CompatMode,
+) -> Expression {
     // When the input schema is empty (e.g. SQL path in relaxed mode without table-scan
     // enrichment), type inference on aggregate arguments is unreliable — a CaseWhen with
     // `ELSE 0` can mis-infer as Integer even when THEN branches are Decimal, causing
@@ -2426,10 +2591,14 @@ fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType, mode: Comp
     match expr {
         Expression::Alias(a) => {
             let inner = apply_agg_type_casts(&a.expr, input_schema, mode);
-            Expression::Alias(AliasExpression { expr: Box::new(inner), alias: a.alias.clone() })
+            Expression::Alias(AliasExpression {
+                expr: Box::new(inner),
+                alias: a.alias.clone(),
+            })
         }
         Expression::FunctionCall(f)
-            if f.name.eq_ignore_ascii_case("sum") || f.name.eq_ignore_ascii_case("sum_distinct") =>
+            if f.name.eq_ignore_ascii_case("sum")
+                || f.name.eq_ignore_ascii_case("sum_distinct") =>
         {
             if let Some(arg) = f.args.first() {
                 let arg_type = arg.data_type(input_schema);
@@ -2449,10 +2618,14 @@ fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType, mode: Comp
                             args: f.args.clone(),
                             distinct: false,
                         });
-                        let new_p = ((precision as u16) + 10).min(38) as u8;
+                        let (new_p, new_s) = spark_decimal_agg_type("sum", precision, scale)
+                            .expect("sum always returns Some for spark_decimal_agg_type");
                         return Expression::Cast(CastExpression {
                             expr: Box::new(spark_sum_call),
-                            to_type: DataType::Decimal { precision: new_p, scale },
+                            to_type: DataType::Decimal {
+                                precision: new_p,
+                                scale: new_s,
+                            },
                             try_cast: false,
                         });
                     }
@@ -2484,11 +2657,14 @@ fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType, mode: Comp
                             args: f.args.clone(),
                             distinct: false,
                         });
-                        let new_p = ((precision as u16) + 4).min(38) as u8;
-                        let new_s = (scale + 4).min(18).min(new_p);
+                        let (new_p, new_s) = spark_decimal_agg_type("avg", precision, scale)
+                            .expect("avg always returns Some for spark_decimal_agg_type");
                         return Expression::Cast(CastExpression {
                             expr: Box::new(spark_avg_call),
-                            to_type: DataType::Decimal { precision: new_p, scale: new_s },
+                            to_type: DataType::Decimal {
+                                precision: new_p,
+                                scale: new_s,
+                            },
                             try_cast: false,
                         });
                     }
@@ -2541,9 +2717,12 @@ impl BinaryOpExt for BinaryOp {
         match self {
             BinaryOp::Or => 1,
             BinaryOp::And => 2,
-            BinaryOp::Eq | BinaryOp::NotEq
-            | BinaryOp::Lt | BinaryOp::LtEq
-            | BinaryOp::Gt | BinaryOp::GtEq => 3,
+            BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq => 3,
             BinaryOp::BitwiseOr => 4,
             BinaryOp::BitwiseXor => 5,
             BinaryOp::BitwiseAnd => 6,
@@ -2552,719 +2731,6 @@ impl BinaryOpExt for BinaryOp {
             BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => 8,
         }
     }
-}
-
-// ── Spark SQL Preprocessing ────────────────────────────────────────────────────
-
-/// Convert Spark-style backtick-quoted identifiers to DuckDB double-quoted identifiers.
-/// e.g. `count(\`l_orderkey\`)` → `count("l_orderkey")`
-/// Correctly skips single-quoted string literals and already double-quoted identifiers.
-fn rewrite_backtick_identifiers(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            // Skip single-quoted string literals (don't convert backticks inside them)
-            '\'' => {
-                result.push('\'');
-                loop {
-                    match chars.next() {
-                        None => break,
-                        Some('\'') => {
-                            result.push('\'');
-                            // Handle escaped quote ''
-                            if chars.peek() == Some(&'\'') {
-                                chars.next();
-                                result.push('\'');
-                            } else {
-                                break;
-                            }
-                        }
-                        Some(c) => result.push(c),
-                    }
-                }
-            }
-            // Pass through already double-quoted identifiers unchanged
-            '"' => {
-                result.push('"');
-                for c in chars.by_ref() {
-                    result.push(c);
-                    if c == '"' { break; }
-                }
-            }
-            // Convert backtick identifier to double-quoted
-            '`' => {
-                result.push('"');
-                for c in chars.by_ref() {
-                    if c == '`' { break; }
-                    if c == '"' {
-                        result.push('"'); // escape embedded double-quote
-                        result.push('"');
-                    } else {
-                        result.push(c);
-                    }
-                }
-                result.push('"');
-            }
-            c => result.push(c),
-        }
-    }
-    result
-}
-
-/// Preprocess Spark SQL to replace Spark-specific constructs with DuckDB equivalents.
-/// Applied to raw SQL strings in SqlRelation before passing to DuckDB.
-fn preprocess_spark_sql(sql: &str) -> String {
-    // Phase 0: Convert backtick-quoted identifiers to double-quoted
-    // DuckDB does not support MySQL-style backtick quoting; Spark SQL uses it freely.
-    let sql = rewrite_backtick_identifiers(sql);
-    // Phase 1: ARRAY( → LIST_VALUE(
-    let mut sql = replace_spark_func(&sql, "ARRAY", "LIST_VALUE");
-    // Phase 2: NAMED_STRUCT( → struct literal — loop until stable for nested structs
-    loop {
-        let new = rewrite_named_struct(&sql);
-        if new == sql { break; }
-        sql = new;
-    }
-    // Phase 3: MAP(k1, v1, k2, v2, ...) → MAP([k1, k2, ...], [v1, v2, ...])
-    let sql = rewrite_spark_map_constructor(&sql);
-    // Phase 4: simple 1:1 function name renames for raw Spark SQL
-    let replacements: &[(&str, &str)] = &[
-        // COLLECT_LIST/COLLECT_SET handled by DuckDB macro (null-filtering); no rename needed
-        ("STARTSWITH",       "STARTS_WITH"),
-        ("ENDSWITH",         "ENDS_WITH"),
-        ("SIZE",             "LEN"),
-        ("GET_JSON_OBJECT",  "JSON_EXTRACT_STRING"),
-        ("JSON_OBJECT_KEYS", "json_keys"),
-        ("TRANSFORM",        "LIST_TRANSFORM"),
-        ("EXPLODE",          "UNNEST"),
-        ("POSEXPLODE",       "UNNEST"),    // positional explode — DuckDB UNNEST handles both
-    ];
-    let mut sql = sql; // already a String from phase 3
-    for (from, to) in replacements {
-        sql = replace_spark_func(&sql, from, to);
-    }
-    // Phase 5: percentile(col, pct) → PERCENTILE_CONT(pct) WITHIN GROUP (ORDER BY col)
-    let sql = rewrite_percentile(&sql);
-    // Phase 6: overlay(col PLACING repl FROM pos [FOR len]) → LEFT/SUBSTRING concat
-    let sql = rewrite_overlay_syntax(&sql);
-    // Phase 7: Spark angle-bracket type syntax → DuckDB: ARRAY<TYPE> → TYPE[]
-    let sql = rewrite_spark_type_syntax(&sql);
-    // Phase 8: split(str, pat, n) with 3 args → CASE/STR_SPLIT_REGEX expression
-    let sql = rewrite_split_with_limit(&sql);
-    // Phase 9: DATE 'lit' + INTERVAL 'n' YEAR/MONTH → CAST(... AS DATE)
-    // DuckDB promotes DATE+INTERVAL to TIMESTAMP; Spark keeps DATE type.
-    let sql = rewrite_date_interval_to_date(&sql);
-    // Phase 10: Spark HOF SQL functions → DuckDB equivalents
-    // exists(arr, x -> cond) → (len(list_filter(arr, x -> cond)) > 0)
-    let sql = rewrite_hof_func(&sql, "exists", |args| {
-        if args.len() >= 2 {
-            format!("(len(list_filter({}, {})) > 0)", args[0], args[1])
-        } else if args.len() == 1 {
-            // EXISTS(subquery) — reconstruct unchanged
-            format!("exists({})", args[0])
-        } else {
-            "FALSE".to_string()
-        }
-    });
-    // forall(arr, x -> cond) → (len(list_filter(arr, x -> cond)) = len(arr))
-    let sql = rewrite_hof_func(&sql, "forall", |args| {
-        if args.len() >= 2 {
-            format!("(len(list_filter({}, {})) = len({}))", args[0], args[1], args[0])
-        } else {
-            "TRUE".to_string()
-        }
-    });
-    // aggregate(arr, init, merge[, finish]) → list_reduce(list_concat([init], arr), merge)
-    let sql = rewrite_hof_func(&sql, "aggregate", |args| {
-        match args.len() {
-            3 => format!("list_reduce(list_concat([{}], {}), {})", args[1], args[0], args[2]),
-            4 => {
-                let reduced = format!("list_reduce(list_concat([{}], {}), {})", args[1], args[0], args[2]);
-                format!("list_transform([{reduced}], {})[1]", args[3])
-            }
-            _ => format!("list_reduce({})", args.first().map(|s| s.as_str()).unwrap_or("")),
-        }
-    });
-    // Phase 11a: json_tuple(col, 'k1', 'k2') AS (a1, a2) →
-    //   json_extract_string(col, '$.k1') AS a1, json_extract_string(col, '$.k2') AS a2
-    let sql = rewrite_json_tuple(&sql);
-    // Phase 11b: from_json(col, 'Spark DDL schema') → json_transform(col, '{"field": "TYPE"}')
-    // DuckDB has its own from_json (= json_transform) but expects a JSON schema, not Spark DDL.
-    let sql = rewrite_hof_func(&sql, "from_json", |args| {
-        if args.len() < 2 {
-            return format!("from_json({})", args.join(", "));
-        }
-        let col = &args[0];
-        let schema_arg = args[1].trim();
-        // The schema arg is a SQL string literal like 'name STRING, age INT'
-        let ddl = if schema_arg.starts_with('\'') && schema_arg.ends_with('\'') && schema_arg.len() >= 2 {
-            &schema_arg[1..schema_arg.len() - 1]
-        } else {
-            // Not a plain DDL string (e.g. already a JSON schema or complex expression)
-            return format!("json_transform({col}, {schema_arg})");
-        };
-        let json_schema = spark_ddl_to_json_schema_inline(ddl);
-        format!("json_transform({col}, '{json_schema}')")
-    });
-    sql
-}
-
-/// Convert a Spark schema (DDL string or Spark JSON format) to a DuckDB
-/// `json_transform` schema JSON (e.g. `{"name": "VARCHAR", "age": "INTEGER"}`).
-///
-/// Handles two input formats:
-/// 1. DDL: `name STRING, age INT`
-/// 2. Spark StructType JSON: `{"type":"struct","fields":[{"name":"...", "type":"...", ...}]}`
-fn spark_ddl_to_json_schema_inline(ddl: &str) -> String {
-    let trimmed = ddl.trim();
-    // Detect Spark JSON schema format (starts with '{' and contains "fields")
-    if trimmed.starts_with('{') && trimmed.contains("\"fields\"") {
-        return spark_json_schema_to_duckdb(trimmed);
-    }
-    // DDL format: "name STRING, age INT"
-    ddl_string_to_duckdb_schema(ddl)
-}
-
-/// Parse a Spark DDL schema string to DuckDB json_transform schema.
-fn ddl_string_to_duckdb_schema(ddl: &str) -> String {
-    let fields: Vec<String> = ddl
-        .split(',')
-        .filter_map(|field_def| {
-            let trimmed = field_def.trim();
-            let mut parts = trimmed.splitn(2, char::is_whitespace);
-            let name = parts.next()?.trim();
-            let spark_type = parts.next().unwrap_or("STRING").trim().to_uppercase();
-            if name.is_empty() {
-                return None;
-            }
-            let duckdb_type = spark_type_str_to_duckdb(&spark_type);
-            Some(format!("\"{name}\": \"{duckdb_type}\""))
-        })
-        .collect();
-    format!("{{{}}}", fields.join(", "))
-}
-
-/// Parse Spark StructType JSON format to DuckDB json_transform schema.
-/// Spark JSON: `{"type":"struct","fields":[{"name":"n","type":"string","nullable":true,...}]}`
-/// DuckDB result: `{"n": "VARCHAR", ...}`
-fn spark_json_schema_to_duckdb(json: &str) -> String {
-    // Simple field extraction: find all "name":"..." and "type":"..." pairs
-    let mut fields: Vec<String> = Vec::new();
-    // Find the "fields": [...] array content
-    if let Some(arr_start) = json.find("\"fields\"") {
-        let after_fields = &json[arr_start + 8..]; // skip "fields"
-        if let Some(bracket_pos) = after_fields.find('[') {
-            let arr_content = &after_fields[bracket_pos + 1..];
-            // Parse each field object: {"name":"...", "type":"...", ...}
-            let mut depth = 0i32;
-            let mut field_start = 0;
-            let bytes = arr_content.as_bytes();
-            let mut i = 0;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'{' => {
-                        if depth == 0 { field_start = i + 1; }
-                        depth += 1;
-                    }
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            let field_obj = &arr_content[field_start..i];
-                            if let Some(entry) = parse_spark_field_json(field_obj) {
-                                fields.push(entry);
-                            }
-                        }
-                    }
-                    b']' if depth == 0 => break,
-                    _ => {}
-                }
-                i += 1;
-            }
-        }
-    }
-    if fields.is_empty() {
-        // Fallback: try DDL parse
-        return ddl_string_to_duckdb_schema(json);
-    }
-    format!("{{{}}}", fields.join(", "))
-}
-
-/// Extract ("name", "type") from a Spark field JSON object string and return DuckDB schema entry.
-fn parse_spark_field_json(field_obj: &str) -> Option<String> {
-    let name = extract_json_string_field(field_obj, "name")?;
-    let spark_type = extract_json_string_field(field_obj, "type").unwrap_or_else(|| "string".to_string());
-    let duckdb_type = spark_type_str_to_duckdb(&spark_type.to_uppercase());
-    Some(format!("\"{name}\": \"{duckdb_type}\""))
-}
-
-/// Extract the string value of a JSON key from a flat JSON object string.
-fn extract_json_string_field(json: &str, key: &str) -> Option<String> {
-    let search = format!("\"{}\":", key);
-    let pos = json.find(&search)?;
-    let after_colon = json[pos + search.len()..].trim_start();
-    if after_colon.starts_with('"') {
-        let content = &after_colon[1..];
-        let end = content.find('"')?;
-        Some(content[..end].to_string())
-    } else {
-        None
-    }
-}
-
-fn spark_type_str_to_duckdb(spark_type: &str) -> &'static str {
-    let base = spark_type.split('(').next().unwrap_or(spark_type).trim();
-    match base {
-        "STRING" | "VARCHAR" | "TEXT" | "CHAR" => "VARCHAR",
-        "INT" | "INTEGER" | "INT4" => "INTEGER",
-        "LONG" | "BIGINT" | "INT8" => "BIGINT",
-        "SHORT" | "SMALLINT" | "INT2" => "SMALLINT",
-        "BYTE" | "TINYINT" | "INT1" => "TINYINT",
-        "DOUBLE" | "FLOAT8" => "DOUBLE",
-        "FLOAT" | "REAL" | "FLOAT4" => "FLOAT",
-        "BOOLEAN" | "BOOL" => "BOOLEAN",
-        "DATE" => "DATE",
-        "TIMESTAMP" | "TIMESTAMP_NTZ" => "TIMESTAMP",
-        "DECIMAL" | "NUMERIC" => "DOUBLE",
-        "BINARY" | "BYTES" => "BLOB",
-        _ if spark_type.starts_with("ARRAY") => "JSON",
-        _ => "VARCHAR",
-    }
-}
-
-/// Replace a Spark function name with a DuckDB equivalent.
-/// Respects word boundaries: only replaces when not preceded/followed by word chars.
-fn replace_spark_func(sql: &str, from: &str, to: &str) -> String {
-    let from_len = from.len();
-    let bytes = sql.as_bytes();
-    let mut result = String::with_capacity(sql.len());
-    let mut i = 0;
-    let mut slice_start = 0;
-    while i < bytes.len() {
-        if i + from_len <= bytes.len()
-            && sql[i..i + from_len].eq_ignore_ascii_case(from)
-        {
-            let prev_is_word = i > 0 && {
-                let c = bytes[i - 1];
-                c.is_ascii_alphanumeric() || c == b'_'
-            };
-            let mut j = i + from_len;
-            while j < bytes.len() && bytes[j] == b' ' { j += 1; }
-            let next_is_paren = j < bytes.len() && bytes[j] == b'(';
-            if !prev_is_word && next_is_paren {
-                result.push_str(&sql[slice_start..i]);
-                result.push_str(to);
-                i += from_len;
-                slice_start = i;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    result.push_str(&sql[slice_start..]);
-    result
-}
-
-/// Rewrite NAMED_STRUCT('key1', val1, 'key2', val2, ...) → {'key1': val1, 'key2': val2}
-fn rewrite_named_struct(sql: &str) -> String {
-    let marker = "named_struct(";
-    let mut result = String::with_capacity(sql.len());
-    let sql_lower = sql.to_lowercase();
-    let mut start = 0;
-    while let Some(pos) = sql_lower[start..].find(marker) {
-        let abs_pos = start + pos;
-        // Check word boundary before
-        let prev_is_word = abs_pos > 0 && {
-            let c = sql.as_bytes()[abs_pos - 1] as char;
-            c.is_alphanumeric() || c == '_'
-        };
-        if prev_is_word {
-            result.push_str(&sql[start..abs_pos + marker.len()]);
-            start = abs_pos + marker.len();
-            continue;
-        }
-        // Emit everything before this match
-        result.push_str(&sql[start..abs_pos]);
-        // Find the matching closing paren
-        let args_start = abs_pos + marker.len(); // after '('
-        let mut depth = 1usize;
-        let mut k = args_start;
-        let bytes = sql.as_bytes();
-        while k < bytes.len() && depth > 0 {
-            match bytes[k] {
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                b'\'' | b'"' => {
-                    let quote = bytes[k];
-                    k += 1;
-                    while k < bytes.len() {
-                        if bytes[k] == quote {
-                            if k + 1 < bytes.len() && bytes[k + 1] == quote {
-                                k += 2;
-                                continue;
-                            }
-                            break;
-                        }
-                        k += 1;
-                    }
-                }
-                _ => {}
-            }
-            if depth > 0 { k += 1; }
-        }
-        // k now points at closing ')'
-        let args_str = &sql[args_start..k];
-        // Parse comma-separated args (respecting parens/quotes)
-        let args = split_sql_args(args_str);
-        if args.len() % 2 == 0 {
-            // Build struct literal: {key: val, ...}
-            let fields: Vec<String> = args.chunks(2).map(|pair| {
-                let key = pair[0].trim().trim_matches('\'').trim_matches('"');
-                format!("\"{}\": {}", key.replace('"', "\"\""), pair[1].trim())
-            }).collect();
-            result.push_str(&format!("{{{}}}", fields.join(", ")));
-        } else {
-            // Odd arg count — just pass through unchanged
-            result.push_str(&format!("named_struct({})", args_str));
-        }
-        start = k + 1; // skip ')'
-    }
-    result.push_str(&sql[start..]);
-    result
-}
-
-/// Rewrite 3-arg split(str, pat, limit) → a CASE expression using STR_SPLIT_REGEX.
-/// Spark semantics: at most `limit` pieces; the last piece contains the remainder.
-fn rewrite_split_with_limit(sql: &str) -> String {
-    let marker = "split(";
-    let mut result = String::with_capacity(sql.len());
-    let sql_lower = sql.to_lowercase();
-    let mut start = 0;
-
-    while let Some(rel_pos) = sql_lower[start..].find(marker) {
-        let abs_pos = start + rel_pos;
-        // Skip if preceded by a word char (e.g. str_split, str_split_regex)
-        let prev_is_word = abs_pos > 0 && {
-            let c = sql.as_bytes()[abs_pos - 1] as char;
-            c.is_alphanumeric() || c == '_'
-        };
-        if prev_is_word {
-            result.push_str(&sql[start..abs_pos + marker.len()]);
-            start = abs_pos + marker.len();
-            continue;
-        }
-
-        result.push_str(&sql[start..abs_pos]);
-
-        // Find matching closing paren
-        let args_start = abs_pos + marker.len();
-        let mut depth = 1usize;
-        let mut k = args_start;
-        let bytes = sql.as_bytes();
-        while k < bytes.len() && depth > 0 {
-            match bytes[k] {
-                b'(' | b'[' => depth += 1,
-                b')' | b']' => depth -= 1,
-                b'\'' | b'"' => {
-                    let quote = bytes[k];
-                    k += 1;
-                    while k < bytes.len() && bytes[k] != quote { k += 1; }
-                }
-                _ => {}
-            }
-            if depth > 0 { k += 1; }
-        }
-        let args_str = &sql[args_start..k];
-        let args = split_sql_args(args_str);
-
-        if args.len() == 3 {
-            let s = args[0].trim();
-            let p = args[1].trim();
-            let n = args[2].trim();
-            result.push_str(&format!(
-                "CASE WHEN ARRAY_LENGTH(STR_SPLIT_REGEX({s}, {p})) <= {n} \
-                 THEN STR_SPLIT_REGEX({s}, {p}) \
-                 ELSE LIST_APPEND(STR_SPLIT_REGEX({s}, {p})[1:{n}-1], \
-                      ARRAY_TO_STRING(STR_SPLIT_REGEX({s}, {p})[{n}:], {p})) \
-                 END"
-            ));
-        } else if args.len() == 2 {
-            // Convert 2-arg split to STR_SPLIT_REGEX (DuckDB's split uses literal sep, not regex)
-            let s = args[0].trim();
-            let p = args[1].trim();
-            result.push_str(&format!("STR_SPLIT_REGEX({s}, {p})"));
-        } else {
-            result.push_str(&format!("split({})", args_str));
-        }
-        start = k + 1;
-    }
-    result.push_str(&sql[start..]);
-    result
-}
-
-/// Check if a trimmed string looks like a SQL type name (not a value).
-/// Used to distinguish MAP(K_TYPE, V_TYPE) from MAP(key_val, val_val).
-fn is_sql_type_name(s: &str) -> bool {
-    let upper = s.trim().to_uppercase();
-    matches!(
-        upper.as_str(),
-        "VARCHAR" | "TEXT" | "STRING" | "INTEGER" | "INT" | "BIGINT" | "SMALLINT"
-            | "TINYINT" | "FLOAT" | "DOUBLE" | "BOOLEAN" | "BOOL" | "DATE"
-            | "TIMESTAMP" | "BLOB" | "BINARY" | "DECIMAL" | "NUMERIC" | "REAL"
-            | "HUGEINT" | "UBIGINT" | "UINTEGER" | "USMALLINT" | "UTINYINT"
-    ) || upper.starts_with("DECIMAL(")
-        || upper.starts_with("NUMERIC(")
-        || upper.ends_with("[]")
-        || upper.starts_with("MAP(")
-        || upper.starts_with("STRUCT")
-        || upper.starts_with("ARRAY")
-}
-
-/// Rewrite Spark's MAP(k1, v1, k2, v2, ...) constructor → DuckDB MAP([k1, k2, ...], [v1, v2, ...]).
-/// Leaves MAP(key_type, val_type) type references unchanged.
-fn rewrite_spark_map_constructor(sql: &str) -> String {
-    let marker = "map(";
-    let mut result = String::with_capacity(sql.len());
-    let sql_lower = sql.to_lowercase();
-    let mut start = 0;
-
-    while let Some(rel_pos) = sql_lower[start..].find(marker) {
-        let abs_pos = start + rel_pos;
-        // Only replace standalone MAP( (not preceded by word chars like map_from_arrays)
-        let prev_is_word = abs_pos > 0 && {
-            let c = sql.as_bytes()[abs_pos - 1] as char;
-            c.is_alphanumeric() || c == '_'
-        };
-        if prev_is_word {
-            result.push_str(&sql[start..abs_pos + marker.len()]);
-            start = abs_pos + marker.len();
-            continue;
-        }
-
-        result.push_str(&sql[start..abs_pos]);
-
-        // Find matching closing paren
-        let args_start = abs_pos + marker.len();
-        let mut depth = 1usize;
-        let mut k = args_start;
-        let bytes = sql.as_bytes();
-        while k < bytes.len() && depth > 0 {
-            match bytes[k] {
-                b'(' | b'[' => depth += 1,
-                b')' | b']' => depth -= 1,
-                b'\'' | b'"' => {
-                    let quote = bytes[k];
-                    k += 1;
-                    while k < bytes.len() && bytes[k] != quote { k += 1; }
-                }
-                _ => {}
-            }
-            if depth > 0 { k += 1; }
-        }
-        let args_str = &sql[args_start..k];
-        let args = split_sql_args(args_str);
-
-        // Only rewrite if it looks like a constructor (even # args, not SQL type names)
-        let is_type_ref = args.len() == 2
-            && is_sql_type_name(args[0].trim())
-            && is_sql_type_name(args[1].trim());
-
-        if !is_type_ref && args.len() >= 2 && args.len() % 2 == 0 {
-            let keys: Vec<&str> = args.iter().step_by(2).map(|s| s.trim()).collect();
-            let vals: Vec<&str> = args.iter().skip(1).step_by(2).map(|s| s.trim()).collect();
-            result.push_str(&format!("MAP([{}], [{}])", keys.join(", "), vals.join(", ")));
-        } else {
-            result.push_str(&format!("MAP({})", args_str));
-        }
-        start = k + 1;
-    }
-    result.push_str(&sql[start..]);
-    result
-}
-
-/// Rewrite Spark angle-bracket type syntax to DuckDB type syntax.
-/// ARRAY<TYPE> → TYPE[], MAP<K, V> → MAP(K, V) (DuckDB accepts this for types).
-fn rewrite_spark_type_syntax(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len());
-    let sql_lower = sql.to_lowercase();
-    let mut start = 0;
-
-    while let Some(rel_pos) = sql_lower[start..].find("array<") {
-        let abs_pos = start + rel_pos;
-        // Check word boundary before
-        let prev_is_word = abs_pos > 0 && {
-            let c = sql.as_bytes()[abs_pos - 1] as char;
-            c.is_alphanumeric() || c == '_'
-        };
-        if prev_is_word {
-            result.push_str(&sql[start..abs_pos + 6]);
-            start = abs_pos + 6;
-            continue;
-        }
-
-        result.push_str(&sql[start..abs_pos]);
-
-        // Find matching closing >
-        let inner_start = abs_pos + 6; // after "array<"
-        let mut depth = 1usize;
-        let mut k = inner_start;
-        let bytes = sql.as_bytes();
-        while k < bytes.len() && depth > 0 {
-            match bytes[k] {
-                b'<' => depth += 1,
-                b'>' => depth -= 1,
-                b'\'' | b'"' => {
-                    let quote = bytes[k];
-                    k += 1;
-                    while k < bytes.len() && bytes[k] != quote { k += 1; }
-                }
-                _ => {}
-            }
-            if depth > 0 { k += 1; }
-        }
-        let inner = &sql[inner_start..k];
-        // Recursively convert inner type and append []
-        let inner_converted = rewrite_spark_type_syntax(inner);
-        result.push_str(&format!("{}[]", inner_converted));
-        start = k + 1; // skip '>'
-    }
-    result.push_str(&sql[start..]);
-    result
-}
-
-/// Rewrite percentile(col, pct) → PERCENTILE_CONT(pct) WITHIN GROUP (ORDER BY col).
-/// Handles word-boundary detection to avoid matching `percentile_approx` etc.
-fn rewrite_percentile(sql: &str) -> String {
-    let marker = "percentile(";
-    let mut result = String::with_capacity(sql.len());
-    let sql_lower = sql.to_lowercase();
-    let mut start = 0;
-    while let Some(rel_pos) = sql_lower[start..].find(marker) {
-        let abs_pos = start + rel_pos;
-        // Skip if preceded by a word char (e.g. percentile_approx, percentile_disc)
-        let prev_is_word = abs_pos > 0 && {
-            let c = sql.as_bytes()[abs_pos - 1] as char;
-            c.is_alphanumeric() || c == '_'
-        };
-        if prev_is_word {
-            result.push_str(&sql[start..abs_pos + marker.len()]);
-            start = abs_pos + marker.len();
-            continue;
-        }
-        result.push_str(&sql[start..abs_pos]);
-        let args_start = abs_pos + marker.len();
-        let mut depth = 1usize;
-        let mut k = args_start;
-        let bytes = sql.as_bytes();
-        while k < bytes.len() && depth > 0 {
-            match bytes[k] {
-                b'(' => { depth += 1; k += 1; }
-                b')' => { depth -= 1; if depth > 0 { k += 1; } }
-                b'\'' | b'"' => {
-                    let quote = bytes[k]; k += 1;
-                    while k < bytes.len() && bytes[k] != quote { k += 1; }
-                    if k < bytes.len() { k += 1; }
-                }
-                _ => { k += 1; }
-            }
-        }
-        let args_str = &sql[args_start..k];
-        let args = split_sql_args(args_str);
-        if args.len() >= 2 {
-            result.push_str(&format!(
-                "PERCENTILE_CONT({}) WITHIN GROUP (ORDER BY {})",
-                args[1].trim(),
-                args[0].trim()
-            ));
-        } else {
-            result.push_str(&format!("percentile({})", args_str));
-        }
-        start = k + 1;
-    }
-    result.push_str(&sql[start..]);
-    result
-}
-
-/// Rewrite `overlay(str PLACING repl FROM pos [FOR len])` SQL standard syntax
-/// to string concat form: `LEFT(str, pos-1) || repl || SUBSTRING(str, pos+len)`.
-/// DuckDB 1.5 has no OVERLAY function.
-fn rewrite_overlay_syntax(sql: &str) -> String {
-    let marker = "overlay(";
-    let mut result = String::with_capacity(sql.len());
-    let sql_lower = sql.to_lowercase();
-    let mut start = 0;
-
-    while let Some(rel_pos) = sql_lower[start..].find(marker) {
-        let abs_pos = start + rel_pos;
-        // Check word boundary before
-        let prev_is_word = abs_pos > 0 && {
-            let c = sql.as_bytes()[abs_pos - 1] as char;
-            c.is_alphanumeric() || c == '_'
-        };
-        let inner_start = abs_pos + marker.len();
-
-        if prev_is_word {
-            result.push_str(&sql[start..inner_start]);
-            start = inner_start;
-            continue;
-        }
-
-        // Find the matching closing paren
-        let mut depth = 1usize;
-        let mut k = inner_start;
-        let bytes = sql.as_bytes();
-        while k < bytes.len() && depth > 0 {
-            match bytes[k] {
-                b'(' => depth += 1,
-                b')' => { depth -= 1; if depth == 0 { break; } }
-                b'\'' | b'"' => {
-                    let quote = bytes[k]; k += 1;
-                    while k < bytes.len() && bytes[k] != quote { k += 1; }
-                }
-                _ => {}
-            }
-            k += 1;
-        }
-
-        let inner = &sql[inner_start..k]; // content between outer parens
-        let inner_lower = inner.to_lowercase();
-
-        // Check if this is the SQL-standard PLACING...FROM...FOR syntax
-        if let Some(placing_pos) = inner_lower.find(" placing ") {
-            let str_expr = inner[..placing_pos].trim();
-            let after_placing = &inner[placing_pos + " placing ".len()..];
-            let after_lower = after_placing.to_lowercase();
-
-            if let Some(from_pos) = after_lower.find(" from ") {
-                let repl_expr = after_placing[..from_pos].trim();
-                let after_from = &after_placing[from_pos + " from ".len()..];
-                let after_from_lower = after_from.to_lowercase();
-
-                result.push_str(&sql[start..abs_pos]);
-                if let Some(for_pos) = after_from_lower.find(" for ") {
-                    let pos_expr = after_from[..for_pos].trim();
-                    let len_expr = after_from[for_pos + " for ".len()..].trim();
-                    result.push_str(&format!(
-                        "LEFT({str_expr}, ({pos_expr}) - 1) || ({repl_expr}) || SUBSTRING({str_expr}, ({pos_expr}) + ({len_expr}))"
-                    ));
-                } else {
-                    let pos_expr = after_from.trim();
-                    result.push_str(&format!(
-                        "LEFT({str_expr}, ({pos_expr}) - 1) || ({repl_expr}) || SUBSTRING({str_expr}, ({pos_expr}) + LENGTH({repl_expr}))"
-                    ));
-                }
-                start = k + 1; // skip closing ')'
-                continue;
-            }
-        }
-
-        // Not SQL-standard syntax — pass through (may be regular function call args)
-        result.push_str(&sql[start..inner_start]);
-        start = inner_start;
-    }
-
-    result.push_str(&sql[start..]);
-    result
 }
 
 /// Build `SELECT key1, key2, * EXCLUDE (key1, key2)` for a USING join.
@@ -3287,7 +2753,11 @@ fn equijoin_to_using(expr: &Expression) -> Option<Vec<String>> {
         Expression::Binary(b) if b.op == BinaryOp::Eq => {
             let l = col_name_unqualified(&b.left)?;
             let r = col_name_unqualified(&b.right)?;
-            if l == r { Some(vec![l]) } else { None }
+            if l == r {
+                Some(vec![l])
+            } else {
+                None
+            }
         }
         Expression::Binary(b) if b.op == BinaryOp::And => {
             let mut l = equijoin_to_using(&b.left)?;
@@ -3303,13 +2773,18 @@ fn col_name_unqualified(expr: &Expression) -> Option<String> {
     match expr {
         Expression::UnresolvedColumn(u) => {
             // Columns with plan_id qualifiers are side-specific; don't use them for USING.
-            if u.qualifier.as_ref().map_or(false, |q| q.starts_with("__plan_id_") && q.ends_with("__")) {
+            if u.qualifier
+                .as_ref()
+                .map_or(false, |q| q.starts_with("__plan_id_") && q.ends_with("__"))
+            {
                 return None;
             }
             Some(u.name.clone())
         }
         Expression::ColumnReference(c) => {
-            if c.qualifier.is_some() { return None; }
+            if c.qualifier.is_some() {
+                return None;
+            }
             Some(c.name.clone())
         }
         _ => None,
@@ -3321,7 +2796,9 @@ fn col_name_unqualified(expr: &Expression) -> Option<String> {
 /// to relations inside a subquery (where the alias won't be directly accessible).
 fn collect_plan_aliases(plan: &LogicalPlan, aliases: &mut std::collections::HashSet<String>) {
     match plan {
-        LogicalPlan::AliasedRelation(ar) => { aliases.insert(ar.alias.clone()); }
+        LogicalPlan::AliasedRelation(ar) => {
+            aliases.insert(ar.alias.clone());
+        }
         LogicalPlan::Filter(f) => collect_plan_aliases(&f.input, aliases),
         LogicalPlan::Join(j) => {
             collect_plan_aliases(&j.left, aliases);
@@ -3346,7 +2823,10 @@ fn strip_qualifiers_in_expr(
     match expr {
         Expression::UnresolvedColumn(u) => {
             if u.qualifier.as_ref().map_or(false, |q| aliases.contains(q)) {
-                Expression::UnresolvedColumn(UnresolvedColumn { name: u.name, qualifier: None })
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: u.name,
+                    qualifier: None,
+                })
             } else {
                 Expression::UnresolvedColumn(u)
             }
@@ -3354,175 +2834,23 @@ fn strip_qualifiers_in_expr(
         Expression::Binary(b) => {
             let left = strip_qualifiers_in_expr(*b.left, aliases);
             let right = strip_qualifiers_in_expr(*b.right, aliases);
-            Expression::Binary(BinaryExpression { op: b.op, left: Box::new(left), right: Box::new(right) })
+            Expression::Binary(BinaryExpression {
+                op: b.op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
         }
         Expression::Unary(u) => {
             let operand = strip_qualifiers_in_expr(*u.operand, aliases);
-            Expression::Unary(UnaryExpression { op: u.op, operand: Box::new(operand) })
+            Expression::Unary(UnaryExpression {
+                op: u.op,
+                operand: Box::new(operand),
+            })
         }
         other => other,
     }
 }
 
-/// Returns the natural table/alias name for a simple leaf-like plan node (TableScan,
-/// InMemoryRelation, AliasedRelation). Used in the flat join path to determine what alias
-/// to use when rewriting __td_jr_X__ qualifiers in join ON conditions.
-fn right_plan_natural_name(plan: &LogicalPlan) -> Option<String> {
-    match plan {
-        LogicalPlan::TableScan(ts) => {
-            Some(ts.alias.clone().unwrap_or_else(|| ts.table.clone()))
-        }
-        LogicalPlan::InMemoryRelation(imr) => Some(imr.view_name.clone()),
-        LogicalPlan::AliasedRelation(ar) => {
-            if !ar.alias.starts_with("__") { Some(ar.alias.clone()) } else { None }
-        }
-        _ => None,
-    }
-}
-
-/// Returns true if the plan tree contains any AliasedRelation with a user-facing alias
-/// (i.e., not starting with "__"). Used to detect when the flat join path is needed
-/// to keep those aliases accessible in outer WHERE/HAVING clauses.
-fn plan_contains_user_alias(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::AliasedRelation(ar) => !ar.alias.starts_with("__"),
-        LogicalPlan::Join(j) => {
-            plan_contains_user_alias(&j.left) || plan_contains_user_alias(&j.right)
-        }
-        LogicalPlan::Filter(f) => plan_contains_user_alias(&f.input),
-        LogicalPlan::Project(p) => plan_contains_user_alias(&p.input),
-        LogicalPlan::Aggregate(a) => plan_contains_user_alias(&a.input),
-        LogicalPlan::Sort(s) => plan_contains_user_alias(&s.input),
-        LogicalPlan::Limit(l) => plan_contains_user_alias(&l.input),
-        LogicalPlan::Distinct(d) => plan_contains_user_alias(&d.input),
-        _ => false,
-    }
-}
-
-/// Rewrite qualifiers in a join ON condition for the "natural flat join" path.
-///
-/// When we use an AliasedRelation's natural alias (e.g. "d1") instead of the generated
-/// __td_jr_X__ alias, we need to:
-/// 1. Replace __td_jr_X__ qualifier → nat_alias (e.g. "d1")
-/// 2. Strip __td_jl_X__ qualifiers (left-side columns are unqualified in flat join)
-///
-/// This is applied to the ON condition so DuckDB sees proper column references.
-fn rewrite_td_join_qualifiers(
-    expr: Expression,
-    td_right_alias: &str,
-    nat_alias: &str,
-) -> Expression {
-    match expr {
-        Expression::UnresolvedColumn(u) => {
-            match u.qualifier.as_deref() {
-                Some(q) if q == td_right_alias => {
-                    // Right-side column: use natural alias
-                    Expression::UnresolvedColumn(UnresolvedColumn {
-                        name: u.name,
-                        qualifier: Some(nat_alias.to_string()),
-                    })
-                }
-                Some(q) if q.starts_with("__td_jl_") => {
-                    // Left-side column: strip qualifier (accessible unqualified in flat join)
-                    Expression::UnresolvedColumn(UnresolvedColumn { name: u.name, qualifier: None })
-                }
-                _ => Expression::UnresolvedColumn(u),
-            }
-        }
-        Expression::Binary(b) => {
-            let left = rewrite_td_join_qualifiers(*b.left, td_right_alias, nat_alias);
-            let right = rewrite_td_join_qualifiers(*b.right, td_right_alias, nat_alias);
-            Expression::Binary(BinaryExpression { op: b.op, left: Box::new(left), right: Box::new(right) })
-        }
-        Expression::Unary(u) => {
-            let operand = rewrite_td_join_qualifiers(*u.operand, td_right_alias, nat_alias);
-            Expression::Unary(UnaryExpression { op: u.op, operand: Box::new(operand) })
-        }
-        other => other,
-    }
-}
-
-/// Split a SQL argument list by commas, respecting nested parens and quotes.
-///
-/// Delegates to `extract_top_level_args` so the logic lives in exactly one place.
-fn split_sql_args(s: &str) -> Vec<String> {
-    extract_top_level_args(s.as_bytes(), 0).0
-}
-
-/// Rewrite `DATE 'lit' + INTERVAL 'n' YEAR/MONTH` → `CAST(... AS DATE)`.
-/// DuckDB promotes DATE + year/month interval to TIMESTAMP; Spark preserves DATE type.
-fn rewrite_date_interval_to_date(sql: &str) -> String {
-    let bytes = sql.as_bytes();
-    let n = bytes.len();
-    // Quick scan: skip if no DATE literal at all
-    if !sql.to_uppercase().contains("DATE '") {
-        return sql.to_string();
-    }
-    let upper: String = sql.to_ascii_uppercase();
-    let ub = upper.as_bytes();
-    let mut result = String::with_capacity(n + 40);
-    let mut i = 0;
-
-    while i < n {
-        // Match DATE keyword at word boundary
-        let at_date = i + 4 <= n
-            && &ub[i..i + 4] == b"DATE"
-            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
-            && (i + 4 >= n || !(bytes[i + 4].is_ascii_alphanumeric() || bytes[i + 4] == b'_'));
-
-        if at_date {
-            if let Some((full, end)) = try_date_plus_interval(bytes, ub.as_ref(), i) {
-                result.push_str(&format!("CAST({full} AS DATE)"));
-                i = end;
-                continue;
-            }
-        }
-        result.push(bytes[i] as char);
-        i += 1;
-    }
-    result
-}
-
-/// Try to match `DATE 'lit' OP INTERVAL 'n' YEAR/MONTH` at position `start`.
-/// Returns `(full_expression_str, end_position)` on success.
-fn try_date_plus_interval(bytes: &[u8], upper: &[u8], start: usize) -> Option<(String, usize)> {
-    let n = bytes.len();
-    let mut i = start + 4; // skip "DATE"
-    while i < n && bytes[i] == b' ' { i += 1; }
-    // Date literal: 'YYYY-MM-DD'
-    if i >= n || bytes[i] != b'\'' { return None; }
-    i += 1;
-    while i < n && bytes[i] != b'\'' { i += 1; }
-    if i >= n { return None; }
-    i += 1; // past closing quote
-    while i < n && bytes[i] == b' ' { i += 1; }
-    // Operator: + or -
-    if i >= n || (bytes[i] != b'+' && bytes[i] != b'-') { return None; }
-    i += 1;
-    while i < n && bytes[i] == b' ' { i += 1; }
-    // INTERVAL keyword
-    if i + 8 > n || &upper[i..i + 8] != b"INTERVAL" { return None; }
-    i += 8;
-    while i < n && bytes[i] == b' ' { i += 1; }
-    // Interval value: 'n'
-    if i >= n || bytes[i] != b'\'' { return None; }
-    i += 1;
-    while i < n && bytes[i] != b'\'' { i += 1; }
-    if i >= n { return None; }
-    i += 1; // past closing quote
-    while i < n && bytes[i] == b' ' { i += 1; }
-    // Unit keyword — only wrap for YEAR/MONTH/QUARTER (not DAY/HOUR/MINUTE/SECOND)
-    let rem = &upper[i.min(n)..];
-    let is_ym = rem.starts_with(b"YEAR") || rem.starts_with(b"MONTH") || rem.starts_with(b"QUARTER");
-    if !is_ym { return None; }
-    while i < n && bytes[i].is_ascii_alphabetic() { i += 1; }
-
-    let expr = std::str::from_utf8(&bytes[start..i]).ok()?;
-    Some((expr.to_string(), i))
-}
-
-/// Rewrite a Spark SQL HOF function call to its DuckDB equivalent.
-/// Finds `func_name(` at word boundaries, extracts top-level arguments, and applies `rewrite`.
 /// Rewrite `json_tuple(col, 'k1', 'k2') AS (a1, a2)` →
 /// `json_extract_string(col, '$.k1') AS a1, json_extract_string(col, '$.k2') AS a2`
 ///
@@ -3552,34 +2880,32 @@ pub(crate) fn rewrite_json_tuple(sql: &str) -> String {
             let after_call = &sql[end_paren + 1..];
             let after_trimmed = after_call.trim_start();
             // Check for `AS (`
-            let (aliases, consumed_after) =
-                if after_trimmed.to_ascii_uppercase().starts_with("AS") {
-                    let after_as = &after_trimmed[2..];
-                    let rest = after_as.trim_start();
-                    if rest.starts_with('(') {
-                        // Find the closing ')'
-                        if let Some(close) = rest.find(')') {
-                            let alias_str = &rest[1..close];
-                            let aliases: Vec<String> = alias_str
-                                .split(',')
-                                .map(|a| a.trim().to_string())
-                                .collect();
-                            // Bytes consumed in after_call:
-                            //   leading_spaces + "AS" + spaces_before_paren + "(alias_str)"
-                            // close is the 0-based index of ')' in rest, so "(alias_str)" = close+1 bytes
-                            let leading = after_call.len() - after_trimmed.len();
-                            let spaces_before = after_as.len() - rest.len();
-                            let consumed = leading + 2 + spaces_before + close + 1;
-                            (aliases, consumed)
-                        } else {
-                            (vec![], 0)
-                        }
+            let (aliases, consumed_after) = if after_trimmed.to_ascii_uppercase().starts_with("AS")
+            {
+                let after_as = &after_trimmed[2..];
+                let rest = after_as.trim_start();
+                if rest.starts_with('(') {
+                    // Find the closing ')'
+                    if let Some(close) = rest.find(')') {
+                        let alias_str = &rest[1..close];
+                        let aliases: Vec<String> =
+                            alias_str.split(',').map(|a| a.trim().to_string()).collect();
+                        // Bytes consumed in after_call:
+                        //   leading_spaces + "AS" + spaces_before_paren + "(alias_str)"
+                        // close is the 0-based index of ')' in rest, so "(alias_str)" = close+1 bytes
+                        let leading = after_call.len() - after_trimmed.len();
+                        let spaces_before = after_as.len() - rest.len();
+                        let consumed = leading + 2 + spaces_before + close + 1;
+                        (aliases, consumed)
                     } else {
                         (vec![], 0)
                     }
                 } else {
                     (vec![], 0)
-                };
+                }
+            } else {
+                (vec![], 0)
+            };
 
             // Build the expanded expression
             if args.is_empty() {
@@ -3613,35 +2939,6 @@ pub(crate) fn rewrite_json_tuple(sql: &str) -> String {
     result
 }
 
-fn rewrite_hof_func(sql: &str, func_name: &str, rewrite: impl Fn(&[String]) -> String) -> String {
-    let flen = func_name.len();
-    let bytes = sql.as_bytes();
-    let slen = bytes.len();
-    let mut result = String::with_capacity(sql.len() + 64);
-    let mut i = 0;
-
-    while i < slen {
-        // Check word boundary: not preceded by word char, followed by func_name (case-insensitive) + '('
-        let name_matches = i + flen < slen
-            && bytes[i + flen] == b'('
-            && sql[i..i + flen].eq_ignore_ascii_case(func_name)
-            && (i == 0 || {
-                let prev = bytes[i - 1];
-                !(prev.is_ascii_alphanumeric() || prev == b'_')
-            });
-
-        if name_matches {
-            let (args, end_pos) = extract_top_level_args(bytes, i + flen + 1);
-            result.push_str(&rewrite(&args));
-            i = end_pos + 1;
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    result
-}
-
 /// Extract top-level comma-separated arguments from a function call starting at `start`
 /// (the position right after the opening `(`).
 /// Returns `(args, index_of_closing_paren)`.
@@ -3657,7 +2954,10 @@ fn extract_top_level_args(bytes: &[u8], start: usize) -> (Vec<String>, usize) {
 
     while i < bytes.len() {
         match bytes[i] {
-            b'(' | b'[' | b'{' => { depth += 1; i += 1; }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
             b')' if depth == 0 => {
                 let trimmed = s[arg_start..i].trim();
                 if !trimmed.is_empty() || !args.is_empty() {
@@ -3665,19 +2965,28 @@ fn extract_top_level_args(bytes: &[u8], start: usize) -> (Vec<String>, usize) {
                 }
                 return (args, i);
             }
-            b')' | b']' | b'}' => { depth -= 1; i += 1; }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                i += 1;
+            }
             b'\'' | b'"' | b'`' => {
                 let q = bytes[i];
                 i += 1;
-                while i < bytes.len() && bytes[i] != q { i += 1; }
-                if i < bytes.len() { i += 1; } // skip closing quote
+                while i < bytes.len() && bytes[i] != q {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                } // skip closing quote
             }
             b',' if depth == 0 => {
                 args.push(s[arg_start..i].trim().to_string());
                 i += 1;
                 arg_start = i;
             }
-            _ => { i += 1; }
+            _ => {
+                i += 1;
+            }
         }
     }
     // Unterminated — push whatever remains
@@ -3694,13 +3003,13 @@ fn extract_top_level_args(bytes: &[u8], start: usize) -> (Vec<String>, usize) {
 mod tests {
     use super::*;
     use crate::expression::{
-        AliasExpression, BinaryExpression, ColumnReference, ExtractValueExpression,
-        FunctionCall, IntervalExpression, IsDistinctFromExpression, LikeExpression, Literal,
+        AliasExpression, BinaryExpression, ColumnReference, ExtractValueExpression, FunctionCall,
+        IntervalExpression, IsDistinctFromExpression, LikeExpression, Literal,
         RowConstructorExpression, StarExpression, WindowFunction,
     };
     use crate::logical::{
         Aggregate, AggregateExpr, AliasedRelation, Filter, Join, JoinType, Limit, LogicalPlan,
-        Project, SingleRowRelation, Sort, TableScan, Union, WithColumns,
+        Project, SelectEntry, SingleRowRelation, Sort, TableScan, Union, WithColumns,
     };
 
     fn gen() -> SqlGenerator {
@@ -3708,7 +3017,11 @@ mod tests {
     }
 
     fn table(name: &str) -> LogicalPlan {
-        LogicalPlan::TableScan(TableScan { table: name.to_string(), alias: None, schema: Default::default() })
+        LogicalPlan::TableScan(TableScan {
+            table: name.to_string(),
+            alias: None,
+            schema: Default::default(),
+        })
     }
 
     fn col(name: &str) -> Expression {
@@ -3730,12 +3043,10 @@ mod tests {
     fn project_with_alias() {
         let plan = LogicalPlan::Project(Project {
             input: Box::new(table("t")),
-            projections: vec![
-                Expression::Alias(AliasExpression {
-                    expr: Box::new(col("a")),
-                    alias: "x".to_string(),
-                }),
-            ],
+            projections: vec![Expression::Alias(AliasExpression {
+                expr: Box::new(col("a")),
+                alias: "x".to_string(),
+            })],
         });
         let sql = gen().generate(&plan).unwrap();
         assert!(sql.contains("\"a\" AS \"x\""), "got: {sql}");
@@ -4200,7 +3511,10 @@ mod tests {
     fn range_relation() {
         use crate::logical::RangeRelation;
         let plan = LogicalPlan::RangeRelation(RangeRelation {
-            start: 0, end: 10, step: 1, num_partitions: None,
+            start: 0,
+            end: 10,
+            step: 1,
+            num_partitions: None,
         });
         let sql = gen().generate(&plan).unwrap();
         assert!(sql.contains("range(0, 10, 1)"), "got: {sql}");
@@ -4239,7 +3553,9 @@ mod tests {
             input: Box::new(LogicalPlan::SqlRelation(SqlRelation {
                 sql: "SELECT 1 AS a, 2 AS b".to_string(),
                 schema: crate::types::StructType::empty(),
-                duckdb_ready: false, view_name: None, })),
+                duckdb_ready: true,
+                view_name: None,
+            })),
             column_names: vec!["x".to_string(), "y".to_string()],
         });
         let sql = gen().generate(&plan).unwrap();
@@ -4405,36 +3721,15 @@ mod tests {
     }
 
     #[test]
-    fn backtick_identifiers_rewritten_to_double_quote() {
-        // Spark SQL uses backtick quoting; DuckDB requires double quotes.
-        assert_eq!(
-            rewrite_backtick_identifiers("SELECT `l_orderkey` FROM lineitem"),
-            r#"SELECT "l_orderkey" FROM lineitem"#,
-        );
-        // Multiple identifiers in one expression
-        assert_eq!(
-            rewrite_backtick_identifiers("count(`l_orderkey`), count(`l_partkey`)"),
-            r#"count("l_orderkey"), count("l_partkey")"#,
-        );
-        // Backticks inside string literals must NOT be converted
-        assert_eq!(
-            rewrite_backtick_identifiers("SELECT 'hello `world`' AS greeting"),
-            "SELECT 'hello `world`' AS greeting",
-        );
-        // Already double-quoted identifiers pass through unchanged
-        assert_eq!(
-            rewrite_backtick_identifiers(r#"SELECT "col" FROM t"#),
-            r#"SELECT "col" FROM t"#,
-        );
-    }
-
-    #[test]
     fn window_avg_decimal_strict_adds_cast() {
         let gen = SqlGenerator::strict();
         let arg = Expression::ColumnReference(ColumnReference {
             name: "amount".to_owned(),
             qualifier: None,
-            data_type: DataType::Decimal { precision: 17, scale: 2 },
+            data_type: DataType::Decimal {
+                precision: 17,
+                scale: 2,
+            },
             nullable: true,
         });
         let w = WindowFunction {
@@ -4461,7 +3756,10 @@ mod tests {
         let arg = Expression::ColumnReference(ColumnReference {
             name: "amount".to_owned(),
             qualifier: None,
-            data_type: DataType::Decimal { precision: 17, scale: 2 },
+            data_type: DataType::Decimal {
+                precision: 17,
+                scale: 2,
+            },
             nullable: true,
         });
         let w = WindowFunction {
@@ -4487,7 +3785,10 @@ mod tests {
         let arg = Expression::ColumnReference(ColumnReference {
             name: "price".to_owned(),
             qualifier: None,
-            data_type: DataType::Decimal { precision: 12, scale: 2 },
+            data_type: DataType::Decimal {
+                precision: 12,
+                scale: 2,
+            },
             nullable: true,
         });
         let w = WindowFunction {
@@ -4508,4 +3809,153 @@ mod tests {
         );
     }
 
+    /// `Date + Expression::Interval` must be wrapped in `CAST(... AS DATE)` so
+    /// the result matches Spark's DATE type rather than DuckDB's promoted
+    /// TIMESTAMP. The gate is driven by the typed `data_type()` of the right
+    /// operand — no SQL-string sniffing.
+    #[test]
+    fn date_plus_interval_casts_back_to_date() {
+        use crate::types::{StructField, StructType};
+        let schema = StructType::new(vec![StructField::not_null("d", DataType::Date)]);
+        let expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(col("d")),
+            right: Box::new(Expression::Interval(IntervalExpression {
+                months: 0,
+                days: 7,
+                microseconds: 0,
+            })),
+        });
+        let sql = SqlGenerator::relaxed()
+            .with_schema(schema)
+            .gen_expr(&expr)
+            .unwrap();
+        assert!(sql.starts_with("CAST("), "expected CAST wrap, got: {sql}");
+        assert!(
+            sql.ends_with(" AS DATE)"),
+            "expected AS DATE suffix, got: {sql}"
+        );
+    }
+
+    /// A `RawSql` interval (produced by the SparkSQL parser for `INTERVAL N DAY`
+    /// literals) carries `data_type: Some(DataType::Interval)`. The gate must
+    /// recognise it through the typed path — not by string-sniffing the
+    /// already-generated SQL.
+    #[test]
+    fn date_plus_raw_sql_interval_casts_back_to_date() {
+        use crate::expression::RawSqlExpression;
+        use crate::types::{StructField, StructType};
+        let schema = StructType::new(vec![StructField::not_null("d", DataType::Date)]);
+        let raw_interval = Expression::RawSql(RawSqlExpression {
+            sql: "INTERVAL 3 DAY".to_string(),
+            data_type: Some(DataType::Interval),
+            nullable: Some(false),
+        });
+        let expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Sub,
+            left: Box::new(col("d")),
+            right: Box::new(raw_interval),
+        });
+        let sql = SqlGenerator::relaxed()
+            .with_schema(schema)
+            .gen_expr(&expr)
+            .unwrap();
+        assert!(sql.starts_with("CAST("), "expected CAST wrap, got: {sql}");
+        assert!(
+            sql.ends_with(" AS DATE)"),
+            "expected AS DATE suffix, got: {sql}"
+        );
+    }
+
+    /// `SelectEntry::AggregateExpr` carries its `AggregateExpr` value
+    /// directly. The previous `(usize)` indirection silently dropped the
+    /// entry when the index was out of range; with the value carried inline,
+    /// every entry renders.
+    #[test]
+    fn select_entry_aggregate_expr_renders_inline_value() {
+        let count_call = Expression::FunctionCall(FunctionCall {
+            name: "count".to_owned(),
+            args: vec![col("id")],
+            distinct: false,
+        });
+        let agg = AggregateExpr::new(count_call);
+        // Note: `aggregates` is intentionally LEFT EMPTY here. With the old
+        // index-based design, this would silently produce no aggregate column.
+        // With the value carried inline in `select_order`, the COUNT renders.
+        let plan = LogicalPlan::Aggregate(Aggregate {
+            input: Box::new(table("t")),
+            grouping: vec![col("dept")],
+            aggregates: vec![],
+            having: None,
+            grouping_sets: None,
+            select_order: vec![
+                SelectEntry::GroupingExpr(col("dept")),
+                SelectEntry::AggregateExpr(agg),
+            ],
+        });
+        let sql = gen().generate(&plan).unwrap();
+        assert!(
+            sql.contains("count("),
+            "expected count(...) in output: {sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY"),
+            "expected GROUP BY in output: {sql}"
+        );
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_sum_basic() {
+        // SUM on DECIMAL(10,2) → DECIMAL(20,2)
+        let result = spark_decimal_agg_type("sum", 10, 2);
+        assert_eq!(result, Some((20, 2)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_sum_clamped_to_38() {
+        // SUM on DECIMAL(35,5) → DECIMAL(38,5) (clamped)
+        let result = spark_decimal_agg_type("sum", 35, 5);
+        assert_eq!(result, Some((38, 5)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_sum_distinct() {
+        let result = spark_decimal_agg_type("sum_distinct", 12, 3);
+        assert_eq!(result, Some((22, 3)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_avg_basic() {
+        // AVG on DECIMAL(10,2) → DECIMAL(14,6)
+        let result = spark_decimal_agg_type("avg", 10, 2);
+        assert_eq!(result, Some((14, 6)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_avg_scale_capped_at_18() {
+        // AVG on DECIMAL(20,16) → scale = min(20, 18, 24) = 18
+        let result = spark_decimal_agg_type("avg", 20, 16);
+        assert_eq!(result, Some((24, 18)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_avg_scale_capped_by_precision() {
+        // AVG on DECIMAL(3,2) → new_p=7, new_s=min(6, 18, 7)=6
+        let result = spark_decimal_agg_type("avg", 3, 2);
+        assert_eq!(result, Some((7, 6)));
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_mean_same_as_avg() {
+        let avg = spark_decimal_agg_type("avg", 10, 2);
+        let mean = spark_decimal_agg_type("mean", 10, 2);
+        assert_eq!(avg, mean);
+    }
+
+    #[test]
+    fn spark_decimal_agg_type_unknown_returns_none() {
+        assert_eq!(spark_decimal_agg_type("count", 10, 2), None);
+        assert_eq!(spark_decimal_agg_type("max", 10, 2), None);
+        assert_eq!(spark_decimal_agg_type("min", 10, 2), None);
+    }
 }

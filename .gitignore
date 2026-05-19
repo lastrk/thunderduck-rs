@@ -3,6 +3,9 @@
 .devcontainer/.claude-auth-token
 .devcontainer/.claude-base-url
 .devcontainer/.claude-custom-headers
+
+# GitHub auth token forwarded from host (auto-generated, keep secret)
+.devcontainer/.github-token
 .reference/
 
 # Rust
@@ -30,3 +33,10 @@ extensions/
 playground/__marimo__/
 playground/data/
 playground/logs/
+
+# macOS Finder metadata
+.DS_Store
+
+# Claude Code local artifacts
+.agent-output/
+.claude/worktrees/

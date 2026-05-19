@@ -24,7 +24,8 @@ impl TypeInferenceEngine {
             let field_name = &name[dot_pos + 1..];
             if let Some(f) = schema.field_by_name(struct_name) {
                 if let DataType::Struct(st) = &f.data_type {
-                    return st.field_by_name(field_name)
+                    return st
+                        .field_by_name(field_name)
                         .map(|ff| ff.data_type.clone())
                         .unwrap_or(DataType::Unresolved);
                 }
@@ -48,7 +49,8 @@ impl TypeInferenceEngine {
             let field_name = &name[dot_pos + 1..];
             if let Some(f) = schema.field_by_name(struct_name) {
                 if let DataType::Struct(st) = &f.data_type {
-                    let field_nullable = st.field_by_name(field_name)
+                    let field_nullable = st
+                        .field_by_name(field_name)
                         .map(|ff| ff.nullable)
                         .unwrap_or(true);
                     return f.nullable || field_nullable;
@@ -62,7 +64,11 @@ impl TypeInferenceEngine {
     ///
     /// When `qualifier` matches a struct-typed column, resolves `name`
     /// as a field within that struct. Otherwise falls back to flat lookup.
-    pub fn qualified_column_type(name: &str, qualifier: Option<&str>, schema: &StructType) -> DataType {
+    pub fn qualified_column_type(
+        name: &str,
+        qualifier: Option<&str>,
+        schema: &StructType,
+    ) -> DataType {
         if let Some(q) = qualifier {
             // Try qualifier as struct column name
             if let Some(f) = schema.field_by_name(q) {
@@ -86,7 +92,11 @@ impl TypeInferenceEngine {
     ///
     /// When `qualifier` matches a struct-typed column, returns
     /// `struct_col.nullable || field.nullable` (Spark semantics).
-    pub fn qualified_column_nullable(name: &str, qualifier: Option<&str>, schema: &StructType) -> bool {
+    pub fn qualified_column_nullable(
+        name: &str,
+        qualifier: Option<&str>,
+        schema: &StructType,
+    ) -> bool {
         if let Some(q) = qualifier {
             if let Some(f) = schema.field_by_name(q) {
                 if let DataType::Struct(st) = &f.data_type {
@@ -158,7 +168,8 @@ impl TypeInferenceEngine {
         element_type: &DataType,
         element_nullable: bool,
     ) -> StructType {
-        let mut fields: Vec<crate::types::StructField> = schema.fields
+        let mut fields: Vec<crate::types::StructField> = schema
+            .fields
             .iter()
             .filter(|f| !param_names.iter().any(|p| f.name.eq_ignore_ascii_case(p)))
             .cloned()
@@ -195,9 +206,16 @@ impl TypeInferenceEngine {
             (a, b) if a == b => a.clone(),
 
             // Decimal × Decimal → unified decimal
-            (Decimal { precision: p1, scale: s1 }, Decimal { precision: p2, scale: s2 }) => {
-                Self::unify_decimal(*p1, *s1, *p2, *s2)
-            }
+            (
+                Decimal {
+                    precision: p1,
+                    scale: s1,
+                },
+                Decimal {
+                    precision: p2,
+                    scale: s2,
+                },
+            ) => Self::unify_decimal(*p1, *s1, *p2, *s2),
 
             // Any numeric + Double → Double
             (Double, _) | (_, Double) => Double,
@@ -211,10 +229,17 @@ impl TypeInferenceEngine {
                 if b.is_integral() =>
             {
                 let other_dec = Self::integral_to_decimal(b);
-                if let Decimal { precision: p2, scale: s2 } = other_dec {
+                if let Decimal {
+                    precision: p2,
+                    scale: s2,
+                } = other_dec
+                {
                     Self::unify_decimal(*precision, *scale, p2, s2)
                 } else {
-                    Decimal { precision: *precision, scale: *scale }
+                    Decimal {
+                        precision: *precision,
+                        scale: *scale,
+                    }
                 }
             }
 
@@ -248,6 +273,7 @@ impl TypeInferenceEngine {
             (Boolean, y) if y.is_numeric() => y.clone(),
             (x, Boolean) if x.is_numeric() => x.clone(),
             (Date, Timestamp) | (Timestamp, Date) => Timestamp,
+            (x, y) if x.is_interval() && y.is_interval() => Interval,
             _ => String,
         }
     }
@@ -281,9 +307,12 @@ impl TypeInferenceEngine {
     pub fn decimal_mod_type(p1: u8, s1: u8, p2: u8, s2: u8) -> DataType {
         let scale = s1.max(s2);
         let int_digits = (p1 as i16 - s1 as i16).min(p2 as i16 - s2 as i16);
-        let (precision, scale_out) = Self::adjust_precision_scale(
-            int_digits + scale as i16, scale as i16);
-        DataType::Decimal { precision, scale: scale_out }
+        let (precision, scale_out) =
+            Self::adjust_precision_scale(int_digits + scale as i16, scale as i16);
+        DataType::Decimal {
+            precision,
+            scale: scale_out,
+        }
     }
 
     // ── Aggregate return types ─────────────────────────────────────────────────
@@ -303,7 +332,10 @@ impl TypeInferenceEngine {
                 Double => Double,
                 Decimal { precision, scale } => {
                     let p = (*precision as u16 + 10).min(38) as u8;
-                    Decimal { precision: p, scale: *scale }
+                    Decimal {
+                        precision: p,
+                        scale: *scale,
+                    }
                 }
                 _ => arg_type.clone(),
             },
@@ -315,7 +347,10 @@ impl TypeInferenceEngine {
                 Decimal { precision, scale } => {
                     let p = (*precision as u16 + 4).min(38) as u8;
                     let s = (*scale + 4).min(18).min(p);
-                    Decimal { precision: p, scale: s }
+                    Decimal {
+                        precision: p,
+                        scale: s,
+                    }
                 }
                 _ => arg_type.clone(),
             },
@@ -394,18 +429,47 @@ impl TypeInferenceEngine {
     pub fn aggregate_is_always_nullable(name: &str) -> bool {
         matches!(
             name.to_lowercase().as_str(),
-            "sum" | "sum_distinct" | "avg" | "mean" | "min" | "max"
-            | "first" | "last" | "first_value" | "last_value" | "any_value"
-            | "stddev" | "stddev_samp" | "stddev_pop"
-            | "variance" | "var_samp" | "var_pop"
-            | "percentile" | "percentile_approx" | "approx_percentile"
-            | "collect_list" | "collect_set" | "array_agg"
-            | "kurtosis" | "skewness" | "corr" | "covar_pop" | "covar_samp"
-            | "regr_avgx" | "regr_avgy" | "regr_count" | "regr_r2"
-            | "regr_slope" | "regr_intercept"
-            | "bit_and" | "bit_or" | "bit_xor"
-            | "bool_and" | "bool_or" | "every"
-            | "nth_value"
+            "sum"
+                | "sum_distinct"
+                | "avg"
+                | "mean"
+                | "min"
+                | "max"
+                | "first"
+                | "last"
+                | "first_value"
+                | "last_value"
+                | "any_value"
+                | "stddev"
+                | "stddev_samp"
+                | "stddev_pop"
+                | "variance"
+                | "var_samp"
+                | "var_pop"
+                | "percentile"
+                | "percentile_approx"
+                | "approx_percentile"
+                | "collect_list"
+                | "collect_set"
+                | "array_agg"
+                | "kurtosis"
+                | "skewness"
+                | "corr"
+                | "covar_pop"
+                | "covar_samp"
+                | "regr_avgx"
+                | "regr_avgy"
+                | "regr_count"
+                | "regr_r2"
+                | "regr_slope"
+                | "regr_intercept"
+                | "bit_and"
+                | "bit_or"
+                | "bit_xor"
+                | "bool_and"
+                | "bool_or"
+                | "every"
+                | "nth_value"
         )
     }
 
@@ -413,8 +477,14 @@ impl TypeInferenceEngine {
     pub fn window_is_non_nullable(name: &str) -> bool {
         matches!(
             name.to_lowercase().as_str(),
-            "row_number" | "rank" | "dense_rank" | "ntile" | "percent_rank" | "cume_dist"
-            | "count" | "count_distinct"
+            "row_number"
+                | "rank"
+                | "dense_rank"
+                | "ntile"
+                | "percent_rank"
+                | "cume_dist"
+                | "count"
+                | "count_distinct"
         )
     }
 
@@ -428,12 +498,11 @@ impl TypeInferenceEngine {
         match name_lower.as_str() {
             // ── String functions ──────────────────────────────────────────────
             "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "lpad" | "rpad" | "concat"
-            | "concat_ws" | "substring" | "substr" | "replace" | "regexp_replace"
-            | "translate" | "repeat" | "space" | "soundex" | "hex"
-            | "base64" | "unbase64" | "decode" | "overlay" | "initcap"
-            | "format_string" | "printf" | "from_unixtime" | "date_format" | "to_char"
-            | "to_number" | "format_number" | "left" | "right" | "uuid" | "md5"
-            | "sha" | "sha1" | "sha2" | "crc32" | "ascii" | "chr" | "char"
+            | "concat_ws" | "substring" | "substr" | "replace" | "regexp_replace" | "translate"
+            | "repeat" | "space" | "soundex" | "hex" | "base64" | "unbase64" | "decode"
+            | "overlay" | "initcap" | "format_string" | "printf" | "from_unixtime"
+            | "date_format" | "to_char" | "to_number" | "format_number" | "left" | "right"
+            | "uuid" | "md5" | "sha" | "sha1" | "sha2" | "crc32" | "ascii" | "chr" | "char"
             | "conv" | "sentences" | "url_decode" | "url_encode" | "string" => String,
 
             // ── String → Integer ─────────────────────────────────────────────
@@ -449,15 +518,13 @@ impl TypeInferenceEngine {
             | "arrays_overlap" | "map_contains_key" | "in" => Boolean,
 
             // ── Math → Double ─────────────────────────────────────────────────
-            "sqrt" | "exp" | "log" | "ln" | "log2" | "log10" | "sin" | "cos" | "tan"
-            | "asin" | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh" | "asinh"
-            | "acosh" | "atanh" | "degrees" | "radians" | "months_between" | "pow"
-            | "power" | "hypot" | "expm1" | "log1p" => Double,
+            "sqrt" | "exp" | "log" | "ln" | "log2" | "log10" | "sin" | "cos" | "tan" | "asin"
+            | "acos" | "atan" | "atan2" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
+            | "atanh" | "degrees" | "radians" | "months_between" | "pow" | "power" | "hypot"
+            | "expm1" | "log1p" => Double,
 
             // ── Math same-type (abs, ceil, floor, round, etc.) ───────────────
-            "abs" | "negative" | "positive" => {
-                arg_types.first().cloned().unwrap_or(Double)
-            }
+            "abs" | "negative" | "positive" => arg_types.first().cloned().unwrap_or(Double),
             "ceil" | "ceiling" | "floor" => match arg_types.first() {
                 Some(Decimal { .. }) | Some(Double) | Some(Float) => Long,
                 Some(t) => t.clone(),
@@ -498,19 +565,19 @@ impl TypeInferenceEngine {
             "current_date" | "curdate" => Date,
 
             // ── Date → Integer ────────────────────────────────────────────────
-            "year" | "month" | "day" | "dayofmonth" | "dayofweek" | "dayofyear"
-            | "weekofyear" | "quarter" | "hour" | "minute" | "second"
-            | "extract" | "datediff" | "days" | "months" | "years" => Integer,
+            "year" | "month" | "day" | "dayofmonth" | "dayofweek" | "dayofyear" | "weekofyear"
+            | "quarter" | "hour" | "minute" | "second" | "extract" | "datediff" | "days"
+            | "months" | "years" => Integer,
 
             // ── Array functions ────────────────────────────────────────────────
             "array" | "make_array" => {
                 let elem = arg_types.first().cloned().unwrap_or(Unresolved);
                 Array(Box::new(elem), true)
             }
-            "array_distinct" | "array_sort" | "sort_array" | "array_reverse"
-            | "slice" => {
-                arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved), true))
-            }
+            "array_distinct" | "array_sort" | "sort_array" | "array_reverse" | "slice" => arg_types
+                .first()
+                .cloned()
+                .unwrap_or(Array(Box::new(Unresolved), true)),
             // flatten unwraps one nesting level: array<array<T>> → array<T>
             "flatten" => match arg_types.first() {
                 Some(Array(inner, _)) => match inner.as_ref() {
@@ -518,17 +585,20 @@ impl TypeInferenceEngine {
                     _ => arg_types[0].clone(),
                 },
                 _ => Array(Box::new(Unresolved), true),
-            }
+            },
             // reverse: polymorphic — array<T> → array<T>, string → string
             "reverse" => match arg_types.first() {
                 Some(Array(_, _)) => arg_types[0].clone(),
                 _ => String,
-            }
+            },
             // array_append / array_prepend: Spark conservatively sets containsNull=true
             "array_append" | "array_prepend" | "append_element" | "prepend_element" => {
                 match arg_types.first() {
                     Some(Array(elem, _)) => Array(elem.clone(), true),
-                    _ => arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved), true)),
+                    _ => arg_types
+                        .first()
+                        .cloned()
+                        .unwrap_or(Array(Box::new(Unresolved), true)),
                 }
             }
             "array_compact" => {
@@ -539,18 +609,20 @@ impl TypeInferenceEngine {
                     None => Array(Box::new(Unresolved), false),
                 }
             }
-            "array_union" | "array_intersect" | "array_except" | "array_concat" => {
-                arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved), true))
-            }
+            "array_union" | "array_intersect" | "array_except" | "array_concat" => arg_types
+                .first()
+                .cloned()
+                .unwrap_or(Array(Box::new(Unresolved), true)),
             "transform" | "list_transform" => {
                 // transform(array, x -> expr): return type is Array of whatever lambda returns
                 // arg_types[1] is the lambda return type when available
                 let elem = arg_types.get(1).cloned().unwrap_or(Unresolved);
                 Array(Box::new(elem), true)
             }
-            "filter" | "array_filter" | "list_filter" => {
-                arg_types.first().cloned().unwrap_or(Array(Box::new(Unresolved), true))
-            }
+            "filter" | "array_filter" | "list_filter" => arg_types
+                .first()
+                .cloned()
+                .unwrap_or(Array(Box::new(Unresolved), true)),
             // ── HOF predicates ────────────────────────────────────────────
             "exists" | "forall" | "list_bool_or" | "list_bool_and" => Boolean,
             "aggregate" | "reduce" | "list_reduce" => {
@@ -574,8 +646,8 @@ impl TypeInferenceEngine {
                 Some(Map { value, .. }) => *value.clone(),
                 _ => Unresolved,
             },
-            "explode" | "explode_outer" | "posexplode" | "posexplode_outer"
-            | "inline" | "inline_outer" => match arg_types.first() {
+            "explode" | "explode_outer" | "posexplode" | "posexplode_outer" | "inline"
+            | "inline_outer" => match arg_types.first() {
                 Some(Array(elem, _)) => *elem.clone(),
                 _ => Unresolved,
             },
@@ -584,7 +656,11 @@ impl TypeInferenceEngine {
             "map" | "create_map" => {
                 let k = arg_types.first().cloned().unwrap_or(Unresolved);
                 let v = arg_types.get(1).cloned().unwrap_or(Unresolved);
-                Map { key: Box::new(k), value: Box::new(v), value_nullable: true }
+                Map {
+                    key: Box::new(k),
+                    value: Box::new(v),
+                    value_nullable: true,
+                }
             }
             "map_from_arrays" => {
                 // map_from_arrays(Array<K>, Array<V>) → Map<K, V>
@@ -596,12 +672,20 @@ impl TypeInferenceEngine {
                     Some(Array(elem, contains_null)) => (*elem.clone(), *contains_null),
                     _ => (arg_types.get(1).cloned().unwrap_or(Unresolved), true),
                 };
-                Map { key: Box::new(k), value: Box::new(v), value_nullable }
+                Map {
+                    key: Box::new(k),
+                    value: Box::new(v),
+                    value_nullable,
+                }
             }
             "map_from_entries" => {
                 let k = arg_types.first().cloned().unwrap_or(Unresolved);
                 let v = arg_types.get(1).cloned().unwrap_or(Unresolved);
-                Map { key: Box::new(k), value: Box::new(v), value_nullable: true }
+                Map {
+                    key: Box::new(k),
+                    value: Box::new(v),
+                    value_nullable: true,
+                }
             }
             "map_keys" => {
                 let k = match arg_types.first() {
@@ -620,7 +704,11 @@ impl TypeInferenceEngine {
             }
             "map_concat" => arg_types.first().cloned().unwrap_or(Unresolved),
             "map_entries" => match arg_types.first() {
-                Some(Map { key, value, value_nullable }) => {
+                Some(Map {
+                    key,
+                    value,
+                    value_nullable,
+                }) => {
                     // Spark: ArrayType(StructType([key: K NOT NULL, value: V nullable]), containsNull=false)
                     use crate::types::StructField;
                     let entry_struct = DataType::Struct(crate::types::StructType::new(vec![
@@ -630,7 +718,7 @@ impl TypeInferenceEngine {
                     Array(Box::new(entry_struct), false)
                 }
                 _ => Unresolved,
-            }
+            },
 
             // ── Struct ────────────────────────────────────────────────────────
             "to_csv" => String,
@@ -648,7 +736,8 @@ impl TypeInferenceEngine {
                 if arg_types.iter().any(|t| matches!(t, Unresolved)) {
                     Unresolved
                 } else {
-                    arg_types.iter()
+                    arg_types
+                        .iter()
                         .filter(|t| !matches!(t, Null))
                         .cloned()
                         .reduce(|acc, t| Self::unify_types(&acc, &t))
@@ -662,14 +751,11 @@ impl TypeInferenceEngine {
             "when" => {
                 let has_else = arg_types.len() % 2 == 1;
                 let pair_count = arg_types.len() / 2; // number of (cond, value) pairs
-                // THEN values are at odd indices: 1, 3, 5, ...
+                                                      // THEN values are at odd indices: 1, 3, 5, ...
                 let then_types = (0..pair_count).map(|i| &arg_types[i * 2 + 1]);
-                let else_type = if has_else {
-                    arg_types.last()
-                } else {
-                    None
-                };
-                then_types.chain(else_type)
+                let else_type = if has_else { arg_types.last() } else { None };
+                then_types
+                    .chain(else_type)
                     .filter(|t| !matches!(t, Unresolved | Null))
                     .cloned()
                     .reduce(|acc, t| Self::unify_types(&acc, &t))
@@ -715,14 +801,35 @@ impl TypeInferenceEngine {
             "grouping_id" => Long,
 
             // Aggregate functions — delegate to aggregate_return_type for correct Spark types
-            "sum" | "sum_distinct" | "avg" | "mean" | "count" | "count_distinct"
-            | "min" | "max" | "first" | "last" | "first_value" | "last_value"
-            | "stddev" | "stddev_samp" | "std" | "stddev_pop" | "variance" | "var_samp"
-            | "var_pop" | "skewness" | "kurtosis"
-            | "approx_count_distinct" | "count_approx_distinct"
-            | "bit_and" | "bit_or" | "bit_xor" => {
-                Self::aggregate_return_type(name_lower.as_str(), arg_types.first().unwrap_or(&Unresolved))
-            }
+            "sum"
+            | "sum_distinct"
+            | "avg"
+            | "mean"
+            | "count"
+            | "count_distinct"
+            | "min"
+            | "max"
+            | "first"
+            | "last"
+            | "first_value"
+            | "last_value"
+            | "stddev"
+            | "stddev_samp"
+            | "std"
+            | "stddev_pop"
+            | "variance"
+            | "var_samp"
+            | "var_pop"
+            | "skewness"
+            | "kurtosis"
+            | "approx_count_distinct"
+            | "count_approx_distinct"
+            | "bit_and"
+            | "bit_or"
+            | "bit_xor" => Self::aggregate_return_type(
+                name_lower.as_str(),
+                arg_types.first().unwrap_or(&Unresolved),
+            ),
 
             // Fallback: return first arg type or Unresolved
             _ => arg_types.first().cloned().unwrap_or(Unresolved),
@@ -740,10 +847,22 @@ impl TypeInferenceEngine {
 
     pub fn integral_to_decimal(dt: &DataType) -> DataType {
         match dt {
-            DataType::Byte => DataType::Decimal { precision: 3, scale: 0 },
-            DataType::Short => DataType::Decimal { precision: 5, scale: 0 },
-            DataType::Integer => DataType::Decimal { precision: 10, scale: 0 },
-            DataType::Long => DataType::Decimal { precision: 20, scale: 0 },
+            DataType::Byte => DataType::Decimal {
+                precision: 3,
+                scale: 0,
+            },
+            DataType::Short => DataType::Decimal {
+                precision: 5,
+                scale: 0,
+            },
+            DataType::Integer => DataType::Decimal {
+                precision: 10,
+                scale: 0,
+            },
+            DataType::Long => DataType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
             other => other.clone(),
         }
     }
@@ -780,10 +899,22 @@ mod tests {
 
     #[test]
     fn numeric_promotion() {
-        assert_eq!(TypeInferenceEngine::promote_numeric(&DataType::Integer, &DataType::Long), DataType::Long);
-        assert_eq!(TypeInferenceEngine::promote_numeric(&DataType::Integer, &DataType::Double), DataType::Double);
-        assert_eq!(TypeInferenceEngine::promote_numeric(&DataType::Float, &DataType::Long), DataType::Double);
-        assert_eq!(TypeInferenceEngine::promote_numeric(&DataType::Long, &DataType::Long), DataType::Long);
+        assert_eq!(
+            TypeInferenceEngine::promote_numeric(&DataType::Integer, &DataType::Long),
+            DataType::Long
+        );
+        assert_eq!(
+            TypeInferenceEngine::promote_numeric(&DataType::Integer, &DataType::Double),
+            DataType::Double
+        );
+        assert_eq!(
+            TypeInferenceEngine::promote_numeric(&DataType::Float, &DataType::Long),
+            DataType::Double
+        );
+        assert_eq!(
+            TypeInferenceEngine::promote_numeric(&DataType::Long, &DataType::Long),
+            DataType::Long
+        );
     }
 
     #[test]
@@ -818,8 +949,14 @@ mod tests {
 
     #[test]
     fn window_ranking_to_integer() {
-        assert_eq!(TypeInferenceEngine::window_return_type("row_number", None), DataType::Integer);
-        assert_eq!(TypeInferenceEngine::window_return_type("rank", None), DataType::Integer);
+        assert_eq!(
+            TypeInferenceEngine::window_return_type("row_number", None),
+            DataType::Integer
+        );
+        assert_eq!(
+            TypeInferenceEngine::window_return_type("rank", None),
+            DataType::Integer
+        );
         assert!(TypeInferenceEngine::window_is_non_nullable("row_number"));
     }
 
@@ -827,7 +964,10 @@ mod tests {
     fn unify_types_cases() {
         use DataType::*;
         // Same type
-        assert_eq!(TypeInferenceEngine::unify_types(&Integer, &Integer), Integer);
+        assert_eq!(
+            TypeInferenceEngine::unify_types(&Integer, &Integer),
+            Integer
+        );
         assert_eq!(TypeInferenceEngine::unify_types(&String, &String), String);
         // Numeric promotion
         assert_eq!(TypeInferenceEngine::unify_types(&Integer, &Long), Long);
@@ -840,12 +980,21 @@ mod tests {
         assert_eq!(TypeInferenceEngine::unify_types(&Unresolved, &Long), Long);
         assert_eq!(TypeInferenceEngine::unify_types(&Long, &Unresolved), Long);
         // Date + Timestamp
-        assert_eq!(TypeInferenceEngine::unify_types(&Date, &Timestamp), Timestamp);
-        assert_eq!(TypeInferenceEngine::unify_types(&Timestamp, &Date), Timestamp);
+        assert_eq!(
+            TypeInferenceEngine::unify_types(&Date, &Timestamp),
+            Timestamp
+        );
+        assert_eq!(
+            TypeInferenceEngine::unify_types(&Timestamp, &Date),
+            Timestamp
+        );
         // Incompatible non-numeric → String
         assert_eq!(TypeInferenceEngine::unify_types(&Boolean, &Date), String);
         // Boolean + numeric → numeric (Spark coercion)
-        assert_eq!(TypeInferenceEngine::unify_types(&Boolean, &Integer), Integer);
+        assert_eq!(
+            TypeInferenceEngine::unify_types(&Boolean, &Integer),
+            Integer
+        );
         assert_eq!(TypeInferenceEngine::unify_types(&Long, &Boolean), Long);
     }
 
@@ -855,7 +1004,10 @@ mod tests {
         // Decimal(10,2) / Decimal(5,1) → scale=max(6,2+5+1)=8, prec=10-2+1+8=17
         assert_eq!(
             TypeInferenceEngine::decimal_div_type(10, 2, 5, 1),
-            Decimal { precision: 17, scale: 8 }
+            Decimal {
+                precision: 17,
+                scale: 8
+            }
         );
         // Decimal(38,2) / Decimal(38,2) → overflow case
         let result = TypeInferenceEngine::decimal_div_type(38, 2, 38, 2);
@@ -868,12 +1020,18 @@ mod tests {
         // Decimal(10,2) % Decimal(10,2) → scale=2, int=min(8,8)=8, prec=10
         assert_eq!(
             TypeInferenceEngine::decimal_mod_type(10, 2, 10, 2),
-            Decimal { precision: 10, scale: 2 }
+            Decimal {
+                precision: 10,
+                scale: 2
+            }
         );
         // Decimal(10,2) % Decimal(5,1) → scale=2, int=min(8,4)=4, prec=6
         assert_eq!(
             TypeInferenceEngine::decimal_mod_type(10, 2, 5, 1),
-            Decimal { precision: 6, scale: 2 }
+            Decimal {
+                precision: 6,
+                scale: 2
+            }
         );
     }
 
@@ -882,13 +1040,31 @@ mod tests {
         use DataType::*;
         // AVG(Decimal(10,2)) → prec=14, scale=min(min(6,18),14)=6
         assert_eq!(
-            TypeInferenceEngine::aggregate_return_type("avg", &Decimal { precision: 10, scale: 2 }),
-            Decimal { precision: 14, scale: 6 }
+            TypeInferenceEngine::aggregate_return_type(
+                "avg",
+                &Decimal {
+                    precision: 10,
+                    scale: 2
+                }
+            ),
+            Decimal {
+                precision: 14,
+                scale: 6
+            }
         );
         // AVG(Decimal(10,16)) → prec=14, scale=min(min(20,18),14)=14
         assert_eq!(
-            TypeInferenceEngine::aggregate_return_type("avg", &Decimal { precision: 10, scale: 16 }),
-            Decimal { precision: 14, scale: 14 }
+            TypeInferenceEngine::aggregate_return_type(
+                "avg",
+                &Decimal {
+                    precision: 10,
+                    scale: 16
+                }
+            ),
+            Decimal {
+                precision: 14,
+                scale: 14
+            }
         );
     }
 
@@ -899,10 +1075,19 @@ mod tests {
             StructField::nullable("id", DataType::Long),
             StructField::not_null("code", DataType::String),
         ]);
-        assert_eq!(TypeInferenceEngine::column_type("id", &schema), DataType::Long);
-        assert_eq!(TypeInferenceEngine::column_type("ID", &schema), DataType::Long);
+        assert_eq!(
+            TypeInferenceEngine::column_type("id", &schema),
+            DataType::Long
+        );
+        assert_eq!(
+            TypeInferenceEngine::column_type("ID", &schema),
+            DataType::Long
+        );
         assert_eq!(TypeInferenceEngine::column_nullable("code", &schema), false);
-        assert_eq!(TypeInferenceEngine::column_type("missing", &schema), DataType::Unresolved);
+        assert_eq!(
+            TypeInferenceEngine::column_type("missing", &schema),
+            DataType::Unresolved
+        );
     }
 
     #[test]
@@ -918,7 +1103,10 @@ mod tests {
     fn aggregate_returns_init_type() {
         use DataType::*;
         assert_eq!(
-            TypeInferenceEngine::function_return_type("aggregate", &[Array(Box::new(Integer), false), Long]),
+            TypeInferenceEngine::function_return_type(
+                "aggregate",
+                &[Array(Box::new(Integer), false), Long]
+            ),
             Long
         );
     }
@@ -926,9 +1114,7 @@ mod tests {
     #[test]
     fn augment_schema_adds_lambda_params() {
         use crate::types::{StructField, StructType};
-        let schema = StructType::new(vec![
-            StructField::nullable("id", DataType::Long),
-        ]);
+        let schema = StructType::new(vec![StructField::nullable("id", DataType::Long)]);
         let augmented = TypeInferenceEngine::augment_schema_with_lambda_params(
             &schema,
             &["x".to_owned(), "i".to_owned()],
@@ -947,46 +1133,74 @@ mod tests {
     #[test]
     fn column_type_dot_notation_struct_field() {
         use crate::types::{StructField, StructType};
-        let schema = StructType::new(vec![
-            StructField::not_null("person", DataType::Struct(StructType::new(vec![
+        let schema = StructType::new(vec![StructField::not_null(
+            "person",
+            DataType::Struct(StructType::new(vec![
                 StructField::not_null("name", DataType::String),
                 StructField::nullable("age", DataType::Integer),
-            ]))),
-        ]);
-        assert_eq!(TypeInferenceEngine::column_type("person.name", &schema), DataType::String);
-        assert_eq!(TypeInferenceEngine::column_type("person.age", &schema), DataType::Integer);
-        assert_eq!(TypeInferenceEngine::column_type("person.missing", &schema), DataType::Unresolved);
-        assert_eq!(TypeInferenceEngine::column_type("missing.name", &schema), DataType::Unresolved);
+            ])),
+        )]);
+        assert_eq!(
+            TypeInferenceEngine::column_type("person.name", &schema),
+            DataType::String
+        );
+        assert_eq!(
+            TypeInferenceEngine::column_type("person.age", &schema),
+            DataType::Integer
+        );
+        assert_eq!(
+            TypeInferenceEngine::column_type("person.missing", &schema),
+            DataType::Unresolved
+        );
+        assert_eq!(
+            TypeInferenceEngine::column_type("missing.name", &schema),
+            DataType::Unresolved
+        );
     }
 
     #[test]
     fn column_nullable_dot_notation_struct_field() {
         use crate::types::{StructField, StructType};
         let schema = StructType::new(vec![
-            StructField::not_null("person", DataType::Struct(StructType::new(vec![
-                StructField::not_null("name", DataType::String),
-                StructField::nullable("age", DataType::Integer),
-            ]))),
-            StructField::nullable("nullable_person", DataType::Struct(StructType::new(vec![
-                StructField::not_null("street", DataType::String),
-            ]))),
+            StructField::not_null(
+                "person",
+                DataType::Struct(StructType::new(vec![
+                    StructField::not_null("name", DataType::String),
+                    StructField::nullable("age", DataType::Integer),
+                ])),
+            ),
+            StructField::nullable(
+                "nullable_person",
+                DataType::Struct(StructType::new(vec![StructField::not_null(
+                    "street",
+                    DataType::String,
+                )])),
+            ),
         ]);
         // person NOT NULL, name NOT NULL => false
-        assert!(!TypeInferenceEngine::column_nullable("person.name", &schema));
+        assert!(!TypeInferenceEngine::column_nullable(
+            "person.name",
+            &schema
+        ));
         // person NOT NULL, age NULLABLE => true
         assert!(TypeInferenceEngine::column_nullable("person.age", &schema));
         // nullable_person NULLABLE, street NOT NULL => true
-        assert!(TypeInferenceEngine::column_nullable("nullable_person.street", &schema));
+        assert!(TypeInferenceEngine::column_nullable(
+            "nullable_person.street",
+            &schema
+        ));
     }
 
     #[test]
     fn qualified_column_type_struct_field() {
         use crate::types::{StructField, StructType};
-        let schema = StructType::new(vec![
-            StructField::not_null("person", DataType::Struct(StructType::new(vec![
-                StructField::not_null("name", DataType::String),
-            ]))),
-        ]);
+        let schema = StructType::new(vec![StructField::not_null(
+            "person",
+            DataType::Struct(StructType::new(vec![StructField::not_null(
+                "name",
+                DataType::String,
+            )])),
+        )]);
         assert_eq!(
             TypeInferenceEngine::qualified_column_type("name", Some("person"), &schema),
             DataType::String
@@ -1001,12 +1215,18 @@ mod tests {
     #[test]
     fn qualified_column_nullable_struct_field() {
         use crate::types::{StructField, StructType};
-        let schema = StructType::new(vec![
-            StructField::not_null("person", DataType::Struct(StructType::new(vec![
-                StructField::not_null("name", DataType::String),
-            ]))),
-        ]);
-        assert!(!TypeInferenceEngine::qualified_column_nullable("name", Some("person"), &schema));
+        let schema = StructType::new(vec![StructField::not_null(
+            "person",
+            DataType::Struct(StructType::new(vec![StructField::not_null(
+                "name",
+                DataType::String,
+            )])),
+        )]);
+        assert!(!TypeInferenceEngine::qualified_column_nullable(
+            "name",
+            Some("person"),
+            &schema
+        ));
     }
 
     #[test]
@@ -1049,7 +1269,10 @@ mod tests {
             DataType::Long,
         );
         assert_eq!(
-            TypeInferenceEngine::function_return_type("xxhash64", &[DataType::String, DataType::Long]),
+            TypeInferenceEngine::function_return_type(
+                "xxhash64",
+                &[DataType::String, DataType::Long]
+            ),
             DataType::Long,
         );
     }

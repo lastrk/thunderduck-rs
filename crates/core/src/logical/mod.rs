@@ -43,10 +43,18 @@ pub struct AggregateExpr {
 
 impl AggregateExpr {
     pub fn new(func: Expression) -> Self {
-        Self { func, is_distinct: false, filter: None }
+        Self {
+            func,
+            is_distinct: false,
+            filter: None,
+        }
     }
     pub fn distinct(func: Expression) -> Self {
-        Self { func, is_distinct: true, filter: None }
+        Self {
+            func,
+            is_distinct: true,
+            filter: None,
+        }
     }
 }
 
@@ -62,9 +70,7 @@ impl GroupingSets {
     /// Returns references to the inner set lists for any variant.
     fn sets(&self) -> &[Vec<Expression>] {
         match self {
-            GroupingSets::Rollup(s)
-            | GroupingSets::Cube(s)
-            | GroupingSets::GroupingSets(s) => s,
+            GroupingSets::Rollup(s) | GroupingSets::Cube(s) | GroupingSets::GroupingSets(s) => s,
         }
     }
 
@@ -95,11 +101,16 @@ fn grouping_expr_name(expr: &Expression) -> Option<&str> {
 }
 
 /// Describes a position in an Aggregate's SELECT list — either a grouping
-/// column or an aggregate expression (by index into the aggregates vec).
+/// column or an aggregate expression carried inline.
+///
+/// `AggregateExpr` carries the value directly rather than indexing into a
+/// separate vec. The previous index-based design silently dropped entries
+/// when the index was out of range, which is the kind of "default arm
+/// silently drops unknowns" anti-pattern called out in CLAUDE.md.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectEntry {
     GroupingExpr(Expression),
-    AggregateExpr(usize),
+    AggregateExpr(AggregateExpr),
     /// SQL path marker: GROUP BY key intentionally not in SELECT list.
     /// Suppresses the auto-prepend of grouping columns in gen_aggregate but renders nothing.
     GroupingNotSelected,
@@ -334,11 +345,9 @@ pub struct SqlRelation {
     /// with Arrow IPC data so that type inference (e.g. SUM→BIGINT cast) can
     /// look up column types without issuing a DESCRIBE query.
     pub schema: StructType,
-    /// When true, the SQL is already in DuckDB-native format and must NOT be run
-    /// through `preprocess_spark_sql`. This prevents double-processing of constructs
-    /// like `MAP([keys], [vals])` which would be incorrectly rewritten to
-    /// `MAP([[keys]], [[vals]])`.
-    #[doc(hidden)]
+    /// Legacy field: previously controlled whether `preprocess_spark_sql` was
+    /// applied. All SQL is now generated in DuckDB-native format by the typed AST
+    /// pipeline, so this is always `true`. Retained for structural compatibility.
     pub duckdb_ready: bool,
     /// For CREATE VIEW DDL: the unquoted view name. When set, the service layer
     /// caches `self.schema` as the view's Spark-accurate schema so that
@@ -348,14 +357,14 @@ pub struct SqlRelation {
 }
 
 impl SqlRelation {
-    /// Create a new SqlRelation with raw Spark SQL that needs preprocessing.
-    pub fn new(sql: String, schema: StructType) -> Self {
-        Self { sql, schema, duckdb_ready: false, view_name: None }
-    }
-
     /// Create a new SqlRelation with DuckDB-ready SQL that must skip preprocessing.
     pub fn duckdb_native(sql: String, schema: StructType) -> Self {
-        Self { sql, schema, duckdb_ready: true, view_name: None }
+        Self {
+            sql,
+            schema,
+            duckdb_ready: true,
+            view_name: None,
+        }
     }
 }
 
@@ -504,7 +513,11 @@ pub struct NAFill {
 pub struct NAReplace {
     pub input: Box<LogicalPlan>,
     /// (column_name, from_value, to_value) triples.
-    pub replacements: Vec<(String, crate::expression::Literal, crate::expression::Literal)>,
+    pub replacements: Vec<(
+        String,
+        crate::expression::Literal,
+        crate::expression::Literal,
+    )>,
     /// All column names in the schema.
     pub all_columns: Vec<String>,
 }
@@ -571,14 +584,20 @@ impl LogicalPlan {
                 // Apply outer-join nullability: LEFT makes right-side nullable,
                 // RIGHT makes left-side nullable, FULL makes both nullable.
                 let right_nullable = matches!(j.join_type, JoinType::Left | JoinType::Full);
-                let left_nullable  = matches!(j.join_type, JoinType::Right | JoinType::Full);
+                let left_nullable = matches!(j.join_type, JoinType::Right | JoinType::Full);
                 let merged = if left_nullable || right_nullable {
-                    let fields = merged.fields.into_iter().enumerate().map(|(i, mut f)| {
-                        if (i < left_len && left_nullable) || (i >= left_len && right_nullable) {
-                            f.nullable = true;
-                        }
-                        f
-                    }).collect();
+                    let fields = merged
+                        .fields
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, mut f)| {
+                            if (i < left_len && left_nullable) || (i >= left_len && right_nullable)
+                            {
+                                f.nullable = true;
+                            }
+                            f
+                        })
+                        .collect();
                     StructType::new(fields)
                 } else {
                     merged
@@ -606,7 +625,11 @@ impl LogicalPlan {
                             Expression::Binary(b) if b.op == BinaryOp::Eq => {
                                 let l = col_name(&b.left)?;
                                 let r = col_name(&b.right)?;
-                                if l == r { Some(vec![l]) } else { None }
+                                if l == r {
+                                    Some(vec![l])
+                                } else {
+                                    None
+                                }
                             }
                             Expression::Binary(b) if b.op == BinaryOp::And => {
                                 let mut l = equijoin_cols(&b.left)?;
@@ -637,11 +660,15 @@ impl LogicalPlan {
                     }
                     // 2. Left non-USING columns
                     for f in &left_schema.fields {
-                        if !using_set.contains(f.name.as_str()) { fields.push(f.clone()); }
+                        if !using_set.contains(f.name.as_str()) {
+                            fields.push(f.clone());
+                        }
                     }
                     // 3. Right non-USING columns
                     for f in &right_schema.fields {
-                        if !using_set.contains(f.name.as_str()) { fields.push(f.clone()); }
+                        if !using_set.contains(f.name.as_str()) {
+                            fields.push(f.clone());
+                        }
                     }
                     StructType::new(fields)
                 }
@@ -655,10 +682,14 @@ impl LogicalPlan {
                 if left.is_empty() || right.is_empty() || left.fields.len() != right.fields.len() {
                     return left;
                 }
-                let fields = left.fields.into_iter().zip(right.fields)
+                let fields = left
+                    .fields
+                    .into_iter()
+                    .zip(right.fields)
                     .map(|(mut lf, rf)| {
                         lf.data_type = crate::types::TypeInferenceEngine::unify_types(
-                            &lf.data_type, &rf.data_type,
+                            &lf.data_type,
+                            &rf.data_type,
                         );
                         lf.nullable = lf.nullable || rf.nullable;
                         lf
@@ -674,18 +705,23 @@ impl LogicalPlan {
             LogicalPlan::SqlRelation(r) => r.schema.clone(),
             LogicalPlan::LocalRelation(r) => r.schema.clone(),
             LogicalPlan::LocalDataRelation(r) => r.schema.clone(),
-            LogicalPlan::RangeRelation(_) => StructType::new(vec![
-                StructField::not_null("id", DataType::Long),
-            ]),
+            LogicalPlan::RangeRelation(_) => {
+                StructType::new(vec![StructField::not_null("id", DataType::Long)])
+            }
             LogicalPlan::InMemoryRelation(r) => r.schema.clone(),
             LogicalPlan::WithCte(c) => c.input.infer_schema(),
             LogicalPlan::WithColumns(w) => infer_with_columns_schema(w),
             LogicalPlan::AliasedRelation(a) => {
                 let child = a.input.infer_schema();
                 if !a.column_aliases.is_empty() && a.column_aliases.len() == child.fields.len() {
-                    let fields = child.fields.into_iter()
+                    let fields = child
+                        .fields
+                        .into_iter()
                         .zip(&a.column_aliases)
-                        .map(|(mut f, name)| { f.name = name.clone(); f })
+                        .map(|(mut f, name)| {
+                            f.name = name.clone();
+                            f
+                        })
                         .collect();
                     StructType::new(fields)
                 } else {
@@ -700,7 +736,11 @@ impl LogicalPlan {
                 let excluded: std::collections::HashSet<&str> =
                     d.column_names.iter().map(String::as_str).collect();
                 StructType::new(
-                    child.fields.into_iter().filter(|f| !excluded.contains(f.name.as_str())).collect(),
+                    child
+                        .fields
+                        .into_iter()
+                        .filter(|f| !excluded.contains(f.name.as_str()))
+                        .collect(),
                 )
             }
             LogicalPlan::ShowString(s) => s.input.infer_schema(),
@@ -708,14 +748,21 @@ impl LogicalPlan {
             LogicalPlan::NAFill(n) => {
                 // na.fill(valueMap) guarantees no NULLs for filled columns → mark them NOT NULL.
                 let mut schema = n.input.infer_schema();
-                let filled_cols: std::collections::HashSet<String> =
-                    n.values.iter().map(|(name, _)| name.to_lowercase()).collect();
-                schema.fields = schema.fields.into_iter().map(|mut f| {
-                    if filled_cols.contains(&f.name.to_lowercase()) {
-                        f.nullable = false;
-                    }
-                    f
-                }).collect();
+                let filled_cols: std::collections::HashSet<String> = n
+                    .values
+                    .iter()
+                    .map(|(name, _)| name.to_lowercase())
+                    .collect();
+                schema.fields = schema
+                    .fields
+                    .into_iter()
+                    .map(|mut f| {
+                        if filled_cols.contains(&f.name.to_lowercase()) {
+                            f.nullable = false;
+                        }
+                        f
+                    })
+                    .collect();
                 schema
             }
             LogicalPlan::NAReplace(n) => n.input.infer_schema(),
@@ -758,26 +805,32 @@ impl LogicalPlan {
             // full DuckDB fallback in the service layer.
             LogicalPlan::Pivot(_) => StructType::empty(),
             // StatCov/StatCorr return a single DOUBLE column.
-            LogicalPlan::StatCov(s) => StructType::new(vec![
-                StructField::nullable(format!("cov({}, {})", s.col1, s.col2), DataType::Double),
-            ]),
-            LogicalPlan::StatCorr(s) => StructType::new(vec![
-                StructField::nullable(format!("corr({}, {})", s.col1, s.col2), DataType::Double),
-            ]),
+            LogicalPlan::StatCov(s) => StructType::new(vec![StructField::nullable(
+                format!("cov({}, {})", s.col1, s.col2),
+                DataType::Double,
+            )]),
+            LogicalPlan::StatCorr(s) => StructType::new(vec![StructField::nullable(
+                format!("corr({}, {})", s.col1, s.col2),
+                DataType::Double,
+            )]),
             // ApproxQuantile returns one column of ARRAY<DOUBLE>, one row per input column.
-            LogicalPlan::ApproxQuantile(_) => StructType::new(vec![
-                StructField::nullable("quantiles".to_string(), DataType::Array(Box::new(DataType::Double), true)),
-            ]),
+            LogicalPlan::ApproxQuantile(_) => StructType::new(vec![StructField::nullable(
+                "quantiles".to_string(),
+                DataType::Array(Box::new(DataType::Double), true),
+            )]),
             // Crosstab: pivot columns unknown at plan time → DuckDB fallback.
             LogicalPlan::StatCrosstab(_) => StructType::empty(),
             // FreqItems: one Array<String> column per input col, named "{col}_freqItems".
             LogicalPlan::StatFreqItems(s) => StructType::new(
-                s.cols.iter()
-                    .map(|c| StructField::nullable(
-                        format!("{}_freqItems", c),
-                        DataType::Array(Box::new(DataType::String), true),
-                    ))
-                    .collect()
+                s.cols
+                    .iter()
+                    .map(|c| {
+                        StructField::nullable(
+                            format!("{}_freqItems", c),
+                            DataType::Array(Box::new(DataType::String), true),
+                        )
+                    })
+                    .collect(),
             ),
             // SampleBy: same schema as input.
             LogicalPlan::StatSampleBy(s) => s.input.infer_schema(),
@@ -864,14 +917,19 @@ impl LogicalPlan {
 
 fn infer_project_schema(p: &Project) -> StructType {
     let child_schema = p.input.infer_schema();
-    let has_star = p.projections.iter().any(|e| matches!(e, Expression::Star(_)));
+    let has_star = p
+        .projections
+        .iter()
+        .any(|e| matches!(e, Expression::Star(_)));
     // If we have a wildcard but can't statically resolve the child schema (e.g. TableScan),
     // collect explicitly computed (non-star) projections with known types and return them
     // alongside a sentinel Unresolved field. The sentinel forces `has_unresolved = true` in
     // service.rs, triggering DuckDB schema lookup; the name-based merge then overlays the
     // computed types (e.g. row_number → Integer) onto DuckDB's full expanded schema.
     if has_star && child_schema.is_empty() {
-        let mut computed: Vec<StructField> = p.projections.iter()
+        let mut computed: Vec<StructField> = p
+            .projections
+            .iter()
             .filter(|e| !matches!(e, Expression::Star(_)))
             .filter_map(|e| projection_to_field(e, &child_schema))
             .filter(|f| !f.data_type.contains_unresolved())
@@ -938,7 +996,11 @@ fn projection_to_field(expr: &Expression, schema: &StructType) -> Option<StructF
         }
         other => {
             let dt = other.data_type(schema);
-            Some(StructField::new(spark_column_name(other), dt, other.nullable(schema)))
+            Some(StructField::new(
+                spark_column_name(other),
+                dt,
+                other.nullable(schema),
+            ))
         }
     }
 }
@@ -954,12 +1016,22 @@ pub fn spark_column_name(expr: &Expression) -> String {
             // Spark names unaliased count(*) as "count(1)".
             // The sql_converter converts count(*) → count(1) (Literal::int(1)), so match both.
             let is_count_star = f.name.eq_ignore_ascii_case("count")
-                && f.args.iter().any(|a| matches!(a,
-                    Expression::Star(_)
-                    | Expression::Literal(crate::expression::Literal { value: crate::expression::LiteralValue::Int(1), .. })
-                ));
-            if is_count_star { return "count(1)".to_string(); }
-            let args = f.args.iter()
+                && f.args.iter().any(|a| {
+                    matches!(
+                        a,
+                        Expression::Star(_)
+                            | Expression::Literal(crate::expression::Literal {
+                                value: crate::expression::LiteralValue::Int(1),
+                                ..
+                            })
+                    )
+                });
+            if is_count_star {
+                return "count(1)".to_string();
+            }
+            let args = f
+                .args
+                .iter()
                 .map(spark_column_name)
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1015,7 +1087,10 @@ pub fn spark_column_name(expr: &Expression) -> String {
             if let Some(as_pos) = sql_upper.rfind(" AS ") {
                 let candidate = sql[as_pos + 4..].trim();
                 // Strip double-quote wrapping for quoted identifiers (e.g. `"key"` → `key`).
-                let unquoted = if candidate.starts_with('"') && candidate.ends_with('"') && candidate.len() > 2 {
+                let unquoted = if candidate.starts_with('"')
+                    && candidate.ends_with('"')
+                    && candidate.len() > 2
+                {
                     &candidate[1..candidate.len() - 1]
                 } else {
                     candidate
@@ -1062,8 +1137,12 @@ fn infer_aggregate_schema(a: &Aggregate) -> StructType {
         // If no grouping column appears in select_order (e.g. groupBy().count() shorthand),
         // prepend all grouping columns so the schema matches the actual SELECT output.
         // GroupingNotSelected suppresses the prepend for SQL path (GROUP BY not in SELECT).
-        let has_grouping_in_order = a.select_order.iter()
-            .any(|e| matches!(e, SelectEntry::GroupingExpr(_) | SelectEntry::GroupingNotSelected));
+        let has_grouping_in_order = a.select_order.iter().any(|e| {
+            matches!(
+                e,
+                SelectEntry::GroupingExpr(_) | SelectEntry::GroupingNotSelected
+            )
+        });
         if !has_grouping_in_order {
             for e in &a.grouping {
                 if let Some(f) = projection_to_field(e, &child_schema) {
@@ -1078,11 +1157,9 @@ fn infer_aggregate_schema(a: &Aggregate) -> StructType {
                         fields.push(f);
                     }
                 }
-                SelectEntry::AggregateExpr(idx) => {
-                    if let Some(agg) = a.aggregates.get(*idx) {
-                        if let Some(f) = agg_expr_to_field(&agg.func, &child_schema) {
-                            fields.push(f);
-                        }
+                SelectEntry::AggregateExpr(agg) => {
+                    if let Some(f) = agg_expr_to_field(&agg.func, &child_schema) {
+                        fields.push(f);
                     }
                 }
                 SelectEntry::GroupingNotSelected => {}
@@ -1147,7 +1224,11 @@ fn agg_expr_to_field(expr: &Expression, schema: &StructType) -> Option<StructFie
                 &f.name,
                 arg_types.first().unwrap_or(&DataType::Unresolved),
             );
-            Some(StructField::new(spark_column_name(expr), dt, expr.nullable(schema)))
+            Some(StructField::new(
+                spark_column_name(expr),
+                dt,
+                expr.nullable(schema),
+            ))
         }
         other => projection_to_field(other, schema),
     }
@@ -1185,7 +1266,9 @@ fn infer_with_columns_schema(w: &WithColumns) -> StructType {
             if let Some(idx) = schema.field_index(new_name) {
                 schema.fields[idx] = StructField::new(new_name.clone(), dt, nullable);
             } else {
-                schema.fields.push(StructField::new(new_name.clone(), dt, nullable));
+                schema
+                    .fields
+                    .push(StructField::new(new_name.clone(), dt, nullable));
             }
         }
     }
@@ -1199,9 +1282,14 @@ fn infer_to_dataframe_schema(t: &ToDataFrame) -> StructType {
         return child;
     }
     let extra_start = t.column_names.len().min(child.fields.len());
-    let mut fields: Vec<StructField> = child.fields.into_iter()
+    let mut fields: Vec<StructField> = child
+        .fields
+        .into_iter()
         .zip(t.column_names.iter())
-        .map(|(mut f, name)| { f.name = name.clone(); f })
+        .map(|(mut f, name)| {
+            f.name = name.clone();
+            f
+        })
         .collect();
     // Extra names beyond child column count → String fields (matches Java behaviour)
     for name in t.column_names.iter().skip(extra_start) {
@@ -1216,17 +1304,30 @@ use crate::types::data_type::PipeIfUnresolved;
 
 impl LogicalPlan {
     pub fn table_scan(table: impl Into<String>) -> Self {
-        LogicalPlan::TableScan(TableScan { table: table.into(), alias: None, schema: Default::default() })
+        LogicalPlan::TableScan(TableScan {
+            table: table.into(),
+            alias: None,
+            schema: Default::default(),
+        })
     }
     pub fn filter(input: LogicalPlan, condition: Expression) -> Self {
-        LogicalPlan::Filter(Filter { input: Box::new(input), condition })
+        LogicalPlan::Filter(Filter {
+            input: Box::new(input),
+            condition,
+        })
     }
     pub fn project(input: LogicalPlan, projections: Vec<Expression>) -> Self {
-        LogicalPlan::Project(Project { input: Box::new(input), projections })
+        LogicalPlan::Project(Project {
+            input: Box::new(input),
+            projections,
+        })
     }
     pub fn limit(input: LogicalPlan, n: i64) -> Self {
         use crate::expression::Literal;
-        LogicalPlan::Limit(Limit { input: Box::new(input), limit: Literal::long(n) })
+        LogicalPlan::Limit(Limit {
+            input: Box::new(input),
+            limit: Literal::long(n),
+        })
     }
 
     /// Collect pivot grouping column nullable overrides from any `Pivot` node
@@ -1251,9 +1352,7 @@ impl LogicalPlan {
                             Expression::Alias(a) => Some(a.alias.clone()),
                             _ => None,
                         };
-                        name.and_then(|n| {
-                            input_schema.field_by_name(&n).map(|f| (n, f.nullable))
-                        })
+                        name.and_then(|n| input_schema.field_by_name(&n).map(|f| (n, f.nullable)))
                     })
                     .collect()
             }
@@ -1401,19 +1500,13 @@ mod tests {
         let project = LogicalPlan::project(leaf, vec![]);
         assert_eq!(project.depth(), 2);
 
-        let filtered = LogicalPlan::filter(
-            project,
-            Literal::boolean(true),
-        );
+        let filtered = LogicalPlan::filter(project, Literal::boolean(true));
         assert_eq!(filtered.depth(), 3);
     }
 
     #[test]
     fn depth_join_takes_max_of_children() {
-        let left = LogicalPlan::project(
-            LogicalPlan::table_scan("a"),
-            vec![],
-        );
+        let left = LogicalPlan::project(LogicalPlan::table_scan("a"), vec![]);
         // left depth = 2
         let right = LogicalPlan::table_scan("b");
         // right depth = 1
@@ -1446,12 +1539,10 @@ mod tests {
         });
         LogicalPlan::Pivot(Pivot {
             input: Box::new(input),
-            grouping: vec![
-                Expression::UnresolvedColumn(UnresolvedColumn {
-                    name: "product".to_owned(),
-                    qualifier: None,
-                }),
-            ],
+            grouping: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "product".to_owned(),
+                qualifier: None,
+            })],
             pivot_col: Expression::UnresolvedColumn(UnresolvedColumn {
                 name: "region".to_owned(),
                 qualifier: None,

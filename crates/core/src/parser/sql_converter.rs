@@ -1,31 +1,37 @@
 //! SqlConverter: sqlparser-rs AST → Thunderduck LogicalPlan + Expression.
 
-use sqlparser::ast::{
-    AccessExpr, AlterTableOperation, ArrayElemTypeDef, BinaryOperator, CastKind,
-    DataType as SqlDataType, DuplicateTreatment, ExactNumberInfo, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause,
-    ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, SetQuantifier, Statement, Subscript, TableFactor,
-    TableObject, TableWithJoins, UnaryOperator, Value, ValueWithSpan, WindowFrameBound,
-    WindowFrameUnits, WindowSpec, WindowType,
-};
 use crate::error::{Result, ThunderduckError};
 use crate::expression::*;
 use crate::logical::*;
 use crate::types::{DataType, StructType};
+use sqlparser::ast::{
+    AccessExpr, AlterTableOperation, ArrayElemTypeDef, BinaryOperator, CastKind,
+    DataType as SqlDataType, DateTimeField, DuplicateTreatment, ExactNumberInfo, Expr, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator,
+    LimitClause, ObjectName, ObjectNamePart, ObjectType, OrderByExpr, OrderByKind, Query, Select,
+    SelectItem, SelectItemQualifiedWildcardKind, SetExpr, SetQuantifier, Statement, Subscript,
+    TableFactor, TableObject, TableWithJoins, UnaryOperator, Value, ValueWithSpan,
+    WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
+};
 
 pub struct SqlConverter;
 
 impl SqlConverter {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     pub fn convert_statement(&self, stmt: Statement) -> Result<LogicalPlan> {
         match stmt {
             Statement::Query(q) => self.convert_query(*q),
 
             // ── 6A: DDL statements ────────────────────────────────────────
-
-            Statement::Drop { object_type: ObjectType::Table, if_exists, names, .. } => {
+            Statement::Drop {
+                object_type: ObjectType::Table,
+                if_exists,
+                names,
+                ..
+            } => {
                 let name = self.object_name_to_string(&names[0]);
                 Ok(LogicalPlan::DdlStatement(DdlStatement {
                     operation: DdlOperation::DropTable {
@@ -35,7 +41,12 @@ impl SqlConverter {
                 }))
             }
 
-            Statement::Drop { object_type: ObjectType::View, if_exists, names, .. } => {
+            Statement::Drop {
+                object_type: ObjectType::View,
+                if_exists,
+                names,
+                ..
+            } => {
                 let name = self.object_name_to_string(&names[0]);
                 Ok(LogicalPlan::DdlStatement(DdlStatement {
                     operation: DdlOperation::DropView {
@@ -69,13 +80,22 @@ impl SqlConverter {
 
             Statement::CreateTable(ct) => {
                 let table_name = self.object_name_to_quoted_string(&ct.name);
-                let if_not_exists = if ct.if_not_exists { " IF NOT EXISTS" } else { "" };
+                let if_not_exists = if ct.if_not_exists {
+                    " IF NOT EXISTS"
+                } else {
+                    ""
+                };
                 let sql = if let Some(query) = ct.query {
                     let inner = self.convert_query(*query)?;
                     let inner_sql = self.plan_to_sql(&inner)?;
-                    format!("CREATE TABLE{} {} AS ({})", if_not_exists, table_name, inner_sql)
+                    format!(
+                        "CREATE TABLE{} {} AS ({})",
+                        if_not_exists, table_name, inner_sql
+                    )
                 } else {
-                    let cols: Vec<String> = ct.columns.iter()
+                    let cols: Vec<String> = ct
+                        .columns
+                        .iter()
                         .map(|c| {
                             let col_name = format!("\"{}\"", c.name.value);
                             let col_type = self.sql_data_type_to_duckdb_string(&c.data_type);
@@ -83,8 +103,13 @@ impl SqlConverter {
                         })
                         .collect();
                     let or_replace = if ct.or_replace { " OR REPLACE" } else { "" };
-                    format!("CREATE{} TABLE{} {} ({})",
-                        or_replace, if_not_exists, table_name, cols.join(", "))
+                    format!(
+                        "CREATE{} TABLE{} {} ({})",
+                        or_replace,
+                        if_not_exists,
+                        table_name,
+                        cols.join(", ")
+                    )
                 };
                 Ok(LogicalPlan::DdlStatement(DdlStatement {
                     operation: DdlOperation::CreateTable { sql },
@@ -99,7 +124,9 @@ impl SqlConverter {
                 let cols_clause = if insert.columns.is_empty() {
                     String::new()
                 } else {
-                    let cols: Vec<String> = insert.columns.iter()
+                    let cols: Vec<String> = insert
+                        .columns
+                        .iter()
                         .map(|c| format!("\"{}\"", c.value))
                         .collect();
                     format!(" ({})", cols.join(", "))
@@ -110,7 +137,7 @@ impl SqlConverter {
                     format!("INSERT INTO {}{} {}", table_name, cols_clause, inner_sql)
                 } else {
                     return Err(ThunderduckError::Unsupported(
-                        "INSERT without source query not supported".to_string()
+                        "INSERT without source query not supported".to_string(),
                     ));
                 };
                 Ok(LogicalPlan::DdlStatement(DdlStatement {
@@ -127,7 +154,9 @@ impl SqlConverter {
                         },
                     }))
                 } else {
-                    Err(ThunderduckError::Unsupported("TRUNCATE with no table".to_string()))
+                    Err(ThunderduckError::Unsupported(
+                        "TRUNCATE with no table".to_string(),
+                    ))
                 }
             }
 
@@ -135,45 +164,68 @@ impl SqlConverter {
                 let table_name = self.object_name_to_quoted_string(&at.name);
                 if let Some(op) = at.operations.first() {
                     let sql = match op {
-                        AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                        AlterTableOperation::RenameColumn {
+                            old_column_name,
+                            new_column_name,
+                        } => {
                             format!(
                                 "ALTER TABLE {} RENAME COLUMN \"{}\" TO \"{}\"",
-                                table_name,
-                                old_column_name.value,
-                                new_column_name.value,
+                                table_name, old_column_name.value, new_column_name.value,
                             )
                         }
                         AlterTableOperation::AddColumn { column_def, .. } => {
                             let col_name = format!("\"{}\"", column_def.name.value);
-                            let col_type = self.sql_data_type_to_duckdb_string(&column_def.data_type);
-                            format!("ALTER TABLE {} ADD COLUMN {} {}", table_name, col_name, col_type)
+                            let col_type =
+                                self.sql_data_type_to_duckdb_string(&column_def.data_type);
+                            format!(
+                                "ALTER TABLE {} ADD COLUMN {} {}",
+                                table_name, col_name, col_type
+                            )
                         }
-                        AlterTableOperation::DropColumn { column_names, if_exists, .. } => {
+                        AlterTableOperation::DropColumn {
+                            column_names,
+                            if_exists,
+                            ..
+                        } => {
                             let ie = if *if_exists { " IF EXISTS" } else { "" };
-                            let cols: Vec<String> = column_names.iter().map(|c| format!("\"{}\"", c.value)).collect();
-                            format!("ALTER TABLE {} DROP COLUMN{} {}", table_name, ie, cols.join(", "))
+                            let cols: Vec<String> = column_names
+                                .iter()
+                                .map(|c| format!("\"{}\"", c.value))
+                                .collect();
+                            format!(
+                                "ALTER TABLE {} DROP COLUMN{} {}",
+                                table_name,
+                                ie,
+                                cols.join(", ")
+                            )
                         }
-                        AlterTableOperation::RenameTable { table_name: new_name } => {
+                        AlterTableOperation::RenameTable {
+                            table_name: new_name,
+                        } => {
                             let new = new_name.to_string();
                             format!("ALTER TABLE {} RENAME TO {}", table_name, new)
                         }
                         other => {
-                            return Err(ThunderduckError::Unsupported(
-                                format!("ALTER TABLE operation not supported: {:?}", other)
-                            ));
+                            return Err(ThunderduckError::Unsupported(format!(
+                                "ALTER TABLE operation not supported: {:?}",
+                                other
+                            )));
                         }
                     };
                     Ok(LogicalPlan::DdlStatement(DdlStatement {
                         operation: DdlOperation::AlterTable { sql },
                     }))
                 } else {
-                    Err(ThunderduckError::Unsupported("ALTER TABLE with no operations".to_string()))
+                    Err(ThunderduckError::Unsupported(
+                        "ALTER TABLE with no operations".to_string(),
+                    ))
                 }
             }
 
-            other => Err(ThunderduckError::Unsupported(
-                format!("SQL statement type not yet supported: {}", other.to_string().split_whitespace().next().unwrap_or("?"))
-            )),
+            other => Err(ThunderduckError::Unsupported(format!(
+                "SQL statement type not yet supported: {}",
+                other.to_string().split_whitespace().next().unwrap_or("?")
+            ))),
         }
     }
 
@@ -201,7 +253,8 @@ impl SqlConverter {
         };
         let (limit_expr_opt, offset_opt) = self.extract_limit_offset(&query.limit_clause);
 
-        let inner = self.convert_set_expr(*query.body, &order_by_exprs, limit_expr_opt, offset_opt)?;
+        let inner =
+            self.convert_set_expr(*query.body, &order_by_exprs, limit_expr_opt, offset_opt)?;
 
         if ctes.is_empty() {
             Ok(inner)
@@ -237,10 +290,18 @@ impl SqlConverter {
             SetExpr::Select(sel) => {
                 self.convert_select_body(*sel, order_by.to_vec(), limit, offset)
             }
-            SetExpr::SetOperation { op, set_quantifier, left, right } => {
+            SetExpr::SetOperation {
+                op,
+                set_quantifier,
+                left,
+                right,
+            } => {
                 let left_plan = self.convert_set_expr(*left, &[], None, None)?;
                 let right_plan = self.convert_set_expr(*right, &[], None, None)?;
-                let all = matches!(set_quantifier, SetQuantifier::All | SetQuantifier::AllByName);
+                let all = matches!(
+                    set_quantifier,
+                    SetQuantifier::All | SetQuantifier::AllByName
+                );
                 let base = match op {
                     sqlparser::ast::SetOperator::Union => LogicalPlan::Union(Union {
                         left: Box::new(left_plan),
@@ -270,10 +331,16 @@ impl SqlConverter {
                 // can propagate column names + nullable=false to callers (e.g. analyze_plan).
                 let schema = if let Some(first_row) = values.rows.first() {
                     use crate::types::StructField;
-                    let fields: Vec<StructField> = first_row.iter().enumerate()
+                    let fields: Vec<StructField> = first_row
+                        .iter()
+                        .enumerate()
                         .map(|(i, expr)| {
                             let (dt, nullable) = infer_value_literal_type(expr);
-                            StructField { name: format!("col_{i}"), data_type: dt, nullable }
+                            StructField {
+                                name: format!("col_{i}"),
+                                data_type: dt,
+                                nullable,
+                            }
                         })
                         .collect();
                     StructType::new(fields)
@@ -283,11 +350,14 @@ impl SqlConverter {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql: format!("{}", values),
                     schema,
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
-            other => Err(ThunderduckError::Unsupported(format!("set expression not supported: {:?}", other))),
+            other => Err(ThunderduckError::Unsupported(format!(
+                "set expression not supported: {:?}",
+                other
+            ))),
         }
     }
 
@@ -309,14 +379,19 @@ impl SqlConverter {
             base
         };
 
-        let has_group_by = !matches!(&select.group_by, GroupByExpr::Expressions(v, _) if v.is_empty());
+        let has_group_by =
+            !matches!(&select.group_by, GroupByExpr::Expressions(v, _) if v.is_empty());
         let has_aggregates = has_group_by
-            || select.projection.iter().any(|item| self.select_item_has_aggregate(item));
+            || select
+                .projection
+                .iter()
+                .any(|item| self.select_item_has_aggregate(item));
 
         let plan = if has_aggregates {
             self.convert_aggregate_select(base, &select.projection, select.group_by, select.having)?
         } else {
-            let projections: Result<Vec<Expression>> = select.projection
+            let projections: Result<Vec<Expression>> = select
+                .projection
                 .into_iter()
                 .map(|item| self.convert_select_item(item))
                 .collect();
@@ -328,7 +403,10 @@ impl SqlConverter {
             });
 
             if select.distinct.is_some() {
-                LogicalPlan::Distinct(Distinct { input: Box::new(projected), columns: vec![] })
+                LogicalPlan::Distinct(Distinct {
+                    input: Box::new(projected),
+                    columns: vec![],
+                })
             } else {
                 projected
             }
@@ -341,7 +419,8 @@ impl SqlConverter {
         if from.is_empty() {
             return Ok(LogicalPlan::SingleRow(SingleRowRelation));
         }
-        let mut plans = from.into_iter()
+        let mut plans = from
+            .into_iter()
             .map(|twj| self.convert_table_with_joins(twj))
             .collect::<Result<Vec<_>>>()?;
 
@@ -365,7 +444,8 @@ impl SqlConverter {
         let mut plan = self.convert_table_factor(twj.relation)?;
         for join in twj.joins {
             let right = self.convert_table_factor(join.relation)?;
-            let (join_type, condition, using_columns) = self.convert_join_operator(join.join_operator)?;
+            let (join_type, condition, using_columns) =
+                self.convert_join_operator(join.join_operator)?;
             plan = LogicalPlan::Join(Join {
                 left: Box::new(plan),
                 right: Box::new(right),
@@ -386,9 +466,15 @@ impl SqlConverter {
             TableFactor::Table { name, alias, .. } => {
                 let table = self.object_name_to_string(&name);
                 let alias_str = alias.map(|a| a.name.value);
-                Ok(LogicalPlan::TableScan(TableScan { table, alias: alias_str, schema: Default::default() }))
+                Ok(LogicalPlan::TableScan(TableScan {
+                    table,
+                    alias: alias_str,
+                    schema: Default::default(),
+                }))
             }
-            TableFactor::Derived { subquery, alias, .. } => {
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
                 let inner = self.convert_query(*subquery)?;
                 let (alias_str, column_aliases) = match alias {
                     Some(a) => {
@@ -405,16 +491,22 @@ impl SqlConverter {
                 }))
             }
             // 6D: LATERAL EXPLODE / table functions → SqlRelation with UNNEST
-            TableFactor::Function { name, args, alias, .. } => {
+            TableFactor::Function {
+                name, args, alias, ..
+            } => {
                 let func_name = self.object_name_to_string(&name).to_lowercase();
                 // Convert function args to SQL
-                let arg_sqls: Result<Vec<String>> = args.iter()
+                let arg_sqls: Result<Vec<String>> = args
+                    .iter()
                     .map(|a| match a {
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
                             let converted = self.convert_expr(e.clone())?;
                             SqlConverter::expr_display(&converted)
                         }
-                        FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. } => {
+                        FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        } => {
                             let converted = self.convert_expr(e.clone())?;
                             SqlConverter::expr_display(&converted)
                         }
@@ -422,24 +514,37 @@ impl SqlConverter {
                     })
                     .collect();
                 let arg_sqls = arg_sqls?;
-                let alias_str = alias.as_ref().map(|a| {
-                    let col_aliases = a.columns.iter()
-                        .map(|c| format!("\"{}\"", c.name.value))
-                        .collect::<Vec<_>>();
-                    if col_aliases.is_empty() {
-                        format!(" AS \"{}\"", a.name.value)
-                    } else {
-                        format!(" AS \"{}\"({})", a.name.value, col_aliases.join(", "))
-                    }
-                }).unwrap_or_default();
+                let alias_str = alias
+                    .as_ref()
+                    .map(|a| {
+                        let col_aliases = a
+                            .columns
+                            .iter()
+                            .map(|c| format!("\"{}\"", c.name.value))
+                            .collect::<Vec<_>>();
+                        if col_aliases.is_empty() {
+                            format!(" AS \"{}\"", a.name.value)
+                        } else {
+                            format!(" AS \"{}\"({})", a.name.value, col_aliases.join(", "))
+                        }
+                    })
+                    .unwrap_or_default();
 
                 let duckdb_sql = match func_name.as_str() {
                     "explode" | "explode_outer" => {
-                        let outer = if func_name == "explode_outer" { " true" } else { "" };
+                        let outer = if func_name == "explode_outer" {
+                            " true"
+                        } else {
+                            ""
+                        };
                         format!("UNNEST([{}]{}){}", arg_sqls.join(", "), outer, alias_str)
                     }
                     "posexplode" | "posexplode_outer" => {
-                        format!("UNNEST([{}]) WITH ORDINALITY{}", arg_sqls.join(", "), alias_str)
+                        format!(
+                            "UNNEST([{}]) WITH ORDINALITY{}",
+                            arg_sqls.join(", "),
+                            alias_str
+                        )
                     }
                     other => {
                         // Generic table function passthrough
@@ -449,30 +554,56 @@ impl SqlConverter {
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql: format!("SELECT * FROM {}", duckdb_sql),
                     schema: StructType::empty(),
-                    duckdb_ready: false,
+                    duckdb_ready: true,
                     view_name: None,
                 }))
             }
-            TableFactor::UNNEST { alias, array_exprs, with_offset, with_ordinality, .. } => {
-                let exprs: Result<Vec<String>> = array_exprs.into_iter()
+            TableFactor::UNNEST {
+                alias,
+                array_exprs,
+                with_offset,
+                with_ordinality,
+                ..
+            } => {
+                let exprs: Result<Vec<String>> = array_exprs
+                    .into_iter()
                     .map(|e| {
                         let converted = self.convert_expr(e)?;
                         SqlConverter::expr_display(&converted)
                     })
                     .collect();
-                let alias_str = alias.map(|a| format!(" AS \"{}\"", a.name.value)).unwrap_or_default();
-                let ordinality = if with_offset || with_ordinality { " WITH ORDINALITY" } else { "" };
-                let sql = format!("SELECT * FROM UNNEST({}){}{}", exprs?.join(", "), alias_str, ordinality);
+                let alias_str = alias
+                    .map(|a| format!(" AS \"{}\"", a.name.value))
+                    .unwrap_or_default();
+                let ordinality = if with_offset || with_ordinality {
+                    " WITH ORDINALITY"
+                } else {
+                    ""
+                };
+                let sql = format!(
+                    "SELECT * FROM UNNEST({}){}{}",
+                    exprs?.join(", "),
+                    alias_str,
+                    ordinality
+                );
                 Ok(LogicalPlan::SqlRelation(SqlRelation {
                     sql,
                     schema: StructType::empty(),
-                    duckdb_ready: false, view_name: None, }))
+                    duckdb_ready: true,
+                    view_name: None,
+                }))
             }
-            other => Err(ThunderduckError::Unsupported(format!("table factor not supported: {:?}", other))),
+            other => Err(ThunderduckError::Unsupported(format!(
+                "table factor not supported: {:?}",
+                other
+            ))),
         }
     }
 
-    fn convert_join_operator(&self, op: JoinOperator) -> Result<(JoinType, Option<Expression>, Vec<String>)> {
+    fn convert_join_operator(
+        &self,
+        op: JoinOperator,
+    ) -> Result<(JoinType, Option<Expression>, Vec<String>)> {
         match op {
             JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
                 let (cond, using) = self.convert_join_constraint(constraint)?;
@@ -502,18 +633,23 @@ impl SqlConverter {
                 let (cond, using) = self.convert_join_constraint(constraint)?;
                 Ok((JoinType::LeftAnti, cond, using))
             }
-            other => Err(ThunderduckError::Unsupported(format!("join operator not supported: {:?}", other))),
+            other => Err(ThunderduckError::Unsupported(format!(
+                "join operator not supported: {:?}",
+                other
+            ))),
         }
     }
 
-    fn convert_join_constraint(&self, constraint: JoinConstraint) -> Result<(Option<Expression>, Vec<String>)> {
+    fn convert_join_constraint(
+        &self,
+        constraint: JoinConstraint,
+    ) -> Result<(Option<Expression>, Vec<String>)> {
         match constraint {
             JoinConstraint::On(expr) => Ok((Some(self.convert_expr(expr)?), vec![])),
             JoinConstraint::Using(cols) => {
                 // Each col is an ObjectName in sqlparser 0.61
-                let names: Vec<String> = cols.iter()
-                    .map(|c| self.object_name_to_string(c))
-                    .collect();
+                let names: Vec<String> =
+                    cols.iter().map(|c| self.object_name_to_string(c)).collect();
                 Ok((None, names))
             }
             JoinConstraint::Natural => Ok((None, vec![])),
@@ -542,10 +678,21 @@ impl SqlConverter {
             Expr::UnaryOp { expr, .. } => self.expr_has_aggregate(expr),
             Expr::Nested(e) => self.expr_has_aggregate(e),
             Expr::Cast { expr, .. } => self.expr_has_aggregate(expr),
-            Expr::Case { operand, conditions, else_result, .. } => {
-                operand.as_ref().map_or(false, |e| self.expr_has_aggregate(e))
-                    || conditions.iter().any(|c| self.expr_has_aggregate(&c.condition) || self.expr_has_aggregate(&c.result))
-                    || else_result.as_ref().map_or(false, |e| self.expr_has_aggregate(e))
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                operand
+                    .as_ref()
+                    .map_or(false, |e| self.expr_has_aggregate(e))
+                    || conditions.iter().any(|c| {
+                        self.expr_has_aggregate(&c.condition) || self.expr_has_aggregate(&c.result)
+                    })
+                    || else_result
+                        .as_ref()
+                        .map_or(false, |e| self.expr_has_aggregate(e))
             }
             _ => false,
         }
@@ -554,13 +701,45 @@ impl SqlConverter {
     fn is_aggregate_function(&self, name: &str) -> bool {
         matches!(
             name.to_uppercase().as_str(),
-            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP"
-            | "VARIANCE" | "VAR_POP" | "VAR_SAMP" | "COLLECT_LIST" | "COLLECT_SET"
-            | "FIRST" | "LAST" | "FIRST_VALUE" | "LAST_VALUE" | "ANY_VALUE"
-            | "APPROX_COUNT_DISTINCT" | "PERCENTILE_APPROX" | "CORR" | "COVAR_POP" | "COVAR_SAMP"
-            | "KURTOSIS" | "SKEWNESS" | "REGR_AVGX" | "REGR_AVGY" | "REGR_COUNT"
-            | "REGR_INTERCEPT" | "REGR_R2" | "REGR_SLOPE" | "REGR_SXX" | "REGR_SXY" | "REGR_SYY"
-            | "BIT_AND" | "BIT_OR" | "BIT_XOR" | "BOOL_AND" | "BOOL_OR"
+            "COUNT"
+                | "SUM"
+                | "AVG"
+                | "MIN"
+                | "MAX"
+                | "STDDEV"
+                | "STDDEV_POP"
+                | "STDDEV_SAMP"
+                | "VARIANCE"
+                | "VAR_POP"
+                | "VAR_SAMP"
+                | "COLLECT_LIST"
+                | "COLLECT_SET"
+                | "FIRST"
+                | "LAST"
+                | "FIRST_VALUE"
+                | "LAST_VALUE"
+                | "ANY_VALUE"
+                | "APPROX_COUNT_DISTINCT"
+                | "PERCENTILE_APPROX"
+                | "CORR"
+                | "COVAR_POP"
+                | "COVAR_SAMP"
+                | "KURTOSIS"
+                | "SKEWNESS"
+                | "REGR_AVGX"
+                | "REGR_AVGY"
+                | "REGR_COUNT"
+                | "REGR_INTERCEPT"
+                | "REGR_R2"
+                | "REGR_SLOPE"
+                | "REGR_SXX"
+                | "REGR_SXY"
+                | "REGR_SYY"
+                | "BIT_AND"
+                | "BIT_OR"
+                | "BIT_XOR"
+                | "BOOL_AND"
+                | "BOOL_OR"
         )
     }
 
@@ -587,14 +766,16 @@ impl SqlConverter {
 
                     if self.is_aggregate_top_level(expr) {
                         let (agg_expr, _agg_alias) = self.extract_aggregate(expr, alias)?;
-                        let idx = aggregates.len();
-                        aggregates.push(agg_expr);
-                        select_order.push(SelectEntry::AggregateExpr(idx));
+                        aggregates.push(agg_expr.clone());
+                        select_order.push(SelectEntry::AggregateExpr(agg_expr));
                     } else if self.expr_has_aggregate(expr) {
                         // Aggregate embedded in expression (e.g., sum(a) * 1.2)
                         let converted = self.convert_expr(expr.clone())?;
                         let aliased = if let Some(al) = alias {
-                            Expression::Alias(AliasExpression { expr: Box::new(converted), alias: al })
+                            Expression::Alias(AliasExpression {
+                                expr: Box::new(converted),
+                                alias: al,
+                            })
                         } else {
                             converted
                         };
@@ -602,7 +783,10 @@ impl SqlConverter {
                     } else {
                         let converted = self.convert_expr(expr.clone())?;
                         let aliased = if let Some(al) = alias {
-                            Expression::Alias(AliasExpression { expr: Box::new(converted), alias: al })
+                            Expression::Alias(AliasExpression {
+                                expr: Box::new(converted),
+                                alias: al,
+                            })
                         } else {
                             converted
                         };
@@ -610,14 +794,22 @@ impl SqlConverter {
                     }
                 }
                 SelectItem::Wildcard(_) => {
-                    select_order.push(SelectEntry::GroupingExpr(Expression::Star(StarExpression { qualifier: None })));
+                    select_order.push(SelectEntry::GroupingExpr(Expression::Star(
+                        StarExpression { qualifier: None },
+                    )));
                 }
                 SelectItem::QualifiedWildcard(kind, _) => {
                     let qualifier = match kind {
-                        SelectItemQualifiedWildcardKind::ObjectName(n) => self.object_name_to_string(n),
+                        SelectItemQualifiedWildcardKind::ObjectName(n) => {
+                            self.object_name_to_string(n)
+                        }
                         SelectItemQualifiedWildcardKind::Expr(e) => e.to_string(),
                     };
-                    select_order.push(SelectEntry::GroupingExpr(Expression::Star(StarExpression { qualifier: Some(qualifier) })));
+                    select_order.push(SelectEntry::GroupingExpr(Expression::Star(
+                        StarExpression {
+                            qualifier: Some(qualifier),
+                        },
+                    )));
                 }
             }
         }
@@ -626,7 +818,9 @@ impl SqlConverter {
 
         // If GROUP BY is non-empty but no grouping keys appear in the SELECT list, add a sentinel
         // to prevent gen_aggregate from auto-prepending the GROUP BY columns to the output.
-        let has_grouping_in_select = select_order.iter().any(|e| matches!(e, SelectEntry::GroupingExpr(_)));
+        let has_grouping_in_select = select_order
+            .iter()
+            .any(|e| matches!(e, SelectEntry::GroupingExpr(_)));
         if !grouping.is_empty() && !has_grouping_in_select {
             select_order.push(SelectEntry::GroupingNotSelected);
         }
@@ -643,12 +837,18 @@ impl SqlConverter {
 
     fn is_aggregate_top_level(&self, expr: &Expr) -> bool {
         match expr {
-            Expr::Function(f) => f.over.is_none() && self.is_aggregate_function(&f.name.to_string()),
+            Expr::Function(f) => {
+                f.over.is_none() && self.is_aggregate_function(&f.name.to_string())
+            }
             _ => false,
         }
     }
 
-    fn extract_aggregate(&self, expr: &Expr, outer_alias: Option<String>) -> Result<(AggregateExpr, Option<String>)> {
+    fn extract_aggregate(
+        &self,
+        expr: &Expr,
+        outer_alias: Option<String>,
+    ) -> Result<(AggregateExpr, Option<String>)> {
         match expr {
             Expr::Function(f) => {
                 let func_name = self.object_name_to_string(&f.name).to_lowercase();
@@ -659,7 +859,10 @@ impl SqlConverter {
                     distinct: is_distinct,
                 });
                 let func_expr = if let Some(al) = &outer_alias {
-                    Expression::Alias(AliasExpression { expr: Box::new(func_expr), alias: al.clone() })
+                    Expression::Alias(AliasExpression {
+                        expr: Box::new(func_expr),
+                        alias: al.clone(),
+                    })
                 } else {
                     func_expr
                 };
@@ -667,11 +870,17 @@ impl SqlConverter {
                 // would cause render_agg_expr to inject it a second time.
                 Ok((AggregateExpr::new(func_expr), outer_alias))
             }
-            other => Err(ThunderduckError::Unsupported(format!("expected aggregate function, got: {:?}", other))),
+            other => Err(ThunderduckError::Unsupported(format!(
+                "expected aggregate function, got: {:?}",
+                other
+            ))),
         }
     }
 
-    fn convert_group_by(&self, group_by: GroupByExpr) -> Result<(Vec<Expression>, Option<GroupingSets>)> {
+    fn convert_group_by(
+        &self,
+        group_by: GroupByExpr,
+    ) -> Result<(Vec<Expression>, Option<GroupingSets>)> {
         match group_by {
             GroupByExpr::Expressions(exprs, _modifiers) => {
                 let mut plain = vec![];
@@ -679,13 +888,17 @@ impl SqlConverter {
                 for e in exprs {
                     match e {
                         Expr::Rollup(sets) => {
-                            sets_opt = Some(GroupingSets::Rollup(self.convert_grouping_set_list(sets)?));
+                            sets_opt =
+                                Some(GroupingSets::Rollup(self.convert_grouping_set_list(sets)?));
                         }
                         Expr::Cube(sets) => {
-                            sets_opt = Some(GroupingSets::Cube(self.convert_grouping_set_list(sets)?));
+                            sets_opt =
+                                Some(GroupingSets::Cube(self.convert_grouping_set_list(sets)?));
                         }
                         Expr::GroupingSets(sets) => {
-                            sets_opt = Some(GroupingSets::GroupingSets(self.convert_grouping_set_list(sets)?));
+                            sets_opt = Some(GroupingSets::GroupingSets(
+                                self.convert_grouping_set_list(sets)?,
+                            ));
                         }
                         other => plain.push(self.convert_expr(other)?),
                     }
@@ -698,7 +911,11 @@ impl SqlConverter {
 
     fn convert_grouping_set_list(&self, sets: Vec<Vec<Expr>>) -> Result<Vec<Vec<Expression>>> {
         sets.into_iter()
-            .map(|row| row.into_iter().map(|e| self.convert_expr(e)).collect::<Result<Vec<_>>>())
+            .map(|row| {
+                row.into_iter()
+                    .map(|e| self.convert_expr(e))
+                    .collect::<Result<Vec<_>>>()
+            })
             .collect()
     }
 
@@ -744,7 +961,10 @@ impl SqlConverter {
                     }))
                 } else {
                     let name = values.into_iter().last().unwrap_or_default();
-                    Ok(Expression::UnresolvedColumn(UnresolvedColumn { name, qualifier: None }))
+                    Ok(Expression::UnresolvedColumn(UnresolvedColumn {
+                        name,
+                        qualifier: None,
+                    }))
                 }
             }
             Expr::Value(val) => self.convert_value_with_span(val),
@@ -756,22 +976,28 @@ impl SqlConverter {
                     right: Box::new(self.convert_expr(*right)?),
                 }))
             }
-            Expr::UnaryOp { op, expr } => {
-                match op {
-                    UnaryOperator::Not => Ok(Expression::Unary(UnaryExpression {
-                        op: UnaryOp::Not,
-                        operand: Box::new(self.convert_expr(*expr)?),
-                    })),
-                    UnaryOperator::Minus => Ok(Expression::Unary(UnaryExpression {
-                        op: UnaryOp::Negate,
-                        operand: Box::new(self.convert_expr(*expr)?),
-                    })),
-                    UnaryOperator::Plus => self.convert_expr(*expr),
-                    other => Err(ThunderduckError::Unsupported(format!("unary op not supported: {:?}", other))),
-                }
-            }
+            Expr::UnaryOp { op, expr } => match op {
+                UnaryOperator::Not => Ok(Expression::Unary(UnaryExpression {
+                    op: UnaryOp::Not,
+                    operand: Box::new(self.convert_expr(*expr)?),
+                })),
+                UnaryOperator::Minus => Ok(Expression::Unary(UnaryExpression {
+                    op: UnaryOp::Negate,
+                    operand: Box::new(self.convert_expr(*expr)?),
+                })),
+                UnaryOperator::Plus => self.convert_expr(*expr),
+                other => Err(ThunderduckError::Unsupported(format!(
+                    "unary op not supported: {:?}",
+                    other
+                ))),
+            },
             Expr::Nested(e) => self.convert_expr(*e),
-            Expr::Cast { kind, expr, data_type, .. } => {
+            Expr::Cast {
+                kind,
+                expr,
+                data_type,
+                ..
+            } => {
                 let try_cast = matches!(kind, CastKind::TryCast | CastKind::SafeCast);
                 Ok(Expression::Cast(CastExpression {
                     expr: Box::new(self.convert_expr(*expr)?),
@@ -780,32 +1006,64 @@ impl SqlConverter {
                 }))
             }
             Expr::Function(f) => self.convert_function(f),
-            Expr::Case { operand, conditions, else_result, .. } => {
-                let base = operand.map(|e| self.convert_expr(*e)).transpose()?.map(Box::new);
+            Expr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => {
+                let base = operand
+                    .map(|e| self.convert_expr(*e))
+                    .transpose()?
+                    .map(Box::new);
                 let branches: Result<Vec<(Expression, Expression)>> = conditions
                     .into_iter()
-                    .map(|c| Ok((self.convert_expr(c.condition)?, self.convert_expr(c.result)?)))
+                    .map(|c| {
+                        Ok((
+                            self.convert_expr(c.condition)?,
+                            self.convert_expr(c.result)?,
+                        ))
+                    })
                     .collect();
-                let else_expr = else_result.map(|e| self.convert_expr(*e)).transpose()?.map(Box::new);
-                Ok(Expression::CaseWhen(CaseWhenExpression { base, branches: branches?, else_expr }))
-            }
-            Expr::Between { expr, negated, low, high } => {
-                Ok(Expression::Between(BetweenExpression {
-                    expr: Box::new(self.convert_expr(*expr)?),
-                    low: Box::new(self.convert_expr(*low)?),
-                    high: Box::new(self.convert_expr(*high)?),
-                    negated,
+                let else_expr = else_result
+                    .map(|e| self.convert_expr(*e))
+                    .transpose()?
+                    .map(Box::new);
+                Ok(Expression::CaseWhen(CaseWhenExpression {
+                    base,
+                    branches: branches?,
+                    else_expr,
                 }))
             }
-            Expr::InList { expr, list, negated } => {
-                let converted_list: Result<Vec<Expression>> = list.into_iter().map(|e| self.convert_expr(e)).collect();
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => Ok(Expression::Between(BetweenExpression {
+                expr: Box::new(self.convert_expr(*expr)?),
+                low: Box::new(self.convert_expr(*low)?),
+                high: Box::new(self.convert_expr(*high)?),
+                negated,
+            })),
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let converted_list: Result<Vec<Expression>> =
+                    list.into_iter().map(|e| self.convert_expr(e)).collect();
                 Ok(Expression::InList(InListExpression {
                     expr: Box::new(self.convert_expr(*expr)?),
                     list: converted_list?,
                     negated,
                 }))
             }
-            Expr::InSubquery { expr, subquery, negated } => {
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
                 let subplan = self.convert_query(*subquery)?;
                 Ok(Expression::InSubquery(InSubquery {
                     expr: Box::new(self.convert_expr(*expr)?),
@@ -834,28 +1092,39 @@ impl SqlConverter {
                 op: UnaryOp::IsNotNull,
                 operand: Box::new(self.convert_expr(*e)?),
             })),
-            Expr::Like { expr, pattern, negated, .. } => {
-                Ok(Expression::Like(LikeExpression {
-                    value: Box::new(self.convert_expr(*expr)?),
-                    pattern: Box::new(self.convert_expr(*pattern)?),
-                    negated,
-                    case_insensitive: false,
-                }))
-            }
-            Expr::ILike { expr, pattern, negated, .. } => {
-                Ok(Expression::Like(LikeExpression {
-                    value: Box::new(self.convert_expr(*expr)?),
-                    pattern: Box::new(self.convert_expr(*pattern)?),
-                    negated,
-                    case_insensitive: true,
-                }))
-            }
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+                ..
+            } => Ok(Expression::Like(LikeExpression {
+                value: Box::new(self.convert_expr(*expr)?),
+                pattern: Box::new(self.convert_expr(*pattern)?),
+                negated,
+                case_insensitive: false,
+            })),
+            Expr::ILike {
+                expr,
+                pattern,
+                negated,
+                ..
+            } => Ok(Expression::Like(LikeExpression {
+                value: Box::new(self.convert_expr(*expr)?),
+                pattern: Box::new(self.convert_expr(*pattern)?),
+                negated,
+                case_insensitive: true,
+            })),
             Expr::Wildcard(_) => Ok(Expression::Star(StarExpression { qualifier: None })),
-            Expr::QualifiedWildcard(name, _) => {
-                Ok(Expression::Star(StarExpression { qualifier: Some(self.object_name_to_string(&name)) }))
-            }
+            Expr::QualifiedWildcard(name, _) => Ok(Expression::Star(StarExpression {
+                qualifier: Some(self.object_name_to_string(&name)),
+            })),
 
-            Expr::Substring { expr, substring_from, substring_for, .. } => {
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                ..
+            } => {
                 let mut args = vec![self.convert_expr(*expr)?];
                 if let Some(from) = substring_from {
                     args.push(self.convert_expr(*from)?);
@@ -863,24 +1132,23 @@ impl SqlConverter {
                 if let Some(for_len) = substring_for {
                     args.push(self.convert_expr(*for_len)?);
                 }
-                Ok(Expression::FunctionCall(FunctionCall { name: "substr".to_string(), args, distinct: false }))
-            }
-            Expr::Interval(interval) => {
-                let unit = interval.leading_field
-                    .map(|f| format!(" {}", f))
-                    .unwrap_or_default();
-                Ok(Expression::RawSql(RawSqlExpression {
-                    sql: format!("INTERVAL {}{}", interval.value, unit),
-                    data_type: None,
-                    nullable: Some(false), // interval literals are never null
+                Ok(Expression::FunctionCall(FunctionCall {
+                    name: "substr".to_string(),
+                    args,
+                    distinct: false,
                 }))
             }
+            Expr::Interval(interval) => self.convert_interval(interval),
             Expr::Extract { field, expr, .. } => {
                 let inner = self.convert_expr(*expr)?;
                 Ok(Expression::FunctionCall(FunctionCall {
                     name: "extract".to_string(),
                     args: vec![
-                        Expression::RawSql(RawSqlExpression { sql: format!("{}", field), data_type: None, nullable: None }),
+                        Expression::RawSql(RawSqlExpression {
+                            sql: format!("{}", field),
+                            data_type: None,
+                            nullable: None,
+                        }),
                         inner,
                     ],
                     distinct: false,
@@ -901,8 +1169,11 @@ impl SqlConverter {
                 }))
             }
             Expr::Tuple(exprs) => {
-                let converted: Result<Vec<Expression>> = exprs.into_iter().map(|e| self.convert_expr(e)).collect();
-                Ok(Expression::RowConstructor(RowConstructorExpression { fields: converted? }))
+                let converted: Result<Vec<Expression>> =
+                    exprs.into_iter().map(|e| self.convert_expr(e)).collect();
+                Ok(Expression::RowConstructor(RowConstructorExpression {
+                    fields: converted?,
+                }))
             }
             Expr::TypedString(ts) => {
                 // ts.value is a ValueWithSpan; .to_string() includes surrounding quote
@@ -954,28 +1225,38 @@ impl SqlConverter {
                 right: Box::new(Literal::boolean(true)),
             })),
 
-            // OVERLAY(str PLACING what FROM pos [FOR len]) — standard SQL, DuckDB-compatible
-            Expr::Overlay { expr, overlay_what, overlay_from, overlay_for } => {
-                let expr_sql = SqlConverter::expr_display(&self.convert_expr(*expr)?)?;
-                let what_sql = SqlConverter::expr_display(&self.convert_expr(*overlay_what)?)?;
-                let from_sql = SqlConverter::expr_display(&self.convert_expr(*overlay_from)?)?;
-                let for_clause = if let Some(for_expr) = overlay_for {
-                    let for_sql = SqlConverter::expr_display(&self.convert_expr(*for_expr)?)?;
-                    format!(" FOR {}", for_sql)
-                } else {
-                    String::new()
-                };
-                Ok(Expression::RawSql(RawSqlExpression {
-                    sql: format!("OVERLAY({} PLACING {} FROM {}{})",
-                        expr_sql, what_sql, from_sql, for_clause),
-                    data_type: None,
-                    nullable: None,
+            // OVERLAY(str PLACING what FROM pos [FOR len])
+            // Convert to FunctionCall so the FunctionRegistry custom handler
+            // translates it to DuckDB-compatible concat+substring.
+            Expr::Overlay {
+                expr,
+                overlay_what,
+                overlay_from,
+                overlay_for,
+            } => {
+                let mut args = vec![
+                    self.convert_expr(*expr)?,
+                    self.convert_expr(*overlay_what)?,
+                    self.convert_expr(*overlay_from)?,
+                ];
+                if let Some(for_expr) = overlay_for {
+                    args.push(self.convert_expr(*for_expr)?);
+                }
+                Ok(Expression::FunctionCall(FunctionCall {
+                    name: "overlay".to_owned(),
+                    args,
+                    distinct: false,
                 }))
             }
 
             other => Err(ThunderduckError::Unsupported(format!(
                 "expression not yet supported: {}",
-                other.to_string().split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+                other
+                    .to_string()
+                    .split_whitespace()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(" ")
             ))),
         }
     }
@@ -989,15 +1270,19 @@ impl SqlConverter {
             if name == "named_struct" {
                 // named_struct('key1', val1, 'key2', val2, ...)
                 if args.len() % 2 != 0 {
-                    return Err(ThunderduckError::Unsupported(
-                        format!("named_struct requires an even number of arguments, got {}", args.len())
-                    ));
+                    return Err(ThunderduckError::Unsupported(format!(
+                        "named_struct requires an even number of arguments, got {}",
+                        args.len()
+                    )));
                 }
                 let mut fields: Vec<(String, Expression)> = Vec::with_capacity(args.len() / 2);
                 let mut iter = args.into_iter();
                 while let (Some(key_expr), Some(val_expr)) = (iter.next(), iter.next()) {
                     let key = match key_expr {
-                        Expression::Literal(Literal { value: LiteralValue::String(s), .. }) => s,
+                        Expression::Literal(Literal {
+                            value: LiteralValue::String(s),
+                            ..
+                        }) => s,
                         other => {
                             // Fallback: render the expression as a string field name
                             format!("{:?}", other)
@@ -1005,20 +1290,27 @@ impl SqlConverter {
                     };
                     fields.push((key, val_expr));
                 }
-                return Ok(Expression::StructLiteral(StructLiteralExpression { fields }));
+                return Ok(Expression::StructLiteral(StructLiteralExpression {
+                    fields,
+                }));
             } else {
                 // struct(val1, val2, ...) — positional fields with generated names col1, col2...
-                let fields: Vec<(String, Expression)> = args.into_iter()
+                let fields: Vec<(String, Expression)> = args
+                    .into_iter()
                     .enumerate()
                     .map(|(i, e)| (format!("col{}", i + 1), e))
                     .collect();
-                return Ok(Expression::StructLiteral(StructLiteralExpression { fields }));
+                return Ok(Expression::StructLiteral(StructLiteralExpression {
+                    fields,
+                }));
             }
         }
 
         // Spark outputs COUNT(*) as column "count(1)" (not "count_star()").
         // Replace COUNT(*) with COUNT(1) for consistent column naming.
-        if name == "count" && !is_distinct && args.len() == 1
+        if name == "count"
+            && !is_distinct
+            && args.len() == 1
             && matches!(&args[0], Expression::Star(_))
         {
             args = vec![Literal::int(1)];
@@ -1034,7 +1326,11 @@ impl SqlConverter {
             return self.convert_window_from_over(func_expr, over);
         }
 
-        Ok(Expression::FunctionCall(FunctionCall { name, args, distinct: is_distinct }))
+        Ok(Expression::FunctionCall(FunctionCall {
+            name,
+            args,
+            distinct: is_distinct,
+        }))
     }
 
     fn convert_window_from_over(&self, func: Expression, over: WindowType) -> Result<Expression> {
@@ -1049,25 +1345,29 @@ impl SqlConverter {
     }
 
     fn convert_window(&self, func: Expression, window_spec: WindowSpec) -> Result<Expression> {
-        let partition_by: Result<Vec<Expression>> = window_spec.partition_by
+        let partition_by: Result<Vec<Expression>> = window_spec
+            .partition_by
             .into_iter()
             .map(|e| self.convert_expr(e))
             .collect();
         let order_by = self.convert_order_by_exprs(window_spec.order_by)?;
-        let frame = window_spec.window_frame.map(|wf| -> Result<WindowFrame> {
-            let unit = match wf.units {
-                WindowFrameUnits::Rows => FrameUnit::Rows,
-                WindowFrameUnits::Range => FrameUnit::Range,
-                WindowFrameUnits::Groups => FrameUnit::Rows,
-            };
-            let start = self.convert_frame_boundary(wf.start_bound)?;
-            let end = if let Some(end) = wf.end_bound {
-                self.convert_frame_boundary(end)?
-            } else {
-                FrameBoundary::CurrentRow
-            };
-            Ok(WindowFrame { unit, start, end })
-        }).transpose()?;
+        let frame = window_spec
+            .window_frame
+            .map(|wf| -> Result<WindowFrame> {
+                let unit = match wf.units {
+                    WindowFrameUnits::Rows => FrameUnit::Rows,
+                    WindowFrameUnits::Range => FrameUnit::Range,
+                    WindowFrameUnits::Groups => FrameUnit::Rows,
+                };
+                let start = self.convert_frame_boundary(wf.start_bound)?;
+                let end = if let Some(end) = wf.end_bound {
+                    self.convert_frame_boundary(end)?
+                } else {
+                    FrameBoundary::CurrentRow
+                };
+                Ok(WindowFrame { unit, start, end })
+            })
+            .transpose()?;
 
         Ok(Expression::Window(WindowFunction {
             func: Box::new(func),
@@ -1097,22 +1397,34 @@ impl SqlConverter {
     }
 
     /// Extract args and distinct flag, converting Lambda args to Expression::Lambda.
-    fn extract_function_args_and_distinct_with_lambda(&self, f: &Function) -> Result<(bool, Vec<Expression>)> {
+    fn extract_function_args_and_distinct_with_lambda(
+        &self,
+        f: &Function,
+    ) -> Result<(bool, Vec<Expression>)> {
         match &f.args {
             FunctionArguments::None => Ok((false, vec![])),
-            FunctionArguments::Subquery(_) => {
-                Err(ThunderduckError::Unsupported("subquery in function args not supported".to_string()))
-            }
+            FunctionArguments::Subquery(_) => Err(ThunderduckError::Unsupported(
+                "subquery in function args not supported".to_string(),
+            )),
             FunctionArguments::List(arg_list) => {
-                let is_distinct = arg_list.duplicate_treatment
+                let is_distinct = arg_list
+                    .duplicate_treatment
                     .as_ref()
                     .map(|d| matches!(d, DuplicateTreatment::Distinct))
                     .unwrap_or(false);
-                let args = arg_list.args.iter()
+                let args = arg_list
+                    .args
+                    .iter()
                     .map(|arg| match arg {
-                        FunctionArg::Named { arg, .. } => self.convert_function_arg_expr_with_lambda(arg),
-                        FunctionArg::Unnamed(arg) => self.convert_function_arg_expr_with_lambda(arg),
-                        FunctionArg::ExprNamed { arg, .. } => self.convert_function_arg_expr_with_lambda(arg),
+                        FunctionArg::Named { arg, .. } => {
+                            self.convert_function_arg_expr_with_lambda(arg)
+                        }
+                        FunctionArg::Unnamed(arg) => {
+                            self.convert_function_arg_expr_with_lambda(arg)
+                        }
+                        FunctionArg::ExprNamed { arg, .. } => {
+                            self.convert_function_arg_expr_with_lambda(arg)
+                        }
                     })
                     .collect::<Result<Vec<_>>>()?;
                 Ok((is_distinct, args))
@@ -1124,9 +1436,9 @@ impl SqlConverter {
         match arg {
             FunctionArgExpr::Expr(e) => self.convert_expr(e.clone()),
             FunctionArgExpr::Wildcard => Ok(Expression::Star(StarExpression { qualifier: None })),
-            FunctionArgExpr::QualifiedWildcard(name) => {
-                Ok(Expression::Star(StarExpression { qualifier: Some(self.object_name_to_string(name)) }))
-            }
+            FunctionArgExpr::QualifiedWildcard(name) => Ok(Expression::Star(StarExpression {
+                qualifier: Some(self.object_name_to_string(name)),
+            })),
         }
     }
 
@@ -1162,7 +1474,10 @@ impl SqlConverter {
                     } else {
                         Ok(Expression::Literal(Literal {
                             value: LiteralValue::Decimal(s),
-                            data_type: DataType::Decimal { precision: 38, scale: 18 },
+                            data_type: DataType::Decimal {
+                                precision: 38,
+                                scale: 18,
+                            },
                         }))
                     }
                 } else if let Ok(f) = s.parse::<f64>() {
@@ -1171,7 +1486,10 @@ impl SqlConverter {
                 } else {
                     Ok(Expression::Literal(Literal {
                         value: LiteralValue::Decimal(s),
-                        data_type: DataType::Decimal { precision: 38, scale: 18 },
+                        data_type: DataType::Decimal {
+                            precision: 38,
+                            scale: 18,
+                        },
                     }))
                 }
             }
@@ -1183,8 +1501,121 @@ impl SqlConverter {
             | Value::UnicodeStringLiteral(s) => Ok(Literal::string(s)),
             Value::Boolean(b) => Ok(Literal::boolean(b)),
             Value::Null => Ok(Literal::null()),
-            Value::Placeholder(p) => Err(ThunderduckError::Unsupported(format!("query parameters not supported: {}", p))),
-            other => Err(ThunderduckError::Unsupported(format!("literal value not supported: {:?}", other))),
+            Value::Placeholder(p) => Err(ThunderduckError::Unsupported(format!(
+                "query parameters not supported: {}",
+                p
+            ))),
+            other => Err(ThunderduckError::Unsupported(format!(
+                "literal value not supported: {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// Convert a sqlparser `Interval` node to a typed `Expression::Interval` when
+    /// the value is a simple integer literal and the unit is one of the six
+    /// calendar/time fields Spark supports. Falls back to `Expression::RawSql`
+    /// for compound intervals or non-literal values.
+    fn convert_interval(&self, interval: sqlparser::ast::Interval) -> Result<Expression> {
+        // Try to extract a simple integer from the value expression.
+        // The parser produces `Expr::Value(Value::SingleQuotedString("3"))` for
+        // `INTERVAL '3' YEAR`, or `Expr::Value(Value::Number("3", false))` for
+        // `INTERVAL 3 YEAR`.
+        let int_value = Self::try_extract_interval_int(&interval.value);
+
+        if let (Some(n), Some(field)) = (int_value, &interval.leading_field) {
+            // Only convert simple single-field intervals; compound (YEAR TO MONTH)
+            // intervals have `last_field` set — fall through to RawSql.
+            if interval.last_field.is_none() {
+                const MICROS_PER_SECOND: i64 = 1_000_000;
+                const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
+                const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
+
+                let interval_expr = match field {
+                    DateTimeField::Year | DateTimeField::Years => Some(IntervalExpression {
+                        months: n.checked_mul(12).ok_or_else(|| {
+                            ThunderduckError::Parse("interval year overflow".to_owned())
+                        })?,
+                        days: 0,
+                        microseconds: 0,
+                    }),
+                    DateTimeField::Month | DateTimeField::Months => Some(IntervalExpression {
+                        months: n,
+                        days: 0,
+                        microseconds: 0,
+                    }),
+                    DateTimeField::Day | DateTimeField::Days => Some(IntervalExpression {
+                        months: 0,
+                        days: n,
+                        microseconds: 0,
+                    }),
+                    DateTimeField::Hour | DateTimeField::Hours => {
+                        let micros =
+                            i64::from(n).checked_mul(MICROS_PER_HOUR).ok_or_else(|| {
+                                ThunderduckError::Parse("interval hour overflow".to_owned())
+                            })?;
+                        Some(IntervalExpression {
+                            months: 0,
+                            days: 0,
+                            microseconds: micros,
+                        })
+                    }
+                    DateTimeField::Minute | DateTimeField::Minutes => {
+                        let micros =
+                            i64::from(n).checked_mul(MICROS_PER_MINUTE).ok_or_else(|| {
+                                ThunderduckError::Parse("interval minute overflow".to_owned())
+                            })?;
+                        Some(IntervalExpression {
+                            months: 0,
+                            days: 0,
+                            microseconds: micros,
+                        })
+                    }
+                    DateTimeField::Second | DateTimeField::Seconds => {
+                        let micros =
+                            i64::from(n).checked_mul(MICROS_PER_SECOND).ok_or_else(|| {
+                                ThunderduckError::Parse("interval second overflow".to_owned())
+                            })?;
+                        Some(IntervalExpression {
+                            months: 0,
+                            days: 0,
+                            microseconds: micros,
+                        })
+                    }
+                    _ => None, // Unsupported field (WEEK, QUARTER, etc.) — fall through
+                };
+
+                if let Some(ie) = interval_expr {
+                    return Ok(Expression::Interval(ie));
+                }
+            }
+        }
+
+        // Fallback: compound intervals, non-literal values, or unsupported fields.
+        let unit = interval
+            .leading_field
+            .map(|f| format!(" {f}"))
+            .unwrap_or_default();
+        Ok(Expression::RawSql(RawSqlExpression {
+            sql: format!("INTERVAL {}{}", interval.value, unit),
+            data_type: Some(DataType::Interval),
+            nullable: Some(false),
+        }))
+    }
+
+    /// Try to extract a plain integer from the value expression of an interval.
+    ///
+    /// Handles both `'3'` (single-quoted string) and `3` (numeric literal).
+    fn try_extract_interval_int(expr: &Expr) -> Option<i32> {
+        match expr {
+            Expr::Value(v) => match &v.value {
+                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+                    s.parse::<i32>().ok()
+                }
+                Value::Number(s, _) => s.parse::<i32>().ok(),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -1207,7 +1638,10 @@ impl SqlConverter {
             BinaryOperator::BitwiseAnd => Ok(BinaryOp::BitwiseAnd),
             BinaryOperator::BitwiseOr => Ok(BinaryOp::BitwiseOr),
             BinaryOperator::BitwiseXor => Ok(BinaryOp::BitwiseXor),
-            other => Err(ThunderduckError::Unsupported(format!("binary op not supported: {:?}", other))),
+            other => Err(ThunderduckError::Unsupported(format!(
+                "binary op not supported: {:?}",
+                other
+            ))),
         }
     }
 
@@ -1216,49 +1650,82 @@ impl SqlConverter {
             SqlDataType::Boolean | SqlDataType::Bool => Ok(DataType::Boolean),
             SqlDataType::TinyInt(_) => Ok(DataType::Byte),
             SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => Ok(DataType::Short),
-            SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => Ok(DataType::Integer),
+            SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => {
+                Ok(DataType::Integer)
+            }
             SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Ok(DataType::Long),
             SqlDataType::Float(_) | SqlDataType::Real => Ok(DataType::Float),
-            SqlDataType::Double(_) | SqlDataType::Float8 | SqlDataType::DoublePrecision => Ok(DataType::Double),
-            SqlDataType::Decimal(info) | SqlDataType::Numeric(info) => {
-                match info {
-                    ExactNumberInfo::PrecisionAndScale(p, s) => Ok(DataType::Decimal { precision: u8::try_from(p).unwrap_or(38), scale: u8::try_from(s).unwrap_or(0) }),
-                    ExactNumberInfo::Precision(p) => Ok(DataType::Decimal { precision: u8::try_from(p).unwrap_or(38), scale: 0 }),
-                    ExactNumberInfo::None => Ok(DataType::Decimal { precision: 38, scale: 18 }),
-                }
+            SqlDataType::Double(_) | SqlDataType::Float8 | SqlDataType::DoublePrecision => {
+                Ok(DataType::Double)
             }
-            SqlDataType::Varchar(_) | SqlDataType::Char(_) | SqlDataType::Text | SqlDataType::String(_) => Ok(DataType::String),
-            SqlDataType::Binary(_) | SqlDataType::Varbinary(_) | SqlDataType::Blob(_) | SqlDataType::Bytea => Ok(DataType::Binary),
+            SqlDataType::Decimal(info) | SqlDataType::Numeric(info) => match info {
+                ExactNumberInfo::PrecisionAndScale(p, s) => Ok(DataType::Decimal {
+                    precision: u8::try_from(p).unwrap_or(38),
+                    scale: u8::try_from(s).unwrap_or(0),
+                }),
+                ExactNumberInfo::Precision(p) => Ok(DataType::Decimal {
+                    precision: u8::try_from(p).unwrap_or(38),
+                    scale: 0,
+                }),
+                ExactNumberInfo::None => Ok(DataType::Decimal {
+                    precision: 38,
+                    scale: 18,
+                }),
+            },
+            SqlDataType::Varchar(_)
+            | SqlDataType::Char(_)
+            | SqlDataType::Text
+            | SqlDataType::String(_) => Ok(DataType::String),
+            SqlDataType::Binary(_)
+            | SqlDataType::Varbinary(_)
+            | SqlDataType::Blob(_)
+            | SqlDataType::Bytea => Ok(DataType::Binary),
             SqlDataType::Date => Ok(DataType::Date),
             SqlDataType::Timestamp(_, _) | SqlDataType::TimestampNtz(_) => Ok(DataType::Timestamp),
-            SqlDataType::Array(elem) => {
-                match elem {
-                    ArrayElemTypeDef::AngleBracket(inner) | ArrayElemTypeDef::SquareBracket(inner, _) | ArrayElemTypeDef::Parenthesis(inner) => {
-                        let inner_type = self.convert_data_type(*inner)?;
-                        Ok(DataType::Array(Box::new(inner_type), true))
-                    }
-                    ArrayElemTypeDef::None => Ok(DataType::Array(Box::new(DataType::Unresolved), true)),
+            SqlDataType::Array(elem) => match elem {
+                ArrayElemTypeDef::AngleBracket(inner)
+                | ArrayElemTypeDef::SquareBracket(inner, _)
+                | ArrayElemTypeDef::Parenthesis(inner) => {
+                    let inner_type = self.convert_data_type(*inner)?;
+                    Ok(DataType::Array(Box::new(inner_type), true))
                 }
-            }
-            other => Err(ThunderduckError::Unsupported(format!("data type not supported: {:?}", other))),
+                ArrayElemTypeDef::None => Ok(DataType::Array(Box::new(DataType::Unresolved), true)),
+            },
+            other => Err(ThunderduckError::Unsupported(format!(
+                "data type not supported: {:?}",
+                other
+            ))),
         }
     }
 
     fn convert_order_by_exprs(&self, items: Vec<OrderByExpr>) -> Result<Vec<SortOrder>> {
-        items.into_iter().map(|item| {
-            let expr = self.convert_expr(item.expr)?;
-            let direction = if item.options.asc.unwrap_or(true) {
-                SortDirection::Asc
-            } else {
-                SortDirection::Desc
-            };
-            let null_ordering = match item.options.nulls_first {
-                Some(true) => NullOrdering::NullsFirst,
-                Some(false) => NullOrdering::NullsLast,
-                None => if matches!(direction, SortDirection::Asc) { NullOrdering::NullsFirst } else { NullOrdering::NullsLast },
-            };
-            Ok(SortOrder { expr, direction, null_ordering })
-        }).collect()
+        items
+            .into_iter()
+            .map(|item| {
+                let expr = self.convert_expr(item.expr)?;
+                let direction = if item.options.asc.unwrap_or(true) {
+                    SortDirection::Asc
+                } else {
+                    SortDirection::Desc
+                };
+                let null_ordering = match item.options.nulls_first {
+                    Some(true) => NullOrdering::NullsFirst,
+                    Some(false) => NullOrdering::NullsLast,
+                    None => {
+                        if matches!(direction, SortDirection::Asc) {
+                            NullOrdering::NullsFirst
+                        } else {
+                            NullOrdering::NullsLast
+                        }
+                    }
+                };
+                Ok(SortOrder {
+                    expr,
+                    direction,
+                    null_ordering,
+                })
+            })
+            .collect()
     }
 
     fn wrap_with_sort_limit(
@@ -1284,7 +1751,8 @@ impl SqlConverter {
     }
 
     fn object_name_to_string(&self, name: &ObjectName) -> String {
-        name.0.iter()
+        name.0
+            .iter()
             .map(|part| match part {
                 ObjectNamePart::Identifier(i) => i.value.clone(),
                 ObjectNamePart::Function(f) => f.to_string(),
@@ -1295,7 +1763,8 @@ impl SqlConverter {
 
     /// Like `object_name_to_string` but double-quotes each identifier part.
     fn object_name_to_quoted_string(&self, name: &ObjectName) -> String {
-        name.0.iter()
+        name.0
+            .iter()
             .map(|part| match part {
                 ObjectNamePart::Identifier(i) => format!("\"{}\"", i.value),
                 ObjectNamePart::Function(f) => f.to_string(),
@@ -1310,31 +1779,39 @@ impl SqlConverter {
             SqlDataType::Boolean | SqlDataType::Bool => "BOOLEAN".to_string(),
             SqlDataType::TinyInt(_) => "TINYINT".to_string(),
             SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => "SMALLINT".to_string(),
-            SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => "INTEGER".to_string(),
+            SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => {
+                "INTEGER".to_string()
+            }
             SqlDataType::BigInt(_) | SqlDataType::Int8(_) => "BIGINT".to_string(),
             SqlDataType::Float(_) | SqlDataType::Real => "FLOAT".to_string(),
-            SqlDataType::Double(_) | SqlDataType::Float8 | SqlDataType::DoublePrecision => "DOUBLE".to_string(),
-            SqlDataType::Decimal(info) | SqlDataType::Numeric(info) => {
-                match info {
-                    sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => format!("DECIMAL({}, {})", p, s),
-                    sqlparser::ast::ExactNumberInfo::Precision(p) => format!("DECIMAL({})", p),
-                    sqlparser::ast::ExactNumberInfo::None => "DECIMAL".to_string(),
-                }
+            SqlDataType::Double(_) | SqlDataType::Float8 | SqlDataType::DoublePrecision => {
+                "DOUBLE".to_string()
             }
-            SqlDataType::Varchar(_) | SqlDataType::Char(_) | SqlDataType::Text | SqlDataType::String(_) => "VARCHAR".to_string(),
-            SqlDataType::Binary(_) | SqlDataType::Varbinary(_) | SqlDataType::Blob(_) | SqlDataType::Bytea => "BLOB".to_string(),
+            SqlDataType::Decimal(info) | SqlDataType::Numeric(info) => match info {
+                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                    format!("DECIMAL({}, {})", p, s)
+                }
+                sqlparser::ast::ExactNumberInfo::Precision(p) => format!("DECIMAL({})", p),
+                sqlparser::ast::ExactNumberInfo::None => "DECIMAL".to_string(),
+            },
+            SqlDataType::Varchar(_)
+            | SqlDataType::Char(_)
+            | SqlDataType::Text
+            | SqlDataType::String(_) => "VARCHAR".to_string(),
+            SqlDataType::Binary(_)
+            | SqlDataType::Varbinary(_)
+            | SqlDataType::Blob(_)
+            | SqlDataType::Bytea => "BLOB".to_string(),
             SqlDataType::Date => "DATE".to_string(),
             SqlDataType::Timestamp(_, _) | SqlDataType::TimestampNtz(_) => "TIMESTAMP".to_string(),
-            SqlDataType::Array(elem) => {
-                match elem {
-                    sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner)
-                    | sqlparser::ast::ArrayElemTypeDef::SquareBracket(inner, _)
-                    | sqlparser::ast::ArrayElemTypeDef::Parenthesis(inner) => {
-                        format!("{}[]", self.sql_data_type_to_duckdb_string(inner))
-                    }
-                    sqlparser::ast::ArrayElemTypeDef::None => "INTEGER[]".to_string(),
+            SqlDataType::Array(elem) => match elem {
+                sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner)
+                | sqlparser::ast::ArrayElemTypeDef::SquareBracket(inner, _)
+                | sqlparser::ast::ArrayElemTypeDef::Parenthesis(inner) => {
+                    format!("{}[]", self.sql_data_type_to_duckdb_string(inner))
                 }
-            }
+                sqlparser::ast::ArrayElemTypeDef::None => "INTEGER[]".to_string(),
+            },
             other => other.to_string(),
         }
     }
@@ -1352,7 +1829,11 @@ impl SqlConverter {
     }
 
     /// Convert compound field access (arr[0], struct.field, map['key']) to ExtractValue chain.
-    fn convert_compound_field_access(&self, root: Expr, access_chain: Vec<AccessExpr>) -> Result<Expression> {
+    fn convert_compound_field_access(
+        &self,
+        root: Expr,
+        access_chain: Vec<AccessExpr>,
+    ) -> Result<Expression> {
         let mut expr = self.convert_expr(root)?;
         for access in access_chain {
             match access {
@@ -1407,12 +1888,10 @@ mod tests {
             LogicalPlan::Project(p) => {
                 assert_eq!(p.projections.len(), 2);
                 match *p.input {
-                    LogicalPlan::Filter(f) => {
-                        match *f.input {
-                            LogicalPlan::TableScan(ts) => assert_eq!(ts.table, "t"),
-                            other => panic!("expected TableScan, got {:?}", other),
-                        }
-                    }
+                    LogicalPlan::Filter(f) => match *f.input {
+                        LogicalPlan::TableScan(ts) => assert_eq!(ts.table, "t"),
+                        other => panic!("expected TableScan, got {:?}", other),
+                    },
                     other => panic!("expected Filter, got {:?}", other),
                 }
             }
@@ -1457,6 +1936,194 @@ mod tests {
             other => panic!("expected Aggregate, got {:?}", other),
         }
     }
+
+    #[test]
+    fn overlay_produces_function_call_3_args() {
+        let sql = "SELECT OVERLAY('abcdef' PLACING 'XY' FROM 3) AS r FROM t";
+        let plan = SparkSqlParser::parse(sql).unwrap();
+        match plan {
+            LogicalPlan::Project(p) => {
+                // Should be Alias(FunctionCall("overlay", 3 args))
+                let expr = &p.projections[0];
+                match expr {
+                    Expression::Alias(a) => match a.expr.as_ref() {
+                        Expression::FunctionCall(f) => {
+                            assert_eq!(f.name, "overlay");
+                            assert_eq!(f.args.len(), 3);
+                        }
+                        other => panic!("expected FunctionCall, got {:?}", other),
+                    },
+                    other => panic!("expected Alias, got {:?}", other),
+                }
+            }
+            other => panic!("expected Project, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn overlay_produces_function_call_4_args() {
+        let sql = "SELECT OVERLAY('abcdef' PLACING 'XY' FROM 3 FOR 2) AS r FROM t";
+        let plan = SparkSqlParser::parse(sql).unwrap();
+        match plan {
+            LogicalPlan::Project(p) => {
+                let expr = &p.projections[0];
+                match expr {
+                    Expression::Alias(a) => match a.expr.as_ref() {
+                        Expression::FunctionCall(f) => {
+                            assert_eq!(f.name, "overlay");
+                            assert_eq!(f.args.len(), 4);
+                        }
+                        other => panic!("expected FunctionCall, got {:?}", other),
+                    },
+                    other => panic!("expected Alias, got {:?}", other),
+                }
+            }
+            other => panic!("expected Project, got {:?}", other),
+        }
+    }
+
+    // ── B1 interval conversion tests ─────────────────────────────────────
+
+    /// Helper: parse `SELECT <expr> AS r FROM t` and return the inner expression
+    /// (unwrapped from Alias).
+    fn parse_select_expr(sql: &str) -> Expression {
+        let plan = SparkSqlParser::parse(sql).unwrap();
+        match plan {
+            LogicalPlan::Project(p) => match p.projections.into_iter().next().unwrap() {
+                Expression::Alias(a) => *a.expr,
+                other => other,
+            },
+            other => panic!("expected Project, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_year_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '3' YEAR AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 36);
+                assert_eq!(ie.days, 0);
+                assert_eq!(ie.microseconds, 0);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_month_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '5' MONTH AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 5);
+                assert_eq!(ie.days, 0);
+                assert_eq!(ie.microseconds, 0);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_day_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '7' DAY AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 0);
+                assert_eq!(ie.days, 7);
+                assert_eq!(ie.microseconds, 0);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_hour_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '2' HOUR AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 0);
+                assert_eq!(ie.days, 0);
+                assert_eq!(ie.microseconds, 2 * 3_600_000_000);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_minute_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '10' MINUTE AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 0);
+                assert_eq!(ie.days, 0);
+                assert_eq!(ie.microseconds, 10 * 60_000_000);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_second_produces_typed_expression() {
+        let expr = parse_select_expr("SELECT INTERVAL '30' SECOND AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 0);
+                assert_eq!(ie.days, 0);
+                assert_eq!(ie.microseconds, 30_000_000);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_negative_value_produces_typed_expression() {
+        // Spark parses `INTERVAL '-3' DAY` as value='-3', field=DAY
+        let expr = parse_select_expr("SELECT INTERVAL '-3' DAY AS r FROM t");
+        match expr {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.months, 0);
+                assert_eq!(ie.days, -3);
+                assert_eq!(ie.microseconds, 0);
+            }
+            other => panic!("expected Interval, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_non_integer_falls_back_to_raw_sql() {
+        // A non-integer value (e.g., a float string) should fall back to RawSql
+        let expr = parse_select_expr("SELECT INTERVAL '1.5' DAY AS r FROM t");
+        match expr {
+            Expression::RawSql(r) => {
+                assert_eq!(r.data_type, Some(DataType::Interval));
+            }
+            other => panic!("expected RawSql fallback, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interval_data_type_is_interval() {
+        let expr = parse_select_expr("SELECT INTERVAL '1' DAY AS r FROM t");
+        assert_eq!(expr.data_type(&StructType::empty()), DataType::Interval);
+    }
+
+    // ── B2 VALUES duckdb_ready tests ────────────────────────────────────
+
+    #[test]
+    fn values_clause_is_duckdb_ready() {
+        // Bare VALUES query maps to SetExpr::Values → SqlRelation.
+        let plan = SparkSqlParser::parse("VALUES (1, 'a'), (2, 'b')").unwrap();
+        fn find_sql_relation(plan: &LogicalPlan) -> Option<&SqlRelation> {
+            match plan {
+                LogicalPlan::SqlRelation(sr) => Some(sr),
+                LogicalPlan::Project(p) => find_sql_relation(&p.input),
+                LogicalPlan::AliasedRelation(a) => find_sql_relation(&a.input),
+                _ => None,
+            }
+        }
+        let sr = find_sql_relation(&plan).expect("should contain SqlRelation");
+        assert!(sr.duckdb_ready, "VALUES SqlRelation should be duckdb_ready");
+    }
 }
 
 /// Infer the Thunderduck DataType and nullable flag for a VALUES literal expression.
@@ -1473,12 +2140,17 @@ fn infer_value_literal_type(expr: &Expr) -> (DataType, bool) {
                     (DataType::Long, false)
                 }
             }
-            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) => (DataType::String, false),
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) => {
+                (DataType::String, false)
+            }
             Value::Boolean(_) => (DataType::Boolean, false),
             Value::Null => (DataType::String, true),
             _ => (DataType::String, false),
         },
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } => {
             let (dt, _nullable) = infer_value_literal_type(inner);
             (dt, false)
         }

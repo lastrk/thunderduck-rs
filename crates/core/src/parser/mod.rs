@@ -44,8 +44,8 @@ impl SparkSqlParser {
             sql
         };
         let dialect = SparkDialect::default();
-        let mut stmts = Parser::parse_sql(&dialect, sql)
-            .map_err(|e| ThunderduckError::Parse(e.to_string()))?;
+        let mut stmts =
+            Parser::parse_sql(&dialect, sql).map_err(|e| ThunderduckError::Parse(e.to_string()))?;
         if stmts.len() != 1 {
             return Err(ThunderduckError::Unsupported(format!(
                 "expected exactly one SQL statement, got {}",

@@ -106,10 +106,10 @@ session thread → oneshot::Sender<SessionResult> → tokio task → gRPC stream
 ### Dual SQL Generation Paths for Joins
 
 When modifying join SQL generation, check BOTH paths:
-- `visit_join()` — primary path, converts SEMI/ANTI to EXISTS subqueries
-- `generate_flat_join_chain()` — optimised chain path, **breaks at SEMI/ANTI** (no EXISTS conversion)
+- `gen_join()` — primary path, emits native DuckDB `SEMI JOIN` / `ANTI JOIN` directly (no EXISTS-subquery conversion).
+- Flat-chain rendering inside `gen_join()` (the natural-flat-join branch) — must break at SEMI/ANTI to preserve the tree shape; the chain cannot fold across a semi/anti boundary.
 
-Aggregate SQL generation uses a **single canonical path** through `visit_aggregate()`.
+Aggregate SQL generation uses a **single canonical path** through `gen_aggregate()`.
 
 ### Expression Hierarchy (key types)
 
@@ -140,7 +140,7 @@ Expression (enum)
 
 3. **Composite aggregate expressions**: When adding expression types that can appear inside aggregates, ensure `RelationConverter::convert_aggregate()` handles them. A default `_` arm silently drops unknown cases.
 
-4. **Semi/Anti join in flat chains**: `generate_flat_join_chain()` does NOT convert semi/anti joins to EXISTS subqueries. Chain must break at semi/anti joins.
+4. **Semi/Anti join in flat chains**: `gen_join()` emits native `SEMI JOIN` / `ANTI JOIN`. The flat-chain rendering branch inside `gen_join()` must break at semi/anti boundaries — folding the chain across a semi/anti would change the tree shape and reorder filtering semantics.
 
 5. **DuckDB SEMI JOIN syntax**: DuckDB uses `SEMI JOIN` and `ANTI JOIN` (without `LEFT` prefix). `LEFT SEMI JOIN` is a parser error.
 
@@ -177,7 +177,7 @@ cargo build --release
 cargo build --release --features bundled-extension
 ```
 
-The `thdck_spark_funcs` DuckDB extension (release [`ext4`](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/ext4), multi-version — currently pulls the `v1.5.1` binaries) implements Spark-precise numerical semantics:
+The `thdck_spark_funcs` DuckDB extension (release [`ext4`](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext4), multi-version — currently pulls the `v1.5.1` binaries) implements Spark-precise numerical semantics:
 - `spark_hash(c1, ..., cN)` — Spark `hash()` (Murmur3-32, signed INT, seed 42)
 - `spark_xxhash64(c1, ..., cN)` — Spark `xxhash64()` (xxHash64, signed BIGINT, seed 42)
 - `spark_decimal_div(a, b)` — decimal division with `ROUND_HALF_UP`

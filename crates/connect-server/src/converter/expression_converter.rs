@@ -1,6 +1,6 @@
 use thunderduck_core::expression::{
     AliasExpression, ArrayLiteralExpression, BinaryExpression, BinaryOp, CastExpression,
-    Expression, ExtractValueExpression, FunctionCall, FrameBoundary, FrameUnit, LambdaExpression,
+    Expression, ExtractValueExpression, FrameBoundary, FrameUnit, FunctionCall, LambdaExpression,
     LambdaVariableExpression, Literal, LiteralValue, MapLiteralExpression,
     NullOrdering as CoreNullOrdering, RawSqlExpression, SortDirection, SortOrder, StarExpression,
     StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UpdateFieldsExpression,
@@ -46,10 +46,16 @@ impl ExpressionConverter {
                 // Try to parse the expression string into a typed AST node so that
                 // `data_type()` / `nullable()` work correctly (e.g. `size(name) → Integer`
                 // instead of Unresolved). Fall back to RawSql on any parse error.
-                Ok(thunderduck_core::parser::SparkSqlParser::parse_single_expr(&es.expression)
-                    .unwrap_or_else(|_| {
-                        Expression::RawSql(RawSqlExpression { sql: es.expression.clone(), data_type: None, nullable: None })
-                    }))
+                Ok(
+                    thunderduck_core::parser::SparkSqlParser::parse_single_expr(&es.expression)
+                        .unwrap_or_else(|_| {
+                            Expression::RawSql(RawSqlExpression {
+                                sql: es.expression.clone(),
+                                data_type: None,
+                                nullable: None,
+                            })
+                        }),
+                )
             }
             Some(ExprType::CommonInlineUserDefinedFunction(udf)) => {
                 // Treat as a regular function call with the UDF name.
@@ -81,33 +87,34 @@ impl ExpressionConverter {
                         alias: na.key.clone(),
                     }))
                 } else {
-                    Err(ConnectError::PlanConversion("NamedArgument missing value".into()))
+                    Err(ConnectError::PlanConversion(
+                        "NamedArgument missing value".into(),
+                    ))
                 }
             }
-            Some(ExprType::MergeAction(_)) => {
-                Err(ConnectError::Unsupported("MergeAction not supported".into()))
-            }
-            Some(ExprType::TypedAggregateExpression(_)) => {
-                Err(ConnectError::Unsupported("TypedAggregateExpression not supported".into()))
-            }
-            Some(ExprType::SubqueryExpression(_)) => {
-                Err(ConnectError::Unsupported("SubqueryExpression not supported".into()))
-            }
-            Some(ExprType::DirectShufflePartitionId(_)) => {
-                Err(ConnectError::Unsupported("DirectShufflePartitionID not supported".into()))
-            }
-            Some(ExprType::Extension(_)) => {
-                Err(ConnectError::Unsupported("Extension expression not supported".into()))
-            }
+            Some(ExprType::MergeAction(_)) => Err(ConnectError::Unsupported(
+                "MergeAction not supported".into(),
+            )),
+            Some(ExprType::TypedAggregateExpression(_)) => Err(ConnectError::Unsupported(
+                "TypedAggregateExpression not supported".into(),
+            )),
+            Some(ExprType::SubqueryExpression(_)) => Err(ConnectError::Unsupported(
+                "SubqueryExpression not supported".into(),
+            )),
+            Some(ExprType::DirectShufflePartitionId(_)) => Err(ConnectError::Unsupported(
+                "DirectShufflePartitionID not supported".into(),
+            )),
+            Some(ExprType::Extension(_)) => Err(ConnectError::Unsupported(
+                "Extension expression not supported".into(),
+            )),
         }
     }
 
     /// Convert a SortOrder expression (used by RelationConverter).
-    pub fn convert_sort_order(
-        &mut self,
-        so: &proto::expression::SortOrder,
-    ) -> Result<SortOrder> {
-        use proto::expression::sort_order::{NullOrdering as ProtoNullOrdering, SortDirection as ProtoSortDir};
+    pub fn convert_sort_order(&mut self, so: &proto::expression::SortOrder) -> Result<SortOrder> {
+        use proto::expression::sort_order::{
+            NullOrdering as ProtoNullOrdering, SortDirection as ProtoSortDir,
+        };
         let child = so
             .child
             .as_ref()
@@ -121,7 +128,11 @@ impl ExpressionConverter {
             ProtoNullOrdering::SortNullsLast => CoreNullOrdering::NullsLast,
             _ => CoreNullOrdering::NullsFirst,
         };
-        Ok(SortOrder { expr, direction, null_ordering })
+        Ok(SortOrder {
+            expr,
+            direction,
+            null_ordering,
+        })
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -213,7 +224,9 @@ impl ExpressionConverter {
                     .enumerate()
                     .map(|(i, e)| self.convert_literal(e).map(|expr| (format!("_{i}"), expr)))
                     .collect();
-                Ok(Expression::StructLiteral(StructLiteralExpression { fields: fields? }))
+                Ok(Expression::StructLiteral(StructLiteralExpression {
+                    fields: fields?,
+                }))
             }
             Some(LiteralType::SpecializedArray(sa)) => {
                 use proto::expression::literal::specialized_array::ValueType;
@@ -236,10 +249,12 @@ impl ExpressionConverter {
                     Some(ValueType::Floats(fv)) => fv
                         .values
                         .iter()
-                        .map(|v| Ok(Expression::Literal(Literal {
-                            value: LiteralValue::Float(*v),
-                            data_type: DataType::Float,
-                        })))
+                        .map(|v| {
+                            Ok(Expression::Literal(Literal {
+                                value: LiteralValue::Float(*v),
+                                data_type: DataType::Float,
+                            }))
+                        })
                         .collect::<Result<_>>()?,
                     Some(ValueType::Doubles(dv)) => dv
                         .values
@@ -372,7 +387,10 @@ impl ExpressionConverter {
             .first()
             .cloned()
             .unwrap_or_else(|| "_col".to_string());
-        Ok(Expression::Alias(AliasExpression { expr: Box::new(expr), alias: name }))
+        Ok(Expression::Alias(AliasExpression {
+            expr: Box::new(expr),
+            alias: name,
+        }))
     }
 
     fn convert_cast(&mut self, cast: &proto::expression::Cast) -> Result<Expression> {
@@ -387,10 +405,7 @@ impl ExpressionConverter {
             Some(CastToType::TypeStr(s)) => parse_type_str(s),
             None => DataType::Unresolved,
         };
-        let try_cast = matches!(
-            cast.eval_mode(),
-            proto::expression::cast::EvalMode::Try
-        );
+        let try_cast = matches!(cast.eval_mode(), proto::expression::cast::EvalMode::Try);
         Ok(Expression::Cast(CastExpression {
             expr: Box::new(expr),
             to_type,
@@ -415,10 +430,17 @@ impl ExpressionConverter {
 
         let partition_by: Result<Vec<Expression>> =
             win.partition_spec.iter().map(|e| self.convert(e)).collect();
-        let order_by: Result<Vec<SortOrder>> =
-            win.order_spec.iter().map(|so| self.convert_sort_order(so)).collect();
+        let order_by: Result<Vec<SortOrder>> = win
+            .order_spec
+            .iter()
+            .map(|so| self.convert_sort_order(so))
+            .collect();
 
-        let frame = win.frame_spec.as_ref().map(|fs| self.convert_window_frame(fs)).transpose()?;
+        let frame = win
+            .frame_spec
+            .as_ref()
+            .map(|fs| self.convert_window_frame(fs))
+            .transpose()?;
 
         Ok(Expression::Window(WindowFunction {
             func: Box::new(func),
@@ -506,10 +528,7 @@ impl ExpressionConverter {
         }
     }
 
-    fn convert_lambda(
-        &mut self,
-        lf: &proto::expression::LambdaFunction,
-    ) -> Result<Expression> {
+    fn convert_lambda(&mut self, lf: &proto::expression::LambdaFunction) -> Result<Expression> {
         // Collect param names and push a new scope
         let params: Vec<String> = lf
             .arguments
@@ -537,15 +556,13 @@ impl ExpressionConverter {
         v: &proto::expression::UnresolvedNamedLambdaVariable,
     ) -> Result<Expression> {
         let name = v.name_parts.join(".");
-        Ok(Expression::LambdaVariable(LambdaVariableExpression { name }))
+        Ok(Expression::LambdaVariable(LambdaVariableExpression {
+            name,
+        }))
     }
 
-    fn convert_call_function(
-        &mut self,
-        cf: &proto::CallFunction,
-    ) -> Result<Expression> {
-        let args: Result<Vec<Expression>> =
-            cf.arguments.iter().map(|a| self.convert(a)).collect();
+    fn convert_call_function(&mut self, cf: &proto::CallFunction) -> Result<Expression> {
+        let args: Result<Vec<Expression>> = cf.arguments.iter().map(|a| self.convert(a)).collect();
         Ok(Expression::FunctionCall(FunctionCall {
             name: cf.function_name.clone(),
             args: args?,
@@ -561,10 +578,9 @@ impl ExpressionConverter {
             .child
             .as_ref()
             .ok_or_else(|| ConnectError::PlanConversion("ExtractValue missing child".into()))?;
-        let extraction = ev
-            .extraction
-            .as_ref()
-            .ok_or_else(|| ConnectError::PlanConversion("ExtractValue missing extraction".into()))?;
+        let extraction = ev.extraction.as_ref().ok_or_else(|| {
+            ConnectError::PlanConversion("ExtractValue missing extraction".into())
+        })?;
         let child_expr = self.convert(child)?;
         let key_expr = self.convert(extraction)?;
         Ok(Expression::ExtractValue(ExtractValueExpression {
@@ -577,12 +593,12 @@ impl ExpressionConverter {
         &mut self,
         uf: &proto::expression::UpdateFields,
     ) -> Result<Expression> {
-        let struct_expr = uf
-            .struct_expression
-            .as_ref()
-            .ok_or_else(|| ConnectError::PlanConversion("UpdateFields missing struct_expression".into()))?;
+        let struct_expr = uf.struct_expression.as_ref().ok_or_else(|| {
+            ConnectError::PlanConversion("UpdateFields missing struct_expression".into())
+        })?;
         let struct_expr = self.convert(struct_expr)?;
-        let value = uf.value_expression
+        let value = uf
+            .value_expression
             .as_ref()
             .map(|v| self.convert(v))
             .transpose()?;

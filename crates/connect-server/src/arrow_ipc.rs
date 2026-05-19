@@ -42,7 +42,10 @@ pub fn record_batches_to_arrow_batches(batches: &[RecordBatch]) -> Result<Vec<Ar
     let mut out = Vec::new();
     for batch in batches {
         let estimated_size = 128usize.saturating_add(
-            batch.num_rows().saturating_mul(batch.num_columns()).saturating_mul(64),
+            batch
+                .num_rows()
+                .saturating_mul(batch.num_columns())
+                .saturating_mul(64),
         );
         let mut buf = Vec::with_capacity(estimated_size);
         {

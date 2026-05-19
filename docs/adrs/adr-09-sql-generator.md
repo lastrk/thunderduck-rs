@@ -23,10 +23,10 @@ impl SqlGenerator {
 
 Internal helpers follow the `gen_*` naming convention (`gen_project`, `gen_filter`, `gen_join`, etc.).
 
-**Join dual-path rule (inherited from the Java reference)**:
-- `gen_join()`: primary path, converts SEMI/ANTI to `EXISTS` subqueries.
-- `generate_flat_join_chain()`: optimised flat chain path, **must break at SEMI/ANTI joins** (does not do EXISTS conversion).
-- When modifying join SQL generation, **always check both paths**.
+**Join rendering rule**:
+- `gen_join()`: emits DuckDB's native `SEMI JOIN` / `ANTI JOIN` syntax directly. The Rust port does **not** convert semi/anti joins to `EXISTS` subqueries (a departure from the Java reference, which had to do so for compatibility with a SQL dialect that lacked native SEMI/ANTI).
+- Flat-chain rendering inside `gen_join()` (the "natural flat join" branch) **must break at SEMI/ANTI joins** — folding the chain across a semi/anti boundary would change the tree shape and reorder filtering semantics.
+- When modifying join SQL generation, **always check both branches** of `gen_join()` (the wrapped-subquery path and the natural-flat-join path).
 
 **Aggregate path**: single canonical path through `gen_aggregate()` — no dual-path issue.
 

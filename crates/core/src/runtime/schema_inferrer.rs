@@ -61,22 +61,32 @@ fn arrow_type_to_core(dt: &ArrowDataType) -> DataType {
             if *p == 38 && *s == 0 {
                 DataType::Long
             } else {
-                DataType::Decimal { precision: *p, scale: (*s).max(0) as u8 }
+                DataType::Decimal {
+                    precision: *p,
+                    scale: (*s).max(0) as u8,
+                }
             }
         }
-        ArrowDataType::List(field) | ArrowDataType::LargeList(field) => {
-            DataType::Array(Box::new(arrow_type_to_core(field.data_type())), field.is_nullable())
-        }
+        ArrowDataType::List(field) | ArrowDataType::LargeList(field) => DataType::Array(
+            Box::new(arrow_type_to_core(field.data_type())),
+            field.is_nullable(),
+        ),
         ArrowDataType::Map(field, _) => {
             // Arrow Map field is a Struct { key, value }
             if let ArrowDataType::Struct(fields) = field.data_type() {
-                let key = fields.iter().find(|f| f.name() == "key")
+                let key = fields
+                    .iter()
+                    .find(|f| f.name() == "key")
                     .map(|f| arrow_type_to_core(f.data_type()))
                     .unwrap_or(DataType::Unresolved);
-                let value = fields.iter().find(|f| f.name() == "value")
+                let value = fields
+                    .iter()
+                    .find(|f| f.name() == "value")
                     .map(|f| arrow_type_to_core(f.data_type()))
                     .unwrap_or(DataType::Unresolved);
-                let value_nullable = fields.iter().find(|f| f.name() == "value")
+                let value_nullable = fields
+                    .iter()
+                    .find(|f| f.name() == "value")
                     .map(|f| f.is_nullable())
                     .unwrap_or(true);
                 DataType::Map {

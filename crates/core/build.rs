@@ -7,14 +7,18 @@ fn main() {
 
 #[cfg(feature = "bundled-extension")]
 fn download_extension() {
-    const RELEASE_TAG: &str = "duckdb1.5.1-ext3";
+    // The `ext4` release packs binaries for multiple DuckDB versions under a
+    // single tag, with the DuckDB version embedded in each filename. We pick
+    // the one matching the duckdb crate (currently 1.10501.0 → DuckDB 1.5.1).
+    const RELEASE_TAG: &str = "ext4";
+    const EXT_DUCKDB_VERSION: &str = "v1.5.1";
     const BASE_URL: &str =
         "https://github.com/lastrk/thunderduck-duckdb-extension/releases/download";
 
     let target = std::env::var("TARGET").expect("TARGET not set by Cargo");
     let platform = detect_platform(&target);
 
-    let filename = format!("thdck_spark_funcs-{platform}.duckdb_extension");
+    let filename = format!("thdck_spark_funcs-{EXT_DUCKDB_VERSION}-{platform}.duckdb_extension");
 
     // Persistent cache: {workspace_root}/extensions/{tag}/{filename}
     // Lives outside Cargo's target/ so it survives `cargo clean`.

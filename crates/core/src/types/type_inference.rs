@@ -637,7 +637,10 @@ impl TypeInferenceEngine {
             "struct" | "named_struct" => Unresolved,
 
             // ── Hash / fingerprint ────────────────────────────────────────────
-            "hash" | "xxhash64" | "murmur3" => Integer,
+            // Spark hash() and murmur3 return signed INT32; xxhash64 returns
+            // signed INT64. The previous shared arm was wrong for xxhash64.
+            "hash" | "murmur3" => Integer,
+            "xxhash64" => Long,
 
             // ── Null / conditional ────────────────────────────────────────────
             "coalesce" | "nvl" | "ifnull" => {
@@ -1018,6 +1021,35 @@ mod tests {
     fn aggregate_return_type_grouping_id_returns_long() {
         assert_eq!(
             TypeInferenceEngine::aggregate_return_type("grouping_id", &DataType::String),
+            DataType::Long,
+        );
+    }
+
+    // ── Spark hash / xxhash64 ──────────────────────────────────────────────────
+
+    /// Spark `hash` returns signed INT32 → DuckDB INTEGER.
+    #[test]
+    fn hash_return_type_is_integer() {
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("hash", &[DataType::Integer]),
+            DataType::Integer,
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("hash", &[DataType::String, DataType::Long]),
+            DataType::Integer,
+        );
+    }
+
+    /// Spark `xxhash64` returns signed INT64 → DuckDB BIGINT. Regression for
+    /// the previous shared arm that incorrectly returned Integer.
+    #[test]
+    fn xxhash64_return_type_is_long() {
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("xxhash64", &[DataType::Integer]),
+            DataType::Long,
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("xxhash64", &[DataType::String, DataType::Long]),
             DataType::Long,
         );
     }

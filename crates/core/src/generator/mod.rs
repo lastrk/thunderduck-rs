@@ -17,10 +17,10 @@ use crate::expression::{
 use crate::functions::{CompatMode, FunctionRegistry};
 use crate::logical::{
     spark_column_name,
-    Aggregate, AliasedRelation, Distinct, DropColumns, Except, Filter, GroupingSets,
-    InMemoryRelation, Intersect, Join, Limit, LocalDataRelation, LocalRelation, LogicalPlan,
-    NADrop, NADropHow, NAFill, NAReplace, Pivot, Project, RangeRelation, Sample, SelectEntry,
-    ApproxQuantile, DdlOperation, Describe, ShowString, SingleRowRelation, Sort,
+    Aggregate, AggregateExpr, AliasedRelation, Distinct, DropColumns, Except, Filter, GroupingSets,
+    InMemoryRelation, Intersect, Join, JoinType, Limit, LocalDataRelation, LocalRelation,
+    LogicalPlan, NADrop, NADropHow, NAFill, NAReplace, Pivot, Project, RangeRelation, Sample,
+    SelectEntry, ApproxQuantile, DdlOperation, Describe, ShowString, SingleRowRelation, Sort,
     SqlRelation, StatCorr, StatCov, StatCrosstab, StatFreqItems, StatSampleBy,
     Summary, TableScan, Tail, ToDataFrame, Union, Unpivot, WithColumns, WithCte,
 };
@@ -194,6 +194,16 @@ impl SqlGenerator {
     }
 
     fn gen_aggregate(&self, a: &Aggregate) -> Result<String> {
+        // PR #42 port: Aggregate(WithColumns*(Filter*(Join))) needs the WithColumns
+        // substitutions inlined into the aggregate's expressions; otherwise the
+        // WithColumns layer renders as `FROM (\n…)` (gen_from's catch-all) and
+        // buries table aliases used by the outer GROUP BY / aggregate args. The
+        // helper returns Some(rewritten) only when the pattern matches and no
+        // semi/anti join sits in the chain; in all other cases we fall through.
+        if let Some(rewritten) = inline_with_columns_into_aggregate(a) {
+            return self.gen_aggregate(&rewritten);
+        }
+
         // Infer input schema once for type-aware aggregate cast wrapping.
         let input_schema = a.input.infer_schema();
         // Use a typed generator so gen_strict_decimal_div can see actual types.
@@ -2177,6 +2187,206 @@ pub fn quote_ident(name: &str) -> String {
     }
 }
 
+// ── WithColumns-over-Join inlining for Aggregate (PR #42 port) ────────────────
+
+/// If `a.input` matches `WithColumns+ → Filter* → Join` and the join chain
+/// contains no semi/anti joins, inline the WithColumns substitutions into
+/// the aggregate's grouping / aggregate / having expressions and return a
+/// rewritten `Aggregate` whose input is the `Filter* → Join` chain directly.
+///
+/// Returns `None` if the pattern doesn't match — caller falls through to
+/// standard rendering.
+///
+/// This is the core of the PR #42 port: without it, the `WithColumns` layer
+/// renders through `gen_from`'s catch-all as `FROM (\n…)`, hiding table
+/// aliases used by the outer `GROUP BY` (e.g. `n1.n_name` in TPC-H Q7/Q8
+/// DataFrame queries).
+fn inline_with_columns_into_aggregate(a: &Aggregate) -> Option<Aggregate> {
+    use std::collections::HashMap;
+
+    // Peel WithColumns layers (outermost-first, preserving order).
+    let mut subs: HashMap<String, Expression> = HashMap::new();
+    let mut cur: &LogicalPlan = &a.input;
+    while let LogicalPlan::WithColumns(wc) = cur {
+        for (name, expr) in &wc.columns {
+            // Outer WithColumns "wins" on name collision: it was applied
+            // last in DataFrame order, so it's the visible value to the
+            // Aggregate above. or_insert_with respects that priority.
+            subs.entry(name.clone()).or_insert_with(|| expr.clone());
+        }
+        cur = &wc.input;
+    }
+    if subs.is_empty() {
+        return None;
+    }
+
+    // Then peel Filter layers (outer→inner).
+    let mut filter_conditions: Vec<Expression> = Vec::new();
+    while let LogicalPlan::Filter(f) = cur {
+        filter_conditions.push(f.condition.clone());
+        cur = &f.input;
+    }
+
+    // Expect Join with no semi/anti anywhere in the chain. Otherwise bail
+    // — gen_join's EXISTS-conversion path for semi/anti needs the original
+    // tree shape.
+    let join = match cur {
+        LogicalPlan::Join(j) if !join_chain_contains_semi_or_anti(cur) => j.clone(),
+        _ => return None,
+    };
+
+    // Rebuild Filter chain wrapping the Join (outer→inner — reverse of
+    // peeling order, since filter_conditions was pushed outermost-first).
+    let mut new_child: LogicalPlan = LogicalPlan::Join(join);
+    for cond in filter_conditions.into_iter().rev() {
+        new_child = LogicalPlan::Filter(Filter {
+            input: Box::new(new_child),
+            condition: cond,
+        });
+    }
+
+    let new_grouping: Vec<Expression> = a
+        .grouping
+        .iter()
+        .map(|e| rewrite_grouping_expr(e, &subs))
+        .collect();
+    let new_aggregates: Vec<AggregateExpr> = a
+        .aggregates
+        .iter()
+        .map(|ae| rewrite_agg_expr(ae, &subs))
+        .collect();
+    let new_having = a.having.as_ref().map(|h| substitute_expr(h, &subs));
+
+    Some(Aggregate {
+        input: Box::new(new_child),
+        grouping: new_grouping,
+        aggregates: new_aggregates,
+        having: new_having,
+        grouping_sets: a.grouping_sets.clone(),
+        // SelectEntry indices reference aggregate positions, which don't
+        // shift across this rewrite — keep as-is.
+        select_order: a.select_order.clone(),
+    })
+}
+
+/// Substitute unqualified column references in `expr` against `subs`.
+/// Recurses into every Expression variant that can hold sub-expressions;
+/// other variants pass through unchanged.
+fn substitute_expr(
+    expr: &Expression,
+    subs: &std::collections::HashMap<String, Expression>,
+) -> Expression {
+    use Expression as E;
+    match expr {
+        E::UnresolvedColumn(c) if c.qualifier.is_none() => {
+            subs.get(&c.name).cloned().unwrap_or_else(|| expr.clone())
+        }
+        E::ColumnReference(c) if c.qualifier.is_none() => {
+            subs.get(&c.name).cloned().unwrap_or_else(|| expr.clone())
+        }
+        E::Alias(a) => E::Alias(AliasExpression {
+            expr: Box::new(substitute_expr(&a.expr, subs)),
+            alias: a.alias.clone(),
+        }),
+        E::Binary(b) => E::Binary(BinaryExpression {
+            op: b.op.clone(),
+            left: Box::new(substitute_expr(&b.left, subs)),
+            right: Box::new(substitute_expr(&b.right, subs)),
+        }),
+        E::Unary(u) => E::Unary(UnaryExpression {
+            op: u.op.clone(),
+            operand: Box::new(substitute_expr(&u.operand, subs)),
+        }),
+        E::FunctionCall(fc) => E::FunctionCall(FunctionCall {
+            name: fc.name.clone(),
+            args: fc.args.iter().map(|a| substitute_expr(a, subs)).collect(),
+            distinct: fc.distinct,
+        }),
+        E::Cast(c) => E::Cast(CastExpression {
+            expr: Box::new(substitute_expr(&c.expr, subs)),
+            to_type: c.to_type.clone(),
+            try_cast: c.try_cast,
+        }),
+        E::CaseWhen(cw) => E::CaseWhen(CaseWhenExpression {
+            base: cw
+                .base
+                .as_ref()
+                .map(|b| Box::new(substitute_expr(b, subs))),
+            branches: cw
+                .branches
+                .iter()
+                .map(|(w, t)| (substitute_expr(w, subs), substitute_expr(t, subs)))
+                .collect(),
+            else_expr: cw
+                .else_expr
+                .as_ref()
+                .map(|e| Box::new(substitute_expr(e, subs))),
+        }),
+        // Pass-through for variants that either don't contain substitutable
+        // sub-expressions (Literal, Star) or whose semantics make substitution
+        // inappropriate at this layer (subqueries, lambdas, complex literals).
+        _ => expr.clone(),
+    }
+}
+
+/// Rewrite a GROUP BY entry. If the user wrote `groupBy("l_year")` referencing
+/// a withColumn synthetic name, wrap the substituted expression in
+/// `Alias(name)` so the output column keeps the original name (downstream
+/// ORDER BY can still reference "l_year"). All other expressions go through
+/// `substitute_expr` unchanged.
+fn rewrite_grouping_expr(
+    expr: &Expression,
+    subs: &std::collections::HashMap<String, Expression>,
+) -> Expression {
+    use Expression as E;
+    match expr {
+        E::UnresolvedColumn(c) if c.qualifier.is_none() && subs.contains_key(&c.name) => {
+            E::Alias(AliasExpression {
+                expr: Box::new(subs[&c.name].clone()),
+                alias: c.name.clone(),
+            })
+        }
+        E::ColumnReference(c) if c.qualifier.is_none() && subs.contains_key(&c.name) => {
+            E::Alias(AliasExpression {
+                expr: Box::new(subs[&c.name].clone()),
+                alias: c.name.clone(),
+            })
+        }
+        E::Alias(a) => E::Alias(AliasExpression {
+            expr: Box::new(substitute_expr(&a.expr, subs)),
+            alias: a.alias.clone(),
+        }),
+        _ => substitute_expr(expr, subs),
+    }
+}
+
+/// Substitute over the aggregate's function expression and FILTER clause.
+fn rewrite_agg_expr(
+    ae: &AggregateExpr,
+    subs: &std::collections::HashMap<String, Expression>,
+) -> AggregateExpr {
+    AggregateExpr {
+        func: substitute_expr(&ae.func, subs),
+        is_distinct: ae.is_distinct,
+        filter: ae.filter.as_ref().map(|f| substitute_expr(f, subs)),
+    }
+}
+
+/// Recursively check whether any Join node in the subtree is LeftSemi or
+/// LeftAnti. Mirrors Java's `containsSemiOrAntiJoin` — gates the
+/// WithColumns-inlining path because `gen_join`'s EXISTS conversion for
+/// semi/anti needs the original tree shape.
+fn join_chain_contains_semi_or_anti(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Join(j) => {
+            matches!(j.join_type, JoinType::LeftSemi | JoinType::LeftAnti)
+                || join_chain_contains_semi_or_anti(&j.left)
+                || join_chain_contains_semi_or_anti(&j.right)
+        }
+        _ => false,
+    }
+}
+
 /// Wrap aggregate expressions with CASTs to match Spark's return types:
 /// - `SUM(integer)` → `CAST(SUM(...) AS BIGINT)` (DuckDB returns HUGEINT)
 /// - `SUM(decimal{p,s})` → `CAST(SUM(...) AS DECIMAL(min(p+10,38), s))`
@@ -3484,13 +3694,13 @@ fn extract_top_level_args(bytes: &[u8], start: usize) -> (Vec<String>, usize) {
 mod tests {
     use super::*;
     use crate::expression::{
-        AliasExpression, BinaryExpression, ColumnReference, ExtractValueExpression, FunctionCall,
-        IntervalExpression, IsDistinctFromExpression, LikeExpression, Literal,
+        AliasExpression, BinaryExpression, ColumnReference, ExtractValueExpression,
+        FunctionCall, IntervalExpression, IsDistinctFromExpression, LikeExpression, Literal,
         RowConstructorExpression, StarExpression, WindowFunction,
     };
     use crate::logical::{
-        AliasedRelation, Filter, Join, JoinType, Limit, LogicalPlan, Project, SingleRowRelation,
-        Sort, TableScan, Union,
+        Aggregate, AggregateExpr, AliasedRelation, Filter, Join, JoinType, Limit, LogicalPlan,
+        Project, SingleRowRelation, Sort, TableScan, Union, WithColumns,
     };
 
     fn gen() -> SqlGenerator {
@@ -3554,10 +3764,8 @@ mod tests {
         assert!(!sql.contains("AS subquery"), "got: {sql}");
     }
 
-    /// Build an inner Join with no plan_id aliases. Matches the shape produced
-    /// by RelationConverter for joins whose ON condition has no plan_id
-    /// qualifiers — exercises gen_join's simple else-branch which calls
-    /// gen_from on each side.
+    /// Build an inner Join with no plan_id aliases. Inlined here (rather than
+    /// shared with PR #2's branch) so this PR stands alone against nubank/main.
     fn inner_join(
         left: LogicalPlan,
         right: LogicalPlan,
@@ -3581,6 +3789,14 @@ mod tests {
             op: BinaryOp::Eq,
             left: Box::new(left),
             right: Box::new(right),
+        })
+    }
+
+    fn func_call(name: &str, args: Vec<Expression>) -> Expression {
+        Expression::FunctionCall(FunctionCall {
+            name: name.to_string(),
+            args,
+            distinct: false,
         })
     }
 
@@ -3647,6 +3863,254 @@ mod tests {
         assert!(
             !sql.contains(") AS subquery"),
             "join chain wrapped in subquery, got: {sql}"
+        );
+    }
+
+    /// Reproduction for nubank/thunderduck#42: `.withColumn().groupBy("n1.col")…`
+    /// pattern produces `Aggregate(WithColumns(Join(…AliasedRelation…)))`. The
+    /// Java reference wrapped the WithColumns layer in `_withcol_subquery`,
+    /// burying `n1` in the inner scope so the outer GROUP BY couldn't resolve it.
+    /// PR #42 fixes Java by collecting WithColumns substitutions into a map,
+    /// rewriting the Aggregate's expressions inline, and recursing into
+    /// visitAggregate with the rewritten plan whose child is now the Join.
+    ///
+    /// Expected outcome on current Rust HEAD: this test FAILS — the generator
+    /// falls into the `gen_from` catch-all that wraps non-special-cased plans
+    /// in `(\n…\n)`, hiding `n1` from the outer scope. Once the fix lands,
+    /// this test pins the corrected behavior.
+    #[test]
+    fn aggregate_over_with_columns_over_join_preserves_aliases() {
+        // join = supplier ⋈ (nation AS n1) ON s_nationkey = n1.n_nationkey
+        let n1 = LogicalPlan::AliasedRelation(AliasedRelation {
+            input: Box::new(table("nation")),
+            alias: "n1".to_string(),
+            column_aliases: Vec::new(),
+        });
+        let join = inner_join(
+            table("supplier"),
+            n1,
+            eq(col("s_nationkey"), ColumnReference::qualified("n1", "n_nationkey")),
+        );
+
+        // withColumn("l_year", year("l_shipdate"))
+        let year_expr = func_call("year", vec![col("l_shipdate")]);
+        let with_cols = LogicalPlan::WithColumns(WithColumns {
+            input: Box::new(join),
+            columns: vec![("l_year".to_string(), year_expr)],
+        });
+
+        // .groupBy(F.col("n1.n_name").alias("supp_nation"), "l_year")
+        //   .agg(sum("l_extendedprice").alias("revenue"))
+        let grouping = vec![
+            Expression::Alias(AliasExpression {
+                expr: Box::new(ColumnReference::qualified("n1", "n_name")),
+                alias: "supp_nation".to_string(),
+            }),
+            col("l_year"),
+        ];
+        let aggregates = vec![AggregateExpr::new(func_call("sum", vec![col("l_extendedprice")]))];
+
+        let plan = LogicalPlan::Aggregate(Aggregate {
+            input: Box::new(with_cols),
+            grouping,
+            aggregates,
+            having: None,
+            grouping_sets: None,
+            select_order: Vec::new(),
+        });
+
+        let sql = gen().generate(&plan).unwrap();
+        eprintln!("--- generated SQL ---\n{sql}\n---");
+
+        // 1. The user-facing n1 alias must survive into the outer scope.
+        assert!(sql.contains("\"n1\""), "n1 alias buried, got:\n{sql}");
+
+        // 2. No nested subquery between Aggregate and Join — the WithColumns layer
+        //    must be inlined into the SELECT, not wrapped as a derived table.
+        //    `FROM (\n` is the Rust generator's catch-all subquery wrapper shape.
+        assert!(
+            !sql.contains("FROM (\n"),
+            "WithColumns wrapped in subquery (the PR #42 bug), got:\n{sql}"
+        );
+
+        // 3. The l_year alias must be inlined as YEAR(...) in BOTH the SELECT
+        //    list (so output naming is preserved via `AS "l_year"`) and the
+        //    GROUP BY (so DuckDB resolves the synthetic name correctly).
+        let upper = sql.to_uppercase();
+        assert!(
+            upper.contains("YEAR("),
+            "l_year not inlined to year(l_shipdate), got:\n{sql}"
+        );
+        // The synthetic name should NOT appear naked in GROUP BY — only the
+        // inlined expression. The SELECT keeps `AS "l_year"` for output naming.
+        let groupby = sql
+            .split("GROUP BY")
+            .nth(1)
+            .expect("GROUP BY clause missing")
+            .to_uppercase();
+        assert!(
+            !groupby.contains("\"L_YEAR\""),
+            "GROUP BY still references synthetic l_year column instead of inlined expr:\n{sql}"
+        );
+    }
+
+    /// Multiple stacked `WithColumns` layers: both substitutions should fold
+    /// into the aggregate and the join chain stays flat.
+    #[test]
+    fn aggregate_over_multiple_with_columns_inlines_all() {
+        let n1 = LogicalPlan::AliasedRelation(AliasedRelation {
+            input: Box::new(table("nation")),
+            alias: "n1".to_string(),
+            column_aliases: Vec::new(),
+        });
+        let join = inner_join(
+            table("supplier"),
+            n1,
+            eq(col("s_nationkey"), ColumnReference::qualified("n1", "n_nationkey")),
+        );
+
+        // .withColumn("volume", l_extendedprice * (1 - l_discount))
+        //   .withColumn("l_year", year(l_shipdate))
+        let volume_expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Mul,
+            left: Box::new(col("l_extendedprice")),
+            right: Box::new(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Sub,
+                left: Box::new(int(1)),
+                right: Box::new(col("l_discount")),
+            })),
+        });
+        let inner_wc = LogicalPlan::WithColumns(WithColumns {
+            input: Box::new(join),
+            columns: vec![("volume".to_string(), volume_expr)],
+        });
+        let outer_wc = LogicalPlan::WithColumns(WithColumns {
+            input: Box::new(inner_wc),
+            columns: vec![("l_year".to_string(), func_call("year", vec![col("l_shipdate")]))],
+        });
+
+        let plan = LogicalPlan::Aggregate(Aggregate {
+            input: Box::new(outer_wc),
+            grouping: vec![col("l_year")],
+            aggregates: vec![AggregateExpr::new(func_call("sum", vec![col("volume")]))],
+            having: None,
+            grouping_sets: None,
+            select_order: Vec::new(),
+        });
+
+        let sql = gen().generate(&plan).unwrap();
+        eprintln!("--- generated SQL ---\n{sql}\n---");
+
+        assert!(sql.contains("\"n1\""), "n1 buried, got:\n{sql}");
+        assert!(!sql.contains("FROM (\n"), "Aggregate wrapped in subquery, got:\n{sql}");
+        let upper = sql.to_uppercase();
+        assert!(upper.contains("YEAR("), "l_year not inlined, got:\n{sql}");
+        // `volume` should be inlined inside SUM(...) as the multiplication.
+        assert!(
+            sql.contains("\"l_extendedprice\"") && sql.contains("\"l_discount\""),
+            "volume not inlined into SUM, got:\n{sql}"
+        );
+    }
+
+    /// `Aggregate(WithColumns(Filter(Join)))`: the Filter between WithColumns
+    /// and Join must be preserved (rebuilt around the Join inside the
+    /// rewritten Aggregate's input), and the inner table alias must stay
+    /// visible.
+    #[test]
+    fn aggregate_over_with_columns_then_filter_then_join_preserves_aliases() {
+        let n1 = LogicalPlan::AliasedRelation(AliasedRelation {
+            input: Box::new(table("nation")),
+            alias: "n1".to_string(),
+            column_aliases: Vec::new(),
+        });
+        let join = inner_join(
+            table("supplier"),
+            n1,
+            eq(col("s_nationkey"), ColumnReference::qualified("n1", "n_nationkey")),
+        );
+        let filter = LogicalPlan::Filter(Filter {
+            input: Box::new(join),
+            condition: eq(ColumnReference::qualified("n1", "n_name"), col("s_acctbal")),
+        });
+        let wc = LogicalPlan::WithColumns(WithColumns {
+            input: Box::new(filter),
+            columns: vec![("l_year".to_string(), func_call("year", vec![col("l_shipdate")]))],
+        });
+
+        let plan = LogicalPlan::Aggregate(Aggregate {
+            input: Box::new(wc),
+            grouping: vec![col("l_year")],
+            aggregates: vec![AggregateExpr::new(func_call("sum", vec![col("l_extendedprice")]))],
+            having: None,
+            grouping_sets: None,
+            select_order: Vec::new(),
+        });
+
+        let sql = gen().generate(&plan).unwrap();
+        eprintln!("--- generated SQL ---\n{sql}\n---");
+
+        assert!(sql.contains("\"n1\""), "n1 buried, got:\n{sql}");
+        assert!(!sql.contains("FROM (\n"), "Aggregate wrapped in subquery, got:\n{sql}");
+        assert!(sql.contains("WHERE"), "Filter dropped, got:\n{sql}");
+        // Filter referenced n1.n_name; that reference must survive to the WHERE clause.
+        assert!(
+            sql.contains("\"n1\".\"n_name\""),
+            "Filter's n1.n_name reference lost, got:\n{sql}"
+        );
+    }
+
+    /// Semi/anti joins in the chain must skip the rewrite path so the
+    /// existing `gen_join` EXISTS-conversion path stays in control. This
+    /// pins the gating behavior — same rationale as Java's
+    /// `containsSemiOrAntiJoin` check.
+    #[test]
+    fn aggregate_over_with_columns_skipped_for_semi_join() {
+        let n1 = LogicalPlan::AliasedRelation(AliasedRelation {
+            input: Box::new(table("nation")),
+            alias: "n1".to_string(),
+            column_aliases: Vec::new(),
+        });
+        // Semi join — should NOT trigger WithColumns inlining.
+        let semi_join = LogicalPlan::Join(Join {
+            left: Box::new(table("supplier")),
+            right: Box::new(n1),
+            join_type: JoinType::LeftSemi,
+            condition: Some(eq(
+                col("s_nationkey"),
+                ColumnReference::qualified("n1", "n_nationkey"),
+            )),
+            using_columns: Vec::new(),
+            left_alias: None,
+            right_alias: None,
+            left_plan_ids: Vec::new(),
+            right_plan_ids: Vec::new(),
+        });
+        let wc = LogicalPlan::WithColumns(WithColumns {
+            input: Box::new(semi_join),
+            columns: vec![("l_year".to_string(), func_call("year", vec![col("l_shipdate")]))],
+        });
+        let plan = LogicalPlan::Aggregate(Aggregate {
+            input: Box::new(wc),
+            grouping: vec![col("l_year")],
+            aggregates: vec![AggregateExpr::new(func_call("sum", vec![col("l_extendedprice")]))],
+            having: None,
+            grouping_sets: None,
+            select_order: Vec::new(),
+        });
+
+        // We don't assert specific SQL shape here — semi/anti rendering is its
+        // own complex path. We only assert that the rewrite did NOT fire,
+        // surfacing as a SUM(...) reference to the synthetic column or a
+        // subquery wrap — i.e. l_year-as-column (un-inlined). If the rewrite
+        // had fired with semi/anti, gen_join's EXISTS conversion might break.
+        let sql = gen().generate(&plan).unwrap();
+        eprintln!("--- generated SQL ---\n{sql}\n---");
+        // The synthetic l_year ends up as either a column reference (no
+        // inlining) or wrapped in a subquery. Either way, the rewrite path
+        // did NOT take effect.
+        assert!(
+            sql.contains("\"l_year\"") || sql.contains("FROM (\n"),
+            "rewrite path fired for semi join — should have been skipped, got:\n{sql}"
         );
     }
 

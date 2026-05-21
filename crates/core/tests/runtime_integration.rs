@@ -257,3 +257,91 @@ async fn check_parquet_types() {
         println!("  {}: {:?}", field.name(), field.data_type());
     }
 }
+
+// ── struct_field_name_case_is_preserved ────────────────────────────────────────
+
+/// Regression: STRUCT field names must round-trip through schema inference
+/// with their original case. The Java reference (commit `e174e6c`) fixed a bug
+/// where `mapDuckDBType` uppercased the full DuckDB type string and then sliced
+/// field identifiers out of it, producing `STREET`/`ZIP` instead of
+/// `street`/`zip`. The Rust port avoids that class of bug by reading the
+/// typed Arrow schema (case-preserving `Field::name()`) instead of parsing
+/// DuckDB's textual type description. This test locks that behaviour in so a
+/// future refactor cannot silently regress it.
+///
+/// Covers the same shapes the Java fix asserted on:
+///   1. flat `STRUCT(street, zip)`
+///   2. `LIST<STRUCT<...>>`
+///   3. `MAP<VARCHAR, STRUCT<...>>`
+///   4. mixed-case identifiers (`Street`, `ZipCode`)
+#[tokio::test]
+async fn struct_field_name_case_is_preserved() {
+    use thunderduck_core::runtime::SchemaInferrer;
+    use thunderduck_core::types::DataType;
+
+    let session = DuckDbSession::spawn(
+        "struct-field-case",
+        RuntimeCompatMode::Relaxed,
+        &StreamingConfig::default(),
+    )
+    .expect("spawn failed");
+
+    let inferrer = SchemaInferrer::new(&session);
+
+    // Helper: pull the innermost STRUCT field names out of a result schema's
+    // single top-level column, walking through LIST / MAP wrappers if needed.
+    fn struct_field_names(dt: &DataType) -> Vec<String> {
+        match dt {
+            DataType::Struct(s) => s.fields.iter().map(|f| f.name.clone()).collect(),
+            DataType::Array(elem, _) => struct_field_names(elem),
+            DataType::Map { value, .. } => struct_field_names(value),
+            other => panic!("expected STRUCT (or LIST/MAP of STRUCT), got {other:?}"),
+        }
+    }
+
+    // 1. Flat STRUCT
+    let schema = inferrer
+        .infer_sql("SELECT {'street': 'Main', 'zip': '01000'} AS addr")
+        .await
+        .expect("infer flat struct");
+    assert_eq!(schema.fields.len(), 1);
+    assert_eq!(schema.fields[0].name, "addr");
+    assert_eq!(
+        struct_field_names(&schema.fields[0].data_type),
+        vec!["street".to_string(), "zip".to_string()],
+        "flat STRUCT field names must preserve case"
+    );
+
+    // 2. LIST<STRUCT>
+    let schema = inferrer
+        .infer_sql("SELECT [{'street': 'A', 'zip': 'Z'}] AS addrs")
+        .await
+        .expect("infer list<struct>");
+    assert_eq!(
+        struct_field_names(&schema.fields[0].data_type),
+        vec!["street".to_string(), "zip".to_string()],
+        "LIST<STRUCT> field names must preserve case"
+    );
+
+    // 3. MAP<VARCHAR, STRUCT>
+    let schema = inferrer
+        .infer_sql("SELECT MAP {'a': {'street': 'A', 'zip': 'Z'}} AS m")
+        .await
+        .expect("infer map<varchar,struct>");
+    assert_eq!(
+        struct_field_names(&schema.fields[0].data_type),
+        vec!["street".to_string(), "zip".to_string()],
+        "MAP<VARCHAR, STRUCT> field names must preserve case"
+    );
+
+    // 4. Mixed-case identifiers — the exact failure shape from the Java bug.
+    let schema = inferrer
+        .infer_sql("SELECT {'Street': 'A', 'ZipCode': 'Z'} AS addr")
+        .await
+        .expect("infer mixed-case struct");
+    assert_eq!(
+        struct_field_names(&schema.fields[0].data_type),
+        vec!["Street".to_string(), "ZipCode".to_string()],
+        "mixed-case STRUCT field names must NOT be upper-cased (Java e174e6c regression guard)"
+    );
+}

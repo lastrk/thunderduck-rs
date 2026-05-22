@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use thunderduck_core::expression::{
-    Expression, Literal, LiteralValue, SortOrder, UnresolvedColumn,
+    AliasExpression, CastExpression, ColumnReference, Expression, Literal, LiteralValue, SortOrder,
+    UnresolvedColumn,
 };
 use thunderduck_core::generator::SqlGenerator;
 use thunderduck_core::logical::{
@@ -141,6 +142,19 @@ impl<'a> RelationConverter<'a> {
             .map(|e| self.expr_conv.convert(e))
             .collect();
         let mut projections = projections?;
+
+        // Spark Connect emits `df.select(col("c").cast(T))` as a bare `Cast` with no
+        // outer `Alias`, which would otherwise be rendered as
+        // `CAST("c" AS BIGINT)` and named by DuckDB as the literal projection text
+        // — breaking downstream parquet round-trips (`SELECT "c" FROM read_parquet(...)`
+        // would fail to bind). Match the Java reference's deliberate Spark-divergence:
+        // when a top-level projection is a bare `Cast(col, T)` over an
+        // `UnresolvedColumn` / `ColumnReference`, wrap it as `Alias(Cast(...), name)`.
+        // Explicit aliases (`Alias(Cast(...), "x")`) are untouched — they reach this
+        // point as `Expression::Alias`, not `Expression::Cast`.
+        for expr in &mut projections {
+            alias_bare_cast_over_column(expr);
+        }
 
         // Expand explode(map_col) → UNNEST(map_keys) AS key + UNNEST(map_values) AS value
         let input_schema = input.infer_schema();
@@ -1644,7 +1658,7 @@ impl<'a> RelationConverter<'a> {
             if let Some(schema) = cached {
                 return Ok(schema);
             }
-            // Fall back to DuckDB DESCRIBE.
+            // Fall back to Arrow-typed schema inference via `SELECT ... LIMIT 0`.
             use thunderduck_core::generator::quote_ident;
             let sql = format!("SELECT * FROM {}", quote_ident(table));
             let session = Arc::clone(session);
@@ -2537,6 +2551,36 @@ fn local_relation_to_values_sql(data: &[u8]) -> Result<String> {
 /// Expand `explode(map_col)` / `explode_outer(map_col)` expressions into two RawSql expressions
 /// (`UNNEST(map_keys(col)) AS "key"` and `UNNEST(map_values(col)) AS "value"`) when the column
 /// is a MAP type. This must be called before SQL generation since DuckDB cannot UNNEST a MAP.
+/// If `expr` is a bare `Cast(UnresolvedColumn(n)|ColumnReference(n), T)` (not
+/// already wrapped in an `Alias`), wrap it as `Alias(Cast(...), n)` so the
+/// projected column keeps its original name.
+///
+/// Mirrors the Java reference's narrow fix: only the
+/// bare-`Cast`-over-column-ref shape is rewritten. Nested casts (e.g.
+/// `Cast(Cast(col, T1), T2)`), casts over function calls / literals / binary
+/// ops, and explicit aliases are all left untouched.
+fn alias_bare_cast_over_column(expr: &mut Expression) {
+    let Expression::Cast(CastExpression { expr: inner, .. }) = expr else {
+        return;
+    };
+    let inner_name: Option<String> = match inner.as_ref() {
+        Expression::UnresolvedColumn(UnresolvedColumn { name, .. }) => Some(name.clone()),
+        Expression::ColumnReference(ColumnReference { name, .. }) => Some(name.clone()),
+        _ => None,
+    };
+    let Some(alias) = inner_name else {
+        return;
+    };
+    // Replace `*expr` with `Alias(Cast(...), name)` without cloning the cast.
+    // Literal::null() is a cheap throwaway placeholder; it is overwritten on the
+    // next line.
+    let cast = std::mem::replace(expr, Literal::null());
+    *expr = Expression::Alias(AliasExpression {
+        expr: Box::new(cast),
+        alias,
+    });
+}
+
 fn expand_map_explodes(
     input_schema: &thunderduck_core::types::StructType,
     projections: &mut Vec<Expression>,
@@ -2822,7 +2866,115 @@ fn qualify_join_condition(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_parquet_path;
+    use super::*;
+    use thunderduck_core::expression::ColumnReference as CR;
+    use thunderduck_core::types::DataType;
+
+    fn unresolved_col(name: &str) -> Expression {
+        Expression::UnresolvedColumn(UnresolvedColumn {
+            name: name.to_string(),
+            qualifier: None,
+        })
+    }
+
+    fn bare_cast(inner: Expression, to_type: DataType) -> Expression {
+        Expression::Cast(CastExpression {
+            expr: Box::new(inner),
+            to_type,
+            try_cast: false,
+        })
+    }
+
+    /// Regression: `df.select(col("c").cast("long"))` arrives as a bare
+    /// `Cast(UnresolvedColumn("c"), Long)`. The converter must wrap it in
+    /// `Alias(..., "c")` so the projected column keeps its original name
+    /// (otherwise a downstream parquet write/read round-trip fails because
+    /// DuckDB names the column `CAST(c AS BIGINT)`).
+    #[test]
+    fn bare_cast_over_unresolved_column_gets_inner_name_as_alias() {
+        let mut expr = bare_cast(unresolved_col("c"), DataType::Long);
+        alias_bare_cast_over_column(&mut expr);
+        match expr {
+            Expression::Alias(AliasExpression { alias, expr: inner }) => {
+                assert_eq!(alias, "c", "expected alias matching inner column name");
+                assert!(
+                    matches!(*inner, Expression::Cast(_)),
+                    "inner expression must remain the original Cast"
+                );
+            }
+            other => panic!("expected Alias(Cast(...), \"c\"), got {other:?}"),
+        }
+    }
+
+    /// `Cast(ColumnReference("c"), Long)` (post-resolution form) must also be
+    /// aliased — same user intent as the unresolved-column case.
+    #[test]
+    fn bare_cast_over_column_reference_gets_inner_name_as_alias() {
+        let col = Expression::ColumnReference(CR {
+            name: "c".into(),
+            qualifier: None,
+            data_type: DataType::Integer,
+            nullable: true,
+        });
+        let mut expr = bare_cast(col, DataType::Long);
+        alias_bare_cast_over_column(&mut expr);
+        match expr {
+            Expression::Alias(AliasExpression { alias, .. }) => {
+                assert_eq!(alias, "c");
+            }
+            other => panic!("expected Alias(Cast(...), \"c\"), got {other:?}"),
+        }
+    }
+
+    /// An explicit `.alias("renamed")` must win. By the time the converter sees
+    /// it the expression is already `Expression::Alias`, so the bare-Cast
+    /// rewriter must leave it untouched.
+    #[test]
+    fn explicit_alias_over_cast_is_not_reinterpreted() {
+        let inner = bare_cast(unresolved_col("c"), DataType::Long);
+        let mut expr = Expression::Alias(AliasExpression {
+            expr: Box::new(inner),
+            alias: "renamed".to_string(),
+        });
+        let before = expr.clone();
+        alias_bare_cast_over_column(&mut expr);
+        assert_eq!(
+            expr, before,
+            "an Alias(Cast(...), \"renamed\") must not be rewritten"
+        );
+        match expr {
+            Expression::Alias(AliasExpression { alias, .. }) => assert_eq!(alias, "renamed"),
+            other => panic!("expected Alias, got {other:?}"),
+        }
+    }
+
+    /// `Cast(Cast(col("c"), Int), Long)` is NOT a bare cast over a column ref
+    /// — the inner expression is itself a `Cast`. Match the Java reference's
+    /// `castOverNonColumnHasNoAlias` behavior: leave the outer cast unaliased.
+    #[test]
+    fn double_cast_unaliased_is_left_alone() {
+        let inner_cast = bare_cast(unresolved_col("c"), DataType::Integer);
+        let mut expr = bare_cast(inner_cast, DataType::Long);
+        let before = expr.clone();
+        alias_bare_cast_over_column(&mut expr);
+        assert_eq!(
+            expr, before,
+            "Cast(Cast(col, T1), T2) must NOT be wrapped in an alias"
+        );
+    }
+
+    /// A bare cast over a non-column expression (literal here) must not get a
+    /// synthesized alias — there is no inner column name to use.
+    #[test]
+    fn bare_cast_over_literal_is_left_alone() {
+        let mut expr = bare_cast(Literal::int(1), DataType::Long);
+        let before = expr.clone();
+        alias_bare_cast_over_column(&mut expr);
+        assert_eq!(
+            expr, before,
+            "Cast(Literal, T) must NOT be wrapped in an alias"
+        );
+    }
 
     #[test]
     fn s3_directory_path_gets_glob_appended() {

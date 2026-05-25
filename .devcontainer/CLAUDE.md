@@ -34,15 +34,17 @@ The project uses a **two-stage distribution model**:
 
 ### Authentication Flow Architecture
 
-Simple environment variable authentication using `ANTHROPIC_AUTH_TOKEN`:
+Simple environment variable authentication using `ANTHROPIC_AUTH_TOKEN`, plus an optional GitHub CLI auth bridge:
 
 ```
 Host System
   ↓ initializeCommand (runs before container creation)
-  └─→ Capture ANTHROPIC_* environment variables from host
-      ├─→ ANTHROPIC_AUTH_TOKEN → .devcontainer/.claude-auth-token (required)
-      ├─→ ANTHROPIC_BASE_URL → .devcontainer/.claude-base-url (optional)
-      └─→ ANTHROPIC_CUSTOM_HEADERS → .devcontainer/.claude-custom-headers (optional)
+  ├─→ Capture ANTHROPIC_* environment variables from host
+  │   ├─→ ANTHROPIC_AUTH_TOKEN → .devcontainer/.claude-auth-token (required)
+  │   ├─→ ANTHROPIC_BASE_URL → .devcontainer/.claude-base-url (optional)
+  │   └─→ ANTHROPIC_CUSTOM_HEADERS → .devcontainer/.claude-custom-headers (optional)
+  └─→ If gh CLI is installed AND logged in on host:
+      └─→ `gh auth token` → .devcontainer/.gh-auth-token (optional)
 
 Container Creation
   ↓ postCreateCommand (runs inside container after creation)
@@ -50,12 +52,15 @@ Container Creation
   └─→ Run generate-claude-config.sh
       ├─→ Read credential files from .devcontainer/
       ├─→ Generate ~/.claude.json (minimal config)
-      └─→ Generate ~/.claude/settings.json with env vars:
-          ├─→ ANTHROPIC_AUTH_TOKEN (required)
-          ├─→ ANTHROPIC_BASE_URL (if set)
-          └─→ ANTHROPIC_CUSTOM_HEADERS (if set)
+      ├─→ Generate ~/.claude/settings.json with env vars:
+      │   ├─→ ANTHROPIC_AUTH_TOKEN (required)
+      │   ├─→ ANTHROPIC_BASE_URL (if set)
+      │   └─→ ANTHROPIC_CUSTOM_HEADERS (if set)
+      └─→ If .gh-auth-token was captured:
+          └─→ `gh auth login --with-token` populates ~/.config/gh/hosts.yml
 
-Result: Claude Code authenticated without manual login
+Result: Claude Code authenticated without manual login.
+        If host had gh logged in, `gh` works in every container shell too.
 ```
 
 **Required environment variable**:
@@ -65,11 +70,59 @@ Result: Claude Code authenticated without manual login
 - `ANTHROPIC_BASE_URL` - Custom API endpoint
 - `ANTHROPIC_CUSTOM_HEADERS` - Additional HTTP headers for API requests
 
+**Optional GitHub CLI bridge**:
+- If `gh` is installed on the host AND the user is logged in (`gh auth status` succeeds), `initializeCommand` runs `gh auth token` and writes the result to `.devcontainer/.gh-auth-token`.
+- Inside the container, `generate-claude-config.sh` pipes that token into `gh auth login --with-token`, which writes `~/.config/gh/hosts.yml`. The token is then available to every shell in the container — both the user's terminal and any Claude Code subprocess — without setting an env var.
+- If `gh` is missing on the host or the user isn't logged in, the step is skipped with a status message; Anthropic auth and the rest of the container build are unaffected.
+- `.devcontainer/.gh-auth-token` is gitignored alongside the Anthropic credential files.
+
 **Critical implementation details**:
 - `initializeCommand` runs on HOST before container exists
 - `postCreateCommand` runs INSIDE container after it's created
 - All credential files are gitignored and never committed
 - Container will fail to configure if `ANTHROPIC_AUTH_TOKEN` is not set
+- The gh token is recaptured on every container init, so revoking it on the host (via `gh auth logout`) takes effect after the next container rebuild
+
+### Installing MCP Servers on Demand
+
+The image ships with **no** MCP servers preinstalled. Instead, the package managers needed to install them are available unconditionally so you can opt in to whichever servers you want — without paying the image-build cost for tools you don't use.
+
+**Package managers available in every container**:
+- `npm install -g <pkg>` — global Node binaries land in `~/.npm-global/bin` (already on PATH)
+- `uv tool install <pkg>` — isolated Python tools land in `~/.local/bin` (already on PATH)
+- `pip3 install <pkg>` — Python packages into the system interpreter
+- `pkgx install <pkg>` — ad-hoc tool installs in user space
+
+After installing a server, register it by adding an `mcpServers.<name>` entry to `~/.claude.json`, then restart `claude` for it to be picked up.
+
+**Recipe — codegraph** ([repo](https://github.com/colbymchenry/codegraph)) — Tree-sitter + SQLite code knowledge graph:
+```bash
+npm install -g @colbymchenry/codegraph
+# Native better-sqlite3 compiles at install time using build-essential / python3 / make
+# (all preinstalled in the image).
+codegraph --version
+# Then add to ~/.claude.json under mcpServers:
+#   "codegraph": { "type": "stdio", "command": "codegraph", "args": ["serve", "--mcp"] }
+# First-time project setup:
+cd /workspace && codegraph init -i && codegraph index
+# Verify native backend (should print Backend: native, not wasm):
+codegraph status
+```
+
+**Recipe — semble** ([repo](https://github.com/MinishLab/semble)) — fast semantic + BM25 code search:
+```bash
+uv tool install 'semble[mcp]'
+semble --version
+# Then add to ~/.claude.json under mcpServers:
+#   "semble": { "type": "stdio", "command": "semble", "args": [] }
+# Indexing happens on demand on first query.
+```
+
+**Verifying a server is registered**:
+```bash
+jq '.mcpServers' ~/.claude.json     # should list the entry you added
+claude mcp list                      # should show it as connected after restarting claude
+```
 
 ### Security Architecture
 
@@ -161,6 +214,39 @@ bash /path/to/claude-container/install.sh
 - Extracts all embedded files
 - Makes generate-claude-config.sh executable
 - Adds credential files to .gitignore
+
+### Upgrading an Existing Install
+
+`install.sh` has three modes:
+
+| Mode | Behavior |
+|---|---|
+| (default) | Fresh install. Errors if `.devcontainer/` already exists. |
+| `--force-upgrade` | Overwrite existing files. Requires `.devcontainer/` be git-tracked (safety net). |
+| `--merge` | Three-way merge: preserves your customizations, emits standard git conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`) where both you and the new template changed the same lines. |
+
+```bash
+# Upgrade preserving your customizations
+bash /path/to/install.sh --merge
+```
+
+**3-way merge model**:
+- **ours** = `.devcontainer/<file>` on disk (your version, possibly customized)
+- **base** = templates from the *previous installer release* — extracted at build time from `git show HEAD:install.sh` and embedded in the new `install.sh`
+- **theirs** = templates from *this installer release*
+
+The merge uses `git merge-file --diff3`. Clean hunks are applied silently; overlapping changes produce git conflict markers in the file. Resolve in your editor, then `git add .devcontainer/ && git commit`.
+
+**Recovery / abort**: `git checkout -- .devcontainer/` discards the merge result and restores the last commit.
+
+**Requirements for `--merge`**:
+- `.devcontainer/` exists
+- Each managed file is tracked by git
+- No uncommitted changes in any managed file (so `git checkout` can recover)
+
+**Multi-version-skip caveat**: The embedded base is the *previous release's* templates, not necessarily the version you have installed. If you've skipped multiple releases, expect spurious conflicts where your version differs from a base that doesn't match. Workaround: `--force-upgrade` (clean overwrite), then re-apply your local changes by hand.
+
+**Why no local snapshot file?** Keeping `install.sh` self-contained is more important than perfect ancestor tracking — there's no `.devcontainer/.installer/` directory to maintain or git-ignore.
 
 ### Run Claude Code in Unsupervised Mode
 

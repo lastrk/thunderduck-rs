@@ -9,7 +9,27 @@
       "Bash(mkdir -p .github)",
       "Bash(git add *)",
       "Bash(git commit *)",
-      "Bash(gh pr *)"
+      "Bash(gh pr *)",
+      "Bash(git stash *)",
+      "Read(//Users/laszlo.torok/.claude/**)",
+      "Read(//Users/laszlo.torok/.claude/plugins/**)",
+      "Bash(claude plugin *)",
+      "Bash(command -v uv)",
+      "Bash(command -v uvx)",
+      "Bash(command -v codegraph)",
+      "Bash(command -v rust-analyzer)",
+      "Bash(command -v jdtls)",
+      "Bash(git rev-parse *)",
+      "Bash(curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh)",
+      "Bash(sh)",
+      "Bash(git check-ignore *)",
+      "Bash(command -v install-git-hooks.sh)",
+      "mcp__semble__search",
+      "mcp__plugin_agentic-dev_codegraph__codegraph_status",
+      "Bash(rust-analyzer --version)",
+      "Bash(rustup show *)",
+      "Bash(rustup which *)",
+      "Bash(rustup component *)"
     ]
   }
 }

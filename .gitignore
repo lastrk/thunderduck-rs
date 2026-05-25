@@ -6,6 +6,7 @@
 
 # GitHub auth token forwarded from host (auto-generated, keep secret)
 .devcontainer/.github-token
+.devcontainer/.gh-auth-token
 .reference/
 
 # Rust
@@ -40,3 +41,6 @@ playground/logs/
 # Claude Code local artifacts
 .agent-output/
 .claude/worktrees/
+
+# codegraph index (per-machine, managed by /agentic-dev:setup)
+.codegraph/

@@ -30,7 +30,6 @@
 #   SPARK_PORT=15003                    - Spark reference server port
 #   THUNDERDUCK_PORT=15002              - Thunderduck server port
 #   THUNDERDUCK_BINARY=path/to/binary   - Override Thunderduck binary path
-#   THUNDERDUCK_COMPAT_MODE=strict|relaxed|auto
 #   CONNECT_TIMEOUT=10                  - Session creation timeout (seconds)
 #   COLLECT_TIMEOUT=10                  - Result collection timeout
 #   SERVER_STARTUP_TIMEOUT=60           - Server startup timeout
@@ -58,7 +57,19 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SPARK_HOME="${SPARK_HOME:-$HOME/spark/current}"
+
+# Source the env file written by setup-differential-testing.sh if present
+# (sets SPARK_HOME, THUNDERDUCK_VENV_DIR, etc. to the vendored install).
+ENV_FILE="$WORKSPACE_DIR/tests/integration/.env"
+if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+fi
+
+# Fall back to the vendored in-tree install, then $HOME/spark/current for
+# legacy setups, before failing in the prerequisite check below.
+SPARK_HOME="${SPARK_HOME:-$WORKSPACE_DIR/.spark/spark-4.1.1}"
+[ -d "$SPARK_HOME" ] || SPARK_HOME="$HOME/spark/current"
 
 # Handle --ci flag
 if [[ "$1" == "--ci" ]]; then
@@ -228,7 +239,6 @@ echo -e "    Python:            $PYTHON"
 echo -e "    Binary:            $BINARY_PATH"
 echo -e "    Spark port:        ${SPARK_PORT:-auto}"
 echo -e "    Thunderduck port:  ${THUNDERDUCK_PORT:-auto}"
-echo -e "    Compat mode:       ${THUNDERDUCK_COMPAT_MODE:-auto}"
 echo -e "    Collect timeout:   ${COLLECT_TIMEOUT:-10}s"
 echo -e "    Continue on error: ${THUNDERDUCK_TEST_SUITE_CONTINUE_ON_ERROR:-false}"
 echo ""

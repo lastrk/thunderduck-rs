@@ -24,8 +24,11 @@ tests/integration/tpch_sf001/
 tests/integration/tpcds_sf001/
 tests/integration/.env
 
-# DuckDB extension binaries (downloaded by build.rs on first --features bundled-extension build)
+# DuckDB extension binaries (downloaded by build.rs on every fresh build)
 extensions/
+
+# Vendored Apache Spark reference install (downloaded by setup-differential-testing.sh)
+.spark/
 
 # Downloaded build tools
 .tools/

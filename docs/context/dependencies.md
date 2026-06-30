@@ -2,17 +2,10 @@
 
 ## Spark Compatibility Extension
 
-Two modes:
-
-- **Relaxed** (default, no extension, ~85% compat — value-equivalent results, type equivalence not required)
-- **Strict** (extension loaded, ~100% compat — exact Spark types, rounding, NULL semantics)
+Spark parity is the only emission target. The `thdck_spark_funcs` extension is mandatory and bundled into every build (see [rearchitect ADR-020](../thunderduck-rearchitect-ADRs.md)).
 
 ```bash
-# Build WITHOUT extension (relaxed mode, default)
 cargo build --release
-
-# Build WITH extension (strict mode — downloads binary on first run)
-cargo build --release --features bundled-extension
 ```
 
 ### Version Pinning
@@ -22,11 +15,11 @@ The `.duckdb_extension` binary's embedded DuckDB version must exactly match the 
 - Extension release: `ext4` (multi-version — pulls the `v1.5.1` binaries)
 - `duckdb` crate: `1.10501.0`
 
-On first `--features bundled-extension` build, `build.rs` downloads the correct platform binary from the GitHub releases of `thunderduck-duckdb-extension` and caches it under `extensions/` (gitignored). The binary is embedded via `include_bytes!()` and loaded at startup in strict mode.
+On the first build, `build.rs` downloads the correct platform binary from the GitHub releases of `thunderduck-duckdb-extension` and caches it under `extensions/ext4/` (gitignored). The binary is embedded via `include_bytes!()` and loaded at every session's startup; failure to load is a hard error.
 
 ### `thdck_spark_funcs` Extension Functions
 
-The strict-mode extension implements Spark-precise numerical semantics:
+The extension implements Spark-precise numerical semantics:
 
 | Function | Replaces | Behavior |
 |----------|----------|----------|

@@ -1,5 +1,7 @@
 # ADR-15: Compatibility Modes
 
+> **Superseded.** Compatibility modes have been eliminated in favor of strict-only operation; see [ADR-020 in the rearchitect series](../thunderduck-rearchitect-ADRs.md). The decisions below are preserved for historical context.
+
 **Decision: Mirror the Java strict/relaxed/auto model**
 
 ```rust

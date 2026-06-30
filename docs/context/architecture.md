@@ -8,10 +8,9 @@ These are non-negotiable constraints governing all SQL generation and type handl
 2. **Zero pre/post-processing of SQL strings.** All transformations happen on the AST.
 3. **SparkSQL data flow**: Spark SQL string → sqlparser-rs parse tree → Thunderduck expression tree → `SqlGenerator::generate()` → SQL string for DuckDB.
 4. **DataFrame data flow**: Spark Connect protobuf → Thunderduck expression tree → `SqlGenerator::generate()` → SQL string for DuckDB.
-5. **Relaxed mode**: Best performance mapping to vanilla DuckDB constructs producing value-equivalent results (type equivalence not required).
-6. **Strict mode**: Match Apache Spark exactly via (a) CASTs at top-level SELECT projection, or (b) DuckDB extension functions. No casts on intermediate values.
-7. **Zero result copying**: Strict mode achieves 100% type matching at SQL generation time using extension functions + AS aliases. No Arrow vector copying or rewriting.
-8. **`to_sql()` is for SQL generation only.** `Display` / `Debug` implementations are human-readable debug output only — never used to build SQL strings sent to DuckDB.
+5. **Spark parity is the only emission target.** τ matches Apache Spark exactly via (a) CASTs at top-level SELECT projection or (b) DuckDB extension functions; the `thdck_spark_funcs` extension is mandatory (rearchitect ADR-020).
+6. **Zero result copying**: 100% type matching is achieved at SQL generation time using extension functions + AS aliases. No Arrow vector copying or rewriting.
+7. **`to_sql()` is for SQL generation only.** `Display` / `Debug` implementations are human-readable debug output only — never used to build SQL strings sent to DuckDB.
 
 ## Crate Structure
 

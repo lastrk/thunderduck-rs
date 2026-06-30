@@ -28,9 +28,6 @@ The differential suite validates Thunderduck against Apache Spark 4.1.1 by runni
 
 # Quick check: TPC-H only
 ./tests/scripts/run-differential-tests.sh tpch
-
-# Strict mode (requires extension — must build with --features bundled-extension first)
-THUNDERDUCK_COMPAT_MODE=strict ./tests/scripts/run-differential-tests.sh tpch
 ```
 
 ### Direct pytest (activate venv first)
@@ -38,9 +35,6 @@ THUNDERDUCK_COMPAT_MODE=strict ./tests/scripts/run-differential-tests.sh tpch
 ```bash
 # All differential tests
 cd tests/integration && python3 -m pytest differential/ -v --tb=short
-
-# Strict mode via pytest
-cd tests/integration && THUNDERDUCK_COMPAT_MODE=strict python3 -m pytest differential/ -v --tb=short
 
 # Single parameterized SQL query (e.g., TPC-H Q7)
 cd tests/integration && python3 -m pytest \

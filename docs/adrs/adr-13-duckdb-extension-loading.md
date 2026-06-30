@@ -1,19 +1,16 @@
 # ADR-13: DuckDB Extension Loading
 
-**Decision: Embed platform-specific extension binaries in the Rust binary; extract to a temp file and `LOAD` at runtime**
+**Decision: Bundle the `thdck_spark_funcs` binary into the Rust binary at build time; extract to a temp file and `LOAD` at every session's startup**
 
 ```rust
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const EXTENSION: &[u8] = include_bytes!("../extensions/linux_amd64/thdck_spark_funcs.duckdb_extension");
+static EXTENSION_BYTES: &[u8] = include_bytes!(env!("EXTENSION_BIN_PATH"));
 ```
 
-The extension is the `thdck_spark_funcs` DuckDB extension from the `thunderduck-duckdb-extension` repository (v1.5.0 branch). It is a C/C++ DuckDB extension — platform-independent from the Rust host's perspective, compiled separately and bundled as bytes.
+`build.rs` downloads the platform-appropriate binary from the [`ext4` release](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext4) and caches it under `extensions/ext4/`. The extension is **mandatory** — failure to load is a hard startup error (see [rearchitect ADR-020](../thunderduck-rearchitect-ADRs.md)). The extension is the `thdck_spark_funcs` DuckDB extension from the `thunderduck-duckdb-extension` repository — a C/C++ extension, platform-independent from the Rust host's perspective, compiled separately and bundled as bytes.
 
-Platforms supported: `linux_amd64`, `linux_arm64`, `osx_amd64`, `osx_arm64`.
+Platforms supported: `linux_amd64`, `linux_arm64`, `osx_amd64`, `osx_arm64`. Unsupported host platforms are unsupported builds; `build.rs` panics with a clear message.
 
-If no extension is bundled for the current platform, the server starts in relaxed mode with a log warning.
-
-**Critical**: The extension binary DuckDB version must exactly match the `duckdb` crate's linked library version (1.5.0). DuckDB enforces this at `LOAD` time.
+**Critical**: The extension binary DuckDB version must exactly match the `duckdb` crate's linked library version. DuckDB enforces this at `LOAD` time.
 
 ---
 

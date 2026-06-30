@@ -12,14 +12,12 @@
 //! Today [`generate`] is a stub that returns [`ThunderduckError::Unsupported`].
 
 use crate::error::{Result, ThunderduckError};
-use crate::functions::CompatMode;
 use crate::logical::LogicalPlan;
 
 /// Which transpiler path a request is routed to. Set once at startup.
 ///
-/// Resolution mirrors [`crate::runtime::RuntimeCompatMode`]: a CLI flag wins,
-/// otherwise [`TranspilerPath::from_env`] is consulted, defaulting to
-/// [`TranspilerPath::Legacy`].
+/// Resolution: a CLI flag wins, otherwise [`TranspilerPath::from_env`] is
+/// consulted, defaulting to [`TranspilerPath::Legacy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TranspilerPath {
     /// The existing [`crate::generator::SqlGenerator`] path (default).
@@ -54,7 +52,7 @@ impl TranspilerPath {
 /// **Stub.** The v2 pipeline (ADR-003 → ADR-010) is not yet implemented; this
 /// returns [`ThunderduckError::Unsupported`] so a request that opts into the
 /// v2 path fails loudly rather than silently using the legacy path.
-pub fn generate(_plan: &LogicalPlan, _mode: CompatMode) -> Result<String> {
+pub fn generate(_plan: &LogicalPlan) -> Result<String> {
     Err(ThunderduckError::Unsupported(
         "transpiler v2 (rearchitecture path) is not yet implemented; \
          use --transpiler legacy (the default) or unset THUNDERDUCK_TRANSPILER"
@@ -84,7 +82,7 @@ mod tests {
     #[test]
     fn generate_is_unimplemented() {
         let plan = LogicalPlan::SingleRow(crate::logical::SingleRowRelation);
-        let err = generate(&plan, CompatMode::Relaxed).unwrap_err();
+        let err = generate(&plan).unwrap_err();
         assert!(matches!(err, ThunderduckError::Unsupported(_)));
     }
 }

@@ -1,8 +1,7 @@
 //! Pre-rendering AST normalisation pass for the SQL generator.
 //!
 //! Applies structural rewrites to a `LogicalPlan` tree that simplify SQL
-//! generation.  All transformations are semantics-preserving and
-//! mode-independent (they do not depend on `CompatMode`).
+//! generation. All transformations are semantics-preserving.
 //!
 //! Currently implemented:
 //! - **Filter-stack flattening**: collapses `Filter(Filter(...(base)))` into a

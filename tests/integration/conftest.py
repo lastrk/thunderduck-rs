@@ -308,12 +308,6 @@ def pytest_configure(config):
         "markers", "window: mark test as window function test"
     )
     config.addinivalue_line(
-        "markers", "skip_relaxed: skip test in relaxed compatibility mode"
-    )
-    config.addinivalue_line(
-        "markers", "skip_strict: skip test in strict compatibility mode"
-    )
-    config.addinivalue_line(
         "markers", "conditional: mark test as conditional expression test"
     )
     config.addinivalue_line(
@@ -325,9 +319,7 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Add markers automatically based on test names and handle mode-specific skipping"""
-    compat_mode = os.environ.get('THUNDERDUCK_COMPAT_MODE', 'auto').lower()
-
+    """Add markers automatically based on test names."""
     for item in items:
         # Add tpch marker to tests with 'tpch' in name
         if 'tpch' in item.nodeid.lower():
@@ -340,19 +332,6 @@ def pytest_collection_modifyitems(config, items):
         # Add sql marker to tests with 'sql' in name
         if '_sql' in item.nodeid.lower():
             item.add_marker(pytest.mark.sql)
-
-        # Mode-specific skipping
-        if compat_mode in ('relaxed', 'auto'):
-            marker = item.get_closest_marker('skip_relaxed')
-            if marker:
-                reason = marker.kwargs.get('reason', 'Skipped in relaxed mode')
-                item.add_marker(pytest.mark.skip(reason=reason))
-
-        if compat_mode == 'strict':
-            marker = item.get_closest_marker('skip_strict')
-            if marker:
-                reason = marker.kwargs.get('reason', 'Skipped in strict mode')
-                item.add_marker(pytest.mark.skip(reason=reason))
 
 
 # TPC-DS Fixtures
@@ -488,7 +467,6 @@ def dual_server_manager():
     # Kill orphan servers from crashed previous runs (reads stale PID file)
     _cleanup_pid_file()
 
-    compat_mode = os.environ.get('THUNDERDUCK_COMPAT_MODE', None)
     td_port = int(os.environ.get('THUNDERDUCK_PORT', 0)) or _allocate_free_port()
     spark_port = int(os.environ.get('SPARK_PORT', 0)) or _allocate_free_port()
 
@@ -503,7 +481,6 @@ def dual_server_manager():
     manager = DualServerManager(
         thunderduck_port=td_port,
         spark_reference_port=spark_port,
-        compat_mode=compat_mode
     )
 
     print("\n" + "="*80)
@@ -544,16 +521,6 @@ def dual_server_manager():
         pid_entries.append(("spark", spark_port, spark_pid))
     if pid_entries:
         _write_pid_file(pid_entries)
-
-    # Report compatibility mode
-    requested_mode = compat_mode or 'auto'
-    log_file = Path(__file__).parent / "logs" / "server_stderr.log"
-    extension_loaded = False
-    if log_file.exists():
-        log_content = log_file.read_text()
-        extension_loaded = "extension loaded" in log_content.lower()
-    actual_mode = "strict (extension loaded)" if extension_loaded else "relaxed (no extension)"
-    print(f"  Compat mode: requested={requested_mode}, actual={actual_mode}")
 
     yield manager
 

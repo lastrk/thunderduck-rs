@@ -7,9 +7,8 @@ use duckdb::arrow::record_batch::RecordBatch;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Result, ThunderduckError};
-use crate::functions::CompatMode;
-use crate::runtime::compat_mode::{self, RuntimeCompatMode};
 use crate::runtime::config::{HardwareProfile, StreamingConfig};
+use crate::runtime::extension_loader;
 use crate::types::StructType;
 
 /// A single item streamed from the DuckDB session thread during query execution.
@@ -163,21 +162,16 @@ pub(crate) enum SessionResult {
 /// All communication goes through `tokio::sync::mpsc` + `oneshot` channels.
 pub struct DuckDbSession {
     cmd_tx: mpsc::Sender<SessionCommand>,
-    resolved_mode: CompatMode,
 }
 
 impl DuckDbSession {
     /// Spawn a session thread with an in-memory DuckDB database and return a handle.
     ///
     /// This function blocks until the thread is ready (connection opened, settings
-    /// applied, extension loaded if requested).
-    pub fn spawn(
-        session_id: &str,
-        mode: RuntimeCompatMode,
-        _config: &StreamingConfig,
-    ) -> Result<Self> {
+    /// applied, `thdck_spark_funcs` extension loaded).
+    pub fn spawn(session_id: &str, _config: &StreamingConfig) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(32);
-        let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<CompatMode>>(1);
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<()>>(1);
 
         let session_id = session_id.to_string();
 
@@ -403,11 +397,11 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
                     return;
                 }
 
-                // Resolve compat mode (loads extension if requested).
-                let resolved_mode = match compat_mode::resolve(mode, &conn) {
-                    Ok(m) => m,
-                    Err(e) => { let _ = ready_tx.send(Err(e)); return; }
-                };
+                // Load the mandatory thdck_spark_funcs extension.
+                if let Err(e) = extension_loader::load(&conn) {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
 
                 // Opt-in S3 credential_chain (IRSA-friendly auth on EKS).
                 configure_s3_credential_chain(
@@ -415,27 +409,18 @@ CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
                     std::env::var("THUNDERDUCK_S3_CREDENTIAL_CHAIN").ok(),
                 );
 
-                // Signal ready with the resolved mode.
-                let _ = ready_tx.send(Ok(resolved_mode));
+                let _ = ready_tx.send(Ok(()));
 
                 // Enter command loop.
                 session_loop(conn, cmd_rx);
             })
             .map_err(|e| ThunderduckError::DuckDb(format!("failed to spawn session thread: {e}")))?;
 
-        let resolved_mode = ready_rx
+        ready_rx
             .recv()
             .map_err(|_| ThunderduckError::DuckDb("session thread exited before ready".into()))??;
 
-        Ok(DuckDbSession {
-            cmd_tx,
-            resolved_mode,
-        })
-    }
-
-    /// Return the resolved compat mode for this session (Strict or Relaxed).
-    pub fn mode(&self) -> CompatMode {
-        self.resolved_mode
+        Ok(DuckDbSession { cmd_tx })
     }
 
     /// Execute a SQL statement and collect all result Arrow batches.

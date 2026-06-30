@@ -3,9 +3,6 @@ name = "thunderduck-core"
 version.workspace = true
 edition.workspace = true
 
-[features]
-bundled-extension = []
-
 [dependencies]
 thiserror.workspace = true
 duckdb.workspace    = true

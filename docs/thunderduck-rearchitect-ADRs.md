@@ -486,6 +486,35 @@ Because inputs and outputs are *different tables in different formats*, no singl
 
 ---
 
+## ADR-020 — Strict-only target: the `thdck_spark_funcs` extension is mandatory; "relaxed mode" is eliminated
+
+**Status:** Proposed
+**Depends on:** ADR-000, ADR-001, ADR-010
+**Depended on by:** ADR-009, ADR-015 (each is simplified by the single target this ADR fixes)
+
+**Context.** The existing implementation ships two compatibility modes. *Relaxed* (the default) emits to vanilla DuckDB and accepts a documented gap to Spark — sample-vs-population semantics for kurtosis/skewness, DuckDB-typed return widths for `SUM`/`AVG` on integers and decimals, DuckDB decimal-division semantics, and a runtime error for `hash` / `xxhash64` because no vanilla form matches Spark. *Strict* loads the `thdck_spark_funcs` DuckDB extension and routes each of those Spark-divergent functions through it, restoring Spark semantics. The two-mode design predates the rearchitecture: it bought platform flexibility (the extension was optional, and unsupported targets could still run *something*) and let the project ship before the extension binary was production-ready.
+
+That positioning has shifted. ADR-010 already classifies the extension functions as the *principled* answer to Spark/DuckDB divergence — a minimal gap-filler, emitted by a small subset of dispatch cells in ADR-009's table, validated as part of the same differential surface (ADR-015) as everything else. With ADR-010 in place, a second emission target is no longer carrying its weight. It costs: every divergent function carries two implementations and two differential-suite passes, the dispatch tables and code branches inside τ encode a `CompatMode`, and "relaxed-only" defects (silently wrong values, surface-level overflows) live in the *default* mode where most users land. Worse, each future Spark/DuckDB gap re-litigates ADR-010 — "do we add this to the extension, or document a relaxed gap?" — at the moment a single answer is what ADR-010 was meant to settle.
+
+**Decision.** thunderduck has **one** emission target: Spark parity, with the `thdck_spark_funcs` extension loaded. There is no `CompatMode`, no `RuntimeCompatMode`, no `--relaxed` flag, no `THUNDERDUCK_COMPAT_MODE` selection. The extension binary is downloaded by `build.rs` unconditionally, embedded into the server via `include_bytes!`, and **loaded at every session's startup**; failure to load is a hard startup error, not a fallback. ADR-009's dispatch table emits one form per Spark expression; where that form is an `Extension(name)` call (ADR-010), the extension is guaranteed present by construction. The previously-relaxed-only function arms (`hash`, `xxhash64`, kurtosis-as-sample, skewness-as-sample, integer/decimal SUM and AVG return widths, DuckDB decimal division) are deleted; every emission goes through the Spark-faithful path.
+
+**Alternatives considered (and rejected).**
+- *Keep both modes, document strict as preferred.* **Rejected.** Documentation does not eliminate the maintenance cost: the relaxed code paths still exist, the registry still branches, the differential suite still must defend two emission targets, and "passes in relaxed" remains a real failure mode wherever a user lands in the default. Every gap discovered after this point would still force a two-arm decision.
+- *Make strict the default, keep relaxed available behind a flag.* **Rejected** for the same reason — the maintenance cost is identical and the flag becomes an escape hatch for "I'll just turn relaxed on for this query," which re-creates the silent-divergence failure mode the rearchitecture is meant to remove.
+- *Strict-only with the extension mandatory.* **Chosen.** Single emission target absorbs every Spark/DuckDB divergence through the mechanism ADR-010 already endorses. The dispatch table (ADR-009) has one row per construct, the analyzer's type and nullability conclusions (ADR-005) flow to one emission, and the oracle (ADR-015) has one configuration to defend.
+
+**Consequences.**
+- (+) τ has one emission target. ADR-009's table simplifies (no per-cell strict/relaxed split), and ADR-015's differential oracle has one configuration to defend against reference Spark — the "skip in relaxed" / "skip in strict" markers go away.
+- (+) The `CompatMode` / `RuntimeCompatMode` types, the `mode` parameter threaded through `SqlGenerator` and the function registry, and the `bundled-extension` Cargo feature gate all disappear from the codebase. The mode-resolution code in session startup collapses to "load the extension, fail if you can't."
+- (+) The full Spark function surface (notably `hash` and `xxhash64`, which previously errored on the default path) becomes uniformly available. No per-function "requires strict mode" disclaimer.
+- (−) The build now requires network access to download the extension binary on first build (cached under `extensions/<release>/` after that). Unsupported host platforms become unsupported *builds*, not degraded runs — the binary's platform set (linux/x86_64, linux/aarch64, macos/x86_64, macos/aarch64 at the `ext4` release) is now a hard precondition.
+- (−) The upstream extension repository (`nubank/thunderduck-duckdb-extension`) becomes a hard build dependency. An outage there during a fresh build is a build failure. The cache mitigates this for established workstations and CI runners that have built at least once.
+- (neutral) The CLI keeps `--strict` as a deprecated no-op (with a one-line `tracing::warn!`) so existing scripts and Helm-style invocations do not break the day this lands; `--relaxed` and `THUNDERDUCK_COMPAT_MODE=relaxed` are rejected at startup with a clear message pointing at this ADR.
+
+**Refinement hooks.** When a new Spark/DuckDB divergence is found, the workflow is unambiguous: add a function to the extension (or extend an existing one), add the dispatch row in τ, validate via ADR-015 — the "should we just document a relaxed gap?" question does not arise. The extension's exported function set must be kept in lockstep with τ's dispatch (this is ADR-010's INV6, sharpened: every `Extension(name)` cell now has exactly one binary it must agree with, not two configurations to validate). If a host platform without an extension binary ever becomes a requirement, this ADR is revisited rather than worked around at runtime — the answer is "ship the binary for that platform," not "re-introduce a vanilla fallback."
+
+---
+
 # Cross-Validation
 
 This section is the instrument for checking the decisions against each other. Refining any single ADR above should be followed by a pass through §CV to confirm the change respects the dependency structure, the tension resolutions, the load-bearing assumptions, and the invariants.

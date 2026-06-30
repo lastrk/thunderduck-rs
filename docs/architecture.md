@@ -29,7 +29,7 @@ PySpark / Spark Client
 ┌─────────────────────────────────────────────────────┐
 │        DuckDB Execution + Arrow Streaming           │
 │  duckdb-rs  →  Arrow RecordBatch (zero-copy)        │
-│  thdck_spark_funcs extension (strict mode)          │
+│  thdck_spark_funcs extension (mandatory)            │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -52,10 +52,10 @@ All architectural decisions are documented as individual ADRs. Each entry below 
 | ADR-09 | SQL Generator | `SqlGenerator` struct with `match`-based dispatch; `gen_*` naming; dual join path rule | [adr-09](adrs/adr-09-sql-generator.md) |
 | ADR-10 | SparkSQL Raw SQL Path | ~~`preprocess_spark_sql` 13-phase text rewrite~~ — **superseded by ADR-21** | [adr-10](adrs/adr-10-sparksql-raw-sql-path.md) |
 | ADR-11 | Protobuf Plan Conversion | Two-module converter: `RelationConverter` + `ExpressionConverter` | [adr-11](adrs/adr-11-protobuf-plan-conversion.md) |
-| ADR-12 | Function Registry | `LazyLock<FunctionRegistry>` with 500+ Spark→DuckDB mappings; strict/relaxed routing | [adr-12](adrs/adr-12-function-registry.md) |
-| ADR-13 | DuckDB Extension Loading | Embed platform binaries via `include_bytes!`; extract to temp file and `LOAD` at runtime | [adr-13](adrs/adr-13-duckdb-extension-loading.md) |
+| ADR-12 | Function Registry | `LazyLock<FunctionRegistry>` with 500+ Spark→DuckDB mappings; divergent functions route through the `thdck_spark_funcs` extension | [adr-12](adrs/adr-12-function-registry.md) |
+| ADR-13 | DuckDB Extension Loading | Bundle `thdck_spark_funcs` via `include_bytes!`; `LOAD` at every session's startup (mandatory) | [adr-13](adrs/adr-13-duckdb-extension-loading.md) |
 | ADR-14 | Session Management | `DashMap<String, Arc<SessionHandle>>`; named in-memory DuckDB databases per session | [adr-14](adrs/adr-14-session-management.md) |
-| ADR-15 | Compatibility Modes | `CompatMode` enum: Strict / Relaxed / Auto; CLI flags and env var | [adr-15](adrs/adr-15-compatibility-modes.md) |
+| ADR-15 | Compatibility Modes | **Superseded by [rearchitect ADR-020](thunderduck-rearchitect-ADRs.md)** — relaxed mode eliminated; strict-only target | [adr-15](adrs/adr-15-compatibility-modes.md) |
 | ADR-16 | Crate Structure | Cargo workspace: `core` (pure translation) + `connect-server` (gRPC binary) | [adr-16](adrs/adr-16-crate-structure.md) |
 | ADR-17 | Arrow ↔ DuckDB Zero-Copy Exchange | `query_arrow()` → Arrow IPC → tonic streaming; no data copies on hot path | [adr-17](adrs/adr-17-arrow-duckdb-zero-copy-exchange.md) |
 | ADR-18 | Error Handling | `thiserror` in `core`; `anyhow` in `connect-server`; maps to `tonic::Status` | [adr-18](adrs/adr-18-error-handling.md) |

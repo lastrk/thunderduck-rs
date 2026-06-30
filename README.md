@@ -6,7 +6,7 @@
 
 > **Alpha Software**: Despite extensive test coverage, Thunderduck is currently alpha quality software and will undergo extensive testing with real-world workloads before production readiness.
 
-**Thunderduck** is an embedded execution engine that translates Spark operations to DuckDB SQL, providing fast single-node query execution as a drop-in replacement for Apache Spark. This is the Rust port: same Spark API compatibility, ~50ms startup (vs ~10s JVM), and ~45MB baseline memory (vs ~500MB JVM). Both relaxed and strict compatibility modes achieve **100% pass rate** on the 835-test differential suite against Apache Spark 4.1.1.
+**Thunderduck** is an embedded execution engine that translates Spark operations to DuckDB SQL, providing fast single-node query execution as a drop-in replacement for Apache Spark. This is the Rust port: same Spark API compatibility, ~50ms startup (vs ~10s JVM), and ~45MB baseline memory (vs ~500MB JVM). Achieves **100% pass rate** on the 835-test differential suite against Apache Spark 4.1.1.
 
 ### Key Features
 
@@ -18,7 +18,7 @@
 - **Arrow-native data interchange** with DuckDB's vectorized engine
 - **Format support**: Parquet, Delta Lake (PLANNED), Iceberg (PLANNED)
 - **835 differential tests** against Spark 4.1.1 — TPC-H (100%), TPC-DS (100%), functions, joins, window, aggregations, lambdas, complex types
-- **Two compatibility modes**: Relaxed (vanilla DuckDB, best-effort type matching) and Strict (DuckDB extension, exact Spark type parity)
+- **Exact Spark type parity** via the bundled `thdck_spark_funcs` DuckDB extension
 - **Query plan introspection** via EXPLAIN statements
 
 ### Why Thunderduck?
@@ -144,7 +144,7 @@ session thread → oneshot::Sender<SessionResult> → tokio task → gRPC stream
 
 - **Rust** 1.75+ (`rustup` recommended)
 - **protoc** — Protocol Buffers compiler
-- **curl** (optional — required to download the extension for strict Spark type parity)
+- **curl** — required by `build.rs` to download the mandatory `thdck_spark_funcs` extension binary on first build
 
 ```bash
 # Install Rust
@@ -157,13 +157,14 @@ brew install protobuf
 apt-get install -y protobuf-compiler
 ```
 
-### Build (relaxed mode — default)
+### Build
 
 ```bash
 # Full build (debug)
 cargo build
 
-# Release build (required for integration/differential tests)
+# Release build (required for integration/differential tests).
+# Downloads and embeds the thdck_spark_funcs extension automatically.
 cargo build --release
 
 # Build a single crate
@@ -174,56 +175,35 @@ cargo build -p thunderduck-connect-server
 cargo check
 ```
 
-### Build with Spark Compatibility Extension (strict mode)
-
-```bash
-cargo build --release --features bundled-extension
-```
-
-The extension binary for the current platform is automatically downloaded from the
+The extension binary for the current platform is downloaded by `build.rs` from the
 [`ext4` release](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext4)
 (which bundles binaries for multiple DuckDB versions — we pull the `v1.5.1` set to match the
-`duckdb` crate at `1.10501.0`) and cached under `extensions/` on first build. Subsequent builds
-reuse the cached file — no re-download. The extension is then embedded directly in the binary
-via `include_bytes!()`.
+`duckdb` crate at `1.10501.0`) and cached under `extensions/ext4/` on first build. Subsequent builds
+reuse the cached file — no re-download. The extension is embedded directly in the binary
+via `include_bytes!()` and loaded at every session's startup.
 
 ### Start the Server
 
 ```bash
-# Default (relaxed mode, port 15002)
+# Default
 ./target/release/thunderduck-connect-server
 
 # Custom port
 ./target/release/thunderduck-connect-server --port 15002
 
-# Strict mode (exact Spark type parity via bundled extension)
-./target/release/thunderduck-connect-server --strict
-
-# Relaxed mode (vanilla DuckDB, best-effort types — default)
-./target/release/thunderduck-connect-server --relaxed
-
 # Kill the server
 pkill -f thunderduck-connect-server
 ```
 
-## Compatibility Modes
+## Spark Compatibility Extension
 
-Thunderduck supports two compatibility modes:
-
-| Mode | Extension | Type Accuracy | Performance |
-|------|-----------|---------------|-------------|
-| **Relaxed** (default) | Not loaded | ~95% — value-equivalent, may differ in output types | Maximum |
-| **Strict** | Embedded at build time | 100% — exact Spark type parity | Near-maximum |
-
-The `thdck_spark_funcs` DuckDB extension implements Spark-precise numerical semantics:
+Spark parity is the only emission target. The `thdck_spark_funcs` DuckDB extension is mandatory and bundled into every build (see [rearchitect ADR-020](docs/thunderduck-rearchitect-ADRs.md)). It implements Spark-precise numerical semantics:
 - `spark_hash(c1, ..., cN)` — Spark `hash()` (Murmur3-32, signed INT, seed 42)
 - `spark_xxhash64(c1, ..., cN)` — Spark `xxhash64()` (xxHash64, signed BIGINT, seed 42)
 - `spark_decimal_div(a, b)` — decimal division with `ROUND_HALF_UP`
 - `spark_sum(col)` — Spark-compatible SUM return types
 - `spark_avg(col)` — Spark-compatible AVG return types
 - `spark_skewness(col)` — population skewness (Spark's formula, no bias correction)
-
-Strict mode requires building with `--features bundled-extension` (see [Build with Extension](#build-with-spark-compatibility-extension-strict-mode)). The extension is embedded in the binary at compile time and loaded at startup.
 
 ## Testing
 
@@ -245,7 +225,7 @@ cargo test -p thunderduck-core -- generator::tests::test_project_to_sql
 cargo test -- --nocapture
 ```
 
-### Differential Tests — Relaxed Mode
+### Differential Tests
 
 ```bash
 # Full suite (all 41 test files: TPC-H, TPC-DS, joins, window, aggregations, etc.)
@@ -253,14 +233,6 @@ cargo test -- --nocapture
 
 # Quick check: TPC-H only
 ./tests/scripts/run-differential-tests.sh tpch
-```
-
-### Differential Tests — Strict Mode
-
-Requires a binary built with `--features bundled-extension` (see above).
-
-```bash
-THUNDERDUCK_COMPAT_MODE=strict ./tests/scripts/run-differential-tests.sh tpch
 ```
 
 The run script handles virtualenv setup, server lifecycle, and cleanup automatically.

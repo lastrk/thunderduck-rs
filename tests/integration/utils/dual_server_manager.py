@@ -24,7 +24,6 @@ class DualServerManager:
         self,
         thunderduck_port: int = 15002,
         spark_reference_port: int = 15003,
-        compat_mode: str | None = None
     ):
         """
         Initialize dual server manager
@@ -32,7 +31,6 @@ class DualServerManager:
         Args:
             thunderduck_port: Port for Thunderduck server (default 15002)
             spark_reference_port: Port for Spark reference server (default 15003)
-            compat_mode: Spark compat mode ("strict", "relaxed", or None for auto)
         """
         self.thunderduck_port = thunderduck_port
         self.spark_reference_port = spark_reference_port
@@ -42,7 +40,6 @@ class DualServerManager:
         self.thunderduck_manager = ServerManager(
             host="localhost",
             port=thunderduck_port,
-            compat_mode=compat_mode
         )
 
         # Spark Connect container name

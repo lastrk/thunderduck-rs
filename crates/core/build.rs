@@ -1,11 +1,8 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-
-    #[cfg(feature = "bundled-extension")]
     download_extension();
 }
 
-#[cfg(feature = "bundled-extension")]
 fn download_extension() {
     // The `ext4` release packs binaries for multiple DuckDB versions under a
     // single tag, with the DuckDB version embedded in each filename. We pick
@@ -61,7 +58,6 @@ fn download_extension() {
     println!("cargo:rustc-env=EXTENSION_BIN_PATH={}", dest.display());
 }
 
-#[cfg(feature = "bundled-extension")]
 fn detect_platform(target: &str) -> &'static str {
     if target.contains("x86_64") && target.contains("linux") {
         "linux_amd64"

@@ -4,9 +4,7 @@ use std::sync::Arc;
 use futures::stream;
 use thunderduck_core::generator::SqlGenerator;
 use thunderduck_core::logical::LogicalPlan;
-use thunderduck_core::runtime::{
-    DuckDbSession, RuntimeCompatMode, SchemaInferrer, SessionManager, StreamBatch,
-};
+use thunderduck_core::runtime::{SchemaInferrer, SessionManager, StreamBatch};
 use thunderduck_core::transpiler_v2::{self, TranspilerPath};
 use thunderduck_core::types::DataType;
 use tonic::{Request, Response, Status};
@@ -28,20 +26,14 @@ const MAX_PLAN_DEPTH: usize = 256;
 
 pub struct ThunderduckService {
     session_manager: Arc<SessionManager>,
-    mode: RuntimeCompatMode,
     /// Selected transpiler path (startup-global). See [`generate_sql`].
     transpiler: TranspilerPath,
 }
 
 impl ThunderduckService {
-    pub fn new(
-        session_manager: Arc<SessionManager>,
-        mode: RuntimeCompatMode,
-        transpiler: TranspilerPath,
-    ) -> Self {
+    pub fn new(session_manager: Arc<SessionManager>, transpiler: TranspilerPath) -> Self {
         Self {
             session_manager,
-            mode,
             transpiler,
         }
     }
@@ -54,16 +46,12 @@ impl ThunderduckService {
 /// path is chosen once at startup ([`ThunderduckService::transpiler`]); the
 /// v2 arm currently fails with a gRPC `Unimplemented` status until that
 /// pipeline lands.
-fn generate_sql(
-    transpiler: TranspilerPath,
-    plan: &LogicalPlan,
-    session: &DuckDbSession,
-) -> Result<String, Status> {
+fn generate_sql(transpiler: TranspilerPath, plan: &LogicalPlan) -> Result<String, Status> {
     match transpiler {
-        TranspilerPath::Legacy => SqlGenerator::new(session.mode())
+        TranspilerPath::Legacy => SqlGenerator::new()
             .generate(plan)
             .map_err(|e| Status::from(ConnectError::SqlGeneration(e))),
-        TranspilerPath::V2 => transpiler_v2::generate(plan, session.mode())
+        TranspilerPath::V2 => transpiler_v2::generate(plan)
             .map_err(|e| Status::from(ConnectError::Unsupported(e.to_string()))),
     }
 }
@@ -128,7 +116,7 @@ impl SparkConnectService for ThunderduckService {
                     return Ok(Response::new(Box::pin(stream)));
                 }
 
-                let sql = generate_sql(self.transpiler, &logical_plan, session.as_ref())?;
+                let sql = generate_sql(self.transpiler, &logical_plan)?;
 
                 match classify_plan(&logical_plan) {
                     PlanKind::Ddl(ddl) => {
@@ -208,7 +196,7 @@ impl SparkConnectService for ThunderduckService {
                 if struct_type.is_empty() || has_unresolved || logical_plan.has_partial_schema() {
                     // Static inference failed or produced Unresolved types — ask DuckDB
                     // for the actual column types/nullability.
-                    let sql = generate_sql(self.transpiler, &logical_plan, session.as_ref())?;
+                    let sql = generate_sql(self.transpiler, &logical_plan)?;
                     let duckdb_schema = SchemaInferrer::new(&session)
                         .infer_sql(&sql)
                         .await
@@ -435,7 +423,7 @@ async fn handle_command(
             let logical_plan =
                 PlanConverter::convert_relation_with_session(&relation, Arc::clone(session))
                     .map_err(Status::from)?;
-            let sql = generate_sql(transpiler, &logical_plan, session.as_ref())?;
+            let sql = generate_sql(transpiler, &logical_plan)?;
 
             // Infer schema from the input relation and cache it so downstream
             // reads preserve Spark-declared nullable flags that DuckDB's
@@ -461,7 +449,7 @@ async fn handle_command(
         Some(CommandType::SqlCommand(sql_cmd)) => {
             let (sql, logical_plan) = if let Some(input_rel) = sql_cmd.input {
                 let plan = PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
-                let sql = generate_sql(transpiler, &plan, session.as_ref())?;
+                let sql = generate_sql(transpiler, &plan)?;
                 (sql, Some(plan))
             } else {
                 // Fallback: older clients send spark.sql() via the deprecated `sql` text field
@@ -492,7 +480,7 @@ async fn handle_command(
                 .input
                 .ok_or_else(|| Status::invalid_argument("WriteOperation missing input"))?;
             let logical_plan = PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
-            let select_sql = generate_sql(transpiler, &logical_plan, session.as_ref())?;
+            let select_sql = generate_sql(transpiler, &logical_plan)?;
 
             let path = match write_cmd.save_type {
                 Some(SaveType::Path(p)) => p,
@@ -550,7 +538,7 @@ async fn execute_approx_quantile(
     use arrow::record_batch::RecordBatch;
 
     // Generate SQL for the input sub-plan via the selected transpiler.
-    let input_sql = generate_sql(transpiler, &aq.input, session.as_ref())
+    let input_sql = generate_sql(transpiler, &aq.input)
         .map_err(|s| format!("approx_quantile input gen: {}", s.message()))?;
 
     let n_probs = aq.probabilities.len();

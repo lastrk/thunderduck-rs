@@ -375,13 +375,8 @@ class DataFrameDiff:
 
 
 def _is_relaxed_mode():
-    """Check if running in relaxed comparison mode.
-
-    Returns True for 'relaxed' and 'auto' modes (without extension, types won't
-    match exactly). Only 'strict' mode uses strict comparison.
-    """
-    mode = os.environ.get('THUNDERDUCK_COMPAT_MODE', 'auto')
-    return mode.lower() in ('relaxed', 'auto')
+    """Always False: strict is the only mode (see rearchitect ADR-020)."""
+    return False
 
 
 # Convenience function for pytest

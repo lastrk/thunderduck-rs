@@ -632,19 +632,10 @@ impl<'a> RelationConverter<'a> {
     }
 
     fn convert_sql(&self, s: &proto::Sql) -> Result<LogicalPlan> {
-        use thunderduck_core::functions::CompatMode;
         use thunderduck_core::parser::SparkSqlParser;
         let plan = SparkSqlParser::parse(&s.query).map_err(ConnectError::from)?;
-        // Enrich TableScan leaves only in strict mode.
-        // In relaxed mode the enriched INTEGER types feed apply_agg_type_casts and add
-        // BIGINT casts that corrupt decimal arithmetic (e.g. TPC-DS Q66/Q12/Q20/Q98).
-        let strict = self.session.as_ref().map(|s| s.mode()) == Some(CompatMode::Strict);
-        if strict {
-            let enriched = self.enrich_table_scans(plan);
-            Ok(propagate_cte_schemas(enriched))
-        } else {
-            Ok(plan)
-        }
+        let enriched = self.enrich_table_scans(plan);
+        Ok(propagate_cte_schemas(enriched))
     }
 
     /// Recursively walk a plan tree, populating empty `TableScan.schema` fields by
@@ -1624,7 +1615,7 @@ impl<'a> RelationConverter<'a> {
         }
         // Slow path: execute a LIMIT 0 query via DuckDB
         if let Some(session) = &self.session {
-            let sql = SqlGenerator::relaxed().generate(plan).map_err(|e| {
+            let sql = SqlGenerator::new().generate(plan).map_err(|e| {
                 ConnectError::PlanConversion(format!("schema inference SQL gen: {e}"))
             })?;
             let session = Arc::clone(session);
@@ -1677,7 +1668,7 @@ impl<'a> RelationConverter<'a> {
     /// Infer the full schema (column names + types) of a plan using DuckDB.
     fn infer_full_schema(&self, plan: &LogicalPlan) -> Result<StructType> {
         if let Some(session) = &self.session {
-            let sql = SqlGenerator::relaxed().generate(plan).map_err(|e| {
+            let sql = SqlGenerator::new().generate(plan).map_err(|e| {
                 ConnectError::PlanConversion(format!("schema inference SQL gen: {e}"))
             })?;
             let session = Arc::clone(session);

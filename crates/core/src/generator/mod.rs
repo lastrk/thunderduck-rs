@@ -15,14 +15,14 @@ use crate::expression::{
     RowConstructorExpression, ScalarSubquery, SortOrder, StructLiteralExpression, UnaryExpression,
     UnaryOp, UnresolvedColumn, WindowFunction,
 };
-use crate::functions::{CompatMode, FunctionRegistry};
+use crate::functions::FunctionRegistry;
 use crate::logical::{
     spark_column_name, Aggregate, AggregateExpr, AliasedRelation, ApproxQuantile, DdlOperation,
     Describe, Distinct, DropColumns, Except, Filter, GroupingSets, InMemoryRelation, Intersect,
-    Join, JoinType, Limit, LocalDataRelation, LocalRelation, LogicalPlan, NADrop, NADropHow, NAFill,
-    NAReplace, Pivot, Project, RangeRelation, Sample, SelectEntry, ShowString, SingleRowRelation,
-    Sort, SqlRelation, StatCorr, StatCov, StatCrosstab, StatFreqItems, StatSampleBy, Summary,
-    TableScan, Tail, ToDataFrame, Union, Unpivot, WithColumns, WithCte,
+    Join, JoinType, Limit, LocalDataRelation, LocalRelation, LogicalPlan, NADrop, NADropHow,
+    NAFill, NAReplace, Pivot, Project, RangeRelation, Sample, SelectEntry, ShowString,
+    SingleRowRelation, Sort, SqlRelation, StatCorr, StatCov, StatCrosstab, StatFreqItems,
+    StatSampleBy, Summary, TableScan, Tail, ToDataFrame, Union, Unpivot, WithColumns, WithCte,
 };
 use crate::types::{DataType, StructType, TypeInferenceEngine, TypeMapper};
 
@@ -30,33 +30,26 @@ use crate::types::{DataType, StructType, TypeInferenceEngine, TypeMapper};
 
 /// Generates DuckDB-compatible SQL from a `LogicalPlan` tree.
 pub struct SqlGenerator {
-    mode: CompatMode,
     /// Schema of the current input relation, used for polymorphic function dispatch.
     schema: StructType,
 }
 
+impl Default for SqlGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SqlGenerator {
-    pub fn new(mode: CompatMode) -> Self {
+    pub fn new() -> Self {
         Self {
-            mode,
             schema: StructType::empty(),
         }
     }
 
-    pub fn relaxed() -> Self {
-        Self::new(CompatMode::Relaxed)
-    }
-
-    pub fn strict() -> Self {
-        Self::new(CompatMode::Strict)
-    }
-
     /// Return a new generator with the given schema for type-aware dispatch.
     fn with_schema(&self, schema: StructType) -> Self {
-        Self {
-            mode: self.mode,
-            schema,
-        }
+        Self { schema }
     }
 
     /// Generate a complete SQL statement from the plan.
@@ -177,7 +170,7 @@ impl SqlGenerator {
         ae: &crate::logical::AggregateExpr,
         input_schema: &StructType,
     ) -> Result<String> {
-        let func = apply_agg_type_casts(&ae.func, input_schema, self.mode);
+        let func = apply_agg_type_casts(&ae.func, input_schema);
         let mut s = self.gen_expr(&func)?;
         if ae.is_distinct {
             s = inject_distinct(s);
@@ -1331,12 +1324,10 @@ impl SqlGenerator {
         exprs
             .iter()
             .map(|e| {
-                // Strict mode: wrap computed DECIMAL projections with explicit CAST so the
-                // output column type matches Spark exactly (mirrors Java generateExpressionWithCast).
-                if self.mode == CompatMode::Strict {
-                    if let Some(sql) = self.try_strict_decimal_cast(e)? {
-                        return Ok(sql);
-                    }
+                // Wrap computed DECIMAL projections with explicit CAST so the output column
+                // type matches Spark exactly (mirrors Java generateExpressionWithCast).
+                if let Some(sql) = self.try_strict_decimal_cast(e)? {
+                    return Ok(sql);
                 }
                 let sql = self.gen_expr(e)?;
                 // DuckDB normalises DECIMAL(p,s) to DECIMAL(p, s) (adds space) in auto-generated
@@ -1513,8 +1504,8 @@ impl SqlGenerator {
     }
 
     fn gen_binary(&self, b: &BinaryExpression) -> Result<String> {
-        // Strict mode: decimal division uses spark_decimal_div() extension
-        if matches!(b.op, BinaryOp::Div) && self.mode == CompatMode::Strict {
+        // Decimal division routes through the spark_decimal_div() extension function.
+        if matches!(b.op, BinaryOp::Div) {
             let lt = b.left.data_type(&self.schema);
             let rt = b.right.data_type(&self.schema);
             if let Some(sql) = self.gen_strict_decimal_div(b, &lt, &rt)? {
@@ -1731,8 +1722,7 @@ impl SqlGenerator {
         let arg_types: Vec<DataType> = f.args.iter().map(|a| a.data_type(&self.schema)).collect();
 
         // Route through FunctionRegistry for Spark→DuckDB translation
-        let translated =
-            FunctionRegistry::translate_typed(&f.name, &arg_refs, &arg_types, self.mode);
+        let translated = FunctionRegistry::translate_typed(&f.name, &arg_refs, &arg_types);
 
         if f.distinct {
             // DuckDB's COUNT(DISTINCT ...) only accepts a single expression.
@@ -1793,16 +1783,10 @@ impl SqlGenerator {
     }
 
     fn gen_window(&self, w: &WindowFunction) -> Result<String> {
-        // Extension functions (thdck_avg, spark_sum, etc.) are custom scalar aggregates
-        // that do NOT support the OVER clause. Window function bodies must always use
-        // native DuckDB aggregate names regardless of the outer CompatMode.
-        let relaxed_for_window;
-        let window_func_gen: &SqlGenerator = if self.mode == CompatMode::Strict {
-            relaxed_for_window = SqlGenerator::relaxed();
-            &relaxed_for_window
-        } else {
-            self
-        };
+        // Window bodies render through `self`. Aggregate-only extension rewrites
+        // (spark_sum, spark_avg) live in `apply_agg_type_casts`, which only runs
+        // from `gen_aggregate` — never from here — so the body cannot pick up an
+        // OVER-incompatible extension call by accident.
 
         // Handle first/last/nth_value with ignore_nulls argument.
         // Spark: first(col, ignorenulls=True) → DuckDB: first_value(col IGNORE NULLS)
@@ -1822,7 +1806,7 @@ impl SqlGenerator {
                     .args
                     .iter()
                     .take(nulls_idx)
-                    .map(|a| window_func_gen.gen_expr(a))
+                    .map(|a| self.gen_expr(a))
                     .collect::<Result<Vec<_>>>()?;
                 let col_str = col_args.join(", ");
                 if ignore_nulls {
@@ -1831,10 +1815,10 @@ impl SqlGenerator {
                     format!("{duckdb_name}({col_str})")
                 }
             } else {
-                window_func_gen.gen_expr(&w.func)?
+                self.gen_expr(&w.func)?
             }
         } else {
-            window_func_gen.gen_expr(&w.func)?
+            self.gen_expr(&w.func)?
         };
 
         let mut over_parts = Vec::new();
@@ -1866,21 +1850,16 @@ impl SqlGenerator {
         let over = over_parts.join(" ");
         let mut result = format!("{func} OVER ({over})");
 
-        // Strict mode: compensate for native DuckDB window aggregate types.
-        // Extension functions (spark_avg, spark_sum) don't support OVER clauses,
-        // so window bodies use native DuckDB aggregates. We add a compensating
-        // CAST to produce the Spark-expected decimal type.
-        if self.mode == CompatMode::Strict {
-            if let Expression::FunctionCall(f) = &*w.func {
-                let lower = f.name.to_lowercase();
-                if let Some(arg) = f.args.first() {
-                    let arg_type = arg.data_type(&self.schema);
-                    if let DataType::Decimal { precision, scale } = arg_type {
-                        if let Some((new_p, new_s)) =
-                            spark_decimal_agg_type(&lower, precision, scale)
-                        {
-                            result = format!("CAST({result} AS DECIMAL({new_p},{new_s}))");
-                        }
+        // Compensate for native DuckDB window aggregate types. Extension functions
+        // (spark_avg, spark_sum) don't support OVER clauses, so window bodies use
+        // native DuckDB aggregates; cast back to the Spark-expected decimal type.
+        if let Expression::FunctionCall(f) = &*w.func {
+            let lower = f.name.to_lowercase();
+            if let Some(arg) = f.args.first() {
+                let arg_type = arg.data_type(&self.schema);
+                if let DataType::Decimal { precision, scale } = arg_type {
+                    if let Some((new_p, new_s)) = spark_decimal_agg_type(&lower, precision, scale) {
+                        result = format!("CAST({result} AS DECIMAL({new_p},{new_s}))");
                     }
                 }
             }
@@ -2440,10 +2419,7 @@ fn substitute_expr(
             try_cast: c.try_cast,
         }),
         E::CaseWhen(cw) => E::CaseWhen(CaseWhenExpression {
-            base: cw
-                .base
-                .as_ref()
-                .map(|b| Box::new(substitute_expr(b, subs))),
+            base: cw.base.as_ref().map(|b| Box::new(substitute_expr(b, subs))),
             branches: cw
                 .branches
                 .iter()
@@ -2570,27 +2546,23 @@ fn spark_decimal_agg_type(agg_name: &str, precision: u8, scale: u8) -> Option<(u
 /// Applies Spark-compatible type casts to aggregate expressions in projection lists.
 ///
 /// - `SUM(integer)` → `CAST(SUM(...) AS BIGINT)` (DuckDB returns HUGEINT)
-/// - `SUM(decimal{p,s})` → `CAST(spark_sum(...) AS DECIMAL(min(p+10,38), s))` (strict only)
+/// - `SUM(decimal{p,s})` → `CAST(spark_sum(...) AS DECIMAL(min(p+10,38), s))`
 /// - `AVG(integer)` → `CAST(AVG(...) AS DOUBLE)` (Spark promotes integer AVG to DOUBLE)
-/// - `AVG(decimal{p,s})` → `CAST(spark_avg(...) AS DECIMAL(min(p+4,38), min(s+4,18)))` (strict only)
+/// - `AVG(decimal{p,s})` → `CAST(spark_avg(...) AS DECIMAL(min(p+4,38), min(s+4,18)))`
 ///
 /// Passes through aliases transparently so the alias is preserved on the outer Cast.
-fn apply_agg_type_casts(
-    expr: &Expression,
-    input_schema: &StructType,
-    mode: CompatMode,
-) -> Expression {
-    // When the input schema is empty (e.g. SQL path in relaxed mode without table-scan
-    // enrichment), type inference on aggregate arguments is unreliable — a CaseWhen with
-    // `ELSE 0` can mis-infer as Integer even when THEN branches are Decimal, causing
-    // a spurious CAST(SUM(...) AS BIGINT) that truncates decimal results.
-    // Skip all aggregate type casts in this case and let DuckDB handle natively.
+fn apply_agg_type_casts(expr: &Expression, input_schema: &StructType) -> Expression {
+    // When the input schema is empty (e.g. SQL path without table-scan enrichment),
+    // type inference on aggregate arguments is unreliable — a CaseWhen with `ELSE 0`
+    // can mis-infer as Integer even when THEN branches are Decimal, causing a spurious
+    // CAST(SUM(...) AS BIGINT) that truncates decimal results. Skip the rewrite then
+    // and let DuckDB handle natively.
     if input_schema.is_empty() {
         return expr.clone();
     }
     match expr {
         Expression::Alias(a) => {
-            let inner = apply_agg_type_casts(&a.expr, input_schema, mode);
+            let inner = apply_agg_type_casts(&a.expr, input_schema);
             Expression::Alias(AliasExpression {
                 expr: Box::new(inner),
                 alias: a.alias.clone(),
@@ -2604,15 +2576,15 @@ fn apply_agg_type_casts(
                 let arg_type = arg.data_type(input_schema);
                 match arg_type {
                     DataType::Byte | DataType::Short | DataType::Integer | DataType::Long => {
-                        // Both modes: cast integer SUM → Long to avoid DuckDB's HUGEINT.
+                        // Cast integer SUM → Long to avoid DuckDB's HUGEINT default.
                         return Expression::Cast(CastExpression {
                             expr: Box::new(expr.clone()),
                             to_type: DataType::Long,
                             try_cast: false,
                         });
                     }
-                    DataType::Decimal { precision, scale } if mode == CompatMode::Strict => {
-                        // Strict only: use spark_sum extension for DECIMAL inputs.
+                    DataType::Decimal { precision, scale } => {
+                        // Route DECIMAL inputs through the spark_sum extension.
                         let spark_sum_call = Expression::FunctionCall(FunctionCall {
                             name: "spark_sum".to_owned(),
                             args: f.args.clone(),
@@ -2641,17 +2613,16 @@ fn apply_agg_type_casts(
                 let arg_type = arg.data_type(input_schema);
                 match arg_type {
                     DataType::Byte | DataType::Short | DataType::Integer | DataType::Long => {
-                        // Both modes: cast integer AVG → Double.
+                        // Cast integer AVG → Double (Spark promotes).
                         return Expression::Cast(CastExpression {
                             expr: Box::new(expr.clone()),
                             to_type: DataType::Double,
                             try_cast: false,
                         });
                     }
-                    DataType::Decimal { precision, scale } if mode == CompatMode::Strict => {
-                        // Strict only: use spark_avg for DECIMAL inputs (the extension only
-                        // supports DECIMAL — integer/double inputs use native AVG above/below).
-                        // spark_avg returns DECIMAL(min(p+4,38), s+4) per Spark semantics.
+                    DataType::Decimal { precision, scale } => {
+                        // Route DECIMAL inputs through spark_avg; integer/double inputs use
+                        // native AVG above/below. spark_avg returns DECIMAL(min(p+4,38), s+4).
                         let spark_avg_call = Expression::FunctionCall(FunctionCall {
                             name: "spark_avg".to_string(),
                             args: f.args.clone(),
@@ -2674,8 +2645,8 @@ fn apply_agg_type_casts(
             expr.clone()
         }
         Expression::Binary(b) => {
-            let new_left = apply_agg_type_casts(&b.left, input_schema, mode);
-            let new_right = apply_agg_type_casts(&b.right, input_schema, mode);
+            let new_left = apply_agg_type_casts(&b.left, input_schema);
+            let new_right = apply_agg_type_casts(&b.right, input_schema);
             Expression::Binary(BinaryExpression {
                 left: Box::new(new_left),
                 right: Box::new(new_right),
@@ -2683,7 +2654,7 @@ fn apply_agg_type_casts(
             })
         }
         Expression::Cast(c) => {
-            let inner = apply_agg_type_casts(&c.expr, input_schema, mode);
+            let inner = apply_agg_type_casts(&c.expr, input_schema);
             Expression::Cast(CastExpression {
                 expr: Box::new(inner),
                 to_type: c.to_type.clone(),
@@ -3013,7 +2984,7 @@ mod tests {
     };
 
     fn gen() -> SqlGenerator {
-        SqlGenerator::relaxed()
+        SqlGenerator::new()
     }
 
     fn table(name: &str) -> LogicalPlan {
@@ -3077,11 +3048,7 @@ mod tests {
 
     /// Build an inner Join with no plan_id aliases. Inlined here (rather than
     /// shared with PR #2's branch) so this PR stands alone against nubank/main.
-    fn inner_join(
-        left: LogicalPlan,
-        right: LogicalPlan,
-        condition: Expression,
-    ) -> LogicalPlan {
+    fn inner_join(left: LogicalPlan, right: LogicalPlan, condition: Expression) -> LogicalPlan {
         LogicalPlan::Join(Join {
             left: Box::new(left),
             right: Box::new(right),
@@ -3131,9 +3098,16 @@ mod tests {
         let inner = inner_join(
             table("supplier"),
             n1,
-            eq(col("s_nationkey"), ColumnReference::qualified("n1", "n_nationkey")),
+            eq(
+                col("s_nationkey"),
+                ColumnReference::qualified("n1", "n_nationkey"),
+            ),
         );
-        let plan = inner_join(inner, table("lineitem"), eq(col("s_suppkey"), col("l_suppkey")));
+        let plan = inner_join(
+            inner,
+            table("lineitem"),
+            eq(col("s_suppkey"), col("l_suppkey")),
+        );
         let sql = gen().generate(&plan).unwrap();
         assert!(sql.contains("\"n1\""), "alias buried, got: {sql}");
         assert!(
@@ -3160,13 +3134,23 @@ mod tests {
         let j1 = inner_join(
             table("supplier"),
             n1,
-            eq(col("s_nationkey"), ColumnReference::qualified("n1", "n_nationkey")),
+            eq(
+                col("s_nationkey"),
+                ColumnReference::qualified("n1", "n_nationkey"),
+            ),
         );
-        let j2 = inner_join(j1, table("customer"), eq(col("o_custkey"), col("c_custkey")));
+        let j2 = inner_join(
+            j1,
+            table("customer"),
+            eq(col("o_custkey"), col("c_custkey")),
+        );
         let j3 = inner_join(
             j2,
             n2,
-            eq(col("c_nationkey"), ColumnReference::qualified("n2", "n_nationkey")),
+            eq(
+                col("c_nationkey"),
+                ColumnReference::qualified("n2", "n_nationkey"),
+            ),
         );
         let sql = gen().generate(&j3).unwrap();
         assert!(sql.contains("\"n1\""), "n1 buried, got: {sql}");
@@ -3200,7 +3184,10 @@ mod tests {
         let join = inner_join(
             table("supplier"),
             n1,
-            eq(col("s_nationkey"), ColumnReference::qualified("n1", "n_nationkey")),
+            eq(
+                col("s_nationkey"),
+                ColumnReference::qualified("n1", "n_nationkey"),
+            ),
         );
 
         // withColumn("l_year", year("l_shipdate"))
@@ -3219,7 +3206,10 @@ mod tests {
             }),
             col("l_year"),
         ];
-        let aggregates = vec![AggregateExpr::new(func_call("sum", vec![col("l_extendedprice")]))];
+        let aggregates = vec![AggregateExpr::new(func_call(
+            "sum",
+            vec![col("l_extendedprice")],
+        ))];
 
         let plan = LogicalPlan::Aggregate(Aggregate {
             input: Box::new(with_cols),
@@ -3277,7 +3267,10 @@ mod tests {
         let join = inner_join(
             table("supplier"),
             n1,
-            eq(col("s_nationkey"), ColumnReference::qualified("n1", "n_nationkey")),
+            eq(
+                col("s_nationkey"),
+                ColumnReference::qualified("n1", "n_nationkey"),
+            ),
         );
 
         // .withColumn("volume", l_extendedprice * (1 - l_discount))
@@ -3297,7 +3290,10 @@ mod tests {
         });
         let outer_wc = LogicalPlan::WithColumns(WithColumns {
             input: Box::new(inner_wc),
-            columns: vec![("l_year".to_string(), func_call("year", vec![col("l_shipdate")]))],
+            columns: vec![(
+                "l_year".to_string(),
+                func_call("year", vec![col("l_shipdate")]),
+            )],
         });
 
         let plan = LogicalPlan::Aggregate(Aggregate {
@@ -3313,7 +3309,10 @@ mod tests {
         eprintln!("--- generated SQL ---\n{sql}\n---");
 
         assert!(sql.contains("\"n1\""), "n1 buried, got:\n{sql}");
-        assert!(!sql.contains("FROM (\n"), "Aggregate wrapped in subquery, got:\n{sql}");
+        assert!(
+            !sql.contains("FROM (\n"),
+            "Aggregate wrapped in subquery, got:\n{sql}"
+        );
         let upper = sql.to_uppercase();
         assert!(upper.contains("YEAR("), "l_year not inlined, got:\n{sql}");
         // `volume` should be inlined inside SUM(...) as the multiplication.
@@ -3337,7 +3336,10 @@ mod tests {
         let join = inner_join(
             table("supplier"),
             n1,
-            eq(col("s_nationkey"), ColumnReference::qualified("n1", "n_nationkey")),
+            eq(
+                col("s_nationkey"),
+                ColumnReference::qualified("n1", "n_nationkey"),
+            ),
         );
         let filter = LogicalPlan::Filter(Filter {
             input: Box::new(join),
@@ -3345,13 +3347,19 @@ mod tests {
         });
         let wc = LogicalPlan::WithColumns(WithColumns {
             input: Box::new(filter),
-            columns: vec![("l_year".to_string(), func_call("year", vec![col("l_shipdate")]))],
+            columns: vec![(
+                "l_year".to_string(),
+                func_call("year", vec![col("l_shipdate")]),
+            )],
         });
 
         let plan = LogicalPlan::Aggregate(Aggregate {
             input: Box::new(wc),
             grouping: vec![col("l_year")],
-            aggregates: vec![AggregateExpr::new(func_call("sum", vec![col("l_extendedprice")]))],
+            aggregates: vec![AggregateExpr::new(func_call(
+                "sum",
+                vec![col("l_extendedprice")],
+            ))],
             having: None,
             grouping_sets: None,
             select_order: Vec::new(),
@@ -3361,7 +3369,10 @@ mod tests {
         eprintln!("--- generated SQL ---\n{sql}\n---");
 
         assert!(sql.contains("\"n1\""), "n1 buried, got:\n{sql}");
-        assert!(!sql.contains("FROM (\n"), "Aggregate wrapped in subquery, got:\n{sql}");
+        assert!(
+            !sql.contains("FROM (\n"),
+            "Aggregate wrapped in subquery, got:\n{sql}"
+        );
         assert!(sql.contains("WHERE"), "Filter dropped, got:\n{sql}");
         // Filter referenced n1.n_name; that reference must survive to the WHERE clause.
         assert!(
@@ -3398,12 +3409,18 @@ mod tests {
         });
         let wc = LogicalPlan::WithColumns(WithColumns {
             input: Box::new(semi_join),
-            columns: vec![("l_year".to_string(), func_call("year", vec![col("l_shipdate")]))],
+            columns: vec![(
+                "l_year".to_string(),
+                func_call("year", vec![col("l_shipdate")]),
+            )],
         });
         let plan = LogicalPlan::Aggregate(Aggregate {
             input: Box::new(wc),
             grouping: vec![col("l_year")],
-            aggregates: vec![AggregateExpr::new(func_call("sum", vec![col("l_extendedprice")]))],
+            aggregates: vec![AggregateExpr::new(func_call(
+                "sum",
+                vec![col("l_extendedprice")],
+            ))],
             having: None,
             grouping_sets: None,
             select_order: Vec::new(),
@@ -3721,8 +3738,8 @@ mod tests {
     }
 
     #[test]
-    fn window_avg_decimal_strict_adds_cast() {
-        let gen = SqlGenerator::strict();
+    fn window_avg_decimal_adds_cast() {
+        let gen = SqlGenerator::new();
         let arg = Expression::ColumnReference(ColumnReference {
             name: "amount".to_owned(),
             qualifier: None,
@@ -3746,42 +3763,13 @@ mod tests {
         // AVG(Decimal(17,2)) → Decimal(min(17+4,38), min(2+4,18)) = Decimal(21,6)
         assert!(
             sql.contains("CAST(") && sql.contains("DECIMAL(21,6)"),
-            "strict-mode window AVG of decimal should produce CAST wrapper, got: {sql}"
+            "window AVG of decimal should produce CAST wrapper, got: {sql}"
         );
     }
 
     #[test]
-    fn window_avg_decimal_relaxed_no_cast() {
-        let gen = SqlGenerator::relaxed();
-        let arg = Expression::ColumnReference(ColumnReference {
-            name: "amount".to_owned(),
-            qualifier: None,
-            data_type: DataType::Decimal {
-                precision: 17,
-                scale: 2,
-            },
-            nullable: true,
-        });
-        let w = WindowFunction {
-            func: Box::new(Expression::FunctionCall(FunctionCall {
-                name: "avg".to_owned(),
-                args: vec![arg],
-                distinct: false,
-            })),
-            partition_by: vec![col("region")],
-            order_by: vec![],
-            frame: None,
-        };
-        let sql = gen.gen_window(&w).expect("gen_window should succeed");
-        assert!(
-            !sql.contains("CAST("),
-            "relaxed-mode window AVG should NOT produce CAST wrapper, got: {sql}"
-        );
-    }
-
-    #[test]
-    fn window_sum_decimal_strict_adds_cast() {
-        let gen = SqlGenerator::strict();
+    fn window_sum_decimal_adds_cast() {
+        let gen = SqlGenerator::new();
         let arg = Expression::ColumnReference(ColumnReference {
             name: "price".to_owned(),
             qualifier: None,
@@ -3805,7 +3793,7 @@ mod tests {
         // SUM(Decimal(12,2)) → Decimal(min(12+10,38), 2) = Decimal(22,2)
         assert!(
             sql.contains("CAST(") && sql.contains("DECIMAL(22,2)"),
-            "strict-mode window SUM of decimal should produce CAST wrapper, got: {sql}"
+            "window SUM of decimal should produce CAST wrapper, got: {sql}"
         );
     }
 
@@ -3826,7 +3814,7 @@ mod tests {
                 microseconds: 0,
             })),
         });
-        let sql = SqlGenerator::relaxed()
+        let sql = SqlGenerator::new()
             .with_schema(schema)
             .gen_expr(&expr)
             .unwrap();
@@ -3856,7 +3844,7 @@ mod tests {
             left: Box::new(col("d")),
             right: Box::new(raw_interval),
         });
-        let sql = SqlGenerator::relaxed()
+        let sql = SqlGenerator::new()
             .with_schema(schema)
             .gen_expr(&expr)
             .unwrap();

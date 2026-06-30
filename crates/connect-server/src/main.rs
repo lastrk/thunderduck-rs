@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use thunderduck_core::runtime::{RuntimeCompatMode, SessionManager, StreamingConfig};
+use thunderduck_core::runtime::{SessionManager, StreamingConfig};
 use thunderduck_core::transpiler_v2::TranspilerPath;
 use tonic::transport::Server;
 
@@ -37,13 +37,10 @@ struct Args {
     #[arg(long)]
     port: Option<u16>,
 
-    /// Enable strict Spark compatibility mode (requires thdck_spark_funcs extension)
-    #[arg(long, conflicts_with = "relaxed")]
+    /// Deprecated no-op: strict mode is the only supported mode. Accepted so
+    /// existing scripts keep working; logs a one-line deprecation warning.
+    #[arg(long)]
     strict: bool,
-
-    /// Enable relaxed mode (vanilla DuckDB functions, ~85% Spark parity)
-    #[arg(long, conflicts_with = "strict")]
-    relaxed: bool,
 
     /// Transpiler path: `legacy` (default) or `v2` (rearchitecture path, WIP).
     /// Falls back to THUNDERDUCK_TRANSPILER when unset.
@@ -68,13 +65,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.bind.parse()?
     };
 
-    let mode = if args.strict {
-        RuntimeCompatMode::Strict
-    } else if args.relaxed {
-        RuntimeCompatMode::Relaxed
-    } else {
-        RuntimeCompatMode::from_env()
-    };
+    if args.strict {
+        tracing::warn!(
+            "--strict is deprecated and has no effect; strict is the only mode \
+             (see ADR-020 in docs/thunderduck-rearchitect-ADRs.md)"
+        );
+    }
+
+    // Reject any THUNDERDUCK_COMPAT_MODE=relaxed at startup so users discover the
+    // change loudly; "strict" and "auto" are accepted as deprecated no-ops.
+    match std::env::var("THUNDERDUCK_COMPAT_MODE")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "" => {}
+        "strict" | "auto" => {
+            tracing::warn!(
+                "THUNDERDUCK_COMPAT_MODE is deprecated and ignored; strict is the only mode"
+            );
+        }
+        "relaxed" => {
+            return Err("THUNDERDUCK_COMPAT_MODE=relaxed is no longer supported \
+                        (see ADR-020); strict is the only mode"
+                .into());
+        }
+        other => {
+            return Err(format!(
+                "unrecognized THUNDERDUCK_COMPAT_MODE '{other}', expected 'strict' or unset"
+            )
+            .into());
+        }
+    }
 
     // CLI flag wins; otherwise consult the environment (default: Legacy).
     // An explicit but unrecognized CLI value is a hard error.
@@ -90,14 +112,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     tracing::info!(
-        "Starting Thunderduck Connect Server on {} (mode: {:?}, transpiler: {:?})",
+        "Starting Thunderduck Connect Server on {} (transpiler: {:?})",
         bind,
-        mode,
         transpiler
     );
 
-    let mgr = Arc::new(SessionManager::new(mode, StreamingConfig::default()));
-    let svc = ThunderduckService::new(mgr, mode, transpiler);
+    let mgr = Arc::new(SessionManager::new(StreamingConfig::default()));
+    let svc = ThunderduckService::new(mgr, transpiler);
 
     Server::builder()
         .add_service(SparkConnectServiceServer::new(svc))

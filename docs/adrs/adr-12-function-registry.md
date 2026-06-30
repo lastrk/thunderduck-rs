@@ -11,7 +11,7 @@ pub struct FunctionRegistry {
 }
 ```
 
-500+ Spark → DuckDB function mappings ported from the Java reference. The registry is mode-aware: in strict mode, calls like `round()` and `avg()` on Decimals route through `thdck_spark_funcs` extension functions instead of vanilla DuckDB.
+500+ Spark → DuckDB function mappings ported from the Java reference. Spark-divergent functions (e.g. `hash`, `xxhash64`, decimal `sum`/`avg`, `skewness`) route through the `thdck_spark_funcs` extension, which is mandatory and bundled into every build (see [rearchitect ADR-020](../thunderduck-rearchitect-ADRs.md)).
 
 ---
 

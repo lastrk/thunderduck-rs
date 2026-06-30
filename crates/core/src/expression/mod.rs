@@ -667,6 +667,25 @@ impl Expression {
                     Add | Sub => {
                         let lt = b.left.data_type(schema);
                         let rt = b.right.data_type(schema);
+                        // Date/Timestamp ± Interval preserves the date-like side
+                        // (Spark semantics — DuckDB widens DATE+INTERVAL to TIMESTAMP, but the
+                        // emitter wraps that back to DATE in `gen_binary`).
+                        match (&lt, &rt) {
+                            (DataType::Date, t) | (t, DataType::Date) if t.is_interval() => {
+                                return DataType::Date;
+                            }
+                            (DataType::Timestamp, t) | (t, DataType::Timestamp)
+                                if t.is_interval() =>
+                            {
+                                return DataType::Timestamp;
+                            }
+                            (DataType::TimestampNtz, t) | (t, DataType::TimestampNtz)
+                                if t.is_interval() =>
+                            {
+                                return DataType::TimestampNtz;
+                            }
+                            _ => {}
+                        }
                         match (&lt, &rt) {
                             (
                                 DataType::Decimal {

@@ -35,9 +35,8 @@ Never mark a task complete without proving it works. For any non-trivial change,
 1. **Format** — `cargo fmt --check` must be clean.
 2. **Lint** — `cargo clippy -- -D warnings` must be clean (zero warnings).
 3. **Unit tests** — `cargo test` must pass across all crates.
-4. **TPC-H differential (mandatory)** — `./tests/scripts/run-differential-tests.sh tpch` must pass in relaxed mode.
+4. **TPC-H differential (mandatory)** — `./tests/scripts/run-differential-tests.sh tpch` must pass.
 5. **Full differential (when SQL-relevant)** — if the change touches SQL generation, expressions, logical plans, the parser, the converter, or the function registry, also run `./tests/scripts/run-differential-tests.sh all`.
-6. **Strict mode (when semantics-relevant)** — if the change touches numerical semantics, hashing, decimal arithmetic, or SUM/AVG return types, repeat steps 4–5 with `THUNDERDUCK_COMPAT_MODE=strict` (requires `--features bundled-extension`).
 
 A task is **not** done if any step is red. Do not commit, do not declare success, do not move on. If a step is intentionally skipped (e.g., docs-only change skips clippy), state which step and why.
 
@@ -86,10 +85,9 @@ These are non-negotiable constraints governing all SQL generation and type handl
 2. **Zero pre/post-processing of SQL strings.** All transformations happen on the AST.
 3. **SparkSQL data flow**: Spark SQL string → sqlparser-rs parse tree → Thunderduck expression tree → `SqlGenerator::generate()` → SQL string for DuckDB.
 4. **DataFrame data flow**: Spark Connect protobuf → Thunderduck expression tree → `SqlGenerator::generate()` → SQL string for DuckDB.
-5. **Relaxed mode**: Best performance mapping to vanilla DuckDB constructs producing value-equivalent results (type equivalence not required).
-6. **Strict mode**: Match Apache Spark exactly via (a) CASTs at top-level SELECT projection, or (b) DuckDB extension functions. No casts on intermediate values.
-7. **Zero result copying**: Strict mode achieves 100% type matching at SQL generation time using extension functions + AS aliases. No Arrow vector copying or rewriting.
-8. **`to_sql()` is for SQL generation only.** `Display` / `Debug` implementations are human-readable debug output only — never used to build SQL strings sent to DuckDB.
+5. **Spark parity is the only emission target.** τ matches Apache Spark exactly via (a) CASTs at top-level SELECT projection or (b) DuckDB extension functions; the `thdck_spark_funcs` extension is mandatory (rearchitect ADR-020).
+6. **Zero result copying**: 100% type matching is achieved at SQL generation time using extension functions + AS aliases. No Arrow vector copying or rewriting.
+7. **`to_sql()` is for SQL generation only.** `Display` / `Debug` implementations are human-readable debug output only — never used to build SQL strings sent to DuckDB.
 
 ## Architecture Quick-Reference
 
@@ -206,28 +204,17 @@ Differential tests validate: same row count, same column names, **same column ty
 
 ## Spark Compatibility Extension
 
-Two modes: **Relaxed** (default, no extension, ~85% compat) and **Strict** (extension loaded, ~100% compat).
-
-```bash
-# Build WITHOUT extension (relaxed mode, default)
-cargo build --release
-
-# Build WITH extension (strict mode — downloads binary on first run)
-cargo build --release --features bundled-extension
-```
-
-The `thdck_spark_funcs` DuckDB extension (release [`ext4`](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext4), multi-version — currently pulls the `v1.5.1` binaries) implements Spark-precise numerical semantics:
+The `thdck_spark_funcs` DuckDB extension is **mandatory** and bundled into every build (rearchitect ADR-020 — "relaxed mode" has been eliminated). It implements Spark-precise numerical semantics:
 - `spark_hash(c1, ..., cN)` — Spark `hash()` (Murmur3-32, signed INT, seed 42)
 - `spark_xxhash64(c1, ..., cN)` — Spark `xxhash64()` (xxHash64, signed BIGINT, seed 42)
 - `spark_decimal_div(a, b)` — decimal division with `ROUND_HALF_UP`
 - `spark_sum(col)` — Spark-compatible SUM return types
 - `spark_avg(col)` — Spark-compatible AVG return types
+- `spark_skewness(col)` — population skewness (Spark semantics)
 
-On first `--features bundled-extension` build, `build.rs` downloads the correct platform binary
-from GitHub releases and caches it under `extensions/` (gitignored). The binary is embedded via
-`include_bytes!()` and loaded at startup in strict mode.
+Source: release [`ext4`](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext4) (multi-version — currently pulls the `v1.5.1` binaries). On a fresh build, `build.rs` downloads the correct platform binary from GitHub releases and caches it under `extensions/ext4/` (gitignored). The binary is embedded via `include_bytes!()` and loaded at every session's startup; failure to load is a hard error.
 
-> Full details: [docs/architecture.md#adr-13](docs/architecture.md)
+> Full details: [rearchitect ADR-020](docs/thunderduck-rearchitect-ADRs.md).
 
 ## Documentation Structure
 
@@ -249,11 +236,8 @@ from GitHub releases and caches it under `extensions/` (gitignored). The binary 
 # Full build (debug)
 cargo build
 
-# Release build (for integration tests)
+# Release build (for integration tests) — bundles thdck_spark_funcs extension
 cargo build --release
-
-# Release build WITH strict-mode extension (downloads binary on first run)
-cargo build --release --features bundled-extension
 
 # Build a single crate
 cargo build -p thunderduck-core
@@ -288,13 +272,6 @@ cargo test -- --nocapture
 # Quick check: TPC-H only
 ./tests/scripts/run-differential-tests.sh tpch
 
-# Strict mode (requires extension — must build with bundled-extension feature first)
-# cargo build --release --features bundled-extension
-THUNDERDUCK_COMPAT_MODE=strict ./tests/scripts/run-differential-tests.sh tpch
-
-# Strict mode via pytest (activate venv first)
-cd tests/integration && THUNDERDUCK_COMPAT_MODE=strict python3 -m pytest differential/ -v --tb=short
-
 # Direct pytest (activate venv first)
 cd tests/integration && python3 -m pytest differential/ -v --tb=short
 
@@ -312,11 +289,10 @@ cd tests/integration && python3 -m pytest \
 # Custom port
 ./target/release/thunderduck-connect-server --port 15002
 
-# Strict mode
-./target/release/thunderduck-connect-server --strict
-
-# Relaxed mode
-./target/release/thunderduck-connect-server --relaxed
+# Transpiler path (legacy = existing generator, default; v2 = rearchitecture path, WIP)
+./target/release/thunderduck-connect-server --transpiler v2
+THUNDERDUCK_TRANSPILER=v2 ./target/release/thunderduck-connect-server
+# Unset / --transpiler legacy → existing path (unchanged behavior). See docs/thunderduck-rearchitect-ADRs.md.
 
 # Kill server
 pkill -f thunderduck-connect-server

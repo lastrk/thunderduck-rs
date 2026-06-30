@@ -1819,13 +1819,13 @@ impl SqlConverter {
     /// Convert a LogicalPlan to a SQL string by delegating to SqlGenerator.
     fn plan_to_sql(&self, plan: &LogicalPlan) -> Result<String> {
         use crate::generator::SqlGenerator;
-        SqlGenerator::relaxed().generate(plan)
+        SqlGenerator::new().generate(plan)
     }
 
     /// Convert an Expression to a SQL string using SqlGenerator.
     fn expr_display(expr: &Expression) -> Result<String> {
         use crate::generator::SqlGenerator;
-        SqlGenerator::relaxed().gen_expr(expr)
+        SqlGenerator::new().gen_expr(expr)
     }
 
     /// Convert compound field access (arr[0], struct.field, map['key']) to ExtractValue chain.

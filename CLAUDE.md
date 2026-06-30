@@ -46,6 +46,40 @@ For non-trivial changes: pause and ask "is there a more elegant Rust way?" Skip 
 ### 6. Autonomous Bug Fixing
 When given a bug report: just fix it. Point at logs, errors, failing tests, then resolve them.
 
+## Quality Gate
+
+This is the **agent-pipeline gate** — the checks the orchestrated agents in
+`/new-feature` and `/fix-bug` must clear after every implementation and after
+every review-fix pass. The differential test suites are **intentionally
+excluded** from this gate: `core_v2` (and `core` while the v2 path is being
+grown) is the v2-transpiler progress signal, currently expected to be
+partially red, run separately via
+`cargo test -p thunderduck-connect-server --test differential core_v2 -- --ignored`.
+
+Run, in order, after every implementation and after every review fix:
+
+1. **`cargo check -p <touched-crate>`** must succeed (no compile errors, no
+   missing imports). For multi-crate changes, run once per crate touched.
+
+2. **`cargo fmt --check`** on the files the agent created or modified must be
+   clean. Use `git diff --name-only HEAD -- '*.rs' | xargs -r rustfmt --check`
+   to scope to changed files, since the workspace baseline has pre-existing
+   formatting drift this work does not own.
+
+3. **`cargo test -p <touched-crate> --lib --tests`** must pass — all unit and
+   lib tests for the crate the change touches. Examples:
+   `cargo test -p thunderduck-core` for `crates/core/` work;
+   `cargo test -p thunderduck-connect-server` for `crates/connect-server/`.
+
+Clippy is **not** in the agent pipeline's gate because the workspace baseline
+has pre-existing clippy errors in unrelated modules. The agent must not
+introduce *new* clippy warnings on the files it touches — verify ad-hoc, but a
+workspace `cargo clippy` run is not required.
+
+For the broader human-driven verification (full clippy, full differential
+suite when SQL generation is touched), see `### 4. Verification Before Done`
+above.
+
 ## Code Search Tools
 
 Two MCP-backed search tools are preinstalled in the devcontainer. They answer different kinds of questions — pick the right one:

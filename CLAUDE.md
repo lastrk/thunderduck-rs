@@ -232,12 +232,21 @@ Source: release [`ext4`](https://github.com/nubank/thunderduck-duckdb-extension/
 
 ### Build
 
-```bash
-# Full build (debug)
-cargo build
+> **DuckDB linkage:** DuckDB is **non-bundled by default**. Pick one:
+> - **Local dev:** run `scripts/dev/dev-cache-setup.sh` once (links a shared prebuilt libduckdb via
+>   `DUCKDB_LIB_DIR`); then the plain commands below work — no DuckDB recompile.
+> - **Fresh clone / CI:** add `--features bundled` to `build`/`test`/`check`/`clippy` to compile DuckDB
+>   from source. Builds fail to link without one of these.
 
-# Release build (for integration tests) — bundles thdck_spark_funcs extension
-cargo build --release
+```bash
+# Full build (debug) — local dev (prebuilt libduckdb via scripts/dev/)
+cargo build
+# Fresh clone / CI: compile DuckDB from source
+cargo build --features bundled
+
+# Release build (for integration tests) — always bundles the thdck_spark_funcs extension
+cargo build --release                       # local dev (prebuilt libduckdb via scripts/dev/)
+cargo build --release --features bundled    # fresh clone / CI (compile DuckDB from source)
 
 # Build a single crate
 cargo build -p thunderduck-core
@@ -248,6 +257,9 @@ cargo check
 ```
 
 ### Unit Tests
+
+> Same DuckDB linkage rule as Build: local dev works as-is (prebuilt lib); on a fresh clone / CI add
+> `--features bundled` (e.g. `cargo test --features bundled`).
 
 ```bash
 # All unit tests

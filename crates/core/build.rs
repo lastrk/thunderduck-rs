@@ -1,6 +1,29 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    link_external_duckdb_runtime();
     download_extension();
+}
+
+/// When DuckDB is NOT compiled from source (the `bundled` feature is off), we
+/// link a prebuilt `libduckdb` provided via `DUCKDB_LIB_DIR`. That static
+/// archive is built from C++ and pulls in the C++ runtime plus libm, which the
+/// non-bundled path of `libduckdb-sys` does not emit. Add them here so they
+/// land after `duckdb` on the final link line and resolve its symbols. The
+/// `bundled` path already links the C++ runtime itself, so skip it then.
+fn link_external_duckdb_runtime() {
+    println!("cargo:rerun-if-env-changed=DUCKDB_LIB_DIR");
+    if std::env::var_os("CARGO_FEATURE_BUNDLED").is_some() {
+        return; // bundled build handles the C++ runtime
+    }
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-lib=dylib=m");
+    if std::env::var_os("DUCKDB_LIB_DIR").is_none() {
+        println!(
+            "cargo:warning=DuckDB `bundled` feature is off and DUCKDB_LIB_DIR is unset; \
+             linking will look for a system libduckdb. For local dev run \
+             scripts/dev/dev-cache-setup.sh, or build with `--features bundled`."
+        );
+    }
 }
 
 fn download_extension() {
@@ -69,7 +92,7 @@ fn detect_platform(target: &str) -> &'static str {
         "osx_arm64"
     } else {
         panic!(
-            "Unsupported target for bundled-extension: {target}\n\
+            "Unsupported target for thdck_spark_funcs extension: {target}\n\
              Supported targets: x86_64-linux, aarch64-linux, x86_64-apple, aarch64-apple"
         )
     }

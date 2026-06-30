@@ -45,12 +45,17 @@ Thunderduck supports **x86_64** (Intel/AMD) and **ARM64** (AWS Graviton, Apple S
 git clone https://github.com/lastrk/thunderduck-rs.git
 cd thunderduck-rs
 
-# Build the release binary
-cargo build --release
+# Build the release binary (--features bundled compiles DuckDB from source)
+cargo build --release --features bundled
 
 # Start the Spark Connect server (default port 15002)
 ./target/release/thunderduck-connect-server
 ```
+
+> **DuckDB linkage:** DuckDB is non-bundled by default, so a fresh clone builds with `--features bundled`
+> (compiles DuckDB from source). Inside the devcontainer you can instead run
+> `scripts/dev/dev-cache-setup.sh` once to link a shared prebuilt libduckdb — then `--features bundled`
+> is no longer needed. See [`scripts/dev/README.md`](scripts/dev/README.md).
 
 Connect with PySpark:
 
@@ -159,8 +164,13 @@ apt-get install -y protobuf-compiler
 
 ### Build
 
+> DuckDB is non-bundled by default. The commands below need an external libduckdb: either run
+> `scripts/dev/dev-cache-setup.sh` once (devcontainer — links a shared prebuilt lib), **or** append
+> `--features bundled` to compile DuckDB from source (fresh clones / CI). `--features bundled` applies
+> equally to `build`, `test`, `check`, and `clippy`.
+
 ```bash
-# Full build (debug)
+# Full build (debug) — add `--features bundled` on a fresh clone / CI
 cargo build
 
 # Release build (required for integration/differential tests).
@@ -210,6 +220,9 @@ Spark parity is the only emission target. The `thdck_spark_funcs` DuckDB extensi
 Assumes the project is already built (see [Building from Source](#building-from-source)). **Always use a release build for differential tests** — test servers launch `./target/release/thunderduck-connect-server`.
 
 ### Unit Tests
+
+> Same DuckDB linkage rule as Build: works as-is with the devcontainer prebuilt lib; on a fresh clone / CI
+> add `--features bundled` (e.g. `cargo test --features bundled`).
 
 ```bash
 # All unit tests

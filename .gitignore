@@ -33,6 +33,13 @@ extensions/
 # Downloaded build tools
 .tools/
 
+# Local build-acceleration cache (mold/sccache binaries, shared sccache cache,
+# frozen libduckdb.a). Lives at the main checkout root; see scripts/dev/.
+/.build-cache/
+
+# Build-profiling run artifacts (machine/run-specific); harness + FINDINGS kept.
+tasks/build-profiling/results/
+
 # Playground runtime state and data
 playground/__marimo__/
 playground/data/

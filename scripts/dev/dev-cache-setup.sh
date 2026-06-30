@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# dev-cache-setup.sh — wire up fast local builds for this devcontainer.
+#
+# Idempotent. Safe to run on every container start and in every worktree.
+# Sets up (all under the persistent <main-repo>/.build-cache/, gitignored):
+#   * mold + sccache static binaries (downloaded once)
+#   * a linker shim dir so gcc drives mold (fallback: LLVM lld)
+#   * $CARGO_HOME/config.toml making cargo use sccache + the fast linker
+#   * thaws the cached libduckdb.a into this worktree's target (if cached)
+#
+# LOCAL DEV ONLY — nothing here touches the repo's tracked config or CI.
+# To disable: delete $CARGO_HOME/config.toml (or the [build]/[target] keys it
+# wrote) and re-run is harmless. See scripts/dev/README.md.
+set -euo pipefail
+
+MOLD_VERSION="${MOLD_VERSION:-2.41.0}"
+SCCACHE_VERSION="${SCCACHE_VERSION:-0.16.0}"
+
+log() { printf '[dev-cache] %s\n' "$*" >&2; }
+
+# --- locations ---------------------------------------------------------------
+common_git="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+[[ -z "$common_git" ]] && { log "not inside a git repo — aborting"; exit 1; }
+MAIN_ROOT="$(dirname "$common_git")"
+CACHE_ROOT="${BUILD_CACHE_ROOT:-$MAIN_ROOT/.build-cache}"
+BIN="$CACHE_ROOT/bin"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+mkdir -p "$BIN" "$CACHE_ROOT/sccache"
+
+triple="$(rustc -vV | awk '/^host: /{print $2}')"   # e.g. aarch64-unknown-linux-gnu
+arch="$(uname -m)"                                   # e.g. aarch64
+
+# --- download helpers --------------------------------------------------------
+fetch() { curl -fsSL --retry 3 --max-time 180 "$1" -o "$2"; }
+
+install_mold() {
+  if [[ -x "$BIN/mold" ]]; then log "mold present ($("$BIN/mold" --version | head -1))"; return; fi
+  local url tgz tmp
+  url="https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-${arch}-linux.tar.gz"
+  tmp="$(mktemp -d)"; tgz="$tmp/mold.tgz"
+  log "downloading mold ${MOLD_VERSION} ..."
+  if fetch "$url" "$tgz"; then
+    tar xzf "$tgz" -C "$tmp"
+    install -m755 "$tmp"/mold-*/bin/mold "$BIN/mold"
+    log "installed mold -> $BIN/mold"
+  else
+    log "WARN: mold download failed; will fall back to lld"
+  fi
+  rm -rf "$tmp"
+}
+
+install_sccache() {
+  if [[ -x "$BIN/sccache" ]]; then log "sccache present ($("$BIN/sccache" --version))"; return; fi
+  local url tgz tmp name
+  name="sccache-v${SCCACHE_VERSION}-${arch}-unknown-linux-musl"
+  url="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/${name}.tar.gz"
+  tmp="$(mktemp -d)"; tgz="$tmp/sccache.tgz"
+  log "downloading sccache ${SCCACHE_VERSION} ..."
+  if fetch "$url" "$tgz"; then
+    tar xzf "$tgz" -C "$tmp"
+    install -m755 "$tmp/$name/sccache" "$BIN/sccache"
+    log "installed sccache -> $BIN/sccache"
+  else
+    log "WARN: sccache download failed; builds will run without the shared cache"
+  fi
+  rm -rf "$tmp"
+}
+
+install_mold
+install_sccache
+
+# --- linker shim dirs (gcc -B<dir> uses <dir>/ld) ----------------------------
+# gcc 11 has no -fuse-ld=mold; the -B trick swaps the linker while keeping the
+# gcc driver, so the g++-built libduckdb.a links with the identical C++ runtime.
+mkdir -p "$BIN/ld-mold" "$BIN/ld-lld"
+[[ -x "$BIN/mold" ]] && ln -sf "$BIN/mold" "$BIN/ld-mold/ld"
+lld_path="$(command -v ld.lld || echo /usr/bin/ld.lld-18)"
+[[ -e "$lld_path" ]] && ln -sf "$lld_path" "$BIN/ld-lld/ld"
+
+# Prefer mold, else lld, else leave the default linker alone.
+LINKER_DIR=""
+if [[ -e "$BIN/ld-mold/ld" ]]; then LINKER_DIR="$BIN/ld-mold"; LINKER_NAME="mold"
+elif [[ -e "$BIN/ld-lld/ld" ]]; then LINKER_DIR="$BIN/ld-lld"; LINKER_NAME="lld"
+fi
+
+# --- ensure the shared prebuilt libduckdb exists (build once, then reused) ---
+# This is what lets every worktree skip the ~2 GB DuckDB C++ compile: builds
+# link the prebuilt static lib via DUCKDB_LIB_DIR (the default, non-bundled path).
+"$SCRIPT_DIR/duckdb-build-cache.sh" ensure || log "WARN: could not prepare prebuilt libduckdb (builds will need --features bundled)"
+duckdb_dir="$("$SCRIPT_DIR/duckdb-build-cache.sh" dir 2>/dev/null || true)"
+duckdb_lib="$duckdb_dir/lib/libduckdb_static.a"
+
+# --- generate $CARGO_HOME/config.toml (local-only, merges with repo config) --
+# IMPORTANT: we deliberately do NOT put the linker in rustflags. A rustflags
+# entry is part of cargo's fingerprint, so it would invalidate EVERY crate's
+# hash (including the frozen libduckdb.a) and force a full rebuild. The linker
+# is selected via PATH instead (see env.sh below): gcc finds our shim `ld`,
+# which doesn't enter the fingerprint — so existing/cached artifacts stay valid.
+# sccache as rustc-wrapper is transparent and does not churn the hash.
+CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+cfg="$CARGO_HOME/config.toml"
+mkdir -p "$CARGO_HOME"
+
+marker_begin="# >>> thunderduck dev-cache (managed) >>>"
+marker_end="# <<< thunderduck dev-cache (managed) <<<"
+if [[ -f "$cfg" ]]; then
+  awk -v b="$marker_begin" -v e="$marker_end" '
+    $0==b{skip=1} skip&&$0==e{skip=0;next} !skip{print}' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+fi
+
+{
+  echo "$marker_begin"
+  echo "# Generated by scripts/dev/dev-cache-setup.sh — do not edit by hand."
+  if [[ -x "$BIN/sccache" ]]; then
+    echo "[build]"
+    echo "rustc-wrapper = \"$BIN/sccache\""
+    echo
+  fi
+  echo "[env]"
+  echo "SCCACHE_DIR = \"$CACHE_ROOT/sccache\""
+  echo "SCCACHE_CACHE_SIZE = \"30G\""
+  if [[ -f "$duckdb_lib" ]]; then
+    # Link the shared prebuilt libduckdb (non-bundled). Applies to cargo AND
+    # rust-analyzer, so no per-build flags are needed.
+    echo "DUCKDB_LIB_DIR = \"$(dirname "$duckdb_lib")\""
+    echo "DUCKDB_INCLUDE_DIR = \"$duckdb_dir/include\""
+    echo "DUCKDB_STATIC = \"1\""
+  fi
+  echo "$marker_end"
+} >> "$cfg"
+
+log "wrote managed block to $cfg (sccache=$([[ -x $BIN/sccache ]] && echo on || echo off), duckdb=$([[ -f $duckdb_lib ]] && echo prebuilt || echo MISSING))"
+
+# --- env.sh: prepend the linker shim to PATH (no fingerprint impact) ---------
+# Source this in shells that build/test. (cargo check / rust-analyzer don't link,
+# so they don't need it; they still get sccache from the cargo config above.)
+envsh="$CACHE_ROOT/env.sh"
+{
+  echo "# Generated by scripts/dev/dev-cache-setup.sh — source me for fast local builds."
+  [[ -n "$LINKER_DIR" ]] && echo "export PATH=\"$LINKER_DIR:\$PATH\"   # gcc picks up '$LINKER_NAME' as ld"
+  echo "export SCCACHE_DIR=\"$CACHE_ROOT/sccache\""
+  echo "export SCCACHE_CACHE_SIZE=\"30G\""
+  if [[ -f "$duckdb_lib" ]]; then
+    echo "export DUCKDB_LIB_DIR=\"$(dirname "$duckdb_lib")\""
+    echo "export DUCKDB_INCLUDE_DIR=\"$duckdb_dir/include\""
+    echo "export DUCKDB_STATIC=1"
+  fi
+} > "$envsh"
+
+# Wire env.sh into interactive shells (idempotent), durable in the persistent mount.
+src_line="[ -f \"$envsh\" ] && . \"$envsh\"  # thunderduck dev-cache"
+for rc in "$HOME/.bashrc" "$HOME/.profile"; do
+  [[ -f "$rc" ]] || touch "$rc"
+  grep -qF "$envsh" "$rc" 2>/dev/null || printf '%s\n' "$src_line" >> "$rc"
+done
+log "linker=${LINKER_NAME:-default} via PATH (source $envsh in this shell to activate now)"
+
+log "done. In this shell run:  source $envsh  then build normally (cargo build)."
+log "Builds link the shared prebuilt libduckdb — no DuckDB recompile, no --features bundled needed locally."

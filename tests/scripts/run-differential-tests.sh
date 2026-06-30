@@ -193,7 +193,15 @@ BINARY_PATH="${THUNDERDUCK_BINARY:-$WORKSPACE_DIR/target/release/thunderduck-con
 if [ ! -f "$BINARY_PATH" ]; then
     echo -e "${YELLOW}  Thunderduck binary not found at $BINARY_PATH. Building...${NC}"
     cd "$WORKSPACE_DIR"
-    cargo build --release 2>&1 | tail -20
+    # DuckDB is non-bundled by default. If no external libduckdb is configured
+    # (DUCKDB_LIB_DIR — set by local dev via scripts/dev/), compile it from
+    # source so fresh clones / CI link successfully.
+    BUILD_FEATURES=""
+    if [ -z "${DUCKDB_LIB_DIR:-}" ]; then
+        echo -e "${YELLOW}  DUCKDB_LIB_DIR unset — compiling DuckDB from source (--features bundled)${NC}"
+        BUILD_FEATURES="--features bundled"
+    fi
+    cargo build --release $BUILD_FEATURES 2>&1 | tail -20
     if [ ! -f "$BINARY_PATH" ]; then
         echo -e "${RED}ERROR: Failed to build Thunderduck server${NC}"
         exit 1

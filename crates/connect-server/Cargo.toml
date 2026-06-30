@@ -7,6 +7,11 @@ edition.workspace = true
 name = "thunderduck-connect-server"
 path = "src/main.rs"
 
+[features]
+# Compile DuckDB from source; off by default (local dev links a shared prebuilt
+# libduckdb — see scripts/dev/). CI / fresh clones: `cargo build --features bundled`.
+bundled = ["thunderduck-core/bundled"]
+
 [dependencies]
 thunderduck-core = { path = "../core" }
 tonic.workspace = true

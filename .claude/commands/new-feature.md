@@ -11,53 +11,32 @@ to the next stage, and handle the inner loops.
 
 The user's feature requirement is: $ARGUMENTS
 
-## Setup: Fresh Worktree
+## Preflight
 
-Before any work begins, create an isolated git worktree on a fresh
-branch under `.gitworktrees/` **and relocate the session into it** so
-every subsequent tool call (Bash, Read, Write, Edit, and subagents)
-inherits the new working directory automatically.
+Before the first subagent runs, capture state the later stages depend on.
 
-1. **Compute** a slug from `$ARGUMENTS`: lowercase, replace any run of
-   non-alphanumeric characters with `-`, trim leading/trailing `-`, cap
-   at 40 characters. If the result is empty, use `feature` as the
-   fallback slug.
+1. **Project root** — resolve via `PROJECT_ROOT="$(git rev-parse --show-toplevel)"`.
+   All relative paths in the stages below resolve relative to this. If
+   `git rev-parse` fails (not a git repo), halt with a clear error:
+   `/new-feature requires a git repository to capture the pipeline's
+   review window.`
 
-2. **Compose** a branch name: `feature/<slug>-<YYYYMMDD-HHMMSS>`
-   (use the current local timestamp via `date +%Y%m%d-%H%M%S`).
+2. **Pipeline start commit** — capture
+   `PIPELINE_START_SHA="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"`.
+   Stage 3 (reviewer) and Stage 6 (docs-updater) diff against this SHA
+   to determine the review window — so the pipeline knows "what changed
+   in this run" without assuming a particular base branch.
 
-3. **Create** the worktree from a freshly fetched `origin/main`:
-   ```bash
-   mkdir -p /workspace/.gitworktrees
-   git -C /workspace fetch origin
-   git -C /workspace worktree add \
-     /workspace/.gitworktrees/<branch-name> \
-     -b <branch-name> origin/main
-   ```
+3. **Agent output directory** — create `$PROJECT_ROOT/.agent-output/`
+   if it doesn't exist. The pipeline writes its stage artifacts there.
 
-4. **Relocate the session** by calling the `EnterWorktree` tool with
-   `path: "/workspace/.gitworktrees/<branch-name>"`. After this call,
-   the session cwd IS the worktree — relative paths in every subsequent
-   step resolve inside it.
-
-   If `EnterWorktree` returns an error indicating an active worktree
-   session is already in progress, stop and surface the error to the
-   user; do not attempt to continue. They need to exit that session
-   first.
-
-5. **Create the agent output directory** inside the worktree:
-   ```bash
-   mkdir -p .agent-output
-   ```
-
-6. **Tell the user** the branch name and the worktree absolute path so
-   they can review and merge the result later. The worktree is preserved
-   when the pipeline finishes — the user owns cleanup (`ExitWorktree` or
-   `git worktree remove …`).
-
-From this point on, every relative path in the stages below resolves
-inside the worktree because the session cwd was relocated in step 4.
-No per-subagent worktree preamble is required.
+This pipeline makes **no assumption about isolation**. It operates on
+the working tree it finds — current branch, current uncommitted state.
+If you want isolation (a fresh worktree on a new branch from a clean
+upstream), set that up *yourself* before invoking; `EnterWorktree` is
+one way, a plain `git worktree add` + `cd` is another. The pipeline
+takes a snapshot of where you start and reports what changed when it
+ends.
 
 ---
 
@@ -66,10 +45,10 @@ No per-subagent worktree preamble is required.
 Detect the project's primary programming language to dispatch to the appropriate
 language-specific agents:
 
-- If `pom.xml` exists in the worktree root → `LANG=java`
-- If `Cargo.toml` exists → `LANG=rust`
-- If `pyproject.toml` or `setup.py` exists → `LANG=python`
-- If `package.json` exists → `LANG=typescript`
+- If `pom.xml` exists at `$PROJECT_ROOT` → `LANG=java`
+- If `Cargo.toml` exists at `$PROJECT_ROOT` → `LANG=rust`
+- If `pyproject.toml` or `setup.py` exists at `$PROJECT_ROOT` → `LANG=python`
+- If `package.json` exists at `$PROJECT_ROOT` → `LANG=typescript`
 - Otherwise → `LANG=generic` (fallback, may not have specialized agents)
 
 All subsequent references to `architect`, `coder`, `reviewer`, `perf` subagents
@@ -84,8 +63,8 @@ Before invoking any subagent, verify that the project has declared its
 post-implementation quality checks. A guessed quality gate is worse than
 no quality gate.
 
-1. Confirm a top-level `CLAUDE.md` exists in the worktree root. If it
-   does not, halt with the message below and do NOT proceed to Stage 1.
+1. Confirm a top-level `CLAUDE.md` exists at `$PROJECT_ROOT`. If it does
+   not, halt with the message below and do NOT proceed to Stage 1.
 2. Read `CLAUDE.md` and scan for a level-2 heading `## Quality Gate`
    (exact match, case-sensitive). The section runs from that heading
    up to the next heading of equal-or-higher level (or end of file).
@@ -133,8 +112,8 @@ Example (for a Maven project):
 Re-run /new-feature once CLAUDE.md is updated.
 ```
 
-After printing the halt message, stop the pipeline. The worktree
-created in Setup is left in place; the user owns cleanup.
+After printing the halt message, stop the pipeline. No pipeline-side
+cleanup is required.
 
 ---
 
@@ -214,8 +193,11 @@ Use the `${LANG}-reviewer` subagent with this task:
 > Context:
 > - Architecture plan: `.agent-output/001-architecture-plan.md`
 > - Implementation log: `.agent-output/002-implementation-log.md`
-> - Use `git diff main` to see all changes (or inspect changed files
->   directly via Read)
+> - Use `git diff $PIPELINE_START_SHA..HEAD` plus `git diff` (for
+>   uncommitted changes) to see exactly what this pipeline run produced.
+>   `PIPELINE_START_SHA` is the commit the pipeline started at, captured
+>   in the Preflight section above. Alternatively, inspect changed files
+>   directly via Read.
 >
 > Perform the full multi-pass review enumerated in your own system
 > prompt (typically: correctness & safety, idiomatic style for this
@@ -332,11 +314,13 @@ Use the `docs-updater` subagent with this task:
 > Follow your standard phases:
 > 1. Load the documentation policy from the top-level `CLAUDE.md` and
 >    catalog any doc files it references.
-> 2. Determine the review window. **You are running on a feature branch
->    cut from `origin/main` in this pipeline, so use the branch-off
->    point — do NOT prompt the human for a window.** Concretely, use
->    `git merge-base HEAD origin/main` as the start of the range, plus
->    any uncommitted work.
+> 2. Determine the review window. **Use `PIPELINE_START_SHA` (captured
+>    in the Preflight section) as the start of the range — do NOT prompt
+>    the human for a window.** Concretely, inspect
+>    `git diff $PIPELINE_START_SHA..HEAD` for committed changes plus
+>    `git diff` for uncommitted ones. The pipeline makes no assumption
+>    about how you arrived at HEAD (current branch, fresh worktree,
+>    isolated CI checkout — all valid).
 > 3. Inspect the diff and identify documentation impact.
 > 4. Apply the minimum edits needed; write the log to
 >    `.agent-output/006-docs-update-log.md`.

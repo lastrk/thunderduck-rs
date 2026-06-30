@@ -294,10 +294,9 @@ cd tests/integration && python3 -m pytest \
 
 ## Documentation
 
-- **[Architecture](docs/architecture.md)**: All architectural decisions (ADRs 1–21)
-- **[Implementation Plan](docs/implementation-plan.md)**: Phased delivery plan
+- **[Rearchitecture ADRs](docs/thunderduck-rearchitect-ADRs.md)**: Authoritative architecture for the transpiler redesign (ADR-000 → ADR-019)
+- **[Architecture](docs/architecture.md)**: Architectural decisions for the existing implementation (ADRs 1–21)
 - **[Dev Journal](docs/dev-journal-toc.md)**: Chronological development history
-- **[Test Tracker](docs/reference-gap-analysis.md)**: Differential test status and remaining items
 
 ## Contributing
 

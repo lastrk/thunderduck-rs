@@ -1,5 +1,7 @@
 # Thunderduck Rust — Architecture Decisions
 
+> **Superseded where it conflicts.** This document records the ADRs (01–21) of the **existing** implementation. The authoritative architecture for the transpiler going forward is [`thunderduck-rearchitect-ADRs.md`](thunderduck-rearchitect-ADRs.md) (ADR-000 → ADR-019). The decisions below remain valid reference for the current code, which continues to run behind a dispatch flag while the rearchitected path is built alongside it; on any contradiction, the rearchitecture ADRs win.
+
 **Thunderduck** is a Rust-native Spark Connect server that translates Spark DataFrame/SQL operations to DuckDB SQL and streams Arrow results back to clients. Goals: identical Spark API compatibility as the Java reference, plus fast startup and minimal memory footprint by eliminating the JVM.
 
 ---

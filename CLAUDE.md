@@ -6,7 +6,15 @@ This file contains project-specific rules and guidelines for working with thunde
 
 **Keep your Spark API, get single-node DuckDB performance.** Thunderduck is a drop-in Spark Connect server backed by DuckDB for workloads that don't need distributed compute. This is the Rust port: same Spark API compatibility, fast startup (~50ms vs ~10s JVM), and low memory overhead (~30MB vs ~500MB JVM baseline).
 
-See [docs/architecture.md](docs/architecture.md) for all architectural decisions.
+### Authoritative architecture
+
+[**docs/thunderduck-rearchitect-ADRs.md**](docs/thunderduck-rearchitect-ADRs.md) (ADR-000 → ADR-019 + Cross-Validation) is the **authoritative** architecture source for the transpiler going forward. It records a principled redesign of the Spark → DuckDB transliterator (`τ`): a common AST fed by both front-ends, an owned type/nullability analyzer over that AST, a declarative compiled emission table, extension functions as minimal gap-fillers, and a differential + AnalyzePlan test architecture.
+
+The older [docs/architecture.md](docs/architecture.md) and [docs/adrs/](docs/adrs/) describe the **existing** implementation and remain valid reference for it, but where they contradict the rearchitecture ADRs, **the rearchitecture ADRs win.**
+
+### Rearchitecture is additive and non-destructive
+
+The new transpiler is being built **alongside** the existing one, not in place of it. A dispatch flag selects which path a request takes (legacy path vs. new common-AST/analyzer path), so the existing implementation keeps passing its differential suite while the new path is grown to conformance. Do not delete or rewrite the existing transpiler to make room for the new one — both coexist until the new path supersedes the old behind the flag.
 
 ## Workflow Orchestration
 
@@ -22,7 +30,16 @@ Offload research, exploration, and parallel analysis to subagents. One task per 
 After ANY correction from the user: update `tasks/lessons.md` with the pattern. Review lessons at session start.
 
 ### 4. Verification Before Done
-Never mark a task complete without proving it works. Run tests, check logs, demonstrate correctness.
+Never mark a task complete without proving it works. For any non-trivial change, run the following in order and require each to pass before moving on. Commands live in the [Development Cheatsheet](#development-cheatsheet); do not duplicate them here.
+
+1. **Format** — `cargo fmt --check` must be clean.
+2. **Lint** — `cargo clippy -- -D warnings` must be clean (zero warnings).
+3. **Unit tests** — `cargo test` must pass across all crates.
+4. **TPC-H differential (mandatory)** — `./tests/scripts/run-differential-tests.sh tpch` must pass in relaxed mode.
+5. **Full differential (when SQL-relevant)** — if the change touches SQL generation, expressions, logical plans, the parser, the converter, or the function registry, also run `./tests/scripts/run-differential-tests.sh all`.
+6. **Strict mode (when semantics-relevant)** — if the change touches numerical semantics, hashing, decimal arithmetic, or SUM/AVG return types, repeat steps 4–5 with `THUNDERDUCK_COMPAT_MODE=strict` (requires `--features bundled-extension`).
+
+A task is **not** done if any step is red. Do not commit, do not declare success, do not move on. If a step is intentionally skipped (e.g., docs-only change skips clippy), state which step and why.
 
 ### 5. Demand Elegance (Balanced)
 For non-trivial changes: pause and ask "is there a more elegant Rust way?" Skip for simple, obvious fixes.
@@ -214,12 +231,11 @@ from GitHub releases and caches it under `extensions/` (gitignored). The binary 
 
 ## Documentation Structure
 
-1. **Architecture** (`docs/architecture.md`) — all architectural decisions (ADRs 1–21); links to individual files in `docs/adrs/`
-2. **Implementation Plan** (`docs/implementation-plan.md`) — phased delivery plan
+1. **Rearchitecture ADRs** (`docs/thunderduck-rearchitect-ADRs.md`) — **authoritative** architecture for the transpiler redesign (ADR-000 → ADR-019 + Cross-Validation). Source of truth on any contradiction.
+2. **Existing architecture** (`docs/architecture.md`) — architectural decisions for the current implementation (ADRs 1–21); links to individual files in `docs/adrs/`. Valid for the existing path; superseded by item 1 where they conflict.
 3. **Dev journal** (`docs/dev-journal-toc.md`) — chronological development history; entries in `docs/dev_journal/`
-4. **Gap analysis** (`docs/reference-gap-analysis.md`) — Java reference vs Rust port comparison; HIGH/MEDIUM/LOW items
-5. **Historical plans** (`docs/phase5-parser-plan.md`) — Phase 5 parser plan (superseded; Phase 5 shipped in commit `cb9e81f`)
-6. **Task tracking** (`tasks/`) — active work items and lessons learned
+4. **Agent context** (`docs/context/`) — condensed reference (architecture, build commands, coding standards, dependencies, gotchas, testing) for the current codebase
+5. **Task tracking** (`tasks/`) — active work items and lessons learned
 
 ## Git Commit Workflow
 
@@ -316,7 +332,7 @@ pkill -f thunderduck-connect-server
 | Test conftest | `tests/integration/conftest.py` |
 | DataFrame diff util | `tests/integration/utils/dataframe_diff.py` |
 
-**Last Updated**: 2026-04-05
+**Last Updated**: 2026-05-24
 
 # Project Guidelines
 
@@ -324,8 +340,15 @@ pkill -f thunderduck-connect-server
 
 This project follows strict Rust conventions enforced by specialized agents.
 
-### Build & Quality Gates
-- All code must pass: `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`
+### Quality Gate Commands
+Run in this order; each must pass before the next is meaningful. See [Verification Before Done](#4-verification-before-done) for when each is mandatory.
+- `cargo fmt --check`
+- `cargo clippy -- -D warnings`
+- `cargo test`
+- `./tests/scripts/run-differential-tests.sh tpch` (always, for non-trivial changes)
+- `./tests/scripts/run-differential-tests.sh all` (when the change touches SQL generation)
+
+### Code Style & Invariants
 - No `.unwrap()` in library code. `.expect()` only for proven invariants.
 - All public items must have `///` doc comments.
 - Error types use `thiserror` in library crates, `anyhow` in application crates.

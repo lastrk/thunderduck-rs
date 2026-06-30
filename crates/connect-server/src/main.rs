@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use thunderduck_core::runtime::{RuntimeCompatMode, SessionManager, StreamingConfig};
+use thunderduck_core::transpiler_v2::TranspilerPath;
 use tonic::transport::Server;
 
 use crate::proto::spark::connect::spark_connect_service_server::SparkConnectServiceServer;
@@ -43,6 +44,11 @@ struct Args {
     /// Enable relaxed mode (vanilla DuckDB functions, ~85% Spark parity)
     #[arg(long, conflicts_with = "strict")]
     relaxed: bool,
+
+    /// Transpiler path: `legacy` (default) or `v2` (rearchitecture path, WIP).
+    /// Falls back to THUNDERDUCK_TRANSPILER when unset.
+    #[arg(long)]
+    transpiler: Option<String>,
 }
 
 #[tokio::main]
@@ -70,14 +76,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RuntimeCompatMode::from_env()
     };
 
+    // CLI flag wins; otherwise consult the environment (default: Legacy).
+    // An explicit but unrecognized CLI value is a hard error.
+    let transpiler = match args.transpiler.as_deref() {
+        Some("legacy") => TranspilerPath::Legacy,
+        Some("v2") => TranspilerPath::V2,
+        Some(other) => {
+            return Err(
+                format!("unrecognized --transpiler '{other}', expected 'legacy' or 'v2'").into(),
+            )
+        }
+        None => TranspilerPath::from_env(),
+    };
+
     tracing::info!(
-        "Starting Thunderduck Connect Server on {} (mode: {:?})",
+        "Starting Thunderduck Connect Server on {} (mode: {:?}, transpiler: {:?})",
         bind,
-        mode
+        mode,
+        transpiler
     );
 
     let mgr = Arc::new(SessionManager::new(mode, StreamingConfig::default()));
-    let svc = ThunderduckService::new(mgr, mode);
+    let svc = ThunderduckService::new(mgr, mode, transpiler);
 
     Server::builder()
         .add_service(SparkConnectServiceServer::new(svc))

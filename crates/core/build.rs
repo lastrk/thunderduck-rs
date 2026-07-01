@@ -27,11 +27,11 @@ fn link_external_duckdb_runtime() {
 }
 
 fn download_extension() {
-    // The `ext4` release packs binaries for multiple DuckDB versions under a
+    // The `ext6` release packs binaries for multiple DuckDB versions under a
     // single tag, with the DuckDB version embedded in each filename. We pick
-    // the one matching the duckdb crate (currently 1.10501.0 → DuckDB 1.5.1).
-    const RELEASE_TAG: &str = "ext4";
-    const EXT_DUCKDB_VERSION: &str = "v1.5.1";
+    // the one matching the duckdb crate (currently 1.10504.0 → DuckDB 1.5.4).
+    const RELEASE_TAG: &str = "ext6";
+    const EXT_DUCKDB_VERSION: &str = "v1.5.4";
     const BASE_URL: &str =
         "https://github.com/nubank/thunderduck-duckdb-extension/releases/download";
 

@@ -40,7 +40,7 @@ Review before working on SQL generation, expression handling, threading, extensi
 
 **Gotcha**: The `.duckdb_extension` binary's embedded DuckDB version must exactly match the `duckdb` crate version in `Cargo.toml`. Mismatch causes runtime load failures with cryptic ABI errors.
 
-**Rule**: Currently pinned to the `ext4` release (multi-version: pulls the `v1.5.1` binaries to match the `duckdb` crate at `1.10501.0`). When bumping either the crate or the extension, bump both in lockstep and re-run `cargo build --release` to confirm.
+**Rule**: Currently pinned to the `ext6` release (multi-version: pulls the `v1.5.4` binaries to match the `duckdb` crate at `1.10504.0`). When bumping either the crate or the extension, bump both in lockstep and re-run `cargo build --release` to confirm.
 
 ## HUGEINT Overflow on Integer SUM
 

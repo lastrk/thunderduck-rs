@@ -14,7 +14,7 @@ thiserror  = "2"
 #     scripts/dev/. Avoids recompiling the ~2 GB C++ amalgamation per worktree.
 #   * `bundled` feature (enabled by the workspace `bundled` feature): compile
 #     DuckDB from source as before. CI / fresh clones build with `--features bundled`.
-duckdb     = { version = "1.10501.0", default-features = false }
+duckdb     = { version = "1.10504.0", default-features = false }
 arrow      = "58"
 arrow-ipc  = "58"
 dashmap    = "6"

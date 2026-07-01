@@ -215,7 +215,7 @@ Expression (enum)
 
 5. **DuckDB SEMI JOIN syntax**: DuckDB uses `SEMI JOIN` and `ANTI JOIN` (without `LEFT` prefix). `LEFT SEMI JOIN` is a parser error.
 
-6. **Extension version pinning**: The `.duckdb_extension` binary DuckDB version must exactly match the `duckdb` crate version in `Cargo.toml`. Currently pinned to the `ext4` release (multi-version: pulls the `v1.5.1` binaries to match the `duckdb` crate at `1.10501.0`).
+6. **Extension version pinning**: The `.duckdb_extension` binary DuckDB version must exactly match the `duckdb` crate version in `Cargo.toml`. Currently pinned to the `ext6` release (multi-version: pulls the `v1.5.4` binaries to match the `duckdb` crate at `1.10504.0`).
 
 7. **HUGEINT overflow**: DuckDB `SUM()` of integer columns returns `HUGEINT` (i128). Spark returns `BIGINT` (i64). SQL generation must emit explicit `CAST(... AS BIGINT)` for integer SUM.
 
@@ -248,7 +248,7 @@ The `thdck_spark_funcs` DuckDB extension is **mandatory** and bundled into every
 - `spark_avg(col)` — Spark-compatible AVG return types
 - `spark_skewness(col)` — population skewness (Spark semantics)
 
-Source: release [`ext4`](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext4) (multi-version — currently pulls the `v1.5.1` binaries). On a fresh build, `build.rs` downloads the correct platform binary from GitHub releases and caches it under `extensions/ext4/` (gitignored). The binary is embedded via `include_bytes!()` and loaded at every session's startup; failure to load is a hard error.
+Source: release [`ext6`](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext6) (multi-version — currently pulls the `v1.5.4` binaries). On a fresh build, `build.rs` downloads the correct platform binary from GitHub releases and caches it under `extensions/ext6/` (gitignored). The binary is embedded via `include_bytes!()` and loaded at every session's startup; failure to load is a hard error.
 
 > Full details: [rearchitect ADR-020](docs/thunderduck-rearchitect-ADRs.md).
 

@@ -12,10 +12,10 @@ cargo build --release
 
 The `.duckdb_extension` binary's embedded DuckDB version must exactly match the `duckdb` crate version in `Cargo.toml`. Currently pinned to:
 
-- Extension release: `ext4` (multi-version — pulls the `v1.5.1` binaries)
-- `duckdb` crate: `1.10501.0`
+- Extension release: `ext6` (multi-version — pulls the `v1.5.4` binaries)
+- `duckdb` crate: `1.10504.0`
 
-On the first build, `build.rs` downloads the correct platform binary from the GitHub releases of `thunderduck-duckdb-extension` and caches it under `extensions/ext4/` (gitignored). The binary is embedded via `include_bytes!()` and loaded at every session's startup; failure to load is a hard error.
+On the first build, `build.rs` downloads the correct platform binary from the GitHub releases of `thunderduck-duckdb-extension` and caches it under `extensions/ext6/` (gitignored). The binary is embedded via `include_bytes!()` and loaded at every session's startup; failure to load is a hard error.
 
 ### `thdck_spark_funcs` Extension Functions
 

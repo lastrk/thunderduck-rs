@@ -24,6 +24,16 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   hand-write until you have real clients, or write the interpreter in the same pass. Slice
   C.2 lands the declarative table when it has per-function rows that need it.
 
+- **The up-front audit is worth the cost.** Slice D Phase 1's architect §0 (2026-07-01)
+  audited the actual `emission.rs` state before proposing edits and found that `md5`,
+  `sha1`/`sha2`, and the full stddev/variance family were already wired in Slice C.2 — the
+  readiness map and initial prompt listed them as "wiring to add." The audit collapsed the
+  planned edit surface from ~14 arms to 8 and saved multiple Pass-1 iterations that would
+  have discovered the overlap during coder work (each `render_function_call` arm collision
+  is a fresh compile error + re-review cycle). Rule: for any slice that touches a
+  large-surface file already grown by a previous slice, spend a plan §0 pass diff'ing the
+  actual substrate against the prompt's assumptions before enumerating deliverables.
+
 - **Approach A is the honest choice when the interpreter is trivial.** Slice C.2's architect
   (2026-07-01) chose Approach A (hand-written per-variant / per-function `match` arms) over
   Approach B (declarative row substrate + interpreter) precisely because the ~50 non-trivial

@@ -4,7 +4,7 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
-## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2
+## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1
 
 [`dev_journal/2026-07-01-v2-slice-b-analyzer.md`](dev_journal/2026-07-01-v2-slice-b-analyzer.md)
 
@@ -38,6 +38,22 @@ per-column CAST wrapper. OPT-M2 subsumed by seam drain; OPT-M3 closed via
 iterations: iteration 1 `APPROVED` with 2 CLOSE_NOW Mediums (M1 qualified Star drop, M4 aliased
 Div CAST); iteration 2 closed both plus an M2 log correction. Perf `OPTIMIZED` (0 HIGH + 0 MEDIUM);
 seam drain silently absorbed OPT-M2 + L1 wins.
+
+**Slice D Phase 1** (ext4 wiring, partially lands Slice D): Two-file diff (`emission.rs` +
+`invariants.rs`). 6 scalar arms (`crc32`, `hash`, `xxhash64`, `skewness`, `percentile_approx`,
+`median`) + 2 verify-first arms (`kurtosis` → `KURTOSIS_POP`, `count_if` → `COUNT_IF`, both
+native pending scoped-differential confirmation at Phase 1 termination). `render_binary`
+DECIMAL-div branch + `render_spark_decimal_div` helper mirroring legacy
+`gen_strict_decimal_div`. New `spark_aggregate_rewrite` sibling helper rewrites DECIMAL
+`SUM`/`AVG`/`mean` to `spark_sum`/`spark_avg` with widened outer CAST.
+`extension_targets()` populated with 6-entry ext4 allow-list. **INV6** activated over the
+ext4 subset (containment check against `duckdb_functions()` turned green); INV3
+`REQUIRED_RENDERERS` extended with the two new helpers. Up-front audit surfaced `md5`,
+`sha1`/`sha2`, and stddev family were already wired in Slice C.2, collapsing planned
+edit surface from ~14 arms to 8. Review `APPROVED` (5 Mediums: M1 + M5 CLOSE_NOW closed
+via iter 2; M2 scoped-differential at Phase 1 termination; M3 + M4 DEFER). Perf
+`OPTIMIZED` (5 LOWs all deferred). Slice D as a whole does not terminate here — Phase 2
+remains blocked on the ext5 pin.
 
 **Tests**: 269 core + 14 connect-server · differential unchanged (not re-run)
 

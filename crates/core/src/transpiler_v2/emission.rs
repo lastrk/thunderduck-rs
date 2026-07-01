@@ -14,7 +14,7 @@
 //! (`emit`) fires the [INV2] tap. [`dispatch`] is the sole caller of
 //! `emit`, so INV2 holds by type-system construction.
 //!
-//! # Scope for Slice C.2
+//! # Scope for Slice C.2 + Slice D Phase 1
 //!
 //! The dispatch arms cover: Project, Filter, Sort, Limit, Tail, Distinct,
 //! WithColumns, DropColumns, AliasedRelation, TableScan, LocalRelation,
@@ -22,15 +22,31 @@
 //! primitive Aggregate. Scalar-expression rendering covers Literal,
 //! ColumnReference, UnresolvedColumn, Binary, Unary, Cast, CaseWhen,
 //! Alias, Star, RawSql passthrough, and ~40 scalar function shapes
-//! hand-copied verbatim from the legacy `FunctionRegistry`. Extension-
-//! function targets (spark_*, try_cast, try_divide, spark4 syntax) are
-//! Slice D and land on `EmissionError::UnsupportedFunction`, which the
-//! caller in `service.rs` treats as fallback-eligible.
+//! hand-copied verbatim from the legacy `FunctionRegistry`.
+//!
+//! **Slice D Phase 1** adds the ext4 extension-function arms whose
+//! DuckDB-side implementation already ships in `thdck_spark_funcs`
+//! (ADR-020 pin `ext4`): `spark_hash`, `spark_xxhash64`, `spark_skewness`,
+//! and the DECIMAL routes for `spark_sum`, `spark_avg`, `spark_decimal_div`.
+//! Native-DuckDB scalars newly wired: `crc32`, `percentile_approx`,
+//! `median`, `kurtosis`, `count_if`. Extension arms that require the
+//! future `ext5` release (`try_divide`, `try_cast`, `corr`, `covar_samp`,
+//! `regr_*`, `try_sum`, `try_avg`) remain surfaced as
+//! `EmissionError::UnsupportedFunction` — the caller in `service.rs`
+//! treats that as fallback-eligible.
+//!
+//! Two Slice D dispatch sites are non-obvious and are **not** reachable by
+//! grepping [`render_function_call`] alone: `spark_decimal_div` is dispatched
+//! from [`render_binary`]'s DECIMAL `/` branch (via `render_spark_decimal_div`),
+//! not from a `render_function_call` arm. DECIMAL `sum`/`avg`/`mean` are
+//! rewritten to `spark_sum`/`spark_avg` inside [`spark_aggregate_rewrite`],
+//! which is invoked by `render_aggregate` before the aggregate expression
+//! is rendered — again, not visible in [`render_function_call`] arms.
 
 use crate::expression::{
-    BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, ColumnReference, Expression,
-    FunctionCall, Literal, LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression,
-    UnaryExpression, UnaryOp, UnresolvedColumn,
+    AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
+    ColumnReference, Expression, FunctionCall, Literal, LiteralValue, NullOrdering, SortDirection,
+    SortOrder, StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
 use crate::logical::spark_column_name;
 use crate::transpiler_v2::analyzer::{Schema, TypedOp};
@@ -196,12 +212,21 @@ pub fn external_emit_paths() -> &'static [ExternalEmit] {
 /// `Extension(name)` targets the dispatch table declares. [INV6 §CV.5]
 /// requires every name resolve to a function exported by `thdck_spark_funcs`.
 ///
-/// **Stub.** Empty today; entries are added as ADR-010 extension targets
-/// are wired into the table.
-///
-/// TODO INV6: populate as ADR-010 extension targets are declared.
+/// Populated in Slice D Phase 1 with the ext4-bundled extension functions
+/// consumed by [`render_function_call`], [`render_binary`]'s
+/// decimal-division branch, and [`spark_aggregate_rewrite`]'s DECIMAL
+/// SUM/AVG routing. Further entries land as later Slice-D passes wire
+/// ext5 targets (`try_sum`, `try_avg`, `try_cast`, `try_divide`, `corr`,
+/// `covar_samp`, `regr_*`).
 pub fn extension_targets() -> &'static [&'static str] {
-    &[]
+    &[
+        "spark_hash",
+        "spark_xxhash64",
+        "spark_skewness",
+        "spark_sum",
+        "spark_avg",
+        "spark_decimal_div",
+    ]
 }
 
 // ── dispatch entry point ──────────────────────────────────────────────────────
@@ -612,7 +637,16 @@ fn render_aggregate(
         // from Spark's aggregate protocol (`AggregateExpr.is_distinct`,
         // propagated through the lowering adapter) and must not be
         // dropped — `COUNT(DISTINCT x)` and `COUNT(x)` differ.
-        let mut decorated = render_expr(&agg.func, schema, "Aggregate")?;
+        //
+        // Slice D Phase 1: DECIMAL-typed SUM/AVG arguments must route
+        // through the `spark_sum` / `spark_avg` extension functions to
+        // preserve Spark's widened DECIMAL return types. The rewrite
+        // both renames the aggregate and picks the outer CAST target.
+        let (func_to_render, extra_cast) = match spark_aggregate_rewrite(&agg.func, schema) {
+            Some((rewritten, target)) => (rewritten, Some(target)),
+            None => (agg.func.clone(), None),
+        };
+        let mut decorated = render_expr(&func_to_render, schema, "Aggregate")?;
         if agg.is_distinct {
             decorated = inject_distinct(decorated);
         }
@@ -622,8 +656,12 @@ fn render_aggregate(
         }
         // Spark-parity return-type CAST for aggregates whose Spark return
         // type diverges from DuckDB's default (e.g., SUM of integer types
-        // returns HUGEINT in DuckDB but BIGINT in Spark).
-        if let Some(target) = spark_aggregate_return_cast(&agg.func, schema) {
+        // returns HUGEINT in DuckDB but BIGINT in Spark). For DECIMAL
+        // SUM/AVG the CAST target is supplied by `spark_aggregate_rewrite`
+        // (Slice D Phase 1); everything else routes through the
+        // integral-return `spark_aggregate_return_cast` helper.
+        let cast_target = extra_cast.or_else(|| spark_aggregate_return_cast(&agg.func, schema));
+        if let Some(target) = cast_target {
             decorated = format!("CAST({decorated} AS {})", TypeMapper::to_duckdb(&target));
         }
         let name = match &agg.func {
@@ -917,6 +955,17 @@ fn render_binary(
     schema: &Schema,
     op_kind: &'static str,
 ) -> Result<String, EmissionError> {
+    // Slice D Phase 1: DECIMAL division routes through the
+    // `spark_decimal_div` extension so that ROUND_HALF_UP semantics and
+    // the widened result-precision/scale match Spark exactly. Mirrors
+    // legacy `gen_strict_decimal_div` at `generator/mod.rs:1541-1644`.
+    if matches!(b.op, BinaryOp::Div) {
+        let lt = b.left.data_type(schema);
+        let rt = b.right.data_type(schema);
+        if let Some(sql) = render_spark_decimal_div(b, &lt, &rt, schema, op_kind)? {
+            return Ok(sql);
+        }
+    }
     let left = render_expr_paren(&b.left, schema, op_kind, binop_precedence(&b.op))?;
     let right = render_expr_paren(&b.right, schema, op_kind, binop_precedence(&b.op))?;
     let sql = format!("{left} {} {right}", b.op.symbol());
@@ -929,6 +978,121 @@ fn render_binary(
         return Ok(format!("CAST({sql} AS DATE)"));
     }
     Ok(sql)
+}
+
+/// Slice D Phase 1: strict-mode decimal division via the `spark_decimal_div`
+/// extension. Duplicates the shape of legacy `gen_strict_decimal_div`
+/// (`generator/mod.rs:1541-1644`) — Slice C.2's INV3 contamination barrier
+/// forbids importing `SqlGenerator`, so the arithmetic is inlined here.
+///
+/// The three (Decimal, Decimal) / (Decimal, integral) / (integral, Decimal)
+/// branches return `Some(sql)`; every other operand-type pair returns
+/// `Ok(None)` and lets [`render_binary`] fall through to the plain
+/// `left / right` shape.
+///
+/// Operands are re-rendered via [`render_expr`] (unparenthesised) rather
+/// than reusing [`render_expr_paren`] outputs, matching legacy line 1549.
+fn render_spark_decimal_div(
+    b: &BinaryExpression,
+    lt: &DataType,
+    rt: &DataType,
+    schema: &Schema,
+    op_kind: &'static str,
+) -> Result<Option<String>, EmissionError> {
+    use crate::types::TypeInferenceEngine;
+    let left_sql = render_expr(&b.left, schema, op_kind)?;
+    let right_sql = render_expr(&b.right, schema, op_kind)?;
+    match (lt, rt) {
+        (
+            DataType::Decimal {
+                precision: p1,
+                scale: s1,
+            },
+            DataType::Decimal {
+                precision: p2,
+                scale: s2,
+            },
+        ) => {
+            // Defensively cast operands to their inferred DECIMAL types;
+            // DuckDB may return DOUBLE at runtime (e.g. native AVG inside
+            // window functions) even though plan-level inference says
+            // DECIMAL. The explicit CASTs guarantee `spark_decimal_div`
+            // always receives DECIMAL arguments.
+            let left_cast = format!("CAST({left_sql} AS DECIMAL({p1},{s1}))");
+            let right_cast = format!("CAST({right_sql} AS DECIMAL({p2},{s2}))");
+            let result_type = TypeInferenceEngine::decimal_div_type(*p1, *s1, *p2, *s2);
+            if let DataType::Decimal {
+                precision: rp,
+                scale: rs,
+            } = result_type
+            {
+                Ok(Some(format!(
+                    "CAST(spark_decimal_div({left_cast}, {right_cast}) AS DECIMAL({rp},{rs}))"
+                )))
+            } else {
+                Ok(Some(format!(
+                    "spark_decimal_div({left_cast}, {right_cast})"
+                )))
+            }
+        }
+        (
+            DataType::Decimal {
+                precision: p1,
+                scale: s1,
+            },
+            i,
+        ) if i.is_integral() => {
+            if let DataType::Decimal {
+                precision: p2,
+                scale: s2,
+            } = b.right.integral_to_decimal_for_arithmetic(schema)
+            {
+                let result_type = TypeInferenceEngine::decimal_div_type(*p1, *s1, p2, s2);
+                if let DataType::Decimal {
+                    precision: rp,
+                    scale: rs,
+                } = result_type
+                {
+                    Ok(Some(format!(
+                        "CAST(spark_decimal_div({left_sql}, CAST({right_sql} AS DECIMAL({p2},0))) AS DECIMAL({rp},{rs}))"
+                    )))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        (
+            i,
+            DataType::Decimal {
+                precision: p2,
+                scale: s2,
+            },
+        ) if i.is_integral() => {
+            if let DataType::Decimal {
+                precision: p1,
+                scale: s1,
+            } = b.left.integral_to_decimal_for_arithmetic(schema)
+            {
+                let result_type = TypeInferenceEngine::decimal_div_type(p1, s1, *p2, *s2);
+                if let DataType::Decimal {
+                    precision: rp,
+                    scale: rs,
+                } = result_type
+                {
+                    Ok(Some(format!(
+                        "CAST(spark_decimal_div(CAST({left_sql} AS DECIMAL({p1},0)), {right_sql}) AS DECIMAL({rp},{rs}))"
+                    )))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 fn render_expr_paren(
@@ -1491,6 +1655,43 @@ fn render_function_call(
         "bool_and" | "every" => format!("BOOL_AND({})", joined()),
         "bool_or" => format!("BOOL_OR({})", joined()),
         "any_value" => format!("ANY_VALUE({})", joined()),
+        // ── Slice D Phase 1: hash / extension aggregates ─────────────────
+        // Legacy oracle: `functions/mod.rs:522-525` (hash / xxhash64),
+        // `functions/mod.rs:428-430` (skewness). Extension bindings ship
+        // in the ext4 release of `thdck_spark_funcs` (see ADR-020).
+        "hash" => format!("spark_hash({})", joined()),
+        "xxhash64" => format!("spark_xxhash64({})", joined()),
+        "skewness" => format!("spark_skewness({})", joined()),
+        // `spark_sum` / `spark_avg` are emitted synthetically by
+        // `spark_aggregate_rewrite` when a DECIMAL-typed SUM/AVG needs
+        // the ext4 extension for Spark-precise widening; render them
+        // through here so the aggregate path can dispatch cleanly.
+        "spark_sum" => format!("spark_sum({})", joined()),
+        "spark_avg" => format!("spark_avg({})", joined()),
+        // ── Slice D Phase 1: native-DuckDB scalar/aggregate additions ────
+        // Legacy oracle: `functions/mod.rs:1332-1334` (crc32),
+        // `functions/mod.rs:460-465` (percentile_approx → approx_quantile),
+        // `functions/mod.rs:423-425` (kurtosis → KURTOSIS_POP).
+        "crc32" => format!("CRC32({})", arg_refs.first().copied().unwrap_or("")),
+        "percentile_approx" => {
+            if arg_refs.len() >= 2 {
+                format!("approx_quantile({}, {})", arg_refs[0], arg_refs[1])
+            } else {
+                "NULL".to_string()
+            }
+        }
+        "median" => format!("MEDIAN({})", joined()),
+        // Verify-first arm (plan §5.1): legacy already maps `kurtosis` →
+        // `KURTOSIS_POP` (`functions/mod.rs:423-425`) and legacy passes
+        // its differential gate, so the native mapping is the empirically
+        // vetted shape.
+        "kurtosis" => format!("KURTOSIS_POP({})", joined()),
+        // Verify-first arm (plan §5.2): legacy has no explicit arm and
+        // falls through to pass-through (`functions/mod.rs:66`), emitting
+        // `count_if(args)` verbatim; DuckDB accepts this as native
+        // `COUNT_IF`. v2 emits the same shape, so parity with the legacy
+        // path is preserved by construction.
+        "count_if" => format!("COUNT_IF({})", joined()),
 
         // ── Misc simple ──────────────────────────────────────────────────
         "isnull" => {
@@ -1580,9 +1781,12 @@ fn spark_return_cast(expr: &Expression, schema: &Schema) -> Option<DataType> {
 ///
 /// Slice C.2 handles the native-DuckDB-return divergences:
 /// `SUM(integer)` returns HUGEINT in DuckDB but BIGINT in Spark; and
-/// `AVG(integer)` returns DECIMAL in DuckDB but DOUBLE in Spark. Slice D
-/// will add the `spark_sum` / `spark_avg` extension-function rewrites
-/// for DECIMAL argument types.
+/// `AVG(integer)` returns DECIMAL in DuckDB but DOUBLE in Spark.
+///
+/// DECIMAL SUM/AVG rewrites (rename `SUM`/`AVG` → `spark_sum`/`spark_avg`)
+/// live in the sibling [`spark_aggregate_rewrite`] helper (Slice D Phase 1)
+/// because they must alter both the function name and the outer CAST
+/// target — a shape this `Option<DataType>` return cannot express.
 fn spark_aggregate_return_cast(func: &Expression, schema: &Schema) -> Option<DataType> {
     // Unwrap Alias so an aliased sum still gets the CAST.
     let inner: &Expression = match func {
@@ -1607,18 +1811,104 @@ fn spark_aggregate_return_cast(func: &Expression, schema: &Schema) -> Option<Dat
             DataType::Byte | DataType::Short | DataType::Integer | DataType::Long => {
                 Some(DataType::Long)
             }
-            // DECIMAL / spark_sum handling is Slice D.
+            // DECIMAL routes through `spark_aggregate_rewrite`, not here.
             _ => None,
         },
         "avg" | "mean" => match arg_type {
             DataType::Byte | DataType::Short | DataType::Integer | DataType::Long => {
                 Some(DataType::Double)
             }
-            // DECIMAL / spark_avg handling is Slice D.
+            // DECIMAL routes through `spark_aggregate_rewrite`, not here.
             _ => None,
         },
         _ => None,
     }
+}
+
+/// Slice D Phase 1 — DECIMAL-argument `SUM` / `AVG` route through the
+/// `spark_sum` / `spark_avg` extension functions so Spark's widened
+/// DECIMAL return types (precision/scale) are preserved exactly.
+///
+/// Returns `Some((rewritten_expr, outer_cast_target))`:
+///   * `rewritten_expr` is the original expression with the inner
+///     `FunctionCall.name` rebound to `spark_sum` or `spark_avg` (Alias
+///     wrapping is preserved so `spark_column_name` picks up the right
+///     output name).
+///   * `outer_cast_target` is the widened DECIMAL type
+///     [`render_aggregate`] wraps the emitted SQL in via `CAST(... AS ...)`.
+///
+/// Cast-type formulas duplicate legacy `spark_decimal_agg_type`
+/// (`generator/mod.rs:2543-2556`) verbatim — pure arithmetic, no legacy
+/// import required (Slice C.2's INV3 contamination barrier).
+///
+/// Returns `None` for every other aggregate shape (integer args are
+/// handled by [`spark_aggregate_return_cast`]; non-decimal / non-integer
+/// args need no wrapping).
+fn spark_aggregate_rewrite(func: &Expression, schema: &Schema) -> Option<(Expression, DataType)> {
+    // Unwrap Alias so we can inspect the underlying FunctionCall while
+    // preserving the alias binding on the rebuilt expression.
+    let (alias_wrap, call) = match func {
+        Expression::Alias(a) => match a.expr.as_ref() {
+            Expression::FunctionCall(f) => (Some(a.alias.clone()), f),
+            _ => return None,
+        },
+        Expression::FunctionCall(f) => (None, f),
+        _ => return None,
+    };
+    // Type inference on args is unreliable when the input schema is
+    // empty (SQL path without table enrichment). Skip the rewrite and
+    // let DuckDB handle natively — matches legacy `apply_agg_type_casts`.
+    if schema.is_empty() {
+        return None;
+    }
+    let name = call.name.to_ascii_lowercase();
+    let arg = call.args.first()?;
+    let (precision, scale) = match arg.data_type(schema) {
+        DataType::Decimal { precision, scale } => (precision, scale),
+        _ => return None,
+    };
+    let (new_name, cast_target) = match name.as_str() {
+        // Cast-type formulas duplicated from legacy `spark_decimal_agg_type`
+        // (`generator/mod.rs:2543-2556`).
+        "sum" | "sum_distinct" => {
+            let p = ((precision as u16) + 10).min(38) as u8;
+            (
+                "spark_sum",
+                DataType::Decimal {
+                    precision: p,
+                    scale,
+                },
+            )
+        }
+        "avg" | "mean" => {
+            let new_p = ((precision as u16) + 4).min(38) as u8;
+            let new_s = (scale + 4).min(18).min(new_p);
+            (
+                "spark_avg",
+                DataType::Decimal {
+                    precision: new_p,
+                    scale: new_s,
+                },
+            )
+        }
+        _ => return None,
+    };
+    // DISTINCT is injected at aggregate level via `agg.is_distinct` in
+    // `render_aggregate` (see ~line 642); do NOT propagate `call.distinct`
+    // here or we get `spark_sum(DISTINCT DISTINCT x)` for `sum_distinct(decimal)`.
+    let rewritten_call = Expression::FunctionCall(FunctionCall {
+        name: new_name.to_owned(),
+        args: call.args.clone(),
+        distinct: false,
+    });
+    let rewritten = match alias_wrap {
+        Some(alias) => Expression::Alias(AliasExpression {
+            expr: Box::new(rewritten_call),
+            alias,
+        }),
+        None => rewritten_call,
+    };
+    Some((rewritten, cast_target))
 }
 
 fn quote_ident(name: &str) -> String {

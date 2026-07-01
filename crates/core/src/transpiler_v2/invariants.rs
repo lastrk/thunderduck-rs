@@ -226,6 +226,9 @@ fn inv3_emission_table_single_source_of_truth() {
         // Spark-parity CAST helpers (C.2)
         "fn spark_return_cast",
         "fn spark_aggregate_return_cast",
+        // Slice D Phase 1 helpers (ext4 extension routing)
+        "fn render_spark_decimal_div",
+        "fn spark_aggregate_rewrite",
     ];
     for name in REQUIRED_RENDERERS {
         assert!(
@@ -366,8 +369,11 @@ fn inv5_no_unresolved_after_analyzer() {
 /// **INV6 — Every `Extension(...)` target in the dispatch table corresponds to an existing, loaded function in the `thunderduck-duckdb-extension` C++ project.** (Touches ADR-009, ADR-010.) Unlike LB5 (an empirical bet about expressiveness), this is a mechanically *checkable, preservable* property — verify at build/test time that the table's emission targets and the extension's exported symbols agree. It is the mechanical complement to LB5: LB5 asserts an adequate extension *can* be written; INV6 asserts every extension the table *names* actually *exists and is loaded*. A compiled-dispatch build (ADR-009) can enforce INV6 at compile time.
 ///
 /// ADR cross-reference: ADR-009 (declarative emission table) / ADR-010 (extension surface).
-/// today: `extension_targets()` is empty; the containment check is vacuously true, but the connection + LOAD path runs so a regression in the extension load is caught here.
-/// TODO INV6: as ADR-010 extension targets are declared, this test diffs them against `duckdb_functions()` and fails loudly on any missing symbol.
+/// Slice D Phase 1: `extension_targets()` now enumerates the ext4-bundled
+/// symbols (`spark_hash`, `spark_xxhash64`, `spark_skewness`, `spark_sum`,
+/// `spark_avg`, `spark_decimal_div`) — the containment check is real, not
+/// vacuous. Every declared target must resolve inside `duckdb_functions()`
+/// after `thdck_spark_funcs` has loaded.
 #[test]
 fn inv6_extension_targets_exist_in_loaded_extension() {
     // Structural reservation: open an in-memory DuckDB with
@@ -402,8 +408,10 @@ fn inv6_extension_targets_exist_in_loaded_extension() {
         );
     }
 
-    // TODO INV6: fail on the *reverse* direction too (exported but undeclared)
-    // once the coverage denominator (ADR-015) is derivable from the table.
+    // DEFER INV6 → ADR-015 coverage-denominator activation: fail on the
+    // *reverse* direction too (exported by `thdck_spark_funcs` but not
+    // declared by `extension_targets()`) once the emission table exposes
+    // a coverage denominator we can diff against `duckdb_functions()`.
 }
 
 /// **INV7 — Both front-ends produce the same common-AST node for semantically equivalent inputs.** (Added with the common-AST/SQL ADRs; touches ADR-003, ADR-004.) The SparkSQL parser and the Connect-proto deserializer must normalize to identical AST (same node, same resolved type/nullability) for the same meaning; otherwise the common-AST guarantee — that SQL inherits emission/inference rules for free for shared constructs — breaks. This is the soundness condition for having one τ behind two front-ends. **Check:** AnalyzePlan schema diff on the same SQL parsed by thunderduck vs analyzed by Spark (Tension T5).

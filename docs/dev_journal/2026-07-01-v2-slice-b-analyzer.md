@@ -1,4 +1,4 @@
-# Dev Journal — 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2
+# Dev Journal — 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1
 
 ## Slice B — Type & Nullability Analyzer
 
@@ -407,3 +407,144 @@ only, splicing the already-rendered inner SQL into the wrap.
   `with_schema_for_v2` is no longer called by emission after C.2.
 
 **5 files changed, +1947 / -125 lines.** 42 tests added.
+
+---
+
+## Slice D Phase 1 — Extension dispatch (ext4 subset)
+
+### Summary
+
+Slice D Phase 1 lands as a two-file diff (`emission.rs` + `invariants.rs`) inside
+`crates/core/src/transpiler_v2/`. INV6 (extension-target existence) gains real teeth over the
+ext4-available function subset; INV3's `REQUIRED_RENDERERS` grows to cover the two new helpers.
+Slice D as a whole does **not** terminate here — Phase 2 remains blocked on the
+`thunderduck-duckdb-extension` project shipping the `ext5` release and this repo pinning it.
+
+**Progress signal**: **not re-measured this pass** — `tests/integration/v2_progress.md` still
+reads 134/324 from Slice C.2. Expected delta at Phase 1 termination: ~140-142.
+
+**Pipeline artifacts**: `.agent-output/001-architecture-plan.md` through
+`.agent-output/006-docs-update-log.md`. Two coder iterations (Pass 1 delivered all 8
+deliverables; Review Fix Iteration 2 closed M1 + M5). Review verdict `APPROVED` on iteration 1
+with 5 Mediums (M1 + M5 CLOSE_NOW closed via iter 2; M2 scoped-differential at Phase 1
+termination; M3 + M4 DEFER). Perf verdict `OPTIMIZED` with 5 LOWs all deferred.
+
+### Up-front audit (§0 halt-and-flag)
+
+The architect's §0 audit surfaced three arms already wired in Slice C.2 that the initial
+prompt / readiness map listed as "wiring to add":
+
+- `md5` already emits `MD5(...)` (`emission.rs:1112`).
+- `sha`/`sha1`/`sha2` already route to `SHA256(...)` (`emission.rs:1113`), matching legacy
+  `functions/mod.rs:173-175` as an intentional-parity-gap approximation.
+- `stddev`/`stddev_samp`/`stddev_pop`/`variance`/`var_samp`/`var_pop` already wired
+  (`emission.rs:1485-1488`).
+
+The audit collapsed the planned edit surface from ~14 arm additions to **6 confirmed + 2
+verify-first = 8 arm additions**, saving iterations that would otherwise have discovered the
+overlap during coder work.
+
+### What landed
+
+- **`emission.rs::render_function_call`** — 6 new scalar arms: `crc32` → `CRC32(...)`,
+  `hash` → `spark_hash(...)`, `xxhash64` → `spark_xxhash64(...)`, `skewness` →
+  `spark_skewness(...)`, `percentile_approx` → `approx_quantile(...)`, `median` → `MEDIAN(...)`.
+  Plus 2 verify-first arms: `kurtosis` → `KURTOSIS_POP(...)` (native, byte-identical to
+  legacy) and `count_if` → `COUNT_IF(...)` (native, semantically identical to legacy's
+  pass-through). Plus two synthetic arms `spark_sum` / `spark_avg` (reachable only via
+  `spark_aggregate_rewrite`).
+
+- **`emission.rs::render_binary`** — DECIMAL-div branch: `BinaryOp::Div` with a DECIMAL
+  operand routes through the new private helper `render_spark_decimal_div`, which mirrors
+  legacy `gen_strict_decimal_div` (`generator/mod.rs:1541-1644`) — three sub-branches for
+  `(Decimal, Decimal)`, `(Decimal, integral)`, and `(integral, Decimal)`. Non-DECIMAL Div
+  falls through to the plain `left / right` path (still wrapped by
+  `spark_return_cast(&Div, schema)` for int/int → DOUBLE parity from Slice C.2).
+
+- **`emission.rs::spark_aggregate_rewrite`** — new sibling helper to
+  `spark_aggregate_return_cast`. For `SUM(Decimal{p,s})` returns
+  `(FunctionCall{name: "spark_sum", distinct: false, ...}, Decimal{min(p+10,38), s})`; for
+  `AVG(Decimal{p,s})` / `mean(Decimal{p,s})` returns
+  `(FunctionCall{name: "spark_avg", ...}, Decimal{min(p+4,38), min(min(s+4,18), new_p)})`.
+  `render_aggregate` calls this before rendering; the rewritten call's `distinct` is
+  always `false` (M1 iter-2 fix — DISTINCT is injected at the aggregate level, propagating
+  it would emit `spark_sum(DISTINCT DISTINCT x)`).
+
+- **`emission.rs::extension_targets()`** — replaced `&[]` with a 6-entry allow-list:
+  `spark_hash`, `spark_xxhash64`, `spark_skewness`, `spark_sum`, `spark_avg`,
+  `spark_decimal_div`. `TODO INV6:` marker removed from the doc comment.
+
+- **`emission.rs` module docstring** — Slice D paragraph names the two non-obvious
+  dispatch sites (M5 iter-2 fix): `spark_decimal_div` is dispatched from `render_binary`'s
+  DECIMAL `/` branch, not a `render_function_call` arm; DECIMAL `sum`/`avg`/`mean` are
+  rewritten inside `spark_aggregate_rewrite`.
+
+- **`invariants.rs`** — `TODO INV6:` marker removed; INV6 test body (already ~95% written)
+  now runs as a real containment check against `duckdb_functions()` and **turns green**
+  with the 6-entry allow-list. INV3's `REQUIRED_RENDERERS` list gained
+  `"fn render_spark_decimal_div"` and `"fn spark_aggregate_rewrite"` so future refactors
+  can't silently rename or remove them.
+
+### Verify-first verdicts
+
+Both wired native pending scoped-differential confirmation at Phase 1 termination:
+
+- **`kurtosis` → `KURTOSIS_POP(...)`** — byte-identical to legacy `functions/mod.rs:422-425`;
+  if legacy differential is green, v2's arm emits the same SQL.
+- **`count_if` → `COUNT_IF(...)`** — semantically identical to legacy's pass-through
+  (legacy falls through `translate`'s pass-through arm and emits literal `count_if(...)`,
+  case-insensitive at DuckDB parse time). Type-inference already maps `count_if` to `Long`.
+
+Both fall back to `EmissionError::UnsupportedFunction` → legacy path if a future differential
+run flags them red; spec files (`tasks/duckdb-extension-specs/spark_kurtosis.md`,
+`spark_count_if.md`) remain authoritative for the extension replacement.
+
+### Review Fix Iteration 2
+
+Closed 2 CLOSE_NOW Mediums from iteration 1's review:
+
+- **M1** (`emission.rs:1888-1895`) — `spark_aggregate_rewrite` synthesized call had
+  `distinct: call.distinct`; changed to `distinct: false` with an inline comment naming
+  the aggregate-level injection site.
+- **M5** (`emission.rs:27-36`) — module doc Slice D paragraph extended to name the two
+  non-obvious dispatch sites.
+
+Remaining Mediums: M2 (scoped-differential at Phase 1 termination — not a code change);
+M3 (`render_spark_decimal_div` re-renders operand SQLs before the guard) and M4 (`Ok(None)`
+fallback on `decimal_div_type` non-Decimal) both DEFER.
+
+### Carryover to Phase 2
+
+- 5-8 `spark_*` functions requiring new C++ work (spec files pre-drafted under
+  `tasks/duckdb-extension-specs/`): `spark_try_divide`, `spark_try_cast`, `spark_corr`,
+  `spark_covar_samp`, `spark_regr_slope`, `spark_regr_r2`, `spark_try_sum`, `spark_try_avg`
+  (definite); potentially `spark_kurtosis` and `spark_count_if` (verify-first only if
+  scoped-differential flags them).
+- Phase 1 defer items (M3, M4, all 5 perf LOWs) are all internal micro-refinements; none
+  affects Phase 2's C++ extension surface.
+
+### Quality-gate output
+
+- `cargo check -p thunderduck-core` — clean.
+- `cargo check -p thunderduck-connect-server` — clean.
+- `cargo fmt --check` on touched files — clean.
+- `cargo test -p thunderduck-core --lib --tests` — **269 passed / 0 failed** (unchanged
+  from Slice C.2 baseline; two-file diff added no new unit tests by design — the
+  load-bearing coverage is INV6 turning green).
+- **INV6** (`inv6_extension_targets_exist_in_loaded_extension`) — **PASSED with the 6-entry
+  allow-list**. This is the single most important coverage signal for Phase 1.
+- Differential suite (`core_v2`) intentionally not re-run — Phase 1 termination is the next
+  step, but not this pass's responsibility.
+
+**Tests**: 269 core + 14 connect-server · differential unchanged (not re-run)
+
+### Files changed (Phase 1)
+
+- `/workspace/crates/core/src/transpiler_v2/emission.rs` — 6 scalar arms + 2 verify-first arms +
+  `render_binary` DECIMAL-div branch + `render_spark_decimal_div` helper +
+  `spark_aggregate_rewrite` helper + `extension_targets()` populated + module doc + Slice-D
+  TODO cleanup.
+- `/workspace/crates/core/src/transpiler_v2/invariants.rs` — INV6 marker cleanup + INV3
+  `REQUIRED_RENDERERS` list extended.
+
+**2 files changed, +333 / -26 lines.** Zero new unit tests (INV6 is the coverage signal).

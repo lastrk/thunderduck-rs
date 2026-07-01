@@ -1,4 +1,4 @@
-# Dev Journal — 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4
+# Dev Journal — 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4 + Slice C.3-3 + Slice C.3-5
 
 ## Slice B — Type & Nullability Analyzer
 
@@ -777,3 +777,80 @@ Four unit tests total across two iterations:
 
 **2 files changed.** 4 regression tests added.
 `agg-020`/`agg2-006` green on `THUNDERDUCK_TRANSPILER=v2`.
+
+---
+
+## Slice C.3-5 — `sum(decimal)` routing verification (verify-only)
+
+### Summary
+
+Landed as a **verify-only** `/fix-bug` pass. No production code changed;
+two regression unit tests added to `crates/core/src/transpiler_v2/emission.rs`
+locking in the DECIMAL SUM/AVG routing invariant through
+`spark_aggregate_rewrite`. The corpus case that motivated the ticket
+(`agg-007`) was already GREEN on v2 as of the composition of C.3-4 +
+Slice D Phase 1.
+
+**Progress signal**: **151 → 151 core_v2 passing (+0)** per
+`tests/integration/v2_progress.md`. `agg-007` was already inside the 151
+baseline from prior landings.
+
+**Pipeline artifacts**: `.agent-output/001-diagnostic-report.md` through
+`.agent-output/004-verification-log.md`. `/fix-bug` pipeline shape;
+APPROVED with 0 Critical + 0 High.
+
+### Rerun-first preflight caught the case-already-green state
+
+The diagnostician's Phase-1 preflight ("rerun the reproducer first") ran
+`agg-007` under `THUNDERDUCK_TRANSPILER=v2` twice before staging any
+hypotheses. Both runs PASSED deterministically. The diagnostician then
+verified the composition explanation:
+
+1. **C.3-4** (`crates/connect-server/src/converter/relation_converter.rs`,
+   commit `960995b`): unmasked `Decimal128` `LocalRelation` payloads that
+   had previously been silently NULL'd — so `bonus: Decimal(9,2)` now
+   arrives with real values, not empty-of-values NULLs.
+2. **Slice D Phase 1** (`spark_aggregate_rewrite` in
+   `emission.rs` ~line 1888): rewrites `SUM(Decimal)` → `spark_sum(...)`
+   and `AVG(Decimal)` / `mean(Decimal)` → `spark_avg(...)` with the
+   Spark-precise widened DECIMAL return CAST.
+
+The C.3-5 ticket's residual assumption ("wired but broken") predated
+C.3-4. No live bug remained on the target surface, so no code change
+was needed. Multi-hypothesis Phase-2 investigation was skipped — the
+reproducer itself was the falsification test.
+
+### Tests added
+
+Both live adjacent to the C.3-4 sibling anchor
+`decimal_div_decimal_routes_through_spark_decimal_div` for symmetry:
+
+- **`sum_of_decimal_routes_through_spark_sum`** — constructs a
+  `TypedOp::Aggregate` fixture with `SUM(bonus)` over a TableScan
+  declaring `bonus: Decimal(9,2) nullable` (matching the `agg-007`
+  corpus fixture). Asserts the dispatched SQL contains `spark_sum(`
+  (extension routing) and `AS DECIMAL(19,2)` (outer CAST — precision
+  `min(9+10, 38) = 19`, scale unchanged at 2).
+- **`avg_of_decimal_routes_through_spark_avg`** — same fixture shape
+  with `AVG(bonus)`. Asserts `spark_avg(` and `AS DECIMAL(13,6)`
+  (precision `min(9+4, 38) = 13`, scale `min(min(2+4, 18), 13) = 6`).
+
+Both would have failed against pre-Slice-D-Phase-1 emission (the
+aggregate would have rendered as `sum(bonus)` / `avg(bonus)` without
+extension routing or the widened DECIMAL CAST) and pass today.
+
+The tests use the on-disk rendering `DECIMAL(p,s)` (no space after the
+comma, as `TypeMapper::to_duckdb` renders it) rather than the C.3-5
+initial-prompt spec's `DECIMAL(p, s)` — a documented cosmetic deviation,
+not a semantic difference; inline comments on the asserts note the
+discrepancy.
+
+### Files changed (C.3-5)
+
+- `/workspace/crates/core/src/transpiler_v2/emission.rs` — 2 regression
+  unit tests added inside the existing `#[cfg(test)] mod tests` block.
+  Zero production-code change.
+
+**1 file changed.** 2 regression tests added. `agg-007` remains green on
+`THUNDERDUCK_TRANSPILER=v2`; v2-progress unchanged at 151/324. Legacy
+TPC-H 51/51 unregressed.

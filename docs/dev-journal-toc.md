@@ -4,7 +4,7 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
-## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4 + Slice C.3-3
+## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4 + Slice C.3-3 + Slice C.3-5
 
 [`dev_journal/2026-07-01-v2-slice-b-analyzer.md`](dev_journal/2026-07-01-v2-slice-b-analyzer.md)
 
@@ -89,7 +89,18 @@ and both omitted `count_if`; C.3-3 closes both. 4 regression tests.
 **Progress signal delta: 149 → 151 core_v2 passing (+2)** — exactly the two
 target unblocks. Legacy TPC-H 51/51 unregressed.
 
-**Tests**: 274 core + 17 connect-server (+ 4 regression tests from C.3-3) · differential 151/324 core_v2 (v2 path) · 51/51 legacy TPC-H
+**Slice C.3-5** (post-Slice-C.3-3 follow-up; `/fix-bug` pipeline, **verify-only**):
+diagnostician's "rerun first" preflight caught the case-already-green state — `agg-007`
+was already GREEN on v2 as of C.3-4 + Slice D Phase 1's composition (Decimal128
+`LocalRelation` marshalling + `spark_aggregate_rewrite` routing for DECIMAL SUM/AVG).
+No production code change; 2 regression unit tests added to
+`crates/core/src/transpiler_v2/emission.rs::tests`
+(`sum_of_decimal_routes_through_spark_sum`, `avg_of_decimal_routes_through_spark_avg`)
+locking in the extension-routing + widened-DECIMAL-CAST invariant. Both would have
+failed against pre-Slice-D-Phase-1 emission. **Progress signal delta: +0** (151 → 151;
+`agg-007` was already inside the 151 baseline). Legacy TPC-H 51/51 unregressed.
+
+**Tests**: 276 core + 17 connect-server (+ 2 regression tests from C.3-5) · differential 151/324 core_v2 (v2 path) · 51/51 legacy TPC-H
 
 ---
 

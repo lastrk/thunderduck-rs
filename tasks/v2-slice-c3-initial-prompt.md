@@ -208,18 +208,30 @@ diagnostician-overturned scopes are a strong signal; trust the
 falsification. Silent-NULL catch-alls in typed dispatch are
 data-corruption anti-patterns.
 
-### C.3-5: `sum(decimal)` routing verification
+### C.3-5: `sum(decimal)` routing verification — **CLOSED 2026-07-01 (verify-only)**
 
-- **Location:** `emission.rs::render_aggregate` + `spark_aggregate_rewrite`
-  (Slice D Phase 1 addition).
-- **Bug hypothesis:** `agg-007` fails despite Phase 1 having wired
-  `spark_aggregate_rewrite` for DECIMAL SUM/AVG. Possible causes similar
-  to C.3-4: guard too narrow, analyzer's arg-type inference wrong, or
-  return-cast formula miscomputed.
-- **Fix:** Same diagnostic + fix pattern as C.3-4. Trace `agg-007` through.
-- **Regression test:** unit test asserting `SUM(Decimal(9,2))` emits
-  `spark_sum(...)` wrapped in the correct outer CAST.
-- **Target case ID unblocked:** `agg-007`.
+**Status:** LANDED via `/fix-bug` pipeline as a **verify-only** pass;
+delivered **+0** core_v2 delta (151 → 151). The diagnostician's
+"rerun first" preflight fired: `agg-007` was already GREEN on v2 as of
+C.3-4 + Slice D Phase 1's composition (Decimal128 `LocalRelation`
+marshalling + `spark_aggregate_rewrite` routing for DECIMAL SUM/AVG).
+No production code change was needed.
+
+**Landing shape.** Two regression unit tests were added to
+`crates/core/src/transpiler_v2/emission.rs::tests` adjacent to
+`decimal_div_decimal_routes_through_spark_decimal_div` (the C.3-4
+sibling anchor), locking in the routing invariant:
+
+- `sum_of_decimal_routes_through_spark_sum` — asserts
+  `SUM(Decimal(9,2))` emits `spark_sum(` with outer `CAST(... AS DECIMAL(19,2))`.
+- `avg_of_decimal_routes_through_spark_avg` — asserts `AVG(Decimal(9,2))`
+  emits `spark_avg(` with outer `CAST(... AS DECIMAL(13,6))`.
+
+Both tests would have failed against pre-Slice-D-Phase-1 emission
+(before `spark_aggregate_rewrite` existed) and pass today.
+
+**Target case ID:** `agg-007` — already inside the 151 baseline; no
+counter movement expected or observed.
 
 ### C.3-6: `percentile_approx` / `median` shape verification
 

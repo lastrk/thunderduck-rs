@@ -80,3 +80,11 @@ Slice C.3-3 landed as a `/fix-bug` pass (commit forthcoming). The initial prompt
 **Progress signal delta: 149 → 151 core_v2 passing (+2)** — exactly the two direct target-case unblocks (`agg-020`, `agg2-006`). Failed count dropped 175 → 173 with no other case flipping. Legacy TPC-H 51/51 unregressed.
 
 **C.3-3 is now closed.** The remaining four Slice C.3 fixes (C.3-1 sha/sha1/sha2 arg-stripping, C.3-2 hash/xxhash64 nullability, C.3-5 sum(decimal) routing verification, C.3-6 percentile_approx/median shape verification) still gate the Phase 1 hash/sum/percentile target cases.
+
+### Phase 1 termination update (2026-07-01) — C.3-5 closed verify-only, +0 delta
+
+Slice C.3-5 landed as a **verify-only** `/fix-bug` pass. The diagnostician's "rerun first" preflight caught the case-already-green state: `agg-007` was already GREEN on v2 as of the composition of C.3-4 (Decimal128 `LocalRelation` marshalling) + Slice D Phase 1 (`spark_aggregate_rewrite` routing for DECIMAL SUM/AVG). No production code change was needed. Two regression unit tests were added to `crates/core/src/transpiler_v2/emission.rs::tests` locking in the routing invariant (`sum_of_decimal_routes_through_spark_sum`, `avg_of_decimal_routes_through_spark_avg`); both would have failed against pre-Slice-D-Phase-1 emission.
+
+**Progress signal delta: 151 → 151 core_v2 passing (+0)** — `agg-007` was already inside the 151 baseline from prior landings; no counter movement expected or observed. Legacy TPC-H 51/51 unregressed.
+
+**C.3-5 is now closed.** The remaining three Slice C.3 fixes (C.3-1 sha/sha1/sha2 arg-stripping, C.3-2 hash/xxhash64 nullability, C.3-6 percentile_approx/median shape verification) still gate the Phase 1 hash/percentile target cases.

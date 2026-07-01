@@ -2817,6 +2817,137 @@ mod tests {
         );
     }
 
+    /// C.3-5 regression: `SUM(Decimal(9, 2))` on a typed AST must route
+    /// through `spark_aggregate_rewrite` so the emitted aggregate becomes
+    /// `spark_sum(...)` (extension function) and `render_aggregate` wraps
+    /// it in the widened outer CAST target `DECIMAL(19, 2)` — precision
+    /// `min(9 + 10, 38) = 19`, scale unchanged at `2`, per the legacy
+    /// `spark_decimal_agg_type` formula duplicated in
+    /// [`spark_aggregate_rewrite`].
+    ///
+    /// This behaviour was introduced by Slice D Phase 1 (the
+    /// `spark_aggregate_rewrite` helper) together with the C.3-4
+    /// `Decimal128` LocalRelation payload fix. Before that combination
+    /// landed, corpus case `agg-007`
+    /// (`emp.agg(F.sum("bonus").alias("sum_bonus"))`, `bonus: Decimal(9,2)`)
+    /// was red on v2. The test locks the invariant so a future refactor
+    /// of `render_aggregate` or `spark_aggregate_rewrite` cannot silently
+    /// regress DECIMAL SUM routing.
+    #[test]
+    fn sum_of_decimal_routes_through_spark_sum() {
+        use crate::expression::FunctionCall;
+        use crate::transpiler_v2::analyzer::{TypedAttr, TypedOp};
+        use crate::transpiler_v2::ast::AggregateCall;
+
+        let bonus_type = DataType::Decimal {
+            precision: 9,
+            scale: 2,
+        };
+        let widened_type = DataType::Decimal {
+            precision: 19,
+            scale: 2,
+        };
+        let agg = TypedOp::Aggregate {
+            input: Box::new(TypedOp::TableScan {
+                name: "emp".to_string(),
+                schema: StructType::new(vec![StructField::nullable("bonus", bonus_type.clone())]),
+            }),
+            grouping: Vec::new(),
+            grouping_types: Vec::new(),
+            aggregates: vec![AggregateCall {
+                func: Expression::FunctionCall(FunctionCall {
+                    name: "sum".to_string(),
+                    args: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "bonus".to_string(),
+                        qualifier: None,
+                    })],
+                    distinct: false,
+                }),
+                is_distinct: false,
+                filter: None,
+            }],
+            aggregate_types: vec![TypedAttr {
+                data_type: widened_type.clone(),
+                nullable: true,
+            }],
+            having: None,
+            grouping_sets: None,
+            schema: StructType::single("sum(bonus)", widened_type),
+        };
+        let sql = dispatch(&agg).expect("aggregate dispatch");
+        let s = sql.as_str();
+        assert!(
+            s.contains("spark_sum("),
+            "SUM(Decimal) must route through spark_sum(...), got {s:?}"
+        );
+        // Note: `TypeMapper::to_duckdb` renders DECIMAL without a space
+        // after the comma (`DECIMAL(p,s)`), so the outer CAST target
+        // appears as `AS DECIMAL(19,2)` even though the ADR-level spec
+        // writes it with a space.
+        assert!(
+            s.contains("AS DECIMAL(19,2)"),
+            "SUM(Decimal(9,2)) must wrap in outer CAST AS DECIMAL(19,2), got {s:?}"
+        );
+    }
+
+    /// C.3-5 companion: `AVG(Decimal(9, 2))` must route through
+    /// `spark_avg(...)` and wrap in `CAST(... AS DECIMAL(13, 6))` —
+    /// precision `min(9 + 4, 38) = 13`, scale `min(min(2 + 4, 18), 13) = 6`
+    /// per the legacy `spark_decimal_agg_type` formula duplicated in
+    /// [`spark_aggregate_rewrite`].
+    #[test]
+    fn avg_of_decimal_routes_through_spark_avg() {
+        use crate::expression::FunctionCall;
+        use crate::transpiler_v2::analyzer::{TypedAttr, TypedOp};
+        use crate::transpiler_v2::ast::AggregateCall;
+
+        let bonus_type = DataType::Decimal {
+            precision: 9,
+            scale: 2,
+        };
+        let widened_type = DataType::Decimal {
+            precision: 13,
+            scale: 6,
+        };
+        let agg = TypedOp::Aggregate {
+            input: Box::new(TypedOp::TableScan {
+                name: "emp".to_string(),
+                schema: StructType::new(vec![StructField::nullable("bonus", bonus_type.clone())]),
+            }),
+            grouping: Vec::new(),
+            grouping_types: Vec::new(),
+            aggregates: vec![AggregateCall {
+                func: Expression::FunctionCall(FunctionCall {
+                    name: "avg".to_string(),
+                    args: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "bonus".to_string(),
+                        qualifier: None,
+                    })],
+                    distinct: false,
+                }),
+                is_distinct: false,
+                filter: None,
+            }],
+            aggregate_types: vec![TypedAttr {
+                data_type: widened_type.clone(),
+                nullable: true,
+            }],
+            having: None,
+            grouping_sets: None,
+            schema: StructType::single("avg(bonus)", widened_type),
+        };
+        let sql = dispatch(&agg).expect("aggregate dispatch");
+        let s = sql.as_str();
+        assert!(
+            s.contains("spark_avg("),
+            "AVG(Decimal) must route through spark_avg(...), got {s:?}"
+        );
+        assert!(
+            s.contains("AS DECIMAL(13,6)"),
+            "AVG(Decimal(9,2)) must wrap in outer CAST AS DECIMAL(13,6), got {s:?}"
+        );
+    }
+
     #[test]
     fn agg_sum_of_integer_wraps_in_bigint_cast() {
         // Verify `render_aggregate` wraps SUM(int) in CAST AS BIGINT.

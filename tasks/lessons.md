@@ -133,6 +133,23 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   corpus fixture verbatim before enumerating hypotheses — cheaper than
   probing the runtime.
 
+- **The diagnostician's "rerun first" preflight can collapse a `/fix-bug` pipeline
+  to a verify-only pass.** Slice C.3-5 (2026-07-01) was scoped as a `sum(decimal)`
+  routing fix in `emission.rs::render_aggregate` / `spark_aggregate_rewrite`. The
+  diagnostician ran the reproducer (`agg-007` under `THUNDERDUCK_TRANSPILER=v2`)
+  twice before staging any hypotheses — both PASSED deterministically. The bug
+  report predated the C.3-4 landing that unmasked `Decimal128` `LocalRelation`
+  payloads; combined with Slice D Phase 1's existing `spark_aggregate_rewrite`
+  helper, the case was already GREEN. The pipeline landed as verify-only: two
+  regression tests locking in the routing invariant, no production code change.
+  Same shape as C.3-4's scope-overturn (diagnostician-first pipelines catch
+  stale-scope bugs), but from a different angle: here the bug report itself
+  had already been closed by subsequent landings. Rule: when a `/fix-bug`
+  prompt was drafted before recent landings, the diagnostician's Phase-1
+  reproducer step doubles as a preflight; if the reproducer is green, the
+  pipeline correctly collapses to a test-lock-in verify-only pass — do not
+  fabricate a fix for a bug that no longer reproduces.
+
 - **Silent-NULL catch-alls in typed dispatch are data-corruption anti-patterns.**
   The Slice C.3-4 root cause was a single-line `_ => Ok("NULL".to_string())`
   at `relation_converter.rs:2513`. It silently mapped every unhandled Arrow

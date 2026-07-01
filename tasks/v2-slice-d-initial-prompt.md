@@ -1,5 +1,7 @@
 # Slice D — Initial `/new-feature` prompt (pass 1)
 
+> **STALE (2026-07-01).** This is a historical Phase-1-era prompt. The referenced `tasks/duckdb-extension-specs/` directory and `tasks/v2-slice-c-iteration-log.md` were deleted post-audit; several assumptions (10 pending ext5 functions, "verify-first" for 2 cases) were revised. For current Slice D scope + routing, see `tasks/v2-adr-readiness-map.md` §Slice D. This file is retained for git-history readability only.
+
 Use this file verbatim as the `/new-feature` prompt for pass 1 of Slice D
 under the iteration methodology in `tasks/v2-slice-iteration-methodology.md`.
 

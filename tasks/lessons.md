@@ -198,3 +198,27 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   Corollary: `tests/scripts/v2-progress.sh` is a measurement, not a completion gate. Use it to
   recalibrate the readiness map's per-slice deltas *after* the slice lands, not to score the
   slice's completion during termination.
+
+## Extension-spec discipline
+
+- **Verify-native-first before drafting extension specs.** The ext5 spec set pre-drafted 10 `spark_*`
+  functions; when ext6 shipped (2026-07-01 audit), 7 of them turned out to be unnecessary because
+  native DuckDB matches Spark semantics — `TRY_CAST`, `CORR`, `COVAR_SAMP`, `REGR_SLOPE`, `REGR_R2`,
+  `KURTOSIS_POP`, `COUNT_IF`. Only 3 of the 10 (`spark_try_divide`, `spark_try_sum`, `spark_try_avg`)
+  actually shipped as extension functions because they add real gap-filling value.
+  Rule: **before writing a `spark_<fn>` spec, run `SELECT * FROM duckdb_functions() WHERE
+  function_name = '<fn>'` in a live DuckDB session** and check whether the native function's
+  value + type behavior matches Spark for the corpus test range. Only spec an extension arm when
+  the native path demonstrably diverges. This is ADR-010's cast-preferred discipline applied at
+  the spec-drafting stage, not just the routing stage — and it prevents 7-of-10 wasted-work rates
+  in the sibling C++ project.
+
+- **`extension_targets()` allow-list is not authoritative for what the extension provides.** The
+  first Slice D Phase 2 `/goal` preflight (2026-07-01) halted on a `grep` of `extension_targets()`
+  that returned no Phase-2 `spark_*` names — but the ext6 binary DID register `spark_try_divide`,
+  `spark_try_sum`, `spark_try_avg`. The allow-list simply hadn't been extended yet. Rule: for "does
+  the extension provide function X" questions, **query `duckdb_functions()` on a live session**,
+  not the source-side allow-list. INV6 checks the allow-list ⊆ `duckdb_functions()` direction; it
+  does not check the reverse — extensions can register functions the allow-list hasn't caught up
+  with. A preflight that checks the allow-list is testing "did *this repo* wire the arm," not
+  "does the extension provide the function." Design preflights for what they actually measure.

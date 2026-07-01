@@ -26,12 +26,21 @@
 //!
 //! **Slice D Phase 1** adds the ext4 extension-function arms whose
 //! DuckDB-side implementation already ships in `thdck_spark_funcs`
-//! (ADR-020 pin `ext4`): `spark_hash`, `spark_xxhash64`, `spark_skewness`,
-//! and the DECIMAL routes for `spark_sum`, `spark_avg`, `spark_decimal_div`.
-//! Native-DuckDB scalars newly wired: `crc32`, `percentile_approx`,
-//! `median`, `kurtosis`, `count_if`. Extension arms that require the
-//! future `ext5` release (`try_divide`, `try_cast`, `corr`, `covar_samp`,
-//! `regr_*`, `try_sum`, `try_avg`) remain surfaced as
+//! (ADR-020 pin `ext6`, which packages both the ext4 function set and the
+//! ext6-additions listed below): `spark_hash`, `spark_xxhash64`,
+//! `spark_skewness`, and the DECIMAL routes for `spark_sum`, `spark_avg`,
+//! `spark_decimal_div`. Native-DuckDB scalars newly wired: `crc32`,
+//! `percentile_approx`, `median`, `kurtosis`, `count_if`.
+//!
+//! **Slice D Phase 2** wires the ext6-added extension arms
+//! (`spark_try_divide`, `spark_try_sum`, `spark_try_avg`) plus native-DuckDB
+//! parity routing for `try_cast` (→ `TRY_CAST`), `corr` (→ `CORR`),
+//! `covar_samp` (→ `COVAR_SAMP`), `regr_slope`/`regr_r2`
+//! (→ `REGR_SLOPE(y,x)`/`REGR_R2(y,x)`), `kurtosis` (→ `KURTOSIS_POP`,
+//! population/excess — not DuckDB's sample-based `KURTOSIS`), and
+//! `count_if` (→ `COUNT_IF`) per the 2026-07-01 ext6 audit's
+//! resolved-routing table (see `tasks/v2-adr-readiness-map.md` §Slice D
+//! Phase 2). Arms not yet in either category surface as
 //! `EmissionError::UnsupportedFunction` — the caller in `service.rs`
 //! treats that as fallback-eligible.
 //!
@@ -146,9 +155,10 @@ pub enum EmissionError {
 
     /// A `FunctionCall` name has no matching arm in [`render_function_call`].
     ///
-    /// Slice-D extensions (`spark_*`, `try_cast`, `try_divide`) and Slice-F
-    /// complex-type functions surface here. The caller in `service.rs`
-    /// treats this as fallback-eligible.
+    /// Slice-D extension arms (`spark_*` ext6-provided names) and Slice-F
+    /// complex-type functions surface here. Note: `try_cast` is routed
+    /// via the `Cast::try_cast` flag in `render_cast`, not this arm.
+    /// The caller in `service.rs` treats this as fallback-eligible.
     #[error("emission arm `{op_kind}` has no rule for function `{name}`")]
     UnsupportedFunction {
         /// The operator arm that owned the failing function call.
@@ -213,11 +223,17 @@ pub fn external_emit_paths() -> &'static [ExternalEmit] {
 /// requires every name resolve to a function exported by `thdck_spark_funcs`.
 ///
 /// Populated in Slice D Phase 1 with the ext4-bundled extension functions
-/// consumed by [`render_function_call`], [`render_binary`]'s
-/// decimal-division branch, and [`spark_aggregate_rewrite`]'s DECIMAL
-/// SUM/AVG routing. Further entries land as later Slice-D passes wire
-/// ext5 targets (`try_sum`, `try_avg`, `try_cast`, `try_divide`, `corr`,
-/// `covar_samp`, `regr_*`).
+/// (packaged in ext6): consumed by [`render_function_call`],
+/// [`render_binary`]'s decimal-division branch, and
+/// [`spark_aggregate_rewrite`]'s DECIMAL SUM/AVG routing.
+///
+/// **Slice D Phase 2** extends this list with the three ext6-added arms
+/// (`spark_try_divide`, `spark_try_sum`, `spark_try_avg`). The other
+/// originally-planned "ext5" targets (`try_cast`, `corr`, `covar_samp`,
+/// `regr_slope`, `regr_r2`, `kurtosis`, `count_if`) turned out to resolve
+/// via native DuckDB per ADR-010's cast-preferred discipline, so no
+/// extension arm is required — they are routed directly in
+/// [`render_function_call`] (or in `render_cast` for `try_cast`).
 pub fn extension_targets() -> &'static [&'static str] {
     &[
         "spark_hash",

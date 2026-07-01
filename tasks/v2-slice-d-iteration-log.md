@@ -1,5 +1,7 @@
 # Slice D Iteration Log
 
+> **STALE (2026-07-01).** Phase-1-era log. Referenced `tasks/duckdb-extension-specs/` deleted post-audit (3 shipped in ext6, 7 canceled as native-suffices). Current Slice D status: see `tasks/v2-adr-readiness-map.md` §Slice D.
+
 **Baseline:** commit `f712b06` (Slice C landed at 134/324 core_v2 + audit-driven specs committed).
 **Methodology:** `tasks/v2-slice-iteration-methodology.md`.
 **Initial prompt:** `tasks/v2-slice-d-initial-prompt.md`.

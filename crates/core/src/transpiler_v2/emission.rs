@@ -1675,7 +1675,21 @@ fn render_function_call(
         "crc32" => format!("CRC32({})", arg_refs.first().copied().unwrap_or("")),
         "percentile_approx" => {
             if arg_refs.len() >= 2 {
-                format!("approx_quantile({}, {})", arg_refs[0], arg_refs[1])
+                // DuckDB's `approx_quantile(x, pct)` overloads all require the
+                // quantile position to be `FLOAT` — DuckDB 1.5.1 has no
+                // `(X, DOUBLE)` overload, and it does not implicitly downcast
+                // a typed DOUBLE (narrowing). Spark's `percentile_approx(col,
+                // pct)` accepts a Double `pct` (Python `float` = binary64), so
+                // the analyzer types the literal as `DataType::Double` and
+                // `render_literal` correctly emits `<v>::DOUBLE`. τ absorbs
+                // this DuckDB idiosyncrasy at the emission arm (INV3) by
+                // wrapping arg 1 in an explicit CAST to `FLOAT`; arg 0's type
+                // is left untouched so the overall return type still matches
+                // Spark's `percentile_approx` on the input column type.
+                format!(
+                    "approx_quantile({}, CAST({} AS FLOAT))",
+                    arg_refs[0], arg_refs[1]
+                )
             } else {
                 "NULL".to_string()
             }
@@ -2945,6 +2959,67 @@ mod tests {
         assert!(
             s.contains("AS DECIMAL(13,6)"),
             "AVG(Decimal(9,2)) must wrap in outer CAST AS DECIMAL(13,6), got {s:?}"
+        );
+    }
+
+    /// C.3-6b regression: `percentile_approx(col, quantile)` must wrap the
+    /// second argument in `CAST(... AS FLOAT)` at the emission arm. DuckDB
+    /// 1.5.1 only exposes `approx_quantile(X, FLOAT)` overloads — no
+    /// `(X, DOUBLE)` variant — and does not implicitly downcast a typed
+    /// DOUBLE literal to FLOAT (narrowing). Spark serialises Python `float`
+    /// as `Double`, so the analyzer types the quantile as `DataType::Double`
+    /// and `render_literal` emits `0.5::DOUBLE`. Without the arm-level CAST
+    /// wrap, corpus case `agg-013`
+    /// (`emp.agg(F.percentile_approx("salary", 0.5).alias("p50"))`,
+    /// `salary: Double nullable`) failed with a DuckDB binder error. The
+    /// test locks the invariant so a future refactor of the
+    /// `percentile_approx` arm cannot silently regress it.
+    #[test]
+    fn percentile_approx_wraps_quantile_arg_in_cast_as_float() {
+        use crate::expression::FunctionCall;
+        use crate::transpiler_v2::analyzer::{TypedAttr, TypedOp};
+        use crate::transpiler_v2::ast::AggregateCall;
+
+        let agg = TypedOp::Aggregate {
+            input: Box::new(TypedOp::TableScan {
+                name: "emp".to_string(),
+                schema: StructType::new(vec![StructField::nullable("salary", DataType::Double)]),
+            }),
+            grouping: Vec::new(),
+            grouping_types: Vec::new(),
+            aggregates: vec![AggregateCall {
+                func: Expression::FunctionCall(FunctionCall {
+                    name: "percentile_approx".to_string(),
+                    args: vec![
+                        Expression::UnresolvedColumn(UnresolvedColumn {
+                            name: "salary".to_string(),
+                            qualifier: None,
+                        }),
+                        Literal::double(0.5),
+                    ],
+                    distinct: false,
+                }),
+                is_distinct: false,
+                filter: None,
+            }],
+            aggregate_types: vec![TypedAttr {
+                data_type: DataType::Double,
+                nullable: true,
+            }],
+            having: None,
+            grouping_sets: None,
+            schema: StructType::single("percentile_approx(salary, 0.5)", DataType::Double),
+        };
+        let sql = dispatch(&agg).expect("aggregate dispatch");
+        let s = sql.as_str();
+        assert!(
+            s.contains("approx_quantile("),
+            "percentile_approx must route through approx_quantile(...), got {s:?}"
+        );
+        assert!(
+            s.contains("CAST(0.5::DOUBLE AS FLOAT)"),
+            "percentile_approx arg 1 must be wrapped in CAST(... AS FLOAT) \
+             to satisfy DuckDB's approx_quantile(X, FLOAT) overload, got {s:?}"
         );
     }
 

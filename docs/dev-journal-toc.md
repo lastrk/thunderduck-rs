@@ -4,6 +4,22 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-07-01 — v2 Slice B: Type & Nullability Analyzer
+
+[`dev_journal/2026-07-01-v2-slice-b-analyzer.md`](dev_journal/2026-07-01-v2-slice-b-analyzer.md)
+
+`CommonAst` grew from unit struct to 15-operator enum + `Punt`. Analyzer substrate landed:
+`TypedAst`, `TypedAttr`, `AnalyzerError`, sealed `HasSchema`, three bounded passes (`resolve`,
+`assign_types` with `Union` downward sub-sweep, `derive_nullability`), five input-relation
+fixtures + five mini `CommonAst` fixtures, `inference_smoke()`. **INV4** and **INV5**
+activated (TODO markers deleted); `transpiler_v2::generate` still returns `Unsupported`
+(Slice C wires dispatch). All delegation to legacy `Expression::{data_type, nullable}` and
+`TypeInferenceEngine` — zero rule re-derivation per ADR-015.
+
+**Tests**: 215 unit + lib · differential unchanged (not re-run)
+
+---
+
 ## 2026-04-03 — Array containsNull, HOF Types, CTE Schema Propagation
 
 [`dev_journal/2026-04-03-array-hof-cte-schemas.md`](dev_journal/2026-04-03-array-hof-cte-schemas.md)

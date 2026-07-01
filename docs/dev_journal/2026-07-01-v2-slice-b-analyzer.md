@@ -1,0 +1,110 @@
+# Dev Journal — 2026-07-01 — v2 Slice B: Type & Nullability Analyzer
+
+## Summary
+
+Slice B of the rearchitecture readiness map (`tasks/v2-adr-readiness-map.md` §1) landed as a
+substrate-only change inside `crates/core/src/transpiler_v2/`. The v2 transpiler now has a real
+common AST + analyzer to build emission on top of. Legacy transpiler untouched;
+`transpiler_v2::generate` still returns `Unsupported` — no dispatch wiring in this slice.
+
+**Progress signal**: unchanged from baseline (12/324 in `tests/integration/v2_progress.md`) —
+the analyzer alone can't move differential counts without emission. Expected delta on next
+`tests/scripts/v2-progress.sh` after Slice C wires dispatch: +5 to +15.
+
+**Pipeline artifacts**: `.agent-output/001-architecture-plan.md` through
+`.agent-output/006-docs-update-log.md`. Multi-agent `/new-feature` run
+(architect / coder / reviewer / perf-reviewer / perf-optimizer / docs).
+
+---
+
+## What landed
+
+- **`ast.rs`**: `CommonAst` grew from a unit struct to a 15-operator enum + `Punt`
+  (Project / Filter / Join / Aggregate / Sort / Limit / Tail / Union / Intersect / Except /
+  Distinct / WithColumns / DropColumns / AliasedRelation / TableScan / LocalRelation /
+  RangeRelation). Expression slots reuse `crate::expression::Expression` verbatim per plan §4.3
+  — no parallel `V2Expression` in this slice. Local `JoinKind` enum + `AggregateCall` struct.
+
+- **`analyzer.rs`**: `TypedAst`, `TypedOp` (17 variants), `TypedAttr { data_type, nullable }`,
+  `Schema` / `BaseTypes` aliases, `AnalyzerError` (six `thiserror` variants), sealed `HasSchema`
+  trait, `pub(crate) analyze()`, `pub has_resolved_schema()`, `pub inference_smoke()`, and three
+  bounded passes: `resolve` (bottom-up structural, delegates star-expansion / USING dedup /
+  alias flatten to the shape logic from `LogicalPlan::infer_schema()`), `assign_types`
+  (bottom-up + one downward sub-sweep for `Union` type widening per ADR-006 line 168),
+  `derive_nullability` (outer-join nullability + grouping-sets column widening). All type /
+  nullability decisions delegate to `Expression::data_type(&schema)` /
+  `Expression::nullable(&schema)` and `TypeInferenceEngine::{unify_types, promote_numeric,
+  aggregate_return_type, ...}` — zero rule re-derivation, per ADR-015 discipline.
+
+- **`analyzer_fixtures.rs` (new)**: five literal `StructType` fixtures matching
+  `tests/integration/differential/dataframe_corpus.py::build_inputs`
+  (`emp` 14 fields with two-level-nested `address.geo` struct, `dept` 5, `emp2` 6, `nums` 7,
+  `raw` 5); five mini `CommonAst` fixtures (`smoke_type_001`, `smoke_cond_003`, `smoke_agg_013`,
+  `smoke_type_011` for outer-join right-side widening, `smoke_type_019` for union widening);
+  `run_all()` panics with per-field diffs on mismatch. Wired as `#[path]` submodule of
+  `analyzer` to avoid editing `mod.rs`.
+
+- **`invariants.rs`**: `inv4_inference_isolation` and `inv5_no_unresolved_after_analyzer` now
+  have real assertion bodies. INV4 hands off to `inference_smoke()`. INV5 runs `analyze` on a
+  real fixture, then plants a `DataType::Unresolved` at `projection_types[0]` — with the
+  top-level schema left clean — to prove the walker inspects every slot, not just surface
+  schemas. Both `TODO INV4` / `TODO INV5` markers deleted. `inv7_both_frontends_produce_same_ast`
+  rewritten around the new `CommonAst { root }` shape; still a placeholder for the eventual
+  two-front-end corpus test.
+
+---
+
+## Notable coder decisions
+
+- **`smoke_type_019` expected value corrected** from the plan's guess `Decimal(11,2)` to
+  `Decimal(10,2)` — `TypeInferenceEngine::unify_decimal(5,0,10,2)` computes precision =
+  `min(max(5-0, 10-2) + max(0,2), 38) = 10`. The legacy engine is the oracle per ADR-015; the
+  plan document is not. Textbook ADR-015 discipline: LLM-extracted rule is untrusted until the
+  oracle validates.
+- **`analyzer_fixtures` wired as a `#[path]` submodule of `analyzer`** rather than a sibling of
+  `mod.rs`, to satisfy the "no `mod.rs` edits" constraint. Physical file at
+  `crates/core/src/transpiler_v2/analyzer_fixtures.rs` per plan §8.
+- **`GroupingSets` reused from `crate::logical`** directly (already `pub`). The two helpers the
+  analyzer needs (`grouping_expr_name`, `grouping_column_names`) are mirrored as private
+  free functions in `analyzer.rs` — 15 lines of intentional duplication to preserve module
+  isolation without a cross-module edit.
+- **Perf M2 applied**: `HashSet<String>` + per-field `.to_lowercase()` case-fold lookups replaced
+  with `.iter().any(|n| f.name.eq_ignore_ascii_case(n))` linear scans at five sites (matches
+  legacy `field_by_name` conventions). Zero heap allocations on the case-fold path.
+
+---
+
+## What's still open (Slice C follow-ups)
+
+Non-blocking review findings queued for the Slice C emission work:
+
+- **M1** — `has_resolved_schema` reports `false` for any Project containing a bare `Star`. No
+  fixture exercises Star today; Slice C's first `SELECT *` will trip INV5. Fix: skip Star slots
+  in the walker's projection_types check, or fill with a schema-derived sentinel.
+- **M2** — RIGHT join with USING keeps the USING key on the left side; Pass 3 then marks it
+  incorrectly nullable. Latent correctness bug; no fixture triggers it.
+- **M3** — Pass 2's `Union` widening updates each child's `schema` and `projection_types` but
+  not the deeper `Expression`-slot types. Doc-comment marker recommended in `analyzer.rs:1376`.
+- **M4** — `Union` fields keep left-side names (`unionByName` not modeled). Add `by_name: bool`
+  to `ast::Union` — arguably a Slice C task.
+- **M5** — `AnalyzerError::AmbiguousColumn` and `::TypeMismatch` are never constructed. Either
+  drop or comment which future pass will construct them.
+- **M6** — `resolve_project` seeds `projection_types` with `Unresolved` that Pass 2 completely
+  overwrites. Doc-comment or skip seeding.
+
+Slice C will also wire the `LogicalPlan → CommonAst` adapter and flip `transpiler_v2::generate`
+off `Unsupported`. Until then, `THUNDERDUCK_TRANSPILER=v2` still hard-errors per session.
+
+---
+
+## Quality-gate output
+
+- `cargo check -p thunderduck-core` — clean.
+- `cargo fmt --check` on touched files — clean.
+- `cargo test -p thunderduck-core --lib --tests` — **215 passed / 0 failed** (1 runtime
+  integration test passed, 5 pre-existing ignored, unrelated to this slice).
+- Differential suite (`core_v2`) intentionally not re-run — excluded from the agent-pipeline
+  gate per `CLAUDE.md` (`## Quality Gate`); it's the v2-transpiler progress signal, measured
+  separately via `tests/scripts/v2-progress.sh` after Slice C.
+
+**Tests**: 215 unit + lib · differential unchanged (not re-run)

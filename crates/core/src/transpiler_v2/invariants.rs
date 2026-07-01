@@ -10,11 +10,17 @@
 //! The `TODO INV<N>:` line in each body names the substrate that will
 //! replace the stub, so `git grep "TODO INV"` lists the unblocking work.
 
-use super::analyzer::{has_resolved_schema, inference_smoke};
-use super::ast::CommonAst;
+use super::analyzer::{
+    analyze, has_resolved_schema, inference_smoke, BaseTypes, TypedAttr, TypedOp,
+};
+use super::ast::{CommonAst, CommonOp, Project, TableScan};
 use super::emission::{extension_targets, external_emit_paths, EmissionTable, ExternalEmit};
 use super::provenance::{emit_write, Error as ProvError, ExternalRelation, Provenance};
 use super::{set_serializer_tap, C_ESCAPE_HATCHES};
+use crate::expression::{
+    AliasExpression, BinaryExpression, BinaryOp, Expression, UnresolvedColumn,
+};
+use crate::types::{DataType, StructField, StructType};
 
 /// **INV1 — Both engines receive byte-identical input.** (Touches ADR-015; constrains ADR-001.) Parity-via-identical-bytes is achieved by serialize-once-send-twice. Note this is *not* violated by ADR-001's cosmetic simplifications: cosmetic simplification is a τ transformation applied *once*, upstream of the single serialization, so both engines still receive the same simplified bytes — and DuckDB SQL is consumed only by DuckDB, never by Spark, so the cosmetic DuckDB cleanup is invisible to the comparison. (This is exactly why the rejected production-*canonicalizer* was different: it was proposed as a normalization that could differ from what Spark sees.) A proposal to add production-side normalization that could differ per engine, or that Spark would observe, must demonstrate it does not break this.
 ///
@@ -80,34 +86,82 @@ fn inv3_emission_table_single_source_of_truth() {
 /// **INV4 — Inference is validated in isolation before translation tests run.** (Touches ADR-005, ADR-006, ADR-015.) Preserves attributability (ADR-014). The AnalyzePlan schema diff must be green before result-level translation failures are interpreted as translation bugs. Applies also to rule *provenance*: an LLM-extracted coercion/nullability rule is not trusted until the diff is green for it.
 ///
 /// ADR cross-reference: ADR-005 (analyzer) / ADR-006 (nullability) / ADR-015 (AnalyzePlan diff harness).
-/// today: `inference_smoke()` is a no-op; there is no analyzer to run yet.
-/// TODO INV4: replace with an AnalyzePlan schema-diff assertion once the analyzer (ADR-005/006) ships.
 #[test]
-fn inv4_inference_validated_in_isolation() {
-    // Structural reservation: an inference-only entry point exists. Calling
-    // it must succeed without touching a translation path.
+fn inv4_inference_isolation() {
+    // The analyzer's inference-only smoke test runs the analyzer over five
+    // literal fixtures drawn from the DataFrame corpus (`type-001`,
+    // `cond-003`, `agg-013`, `type-011`, `type-019`) and panics with a rich
+    // diff on any schema mismatch. If it returns without panic, every
+    // mini-fixture's produced schema matched the expected literal — that is
+    // the isolation guarantee INV4 requires.
     inference_smoke();
-
-    // TODO INV4: assert the AnalyzePlan schema diff is green for a fixed
-    // corpus once the analyzer is real.
 }
 
 /// **INV5 — thunderduck knows the schema everywhere, even where it emits delegated structure.** (Touches ADR-002, ADR-005.) The internal resolver/star-expander for type-tracking must not be removed on the grounds that resolution/star-expansion is delegated. Emit-level delegation ≠ analysis-level delegation.
 ///
 /// ADR cross-reference: ADR-002 (delegation premise) / ADR-005 (analyzer).
-/// today: `CommonAst` is a unit struct; `has_resolved_schema` is vacuously `true`.
-/// TODO INV5: once `CommonAst` carries nodes, assert the predicate detects any `DataType::Unresolved` (or its analyzer-facing successor).
 #[test]
-fn inv5_thunderduck_knows_schema_everywhere() {
-    // Structural reservation: an empty AST is trivially fully resolved.
-    let ast = CommonAst;
+fn inv5_no_unresolved_after_analyzer() {
+    // Build a small CommonAst: project `col('a') + col('lng')` from the `nums`
+    // fixture, seed the base-types catalog, and analyze.
+    let mut base_types = BaseTypes::new();
+    base_types.insert(
+        "nums".to_string(),
+        super::analyzer::analyzer_fixtures::fixture_nums(),
+    );
+    let a_plus_lng = Expression::Alias(AliasExpression {
+        expr: Box::new(Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "a".to_string(),
+                qualifier: None,
+            })),
+            right: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "lng".to_string(),
+                qualifier: None,
+            })),
+        })),
+        alias: "r".to_string(),
+    });
+    let ast = CommonAst {
+        root: CommonOp::Project(Project {
+            input: Box::new(CommonOp::TableScan(TableScan {
+                name: "nums".to_string(),
+                schema: StructType::empty(),
+            })),
+            projections: vec![a_plus_lng],
+        }),
+    };
+    let typed = analyze(ast, &base_types).expect("analyze must succeed");
     assert!(
-        has_resolved_schema(&ast),
-        "empty CommonAst must be considered resolved"
+        has_resolved_schema(&typed),
+        "analyzer output must have no Unresolved slots (INV5)"
     );
 
-    // TODO INV5: build an AST containing a `DataType::Unresolved` leaf and
-    // assert the predicate returns `false`, once the walker is real.
+    // Now plant an intentionally-`Unresolved` TypedAttr slot in a
+    // hand-built `TypedAst` and prove the walker actually looks — i.e.
+    // catches Unresolved wherever it appears, not just when the analyzer
+    // produced a clean result.
+    let planted = super::analyzer::TypedAst {
+        root: TypedOp::Project {
+            input: Box::new(TypedOp::LocalRelation {
+                schema: StructType::single("x", DataType::Long),
+            }),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "x".to_string(),
+                qualifier: None,
+            })],
+            projection_types: vec![TypedAttr {
+                data_type: DataType::Unresolved,
+                nullable: true,
+            }],
+            schema: StructType::new(vec![StructField::nullable("x", DataType::Long)]),
+        },
+    };
+    assert!(
+        !has_resolved_schema(&planted),
+        "walker must detect a planted DataType::Unresolved slot (INV5 teeth)"
+    );
 }
 
 /// **INV6 — Every `Extension(...)` target in the dispatch table corresponds to an existing, loaded function in the `thunderduck-duckdb-extension` C++ project.** (Touches ADR-009, ADR-010.) Unlike LB5 (an empirical bet about expressiveness), this is a mechanically *checkable, preservable* property — verify at build/test time that the table's emission targets and the extension's exported symbols agree. It is the mechanical complement to LB5: LB5 asserts an adequate extension *can* be written; INV6 asserts every extension the table *names* actually *exists and is loaded*. A compiled-dispatch build (ADR-009) can enforce INV6 at compile time.
@@ -160,19 +214,24 @@ fn inv6_extension_targets_exist_in_loaded_extension() {
 /// TODO INV7: parse a small corpus through both front-ends and assert AST equality (structural + resolved types) once ADR-003/004 land.
 #[test]
 fn inv7_both_frontends_produce_same_ast() {
-    // Structural reservation: two independent constructions of `CommonAst`
-    // (one standing in for the SparkSQL front-end, one for the Connect-proto
-    // front-end) must be equal today because there is nothing to disagree
-    // about.
-    let from_sql = CommonAst;
-    let from_proto = CommonAst;
-
-    // Unit structs have no `PartialEq` by default, but both are trivially the
-    // same shape. The Debug rendering exercises the reservation.
-    assert_eq!(format!("{from_sql:?}"), format!("{from_proto:?}"));
+    // Structural reservation: two independent constructions of the same
+    // trivial `CommonAst` (one standing in for the SparkSQL front-end, one
+    // for the Connect-proto front-end) must be equal. Slice B grew
+    // `CommonAst` from a unit struct into a full tree, so this now compares
+    // real structural equality via `PartialEq`.
+    let build = || CommonAst {
+        root: CommonOp::TableScan(TableScan {
+            name: "nums".to_string(),
+            schema: StructType::empty(),
+        }),
+    };
+    let from_sql = build();
+    let from_proto = build();
+    assert_eq!(from_sql, from_proto);
 
     // TODO INV7: replace with a real corpus + `assert_eq!(sql_ast, proto_ast)`
-    // once `CommonAst` carries structure.
+    // for shared SQL/DataFrame constructs once the two front-ends both lower
+    // to `CommonAst` (Slice C+).
 }
 
 /// **INV8 — External-table access is always delegated to a DuckDB storage extension.** (Added with ADR-013; touches ADR-002, ADR-013.) thunderduck emits the storage-extension surface (`read_parquet`/`iceberg_scan`/`delta_scan`/`ATTACH TYPE iceberg`/`uc_catalog`) and **never** parses a table format, reads a transaction log, or speaks a catalog protocol itself. This is the bounded-scope line for storage, analogous to INV5 (don't remove the internal type-resolver) and INV6 (every extension target exists): it keeps the external-table surface a *translation* concern, not a reimplementation one. A proposal to read a format directly in thunderduck must demonstrate why delegation is impossible — and would reopen ADR-013.

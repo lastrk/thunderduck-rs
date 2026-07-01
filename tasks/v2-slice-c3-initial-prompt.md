@@ -111,28 +111,59 @@ test that would have caught the bug before Slice C.3.
   projection slot's `TypedAttr.nullable == false`.
 - **Target case ID unblocked:** `hash-003`.
 
-### C.3-3: `count_if` aggregate-context Decimal-to-Boolean inference
+### C.3-3: `count_if` aggregate-context Decimal-to-Boolean inference — **CLOSED 2026-07-01**
 
-- **Location:** analyzer's aggregate-return-type or predicate-type
-  inference. Grep for how the analyzer handles the boolean predicate
-  inside `count_if(cond)`.
-- **Bug:** `agg-020` and `agg2-006` fail with:
-  ```
-  pyarrow.lib.ArrowInvalid: Could not convert Decimal('2')
-    with type decimal.Decimal: tried to convert to boolean
-  ```
-  This suggests the emitted SQL runs correctly on DuckDB, but the fetched
-  result column has a Decimal type where a Boolean is expected — a schema
-  or return-type-inference bug at the count_if aggregate level.
-- **Fix:** Investigate at implementation time. Two plausible root causes:
-  (a) the analyzer infers `count_if(col > 90000)` as returning Decimal
-  (from the `> 90000` predicate) instead of Long; (b) an emission-side
-  cast wrapper misfires. Diagnostic: build a mini fixture, run through
-  v2, inspect the emitted SQL AND the resulting Arrow schema. Fix at the
-  layer where the divergence surfaces.
-- **Regression test:** unit test asserting `count_if(F.col("salary") > 90000)`
-  has `TypedAttr.data_type == Long, nullable == false`.
-- **Target case IDs unblocked:** `agg-020`, `agg2-006`.
+**Status:** LANDED via `/fix-bug` pipeline; delivered **+2** core_v2 delta
+(149 → 151) closing `agg-020` and `agg2-006`. Diagnostic report at
+`.agent-output/001-diagnostic-report.md`. Two iterations; APPROVED after
+iter 2 with 0 Critical + 0 High.
+
+**Scope refinement (retain for future reference).** The initial prompt
+speculated on the `salary > 90000` predicate being routed as Decimal.
+Corpus-first reading (verified verbatim by the coder) proved otherwise:
+`agg-020` at `dataframe_corpus.py:359` uses `F.count_if(F.col("active"))`
+— argument is a Boolean *column* — and `agg2-006` at `:655` uses
+`F.count_if(F.col("salary") > 90000)` where the argument type is Boolean
+(the comparison result), not Decimal. The pyarrow Decimal-vs-Boolean
+symptom came from DuckDB returning HUGEINT (Arrow `Decimal128(38,0)`)
+while the client schema advertised `Boolean` (courtesy of the buggy
+inference helper).
+
+**Actual root cause — symmetric-omission pattern.** Two files listed the
+count family (`count`, `count_distinct`, `grouping`, `grouping_id`) and
+both omitted `count_if`:
+
+- `TypeInferenceEngine::aggregate_return_type` at
+  `crates/core/src/types/type_inference.rs:326` — the fall-through arm
+  `_ => arg_type.clone()` returned the argument type (Boolean) instead
+  of `Long`.
+- `Expression::FunctionCall::nullable` at
+  `crates/core/src/expression/mod.rs:1051` — the default `_` arm marked
+  the result nullable instead of non-nullable.
+
+The scalar-context helper at `type_inference.rs:797` already handled
+`count_if => Long` correctly, so the omission was site-local, not
+design-wide. The Java reference at
+`.reference/core/src/main/java/com/thunderduck/types/TypeInferenceEngine.java:1755-1757`
+has the same latent gap.
+
+**Fix.** Two-file diff on the Rust core:
+
+- `types/type_inference.rs` — added `count_if` to the `count |
+  count_distinct => Long` alternation (line 326) and to sibling
+  `aggregate_is_non_nullable` (lines 395-398, to prevent future drift).
+- `expression/mod.rs` — added `count_if` to `FunctionCall::nullable`'s
+  non-nullable-aggregate literal list (line 1051).
+
+**Iteration structure.** Iter 1 landed only the type-inference fix; the
+reviewer flagged H1 (High) for the newly-visible nullability mismatch.
+Iter 2 closed H1 with the mirror-pattern one-line addition. 4
+regression tests added across the two files.
+
+**Lesson recorded** (`tasks/lessons.md` §"Bug-fix diagnostics"): whenever
+a code region enumerates the count family, audit for `count_if`
+inclusion; the omission travels together across sibling code paths.
+Also: corpus-first reading beats prompt speculation.
 
 ### C.3-4: `Binary(Div, Decimal, Decimal)` routing verification — **CLOSED 2026-07-01**
 

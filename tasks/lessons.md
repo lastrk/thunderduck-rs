@@ -108,6 +108,31 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   the coder starts; `/new-feature`'s architect-first shape assumes the scope
   is roughly right, which is safe only when there's no bug to reproduce yet.
 
+- **Symmetric-omission bug pattern — audit for `count_if` whenever the count family is enumerated.**
+  Slice C.3-3 (2026-07-01) closed `agg-020`/`agg2-006` by adding `count_if` in
+  **two** independent files that both enumerated the count family and both
+  omitted it: `TypeInferenceEngine::aggregate_return_type` at
+  `types/type_inference.rs:326` (arg-type fall-through returned Boolean
+  instead of Long) and `Expression::FunctionCall::nullable` at
+  `expression/mod.rs:1051` (default `_` arm marked it nullable). The
+  scalar-context helper at `type_inference.rs:797` already handled
+  `count_if => Long` correctly — so the omission was site-local, not
+  design-wide. The Java reference has the same latent gap. Rule: when a
+  region enumerates the count family (`count`, `count_distinct`,
+  `grouping`, `grouping_id`), always audit for `count_if` inclusion; the
+  omission travels together across sibling code paths.
+
+- **Corpus-first reading beats prompt speculation.** The C.3-3 initial
+  /fix-bug prompt speculated the `salary > 90000` predicate inside
+  `count_if` was being routed as Decimal. Reading the corpus fixtures
+  verbatim (`agg-020` uses `F.count_if(F.col("active"))` — argument is a
+  Boolean *column*; `agg2-006` uses `count_if(salary > 90000)` where the
+  comparison result is Boolean, not Decimal) immediately narrowed the
+  hypothesis space to "return-type of `count_if(Boolean)` is wrong."
+  Rule: whenever a bug report speculates about the input shape, read the
+  corpus fixture verbatim before enumerating hypotheses — cheaper than
+  probing the runtime.
+
 - **Silent-NULL catch-alls in typed dispatch are data-corruption anti-patterns.**
   The Slice C.3-4 root cause was a single-line `_ => Ok("NULL".to_string())`
   at `relation_converter.rs:2513`. It silently mapped every unhandled Arrow

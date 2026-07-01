@@ -4,7 +4,7 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
-## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4
+## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4 + Slice C.3-3
 
 [`dev_journal/2026-07-01-v2-slice-b-analyzer.md`](dev_journal/2026-07-01-v2-slice-b-analyzer.md)
 
@@ -73,7 +73,23 @@ decimal-payload cases than the halt-and-flag audit had visibility into. Legacy T
 unregressed. Deferred: M1 (`format_decimal128` negative-scale defense-in-depth), M2 (symmetric
 `Decimal256` arm — no corpus case exercises).
 
-**Tests**: 269 core + 14 connect-server (+ 4 regression tests from C.3-4) · differential unchanged (not re-run)
+**Slice C.3-3** (post-Slice-C.3-4 follow-up; `/fix-bug` pipeline): closes the
+`count_if` aggregate-context type + nullability gap that C.3-4's decimal
+marshalling fix uncovered as blocking `agg-020` and `agg2-006`. Initial prompt
+speculated the `salary > 90000` predicate was routed as Decimal; corpus-first
+reading (agg-020 uses Boolean column `active`; agg2-006's comparison result is
+Boolean) narrowed to `TypeInferenceEngine::aggregate_return_type` returning the
+argument type via a `_` fall-through. Two-file fix: `types/type_inference.rs`
+(added `count_if` to the `count | count_distinct => Long` alternation and to
+sibling `aggregate_is_non_nullable`) + `expression/mod.rs` (added `count_if`
+to `FunctionCall::nullable`'s non-nullable-aggregate literal list —
+iteration 2, after iter-1's type-only fix left a newly-visible nullability
+mismatch). Symmetric-omission pattern: both files enumerated the count family
+and both omitted `count_if`; C.3-3 closes both. 4 regression tests.
+**Progress signal delta: 149 → 151 core_v2 passing (+2)** — exactly the two
+target unblocks. Legacy TPC-H 51/51 unregressed.
+
+**Tests**: 274 core + 17 connect-server (+ 4 regression tests from C.3-3) · differential 151/324 core_v2 (v2 path) · 51/51 legacy TPC-H
 
 ---
 

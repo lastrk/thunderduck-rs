@@ -1048,7 +1048,7 @@ impl Expression {
                 let lower = f.name.to_lowercase();
                 if matches!(
                     lower.as_str(),
-                    "count" | "count_distinct" | "grouping" | "grouping_id"
+                    "count" | "count_distinct" | "count_if" | "grouping" | "grouping_id"
                 ) {
                     false
                 } else if TypeInferenceEngine::aggregate_is_always_nullable(&lower) {
@@ -1445,5 +1445,37 @@ mod tests {
         } else {
             panic!("expected Struct type");
         }
+    }
+
+    /// Regression: `count_if(boolean_col)` must report `nullable = false`.
+    /// Like `count`, `count_if` returns 0 for empty groups — never NULL. Prior
+    /// to the fix, `Expression::FunctionCall::nullable` omitted `count_if` from
+    /// the non-nullable-aggregate literal list, so the default `_` arm returned
+    /// `true`, causing agg-020 (`count_if(F.col("active"))`) to fail the
+    /// per-column nullable check against Spark.
+    #[test]
+    fn count_if_function_call_is_non_nullable() {
+        let s = StructType::new(vec![StructField::nullable("active", DataType::Boolean)]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "count_if".to_owned(),
+            args: vec![ColumnReference::untyped("active")],
+            distinct: false,
+        });
+        assert!(!expr.nullable(&s));
+    }
+
+    /// Sanity anchor for the existing `"count"` case in the same literal list.
+    /// Protects against a future edit that removes `count` from the
+    /// non-nullable-aggregate set: `count` over a nullable column must still
+    /// report `nullable = false` (returns 0 for empty groups).
+    #[test]
+    fn count_of_nullable_column_is_non_nullable() {
+        let s = StructType::new(vec![StructField::nullable("id", DataType::Long)]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "count".to_owned(),
+            args: vec![ColumnReference::untyped("id")],
+            distinct: false,
+        });
+        assert!(!expr.nullable(&s));
     }
 }

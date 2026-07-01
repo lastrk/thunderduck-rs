@@ -323,7 +323,7 @@ impl TypeInferenceEngine {
         use DataType::*;
         match name.to_lowercase().as_str() {
             // COUNT always returns Long
-            "count" | "count_distinct" => Long,
+            "count" | "count_distinct" | "count_if" => Long,
 
             // SUM: integer types → Long, float → Double, decimal → wider decimal
             "sum" | "sum_distinct" => match arg_type {
@@ -393,7 +393,10 @@ impl TypeInferenceEngine {
 
     /// Is this aggregate function always non-nullable? (COUNT is.)
     pub fn aggregate_is_non_nullable(name: &str) -> bool {
-        matches!(name.to_lowercase().as_str(), "count" | "count_distinct")
+        matches!(
+            name.to_lowercase().as_str(),
+            "count" | "count_distinct" | "count_if"
+        )
     }
 
     // ── Window function return types ───────────────────────────────────────────
@@ -925,6 +928,28 @@ mod tests {
         );
         assert!(TypeInferenceEngine::aggregate_is_non_nullable("count"));
         assert!(!TypeInferenceEngine::aggregate_is_non_nullable("sum"));
+    }
+
+    /// Regression: `count_if(boolean_col)` must return Long, not Boolean.
+    /// Prior to the fix the default `_ => arg_type.clone()` arm returned the
+    /// argument type, which caused agg-020 (`count_if(F.col("active"))`) to
+    /// advertise `Boolean` in the client schema while DuckDB returned HUGEINT.
+    #[test]
+    fn count_if_of_boolean_returns_long() {
+        assert_eq!(
+            TypeInferenceEngine::aggregate_return_type("count_if", &DataType::Boolean),
+            DataType::Long
+        );
+    }
+
+    /// Regression: `count_if(salary > 90000)` — the argument type is Boolean
+    /// (the `>` comparison result), same as agg2-006. Must still return Long.
+    #[test]
+    fn count_if_of_boolean_expression_returns_long() {
+        assert_eq!(
+            TypeInferenceEngine::aggregate_return_type("count_if", &DataType::Boolean),
+            DataType::Long
+        );
     }
 
     #[test]

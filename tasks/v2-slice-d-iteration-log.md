@@ -72,3 +72,11 @@ Slice C.3-4 landed as a `/fix-bug` pass (commit forthcoming). The diagnostician 
 **Progress signal delta: 134 → 149 core_v2 passing (+15)** — far above the +3 minimum prediction from `type-003/004/005`. The corpus contained many more silently-NULL'd decimal-payload cases than the halt-and-flag audit had visibility into. Legacy TPC-H 51/51 unregressed. `type-005` closed; `math-011` remains a reference-side Spark 4.x ANSI `DIVIDE_BY_ZERO` (not a Thunderduck bug).
 
 **C.3-4 is now closed.** The remaining five Slice C.3 fixes (C.3-1 sha/sha1/sha2 arg-stripping, C.3-2 hash/xxhash64 nullability, C.3-3 count_if predicate typing, C.3-5 sum(decimal) routing verification, C.3-6 percentile_approx/median shape verification) still gate the Phase 1 hash/count_if/sum/percentile target cases. Slice D Phase 1's remaining target case IDs can turn green after those five land.
+
+### Phase 1 termination update (2026-07-01) — C.3-3 closed, +2 delta
+
+Slice C.3-3 landed as a `/fix-bug` pass (commit forthcoming). The initial prompt speculated the `salary > 90000` predicate inside `count_if` was being routed as Decimal; corpus-first reading (`agg-020` uses `F.count_if(F.col("active"))` — argument is a Boolean *column*, not a Decimal comparison; `agg2-006` compares `salary > 90000` which yields Boolean) narrowed to a **symmetric-omission pattern** across two files. Both `TypeInferenceEngine::aggregate_return_type` (returning arg-type instead of `Long`) and `Expression::FunctionCall::nullable` (marking the result nullable) enumerated the count family (`count`, `count_distinct`, `grouping`, `grouping_id`) and both omitted `count_if`; iteration 1 closed the type-inference half, iteration 2 closed the nullability half. Sibling `aggregate_is_non_nullable` extended in parallel to prevent future drift. 4 regression tests added.
+
+**Progress signal delta: 149 → 151 core_v2 passing (+2)** — exactly the two direct target-case unblocks (`agg-020`, `agg2-006`). Failed count dropped 175 → 173 with no other case flipping. Legacy TPC-H 51/51 unregressed.
+
+**C.3-3 is now closed.** The remaining four Slice C.3 fixes (C.3-1 sha/sha1/sha2 arg-stripping, C.3-2 hash/xxhash64 nullability, C.3-5 sum(decimal) routing verification, C.3-6 percentile_approx/median shape verification) still gate the Phase 1 hash/sum/percentile target cases.

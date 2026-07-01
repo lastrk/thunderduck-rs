@@ -662,3 +662,118 @@ exercised on that suite).
 `type-003`/`type-004`/`type-005` all green on `THUNDERDUCK_TRANSPILER=v2`.
 Deferred: M1 (`format_decimal128` negative-scale defense-in-depth),
 M2 (symmetric `Decimal256` arm — no corpus case exercises).
+
+---
+
+## Slice C.3-3 — `count_if` symmetric-omission fix
+
+### Summary
+
+Landed as a two-file diff on the Rust core:
+`crates/core/src/types/type_inference.rs` and
+`crates/core/src/expression/mod.rs`. Closes the `count_if` aggregate-context
+type + nullability gap that blocked `agg-020` and `agg2-006` after Slice
+C.3-4's decimal marshalling fix uncovered the underlying issue.
+
+**Progress signal**: **149 → 151 core_v2 passing (+2)** at commit-forthcoming
+per `tests/integration/v2_progress.md`. Exactly the two direct
+target-case unblocks; failed count dropped 175 → 173 with no other case
+flipping. Legacy TPC-H 51/51 unregressed.
+
+**Pipeline artifacts**: `.agent-output/001-diagnostic-report.md` through
+`.agent-output/004-verification-log.md`. `/fix-bug` pipeline shape
+(diagnostician / coder / reviewer / verifier / docs). Two iterations;
+APPROVED after iteration 2 with 0 Critical + 0 High.
+
+### Bug report vs. actual root cause
+
+The initial /fix-bug prompt speculated that `agg-020` and `agg2-006` failed
+because the `salary > 90000` predicate inside `count_if` was being routed
+as Decimal. The coder read the corpus fixtures verbatim before starting:
+`agg-020` at `dataframe_corpus.py:359` uses
+`F.count_if(F.col("active"))` — argument is a Boolean *column*, not a
+comparison — and `agg2-006` at `:655` uses
+`F.count_if(F.col("salary") > 90000)` where the argument type is Boolean
+(the comparison result), not Decimal. Corpus-first reading immediately
+narrowed the hypothesis space to "return-type of `count_if(Boolean)` is
+wrong," which the diagnostician's direct probe confirmed:
+`TypeInferenceEngine::aggregate_return_type("count_if", &DataType::Boolean)`
+returned `Boolean` (via the fall-through `_ => arg_type.clone()` arm at
+`types/type_inference.rs:390`), not `Long`.
+
+The observed symptom — pyarrow raising
+`Could not convert Decimal('2') with type decimal.Decimal: tried to
+convert to boolean` — was DuckDB returning HUGEINT (Arrow `Decimal128(38,0)`)
+while the client schema advertised `Boolean` (courtesy of the buggy
+inference helper), and pyarrow refused the coercion. The Decimal wasn't a
+cast bug — it was the raw HUGEINT DuckDB always returns for `COUNT_IF`.
+
+### Two-file fix
+
+**File 1 — `crates/core/src/types/type_inference.rs`.**
+`TypeInferenceEngine::aggregate_return_type` at line 326 previously read
+`"count" | "count_distinct" => Long`. Extended to
+`"count" | "count_distinct" | "count_if" => Long`. Spark's `count_if(pred)`
+returns Long (count of truthy values); the Java reference at
+`.reference/core/src/main/java/com/thunderduck/types/TypeInferenceEngine.java:1715-1717`
+confirms `case "COUNT_IF": return LongType.get()`. Sibling helper
+`aggregate_is_non_nullable` at line 395-398 extended in parallel from
+`"count" | "count_distinct"` to `"count" | "count_distinct" | "count_if"`
+so a future caller migrating to the helper cannot inherit the omission.
+
+**File 2 — `crates/core/src/expression/mod.rs`.** Iteration 1 landed only
+the type-inference fix and left `agg-020`/`agg2-006` still red on a
+newly-visible nullability mismatch (`Reference=False, Test=True`). The
+reviewer flagged this as H1 (High). Iteration 2 closed it:
+`Expression::FunctionCall::nullable` at line 1051 previously enumerated
+`"count" | "count_distinct" | "grouping" | "grouping_id"` in the
+non-nullable-aggregate literal list. Extended to
+`"count" | "count_distinct" | "count_if" | "grouping" | "grouping_id"`.
+Spark's `count_if` returns 0 for empty groups, never NULL — same shape as
+`count`.
+
+### The symmetric-omission pattern
+
+The interesting hardening finding: **both** files enumerated the count
+family and **both** omitted `count_if`. The scalar-context return-type
+helper at `type_inference.rs:797` already handled
+`count_if => Long` correctly; the aggregate-context sibling did not. And
+inside `expression/mod.rs`, the non-nullable-aggregate literal list at
+line 1051 (used by `FunctionCall::nullable`) did not consult
+`TypeInferenceEngine::aggregate_is_non_nullable` — it inlined its own
+literal list, which also omitted `count_if`. The Java reference at
+`.reference/core/src/main/java/com/thunderduck/types/TypeInferenceEngine.java:1755-1757`
+has the same latent gap (only `COUNT` / `COUNT_DISTINCT` return `false`;
+`COUNT_IF` falls through to the default `return true`).
+
+The lesson generalizes: when a code region enumerates the count family,
+always audit for `count_if` inclusion — the omission travels together.
+This is now recorded in `tasks/lessons.md` under "Bug-fix diagnostics."
+
+### Tests added
+
+Four unit tests total across two iterations:
+
+- `count_if_of_boolean_returns_long` and
+  `count_if_of_boolean_expression_returns_long` in
+  `type_inference.rs::tests` (iteration 1) — both assert
+  `aggregate_return_type("count_if", &DataType::Boolean) == DataType::Long`.
+- `count_if_function_call_is_non_nullable` and
+  `count_of_nullable_column_is_non_nullable` in
+  `expression/mod.rs::tests` (iteration 2) — the first asserts the
+  previously-broken behavior; the second is a durable sanity anchor for
+  the `"count"` case in the same literal list (protects against a future
+  edit removing `count` from the non-nullable-aggregate set).
+
+### Files changed (C.3-3)
+
+- `/workspace/crates/core/src/types/type_inference.rs` — `count_if` added
+  to `aggregate_return_type` alternation (line 326) and to
+  `aggregate_is_non_nullable` literal list (lines 395-398). 2 regression
+  tests added.
+- `/workspace/crates/core/src/expression/mod.rs` — `count_if` added to
+  `FunctionCall::nullable`'s non-nullable-aggregate literal list (line
+  1051). 2 regression tests added.
+
+**2 files changed.** 4 regression tests added.
+`agg-020`/`agg2-006` green on `THUNDERDUCK_TRANSPILER=v2`.

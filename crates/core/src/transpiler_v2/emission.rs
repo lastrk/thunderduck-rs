@@ -242,6 +242,13 @@ pub fn extension_targets() -> &'static [&'static str] {
         "spark_sum",
         "spark_avg",
         "spark_decimal_div",
+        // ── Slice D Phase 2 (ext6) additions ─────────────────────────
+        // ADR-010 gap-fillers: DuckDB has no native `try_sum` / `try_avg`,
+        // and Spark's overflow-safe `try_divide` semantics need the
+        // extension. Registered by `thdck_spark_funcs` ext6.
+        "spark_try_divide",
+        "spark_try_sum",
+        "spark_try_avg",
     ]
 }
 
@@ -1684,6 +1691,16 @@ fn render_function_call(
         // through here so the aggregate path can dispatch cleanly.
         "spark_sum" => format!("spark_sum({})", joined()),
         "spark_avg" => format!("spark_avg({})", joined()),
+        // ── Slice D Phase 2: ext6-added extension arms ───────────────────
+        // ADR-010 gap-filler discipline: DuckDB has no native
+        // `try_sum` / `try_avg`. Route unconditionally through the
+        // extension so Spark's overflow-safe semantics + widened return
+        // types are preserved. `try_divide` likewise routes to the
+        // extension because Spark's overflow-safe division has no native
+        // DuckDB analogue. Corpus: math-016, agg2-004.
+        "try_divide" => format!("spark_try_divide({})", joined()),
+        "try_sum" => format!("spark_try_sum({})", joined()),
+        "try_avg" => format!("spark_try_avg({})", joined()),
         // ── Slice D Phase 1: native-DuckDB scalar/aggregate additions ────
         // Legacy oracle: `functions/mod.rs:1332-1334` (crc32),
         // `functions/mod.rs:460-465` (percentile_approx → approx_quantile),
@@ -1722,6 +1739,16 @@ fn render_function_call(
         // `COUNT_IF`. v2 emits the same shape, so parity with the legacy
         // path is preserved by construction.
         "count_if" => format!("COUNT_IF({})", joined()),
+        // ── Slice D Phase 2: native-DuckDB aggregate parity ──────────────
+        // ADR-010 cast-preferred discipline: native DuckDB matches Spark
+        // semantics — no extension arm required. `corr` / `covar_samp`
+        // are symmetric; `regr_slope` / `regr_r2` are direction-sensitive
+        // and Spark / DuckDB agree that arg 0 is `y` (dependent), arg 1
+        // is `x` (independent). Corpus: agg-012, agg2-003.
+        "corr" => format!("CORR({})", joined()),
+        "covar_samp" => format!("COVAR_SAMP({})", joined()),
+        "regr_slope" => format!("REGR_SLOPE({})", joined()),
+        "regr_r2" => format!("REGR_R2({})", joined()),
 
         // ── Misc simple ──────────────────────────────────────────────────
         "isnull" => {
@@ -3217,6 +3244,281 @@ mod tests {
         assert_eq!(
             sql, "SHA256(\"name\")",
             "sha2 must emit exactly one arg to SHA256, got {sql:?}"
+        );
+    }
+
+    // ── Slice D Phase 2: ext6-added arm coverage ───────────────────────────
+    //
+    // Five tests below cover the 5 new arms (3 ext6 pass-throughs, 4 native
+    // aggregates — grouped into 2 tests to co-verify semantic clusters).
+    // Three verify-first regression tests (`fn_try_cast_*`, `fn_kurtosis_*`,
+    // `fn_count_if_*`) lock in the emission-line-under-test for already-wired
+    // arms so a refactor drift is caught mechanically.
+
+    /// Corpus anchor: `math-016` — `F.expr("try_divide(a, b)")` must route
+    /// through the ext6 `spark_try_divide` extension. ADR-010 gap-filler:
+    /// Spark's overflow-safe divide has no native DuckDB analogue.
+    #[test]
+    fn fn_try_divide_maps_to_spark_try_divide() {
+        let sch = StructType::new(vec![
+            StructField::nullable("a", DataType::Integer),
+            StructField::nullable("b", DataType::Integer),
+        ]);
+        let sql = s(render_expr(
+            &call(
+                "try_divide",
+                vec![
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "a".to_string(),
+                        qualifier: None,
+                    }),
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "b".to_string(),
+                        qualifier: None,
+                    }),
+                ],
+            ),
+            &sch,
+            "t",
+        ));
+        assert_eq!(sql, "spark_try_divide(\"a\", \"b\")");
+    }
+
+    /// Corpus anchor: `agg2-004` (half) — `F.expr("try_sum(lng)")` must route
+    /// through the ext6 `spark_try_sum` extension. DuckDB has no native
+    /// `try_sum`; the extension provides Spark's overflow-safe widening.
+    #[test]
+    fn fn_try_sum_maps_to_spark_try_sum() {
+        let sch = StructType::new(vec![StructField::nullable("lng", DataType::Long)]);
+        let sql = s(render_expr(
+            &call(
+                "try_sum",
+                vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "lng".to_string(),
+                    qualifier: None,
+                })],
+            ),
+            &sch,
+            "t",
+        ));
+        assert_eq!(sql, "spark_try_sum(\"lng\")");
+    }
+
+    /// Corpus anchor: `agg2-004` (half) — `F.expr("try_avg(a)")` must route
+    /// through the ext6 `spark_try_avg` extension. DuckDB has no native
+    /// `try_avg`; the extension provides Spark's overflow-safe widening.
+    #[test]
+    fn fn_try_avg_maps_to_spark_try_avg() {
+        let sch = StructType::new(vec![StructField::nullable("a", DataType::Integer)]);
+        let sql = s(render_expr(
+            &call(
+                "try_avg",
+                vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "a".to_string(),
+                    qualifier: None,
+                })],
+            ),
+            &sch,
+            "t",
+        ));
+        assert_eq!(sql, "spark_try_avg(\"a\")");
+    }
+
+    /// Corpus anchor: `agg-012` — `F.corr("age","salary")` and
+    /// `F.covar_samp("age","salary")` must route to native DuckDB `CORR` /
+    /// `COVAR_SAMP`. Both are symmetric in their two arguments (Pearson
+    /// correlation / sample covariance), but the emitted SQL must preserve
+    /// the caller's argument order so the trace matches Spark's semantics.
+    #[test]
+    fn fn_corr_and_covar_samp_map_to_native() {
+        let sch = StructType::new(vec![
+            StructField::nullable("age", DataType::Integer),
+            StructField::nullable("salary", DataType::Double),
+        ]);
+        let corr_sql = s(render_expr(
+            &call(
+                "corr",
+                vec![
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "age".to_string(),
+                        qualifier: None,
+                    }),
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "salary".to_string(),
+                        qualifier: None,
+                    }),
+                ],
+            ),
+            &sch,
+            "t",
+        ));
+        assert_eq!(corr_sql, "CORR(\"age\", \"salary\")");
+
+        let cov_sql = s(render_expr(
+            &call(
+                "covar_samp",
+                vec![
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "age".to_string(),
+                        qualifier: None,
+                    }),
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "salary".to_string(),
+                        qualifier: None,
+                    }),
+                ],
+            ),
+            &sch,
+            "t",
+        ));
+        assert_eq!(cov_sql, "COVAR_SAMP(\"age\", \"salary\")");
+    }
+
+    /// Corpus anchor: `agg2-003` — `F.regr_slope("salary","age")` and
+    /// `F.regr_r2("salary","age")` must route to native DuckDB `REGR_SLOPE` /
+    /// `REGR_R2`. Unlike `CORR`/`COVAR_SAMP`, these are **direction-
+    /// sensitive**: arg 0 is `y` (dependent), arg 1 is `x` (independent).
+    /// Spark and DuckDB agree on this convention, so the arm is a
+    /// straight pass-through — but the test asserts the exact argument
+    /// order so a future swap-args refactor is caught.
+    #[test]
+    fn fn_regr_slope_and_regr_r2_preserve_arg_order() {
+        let sch = StructType::new(vec![
+            StructField::nullable("age", DataType::Integer),
+            StructField::nullable("salary", DataType::Double),
+        ]);
+        let slope_sql = s(render_expr(
+            &call(
+                "regr_slope",
+                vec![
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "salary".to_string(),
+                        qualifier: None,
+                    }),
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "age".to_string(),
+                        qualifier: None,
+                    }),
+                ],
+            ),
+            &sch,
+            "t",
+        ));
+        assert_eq!(slope_sql, "REGR_SLOPE(\"salary\", \"age\")");
+
+        let r2_sql = s(render_expr(
+            &call(
+                "regr_r2",
+                vec![
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "salary".to_string(),
+                        qualifier: None,
+                    }),
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "age".to_string(),
+                        qualifier: None,
+                    }),
+                ],
+            ),
+            &sch,
+            "t",
+        ));
+        assert_eq!(r2_sql, "REGR_R2(\"salary\", \"age\")");
+    }
+
+    // ── Slice D Phase 2: verify-first regression tests ─────────────────────
+    //
+    // The three arms below (`try_cast`, `kurtosis`, `count_if`) were already
+    // wired before Slice D Phase 2 (see the specific emission.rs line
+    // referenced in each doc-comment). These regression tests lock in the
+    // exact emission shape so a refactor drift on the arm body is caught
+    // mechanically, and so the corpus cases (cast-012, agg-009, agg2-006)
+    // that depend on these arms are anchored to a unit test.
+
+    /// Corpus anchor: `cast-012` — `F.expr("try_cast(name as int)")` routes
+    /// through `Cast{ try_cast: true }` in [`render_cast`] (emission.rs
+    /// ~L1190-1191, unchanged in Slice D Phase 2), emitting
+    /// `TRY_CAST(... AS INTEGER)`. Rejects a regression that would swap the
+    /// `try_cast` flag for a distinct function-call arm.
+    #[test]
+    fn fn_try_cast_still_uses_try_cast_syntax() {
+        let sql = render_expr(
+            &Expression::Cast(CastExpression {
+                expr: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "name".to_string(),
+                    qualifier: None,
+                })),
+                to_type: DataType::Integer,
+                try_cast: true,
+            }),
+            &empty_schema(),
+            "test",
+        )
+        .expect("render try_cast");
+        assert!(
+            sql.starts_with("TRY_CAST("),
+            "try_cast must emit TRY_CAST(...), got {sql:?}"
+        );
+        assert!(
+            sql.ends_with(" AS INTEGER)"),
+            "try_cast to Integer must end with ` AS INTEGER)`, got {sql:?}"
+        );
+    }
+
+    /// Corpus anchor: `agg-009` (kurtosis half) — `F.kurtosis(...)` routes
+    /// through `render_function_call`'s existing `"kurtosis"` arm
+    /// (emission.rs ~L1718, unchanged in Slice D Phase 2), emitting
+    /// `KURTOSIS_POP(...)`. Rejects a regression that would route to
+    /// DuckDB's sample-based `KURTOSIS` (Spark uses the population /
+    /// excess-kurtosis formula, matching DuckDB's `KURTOSIS_POP`).
+    #[test]
+    fn fn_kurtosis_still_maps_to_kurtosis_pop() {
+        let sch = StructType::new(vec![StructField::nullable("salary", DataType::Double)]);
+        let sql = s(render_expr(
+            &call(
+                "kurtosis",
+                vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "salary".to_string(),
+                    qualifier: None,
+                })],
+            ),
+            &sch,
+            "t",
+        ));
+        assert_eq!(sql, "KURTOSIS_POP(\"salary\")");
+    }
+
+    /// Corpus anchor: `agg2-006` — `F.count_if(F.col("salary") > 90000)`
+    /// routes through `render_function_call`'s existing `"count_if"` arm
+    /// (emission.rs ~L1724, C.3-3, unchanged in Slice D Phase 2), emitting
+    /// `COUNT_IF(...)`. Rejects a regression that would fall back to a
+    /// pass-through `count_if(...)` (lower-case) or a rewrite through
+    /// `COUNT(CASE WHEN ... THEN 1 END)`.
+    #[test]
+    fn fn_count_if_still_maps_to_native_count_if() {
+        let sch = StructType::new(vec![StructField::nullable("salary", DataType::Double)]);
+        let sql = s(render_expr(
+            &call(
+                "count_if",
+                vec![Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Gt,
+                    left: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "salary".to_string(),
+                        qualifier: None,
+                    })),
+                    right: Box::new(Literal::int(90000)),
+                })],
+            ),
+            &sch,
+            "t",
+        ));
+        assert!(
+            sql.starts_with("COUNT_IF("),
+            "count_if must emit COUNT_IF(...), got {sql:?}"
+        );
+        assert!(
+            sql.contains("> 90000"),
+            "count_if body must include the `> 90000` predicate, got {sql:?}"
         );
     }
 }

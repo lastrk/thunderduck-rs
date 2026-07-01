@@ -358,9 +358,18 @@ impl TypeInferenceEngine {
             // MIN/MAX: same type as argument
             "min" | "max" | "first" | "last" | "first_value" | "last_value" => arg_type.clone(),
 
-            // STDDEV / VARIANCE → Double
+            // STDDEV / VARIANCE / CORR / COVAR / REGR → Double
+            //
+            // Slice D Phase 2 (2026-07-01) added the correlation / covariance /
+            // regression family here. Previously these fell through to the
+            // arg-type default, which for INTEGER-typed columns caused an
+            // Integer schema/query-type mismatch (agg-012 symmetric-omission).
+            // All members are already in `aggregate_is_always_nullable` at
+            // line 432, so no nullability change is needed.
             "stddev" | "stddev_samp" | "std" | "stddev_pop" | "variance" | "var_samp"
-            | "var_pop" | "skewness" | "kurtosis" => Double,
+            | "var_pop" | "skewness" | "kurtosis" | "corr" | "covar_samp" | "covar_pop"
+            | "regr_slope" | "regr_r2" | "regr_intercept" | "regr_avgx" | "regr_avgy"
+            | "regr_sxx" | "regr_sxy" | "regr_syy" => Double,
 
             // Percentile → Double
             "percentile" | "percentile_approx" | "approx_percentile" => Double,

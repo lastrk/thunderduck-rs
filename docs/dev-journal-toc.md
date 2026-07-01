@@ -4,6 +4,14 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-07-01 — v2 Slice D Phase 2 landing (ext6 arms + native-arm gaps + analyzer symmetric-omission fix)
+
+[`dev_journal/2026-07-01-v2-slice-d-phase2.md`](dev_journal/2026-07-01-v2-slice-d-phase2.md)
+
+**Delta:** 152 → 153 core_v2 (+1). 5 of 7 targets GREEN. 2 dormant (`math-016`, `agg2-004`) reassigned to Slice E — dormant-v2-fix pattern instances #3 and #4 after C.3-1 and C.3-6b. Ext arms: `try_divide`/`try_sum`/`try_avg` → `spark_*` (ext6-provided). Native arms: `corr`/`covar_samp`/`regr_slope`/`regr_r2` → uppercase DuckDB. Analyzer fix: extended `aggregate_return_type` `→ Double` arm to cover the correlation/covariance/regression family (unblocked `agg-012`). Verify-native-first validated: 7 of 10 pre-drafted ext5 specs were unnecessary because native DuckDB matched Spark.
+
+---
+
 ## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4 + Slice C.3-3 + Slice C.3-5 + Slice C.3 remaining (C.3-1 / C.3-2 / C.3-6)
 
 [`dev_journal/2026-07-01-v2-slice-b-analyzer.md`](dev_journal/2026-07-01-v2-slice-b-analyzer.md)

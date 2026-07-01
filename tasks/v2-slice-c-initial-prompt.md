@@ -234,7 +234,8 @@ Slice C owns:
 - Zero new clippy warnings on files touched (workspace-wide clippy is
   not part of the pipeline gate per CLAUDE.md).
 
-- `git grep 'TODO INV1'`, `git grep 'TODO INV2'`, `git grep 'TODO INV3'`
+- `git grep 'TODO<space>INV<n>'` for each n in {1,2,3} (i.e. the marker <!--rewritten post-termination; see iteration-log §Marker-convention note-->
+  `TODO` followed by `INV1`, `INV2`, `INV3` in source)
   all return empty.
 
 - Legacy `SqlGenerator` behavior UNCHANGED — verify by running

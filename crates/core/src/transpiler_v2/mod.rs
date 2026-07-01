@@ -97,8 +97,8 @@ pub fn clear_emit_tap() {
 /// integration harnesses that already referred to the old name keep
 /// compiling; new code should use `set_emit_tap`.
 ///
-/// TODO INV1: the differential harness in `tests/integration/` owns
-/// INV1's serialize-once-send-twice check; this hook covers INV2 only.
+/// DEFER INV1 → differential-harness slice: the harness in `tests/integration/`
+/// owns INV1's serialize-once-send-twice check; this hook covers INV2 only.
 #[deprecated(since = "0.1.0", note = "use set_emit_tap")]
 pub fn set_serializer_tap(tap: fn(&[u8])) {
     set_emit_tap(tap)

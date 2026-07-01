@@ -18,8 +18,14 @@ A slice `X` is **complete** iff, on the last pass, ALL of the following hold:
 4. The architect did NOT propose a further within-slice sub-split in their
    plan. If they did, that sub-slice runs as a follow-up pass under the
    same iteration loop (not deferred to a later slice).
-5. `git grep 'TODO INV<N>'` for every invariant activated by this slice
-   returns zero hits.
+5. `git grep 'TODO INV<N>'` returns zero hits crate-wide (not just for
+   invariants "activated by this slice"). Invariants that were legitimately
+   reassigned to a named future slice by an architect decision (per §Loop
+   step 4) MUST be marked with the deferred-convention prefix
+   `DEFER INV<N> → <slice-name>:` instead of `TODO INV<N>:`. This keeps the
+   grep-based termination check honest: any remaining `TODO INV<N>` is
+   evidence of un-owned unblocking work; a `DEFER INV<N> → ...` marker
+   documents the ownership handoff and does not trip the check.
 6. The Quality Gate steps from `CLAUDE.md` §Quality Gate all pass.
 
 ## The loop

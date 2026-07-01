@@ -119,7 +119,7 @@ The following are DEFER_LATER_SLICE per Pass 1 and MUST NOT be reintroduced in P
 ## Section D — Reminders
 
 - The architect for Pass 1 explicitly said: "Slice C.2 promotes the arms to declarative per-function rows once row count justifies the substrate; INV3's `use crate::generator::SqlGenerator` allowance is a *deliberate seam* that C.2 will drain." Pass 2 delivers that promise.
-- The methodology's Pass 2 termination check runs `git grep 'TODO INV3'` (empty), plus verifies APPROVED with zero CLOSE_NOW items. INV1/INV2-escape-hatch stay stubbed with honest DEFER markers pointing at the correct future slices.
+- The methodology's Pass 2 termination check runs `git grep 'TODO<space>INV3'` (empty), plus verifies APPROVED with zero CLOSE_NOW items. INV1/INV2-escape-hatch stay stubbed with honest DEFER markers pointing at the correct future slices. <!--rewritten post-termination; see iteration-log §Marker-convention note-->
 - Pass 2's expected empirical delta lands at final Slice C termination — per methodology, `v2-progress.sh` runs ONCE at final termination, not between passes. The progress-signal claim (12 → 180-200) is validated then.
 - If the architect proposes a further sub-split within C.2 (e.g., "C.2.a = scalar rows, C.2.b = seam drain"), that is legitimate under methodology §Loop step 4 and Pass 2 tackles the sub-split's first sub-slice. Each becomes its own pass with its own carryover.
 

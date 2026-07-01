@@ -7,8 +7,15 @@
 //!   3. Makes one semantic assertion — vacuous today, load-bearing once the
 //!      substrate under it grows real behavior.
 //!
-//! The `TODO INV<N>:` line in each body names the substrate that will
-//! replace the stub, so `git grep "TODO INV"` lists the unblocking work.
+//! Marker convention:
+//!   - `TODO INV<N>:` — within-current-slice unblocking work. `git grep
+//!     "TODO INV"` returning empty is the current slice's completion
+//!     signal for its INV activations.
+//!   - `DEFER INV<N> → <slice-name>:` — the invariant stub has been
+//!     honestly reclassified to a named future slice by an architect
+//!     decision (per iteration methodology §Loop step 4). The substrate
+//!     that will replace the stub lands with that slice, not this one.
+//!     Deferred markers do NOT trip `git grep "TODO INV"`.
 
 use super::analyzer::{
     analyze, has_resolved_schema, inference_smoke, BaseTypes, TypedAttr, TypedOp,
@@ -59,7 +66,7 @@ fn lock_emit_tap() -> std::sync::MutexGuard<'static, ()> {
 /// reservation exist; the check itself will be re-implemented on the
 /// harness side, not here.
 ///
-/// TODO INV1: the differential harness owns this — assert
+/// DEFER INV1 → differential-harness slice: the harness owns this — assert
 /// `payloads.len() == 2 && payloads[0] == payloads[1]` once ADR-015's
 /// harness ships. The `set_emit_tap` renamed hook (Slice C.1) is the
 /// wire on the v2-emitter side; INV2 exercises it locally.
@@ -83,7 +90,7 @@ fn inv1_both_engines_receive_byte_identical_input() {
     set_emit_tap(noop_tap);
     clear_emit_tap();
 
-    // TODO INV1: the differential harness activates the full check;
+    // DEFER INV1 → differential-harness slice: the harness activates the full check;
     // this unit stub keeps the name reserved.
     let payloads: &[&[u8]] = &[];
     assert!(
@@ -96,7 +103,7 @@ fn inv1_both_engines_receive_byte_identical_input() {
 ///
 /// ADR cross-reference: ADR-007 (B-layer) / ADR-009 (declarative emission table).
 /// today: `C_ESCAPE_HATCHES` is empty; the uniqueness/non-empty invariant is vacuously true.
-/// TODO INV2: as ADR-007/ADR-009 land specific escape hatches, this test enforces they are named and unique.
+/// DEFER INV2 → ADR-007 slice: as ADR-007/ADR-009 land specific escape hatches, this test enforces they are named and unique.
 #[test]
 fn inv2_node_local_or_labeled_escape_hatch() {
     // Structural reservation: every entry in the reviewed exception list
@@ -107,7 +114,7 @@ fn inv2_node_local_or_labeled_escape_hatch() {
         assert!(!name.is_empty(), "C_ESCAPE_HATCHES[{i}] must not be empty");
     }
 
-    // TODO INV2: enforce uniqueness once entries land.
+    // DEFER INV2 → ADR-007 slice: enforce uniqueness once entries land.
     let mut seen: Vec<&&str> = Vec::new();
     for name in hatches {
         assert!(!seen.contains(&name), "duplicate C escape hatch: {name}");

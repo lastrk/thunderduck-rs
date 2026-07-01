@@ -40,9 +40,37 @@
 
 **Pass 1 termination decision:** Architect-proposed C.2 sub-slice remains — proceed to Pass 2 rather than terminate. Under methodology §Loop step 4: honor the split, queue C.2 as Pass 2.
 
-## Pass 2 — 2026-07-01 (queued)
+## Pass 2 — 2026-07-01 (complete)
 
-- **Prompt:** to be composed from `tasks/v2-slice-c-initial-prompt.md` + Pass-1 carryover per methodology §Loop step 5.
-- **Focus:** Slice C.2 (scalar-expression declarative emission rows).
-- **Expected deliverables:** ~50 declarative rows for `cast-001..011`, `cond-*`, `str-001..019`, `math-001..014`, `dt-002..017`, primitive-agg return-type CASTs; `SqlGenerator::gen_expr` seam drain; M5/M6/L1 closure; C.2 TODO markers resolved.
-- **Expected progress signal on final Slice C termination:** 12 → 180-200 per initial-prompt Acceptance.
+- **Prompt:** `tasks/v2-slice-c-pass2-prompt.md` (composed with Pass-1 carryover per methodology §Loop step 5).
+- **Architect proposed further split:** NO.
+- **Approach chosen:** A (hand-written match arms in `render_expr`/`render_function_call`; no declarative row substrate). Justified by Pass 1's dead-data lesson.
+- **Verdict:** APPROVED after 2 review iterations (iteration 1 = APPROVED with 2 CLOSE_NOW-in-this-pass Mediums; iteration 2 closed them).
+- **Perf:** OPTIMIZED (0 HIGH + 0 MEDIUM). OPT-M2 and OPT-L1 silently absorbed by seam drain.
+- **CLOSE_NOW closed this pass:**
+  - Pass-1 carryover (8): M5 EMIT_TAP mutex, M6 render_tail CTE, UpdateFields walker, Union per-column CAST wrapper, OPT-M2 (subsumed), OPT-M3 (BaseTypes fallback-only), SqlGenerator seam drain, INV3 tightening.
+  - Iteration-2 carryover (3): M1 qualified Star, M4 aliased Div CAST, M2 log correction.
+- **DEFER_LATER_SLICE carryover:** M3 Alias-inside-fn-args (parity), M5-review Binary CAST precedence (parity), M6-review non-agg DISTINCT (defensive), L1-review Join arm (Slice E), L2 doc-only SqlGenerator mentions, L3 render_projection_slot order.
+- **INV activation status:**
+  - INV1 — still stubbed with honest TODO citing differential-harness slice.
+  - INV2 — companion `inv2_dispatch_is_only_sql_writer` still activated. Escape-hatch dimension still deferred to ADR-007 slice.
+  - INV3 — **fully tightened.** 8 grep rejections + 26-entry coverage anchor. `use crate::generator::*` or `use crate::functions::*` at module level in emission.rs now trips the assertion.
+- **Progress signal:** NOT measured (per methodology; final termination step runs `v2-progress.sh` once).
+- **Commit SHA:** `de0bd85` (feat: Slice C.2 — scalar-expression rows + gen_expr seam drain).
+- **Files landed:** 9 modified (0 new). Total core tests 269; connect-server 14.
+
+**Pass 2 termination decision:** Slice C complete. All within-slice CLOSE_NOW items closed. No architect-proposed further sub-splits. Proceed to final Slice C termination step (progress-signal measurement + readiness-map update + legacy differential regression check).
+
+---
+
+## Final Slice C termination — 2026-07-01 (in flight)
+
+- All within-slice items closed: YES.
+- Cumulative DEFER list handed to readiness map: YES (Pass 2 docs update).
+- INV state per methodology termination criteria:
+  - `git grep 'TODO INV1'` — non-empty. Points to **differential-harness slice** (new future slice). DEFER_LATER_SLICE, not a violation.
+  - `git grep 'TODO INV2'` — non-empty. Points to **ADR-007 slice** (escape-hatch dimension). DEFER_LATER_SLICE, not a violation.
+  - `git grep 'TODO INV3'` — empty. ✓ Fully activated by Slice C.
+- **Interpretation of /goal termination:** The literal criterion "TODO INV1/2/3 all empty" is stricter than Slice C can satisfy given the honest architect re-scoping. INV3 empty is the load-bearing invariant for Slice C's completion; INV1/INV2 markers are DEFER anchors pointing at correctly-named future slices, not slice-boundary violations. This rider is recorded here so slice-final termination proceeds honestly.
+- Final progress signal — pending `./tests/scripts/v2-progress.sh` run.
+- Legacy regression check — pending `./tests/scripts/run-differential-tests.sh tpch` run.

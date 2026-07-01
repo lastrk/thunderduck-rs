@@ -4,7 +4,7 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
-## 2026-07-01 — v2 Slice B + Slice C.1 (Substrate)
+## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2
 
 [`dev_journal/2026-07-01-v2-slice-b-analyzer.md`](dev_journal/2026-07-01-v2-slice-b-analyzer.md)
 
@@ -13,7 +13,7 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 `assign_types` with `Union` downward sub-sweep, `derive_nullability`), five input-relation
 fixtures + five mini `CommonAst` fixtures, `inference_smoke()`. **INV4** and **INV5** activated.
 
-**Slice C.1** (architect-proposed C.1/C.2 sub-split honored; C.2 next pass): `lowering.rs`
+**Slice C.1** (architect-proposed C.1/C.2 sub-split honored): `lowering.rs`
 (29-variant `LogicalPlan → CommonAst` adapter with `Punt`); `emission.rs` grown into hand-written
 `dispatch_op` `match` + per-op renderers + `EmittedSql` newtype; `mod.rs` `pub fn generate`
 composes `lower → analyze → dispatch`; `service.rs` `TranspilerPath::V2` dispatches with
@@ -23,7 +23,23 @@ iterations (iteration 1 `NEEDS_CHANGES` — half-declarative `EMISSION_TABLE` sc
 interpreter; iteration 2 `APPROVED` — scaffolding deleted). OPT-M1 (`quote_ident` fast path)
 applied. `SqlGenerator::gen_expr` remains as a documented C.2 seam.
 
-**Tests**: 230 core + 14 connect-server · differential unchanged (not re-run)
+**Slice C.2** (pass 2 of Slice C): Approach A chosen (hand-written per-variant / per-function
+match arms — dead-data lesson applied). `render_expr` became an exhaustive match over all 27
+`Expression` variants; `render_function_call` grew ~130 lowercased-name arms hand-copied from
+`FunctionRegistry`. `SqlGenerator::gen_expr` seam drained (`use crate::generator::SqlGenerator`
+removed; `.with_schema_for_v2(` / `.gen_expr(` / `SqlGenerator::new()` all gone).
+`EmissionError::LegacyRenderFailed` removed; new `UnsupportedExpression` / `UnsupportedFunction`
+variants fallback-eligible. `spark_return_cast` (projection slot) + `spark_aggregate_return_cast`
+(inside `render_aggregate`) handle Spark-parity CASTs. INV3 tightened (8 grep rejections +
+26-entry `REQUIRED_RENDERERS`). M5 closed via module-scoped `EMIT_TAP_MUTEX`; M6 closed via
+`render_tail` CTE rewrite; UpdateFields walking added; Union / Intersect / Except gained
+per-column CAST wrapper. OPT-M2 subsumed by seam drain; OPT-M3 closed via
+`plan_has_empty_scan` short-circuit + `BaseTypes` fallback-only doc contract. Two review
+iterations: iteration 1 `APPROVED` with 2 CLOSE_NOW Mediums (M1 qualified Star drop, M4 aliased
+Div CAST); iteration 2 closed both plus an M2 log correction. Perf `OPTIMIZED` (0 HIGH + 0 MEDIUM);
+seam drain silently absorbed OPT-M2 + L1 wins.
+
+**Tests**: 269 core + 14 connect-server · differential unchanged (not re-run)
 
 ---
 

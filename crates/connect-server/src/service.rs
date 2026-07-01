@@ -81,11 +81,14 @@ fn generate_sql(transpiler: TranspilerPath, plan: &LogicalPlan) -> Result<String
 /// Fallback-eligible: [`AnalyzerError::PuntedOperator`] (adapter marked
 /// the op out-of-scope for Slice B), [`AnalyzerError::UnknownTable`]
 /// (catalog seed missing the referenced view — legacy resolves it via
-/// DuckDB), [`EmissionError::UnsupportedOp`] (no emission row matched).
+/// DuckDB), [`EmissionError::UnsupportedOp`] (no emission row matched),
+/// [`EmissionError::UnsupportedExpression`] (Slice-D/F Expression variant
+/// not yet on the v2 substrate), [`EmissionError::UnsupportedFunction`]
+/// (Slice-D extension function / Slice-F complex-type function).
 ///
 /// NOT fallback-eligible (must surface as `Unsupported`): analyzer
 /// `AmbiguousColumn` / `TypeMismatch` / `SetOpArityMismatch`, emitter
-/// `ChildFailed` / `MissingField` / `LegacyRenderFailed`, and every
+/// `ChildFailed` / `MissingField`, and every
 /// [`ThunderduckError::V2Lowering`] variant (structural adapter defects).
 fn is_v2_fallback_eligible(e: &ThunderduckError) -> bool {
     matches!(
@@ -93,6 +96,8 @@ fn is_v2_fallback_eligible(e: &ThunderduckError) -> bool {
         ThunderduckError::V2Analyzer(AnalyzerError::PuntedOperator { .. })
             | ThunderduckError::V2Analyzer(AnalyzerError::UnknownTable { .. })
             | ThunderduckError::V2Emission(EmissionError::UnsupportedOp { .. })
+            | ThunderduckError::V2Emission(EmissionError::UnsupportedExpression { .. })
+            | ThunderduckError::V2Emission(EmissionError::UnsupportedFunction { .. })
     )
 }
 
@@ -100,15 +105,77 @@ fn is_v2_fallback_eligible(e: &ThunderduckError) -> bool {
 /// [`LogicalPlan::TableScan`] and [`LogicalPlan::InMemoryRelation`]
 /// nodes and copying each one's schema into the catalog.
 ///
+/// **OPT-M3 short-circuit (Slice C.2):** the analyzer's
+/// [`thunderduck_core::transpiler_v2::analyzer`]::`resolve_table_scan`
+/// consumes this overlay only as a fallback — it prefers the AST-carried
+/// schema when it is non-empty. So a plan whose every scan already carries
+/// its own schema does not need the seed at all; we skip the walk in that
+/// case to avoid an O(nodes) schema clone for a walk whose result would
+/// go unread.
+///
 /// Bounded walk (a plan-scoped subset, not a session-wide catalog dump).
 /// Async session lookups are deferred to a follow-up — Slice C.1 accepts
 /// that a table-scan without a pre-populated schema will produce an
 /// [`AnalyzerError::UnknownTable`], which the fallback wrapper handles
 /// by delegating to legacy.
 fn build_base_types_from_plan(plan: &LogicalPlan) -> BaseTypes {
+    if !plan_has_empty_scan(plan) {
+        return BaseTypes::new();
+    }
     let mut base = BaseTypes::new();
     collect_base_types(plan, &mut base);
     base
+}
+
+/// Return `true` if any [`LogicalPlan::TableScan`] or
+/// [`LogicalPlan::InMemoryRelation`] leaf reachable from `plan` carries an
+/// empty schema — those are the only scans for which
+/// `resolve_table_scan` consults the [`BaseTypes`] overlay. Any other
+/// case, the seed walk is dead work (see OPT-M3 in the C.2 architecture
+/// plan).
+fn plan_has_empty_scan(plan: &LogicalPlan) -> bool {
+    use LogicalPlan::*;
+    match plan {
+        TableScan(t) => t.schema.is_empty(),
+        InMemoryRelation(r) => r.schema.is_empty(),
+        // Single-child recursion — mirror `collect_base_types` below.
+        Project(p) => plan_has_empty_scan(&p.input),
+        Filter(f) => plan_has_empty_scan(&f.input),
+        Aggregate(a) => plan_has_empty_scan(&a.input),
+        Sort(s) => plan_has_empty_scan(&s.input),
+        Limit(l) => plan_has_empty_scan(&l.input),
+        Tail(t) => plan_has_empty_scan(&t.input),
+        Distinct(d) => plan_has_empty_scan(&d.input),
+        WithColumns(w) => plan_has_empty_scan(&w.input),
+        DropColumns(d) => plan_has_empty_scan(&d.input),
+        AliasedRelation(a) => plan_has_empty_scan(&a.input),
+        Sample(s) => plan_has_empty_scan(&s.input),
+        ToDataFrame(t) => plan_has_empty_scan(&t.input),
+        ShowString(s) => plan_has_empty_scan(&s.input),
+        NADrop(n) => plan_has_empty_scan(&n.input),
+        NAFill(n) => plan_has_empty_scan(&n.input),
+        NAReplace(n) => plan_has_empty_scan(&n.input),
+        Unpivot(u) => plan_has_empty_scan(&u.input),
+        Pivot(p) => plan_has_empty_scan(&p.input),
+        StatCov(s) => plan_has_empty_scan(&s.input),
+        StatCorr(s) => plan_has_empty_scan(&s.input),
+        ApproxQuantile(a) => plan_has_empty_scan(&a.input),
+        StatCrosstab(s) => plan_has_empty_scan(&s.input),
+        StatFreqItems(s) => plan_has_empty_scan(&s.input),
+        StatSampleBy(s) => plan_has_empty_scan(&s.input),
+        Describe(d) => plan_has_empty_scan(&d.input),
+        Summary(s) => plan_has_empty_scan(&s.input),
+        Join(j) => plan_has_empty_scan(&j.left) || plan_has_empty_scan(&j.right),
+        Union(u) => plan_has_empty_scan(&u.left) || plan_has_empty_scan(&u.right),
+        Except(e) => plan_has_empty_scan(&e.left) || plan_has_empty_scan(&e.right),
+        Intersect(i) => plan_has_empty_scan(&i.left) || plan_has_empty_scan(&i.right),
+        WithCte(c) => {
+            plan_has_empty_scan(&c.input) || c.ctes.iter().any(|(_, sub)| plan_has_empty_scan(sub))
+        }
+        // Leaves without a scan-relevant schema.
+        SqlRelation(_) | LocalRelation(_) | LocalDataRelation(_) | RangeRelation(_)
+        | DdlStatement(_) | SingleRow(_) => false,
+    }
 }
 
 fn collect_base_types(plan: &LogicalPlan, out: &mut BaseTypes) {

@@ -1,4 +1,4 @@
-# Dev Journal — 2026-07-01 — v2 Slice B + Slice C.1 (Substrate)
+# Dev Journal — 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2
 
 ## Slice B — Type & Nullability Analyzer
 
@@ -248,3 +248,162 @@ Critical / 2 High; iteration 2 → `APPROVED`).
   final Slice-C termination.
 
 **Tests**: 230 core + 14 connect-server · differential unchanged (not re-run)
+
+---
+
+## Slice C.2 — Scalar-expression rows + `SqlGenerator::gen_expr` seam drain (pass 2 of Slice C)
+
+### Summary
+
+Slice C.2 lands as pass 2 of Slice C per the architect's within-slice sub-split. C.2 drains the
+Pass-1 seam through which `emission::render_expr` still delegated scalar rendering to legacy
+`SqlGenerator::gen_expr`, promotes scalar-expression handling into `emission.rs` as an exhaustive
+`match` over all 27 `Expression` variants, and hand-copies ~130 lowercased-name arms from
+`FunctionRegistry` into `render_function_call`. All CLOSE_NOW carryovers from Pass 1 (M5 EMIT_TAP
+test isolation, M6 `render_tail` CTE, UpdateFields walker, Union per-column CAST, OPT-M2, OPT-M3)
+closed in the same pass. Baseline: `208e9b1` (Slice C.1 substrate).
+
+**Progress signal**: not re-measured — per iteration methodology,
+`tests/scripts/v2-progress.sh` runs only at final Slice-C termination.
+`tests/integration/v2_progress.md` still reads 12/324.
+
+**Pipeline artifacts**: `.agent-output/001-architecture-plan.md` through
+`.agent-output/006-docs-update-log.md`. Two review iterations (iteration 1 → `APPROVED` with 2
+CLOSE_NOW-in-this-pass Mediums; iteration 2 → both closed).
+
+### Approach A (chosen)
+
+Per plan §1, the architect chose **Approach A**: hand-written per-`Expression`-variant match
+arms in `render_expr`; for `FunctionCall`, fan out to a per-function `match` on the lowercased
+name. The dead-data lesson from Pass 1 iteration 1 is the deciding constraint — the ~50
+non-trivial function shapes are 3-to-5-line `format!` strings, not enough interpreter substrate
+to justify a declarative row table. Approach B (row substrate with interpreter) was rejected
+for the same reason Pass 1's `EmissionRow` scaffolding was deleted; Approach C (narrow
+`FunctionRegistry` accessor) would have regressed Pass 1's INV3 tightening. ADR-009 explicitly
+permits interpreted-vs-compiled as an implementation choice; a declarative substrate becomes
+motivated when Slice D adds `spark_*` extension rows or Slice F adds ~30 complex-type function
+rows — not at C.2's row count.
+
+### What landed
+
+- **`emission.rs` (~1850 lines net)**: `render_expr` reworked as an exhaustive 27-variant match
+  with per-variant helpers (`render_literal`, `render_column_ref`, `render_unresolved_column`,
+  `render_binary`, `render_unary`, `render_cast`, `render_case_when`, `render_star`,
+  `render_expr_paren`, `binop_precedence`) and the fan-out `render_function_call` (~130 name
+  arms across string, math, dt, cond, aggregate-shape, and misc clusters). Slice-D/F variants
+  (Window, InSubquery, ExistsSubquery, ScalarSubquery, Lambda, LambdaVariable, ArrayLiteral,
+  MapLiteral, StructLiteral, Between, InList, Like, Interval, IsDistinctFrom, ExtractValue,
+  RowConstructor, UpdateFields) surface as `EmissionError::UnsupportedExpression`; unknown
+  function names surface as `EmissionError::UnsupportedFunction`. `RawSql` passes through
+  unchanged. `EmissionError::LegacyRenderFailed` fully removed (net-positive vs. the plan —
+  grep confirmed zero remaining references). `spark_return_cast` handles projection-slot
+  Spark-parity CASTs (int/int Div → DOUBLE, incl. the aliased-Div case closed in iteration 2);
+  `spark_aggregate_return_cast` handles integer SUM/AVG return-type wrapping inside
+  `render_aggregate`. `render_tail` rewritten with a `WITH __td_child AS (...)` CTE (M6 closure).
+  `maybe_wrap_widened_child` gives `render_union` / `render_intersect` / `render_except` a
+  per-column CAST wrapper when the analyzer's widened schema diverges from a child's schema.
+  Function-level `grouping` / `grouping_id` CASTs live inside `render_function_call` (matching
+  legacy shape).
+
+- **`invariants.rs`**: INV3 grep rejects `use crate::generator::SqlGenerator`,
+  `use crate::generator;`, `use crate::generator::*`, `use crate::functions::FunctionRegistry`,
+  `use crate::functions::*`, `SqlGenerator::new()`, `.gen_expr(`, `.with_schema_for_v2(` (8
+  rejections). `REQUIRED_RENDERERS` coverage anchor grew to 26 entries covering every renderer
+  helper plus `spark_return_cast` / `spark_aggregate_return_cast`. Docstring rewritten to
+  reflect the drained-seam invariant. M5 closed via a module-scoped `EMIT_TAP_MUTEX`
+  (`static Mutex<()>` + `lock_emit_tap()` helper with poison recovery) acquired by both
+  `inv1_...` and `inv2_dispatch_is_only_sql_writer` tests; no new dep (the `serial_test`
+  option from plan §OQ6 was rejected in favor of the eight-line mutex).
+
+- **`analyzer.rs`**: `ensure_no_ambiguous_columns` now recurses into
+  `UpdateFieldsExpression::struct_expr` and its optional `value` (Pass-1 `TODO Slice C.2:`
+  marker deleted); doc-comment on `pub type BaseTypes` documents the fallback-only overlay
+  contract (`resolve_table_scan` prefers the AST-carried schema; overlay is consulted only when
+  the AST schema is empty) so future readers don't reintroduce eager seeding.
+
+- **`service.rs`**: `is_v2_fallback_eligible` accepts `EmissionError::UnsupportedExpression`
+  and `EmissionError::UnsupportedFunction` (additive-only contract preserved).
+  `build_base_types_from_plan` gains an OPT-M3 short-circuit via a new `plan_has_empty_scan`
+  predicate walk — in the common case where every scan carries a populated schema, the walk
+  returns early and no `BaseTypes` entries are cloned.
+
+- **`generator/mod.rs`**: doc comment on `with_schema_for_v2` records that the method is no
+  longer called by `emission.rs` after C.2's seam drain. Legacy body unchanged (out of scope).
+
+### Iteration 1 vs. iteration 2
+
+- **Iteration 1 → `APPROVED`** with zero Critical / zero High and 6 Mediums (2
+  CLOSE_NOW-in-this-pass, 3 DEFER_LATER_SLICE, 1 doc-only). CLOSE_NOW items: **M1** —
+  `render_projection_slot`'s `Expression::Star(_)` arm collapsed qualified `Star` to bare `"*"`
+  instead of routing through `render_star` (dropped the qualifier); **M4** —
+  `render_projection_slot`'s `Expression::Alias(a)` arm rendered `<inner> AS <alias>` without
+  consulting `spark_return_cast`, so an aliased `Binary(Div, int, int)` emitted
+  `"a" / "b" AS "r"` instead of `CAST("a" / "b" AS DOUBLE) AS "r"`. **M2** was a log-only
+  correction (the implementation log incorrectly claimed `LegacyRenderFailed` was "kept for
+  source stability" when grep confirmed it was fully removed).
+- **Iteration 2 → both CLOSE_NOW closed**. M1 fix: replace `Ok("*".to_string())` with
+  `Ok(render_star(s))` in the projection-slot Star arm. M4 fix: consult
+  `spark_return_cast(&a.expr, schema)` in the Alias arm and wrap the inner render in
+  `CAST(... AS <duckdb type>)` when it returns `Some(dt)` (same idiom already used three lines
+  below in the "other" arm). Two regression tests added:
+  `qualified_star_in_projection_slot_preserves_qualifier` and `alias_of_int_div_gets_double_cast`.
+  Iteration-2 test count: 269 core + 14 connect-server.
+
+### Perf verdict — OPTIMIZED
+
+Perf reviewer verdict `OPTIMIZED` with 0 HIGH + 0 MEDIUM. The perf agent explicitly noted the
+seam drain **silently absorbed** OPT-M2 (per-expression `SqlGenerator::new().with_schema_for_v2(schema.clone())`
+allocation) and Pass-1's L1 (schema clone in `render_expr`) — both die naturally with the
+`SqlGenerator` import removal. Six LOWs documented for post-conformance benchmarking
+(`arg_refs: Vec<&str>` intermediate, `to_ascii_lowercase` allocation, `data_type()`
+recomputation, `spark_column_name` per-node String allocs, per-node `format!` allocation
+pattern, `RawSql` clone-on-passthrough); none crosses the "clear win" bar at Slice C.2's scale.
+The M4 fix explicitly does **not** re-render expressions — `spark_return_cast` walks types
+only, splicing the already-rendered inner SQL into the wrap.
+
+### Carryover DEFER to future slices
+
+- Extension functions (`spark_*`, `try_cast`, `try_divide`, `spark_sum`/`spark_avg` on
+  decimal) — Slice D.
+- Full join cluster (`Join` remains `UnsupportedOp`) — Slice E.
+- Complex types (Array/Map/Struct literals, HOF lambdas, ExtractValue, RowConstructor) —
+  Slice F.
+- Verticals (Window, subqueries, Interval, Between, InList, Like, IsDistinctFrom,
+  `to_utc_timestamp` / `from_utc_timestamp`, `extract` spark4) — Slice G.
+- Writes and `UpdateFields` emission, `na.fill` / `na.drop` / `na.replace` operator arms —
+  Slice H (or an earlier operator-level slice).
+- INV1 full activation — new differential-harness slice.
+- INV2 escape-hatch dimension (`C_ESCAPE_HATCHES: &[]`) — ADR-007 slice.
+- Subquery-body walking in `ensure_no_ambiguous_columns` — Slice G.
+- Reviewer M3 (alias-in-fn-args), M5 (Binary CAST precedence for DATE+INTERVAL), M6 (non-agg
+  DISTINCT check) — parity-with-legacy hardening; DEFER.
+
+### Quality-gate output
+
+- `cargo check -p thunderduck-core` — clean.
+- `cargo check -p thunderduck-connect-server` — clean.
+- `cargo fmt --check` on touched files — clean.
+- `cargo test -p thunderduck-core --lib --tests` — **269 passed / 0 failed** (delta 230 → 269
+  from Slice C.1's baseline: +42 new tests including the two iteration-2 regression tests).
+- `cargo test -p thunderduck-connect-server --tests` — **14 passed / 0 failed**; 14
+  differential ignored per pipeline gate.
+- Differential suite (`core_v2`) intentionally not re-run — final Slice-C termination will
+  measure via `tests/scripts/v2-progress.sh`.
+
+**Tests**: 269 core + 14 connect-server · differential unchanged (not re-run)
+
+### Files changed (Pass 2)
+
+- `/workspace/crates/core/src/transpiler_v2/emission.rs` — ~130 function arms +
+  per-Expression helpers, seam drain, M1 / M4 iteration-2 fixes, Union CAST wrapper,
+  M6 render_tail CTE.
+- `/workspace/crates/core/src/transpiler_v2/invariants.rs` — INV3 tightening (8 grep
+  rejections + 26-entry coverage anchor), `EMIT_TAP_MUTEX`.
+- `/workspace/crates/core/src/transpiler_v2/analyzer.rs` — UpdateFields walking + BaseTypes
+  fallback-only doc contract.
+- `/workspace/crates/connect-server/src/service.rs` — fallback-eligible variants + OPT-M3
+  `plan_has_empty_scan` short-circuit.
+- `/workspace/crates/core/src/generator/mod.rs` — doc-only note that
+  `with_schema_for_v2` is no longer called by emission after C.2.
+
+**5 files changed, +1947 / -125 lines.** 42 tests added.

@@ -89,11 +89,12 @@ The un-changed target list this slice underwrites (unlocks land with Slice C dis
 
 **Progress signal target: 12 → ≈45–55.** Roughly 22 (type_inference) + 12 (schema-only) + 12 (nondeterministic) + ~5 (analyzer-derived cond/agg) — precise count depends on how many nondeterministic cases already pass at baseline via infer_schema.
 
-**Slice C — Core emission (first tranche).** *Substrate (C.1) landed 2026-07-01.* The architect
-proposed a within-slice sub-split (`.agent-output/001-architecture-plan.md` §0) — C.1 (substrate +
-operator emission + Slice-B carryover close) and C.2 (scalar-expression declarative rows). The
-iteration methodology honors the split: each sub-slice is its own pass with its own carryover.
-This pass landed C.1 only.
+**Slice C — Core emission (first tranche).** *Slice C landed 2026-07-01 across 2 passes.* The
+architect proposed a within-slice sub-split (`.agent-output/001-architecture-plan.md` §0) — C.1
+(substrate + operator emission + Slice-B carryover close) and C.2 (scalar-expression rows + seam
+drain). The iteration methodology honors the split: each sub-slice is its own pass with its own
+carryover. **Pass 1 = C.1 substrate** (commit `208e9b1`). **Pass 2 = C.2 scalar rows + seam drain**
+(commit forthcoming).
 
 **C.1 shipped**: `lowering.rs` (new file, 29-variant `LogicalPlan → CommonAst` adapter with
 `CommonOp::Punt` for unsupported variants); `emission.rs` grew into a hand-written `match` over
@@ -127,11 +128,51 @@ list, H2 grep tightened + `TODO Slice C.2:` seam markers). Tests: 230 core + 14 
 Progress signal **not re-measured** (per methodology, only at final termination); `core_v2`
 `v2_progress.md` still at 12/324 baseline.
 
-**C.2 will deliver**: scalar-expression declarative rows for the `cast-*`, `str-*`, `math-*`,
-`dt-*`, and `agg-*` cases where Spark parity requires a projection CAST; drains the
-`SqlGenerator::gen_expr` seam entirely (removes the `use crate::generator::SqlGenerator` import
-from `emission.rs` and tightens INV3 to reject it); adds the projection-cast slot to per-op
-renderers. Expected progress delta: 12 → ≈180–200.
+**C.2 shipped**: Approach A chosen per plan §1 (hand-written per-variant / per-function `match`
+arms; no declarative-row substrate — dead-data lesson from Pass 1 iteration 1 applied). `render_expr`
+became an exhaustive match over all 27 `Expression` variants; `render_function_call` grew ~130
+lowercased-name arms hand-copied verbatim from `FunctionRegistry` (str, math, dt, cond, aggregate
+shapes). The `SqlGenerator::gen_expr` seam is drained: `use crate::generator::SqlGenerator`
+removed from `emission.rs`, `.with_schema_for_v2(` / `SqlGenerator::new()` / `.gen_expr(` all gone.
+`EmissionError::LegacyRenderFailed` deleted; new `UnsupportedExpression` / `UnsupportedFunction`
+variants are fallback-eligible in `service.rs`. Spark-parity CASTs: `spark_return_cast` for
+projection-slot decisions (int/int Div → DOUBLE incl. the aliased-Div case fixed in iteration 2);
+`spark_aggregate_return_cast` for integer SUM/AVG return-type wrapping inside `render_aggregate`.
+INV3 tightened (8 grep rejections + 26-entry `REQUIRED_RENDERERS` coverage anchor). M5 closed via
+a module-scoped `EMIT_TAP_MUTEX` (no new dep); M6 closed via `render_tail` CTE rewrite;
+UpdateFields walking added to `ensure_no_ambiguous_columns`; Union / Intersect / Except gained a
+per-column CAST wrapper (`maybe_wrap_widened_child`). OPT-M2 closed by seam-drain subsumption;
+OPT-M3 closed via `plan_has_empty_scan` short-circuit in `service.rs` + a fallback-only contract
+doc-comment on `pub type BaseTypes` in `analyzer.rs`. Two review iterations: iteration 1
+`APPROVED` with 2 CLOSE_NOW-in-this-pass Mediums (M1 qualified `Star` in projection slot, M4
+aliased Div CAST) plus M2 log correction; iteration 2 closed all three. Perf verdict `OPTIMIZED`
+(0 HIGH + 0 MEDIUM); the perf agent noted the seam drain silently absorbed OPT-M2 and Pass-1's
+L1 wins. Files changed (Pass 2): 5 (`emission.rs`, `invariants.rs`, `analyzer.rs`, `service.rs`,
+`generator/mod.rs`); +1947 / -125 lines; 42 tests added (269 core + 14 connect-server pass).
+Progress signal **not yet re-measured** — final Slice-C termination will re-run
+`tests/scripts/v2-progress.sh`; `tests/integration/v2_progress.md` still reads the 12/324
+baseline.
+
+**Cumulative DEFER carryover to future slices** (from Pass 2 review + perf):
+- **Extension functions** (`spark_*`, `try_cast`, `try_divide`, `spark_sum`/`spark_avg` on
+  decimal) — Slice D.
+- **Full join cluster** (`Join` still `UnsupportedOp` in `dispatch_op`) — Slice E.
+- **Complex-type emission** (Array/Map/Struct literals, HOF lambdas, ExtractValue,
+  RowConstructor) — Slice F.
+- **Vertical extensions** (Window / subqueries / Interval / Between / InList / Like / IsDistinctFrom
+  / `to_utc_timestamp` / `from_utc_timestamp` / `extract` spark4 syntax) — Slice G.
+- **Command / write path** (`UpdateFields` emission, na.fill / na.drop / na.replace operator
+  arms) — Slice H (or an earlier operator-level slice that expands `CommonOp`).
+- **INV1 full activation** — new differential-harness slice (Pass-1 INV1 stub remains).
+- **INV2 escape-hatch dimension** — ADR-007 slice (`C_ESCAPE_HATCHES: &[]` remains empty).
+- **Subquery-body walking** in `ensure_no_ambiguous_columns` — Slice G.
+- **M3 (alias-in-fn-args)** — parity with legacy; Slice G defensive hardening.
+- **M5 review (Binary CAST precedence for DATE+INTERVAL)** — parity with legacy; benign today.
+- **M6 review (non-agg DISTINCT check)** — defensive hardening.
+
+**C.2 acceptance targets** (unchanged from original list): projection-CAST-dependent cases in the
+`cast-*` / `str-*` / `math-*` / `dt-*` / `agg-*` / `set-*` clusters. Expected progress delta:
+12 → ≈180–200 once measured.
 
 **DEFER carryover to C.2** (`tasks/v2-slice-c-iteration-log.md` for details): M5 (global
 `EMIT_TAP` not test-isolated — latent flake), M6 (`render_tail` embeds `child_sql` twice —
@@ -258,8 +299,8 @@ For each of INV1–INV9, the slice from §1 that turns its stub (`crates/core/sr
 | INV | §CV.5 name | Activates in | Stub deleted |
 |---|---|---|---|
 | **INV1** | byte-identical input to both engines | Slice A + ADR-015 harness | `set_serializer_tap` no-op in `mod.rs`; the harness sets a real tap that hashes payloads |
-| **INV2** | node-local or labeled C escape hatch | Slice C (first entry to `C_ESCAPE_HATCHES`) | `C_ESCAPE_HATCHES: &[]` gains its first name; INV2's non-empty/unique check becomes load-bearing |
-| **INV3** | single emission table | Slice C (first real row) | `EmissionTable` unit struct in `emission.rs` becomes a real dispatch table |
+| **INV2** | node-local or labeled C escape hatch | Slice C.1 (single-writer companion, landed 2026-07-01) + future ADR-007 slice (`C_ESCAPE_HATCHES` dimension, still stubbed) | `inv2_dispatch_is_only_sql_writer` uses a counting `EMIT_TAP` (test-serialized via `EMIT_TAP_MUTEX` after C.2 M5); `C_ESCAPE_HATCHES: &[]` non-empty/unique check remains vacuous |
+| **INV3** | single emission table | Slice C.1 (activated 2026-07-01) + Slice C.2 (tightened 2026-07-01) | `emission.rs` `dispatch_op` match + `render_expr` exhaustive match are the single source of truth; grep rejects `SqlGenerator` / `FunctionRegistry` imports and their transitive-use forms (`SqlGenerator::new()`, `.gen_expr(`, `.with_schema_for_v2(`) after C.2's seam drain; `REQUIRED_RENDERERS` coverage anchor names every renderer helper |
 | **INV4** | inference validated in isolation | Slice B *(landed 2026-07-01)* | `inference_smoke()` iterates the five `analyzer_fixtures` mini-corpus and panics with per-field diffs on any schema mismatch; `inv4_inference_isolation` calls it |
 | **INV5** | schema everywhere | Slice B *(landed 2026-07-01)* | `has_resolved_schema(&TypedAst)` walks every op's schema, every `projection_types`/`grouping_types`/`aggregate_types` `TypedAttr`, and rejects `DataType::Unresolved`; two-part test in `inv5_no_unresolved_after_analyzer` verifies both happy-path and planted-`Unresolved` slot detection |
 | **INV6** | extension targets exist | Slice D | `extension_targets()` empty slice becomes non-empty; the DuckDB `duckdb_functions()` diff becomes a hard check |

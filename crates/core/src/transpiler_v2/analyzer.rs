@@ -26,6 +26,15 @@ use crate::types::{DataType, StructField, StructType, TypeInferenceEngine};
 /// Catalog seed — the Spark-typed schemas for base relations the
 /// analyzer's `TableScan`s reference. See ADR-012 (overlay) — Slice B
 /// consumes this as a `&HashMap`; the real overlay lands in Slice H.
+///
+/// **Fallback-only overlay semantics (Slice C.2 OPT-M3):** the analyzer's
+/// [`resolve_table_scan`] prefers the AST-carried [`TableScan::schema`]
+/// when it is non-empty; this overlay is consulted **only** when a scan's
+/// AST schema is [`StructType::empty()`]. That means callers that
+/// construct a plan whose every scan carries its own schema can skip
+/// seeding this overlay entirely — the walk that populates it is dead
+/// work for the common case. See `service.rs::build_base_types_from_plan`
+/// for the short-circuit that materialises this contract.
 pub type BaseTypes = std::collections::HashMap<String, StructType>;
 
 /// A resolved schema — the output shape of an operator. Alias to
@@ -1874,11 +1883,17 @@ fn ensure_no_ambiguous_columns(
                 ensure_no_ambiguous_columns(f, schema)?;
             }
         }
-        Expression::UpdateFields(_) => {
-            // TODO Slice C.2: struct-field update semantics not yet on
-            // the v2 substrate — the analyzer treats these as opaque
-            // for ambiguity purposes. Once C.2 grows the update-fields
-            // path, walk `struct_expr` and any per-field update expr.
+        Expression::UpdateFields(uf) => {
+            // Walk into the struct expression AND any replacement value.
+            // Even though Slice C.2 doesn't *emit* UpdateFields (Slice F
+            // territory), the analyzer must still catch ambiguity inside
+            // its subexpressions — otherwise a plan the analyzer accepts
+            // might carry unrelated ambiguity that only surfaces at emit
+            // time (or in the legacy fallback path).
+            ensure_no_ambiguous_columns(&uf.struct_expr, schema)?;
+            if let Some(value) = &uf.value {
+                ensure_no_ambiguous_columns(value, schema)?;
+            }
         }
         Expression::InSubquery(_)
         | Expression::ExistsSubquery(_)

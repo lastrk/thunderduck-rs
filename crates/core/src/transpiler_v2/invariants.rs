@@ -30,6 +30,26 @@ use crate::expression::{
 };
 use crate::types::{DataType, StructField, StructType};
 
+/// M5 closure (Slice C.2 review carryover): tests that install
+/// [`set_emit_tap`] must serialise. The tap is a global
+/// [`std::sync::atomic::AtomicUsize`] in `mod.rs`; two parallel tests
+/// racing on it can trip false positives (or worse, silent misses when
+/// one test's counter increments during another's dispatch). Every test
+/// below that installs a tap acquires this mutex first.
+///
+/// A `Mutex` is preferred over an `#[serial]` dep here because the
+/// workspace does not currently pull in `serial_test`, and the two-line
+/// lock guard is smaller than the dep bloat.
+static EMIT_TAP_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_emit_tap() -> std::sync::MutexGuard<'static, ()> {
+    // If a prior test panicked while holding the lock, recover — the
+    // shared resource is a global tap slot, not an invariant.
+    EMIT_TAP_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// **INV1 — Both engines receive byte-identical input.** (Touches ADR-015; constrains ADR-001.) Parity-via-identical-bytes is achieved by serialize-once-send-twice. Note this is *not* violated by ADR-001's cosmetic simplifications: cosmetic simplification is a τ transformation applied *once*, upstream of the single serialization, so both engines still receive the same simplified bytes — and DuckDB SQL is consumed only by DuckDB, never by Spark, so the cosmetic DuckDB cleanup is invisible to the comparison. (This is exactly why the rejected production-*canonicalizer* was different: it was proposed as a normalization that could differ from what Spark sees.) A proposal to add production-side normalization that could differ per engine, or that Spark would observe, must demonstrate it does not break this.
 ///
 /// ADR cross-reference: ADR-015 (differential harness) / ADR-001 (cosmetic τ).
@@ -49,6 +69,9 @@ use crate::types::{DataType, StructField, StructType};
                      // `set_emit_tap`. When the alias is removed, so is
                      // this test.
 fn inv1_both_engines_receive_byte_identical_input() {
+    // M5: serialise with any concurrent test that touches the global tap.
+    let _guard = lock_emit_tap();
+
     // Structural reservation: the serializer tap's signature is fixed
     // even though no differential harness owns it yet. Setting a tap
     // must succeed via both the renamed `set_emit_tap` and the retained
@@ -92,33 +115,36 @@ fn inv2_node_local_or_labeled_escape_hatch() {
     }
 }
 
-/// **INV3 — The dispatch match arms in `emission::dispatch_op` are the single source of truth for v2 SQL shape; there is no runtime string dispatch.** (Touches ADR-009, ADR-014, ADR-015.) In Slice C.1 the emitter is a hand-written `match` over `TypedOp` discriminants — declarative-not-runtime discipline is preserved by keeping every `TypedOp → SQL` decision inside those arms and by disallowing module-level imports of the legacy runtime `FunctionRegistry`. Slice C.2 promotes the arms to declarative per-function rows once row count justifies the substrate; INV3's `use crate::generator::SqlGenerator` allowance is a *deliberate seam* that C.2 will drain.
+/// **INV3 — The dispatch match arms in `emission::dispatch_op` and the
+/// expression match arms in `emission::render_expr` are the single source
+/// of truth for v2 SQL shape; there is no runtime string dispatch, no
+/// import of the legacy `SqlGenerator`, no import of the runtime
+/// `FunctionRegistry`.** (Touches ADR-009, ADR-014, ADR-015.) After Slice
+/// C.2, the C.1 seam is drained: every scalar expression is rendered by an
+/// exhaustive `match` arm in `render_expr`, and every function call is
+/// rendered by an exhaustive `match` arm in `render_function_call`. Slice
+/// D introduces extension functions (`spark_hash`, `spark_avg`, `try_cast`,
+/// ...) by adding rows to `render_function_call` — never by re-opening the
+/// legacy delegation.
 ///
 /// ADR cross-reference: ADR-009 (declarative emission) / ADR-014 (attributability) / ADR-015 (coverage denominator).
-/// today: `EmissionTable::dispatch` is the sole public path to build an
-/// `EmittedSql`; `emission::dispatch_op`'s `match` covers every
-/// `TypedOp` variant Slice C.1 supports. Slice C.2 replaces per-function
-/// `SqlGenerator::gen_expr` calls with declarative rows; when it lands
-/// the `SqlGenerator` import in `emission.rs` goes away and this test
-/// should reject it entirely.
 #[test]
 fn inv3_emission_table_single_source_of_truth() {
     // Structural reservation: the *only* public dispatch artifact is
     // `emission::EmissionTable`. Constructing one is the reservation.
     let _table = EmissionTable;
 
-    // Slice C.1 teeth (part 1) — grep-based: the emission module MUST
-    // NOT import the runtime `FunctionRegistry` at the module surface.
-    // Delegation to the legacy scalar-expression renderer
-    // (`SqlGenerator::gen_expr`) is permitted inside a helper fn
-    // (documented as the C.2 seam), but importing the function registry
-    // directly would let arbitrary runtime dispatch leak in. This is
-    // the ADR-014 contamination barrier applied to source text.
+    // Slice C.2 teeth (part 1) — grep-based: the emission module MUST
+    // NOT import the legacy `SqlGenerator` OR the runtime `FunctionRegistry`
+    // at the module surface. C.2 drained the C.1 seam; INV3 now rejects
+    // every form of that dependency.
     //
-    // We check specifically for `use ...FunctionRegistry` module-level
-    // clauses (not any mention of the name in doc comments — those may
-    // reference the type to explain the seam).
+    // We check specifically for `use ...` module-level clauses (not any
+    // mention of the name in doc comments — those may reference the type
+    // to explain history).
     const EMISSION_SRC: &str = include_str!("emission.rs");
+
+    // Legacy FunctionRegistry rejections (carried from C.1).
     assert!(
         !EMISSION_SRC.contains("use crate::functions::FunctionRegistry"),
         "INV3 violated: emission.rs imports `FunctionRegistry` (ADR-009 declarative-not-runtime)"
@@ -127,22 +153,42 @@ fn inv3_emission_table_single_source_of_truth() {
         !EMISSION_SRC.contains("use crate::functions::*"),
         "INV3 violated: emission.rs glob-imports crate::functions (ADR-014 contamination barrier)"
     );
+
+    // Legacy SqlGenerator rejections (added by C.2's seam drain).
     assert!(
-        !EMISSION_SRC.contains("SqlGenerator::new().generate("),
-        "INV3 violated: emission.rs calls `SqlGenerator::generate` (should go through the emission table)"
+        !EMISSION_SRC.contains("use crate::generator::SqlGenerator"),
+        "INV3 violated: emission.rs imports `SqlGenerator` (Slice C.2 drained the seam)"
     );
     assert!(
         !EMISSION_SRC.contains("use crate::generator::*"),
         "INV3 violated: emission.rs glob-imports crate::generator (ADR-014 contamination barrier)"
     );
+    assert!(
+        !EMISSION_SRC.contains("use crate::generator;"),
+        "INV3 violated: emission.rs imports crate::generator module (Slice C.2)"
+    );
+    assert!(
+        !EMISSION_SRC.contains("SqlGenerator::new()"),
+        "INV3 violated: emission.rs constructs `SqlGenerator` (Slice C.2 drained the seam)"
+    );
+    assert!(
+        !EMISSION_SRC.contains(".gen_expr("),
+        "INV3 violated: emission.rs calls `.gen_expr` (Slice C.2 replaced the delegation with render_expr)"
+    );
+    assert!(
+        !EMISSION_SRC.contains(".with_schema_for_v2("),
+        "INV3 violated: emission.rs calls `.with_schema_for_v2` (Slice C.1 → C.2 transition helper)"
+    );
 
-    // Slice C.1 teeth (part 2) — coverage anchor: the SQL-emitting
+    // Slice C.2 teeth (part 2) — coverage anchor: the SQL-emitting
     // choke point is the set of `render_<op>` helpers reachable from
-    // `dispatch_op`'s match. Enumerate their function names in source
-    // so a future refactor can't rename them out from under the arm
-    // without failing this test. Any new op arm must add its
-    // `render_<op>` here.
+    // `dispatch_op`'s match plus the per-Expression-variant helpers in
+    // `render_expr`. Enumerate their function names in source so a
+    // future refactor can't rename them out from under the arm without
+    // failing this test. Any new op arm or expression helper must add
+    // its `render_<x>` here.
     const REQUIRED_RENDERERS: &[&str] = &[
+        // Operator-level renderers (C.1 baseline)
         "fn render_project",
         "fn render_filter",
         "fn render_sort",
@@ -159,6 +205,20 @@ fn inv3_emission_table_single_source_of_truth() {
         "fn render_intersect",
         "fn render_except",
         "fn render_aggregate",
+        // Expression-level renderers (C.2 additions)
+        "fn render_expr",
+        "fn render_literal",
+        "fn render_column_ref",
+        "fn render_unresolved_column",
+        "fn render_binary",
+        "fn render_unary",
+        "fn render_cast",
+        "fn render_case_when",
+        "fn render_function_call",
+        "fn render_star",
+        // Spark-parity CAST helpers (C.2)
+        "fn spark_return_cast",
+        "fn spark_aggregate_return_cast",
     ];
     for name in REQUIRED_RENDERERS {
         assert!(
@@ -193,6 +253,9 @@ fn inv3_emission_table_single_source_of_truth() {
 ///   4. Clear the tap so unrelated tests are not perturbed.
 #[test]
 fn inv2_dispatch_is_only_sql_writer() {
+    // M5: serialise with any concurrent test that touches the global tap.
+    let _guard = lock_emit_tap();
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     static TAP_HITS: AtomicUsize = AtomicUsize::new(0);
     fn counting_tap(_bytes: &[u8]) {

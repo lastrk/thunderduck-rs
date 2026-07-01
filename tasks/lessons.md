@@ -24,6 +24,16 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   hand-write until you have real clients, or write the interpreter in the same pass. Slice
   C.2 lands the declarative table when it has per-function rows that need it.
 
+- **Approach A is the honest choice when the interpreter is trivial.** Slice C.2's architect
+  (2026-07-01) chose Approach A (hand-written per-variant / per-function `match` arms) over
+  Approach B (declarative row substrate + interpreter) precisely because the ~50 non-trivial
+  function shapes are 3-to-5-line `format!` strings — not enough interpreter substrate to
+  justify a table. This is the *inverse* of the Pass-1 dead-data lesson at a different scale:
+  once the substrate is real (Slice D adds `spark_*` extension rows, Slice F adds ~30
+  complex-type functions), the interpreter becomes non-trivial and the declarative form pays
+  off. Rule: pick the shape that matches the interpreter's own weight — trivial interpreter
+  → hand-written `match`; non-trivial interpreter → declarative rows.
+
 ## ADR-015 discipline (differential oracle > plan document)
 
 - **The legacy `TypeInferenceEngine` is the oracle for Spark-parity coercion, not the plan.**

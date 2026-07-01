@@ -370,6 +370,8 @@ The two access modes are the central structural content:
 
 **Anti-pattern:** keeping a "temporary" seam alive across more than one seam-draining slice, or across a slice that promises but does not deliver the drain. Both convert a deliberate seam into permanent contamination and drift the two decision spaces (translation and resolution) back toward opaque coupling.
 
+**Post-drain doc-reference doctrine (added post-Slice-C orphan-audit, 2026-07-01).** After the drain slice tightens the invariant back to full strength, residual comment or doc references to the drained substrate MAY be retained if each carries active parity or traceability value (e.g. explaining why a legacy shape was matched, documenting the seam-drain history for future readers, or anchoring a location where the drained substrate's return type still shapes the emitter's decision). Every retained reference MUST carry an inline comment explaining its purpose; unannotated references are scheduled for cleanup by the next slice touching the file. This keeps the deliberate-seam pattern legible over time without letting drained-substrate mentions accumulate as unowned noise. Crucially, the doctrine does not weaken INV3: the invariant continues to reject *imports* and *runtime uses* of the drained substrate — only annotated doc/comment mentions are permitted. Slice C.2's L2 hygiene item and the six retained `SqlGenerator` doc references in `emission.rs` are the anchor precedent.
+
 ---
 
 ## ADR-015 — Differential oracle against reference Spark; all variation-suppression is test-side; inference validated in isolation via AnalyzePlan

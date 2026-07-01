@@ -29,12 +29,37 @@
 - **Commit SHA:** pending
 - **Deviation from plan:** the C.3-1 plan §2.1 claimed the fix "matches legacy behavior" — the diagnostic-first surface at implementation time proved this false. Legacy `FunctionRegistry` mapping is name-only (`sha2 → SHA256`); it does not strip the bit-length arg. Handled via HALT-AND-FLAG per the coder-agent invariant rather than silently rewriting legacy.
 
-## Termination
+## Pass 2 — 2026-07-01 (follow-up /fix-bug for C.3-6b)
 
-Slice C.3 remaining terminates in a **partial state**:
+- **Prompt:** `/fix-bug` for C.3-6b — FLOAT/DOUBLE quantile-arg emission for `percentile_approx`.
+- **Verdict:** APPROVED (0 Critical + 0 High, 1 review iteration).
+- **Progress signal:** **152 → 152 core_v2 passing (+0).** Second dormant v2 fix — `agg-013` remains RED.
+- **Outcome — C.3-6b (percentile_approx FLOAT CAST):** LANDED DORMANT. V2 fix at `crates/core/src/transpiler_v2/emission.rs:1676-1696` wraps `approx_quantile`'s arg-1 in `CAST(... AS FLOAT)` (diagnostician's option (a) — single-site DuckDB-idiosyncrasy adapter, INV3-preserving, blast radius = exactly one arm). Regression test `percentile_approx_wraps_quantile_arg_in_cast_as_float` committed (non-tautological — pre-fix arm did not emit the CAST substring). `agg-013` remains RED because the runtime routes through legacy fallback: v2 lowering at `lowering.rs:225-230` punts on `AggregateSelectOrder`; legacy `FunctionRegistry` at `functions/mod.rs:459-465` has the identical latent bug. Non-goals forbid touching legacy `FunctionRegistry`, so the fix is dormant until Slice E wires `AggregateSelectOrder` on the v2 common-AST surface. Second instance of the "dormant v2 fix" pattern (anchored via C.3-1) — lesson stands in `tasks/lessons.md`.
+- **Files changed:** 1 (`crates/core/src/transpiler_v2/emission.rs` — arm change + regression test).
+- **Tests added:** 1 (non-tautological).
+- **Quality Gate:** GREEN (279 core tests pass; legacy TPC-H 51/51 unregressed).
+- **Commit SHA:** 797893e.
 
-- C.3-2 fully closes (+1, `hash-003` green).
-- C.3-1 lands as a dormant v2 fix; `hash-002` blocked on future Slice D/E `SqlRelation` handling.
-- C.3-6 halts; needs a **C.3-6b** follow-up `/fix-bug` for the FLOAT/DOUBLE quantile-arg emission.
+## Termination — user-authorized halt-and-flag
 
-Cumulative Slice C.3 delta across all sub-slices (C.3-3 + C.3-4 + C.3-5 + C.3-1 + C.3-2 + C.3-6): 134 → 152 core_v2 passing (+18). Slice D Phase 1's remaining outstanding target case IDs are `hash-002` (dormant) and `agg-013` (blocked on C.3-6b).
+Slice C.3 remaining terminates in a **user-authorized halt-and-flag state** (2026-07-01) per methodology §"Hard cap" escalation clause (the clause fires at Pass 5+; the user invoked it early at Pass 2 because the slice boundary was empirically proven wrong by two consecutive dormant v2 fixes).
+
+**Resolution path taken.** After Pass 2 produced a second dormant fix, the assistant surfaced the deadlock via `AskUserQuestion`: continued `/new-feature` or `/fix-bug` iteration cannot close hash-002 or agg-013 within the /goal's stated non-goals (no legacy `FunctionRegistry` modifications), because the runtime routes both cases through legacy and the identical bug lives there. The user selected **"Terminate the /goal in halt-and-flag state (accept partial)"** — an explicit invocation of the methodology's Hard-cap escalation.
+
+**Reassignment.** Both dormant v2 fixes have been formally reassigned to **Slice E** per readiness-map §Slice E scope extension (added same day). Slice E now owns `LogicalPlan::SqlRelation` lowering (activates C.3-1's dormant sha arg-strip → hash-002 green) and `LogicalPlan::AggregateSelectOrder` lowering (activates C.3-6b's dormant `approx_quantile` FLOAT CAST → agg-013 green). Both v2-side fixes are landed with regression-test lock-in; both will flip green automatically when Slice E lands the lowering substrate.
+
+**Slice C.3 final cumulative** (across all sub-fixes C.3-1 through C.3-6b):
+
+| Sub-fix | Delta | Outcome |
+|---|---|---|
+| C.3-3 (count_if) | +2 | Landed (prior /goal) |
+| C.3-4 (LocalRelation Decimal128) | +15 | Landed (prior /goal) |
+| C.3-5 (sum/avg decimal verify-only) | +0 | Landed (prior /goal) |
+| C.3-1 (sha arg-strip) | +0 | Dormant v2 fix → Slice E |
+| C.3-2 (hash nullability) | +1 | Landed (`hash-003` green) |
+| C.3-6b (approx_quantile FLOAT) | +0 | Dormant v2 fix → Slice E |
+| **Total** | **+18** | 134 → 152 |
+
+**Slice D Phase 1 formal termination.** Depends on Slice E's dormant-fix activation (hash-002 + agg-013 are the only remaining Phase 1 target case IDs). Slice D Phase 2 (post-`ext5` pin) is the natural next `/goal` on the Slice D axis; a draft prompt is prepared in-conversation (readiness-map §Slice D Phase 2 anchor).
+
+**Lesson recorded.** The dormant-v2-fix pattern now has two instances anchoring it — C.3-1 (sha2 arg-strip) and C.3-6b (`approx_quantile` FLOAT). Any future case with the shape "v2 fix correct + unit-tested + INV-preserving, but corpus routes through legacy where the identical bug lives" can cite this precedent for a legitimate dormant-landing outcome.

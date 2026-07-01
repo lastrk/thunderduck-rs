@@ -7,16 +7,34 @@ under the iteration methodology in `tasks/v2-slice-iteration-methodology.md`.
 
 Bring the v2 extension-dispatch tranche online (Slice D) per rearchitect
 ADR-010. Populate `crates/core/src/transpiler_v2/emission.rs`'s function-
-call arms with `spark_*` extension calls for the ~14 Spark/DuckDB-divergent-
+call arms with `spark_*` extension calls for Spark/DuckDB-divergent-
 semantics corpus cases; populate
 `crates/core/src/transpiler_v2/emission.rs::extension_targets()` (currently
 returns an empty slice) with the `spark_*` names the emitter now references;
 activate **INV6** (every emitted `Extension(...)` target corresponds to an
-existing, loaded function in the `thdck_spark_funcs` C++ extension). Expected
-`v2-progress.sh` delta at Slice D completion: **134 → 145-160 core_v2 passing**
-(the readiness map §Slice D estimate is +14; the wider range acknowledges
-that some corpus cases in the target list are indirectly gated on join or
-window support and will need Slice E/G to fully unblock).
+existing, loaded function in the `thdck_spark_funcs` C++ extension).
+
+**Slice D is structured as two phases** per the 2026-07-01 up-front audit
+(`tasks/v2-adr-readiness-map.md` §Slice D):
+
+- **Phase 1 — ext4 wiring (this pipeline's immediate scope).** Wire the
+  `spark_*` functions already in the pinned `ext4` release plus the native-
+  DuckDB functions matching Spark. Progress signal delta: **134 → ~140-142**.
+- **Phase 2 — post-`ext5` pin (blocked externally).** Wire the ~5-8
+  functions requiring new C++ extension work per the pre-drafted specs in
+  `tasks/duckdb-extension-specs/`. Blocked on the separate
+  `thunderduck-duckdb-extension` project shipping `ext5` and this repo
+  pinning it. Progress signal delta: **~142 → ~145-148**.
+
+**Slice D terminates only when Phase 2 completes** (all 14 target case IDs
+pass, `git grep 'TODO INV6'` empty over the full function surface). Between
+phases, the iteration pauses with a "waiting for ext5 pin" state; a
+follow-up `/goal` invocation resumes when ext5 is pinned.
+
+The 10 spec files in `tasks/duckdb-extension-specs/` are **already committed**
+as handoff artifacts for the extension project. Do NOT re-draft them; if
+Pass 1 discovers additional missing functions beyond the audit's 10, follow
+the reactive protocol in the spec directory README.
 
 ## Design mandate (authoritative)
 
@@ -90,63 +108,77 @@ also modifies. Verify none regress:
 
 ## Scope
 
-1. **Extension-function rows** in `emission.rs::render_function_call`:
-   - `hash` → `spark_hash` (single arg or variadic, INT return)
-   - `xxhash64` → `spark_xxhash64` (variadic, BIGINT return)
-   - `try_divide` → `spark_try_divide` OR DuckDB-native `TRY(a/b)` — **verify at
-     implementation time** which the extension provides; ADR-020's `ext4`
-     release notes have the authoritative list.
-   - `try_cast` → DuckDB-native `TRY_CAST(expr AS type)` — likely native, not
-     extension; verify.
+### Phase 1 (this pipeline's scope — ext4 wiring)
 
-2. **Aggregate extension rows** in `emission.rs::render_aggregate`:
-   - `sum(decimal)` → `spark_sum(...)` (correct decimal precision propagation)
-   - `avg(decimal)` → `spark_avg(...)` (correct decimal precision propagation)
-   - `stddev` / `stddev_samp` / `stddev_pop` — verify shapes against
-     `FunctionRegistry`.
-   - `variance` / `var_samp` / `var_pop` — same.
-   - `skewness` → `spark_skewness(...)` (Spark's population semantics)
-   - `kurtosis` — verify shape.
-   - `corr` / `covar_samp` / `covar_pop` — verify shapes; may be native.
-   - `percentile_approx` / `median` — verify shape; `agg-013` was Slice B's
-     schema-only target — Slice D lands the full row-diff.
-   - `regr_*` (regression aggregates) — verify shapes.
-   - `try_sum` / `try_avg` — verify.
-   - `count_if` — verify shape (may be native DuckDB `COUNT_IF`).
-   - `histogram_numeric` — verify shape.
+1. **Extension-function rows in `emission.rs::render_function_call`** (functions already in ext4):
+   - `hash` → `spark_hash` (single arg or variadic, INT return).
+   - `xxhash64` → `spark_xxhash64` (variadic, BIGINT return).
+   - `skewness` → `spark_skewness` (already in ext4; add the arm).
 
-3. **Decimal-division correction** — anywhere Slice C.2 emits `a / b` where
-   both operands are `Decimal(_,_)`, the correct Spark shape is
-   `spark_decimal_div(a, b)`. Locate in `render_binary` (`Binary(Div, Decimal,
-   Decimal)`) and route to the extension call. This closes the parity gap
-   affecting `type-005`, `math-011`, and Div-in-`chain-*` cases.
+2. **Native DuckDB function rows** (no extension needed):
+   - `md5`, `sha1`, `sha2`, `crc32` → native DuckDB.
+   - `stddev`, `stddev_samp`, `stddev_pop`, `variance`, `var_samp`, `var_pop` → native DuckDB (mostly already wired in Slice C.2; verify coverage).
+   - `percentile_approx` / `median` → native `PERCENTILE_CONT` in DuckDB.
 
-4. **`extension_targets()`** — populate with the exact set of `spark_*` names
-   the arms in #1-#3 now reference. This is the coverage set that INV6
-   checks against `duckdb_functions()`.
+3. **Aggregate extension rows in `emission.rs::render_aggregate`** (routing existing ext4 functions):
+   - `sum(decimal)` → `spark_sum(...)`. The `spark_aggregate_return_cast` helper (`emission.rs` ~line 1610) already has a TODO for this; wire it.
+   - `avg(decimal)` → `spark_avg(...)`. Same pattern.
 
-5. **INV6 activation** — replace the stub body of
-   `inv6_extension_targets_exist_in_loaded_extension` in `invariants.rs`
-   with a real check:
-   - The test opens a DuckDB connection with the `thdck_spark_funcs`
-     extension loaded (via the existing runtime path).
+4. **Decimal-division correction** in `render_binary`:
+   - `Binary(Div, Decimal(_,_), Decimal(_,_))` → `spark_decimal_div(a, b)`.
+   - Function is already in ext4; just route it.
+   - Closes parity gap in `type-005`, `math-011`, Div-in-`chain-*`.
+
+5. **Verify-first arms** (DuckDB may match Spark; decide at Pass 1 implementation time):
+   - `kurtosis` — test native `KURTOSIS_POP` against Spark's excess-kurtosis Fisher's-definition. If parity: wire native. Else: leave as pending `spark_kurtosis` per `tasks/duckdb-extension-specs/spark_kurtosis.md` and defer to Phase 2.
+   - `count_if` — test native `COUNT_IF` NULL-as-FALSE semantics against Spark. If parity: wire native. Else: leave as pending `spark_count_if` per the spec file and defer to Phase 2.
+
+6. **`extension_targets()`** — populate with the Phase 1 subset of `spark_*` names the arms in #1-#4 now reference: `spark_hash`, `spark_xxhash64`, `spark_skewness`, `spark_sum`, `spark_avg`, `spark_decimal_div`. This is Phase 1's coverage set for INV6.
+
+7. **INV6 activation (Phase 1)** — replace the stub body of `inv6_extension_targets_exist_in_loaded_extension` in `invariants.rs` with a real check:
+   - Test opens a DuckDB connection with `thdck_spark_funcs` loaded (existing runtime path).
    - Queries `duckdb_functions()` for the set of function names present.
    - Asserts every name in `extension_targets()` is in that set.
    - Fails loudly with the missing names on any mismatch.
-   - Delete the `TODO INV6:` markers in `invariants.rs`.
+   - Delete the `TODO INV6:` markers in `invariants.rs` — Phase 1 activates INV6 over the ext4 subset, and Phase 2 will extend the set without needing to re-activate.
+
+### Phase 2 (deferred; blocked on `ext5` pin)
+
+Post-`ext5` pin, a follow-up `/goal` invocation of Slice D adds:
+- Extension-function arms for `try_divide`, `try_cast` (verify DuckDB `TRY_CAST` first), `corr`, `covar_samp`, `regr_slope`, `regr_r2`, `try_sum`, `try_avg`.
+- Verify-first resolutions for `kurtosis` / `count_if` if they ended up in Phase 2.
+- Extends `extension_targets()` with the newly-available names.
+- Once complete, `git grep 'TODO INV6'` returns empty **and** all 14 Slice D target case IDs pass.
+
+Between phases, when Pass 1 (or subsequent Phase-1 passes) close, the iteration log records "Phase 1 complete; awaiting ext5 pin" and the pipeline terminates. Slice D as a whole is NOT declared complete until Phase 2 lands.
 
 ## Acceptance
 
-- Case IDs green on `core_v2` (via `tests/scripts/v2-progress.sh`):
-  `hash-001..003` (3), `agg-007`, `agg-008`, `agg-009`, `agg-012`, `agg-013`,
-  `math-016`, `cast-012`, `agg2-003`, `agg2-004`, `agg2-006`; plus decimal-
-  division corrections in `type-005`, `math-011`, and any Div in `chain-*`.
-- Progress signal: 134 → 145-160 (readiness map estimate +14; empirical
-  range acknowledges cross-slice interactions).
-- Quality gate (per `CLAUDE.md` §Quality Gate) green on all passes.
-- `git grep 'TODO INV6'` returns empty crate-wide (INV6 fully activated).
-- Legacy path (`THUNDERDUCK_TRANSPILER=legacy` default) unregressed:
-  `./tests/scripts/run-differential-tests.sh tpch` remains 51/51.
+### Phase 1 acceptance (this pipeline)
+
+- Case IDs green on `core_v2`: `hash-001..003`, `agg-007`, `agg-008`,
+  `agg-013`, `math-011`, `type-005`, `agg-009 skewness` half (paired with
+  the kurtosis half if verify-first resolved it). Plus decimal-division
+  corrections in Div-in-`chain-*`.
+- Phase 1 progress signal: **134 → ~140-142**.
+- `git grep 'TODO INV6'` returns empty crate-wide (INV6 activated over
+  the ext4 subset; extension_targets() populated; the real
+  `duckdb_functions()` diff test passes).
+- Quality gate green on all Phase 1 passes.
+- Legacy path unregressed: TPC-H differential 51/51.
+- Iteration log records "Phase 1 complete; awaiting ext5 pin" and lists
+  the case IDs deferred to Phase 2 with their spec-file pointers.
+
+### Phase 2 acceptance (follow-up /goal after ext5 pins)
+
+- Case IDs green: `math-016`, `cast-012`, `agg-012`, `agg2-003`,
+  `agg2-004`, `agg2-006` (if it ended up in Phase 2). Plus any verify-first
+  cases that deferred.
+- Cumulative Slice D progress signal: **134 → ~145-148**.
+- All 14 original Slice D target case IDs pass.
+- `git grep 'TODO INV6'` still empty (Phase 1 already made it so; Phase 2 just extends `extension_targets()`).
+- Legacy path unregressed.
+- Slice D officially terminates in the readiness map (§Slice D "landed" line).
 
 ## Out of scope (deferred to later slices per readiness map)
 
@@ -158,70 +190,29 @@ also modifies. Verify none regress:
 - **Slice I**: full INV1 activation (differential-harness).
 - **Slice J**: INV2 escape-hatch dimension.
 
-## Handling functions missing from `ext4` — DO write a specification, do NOT silently defer
+## Handling functions missing from `ext4`
 
-The `thdck_spark_funcs` C++ extension binaries in this repo are pinned to the
-`ext4` release (per ADR-020). This repo does NOT own the extension's source —
-that lives in a separate project (`thunderduck-duckdb-extension`), and a
-future release (e.g., `ext5`) will be a coordinated build-pin update per
-ADR-020's revisit-triggers.
+The 2026-07-01 up-front audit already identified 10 functions that will need
+`ext5` work; the specs are pre-drafted in `tasks/duckdb-extension-specs/`.
+Slice D Pass 1 does NOT re-draft them.
 
-If during Slice D you identify a corpus case that requires a `spark_*`
-function **not present in `ext4`**, do NOT halt the slice and do NOT silently
-defer. Instead:
+**If Pass 1 discovers an ADDITIONAL function beyond the audit's 10** (one
+that the audit missed, or that emerges from verify-first cases), the
+reactive protocol per `tasks/duckdb-extension-specs/README.md` applies:
 
-1. **Write a specification** for the function to
-   `tasks/duckdb-extension-specs/spark_<name>.md` per the template below.
-   This is the handoff artifact for a different session working in the
-   `thunderduck-duckdb-extension` project — that session implements the
-   function against the DuckDB extension SDK using the spec as its input.
-2. **DEFER the corpus cases** that depend on the missing function to a
-   future "`thdck_spark_funcs ext5` release slice" — add them under a
-   new **"Pending C++ extension work"** heading in the readiness map's
-   Slice D DEFER list, naming each spec file that unblocks each case.
-3. **Continue Slice D** on the functions that ARE in `ext4`. Do not let a
-   handful of missing extension functions block the rest of the slice's
-   progress.
-4. **Commit spec files in the Slice D pass that identified them.** They
-   are load-bearing artifacts, not scratch notes — the extension session
-   consumes them.
+1. Write a new `spark_<name>.md` spec per the template in the README.
+2. Add the function to the "Pending C++ extension work (`ext5`)" DEFER
+   heading in the readiness map's §Slice D.
+3. Continue Pass 1 on the functions that ARE in ext4.
+4. Commit the new spec file in the same pass that identified it.
 
-### Specification template
-
-Write each spec file as `tasks/duckdb-extension-specs/spark_<name>.md`
-containing:
-
-- **Function name**: `spark_<name>` — the DuckDB-side symbol to be exported
-  by the `thdck_spark_funcs` extension.
-- **Spark equivalent**: the exact Spark function / semantic being
-  replicated (e.g., "Spark's `hash(...)` — Murmur3-32, signed INT return,
-  seed = 42, variadic column input").
-- **Signature**: input types (list — cite `crate::types::DataType`
-  variants), return type, variadic vs. fixed-arity, aggregate vs. scalar.
-- **Semantic contract**: what makes Spark's behavior distinct from
-  DuckDB's native form. Cite the exact Spark rule (link to Spark source
-  if you can find it) OR the legacy `crate::functions::FunctionRegistry`
-  mapping arm that emits this function today (read-only reference — INV3
-  forbids importing in `emission.rs`, but the extension-spec session can
-  read it freely).
-- **Corpus test cases**: the exact case IDs this function unblocks —
-  Slice D's cases first, then later slices if the function participates
-  in complex-type / join / vertical emission.
-- **Reference implementation pointer**: (a) Spark source file/line if
-  known; (b) the legacy `SqlGenerator::gen_expr` arm that emits the
-  function today (usually via `FunctionRegistry::translate_typed`); (c)
-  any C++ or Rust reference implementation of the algorithm (e.g., for
-  `spark_hash` — Murmur3-32 reference impl link).
-- **Dependencies**: any DuckDB internals (`LogicalType`, `Vector`,
-  `AggregateFunctionSet`), other `spark_*` functions this composes with,
-  or other DuckDB extensions this relies on.
-- **Testing notes**: a minimal SQL test that exercises the function
-  once implemented. The extension session runs this against a local
-  DuckDB build with the extension loaded before shipping.
-
-Once `ext5` is released and pinned, a follow-up slice ("`thdck_spark_funcs
-ext5` release slice") consumes the spec files, removes the DEFER carryover,
-and adds the newly-available functions to `extension_targets()`.
+The pre-drafted specs assume `ext5` bundles the following (any deviation
+from this list at ext5 release triggers a follow-up spec update):
+`spark_try_divide`, `spark_try_cast` (or resolves to native `TRY_CAST`),
+`spark_kurtosis` (verify-first — may resolve to native), `spark_corr`
+(verify-first), `spark_covar_samp` (verify-first), `spark_regr_slope`
+(verify-first), `spark_regr_r2` (verify-first), `spark_try_sum`,
+`spark_try_avg`, `spark_count_if` (verify-first — may resolve to native).
 
 ## Non-goals — do NOT do any of these
 

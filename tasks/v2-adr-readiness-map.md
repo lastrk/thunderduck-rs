@@ -18,7 +18,11 @@ Slices are named in the strict order §CV.2's dependency matrix imposes. Each na
 
 **Slice C — Core emission table (first tranche).** Owns ADR-009 (declarative emission table, compiled dispatch), scoped to the "trivial" node kinds: `Project`, `Filter`, plain scalar `Cast`, comparison operators, primitive `Aggregate` (count/min/max/first/last), `OrderBy`, `Limit`, `Distinct`, most `string`/`math`/`datetime` scalar functions, `Union`/`Intersect`/`Except` set ops. Fills `emission::EmissionTable` with its first ~50–70 rows. This is the largest single-slice green-count contributor.
 
-**Slice D — Extension dispatch for Spark-divergent semantics.** Owns ADR-010 (extension functions as gap-fillers). Populates `emission::extension_targets()` with the `spark_*` names the table's `Extension(...)` rows reference: `spark_hash`, `spark_xxhash64`, `spark_decimal_div` (for decimal ÷ decimal), `spark_sum` and `spark_avg` on decimal inputs, `spark_skewness`. INV6 gains real teeth here.
+**Slice D — Extension dispatch for Spark-divergent semantics.** Owns ADR-010 (extension functions as gap-fillers). Populates `emission::extension_targets()` with the `spark_*` names the table's `Extension(...)` rows reference. INV6 gains real teeth here. **Structured as two phases per the 2026-07-01 up-front audit:**
+- **Phase 1 (ext4 wiring):** wire the `spark_*` functions already in the pinned `ext4` release (`spark_hash`, `spark_xxhash64`, `spark_decimal_div`, `spark_sum`, `spark_avg`, `spark_skewness`) plus native-DuckDB functions matching Spark (stddev family, percentile_approx, median). Landable immediately, no external dependencies. Progress signal delta: 134 → ~140-142.
+- **Phase 2 (post-`ext5` pin):** wire the ~8 functions that require new C++ extension work (see `tasks/duckdb-extension-specs/` for the pre-drafted handoff specs). Blocked on the `thunderduck-duckdb-extension` project shipping `ext5` and this repo pinning it. Progress signal delta: ~142 → ~145-148.
+
+Slice D **terminates only when Phase 2 completes** (all 14 target case IDs pass). Between phases, the Slice D iteration pauses with a "waiting for ext5 pin" state recorded in `tasks/v2-slice-d-iteration-log.md`; a follow-up `/goal` invocation resumes when ext5 is pinned.
 
 **Slice E — Outer-join nullability + set-op widening.** Extends Slices B & C with the nullability-preserving join emitter and the union type-widening rule (`int ∪ decimal → decimal` etc.). Owns the `EMISSION_JOIN` + `SETOP` cells in ADR-009's table. Second-tranche emission focused on the divergent-slice cases the corpus deliberately concentrates on.
 
@@ -213,14 +217,35 @@ Original unlock list:
 
 **Progress signal target: ≈45–55 → ≈180–200.**
 
-**Slice D — Extension dispatch.** Unlocks Spark-divergent-semantics cases:
-- `hash-001..003` (3)
-- `agg-007` (sum on decimal → `spark_sum`), `agg-008` (`stddev`/`variance` family), `agg-009` (`skewness`/`kurtosis` → `spark_skewness`), `agg-012` (`corr`/`covar_samp`), `agg-013` (`percentile_approx`/`median`)
-- `math-016` (`try_divide`), `cast-012` (`try_cast`)
-- `agg2-003` (regression aggregates), `agg2-004` (`try_sum`/`try_avg`), `agg2-006` (count_if + filtered agg)
-- Decimal-division corrections triggered inside `type-005`, `math-011`, and any binary-Div in `chain-*` (indirect)
+**Slice D — Extension dispatch.** Unlocks Spark-divergent-semantics cases, split into two phases per the 2026-07-01 up-front audit (`tasks/duckdb-extension-specs/README.md` for the handoff convention):
 
-**Progress signal target: ≈180–200 → ≈210–220.** INV6 gains teeth.
+**Phase 1 acceptance (ext4-only; landable immediately):**
+- `hash-001..003` (3; `hash-001`/`002` via native DuckDB md5/sha1/sha2/crc32; `hash-003` via `spark_hash`/`spark_xxhash64` already in ext4)
+- `agg-007` (`sum(decimal)` → `spark_sum` — routing only, function already in ext4)
+- `agg-008` (`stddev`/`variance` family — native DuckDB, already partially wired)
+- `agg-013` (`percentile_approx`/`median` — native DuckDB)
+- `math-011` (`int/int → DOUBLE` correction — already handled by `spark_return_cast`)
+- `type-005` + Div-in-`chain-*` (`spark_decimal_div` routing in `render_binary` — function already in ext4)
+- `agg-009 skewness` half (`spark_skewness` already in ext4)
+
+**Verify-first cases (Phase 1 or Phase 2 depending on DuckDB parity check):**
+- `agg-009 kurtosis` half — DuckDB has `KURTOSIS_POP`; if it matches Spark's excess-kurtosis Fisher's-definition semantics, wire native; else spec `spark_kurtosis` (spec file already drafted).
+- `agg2-006 count_if` — DuckDB has `COUNT_IF`; if its NULL-as-FALSE semantics match Spark, wire native; else spec `spark_count_if`.
+
+**Phase 1 progress signal target: 134 → ~140-142.**
+
+**Phase 2 acceptance (post-`thdck_spark_funcs ext5` pin):**
+- `math-016` (`try_divide` → `spark_try_divide`)
+- `cast-012` (`try_cast` → `spark_try_cast` OR native `TRY_CAST` if verify-first confirms parity)
+- `agg-012` (`corr`/`covar_samp` → `spark_corr`/`spark_covar_samp`, or native if verify-first confirms parity)
+- `agg2-003` (`regr_slope`/`regr_r2` → `spark_regr_slope`/`spark_regr_r2`, or native)
+- `agg2-004` (`try_sum`/`try_avg` → `spark_try_sum`/`spark_try_avg`)
+
+**Phase 2 progress signal target: ~142 → ~145-148.**
+
+**Pending C++ extension work (`ext5` release):** 10 spec files pre-drafted in `tasks/duckdb-extension-specs/` — the handoff artifact for the separate `thunderduck-duckdb-extension` project session. Blocked corpus cases: `math-016`, `cast-012`, `agg-012`, `agg2-003`, `agg2-004` (definite); potentially `agg-009 kurtosis` and `agg2-006` (verify-first cases). Once `ext5` ships and this repo pins the new binary, Slice D Phase 2 wires the newly-available functions and closes.
+
+**Cumulative Slice D progress signal target: 134 → 145-148.** (Not the naive +14 the pre-audit estimate assumed; the honest number accounts for corpus cases whose Spark parity depends on functions not yet in a pinned extension release.) **INV6 gains partial teeth in Phase 1** (over the ext4-available subset) and **full teeth in Phase 2** (over the ext5 additions).
 
 **Slice E — Outer-join nullability + set-op widening.** Unlocks:
 - `join-001..014` (14; `join-014` is `cosmetic`-flagged broadcast hint, free)

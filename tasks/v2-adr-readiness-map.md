@@ -26,9 +26,13 @@ Slices are named in the strict order §CV.2's dependency matrix imposes. Each na
 
 **Slice G — Vertical extensions: temporal, grouping/pivot, windows, JSON, parsing.** Owns targeted emission verticals that share little internal structure but each unlock a compact case cluster: `EMISSION_INTERVAL` (Date/Timestamp ± Interval, `make_interval`, `timestampadd`), `EMISSION_CTE` (rollup/cube/pivot/unpivot/stack expansion), `EMISSION_WINDOW` (frame specs, `nth_value`, `first`/`last IGNORE NULLS`), `EMISSION_JSON` (`get_json_object`, `from_json`/`to_json`, `from_csv`/`to_csv`), `EMISSION_PARSING` (`parse_url`, `to_number`, `split_part`). Any of these can land independently.
 
-**Slice H — Command/lakehouse writes.** Owns ADR-011 (command arm), ADR-012 (catalog overlay), ADR-013 (external table reads), ADR-017 (Delta append), ADR-018 (Iceberg UC-managed writes), ADR-019 (lakehouse I/O contract). Fills `provenance::emit_write` with real SQL; populates `emission::external_emit_paths()`. **Unlocks zero DataFrame-corpus cases** (the corpus is read-only in-memory DFs, per its own docstring), but activates INV8 and INV9. Landed last because it has no bearing on the `core_v2` gate.
+**Slice H — Command/lakehouse writes.** Owns ADR-011 (command arm), ADR-012 (catalog overlay), ADR-013 (external table reads), ADR-017 (Delta append), ADR-018 (Iceberg UC-managed writes), ADR-019 (lakehouse I/O contract). Fills `provenance::emit_write` with real SQL; populates `emission::external_emit_paths()`. **Unlocks zero DataFrame-corpus cases** (the corpus is read-only in-memory DFs, per its own docstring), but activates INV8 and INV9. Landed last of the corpus-progression slices because it has no bearing on the `core_v2` gate.
 
-**Not a slice — cross-cutting discipline.** ADR-000 (positioning), ADR-001 (transliterator-not-optimizer), ADR-002 (delegation boundary), ADR-007 (A/B/C layer contract), ADR-008 (correlated subqueries direct), ADR-014 (two decision spaces), ADR-015 (differential oracle harness), ADR-016 (version pin), ADR-020 (strict-only, already landed) are premises, disciplines, and testing architecture. They shape *how* Slices A–H are implemented; none of them unlocks corpus cases directly.
+**Slice I — Differential-harness activation** (added post-Slice-C, 2026-07-01). Owns the *full* INV1 activation. Slice C.1 activated INV2's dispatch-is-only-writer companion via `EMIT_TAP`, but INV1's byte-identical-input-to-both-engines check requires the ADR-015 differential harness in `tests/integration/` to install a real serializer tap and diff payloads. Fills the `set_emit_tap`-consuming test in the harness with the real payload-hash check; converts the `DEFER INV1 → differential-harness slice:` markers in `crates/core/src/transpiler_v2/{invariants.rs, mod.rs}` into a load-bearing assertion; removes the deprecated `set_serializer_tap` alias if no external harness still consumes it. **Unlocks zero DataFrame-corpus cases** (the harness is oracle machinery, not translation). Position: orthogonal to Slices B–H's corpus progression; can land any time after Slice A completes (INV7 must hold for the harness's front-end parity to be meaningful). Prerequisite: Slice A (both front-ends producing the same AST).
+
+**Slice J — ADR-007 escape-hatch enumeration** (added post-Slice-C, 2026-07-01). Owns the *escape-hatch dimension* of INV2 (INV2's dispatch-is-only-writer companion is already active from Slice C.1). Populates `crates/core/src/transpiler_v2/mod.rs::C_ESCAPE_HATCHES: &[&str]` with named, unique labels for every structural forced transliteration retained in the B layer per ADR-007. Deletes the `DEFER INV2 → ADR-007 slice:` markers in `invariants.rs`. **Unlocks zero DataFrame-corpus cases**. Position: orthogonal to corpus slices; may benefit from Slice H's ADR-011/012 landing to identify DDL-adjacent escape hatches, but no hard prerequisite.
+
+**Not a slice — cross-cutting discipline.** ADR-000 (positioning), ADR-001 (transliterator-not-optimizer), ADR-002 (delegation boundary), ADR-007 (A/B/C layer contract; substrate for the escape-hatch dimension of INV2 is owned by Slice J), ADR-008 (correlated subqueries direct), ADR-014 (two decision spaces), ADR-015 (differential oracle harness; the harness substrate for INV1 is owned by Slice I), ADR-016 (version pin), ADR-020 (strict-only, already landed) are premises, disciplines, and testing architecture. They shape *how* Slices A–J are implemented; none of them unlocks corpus cases directly.
 
 ---
 
@@ -246,6 +250,18 @@ Original unlock list:
 
 **Slice H — Command/lakehouse writes.** **Zero corpus cases.** The DataFrame corpus is read-only in-memory; every write-path Case belongs to the SQL corpus (out of scope). Slice H's purpose is INV8 (external-access delegation) and INV9 (writable-requires-attached-provenance) activation, not `core_v2` movement.
 
+**Slice I — Differential-harness activation.** **Zero corpus cases.** Progress-signal-neutral; INV1's byte-identical-input assertion is oracle machinery, not translation. Acceptance:
+- `crates/core/src/transpiler_v2/invariants.rs::inv1_both_engines_receive_byte_identical_input` and `mod.rs`'s `set_serializer_tap` no longer carry `DEFER INV1 → differential-harness slice:` markers.
+- `git grep 'DEFER INV1'` returns empty crate-wide.
+- The ADR-015 harness in `tests/integration/` installs a real payload-hashing tap via `set_emit_tap` and diffs the byte-identical-input claim across at least one round-tripped fixture per front-end (SparkSQL and Connect-proto), per §CV.5.1's sub-invariant model.
+- Sub-invariant scoping confirmed: the dispatch-is-only-writer companion (Slice C.1) and the differential-harness dimension (this slice) share the INV1 paragraph without contradiction.
+
+**Slice J — ADR-007 escape-hatch enumeration.** **Zero corpus cases.** Progress-signal-neutral. Acceptance:
+- `crates/core/src/transpiler_v2/mod.rs::C_ESCAPE_HATCHES: &[&str]` is non-empty and contains named, unique labels for every structural forced transliteration retained in the B layer per ADR-007.
+- The `inv2_node_local_or_labeled_escape_hatch` test's uniqueness-and-non-empty check becomes load-bearing (currently vacuously-true on the empty slice).
+- `git grep 'DEFER INV2'` returns empty crate-wide.
+- Sub-invariant scoping confirmed: the dispatch-is-only-writer companion (Slice C.1) and the escape-hatch dimension (this slice) share the INV2 paragraph without contradiction.
+
 ---
 
 ## 4. Sequencing rationale
@@ -304,8 +320,8 @@ For each of INV1–INV9, the slice from §1 that turns its stub (`crates/core/sr
 
 | INV | §CV.5 name | Activates in | Stub deleted |
 |---|---|---|---|
-| **INV1** | byte-identical input to both engines | Slice A + ADR-015 harness | `set_serializer_tap` no-op in `mod.rs`; the harness sets a real tap that hashes payloads |
-| **INV2** | node-local or labeled C escape hatch | Slice C.1 (single-writer companion, landed 2026-07-01) + future ADR-007 slice (`C_ESCAPE_HATCHES` dimension, still stubbed) | `inv2_dispatch_is_only_sql_writer` uses a counting `EMIT_TAP` (test-serialized via `EMIT_TAP_MUTEX` after C.2 M5); `C_ESCAPE_HATCHES: &[]` non-empty/unique check remains vacuous |
+| **INV1** | byte-identical input to both engines | Slice I (differential-harness activation) — full activation; sub-invariant companion (single-writer) already active from Slice C.1 per §CV.5.1 | The ADR-015 harness sets a real payload-hashing tap via `set_emit_tap`; the `DEFER INV1 → differential-harness slice:` markers in `invariants.rs` + `mod.rs` are deleted |
+| **INV2** | node-local or labeled C escape hatch | Slice C.1 (dispatch-is-only-writer companion, landed 2026-07-01) + Slice J (ADR-007 escape-hatch dimension) per §CV.5.1 sub-invariant model | `inv2_dispatch_is_only_sql_writer` uses a counting `EMIT_TAP` (test-serialized via `EMIT_TAP_MUTEX`), landed with C.2 M5; Slice J populates `C_ESCAPE_HATCHES: &[&str]` and deletes the `DEFER INV2 → ADR-007 slice:` markers, making the uniqueness/non-empty check load-bearing |
 | **INV3** | single emission table | Slice C.1 (activated 2026-07-01) + Slice C.2 (tightened 2026-07-01) | `emission.rs` `dispatch_op` match + `render_expr` exhaustive match are the single source of truth; grep rejects `SqlGenerator` / `FunctionRegistry` imports and their transitive-use forms (`SqlGenerator::new()`, `.gen_expr(`, `.with_schema_for_v2(`) after C.2's seam drain; `REQUIRED_RENDERERS` coverage anchor names every renderer helper |
 | **INV4** | inference validated in isolation | Slice B *(landed 2026-07-01)* | `inference_smoke()` iterates the five `analyzer_fixtures` mini-corpus and panics with per-field diffs on any schema mismatch; `inv4_inference_isolation` calls it |
 | **INV5** | schema everywhere | Slice B *(landed 2026-07-01)* | `has_resolved_schema(&TypedAst)` walks every op's schema, every `projection_types`/`grouping_types`/`aggregate_types` `TypedAttr`, and rejects `DataType::Unresolved`; two-part test in `inv5_no_unresolved_after_analyzer` verifies both happy-path and planted-`Unresolved` slot detection |

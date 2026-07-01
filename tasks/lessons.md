@@ -43,3 +43,53 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   `min(max(5-0, 10-2) + max(0,2), 38) = 10`. Fixture updated to match the oracle, not the plan.
   This is the ADR-015 pattern working as designed: LLM-extracted rules stay untrusted until
   the oracle validates. Reuse verbatim; do not re-derive.
+
+## Design tactics learned in Slice C
+
+- **Legacy-verbatim shape hard-copying is the honest cost of a contamination barrier.**
+  Slice C.2 (2026-07-01) needed the shape of ~50 Spark scalar functions inside `emission.rs`
+  but INV3 forbids importing `crate::functions::FunctionRegistry`. The architect considered a
+  narrow accessor (Approach C in ADR-009's refinement) and rejected it: duplication of a
+  bounded, stable surface (~50 function shapes) is honest cost, whereas an accessor becomes a
+  permanent second-place-to-update. Rule: when a load-bearing contamination barrier (INV3-class)
+  forbids importing a substrate, prefer copying the substrate's shape over building a narrower
+  accessor — unless the copied surface would grow unbounded or the accessor's maintenance
+  surface would demonstrably be smaller.
+
+- **The `spark_return_cast` / `spark_aggregate_return_cast` separation prevents double-cast.**
+  In Slice C.2, projection-level and aggregate-level return-type parity live in different
+  renderers (`render_projection_slot` vs. `render_aggregate`). Sharing a single
+  `spark_return_cast` helper across both would double-cast aggregate output. Rule: the CAST
+  that pins Spark's return type belongs at exactly one call site per emission decision. If a
+  helper needs to cover multiple emission contexts, split it by context; do not chain.
+
+- **Silently absorbed performance wins are a real refactoring pattern.** Slice C.2's
+  `SqlGenerator::gen_expr` seam drain (an architectural change) eliminated Slice C.1's
+  per-expression `SqlGenerator::new()` allocation (Pass-1 perf finding OPT-M2 and OPT-L1)
+  without a labeled perf change. When a refactor subsumes a perf concern, the perf backlog is
+  drained *by* the refactor — no separate perf commit needed. But it should be *named* in the
+  Pass N summary so the perf-agent's audit trail stays coherent. Rule: if you're about to
+  restructure code the perf backlog references, close the backlog items in your summary as
+  "subsumed by <refactor>" rather than letting them go silent.
+
+- **One allowed cross-module edit per slice, flagged and documented.** Slice C.1 needed
+  `pub fn with_schema_for_v2` in the legacy `generator/mod.rs` to make the analyzer-side schema
+  threadable into the emission-time renderer. The plan's §Scope allowed exactly one such
+  cross-module edit; the coder's implementation log flagged it as a deviation; the reviewer
+  verified it was minimal and non-behavioral. Rule: cross-module edits outside the slice's
+  designated files are permitted only if (a) the plan sanctions them explicitly, (b) the coder
+  discloses them as a named deviation, and (c) the reviewer verifies both scope and
+  minimality. Silent cross-module edits are a Critical review finding.
+
+## Progress-signal calibration
+
+- **Per-slice progress-signal estimates are lagging indicators; recalibrate after each slice
+  lands.** Slice B predicted `[+5, +15]` on `v2_progress.md`, actual delta was 0 (the analyzer
+  alone can't move differential counts without dispatch). Slice C predicted `12 → 180-200`,
+  actual `12 → 134` (the 46-case gap is the honest DEFER carryover to Slices D/E/F/G). The
+  estimates aren't wrong in principle; they're wrong because the readiness-map case-ID target
+  lists overcounted what the slice alone could unblock without extension functions (Slice D),
+  the full join cluster (Slice E), complex types (Slice F), or verticals (Slice G).
+  Corollary: `tests/scripts/v2-progress.sh` is a measurement, not a completion gate. Use it to
+  recalibrate the readiness map's per-slice deltas *after* the slice lands, not to score the
+  slice's completion during termination.

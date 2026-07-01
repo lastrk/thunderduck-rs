@@ -85,6 +85,8 @@ So the permitted transformations fall in three categories: *expressibility-force
 
 **Refinement hooks.** The exact membership of "the divergent slice" is the keystone of the whole architecture (LB1). It is assumed to be {type inference, nullability}; if structural resolution also diverges for some construct, this boundary moves and ADR-005's scope grows.
 
+**Refinement — additive-landing fallback semantics (added post-Slice-C, 2026-07-01).** Slice C established the runtime pattern for additive v2 landings. Both transpiler paths (legacy `SqlGenerator` and rearchitected τ) coexist under `TranspilerPath::V2` dispatch; the v2 path is *permitted to be incomplete*. When it encounters an operator or expression it does not yet type or emit, it produces a typed error — `CommonOp::Punt { kind, reason }` at the lowering boundary, `AnalyzerError::PuntedOperator` at the analyzer, `EmissionError::UnsupportedOp` / `UnsupportedExpression` / `UnsupportedFunction` at the emitter. The dispatcher exposes an `is_v2_fallback_eligible` predicate; fallback-eligible typed errors route the request to the legacy `SqlGenerator`. Silent in-band fallback (v2 producing partial or wrong SQL for unsupported input) is forbidden. Codified rules: (a) every operator or expression variant not yet supported in v2 MUST produce a typed error, never a partial or synthetic SQL string; (b) the fallback-eligibility predicate is v2-owned; the legacy path never inspects it; (c) non-fallback-eligible errors (e.g. `AnalyzerError::AmbiguousColumn`, `TypeMismatch`) surface to the caller as `ThunderduckError` variants — they do NOT trigger legacy fallback because the input is unambiguously malformed. See ADR-014's contamination barrier for the corollary: the fallback wire between v2 and legacy is a *dispatch-level* seam only; the two implementations do not share substrate through it.
+
 ---
 
 ## ADR-003 — The intermediate representation is a proto-inspired common AST, extended incrementally, not full Catalyst LogicalPlan
@@ -170,6 +172,8 @@ So the permitted transformations fall in three categories: *expressibility-force
 
 **Refinement hooks.** Enumerate the pass sequence explicitly (e.g. CTE/substitution staging → unified resolve-and-type bottom-up pass → set-operation widening down-propagation → correlated-subquery outer-first staging). For each analysis rule, classify its information-flow direction (up / down / outside-in) and confirm against the actual Spark 4.1.1 rule set whether any rule beyond the named three is non-upward. The AnalyzePlan differential (ADR-015) is the backstop: a divergence localizes the rule whose flow direction was modelled wrongly.
 
+**Refinement — set-op widened schema wins at emission time (added post-Slice-C, 2026-07-01).** The downward union sub-sweep produces a widened schema on the set-op node; at *emission* time, that widened schema wins over any child projection's declared cast target. Concretely, when a child projection declares `CAST(a AS DECIMAL(5,0))` and its sibling declares `CAST(b AS DECIMAL(10,2))`, the union's widened schema is `DECIMAL(10,2)` and the emitter wraps each child's projected column in `CAST(... AS DECIMAL(10,2))` **regardless of the child's declared cast target**. This is not a downstream "clean-up" cast; it is the load-bearing rule for set-op parity with Spark, whose analyzer computes the widened union type before the child projections' types are pinned. Codified: the analyzer's set-op widening sub-pass computes the widened schema; the emitter's `render_union` (and `render_intersect` / `render_except`, once those set-ops learn to widen) applies a per-column CAST wrapper. Neither pass is allowed to defer the CAST to the other — the analyzer does not rewrite child projections in place, and the emitter must inspect the widened schema on the parent, not the child-declared cast on the projection.
+
 ---
 
 ## ADR-007 — τ structured as three layers A / B / C; B is retained but currently minimal
@@ -238,6 +242,14 @@ Production dispatch uses the **compiled approach**: a build-time procedural macr
 
 **Refinement hooks.** Decide the codegen mechanism (proc-macro vs `build.rs`). Define the guard resolution-order policy (specificity vs declared priority) and make the non-overlap check a compile-time error. Confirm `Dynamic` (Option-C) sites are handled outside codegen and remain instrumented. Establish the trigger conditions under which the interpreted fallback would be adopted, so that switch remains a recorded decision rather than an ad-hoc one.
 
+**Refinement — Approach A/B/C decision framework for the dispatch shape (added post-Slice-C, 2026-07-01).** The Decision above permits interpretation-fallback in place of build-time codegen, but does not specify *when* to prefer each shape. Slice C settled empirical criteria that superseded the Pass 1 assumption that declarative data structures were always the right first step:
+
+- **Approach A — hand-written `match` arms over the analyzed AST discriminant (and, for `FunctionCall`, over the lowercased function name).** Correct when arms are trivial 3-5-line format strings AND the total arm count is bounded (Slice C.2's ~130 scalar-function arms + ~15 operator arms). The dispatch is a compiled `match`; LLVM lowers the case-insensitive name lookup to length-bucketed `memcmp`; every arm is inspectable at review time. INV3's coverage anchor is the set of `render_*` helper names, greppable from the source.
+- **Approach B — declarative row data structure with a live interpreter.** Correct when arms are heterogeneous (varying arg counts, non-uniform slot patterns, per-arm cast targets) OR the interpreter's per-arg-slot walk is non-trivial. Do NOT choose this when the interpreter would collapse to a one-line `format!` splice — that reduces to Approach A with more indirection and more surface for drift.
+- **Approach C — narrow legacy accessor.** A read-only accessor exposing shape information from an existing substrate (e.g. `crate::functions::FunctionRegistry`), consumed by v2 emission without importing the substrate wholesale. Acceptable *only* when duplication would be measurably worse than the accessor's maintenance surface AND the accessor does not violate ADR-014's contamination barrier (INV3). Slice C.2 considered and rejected Approach C for the ~50-function scalar tranche because the barrier was load-bearing and the duplication was bounded.
+
+**Anti-pattern (Slice C.1 iteration 1 case study, recorded in `tasks/lessons.md`):** declarative row data structures without a live interpreter. Data structures that no runtime dispatch consults are dead data; they inflate INV3's coverage denominator with false coverage claims and drift silently from the actual `match`-based dispatch. If the interpreter is deferred to a later slice, the row substrate is also deferred to that slice — half-declarative is worse than either fully hand-written or fully interpreted.
+
 ---
 
 ## ADR-010 — Extension functions are a minimal gap-filler for Spark/DuckDB divergence, implemented in the C++ extension project
@@ -301,6 +313,8 @@ The overlay additionally records, per base relation, its **access provenance** �
 
 **Refinement hooks.** Decide whether the overlay is materialized alongside DuckDB's catalog or computed by mapping DuckDB types back to Spark types on read. Define the Spark↔DuckDB type mapping table explicitly, and separately the direct Iceberg-type→Spark-type and Delta-type→Spark-type mappings for format-backed relations (ADR-013). Specify how commands keep overlay and DuckDB catalog in sync. Record access provenance + format per relation.
 
+**Refinement — `BaseTypes` overlay is fallback-only for the analyzer (added post-Slice-C, 2026-07-01).** Slice C.2's OPT-M3 semantic decision codifies the overlay's read contract during analysis: `resolve_table_scan` reads the analyzed AST's own `TableScan.schema` field first; the `BaseTypes` overlay is a *fallback-only* source consulted only when the AST-carried schema is unresolved (empty or all-`Unresolved`). The overlay is not authoritative when the AST already carries a schema — the AST wins. Codified rules: (a) `resolve_table_scan(&TableScan, &BaseTypes) -> Result<Schema>` returns AST schema if non-empty; else BaseTypes lookup by name; else `AnalyzerError::UnknownTable`. (b) Request-handler seeding of `BaseTypes` short-circuits — if no `TableScan` in the plan has an empty `schema`, `build_base_types_from_plan` returns an empty overlay without walking the session catalog. Rationale: keeps the analyzer's tree-local reasoning intact (schemas travel with nodes) while still supporting deferred session-catalog resolution for scans that the front-end couldn't schema-thread. The command-arm write contract (this ADR's core) is unchanged; the refinement scopes only the *analyzer's read* side.
+
 ---
 
 ## ADR-013 — External / lakehouse tables (Hive-Parquet, Delta, Iceberg on S3; Unity Catalog) are read by delegating to DuckDB's storage extensions; read-only for this iteration
@@ -346,6 +360,15 @@ The two access modes are the central structural content:
 - (neutral) Triage branches on attribution first, supported by emitted-SQL capture (ADR-015).
 
 **Refinement hooks.** Define the resolution-decision instrumentation (which inference rule fired). Decide how much trust to place in DuckDB's own test suite for the excluded bucket. Specify the triage decision tree.
+
+**Refinement — deliberate-seam pattern for cross-slice contamination boundaries (added post-Slice-C, 2026-07-01).** The contamination barrier between the two decision spaces (encoded operationally as INV3 forbidding v2 emission from importing legacy `SqlGenerator`/`FunctionRegistry` state) is proven load-bearing by Slice C. However, Slice C.1 → C.2 required a *temporary permitted violation*: the `SqlGenerator::gen_expr` seam remained active in `render_expr` during C.1 and was drained by C.2. This is a legitimate cross-slice pattern with these constraints:
+
+- A slice MAY deliberately keep a specific legacy dependency as an acknowledged seam **iff the next slice's core deliverable is to drain that seam**. Cross-slice seams without a named drain slice are not seams, they are contamination.
+- The invariant that would otherwise reject the dependency MUST be relaxed *precisely* to allow the seam and *no more* — narrower predicates rather than broader ones. Slice C.1 rewrote INV3's grep to allow the specific `SqlGenerator::gen_expr` transitive pull while still rejecting bare imports of `FunctionRegistry`.
+- The seam MUST be marked in source with a `TODO Slice <target-slice>:` comment naming exactly which slice will drain it. The drain slice's initial `/new-feature` prompt MUST reference the seam as a CLOSE_NOW carryover.
+- The seam-relaxed invariant MUST be tightened back to full strength when the drain slice completes. Slice C.2 re-tightened INV3 to reject `use crate::generator::SqlGenerator` entirely, and the drain-time grep for `TODO Slice C.2:` markers landed empty.
+
+**Anti-pattern:** keeping a "temporary" seam alive across more than one seam-draining slice, or across a slice that promises but does not deliver the drain. Both convert a deliberate seam into permanent contamination and drift the two decision spaces (translation and resolution) back toward opaque coupling.
 
 ---
 
@@ -624,6 +647,19 @@ Properties that span ADRs. Any refinement must preserve all of these; a change t
 
 **INV9 — A writable external relation must have attached-catalog provenance; path-scan provenance is read-only.** (Added with ADR-017; touches ADR-011, ADR-013, ADR-017.) External tables reached by a bare path-scan (`read_parquet` / `delta_scan` / `iceberg_scan`) are read-only by construction; any write (append/insert/delete/merge/CTAS) requires the table to be reached via an attachment (`ATTACH … TYPE delta`/`iceberg`, or `uc_catalog`). This is the rule that keeps the write story consistent across formats: every per-format write ADR (Delta ADR-017; Iceberg ADR-018; and any future format) must route writes through an attachment, never a path-scan. This is reinforced externally: Databricks UC forbids path-based access to managed tables outright (ADR-018), so for UC targets the invariant is enforced by the catalog as well as by thunderduck. **Check:** the overlay's recorded provenance (ADR-012/013) gates whether a write command may be emitted at all.
 
+### CV.5.1 — Invariant scoping conventions (added post-Slice-C, 2026-07-01)
+
+**Sub-invariants.** Some INV<N> paragraphs cover invariants with multiple orthogonal dimensions. The paragraph remains the canonical statement; each dimension is activated by its own slice. Example: **INV2**'s "node-local decision OR labeled C escape hatch" has two dimensions — the *dispatch-is-only-writer* companion (activated by Slice C.1 via `EMIT_TAP` + `EMIT_TAP_MUTEX`) and the *escape-hatch enumeration* dimension (activated when ADR-007's substrate lands via the future "Slice J — ADR-007 escape-hatch enumeration"). Both dimensions share the INV2 paragraph; they activate at different slices. Similarly, **INV1**'s "byte-identical input" has a within-crate serialize-once-writer dimension (already covered by INV2's companion) and a differential-harness dimension (deferred to the future "Slice I — Differential-harness activation") — a slice's completion is measured against the sub-invariants it *claims* to activate, not against the invariant paragraph as a whole.
+
+**Two-marker convention** for the stubs in `crates/core/src/transpiler_v2/invariants.rs`:
+
+- `TODO INV<N>:` — within-current-slice unblocking work. A `git grep 'TODO INV<N>'` returning empty is the current slice's completion signal for that invariant (or sub-invariant).
+- `DEFER INV<N> → <slice-name>:` — the invariant (or sub-invariant) has been honestly reassigned to a named future slice by an architect decision (per the iteration methodology's Loop step 4 sub-split provision — see §CV.7 below). The substrate that will replace the stub lands with that slice, not this one. Deferred markers do NOT trip `git grep 'TODO INV<N>'`.
+
+When the reassignment happens, the slice performing the reassignment updates BOTH the marker in source AND the readiness-map §6 activation row for that invariant to name the new owning slice.
+
+**Cross-check.** `git grep 'TODO INV'` returning empty crate-wide is the load-bearing per-slice completion check. `git grep 'DEFER INV'` returning entries is expected and healthy: each entry is a claim of ownership by a named future slice, not un-owned unblocking work.
+
 ## CV.6 — Suggested ratification order
 
 Review premise-first, then spine, then substrate, then consequences, then the enabled testing layer — because downstream ADRs inherit upstream framing:
@@ -635,6 +671,20 @@ Review premise-first, then spine, then substrate, then consequences, then the en
 5. **ADR-016** (version pin — it scopes the coverage claims, so fix it first) then **ADR-014 → 015** (the enabled testing architecture).
 
 Defer no ADR's *ratification* past the point where something depending on it is ratified — the matrix in CV.2 gives the order. The two highest-value review items are **ADR-000's no-JVM premise** (widest blast radius; if it moves, Alternative 1 deletes ADR-005/006) and **ADR-005's scope together with LB1** (where the implementation cost and risk concentrate).
+
+## CV.7 — Slice sub-split legitimacy (added post-Slice-C, 2026-07-01)
+
+The iteration methodology (`tasks/v2-slice-iteration-methodology.md`, §Loop step 4) explicitly permits the architect of a slice's Pass 1 to propose a further sub-split when the slice as scoped is too large for a single `/new-feature` pipeline pass. Slice C (Pass 1, 2026-07-01) exercised this by decomposing into C.1 (substrate: lowering + operator emission + Slice-B carryover) and C.2 (scalar-expression rows + `SqlGenerator::gen_expr` seam drain). Slice B did not sub-split. Future slices may or may not.
+
+Codified rules:
+
+- **A sub-split is a load-bearing architectural decision, not a scope-punt.** The architect must justify the decomposition in the Pass 1 architecture plan's §0 (or equivalent named section), pick which sub-slice this pass tackles, and enumerate the deferred sub-slice(s)' scopes at the same level of specificity as the original slice's scope.
+- **Each sub-slice runs as its own pass** under the iteration methodology. The methodology's `pass ≤ 5` hard cap counts sub-slice passes; a slice that legitimately sub-splits into three sub-slices consumes three of its five available passes.
+- **Reviewer approval of the sub-splitting Pass 1's architecture plan constitutes assent to the split.** The next sub-slice's Pass N+1 prompt inherits the previous sub-slice's CLOSE_NOW carryover per methodology §Loop step 5.
+- **Sub-split proposals MUST be surfaced textually.** The architect writes "PROPOSED FURTHER SPLIT" in bold near the top of their plan document, so the iteration driver (whether `/goal`-based or manual) can detect and honor the split without ambiguity.
+- **Sub-splits are not deferments.** A `DEFER_LATER_SLICE` classification (per methodology §Classification) reassigns work to a later *slice* (D/E/F/G/H/I/J). A sub-split creates a new *pass within the current slice*. The two are orthogonal — a Pass 2 that closes CLOSE_NOW items from a sub-split may still produce its own DEFER items for future slices.
+
+The sub-split pattern was validated by Slice C: the architect's C.1/C.2 decomposition was reviewer-approved twice (once at the meta level via approval of Pass 1's plan, and once at the code level via APPROVED verdicts on both C.1 and C.2), and the empirical progress signal (12 → 134 `core_v2`) confirmed the decomposition delivered coherent value at each sub-slice boundary. Sub-splits that fail this test — e.g. a Pass 2 that lands but adds no measurable coverage nor closes a load-bearing invariant — indicate the split was cosmetic rather than substantive, and the next slice's iteration should either re-integrate the sub-slice or recalibrate.
 
 ---
 

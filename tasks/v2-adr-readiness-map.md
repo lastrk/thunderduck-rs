@@ -149,9 +149,15 @@ aliased Div CAST) plus M2 log correction; iteration 2 closed all three. Perf ver
 (0 HIGH + 0 MEDIUM); the perf agent noted the seam drain silently absorbed OPT-M2 and Pass-1's
 L1 wins. Files changed (Pass 2): 5 (`emission.rs`, `invariants.rs`, `analyzer.rs`, `service.rs`,
 `generator/mod.rs`); +1947 / -125 lines; 42 tests added (269 core + 14 connect-server pass).
-Progress signal **not yet re-measured** — final Slice-C termination will re-run
-`tests/scripts/v2-progress.sh`; `tests/integration/v2_progress.md` still reads the 12/324
-baseline.
+Progress signal **12 → 134 core_v2 passing** (+122 cases) at commit `28f74b4` per
+`tests/integration/v2_progress.md`. Below the initial-prompt estimate of 180-200 but
+substantial validation of Slice C — every `str-*`/`math-*`/`dt-*`/`cast-*` case that
+lowers cleanly, plus most `proj-*`/`filt-*`/`ord-*`/`set-*` and primitive `agg-*`,
+now passes end-to-end on the DataFrame corpus. **Legacy TPC-H regression check: 51/51
+PASSED** — legacy `SqlGenerator` behavior unchanged. The 46-case gap between measured
+(134) and estimated (180) is the honest cost of the DEFER carryover: some corpus cases
+require extension functions (Slice D), the full join cluster (Slice E), complex types
+(Slice F), or verticals (Slice G) that intentionally remain punted.
 
 **Cumulative DEFER carryover to future slices** (from Pass 2 review + perf):
 - **Extension functions** (`spark_*`, `try_cast`, `try_divide`, `spark_sum`/`spark_avg` on

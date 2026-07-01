@@ -1,4 +1,4 @@
-# Dev Journal — 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1
+# Dev Journal — 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4
 
 ## Slice B — Type & Nullability Analyzer
 
@@ -548,3 +548,117 @@ fallback on `decimal_div_type` non-Decimal) both DEFER.
   `REQUIRED_RENDERERS` list extended.
 
 **2 files changed, +333 / -26 lines.** Zero new unit tests (INV6 is the coverage signal).
+
+---
+
+## Slice C.3-4 — `LocalRelation` Decimal marshalling (scope overturned by diagnostician)
+
+### Summary
+
+Landed as a two-file diff outside `crates/core/src/transpiler_v2/`: the actual bug
+was upstream of both transpilers, in the Spark Connect protobuf → `LogicalPlan`
+converter. The C.3-4 initial prompt (`tasks/v2-slice-c3-initial-prompt.md`) scoped
+the fix as a Div-routing verification inside `emission.rs::render_binary` /
+`render_spark_decimal_div`; the diagnostician's multi-hypothesis pass falsified
+that scope and traced the failing rows to
+`crates/connect-server/src/converter/relation_converter.rs:2513`.
+
+**Progress signal**: **134 → 149 core_v2 passing (+15)** at commit-forthcoming per
+`tests/integration/v2_progress.md`. Substantially above the +3 minimum the
+diagnostician predicted from `type-003/004/005`, and above the +6-8 estimate the
+readiness map assigned to the whole of C.3 (all six fixes). The corpus contained
+more decimal-payload cases than the halt-and-flag audit surfaced.
+
+**Pipeline artifacts**: `.agent-output/001-diagnostic-report.md` through
+`.agent-output/004-verification-log.md`. `/fix-bug` pipeline shape
+(diagnostician / coder / reviewer / verifier / docs). One iteration; APPROVED
+with 0 Critical + 0 High + 2 Mediums DEFERRED (M1 `format_decimal128` negative
+scale, M2 `Decimal256` symmetric arm).
+
+### Bug report vs. actual root cause
+
+The C.3-4 scope named `emission.rs::render_binary` (Slice D Phase 1 addition,
+v2 substrate). The diagnostician constructed the typed AST for
+`nums.select((d1 / d2).alias("r"))` and observed `render_binary` emit
+`CAST(spark_decimal_div(CAST("d1" AS DECIMAL(10,2)), CAST("d2" AS DECIMAL(6,3))) AS DECIMAL(20,9)) AS "r"`
+— byte-perfect Spark parity. `type-005` was **also failing on
+`THUNDERDUCK_TRANSPILER=legacy`** with identical `None` rows, confirming the
+bug lived upstream of transpiler selection.
+
+The real defect: `local_relation_to_values_sql::val()` at
+`relation_converter.rs:2513` had a `_ => Ok("NULL".to_string())` catch-all that
+silently mapped every Arrow type the match did not enumerate — including
+`Decimal128` / `Decimal256` / `Interval*` / `Duration*` / `Binary` / etc. — to
+the string literal `"NULL"`. `spark.createDataFrame(nums_rows, nums_schema)`
+sent decimal columns over the wire correctly, but the converter dropped the
+values to SQL NULL while preserving the schema, so DuckDB executed
+`NULL / NULL = NULL` on every row. `type-005`, `type-003`, `type-004`, and ~12
+other corpus cases touching `emp.bonus` / `dept.budget` / `nums.d1` /
+`nums.d2` all silently produced wrong-answer NULLs.
+
+### Fix location
+
+**Not on the v2 substrate.** All production changes landed in
+`crates/connect-server/src/converter/relation_converter.rs`:
+
+- New `format_decimal128(unscaled: i128, scale: i8) -> String` helper (~15 LOC).
+- New `ArrowDT::Decimal128(p, s)` match arm in `val()`.
+- Silent-NULL catch-all replaced with `Err(ConnectError::PlanConversion(...))`.
+
+The only touch to `crates/core/src/transpiler_v2/emission.rs` was the
+regression unit test the initial prompt asked for — a Div-routing invariant
+lock, no production code change. The v2 substrate needed nothing.
+
+### The `format_decimal128` helper (necessary deviation)
+
+The diagnostician's prescription sketched
+`format!("CAST({v} AS DECIMAL({p}, {s}))")` where `v` is the raw unscaled
+`i128` Arrow stores. That shape produces SQL DuckDB rejects at execution:
+`CAST(3142 AS DECIMAL(6,3))` fails with "Could not cast value 3142 to
+DECIMAL(6,3)" because DuckDB parses the integer literal `3142` before
+scaling, and 3142 exceeds DECIMAL(6,3)'s max (999.999). The helper renders
+the *scaled* literal `3.142`, which DuckDB accepts. This was flagged as a
+named deviation in the implementation log and confirmed necessary by the
+reviewer.
+
+### Loud-fail catch-all as a systemic prevention pattern
+
+The primary hardening lesson from this fix: silent-NULL catch-alls in typed
+dispatch are a data-corruption anti-pattern. The single line
+`_ => Ok("NULL".to_string())` turned a marshalling gap into wrong answers
+for every unhandled Arrow type. Replacing it with a loud
+`Err(ConnectError::PlanConversion("unsupported arrow type in LocalRelation payload: {other:?}"))`
+means the same marshalling gap now surfaces as a visible failure at first
+use — much better posture than silent data corruption. This pattern belongs
+everywhere the connect-server converter translates typed data into a
+downstream SQL/wire representation.
+
+### Progress signal delta — +15, not +3
+
+Diagnostician's minimum prediction: +3 (`type-003`, `type-004`, `type-005` —
+the reproducer set). Actual delivered delta: **+15** (134 → 149). The
+diagnostician had flagged the possibility of indirect unlocks
+(`cast-006`, `cond-004`, `type-019`, and any case touching `emp.bonus`,
+`dept.budget`, `nums.d1`, `nums.d2`), but the corpus turned out to contain
+more silently-NULL'd decimal-payload cases than the halt-and-flag audit had
+visibility into. Legacy TPC-H remained 51/51 (uses `read.parquet` +
+`createOrReplaceTempView`, not `createDataFrame`, so the code path is not
+exercised on that suite).
+
+### Files changed (C.3-4)
+
+- `/workspace/crates/connect-server/src/converter/relation_converter.rs` —
+  `format_decimal128` helper, `Decimal128(p, s)` match arm in `val()`,
+  silent-NULL catch-all replaced with `Err`, plus 3 regression tests
+  (`local_relation_decimal128_column_survives_as_cast_literal`,
+  `local_relation_unhandled_arrow_type_returns_err_not_null`,
+  `format_decimal128_handles_padding_zero_negative_and_scale_zero`).
+- `/workspace/crates/core/src/transpiler_v2/emission.rs` — 1 regression unit
+  test (`decimal_div_decimal_routes_through_spark_decimal_div`) locking in
+  the (already-correct) Div → `spark_decimal_div` routing invariant. No
+  production code change.
+
+**2 files changed, +260 / -5 lines.** 4 regression tests added.
+`type-003`/`type-004`/`type-005` all green on `THUNDERDUCK_TRANSPILER=v2`.
+Deferred: M1 (`format_decimal128` negative-scale defense-in-depth),
+M2 (symmetric `Decimal256` arm — no corpus case exercises).

@@ -134,28 +134,48 @@ test that would have caught the bug before Slice C.3.
   has `TypedAttr.data_type == Long, nullable == false`.
 - **Target case IDs unblocked:** `agg-020`, `agg2-006`.
 
-### C.3-4: `Binary(Div, Decimal, Decimal)` routing verification
+### C.3-4: `Binary(Div, Decimal, Decimal)` routing verification — **CLOSED 2026-07-01**
 
-- **Location:** `emission.rs::render_binary` (Slice D Phase 1 addition;
-  the `render_spark_decimal_div` guard).
-- **Bug hypothesis:** `type-005` and Div-in-`chain-*` fail on `core_v2`
-  despite Slice D Phase 1 having added the `render_spark_decimal_div`
-  branch. Possible causes: (a) guard condition too narrow (matches only
-  literal `Decimal(_,_)` but analyzer produces `Decimal { precision, scale }`
-  with specific values); (b) type inference upstream not classifying
-  operands as Decimal; (c) `TypeInferenceEngine::decimal_div_type` returns
-  something the emission's outer `if let DataType::Decimal { .. } = ...`
-  drops as `Ok(None)` (see reviewer M4).
-- **Fix:** Trace one failing case (`type-005`) end-to-end: what does the
-  analyzer say the operand types are? What does `render_binary` receive?
-  Does `render_spark_decimal_div` return `Ok(Some(...))` or `Ok(None)`?
-  Root-cause and fix at the correct layer. This is a diagnosis task first,
-  fix second.
-- **Regression test:** unit test in `emission::tests` that constructs a
-  `Binary(Div, ColumnReference(a: Decimal(5,2)), ColumnReference(b: Decimal(3,1)))`,
-  dispatches, and asserts the emitted SQL contains `spark_decimal_div(`.
-- **Target case IDs unblocked:** `type-005`, `math-011` (indirect — same
-  root cause if the int/int → DOUBLE cast isn't firing).
+**Status:** LANDED via `/fix-bug` pipeline; delivered **+15** core_v2 delta
+(134 → 149). Diagnostic report at `.agent-output/001-diagnostic-report.md`.
+
+**Scope overturn (retain for future reference):** the diagnostician
+falsified the prompt's scope. `emission.rs::render_binary` /
+`render_spark_decimal_div` was byte-correct against the analyzer's typed
+shape — verified by constructing the exact typed AST for
+`nums.select((d1 / d2).alias("r"))` and observing the emitted SQL was
+`CAST(spark_decimal_div(CAST("d1" AS DECIMAL(10,2)), CAST("d2" AS DECIMAL(6,3))) AS DECIMAL(20,9)) AS "r"`.
+Confirming evidence: `type-005` also failed under
+`THUNDERDUCK_TRANSPILER=legacy` with identical `None`-row symptoms,
+proving the bug lived upstream of transpiler selection.
+
+**Actual root cause:** silent-NULL catch-all in
+`crates/connect-server/src/converter/relation_converter.rs:2513`
+(`local_relation_to_values_sql::val()`). Every Arrow type not enumerated
+by the match — including `Decimal128` — was silently mapped to SQL
+literal `"NULL"`, corrupting every DECIMAL cell in `createDataFrame`
+payloads while the schema stayed correct.
+
+**Fix landed in the connect-server converter, not the v2 substrate:**
+added a `Decimal128(p, s)` match arm with a new `format_decimal128`
+helper (renders the scaled literal DuckDB requires — DuckDB rejects raw
+unscaled `i128` in `CAST(...)`), and replaced the silent-NULL catch-all
+with a loud `Err(ConnectError::PlanConversion("unsupported arrow type ..."))`.
+The regression unit test the initial prompt asked for landed in
+`emission.rs::tests` as `decimal_div_decimal_routes_through_spark_decimal_div`,
+locking in the (already-correct) Div-routing invariant with no
+production-code change on the v2 substrate.
+
+**Target case IDs unblocked:** `type-005`, `type-003`, `type-004`
+(reproducer trio) plus ~12 indirect unlocks touching decimal-payload
+columns. `math-011` was **not** the same bug — it's a reference-side
+Spark 4.x ANSI `DIVIDE_BY_ZERO` on the corpus row `(10, 0, ...)` and is
+tracked separately.
+
+**Lesson**: recorded in `tasks/lessons.md` under "Bug-fix diagnostics" —
+diagnostician-overturned scopes are a strong signal; trust the
+falsification. Silent-NULL catch-alls in typed dispatch are
+data-corruption anti-patterns.
 
 ### C.3-5: `sum(decimal)` routing verification
 

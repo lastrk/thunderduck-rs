@@ -221,6 +221,8 @@ Expression (enum)
 
 8. **Schema inference vs DESCRIBE**: Prefer `plan.infer_schema()` for schema analysis. Only fall back to issuing `DESCRIBE` queries to DuckDB when plan-level inference is impossible.
 
+9. **Loud-fail on unhandled Arrow types in `local_relation_to_values_sql`**: `crates/connect-server/src/converter/relation_converter.rs::val()` used to have a silent `_ => Ok("NULL")` catch-all that mapped every unhandled Arrow type (including `Decimal128`) to SQL literal `NULL`, corrupting `createDataFrame` payloads. Since 2026-07-01 (Slice C.3-4) the catch-all is a loud `Err`; adding a new Arrow-type payload requires a real match arm, not a silent NULL. Rule: no catch-all `Ok` fallbacks for typed dispatch in the connect-server converter.
+
 ## Spark Parity Requirements
 
 **Critical Rule**: Thunderduck must match Spark EXACTLY, not just produce equivalent results.

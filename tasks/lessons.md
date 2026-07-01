@@ -91,6 +91,39 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   discloses them as a named deviation, and (c) the reviewer verifies both scope and
   minimality. Silent cross-module edits are a Critical review finding.
 
+## Bug-fix diagnostics
+
+- **Diagnostician-overturned bug reports are a strong signal — trust the
+  falsification.** Slice C.3-4 (2026-07-01) was scoped by the initial prompt as a
+  Div-routing bug inside `emission.rs::render_binary` / `render_spark_decimal_div`
+  (v2 substrate). The diagnostician's multi-hypothesis pass proved the v2 path
+  was byte-correct and traced the failure two crates over to
+  `crates/connect-server/src/converter/relation_converter.rs:2513` — a
+  silent-NULL catch-all in `local_relation_to_values_sql::val()`. Confirming
+  evidence: `type-005` also failed under `THUNDERDUCK_TRANSPILER=legacy` with
+  identical symptoms, proving the bug lived upstream of transpiler selection.
+  Rule: when a diagnostician says the initial-prompt scope is wrong, don't
+  argue — follow the falsification. `/fix-bug`'s diagnostic-first pipeline
+  shape is specifically designed to surface this kind of scope overturn before
+  the coder starts; `/new-feature`'s architect-first shape assumes the scope
+  is roughly right, which is safe only when there's no bug to reproduce yet.
+
+- **Silent-NULL catch-alls in typed dispatch are data-corruption anti-patterns.**
+  The Slice C.3-4 root cause was a single-line `_ => Ok("NULL".to_string())`
+  at `relation_converter.rs:2513`. It silently mapped every unhandled Arrow
+  type — including `Decimal128`, `Decimal256`, `Interval*`, `Duration*`,
+  `Binary`, etc. — to SQL literal `"NULL"`, corrupting every affected column
+  in `createDataFrame` payloads while preserving the schema. Replacing it
+  with `_ => Err(...)` immediately turned the marshalling gap into a visible
+  failure at first use, and the fix delivered +15 corpus cases (134 → 149) —
+  far above the diagnostician's minimum +3 prediction from `type-003/004/005`,
+  because the halt-and-flag audit had no visibility into the other
+  silently-corrupted decimal-payload cases. Rule: in `crates/connect-server/src/converter/`
+  (and any encoder translating typed data into a downstream SQL/wire
+  representation), no catch-all `Ok` fallbacks for typed dispatch. Every
+  unhandled type surfaces as a loud error. Silent NULL substitution is
+  worse than a loud panic in every case.
+
 ## Progress-signal calibration
 
 - **Per-slice progress-signal estimates are lagging indicators; recalibrate after each slice

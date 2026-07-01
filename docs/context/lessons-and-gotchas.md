@@ -53,3 +53,11 @@ Review before working on SQL generation, expression handling, threading, extensi
 **Gotcha**: Falling back to `DESCRIBE` queries against DuckDB to learn a plan's schema is slow and round-trips through SQL.
 
 **Rule**: Prefer `plan.infer_schema()` for schema analysis. Only issue `DESCRIBE` when plan-level inference is genuinely impossible (e.g., a `RawSql` node with no upstream type info).
+
+## Loud-Fail on Unhandled Arrow Types in `local_relation_to_values_sql`
+
+**Gotcha**: `crates/connect-server/src/converter/relation_converter.rs::local_relation_to_values_sql::val()` translates each Arrow cell in a `createDataFrame` payload into a SQL literal. Prior to Slice C.3-4 (2026-07-01), an `_ => Ok("NULL".to_string())` catch-all silently mapped every unhandled Arrow type (`Decimal128`, `Decimal256`, `Interval*`, `Duration*`, `Binary`, `Time*`, `Dictionary`, ...) to SQL literal `NULL`. The `SqlRelation` schema was still correct, so DuckDB executed queries where the columns promised DECIMAL but the payload was NULL — producing all-NULL rows for `type-003/004/005` and ~12 other decimal-payload cases while the reference had real values.
+
+**Past bug**: Silent NULL substitution turned a marshalling gap into wrong-answer data corruption for every unhandled Arrow type. The failure was invisible on the differential's row-count / schema check and only surfaced as `None`-valued cells.
+
+**Rule**: The catch-all is now `_ => Err(ConnectError::PlanConversion("unsupported arrow type in LocalRelation payload: {other:?}"))`. Any new Arrow-type payload must land as a real match arm — never `Ok("NULL")`. This posture applies to every encoder in `crates/connect-server/src/converter/` that translates typed data into a downstream SQL/wire representation: no catch-all `Ok` fallbacks for typed dispatch.

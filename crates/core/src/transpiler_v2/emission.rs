@@ -2743,6 +2743,80 @@ mod tests {
         );
     }
 
+    /// C.3-4 regression: `Div(Decimal, Decimal)` on a typed AST must route
+    /// through `render_spark_decimal_div` so the emitted SQL contains a call
+    /// to the `spark_decimal_div` extension. Locks in the current correct
+    /// routing behavior so a future refactor of `render_binary`'s Div arm
+    /// cannot silently regress DECIMAL/DECIMAL division back to a naked
+    /// `d1 / d2` (which would violate Spark's ROUND_HALF_UP semantics).
+    ///
+    /// Uses `Decimal(5, 2) / Decimal(3, 1)` per the C.3-4 prompt.
+    #[test]
+    fn decimal_div_decimal_routes_through_spark_decimal_div() {
+        let nums_schema = StructType::new(vec![
+            StructField::nullable(
+                "a",
+                DataType::Decimal {
+                    precision: 5,
+                    scale: 2,
+                },
+            ),
+            StructField::nullable(
+                "b",
+                DataType::Decimal {
+                    precision: 3,
+                    scale: 1,
+                },
+            ),
+        ]);
+        let mut bt = BaseTypes::new();
+        bt.insert("nums".to_string(), nums_schema.clone());
+
+        let ast = CommonAst {
+            root: CommonOp::Project(Project {
+                input: Box::new(CommonOp::TableScan(TableScan {
+                    name: "nums".to_string(),
+                    schema: nums_schema,
+                })),
+                projections: vec![Expression::Alias(AliasExpression {
+                    expr: Box::new(Expression::Binary(BinaryExpression {
+                        op: BinaryOp::Div,
+                        left: Box::new(Expression::ColumnReference(ColumnReference {
+                            name: "a".to_string(),
+                            qualifier: None,
+                            data_type: DataType::Decimal {
+                                precision: 5,
+                                scale: 2,
+                            },
+                            nullable: true,
+                        })),
+                        right: Box::new(Expression::ColumnReference(ColumnReference {
+                            name: "b".to_string(),
+                            qualifier: None,
+                            data_type: DataType::Decimal {
+                                precision: 3,
+                                scale: 1,
+                            },
+                            nullable: true,
+                        })),
+                    })),
+                    alias: "r".to_string(),
+                })],
+            }),
+        };
+        let typed = analyze(ast, &bt).expect("analyze must succeed");
+        let sql = dispatch(&typed.root).expect("dispatch must succeed");
+        let s = sql.as_str();
+        assert!(
+            s.contains("spark_decimal_div("),
+            "Decimal/Decimal Div must route through spark_decimal_div, got {s:?}"
+        );
+        assert!(
+            s.contains("AS \"r\""),
+            "alias binding must still emit AS \"r\", got {s:?}"
+        );
+    }
+
     #[test]
     fn agg_sum_of_integer_wraps_in_bigint_cast() {
         // Verify `render_aggregate` wraps SUM(int) in CAST AS BIGINT.

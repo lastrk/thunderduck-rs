@@ -64,3 +64,11 @@ A follow-up mini-slice is needed to close the pre-Slice-D-audit-missed Slice C.2
 Recommendation: NEW SLICE `Slice C.3 — Slice C.2 latent-bug corrections` (or equivalent), positioned in the readiness map between Slice C and Slice D. Fixes these before Slice D Phase 1's target cases can meaningfully turn green.
 
 **Slice D Phase 1 iteration terminates in a halt-and-flag state; Slice D as a whole is NOT declared complete.** Phase 2 (ext5) remains blocked externally. The next `/goal` for Slice D should either (a) drive Slice C.3 first, or (b) expand Phase 1's scope to include the corrections.
+
+### Phase 1 termination update (2026-07-01) — C.3-4 closed, larger unblock than expected
+
+Slice C.3-4 landed as a `/fix-bug` pass (commit forthcoming). The diagnostician overturned the C.3-4 scope: the failing rows were NOT caused by `emission.rs::render_binary` (which the diagnostician verified was byte-correct against the analyzer's typed shape), but by a silent-NULL catch-all in `crates/connect-server/src/converter/relation_converter.rs:2513` — the `local_relation_to_values_sql::val()` catch-all silently mapped `Decimal128` (and every other unhandled Arrow type) to SQL literal `"NULL"`, corrupting every DECIMAL cell in `createDataFrame` payloads. Fix landed there, not on the v2 substrate.
+
+**Progress signal delta: 134 → 149 core_v2 passing (+15)** — far above the +3 minimum prediction from `type-003/004/005`. The corpus contained many more silently-NULL'd decimal-payload cases than the halt-and-flag audit had visibility into. Legacy TPC-H 51/51 unregressed. `type-005` closed; `math-011` remains a reference-side Spark 4.x ANSI `DIVIDE_BY_ZERO` (not a Thunderduck bug).
+
+**C.3-4 is now closed.** The remaining five Slice C.3 fixes (C.3-1 sha/sha1/sha2 arg-stripping, C.3-2 hash/xxhash64 nullability, C.3-3 count_if predicate typing, C.3-5 sum(decimal) routing verification, C.3-6 percentile_approx/median shape verification) still gate the Phase 1 hash/count_if/sum/percentile target cases. Slice D Phase 1's remaining target case IDs can turn green after those five land.

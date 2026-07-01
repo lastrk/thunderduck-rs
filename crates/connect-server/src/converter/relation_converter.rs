@@ -2242,13 +2242,43 @@ fn proto_literal_to_core(lit: &proto::expression::Literal) -> Result<Literal> {
 
 // ── LocalRelation data materialisation ─────────────────────────────────────────
 
+/// Render an Arrow-encoded unscaled `i128` decimal value as a Spark-parity
+/// decimal literal (e.g. unscaled `10025` at scale `2` → `"100.25"`; unscaled
+/// `3142` at scale `3` → `"3.142"`). The output is a plain decimal literal
+/// suitable to embed in `CAST(<literal> AS DECIMAL(p, s))` in DuckDB.
+///
+/// - `scale < 0` is not a shape Spark emits; the fallback prints the unscaled
+///   integer as-is (DuckDB will error at cast time, matching the loud-fail
+///   posture of the surrounding `val()` catch-all).
+/// - `scale == 0` emits a bare integer literal (no trailing dot).
+fn format_decimal128(unscaled: i128, scale: i8) -> String {
+    if scale <= 0 {
+        return unscaled.to_string();
+    }
+    let scale_usize = scale as usize;
+    let negative = unscaled < 0;
+    // Take the magnitude via unsigned `u128` to avoid overflow on i128::MIN.
+    let magnitude = unscaled.unsigned_abs();
+    let digits = magnitude.to_string();
+    let sign = if negative { "-" } else { "" };
+    if digits.len() > scale_usize {
+        let split = digits.len() - scale_usize;
+        let (int_part, frac_part) = digits.split_at(split);
+        format!("{sign}{int_part}.{frac_part}")
+    } else {
+        // Pad the fractional part with leading zeros so it lines up at `scale`.
+        let pad = scale_usize - digits.len();
+        format!("{sign}0.{zeros}{digits}", zeros = "0".repeat(pad))
+    }
+}
+
 /// Parse Arrow IPC bytes and emit a `(SELECT … UNION ALL SELECT …)` SQL expression
 /// that can be used as a subquery anywhere a table expression is valid in DuckDB.
 fn local_relation_to_values_sql(data: &[u8]) -> Result<String> {
     use arrow::array::{
-        Array, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array, Int32Array,
-        Int64Array, Int8Array, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
-        TimestampMicrosecondArray,
+        Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int16Array,
+        Int32Array, Int64Array, Int8Array, LargeStringArray, ListArray, MapArray, StringArray,
+        StructArray, TimestampMicrosecondArray,
     };
     use arrow::datatypes::DataType as ArrowDT;
     use arrow_ipc::reader::StreamReader;
@@ -2510,7 +2540,41 @@ fn local_relation_to_values_sql(data: &[u8]) -> Result<String> {
                     .collect::<Result<Vec<_>>>()?;
                 Ok(format!("{{{}}}", pairs.join(", ")))
             }
-            _ => Ok("NULL".to_string()),
+            // Preserve DECIMAL values through the wire. Without this arm the
+            // catch-all below would silently substitute the string "NULL",
+            // corrupting every Decimal column in a `createDataFrame` payload
+            // (see diagnostic report for `type-005` / `type-003` / `type-004`).
+            //
+            // Arrow stores decimals as an unscaled i128; DuckDB's CAST
+            // interprets its argument as an already-parsed value, so we must
+            // render the *scaled* decimal literal (e.g. unscaled `10025` at
+            // scale=2 → `100.25`), not the raw integer. Emitting `100.25`
+            // directly and CASTing to `DECIMAL(p, s)` is the shape Spark's
+            // reference emits and DuckDB accepts.
+            ArrowDT::Decimal128(p, s) => {
+                let a = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        ConnectError::PlanConversion(format!(
+                            "downcast failed for {:?}",
+                            array.data_type()
+                        ))
+                    })?;
+                let unscaled = a.value(row);
+                Ok(format!(
+                    "CAST({} AS DECIMAL({p}, {s}))",
+                    format_decimal128(unscaled, *s)
+                ))
+            }
+            // Never silently substitute NULL for an unhandled Arrow type.
+            // Silent NULL substitution turns a marshalling gap into wrong-
+            // answer data corruption (which is exactly how the `type-005`
+            // DECIMAL-column bug hid). Surface the gap loudly so the caller
+            // can fall back to a schema-only relation or fail closed.
+            other => Err(ConnectError::PlanConversion(format!(
+                "unsupported arrow type in LocalRelation payload: {other:?}"
+            ))),
         }
     }
 
@@ -3012,6 +3076,113 @@ mod tests {
         assert_eq!(
             resolve_parquet_path("/data/part-00000.gz.parquet"),
             "/data/part-00000.gz.parquet"
+        );
+    }
+
+    /// Build an Arrow IPC stream containing a single RecordBatch, suitable for
+    /// feeding to `local_relation_to_values_sql`. Returns the raw IPC bytes
+    /// (the same shape PySpark sends inside `proto::LocalRelation.data`).
+    fn arrow_ipc_bytes(batch: &arrow::record_batch::RecordBatch) -> Vec<u8> {
+        use arrow_ipc::writer::StreamWriter;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer =
+                StreamWriter::try_new(&mut buf, &batch.schema()).expect("IPC writer init");
+            writer.write(batch).expect("IPC write");
+            writer.finish().expect("IPC finish");
+        }
+        buf
+    }
+
+    /// Regression for the `type-005` failure: a `Decimal128(10, 2)` column in
+    /// a `LocalRelation` payload must be preserved as a real DECIMAL literal
+    /// in the emitted VALUES SQL — NOT silently substituted with `NULL`.
+    ///
+    /// Diagnostic report: silent NULL substitution in the catch-all arm of
+    /// `local_relation_to_values_sql::val()` was corrupting every Decimal
+    /// column arriving via `spark.createDataFrame(...)`.
+    #[test]
+    fn local_relation_decimal128_column_survives_as_cast_literal() {
+        use arrow::array::Decimal128Array;
+        use arrow::datatypes::{DataType as ArrowDT, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        // Value 10025 at scale=2 encodes 100.25 — same shape the corpus uses.
+        let arr = Decimal128Array::from(vec![10025_i128])
+            .with_precision_and_scale(10, 2)
+            .expect("valid decimal precision/scale");
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "d1",
+            ArrowDT::Decimal128(10, 2),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch");
+        let ipc = arrow_ipc_bytes(&batch);
+
+        let sql = local_relation_to_values_sql(&ipc).expect("marshalling must succeed");
+        // Arrow stores the unscaled i128 (10025); the SQL literal must be the
+        // *scaled* decimal (100.25) inside `CAST(... AS DECIMAL(10, 2))` so
+        // DuckDB accepts the value at the declared precision/scale.
+        assert!(
+            sql.contains("CAST(100.25 AS DECIMAL(10, 2))"),
+            "Decimal128 cell must render as an explicit DECIMAL cast at the scaled value, got {sql:?}"
+        );
+        assert!(
+            !sql.contains(" NULL AS \"d1\""),
+            "Decimal128 cell must NOT be substituted with NULL, got {sql:?}"
+        );
+    }
+
+    /// Unit-level coverage for the `format_decimal128` helper: makes sure the
+    /// unscaled i128 → scaled-decimal-literal conversion handles the tricky
+    /// cases (padding, zero, negative, scale=0) that DuckDB will otherwise
+    /// reject at CAST time.
+    #[test]
+    fn format_decimal128_handles_padding_zero_negative_and_scale_zero() {
+        // Common shape: 100.25 stored as unscaled 10025 at scale 2.
+        assert_eq!(format_decimal128(10025, 2), "100.25");
+        // Padding case: 0.001 stored as unscaled 1 at scale 3 requires two
+        // leading zeros in the fractional part.
+        assert_eq!(format_decimal128(1, 3), "0.001");
+        // Zero at any positive scale still needs the fractional zeros.
+        assert_eq!(format_decimal128(0, 3), "0.000");
+        // Negative value must preserve the sign in front of the literal.
+        assert_eq!(format_decimal128(-3142, 3), "-3.142");
+        // Scale=0 emits a bare integer, no trailing dot.
+        assert_eq!(format_decimal128(42, 0), "42");
+        // Exactly one digit at scale=1: needs `0.` prefix.
+        assert_eq!(format_decimal128(5, 1), "0.5");
+    }
+
+    /// Regression: `val()`'s catch-all must return `Err` for any Arrow type
+    /// it does not explicitly handle. Silent NULL substitution masked the
+    /// `type-005` decimal-marshalling bug for a long time; the fallback must
+    /// now fail loudly so future gaps surface immediately.
+    ///
+    /// `Binary` is a good stand-in for "an Arrow type we don't handle" —
+    /// it isn't in the match arms and Spark's `createDataFrame` doesn't
+    /// send it today, but a future codepath might.
+    #[test]
+    fn local_relation_unhandled_arrow_type_returns_err_not_null() {
+        use arrow::array::BinaryArray;
+        use arrow::datatypes::{DataType as ArrowDT, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let arr = BinaryArray::from_vec(vec![b"payload".as_slice()]);
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "b",
+            ArrowDT::Binary,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).expect("batch");
+        let ipc = arrow_ipc_bytes(&batch);
+
+        let result = local_relation_to_values_sql(&ipc);
+        assert!(
+            matches!(result, Err(ConnectError::PlanConversion(ref m)) if m.contains("unsupported arrow type")),
+            "unhandled Arrow type must return PlanConversion Err, got {result:?}"
         );
     }
 }

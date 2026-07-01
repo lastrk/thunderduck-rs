@@ -4,7 +4,7 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
-## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1
+## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4
 
 [`dev_journal/2026-07-01-v2-slice-b-analyzer.md`](dev_journal/2026-07-01-v2-slice-b-analyzer.md)
 
@@ -55,7 +55,25 @@ via iter 2; M2 scoped-differential at Phase 1 termination; M3 + M4 DEFER). Perf
 `OPTIMIZED` (5 LOWs all deferred). Slice D as a whole does not terminate here — Phase 2
 remains blocked on the ext5 pin.
 
-**Tests**: 269 core + 14 connect-server · differential unchanged (not re-run)
+**Slice C.3-4** (post-Slice-D-Phase-1 halt-and-flag; `/fix-bug` pipeline): the C.3-4
+initial-prompt scope named `emission.rs::render_binary` / `render_spark_decimal_div`, but
+the diagnostician's multi-hypothesis pass overturned the scope. Actual root cause was
+upstream of both transpilers, in `crates/connect-server/src/converter/relation_converter.rs:2513`:
+a silent-NULL catch-all in `local_relation_to_values_sql::val()` mapped every unhandled Arrow
+type (including `Decimal128`) to the SQL literal `"NULL"`, corrupting every DECIMAL cell in
+`createDataFrame` payloads. Fix: added a `Decimal128(p, s)` match arm with a new
+`format_decimal128` helper (renders the scaled literal DuckDB requires — the diagnostician's
+naive `CAST(<unscaled i128> AS DECIMAL(p,s))` prescription would have hit DuckDB's out-of-range
+CAST error) and replaced the catch-all with a loud `Err`. Regression tests: 3 in
+`relation_converter.rs` (Decimal128 round-trip; unhandled-type errors; `format_decimal128`
+padding/zero/negative/scale-0) plus 1 Div-routing invariant lock in `emission.rs`.
+**Progress signal delta: 134 → 149 core_v2 passing (+15)** — far above the +3 minimum
+prediction from `type-003/004/005`; the corpus contained many more silently-NULL'd
+decimal-payload cases than the halt-and-flag audit had visibility into. Legacy TPC-H 51/51
+unregressed. Deferred: M1 (`format_decimal128` negative-scale defense-in-depth), M2 (symmetric
+`Decimal256` arm — no corpus case exercises).
+
+**Tests**: 269 core + 14 connect-server (+ 4 regression tests from C.3-4) · differential unchanged (not re-run)
 
 ---
 

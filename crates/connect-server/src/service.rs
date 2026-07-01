@@ -2,9 +2,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::stream;
+use thunderduck_core::error::ThunderduckError;
 use thunderduck_core::generator::SqlGenerator;
 use thunderduck_core::logical::LogicalPlan;
 use thunderduck_core::runtime::{SchemaInferrer, SessionManager, StreamBatch};
+use thunderduck_core::transpiler_v2::analyzer::{AnalyzerError, BaseTypes};
+use thunderduck_core::transpiler_v2::emission::EmissionError;
 use thunderduck_core::transpiler_v2::{self, TranspilerPath};
 use thunderduck_core::types::DataType;
 use tonic::{Request, Response, Status};
@@ -43,16 +46,135 @@ impl ThunderduckService {
 ///
 /// This is the single dispatch seam between the legacy
 /// [`SqlGenerator`] path and the rearchitected [`transpiler_v2`] path. The
-/// path is chosen once at startup ([`ThunderduckService::transpiler`]); the
-/// v2 arm currently fails with a gRPC `Unimplemented` status until that
-/// pipeline lands.
+/// path is chosen once at startup ([`ThunderduckService::transpiler`]).
+///
+/// V2 semantics (Slice C.1): try `transpiler_v2::generate` with a
+/// [`BaseTypes`] seed built by [`build_base_types_from_plan`]. If the v2
+/// pipeline punts (unsupported operator, unknown table, or a
+/// [`EmissionError::UnsupportedOp`]) fall back to legacy so the request
+/// keeps working while the v2 path grows coverage. Every *other* v2
+/// error surfaces — we do NOT silently mask analyzer / emitter bugs.
 fn generate_sql(transpiler: TranspilerPath, plan: &LogicalPlan) -> Result<String, Status> {
     match transpiler {
         TranspilerPath::Legacy => SqlGenerator::new()
             .generate(plan)
             .map_err(|e| Status::from(ConnectError::SqlGeneration(e))),
-        TranspilerPath::V2 => transpiler_v2::generate(plan)
-            .map_err(|e| Status::from(ConnectError::Unsupported(e.to_string()))),
+        TranspilerPath::V2 => {
+            let base_types = build_base_types_from_plan(plan);
+            match transpiler_v2::generate(plan, &base_types) {
+                Ok(sql) => Ok(sql),
+                Err(e) if is_v2_fallback_eligible(&e) => {
+                    tracing::debug!(reason = %e, "v2 fallback to legacy");
+                    SqlGenerator::new()
+                        .generate(plan)
+                        .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))
+                }
+                Err(e) => Err(Status::from(ConnectError::Unsupported(e.to_string()))),
+            }
+        }
+    }
+}
+
+/// Whether a v2 error is a coverage gap we can silently fall back on
+/// (vs. a real bug that must surface).
+///
+/// Fallback-eligible: [`AnalyzerError::PuntedOperator`] (adapter marked
+/// the op out-of-scope for Slice B), [`AnalyzerError::UnknownTable`]
+/// (catalog seed missing the referenced view — legacy resolves it via
+/// DuckDB), [`EmissionError::UnsupportedOp`] (no emission row matched).
+///
+/// NOT fallback-eligible (must surface as `Unsupported`): analyzer
+/// `AmbiguousColumn` / `TypeMismatch` / `SetOpArityMismatch`, emitter
+/// `ChildFailed` / `MissingField` / `LegacyRenderFailed`, and every
+/// [`ThunderduckError::V2Lowering`] variant (structural adapter defects).
+fn is_v2_fallback_eligible(e: &ThunderduckError) -> bool {
+    matches!(
+        e,
+        ThunderduckError::V2Analyzer(AnalyzerError::PuntedOperator { .. })
+            | ThunderduckError::V2Analyzer(AnalyzerError::UnknownTable { .. })
+            | ThunderduckError::V2Emission(EmissionError::UnsupportedOp { .. })
+    )
+}
+
+/// Build the v2 analyzer's [`BaseTypes`] seed by walking the plan for
+/// [`LogicalPlan::TableScan`] and [`LogicalPlan::InMemoryRelation`]
+/// nodes and copying each one's schema into the catalog.
+///
+/// Bounded walk (a plan-scoped subset, not a session-wide catalog dump).
+/// Async session lookups are deferred to a follow-up — Slice C.1 accepts
+/// that a table-scan without a pre-populated schema will produce an
+/// [`AnalyzerError::UnknownTable`], which the fallback wrapper handles
+/// by delegating to legacy.
+fn build_base_types_from_plan(plan: &LogicalPlan) -> BaseTypes {
+    let mut base = BaseTypes::new();
+    collect_base_types(plan, &mut base);
+    base
+}
+
+fn collect_base_types(plan: &LogicalPlan, out: &mut BaseTypes) {
+    use LogicalPlan::*;
+    match plan {
+        TableScan(t) if !t.schema.is_empty() => {
+            out.entry(t.table.clone())
+                .or_insert_with(|| t.schema.clone());
+        }
+        InMemoryRelation(r) if !r.schema.is_empty() => {
+            out.entry(r.view_name.clone())
+                .or_insert_with(|| r.schema.clone());
+        }
+        // Single-child recursion
+        Project(p) => collect_base_types(&p.input, out),
+        Filter(f) => collect_base_types(&f.input, out),
+        Aggregate(a) => collect_base_types(&a.input, out),
+        Sort(s) => collect_base_types(&s.input, out),
+        Limit(l) => collect_base_types(&l.input, out),
+        Tail(t) => collect_base_types(&t.input, out),
+        Distinct(d) => collect_base_types(&d.input, out),
+        WithColumns(w) => collect_base_types(&w.input, out),
+        DropColumns(d) => collect_base_types(&d.input, out),
+        AliasedRelation(a) => collect_base_types(&a.input, out),
+        Sample(s) => collect_base_types(&s.input, out),
+        ToDataFrame(t) => collect_base_types(&t.input, out),
+        ShowString(s) => collect_base_types(&s.input, out),
+        NADrop(n) => collect_base_types(&n.input, out),
+        NAFill(n) => collect_base_types(&n.input, out),
+        NAReplace(n) => collect_base_types(&n.input, out),
+        Unpivot(u) => collect_base_types(&u.input, out),
+        Pivot(p) => collect_base_types(&p.input, out),
+        StatCov(s) => collect_base_types(&s.input, out),
+        StatCorr(s) => collect_base_types(&s.input, out),
+        ApproxQuantile(a) => collect_base_types(&a.input, out),
+        StatCrosstab(s) => collect_base_types(&s.input, out),
+        StatFreqItems(s) => collect_base_types(&s.input, out),
+        StatSampleBy(s) => collect_base_types(&s.input, out),
+        Describe(d) => collect_base_types(&d.input, out),
+        Summary(s) => collect_base_types(&s.input, out),
+        // Two-child recursion
+        Join(j) => {
+            collect_base_types(&j.left, out);
+            collect_base_types(&j.right, out);
+        }
+        Union(u) => {
+            collect_base_types(&u.left, out);
+            collect_base_types(&u.right, out);
+        }
+        Except(e) => {
+            collect_base_types(&e.left, out);
+            collect_base_types(&e.right, out);
+        }
+        Intersect(i) => {
+            collect_base_types(&i.left, out);
+            collect_base_types(&i.right, out);
+        }
+        WithCte(c) => {
+            collect_base_types(&c.input, out);
+            for (_, sub) in &c.ctes {
+                collect_base_types(sub, out);
+            }
+        }
+        // Leaves without a scan-relevant schema
+        TableScan(_) | SqlRelation(_) | LocalRelation(_) | LocalDataRelation(_)
+        | RangeRelation(_) | InMemoryRelation(_) | DdlStatement(_) | SingleRow(_) => {}
     }
 }
 

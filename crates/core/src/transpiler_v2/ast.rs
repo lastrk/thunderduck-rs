@@ -202,6 +202,16 @@ pub struct Union {
     pub right: Box<CommonOp>,
     /// When true, `UNION ALL` semantics; when false, deduplicated `UNION`.
     pub all: bool,
+    /// When true, `unionByName` semantics: match right's columns to left's by
+    /// name (reordering the right side) before positional widening. Analyzer
+    /// Pass 1 rewrites the right child's field order to match the left when
+    /// this is set; Pass 2's positional union widening then applies as normal.
+    ///
+    /// The [`crate::transpiler_v2::lowering`] adapter defaults this to `false`
+    /// because [`crate::logical::LogicalPlan::Union`] does not currently carry
+    /// a `by_name` marker; a `unionByName` corpus case would remain positional
+    /// until a follow-up plumbs the flag through `PlanConverter`.
+    pub by_name: bool,
 }
 
 /// `df.intersect(...)` / `df.intersectAll(...)`.

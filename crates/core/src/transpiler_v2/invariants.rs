@@ -14,9 +14,17 @@ use super::analyzer::{
     analyze, has_resolved_schema, inference_smoke, BaseTypes, TypedAttr, TypedOp,
 };
 use super::ast::{CommonAst, CommonOp, Project, TableScan};
-use super::emission::{extension_targets, external_emit_paths, EmissionTable, ExternalEmit};
+use super::emission::{
+    dispatch, extension_targets, external_emit_paths, EmissionTable, ExternalEmit,
+};
 use super::provenance::{emit_write, Error as ProvError, ExternalRelation, Provenance};
-use super::{set_serializer_tap, C_ESCAPE_HATCHES};
+// The `set_serializer_tap` name is deprecated in favor of `set_emit_tap`
+// (see `mod.rs`); INV1 asserts the deprecated alias still delegates
+// correctly, so the `#[allow(deprecated)]` on that use site below is
+// the deprecation-alias contract check.
+#[allow(deprecated)]
+use super::set_serializer_tap;
+use super::{clear_emit_tap, set_emit_tap, C_ESCAPE_HATCHES};
 use crate::expression::{
     AliasExpression, BinaryExpression, BinaryOp, Expression, UnresolvedColumn,
 };
@@ -25,23 +33,39 @@ use crate::types::{DataType, StructField, StructType};
 /// **INV1 — Both engines receive byte-identical input.** (Touches ADR-015; constrains ADR-001.) Parity-via-identical-bytes is achieved by serialize-once-send-twice. Note this is *not* violated by ADR-001's cosmetic simplifications: cosmetic simplification is a τ transformation applied *once*, upstream of the single serialization, so both engines still receive the same simplified bytes — and DuckDB SQL is consumed only by DuckDB, never by Spark, so the cosmetic DuckDB cleanup is invisible to the comparison. (This is exactly why the rejected production-*canonicalizer* was different: it was proposed as a normalization that could differ from what Spark sees.) A proposal to add production-side normalization that could differ per engine, or that Spark would observe, must demonstrate it does not break this.
 ///
 /// ADR cross-reference: ADR-015 (differential harness) / ADR-001 (cosmetic τ).
-/// today: no serializer exists, so the tap is a no-op and no payloads are recorded.
-/// TODO INV1: assert `payloads.len() == 2 && payloads[0] == payloads[1]` once the v2 serializer + harness land (ADR-015).
+/// today: the full serialize-once-send-twice check is owned by the
+/// differential harness in `tests/integration/` (ADR-015). Slice C.1
+/// keeps this unit stub in place so the invariant name and structural
+/// reservation exist; the check itself will be re-implemented on the
+/// harness side, not here.
+///
+/// TODO INV1: the differential harness owns this — assert
+/// `payloads.len() == 2 && payloads[0] == payloads[1]` once ADR-015's
+/// harness ships. The `set_emit_tap` renamed hook (Slice C.1) is the
+/// wire on the v2-emitter side; INV2 exercises it locally.
 #[test]
+#[allow(deprecated)] // intentional: this test asserts the deprecated
+                     // `set_serializer_tap` alias still delegates to
+                     // `set_emit_tap`. When the alias is removed, so is
+                     // this test.
 fn inv1_both_engines_receive_byte_identical_input() {
-    // Structural reservation: the serializer tap's signature is fixed even
-    // though no serializer exists yet. Setting a tap must succeed and remain
-    // a no-op — otherwise a future serializer that starts emitting would
-    // silently take the wrong path.
+    // Structural reservation: the serializer tap's signature is fixed
+    // even though no differential harness owns it yet. Setting a tap
+    // must succeed via both the renamed `set_emit_tap` and the retained
+    // (deprecated) `set_serializer_tap` alias — otherwise a future
+    // serializer that starts emitting would silently take the wrong
+    // path.
     fn noop_tap(_bytes: &[u8]) {}
     set_serializer_tap(noop_tap);
+    set_emit_tap(noop_tap);
+    clear_emit_tap();
 
-    // TODO INV1: replace with `assert_eq!(recorded_spark_bytes, recorded_duckdb_bytes)`
-    // once the serialize-once-send-twice harness (ADR-015) is wired.
+    // TODO INV1: the differential harness activates the full check;
+    // this unit stub keeps the name reserved.
     let payloads: &[&[u8]] = &[];
     assert!(
         payloads.is_empty(),
-        "no payloads recorded until ADR-015 harness ships"
+        "differential harness (ADR-015) owns the full INV1 check"
     );
 }
 
@@ -68,19 +92,124 @@ fn inv2_node_local_or_labeled_escape_hatch() {
     }
 }
 
-/// **INV3 — The emission table is the single source of truth for generation and coverage.** (Touches ADR-009, ADR-014, ADR-015.) Refinements to the table must keep both the input grammar and the coverage denominator derived from it; they must not drift into separate artifacts.
+/// **INV3 — The dispatch match arms in `emission::dispatch_op` are the single source of truth for v2 SQL shape; there is no runtime string dispatch.** (Touches ADR-009, ADR-014, ADR-015.) In Slice C.1 the emitter is a hand-written `match` over `TypedOp` discriminants — declarative-not-runtime discipline is preserved by keeping every `TypedOp → SQL` decision inside those arms and by disallowing module-level imports of the legacy runtime `FunctionRegistry`. Slice C.2 promotes the arms to declarative per-function rows once row count justifies the substrate; INV3's `use crate::generator::SqlGenerator` allowance is a *deliberate seam* that C.2 will drain.
 ///
-/// ADR cross-reference: ADR-009 (declarative emission table) / ADR-014 (attributability) / ADR-015 (coverage denominator).
-/// today: `EmissionTable` is a unit-struct placeholder; there is only one dispatch artifact by construction.
-/// TODO INV3: once the table carries real dispatch entries, assert generation and coverage both derive from `EmissionTable` and no sibling module declares a competing table.
+/// ADR cross-reference: ADR-009 (declarative emission) / ADR-014 (attributability) / ADR-015 (coverage denominator).
+/// today: `EmissionTable::dispatch` is the sole public path to build an
+/// `EmittedSql`; `emission::dispatch_op`'s `match` covers every
+/// `TypedOp` variant Slice C.1 supports. Slice C.2 replaces per-function
+/// `SqlGenerator::gen_expr` calls with declarative rows; when it lands
+/// the `SqlGenerator` import in `emission.rs` goes away and this test
+/// should reject it entirely.
 #[test]
 fn inv3_emission_table_single_source_of_truth() {
-    // Structural reservation: the *only* dispatch artifact is
+    // Structural reservation: the *only* public dispatch artifact is
     // `emission::EmissionTable`. Constructing one is the reservation.
     let _table = EmissionTable;
 
-    // TODO INV3: assert that generation and coverage both trace back to this
-    // single artifact once ADR-009's real dispatch entries land.
+    // Slice C.1 teeth (part 1) — grep-based: the emission module MUST
+    // NOT import the runtime `FunctionRegistry` at the module surface.
+    // Delegation to the legacy scalar-expression renderer
+    // (`SqlGenerator::gen_expr`) is permitted inside a helper fn
+    // (documented as the C.2 seam), but importing the function registry
+    // directly would let arbitrary runtime dispatch leak in. This is
+    // the ADR-014 contamination barrier applied to source text.
+    //
+    // We check specifically for `use ...FunctionRegistry` module-level
+    // clauses (not any mention of the name in doc comments — those may
+    // reference the type to explain the seam).
+    const EMISSION_SRC: &str = include_str!("emission.rs");
+    assert!(
+        !EMISSION_SRC.contains("use crate::functions::FunctionRegistry"),
+        "INV3 violated: emission.rs imports `FunctionRegistry` (ADR-009 declarative-not-runtime)"
+    );
+    assert!(
+        !EMISSION_SRC.contains("use crate::functions::*"),
+        "INV3 violated: emission.rs glob-imports crate::functions (ADR-014 contamination barrier)"
+    );
+    assert!(
+        !EMISSION_SRC.contains("SqlGenerator::new().generate("),
+        "INV3 violated: emission.rs calls `SqlGenerator::generate` (should go through the emission table)"
+    );
+    assert!(
+        !EMISSION_SRC.contains("use crate::generator::*"),
+        "INV3 violated: emission.rs glob-imports crate::generator (ADR-014 contamination barrier)"
+    );
+
+    // Slice C.1 teeth (part 2) — coverage anchor: the SQL-emitting
+    // choke point is the set of `render_<op>` helpers reachable from
+    // `dispatch_op`'s match. Enumerate their function names in source
+    // so a future refactor can't rename them out from under the arm
+    // without failing this test. Any new op arm must add its
+    // `render_<op>` here.
+    const REQUIRED_RENDERERS: &[&str] = &[
+        "fn render_project",
+        "fn render_filter",
+        "fn render_sort",
+        "fn render_limit",
+        "fn render_tail",
+        "fn render_distinct",
+        "fn render_with_columns",
+        "fn render_drop_columns",
+        "fn render_aliased_relation",
+        "fn render_table_scan",
+        "fn render_local_relation",
+        "fn render_range",
+        "fn render_union",
+        "fn render_intersect",
+        "fn render_except",
+        "fn render_aggregate",
+    ];
+    for name in REQUIRED_RENDERERS {
+        assert!(
+            EMISSION_SRC.contains(name),
+            "INV3 violated: expected `{name}` in emission.rs — the dispatch match arms are the single source of truth for v2 SQL shape"
+        );
+    }
+    // The choke point itself must exist and be reachable through
+    // `dispatch` (the module-private wrapper that fires the emit tap).
+    assert!(
+        EMISSION_SRC.contains("fn dispatch_op"),
+        "INV3 violated: `dispatch_op` (the single-choke-point match) missing from emission.rs"
+    );
+    assert!(
+        EMISSION_SRC.contains("pub fn dispatch("),
+        "INV3 violated: `dispatch` public entry point missing from emission.rs"
+    );
+}
+
+/// **INV2 (unit slice) — `dispatch` is the single writer of v2 SQL.**
+///
+/// The full INV2 (labeled C escape hatches enumerated in `C_ESCAPE_HATCHES`)
+/// lives above; this companion test asserts the *type-system-level* claim:
+/// [`crate::transpiler_v2::emission::dispatch`] is the only path that
+/// constructs an [`crate::transpiler_v2::emission::EmittedSql`], so it is
+/// the only path that fires the emit tap.
+///
+/// Setup:
+///   1. Install a counting tap via [`set_emit_tap`].
+///   2. Dispatch a trivial `TypedOp::LocalRelation` (leaf operator).
+///   3. Assert the counter incremented exactly once.
+///   4. Clear the tap so unrelated tests are not perturbed.
+#[test]
+fn inv2_dispatch_is_only_sql_writer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static TAP_HITS: AtomicUsize = AtomicUsize::new(0);
+    fn counting_tap(_bytes: &[u8]) {
+        TAP_HITS.fetch_add(1, Ordering::SeqCst);
+    }
+    TAP_HITS.store(0, Ordering::SeqCst);
+    set_emit_tap(counting_tap);
+    let op = TypedOp::LocalRelation {
+        schema: StructType::single("x", DataType::Long),
+    };
+    let _sql = dispatch(&op).expect("LocalRelation dispatch must succeed");
+    let hits = TAP_HITS.load(Ordering::SeqCst);
+    clear_emit_tap();
+    assert_eq!(
+        hits, 1,
+        "dispatch must fire the emit tap exactly once per outermost call, got {hits}"
+    );
 }
 
 /// **INV4 — Inference is validated in isolation before translation tests run.** (Touches ADR-005, ADR-006, ADR-015.) Preserves attributability (ADR-014). The AnalyzePlan schema diff must be green before result-level translation failures are interpreted as translation bugs. Applies also to rule *provenance*: an LLM-extracted coercion/nullability rule is not trusted until the diff is green for it.

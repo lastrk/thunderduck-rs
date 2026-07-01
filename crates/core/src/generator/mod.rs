@@ -52,6 +52,16 @@ impl SqlGenerator {
         Self { schema }
     }
 
+    /// Return a new generator seeded with `schema` for scalar-expression
+    /// rendering. Used by [`crate::transpiler_v2::emission`] during Slice
+    /// C.1 to delegate projection-list / predicate rendering to the
+    /// legacy generator while the v2 pipeline grows its own per-function
+    /// emission rows (Slice C.2). Prefer [`Self::new`] +
+    /// [`Self::gen_expr`] for callers that do not have a schema to seed.
+    pub fn with_schema_for_v2(self, schema: StructType) -> Self {
+        Self { schema }
+    }
+
     /// Generate a complete SQL statement from the plan.
     pub fn generate(&self, plan: &LogicalPlan) -> Result<String> {
         static DEBUG_SQL: std::sync::LazyLock<bool> =

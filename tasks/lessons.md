@@ -15,6 +15,15 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   substrate for +5..+15 once Slice C lands." Do not force differential movement out of a
   slice whose ADRs (here ADR-005, ADR-006) explicitly own only typing, not emission.
 
+- **Half-declarative is worse than fully-hand-written or fully-interpreted.** In Slice C.1
+  iteration 1 (2026-07-01), the coder built `EmissionRow` / `Template` / `SlotKind` /
+  `EMISSION_TABLE` as declarative data with no interpreter — the actual emission was still
+  hand-written `render_*` helpers, and the table was dead code. The reviewer flagged this as
+  Critical (C1). Iteration 2 closed it by **deleting the scaffolding** rather than adding an
+  interpreter. Rule: don't ship declarative data whose only reader is a `#[test]`. Either
+  hand-write until you have real clients, or write the interpreter in the same pass. Slice
+  C.2 lands the declarative table when it has per-function rows that need it.
+
 ## ADR-015 discipline (differential oracle > plan document)
 
 - **The legacy `TypeInferenceEngine` is the oracle for Spark-parity coercion, not the plan.**

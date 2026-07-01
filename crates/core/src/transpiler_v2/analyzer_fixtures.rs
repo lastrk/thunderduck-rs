@@ -372,6 +372,7 @@ pub fn smoke_type_019() -> (CommonAst, StructType) {
             left: Box::new(left),
             right: Box::new(right),
             all: false,
+            by_name: false,
         }),
     };
     // The left projection field is unnamed; `spark_column_name` renders

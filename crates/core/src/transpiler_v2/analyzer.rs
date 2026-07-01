@@ -221,6 +221,9 @@ pub enum TypedOp {
         right: Box<TypedOp>,
         /// `UNION ALL` when true.
         all: bool,
+        /// `unionByName` when true — Pass 2 reorders the right child by
+        /// column name before widening (M4).
+        by_name: bool,
         /// Widened output schema (per-field type = `unify_types(l, r)`,
         /// nullable = `l.nullable || r.nullable`).
         schema: Schema,
@@ -396,13 +399,22 @@ fn walk_resolved(op: &TypedOp) -> bool {
     match op {
         TypedOp::Project {
             input,
+            projections,
             projection_types,
             ..
         } => {
+            // M1 — `type_projection_list` writes a placeholder `TypedAttr`
+            // with `DataType::Unresolved` for bare `Expression::Star` slots
+            // because a star slot is not a single-value expression. The
+            // walker must skip those slots when checking for Unresolved —
+            // otherwise every `SELECT *` trips INV5 spuriously.
             walk_resolved(input)
-                && projection_types
+                && projections
                     .iter()
-                    .all(|t| !t.data_type.contains_unresolved())
+                    .zip(projection_types.iter())
+                    .all(|(e, t)| {
+                        matches!(e, Expression::Star(_)) || !t.data_type.contains_unresolved()
+                    })
         }
         TypedOp::Filter { input, .. }
         | TypedOp::Sort { input, .. }
@@ -508,53 +520,18 @@ fn resolve_table_scan(t: TableScan, base_types: &BaseTypes) -> Result<TypedOp, A
 }
 
 fn resolve_project(p: Project, base_types: &BaseTypes) -> Result<TypedOp, AnalyzerError> {
+    // M6 — Pass 1 no longer seeds `Unresolved` fields that Pass 2 overwrites.
+    // Pass 2's `assign_types_project` builds `schema` and `projection_types`
+    // from the resolved child schema; we hand it empty vectors so there is a
+    // single writer for each. Star expansion for schema purposes happens in
+    // Pass 2 as well (`type_projection_list`).
     let input = resolve(*p.input, base_types)?;
-    let child_schema = input.schema().clone();
-
-    // Star-expand for schema derivation.  The projection list itself is
-    // preserved verbatim so the emitter can decide whether to emit `*` or
-    // the expanded refs.
-    let mut fields: Vec<StructField> = Vec::new();
-    for expr in &p.projections {
-        match expr {
-            Expression::Star(_) => {
-                fields.extend(child_schema.fields.iter().cloned());
-            }
-            _ => {
-                let name = projection_output_name(expr);
-                // Pass 1 leaves types unresolved; the actual DataType and
-                // nullability are filled in during Pass 2 against the
-                // real child schema. We seed with `Unresolved` and let
-                // Pass 2's assign_types_project resolve them.
-                fields.push(StructField::new(name, DataType::Unresolved, true));
-            }
-        }
-    }
-    let projection_types = p
-        .projections
-        .iter()
-        .map(|_| TypedAttr {
-            data_type: DataType::Unresolved,
-            nullable: true,
-        })
-        .collect();
     Ok(TypedOp::Project {
         input: Box::new(input),
         projections: p.projections,
-        projection_types,
-        schema: StructType::new(fields),
+        projection_types: Vec::new(),
+        schema: StructType::empty(),
     })
-}
-
-/// Compute the output field name for a projection expression, matching the
-/// legacy `projection_to_field` helper's naming conventions.
-fn projection_output_name(expr: &Expression) -> String {
-    match expr {
-        Expression::Alias(a) => a.alias.clone(),
-        Expression::ColumnReference(c) => c.name.clone(),
-        Expression::UnresolvedColumn(u) => u.name.clone(),
-        other => spark_column_name(other),
-    }
 }
 
 fn resolve_filter(f: Filter, base_types: &BaseTypes) -> Result<TypedOp, AnalyzerError> {
@@ -614,52 +591,21 @@ fn resolve_join(j: Join, base_types: &BaseTypes) -> Result<TypedOp, AnalyzerErro
 }
 
 fn resolve_aggregate(a: Aggregate, base_types: &BaseTypes) -> Result<TypedOp, AnalyzerError> {
+    // M6 — Pass 1 no longer seeds `Unresolved` schema / grouping_types /
+    // aggregate_types that Pass 2 will overwrite. Pass 2's
+    // `assign_types` (Aggregate arm) calls `type_aggregate` against the
+    // resolved child schema and produces all three vectors in one place.
     let input = resolve(*a.input, base_types)?;
-    // Grouping fields come first, then aggregate output fields — types get
-    // filled in by Pass 2 (they need the child schema for delegation).
-    let mut fields: Vec<StructField> = Vec::new();
-    for g in &a.grouping {
-        let name = projection_output_name(g);
-        fields.push(StructField::new(name, DataType::Unresolved, true));
-    }
-    for agg in &a.aggregates {
-        let name = aggregate_output_name(&agg.func);
-        fields.push(StructField::new(name, DataType::Unresolved, true));
-    }
-    let grouping_types = a
-        .grouping
-        .iter()
-        .map(|_| TypedAttr {
-            data_type: DataType::Unresolved,
-            nullable: true,
-        })
-        .collect();
-    let aggregate_types = a
-        .aggregates
-        .iter()
-        .map(|_| TypedAttr {
-            data_type: DataType::Unresolved,
-            nullable: true,
-        })
-        .collect();
     Ok(TypedOp::Aggregate {
         input: Box::new(input),
         grouping: a.grouping,
-        grouping_types,
+        grouping_types: Vec::new(),
         aggregates: a.aggregates,
-        aggregate_types,
+        aggregate_types: Vec::new(),
         having: a.having,
         grouping_sets: a.grouping_sets,
-        schema: StructType::new(fields),
+        schema: StructType::empty(),
     })
-}
-
-/// Output field name for an aggregate call — mirrors `agg_expr_to_field`.
-fn aggregate_output_name(func: &Expression) -> String {
-    match func {
-        Expression::Alias(a) => a.alias.clone(),
-        other => spark_column_name(other),
-    }
 }
 
 fn resolve_sort(s: Sort, base_types: &BaseTypes) -> Result<TypedOp, AnalyzerError> {
@@ -695,28 +641,19 @@ fn resolve_tail(t: Tail, base_types: &BaseTypes) -> Result<TypedOp, AnalyzerErro
 }
 
 fn resolve_union(u: Union, base_types: &BaseTypes) -> Result<TypedOp, AnalyzerError> {
+    // M4 — Propagate `by_name` through to `TypedOp::Union`. The actual
+    // name-match reorder happens in Pass 2's Union arm (`assign_types`)
+    // because Pass 1's Project schemas are empty (M6 defers filling
+    // them to Pass 2); by the time Pass 2 sees this Union, both children
+    // have resolved schemas the reorder can key on.
     let left = resolve(*u.left, base_types)?;
     let right = resolve(*u.right, base_types)?;
-    let left_schema = left.schema().clone();
-    let right_schema = right.schema().clone();
-    if left_schema.fields.len() != right_schema.fields.len() {
-        return Err(AnalyzerError::SetOpArityMismatch {
-            op: "UNION",
-            left_cols: left_schema.fields.len(),
-            right_cols: right_schema.fields.len(),
-        });
-    }
-    // Field NAMES from left; types stay Unresolved until Pass 2 widens.
-    let fields = left_schema
-        .fields
-        .iter()
-        .map(|f| StructField::new(f.name.clone(), DataType::Unresolved, true))
-        .collect();
     Ok(TypedOp::Union {
         left: Box::new(left),
         right: Box::new(right),
         all: u.all,
-        schema: StructType::new(fields),
+        by_name: u.by_name,
+        schema: StructType::empty(),
     })
 }
 
@@ -769,32 +706,32 @@ fn resolve_distinct(d: Distinct, base_types: &BaseTypes) -> Result<TypedOp, Anal
 }
 
 fn resolve_with_columns(w: WithColumns, base_types: &BaseTypes) -> Result<TypedOp, AnalyzerError> {
+    // M6 — Pass 1 no longer seeds per-column TypedAttrs or the output schema
+    // that Pass 2's `assign_types` (WithColumns arm) overwrites. Pass 1 only
+    // recurses into the input; Pass 2 walks the columns against the resolved
+    // child schema and produces the final `columns` triples + `schema`.
     let input = resolve(*w.input, base_types)?;
-    let input_schema = input.schema().clone();
-
-    // Apply each column in order, so later entries can reference earlier ones.
-    let mut schema = input_schema;
-    let mut columns: Vec<(String, Expression, TypedAttr)> = Vec::with_capacity(w.columns.len());
-    for (new_name, expr) in w.columns {
-        // Compute data_type + nullability against the current schema.
-        let (dt, nullable) = resolve_with_columns_slot(&new_name, &expr, &schema);
-        let attr = TypedAttr {
-            data_type: dt.clone(),
-            nullable,
-        };
-        if let Some(idx) = schema.field_index(&new_name) {
-            schema.fields[idx] = StructField::new(new_name.clone(), dt, nullable);
-        } else {
-            schema
-                .fields
-                .push(StructField::new(new_name.clone(), dt, nullable));
-        }
-        columns.push((new_name, expr, attr));
-    }
+    // Pass 1 stores placeholder `Unresolved` TypedAttrs so Pass 2 can shred
+    // them without losing the raw `(name, expr)` list.  We prefer this over
+    // introducing a separate WithColumns type just for the Pass-1 shape.
+    let placeholder_columns: Vec<(String, Expression, TypedAttr)> = w
+        .columns
+        .into_iter()
+        .map(|(name, expr)| {
+            (
+                name,
+                expr,
+                TypedAttr {
+                    data_type: DataType::Unresolved,
+                    nullable: true,
+                },
+            )
+        })
+        .collect();
     Ok(TypedOp::WithColumns {
         input: Box::new(input),
-        columns,
-        schema,
+        columns: placeholder_columns,
+        schema: StructType::empty(),
     })
 }
 
@@ -883,6 +820,12 @@ fn assign_types(op: TypedOp) -> Result<TypedOp, AnalyzerError> {
         } => {
             let input = assign_types(*input)?;
             let child_schema = input.schema().clone();
+            // M5 — Ambiguous-column check: every unqualified column
+            // reference in the projection list that matches more than one
+            // field in the child schema is a hard error.
+            for expr in &projections {
+                ensure_no_ambiguous_columns(expr, &child_schema)?;
+            }
             let (fields, projection_types) = type_projection_list(&projections, &child_schema);
             Ok(TypedOp::Project {
                 input: Box::new(input),
@@ -898,6 +841,20 @@ fn assign_types(op: TypedOp) -> Result<TypedOp, AnalyzerError> {
         } => {
             let input = assign_types(*input)?;
             let schema = input.schema().clone();
+            // M5 — Predicate must yield boolean. Give up loudly if not; this
+            // is a real analyzer bug, not a Punt (see `is_fallback_eligible`
+            // in the dispatch wrapper).
+            let predicate_type = predicate.data_type(&schema);
+            if !matches!(
+                predicate_type,
+                DataType::Boolean | DataType::Unresolved | DataType::Null
+            ) {
+                return Err(AnalyzerError::TypeMismatch {
+                    expected: DataType::Boolean,
+                    actual: predicate_type,
+                    context: "filter predicate",
+                });
+            }
             Ok(TypedOp::Filter {
                 input: Box::new(input),
                 predicate,
@@ -996,10 +953,18 @@ fn assign_types(op: TypedOp) -> Result<TypedOp, AnalyzerError> {
             left,
             right,
             all,
+            by_name,
             schema: _,
         } => {
             let left = assign_types(*left)?;
-            let right = assign_types(*right)?;
+            let mut right = assign_types(*right)?;
+
+            // M4 — `unionByName` reorder: right's fields get remapped to
+            // match left's positional order by (case-insensitive) name
+            // *before* positional widening runs.
+            if by_name {
+                right = reorder_union_right_by_name(right, left.schema())?;
+            }
 
             // Downward re-sweep: widen this union's fields, then update
             // both children's field types to the widened types where they
@@ -1013,6 +978,7 @@ fn assign_types(op: TypedOp) -> Result<TypedOp, AnalyzerError> {
                 left: Box::new(left),
                 right: Box::new(right),
                 all,
+                by_name,
                 schema: widened,
             })
         }
@@ -1318,9 +1284,22 @@ fn compute_join_output_schema(
     if using.is_empty() {
         return StructType::merge(left_schema, right_schema);
     }
+
+    // M2 — For RIGHT joins the USING key survives on the *right* side of the
+    // join (LEFT + USING keeps left's copy; RIGHT + USING keeps right's copy).
+    // Pass 3's outer-join nullability rewrite marks the *left* side nullable
+    // for a RIGHT join, so dedupping from the left would incorrectly promote
+    // the USING key to nullable. Choose the right's copy for RIGHT + USING.
+    let (using_source, using_source_nonusing, other_nonusing) =
+        if matches!(join_type, JoinKind::Right) {
+            (right_schema, right_schema, left_schema)
+        } else {
+            (left_schema, left_schema, right_schema)
+        };
+
     let mut fields = Vec::new();
     for name in using {
-        if let Some(f) = left_schema
+        if let Some(f) = using_source
             .fields
             .iter()
             .find(|f| f.name.eq_ignore_ascii_case(name))
@@ -1328,17 +1307,94 @@ fn compute_join_output_schema(
             fields.push(f.clone());
         }
     }
-    for f in &left_schema.fields {
+    for f in &using_source_nonusing.fields {
         if !using.iter().any(|n| f.name.eq_ignore_ascii_case(n)) {
             fields.push(f.clone());
         }
     }
-    for f in &right_schema.fields {
+    for f in &other_nonusing.fields {
         if !using.iter().any(|n| f.name.eq_ignore_ascii_case(n)) {
             fields.push(f.clone());
         }
     }
     StructType::new(fields)
+}
+
+/// [M4] Reorder a Union's right child so its output columns line up
+/// positionally with `left_schema` by (case-insensitive) name match.
+///
+/// Wraps the child in a synthetic `Project` whose projections are the
+/// reordered `UnresolvedColumn` references. Pass 2 has already assigned
+/// types to the child at this point, so we can build the reordered
+/// schema directly from the child's own schema. If a left name has no
+/// case-insensitive match on the right, raise `SetOpArityMismatch`
+/// with a `UNION_BY_NAME` marker (the closest fit in the current error
+/// surface; a dedicated variant is deferred to Slice C.2).
+///
+/// Identity permutations return the child unchanged.
+fn reorder_union_right_by_name(
+    child: TypedOp,
+    left_schema: &Schema,
+) -> Result<TypedOp, AnalyzerError> {
+    let child_schema = child.schema().clone();
+    if child_schema.fields.len() != left_schema.fields.len() {
+        return Err(AnalyzerError::SetOpArityMismatch {
+            op: "UNION_BY_NAME",
+            left_cols: left_schema.fields.len(),
+            right_cols: child_schema.fields.len(),
+        });
+    }
+    let mut permutation: Vec<usize> = Vec::with_capacity(left_schema.fields.len());
+    for lf in &left_schema.fields {
+        match child_schema
+            .fields
+            .iter()
+            .position(|rf| rf.name.eq_ignore_ascii_case(&lf.name))
+        {
+            Some(pos) => permutation.push(pos),
+            None => {
+                return Err(AnalyzerError::SetOpArityMismatch {
+                    op: "UNION_BY_NAME",
+                    left_cols: left_schema.fields.len(),
+                    right_cols: child_schema.fields.len(),
+                });
+            }
+        }
+    }
+    // Identity permutation → no rewrite needed.
+    if permutation.iter().enumerate().all(|(i, &p)| i == p) {
+        return Ok(child);
+    }
+    // Build a Project whose projections reorder the columns by name; its
+    // projection_types match the reordered child schema so this Project
+    // is fully typed at Pass-2 exit (Pass 3 does not need to revisit it).
+    let projections: Vec<Expression> = permutation
+        .iter()
+        .map(|&i| {
+            let name = child_schema.fields[i].name.clone();
+            Expression::UnresolvedColumn(crate::expression::UnresolvedColumn {
+                name,
+                qualifier: None,
+            })
+        })
+        .collect();
+    let reordered_fields: Vec<StructField> = permutation
+        .iter()
+        .map(|&i| child_schema.fields[i].clone())
+        .collect();
+    let projection_types: Vec<TypedAttr> = reordered_fields
+        .iter()
+        .map(|f| TypedAttr {
+            data_type: f.data_type.clone(),
+            nullable: f.nullable,
+        })
+        .collect();
+    Ok(TypedOp::Project {
+        input: Box::new(child),
+        projections,
+        projection_types,
+        schema: StructType::new(reordered_fields),
+    })
 }
 
 /// Widen a union's fields via `TypeInferenceEngine::unify_types`.
@@ -1441,7 +1497,6 @@ fn derive_nullability(op: TypedOp) -> Result<TypedOp, AnalyzerError> {
             let left = derive_nullability(*left)?;
             let right = derive_nullability(*right)?;
 
-            let left_len = left.schema().fields.len();
             let (left_nullable, right_nullable) = match join_type {
                 JoinKind::Left => (false, true),
                 JoinKind::Right => (true, false),
@@ -1449,18 +1504,64 @@ fn derive_nullability(op: TypedOp) -> Result<TypedOp, AnalyzerError> {
                 _ => (false, false),
             };
             let schema = if left_nullable || right_nullable {
+                let using_count = using.len();
+                let left_len = left.schema().fields.len();
+                let right_len = right.schema().fields.len();
+                // M2 — Match the ordinal layout produced by
+                // `compute_join_output_schema`. For USING joins:
+                //   - LEFT/FULL/INNER: [USING (from left), non-USING left, non-USING right]
+                //     positions [0, using_count) = USING keys
+                //     positions [using_count, left_len) = non-USING left
+                //     positions [left_len, ...) = non-USING right
+                //   - RIGHT: [USING (from right), non-USING right, non-USING left]
+                //     positions [0, using_count) = USING keys
+                //     positions [using_count, right_len) = non-USING right
+                //     positions [right_len, ...) = non-USING left
+                let is_right_using = matches!(join_type, JoinKind::Right) && using_count > 0;
+                let (source_len, using_widens) = if using_count == 0 {
+                    // No USING dedup — merged is plain [left..., right...].
+                    (left_len, false)
+                } else if is_right_using {
+                    (right_len, matches!(join_type, JoinKind::Full))
+                } else {
+                    (left_len, matches!(join_type, JoinKind::Full))
+                };
+
                 let fields = schema
                     .fields
                     .into_iter()
                     .enumerate()
                     .map(|(i, mut f)| {
-                        // For semi/anti joins we bailed above with (false, false).
-                        // For regular joins with USING dedup, the merged
-                        // schema puts USING keys first, then non-USING left,
-                        // then non-USING right; we widen the segments that
-                        // correspond to the "outer" side.
-                        if (i < left_len && left_nullable) || (i >= left_len && right_nullable) {
-                            f.nullable = true;
+                        if using_count > 0 && i < using_count {
+                            // USING key: widens in FULL joins only. In LEFT/RIGHT
+                            // the key comes from the outer side, which stays
+                            // non-null; the inner-side pair is dedupped.
+                            if using_widens {
+                                f.nullable = true;
+                            }
+                        } else {
+                            // Non-USING slot: determine which input it comes
+                            // from and widen if that input's outer complement
+                            // is the outer side.
+                            let from_source_side = i < source_len;
+                            let widen = if is_right_using {
+                                // source is right → widen the "left" (non-source) side
+                                if from_source_side {
+                                    right_nullable
+                                } else {
+                                    left_nullable
+                                }
+                            } else {
+                                // source is left → widen right (non-source) side
+                                if from_source_side {
+                                    left_nullable
+                                } else {
+                                    right_nullable
+                                }
+                            };
+                            if widen {
+                                f.nullable = true;
+                            }
                         }
                         f
                     })
@@ -1561,11 +1662,13 @@ fn derive_nullability(op: TypedOp) -> Result<TypedOp, AnalyzerError> {
             left,
             right,
             all,
+            by_name,
             schema,
         } => Ok(TypedOp::Union {
             left: Box::new(derive_nullability(*left)?),
             right: Box::new(derive_nullability(*right)?),
             all,
+            by_name,
             schema,
         }),
         TypedOp::Intersect {
@@ -1658,6 +1761,165 @@ fn grouping_column_names(gs: &GroupingSets) -> std::collections::HashSet<String>
         }
     }
     names
+}
+
+/// [M5 §Layer 3] — reject unqualified column references whose name matches
+/// more than one field in the schema. Called from Pass 2 for `Project`
+/// slots; extended in future passes to Filter/Aggregate resolution.
+///
+/// A qualified reference (`c.qualifier.is_some()`) is not ambiguous by
+/// definition — the qualifier disambiguates. Only unqualified names with
+/// multiple case-insensitive matches raise
+/// [`AnalyzerError::AmbiguousColumn`].
+fn ensure_no_ambiguous_columns(
+    expr: &Expression,
+    schema: &StructType,
+) -> Result<(), AnalyzerError> {
+    match expr {
+        Expression::UnresolvedColumn(u) if u.qualifier.is_none() => {
+            check_name_unique(&u.name, schema)?;
+        }
+        Expression::UnresolvedColumn(_) => {
+            // Qualified — the qualifier disambiguates by definition.
+        }
+        Expression::ColumnReference(c) if c.qualifier.is_none() => {
+            check_name_unique(&c.name, schema)?;
+        }
+        Expression::ColumnReference(_) => {
+            // Qualified — disambiguated by construction.
+        }
+        Expression::Alias(a) => ensure_no_ambiguous_columns(&a.expr, schema)?,
+        Expression::Binary(b) => {
+            ensure_no_ambiguous_columns(&b.left, schema)?;
+            ensure_no_ambiguous_columns(&b.right, schema)?;
+        }
+        Expression::Unary(u) => ensure_no_ambiguous_columns(&u.operand, schema)?,
+        Expression::FunctionCall(f) => {
+            for arg in &f.args {
+                ensure_no_ambiguous_columns(arg, schema)?;
+            }
+        }
+        Expression::Cast(c) => ensure_no_ambiguous_columns(&c.expr, schema)?,
+        Expression::CaseWhen(cw) => {
+            if let Some(base) = &cw.base {
+                ensure_no_ambiguous_columns(base, schema)?;
+            }
+            for (cond, val) in &cw.branches {
+                ensure_no_ambiguous_columns(cond, schema)?;
+                ensure_no_ambiguous_columns(val, schema)?;
+            }
+            if let Some(else_expr) = &cw.else_expr {
+                ensure_no_ambiguous_columns(else_expr, schema)?;
+            }
+        }
+        Expression::Window(w) => {
+            ensure_no_ambiguous_columns(&w.func, schema)?;
+            for p in &w.partition_by {
+                ensure_no_ambiguous_columns(p, schema)?;
+            }
+            for so in &w.order_by {
+                ensure_no_ambiguous_columns(&so.expr, schema)?;
+            }
+        }
+        Expression::Lambda(l) => {
+            // Lambda parameters are locals to the lambda body and do
+            // not shadow schema fields, so walking the body is safe:
+            // any schema-name reference in the body still resolves
+            // against the outer schema.
+            ensure_no_ambiguous_columns(&l.body, schema)?;
+        }
+        Expression::ArrayLiteral(a) => {
+            for elem in &a.elements {
+                ensure_no_ambiguous_columns(elem, schema)?;
+            }
+        }
+        Expression::MapLiteral(m) => {
+            for k in &m.keys {
+                ensure_no_ambiguous_columns(k, schema)?;
+            }
+            for v in &m.values {
+                ensure_no_ambiguous_columns(v, schema)?;
+            }
+        }
+        Expression::StructLiteral(s) => {
+            for (_name, val) in &s.fields {
+                ensure_no_ambiguous_columns(val, schema)?;
+            }
+        }
+        Expression::Between(b) => {
+            ensure_no_ambiguous_columns(&b.expr, schema)?;
+            ensure_no_ambiguous_columns(&b.low, schema)?;
+            ensure_no_ambiguous_columns(&b.high, schema)?;
+        }
+        Expression::InList(il) => {
+            ensure_no_ambiguous_columns(&il.expr, schema)?;
+            for item in &il.list {
+                ensure_no_ambiguous_columns(item, schema)?;
+            }
+        }
+        Expression::Like(l) => {
+            ensure_no_ambiguous_columns(&l.value, schema)?;
+            ensure_no_ambiguous_columns(&l.pattern, schema)?;
+        }
+        Expression::IsDistinctFrom(idf) => {
+            ensure_no_ambiguous_columns(&idf.left, schema)?;
+            ensure_no_ambiguous_columns(&idf.right, schema)?;
+        }
+        Expression::ExtractValue(ev) => {
+            ensure_no_ambiguous_columns(&ev.child, schema)?;
+            ensure_no_ambiguous_columns(&ev.extraction, schema)?;
+        }
+        Expression::RowConstructor(rc) => {
+            for f in &rc.fields {
+                ensure_no_ambiguous_columns(f, schema)?;
+            }
+        }
+        Expression::UpdateFields(_) => {
+            // TODO Slice C.2: struct-field update semantics not yet on
+            // the v2 substrate — the analyzer treats these as opaque
+            // for ambiguity purposes. Once C.2 grows the update-fields
+            // path, walk `struct_expr` and any per-field update expr.
+        }
+        Expression::InSubquery(_)
+        | Expression::ExistsSubquery(_)
+        | Expression::ScalarSubquery(_) => {
+            // TODO Slice G: subquery bodies are analyzed by a nested
+            // `analyze()` call — the outer walker does not descend
+            // into them for the ambiguity pass. Attempting to walk
+            // here would double-analyze the inner plan.
+            // no-op — subquery body walked by nested analyze()
+        }
+        Expression::Literal(_)
+        | Expression::Star(_)
+        | Expression::LambdaVariable(_)
+        | Expression::RawSql(_)
+        | Expression::Interval(_) => {
+            // No column references possible.
+        }
+    }
+    Ok(())
+}
+
+fn check_name_unique(name: &str, schema: &StructType) -> Result<(), AnalyzerError> {
+    // Dot-notation names traverse struct fields — those are unambiguous
+    // even if the outer struct name collides, because the outer + inner
+    // pair identifies a single field.
+    if name.contains('.') {
+        return Ok(());
+    }
+    let candidates: Vec<String> = schema
+        .fields
+        .iter()
+        .filter(|f| f.name.eq_ignore_ascii_case(name))
+        .map(|f| f.name.clone())
+        .collect();
+    if candidates.len() > 1 {
+        return Err(AnalyzerError::AmbiguousColumn {
+            name: name.to_owned(),
+            candidates,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1772,5 +2034,206 @@ mod tests {
         // Redundant with the invariants test but pins the entry point
         // to the mini-fixture matrix.
         inference_smoke();
+    }
+
+    /// M1 regression — `SELECT *` on a resolved child must not trip INV5.
+    #[test]
+    fn m1_bare_star_projection_passes_walker() {
+        use crate::expression::StarExpression;
+        // Project(Star) over the `nums` table scan.
+        let ast = CommonAst {
+            root: CommonOp::Project(Project {
+                input: Box::new(CommonOp::TableScan(super::super::ast::TableScan {
+                    name: "nums".to_string(),
+                    schema: StructType::empty(),
+                })),
+                projections: vec![Expression::Star(StarExpression { qualifier: None })],
+            }),
+        };
+        let typed = analyze(ast, &base_types_all()).expect("bare-Star project must analyze");
+        assert!(
+            has_resolved_schema(&typed),
+            "bare Star projection must not trip INV5 walker (M1 regression)"
+        );
+        // The Star must have expanded to the child schema's fields.
+        assert_eq!(typed.root.schema().fields.len(), 7);
+    }
+
+    /// M2 regression — a `RIGHT + USING` join must keep the USING key
+    /// non-nullable (it comes from the surviving right side, not the
+    /// widened left).
+    #[test]
+    fn m2_right_using_keeps_key_non_nullable() {
+        use crate::expression::UnresolvedColumn;
+        // emp2 has dept_id (nullable), dept has dept_id (NOT NULL).
+        // RIGHT + USING(dept_id) means dept_id comes from the right (dept)
+        // and stays NOT NULL.  The columns from emp2 (the left side)
+        // become nullable via outer-join widening.
+        let ast = CommonAst {
+            root: CommonOp::Join(Join {
+                left: Box::new(CommonOp::Project(Project {
+                    input: Box::new(CommonOp::TableScan(super::super::ast::TableScan {
+                        name: "emp2".to_string(),
+                        schema: StructType::empty(),
+                    })),
+                    projections: vec![
+                        Expression::UnresolvedColumn(UnresolvedColumn {
+                            name: "dept_id".to_string(),
+                            qualifier: None,
+                        }),
+                        Expression::UnresolvedColumn(UnresolvedColumn {
+                            name: "name".to_string(),
+                            qualifier: None,
+                        }),
+                    ],
+                })),
+                right: Box::new(CommonOp::TableScan(super::super::ast::TableScan {
+                    name: "dept".to_string(),
+                    schema: StructType::empty(),
+                })),
+                join_type: JoinKind::Right,
+                on: None,
+                using: vec!["dept_id".to_string()],
+            }),
+        };
+        let typed = analyze(ast, &base_types_all()).expect("RIGHT+USING must analyze");
+        let schema = typed.root.schema();
+        let dept_id = schema
+            .field_by_name("dept_id")
+            .expect("dept_id must be present");
+        assert!(
+            !dept_id.nullable,
+            "RIGHT+USING dept_id must stay NOT NULL (M2 regression); got nullable={}",
+            dept_id.nullable
+        );
+    }
+
+    /// M4 regression — `unionByName` reorders the right's fields to match
+    /// left's before positional widening.
+    #[test]
+    fn m4_union_by_name_reorders_right() {
+        use crate::expression::UnresolvedColumn;
+        use crate::transpiler_v2::ast::Union;
+        // left projects (a, lng); right projects (lng, a). unionByName
+        // must reorder right to (a, lng) so the widened union has the
+        // right per-column types.
+        let left = CommonOp::Project(Project {
+            input: Box::new(CommonOp::TableScan(super::super::ast::TableScan {
+                name: "nums".to_string(),
+                schema: StructType::empty(),
+            })),
+            projections: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "a".to_string(),
+                    qualifier: None,
+                }),
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "lng".to_string(),
+                    qualifier: None,
+                }),
+            ],
+        });
+        let right = CommonOp::Project(Project {
+            input: Box::new(CommonOp::TableScan(super::super::ast::TableScan {
+                name: "nums".to_string(),
+                schema: StructType::empty(),
+            })),
+            projections: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "lng".to_string(),
+                    qualifier: None,
+                }),
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "a".to_string(),
+                    qualifier: None,
+                }),
+            ],
+        });
+        let ast = CommonAst {
+            root: CommonOp::Union(Union {
+                left: Box::new(left),
+                right: Box::new(right),
+                all: true,
+                by_name: true,
+            }),
+        };
+        let typed = analyze(ast, &base_types_all()).expect("unionByName must analyze");
+        let schema = typed.root.schema();
+        assert_eq!(schema.fields[0].name, "a");
+        assert_eq!(schema.fields[1].name, "lng");
+        // Widened per-column type: `a` is Int (both sides Int); `lng` is Long
+        // (both sides Long) — union widening produces Long on `lng` even
+        // after the by-name reorder.
+        assert_eq!(schema.fields[0].data_type, DataType::Integer);
+        assert_eq!(schema.fields[1].data_type, DataType::Long);
+    }
+
+    /// M5 regression — Filter with non-boolean predicate must raise
+    /// `TypeMismatch`, not fall through to legacy.
+    #[test]
+    fn m5_filter_type_mismatch_raises() {
+        use crate::expression::UnresolvedColumn;
+        // `nums.a` is Integer; using it as a predicate must fail.
+        let ast = CommonAst {
+            root: CommonOp::Filter(Filter {
+                input: Box::new(CommonOp::TableScan(super::super::ast::TableScan {
+                    name: "nums".to_string(),
+                    schema: StructType::empty(),
+                })),
+                predicate: Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "a".to_string(),
+                    qualifier: None,
+                }),
+            }),
+        };
+        let err = analyze(ast, &base_types_all()).expect_err("non-boolean predicate must fail");
+        assert!(
+            matches!(err, AnalyzerError::TypeMismatch { .. }),
+            "expected TypeMismatch, got {err:?}"
+        );
+    }
+
+    /// M5 regression — an unqualified reference matching two
+    /// case-insensitively-equal fields must raise `AmbiguousColumn`.
+    #[test]
+    fn m5_ambiguous_column_raises() {
+        use crate::expression::UnresolvedColumn;
+        // Synthesize a schema with two case-insensitively-equal names
+        // (`id` and `ID`). Both are legal StructField names on their
+        // own; together they force any unqualified `id` reference to
+        // be ambiguous by Spark's case-insensitive resolution rules.
+        let ambiguous_schema = StructType::new(vec![
+            StructField::nullable("id", DataType::Long),
+            StructField::nullable("ID", DataType::Long),
+        ]);
+        let ast = CommonAst {
+            root: CommonOp::Project(Project {
+                input: Box::new(CommonOp::TableScan(super::super::ast::TableScan {
+                    name: "ambig".to_string(),
+                    // Passing a populated schema on the TableScan node
+                    // short-circuits the BaseTypes lookup in
+                    // `resolve_table_scan`, so the analyzer sees this
+                    // synthetic ambiguous schema directly.
+                    schema: ambiguous_schema.clone(),
+                })),
+                projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "id".to_string(),
+                    qualifier: None,
+                })],
+            }),
+        };
+        let err = analyze(ast, &BaseTypes::new())
+            .expect_err("ambiguous unqualified column must raise AmbiguousColumn");
+        match err {
+            AnalyzerError::AmbiguousColumn { name, candidates } => {
+                assert_eq!(name, "id");
+                assert_eq!(candidates.len(), 2);
+                assert!(
+                    candidates.iter().any(|c| c == "id") && candidates.iter().any(|c| c == "ID"),
+                    "candidates must include both `id` and `ID`, got {candidates:?}"
+                );
+            }
+            other => panic!("expected AmbiguousColumn, got {other:?}"),
+        }
     }
 }

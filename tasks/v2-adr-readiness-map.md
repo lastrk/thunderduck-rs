@@ -89,7 +89,64 @@ The un-changed target list this slice underwrites (unlocks land with Slice C dis
 
 **Progress signal target: 12 → ≈45–55.** Roughly 22 (type_inference) + 12 (schema-only) + 12 (nondeterministic) + ~5 (analyzer-derived cond/agg) — precise count depends on how many nondeterministic cases already pass at baseline via infer_schema.
 
-**Slice C — Core emission (first tranche).** Unlocks the "trivial" DataFrame surface once dispatch rows exist for its node kinds:
+**Slice C — Core emission (first tranche).** *Substrate (C.1) landed 2026-07-01.* The architect
+proposed a within-slice sub-split (`.agent-output/001-architecture-plan.md` §0) — C.1 (substrate +
+operator emission + Slice-B carryover close) and C.2 (scalar-expression declarative rows). The
+iteration methodology honors the split: each sub-slice is its own pass with its own carryover.
+This pass landed C.1 only.
+
+**C.1 shipped**: `lowering.rs` (new file, 29-variant `LogicalPlan → CommonAst` adapter with
+`CommonOp::Punt` for unsupported variants); `emission.rs` grew into a hand-written `match` over
+`TypedOp` in `dispatch_op` with per-op renderers (`render_project`, `render_filter`,
+`render_sort`, `render_limit`, `render_tail`, `render_distinct`, `render_with_columns`,
+`render_drop_columns`, `render_aliased_relation`, `render_table_scan`, `render_local_relation`,
+`render_range_relation`, `render_union`, `render_intersect`, `render_except`, `render_aggregate`)
+delegating scalar expressions to `SqlGenerator::gen_expr` via a `render_expr` seam explicitly
+marked for C.2 drain; `EmittedSql` newtype with module-private `emit()` constructor gives INV2
+teeth by type construction; `EmissionError` (`UnsupportedOp`/`ChildFailed`/`MissingField`/
+`LegacyRenderFailed`); `mod.rs` gained `pub fn generate(plan, base_types)` composing
+`lower → analyze → dispatch`; `set_serializer_tap` renamed to `set_emit_tap` (deprecated alias
+retained), `EMIT_TAP` atomic. `service.rs` `TranspilerPath::V2` arm now dispatches through
+`transpiler_v2::generate` with a synchronous `build_base_types_from_plan` walk and a
+`is_v2_fallback_eligible` predicate (Punt / `UnknownTable` / `UnsupportedOp` → legacy fallback;
+everything else surfaces). `error.rs` gained `V2Lowering` / `V2Analyzer` / `V2Emission` variants.
+All six Slice-B mediums closed: M1 walker Star fix, M2 RIGHT-USING dedup + Pass-3 ordinal
+rewrite, M3 documented at `render_union` (widened schema wins), M4 `ast::Union.by_name` +
+Pass-2 name-match reorder, M5 `AmbiguousColumn` + `TypeMismatch` wired (Pass-2 Project +
+Filter), M6 Pass-1 seed removal. Invariants activated: **INV2** (`inv2_dispatch_is_only_sql_writer`
+installs a counting tap, asserts exactly-once) and **INV3** (grep-based invariant test asserts
+`emission.rs` does not `use crate::functions::FunctionRegistry` or glob-import
+`crate::generator::*`, plus positive coverage anchors for every `render_<op>` helper and
+`dispatch_op` / `pub fn dispatch(`). Perf **OPT-M1** applied (`quote_ident` no-quote fast path
+mirroring legacy). Pipeline: 2 passes — iteration 1 verdict `NEEDS_CHANGES` (2 Critical: C1
+half-declarative `EMISSION_TABLE` scaffolding-without-interpreter, C2 `AggregateCall.is_distinct`
+dropped; 2 High: H1 aliased-relation alias not emitted, H2 INV3 grep test dishonest); iteration 2
+verdict `APPROVED` (all 10 items closed — C1 fixed by deleting the scaffolding rather than
+adding an interpreter, C2 fixed via `inject_distinct` helper, H1 emits `AS <ident>` + column
+list, H2 grep tightened + `TODO Slice C.2:` seam markers). Tests: 230 core + 14 connect-server.
+Progress signal **not re-measured** (per methodology, only at final termination); `core_v2`
+`v2_progress.md` still at 12/324 baseline.
+
+**C.2 will deliver**: scalar-expression declarative rows for the `cast-*`, `str-*`, `math-*`,
+`dt-*`, and `agg-*` cases where Spark parity requires a projection CAST; drains the
+`SqlGenerator::gen_expr` seam entirely (removes the `use crate::generator::SqlGenerator` import
+from `emission.rs` and tightens INV3 to reject it); adds the projection-cast slot to per-op
+renderers. Expected progress delta: 12 → ≈180–200.
+
+**DEFER carryover to C.2** (`tasks/v2-slice-c-iteration-log.md` for details): M5 (global
+`EMIT_TAP` not test-isolated — latent flake), M6 (`render_tail` embeds `child_sql` twice —
+legacy has same shape), L1 (`render_expr` allocates fresh `SqlGenerator` per call — dies with
+the seam), `UpdateFields` walking in `ensure_no_ambiguous_columns`, subquery-body walking for
+ambiguity (Slice G), union per-column CAST wrapper for widened schema, and the
+`SqlGenerator::gen_expr` seam drain itself. Perf **OPT-M2** (schema clone in `render_expr`) and
+**OPT-M3** (`build_base_types` unconditional clones) deferred to C.2 — both interact with code
+C.2 restructures.
+
+**Note.** The list below is C.1+C.2 combined; C.1 alone lands the operator-level surface. Cases
+whose only projection expressions render unchanged through legacy `SqlGenerator::gen_expr` turn
+green with C.1 dispatch; the projection-CAST-dependent cases wait for C.2.
+
+Original unlock list:
 - `proj-001..015` (15)
 - `filt-001..015` (15)
 - `cast-001..011` (11; `cast-012` is `spark4`+extension, deferred to Slice D)

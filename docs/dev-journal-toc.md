@@ -4,19 +4,26 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
-## 2026-07-01 — v2 Slice B: Type & Nullability Analyzer
+## 2026-07-01 — v2 Slice B + Slice C.1 (Substrate)
 
 [`dev_journal/2026-07-01-v2-slice-b-analyzer.md`](dev_journal/2026-07-01-v2-slice-b-analyzer.md)
 
-`CommonAst` grew from unit struct to 15-operator enum + `Punt`. Analyzer substrate landed:
+**Slice B**: `CommonAst` grew from unit struct to 15-operator enum + `Punt`. Analyzer substrate:
 `TypedAst`, `TypedAttr`, `AnalyzerError`, sealed `HasSchema`, three bounded passes (`resolve`,
 `assign_types` with `Union` downward sub-sweep, `derive_nullability`), five input-relation
-fixtures + five mini `CommonAst` fixtures, `inference_smoke()`. **INV4** and **INV5**
-activated (TODO markers deleted); `transpiler_v2::generate` still returns `Unsupported`
-(Slice C wires dispatch). All delegation to legacy `Expression::{data_type, nullable}` and
-`TypeInferenceEngine` — zero rule re-derivation per ADR-015.
+fixtures + five mini `CommonAst` fixtures, `inference_smoke()`. **INV4** and **INV5** activated.
 
-**Tests**: 215 unit + lib · differential unchanged (not re-run)
+**Slice C.1** (architect-proposed C.1/C.2 sub-split honored; C.2 next pass): `lowering.rs`
+(29-variant `LogicalPlan → CommonAst` adapter with `Punt`); `emission.rs` grown into hand-written
+`dispatch_op` `match` + per-op renderers + `EmittedSql` newtype; `mod.rs` `pub fn generate`
+composes `lower → analyze → dispatch`; `service.rs` `TranspilerPath::V2` dispatches with
+`is_v2_fallback_eligible` legacy fallback; `error.rs` `V2Lowering`/`V2Analyzer`/`V2Emission`
+variants. All six Slice-B mediums (M1-M6) closed. **INV2** and **INV3** activated. Two review
+iterations (iteration 1 `NEEDS_CHANGES` — half-declarative `EMISSION_TABLE` scaffolding-without-
+interpreter; iteration 2 `APPROVED` — scaffolding deleted). OPT-M1 (`quote_ident` fast path)
+applied. `SqlGenerator::gen_expr` remains as a documented C.2 seam.
+
+**Tests**: 230 core + 14 connect-server · differential unchanged (not re-run)
 
 ---
 

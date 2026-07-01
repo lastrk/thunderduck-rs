@@ -158,19 +158,85 @@ also modifies. Verify none regress:
 - **Slice I**: full INV1 activation (differential-harness).
 - **Slice J**: INV2 escape-hatch dimension.
 
+## Handling functions missing from `ext4` — DO write a specification, do NOT silently defer
+
+The `thdck_spark_funcs` C++ extension binaries in this repo are pinned to the
+`ext4` release (per ADR-020). This repo does NOT own the extension's source —
+that lives in a separate project (`thunderduck-duckdb-extension`), and a
+future release (e.g., `ext5`) will be a coordinated build-pin update per
+ADR-020's revisit-triggers.
+
+If during Slice D you identify a corpus case that requires a `spark_*`
+function **not present in `ext4`**, do NOT halt the slice and do NOT silently
+defer. Instead:
+
+1. **Write a specification** for the function to
+   `tasks/duckdb-extension-specs/spark_<name>.md` per the template below.
+   This is the handoff artifact for a different session working in the
+   `thunderduck-duckdb-extension` project — that session implements the
+   function against the DuckDB extension SDK using the spec as its input.
+2. **DEFER the corpus cases** that depend on the missing function to a
+   future "`thdck_spark_funcs ext5` release slice" — add them under a
+   new **"Pending C++ extension work"** heading in the readiness map's
+   Slice D DEFER list, naming each spec file that unblocks each case.
+3. **Continue Slice D** on the functions that ARE in `ext4`. Do not let a
+   handful of missing extension functions block the rest of the slice's
+   progress.
+4. **Commit spec files in the Slice D pass that identified them.** They
+   are load-bearing artifacts, not scratch notes — the extension session
+   consumes them.
+
+### Specification template
+
+Write each spec file as `tasks/duckdb-extension-specs/spark_<name>.md`
+containing:
+
+- **Function name**: `spark_<name>` — the DuckDB-side symbol to be exported
+  by the `thdck_spark_funcs` extension.
+- **Spark equivalent**: the exact Spark function / semantic being
+  replicated (e.g., "Spark's `hash(...)` — Murmur3-32, signed INT return,
+  seed = 42, variadic column input").
+- **Signature**: input types (list — cite `crate::types::DataType`
+  variants), return type, variadic vs. fixed-arity, aggregate vs. scalar.
+- **Semantic contract**: what makes Spark's behavior distinct from
+  DuckDB's native form. Cite the exact Spark rule (link to Spark source
+  if you can find it) OR the legacy `crate::functions::FunctionRegistry`
+  mapping arm that emits this function today (read-only reference — INV3
+  forbids importing in `emission.rs`, but the extension-spec session can
+  read it freely).
+- **Corpus test cases**: the exact case IDs this function unblocks —
+  Slice D's cases first, then later slices if the function participates
+  in complex-type / join / vertical emission.
+- **Reference implementation pointer**: (a) Spark source file/line if
+  known; (b) the legacy `SqlGenerator::gen_expr` arm that emits the
+  function today (usually via `FunctionRegistry::translate_typed`); (c)
+  any C++ or Rust reference implementation of the algorithm (e.g., for
+  `spark_hash` — Murmur3-32 reference impl link).
+- **Dependencies**: any DuckDB internals (`LogicalType`, `Vector`,
+  `AggregateFunctionSet`), other `spark_*` functions this composes with,
+  or other DuckDB extensions this relies on.
+- **Testing notes**: a minimal SQL test that exercises the function
+  once implemented. The extension session runs this against a local
+  DuckDB build with the extension loaded before shipping.
+
+Once `ext5` is released and pinned, a follow-up slice ("`thdck_spark_funcs
+ext5` release slice") consumes the spec files, removes the DEFER carryover,
+and adds the newly-available functions to `extension_targets()`.
+
 ## Non-goals — do NOT do any of these
 
-- Do NOT introduce new C++ extension functions in `thdck_spark_funcs`. The
-  `ext4` release binaries are pinned; if a corpus case needs a function not
-  yet in the extension, DEFER it to a future release-pinning slice per
-  ADR-020's revisit-triggers.
+- Do NOT modify the `thdck_spark_funcs` C++ extension binaries in this
+  repo. The `ext4` release is pinned per ADR-020. New C++ implementations
+  land in the separate `thunderduck-duckdb-extension` project via the
+  specification handoff described above.
 - Do NOT reintroduce `use crate::functions::FunctionRegistry` or
   `use crate::generator::*` in `emission.rs`. INV3's tightened predicate
   (Slice C.2) stays load-bearing.
 - Do NOT change legacy `FunctionRegistry`, `SqlGenerator`, or
   `TypeInferenceEngine` bodies. Legacy remains untouched.
-- Do NOT skip INV6's activation. The whole slice's ADR value is contingent
-  on INV6 having teeth.
+- Do NOT skip INV6's activation for the subset of functions that ARE in
+  `ext4`. INV6 becomes load-bearing over that subset, not vacuously
+  waived because some functions are pending.
 - Do NOT edit the corpus or test harness.
 - Do NOT run the differential suite between passes (methodology forbids it).
 

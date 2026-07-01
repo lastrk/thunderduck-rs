@@ -4,7 +4,7 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
-## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4 + Slice C.3-3 + Slice C.3-5
+## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4 + Slice C.3-3 + Slice C.3-5 + Slice C.3 remaining (C.3-1 / C.3-2 / C.3-6)
 
 [`dev_journal/2026-07-01-v2-slice-b-analyzer.md`](dev_journal/2026-07-01-v2-slice-b-analyzer.md)
 
@@ -100,7 +100,25 @@ locking in the extension-routing + widened-DECIMAL-CAST invariant. Both would ha
 failed against pre-Slice-D-Phase-1 emission. **Progress signal delta: +0** (151 → 151;
 `agg-007` was already inside the 151 baseline). Legacy TPC-H 51/51 unregressed.
 
-**Tests**: 276 core + 17 connect-server (+ 2 regression tests from C.3-5) · differential 151/324 core_v2 (v2 path) · 51/51 legacy TPC-H
+**Slice C.3 remaining** (C.3-1 / C.3-2 / C.3-6; `/new-feature` pipeline): third Slice-C.3
+pass targeting `hash-002`, `hash-003`, `agg-013`. **C.3-2** landed cleanly (single-file
+extension of `FunctionCall::nullable`'s non-nullable literal list in
+`crates/core/src/expression/mod.rs` to include `hash`/`murmur3`/`xxhash64`; `murmur3`
+bundled in as a Spark synonym) — closes `hash-003`, **+1 delta (151 → 152)**. **C.3-1**
+landed **dormant**: the v2 fix in `emission.rs` (sha arg-strip in the `sha`/`sha1`/`sha2`
+arm) + a regression test committed, but `hash-002` stays RED because the corpus routes
+through the legacy `SqlRelation` fallback (`emp` DataFrame's `spark.createDataFrame(...)`
+plan contains `SqlRelation`, which the v2 analyzer punts) and legacy's `FunctionRegistry`
+maps `sha2 → SHA256` name-only with the same bug; non-goals forbid touching legacy, so the
+v2 fix lights up the moment Slice D/E wires `SqlRelation`. **C.3-6** halted: preflight
+showed `agg-013` RED with `Binder Error: approx_quantile(DOUBLE, DOUBLE)` — DuckDB requires
+FLOAT for the quantile arg but v2 emits `0.5::DOUBLE`; emission-side literal-type-suffix
+bug, out of C.3-6's verify-only scope. Tracked as **C.3-6b** for a follow-up `/fix-bug`.
+Discipline instance: the "dormant v2 fix" shape (land + test + halt without touching
+legacy) is a legitimate outcome recorded in `tasks/lessons.md`. Review APPROVED, 0
+Critical + 0 High.
+
+**Tests**: 278 core + 17 connect-server (+ 2 regression tests from Slice C.3 remaining) · differential 152/324 core_v2 (v2 path) · 51/51 legacy TPC-H
 
 ---
 

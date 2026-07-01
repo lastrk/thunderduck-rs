@@ -1274,7 +1274,7 @@ fn render_function_call(
         "left" => format!("LEFT({})", joined()),
         "right" => format!("RIGHT({})", joined()),
         "md5" => format!("MD5({})", joined()),
-        "sha" | "sha1" | "sha2" => format!("SHA256({})", joined()),
+        "sha" | "sha1" | "sha2" => format!("SHA256({})", arg_refs.first().copied().unwrap_or("")),
         "levenshtein" => format!("LEVENSHTEIN({})", joined()),
         "url_decode" => format!("URL_DECODE({})", joined()),
         "url_encode" => format!("URL_ENCODE({})", joined()),
@@ -3080,6 +3080,52 @@ mod tests {
         assert_eq!(
             child_occurrences, 1,
             "tail must reference child only once (via CTE), got {s:?}"
+        );
+    }
+
+    // ── C.3-1 regression: sha2 arg-strip ───────────────────────────────────
+
+    /// Regression for hash-002: Spark `sha2(col, 256)` must translate to
+    /// DuckDB `SHA256(col)` — the bit-length is fixed by the arm and the
+    /// second argument must not be forwarded. Prior to the fix, the arm
+    /// emitted `SHA256(col, 256)`, which DuckDB rejects as a Binder Error
+    /// (`sha256(VARCHAR, INTEGER_LITERAL)` has no matching candidate).
+    #[test]
+    fn sha2_with_bit_length_strips_extra_args() {
+        let sch = empty_schema();
+        let sql = s(render_expr(
+            &call(
+                "sha2",
+                vec![
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "name".to_string(),
+                        qualifier: None,
+                    }),
+                    Literal::int(256),
+                ],
+            ),
+            &sch,
+            "t",
+        ));
+        assert!(
+            sql.contains("SHA256("),
+            "sha2 must route through SHA256(...), got {sql:?}"
+        );
+        // Bit-length arg must be stripped: the emitted SQL must not carry the
+        // literal `256` as an argument value. Note that the function name
+        // itself contains `256`, so we assert on the argument list rather than
+        // the raw string.
+        assert!(
+            !sql.contains(", 256"),
+            "sha2 arm must strip the bit-length arg, got {sql:?}"
+        );
+        assert!(
+            !sql.contains(", "),
+            "sha2 must be a single-arg call after strip, got {sql:?}"
+        );
+        assert_eq!(
+            sql, "SHA256(\"name\")",
+            "sha2 must emit exactly one arg to SHA256, got {sql:?}"
         );
     }
 }

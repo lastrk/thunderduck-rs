@@ -1048,7 +1048,14 @@ impl Expression {
                 let lower = f.name.to_lowercase();
                 if matches!(
                     lower.as_str(),
-                    "count" | "count_distinct" | "count_if" | "grouping" | "grouping_id"
+                    "count"
+                        | "count_distinct"
+                        | "count_if"
+                        | "grouping"
+                        | "grouping_id"
+                        | "hash"
+                        | "murmur3"
+                        | "xxhash64"
                 ) {
                     false
                 } else if TypeInferenceEngine::aggregate_is_always_nullable(&lower) {
@@ -1477,5 +1484,51 @@ mod tests {
             distinct: false,
         });
         assert!(!expr.nullable(&s));
+    }
+
+    /// Regression for hash-003: Spark's `hash()`, `xxhash64()`, and their
+    /// synonym `murmur3()` are total functions over any argument set — they
+    /// always return a value, so nullability of inputs must not propagate.
+    /// Prior to the fix, the default `FunctionCall::nullable` arm
+    /// (`f.args.iter().any(|a| a.nullable(schema))`) marked the result
+    /// nullable whenever any argument was nullable, which caused the
+    /// per-column nullable check to diverge from Spark. Covers single-arg
+    /// and multi-arg variants for all three names.
+    #[test]
+    fn hash_and_xxhash64_are_non_nullable_regardless_of_args() {
+        let s = StructType::new(vec![
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("salary", DataType::Double),
+        ]);
+        // Sanity: the args ARE nullable — proves the default arm would have
+        // marked the result nullable without the fix.
+        assert!(ColumnReference::untyped("name").nullable(&s));
+        assert!(ColumnReference::untyped("salary").nullable(&s));
+
+        for name in ["hash", "xxhash64", "murmur3"] {
+            let single = Expression::FunctionCall(FunctionCall {
+                name: name.to_owned(),
+                args: vec![ColumnReference::untyped("name")],
+                distinct: false,
+            });
+            assert!(
+                !single.nullable(&s),
+                "{name}(nullable_col) must report nullable=false"
+            );
+
+            let multi = Expression::FunctionCall(FunctionCall {
+                name: name.to_owned(),
+                args: vec![
+                    ColumnReference::untyped("name"),
+                    ColumnReference::untyped("salary"),
+                ],
+                distinct: false,
+            });
+            assert!(
+                !multi.nullable(&s),
+                "{name}(nullable_col, nullable_col) must report nullable=false"
+            );
+        }
     }
 }

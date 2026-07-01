@@ -64,7 +64,20 @@ Expected progress signal delta: **134 → ~140-142 core_v2 passing**.
 Six correctness fixes on the Rust side. Every fix must have a regression
 test that would have caught the bug before Slice C.3.
 
-### C.3-1: `sha`/`sha1`/`sha2` arg-stripping
+### C.3-1: `sha`/`sha1`/`sha2` arg-stripping — **LANDED DORMANT 2026-07-01**
+
+**Status:** v2 fix + regression test committed; `hash-002` does **NOT** turn
+green because the runtime path routes through the legacy `SqlRelation`
+fallback (the `emp` DataFrame built via `spark.createDataFrame(...)` triggers
+`AnalyzerError::PuntedOperator` for `SqlRelation`, so v2 punts to legacy),
+and legacy's `FunctionRegistry` name-only mapping `sha2 → SHA256` forwards
+all args and has the same bug. HALT-AND-FLAG per the coder's
+diagnostic-first invariant: the plan's "matches legacy behavior" claim was
+factually incorrect (legacy does NOT strip the bit-length), and the fix
+belongs on the v2 substrate only. Non-goals forbid touching legacy
+`FunctionRegistry`, so `hash-002` stays RED until Slice D/E wires
+`SqlRelation` on the v2 common-AST surface. At that point the v2 fix
+lights up and the corpus case flips green immediately.
 
 - **Location:** `crates/core/src/transpiler_v2/emission.rs:1277`.
 - **Current shape:** `"sha" | "sha1" | "sha2" => format!("SHA256({})", joined())`.
@@ -88,7 +101,25 @@ test that would have caught the bug before Slice C.3.
   contain `256`. Would have failed before Slice C.3.
 - **Target case ID unblocked:** `hash-002`.
 
-### C.3-2: `hash`/`xxhash64` return nullability
+### C.3-2: `hash`/`xxhash64` return nullability — **LANDED 2026-07-01**
+
+**Status:** LANDED cleanly; delivered **+1** core_v2 delta (151 → 152)
+closing `hash-003`. Fix landed in `crates/core/src/expression/mod.rs`
+(single-file edit): extended `FunctionCall::nullable`'s non-nullable
+literal list from `"count" | "count_distinct" | "count_if" | "grouping" |
+"grouping_id"` to include `"hash" | "murmur3" | "xxhash64"`. `murmur3`
+was added alongside `hash` (Spark synonym, same algorithm and
+non-nullability; already grouped with `hash` at `type_inference.rs:733`)
+to pre-empt a latent bug. `Expression::nullable` is a shared code path
+consulted by both v2 and legacy, so the fix closes `hash-003` regardless
+of which emission path handles the plan (the corpus case also routes
+through the legacy `SqlRelation` fallback per the C.3-1 diagnostic). One
+regression test in `expression/mod.rs::tests`:
+`hash_and_xxhash64_are_non_nullable_regardless_of_args` — asserts
+non-nullability for `hash`, `xxhash64`, and `murmur3` on both single-arg
+and multi-arg calls, with a sanity anchor confirming the source args ARE
+nullable so the default fall-through arm would have returned true
+pre-fix.
 
 - **Location:** analyzer's function-return-type inference — likely
   `crates/core/src/transpiler_v2/analyzer.rs::assign_types_function_call`
@@ -233,7 +264,18 @@ Both tests would have failed against pre-Slice-D-Phase-1 emission
 **Target case ID:** `agg-007` — already inside the 151 baseline; no
 counter movement expected or observed.
 
-### C.3-6: `percentile_approx` / `median` shape verification
+### C.3-6: `percentile_approx` / `median` shape verification — **HALT-AND-FLAG 2026-07-01**
+
+**Status:** HALT-AND-FLAG. Preflight showed `agg-013` RED (not GREEN as
+the plan predicted). Root cause: DuckDB's `approx_quantile` requires
+`FLOAT` for the quantile arg but the emission passes `0.5::DOUBLE`
+(`Binder Error: approx_quantile(DOUBLE, DOUBLE) — Candidate:
+approx_quantile(DOUBLE, FLOAT) -> DOUBLE`). The bug is emission-side
+(the literal `0.5` is rendered with a DOUBLE type-suffix rather than
+FLOAT) and does not match C.3-6's verify-only shape. Out of C.3-6 scope
+per the branch table; needs a follow-up `/fix-bug` for the FLOAT/DOUBLE
+quantile-arg emission. No production change or regression tests added
+for `agg-013` this pass. Tracked as **C.3-6b (follow-up)**.
 
 - **Location:** `emission.rs::render_function_call` (Slice D Phase 1
   additions at ~lines 1300-ish).

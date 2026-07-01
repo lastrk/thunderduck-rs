@@ -150,6 +150,26 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   pipeline correctly collapses to a test-lock-in verify-only pass — do not
   fabricate a fix for a bug that no longer reproduces.
 
+- **Dormant v2 fixes are legitimate outcomes when the runtime routes through legacy
+  for a corpus case that Slice D/E has not yet wired.** Slice C.3-1 (2026-07-01)
+  landed the correct sha arg-strip fix in `crates/core/src/transpiler_v2/emission.rs`
+  plus a regression test, but the target case `hash-002` stayed RED because the
+  runtime path for `spark.createDataFrame(...)` DataFrames routes through the
+  legacy `SqlRelation` fallback (`AnalyzerError::PuntedOperator` — raw-SQL
+  sub-relations are out of the Slice B common-AST surface), and legacy's
+  `FunctionRegistry` maps `sha2 → SHA256` name-only and has the same bug. Non-goals
+  forbid touching legacy `FunctionRegistry`. Two shapes were available: (a)
+  silently rewrite legacy to satisfy the corpus, or (b) land the v2 fix + test
+  and halt-and-flag the corpus case as blocked on future Slice D/E `SqlRelation`
+  handling. The coder picked (b). Complements the C.3-4 scope-overturn lesson
+  from a different angle: there the fix belonged upstream of the v2 substrate;
+  here the fix belongs on the v2 substrate but the runtime hasn't yet reached
+  it. Rule: when a v2 fix is correct but the corpus case runs through legacy
+  fallback for a plan shape the current slice doesn't own, land the v2 fix +
+  regression test as dormant; halt-and-flag the corpus case with an explicit
+  "blocked on future slice X" note. The regression test locks the fix in for
+  the moment the routing changes, and no non-goal edits sneak in.
+
 - **Silent-NULL catch-alls in typed dispatch are data-corruption anti-patterns.**
   The Slice C.3-4 root cause was a single-line `_ => Ok("NULL".to_string())`
   at `relation_converter.rs:2513`. It silently mapped every unhandled Arrow

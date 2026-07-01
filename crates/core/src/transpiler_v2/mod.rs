@@ -86,3 +86,36 @@ mod tests {
         assert!(matches!(err, ThunderduckError::Unsupported(_)));
     }
 }
+
+pub mod analyzer;
+pub mod ast;
+pub mod emission;
+pub mod provenance;
+
+#[cfg(test)]
+mod invariants;
+
+/// Reviewed exception list for [INV2 §CV.5]: every τ decision that is not
+/// node-local after the analyzer pass MUST appear here under a stable name.
+///
+/// Empty today; entries are added by the rearchitecture work in ADR-007
+/// (B-layer structural transliterations) and ADR-009 (C escape hatches).
+/// The [`invariants::inv2_node_local_or_labeled_escape_hatch`] test asserts
+/// every entry is non-empty and unique.
+///
+/// TODO INV2: populate as ADR-007/ADR-009 land specific escape hatches.
+pub const C_ESCAPE_HATCHES: &[&str] = &[];
+
+/// Runtime tap used by the differential harness to record the post-serialize
+/// payloads sent to each engine, satisfying [INV1 §CV.5]
+/// (serialize-once-send-twice). The harness sets one tap at suite startup.
+///
+/// **Stub.** No serializer exists in v2 today, so the tap stores nothing and
+/// the [`invariants::inv1_both_engines_receive_byte_identical_input`] test
+/// reads an empty payload list. The tap's *signature* is fixed now so the
+/// future serializer can plug in without churning the test.
+///
+/// TODO INV1: wire to the v2 serializer once ADR-015's harness lands.
+pub fn set_serializer_tap(_tap: fn(&[u8])) {
+    // intentional no-op stub
+}

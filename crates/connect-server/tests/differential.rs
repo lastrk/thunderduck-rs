@@ -11,11 +11,17 @@
 //! ./tests/scripts/setup-differential-testing.sh
 //! cargo build --release
 //!
-//! # per-suite (use cargo's test-name filter to pick):
-//! cargo test -p thunderduck-connect-server --test differential tpch -- --ignored --nocapture
+//! # the fast representative gate (DataFrame-only conformance corpus):
+//! cargo test -p thunderduck-connect-server --test differential core    -- --ignored --nocapture
 //!
-//! # full sweep:
-//! cargo test -p thunderduck-connect-server --test differential all  -- --ignored --nocapture
+//! # same corpus routed through the v2 transpiler — the v2 development gate:
+//! cargo test -p thunderduck-connect-server --test differential core_v2 -- --ignored --nocapture
+//!
+//! # any single suite (use cargo's test-name filter to pick):
+//! cargo test -p thunderduck-connect-server --test differential tpch    -- --ignored --nocapture
+//!
+//! # full sweep (everything, including the corpus):
+//! cargo test -p thunderduck-connect-server --test differential all     -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;
@@ -55,6 +61,24 @@ fn run_suite(suite: &str) {
         status.success(),
         "differential suite '{suite}' failed (status: {status})"
     );
+}
+
+/// Conformance corpus (DataFrame API only, ~324 cases biased toward
+/// Spark/DuckDB type-and-nullability divergence). The fast, representative
+/// gate; should be green on the legacy transpiler.
+#[test]
+#[ignore]
+fn core() {
+    run_suite("core");
+}
+
+/// Same corpus, routed through `THUNDERDUCK_TRANSPILER=v2`. Today expect
+/// nearly all cases to fail with gRPC `Unimplemented` (v2 stub). Each commit
+/// growing the v2 dispatch table should turn one or more Case IDs green.
+#[test]
+#[ignore]
+fn core_v2() {
+    run_suite("core_v2");
 }
 
 #[test]

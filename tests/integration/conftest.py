@@ -606,6 +606,24 @@ def spark_thunderduck(orchestrator, dual_server_manager):
     orchestrator._active_sessions.discard(session)
 
 
+# Corpus-input fixtures: build the 5 corpus DataFrames once per test module so the
+# 324-case parametrized sweep doesn't `createDataFrame` from scratch on every case.
+# Module-scoped matches `spark_reference` / `spark_thunderduck` and shares one build
+# across the whole corpus test file.
+@pytest.fixture(scope="module")
+def corpus_inputs_reference(spark_reference):
+    """Build the corpus's 5 input DataFrames once against the Spark reference session."""
+    from differential.dataframe_corpus import build_inputs
+    return build_inputs(spark_reference)
+
+
+@pytest.fixture(scope="module")
+def corpus_inputs_thunderduck(spark_thunderduck):
+    """Build the corpus's 5 input DataFrames once against the Thunderduck session."""
+    from differential.dataframe_corpus import build_inputs
+    return build_inputs(spark_thunderduck)
+
+
 # Function-scoped sessions (for tests that need per-test isolation)
 @pytest.fixture
 def spark_reference_isolated(orchestrator):

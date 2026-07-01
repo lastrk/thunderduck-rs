@@ -105,6 +105,7 @@ PYTEST_PID=""
 
 get_test_files() {
     case "$1" in
+        core | core_v2) echo "differential/test_dataframe_corpus_differential.py" ;;
         tpch)        echo "differential/test_differential_v2.py differential/test_tpch_differential.py" ;;
         tpcds)       echo "differential/test_tpcds_differential.py differential/test_tpcds_dataframe_differential.py" ;;
         functions)   echo "differential/test_dataframe_functions.py" ;;
@@ -126,6 +127,8 @@ get_test_files() {
 
 get_test_description() {
     case "$1" in
+        core)        echo "Conformance corpus (DataFrame API only, biased to divergence) — legacy transpiler" ;;
+        core_v2)     echo "Same corpus, routed through THUNDERDUCK_TRANSPILER=v2 — v2 conformance gate" ;;
         tpch)        echo "TPC-H SQL and DataFrame tests" ;;
         tpcds)       echo "TPC-DS SQL and DataFrame tests" ;;
         functions)   echo "DataFrame function parity tests" ;;
@@ -140,7 +143,7 @@ get_test_description() {
         dataframe)   echo "TPC-DS DataFrame API tests" ;;
         datetime)    echo "Date/time function tests" ;;
         conditional) echo "Conditional expressions (when/otherwise)" ;;
-        all)         echo "All differential tests" ;;
+        all)         echo "All differential tests (includes core)" ;;
         *)           echo "" ;;
     esac
 }
@@ -213,8 +216,12 @@ echo -e "${GREEN}  Thunderduck binary found: $BINARY_PATH${NC}"
 show_help() {
     echo "Usage: $0 [--ci] [test-group] [pytest-args...]"
     echo ""
-    echo "Test groups: tpch tpcds functions aggregations window datetime"
+    echo "Test groups: core core_v2 tpch tpcds functions aggregations window datetime"
     echo "             conditional operations lambda joins statistics types schema dataframe all"
+    echo ""
+    echo "  core     — DataFrame-only conformance corpus, legacy transpiler (the fast gate)"
+    echo "  core_v2  — same corpus, routed through THUNDERDUCK_TRANSPILER=v2 (v2 dev gate)"
+    echo "  all      — everything including core (the comprehensive gate)"
     exit 0
 }
 
@@ -253,6 +260,19 @@ echo ""
 
 export SPARK_HOME
 export THUNDERDUCK_BINARY="$BINARY_PATH"
+
+# Transpiler dispatch: `core_v2` routes through the v2 path; everything else
+# uses the legacy path. The env var is read by connect-server/main.rs and
+# selects the dispatch arm in service.rs::generate_sql.
+case "$TEST_GROUP" in
+    core_v2)
+        export THUNDERDUCK_TRANSPILER=v2
+        echo -e "    Transpiler:        ${CYAN}v2 (rearchitecture path)${NC}"
+        ;;
+    *)
+        unset THUNDERDUCK_TRANSPILER
+        ;;
+esac
 
 cd "$WORKSPACE_DIR/tests/integration"
 

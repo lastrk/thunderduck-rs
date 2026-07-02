@@ -70,12 +70,12 @@ Required sections:
 - Progress signal measured **at termination only**. Between passes: focused corpus preflight (`pytest -k "<target-ids>"`) for scope calibration.
 
 **Terminate when:**
-- Every target corpus case ID in `tasks/v2-slice-<SLICE_ID>-scope.md` §Targets is GREEN on `core_v2` (verify via `cd tests/integration && python3 -m pytest differential/test_dataframe_corpus_differential.py -k "<target-ids>" -v`).
-- Legacy TPC-H 51/51 unregressed.
-- `./tests/scripts/run-differential-tests.sh all` — no regressions vs baseline.
+- Every target corpus case ID in `tasks/v2-slice-<SLICE_ID>-scope.md` §Targets is GREEN on `core_v2` (verify via `cd tests/integration && python3 -m pytest differential/test_dataframe_corpus_differential.py -k "<target-ids>" -v`). For foundational slices with no case-ID unlocks, the load-bearing gates are §Success criteria items in the scope file.
+- `tests/scripts/v2-progress.sh` shows no regression vs the pass's baseline (cases that were green stay green).
 - Quality Gate green each pass.
 - Every applicable inheritance-checklist item verified present.
 - Every new DEFER item names an owning slice.
+- (TPC-H / TPC-DS full-differential suites are NOT termination gates during the τ reimplementation per ADR-022 — the non-τ path they exercise is not maintained; TPC-H rejoins gates once τ covers its query surface.)
 
 **Hard cap:** 5 passes. Passes 6+ escalate to human — the slice boundary is wrong, not the iteration.
 

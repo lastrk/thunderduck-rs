@@ -20,27 +20,68 @@ fn inv1_byte_identical_input() {
     todo!("INV1 activation is Slice I's deliverable (differential harness)")
 }
 
-// ── INV2 (Slice C.1 dispatch + Slice J escape-hatch) ─────────────────────────
+// ── INV2 (ACTIVE — Slice C.1) ────────────────────────────────────────────────
 
-/// DEFER INV2 → Slice C.1 (dispatch-is-only-writer) + Slice J (escape-hatch dimension):
-/// dispatch is the ONLY writer of SQL text; every emission arm must route
-/// through the dispatch table. Slice C.1 introduces `EMIT_TAP` + `EMIT_TAP_MUTEX`
-/// to instrument this at runtime.
+/// INV2: dispatch is the ONLY writer of SQL text — every emission arm must
+/// route through the dispatch table. Slice C.1 introduces `EMIT_TAP` +
+/// `EMIT_TAP_MUTEX` in `emission.rs`; this test asserts that a successful
+/// `generate()` call increments the tap exactly once.
+///
+/// The Slice J escape-hatch dimension extends this test (verifies emitting
+/// via unregistered paths increments zero times).
 #[test]
-#[ignore]
 fn inv2_dispatch_is_only_sql_writer() {
-    todo!("INV2 activation requires EMIT_TAP + EMIT_TAP_MUTEX (Slice C.1)")
+    use super::emission::{EMIT_TAP, EMIT_TAP_MUTEX};
+    use super::{BaseTypes, CommonAst, CommonOp, generate};
+    use std::sync::atomic::Ordering;
+
+    let _guard = EMIT_TAP_MUTEX.lock().expect("EMIT_TAP_MUTEX poisoned");
+    let before = EMIT_TAP.load(Ordering::Relaxed);
+    // SingleRow is the minimal successful witness.
+    let ast = CommonAst::new(CommonOp::SingleRow);
+    let _ = generate(&ast, &BaseTypes::empty()).expect("SingleRow dispatch");
+    let after = EMIT_TAP.load(Ordering::Relaxed);
+    assert_eq!(
+        after - before,
+        1,
+        "dispatch_op must tap exactly once per Ok return",
+    );
 }
 
-// ── INV3 (Slice C.1 — emission table single source of truth) ─────────────────
+// ── INV3 (ACTIVE — Slice C.1) ────────────────────────────────────────────────
 
-/// DEFER INV3 → Slice C.1: the emission table is the SINGLE source of truth
-/// for function → DuckDB mapping; a grep barrier over `crates/core/src/` must
-/// find zero non-table sources of function → SQL name mappings.
+/// INV3: the emission table is the SINGLE source of truth for function →
+/// DuckDB mapping. Slice C.1's grep-barrier form: `emission.rs` MUST NOT
+/// import from `crate::generator::` or `crate::functions::` (legacy sources
+/// of function-name mappings). INV10's walker already checks intra-τ imports
+/// at the file level; this test asserts the specific emission-file constraint.
 #[test]
-#[ignore]
 fn inv3_emission_table_single_source_of_truth() {
-    todo!("INV3 activation is Slice C.1's grep-barrier deliverable")
+    let root = find_workspace_root().expect("workspace root should be discoverable");
+    let emission = root.join("crates/core/src/transpiler_v2/emission.rs");
+    let contents = std::fs::read_to_string(&emission)
+        .unwrap_or_else(|_| panic!("cannot read {}", emission.display()));
+    // Only scan the non-test region — the `#[cfg(test)]` module in
+    // emission.rs legitimately names legacy paths inside its assertion
+    // literals.
+    let module_marker = "#[cfg(test)]\nmod tests {";
+    let scan_slice = match contents.find(module_marker) {
+        Some(idx) => &contents[..idx],
+        None => contents.as_str(),
+    };
+    // Build needles at runtime so this test's source doesn't self-match.
+    for base in ["generator", "functions"] {
+        let use_form = format!("use crate::{base}::");
+        let path_form = format!("crate::{base}::");
+        assert!(
+            !scan_slice.contains(&use_form),
+            "INV3 violation — emission.rs contains `{use_form}`",
+        );
+        assert!(
+            !scan_slice.contains(&path_form),
+            "INV3 violation — emission.rs contains `{path_form}`",
+        );
+    }
 }
 
 // ── INV4 (ACTIVE — Slice B) ──────────────────────────────────────────────────

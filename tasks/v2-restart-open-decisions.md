@@ -271,3 +271,37 @@ With INV7 deleted (Decision 4), the two front-ends do not need to produce struct
 
 **In CLAUDE.md (project-level, not ADR-level; noted for follow-up):**
 - `### 4. Verification Before Done` step 4 ("TPC-H differential mandatory") is amended in spirit during the restart: DataFrame corpus is the fitness function; TPC-H rejoins the gate once v2 covers its query surface. The CLAUDE.md text itself is a separate follow-up edit.
+
+---
+
+## Decision 13 — Renderers named in C.1 scope with no Slice-B `TypedOp` sink — **RESOLVED (tentative, 2026-07-02; awaiting Slice-C.1 reviewer confirmation)**
+
+**Surfaced by:** Slice C.1 Pass 1 architect (2026-07-02).
+
+**Context.** The C.1 scope file (`tasks/v2-slice-C-scope.md` §Sub-slice sketch, and readiness map §Slice C → C.1 item 2) lists thirteen operator renderers as deliverables: `render_project, render_filter, render_sort, render_limit, render_tail, render_distinct, render_with_columns, render_drop_columns, render_aliased_relation, render_table_scan, render_local_relation, render_range_relation, render_values`. **Six of the thirteen have no matching `TypedOp` variant in the analyzer as landed by Slice B** (`analyzer.rs::TypedOp`): `Tail`, `Distinct`, `WithColumns`, `DropColumns`, `AliasedRelation` (`SubqueryAlias`), `Range`. These proto shapes are not lowered by the current `V2RelationConverter` either — per Open Decision 2's hybrid growth model they surface as `UnsupportedProtoShape` at the front-end boundary, so they never reach `dispatch_op`.
+
+**Why the ADRs are silent.** ADR-009's Approach A specifies the emission shape but does not address renderers landed ahead of their `TypedOp` sinks. The success criteria for C.1 (§5.4 CTE for `render_tail`, §5.6 `quote_ident` fast path) require concrete code today — deferring the six renderers would defer those anchors.
+
+**Options.**
+
+- **13-A** — Land the six unwired renderers as private helpers with worked bodies (implementing §5.4 CTE, §5.6 quote_ident use, etc.), tested directly rather than via `dispatch_op`. Mark `#[allow(dead_code)]`. When a future substrate slice adds the missing `CommonOp`/`TypedOp` variants and the `V2RelationConverter` arms, wiring is a single new `dispatch_op` arm per variant. **Cost:** six dead-code helpers in the compiled binary until sunk. **Benefit:** every C.1 checklist anchor lives in real, tested code today.
+- **13-B** — Reject the scope's renderer list as ill-formed for C.1; land only the seven renderers with `TypedOp` sinks. Defer §5.4 CTE anchor and the `render_range_relation`-style helpers to whichever slice adds the corresponding `TypedOp` variants. **Cost:** several C.1 success criteria unmet at C.1 (they migrate to the sub-slice that lands `TypedOp::Tail` etc.). **Benefit:** zero dead code.
+- **13-C** — Extend `CommonOp`/`TypedOp` in C.1 to add the six missing variants (retro-broadening Slice B substrate). **Rejected** by scope non-goal "Legacy modifications — none. Don't touch Slice A/B substrate."
+
+**Resolution (tentative — orchestrator-recorded 2026-07-02, awaiting reviewer confirmation):** **Option 13-A.**
+
+**Rationale.**
+1. The scope EXPLICITLY LISTS these renderers as C.1 deliverables. The scope authors expected them present.
+2. Two C.1 success criteria (§5.4 CTE for `render_tail`; §5.6 `quote_ident` fast path) require concrete code today. 13-B silently drops those.
+3. 13-C violates the "no legacy/substrate modification" non-goal.
+4. `#[allow(dead_code)]` costs — six functions in the compiled binary, unreachable from `dispatch_op` — are cheap. The Rust compiler emits nothing for unused private functions; the review-time cost is a one-line attribute per helper.
+5. Wiring cost when the missing `TypedOp` variants land: one new arm in `dispatch_op`'s match per variant, zero refactor.
+
+**Landed in:** `crates/core/src/transpiler_v2/emission.rs` (Slice C.1, pending).
+
+**Follow-ups the reviewer must confirm:**
+- The six unwired renderers each carry an `#[allow(dead_code)]` attribute with a comment naming the future slice that will wire them.
+- The §5.4 CTE anchor test (`render_tail_uses_cte_not_double_embed`) invokes `render_tail` directly and asserts CTE shape (not double-embed).
+- A comment near each unwired renderer names its owning future-slice for wiring (`TypedOp::Tail → substrate extension slice; Range → probably Slice A.2 hybrid growth`).
+
+**If the reviewer prefers 13-B**, C.1's Pass N+1 removes the six helpers and demotes the §5.4/§5.6 anchors to comments-only until the corresponding `TypedOp` slice lands.

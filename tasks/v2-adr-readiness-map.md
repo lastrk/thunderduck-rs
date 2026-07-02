@@ -92,11 +92,18 @@ All type/nullability logic delegates to τ's own `Expression::{data_type, nullab
 
 ### Slice C — Core emission substrate + operator arms + scalar/aggregate arms
 
+**C.1 LANDED 2026-07-02 as a single-pass (architect → coder → reviewer APPROVED with 1 High → coder fix iteration → perf HAS_OPPORTUNITIES with 1 HIGH + 3 MEDIUM → coder perf pass). Corpus signal unchanged at 0/324 — architecturally blocked by Slice E's `execute_streaming_query` stub (HALT-AND-FLAG trigger #2 documented; user directive terminated Slice C at C.1 only, escalating C.2/C.3). Realized fitness: `cargo test -p thunderduck-core --lib` went 302 → 342 (+40); INV2 + INV3 activated. `crates/core/src/transpiler_v2/emission.rs` (~1000 LOC post-perf) + `rewrites.rs` (empty). Decision 13-A recorded (six unwired renderers as `#[allow(dead_code)]` helpers keyed to owning future slices). See `docs/dev_journal/2026-07-02-v2-slice-C.md` for details; `.agent-output/005-summary.md` for the full pipeline record. C.2 and C.3 REMAIN OPEN — see "C.2/C.3 status" below.**
+
 Owns ADR-009 (declarative emission table). Per **Open Decision 7 resolution (Option 7a)**, ADR-009's dispatch shape is **Approach A (hand-written match arms) permanently** — the compiled-dispatch codegen macro is formally demoted to a considered-and-rejected alternative for the corpus emission path.
 
 **Inherent dependencies:** A.1, A.2, B. **Non-dependency:** A.3.
 
 **Sub-split (per §CV.7; architect MAY re-scope).** After C.1 substrate lands, C.2 and C.3 may proceed in parallel.
+
+**C.2/C.3 status (2026-07-02):** OPEN. The C.1 pass surfaced that the differential harness (`v2-progress.sh`) is architecturally blocked by Slice E's `execute_streaming_query` unconditional-error stub; corpus signal cannot move at C.2/C.3 either, in isolation. Sequencing options:
+- **Slice E first, then C.2/C.3.** Land Slice E's streaming execution wiring, at which point C.1's already-landed arms move corpus signal to (empirically) whatever C.1 was going to unlock. Then C.2/C.3 add to that signal.
+- **C.2/C.3 first with fitness function reassigned.** Land C.2's ~130 scalar arms + C.3's aggregate arms measured by unit tests + representative SQL emission tests, not by corpus signal. Corpus catches up when Slice E lands.
+- User to decide via a follow-up `/goal`.
 
 **C.1 — Emission substrate + operator arms.** Deliverables:
 
@@ -122,11 +129,18 @@ Owns ADR-009 (declarative emission table). Per **Open Decision 7 resolution (Opt
 2. `spark_aggregate_rewrite` helper (checklist §5.7).
 3. `percentile_approx` FLOAT CAST for quantile arg (checklist §3.2).
 
-**Slice-C-level activated invariants:** INV2 companion, INV3.
+**Slice-C-level activated invariants:** INV2 companion, INV3. **Both ACTIVE as of 2026-07-02 (C.1).**
 
-**Progress signal target:** ~15–25 → ~180–200.
+**Progress signal target:** ~15–25 → ~180–200. **NOT met at C.1** (0/324, unchanged from Slice B baseline) — architecturally blocked by Slice E per above. Empirical progress signal will move when Slice E lands.
 
-**Cumulative sub-slice §Targets:** C.1 ≈ 30–50; C.2 ≈ 120–150 (cumulative); C.3 ≈ 180–200 (cumulative).
+**Cumulative sub-slice §Targets:** C.1 ≈ 30–50; C.2 ≈ 120–150 (cumulative); C.3 ≈ 180–200 (cumulative). **These targets remain valid post-Slice-E; deferred as fitness function during Slice C's isolated execution.**
+
+**Deferred items from C.1 into future slices:**
+- M1 `render_local_relation` panic on row-schema width mismatch → **Slice F** (complex-type LocalRelation payloads).
+- M3 `render_data_type(DataType::Null) = "INTEGER"` silent coercion → **Slice F** (complex-type LocalRelation).
+- L2 `render_projection_slot` nested `Alias(Alias)` peel → **Slice F** (rare Spark idiom).
+- L3 `spark_return_cast` nested-`Div` recursion → **Slice C.2** (extends when scalar-function arms wire).
+- Six `#[allow(dead_code)]` unwired renderers (`render_tail`, `render_distinct`, `render_with_columns`, `render_drop_columns`, `render_aliased_relation`, `render_range_relation`) → each wired by whichever future substrate slice adds the corresponding `TypedOp` variant (Decision 13-A). `render_tail`'s §5.4 CTE anchor is exercised by unit test today.
 
 ---
 

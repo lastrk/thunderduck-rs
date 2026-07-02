@@ -771,7 +771,8 @@ mod tests {
     /// The failure mode we're guarding against: if dispatch fed `Sql` to
     /// `V2RelationConverter`, the error would identify `RelType::Sql` as the
     /// unsupported proto shape. Instead, `parser_v2` parses the SQL and τ's
-    /// `generate()` then errors with `UnsupportedOp`.
+    /// `generate()` emits DuckDB SQL (Slice C.1 wired the Project + SingleRow
+    /// arms — `SELECT 1` is a Project over SingleRow of a literal).
     #[test]
     fn transpile_relation_sql_routes_to_parser_v2_not_converter() {
         let sql_rel = proto::Relation {
@@ -784,23 +785,15 @@ mod tests {
                 pos_arguments: vec![],
             })),
         };
-        let err = transpile_relation(&sql_rel).expect_err("τ emission must error at A.3");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-        // Anchor: message must NOT identify `RelType::Sql` as the
-        // unsupported proto shape (which would prove dispatch fed SQL to the
-        // converter, not `parser_v2`).
+        // Slice C.1 wired Project + SingleRow arms — `SELECT 1` now succeeds.
+        // The routing anchor (SQL → parser_v2, not converter) is still enforced:
+        // a routing bug would have surfaced `RelType::Sql` as an
+        // `UnsupportedProtoShape` error before reaching τ's emission.
+        let (_common_ast, sql) =
+            transpile_relation(&sql_rel).expect("τ must emit SQL for `SELECT 1`");
         assert!(
-            !err.message().contains("RelType::Sql"),
-            "SQL text must route through parser_v2, not V2RelationConverter; \
-             got shape-tagged message: {}",
-            err.message()
-        );
-        // Positive anchor: τ's UnsupportedOp shape.
-        assert!(
-            err.message().contains("unsupported operator")
-                || err.message().contains("<a.2-substrate>"),
-            "expected τ UnsupportedOp; got: {}",
-            err.message()
+            sql.contains("SELECT"),
+            "expected DuckDB SELECT emission; got: {sql}",
         );
     }
 
@@ -857,14 +850,17 @@ mod tests {
     /// `finalize()` builds `BaseTypes::empty()` when the plan carries no
     /// empty-scan (short-circuit anchor at the service layer — the substrate
     /// test in `base_types::tests` already pins the closure-not-invoked
-    /// behavior).
+    /// behavior). Slice C.1 wired SingleRow emission — this test now asserts
+    /// that finalize returns the emitted SQL for a plan with no empty scan
+    /// (proving the short-circuit path builds `BaseTypes::empty()` without
+    /// blocking emission).
     #[test]
     fn finalize_short_circuits_on_plans_without_empty_scan() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
         // A `SingleRow` plan carries no `TableScan` → `plan_has_empty_scan`
-        // is false → `BaseTypes::empty()` (no closure invocation).
+        // is false → `BaseTypes::empty()` (no closure invocation) → τ emits.
         let plan = CommonAst::new(CommonOp::SingleRow);
-        let err = finalize(&plan).expect_err("τ must error at A.3");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        let sql = finalize(&plan).expect("τ must emit for SingleRow");
+        assert_eq!(sql, "SELECT");
     }
 }

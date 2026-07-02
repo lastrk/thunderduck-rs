@@ -4,6 +4,14 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-07-02 — v2 Slice C.1 landing (τ emission substrate + operator arms; C.2/C.3 escalated)
+
+[`dev_journal/2026-07-02-v2-slice-C.md`](dev_journal/2026-07-02-v2-slice-C.md)
+
+**Delta:** 0 → 0 core_v2 (unchanged — HALT-AND-FLAG trigger #2: corpus signal architecturally blocked by Slice E's `execute_streaming_query` stub; τ emits correct SQL for wired arms but harness never reaches DuckDB). C.1 landed as a single pass (architect → coder → reviewer APPROVED with 1 High → fix iteration → perf HAS_OPPORTUNITIES with 1 HIGH + 3 MEDIUM → perf pass). `crates/core/src/transpiler_v2/emission.rs` (~1000 LOC post-perf) + `rewrites.rs` (empty per Decision 6). Approach A hand-written match (ADR-009 + Open Decision 7): 14-arm `dispatch_op` over `TypedOp`, 28-arm `render_expr` over `Expression`. INV2 companion (`EMIT_TAP` + `EMIT_TAP_MUTEX`) + INV3 grep barrier activated. Checklist §-anchors landed in real code: §4.2 (`Cast::try_cast → TRY_CAST`), §5.1 (`spark_return_cast` vs `spark_aggregate_return_cast` as distinct fns), §5.3 (`EMIT_TAP` tap-once), §5.4 (`render_tail` CTE — single `child_sql` embed), §5.6 (`quote_ident` zero-alloc `Cow::Borrowed` fast path, post-perf). Decision 13-A recorded: six unwired renderers (Tail/Distinct/WithColumns/DropColumns/AliasedRelation/Range) landed as `#[allow(dead_code)]` helpers with per-item TODO comments naming owning future slices. Fix pass closed H1 (dead `EmittedSql` newtype deleted), M2 (`DUCKDB_RESERVED` extended with 20 collision-risk keywords), M5 (test rename). Perf pass closed H1 (`quote_ident` fast path truly zero-alloc via byte-level `ascii_ci_cmp`), M1 (`binary_search_by` + invariant guards), M2 (list-building renderers Vec→String buffer), M3 (`is_aggregate_name` `eq_ignore_ascii_case`). Test count 302 → 342 (+40). **Slice C.2 and C.3 REMAIN OPEN** — corpus target requires Slice E execution wiring; user directive terminated Slice C at C.1 only and escalated.
+
+---
+
 ## 2026-07-02 — v2 Slice B landing (τ analyzer: typing + nullability + set-op widening + outer-join nullability)
 
 [`dev_journal/2026-07-02-v2-slice-B.md`](dev_journal/2026-07-02-v2-slice-B.md)

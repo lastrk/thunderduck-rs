@@ -398,6 +398,16 @@ impl V2ExpressionConverter {
             ExprType::UnresolvedStar(star) => Ok(Expression::Star(StarExpression {
                 qualifier: star.unparsed_target.clone(),
             })),
+            ExprType::ExpressionString(es) => {
+                // Spark's `F.expr("<sql>")` / `df.selectExpr("<sql>")` — a
+                // raw SparkSQL expression fragment. Route through τ's
+                // SparkSQL parser so the analyzer can type-resolve the
+                // resulting expression (RawSql passthrough would leak an
+                // `Unresolved` DataType into `analyze_plan(Schema)` and
+                // PySpark would reject the response with
+                // `PySparkValueError: data type unparsed`).
+                thunderduck_core::parser_v2::SparkSqlParserV2::parse_expression(&es.expression)
+            }
             other => Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("Expression::{}", expr_type_kind(other)),
                 reason: "expression shape not covered by V2ExpressionConverter at Slice A.2"

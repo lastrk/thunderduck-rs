@@ -46,4 +46,34 @@ impl SparkSqlParserV2 {
         }
         v2_lowering::lower_statement(stmts.remove(0))
     }
+
+    /// Parse a SparkSQL expression FRAGMENT (e.g. `age + 1`, `upper(name)`)
+    /// into a single [`crate::transpiler_v2::Expression`]. Used by the
+    /// protobuf front-end for `Expression::ExpressionString` — Spark's
+    /// `F.expr("...")` / `df.selectExpr("...")`. Implemented by wrapping the
+    /// fragment as `SELECT (<expr>) AS __td_expr` and extracting the single
+    /// projection.
+    pub fn parse_expression(
+        expr_sql: &str,
+    ) -> Result<crate::transpiler_v2::Expression, EmissionError> {
+        // Spark's `F.expr("<x>")` / `selectExpr("<x>")` allows the fragment
+        // to carry its own alias (e.g. `age + 1 as age1`), so we must NOT
+        // wrap with our own `AS`. Simply parse `SELECT <fragment>` and take
+        // the single projection — the alias, if any, is preserved by the
+        // parser as an `Expression::Alias`.
+        let wrapped = format!("SELECT {expr_sql}");
+        let plan = Self::parse(&wrapped)?;
+        use crate::transpiler_v2::ast::CommonOp;
+        match plan.op {
+            CommonOp::Project { mut projections, .. } if projections.len() == 1 => {
+                Ok(projections.remove(0))
+            }
+            _ => Err(EmissionError::UnsupportedProtoShape {
+                shape: "ExpressionString::not_a_scalar".to_owned(),
+                reason: format!(
+                    "expression fragment did not parse as a single scalar: {expr_sql}"
+                ),
+            }),
+        }
+    }
 }

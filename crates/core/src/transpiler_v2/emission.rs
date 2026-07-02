@@ -138,14 +138,14 @@ fn set_op_kind_name(kind: SetOpKind) -> &'static str {
 // ── Operator renderers ───────────────────────────────────────────────────────
 
 fn render_single_row() -> Result<String, EmissionError> {
-    // DuckDB's `SELECT 1` (single row, single column). Wrapping as a subquery
-    // gives a zero-column empty relation via `SELECT * EXCLUDE(...)` — but for
-    // simplicity we emit `SELECT` with a placeholder that projects nothing
-    // when used as an input. DuckDB supports `SELECT` with no `FROM` returning
-    // one row; the empty projection is achieved by wrapping in a subquery.
-    // Callers that consume `SingleRow` as an input (e.g. `Project`) will
-    // wrap this as `FROM (<sql>) t` — DuckDB parses this and returns 1 row.
-    Ok("SELECT".to_owned())
+    // DuckDB requires a subquery to have a projection list — bare `SELECT`
+    // parses at top-level but fails inside `FROM (...)`. Emit `SELECT 1` so
+    // `SingleRow` is subquery-safe under `Project` (which wraps as
+    // `SELECT expr FROM (<child>) AS __td_proj` — the placeholder column is
+    // unused because Project provides its own SELECT list). The analyzer
+    // stamps SingleRow with an empty schema; no legitimate operator resolves
+    // the placeholder column from downstream code, so its presence is inert.
+    Ok("SELECT 1".to_owned())
 }
 
 fn render_table_scan(table: &str, alias: Option<&str>) -> Result<String, EmissionError> {
@@ -551,18 +551,9 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
             reason: "HOF lambdas land in Slice F".to_owned(),
         }),
         Expression::RawSql(r) => Ok(r.sql.clone()),
-        Expression::ArrayLiteral(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "ArrayLiteral".to_owned(),
-            reason: "complex-type emission lands in Slice F".to_owned(),
-        }),
-        Expression::MapLiteral(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "MapLiteral".to_owned(),
-            reason: "complex-type emission lands in Slice F".to_owned(),
-        }),
-        Expression::StructLiteral(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "StructLiteral".to_owned(),
-            reason: "complex-type emission lands in Slice F".to_owned(),
-        }),
+        Expression::ArrayLiteral(a) => render_array_literal(a, schema),
+        Expression::MapLiteral(m) => render_map_literal(m, schema),
+        Expression::StructLiteral(s) => render_struct_literal(s, schema),
         Expression::Between(b) => {
             let expr = render_expr(&b.expr, schema)?;
             let low = render_expr(&b.low, schema)?;
@@ -663,16 +654,16 @@ fn render_literal(lit: &Literal) -> Result<String, EmissionError> {
         } => Ok(format!("CAST('{value}' AS DECIMAL({precision}, {scale}))")),
         LiteralValue::String(s) => Ok(format!("'{}'", escape_sql_string(s))),
         LiteralValue::Date(days) => {
-            // Days since Unix epoch → DATE via DuckDB's `to_days`-like conversion.
-            Ok(format!(
-                "CAST(epoch_ms(({days})::BIGINT * 86400000) AS DATE)"
-            ))
+            // Days since Unix epoch → DATE. DuckDB `epoch_us`/`epoch_ms` only
+            // extract from timestamps, not construct — use the epoch anchor +
+            // INTERVAL construction so DuckDB parses both directions correctly.
+            Ok(format!("(DATE '1970-01-01' + INTERVAL ({days}) DAY)"))
         }
         LiteralValue::Timestamp(micros) => Ok(format!(
-            "CAST(epoch_us(CAST({micros} AS BIGINT)) AS TIMESTAMP WITH TIME ZONE)"
+            "CAST(make_timestamp(CAST({micros} AS BIGINT)) AS TIMESTAMP WITH TIME ZONE)"
         )),
         LiteralValue::TimestampNtz(micros) => Ok(format!(
-            "CAST(epoch_us(CAST({micros} AS BIGINT)) AS TIMESTAMP)"
+            "make_timestamp(CAST({micros} AS BIGINT))"
         )),
         LiteralValue::Binary(bytes) => {
             let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -795,6 +786,77 @@ pub(crate) fn render_cast(c: &CastExpression, schema: &Schema) -> Result<String,
     } else {
         Ok(format!("CAST({inner} AS {ty})"))
     }
+}
+
+// ── Complex-type literal renderers ───────────────────────────────────────────
+//
+// Minimal support required to serialize `LocalRelation` payloads whose schema
+// carries `ArrayType` / `MapType` / `StructType` fields. Emitted SQL uses
+// DuckDB's native literal syntaxes:
+//   Array : `[a, b, c]` (or `CAST([] AS T[])` for empty).
+//   Map   : `MAP { k1: v1, k2: v2 }` (or `MAP()` for empty).
+//   Struct: `{'name1': v1, 'name2': v2, ...}`.
+// Full complex-type ops (HOF `transform`/`filter`, `explode`, struct-field
+// access) remain Slice F territory.
+
+fn render_array_literal(
+    a: &crate::transpiler_v2::expression::ArrayLiteralExpression,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
+    if a.elements.is_empty() {
+        // Empty array — DuckDB requires a type annotation to disambiguate.
+        let ty = render_data_type(&a.element_type);
+        return Ok(format!("CAST([] AS {ty}[])"));
+    }
+    let mut buf = String::from("[");
+    for (i, e) in a.elements.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(", ");
+        }
+        buf.push_str(&render_expr(e, schema)?);
+    }
+    buf.push(']');
+    Ok(buf)
+}
+
+fn render_map_literal(
+    m: &crate::transpiler_v2::expression::MapLiteralExpression,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
+    if m.entries.is_empty() {
+        return Ok("MAP()".to_owned());
+    }
+    let mut buf = String::from("MAP {");
+    for (i, (k, v)) in m.entries.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(", ");
+        }
+        buf.push_str(&render_expr(k, schema)?);
+        buf.push_str(": ");
+        buf.push_str(&render_expr(v, schema)?);
+    }
+    buf.push('}');
+    Ok(buf)
+}
+
+fn render_struct_literal(
+    s: &crate::transpiler_v2::expression::StructLiteralExpression,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
+    let mut buf = String::from("{");
+    for (i, (name, expr)) in s.fields.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(", ");
+        }
+        // DuckDB struct literal keys are single-quoted string literals.
+        let key_escaped = name.replace('\'', "''");
+        buf.push('\'');
+        buf.push_str(&key_escaped);
+        buf.push_str("': ");
+        buf.push_str(&render_expr(expr, schema)?);
+    }
+    buf.push('}');
+    Ok(buf)
 }
 
 // ── Return-type CAST helpers (§5.1 — SEPARATE `fn` items) ────────────────────
@@ -1126,12 +1188,16 @@ mod tests {
     // ── 1. dispatch_op — SingleRow ───────────────────────────────────────
 
     #[test]
-    fn dispatch_op_single_row_emits_bare_select() {
+    fn dispatch_op_single_row_emits_subquery_safe_select() {
         let _g = tap_guard();
         let ast = CommonAst::new(CommonOp::SingleRow);
         let typed = analyze(ast, &BaseTypes::empty()).expect("analyze SingleRow");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch SingleRow");
-        assert_eq!(sql, "SELECT");
+        // `SELECT 1` is subquery-safe (DuckDB requires a projection list
+        // inside `FROM (...)`); the placeholder column is inert because
+        // analyzer stamps SingleRow with an empty schema and Project provides
+        // its own SELECT list when wrapping.
+        assert_eq!(sql, "SELECT 1");
     }
 
     // ── 2-3. dispatch_op — TableScan ─────────────────────────────────────

@@ -39,7 +39,7 @@ pub fn record_batch_to_arrow_batch(batch: &RecordBatch) -> Result<ArrowBatch> {
 /// Arrow IPC stream so that the client can decode them individually.
 /// A 0-row batch carries the schema, which PySpark requires to build a table.
 pub fn record_batches_to_arrow_batches(batches: &[RecordBatch]) -> Result<Vec<ArrowBatch>> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(batches.len());
     for batch in batches {
         let estimated_size = 128usize.saturating_add(
             batch

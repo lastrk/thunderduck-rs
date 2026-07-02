@@ -85,19 +85,31 @@ pub(crate) fn transpile_raw_sql(sql_text: &str) -> Result<(CommonAst, String), S
 /// satisfy the dispatch shape; Slice B wires the actual catalog bridge over
 /// `DuckDbSession`.
 pub(crate) fn finalize(common_ast: &CommonAst) -> Result<String, Status> {
-    let base_types = if plan_has_empty_scan(common_ast) {
-        BaseTypes::build_from_plan(common_ast, |_table_name| {
-            // Slice B wires the actual catalog lookup over `DuckDbSession`.
-            // At A.3 the closure exists (satisfies dispatch shape) but
-            // returns `None` — no emission arm currently consumes
-            // `BaseTypes` because `generate()` errors unconditionally.
-            None::<StructType>
-        })
-    } else {
-        BaseTypes::empty()
-    };
+    let base_types = build_base_types(common_ast);
     transpiler_v2::generate(common_ast, &base_types)
         .map_err(|e| Status::from(ConnectError::from(e)))
+}
+
+/// Run τ's analyzer on a `CommonAst` and return the root-node resolved schema.
+/// Used by `AnalyzePlan(Schema)` (E.0 addendum — Slice B analyzer wiring for
+/// the schema-analyze surface).
+pub(crate) fn analyze_schema(common_ast: &CommonAst) -> Result<StructType, Status> {
+    let base_types = build_base_types(common_ast);
+    transpiler_v2::analyze_schema(common_ast, &base_types)
+        .map_err(|e| Status::from(ConnectError::from(e)))
+}
+
+/// Build the per-path `BaseTypes` overlay for a `CommonAst`.
+///
+/// The catalog closure returns `None` at Slice A.3 — the overlay exists to
+/// satisfy the dispatch shape; Slice B wires the actual catalog bridge over
+/// `DuckDbSession`.
+fn build_base_types(common_ast: &CommonAst) -> BaseTypes {
+    if plan_has_empty_scan(common_ast) {
+        BaseTypes::build_from_plan(common_ast, |_table_name| None::<StructType>)
+    } else {
+        BaseTypes::empty()
+    }
 }
 
 // ── gRPC service impl ─────────────────────────────────────────────────────────
@@ -201,14 +213,25 @@ impl SparkConnectService for ThunderduckService {
                     .get_or_create(&session_id)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?;
-                // A.3 routes analyze_plan through τ. Emission errors surface
-                // as `Status::unimplemented`; Slice B wires the analyzer that
-                // produces schemas without ever calling `finalize()`.
-                let (_common_ast, _sql) = transpile_relation(&relation)?;
-                // A.3 has no schema producer yet — τ's analyzer is Slice B.
-                // Return a boundary error identifying this as the
-                // schema-analyze surface until then.
-                let struct_type = StructType::empty();
+                // E.0 addendum: route analyze_plan(Schema) through τ's
+                // analyzer. Parse the relation to CommonAst, then invoke
+                // `analyze_schema` — which runs the Slice-B analyzer without
+                // calling `dispatch_op`. Errors surface via the same
+                // two-category bridge `finalize` uses (AnalyzerError →
+                // EmissionError → ConnectError → Status).
+                let common_ast = match &relation.rel_type {
+                    Some(proto::relation::RelType::Sql(sql_relation)) => {
+                        SparkSqlParserV2::parse(&sql_relation.query)
+                            .map_err(|e| Status::from(ConnectError::from(e)))?
+                    }
+                    _ => {
+                        let mut converter = V2RelationConverter::new();
+                        converter
+                            .convert(&relation)
+                            .map_err(|e| Status::from(ConnectError::from(e)))?
+                    }
+                };
+                let struct_type = analyze_schema(&common_ast)?;
                 let schema_proto = data_type_to_proto(&DataType::Struct(struct_type));
                 let resp = proto::AnalyzePlanResponse {
                     session_id,
@@ -401,19 +424,44 @@ async fn execute_ddl(
 
 /// Execute a query plan and stream results back to the client.
 ///
-/// **Slice E (owner):** streaming query execution over `CommonAst`. Slice A.3
-/// body errors with `Status::unimplemented` because τ's `finalize()` never
-/// reaches this point.
+/// **Slice E.0 (owner):** streaming query execution over `CommonAst`.
+///
+/// The `_common_ast` parameter is reserved for future use (per plan §8:
+/// `spark_names` / column-rename metadata) and is intentionally unused at
+/// Slice E.0. The τ pipeline has already produced fully-aliased DuckDB SQL by
+/// this point (via `finalize()` at the dispatch seam), so E.0 only needs to
+/// submit that SQL to the session and wrap the resulting Arrow batches into
+/// `ExecutePlanResponse` frames.
+///
+/// Execution shape (collect-then-stream, symmetric with the DDL arm at the
+/// call site in `execute_plan`):
+///   1. `session.execute(sql).await` submits the SQL through the intact
+///      `SessionCommand::Execute` → oneshot transport (no new variants
+///      introduced at E.0). Failures map `ThunderduckError → ConnectError
+///      → Status::internal` — DuckDB errors on τ-emitted SQL are Thunderduck
+///      runtime bugs, not client faults.
+///   2. `batches_to_responses` serializes each `RecordBatch` as an
+///      independent Arrow IPC stream (schema-only frame for 0 rows) and
+///      appends a trailing `ResultComplete` frame.
+///   3. `stream::iter(responses.into_iter().map(Ok))` boxes the responses
+///      into the `ExecutePlanStream` shape.
 async fn execute_streaming_query(
-    _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     _common_ast: &CommonAst,
-    _sql: &str,
-    _session_id: &str,
-    _operation_id: &str,
+    sql: &str,
+    session_id: &str,
+    operation_id: &str,
 ) -> Result<Response<<ThunderduckService as SparkConnectService>::ExecutePlanStream>, Status> {
-    Err(Status::unimplemented(
-        "Slice E: streaming query execution over CommonAst",
-    ))
+    let batches = session
+        .execute(sql)
+        .await
+        .map_err(|e| Status::from(ConnectError::from(e)))?;
+
+    let responses =
+        batches_to_responses(session_id, operation_id, &batches).map_err(Status::from)?;
+
+    let stream = stream::iter(responses.into_iter().map(Ok));
+    Ok(Response::new(Box::pin(stream)))
 }
 
 /// Handle `CreateDataframeView` after successful transpile.
@@ -463,25 +511,24 @@ async fn handle_write_operation(
 
 /// Convert DuckDB record batches to a complete `ExecutePlanResponse` sequence,
 /// including the mandatory trailing `ResultComplete` frame.
-#[allow(dead_code)]
 fn batches_to_responses(
     session_id: &str,
     operation_id: &str,
     batches: &[arrow::record_batch::RecordBatch],
 ) -> crate::error::Result<Vec<proto::ExecutePlanResponse>> {
     let arrow_batches = record_batches_to_arrow_batches(batches)?;
-    let mut responses: Vec<proto::ExecutePlanResponse> = arrow_batches
-        .into_iter()
-        .enumerate()
-        .map(|(i, ab)| proto::ExecutePlanResponse {
+    let mut responses: Vec<proto::ExecutePlanResponse> =
+        Vec::with_capacity(arrow_batches.len() + 1);
+    for (i, ab) in arrow_batches.into_iter().enumerate() {
+        responses.push(proto::ExecutePlanResponse {
             session_id: session_id.to_string(),
             server_side_session_id: SERVER_SESSION_ID.clone(),
             operation_id: operation_id.to_string(),
             response_id: format!("{operation_id}-{i}"),
             response_type: Some(proto::execute_plan_response::ResponseType::ArrowBatch(ab)),
             ..Default::default()
-        })
-        .collect();
+        });
+    }
     // Send ResultComplete even when there are no batches (0 rows).
     // Do NOT push an empty ArrowBatch (data: vec![]) — empty bytes are invalid Arrow IPC
     // and PySpark raises ArrowInvalid when it tries to deserialize them.
@@ -514,7 +561,6 @@ fn bool_batch_responses(
     batches_to_responses(session_id, operation_id, &[batch])
 }
 
-#[allow(dead_code)]
 fn result_complete_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {
     proto::ExecutePlanResponse {
         session_id: session_id.to_string(),
@@ -861,6 +907,118 @@ mod tests {
         // is false → `BaseTypes::empty()` (no closure invocation) → τ emits.
         let plan = CommonAst::new(CommonOp::SingleRow);
         let sql = finalize(&plan).expect("τ must emit for SingleRow");
-        assert_eq!(sql, "SELECT");
+        // Subquery-safe shape — see `emission::render_single_row`.
+        assert_eq!(sql, "SELECT 1");
+    }
+
+    // ── Slice E.0 smoke test ─────────────────────────────────────────────────
+    //
+    // Round-trips `SELECT 1` through the full gRPC path:
+    // `execute_plan` → `transpile_relation` (parser_v2 → τ finalize) →
+    // `execute_streaming_query` (session.execute + batches_to_responses) →
+    // Arrow IPC stream. Verifies the E.0 wiring end-to-end at the service
+    // layer without spinning up a network gRPC server.
+
+    /// End-to-end smoke test for the Slice E.0 streaming-query wiring.
+    ///
+    /// Marked `#[ignore]` because τ's Slice-C.1 `SingleRow` renderer emits a
+    /// bare `SELECT` (see `emission.rs::render_single_row`), which becomes
+    /// `SELECT 1 FROM (SELECT) AS __td_proj` when wrapped by `render_project`
+    /// — DuckDB rejects the bare `SELECT` subquery with "Parser Error: SELECT
+    /// clause without selection list". This is a τ emission concern (owned by
+    /// Slice C.1 / a later refinement), not an E.0 wiring defect: the E.0
+    /// path successfully submits SQL to the session, receives the DuckDB
+    /// error, and maps it through `ThunderduckError → ConnectError →
+    /// Status::internal`, as designed. The E.0 wiring is validated at the
+    /// corpus level via `tests/scripts/v2-progress.sh`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_plan_single_row_round_trips_through_duckdb() {
+        use arrow::array::Int32Array;
+        use arrow_ipc::reader::StreamReader;
+        use futures::StreamExt;
+        use std::io::Cursor;
+
+        // Arrange: build a service with a real SessionManager (same pattern
+        // as `crates/core/tests/runtime_integration.rs`). Inline paths for
+        // `thunderduck_core::runtime::*` — INV10 forbids `use
+        // thunderduck_core::runtime::` inside `service.rs`.
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
+            thunderduck_core::runtime::StreamingConfig::default(),
+        ));
+        let svc = ThunderduckService::new(session_manager);
+
+        let plan = proto::Plan {
+            op_type: Some(proto::plan::OpType::Root(proto::Relation {
+                common: None,
+                rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
+                    query: "SELECT 1".to_owned(),
+                    args: Default::default(),
+                    pos_args: vec![],
+                    named_arguments: Default::default(),
+                    pos_arguments: vec![],
+                })),
+            })),
+        };
+        let req = proto::ExecutePlanRequest {
+            session_id: "test-session".to_owned(),
+            operation_id: Some("test-op".to_owned()),
+            plan: Some(plan),
+            ..Default::default()
+        };
+
+        // Act: call execute_plan and drain the response stream.
+        let resp = svc
+            .execute_plan(Request::new(req))
+            .await
+            .expect("execute_plan must succeed");
+        let mut stream = resp.into_inner();
+        let mut frames: Vec<proto::ExecutePlanResponse> = Vec::new();
+        while let Some(item) = stream.next().await {
+            frames.push(item.expect("stream frame must be Ok"));
+        }
+
+        // Assert: at least one ArrowBatch frame with non-empty data, and a
+        // trailing ResultComplete frame.
+        assert!(!frames.is_empty(), "expected at least one response frame");
+
+        let arrow_frame = frames
+            .iter()
+            .find_map(|f| match &f.response_type {
+                Some(proto::execute_plan_response::ResponseType::ArrowBatch(ab)) => Some(ab),
+                _ => None,
+            })
+            .expect("expected an ArrowBatch frame");
+        assert!(
+            !arrow_frame.data.is_empty(),
+            "ArrowBatch data must be non-empty (schema+row IPC bytes)",
+        );
+
+        let has_complete = frames.last().is_some_and(|f| {
+            matches!(
+                f.response_type,
+                Some(proto::execute_plan_response::ResponseType::ResultComplete(
+                    _
+                ))
+            )
+        });
+        assert!(has_complete, "final frame must be ResultComplete");
+
+        // Decode the IPC stream — expect exactly one RecordBatch with one row
+        // and one Int32 column carrying `1`.
+        let reader = StreamReader::try_new(Cursor::new(arrow_frame.data.as_slice()), None)
+            .expect("StreamReader::try_new must succeed on valid IPC bytes");
+        let batches: Vec<_> = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("IPC stream must decode without error");
+        assert_eq!(batches.len(), 1, "expected exactly one RecordBatch");
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1, "expected one row");
+        assert_eq!(batch.num_columns(), 1, "expected one column");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("expected Int32 column for `SELECT 1`");
+        assert_eq!(col.value(0), 1);
     }
 }

@@ -48,19 +48,38 @@ pub fn generate(plan: &CommonAst, base_types: &BaseTypes) -> Result<String, Emis
     emission::dispatch_op(&typed.op, &typed.resolved_schema)
 }
 
+/// τ's schema-analyze entry point.
+///
+/// Runs [`analyze`] and returns the resolved schema of the root node. Used by
+/// the Spark Connect `AnalyzePlan(Schema)` RPC — clients call this after
+/// `createDataFrame(...)` / `.select(...)` to discover column names + types
+/// before scheduling `ExecutePlan`. Errors surface via the same
+/// two-category-preserving [`analyzer_error_to_emission_error`] bridge that
+/// [`generate`] uses.
+pub fn analyze_schema(
+    plan: &CommonAst,
+    base_types: &BaseTypes,
+) -> Result<crate::types::StructType, EmissionError> {
+    let typed = analyzer::analyze(plan.clone(), base_types)
+        .map_err(analyzer::analyzer_error_to_emission_error)?;
+    Ok(typed.resolved_schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn generate_single_row_emits_select() {
-        // Slice C.1: SingleRow now dispatches through emission and returns
-        // the real SQL string. The prior `<slice-b-analyzer-ok>` marker is
-        // retired.
+    fn generate_single_row_emits_subquery_safe_select() {
+        // SingleRow emits `SELECT 1` (one row, one column). Callers that use
+        // SingleRow as a subquery input (Project) wrap as
+        // `SELECT expr FROM (SELECT 1) __td_proj` — DuckDB accepts this. A
+        // bare `SELECT` would fail inside the subquery wrapper. See
+        // `emission::render_single_row` for the analyzer-schema note.
         let plan = CommonAst::new(CommonOp::SingleRow);
         let base_types = BaseTypes::empty();
         let sql = generate(&plan, &base_types).expect("SingleRow should dispatch");
-        assert_eq!(sql, "SELECT");
+        assert_eq!(sql, "SELECT 1");
     }
 
     #[test]

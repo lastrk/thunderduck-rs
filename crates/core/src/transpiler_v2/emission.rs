@@ -97,11 +97,12 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             render_with_columns(input, assignments)
         }
 
-        // ── C.3 owns (aggregate arms) ────────────────────────────────────
-        TypedOp::Aggregate { .. } => Err(EmissionError::UnsupportedOp {
-            op: "Aggregate".to_owned(),
-            reason: "aggregate arms land in Slice C.3".to_owned(),
-        }),
+        // ── Aggregate (operator + primitive function arms) ───────────────
+        TypedOp::Aggregate {
+            input,
+            grouping,
+            aggregates,
+        } => render_aggregate_op(input, grouping, aggregates),
 
         // ── Slice E owns ──────────────────────────────────────────────────
         TypedOp::Join { .. } => Err(EmissionError::UnsupportedOp {
@@ -643,14 +644,95 @@ fn render_function_call(f: &FunctionCall, _schema: &Schema) -> Result<String, Em
     })
 }
 
-/// C.1 stub: every aggregate call boundary-errors as
-/// [`EmissionError::UnsupportedOp`]. Slice C.3 will call
-/// [`spark_aggregate_return_cast`] from here.
-fn render_aggregate(f: &FunctionCall, _schema: &Schema) -> Result<String, EmissionError> {
-    Err(EmissionError::UnsupportedOp {
-        op: format!("Aggregate[{}]", f.name),
-        reason: "aggregate arms land in Slice C.3".to_owned(),
-    })
+/// Render an aggregate function call. Primitives (`count`, `sum`, `avg`,
+/// `min`, `max`, `count_distinct`) pass through with Spark-parity CASTs
+/// applied by [`spark_aggregate_return_cast`]. Unknown aggregate names
+/// surface as Thunderduck-boundary [`EmissionError::UnsupportedFunction`]
+/// per ADR-022.
+fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
+    let lower = f.name.to_ascii_lowercase();
+    let (duck_name, force_distinct) = match lower.as_str() {
+        // Direct pass-through — DuckDB accepts the Spark name unchanged.
+        "count" | "sum" | "avg" | "mean" | "min" | "max" | "first" | "last"
+        | "first_value" | "last_value" | "any_value" | "approx_count_distinct"
+        | "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp"
+        | "var_pop" | "bit_and" | "bit_or" | "bit_xor" | "bool_and" | "bool_or" => {
+            (lower.as_str(), false)
+        }
+        // Spark's `mean` is an alias for `avg`; DuckDB accepts both — treat
+        // both identically above. `count_distinct` and `sum_distinct` lower
+        // to DISTINCT-flagged calls.
+        "count_distinct" => ("count", true),
+        "sum_distinct" => ("sum", true),
+        // Non-primitive aggregates surface as Thunderduck-boundary.
+        _ => {
+            return Err(EmissionError::UnsupportedFunction {
+                name: f.name.clone(),
+                reason: "aggregate function not yet in the primitive arm set".to_owned(),
+            });
+        }
+    };
+    let mut args_sql = String::new();
+    if f.args.is_empty() {
+        // `count()` with no args (illegal in Spark) — Thunderduck-boundary.
+        return Err(EmissionError::UnsupportedFunction {
+            name: f.name.clone(),
+            reason: "aggregate function call has no arguments".to_owned(),
+        });
+    }
+    for (i, arg) in f.args.iter().enumerate() {
+        if i > 0 {
+            args_sql.push_str(", ");
+        }
+        args_sql.push_str(&render_expr(arg, schema)?);
+    }
+    let distinct = if f.distinct || force_distinct {
+        "DISTINCT "
+    } else {
+        ""
+    };
+    Ok(format!("{duck_name}({distinct}{args_sql})"))
+}
+
+/// Render the `Aggregate` operator. Emits
+/// `SELECT <aggregates> FROM (<child>) AS __td_agg [GROUP BY <groupings>]`.
+/// The analyzer already resolves each `aggregate` expression's type; this
+/// renderer relies on `render_projection_slot` (which applies
+/// [`spark_return_cast`] on non-aggregate slots) and passes aggregate slots
+/// through unchanged — aggregate-return casts are the responsibility of the
+/// aggregate function arm itself (via [`spark_aggregate_return_cast`], wired
+/// per checklist §5.7 when needed).
+fn render_aggregate_op(
+    input: &TypedAst,
+    grouping: &[Expression],
+    aggregates: &[Expression],
+) -> Result<String, EmissionError> {
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    let input_schema = &input.resolved_schema;
+    // Aggregates may include folded grouping columns at the SparkSQL path
+    // (see `CommonOp::Aggregate` doc). For the DataFrame path, aggregates
+    // are pure aggregate calls; grouping carries the keys. Both cases emit
+    // identically: SELECT the full `aggregates` list; the GROUP BY clause
+    // uses `grouping` when present.
+    let mut slots = String::new();
+    for (i, agg) in aggregates.iter().enumerate() {
+        if i > 0 {
+            slots.push_str(", ");
+        }
+        slots.push_str(&render_projection_slot(agg, input_schema)?);
+    }
+    let mut sql = format!("SELECT {slots} FROM ({child_sql}) AS __td_agg");
+    if !grouping.is_empty() {
+        let mut group_sql = String::new();
+        for (i, g) in grouping.iter().enumerate() {
+            if i > 0 {
+                group_sql.push_str(", ");
+            }
+            group_sql.push_str(&render_expr(g, input_schema)?);
+        }
+        sql.push_str(&format!(" GROUP BY {group_sql}"));
+    }
+    Ok(sql)
 }
 
 // ── Literal / atomic expression renderers ────────────────────────────────────

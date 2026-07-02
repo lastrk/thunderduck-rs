@@ -53,13 +53,14 @@ impl SqlGenerator {
     }
 
     /// Return a new generator seeded with `schema` for scalar-expression
-    /// rendering. Kept for Slice C.1 → C.2 transitional compatibility;
-    /// no longer called by [`crate::transpiler_v2::emission`] after Slice
-    /// C.2's seam drain (the v2 emitter renders scalar expressions
-    /// natively via `render_expr` and no longer delegates to
-    /// `gen_expr`). Legacy call sites, if any, may still use this.
-    /// Prefer [`Self::new`] + [`Self::gen_expr`] for callers that do not
-    /// have a schema to seed.
+    /// rendering. Historical: was introduced as the C.1 → C.2 transitional
+    /// seam between v2 emission and legacy `gen_expr`; the morph-track v2
+    /// implementation has since been discarded (tag `v2-morph-track-end`).
+    /// Kept as a legacy-only helper in case any external caller still uses
+    /// the schema-seeded pattern; the restart's v2 implementation will not
+    /// consume this method (per ADR-021, v2 emission is fully substrate-
+    /// independent). Prefer [`Self::new`] + [`Self::gen_expr`] for callers
+    /// that do not have a schema to seed.
     pub fn with_schema_for_v2(self, schema: StructType) -> Self {
         Self { schema }
     }

@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use clap::Parser;
 use thunderduck_core::runtime::{SessionManager, StreamingConfig};
-use thunderduck_core::transpiler_v2::TranspilerPath;
 use tonic::transport::Server;
 
 use crate::proto::spark::connect::spark_connect_service_server::SparkConnectServiceServer;
@@ -41,11 +40,6 @@ struct Args {
     /// existing scripts keep working; logs a one-line deprecation warning.
     #[arg(long)]
     strict: bool,
-
-    /// Transpiler path: `legacy` (default) or `v2` (rearchitecture path, WIP).
-    /// Falls back to THUNDERDUCK_TRANSPILER when unset.
-    #[arg(long)]
-    transpiler: Option<String>,
 }
 
 #[tokio::main]
@@ -98,27 +92,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // CLI flag wins; otherwise consult the environment (default: Legacy).
-    // An explicit but unrecognized CLI value is a hard error.
-    let transpiler = match args.transpiler.as_deref() {
-        Some("legacy") => TranspilerPath::Legacy,
-        Some("v2") => TranspilerPath::V2,
-        Some(other) => {
-            return Err(
-                format!("unrecognized --transpiler '{other}', expected 'legacy' or 'v2'").into(),
-            )
-        }
-        None => TranspilerPath::from_env(),
-    };
+    // v2 transpiler path removed pending Slice A of the restart track
+    // (see tag `v2-morph-track-end` for the discarded implementation).
+    // Legacy is the sole active path until Slice A relocates dispatch to
+    // the protobuf boundary per ADR-021.
+    if std::env::var("THUNDERDUCK_TRANSPILER").is_ok() {
+        tracing::warn!(
+            "THUNDERDUCK_TRANSPILER is currently ignored; the v2 transpiler was \
+             discarded in favor of a fresh implementation (see \
+             tasks/v2-adr-readiness-map.md Slice A)"
+        );
+    }
 
-    tracing::info!(
-        "Starting Thunderduck Connect Server on {} (transpiler: {:?})",
-        bind,
-        transpiler
-    );
+    tracing::info!("Starting Thunderduck Connect Server on {}", bind);
 
     let mgr = Arc::new(SessionManager::new(StreamingConfig::default()));
-    let svc = ThunderduckService::new(mgr, transpiler);
+    let svc = ThunderduckService::new(mgr);
 
     Server::builder()
         .add_service(SparkConnectServiceServer::new(svc))

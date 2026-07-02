@@ -2,13 +2,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::stream;
-use thunderduck_core::error::ThunderduckError;
 use thunderduck_core::generator::SqlGenerator;
 use thunderduck_core::logical::LogicalPlan;
 use thunderduck_core::runtime::{SchemaInferrer, SessionManager, StreamBatch};
-use thunderduck_core::transpiler_v2::analyzer::{AnalyzerError, BaseTypes};
-use thunderduck_core::transpiler_v2::emission::EmissionError;
-use thunderduck_core::transpiler_v2::{self, TranspilerPath};
 use thunderduck_core::types::DataType;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -29,220 +25,24 @@ const MAX_PLAN_DEPTH: usize = 256;
 
 pub struct ThunderduckService {
     session_manager: Arc<SessionManager>,
-    /// Selected transpiler path (startup-global). See [`generate_sql`].
-    transpiler: TranspilerPath,
 }
 
 impl ThunderduckService {
-    pub fn new(session_manager: Arc<SessionManager>, transpiler: TranspilerPath) -> Self {
-        Self {
-            session_manager,
-            transpiler,
-        }
+    pub fn new(session_manager: Arc<SessionManager>) -> Self {
+        Self { session_manager }
     }
 }
 
-/// Translate a [`LogicalPlan`] into DuckDB SQL via the selected transpiler.
+/// Translate a [`LogicalPlan`] into DuckDB SQL via the legacy [`SqlGenerator`].
 ///
-/// This is the single dispatch seam between the legacy
-/// [`SqlGenerator`] path and the rearchitected [`transpiler_v2`] path. The
-/// path is chosen once at startup ([`ThunderduckService::transpiler`]).
-///
-/// V2 semantics (Slice C.1): try `transpiler_v2::generate` with a
-/// [`BaseTypes`] seed built by [`build_base_types_from_plan`]. If the v2
-/// pipeline punts (unsupported operator, unknown table, or a
-/// [`EmissionError::UnsupportedOp`]) fall back to legacy so the request
-/// keeps working while the v2 path grows coverage. Every *other* v2
-/// error surfaces — we do NOT silently mask analyzer / emitter bugs.
-fn generate_sql(transpiler: TranspilerPath, plan: &LogicalPlan) -> Result<String, Status> {
-    match transpiler {
-        TranspilerPath::Legacy => SqlGenerator::new()
-            .generate(plan)
-            .map_err(|e| Status::from(ConnectError::SqlGeneration(e))),
-        TranspilerPath::V2 => {
-            let base_types = build_base_types_from_plan(plan);
-            match transpiler_v2::generate(plan, &base_types) {
-                Ok(sql) => Ok(sql),
-                Err(e) if is_v2_fallback_eligible(&e) => {
-                    tracing::debug!(reason = %e, "v2 fallback to legacy");
-                    SqlGenerator::new()
-                        .generate(plan)
-                        .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))
-                }
-                Err(e) => Err(Status::from(ConnectError::Unsupported(e.to_string()))),
-            }
-        }
-    }
-}
-
-/// Whether a v2 error is a coverage gap we can silently fall back on
-/// (vs. a real bug that must surface).
-///
-/// Fallback-eligible: [`AnalyzerError::PuntedOperator`] (adapter marked
-/// the op out-of-scope for Slice B), [`AnalyzerError::UnknownTable`]
-/// (catalog seed missing the referenced view — legacy resolves it via
-/// DuckDB), [`EmissionError::UnsupportedOp`] (no emission row matched),
-/// [`EmissionError::UnsupportedExpression`] (Slice-D/F Expression variant
-/// not yet on the v2 substrate), [`EmissionError::UnsupportedFunction`]
-/// (Slice-D extension function / Slice-F complex-type function).
-///
-/// NOT fallback-eligible (must surface as `Unsupported`): analyzer
-/// `AmbiguousColumn` / `TypeMismatch` / `SetOpArityMismatch`, emitter
-/// `ChildFailed` / `MissingField`, and every
-/// [`ThunderduckError::V2Lowering`] variant (structural adapter defects).
-fn is_v2_fallback_eligible(e: &ThunderduckError) -> bool {
-    matches!(
-        e,
-        ThunderduckError::V2Analyzer(AnalyzerError::PuntedOperator { .. })
-            | ThunderduckError::V2Analyzer(AnalyzerError::UnknownTable { .. })
-            | ThunderduckError::V2Emission(EmissionError::UnsupportedOp { .. })
-            | ThunderduckError::V2Emission(EmissionError::UnsupportedExpression { .. })
-            | ThunderduckError::V2Emission(EmissionError::UnsupportedFunction { .. })
-    )
-}
-
-/// Build the v2 analyzer's [`BaseTypes`] seed by walking the plan for
-/// [`LogicalPlan::TableScan`] and [`LogicalPlan::InMemoryRelation`]
-/// nodes and copying each one's schema into the catalog.
-///
-/// **OPT-M3 short-circuit (Slice C.2):** the analyzer's
-/// [`thunderduck_core::transpiler_v2::analyzer`]::`resolve_table_scan`
-/// consumes this overlay only as a fallback — it prefers the AST-carried
-/// schema when it is non-empty. So a plan whose every scan already carries
-/// its own schema does not need the seed at all; we skip the walk in that
-/// case to avoid an O(nodes) schema clone for a walk whose result would
-/// go unread.
-///
-/// Bounded walk (a plan-scoped subset, not a session-wide catalog dump).
-/// Async session lookups are deferred to a follow-up — Slice C.1 accepts
-/// that a table-scan without a pre-populated schema will produce an
-/// [`AnalyzerError::UnknownTable`], which the fallback wrapper handles
-/// by delegating to legacy.
-fn build_base_types_from_plan(plan: &LogicalPlan) -> BaseTypes {
-    if !plan_has_empty_scan(plan) {
-        return BaseTypes::new();
-    }
-    let mut base = BaseTypes::new();
-    collect_base_types(plan, &mut base);
-    base
-}
-
-/// Return `true` if any [`LogicalPlan::TableScan`] or
-/// [`LogicalPlan::InMemoryRelation`] leaf reachable from `plan` carries an
-/// empty schema — those are the only scans for which
-/// `resolve_table_scan` consults the [`BaseTypes`] overlay. Any other
-/// case, the seed walk is dead work (see OPT-M3 in the C.2 architecture
-/// plan).
-fn plan_has_empty_scan(plan: &LogicalPlan) -> bool {
-    use LogicalPlan::*;
-    match plan {
-        TableScan(t) => t.schema.is_empty(),
-        InMemoryRelation(r) => r.schema.is_empty(),
-        // Single-child recursion — mirror `collect_base_types` below.
-        Project(p) => plan_has_empty_scan(&p.input),
-        Filter(f) => plan_has_empty_scan(&f.input),
-        Aggregate(a) => plan_has_empty_scan(&a.input),
-        Sort(s) => plan_has_empty_scan(&s.input),
-        Limit(l) => plan_has_empty_scan(&l.input),
-        Tail(t) => plan_has_empty_scan(&t.input),
-        Distinct(d) => plan_has_empty_scan(&d.input),
-        WithColumns(w) => plan_has_empty_scan(&w.input),
-        DropColumns(d) => plan_has_empty_scan(&d.input),
-        AliasedRelation(a) => plan_has_empty_scan(&a.input),
-        Sample(s) => plan_has_empty_scan(&s.input),
-        ToDataFrame(t) => plan_has_empty_scan(&t.input),
-        ShowString(s) => plan_has_empty_scan(&s.input),
-        NADrop(n) => plan_has_empty_scan(&n.input),
-        NAFill(n) => plan_has_empty_scan(&n.input),
-        NAReplace(n) => plan_has_empty_scan(&n.input),
-        Unpivot(u) => plan_has_empty_scan(&u.input),
-        Pivot(p) => plan_has_empty_scan(&p.input),
-        StatCov(s) => plan_has_empty_scan(&s.input),
-        StatCorr(s) => plan_has_empty_scan(&s.input),
-        ApproxQuantile(a) => plan_has_empty_scan(&a.input),
-        StatCrosstab(s) => plan_has_empty_scan(&s.input),
-        StatFreqItems(s) => plan_has_empty_scan(&s.input),
-        StatSampleBy(s) => plan_has_empty_scan(&s.input),
-        Describe(d) => plan_has_empty_scan(&d.input),
-        Summary(s) => plan_has_empty_scan(&s.input),
-        Join(j) => plan_has_empty_scan(&j.left) || plan_has_empty_scan(&j.right),
-        Union(u) => plan_has_empty_scan(&u.left) || plan_has_empty_scan(&u.right),
-        Except(e) => plan_has_empty_scan(&e.left) || plan_has_empty_scan(&e.right),
-        Intersect(i) => plan_has_empty_scan(&i.left) || plan_has_empty_scan(&i.right),
-        WithCte(c) => {
-            plan_has_empty_scan(&c.input) || c.ctes.iter().any(|(_, sub)| plan_has_empty_scan(sub))
-        }
-        // Leaves without a scan-relevant schema.
-        SqlRelation(_) | LocalRelation(_) | LocalDataRelation(_) | RangeRelation(_)
-        | DdlStatement(_) | SingleRow(_) => false,
-    }
-}
-
-fn collect_base_types(plan: &LogicalPlan, out: &mut BaseTypes) {
-    use LogicalPlan::*;
-    match plan {
-        TableScan(t) if !t.schema.is_empty() => {
-            out.entry(t.table.clone())
-                .or_insert_with(|| t.schema.clone());
-        }
-        InMemoryRelation(r) if !r.schema.is_empty() => {
-            out.entry(r.view_name.clone())
-                .or_insert_with(|| r.schema.clone());
-        }
-        // Single-child recursion
-        Project(p) => collect_base_types(&p.input, out),
-        Filter(f) => collect_base_types(&f.input, out),
-        Aggregate(a) => collect_base_types(&a.input, out),
-        Sort(s) => collect_base_types(&s.input, out),
-        Limit(l) => collect_base_types(&l.input, out),
-        Tail(t) => collect_base_types(&t.input, out),
-        Distinct(d) => collect_base_types(&d.input, out),
-        WithColumns(w) => collect_base_types(&w.input, out),
-        DropColumns(d) => collect_base_types(&d.input, out),
-        AliasedRelation(a) => collect_base_types(&a.input, out),
-        Sample(s) => collect_base_types(&s.input, out),
-        ToDataFrame(t) => collect_base_types(&t.input, out),
-        ShowString(s) => collect_base_types(&s.input, out),
-        NADrop(n) => collect_base_types(&n.input, out),
-        NAFill(n) => collect_base_types(&n.input, out),
-        NAReplace(n) => collect_base_types(&n.input, out),
-        Unpivot(u) => collect_base_types(&u.input, out),
-        Pivot(p) => collect_base_types(&p.input, out),
-        StatCov(s) => collect_base_types(&s.input, out),
-        StatCorr(s) => collect_base_types(&s.input, out),
-        ApproxQuantile(a) => collect_base_types(&a.input, out),
-        StatCrosstab(s) => collect_base_types(&s.input, out),
-        StatFreqItems(s) => collect_base_types(&s.input, out),
-        StatSampleBy(s) => collect_base_types(&s.input, out),
-        Describe(d) => collect_base_types(&d.input, out),
-        Summary(s) => collect_base_types(&s.input, out),
-        // Two-child recursion
-        Join(j) => {
-            collect_base_types(&j.left, out);
-            collect_base_types(&j.right, out);
-        }
-        Union(u) => {
-            collect_base_types(&u.left, out);
-            collect_base_types(&u.right, out);
-        }
-        Except(e) => {
-            collect_base_types(&e.left, out);
-            collect_base_types(&e.right, out);
-        }
-        Intersect(i) => {
-            collect_base_types(&i.left, out);
-            collect_base_types(&i.right, out);
-        }
-        WithCte(c) => {
-            collect_base_types(&c.input, out);
-            for (_, sub) in &c.ctes {
-                collect_base_types(sub, out);
-            }
-        }
-        // Leaves without a scan-relevant schema
-        TableScan(_) | SqlRelation(_) | LocalRelation(_) | LocalDataRelation(_)
-        | RangeRelation(_) | InMemoryRelation(_) | DdlStatement(_) | SingleRow(_) => {}
-    }
+/// The v2 dispatch machinery was removed in the 2026-07-02 restart (tag
+/// `v2-morph-track-end` preserves the discarded implementation). Slice A
+/// of the restart re-introduces v2 dispatch at the protobuf boundary per
+/// ADR-021; until then, legacy is the sole active path.
+fn generate_sql(plan: &LogicalPlan) -> Result<String, Status> {
+    SqlGenerator::new()
+        .generate(plan)
+        .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))
 }
 
 static SERVER_SESSION_ID: std::sync::LazyLock<String> =
@@ -296,7 +96,7 @@ impl SparkConnectService for ThunderduckService {
                 // Special case: ApproxQuantile needs a ListArray response.
                 if let thunderduck_core::logical::LogicalPlan::ApproxQuantile(ref aq) = logical_plan
                 {
-                    let batch = execute_approx_quantile(&session, aq, self.transpiler)
+                    let batch = execute_approx_quantile(&session, aq)
                         .await
                         .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
                     let responses = batches_to_responses(&session_id, &operation_id, &[batch])
@@ -305,7 +105,7 @@ impl SparkConnectService for ThunderduckService {
                     return Ok(Response::new(Box::pin(stream)));
                 }
 
-                let sql = generate_sql(self.transpiler, &logical_plan)?;
+                let sql = generate_sql(&logical_plan)?;
 
                 match classify_plan(&logical_plan) {
                     PlanKind::Ddl(ddl) => {
@@ -324,7 +124,7 @@ impl SparkConnectService for ThunderduckService {
                 }
             }
             Some(proto::plan::OpType::Command(cmd)) => {
-                handle_command(&session, &session_id, &operation_id, cmd, self.transpiler).await?
+                handle_command(&session, &session_id, &operation_id, cmd).await?
             }
             _ => {
                 return Err(Status::unimplemented("Unsupported plan op_type"));
@@ -385,7 +185,7 @@ impl SparkConnectService for ThunderduckService {
                 if struct_type.is_empty() || has_unresolved || logical_plan.has_partial_schema() {
                     // Static inference failed or produced Unresolved types — ask DuckDB
                     // for the actual column types/nullability.
-                    let sql = generate_sql(self.transpiler, &logical_plan)?;
+                    let sql = generate_sql(&logical_plan)?;
                     let duckdb_schema = SchemaInferrer::new(&session)
                         .infer_sql(&sql)
                         .await
@@ -601,7 +401,6 @@ async fn handle_command(
     session_id: &str,
     operation_id: &str,
     cmd: proto::Command,
-    transpiler: TranspilerPath,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
     use proto::command::CommandType;
     match cmd.command_type {
@@ -612,7 +411,7 @@ async fn handle_command(
             let logical_plan =
                 PlanConverter::convert_relation_with_session(&relation, Arc::clone(session))
                     .map_err(Status::from)?;
-            let sql = generate_sql(transpiler, &logical_plan)?;
+            let sql = generate_sql(&logical_plan)?;
 
             // Infer schema from the input relation and cache it so downstream
             // reads preserve Spark-declared nullable flags that DuckDB's
@@ -638,7 +437,7 @@ async fn handle_command(
         Some(CommandType::SqlCommand(sql_cmd)) => {
             let (sql, logical_plan) = if let Some(input_rel) = sql_cmd.input {
                 let plan = PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
-                let sql = generate_sql(transpiler, &plan)?;
+                let sql = generate_sql(&plan)?;
                 (sql, Some(plan))
             } else {
                 // Fallback: older clients send spark.sql() via the deprecated `sql` text field
@@ -669,7 +468,7 @@ async fn handle_command(
                 .input
                 .ok_or_else(|| Status::invalid_argument("WriteOperation missing input"))?;
             let logical_plan = PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
-            let select_sql = generate_sql(transpiler, &logical_plan)?;
+            let select_sql = generate_sql(&logical_plan)?;
 
             let path = match write_cmd.save_type {
                 Some(SaveType::Path(p)) => p,
@@ -719,7 +518,6 @@ async fn handle_command(
 async fn execute_approx_quantile(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     aq: &thunderduck_core::logical::ApproxQuantile,
-    transpiler: TranspilerPath,
 ) -> Result<arrow::record_batch::RecordBatch, String> {
     use arrow::array::{Array, Float64Array, ListArray};
     use arrow::buffer::OffsetBuffer;
@@ -727,7 +525,7 @@ async fn execute_approx_quantile(
     use arrow::record_batch::RecordBatch;
 
     // Generate SQL for the input sub-plan via the selected transpiler.
-    let input_sql = generate_sql(transpiler, &aq.input)
+    let input_sql = generate_sql(&aq.input)
         .map_err(|s| format!("approx_quantile input gen: {}", s.message()))?;
 
     let n_probs = aq.probabilities.len();

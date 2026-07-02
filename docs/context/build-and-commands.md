@@ -1,5 +1,7 @@
 # Build & Commands Reference
 
+> **Scope: applies to both legacy and (future) v2 code.** Since 2026-07-02, legacy is the sole active path (the morph-track v2 implementation was discarded at tag `v2-morph-track-end`; the `--transpiler` CLI flag was removed). The v2 restart begins at Slice A per `tasks/v2-adr-readiness-map.md`; when Slice A lands, dispatch relocates to the protobuf boundary per ADR-021 and this document will gain a v2-side subsection.
+
 ## Build
 
 ```bash
@@ -30,6 +32,8 @@ cargo check
 # Kill server
 pkill -f thunderduck-connect-server
 ```
+
+Note: the `--transpiler {legacy,v2}` CLI flag and `THUNDERDUCK_TRANSPILER` env var were removed in the 2026-07-02 v2 delete. Legacy is the sole active path; the env var, if set, logs a runtime warning and is ignored. Slice A of the v2 restart will re-introduce dispatch selection at the protobuf boundary per ADR-021.
 
 ## Change-and-Test Workflow
 

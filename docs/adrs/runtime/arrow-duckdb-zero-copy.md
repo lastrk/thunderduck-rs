@@ -1,4 +1,6 @@
-# ADR-17: Arrow ↔ DuckDB Zero-Copy Exchange
+# Arrow ↔ DuckDB Zero-Copy Exchange
+
+> **Status: current — runtime/serving substrate.** An existing decision that applies to *both* transpiler paths (legacy and v2); not superseded by the rearchitecture. ADR index: [`../README.md`](../README.md) · v2 spine: [`../../thunderduck-rearchitect-ADRs.md`](../../thunderduck-rearchitect-ADRs.md).
 
 **The performance-critical path.**
 
@@ -18,4 +20,4 @@ Default batch size: 8192 rows. Configurable via `THUNDERDUCK_BATCH_SIZE` env var
 
 ---
 
-← [Back to Architecture Overview](../architecture.md)
+← [Back to ADR Index](../README.md)

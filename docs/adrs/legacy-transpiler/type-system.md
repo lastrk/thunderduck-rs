@@ -1,4 +1,6 @@
-# ADR-08: Type System
+# Type System (legacy path)
+
+> **Status: existing implementation — runs behind `--transpiler legacy` (the default).** The authoritative v2 architecture supersedes this file where they conflict; the two paths coexist, so do not delete the legacy path to make room for v2. This file's v2 successor is listed in the legacy→v2 map in [`../README.md`](../README.md); the v2 spine is [`../../thunderduck-rearchitect-ADRs.md`](../../thunderduck-rearchitect-ADRs.md).
 
 **Decision: `DataType` enum mirroring Spark's type hierarchy**
 
@@ -41,4 +43,4 @@ pub struct StructField {
 
 ---
 
-← [Back to Architecture Overview](../architecture.md)
+← [Back to ADR Index](../README.md)

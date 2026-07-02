@@ -1,6 +1,10 @@
 # Lessons & Gotchas
 
-Review before working on SQL generation, expression handling, threading, extension integration, or aggregate paths.
+> **Scope: LEGACY path.** These gotchas were discovered while building and debugging the legacy `SqlGenerator` / `LogicalPlan` / `Expression` / `TypeInferenceEngine` / `RelationConverter` stack. They apply to the currently-active legacy path in `main`.
+>
+> **v2 has its own inheritance checklist** at `tasks/v2-restart-inheritance-checklist.md`, which distills the concrete bugs the morph-track v2 debugging arc surfaced (analyzer symmetric-omissions on `count_if`/`corr`/`covar_samp`/`regr_*`, `hash`/`xxhash64`/`murmur3` nullability, Decimal128 marshalling in the RelationConverter, `sha` arg-stripping, `percentile_approx` FLOAT CAST). The Slice A architect must cite that checklist during v2 restart, not this file. Some legacy gotchas below (e.g., `duckdb::Connection` threading, HUGEINT overflow, extension version pinning) are universal and apply to v2 too; the file-scope-legacy label attaches to the *examples*, not the *rules*.
+
+Review before working on SQL generation, expression handling, threading, extension integration, or aggregate paths **in the legacy tree**.
 
 ## `to_sql()` vs `Display`
 

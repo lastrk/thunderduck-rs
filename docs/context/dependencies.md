@@ -1,5 +1,7 @@
 # Dependencies & Configuration
 
+> **Scope: applies to both legacy and (future) v2 code.** External dependencies (the `thdck_spark_funcs` extension, protobuf, Arrow, Tokio) are shared substrate. Value-level types (`DataType`/`StructType`/`StructField`) are also shared per ADR-021. Under ADR-021, however, v2 will have its **own** `Expression` enum and its **own** `TypeInferenceEngine` — those are peer implementations to legacy's, validated by ADR-015's differential oracle, not delegating clients. This file is authoritative on shared externals; for v2's substrate-independence commitments see `docs/thunderduck-rearchitect-ADRs.md` §ADR-021 and INV10.
+
 ## Spark Compatibility Extension
 
 Spark parity is the only emission target. The `thdck_spark_funcs` extension is mandatory and bundled into every build (see [rearchitect ADR-020](../thunderduck-rearchitect-ADRs.md)).
@@ -29,7 +31,7 @@ The extension implements Spark-precise numerical semantics:
 | `spark_sum(col)` | `SUM` | Spark-compatible return types |
 | `spark_avg(col)` | `AVG` | Spark-compatible return types |
 
-Full details: [adr-13-duckdb-extension-loading.md](../adrs/adr-13-duckdb-extension-loading.md) (see `docs/architecture.md` for the ADR index).
+Full details: [extension-loading.md](../adrs/runtime/extension-loading.md) (see [`docs/adrs/README.md`](../adrs/README.md) for the ADR index).
 
 ## Spark Connect Configuration
 

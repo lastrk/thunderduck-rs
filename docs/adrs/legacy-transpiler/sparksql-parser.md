@@ -1,15 +1,16 @@
-# ADR-21: SparkSQL Parser Strategy
+# SparkSQL Parser Strategy
 
-> **Supersedes [ADR-10: SparkSQL Raw SQL Path](adr-10-sparksql-raw-sql-path.md)**
-> ADR-10 describes the interim preprocessing pass that this parser strategy will replace.
+> **Status: current — SparkSQL parser front-end; complements (not superseded by) the rearchitecture.** Rearchitect ADR-004 mandates parsing SparkSQL into the common AST; this ADR records the parser *technology* that implements that front-end (sqlparser-rs + a custom `SparkDialect`, Tier 1; `chumsky`, Tier 2). ADR index: [`../README.md`](../README.md) · v2 spine: [`../../thunderduck-rearchitect-ADRs.md`](../../thunderduck-rearchitect-ADRs.md).
+
+> **Context:** the interim `preprocess_spark_sql` text-rewrite pass this strategy replaced has since been removed from the codebase. Raw SQL now flows through a parser front-end (and, in v2, lowers into the common AST per rearchitect ADR-004) rather than through string substitution.
 
 **Decision: sqlparser-rs with a custom `SparkDialect` (Tier 1); chumsky as the upgrade path if sqlparser-rs coverage proves insufficient (Tier 2). Coverage is demand-driven — the parser is extended feature-by-feature as real workloads require it, not upfront.**
 
 ### Context
 
-The current `spark.sql()` path (ADR-10) sends the raw SQL string through `preprocess_spark_sql`
-— a 13-phase chain of text substitutions — before handing it to DuckDB. All 670 differential
-tests pass. However the preprocessing approach has a hard structural ceiling:
+The interim `spark.sql()` path sent the raw SQL string through `preprocess_spark_sql`
+— a 13-phase chain of text substitutions — before handing it to DuckDB. That approach passed the
+differential suite of its day but has a hard structural ceiling:
 
 - `LATERAL VIEW [OUTER] EXPLODE / POSEXPLODE / JSON_TUPLE` — cannot be text-substituted
 - `DISTRIBUTE BY` / `CLUSTER BY` / `SORT BY` — Hive sort directives with no DuckDB analogue
@@ -202,4 +203,4 @@ LL(*) SQL); `nom`/`winnow` (type complexity at SQL grammar scale).
 
 ---
 
-← [Back to Architecture Overview](../architecture.md)
+← [Back to ADR Index](../README.md)

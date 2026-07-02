@@ -1,5 +1,9 @@
 # Testing Guide
 
+> **Scope: universal — applies to both legacy and v2 code.** Unit tests, integration/differential tests, and the differential harness itself are shared infrastructure. Per ADR-015, the differential oracle is the parity contract between v2 and legacy — both implementations are validated against the same corpus and the same result-canonicalization rules. Under ADR-021, code-sharing between the two implementations is limited to value-level types; test infrastructure is not "shared code" in the ADR-021 sense, it's the test harness that validates parity.
+>
+> The `core_v2` differential suite (currently reads 12/324 baseline post-v2-delete) is the v2 progress signal per `tests/scripts/v2-progress.sh`; it re-populates as Slice A → Slice J land.
+
 ## Unit Tests (`cargo test`)
 
 ```bash

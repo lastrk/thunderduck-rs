@@ -1,4 +1,6 @@
-# ADR-18: Error Handling
+# Error Handling
+
+> **Status: current — runtime/serving substrate.** An existing decision that applies to *both* transpiler paths (legacy and v2); not superseded by the rearchitecture. ADR index: [`../README.md`](../README.md) · v2 spine: [`../../thunderduck-rearchitect-ADRs.md`](../../thunderduck-rearchitect-ADRs.md).
 
 **Decision: `thiserror` in `core`, `anyhow` in `connect-server`**
 
@@ -28,4 +30,4 @@ pub enum ThunderduckError {
 
 ---
 
-← [Back to Architecture Overview](../architecture.md)
+← [Back to ADR Index](../README.md)

@@ -1,5 +1,13 @@
 # Architecture Reference
 
+> **Scope: currently-active LEGACY path only.** This document describes the production `SqlGenerator` / `LogicalPlan` / `Expression` / `TypeInferenceEngine` / `RelationConverter` / `FunctionRegistry` / `SparkSqlParser` architecture. It does **not** describe the v2 rearchitecture. Cross-references:
+>
+> - **v2 rearchitecture ADRs (authoritative for the target architecture):** `docs/thunderduck-rearchitect-ADRs.md` — ADRs 000 through 021, including the substrate-independence commitments in ADR-021.
+> - **v2 slice plan:** `tasks/v2-adr-readiness-map.md` — restart-track sequence (Slice A → Slice J).
+> - **v2 restart status (2026-07-02):** the morph-track v2 implementation was discarded (tag `v2-morph-track-end`); a fresh implementation is planned under Slice A. Legacy is the sole active path in `main` until Slice A lands.
+>
+> Where this document and the v2 rearchitecture ADRs disagree, **the rearchitecture ADRs win** for target-architecture questions; this document is authoritative only for what runs in production today.
+
 ## SQL Generation Architecture Principles
 
 These are non-negotiable constraints governing all SQL generation and type handling:

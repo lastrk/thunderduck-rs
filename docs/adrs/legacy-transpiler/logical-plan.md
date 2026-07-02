@@ -1,4 +1,6 @@
-# ADR-06: Logical Plan Representation
+# Logical Plan Representation (legacy path)
+
+> **Status: existing implementation — runs behind `--transpiler legacy` (the default).** The authoritative v2 architecture supersedes this file where they conflict; the two paths coexist, so do not delete the legacy path to make room for v2. This file's v2 successor is listed in the legacy→v2 map in [`../README.md`](../README.md); the v2 spine is [`../../thunderduck-rearchitect-ADRs.md`](../../thunderduck-rearchitect-ADRs.md).
 
 **Decision: Rust `enum` — one variant per plan node**
 
@@ -58,4 +60,4 @@ Each variant wraps a struct carrying the node's fields. `SqlGenerator` is a set 
 
 ---
 
-← [Back to Architecture Overview](../architecture.md)
+← [Back to ADR Index](../README.md)

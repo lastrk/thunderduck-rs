@@ -4,6 +4,14 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-07-02 — v2 Slice B landing (τ analyzer: typing + nullability + set-op widening + outer-join nullability)
+
+[`dev_journal/2026-07-02-v2-slice-B.md`](dev_journal/2026-07-02-v2-slice-B.md)
+
+**Delta:** 0 → 0 core_v2 (unchanged — analyzer alone doesn't emit; corpus climb requires Slice C emission arms). `crates/core/src/transpiler_v2/analyzer.rs` (~1100 LOC) + `analyzer_fixtures.rs` (~410 LOC, `#[cfg(test)]`); single pass (no B.1/B.2 sub-split) — three conceptual passes fused into one bottom-up traversal. `CommonOp::SetOp { kind, all, by_name, children }` + `SetOpKind` added (additive). `AGGREGATE_NAMES` gains `try_sum` + `try_avg` per checklist §1.4; `try_divide` explicitly NOT added (scalar per §4.1). `AnalyzerError` splits per ADR-022 with `[SPARK-EMULATED]` / `[TDCK-BOUNDARY]` Display prefixes. INV4 + INV5 activated with fixture-iterating bodies (5 input relations + 10 mini-fixtures). Fix pass closed H1 (central projection-ambiguity check in `resolve_column`), H2 (redundant walker deleted), M1 (qualified-Star unknown-qualifier → `UnknownColumn`), M2 (arity mismatches → `Other` variant). Verdict APPROVED. 38+ tests added; total transpiler_v2 tests 65 → 95.
+
+---
+
 ## 2026-07-02 — v2 Slice A landing (τ substrate: types + plan + protobuf converter + SparkSQL front-end + dispatch)
 
 [`dev_journal/2026-07-02-v2-slice-A.md`](dev_journal/2026-07-02-v2-slice-A.md)

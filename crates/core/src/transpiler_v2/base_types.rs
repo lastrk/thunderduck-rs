@@ -102,6 +102,7 @@ pub fn plan_has_empty_scan(plan: &CommonAst) -> bool {
         CommonOp::Join { left, right, .. } => {
             plan_has_empty_scan(left) || plan_has_empty_scan(right)
         }
+        CommonOp::SetOp { children, .. } => children.iter().any(plan_has_empty_scan),
         // Leaves other than TableScan carry their schema inline or resolve
         // via other channels — never empty for the purposes of this overlay.
         CommonOp::SingleRow
@@ -127,6 +128,11 @@ fn collect_empty_scan_tables(plan: &CommonAst, out: &mut Vec<String>) {
         CommonOp::Join { left, right, .. } => {
             collect_empty_scan_tables(left, out);
             collect_empty_scan_tables(right, out);
+        }
+        CommonOp::SetOp { children, .. } => {
+            for child in children {
+                collect_empty_scan_tables(child, out);
+            }
         }
         CommonOp::SingleRow
         | CommonOp::Values { .. }

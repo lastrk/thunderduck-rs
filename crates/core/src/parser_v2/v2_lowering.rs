@@ -26,7 +26,6 @@ use sqlparser::ast::{
     UnaryOperator, Value, ValueWithSpan,
 };
 
-use crate::transpiler_v2::EmissionError;
 use crate::transpiler_v2::ast::{CommonAst, CommonOp, JoinType};
 use crate::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
@@ -34,6 +33,7 @@ use crate::transpiler_v2::expression::{
     SortDirection, SortOrder, StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
 use crate::transpiler_v2::type_inference::AGGREGATE_NAMES;
+use crate::transpiler_v2::EmissionError;
 use crate::types::DataType;
 
 /// Lower a parsed sqlparser [`Statement`] into a [`CommonAst`].

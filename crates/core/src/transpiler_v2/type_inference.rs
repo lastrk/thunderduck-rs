@@ -284,7 +284,8 @@ impl TypeInferenceEngine {
             "count" | "count_distinct" | "count_if" => Long,
 
             // SUM family: integer types → Long, float → Double, decimal → wider.
-            "sum" | "sum_distinct" => match arg_type {
+            // `try_sum` mirrors `sum` — Slice B checklist §1.4 adds it here.
+            "sum" | "sum_distinct" | "try_sum" => match arg_type {
                 Byte | Short | Integer | Long => Long,
                 Float => Double,
                 Double => Double,
@@ -299,7 +300,8 @@ impl TypeInferenceEngine {
             },
 
             // AVG family: integer types → Double, decimal → wider.
-            "avg" | "mean" => match arg_type {
+            // `try_avg` mirrors `avg` — Slice B checklist §1.4 adds it here.
+            "avg" | "mean" | "try_avg" => match arg_type {
                 Byte | Short | Integer | Long => Double,
                 Float | Double => Double,
                 Decimal { precision, scale } => {
@@ -407,8 +409,10 @@ impl TypeInferenceEngine {
             name_lower,
             "sum"
                 | "sum_distinct"
+                | "try_sum"
                 | "avg"
                 | "mean"
+                | "try_avg"
                 | "min"
                 | "max"
                 | "first"
@@ -523,8 +527,10 @@ impl TypeInferenceEngine {
             | "count_if"
             | "sum"
             | "sum_distinct"
+            | "try_sum"
             | "avg"
             | "mean"
+            | "try_avg"
             | "min"
             | "max"
             | "first"
@@ -651,9 +657,11 @@ pub(crate) const AGGREGATE_NAMES: &[&str] = &[
     // SUM family (always-nullable).
     "sum",
     "sum_distinct",
+    "try_sum",
     // AVG family.
     "avg",
     "mean",
+    "try_avg",
     // MIN / MAX.
     "min",
     "max",
@@ -899,6 +907,89 @@ mod tests {
             TypeInferenceEngine::column_type("missing", &schema),
             DataType::Unresolved
         );
+    }
+
+    // ── Slice B checklist §1.4 — try_sum / try_avg (aggregate) ──────────────
+
+    /// `try_sum` and `try_avg` must be present in `AGGREGATE_NAMES` so the
+    /// SparkSQL classifier (`is_aggregate_function_name`) picks them up.
+    #[test]
+    fn aggregate_names_contains_try_sum_and_try_avg() {
+        assert!(
+            AGGREGATE_NAMES.contains(&"try_sum"),
+            "AGGREGATE_NAMES must contain try_sum (checklist §1.4)",
+        );
+        assert!(
+            AGGREGATE_NAMES.contains(&"try_avg"),
+            "AGGREGATE_NAMES must contain try_avg (checklist §1.4)",
+        );
+    }
+
+    /// `try_divide` is a scalar function — it must NOT be in `AGGREGATE_NAMES`.
+    #[test]
+    fn aggregate_names_does_not_contain_try_divide() {
+        assert!(
+            !AGGREGATE_NAMES.contains(&"try_divide"),
+            "AGGREGATE_NAMES must NOT contain try_divide (scalar per checklist §4.1)",
+        );
+    }
+
+    /// `try_sum` return-type must mirror `sum` (Integer → Long, Double → Double,
+    /// Decimal → widened).
+    #[test]
+    fn aggregate_return_type_try_sum_matches_sum_path() {
+        for arg in [
+            DataType::Byte,
+            DataType::Short,
+            DataType::Integer,
+            DataType::Long,
+            DataType::Float,
+            DataType::Double,
+            DataType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        ] {
+            assert_eq!(
+                TypeInferenceEngine::aggregate_return_type("try_sum", &arg),
+                TypeInferenceEngine::aggregate_return_type("sum", &arg),
+                "try_sum({arg:?}) must return the same type as sum({arg:?})",
+            );
+        }
+    }
+
+    /// `try_avg` return-type must mirror `avg`.
+    #[test]
+    fn aggregate_return_type_try_avg_matches_avg_path() {
+        for arg in [
+            DataType::Byte,
+            DataType::Short,
+            DataType::Integer,
+            DataType::Long,
+            DataType::Float,
+            DataType::Double,
+            DataType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        ] {
+            assert_eq!(
+                TypeInferenceEngine::aggregate_return_type("try_avg", &arg),
+                TypeInferenceEngine::aggregate_return_type("avg", &arg),
+                "try_avg({arg:?}) must return the same type as avg({arg:?})",
+            );
+        }
+    }
+
+    /// Both `try_sum` and `try_avg` must be in the always-nullable roster
+    /// (empty groups return NULL, and `try_*` variants surface arithmetic
+    /// overflows as NULL in place of errors).
+    #[test]
+    fn try_sum_and_try_avg_are_always_nullable() {
+        assert!(TypeInferenceEngine::aggregate_is_always_nullable("try_sum"));
+        assert!(TypeInferenceEngine::aggregate_is_always_nullable("try_avg"));
+        assert!(!TypeInferenceEngine::aggregate_is_non_nullable("try_sum"));
+        assert!(!TypeInferenceEngine::aggregate_is_non_nullable("try_avg"));
     }
 
     // ── Function dispatch sanity — hash family ──────────────────────────────

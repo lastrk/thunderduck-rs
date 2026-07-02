@@ -179,6 +179,26 @@ pub enum CommonOp {
         with_ordinality: bool,
     },
 
+    // ── Set operations (Slice B) ─────────────────────────────────────────
+    /// A n-ary set operation: UNION / INTERSECT / EXCEPT.
+    ///
+    /// **Slice B adds this variant.** Set-op widening (analyzer's downward
+    /// sub-sweep, per rearchitect ADR-006) runs across `children` to compute
+    /// the widened schema; the resolved schema is stamped by the analyzer.
+    /// `UNION BY NAME` (`by_name = true`) is deferred to Slice G and surfaces
+    /// as `AnalyzerError::PuntedOperator` today.
+    SetOp {
+        /// The kind of set operation.
+        kind: SetOpKind,
+        /// Whether duplicates are preserved (`UNION ALL`) or removed
+        /// (`UNION DISTINCT`).
+        all: bool,
+        /// Whether column matching is by-name (`UNION BY NAME`) or by-position.
+        by_name: bool,
+        /// The n-ary children of the set operation.
+        children: Vec<CommonAst>,
+    },
+
     // ── Join with first-class plan_ids (§2.3) ────────────────────────────
     /// A binary join.
     ///
@@ -215,6 +235,17 @@ pub enum FileFormat {
     Json,
     /// Apache ORC.
     Orc,
+}
+
+/// The set-operation kind carried by [`CommonOp::SetOp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SetOpKind {
+    /// `UNION` / `UNION ALL` — vertical concatenation.
+    Union,
+    /// `INTERSECT` — row intersection.
+    Intersect,
+    /// `EXCEPT` (`MINUS`) — row set difference.
+    Except,
 }
 
 /// The join types supported by [`CommonOp::Join`].
@@ -311,6 +342,33 @@ mod tests {
                 assert!(matches!(rows[0][0], Expression::Literal(_)));
             }
             _ => panic!("expected LocalRelation"),
+        }
+    }
+
+    #[test]
+    fn common_op_setop_construction() {
+        // Anchor: SetOp variant + SetOpKind enum land at Slice B.
+        let child_a = CommonAst::new(CommonOp::SingleRow);
+        let child_b = CommonAst::new(CommonOp::SingleRow);
+        let plan = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Union,
+            all: true,
+            by_name: false,
+            children: vec![child_a, child_b],
+        });
+        match plan.op {
+            CommonOp::SetOp {
+                kind,
+                all,
+                by_name,
+                children,
+            } => {
+                assert_eq!(kind, SetOpKind::Union);
+                assert!(all);
+                assert!(!by_name);
+                assert_eq!(children.len(), 2);
+            }
+            _ => panic!("expected SetOp"),
         }
     }
 

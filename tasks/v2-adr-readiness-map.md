@@ -64,6 +64,8 @@ Owns ADR-003 (common AST), ADR-004 (protobuf-boundary dispatch), ADR-021 (τ own
 
 ### Slice B — Full v2 analyzer (typing, nullability, set-op widening, outer-join nullability)
 
+**LANDED 2026-07-02** as a single pass (no B.1/B.2 sub-split); three conceptual passes fused into one bottom-up traversal. Corpus signal: 0/324 unchanged (analyzer runs but emission arms are Slice C's — expected outcome under /goal HALT-AND-FLAG trigger 2). `crates/core/src/transpiler_v2/analyzer.rs` (~1100 LOC) + `analyzer_fixtures.rs` (~410 LOC) + `CommonOp::SetOp` extension. INV4 + INV5 activated with fixture-iterating bodies. AGGREGATE_NAMES gained `try_sum`/`try_avg` (checklist §1.4). 38+ tests added; total transpiler_v2 tests 65 → 95. See `docs/dev_journal/2026-07-02-v2-slice-B.md` for details; `.agent-output/005-summary.md` for full record.
+
 Owns ADR-005 (owned type/nullability inference), ADR-006 (bounded analyzer passes).
 
 **Inherent dependencies:** A.1 (types substrate), A.2 (plan substrate). **Explicit non-dependency:** A.3 (dispatch relocation). The analyzer is unit-tested against `analyzer_fixtures.rs`; A.3 can proceed in parallel.

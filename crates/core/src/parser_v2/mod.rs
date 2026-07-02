@@ -12,8 +12,8 @@
 mod dialect;
 mod v2_lowering;
 
-use crate::transpiler_v2::EmissionError;
 use crate::transpiler_v2::ast::CommonAst;
+use crate::transpiler_v2::EmissionError;
 use dialect::SparkDialect;
 
 /// τ's public SparkSQL parser entry point.

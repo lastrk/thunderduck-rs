@@ -43,26 +43,61 @@ fn inv3_emission_table_single_source_of_truth() {
     todo!("INV3 activation is Slice C.1's grep-barrier deliverable")
 }
 
-// ── INV4 (Slice B — analyzer isolation) ──────────────────────────────────────
+// ── INV4 (ACTIVE — Slice B) ──────────────────────────────────────────────────
 
-/// DEFER INV4 → Slice B: inference is validated in isolation from emission —
-/// the analyzer's schema/nullability results are verifiable without running
-/// any SQL through DuckDB.
+/// INV4: inference is validated in isolation from emission — the analyzer's
+/// schema/nullability results are verifiable without running any SQL through
+/// DuckDB.
+///
+/// Iterates the Slice B fixture registry and, for each Ok-path fixture,
+/// asserts the analyzed `resolved_schema` field-by-field matches the
+/// expected schema recorded in the fixture.
 #[test]
-#[ignore]
 fn inv4_inference_validated_in_isolation() {
-    todo!("INV4 activation is Slice B's analyzer deliverable")
+    use super::analyze;
+    use super::analyzer_fixtures;
+    for (name, ast, base_types, expected_schema) in analyzer_fixtures::all_fixtures() {
+        let typed = analyze(ast, &base_types)
+            .unwrap_or_else(|e| panic!("fixture `{name}` failed to analyze: {e}"));
+        assert_eq!(
+            typed.resolved_schema.fields.len(),
+            expected_schema.fields.len(),
+            "fixture `{name}` field count mismatch: got {} fields, expected {}",
+            typed.resolved_schema.fields.len(),
+            expected_schema.fields.len(),
+        );
+        for (idx, (actual, expected)) in typed
+            .resolved_schema
+            .fields
+            .iter()
+            .zip(expected_schema.fields.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                actual, expected,
+                "fixture `{name}` field #{idx} mismatch: got {actual:?}, expected {expected:?}",
+            );
+        }
+    }
 }
 
-// ── INV5 (Slice B — schema everywhere) ───────────────────────────────────────
+// ── INV5 (ACTIVE — Slice B) ──────────────────────────────────────────────────
 
-/// DEFER INV5 → Slice B: every plan node carries a resolved schema after
-/// analysis; grep barrier over `crates/core/src/transpiler_v2/` finds zero
-/// `Schema::empty()` fallthroughs post-analyzer.
+/// INV5: every plan node carries a resolved schema after analysis; no
+/// `DataType::Unresolved` remains and no `ColumnReference` has `data_type`
+/// or `nullable` unset.
 #[test]
-#[ignore]
 fn inv5_schema_everywhere() {
-    todo!("INV5 activation is Slice B's analyzer deliverable")
+    use super::analyzer_fixtures;
+    use super::{analyze, has_resolved_schema};
+    for (name, ast, base_types, _expected_schema) in analyzer_fixtures::all_fixtures() {
+        let typed = analyze(ast, &base_types)
+            .unwrap_or_else(|e| panic!("fixture `{name}` failed to analyze: {e}"));
+        assert!(
+            has_resolved_schema(&typed),
+            "fixture `{name}` post-analysis has an unresolved schema or column",
+        );
+    }
 }
 
 // ── INV6 (Slice D — extension targets exist) ─────────────────────────────────

@@ -749,14 +749,21 @@ mod tests {
             tonic::Code::Unimplemented,
             "boundary errors must surface as Status::unimplemented, not internal; got {err:?}"
         );
-        // τ's `UnsupportedOp` (from `generate()`) is what should be surfaced —
-        // NOT `V2RelationConverter`'s `UnsupportedProtoShape` (the proto
-        // shape is supported), and NOT a Slice B/C `unimplemented`.
+        // τ's emission boundary is what should be surfaced — NOT
+        // `V2RelationConverter`'s `UnsupportedProtoShape` (the proto shape is
+        // supported). Since Slice B, this can be either the τ analyzer's
+        // Spark-emulated error (unknown table `t` — the test uses an empty
+        // BaseTypes overlay) or τ's `UnsupportedOp` (`<slice-b-analyzer-ok>`
+        // when the analyzer succeeds). Both signal we reached τ, not the
+        // proto-shape gate.
+        let message = err.message();
         assert!(
-            err.message().contains("unsupported operator")
-                || err.message().contains("<a.2-substrate>"),
-            "message must identify τ's UnsupportedOp; got: {}",
-            err.message()
+            message.contains("unsupported operator")
+                || message.contains("unsupported expression")
+                || message.contains("<slice-b-analyzer-ok>")
+                || message.contains("[SPARK-EMULATED]")
+                || message.contains("<a.2-substrate>"),
+            "message must identify τ's boundary error; got: {message}",
         );
     }
 

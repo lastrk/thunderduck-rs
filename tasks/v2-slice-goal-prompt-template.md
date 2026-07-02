@@ -49,14 +49,16 @@ Required sections:
 **Slice scope:** `tasks/v2-slice-<SLICE_ID>-scope.md` — target case IDs, applicable ADRs, inheritance-checklist sections, sub-slice sketch.
 **Methodology:** `tasks/v2-slice-iteration-methodology.md`.
 **Readiness map:** `tasks/v2-adr-readiness-map.md` §Slice <SLICE_ID>.
-**Design authority:** `docs/thunderduck-rearchitect-ADRs.md` (ADR-000 → ADR-021).
+**Design authority:** `docs/thunderduck-rearchitect-ADRs.md` (ADR-000 → ADR-022). **ADR-022** (2026-07-02) is load-bearing: v2 is the only production path, legacy is superseded (reference source only, deletable at any point), no runtime fallback, two error categories (Spark-emulated vs Thunderduck-boundary).
 **Inheritance discipline:** `tasks/v2-restart-inheritance-checklist.md` — Pass 1's architect plan MUST cite the applicable sections; reviewer verifies presence.
+**Open-decisions record:** `tasks/v2-restart-open-decisions.md` — twelve decisions RESOLVED as of 2026-07-02; new parallel-track blockers append here as Decision 13+.
 **Iteration log:** `tasks/v2-slice-<SLICE_ID>-iteration-log.md` (create at Pass 1; append each pass's verdict + delta + lessons).
 
 **Preflight** (halt any fails):
 1. `cargo check -p thunderduck-core -p thunderduck-connect-server` clean.
-2. Legacy TPC-H differential green (`./tests/scripts/run-differential-tests.sh tpch` = 51/51).
-3. `tests/scripts/v2-progress.sh` reports the expected `<BASELINE_CORE_V2>` count.
+2. `tests/scripts/v2-progress.sh` reports the expected `<BASELINE_CORE_V2>` count.
+
+*(Note: the earlier preflight step "Legacy TPC-H differential green (51/51)" is REMOVED per ADR-022 — legacy is not maintained during the reimplementation; TPC-H is temporarily red until v2 covers its query surface.)*
 
 **Loop** (per methodology §Loop):
 - Each pass = one architect-approved `/new-feature` invocation, OR `/fix-bug` if a target's investigation proves the scope file's hypothesis wrong (diagnostic-first).
@@ -85,7 +87,8 @@ Required sections:
 5. Report closure. **Do NOT commit without user approval** (CLAUDE.md).
 
 **Non-goals:**
-- No legacy `SqlGenerator` / `FunctionRegistry` / `RelationConverter` mods (INV3 + INV10; legacy is separate per ADR-021).
+- No legacy `SqlGenerator` / `FunctionRegistry` / `RelationConverter` mods (INV3 + INV10; legacy is reference-only per ADR-022, not maintained).
+- No fallback-to-legacy plumbing — v2 errors surface directly per ADR-022's two-error-category rule (Spark-emulated vs Thunderduck-boundary).
 - No commits without user approval.
 - No skipping Quality Gate.
 - No full-differential runs between passes; termination only.

@@ -8,13 +8,20 @@ This file contains project-specific rules and guidelines for working with thunde
 
 ### Authoritative architecture
 
-[**docs/thunderduck-rearchitect-ADRs.md**](docs/thunderduck-rearchitect-ADRs.md) (ADR-000 → ADR-019 + Cross-Validation) is the **authoritative** architecture source for the transpiler going forward. It records a principled redesign of the Spark → DuckDB transliterator (`τ`): a common AST fed by both front-ends, an owned type/nullability analyzer over that AST, a declarative compiled emission table, extension functions as minimal gap-fillers, and a differential + AnalyzePlan test architecture.
+[**docs/thunderduck-rearchitect-ADRs.md**](docs/thunderduck-rearchitect-ADRs.md) (ADR-000 → ADR-022 + Cross-Validation) is the **authoritative** architecture source for the transpiler going forward. It records a principled redesign of the Spark → DuckDB transliterator (`τ`): a common AST fed by both front-ends, an owned type/nullability analyzer over that AST, a declarative compiled emission table, extension functions as minimal gap-fillers, and a differential + AnalyzePlan test architecture.
 
 The older [docs/architecture.md](docs/architecture.md) and [docs/adrs/](docs/adrs/) describe the **existing** implementation and remain valid reference for it, but where they contradict the rearchitecture ADRs, **the rearchitecture ADRs win.**
 
-### Rearchitecture is additive and non-destructive
+### τ is the only path (per ADR-022)
 
-The new transpiler is being built **alongside** the existing one, not in place of it. A dispatch flag selects which path a request takes (legacy path vs. new common-AST/analyzer path), so the existing implementation keeps passing its differential suite while the new path is grown to conformance. Do not delete or rewrite the existing transpiler to make room for the new one — both coexist until the new path supersedes the old behind the flag.
+τ (the v2 transpiler at `crates/core/src/transpiler_v2/`, `crates/connect-server/src/converter/v2_relation_converter.rs`, and `crates/core/src/parser_v2/`) is the only production path. Every Spark Connect request flows to τ; τ's output is the response. If τ has not implemented a given operator, τ produces a Thunderduck-boundary error (`Unsupported*`) directly to the caller. There is no fallback, no dispatch flag, no alternate implementation.
+
+**Two error categories** (ADR-022): (1) **Spark-emulated errors** — inputs Spark itself would reject; τ matches Spark's error semantics. (2) **Thunderduck-boundary errors** — inputs Spark accepts but τ has not implemented; honest "not implemented in Thunderduck."
+
+**Practical implications:**
+- The DataFrame corpus (`tests/scripts/v2-progress.sh`, 324 cases) is the fitness function; TPC-H is temporarily red until τ covers its query surface.
+- No new work in modules outside τ. `crates/core/src/{logical,expression,generator,functions}/` and `crates/connect-server/src/converter/{expression,plan,relation,type}_converter.rs` are not part of τ and are deletable at any point (see readiness map §Slice K).
+- Delete legacy files freely once nothing (test, runtime path, doc) references them; see `tasks/v2-adr-readiness-map.md` §Slice K.
 
 ## Workflow Orchestration
 
@@ -35,10 +42,10 @@ Never mark a task complete without proving it works. For any non-trivial change,
 1. **Format** — `cargo fmt --check` must be clean.
 2. **Lint** — `cargo clippy -- -D warnings` must be clean (zero warnings).
 3. **Unit tests** — `cargo test` must pass across all crates.
-4. **TPC-H differential (mandatory)** — `./tests/scripts/run-differential-tests.sh tpch` must pass.
-5. **Full differential (when SQL-relevant)** — if the change touches SQL generation, expressions, logical plans, the parser, the converter, or the function registry, also run `./tests/scripts/run-differential-tests.sh all`.
+4. **TPC-H differential (DEFERRED during the τ reimplementation per ADR-022)** — `./tests/scripts/run-differential-tests.sh tpch` is *not* a required gate right now. The DataFrame corpus (`tests/scripts/v2-progress.sh`, 324 cases) is the fitness function; TPC-H is temporarily red until τ covers its query surface. TPC-H rejoins this step as mandatory once τ covers its query surface (see readiness map, post-Slice-G).
+5. **Full differential (when SQL-relevant)** — DEFERRED for the same reason as step 4. The `all` suite exercises TPC-H + TPC-DS through the non-τ path, which is not maintained. Use `./tests/scripts/v2-progress.sh` to measure τ progress on the DataFrame corpus.
 
-A task is **not** done if any step is red. Do not commit, do not declare success, do not move on. If a step is intentionally skipped (e.g., docs-only change skips clippy), state which step and why.
+A task is **not** done if any step is red. Do not commit, do not declare success, do not move on. If a step is intentionally skipped (e.g., docs-only change skips clippy, or TPC-H is deferred per ADR-022 above), state which step and why.
 
 ### 5. Demand Elegance (Balanced)
 For non-trivial changes: pause and ask "is there a more elegant Rust way?" Skip for simple, obvious fixes.
@@ -51,10 +58,10 @@ When given a bug report: just fix it. Point at logs, errors, failing tests, then
 This is the **agent-pipeline gate** — the checks the orchestrated agents in
 `/new-feature` and `/fix-bug` must clear after every implementation and after
 every review-fix pass. The differential test suites are **intentionally
-excluded** from this gate: `core_v2` (and `core` while the v2 path is being
-grown) is the v2-transpiler progress signal, currently expected to be
-partially red, run separately via
-`cargo test -p thunderduck-connect-server --test differential core_v2 -- --ignored`.
+excluded** from this gate: `core_v2` is the v2-transpiler progress signal,
+currently expected to be partially red, measured separately via
+`tests/scripts/v2-progress.sh` (or `cargo test -p thunderduck-connect-server
+--test differential core_v2 -- --ignored`).
 
 Run, in order, after every implementation and after every review fix:
 
@@ -254,7 +261,7 @@ Source: release [`ext6`](https://github.com/nubank/thunderduck-duckdb-extension/
 
 ## Documentation Structure
 
-1. **Rearchitecture ADRs** (`docs/thunderduck-rearchitect-ADRs.md`) — **authoritative** architecture for the transpiler redesign (ADR-000 → ADR-019 + Cross-Validation). Source of truth on any contradiction.
+1. **Rearchitecture ADRs** (`docs/thunderduck-rearchitect-ADRs.md`) — **authoritative** architecture for the transpiler redesign (ADR-000 → ADR-022 + Cross-Validation). Source of truth on any contradiction.
 2. **Existing architecture** (`docs/architecture.md`) — architectural decisions for the current implementation (ADRs 1–21); links to individual files in `docs/adrs/`. Valid for the existing path; superseded by item 1 where they conflict.
 3. **Dev journal** (`docs/dev-journal-toc.md`) — chronological development history; entries in `docs/dev_journal/`
 4. **Agent context** (`docs/context/`) — condensed reference (architecture, build commands, coding standards, dependencies, gotchas, testing) for the current codebase
@@ -336,11 +343,6 @@ cd tests/integration && python3 -m pytest \
 
 # Custom port
 ./target/release/thunderduck-connect-server --port 15002
-
-# Transpiler path (legacy = existing generator, default; v2 = rearchitecture path, WIP)
-./target/release/thunderduck-connect-server --transpiler v2
-THUNDERDUCK_TRANSPILER=v2 ./target/release/thunderduck-connect-server
-# Unset / --transpiler legacy → existing path (unchanged behavior). See docs/thunderduck-rearchitect-ADRs.md.
 
 # Kill server
 pkill -f thunderduck-connect-server

@@ -64,6 +64,25 @@ continuation.
    this pass; queue the remaining sub-slice(s) as future passes with
    their own carryover, and note this in the iteration log.
 
+   **Sub-slice cumulative-targets convention (added 2026-07-02 per Open
+   Decision 10, resolution: Option 10c).** Each sub-slice declares its
+   own §Targets in its scope file. **The §Targets is CUMULATIVE from
+   prior sub-slices** — a sub-slice's targets are the set expected to
+   be green *at that sub-slice's termination*, INCLUDING every case
+   green at the prior sub-slice's termination. Concretely: if C.1
+   targets `{proj-001..015, filt-001..015}`, C.2 targets
+   `{proj-001..015, filt-001..015, str-001..020, math-001..014, ...}`.
+   The parent slice completes when the last sub-slice terminates on
+   its cumulative target. Rationale: cumulative targets keep each
+   sub-slice individually verifiable via `pytest -k` (the check does
+   not require remembering which sub-slice unlocked what), and make
+   the progress signal legible per sub-slice without a special
+   parent-vs-sub reporting mode. A sub-slice whose cumulative target
+   equals the prior sub-slice's target (no case-ID delta) is legal
+   only for foundation sub-slices — e.g. Slice A's three sub-slices
+   all target 12/324 (substrate does not move corpus); Slice C's three
+   sub-slices target increasing counts.
+
 5. **Classify every review + perf finding** per §"Classification" below
    into three buckets:
    - `CLOSE_NOW` — must be fixed before this slice can be declared done.

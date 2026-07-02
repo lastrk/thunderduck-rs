@@ -4,6 +4,14 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-07-02 — v2 Slice A landing (τ substrate: types + plan + protobuf converter + SparkSQL front-end + dispatch)
+
+[`dev_journal/2026-07-02-v2-slice-A.md`](dev_journal/2026-07-02-v2-slice-A.md)
+
+**Delta:** 153 → 0 core_v2 (designed regression per ADR-022 — τ is the only path and returns `UnsupportedOp` for every input until Slice B/C wire analysis + emission). Three sub-slices landed sequentially. **A.1** — types substrate (τ's `Expression`, `TypeInferenceEngine`, `EmissionError`, INV10 walker) — 5 new files, 41 tests. **A.2** — plan substrate + protobuf converter + SparkSQL front-end (`CommonAst`, `V2RelationConverter` with exhaustive Arrow-value dispatch, `parser_v2/`, `BaseTypes` overlay) — 6 new files + 6 modified, 57 tests. **A.3** — dispatch relocation (`service.rs` funnels every request through τ; `THUNDERDUCK_TRANSPILER` env var deleted; legacy imports gone from dispatch) — 5 modified, 7 tests. Total: 11 new files, 105 tests, 4 INV10 walker scopes active. ADR-021 + ADR-022 fully realized on this branch; Slice K owns legacy source deletion.
+
+---
+
 ## 2026-07-01 — v2 Slice D Phase 2 landing (ext6 arms + native-arm gaps + analyzer symmetric-omission fix)
 
 [`dev_journal/2026-07-01-v2-slice-d-phase2.md`](dev_journal/2026-07-01-v2-slice-d-phase2.md)

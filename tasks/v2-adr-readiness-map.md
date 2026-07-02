@@ -8,7 +8,7 @@
 
 **Open decisions.** All twelve decisions previously listed in `tasks/v2-restart-open-decisions.md` are **RESOLVED** as of 2026-07-02 — see that file for the resolution record. The largest cluster (Decisions 3, 4, 9, 11) is consolidated by **ADR-022**. Other resolutions land in the slice sections below.
 
-**Baseline.** `core_v2` starts at 12/324. Progress is measured via `tests/scripts/v2-progress.sh`; a monotonic climb toward 324 is the signal. The DataFrame corpus (324 cases) is the fitness function; TPC-H is temporarily red until τ covers its query surface and rejoins the gate.
+**Baseline.** `core_v2` currently reports 153/324 (measured at commit `e604193`) because `THUNDERDUCK_TRANSPILER=v2` is a no-op post-morph-track-deletion and all requests fall through to the legacy path. Slice A.3 relocates dispatch to τ (per ADR-022), which returns `Unsupported` for every op until subsequent slices grow coverage — expected floor after A.3 is ≤12/324 (schema-only / nondeterministic cases). Slices B/C/D/E/F/G then climb from that floor toward 324. Progress is measured via `tests/scripts/v2-progress.sh`. The DataFrame corpus (324 cases) is the fitness function; TPC-H is temporarily red until τ covers its query surface and rejoins the gate.
 
 **Constraint.** INV1–INV10 all have stubs in `crates/core/src/transpiler_v2/invariants.rs` (created by Slice A.1). Each carries a `TODO INV<N>:` (this-slice-owned) or `DEFER INV<N> → <slice>:` (reassigned) marker per §CV.5.1. INV7 does not exist. §6 below says which slice makes each remaining invariant stop being vacuous.
 
@@ -21,6 +21,8 @@ Slices are named in the strict order §CV.2's dependency matrix imposes, **with 
 Sub-slices declare **cumulative per-sub-slice corpus targets** per iteration methodology §CV.7 amendment (Open Decision 10 resolution): a sub-slice's §Targets in its scope file is the set expected to be green at that sub-slice's termination, cumulative from prior sub-slices.
 
 ### Slice A — v2 substrate: types, plan, protobuf converter, v2 SparkSQL front-end, dispatch relocation
+
+**LANDED 2026-07-02** across three sub-slices (A.1 + A.2 + A.3) on branch `feat/v2-transpiler`, uncommitted. Corpus signal: 153/324 (pre-slice legacy fallthrough) → 0/324 (post-A.3 designed regression per ADR-022; τ is the only path and returns `UnsupportedOp` for every input until Slice B/C wire real analysis + emission). See `.agent-output/archive-slice-A-1/005-summary.md`, `.agent-output/archive-slice-A-2/005-summary.md`, `.agent-output/005-summary.md` for per-sub-slice records; `tasks/v2-slice-A-iteration-log.md` for the iteration log. 105 tests added cumulatively. INV10 walker scope covers `transpiler_v2/`, `parser_v2/`, `v2_relation_converter.rs`, and `service.rs`.
 
 Owns ADR-003 (common AST), ADR-004 (protobuf-boundary dispatch), ADR-021 (τ owns substrate), **ADR-022 (τ is the only path)**. Activates INV10 (τ imports only value-level types from outside its module tree).
 

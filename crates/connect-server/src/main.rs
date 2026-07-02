@@ -92,18 +92,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // v2 transpiler path removed pending Slice A of the restart track
-    // (see tag `v2-morph-track-end` for the discarded implementation).
-    // Legacy is the sole active path until Slice A relocates dispatch to
-    // the protobuf boundary per ADR-021.
-    if std::env::var("THUNDERDUCK_TRANSPILER").is_ok() {
-        tracing::warn!(
-            "THUNDERDUCK_TRANSPILER is currently ignored; the v2 transpiler was \
-             discarded in favor of a fresh implementation (see \
-             tasks/v2-adr-readiness-map.md Slice A)"
-        );
-    }
-
     tracing::info!("Starting Thunderduck Connect Server on {}", bind);
 
     let mgr = Arc::new(SessionManager::new(StreamingConfig::default()));

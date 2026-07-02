@@ -2,51 +2,105 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::stream;
-use thunderduck_core::generator::SqlGenerator;
-use thunderduck_core::logical::LogicalPlan;
-use thunderduck_core::runtime::{SchemaInferrer, SessionManager, StreamBatch};
-use thunderduck_core::types::DataType;
+use thunderduck_core::parser_v2::SparkSqlParserV2;
+use thunderduck_core::transpiler_v2::base_types::plan_has_empty_scan;
+use thunderduck_core::transpiler_v2::{self, BaseTypes, CommonAst};
+use thunderduck_core::types::{DataType, StructType};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::arrow_ipc::{record_batch_to_arrow_batch, record_batches_to_arrow_batches};
+use crate::arrow_ipc::record_batches_to_arrow_batches;
 use crate::converter::type_converter::data_type_to_proto;
-use crate::converter::PlanConverter;
+use crate::converter::v2_relation_converter::V2RelationConverter;
 use crate::error::ConnectError;
 use crate::proto::spark::connect as proto;
 use crate::proto::spark::connect::spark_connect_service_server::SparkConnectService;
 
 type BoxStream<T> = Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
-/// Maximum allowed depth of a logical plan tree. Plans deeper than this are
-/// rejected to prevent stack overflow from deeply nested plans (e.g., from
-/// malicious clients).
-const MAX_PLAN_DEPTH: usize = 256;
+// TODO(Slice B): re-add a plan-depth guard using `CommonAst::depth()` once
+// the substrate carries a depth query. Slice A.3 removed the legacy
+// `LogicalPlan::depth()` inspection when dispatch relocated to the τ
+// boundary; `MAX_PLAN_DEPTH` will return alongside that query.
 
 pub struct ThunderduckService {
-    session_manager: Arc<SessionManager>,
+    session_manager: Arc<thunderduck_core::runtime::SessionManager>,
 }
 
 impl ThunderduckService {
-    pub fn new(session_manager: Arc<SessionManager>) -> Self {
+    pub fn new(session_manager: Arc<thunderduck_core::runtime::SessionManager>) -> Self {
         Self { session_manager }
     }
 }
 
-/// Translate a [`LogicalPlan`] into DuckDB SQL via the legacy [`SqlGenerator`].
-///
-/// The v2 dispatch machinery was removed in the 2026-07-02 restart (tag
-/// `v2-morph-track-end` preserves the discarded implementation). Slice A
-/// of the restart re-introduces v2 dispatch at the protobuf boundary per
-/// ADR-021; until then, legacy is the sole active path.
-fn generate_sql(plan: &LogicalPlan) -> Result<String, Status> {
-    SqlGenerator::new()
-        .generate(plan)
-        .map_err(|e| Status::from(ConnectError::SqlGeneration(e)))
-}
-
 static SERVER_SESSION_ID: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
+
+// ── τ dispatch helpers (Slice A.3) ────────────────────────────────────────────
+
+/// Convert a Spark Connect [`proto::Relation`] into a [`CommonAst`] and finalize
+/// it into DuckDB SQL via τ.
+///
+/// At Slice A.3, `transpiler_v2::generate()` errors unconditionally, so this
+/// helper always surfaces `Status::unimplemented` for structurally-valid
+/// inputs (via `EmissionError::UnsupportedOp`). The dispatch shape is what
+/// matters; Slices B/C/D/E/F/G grow coverage behind this same boundary.
+///
+/// **Route by `RelType::Sql`** — Option (a) per plan §4: SQL text goes
+/// through `parser_v2`, structured relations through `V2RelationConverter`.
+/// `V2RelationConverter` refuses `RelType::Sql` with `UnsupportedProtoShape`,
+/// so intercepting here keeps the two front-ends peer.
+pub(crate) fn transpile_relation(
+    relation: &proto::Relation,
+) -> Result<(CommonAst, String), Status> {
+    use proto::relation::RelType;
+    let common_ast = match &relation.rel_type {
+        Some(RelType::Sql(sql_relation)) => SparkSqlParserV2::parse(&sql_relation.query)
+            .map_err(|e| Status::from(ConnectError::from(e)))?,
+        _ => {
+            let mut converter = V2RelationConverter::new();
+            converter
+                .convert(relation)
+                .map_err(|e| Status::from(ConnectError::from(e)))?
+        }
+    };
+    let sql = finalize(&common_ast)?;
+    Ok((common_ast, sql))
+}
+
+/// Convert a raw SparkSQL string into a [`CommonAst`] and finalize it into
+/// DuckDB SQL via τ.
+///
+/// Used by the deprecated `SqlCommand.sql` text field on older clients.
+pub(crate) fn transpile_raw_sql(sql_text: &str) -> Result<(CommonAst, String), Status> {
+    let common_ast =
+        SparkSqlParserV2::parse(sql_text).map_err(|e| Status::from(ConnectError::from(e)))?;
+    let sql = finalize(&common_ast)?;
+    Ok((common_ast, sql))
+}
+
+/// Build the per-path `BaseTypes` overlay and run τ's emission entry point.
+///
+/// The catalog closure returns `None` at Slice A.3 — the overlay exists to
+/// satisfy the dispatch shape; Slice B wires the actual catalog bridge over
+/// `DuckDbSession`.
+pub(crate) fn finalize(common_ast: &CommonAst) -> Result<String, Status> {
+    let base_types = if plan_has_empty_scan(common_ast) {
+        BaseTypes::build_from_plan(common_ast, |_table_name| {
+            // Slice B wires the actual catalog lookup over `DuckDbSession`.
+            // At A.3 the closure exists (satisfies dispatch shape) but
+            // returns `None` — no emission arm currently consumes
+            // `BaseTypes` because `generate()` errors unconditionally.
+            None::<StructType>
+        })
+    } else {
+        BaseTypes::empty()
+    };
+    transpiler_v2::generate(common_ast, &base_types)
+        .map_err(|e| Status::from(ConnectError::from(e)))
+}
+
+// ── gRPC service impl ─────────────────────────────────────────────────────────
 
 #[tonic::async_trait]
 impl SparkConnectService for ThunderduckService {
@@ -82,39 +136,19 @@ impl SparkConnectService for ThunderduckService {
 
         let responses: Vec<proto::ExecutePlanResponse> = match plan.op_type {
             Some(proto::plan::OpType::Root(relation)) => {
-                let logical_plan =
-                    PlanConverter::convert_relation_with_session(&relation, Arc::clone(&session))
-                        .map_err(Status::from)?;
-
-                let plan_depth = logical_plan.depth();
-                if plan_depth > MAX_PLAN_DEPTH {
-                    return Err(Status::invalid_argument(format!(
-                        "Plan tree depth {plan_depth} exceeds maximum {MAX_PLAN_DEPTH}"
-                    )));
-                }
-
-                // Special case: ApproxQuantile needs a ListArray response.
-                if let thunderduck_core::logical::LogicalPlan::ApproxQuantile(ref aq) = logical_plan
-                {
-                    let batch = execute_approx_quantile(&session, aq)
-                        .await
-                        .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-                    let responses = batches_to_responses(&session_id, &operation_id, &[batch])
-                        .map_err(|e| Status::from(e))?;
-                    let stream = stream::iter(responses.into_iter().map(Ok));
-                    return Ok(Response::new(Box::pin(stream)));
-                }
-
-                let sql = generate_sql(&logical_plan)?;
-
-                match classify_plan(&logical_plan) {
-                    PlanKind::Ddl(ddl) => {
-                        execute_ddl(&session, ddl, &sql, &session_id, &operation_id).await?
+                let (common_ast, sql) = transpile_relation(&relation)?;
+                // Slice A.3: `finalize()` errors unconditionally, so the
+                // downstream classification / streaming helpers are only
+                // reachable when Slices C/E begin lighting up emission arms.
+                // Signature-swapped helpers preserve the dispatch shape.
+                match classify_plan(&common_ast) {
+                    PlanKind::Ddl => {
+                        execute_ddl(&session, &common_ast, &sql, &session_id, &operation_id).await?
                     }
                     PlanKind::Query => {
                         return execute_streaming_query(
                             &session,
-                            &logical_plan,
+                            &common_ast,
                             &sql,
                             &session_id,
                             &operation_id,
@@ -161,146 +195,21 @@ impl SparkConnectService for ThunderduckService {
                         ));
                     }
                 };
-                let session = self
+                // Warm the session so subsequent slices can reach it.
+                let _session = self
                     .session_manager
                     .get_or_create(&session_id)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?;
-                let logical_plan =
-                    PlanConverter::convert_relation_with_session(&relation, Arc::clone(&session))
-                        .map_err(Status::from)?;
-
-                let plan_depth = logical_plan.depth();
-                if plan_depth > MAX_PLAN_DEPTH {
-                    return Err(Status::invalid_argument(format!(
-                        "Plan tree depth {plan_depth} exceeds maximum {MAX_PLAN_DEPTH}"
-                    )));
-                }
-
-                let mut struct_type = logical_plan.infer_schema();
-                let has_unresolved = struct_type
-                    .fields
-                    .iter()
-                    .any(|f| f.data_type.contains_unresolved());
-                if struct_type.is_empty() || has_unresolved || logical_plan.has_partial_schema() {
-                    // Static inference failed or produced Unresolved types — ask DuckDB
-                    // for the actual column types/nullability.
-                    let sql = generate_sql(&logical_plan)?;
-                    let duckdb_schema = SchemaInferrer::new(&session)
-                        .infer_sql(&sql)
-                        .await
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                    // DuckDB auto-renames duplicate column names by appending `_1`, `_2`, etc.
-                    // (e.g. a self-join produces `col`, `col_1`). Spark allows duplicate names.
-                    // When the static inference produced names but not types (has_unresolved),
-                    // use the Spark-expected names with DuckDB's types so the schema is correct.
-                    use thunderduck_core::types::{StructField, StructType};
-                    struct_type = if struct_type.is_empty() {
-                        // No plan-level schema at all — use DuckDB entirely.
-                        // For Pivot plans (possibly wrapped in Sort/Project/Filter):
-                        // DuckDB reports all columns as nullable, but grouping columns
-                        // inherit nullability from the input.
-                        {
-                            let pivot_overrides = logical_plan.pivot_grouping_nullable_overrides();
-                            if pivot_overrides.is_empty() {
-                                duckdb_schema
-                            } else {
-                                StructType::new(
-                                    duckdb_schema
-                                        .fields
-                                        .into_iter()
-                                        .map(|mut f| {
-                                            for (name, nullable) in &pivot_overrides {
-                                                if name.eq_ignore_ascii_case(&f.name) {
-                                                    f.nullable = *nullable;
-                                                    break;
-                                                }
-                                            }
-                                            f
-                                        })
-                                        .collect(),
-                                )
-                            }
-                        }
-                    } else if struct_type.fields.len() == duckdb_schema.fields.len() {
-                        // Same field count: position-based merge.
-                        // Use Spark type/nullability when resolved, DuckDB otherwise.
-                        // This preserves precise Spark semantics (e.g. IntegerType for row_number,
-                        // levenshtein, cardinality) instead of DuckDB's wider types (BIGINT).
-                        let fields = struct_type
-                            .fields
-                            .iter()
-                            .zip(duckdb_schema.fields.iter())
-                            .map(|(spark_f, duck_f)| {
-                                if spark_f.data_type.contains_unresolved() {
-                                    StructField {
-                                        name: spark_f.name.clone(),
-                                        data_type: duck_f.data_type.clone(),
-                                        nullable: spark_f.nullable,
-                                    }
-                                } else {
-                                    StructField {
-                                        name: spark_f.name.clone(),
-                                        data_type: spark_f.data_type.clone(),
-                                        nullable: spark_f.nullable,
-                                    }
-                                }
-                            })
-                            .collect();
-                        StructType::new(fields)
-                    } else {
-                        // Size mismatch (e.g. star expansion with unknown child schema):
-                        // Use DuckDB schema as base, override by name for any explicitly-typed
-                        // Spark fields (e.g. row_number → Integer, not DuckDB's BIGINT).
-                        let spark_map: std::collections::HashMap<String, &StructField> =
-                            struct_type
-                                .fields
-                                .iter()
-                                .filter(|f| !f.data_type.contains_unresolved())
-                                .map(|f| (f.name.to_lowercase(), f))
-                                .collect();
-                        let fields = duckdb_schema
-                            .fields
-                            .iter()
-                            .map(|duck_f| {
-                                if let Some(spark_f) = spark_map.get(&duck_f.name.to_lowercase()) {
-                                    StructField {
-                                        name: duck_f.name.clone(),
-                                        data_type: spark_f.data_type.clone(),
-                                        nullable: spark_f.nullable,
-                                    }
-                                } else {
-                                    duck_f.clone()
-                                }
-                            })
-                            .collect();
-                        StructType::new(fields)
-                    };
-                    // Post-merge: for Pivot plans, override grouping column nullable
-                    // from input schema (covers both empty and has_unresolved branches)
-                    {
-                        let pivot_overrides = logical_plan.pivot_grouping_nullable_overrides();
-                        if !pivot_overrides.is_empty() {
-                            struct_type = StructType::new(
-                                struct_type
-                                    .fields
-                                    .into_iter()
-                                    .map(|mut f| {
-                                        for (name, nullable) in &pivot_overrides {
-                                            if name.eq_ignore_ascii_case(&f.name) {
-                                                f.nullable = *nullable;
-                                                break;
-                                            }
-                                        }
-                                        f
-                                    })
-                                    .collect(),
-                            );
-                        }
-                    }
-                }
+                // A.3 routes analyze_plan through τ. Emission errors surface
+                // as `Status::unimplemented`; Slice B wires the analyzer that
+                // produces schemas without ever calling `finalize()`.
+                let (_common_ast, _sql) = transpile_relation(&relation)?;
+                // A.3 has no schema producer yet — τ's analyzer is Slice B.
+                // Return a boundary error identifying this as the
+                // schema-analyze surface until then.
+                let struct_type = StructType::empty();
                 let schema_proto = data_type_to_proto(&DataType::Struct(struct_type));
-
                 let resp = proto::AnalyzePlanResponse {
                     session_id,
                     server_side_session_id: SERVER_SESSION_ID.clone(),
@@ -394,7 +303,7 @@ impl SparkConnectService for ThunderduckService {
     }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
+// ── Command dispatch ─────────────────────────────────────────────────────────
 
 async fn handle_command(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
@@ -408,40 +317,17 @@ async fn handle_command(
             let relation = view_cmd
                 .input
                 .ok_or_else(|| Status::invalid_argument("CreateTempView missing input"))?;
-            let logical_plan =
-                PlanConverter::convert_relation_with_session(&relation, Arc::clone(session))
-                    .map_err(Status::from)?;
-            let sql = generate_sql(&logical_plan)?;
-
-            // Infer schema from the input relation and cache it so downstream
-            // reads preserve Spark-declared nullable flags that DuckDB's
-            // CREATE VIEW loses.
-            let schema = logical_plan.infer_schema();
-            if !schema.is_empty() {
-                session
-                    .create_temp_view_with_schema(&view_cmd.name, &sql, schema)
-                    .await
-                    .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-            } else {
-                session
-                    .create_temp_view(&view_cmd.name, &sql)
-                    .await
-                    .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-            }
-
-            Ok(vec![
-                sql_command_result_response(session_id, operation_id),
-                result_complete_response(session_id, operation_id),
-            ])
+            let (common_ast, _sql) = transpile_relation(&relation)?;
+            handle_create_dataframe_view(session, session_id, operation_id, &common_ast).await
         }
         Some(CommandType::SqlCommand(sql_cmd)) => {
-            let (sql, logical_plan) = if let Some(input_rel) = sql_cmd.input {
-                let plan = PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
-                let sql = generate_sql(&plan)?;
-                (sql, Some(plan))
+            let common_ast = if let Some(input_rel) = sql_cmd.input {
+                let (ast, _sql) = transpile_relation(&input_rel)?;
+                ast
             } else {
-                // Fallback: older clients send spark.sql() via the deprecated `sql` text field
-                // (all SqlCommand text fields are proto-deprecated in favour of `input`)
+                // Preserved fallback path for older clients using the
+                // deprecated `sql` text field (all SqlCommand text fields are
+                // proto-deprecated in favour of `input`).
                 #[allow(deprecated)]
                 let text = sql_cmd.sql.clone();
                 if text.is_empty() {
@@ -449,173 +335,135 @@ async fn handle_command(
                         "SqlCommand missing both input relation and sql text",
                     ));
                 }
-                (text, None)
+                let (ast, _sql) = transpile_raw_sql(&text)?;
+                ast
             };
-            // Cache CREATE VIEW schema before execution so subsequent
-            // spark.table() calls get correct nullable metadata.
-            if let Some(ref plan) = logical_plan {
-                cache_create_view_schema(session, plan).await;
-            }
-            let batches = session
-                .execute(&sql)
-                .await
-                .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-            batches_to_responses(session_id, operation_id, &batches).map_err(Status::from)
+            handle_sql_command(session, session_id, operation_id, &common_ast).await
         }
-        Some(CommandType::WriteOperation(write_cmd)) => {
-            use proto::write_operation::SaveType;
+        Some(CommandType::WriteOperation(mut write_cmd)) => {
             let input_rel = write_cmd
                 .input
+                .take()
                 .ok_or_else(|| Status::invalid_argument("WriteOperation missing input"))?;
-            let logical_plan = PlanConverter::convert_relation(&input_rel).map_err(Status::from)?;
-            let select_sql = generate_sql(&logical_plan)?;
-
-            let path = match write_cmd.save_type {
-                Some(SaveType::Path(p)) => p,
-                _ => {
-                    return Err(Status::invalid_argument(
-                        "WriteOperation requires a path destination",
-                    ))
-                }
-            };
-
-            // Determine format from the source proto field
-            let format = match write_cmd.source.as_deref() {
-                Some("parquet") => "PARQUET",
-                Some("csv") => "CSV",
-                Some("json") => "JSON",
-                _ => "PARQUET",
-            };
-
-            let escaped_path = path.replace('\'', "''");
-            let copy_sql = if format == "CSV" {
-                format!("COPY ({select_sql}) TO '{escaped_path}' (FORMAT CSV, HEADER)")
-            } else {
-                format!("COPY ({select_sql}) TO '{escaped_path}' (FORMAT {format})")
-            };
-
-            session
-                .execute(&copy_sql)
-                .await
-                .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-
-            Ok(vec![
-                sql_command_result_response(session_id, operation_id),
-                result_complete_response(session_id, operation_id),
-            ])
+            let (common_ast, _sql) = transpile_relation(&input_rel)?;
+            handle_write_operation(session, session_id, operation_id, &common_ast, &write_cmd).await
         }
         _ => Err(Status::unimplemented("Unsupported command type")),
     }
 }
 
-/// Convert DuckDB record batches to a complete `ExecutePlanResponse` sequence,
-/// including the mandatory trailing `ResultComplete` frame.
-/// Execute an ApproxQuantile plan: for each column, compute approx_quantile for each
-/// probability, then build a RecordBatch with schema `list<list<double>>`, 1 row.
+// ── Signature-swapped downstream helpers (Slice A.3) ─────────────────────────
+//
+// These helpers formerly consumed `&LogicalPlan`. At Slice A.3 they consume
+// `&CommonAst` and return `Err(Status::unimplemented(...))`. `transpile_relation`
+// / `transpile_raw_sql` errors before dispatch ever reaches them today (τ's
+// `generate()` returns `UnsupportedOp` for every input). Slices B/C/D/E/F/G
+// grow the concrete behaviour behind these signatures.
+
+/// Classification of a τ plan for execution routing.
 ///
-/// PySpark Connect client reads: `table[0][0]` (first cell) = ListScalar of N inner lists,
-/// where N = number of input columns and each inner list has M doubles (one per probability).
-async fn execute_approx_quantile(
-    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    aq: &thunderduck_core::logical::ApproxQuantile,
-) -> Result<arrow::record_batch::RecordBatch, String> {
-    use arrow::array::{Array, Float64Array, ListArray};
-    use arrow::buffer::OffsetBuffer;
-    use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-
-    // Generate SQL for the input sub-plan via the selected transpiler.
-    let input_sql = generate_sql(&aq.input)
-        .map_err(|s| format!("approx_quantile input gen: {}", s.message()))?;
-
-    let n_probs = aq.probabilities.len();
-    let n_cols = aq.cols.len();
-
-    // Build a single query with all column×probability combinations.
-    // Layout: col0_p0, col0_p1, ..., col1_p0, col1_p1, ...
-    let mut select_exprs: Vec<String> = Vec::with_capacity(n_cols * n_probs);
-    for (ci, col) in aq.cols.iter().enumerate() {
-        let quoted = format!("\"{}\"", col.replace('"', "\"\""));
-        for (pi, p) in aq.probabilities.iter().enumerate() {
-            select_exprs.push(format!(
-                "approx_quantile({quoted}, {p:.17}) AS __q_{ci}_{pi}"
-            ));
-        }
-    }
-
-    let sql = format!(
-        "SELECT {} FROM ({input_sql}) __aq_input__",
-        select_exprs.join(", ")
-    );
-    let batches = session.execute(&sql).await.map_err(|e| e.to_string())?;
-
-    // Extract all N×M float64 values from the single-row result.
-    let result_batch = batches
-        .first()
-        .ok_or_else(|| "approx_quantile: empty result".to_owned())?;
-    if result_batch.num_rows() == 0 {
-        return Err("approx_quantile: result has zero rows".to_owned());
-    }
-
-    let total = n_cols * n_probs;
-    let mut all_values: Vec<f64> = Vec::with_capacity(total);
-    for idx in 0..total {
-        let col_arr = result_batch.column(idx);
-        let val = col_arr
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .and_then(|a| {
-                if !a.is_empty() {
-                    Some(a.value(0))
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                let ci = idx / n_probs;
-                let pi = idx % n_probs;
-                format!(
-                    "approx_quantile: no float64 result for column {} at p={}",
-                    aq.cols[ci], aq.probabilities[pi]
-                )
-            })?;
-        all_values.push(val);
-    }
-
-    // Build inner ListArray: N entries (one per column), each with M doubles.
-    let values_array = Arc::new(Float64Array::from(all_values));
-    let n_cols_i32 =
-        i32::try_from(n_cols).map_err(|_| "too many columns for approx_quantile".to_owned())?;
-    let n_probs_i32 = i32::try_from(n_probs)
-        .map_err(|_| "too many probabilities for approx_quantile".to_owned())?;
-    let inner_offsets: Vec<i32> = (0..=n_cols_i32).map(|i| i * n_probs_i32).collect();
-    let inner_offsets_buf = OffsetBuffer::new(inner_offsets.into());
-    let float_field = Arc::new(Field::new("item", ArrowDataType::Float64, true));
-    let inner_list_array =
-        ListArray::new(float_field.clone(), inner_offsets_buf, values_array, None);
-
-    // Build outer ListArray: 1 entry containing all N inner lists.
-    // This is the single-row table cell the PySpark client expects.
-    let outer_offsets: Vec<i32> = vec![0, n_cols_i32];
-    let outer_offsets_buf = OffsetBuffer::new(outer_offsets.into());
-    let inner_list_type = ArrowDataType::List(float_field);
-    let inner_field = Arc::new(Field::new("item", inner_list_type.clone(), true));
-    let outer_list_array = ListArray::new(
-        inner_field.clone(),
-        outer_offsets_buf,
-        Arc::new(inner_list_array),
-        None,
-    );
-
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "quantiles",
-        ArrowDataType::List(inner_field),
-        true,
-    )]));
-    RecordBatch::try_new(schema, vec![Arc::new(outer_list_array)])
-        .map_err(|e| format!("approx_quantile batch: {e}"))
+/// Slice A.3 collapses this to a two-arm placeholder (DDL vs. Query). Slice
+/// C.1 restores the meaningful classification over `CommonAst` (currently the
+/// legacy `DdlStatement` variant lives only in `LogicalPlan`, which τ never
+/// touches).
+#[allow(dead_code)] // `Ddl` reintroduced by Slice C.1.
+enum PlanKind {
+    /// A DDL/DML statement — execute without result streaming.
+    Ddl,
+    /// A query — stream results back to the client.
+    Query,
 }
 
+/// Classify a τ plan as DDL or query.
+///
+/// Slice A.3: always returns [`PlanKind::Query`]. The DDL classification is a
+/// Slice C.1 deliverable — `CommonAst` does not yet carry a DDL discriminant.
+fn classify_plan(_common_ast: &CommonAst) -> PlanKind {
+    PlanKind::Query
+}
+
+/// Execute a DDL statement and return appropriate responses.
+///
+/// **Slice C.1 (owner):** DDL classification and execution over `CommonAst`.
+/// Slice A.3 body errors with `Status::unimplemented` because τ's
+/// `finalize()` never reaches this point.
+async fn execute_ddl(
+    _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    _common_ast: &CommonAst,
+    _sql: &str,
+    _session_id: &str,
+    _operation_id: &str,
+) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
+    Err(Status::unimplemented(
+        "Slice C.1: DDL classification and execution over CommonAst",
+    ))
+}
+
+/// Execute a query plan and stream results back to the client.
+///
+/// **Slice E (owner):** streaming query execution over `CommonAst`. Slice A.3
+/// body errors with `Status::unimplemented` because τ's `finalize()` never
+/// reaches this point.
+async fn execute_streaming_query(
+    _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    _common_ast: &CommonAst,
+    _sql: &str,
+    _session_id: &str,
+    _operation_id: &str,
+) -> Result<Response<<ThunderduckService as SparkConnectService>::ExecutePlanStream>, Status> {
+    Err(Status::unimplemented(
+        "Slice E: streaming query execution over CommonAst",
+    ))
+}
+
+/// Handle `CreateDataframeView` after successful transpile.
+///
+/// **Slice B (owner):** schema inference over `CommonAst` for `CREATE VIEW`.
+async fn handle_create_dataframe_view(
+    _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    _session_id: &str,
+    _operation_id: &str,
+    _common_ast: &CommonAst,
+) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
+    Err(Status::unimplemented(
+        "Slice B: schema inference for CreateView over CommonAst",
+    ))
+}
+
+/// Handle `SqlCommand` (both `input`-bearing and deprecated text paths).
+///
+/// **Slice C.1 (owner):** SQL command execution over `CommonAst`.
+async fn handle_sql_command(
+    _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    _session_id: &str,
+    _operation_id: &str,
+    _common_ast: &CommonAst,
+) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
+    Err(Status::unimplemented(
+        "Slice C.1: SqlCommand execution over CommonAst",
+    ))
+}
+
+/// Handle `WriteOperation` after successful transpile.
+///
+/// **Slice H (owner):** external write path over `CommonAst`.
+async fn handle_write_operation(
+    _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    _session_id: &str,
+    _operation_id: &str,
+    _common_ast: &CommonAst,
+    _write_cmd: &proto::WriteOperation,
+) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
+    Err(Status::unimplemented(
+        "Slice H: WriteOperation over CommonAst",
+    ))
+}
+
+// ── Response builders (preserved) ────────────────────────────────────────────
+
+/// Convert DuckDB record batches to a complete `ExecutePlanResponse` sequence,
+/// including the mandatory trailing `ResultComplete` frame.
+#[allow(dead_code)]
 fn batches_to_responses(
     session_id: &str,
     operation_id: &str,
@@ -643,6 +491,7 @@ fn batches_to_responses(
 
 /// Create an ArrowBatch response with a single boolean `value` column = `val`.
 /// Used for DDL operations (DropTempView etc.) that must return a non-null table.
+#[allow(dead_code)]
 fn bool_batch_responses(
     session_id: &str,
     operation_id: &str,
@@ -665,6 +514,7 @@ fn bool_batch_responses(
     batches_to_responses(session_id, operation_id, &[batch])
 }
 
+#[allow(dead_code)]
 fn result_complete_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {
     proto::ExecutePlanResponse {
         session_id: session_id.to_string(),
@@ -678,6 +528,7 @@ fn result_complete_response(session_id: &str, operation_id: &str) -> proto::Exec
     }
 }
 
+#[allow(dead_code)]
 fn sql_command_result_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {
     proto::ExecutePlanResponse {
         session_id: session_id.to_string(),
@@ -692,6 +543,8 @@ fn sql_command_result_response(session_id: &str, operation_id: &str) -> proto::E
         ..Default::default()
     }
 }
+
+// ── Config helpers (preserved) ────────────────────────────────────────────────
 
 /// Return the Spark default value for well-known config keys.
 ///
@@ -776,297 +629,6 @@ fn build_config_pairs(operation: Option<proto::config_request::Operation>) -> Ve
     }
 }
 
-/// If `plan` is a `SqlRelation` with a `view_name` (i.e., a CREATE VIEW DDL),
-/// cache the inner query's plan-inferred schema. DuckDB views lose NOT NULL
-/// metadata, so this preserves correct nullable flags for subsequent
-/// `spark.table()` calls.
-async fn cache_create_view_schema(
-    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    plan: &thunderduck_core::logical::LogicalPlan,
-) {
-    // Extract view_name and schema from either legacy SqlRelation or new DdlStatement.
-    let (view_name, schema) = match plan {
-        thunderduck_core::logical::LogicalPlan::SqlRelation(sr) => {
-            match (&sr.view_name, &sr.schema) {
-                (Some(name), schema) => (name.as_str(), schema),
-                _ => return,
-            }
-        }
-        thunderduck_core::logical::LogicalPlan::DdlStatement(d) => match &d.operation {
-            thunderduck_core::logical::DdlOperation::CreateView {
-                view_name, schema, ..
-            } => (view_name.as_str(), schema),
-            _ => return,
-        },
-        _ => return,
-    };
-    if schema.is_empty() {
-        return;
-    }
-
-    // If schema has unresolved types, merge with DuckDB schema for types
-    // but preserve plan-level nullability where resolved.
-    let final_schema = if schema
-        .fields
-        .iter()
-        .any(|f| f.data_type.contains_unresolved())
-    {
-        use thunderduck_core::types::{StructField, StructType};
-        let duckdb_schema = match SchemaInferrer::new(session)
-            .infer_sql(&format!(
-                "SELECT * FROM \"{}\"",
-                view_name.replace('"', "\"\"")
-            ))
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(view_name, error = %e, "Failed to cache view schema: DuckDB schema inference failed");
-                return;
-            }
-        };
-        if schema.fields.len() == duckdb_schema.fields.len() {
-            let fields = schema
-                .fields
-                .iter()
-                .zip(duckdb_schema.fields.iter())
-                .map(|(plan_f, duck_f)| {
-                    if plan_f.data_type.contains_unresolved() {
-                        StructField {
-                            name: plan_f.name.clone(),
-                            data_type: duck_f.data_type.clone(),
-                            nullable: duck_f.nullable,
-                        }
-                    } else {
-                        plan_f.clone()
-                    }
-                })
-                .collect();
-            StructType::new(fields)
-        } else {
-            tracing::warn!(
-                view_name,
-                "Failed to cache view schema: field count mismatch between plan and DuckDB"
-            );
-            return;
-        }
-    } else {
-        schema.clone()
-    };
-
-    session.cache_view_schema(view_name, final_schema).await;
-}
-
-// ── Plan classification and decomposed execution ──────────────────────────────
-
-/// Classify a logical plan for execution routing.
-enum PlanKind<'a> {
-    /// A DDL/DML statement — execute without result streaming.
-    Ddl(&'a thunderduck_core::logical::DdlStatement),
-    /// A query — stream results back to the client.
-    Query,
-}
-
-/// Classify a plan as DDL or query.
-fn classify_plan(plan: &thunderduck_core::logical::LogicalPlan) -> PlanKind<'_> {
-    match plan {
-        thunderduck_core::logical::LogicalPlan::DdlStatement(d) => PlanKind::Ddl(d),
-        _ => PlanKind::Query,
-    }
-}
-
-/// Execute a DDL statement and return appropriate responses.
-///
-/// For DROP VIEW, synthesizes a boolean result indicating whether the view
-/// existed before the drop. For all other DDL, executes silently and returns
-/// a boolean `true` result.
-async fn execute_ddl(
-    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    ddl: &thunderduck_core::logical::DdlStatement,
-    sql: &str,
-    session_id: &str,
-    operation_id: &str,
-) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
-    use thunderduck_core::logical::DdlOperation;
-
-    // Cache schema for CREATE VIEW before executing.
-    match &ddl.operation {
-        DdlOperation::CreateView {
-            view_name, schema, ..
-        } if !schema.is_empty() => {
-            // Execute DDL first so the view exists when we merge schemas.
-            session
-                .exec_ddl(sql)
-                .await
-                .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-            cache_create_view_schema_direct(session, view_name, schema).await;
-            return bool_batch_responses(session_id, operation_id, true).map_err(Status::from);
-        }
-        _ => {}
-    }
-
-    match &ddl.operation {
-        DdlOperation::DropView { view_name, .. } => {
-            let existed = session.view_exists(view_name).await;
-            session
-                .exec_ddl(sql)
-                .await
-                .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-            bool_batch_responses(session_id, operation_id, existed).map_err(Status::from)
-        }
-        DdlOperation::DropTable { .. }
-        | DdlOperation::CreateView { .. }
-        | DdlOperation::CreateTable { .. }
-        | DdlOperation::AlterTable { .. }
-        | DdlOperation::Truncate { .. }
-        | DdlOperation::Insert { .. }
-        | DdlOperation::Other { .. } => {
-            session
-                .exec_ddl(sql)
-                .await
-                .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-            bool_batch_responses(session_id, operation_id, true).map_err(Status::from)
-        }
-    }
-}
-
-/// Cache a CREATE VIEW schema, merging with DuckDB when plan types are unresolved.
-async fn cache_create_view_schema_direct(
-    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    view_name: &str,
-    schema: &thunderduck_core::types::StructType,
-) {
-    use thunderduck_core::types::{StructField, StructType};
-
-    let final_schema = if schema
-        .fields
-        .iter()
-        .any(|f| f.data_type.contains_unresolved())
-    {
-        let duckdb_schema = match SchemaInferrer::new(session)
-            .infer_sql(&format!(
-                "SELECT * FROM \"{}\"",
-                view_name.replace('"', "\"\"")
-            ))
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(view_name, error = %e, "Failed to cache view schema (direct): DuckDB schema inference failed");
-                return;
-            }
-        };
-        if schema.fields.len() == duckdb_schema.fields.len() {
-            let fields = schema
-                .fields
-                .iter()
-                .zip(duckdb_schema.fields.iter())
-                .map(|(plan_f, duck_f)| {
-                    if plan_f.data_type.contains_unresolved() {
-                        StructField {
-                            name: plan_f.name.clone(),
-                            data_type: duck_f.data_type.clone(),
-                            nullable: duck_f.nullable,
-                        }
-                    } else {
-                        plan_f.clone()
-                    }
-                })
-                .collect();
-            StructType::new(fields)
-        } else {
-            tracing::warn!(view_name, "Failed to cache view schema (direct): field count mismatch between plan and DuckDB");
-            return;
-        }
-    } else {
-        schema.clone()
-    };
-
-    session.cache_view_schema(view_name, final_schema).await;
-}
-
-/// Execute a query plan and stream results back to the client.
-async fn execute_streaming_query(
-    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    logical_plan: &thunderduck_core::logical::LogicalPlan,
-    sql: &str,
-    session_id: &str,
-    operation_id: &str,
-) -> Result<Response<<ThunderduckService as SparkConnectService>::ExecutePlanStream>, Status> {
-    // Compute Spark column names for rename (pushed to session thread).
-    let schema = logical_plan.infer_schema();
-    let spark_names = if !schema.is_empty() {
-        Some(
-            schema
-                .fields
-                .iter()
-                .map(|f| f.name.clone())
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        None
-    };
-
-    let rx = session
-        .execute_streaming(sql, spark_names, 2)
-        .await
-        .map_err(|e| Status::from(ConnectError::Session(e.to_string())))?;
-
-    let sid = session_id.to_string();
-    let oid = operation_id.to_string();
-
-    let stream = futures::stream::unfold(
-        (rx, sid, oid, 0usize, false),
-        |(mut rx, sid, oid, idx, done)| async move {
-            if done {
-                return None;
-            }
-            match rx.recv().await {
-                Some(StreamBatch::Batch(batch)) => {
-                    let resp = match record_batch_to_arrow_batch(&batch) {
-                        Ok(arrow_batch) => Ok(proto::ExecutePlanResponse {
-                            session_id: sid.clone(),
-                            server_side_session_id: SERVER_SESSION_ID.clone(),
-                            operation_id: oid.clone(),
-                            response_id: format!("{oid}-{idx}"),
-                            response_type: Some(
-                                proto::execute_plan_response::ResponseType::ArrowBatch(arrow_batch),
-                            ),
-                            ..Default::default()
-                        }),
-                        Err(e) => Err(Status::internal(format!("IPC serialization: {e}"))),
-                    };
-                    Some((resp, (rx, sid, oid, idx + 1, false)))
-                }
-                Some(StreamBatch::Complete) => {
-                    let resp = Ok(proto::ExecutePlanResponse {
-                        session_id: sid.clone(),
-                        server_side_session_id: SERVER_SESSION_ID.clone(),
-                        operation_id: oid.clone(),
-                        response_id: format!("{oid}-complete"),
-                        response_type: Some(
-                            proto::execute_plan_response::ResponseType::ResultComplete(
-                                proto::execute_plan_response::ResultComplete::default(),
-                            ),
-                        ),
-                        ..Default::default()
-                    });
-                    Some((resp, (rx, sid, oid, idx + 1, true)))
-                }
-                Some(StreamBatch::Error(e)) => {
-                    Some((Err(Status::internal(e)), (rx, sid, oid, idx + 1, true)))
-                }
-                None => Some((
-                    Err(Status::internal("session thread terminated unexpectedly")),
-                    (rx, sid, oid, idx + 1, true),
-                )),
-            }
-        },
-    );
-
-    Ok(Response::new(Box::pin(stream)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,5 +690,174 @@ mod tests {
         let pairs = build_config_pairs(operation);
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].value.as_deref(), Some("200"));
+    }
+
+    // ── Slice A.3 dispatch tests ──────────────────────────────────────────────
+    //
+    // At A.3, τ's `generate()` errors with `EmissionError::UnsupportedOp` on
+    // every input. These tests pin two properties of the dispatch shape:
+    //   1. Structurally-valid inputs reach τ (via `V2RelationConverter` or
+    //      `parser_v2`) and surface the emission boundary via
+    //      `Status::unimplemented` — not `Status::internal`.
+    //   2. `RelType::Sql` routes to `parser_v2`, never through
+    //      `V2RelationConverter` (which would return
+    //      `UnsupportedProtoShape { shape: "RelType::Sql" }`).
+
+    fn table_scan_relation(name: &str) -> proto::Relation {
+        proto::Relation {
+            common: None,
+            rel_type: Some(proto::relation::RelType::Read(proto::Read {
+                is_streaming: false,
+                read_type: Some(proto::read::ReadType::NamedTable(proto::read::NamedTable {
+                    unparsed_identifier: name.to_owned(),
+                    options: Default::default(),
+                })),
+            })),
+        }
+    }
+
+    fn int_literal(v: i32) -> proto::Expression {
+        proto::Expression {
+            common: None,
+            expr_type: Some(proto::expression::ExprType::Literal(
+                proto::expression::Literal {
+                    data_type: None,
+                    literal_type: Some(proto::expression::literal::LiteralType::Integer(v)),
+                },
+            )),
+        }
+    }
+
+    /// A structurally-valid `Project` relation reaches τ and surfaces the
+    /// emission boundary as `Status::unimplemented` (not `internal`) — this
+    /// pins `ConnectError::TranspilerV2Emission → Status::unimplemented`.
+    #[test]
+    fn transpile_relation_project_returns_unsupported_op() {
+        let input = table_scan_relation("t");
+        let project = proto::Relation {
+            common: None,
+            rel_type: Some(proto::relation::RelType::Project(Box::new(
+                proto::Project {
+                    input: Some(Box::new(input)),
+                    expressions: vec![int_literal(1)],
+                },
+            ))),
+        };
+        let err = transpile_relation(&project).expect_err("τ emission must error at A.3");
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unimplemented,
+            "boundary errors must surface as Status::unimplemented, not internal; got {err:?}"
+        );
+        // τ's `UnsupportedOp` (from `generate()`) is what should be surfaced —
+        // NOT `V2RelationConverter`'s `UnsupportedProtoShape` (the proto
+        // shape is supported), and NOT a Slice B/C `unimplemented`.
+        assert!(
+            err.message().contains("unsupported operator")
+                || err.message().contains("<a.2-substrate>"),
+            "message must identify τ's UnsupportedOp; got: {}",
+            err.message()
+        );
+    }
+
+    /// `RelType::Sql` MUST route through `parser_v2`, not `V2RelationConverter`.
+    /// The failure mode we're guarding against: if dispatch fed `Sql` to
+    /// `V2RelationConverter`, the error would identify `RelType::Sql` as the
+    /// unsupported proto shape. Instead, `parser_v2` parses the SQL and τ's
+    /// `generate()` then errors with `UnsupportedOp`.
+    #[test]
+    fn transpile_relation_sql_routes_to_parser_v2_not_converter() {
+        let sql_rel = proto::Relation {
+            common: None,
+            rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
+                query: "SELECT 1".to_owned(),
+                args: Default::default(),
+                pos_args: vec![],
+                named_arguments: Default::default(),
+                pos_arguments: vec![],
+            })),
+        };
+        let err = transpile_relation(&sql_rel).expect_err("τ emission must error at A.3");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        // Anchor: message must NOT identify `RelType::Sql` as the
+        // unsupported proto shape (which would prove dispatch fed SQL to the
+        // converter, not `parser_v2`).
+        assert!(
+            !err.message().contains("RelType::Sql"),
+            "SQL text must route through parser_v2, not V2RelationConverter; \
+             got shape-tagged message: {}",
+            err.message()
+        );
+        // Positive anchor: τ's UnsupportedOp shape.
+        assert!(
+            err.message().contains("unsupported operator")
+                || err.message().contains("<a.2-substrate>"),
+            "expected τ UnsupportedOp; got: {}",
+            err.message()
+        );
+    }
+
+    /// SparkSQL syntax errors surface via `parser_v2`'s boundary policy
+    /// (`UnsupportedProtoShape { shape: "sql::parse_error", ... }`), which
+    /// maps to `Status::unimplemented` per `ConnectError::TranspilerV2Emission`.
+    #[test]
+    fn transpile_relation_sql_syntax_error_surfaces_from_parser_v2() {
+        let sql_rel = proto::Relation {
+            common: None,
+            rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
+                query: "NOT VALID SQL".to_owned(),
+                args: Default::default(),
+                pos_args: vec![],
+                named_arguments: Default::default(),
+                pos_arguments: vec![],
+            })),
+        };
+        let err = transpile_relation(&sql_rel).expect_err("syntax error must surface");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(
+            err.message().contains("sql::parse_error")
+                || err.message().contains("unsupported proto shape"),
+            "expected parser_v2 boundary error; got: {}",
+            err.message()
+        );
+    }
+
+    /// A deferred proto shape (e.g. `Sample`) surfaces via
+    /// `V2RelationConverter`'s `UnsupportedProtoShape` and maps to
+    /// `Status::unimplemented`.
+    #[test]
+    fn transpile_relation_unsupported_proto_shape_surfaces() {
+        let sample = proto::Relation {
+            common: None,
+            rel_type: Some(proto::relation::RelType::Sample(Box::new(proto::Sample {
+                input: Some(Box::new(table_scan_relation("t"))),
+                lower_bound: 0.0,
+                upper_bound: 1.0,
+                with_replacement: None,
+                seed: None,
+                deterministic_order: false,
+            }))),
+        };
+        let err = transpile_relation(&sample).expect_err("deferred shape must error");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(
+            err.message().contains("unsupported proto shape") || err.message().contains("Sample"),
+            "expected UnsupportedProtoShape; got: {}",
+            err.message()
+        );
+    }
+
+    /// `finalize()` builds `BaseTypes::empty()` when the plan carries no
+    /// empty-scan (short-circuit anchor at the service layer — the substrate
+    /// test in `base_types::tests` already pins the closure-not-invoked
+    /// behavior).
+    #[test]
+    fn finalize_short_circuits_on_plans_without_empty_scan() {
+        use thunderduck_core::transpiler_v2::ast::CommonOp;
+        // A `SingleRow` plan carries no `TableScan` → `plan_has_empty_scan`
+        // is false → `BaseTypes::empty()` (no closure invocation).
+        let plan = CommonAst::new(CommonOp::SingleRow);
+        let err = finalize(&plan).expect_err("τ must error at A.3");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 }

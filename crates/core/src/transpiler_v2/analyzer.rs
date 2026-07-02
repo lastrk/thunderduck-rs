@@ -205,6 +205,17 @@ pub enum TypedOp {
         /// Whether to emit an ordinality column.
         with_ordinality: bool,
     },
+    /// `df.withColumn(name, expr)` / `df.withColumns({...})`. Analyzer
+    /// resolves each `expr` against the input schema, then emits the output
+    /// schema by replacing input columns whose name matches an assignment
+    /// (case-insensitive per Spark) and appending assignments whose name is
+    /// new.
+    WithColumns {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// One `(column_name, expression)` per proto Alias, order preserved.
+        assignments: Vec<(String, Expression)>,
+    },
 }
 
 /// A typed attribute — the resolved shape of a single output column.
@@ -400,6 +411,12 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
             .all(|row| row.iter().all(expression_is_fully_resolved)),
         TypedOp::TableFunction { args, .. } => args.iter().all(expression_is_fully_resolved),
         TypedOp::Unnest { expr, .. } => expression_is_fully_resolved(expr),
+        TypedOp::WithColumns { input, assignments } => {
+            has_resolved_schema(input)
+                && assignments
+                    .iter()
+                    .all(|(_, e)| expression_is_fully_resolved(e))
+        }
         TypedOp::SingleRow | TypedOp::TableScan { .. } | TypedOp::FileScan { .. } => true,
     }
 }
@@ -626,6 +643,60 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                     input: Box::new(typed_input),
                     grouping,
                     aggregates,
+                },
+                resolved_schema: output_schema,
+            })
+        }
+
+        // ── WithColumns (add-or-replace by name, Spark semantics) ────────
+        CommonOp::WithColumns { input, assignments } => {
+            let typed_input = analyze_node(*input, base_types)?;
+            let input_schema = &typed_input.resolved_schema;
+            // Resolve each assignment expression against the INPUT schema —
+            // Spark semantics: later assignments see the input value, not
+            // intermediate replacements.
+            let mut resolved_assignments: Vec<(String, Expression)> =
+                Vec::with_capacity(assignments.len());
+            for (name, expr) in assignments {
+                let resolved = resolve_and_stamp(expr, input_schema)?;
+                resolved_assignments.push((name, resolved));
+            }
+            // Output schema: walk input fields; if a field name matches an
+            // assignment (case-insensitive), substitute the assignment's
+            // resolved (type, nullable). Then append assignments whose name
+            // did not match any input field.
+            let mut assigned_lower: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::with_capacity(resolved_assignments.len());
+            for (i, (name, _)) in resolved_assignments.iter().enumerate() {
+                assigned_lower.insert(name.to_lowercase(), i);
+            }
+            let mut consumed = vec![false; resolved_assignments.len()];
+            let mut output_fields: Vec<StructField> =
+                Vec::with_capacity(input_schema.fields.len() + resolved_assignments.len());
+            for f in &input_schema.fields {
+                if let Some(&idx) = assigned_lower.get(&f.name.to_lowercase()) {
+                    let (_, expr) = &resolved_assignments[idx];
+                    let dt = expr.data_type(input_schema);
+                    let nullable = expr.nullable(input_schema);
+                    // Preserve the input field's original casing for the name.
+                    output_fields.push(StructField::new(f.name.clone(), dt, nullable));
+                    consumed[idx] = true;
+                } else {
+                    output_fields.push(f.clone());
+                }
+            }
+            for (i, (name, expr)) in resolved_assignments.iter().enumerate() {
+                if !consumed[i] {
+                    let dt = expr.data_type(input_schema);
+                    let nullable = expr.nullable(input_schema);
+                    output_fields.push(StructField::new(name.clone(), dt, nullable));
+                }
+            }
+            let output_schema = StructType::new(output_fields);
+            Ok(TypedAst {
+                op: TypedOp::WithColumns {
+                    input: Box::new(typed_input),
+                    assignments: resolved_assignments,
                 },
                 resolved_schema: output_schema,
             })

@@ -5,6 +5,7 @@ Provides detailed row-by-row comparison of DataFrames from Spark Reference
 and Thunderduck, with clear diff output for mismatches.
 """
 
+import math
 import os
 import threading
 from decimal import Decimal
@@ -263,17 +264,27 @@ class DataFrameDiff:
         if ref_val is None or test_val is None:
             return False
 
-        # Handle floats with epsilon
+        # Handle floats with epsilon — NaN-safe (NaN == NaN per numpy/pandas
+        # convention; Spark's differential oracle treats matched NaN as equal).
         if isinstance(ref_val, float) and isinstance(test_val, float):
+            if math.isnan(ref_val) and math.isnan(test_val):
+                return True
+            if math.isnan(ref_val) or math.isnan(test_val):
+                return False
             return abs(ref_val - test_val) < self.epsilon
 
         # Handle Decimal
         if isinstance(ref_val, Decimal) and isinstance(test_val, Decimal):
             return abs(ref_val - test_val) < Decimal(str(self.epsilon))
 
-        # Handle mixed numeric types (int vs float)
+        # Handle mixed numeric types (int vs float) — NaN-safe.
         if isinstance(ref_val, (int, float)) and isinstance(test_val, (int, float)):
-            return abs(float(ref_val) - float(test_val)) < self.epsilon
+            rf, tf = float(ref_val), float(test_val)
+            if math.isnan(rf) and math.isnan(tf):
+                return True
+            if math.isnan(rf) or math.isnan(tf):
+                return False
+            return abs(rf - tf) < self.epsilon
 
         # Exact equality for everything else
         return ref_val == test_val
@@ -292,10 +303,15 @@ class DataFrameDiff:
         if ref_val is None or test_val is None:
             return False
 
-        # Both numeric (int, float, Decimal) — convert to float, compare
+        # Both numeric (int, float, Decimal) — convert to float, compare.
+        # NaN-safe: matched NaN → equal, unmatched NaN → unequal.
         if isinstance(ref_val, (int, float, Decimal)) and isinstance(test_val, (int, float, Decimal)):
             ref_f = float(ref_val)
             test_f = float(test_val)
+            if math.isnan(ref_f) and math.isnan(test_f):
+                return True
+            if math.isnan(ref_f) or math.isnan(test_f):
+                return False
             # For integral values: exact integer comparison first
             if ref_f == int(ref_f) and test_f == int(test_f):
                 return int(ref_f) == int(test_f)

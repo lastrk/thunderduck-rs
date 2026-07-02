@@ -93,6 +93,9 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             limit,
             offset,
         } => render_limit(input, *limit, *offset),
+        TypedOp::WithColumns { input, assignments } => {
+            render_with_columns(input, assignments)
+        }
 
         // ── C.3 owns (aggregate arms) ────────────────────────────────────
         TypedOp::Aggregate { .. } => Err(EmissionError::UnsupportedOp {
@@ -435,27 +438,46 @@ fn render_distinct(input: &TypedAst) -> Result<String, EmissionError> {
     ))
 }
 
-#[allow(dead_code)] // wired when TypedOp::WithColumns lands (Decision 13-A)
 fn render_with_columns(
     input: &TypedAst,
     assignments: &[(String, Expression)],
 ) -> Result<String, EmissionError> {
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let input_schema = &input.resolved_schema;
-    let assigned_names: HashSet<String> =
-        assignments.iter().map(|(n, _)| n.to_lowercase()).collect();
+    // Column-order contract with the analyzer: input columns emit in their
+    // original positions (replaced in place if named by an assignment), and
+    // net-new assignments append at the end in assignment order. `analyzer.rs`
+    // `CommonOp::WithColumns` arm produces the resolved schema by the same
+    // walk — any deviation here would misalign Arrow columns with the schema
+    // Spark Connect advertises via `analyze_plan`, corrupting downstream
+    // decoding.
+    let assigned_lower: std::collections::HashMap<String, usize> = assignments
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| (n.to_lowercase(), i))
+        .collect();
+    let mut consumed = vec![false; assignments.len()];
     let mut slots = String::new();
     let mut first = true;
     for f in &input_schema.fields {
-        if !assigned_names.contains(&f.name.to_lowercase()) {
-            if !first {
-                slots.push_str(", ");
-            }
-            first = false;
+        if !first {
+            slots.push_str(", ");
+        }
+        first = false;
+        if let Some(&idx) = assigned_lower.get(&f.name.to_lowercase()) {
+            let (_, expr) = &assignments[idx];
+            let expr_sql = render_expr(expr, input_schema)?;
+            let name_q = quote_ident(&f.name);
+            slots.push_str(&format!("{expr_sql} AS {name_q}"));
+            consumed[idx] = true;
+        } else {
             slots.push_str(&quote_ident(&f.name));
         }
     }
-    for (name, expr) in assignments {
+    for (i, (name, expr)) in assignments.iter().enumerate() {
+        if consumed[i] {
+            continue;
+        }
         if !first {
             slots.push_str(", ");
         }

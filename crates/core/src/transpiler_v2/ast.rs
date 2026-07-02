@@ -199,6 +199,23 @@ pub enum CommonOp {
         children: Vec<CommonAst>,
     },
 
+    // ── Column-list extensions ───────────────────────────────────────────
+    /// `df.withColumn(name, expr)` / `df.withColumns({...})` — add or replace
+    /// per-name column assignments over `input`. Semantics: for each
+    /// `(name, expr)`, if `name` matches an existing input column
+    /// (case-insensitive per Spark), the column is *replaced*; otherwise the
+    /// column is *appended*. Duplicate names within `assignments` are a
+    /// Spark-emulated error surfaced by the analyzer.
+    WithColumns {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// One `(column_name, expression)` per proto `Alias`. Order matters:
+        /// later assignments referencing an earlier assignment's name see the
+        /// pre-assignment value (analyzer resolves against input schema, not
+        /// intermediate state — matches Spark's `withColumn` semantics).
+        assignments: Vec<(String, Expression)>,
+    },
+
     // ── Join with first-class plan_ids (§2.3) ────────────────────────────
     /// A binary join.
     ///

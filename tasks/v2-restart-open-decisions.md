@@ -248,26 +248,22 @@ With INV7 deleted (Decision 4), the two front-ends do not need to produce struct
 - **CV.6 ratification order** — ADR-022 added as the third post-Slice-D commitment.
 - **OQ-1 closure** — the INV7 obligation removed from the closure note.
 
-**In the readiness map (`tasks/v2-adr-readiness-map.md`):**
-- Baseline claim "Legacy TPC-H stays 51/51 throughout" is REMOVED (Decision 11 lifts that requirement).
-- Slice A no longer wires `V2FallbackEligible` trait or fallback machinery (Decisions 3, 9).
-- Slice A no longer routes via `THUNDERDUCK_TRANSPILER` env var (Decision 11).
-- Slice A.2 uses `crates/core/src/parser_v2/` for v2 SparkSQL front-end (Decision 1).
-- Slice A.2 seeds a per-path `crate::transpiler_v2::BaseTypes` overlay (Decision 8).
-- Slice B no longer runs an INV7 check (Decision 4). §6 invariant activation map updates INV7 to DELETED.
-- Slice B's set-op widening scope is UNION + INTERSECT + EXCEPT (Decision 5).
-- Slice C.1 creates the empty `rewrites.rs` module (Decision 6).
-- Slice C uses Approach A permanently (Decision 7).
-- Sub-slice progress signal is cumulative per §CV.7 amendment (Decision 10).
-- §8 references the resolutions here as the closure record.
-- Slice B (analyzer)'s CommonAST plan_id handling covers both `Some(_)` and `None` (Decision 12).
+**In the readiness map (`tasks/v2-adr-readiness-map.md`) — RETIRED 2026-07-02.**
+The slice-based readiness map was deleted after four consecutive slices
+(A/B/C.1/E.0) produced 0 corpus signal on their scope-file estimates. The
+slice methodology is superseded by the corpus-driven `/goal` template at
+`tasks/v2-corpus-driven-goal-prompt-template.md`. Historical slice
+resolutions from Decisions 1-13 were absorbed into ADR-022 or landed in
+the corresponding code; nothing was lost.
 
-**In the /goal template (`tasks/v2-slice-goal-prompt-template.md`):**
+**In the (retired) slice `/goal` template (`tasks/v2-slice-goal-prompt-template.md`):**
 - Preflight step 2 "Legacy TPC-H differential green (51/51)" is REMOVED (Decision 11).
 - Reference to ADR-022 added under §Design authority.
+- **Template itself retired 2026-07-02** — see corpus-driven template above.
 
-**In the iteration methodology (`tasks/v2-slice-iteration-methodology.md`):**
+**In the (retired) slice iteration methodology (`tasks/v2-slice-iteration-methodology.md`):**
 - §CV.7 amended with the sub-slice cumulative-targets convention (Decision 10).
+- **Methodology itself retired 2026-07-02.**
 
 **In CLAUDE.md (project-level, not ADR-level; noted for follow-up):**
 - `### 4. Verification Before Done` step 4 ("TPC-H differential mandatory") is amended in spirit during the restart: DataFrame corpus is the fitness function; TPC-H rejoins the gate once v2 covers its query surface. The CLAUDE.md text itself is a separate follow-up edit.

@@ -85,6 +85,7 @@ impl V2RelationConverter {
             RelType::Read(r) => self.convert_read(r),
             RelType::LocalRelation(lr) => self.convert_local_relation(lr),
             RelType::Join(j) => self.convert_join(j),
+            RelType::WithColumns(wc) => self.convert_with_columns(wc),
             RelType::Sql(_) => Err(EmissionError::UnsupportedProtoShape {
                 shape: "RelType::Sql".to_owned(),
                 reason: "SQL text is owned by parser_v2, not V2RelationConverter".to_owned(),
@@ -112,6 +113,40 @@ impl V2RelationConverter {
                 reason: format!("{ctx} has no input relation"),
             }),
         }
+    }
+
+    fn convert_with_columns(
+        &mut self,
+        wc: &proto::WithColumns,
+    ) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(wc.input.as_deref(), "WithColumns")?;
+        let mut assignments: Vec<(String, thunderduck_core::transpiler_v2::Expression)> =
+            Vec::with_capacity(wc.aliases.len());
+        for alias in &wc.aliases {
+            // Proto contract: exactly one name part for a scalar column.
+            let name = match alias.name.as_slice() {
+                [n] => n.clone(),
+                _ => {
+                    return Err(EmissionError::UnsupportedProtoShape {
+                        shape: "WithColumns::Alias::multi_name".to_owned(),
+                        reason: "WithColumns aliases must carry exactly one name part"
+                            .to_owned(),
+                    });
+                }
+            };
+            let expr_proto = alias.expr.as_deref().ok_or_else(|| {
+                EmissionError::UnsupportedProtoShape {
+                    shape: "WithColumns::Alias::missing_expr".to_owned(),
+                    reason: "WithColumns alias has no expression".to_owned(),
+                }
+            })?;
+            let expr = self.expr.convert(expr_proto)?;
+            assignments.push((name, expr));
+        }
+        Ok(CommonAst::new(CommonOp::WithColumns {
+            input: Box::new(input),
+            assignments,
+        }))
     }
 
     fn convert_project(&mut self, p: &proto::Project) -> Result<CommonAst, EmissionError> {

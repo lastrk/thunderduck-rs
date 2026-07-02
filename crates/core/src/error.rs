@@ -19,6 +19,8 @@ pub enum ThunderduckError {
     #[error("DuckDB error: {0}")]
     DuckDb(String),
 
+    #[error("τ emission error: {0}")]
+    TranspilerV2Emission(#[from] crate::transpiler_v2::EmissionError),
 }
 
 impl From<duckdb::Error> for ThunderduckError {

@@ -94,7 +94,10 @@ Required sections:
 - No full-differential runs between passes; termination only.
 - No scope expansion beyond `tasks/v2-slice-<SLICE_ID>-scope.md` §Targets without user approval.
 
-**HALT-AND-FLAG:** if a target proves diagnostic-first at Pass 1 (architect discovers scope file's hypothesis is wrong), halt for `/fix-bug` rather than iterating with a stale hypothesis. If a fix lands correctly but the corpus stays red because of upstream substrate not yet in place, document + reassign to the appropriate future slice per readiness map.
+**HALT-AND-FLAG.** Three triggers, all legitimate; none is a slice failure:
+1. *Diagnostic-first* — Pass 1's architect discovers the scope file's root-cause hypothesis is wrong. Halt for `/fix-bug` rather than iterating with a stale hypothesis under `/new-feature`.
+2. *Upstream substrate missing* — a fix lands correctly but a case stays red because a future slice hasn't landed the enabling substrate yet. Document the dependency + reassign the case to the appropriate future slice per readiness map.
+3. *New architectural decision surfaced* — the twelve decisions in `tasks/v2-restart-open-decisions.md` are all resolved. If Pass 1 discovers a NEW architectural gap not covered by any current ADR or by those resolutions, halt and surface it as a new decision entry in that file (Decision 13, 14, ...) rather than resolving it inside the plan document. Cross-slice architectural questions get answered in one place, not scattered across slice plans.
 ```
 
 ---
@@ -109,7 +112,7 @@ Required sections:
 
 **Progress signal at termination only.** Running the full differential between passes wastes ~3 minutes per pass and produces noise (partial arm landings appear regressive). Focused corpus preflight (`pytest -k`) between passes is fine — the full-differential run is a termination-gate check.
 
-**HALT-AND-FLAG discipline.** Two triggers: (a) *diagnostic-first* — the scope file's root-cause hypothesis is wrong, so `/fix-bug` is the right pipeline, not `/new-feature`; (b) *upstream substrate missing* — the v2 arm is correct, but a case fails because a future slice hasn't landed the enabling substrate yet. Both are legitimate outcomes; neither is a slice failure.
+**HALT-AND-FLAG discipline.** Three triggers: (a) *diagnostic-first* — the scope file's root-cause hypothesis is wrong, so `/fix-bug` is the right pipeline, not `/new-feature`; (b) *upstream substrate missing* — the τ arm is correct, but a case fails because a future slice hasn't landed the enabling substrate yet; (c) *new architectural decision surfaced* — an architectural gap not covered by any current ADR or by the resolved decisions in `tasks/v2-restart-open-decisions.md` shows up during planning, and gets appended as a new decision entry there rather than resolved inside the plan. All three are legitimate outcomes; none is a slice failure.
 
 **No commits without user approval.** From CLAUDE.md. Non-negotiable.
 

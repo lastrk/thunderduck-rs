@@ -199,6 +199,16 @@ pub enum CommonOp {
         children: Vec<CommonAst>,
     },
 
+    /// `df.dropDuplicates([cols])` / `df.distinct()`. `on_columns` empty ⇒
+    /// dedupe on the full row (`SELECT DISTINCT *`). Non-empty ⇒
+    /// `SELECT DISTINCT ON (cols) * FROM ...`.
+    Deduplicate {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// Optional subset of columns to dedupe on. Empty = all columns.
+        on_columns: Vec<String>,
+    },
+
     /// `df.alias(name)` — wrap the input in a named subquery alias.
     /// Semantically transparent for schemas (analyzer passes input schema
     /// through); the alias name is retained for scope-resolution in

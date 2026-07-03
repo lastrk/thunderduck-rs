@@ -241,6 +241,13 @@ pub enum TypedOp {
         /// Old-name → new-name renames.
         renames: Vec<(String, String)>,
     },
+    /// `df.dropDuplicates` / `df.distinct`. Schema-transparent.
+    Deduplicate {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// Optional subset of columns.
+        on_columns: Vec<String>,
+    },
 }
 
 /// A typed attribute — the resolved shape of a single output column.
@@ -445,6 +452,7 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
         TypedOp::DropColumns { input, .. } => has_resolved_schema(input),
         TypedOp::AliasedRelation { input, .. } => has_resolved_schema(input),
         TypedOp::WithColumnsRenamed { input, .. } => has_resolved_schema(input),
+        TypedOp::Deduplicate { input, .. } => has_resolved_schema(input),
         TypedOp::SingleRow | TypedOp::TableScan { .. } | TypedOp::FileScan { .. } => true,
     }
 }
@@ -725,6 +733,19 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                 op: TypedOp::WithColumns {
                     input: Box::new(typed_input),
                     assignments: resolved_assignments,
+                },
+                resolved_schema: output_schema,
+            })
+        }
+
+        // ── Deduplicate (Spark `df.dropDuplicates` / `df.distinct`) ──────
+        CommonOp::Deduplicate { input, on_columns } => {
+            let typed_input = analyze_node(*input, base_types)?;
+            let output_schema = typed_input.resolved_schema.clone();
+            Ok(TypedAst {
+                op: TypedOp::Deduplicate {
+                    input: Box::new(typed_input),
+                    on_columns,
                 },
                 resolved_schema: output_schema,
             })

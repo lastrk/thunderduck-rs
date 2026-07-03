@@ -90,6 +90,17 @@ impl V2RelationConverter {
             RelType::SetOp(so) => self.convert_set_op(so),
             RelType::SubqueryAlias(sa) => self.convert_subquery_alias(sa),
             RelType::WithColumnsRenamed(wcr) => self.convert_with_columns_renamed(wcr),
+            RelType::Deduplicate(d) => self.convert_deduplicate(d),
+            // Cosmetic ops per Spark 4 semantics — semantically no-op.
+            // Thunderduck ignores them and continues with the input relation
+            // (ADR-001 "result-irrelevant cosmetic" carve-out).
+            RelType::Hint(h) => {
+                self.convert_input(h.input.as_deref(), "Hint")
+            }
+            RelType::RepartitionByExpression(r) => {
+                self.convert_input(r.input.as_deref(), "RepartitionByExpression")
+            }
+            RelType::Repartition(r) => self.convert_input(r.input.as_deref(), "Repartition"),
             RelType::Sql(_) => Err(EmissionError::UnsupportedProtoShape {
                 shape: "RelType::Sql".to_owned(),
                 reason: "SQL text is owned by parser_v2, not V2RelationConverter".to_owned(),
@@ -117,6 +128,24 @@ impl V2RelationConverter {
                 reason: format!("{ctx} has no input relation"),
             }),
         }
+    }
+
+    fn convert_deduplicate(
+        &mut self,
+        d: &proto::Deduplicate,
+    ) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(d.input.as_deref(), "Deduplicate")?;
+        // `all_columns_as_keys=true` → dedupe on all columns (empty on_columns).
+        // Otherwise use column_names.
+        let on_columns = if d.all_columns_as_keys.unwrap_or(false) {
+            Vec::new()
+        } else {
+            d.column_names.clone()
+        };
+        Ok(CommonAst::new(CommonOp::Deduplicate {
+            input: Box::new(input),
+            on_columns,
+        }))
     }
 
     fn convert_subquery_alias(

@@ -102,7 +102,8 @@ pub fn plan_has_empty_scan(plan: &CommonAst) -> bool {
         | CommonOp::WithColumns { input, .. }
         | CommonOp::DropColumns { input, .. }
         | CommonOp::AliasedRelation { input, .. }
-        | CommonOp::WithColumnsRenamed { input, .. } => plan_has_empty_scan(input),
+        | CommonOp::WithColumnsRenamed { input, .. }
+        | CommonOp::Deduplicate { input, .. } => plan_has_empty_scan(input),
         CommonOp::Join { left, right, .. } => {
             plan_has_empty_scan(left) || plan_has_empty_scan(right)
         }
@@ -132,7 +133,8 @@ fn collect_empty_scan_tables(plan: &CommonAst, out: &mut Vec<String>) {
         | CommonOp::WithColumns { input, .. }
         | CommonOp::DropColumns { input, .. }
         | CommonOp::AliasedRelation { input, .. }
-        | CommonOp::WithColumnsRenamed { input, .. } => collect_empty_scan_tables(input, out),
+        | CommonOp::WithColumnsRenamed { input, .. }
+        | CommonOp::Deduplicate { input, .. } => collect_empty_scan_tables(input, out),
         CommonOp::Join { left, right, .. } => {
             collect_empty_scan_tables(left, out);
             collect_empty_scan_tables(right, out);

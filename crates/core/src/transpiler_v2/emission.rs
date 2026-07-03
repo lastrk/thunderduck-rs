@@ -103,6 +103,7 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
         TypedOp::WithColumnsRenamed { input, renames } => {
             render_with_columns_renamed(input, renames)
         }
+        TypedOp::Deduplicate { input, on_columns } => render_deduplicate(input, on_columns),
 
         // ── Aggregate (operator + primitive function arms) ───────────────
         TypedOp::Aggregate {
@@ -674,6 +675,27 @@ fn render_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<String
     Ok(format!(
         "SELECT * EXCLUDE ({dropped}) FROM ({child_sql}) AS __td_drop"
     ))
+}
+
+fn render_deduplicate(
+    input: &TypedAst,
+    on_columns: &[String],
+) -> Result<String, EmissionError> {
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    if on_columns.is_empty() {
+        Ok(format!("SELECT DISTINCT * FROM ({child_sql}) AS __td_dedup"))
+    } else {
+        let mut cols = String::new();
+        for (i, c) in on_columns.iter().enumerate() {
+            if i > 0 {
+                cols.push_str(", ");
+            }
+            cols.push_str(&quote_ident(c));
+        }
+        Ok(format!(
+            "SELECT DISTINCT ON ({cols}) * FROM ({child_sql}) AS __td_dedup"
+        ))
+    }
 }
 
 fn render_with_columns_renamed(

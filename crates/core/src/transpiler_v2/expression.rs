@@ -667,6 +667,11 @@ impl Expression {
                 | "hash"
                 | "murmur3"
                 | "xxhash64"
+                | "collect_list"
+                | "collect_set"
+                | "array_agg"
+                | "approx_count_distinct"
+                | "count_approx_distinct"
         )
     }
 

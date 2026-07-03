@@ -379,7 +379,16 @@ impl TypeInferenceEngine {
         );
         matches!(
             name_lower,
-            "count" | "count_distinct" | "count_if" | "grouping" | "grouping_id"
+            "count"
+                | "count_distinct"
+                | "count_if"
+                | "grouping"
+                | "grouping_id"
+                | "collect_list"
+                | "collect_set"
+                | "array_agg"
+                | "approx_count_distinct"
+                | "count_approx_distinct"
         )
     }
 

@@ -1343,6 +1343,18 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let fmt = render_expr(&f.args[1], schema)?;
             return Ok(format!("date_trunc({fmt}, {d})"));
         }
+        // Spark → thdck_spark_funcs extension remaps (readiness map §4.1).
+        // These functions require the ext6 extension, loaded at session
+        // start by `DuckDbSession`.
+        "hash" | "murmur3" => "spark_hash",
+        "xxhash64" => "spark_xxhash64",
+        "try_divide" => "spark_try_divide",
+        "spark_hash" => "spark_hash",
+        "spark_xxhash64" => "spark_xxhash64",
+        "spark_try_divide" => "spark_try_divide",
+        "spark_try_sum" => "spark_try_sum",
+        "spark_try_avg" => "spark_try_avg",
+        "spark_decimal_div" => "spark_decimal_div",
         // Spark's `regexp_replace(str, pat, repl)` replaces ALL matches.
         // DuckDB's `regexp_replace(str, pat, repl)` replaces only the FIRST;
         // the 4th arg 'g' flag makes it global.
@@ -1769,10 +1781,17 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         | "first_value" | "last_value" | "any_value" | "approx_count_distinct"
         | "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp"
         | "var_pop" | "bit_and" | "bit_or" | "bit_xor" | "bool_and" | "bool_or"
-        | "skewness" | "kurtosis" | "corr" | "covar_samp" | "covar_pop"
+        | "kurtosis" | "corr" | "covar_samp" | "covar_pop"
         | "regr_slope" | "regr_r2" | "regr_intercept" | "regr_avgx" | "regr_avgy"
         | "regr_sxx" | "regr_sxy" | "regr_syy" | "median" | "grouping"
         | "grouping_id" => (lower.as_str(), false),
+        // Spark's population-formula `skewness` — DuckDB's `skewness` uses
+        // the sample formula. The ext6 extension provides `spark_skewness`
+        // with Spark-parity semantics (checklist §4.1).
+        "skewness" => ("spark_skewness", false),
+        // `try_sum` / `try_avg` — ext6 extension arms.
+        "try_sum" => ("spark_try_sum", false),
+        "try_avg" => ("spark_try_avg", false),
         "std" => ("stddev", false),
         // Spark's `count_if(cond)` → DuckDB `count(*) FILTER (WHERE cond)`
         // or simpler `SUM(CASE WHEN cond THEN 1 ELSE 0 END)`. DuckDB accepts

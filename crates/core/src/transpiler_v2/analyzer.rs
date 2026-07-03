@@ -117,6 +117,8 @@ pub enum TypedOp {
         /// Aggregate expressions (may fold grouping columns per Slice A.2
         /// invariant — see [`CommonOp::Aggregate`]).
         aggregates: Vec<Expression>,
+        /// GROUP BY variant.
+        grouping_kind: crate::transpiler_v2::ast::GroupingKind,
     },
     /// A binary join.
     Join {
@@ -447,6 +449,7 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
             input,
             grouping,
             aggregates,
+            ..
         } => {
             has_resolved_schema(input)
                 && grouping.iter().all(expression_is_fully_resolved)
@@ -690,6 +693,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             input,
             grouping,
             aggregates,
+            grouping_kind,
         } => {
             let typed_input = analyze_node(*input, base_types)?;
             let grouping = resolve_expr_list(grouping, &typed_input.resolved_schema)?;
@@ -711,6 +715,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                     input: Box::new(typed_input),
                     grouping,
                     aggregates,
+                    grouping_kind,
                 },
                 resolved_schema: output_schema,
             })
@@ -2693,6 +2698,7 @@ mod tests {
                 })],
                 distinct: false,
             })],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
         });
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(typed.resolved_schema.fields.len(), 1);

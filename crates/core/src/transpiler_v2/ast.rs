@@ -115,6 +115,9 @@ pub enum CommonOp {
         /// columns here alongside the actual aggregate calls until Slice C.1
         /// unfolds them.
         aggregates: Vec<Expression>,
+        /// The grouping kind — GroupBy (default), Rollup, Cube, or
+        /// GroupingSets (Slice G — Pivot lives elsewhere).
+        grouping_kind: GroupingKind,
     },
 
     // ── Leaves ───────────────────────────────────────────────────────────
@@ -337,6 +340,22 @@ pub enum SetOpKind {
     Intersect,
     /// `EXCEPT` (`MINUS`) — row set difference.
     Except,
+}
+
+/// GROUP BY variants for [`CommonOp::Aggregate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GroupingKind {
+    /// Standard `GROUP BY cols`.
+    GroupBy,
+    /// `GROUP BY ROLLUP(cols)`.
+    Rollup,
+    /// `GROUP BY CUBE(cols)`.
+    Cube,
+    /// `GROUP BY GROUPING SETS((cols), (cols), ...)` — Slice G structured
+    /// form. The `grouping` list carries all distinct cols in first-appear
+    /// order; the set membership is applied at emission time (not yet
+    /// wired; punts as `UnsupportedOp` today).
+    GroupingSets,
 }
 
 /// The join types supported by [`CommonOp::Join`].

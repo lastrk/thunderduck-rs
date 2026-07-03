@@ -408,33 +408,19 @@ impl V2RelationConverter {
 
     fn convert_aggregate(&mut self, a: &proto::Aggregate) -> Result<CommonAst, EmissionError> {
         use proto::aggregate::GroupType;
-        match a.group_type() {
-            GroupType::Unspecified | GroupType::Groupby => {}
-            GroupType::Rollup => {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "Aggregate::Rollup".to_owned(),
-                    reason: "ROLLUP deferred to Slice G".to_owned(),
-                });
-            }
-            GroupType::Cube => {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "Aggregate::Cube".to_owned(),
-                    reason: "CUBE deferred to Slice G".to_owned(),
-                });
-            }
-            GroupType::GroupingSets => {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "Aggregate::GroupingSets".to_owned(),
-                    reason: "GROUPING SETS deferred to Slice G".to_owned(),
-                });
-            }
+        use thunderduck_core::transpiler_v2::ast::GroupingKind;
+        let grouping_kind = match a.group_type() {
+            GroupType::Unspecified | GroupType::Groupby => GroupingKind::GroupBy,
+            GroupType::Rollup => GroupingKind::Rollup,
+            GroupType::Cube => GroupingKind::Cube,
+            GroupType::GroupingSets => GroupingKind::GroupingSets,
             GroupType::Pivot => {
                 return Err(EmissionError::UnsupportedProtoShape {
                     shape: "Aggregate::Pivot".to_owned(),
                     reason: "PIVOT deferred to Slice G".to_owned(),
                 });
             }
-        }
+        };
         let input = self.convert_input(a.input.as_deref(), "Aggregate")?;
         let grouping = a
             .grouping_expressions
@@ -450,6 +436,7 @@ impl V2RelationConverter {
             input: Box::new(input),
             grouping,
             aggregates,
+            grouping_kind,
         }))
     }
 

@@ -214,6 +214,7 @@ fn lower_aggregate_select(
         input: Box::new(input),
         grouping,
         aggregates: projections,
+        grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
     });
 
     if let Some(h) = having {

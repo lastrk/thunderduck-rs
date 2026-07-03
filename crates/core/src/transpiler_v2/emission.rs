@@ -125,7 +125,8 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             input,
             grouping,
             aggregates,
-        } => render_aggregate_op(input, grouping, aggregates),
+            grouping_kind,
+        } => render_aggregate_op(input, grouping, aggregates, *grouping_kind),
 
         // ── Join ─────────────────────────────────────────────────────────
         TypedOp::Join {
@@ -1299,7 +1300,15 @@ fn render_aggregate_op(
     input: &TypedAst,
     grouping: &[Expression],
     aggregates: &[Expression],
+    grouping_kind: crate::transpiler_v2::ast::GroupingKind,
 ) -> Result<String, EmissionError> {
+    use crate::transpiler_v2::ast::GroupingKind;
+    if matches!(grouping_kind, GroupingKind::GroupingSets) {
+        return Err(EmissionError::UnsupportedOp {
+            op: "Aggregate[GroupingSets]".to_owned(),
+            reason: "GROUPING SETS emission requires set-membership metadata; Slice G territory".to_owned(),
+        });
+    }
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let input_schema = &input.resolved_schema;
     // Aggregates may include folded grouping columns at the SparkSQL path
@@ -1329,6 +1338,12 @@ fn render_aggregate_op(
             };
             group_sql.push_str(&render_expr(bare, input_schema)?);
         }
+        let group_sql = match grouping_kind {
+            GroupingKind::GroupBy => group_sql,
+            GroupingKind::Rollup => format!("ROLLUP({group_sql})"),
+            GroupingKind::Cube => format!("CUBE({group_sql})"),
+            GroupingKind::GroupingSets => unreachable!(), // returned early above
+        };
         sql.push_str(&format!(" GROUP BY {group_sql}"));
     }
     Ok(sql)
@@ -2576,6 +2591,7 @@ mod tests {
                 args: vec![],
                 distinct: false,
             })],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
         });
         let _ = generate(&ast, &bt);
         let after = EMIT_TAP.load(Ordering::Relaxed);

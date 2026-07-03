@@ -1743,8 +1743,12 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         }
     };
     let mut args_sql = String::new();
-    if f.args.is_empty() {
-        // `count()` with no args (illegal in Spark) — Thunderduck-boundary.
+    // Zero-arg aggregate calls are legal for a handful of Spark functions
+    // (grouping_id() picks up the ambient GROUP BY). Handle by emitting
+    // the empty arg list.
+    let zero_arg_ok =
+        matches!(duck_name, "grouping_id" | "grouping") && f.args.is_empty();
+    if f.args.is_empty() && !zero_arg_ok {
         return Err(EmissionError::UnsupportedFunction {
             name: f.name.clone(),
             reason: "aggregate function call has no arguments".to_owned(),

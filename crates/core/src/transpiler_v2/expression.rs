@@ -751,8 +751,19 @@ impl Expression {
                 if TypeInferenceEngine::window_is_non_nullable(&f.name) {
                     false
                 } else if matches!(f.name.to_lowercase().as_str(), "lag" | "lead") {
-                    // If 3rd arg (default) is present and non-nullable, the result is non-nullable.
-                    f.args.get(2).is_none_or(|default| default.nullable(schema))
+                    // Spark rule: `lag(col, offset, default)` is nullable
+                    // iff `col` is nullable OR `default` is nullable. When
+                    // `default` is absent (no 3rd arg), the out-of-range
+                    // return is NULL — so nullable=true regardless of
+                    // col's nullability.
+                    let col_nullable = f
+                        .args
+                        .first()
+                        .is_none_or(|c| c.nullable(schema));
+                    match f.args.get(2) {
+                        Some(default) => col_nullable || default.nullable(schema),
+                        None => true,
+                    }
                 } else {
                     true
                 }

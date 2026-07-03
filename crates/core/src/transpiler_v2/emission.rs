@@ -1995,10 +1995,26 @@ fn render_interval(i: &IntervalExpression) -> Result<String, EmissionError> {
 pub(crate) fn render_cast(c: &CastExpression, schema: &Schema) -> Result<String, EmissionError> {
     let inner = render_expr(&c.expr, schema)?;
     let ty = render_data_type(&c.to_type);
-    if c.try_cast {
-        Ok(format!("TRY_CAST({inner} AS {ty})"))
+    // Spark's floating→integer cast TRUNCATES toward zero (matches Java's
+    // `(int)f`). DuckDB's CAST(Double AS Integer) ROUNDS to nearest by
+    // default. Insert an explicit `trunc(...)` when the source type is
+    // floating-point and the target is integral. TRY_CAST retains the same
+    // semantics for the truncation phase but wraps the outer CAST.
+    let from_ty = c.expr.data_type(schema);
+    let src_is_float = matches!(from_ty, DataType::Float | DataType::Double);
+    let dst_is_integral = matches!(
+        c.to_type,
+        DataType::Byte | DataType::Short | DataType::Integer | DataType::Long
+    );
+    let expr_sql = if src_is_float && dst_is_integral {
+        format!("trunc({inner})")
     } else {
-        Ok(format!("CAST({inner} AS {ty})"))
+        inner
+    };
+    if c.try_cast {
+        Ok(format!("TRY_CAST({expr_sql} AS {ty})"))
+    } else {
+        Ok(format!("CAST({expr_sql} AS {ty})"))
     }
 }
 

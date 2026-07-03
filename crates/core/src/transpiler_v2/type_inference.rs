@@ -600,12 +600,17 @@ impl TypeInferenceEngine {
             | "atan" | "atan2" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
             | "atanh" | "degrees" | "radians" | "e" | "pi" | "hypot" | "rand"
             | "randn" | "random" | "bround" => Double,
-            // abs / round / signum preserve arg type (identity on numeric).
-            "abs" | "round" | "sign" | "signum" | "ceil" | "ceiling" | "floor"
-            | "greatest" | "least" | "nvl" | "coalesce" | "nullif" | "nvl2"
-            | "if" | "ifnull" => first_arg_type.cloned().unwrap_or(Unresolved),
+            // abs preserves arg type; ceil/floor return Long (Spark rule);
+            // signum returns Double; round returns arg type.
+            "abs" | "round" | "greatest" | "least" | "nvl" | "coalesce"
+            | "nullif" | "nvl2" | "if" | "ifnull" => {
+                first_arg_type.cloned().unwrap_or(Unresolved)
+            }
+            "ceil" | "ceiling" | "floor" => Long,
+            "sign" | "signum" => Double,
+            "factorial" => Long,
             "mod" | "pmod" => first_arg_type.cloned().unwrap_or(Integer),
-            "factorial" | "bin" | "hex" => String,
+            "bin" | "hex" => String,
             "unhex" => Binary,
             "conv" => String,
             "shiftleft" | "shiftright" | "shiftrightunsigned" | "bitwise_and"

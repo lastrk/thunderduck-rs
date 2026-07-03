@@ -1215,6 +1215,40 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `substr` — DuckDB canonical form is `substring` (both
         // spellings accepted actually, but standardize).
         "substr" => "substring",
+        // Spark ceil/floor return Long; DuckDB returns Double. Cast to
+        // BIGINT so schema matches type_inference.
+        "ceil" | "ceiling" => {
+            if f.args.is_empty() {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`ceil` requires at least 1 argument".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            return Ok(format!("CAST(ceil({a}) AS BIGINT)"));
+        }
+        "floor" => {
+            if f.args.is_empty() {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`floor` requires at least 1 argument".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            return Ok(format!("CAST(floor({a}) AS BIGINT)"));
+        }
+        // Spark `signum` returns Double; DuckDB `sign` returns the arg's
+        // type. Cast to DOUBLE at emission.
+        "sign" | "signum" => {
+            if f.args.is_empty() {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`signum` requires at least 1 argument".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            return Ok(format!("CAST(sign({a}) AS DOUBLE)"));
+        }
         // Spark HOF (higher-order function) remaps — DuckDB uses `list_*`.
         "transform" => "list_transform",
         "filter" => "list_filter",
@@ -1427,8 +1461,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let b = render_expr(&f.args[1], schema)?;
             return Ok(format!("xor({a}, {b})"));
         }
-        // Spark `signum` → DuckDB `sign`.
-        "signum" => "sign",
+        // (signum handled above with explicit DOUBLE cast.)
         // Spark's `sha2(str, bits)` → DuckDB `sha256(str)` (Spark defaults
         // bits=256; we ignore the bits arg — non-256 surfaces later as
         // per-case follow-up if it fires).

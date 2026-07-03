@@ -698,17 +698,36 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             let typed_input = analyze_node(*input, base_types)?;
             let grouping = resolve_expr_list(grouping, &typed_input.resolved_schema)?;
             let aggregates = resolve_expr_list(aggregates, &typed_input.resolved_schema)?;
-            // Output schema — one field per aggregate expression (grouping
-            // columns fold into `aggregates` at Slice A.2 per invariant).
-            let output_fields: Vec<StructField> = aggregates
-                .iter()
-                .map(|e| {
-                    let name = expression_output_name(e);
-                    let dt = e.data_type(&typed_input.resolved_schema);
-                    let nullable = e.nullable(&typed_input.resolved_schema);
-                    StructField::new(name, dt, nullable)
-                })
-                .collect();
+            // Output schema construction:
+            // SparkSQL path folds grouping cols into `aggregates` already
+            // (per CommonOp::Aggregate invariant), so output = aggregates as-is.
+            // DataFrame path keeps them separate — detect by seeing whether
+            // the aggregates list already begins with the grouping's output
+            // names; if not, prepend grouping. Empty grouping = global agg
+            // (no unfolding needed).
+            let agg_names: Vec<String> =
+                aggregates.iter().map(expression_output_name).collect();
+            let group_names: Vec<String> =
+                grouping.iter().map(expression_output_name).collect();
+            let already_folded = grouping.is_empty()
+                || group_names
+                    .iter()
+                    .all(|gn| agg_names.iter().any(|an| an.eq_ignore_ascii_case(gn)));
+            let mut output_fields: Vec<StructField> = Vec::new();
+            if !already_folded {
+                for g in &grouping {
+                    let name = expression_output_name(g);
+                    let dt = g.data_type(&typed_input.resolved_schema);
+                    let nullable = g.nullable(&typed_input.resolved_schema);
+                    output_fields.push(StructField::new(name, dt, nullable));
+                }
+            }
+            for e in &aggregates {
+                let name = expression_output_name(e);
+                let dt = e.data_type(&typed_input.resolved_schema);
+                let nullable = e.nullable(&typed_input.resolved_schema);
+                output_fields.push(StructField::new(name, dt, nullable));
+            }
             let output_schema = StructType::new(output_fields);
             Ok(TypedAst {
                 op: TypedOp::Aggregate {

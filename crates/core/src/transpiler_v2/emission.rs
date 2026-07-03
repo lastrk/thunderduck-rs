@@ -1554,11 +1554,46 @@ fn render_aggregate_op(
     // are pure aggregate calls; grouping carries the keys. Both cases emit
     // identically: SELECT the full `aggregates` list; the GROUP BY clause
     // uses `grouping` when present.
+    // Mirror the analyzer's "unfold DataFrame-path grouping" logic — if
+    // the aggregates list doesn't already start with the grouping cols'
+    // output names, prepend them to the SELECT list so the emitted column
+    // count matches the resolved schema.
+    let agg_names: Vec<String> = aggregates
+        .iter()
+        .map(|e| match e {
+            Expression::Alias(a) => a.alias.clone(),
+            Expression::ColumnReference(c) => c.name.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    let group_names: Vec<String> = grouping
+        .iter()
+        .map(|e| match e {
+            Expression::Alias(a) => a.alias.clone(),
+            Expression::ColumnReference(c) => c.name.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    let already_folded = grouping.is_empty()
+        || group_names
+            .iter()
+            .all(|gn| !gn.is_empty() && agg_names.iter().any(|an| an.eq_ignore_ascii_case(gn)));
     let mut slots = String::new();
-    for (i, agg) in aggregates.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    if !already_folded {
+        for g in grouping {
+            if !first {
+                slots.push_str(", ");
+            }
+            first = false;
+            slots.push_str(&render_projection_slot(g, input_schema)?);
+        }
+    }
+    for agg in aggregates {
+        if !first {
             slots.push_str(", ");
         }
+        first = false;
         slots.push_str(&render_projection_slot(agg, input_schema)?);
     }
     let mut sql = format!("SELECT {slots} FROM ({child_sql}) AS __td_agg");

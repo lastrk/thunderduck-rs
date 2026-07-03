@@ -599,7 +599,7 @@ impl TypeInferenceEngine {
             "like" | "ilike" | "rlike" | "regexp_like" | "contains" | "startswith"
             | "starts_with" | "endswith" | "ends_with" | "isnull" | "isnotnull"
             | "isnan" | "eqnullsafe" => Boolean,
-            "split" => DataType::Array(Box::new(String), true),
+            "split" => DataType::Array(Box::new(String), false),
             "sha" | "sha1" | "sha2" | "md5" | "crc32" => String,
 
             // ── Math functions ───────────────────────────────────────────

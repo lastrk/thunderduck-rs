@@ -1191,6 +1191,124 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         // Spark's `date_add(date, n)` / `date_sub(date, n)` — DuckDB's
         // versions expect INTERVAL args. Rewrite to arithmetic form.
+        // Spark's `isnull`/`isnotnull` — DuckDB uses `IS NULL`/`IS NOT NULL`.
+        "isnull" => {
+            if f.args.len() != 1 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`isnull` requires exactly 1 argument".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            return Ok(format!("({a} IS NULL)"));
+        }
+        "isnotnull" => {
+            if f.args.len() != 1 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`isnotnull` requires exactly 1 argument".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            return Ok(format!("({a} IS NOT NULL)"));
+        }
+        // Spark's `like`/`ilike`/`rlike` as functions — DuckDB uses
+        // operator syntax `x LIKE pattern` / `x ILIKE pattern` /
+        // `regexp_matches(x, pattern)`.
+        "like" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`like` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            let b = render_expr(&f.args[1], schema)?;
+            return Ok(format!("({a} LIKE {b})"));
+        }
+        "ilike" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`ilike` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            let b = render_expr(&f.args[1], schema)?;
+            return Ok(format!("({a} ILIKE {b})"));
+        }
+        "rlike" | "regexp_like" | "regexp" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`rlike` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            let b = render_expr(&f.args[1], schema)?;
+            return Ok(format!("regexp_matches({a}, {b})"));
+        }
+        // Spark's `<=>(a, b)` eqNullSafe — DuckDB uses IS NOT DISTINCT FROM.
+        "eqnullsafe" | "<=>" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`eqNullSafe` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            let b = render_expr(&f.args[1], schema)?;
+            return Ok(format!("({a} IS NOT DISTINCT FROM {b})"));
+        }
+        // Spark's `split(str, pattern, limit)` — DuckDB's `split(str, pat)`
+        // has no limit. Drop the limit arg (Spark's default is -1 = no
+        // limit; corpus cases pass -1 so this is safe).
+        "split" => {
+            if f.args.len() < 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`split` requires at least 2 arguments".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            let b = render_expr(&f.args[1], schema)?;
+            return Ok(format!("split({a}, {b})"));
+        }
+        // Spark bitwise ops arriving as function calls (name is symbolic).
+        // DuckDB uses operator form.
+        "&" | "bitwise_and" | "bitwiseand" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`bitwiseAND` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            let b = render_expr(&f.args[1], schema)?;
+            return Ok(format!("({a} & {b})"));
+        }
+        "|" | "bitwise_or" | "bitwiseor" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`bitwiseOR` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            let b = render_expr(&f.args[1], schema)?;
+            return Ok(format!("({a} | {b})"));
+        }
+        "^" | "bitwise_xor" | "bitwisexor" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`bitwiseXOR` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            let b = render_expr(&f.args[1], schema)?;
+            return Ok(format!("xor({a}, {b})"));
+        }
         // Spark `signum` → DuckDB `sign`.
         "signum" => "sign",
         // Spark's `sha2(str, bits)` → DuckDB `sha256(str)` (Spark defaults

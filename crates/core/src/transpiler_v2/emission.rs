@@ -1283,6 +1283,20 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let haystack = render_expr(&f.args[1], schema)?;
             return Ok(format!("strpos({haystack}, {needle})"));
         }
+        // Spark's `date_format(date, fmt)` → DuckDB `strftime(date, fmt)`.
+        // Note: Spark uses Java SimpleDateFormat tokens (yyyy/MM/dd) while
+        // DuckDB uses strftime tokens (%Y/%m/%d). We do a best-effort
+        // token translation for the most common patterns; complex format
+        // strings will diverge and require per-case follow-ups.
+        "date_format" if f.args.len() == 2 => {
+            let d = render_expr(&f.args[0], schema)?;
+            let fmt = render_expr(&f.args[1], schema)?;
+            // Translate Spark tokens to strftime tokens at emission time
+            // — supports yyyy/MM/dd/HH/mm/ss and common variants.
+            return Ok(format!(
+                "strftime({d}, replace(replace(replace(replace(replace(replace(replace(replace({fmt}, 'yyyy', '%Y'), 'MM', '%m'), 'dd', '%d'), 'HH', '%H'), 'mm', '%M'), 'ss', '%S'), 'yy', '%y'), 'a', '%p'))"
+            ));
+        }
         // Spark's `trunc(date, format)` → DuckDB `date_trunc(format, date)`.
         // Spark's arg order is (date, fmt); DuckDB's is (fmt, date).
         "trunc" if f.args.len() == 2 => {

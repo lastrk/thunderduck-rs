@@ -656,7 +656,8 @@ impl TypeInferenceEngine {
             | "list_contains" => Boolean,
 
             // ── Type predicates / control ───────────────────────────────
-            "typeof" | "spark_partition_id" => String,
+            "typeof" => String,
+            "spark_partition_id" => Integer,
             "monotonically_increasing_id" => Long,
 
             // Slice A.1 seed: everything else is unresolved.

@@ -1676,10 +1676,26 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         | "var_pop" | "bit_and" | "bit_or" | "bit_xor" | "bool_and" | "bool_or"
         | "skewness" | "kurtosis" | "corr" | "covar_samp" | "covar_pop"
         | "regr_slope" | "regr_r2" | "regr_intercept" | "regr_avgx" | "regr_avgy"
-        | "regr_sxx" | "regr_sxy" | "regr_syy" | "median" => {
+        | "regr_sxx" | "regr_sxy" | "regr_syy" | "median" | "grouping"
+        | "grouping_id" => {
             (lower.as_str(), false)
         }
         "std" => ("stddev", false), // Spark alias for stddev
+        // Spark's `count_if(cond)` → DuckDB `count(*) FILTER (WHERE cond)`
+        // or simpler `SUM(CASE WHEN cond THEN 1 ELSE 0 END)`. DuckDB accepts
+        // `count_if` in recent versions, but safest to lower.
+        "count_if" => {
+            if f.args.len() != 1 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`count_if` requires exactly 1 argument".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            return Ok(format!(
+                "SUM(CASE WHEN {a} THEN 1 ELSE 0 END)"
+            ));
+        }
         // Spark's `mean` is an alias for `avg`; DuckDB accepts both — treat
         // both identically above. `count_distinct` and `sum_distinct` lower
         // to DISTINCT-flagged calls.

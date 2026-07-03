@@ -575,8 +575,62 @@ impl TypeInferenceEngine {
                 first_arg_type.unwrap_or(&Unresolved),
             ),
 
-            // Slice A.1 seed: everything else is unresolved. Slice C.2 grows
-            // the scalar function arms.
+            // ── String functions ─────────────────────────────────────────
+            // Most string functions return String; length family returns
+            // Integer; regexp / like family returns Boolean.
+            "concat" | "concat_ws" | "upper" | "lower" | "trim" | "ltrim" | "rtrim"
+            | "substr" | "substring" | "left" | "right" | "lpad" | "rpad" | "replace"
+            | "regexp_replace" | "regexp_extract" | "translate" | "reverse"
+            | "initcap" | "space" | "repeat" | "overlay" | "format_string"
+            | "format_number" | "base64" | "unbase64" | "url_encode" | "url_decode"
+            | "encode" | "decode" | "soundex" | "sentences" => String,
+            "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
+            | "levenshtein" | "instr" | "locate" | "position" | "ascii" | "unicode"
+            | "find_in_set" | "regexp_count" | "regexp_instr" => Integer,
+            "like" | "ilike" | "rlike" | "regexp_like" | "contains" | "startswith"
+            | "starts_with" | "endswith" | "ends_with" | "isnull" | "isnotnull"
+            | "isnan" | "eqnullsafe" => Boolean,
+            "split" => DataType::Array(Box::new(String), true),
+            "sha" | "sha1" | "sha2" | "md5" | "crc32" => String,
+
+            // ── Math functions ───────────────────────────────────────────
+            // Most math functions on numeric return Double.
+            "sqrt" | "cbrt" | "exp" | "expm1" | "ln" | "log" | "log10" | "log2"
+            | "log1p" | "pow" | "power" | "sin" | "cos" | "tan" | "asin" | "acos"
+            | "atan" | "atan2" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
+            | "atanh" | "degrees" | "radians" | "e" | "pi" | "hypot" | "rand"
+            | "randn" | "random" | "bround" => Double,
+            // abs / round / signum preserve arg type (identity on numeric).
+            "abs" | "round" | "sign" | "signum" | "ceil" | "ceiling" | "floor"
+            | "greatest" | "least" | "nvl" | "coalesce" | "nullif" | "nvl2"
+            | "if" | "ifnull" => first_arg_type.cloned().unwrap_or(Unresolved),
+            "mod" | "pmod" => first_arg_type.cloned().unwrap_or(Integer),
+            "factorial" | "bin" | "hex" => String,
+            "unhex" => Binary,
+            "conv" => String,
+            "shiftleft" | "shiftright" | "shiftrightunsigned" | "bitwise_and"
+            | "bitwise_or" | "bitwise_xor" | "bitwise_not" | "bit_count"
+            | "bit_length_arg" | "bitwise_or_agg" => {
+                first_arg_type.cloned().unwrap_or(Integer)
+            }
+
+            // ── Date/time functions ──────────────────────────────────────
+            "current_date" | "current_timestamp" | "now" => Timestamp,
+            "date_add" | "date_sub" | "add_months" | "months_between" | "next_day"
+            | "last_day" | "trunc" | "date_trunc" | "to_date" => Date,
+            "to_timestamp" | "from_unixtime" | "from_utc_timestamp" | "to_utc_timestamp"
+            | "make_timestamp" | "make_date" => Timestamp,
+            "date_format" | "date_part" => String,
+            "year" | "month" | "day" | "dayofmonth" | "dayofweek" | "dayofyear"
+            | "weekofyear" | "hour" | "minute" | "second" | "quarter" | "week"
+            | "datediff" | "unix_timestamp" | "unix_micros" | "unix_millis"
+            | "unix_seconds" | "extract" => Integer,
+
+            // ── Type predicates / control ───────────────────────────────
+            "typeof" | "spark_partition_id" => String,
+            "monotonically_increasing_id" => Long,
+
+            // Slice A.1 seed: everything else is unresolved.
             _ => Unresolved,
         }
     }

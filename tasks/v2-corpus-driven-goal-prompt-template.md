@@ -3,6 +3,15 @@
 **Purpose.** Reusable `/goal` prompt for driving Thunderduck's v2 restart to
 100% corpus green using **corpus-test-driven, diagnostic-first** iteration.
 
+Two documents form the corpus-driven pair:
+- **This file** — the `/goal` prompt template. Kept ≤4000 chars so it fits
+  the `/goal` size budget. Contains the mandatory pointer to the methodology
+  and the top-level Loop summary.
+- **`tasks/v2-corpus-driven-iteration-methodology.md`** — the detailed
+  per-pass discipline (Pick / Diagnose / Architect / Implement / Review+Perf,
+  5-iteration cap, HALT-AND-FLAG triggers, zero-DEFER rule, compiler-warning
+  discipline, pass-log format). MUST be read at pass start.
+
 Supersedes `v2-slice-goal-prompt-template.md`. The slice-based top-down
 approach was retired 2026-07-02 after 4 slices (A/B/C.1/E.0) produced 0
 corpus signal on their own scope-file estimates; a subsequent single
@@ -157,58 +166,41 @@ diagnostic hypothesis is wrong; re-run step 2 with fresh instrumentation.
 
 ---
 
-## Template (paste into `/goal` — 3900 chars including boilerplate)
+## Template (paste into `/goal` — externalized details keep it ≤4000 chars)
 
 ```
-/goal Drive Thunderduck v2 corpus to 100% e2e green via iterated
-/new-feature (diagnostic-first) passes
+/goal Drive Thunderduck v2 corpus to 100% e2e green via iterated /new-feature (diagnostic-first) passes
 
-**Primary goal.** 324/324 core_v2 corpus cases green
-(`tests/scripts/v2-progress.sh` reports 100%); every case matches Spark
-byte-identically per ADR-015.
-**Secondary goal (non-negotiable).** Zero DEFER items — review + perf
-findings closed in the pass they surface. No slice-based housekeeping.
+**Primary goal.** 324/324 core_v2 corpus cases green (`tests/scripts/v2-progress.sh` reports 100%); every case matches Spark byte-identically per ADR-015.
+
+**Secondary goal (non-negotiable).** Zero DEFER items — review + perf findings closed in the pass they surface. No new compiler warnings on files this pass modifies. No slice-based housekeeping.
+
+**Methodology (mandatory, read at pass start):** `tasks/v2-corpus-driven-iteration-methodology.md` — per-pass discipline (Pick / Diagnose / Architect / Implement / Review+Perf), 5-fix-iteration cap, HALT-AND-FLAG triggers, zero-DEFER rule, compiler-warning discipline, pass-log format.
+
+**Design authority:** `docs/thunderduck-rearchitect-ADRs.md` (ADR-000..ADR-022). Every fix cites applicable ADR.
+**Open decisions:** `tasks/v2-restart-open-decisions.md` — 13 RESOLVED. New gaps → Decision 14+ (HALT-AND-FLAG-3).
+**Inheritance checklist:** `tasks/v2-restart-inheritance-checklist.md` — every applicable item present by termination.
+**Pass log:** `tasks/v2-corpus-driven-pass-log.md` (append one entry per pass).
 
 **Baseline:** current git HEAD; run `v2-progress.sh` at start; record.
-**Design authority:** `docs/thunderduck-rearchitect-ADRs.md`
-(ADR-000..ADR-022). Every fix cites applicable ADR.
-**Open decisions:** `tasks/v2-restart-open-decisions.md` — 13 RESOLVED.
-New gaps → Decision 14+ (HALT-AND-FLAG-3).
-**Inheritance checklist:** `tasks/v2-restart-inheritance-checklist.md` —
-every applicable item present by termination.
-**Methodology:** `tasks/v2-corpus-driven-goal-prompt-template.md`.
 
-**Loop** (per pass):
-1. **Pick.** One corpus case (≤ 3 same-shape variants). Prefer highest-
-   cascade cluster from post-pass `v2-progress.sh` failure clustering.
-2. **Diagnose.** Run target with tracing instrumentation. Capture
-   layer-boundary snapshots (proto → CommonAst → TypedAst → SQL →
-   DuckDB result). If instrumentation missing at failure site, ADD it —
-   in scope for pass. Log `.agent-output/diagnostic-{case-id}.md`. Use
-   `rust-diagnostician` for multi-hypothesis investigation.
-3. **Architect** (via `/new-feature`). Reads diagnostic; cites ADRs +
-   checklist sections; identifies smallest correct fix (analyzer /
-   converter / type inference / emission / runtime); enumerates every
-   change with file:line.
-4. **Implement.** Quality Gate (CLAUDE.md); target case green AND full
-   `v2-progress.sh` no-regress.
-5. **Review + Perf.** ALL findings CLOSE_NOW_IN_THIS_PASS. Zero DEFER.
-   Findings requiring unrelated-code touch become dedicated follow-up
-   passes queued immediately after — not deferred indefinitely.
+**Loop (summary — see methodology for full detail):**
+1. **Pick.** One corpus case (≤ 3 same-shape variants). Highest-cascade cluster wins.
+2. **Diagnose.** Invoke `rust-diagnostician` agent. Capture layer-boundary snapshots (proto → CommonAst → TypedAst → SQL → DuckDB result). Add `tracing::debug!` if instrumentation missing — in scope for pass. Log `.agent-output/diagnostic-{case-id}.md`.
+3. **Architect.** Dispatch `/new-feature` skill. Architect cites ADRs + checklist sections; identifies smallest correct fix (converter / analyzer / type-inference / emission / runtime); enumerates changes with file:line.
+4. **Implement.** Quality Gate (CLAUDE.md §Quality Gate) green. Target case green. Full `v2-progress.sh` no-regress. Zero new compiler warnings on modified files.
+5. **Review + Perf.** Both agents run. ALL findings CLOSE_NOW_IN_THIS_PASS. Zero DEFER. Findings on unrelated code → dedicated follow-up pass queued immediately after.
 
 **Per-pass HALT-AND-FLAG:**
-- 5 fix iterations without target green → re-diagnose.
-- Upstream substrate gap in a prior pass → reopen it.
-- New architectural decision → append as Decision 14+.
+- 5 fix iterations without target green → re-diagnose (§2).
+- Upstream substrate missing that a prior pass should have supplied → reopen the prior pass.
+- New architectural decision → append as Decision 14+ in open-decisions.md.
 
-**Terminate when:** 324/324; no regressions; INV1..INV10 green; Quality
-Gate green; every applicable checklist item present; zero DEFER.
+**Terminate when:** 324/324; no regressions; INV1..INV10 active + green; Quality Gate green (including no new warnings on touched files); every applicable checklist item present; zero DEFER items outstanding.
 
-**Non-goals:** legacy mods (ADR-022), fallback plumbing, slice-based
-scoping, commits without user approval, dead-code arms.
+**Non-goals:** legacy mods (ADR-022), fallback plumbing, slice-based scoping, commits without user approval, dead-code arms, silencing compiler warnings via `#[allow(...)]` when the fix is trivial.
 
-**On termination:** update `v2_progress.md`; dev journal + TOC entry;
-NO commits without user approval.
+**On termination:** update `v2_progress.md`; add a dev journal entry (`docs/dev_journal/YYYY-MM-DD-corpus-100-percent.md`); extend `docs/dev-journal-toc.md`. **Do NOT commit without user approval** (CLAUDE.md).
 ```
 
 ## Design notes

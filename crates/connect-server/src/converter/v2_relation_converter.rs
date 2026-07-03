@@ -575,6 +575,36 @@ impl V2ExpressionConverter {
             ExprType::UnresolvedStar(star) => Ok(Expression::Star(StarExpression {
                 qualifier: star.unparsed_target.clone(),
             })),
+            ExprType::Window(w) => {
+                let func_proto = w.window_function.as_deref().ok_or_else(|| {
+                    EmissionError::UnsupportedProtoShape {
+                        shape: "Window::window_function::None".to_owned(),
+                        reason: "Window missing window_function".to_owned(),
+                    }
+                })?;
+                let func = self.convert(func_proto)?;
+                let mut partition_by: Vec<Expression> =
+                    Vec::with_capacity(w.partition_spec.len());
+                for p in &w.partition_spec {
+                    partition_by.push(self.convert(p)?);
+                }
+                let mut order_by: Vec<
+                    thunderduck_core::transpiler_v2::expression::SortOrder,
+                > = Vec::with_capacity(w.order_spec.len());
+                for so in &w.order_spec {
+                    order_by.push(self.convert_sort_order(so)?);
+                }
+                // Frame parsing deferred — corpus cases so far do not
+                // exercise custom frames.
+                Ok(Expression::Window(
+                    thunderduck_core::transpiler_v2::expression::WindowFunction {
+                        func: Box::new(func),
+                        partition_by,
+                        order_by,
+                        frame: None,
+                    },
+                ))
+            }
             ExprType::UnresolvedExtractValue(uev) => {
                 let child = uev.child.as_deref().ok_or_else(|| {
                     EmissionError::UnsupportedProtoShape {

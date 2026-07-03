@@ -248,6 +248,35 @@ pub enum TypedOp {
         /// Optional subset of columns.
         on_columns: Vec<String>,
     },
+    /// `df.na.fill`. Schema-transparent (nullability MAY tighten but we
+    /// leave it as-is; emission uses COALESCE which preserves the arg's
+    /// declared nullability).
+    NaFill {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// Subset of columns.
+        cols: Vec<String>,
+        /// Fill values.
+        values: Vec<Expression>,
+    },
+    /// `df.na.drop`. Schema-transparent.
+    NaDrop {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// Subset of columns.
+        cols: Vec<String>,
+        /// Optional min non-nulls.
+        min_non_nulls: Option<i32>,
+    },
+    /// `df.na.replace`. Schema-transparent.
+    NaReplace {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// Subset of columns.
+        cols: Vec<String>,
+        /// (old, new) pairs.
+        replacements: Vec<(Expression, Expression)>,
+    },
 }
 
 /// A typed attribute — the resolved shape of a single output column.
@@ -453,6 +482,9 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
         TypedOp::AliasedRelation { input, .. } => has_resolved_schema(input),
         TypedOp::WithColumnsRenamed { input, .. } => has_resolved_schema(input),
         TypedOp::Deduplicate { input, .. } => has_resolved_schema(input),
+        TypedOp::NaFill { input, .. }
+        | TypedOp::NaDrop { input, .. }
+        | TypedOp::NaReplace { input, .. } => has_resolved_schema(input),
         TypedOp::SingleRow | TypedOp::TableScan { .. } | TypedOp::FileScan { .. } => true,
     }
 }
@@ -733,6 +765,52 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                 op: TypedOp::WithColumns {
                     input: Box::new(typed_input),
                     assignments: resolved_assignments,
+                },
+                resolved_schema: output_schema,
+            })
+        }
+
+        // ── NA family (schema-transparent) ───────────────────────────────
+        CommonOp::NaFill { input, cols, values } => {
+            let typed_input = analyze_node(*input, base_types)?;
+            let output_schema = typed_input.resolved_schema.clone();
+            Ok(TypedAst {
+                op: TypedOp::NaFill {
+                    input: Box::new(typed_input),
+                    cols,
+                    values,
+                },
+                resolved_schema: output_schema,
+            })
+        }
+        CommonOp::NaDrop {
+            input,
+            cols,
+            min_non_nulls,
+        } => {
+            let typed_input = analyze_node(*input, base_types)?;
+            let output_schema = typed_input.resolved_schema.clone();
+            Ok(TypedAst {
+                op: TypedOp::NaDrop {
+                    input: Box::new(typed_input),
+                    cols,
+                    min_non_nulls,
+                },
+                resolved_schema: output_schema,
+            })
+        }
+        CommonOp::NaReplace {
+            input,
+            cols,
+            replacements,
+        } => {
+            let typed_input = analyze_node(*input, base_types)?;
+            let output_schema = typed_input.resolved_schema.clone();
+            Ok(TypedAst {
+                op: TypedOp::NaReplace {
+                    input: Box::new(typed_input),
+                    cols,
+                    replacements,
                 },
                 resolved_schema: output_schema,
             })

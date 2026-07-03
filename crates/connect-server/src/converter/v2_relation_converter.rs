@@ -91,6 +91,9 @@ impl V2RelationConverter {
             RelType::SubqueryAlias(sa) => self.convert_subquery_alias(sa),
             RelType::WithColumnsRenamed(wcr) => self.convert_with_columns_renamed(wcr),
             RelType::Deduplicate(d) => self.convert_deduplicate(d),
+            RelType::FillNa(f) => self.convert_fill_na(f),
+            RelType::DropNa(d) => self.convert_drop_na(d),
+            RelType::Replace(r) => self.convert_replace(r),
             // Cosmetic ops per Spark 4 semantics — semantically no-op.
             // Thunderduck ignores them and continues with the input relation
             // (ADR-001 "result-irrelevant cosmetic" carve-out).
@@ -128,6 +131,71 @@ impl V2RelationConverter {
                 reason: format!("{ctx} has no input relation"),
             }),
         }
+    }
+
+    fn convert_fill_na(&mut self, f: &proto::NaFill) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(f.input.as_deref(), "NaFill")?;
+        let mut values: Vec<thunderduck_core::transpiler_v2::Expression> =
+            Vec::with_capacity(f.values.len());
+        for lit in &f.values {
+            // Wrap each Literal into a proto::Expression for the shared
+            // literal-converter path.
+            let expr = proto::Expression {
+                expr_type: Some(proto::expression::ExprType::Literal(lit.clone())),
+                ..Default::default()
+            };
+            values.push(self.expr.convert(&expr)?);
+        }
+        Ok(CommonAst::new(CommonOp::NaFill {
+            input: Box::new(input),
+            cols: f.cols.clone(),
+            values,
+        }))
+    }
+
+    fn convert_drop_na(&mut self, d: &proto::NaDrop) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(d.input.as_deref(), "NaDrop")?;
+        Ok(CommonAst::new(CommonOp::NaDrop {
+            input: Box::new(input),
+            cols: d.cols.clone(),
+            min_non_nulls: d.min_non_nulls,
+        }))
+    }
+
+    fn convert_replace(&mut self, r: &proto::NaReplace) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(r.input.as_deref(), "NaReplace")?;
+        let mut replacements: Vec<(
+            thunderduck_core::transpiler_v2::Expression,
+            thunderduck_core::transpiler_v2::Expression,
+        )> = Vec::with_capacity(r.replacements.len());
+        for rep in &r.replacements {
+            let old_lit = rep.old_value.as_ref().ok_or_else(|| {
+                EmissionError::UnsupportedProtoShape {
+                    shape: "NaReplace::old_value::None".to_owned(),
+                    reason: "NaReplace replacement missing old_value".to_owned(),
+                }
+            })?;
+            let new_lit = rep.new_value.as_ref().ok_or_else(|| {
+                EmissionError::UnsupportedProtoShape {
+                    shape: "NaReplace::new_value::None".to_owned(),
+                    reason: "NaReplace replacement missing new_value".to_owned(),
+                }
+            })?;
+            let old_expr = proto::Expression {
+                expr_type: Some(proto::expression::ExprType::Literal(old_lit.clone())),
+                ..Default::default()
+            };
+            let new_expr = proto::Expression {
+                expr_type: Some(proto::expression::ExprType::Literal(new_lit.clone())),
+                ..Default::default()
+            };
+            replacements.push((self.expr.convert(&old_expr)?, self.expr.convert(&new_expr)?));
+        }
+        Ok(CommonAst::new(CommonOp::NaReplace {
+            input: Box::new(input),
+            cols: r.cols.clone(),
+            replacements,
+        }))
     }
 
     fn convert_deduplicate(

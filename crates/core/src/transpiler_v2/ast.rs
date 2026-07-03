@@ -199,6 +199,39 @@ pub enum CommonOp {
         children: Vec<CommonAst>,
     },
 
+    /// `df.na.fill(values, subset=cols)`. `values` has length 1 (fill all
+    /// subset cols with that scalar) or length == cols.len() (per-column).
+    NaFill {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// Subset of column names (empty = all columns of matching type).
+        cols: Vec<String>,
+        /// Fill values (Literal expressions).
+        values: Vec<Expression>,
+    },
+
+    /// `df.na.drop(how, subset=cols, thresh)`. Row is dropped if fewer than
+    /// `min_non_nulls` of the subset cols are non-null. When `min_non_nulls`
+    /// is None, all subset cols must be non-null (how="any").
+    NaDrop {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// Subset of columns to inspect.
+        cols: Vec<String>,
+        /// Optional minimum non-null count.
+        min_non_nulls: Option<i32>,
+    },
+
+    /// `df.na.replace([old], [new], subset=cols)`.
+    NaReplace {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// Subset of column names.
+        cols: Vec<String>,
+        /// (old, new) pairs.
+        replacements: Vec<(Expression, Expression)>,
+    },
+
     /// `df.dropDuplicates([cols])` / `df.distinct()`. `on_columns` empty ⇒
     /// dedupe on the full row (`SELECT DISTINCT *`). Non-empty ⇒
     /// `SELECT DISTINCT ON (cols) * FROM ...`.

@@ -104,6 +104,21 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             render_with_columns_renamed(input, renames)
         }
         TypedOp::Deduplicate { input, on_columns } => render_deduplicate(input, on_columns),
+        TypedOp::NaFill {
+            input,
+            cols,
+            values,
+        } => render_na_fill(input, cols, values),
+        TypedOp::NaDrop {
+            input,
+            cols,
+            min_non_nulls,
+        } => render_na_drop(input, cols, *min_non_nulls),
+        TypedOp::NaReplace {
+            input,
+            cols,
+            replacements,
+        } => render_na_replace(input, cols, replacements),
 
         // ── Aggregate (operator + primitive function arms) ───────────────
         TypedOp::Aggregate {
@@ -702,6 +717,152 @@ fn render_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<String
     }
     Ok(format!(
         "SELECT * EXCLUDE ({dropped}) FROM ({child_sql}) AS __td_drop"
+    ))
+}
+
+/// Render `df.na.fill(values, subset=cols)`. For each column in the input
+/// schema, if it's in `cols` (or `cols` is empty and it's the first value's
+/// compatible type), emit `COALESCE(col, value) AS col`; else pass through.
+/// Single-value form (`values.len()==1`) applies that value to all cols in
+/// the subset. Per-column form (`values.len()==cols.len()`) pairs
+/// position-wise.
+fn render_na_fill(
+    input: &TypedAst,
+    cols: &[String],
+    values: &[Expression],
+) -> Result<String, EmissionError> {
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    let input_schema = &input.resolved_schema;
+    if values.is_empty() {
+        return Err(EmissionError::UnsupportedOp {
+            op: "NaFill".to_owned(),
+            reason: "NaFill requires at least one fill value".to_owned(),
+        });
+    }
+    // Build a per-column value map.
+    let value_for = |col_name: &str| -> Option<&Expression> {
+        if cols.is_empty() {
+            // Fill all columns with the single value (Spark accepts this
+            // only when the fill value's type matches; we let DuckDB check).
+            Some(&values[0])
+        } else if values.len() == 1 {
+            if cols.iter().any(|c| c.eq_ignore_ascii_case(col_name)) {
+                Some(&values[0])
+            } else {
+                None
+            }
+        } else {
+            for (c, v) in cols.iter().zip(values.iter()) {
+                if c.eq_ignore_ascii_case(col_name) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+    };
+    let mut slots = String::new();
+    for (i, f) in input_schema.fields.iter().enumerate() {
+        if i > 0 {
+            slots.push_str(", ");
+        }
+        let name_q = quote_ident(&f.name);
+        if let Some(v) = value_for(&f.name) {
+            let v_sql = render_expr(v, input_schema)?;
+            slots.push_str(&format!("COALESCE({name_q}, {v_sql}) AS {name_q}"));
+        } else {
+            slots.push_str(&name_q);
+        }
+    }
+    Ok(format!(
+        "SELECT {slots} FROM ({child_sql}) AS __td_nafill"
+    ))
+}
+
+/// Render `df.na.drop(how, subset, thresh)`. `min_non_nulls=None` means
+/// how="any" (drop if ANY subset col is null); `Some(1)` means how="all"
+/// (drop only if ALL subset cols are null); other values are Spark's
+/// `thresh` semantic.
+fn render_na_drop(
+    input: &TypedAst,
+    cols: &[String],
+    min_non_nulls: Option<i32>,
+) -> Result<String, EmissionError> {
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    let input_schema = &input.resolved_schema;
+    // Resolve subset — empty means all columns.
+    let subset: Vec<&str> = if cols.is_empty() {
+        input_schema.fields.iter().map(|f| f.name.as_str()).collect()
+    } else {
+        cols.iter().map(|s| s.as_str()).collect()
+    };
+    if subset.is_empty() {
+        return Ok(format!(
+            "SELECT * FROM ({child_sql}) AS __td_nadrop"
+        ));
+    }
+    let condition = if let Some(thresh) = min_non_nulls {
+        // Row kept iff at least `thresh` of subset cols are non-null.
+        // Emit: (CAST(col1 IS NOT NULL AS INT) + ... ) >= thresh.
+        let mut sum = String::new();
+        for (i, c) in subset.iter().enumerate() {
+            if i > 0 {
+                sum.push_str(" + ");
+            }
+            let q = quote_ident(c);
+            sum.push_str(&format!("CAST({q} IS NOT NULL AS INTEGER)"));
+        }
+        format!("({sum}) >= {thresh}")
+    } else {
+        // how="any": all subset cols must be non-null.
+        let mut cond = String::new();
+        for (i, c) in subset.iter().enumerate() {
+            if i > 0 {
+                cond.push_str(" AND ");
+            }
+            let q = quote_ident(c);
+            cond.push_str(&format!("{q} IS NOT NULL"));
+        }
+        cond
+    };
+    Ok(format!(
+        "SELECT * FROM ({child_sql}) AS __td_nadrop WHERE {condition}"
+    ))
+}
+
+/// Render `df.na.replace([old_vals], [new_vals], subset=cols)`. Emit
+/// `SELECT CASE WHEN col = old1 THEN new1 ... ELSE col END AS col` for each
+/// column in subset (or all cols if empty).
+fn render_na_replace(
+    input: &TypedAst,
+    cols: &[String],
+    replacements: &[(Expression, Expression)],
+) -> Result<String, EmissionError> {
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    let input_schema = &input.resolved_schema;
+    let in_subset = |name: &str| -> bool {
+        cols.is_empty() || cols.iter().any(|c| c.eq_ignore_ascii_case(name))
+    };
+    let mut slots = String::new();
+    for (i, f) in input_schema.fields.iter().enumerate() {
+        if i > 0 {
+            slots.push_str(", ");
+        }
+        let name_q = quote_ident(&f.name);
+        if in_subset(&f.name) && !replacements.is_empty() {
+            let mut case = String::from("CASE ");
+            for (old, new) in replacements {
+                let old_sql = render_expr(old, input_schema)?;
+                let new_sql = render_expr(new, input_schema)?;
+                case.push_str(&format!("WHEN {name_q} = {old_sql} THEN {new_sql} "));
+            }
+            case.push_str(&format!("ELSE {name_q} END AS {name_q}"));
+            slots.push_str(&case);
+        } else {
+            slots.push_str(&name_q);
+        }
+    }
+    Ok(format!(
+        "SELECT {slots} FROM ({child_sql}) AS __td_nareplace"
     ))
 }
 

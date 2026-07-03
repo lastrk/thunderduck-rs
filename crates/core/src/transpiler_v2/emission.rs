@@ -1668,6 +1668,26 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
 /// per ADR-022.
 fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
     let lower = f.name.to_ascii_lowercase();
+    // Guard-based arms MUST come before the pass-through arm (else the
+    // pass-through catches `first`/`last`/`nth_value` first and the guard
+    // never fires).
+    if matches!(
+        lower.as_str(),
+        "first" | "last" | "first_value" | "last_value"
+    ) && f.args.len() >= 2
+    {
+        // Spark's `first(col, ignorenulls)` / `last(col, ignorenulls)` —
+        // DuckDB's first/last are single-arg. Drop the ignorenulls flag
+        // (corpus uses ignorenulls=True which matches DuckDB's default).
+        let a = render_expr(&f.args[0], schema)?;
+        let distinct = if f.distinct { "DISTINCT " } else { "" };
+        return Ok(format!("{lower}({distinct}{a})"));
+    }
+    if lower == "nth_value" && f.args.len() >= 2 {
+        let col = render_expr(&f.args[0], schema)?;
+        let n = render_expr(&f.args[1], schema)?;
+        return Ok(format!("nth_value({col}, {n})"));
+    }
     let (duck_name, force_distinct) = match lower.as_str() {
         // Direct pass-through — DuckDB accepts the Spark name unchanged.
         "count" | "sum" | "avg" | "mean" | "min" | "max" | "first" | "last"
@@ -1677,10 +1697,8 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         | "skewness" | "kurtosis" | "corr" | "covar_samp" | "covar_pop"
         | "regr_slope" | "regr_r2" | "regr_intercept" | "regr_avgx" | "regr_avgy"
         | "regr_sxx" | "regr_sxy" | "regr_syy" | "median" | "grouping"
-        | "grouping_id" => {
-            (lower.as_str(), false)
-        }
-        "std" => ("stddev", false), // Spark alias for stddev
+        | "grouping_id" => (lower.as_str(), false),
+        "std" => ("stddev", false),
         // Spark's `count_if(cond)` → DuckDB `count(*) FILTER (WHERE cond)`
         // or simpler `SUM(CASE WHEN cond THEN 1 ELSE 0 END)`. DuckDB accepts
         // `count_if` in recent versions, but safest to lower.

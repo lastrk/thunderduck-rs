@@ -1110,6 +1110,30 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let haystack = render_expr(&f.args[1], schema)?;
             return Ok(format!("strpos({haystack}, {needle})"));
         }
+        // Spark's `date_add(date, n)` / `date_sub(date, n)` — DuckDB's
+        // versions expect INTERVAL args. Rewrite to arithmetic form.
+        "date_add" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`date_add` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let d = render_expr(&f.args[0], schema)?;
+            let n = render_expr(&f.args[1], schema)?;
+            return Ok(format!("({d} + INTERVAL ({n}) DAY)"));
+        }
+        "date_sub" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`date_sub` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let d = render_expr(&f.args[0], schema)?;
+            let n = render_expr(&f.args[1], schema)?;
+            return Ok(format!("({d} - INTERVAL ({n}) DAY)"));
+        }
         // Spark's `overlay(str, replacement, position[, length])` maps to
         // the SQL-standard `OVERLAY(str PLACING replacement FROM position
         // [FOR length])` keyword form.

@@ -1665,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_aggregate_rollup_returns_unsupported_proto_shape() {
+    fn convert_aggregate_rollup_produces_rollup_kind() {
         let input = table_scan_rel("t");
         let a = rel(proto::relation::RelType::Aggregate(Box::new(
             proto::Aggregate {
@@ -1678,12 +1678,18 @@ mod tests {
             },
         )));
         let mut c = V2RelationConverter::new();
-        let err = c.convert(&a).unwrap_err();
-        assert!(matches!(err, EmissionError::UnsupportedProtoShape { .. }));
+        let out = c.convert(&a).expect("convert Aggregate::Rollup");
+        match out.op {
+            CommonOp::Aggregate { grouping_kind, .. } => assert_eq!(
+                grouping_kind,
+                thunderduck_core::transpiler_v2::ast::GroupingKind::Rollup
+            ),
+            _ => panic!("expected Aggregate"),
+        }
     }
 
     #[test]
-    fn convert_aggregate_cube_returns_unsupported_proto_shape() {
+    fn convert_aggregate_cube_produces_cube_kind() {
         let input = table_scan_rel("t");
         let a = rel(proto::relation::RelType::Aggregate(Box::new(
             proto::Aggregate {
@@ -1696,14 +1702,18 @@ mod tests {
             },
         )));
         let mut c = V2RelationConverter::new();
-        assert!(matches!(
-            c.convert(&a).unwrap_err(),
-            EmissionError::UnsupportedProtoShape { .. }
-        ));
+        let out = c.convert(&a).expect("convert Aggregate::Cube");
+        match out.op {
+            CommonOp::Aggregate { grouping_kind, .. } => assert_eq!(
+                grouping_kind,
+                thunderduck_core::transpiler_v2::ast::GroupingKind::Cube
+            ),
+            _ => panic!("expected Aggregate"),
+        }
     }
 
     #[test]
-    fn convert_aggregate_grouping_sets_returns_unsupported_proto_shape() {
+    fn convert_aggregate_grouping_sets_produces_grouping_sets_kind() {
         let input = table_scan_rel("t");
         let a = rel(proto::relation::RelType::Aggregate(Box::new(
             proto::Aggregate {
@@ -1716,10 +1726,14 @@ mod tests {
             },
         )));
         let mut c = V2RelationConverter::new();
-        assert!(matches!(
-            c.convert(&a).unwrap_err(),
-            EmissionError::UnsupportedProtoShape { .. }
-        ));
+        let out = c.convert(&a).expect("convert Aggregate::GroupingSets");
+        match out.op {
+            CommonOp::Aggregate { grouping_kind, .. } => assert_eq!(
+                grouping_kind,
+                thunderduck_core::transpiler_v2::ast::GroupingKind::GroupingSets
+            ),
+            _ => panic!("expected Aggregate"),
+        }
     }
 
     #[test]

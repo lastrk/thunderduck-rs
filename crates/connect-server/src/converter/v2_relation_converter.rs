@@ -88,6 +88,8 @@ impl V2RelationConverter {
             RelType::WithColumns(wc) => self.convert_with_columns(wc),
             RelType::Drop(d) => self.convert_drop(d),
             RelType::SetOp(so) => self.convert_set_op(so),
+            RelType::SubqueryAlias(sa) => self.convert_subquery_alias(sa),
+            RelType::WithColumnsRenamed(wcr) => self.convert_with_columns_renamed(wcr),
             RelType::Sql(_) => Err(EmissionError::UnsupportedProtoShape {
                 shape: "RelType::Sql".to_owned(),
                 reason: "SQL text is owned by parser_v2, not V2RelationConverter".to_owned(),
@@ -115,6 +117,34 @@ impl V2RelationConverter {
                 reason: format!("{ctx} has no input relation"),
             }),
         }
+    }
+
+    fn convert_subquery_alias(
+        &mut self,
+        sa: &proto::SubqueryAlias,
+    ) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(sa.input.as_deref(), "SubqueryAlias")?;
+        Ok(CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(input),
+            alias: sa.alias.clone(),
+        }))
+    }
+
+    fn convert_with_columns_renamed(
+        &mut self,
+        wcr: &proto::WithColumnsRenamed,
+    ) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(wcr.input.as_deref(), "WithColumnsRenamed")?;
+        // Proto 3.4+ uses `rename_columns_map` (repeated Rename with existing/new).
+        // Older uses `rename_columns_map` legacy — check field shape.
+        let mut renames: Vec<(String, String)> = Vec::new();
+        for r in &wcr.renames {
+            renames.push((r.col_name.clone(), r.new_col_name.clone()));
+        }
+        Ok(CommonAst::new(CommonOp::WithColumnsRenamed {
+            input: Box::new(input),
+            renames,
+        }))
     }
 
     fn convert_set_op(

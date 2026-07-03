@@ -199,6 +199,26 @@ pub enum CommonOp {
         children: Vec<CommonAst>,
     },
 
+    /// `df.alias(name)` — wrap the input in a named subquery alias.
+    /// Semantically transparent for schemas (analyzer passes input schema
+    /// through); the alias name is retained for scope-resolution in
+    /// downstream operators.
+    AliasedRelation {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// The alias to apply.
+        alias: String,
+    },
+
+    /// `df.withColumnsRenamed({old: new, ...})` — rename columns.
+    /// Column identity + types + nullability are preserved.
+    WithColumnsRenamed {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// Old-name → new-name renames (order preserved).
+        renames: Vec<(String, String)>,
+    },
+
     // ── Column-list extensions ───────────────────────────────────────────
     /// `df.drop(col1, col2, ...)` — remove named columns from the input.
     /// Analyzer produces an output schema equal to input minus the named

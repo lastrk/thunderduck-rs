@@ -99,6 +99,10 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
         TypedOp::DropColumns { input, drop_names } => {
             render_drop_columns(input, drop_names)
         }
+        TypedOp::AliasedRelation { input, alias } => render_aliased_relation(input, alias),
+        TypedOp::WithColumnsRenamed { input, renames } => {
+            render_with_columns_renamed(input, renames)
+        }
 
         // ── Aggregate (operator + primitive function arms) ───────────────
         TypedOp::Aggregate {
@@ -672,7 +676,31 @@ fn render_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<String
     ))
 }
 
-#[allow(dead_code)] // wired when TypedOp::AliasedRelation lands (Decision 13-A)
+fn render_with_columns_renamed(
+    input: &TypedAst,
+    renames: &[(String, String)],
+) -> Result<String, EmissionError> {
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    let rename_map: std::collections::HashMap<String, String> = renames
+        .iter()
+        .map(|(old, new)| (old.to_lowercase(), new.clone()))
+        .collect();
+    let mut slots = String::new();
+    for (i, f) in input.resolved_schema.fields.iter().enumerate() {
+        if i > 0 {
+            slots.push_str(", ");
+        }
+        let src = quote_ident(&f.name);
+        let dst_name = rename_map
+            .get(&f.name.to_lowercase())
+            .cloned()
+            .unwrap_or_else(|| f.name.clone());
+        let dst = quote_ident(&dst_name);
+        slots.push_str(&format!("{src} AS {dst}"));
+    }
+    Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_rename"))
+}
+
 fn render_aliased_relation(input: &TypedAst, alias: &str) -> Result<String, EmissionError> {
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let a = quote_ident(alias);

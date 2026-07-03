@@ -224,6 +224,23 @@ pub enum TypedOp {
         /// The names to drop.
         drop_names: Vec<String>,
     },
+    /// `df.alias(name)`. Schema-transparent; alias retained for scope.
+    AliasedRelation {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// The alias name.
+        alias: String,
+    },
+    /// `df.withColumnsRenamed({old: new, ...})`. Analyzer computes output
+    /// schema by walking input fields and renaming those whose name matches
+    /// a `old` (case-insensitive) to the corresponding `new`. Missing
+    /// entries are silently ignored per Spark semantics.
+    WithColumnsRenamed {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// Old-name → new-name renames.
+        renames: Vec<(String, String)>,
+    },
 }
 
 /// A typed attribute — the resolved shape of a single output column.
@@ -426,6 +443,8 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
                     .all(|(_, e)| expression_is_fully_resolved(e))
         }
         TypedOp::DropColumns { input, .. } => has_resolved_schema(input),
+        TypedOp::AliasedRelation { input, .. } => has_resolved_schema(input),
+        TypedOp::WithColumnsRenamed { input, .. } => has_resolved_schema(input),
         TypedOp::SingleRow | TypedOp::TableScan { .. } | TypedOp::FileScan { .. } => true,
     }
 }
@@ -706,6 +725,46 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                 op: TypedOp::WithColumns {
                     input: Box::new(typed_input),
                     assignments: resolved_assignments,
+                },
+                resolved_schema: output_schema,
+            })
+        }
+
+        // ── AliasedRelation (Spark `df.alias(name)`) ─────────────────────
+        CommonOp::AliasedRelation { input, alias } => {
+            let typed_input = analyze_node(*input, base_types)?;
+            let output_schema = typed_input.resolved_schema.clone();
+            Ok(TypedAst {
+                op: TypedOp::AliasedRelation {
+                    input: Box::new(typed_input),
+                    alias,
+                },
+                resolved_schema: output_schema,
+            })
+        }
+
+        // ── WithColumnsRenamed (Spark `df.withColumnsRenamed(...)`) ──────
+        CommonOp::WithColumnsRenamed { input, renames } => {
+            let typed_input = analyze_node(*input, base_types)?;
+            let rename_map: std::collections::HashMap<String, String> = renames
+                .iter()
+                .map(|(old, new)| (old.to_lowercase(), new.clone()))
+                .collect();
+            let mut output_fields: Vec<StructField> =
+                Vec::with_capacity(typed_input.resolved_schema.fields.len());
+            for f in &typed_input.resolved_schema.fields {
+                let new_name = rename_map.get(&f.name.to_lowercase()).cloned();
+                let mut nf = f.clone();
+                if let Some(n) = new_name {
+                    nf.name = n;
+                }
+                output_fields.push(nf);
+            }
+            let output_schema = StructType::new(output_fields);
+            Ok(TypedAst {
+                op: TypedOp::WithColumnsRenamed {
+                    input: Box::new(typed_input),
+                    renames,
                 },
                 resolved_schema: output_schema,
             })

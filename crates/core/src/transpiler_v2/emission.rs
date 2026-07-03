@@ -96,6 +96,9 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
         TypedOp::WithColumns { input, assignments } => {
             render_with_columns(input, assignments)
         }
+        TypedOp::DropColumns { input, drop_names } => {
+            render_drop_columns(input, drop_names)
+        }
 
         // ── Aggregate (operator + primitive function arms) ───────────────
         TypedOp::Aggregate {
@@ -596,7 +599,6 @@ fn render_with_columns(
     Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_with"))
 }
 
-#[allow(dead_code)] // wired when TypedOp::DropColumns lands (Decision 13-A)
 fn render_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<String, EmissionError> {
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let mut dropped = String::new();

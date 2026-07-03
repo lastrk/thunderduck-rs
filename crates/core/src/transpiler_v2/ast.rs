@@ -200,6 +200,17 @@ pub enum CommonOp {
     },
 
     // ── Column-list extensions ───────────────────────────────────────────
+    /// `df.drop(col1, col2, ...)` — remove named columns from the input.
+    /// Analyzer produces an output schema equal to input minus the named
+    /// columns (case-insensitive per Spark). Missing names are silently
+    /// ignored per Spark semantics.
+    DropColumns {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// Column names to remove.
+        drop_names: Vec<String>,
+    },
+
     /// `df.withColumn(name, expr)` / `df.withColumns({...})` — add or replace
     /// per-name column assignments over `input`. Semantics: for each
     /// `(name, expr)`, if `name` matches an existing input column

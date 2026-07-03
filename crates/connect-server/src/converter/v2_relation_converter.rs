@@ -86,6 +86,7 @@ impl V2RelationConverter {
             RelType::LocalRelation(lr) => self.convert_local_relation(lr),
             RelType::Join(j) => self.convert_join(j),
             RelType::WithColumns(wc) => self.convert_with_columns(wc),
+            RelType::Drop(d) => self.convert_drop(d),
             RelType::Sql(_) => Err(EmissionError::UnsupportedProtoShape {
                 shape: "RelType::Sql".to_owned(),
                 reason: "SQL text is owned by parser_v2, not V2RelationConverter".to_owned(),
@@ -113,6 +114,40 @@ impl V2RelationConverter {
                 reason: format!("{ctx} has no input relation"),
             }),
         }
+    }
+
+    fn convert_drop(&mut self, d: &proto::Drop) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(d.input.as_deref(), "Drop")?;
+        // Spark's `df.drop(col1, col2, ...)` may arrive via `column_names`
+        // (raw strings, most common) or `columns` (Expression references).
+        // For Column references we accept only bare `UnresolvedAttribute`
+        // shapes; anything more elaborate is a Thunderduck-boundary.
+        let mut drop_names: Vec<String> = d.column_names.clone();
+        for col_expr in &d.columns {
+            use proto::expression::ExprType;
+            let expr_type = col_expr.expr_type.as_ref().ok_or_else(|| {
+                EmissionError::UnsupportedProtoShape {
+                    shape: "Drop::column::None".to_owned(),
+                    reason: "Drop.columns entry has no expr_type".to_owned(),
+                }
+            })?;
+            match expr_type {
+                ExprType::UnresolvedAttribute(a) => {
+                    drop_names.push(a.unparsed_identifier.clone());
+                }
+                _ => {
+                    return Err(EmissionError::UnsupportedProtoShape {
+                        shape: "Drop::column::non_attribute".to_owned(),
+                        reason: "Drop.columns must be bare column references"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(CommonAst::new(CommonOp::DropColumns {
+            input: Box::new(input),
+            drop_names,
+        }))
     }
 
     fn convert_with_columns(

@@ -216,6 +216,14 @@ pub enum TypedOp {
         /// One `(column_name, expression)` per proto Alias, order preserved.
         assignments: Vec<(String, Expression)>,
     },
+    /// `df.drop(col1, ...)`. Analyzer computes the output schema as input
+    /// schema minus the named columns.
+    DropColumns {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// The names to drop.
+        drop_names: Vec<String>,
+    },
 }
 
 /// A typed attribute — the resolved shape of a single output column.
@@ -417,6 +425,7 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
                     .iter()
                     .all(|(_, e)| expression_is_fully_resolved(e))
         }
+        TypedOp::DropColumns { input, .. } => has_resolved_schema(input),
         TypedOp::SingleRow | TypedOp::TableScan { .. } | TypedOp::FileScan { .. } => true,
     }
 }
@@ -697,6 +706,28 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                 op: TypedOp::WithColumns {
                     input: Box::new(typed_input),
                     assignments: resolved_assignments,
+                },
+                resolved_schema: output_schema,
+            })
+        }
+
+        // ── DropColumns (Spark `df.drop(...)`) ───────────────────────────
+        CommonOp::DropColumns { input, drop_names } => {
+            let typed_input = analyze_node(*input, base_types)?;
+            let drop_lower: std::collections::HashSet<String> =
+                drop_names.iter().map(|s| s.to_lowercase()).collect();
+            let mut output_fields: Vec<StructField> =
+                Vec::with_capacity(typed_input.resolved_schema.fields.len());
+            for f in &typed_input.resolved_schema.fields {
+                if !drop_lower.contains(&f.name.to_lowercase()) {
+                    output_fields.push(f.clone());
+                }
+            }
+            let output_schema = StructType::new(output_fields);
+            Ok(TypedAst {
+                op: TypedOp::DropColumns {
+                    input: Box::new(typed_input),
+                    drop_names,
                 },
                 resolved_schema: output_schema,
             })

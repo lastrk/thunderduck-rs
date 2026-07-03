@@ -1781,7 +1781,7 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         | "first_value" | "last_value" | "any_value" | "approx_count_distinct"
         | "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp"
         | "var_pop" | "bit_and" | "bit_or" | "bit_xor" | "bool_and" | "bool_or"
-        | "kurtosis" | "corr" | "covar_samp" | "covar_pop"
+        | "corr" | "covar_samp" | "covar_pop"
         | "regr_slope" | "regr_r2" | "regr_intercept" | "regr_avgx" | "regr_avgy"
         | "regr_sxx" | "regr_sxy" | "regr_syy" | "median" | "grouping"
         | "grouping_id" => (lower.as_str(), false),
@@ -1789,6 +1789,9 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         // the sample formula. The ext6 extension provides `spark_skewness`
         // with Spark-parity semantics (checklist §4.1).
         "skewness" => ("spark_skewness", false),
+        // Spark's `kurtosis` uses the population formula; DuckDB has
+        // `kurtosis_pop` for that (native, not via extension).
+        "kurtosis" => ("kurtosis_pop", false),
         // `try_sum` / `try_avg` — ext6 extension arms.
         "try_sum" => ("spark_try_sum", false),
         "try_avg" => ("spark_try_avg", false),

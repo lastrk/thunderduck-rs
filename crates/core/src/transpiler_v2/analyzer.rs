@@ -770,10 +770,48 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             })
         }
 
-        // ── NA family (schema-transparent) ───────────────────────────────
+        // ── NA family ────────────────────────────────────────────────────
         CommonOp::NaFill { input, cols, values } => {
             let typed_input = analyze_node(*input, base_types)?;
-            let output_schema = typed_input.resolved_schema.clone();
+            // Columns filled with a non-null value become non-nullable.
+            // If the fill value itself is null (unusual), preserve
+            // nullability. Empty `cols` = fill all cols compatible with
+            // the (single) value's type — we widen to "make all cols with
+            // that type non-null" via a simple pass.
+            let filled = |col_name: &str| -> Option<&Expression> {
+                if cols.is_empty() {
+                    Some(&values[0])
+                } else if values.len() == 1 {
+                    if cols.iter().any(|c| c.eq_ignore_ascii_case(col_name)) {
+                        Some(&values[0])
+                    } else {
+                        None
+                    }
+                } else {
+                    for (c, v) in cols.iter().zip(values.iter()) {
+                        if c.eq_ignore_ascii_case(col_name) {
+                            return Some(v);
+                        }
+                    }
+                    None
+                }
+            };
+            let mut output_fields: Vec<StructField> =
+                Vec::with_capacity(typed_input.resolved_schema.fields.len());
+            for f in &typed_input.resolved_schema.fields {
+                let fill_expr = filled(&f.name);
+                let mut nf = f.clone();
+                if let Some(v) = fill_expr {
+                    // If fill value is non-null (typical case), the output
+                    // column becomes non-nullable.
+                    let fill_nullable = v.nullable(&typed_input.resolved_schema);
+                    if !fill_nullable {
+                        nf.nullable = false;
+                    }
+                }
+                output_fields.push(nf);
+            }
+            let output_schema = StructType::new(output_fields);
             Ok(TypedAst {
                 op: TypedOp::NaFill {
                     input: Box::new(typed_input),

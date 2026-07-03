@@ -1018,10 +1018,33 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
             let not = if d.negated { "NOT " } else { "" };
             Ok(format!("({l}) IS {not}DISTINCT FROM ({r})"))
         }
-        Expression::ExtractValue(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "ExtractValue".to_owned(),
-            reason: "complex-type field/index extraction lands in Slice F".to_owned(),
-        }),
+        Expression::ExtractValue(ev) => {
+            let child_sql = render_expr(&ev.child, schema)?;
+            // Extraction shape distinguishes struct-field-name (String
+            // literal) vs array-index (Int literal) vs map-key (any
+            // literal). DuckDB uses `.field` for struct, `[expr]` for
+            // both array and map — the latter is a runtime-typed subscript.
+            match ev.extraction.as_ref() {
+                Expression::Literal(l) => match &l.value {
+                    crate::transpiler_v2::expression::LiteralValue::String(name) => {
+                        // Struct field access. DuckDB accepts `child.field`
+                        // when child's static type is struct.
+                        let field = quote_ident(name);
+                        Ok(format!("({child_sql}).{field}"))
+                    }
+                    _ => {
+                        // Numeric index or other literal: emit `[expr]`.
+                        let idx = render_expr(&ev.extraction, schema)?;
+                        Ok(format!("({child_sql})[{idx}]"))
+                    }
+                },
+                _ => {
+                    // Dynamic key/index — same subscript form.
+                    let idx = render_expr(&ev.extraction, schema)?;
+                    Ok(format!("({child_sql})[{idx}]"))
+                }
+            }
+        }
         Expression::RowConstructor(_) => Err(EmissionError::UnsupportedExpression {
             shape: "RowConstructor".to_owned(),
             reason: "complex-type emission lands in Slice F".to_owned(),
@@ -1139,6 +1162,32 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `substr` — DuckDB canonical form is `substring` (both
         // spellings accepted actually, but standardize).
         "substr" => "substring",
+        // Spark array/list remaps — DuckDB uses `list_*` prefix.
+        "sort_array" => "list_sort",
+        "slice" => "list_slice",
+        "array_contains" => "list_contains",
+        "array_distinct" => "list_distinct",
+        "array_intersect" => "list_intersect",
+        "array_union" => "list_concat_unique",
+        "array_except" => "list_filter",
+        "array_position" => "list_position",
+        "array_max" => "list_max",
+        "array_min" => "list_min",
+        "array_join" => "list_string_agg",
+        "arrays_zip" => "list_zip",
+        "size" | "cardinality" => "len",
+        // Spark's `to_date(x)` (single-arg) → simple cast to DATE.
+        "to_date" => {
+            if f.args.len() != 1 {
+                // Two-arg form (with format) — leave to per-case follow-up.
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`to_date` with format arg not yet supported".to_owned(),
+                });
+            }
+            let x = render_expr(&f.args[0], schema)?;
+            return Ok(format!("CAST({x} AS DATE)"));
+        }
         // Spark's `date_add(date, n)` / `date_sub(date, n)` — DuckDB's
         // versions expect INTERVAL args. Rewrite to arithmetic form.
         "date_add" => {

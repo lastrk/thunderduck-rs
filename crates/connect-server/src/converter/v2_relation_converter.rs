@@ -588,6 +588,28 @@ impl V2ExpressionConverter {
             ExprType::UnresolvedStar(star) => Ok(Expression::Star(StarExpression {
                 qualifier: star.unparsed_target.clone(),
             })),
+            ExprType::UnresolvedExtractValue(uev) => {
+                let child = uev.child.as_deref().ok_or_else(|| {
+                    EmissionError::UnsupportedProtoShape {
+                        shape: "UnresolvedExtractValue::child::None".to_owned(),
+                        reason: "ExtractValue missing child expression".to_owned(),
+                    }
+                })?;
+                let extraction = uev.extraction.as_deref().ok_or_else(|| {
+                    EmissionError::UnsupportedProtoShape {
+                        shape: "UnresolvedExtractValue::extraction::None".to_owned(),
+                        reason: "ExtractValue missing extraction expression".to_owned(),
+                    }
+                })?;
+                let child = self.convert(child)?;
+                let extraction = self.convert(extraction)?;
+                Ok(Expression::ExtractValue(
+                    thunderduck_core::transpiler_v2::expression::ExtractValueExpression {
+                        child: Box::new(child),
+                        extraction: Box::new(extraction),
+                    },
+                ))
+            }
             ExprType::ExpressionString(es) => {
                 // Spark's `F.expr("<sql>")` / `df.selectExpr("<sql>")` — a
                 // raw SparkSQL expression fragment. Route through τ's

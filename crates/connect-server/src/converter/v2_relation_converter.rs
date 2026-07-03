@@ -637,14 +637,105 @@ impl V2ExpressionConverter {
                 for so in &w.order_spec {
                     order_by.push(self.convert_sort_order(so)?);
                 }
-                // Frame parsing deferred — corpus cases so far do not
-                // exercise custom frames.
+                // Parse the frame spec if present.
+                use proto::expression::window::window_frame as pwf;
+                use thunderduck_core::transpiler_v2::expression::{
+                    FrameBoundary as VFB, FrameUnit as VFU, WindowFrame as VWF,
+                };
+                let frame = match w.frame_spec.as_deref() {
+                    Some(fs) => {
+                        let unit = match pwf::FrameType::try_from(fs.frame_type)
+                            .unwrap_or(pwf::FrameType::Undefined)
+                        {
+                            pwf::FrameType::Row => VFU::Rows,
+                            pwf::FrameType::Range => VFU::Range,
+                            pwf::FrameType::Undefined => {
+                                // No frame semantics — omit the frame.
+                                return Ok(Expression::Window(
+                                    thunderduck_core::transpiler_v2::expression::WindowFunction {
+                                        func: Box::new(func),
+                                        partition_by,
+                                        order_by,
+                                        frame: None,
+                                    },
+                                ));
+                            }
+                        };
+                        let mut convert_boundary =
+                            |b_opt: Option<&pwf::FrameBoundary>,
+                             is_lower: bool|
+                             -> Result<VFB, EmissionError> {
+                                let b = b_opt.ok_or_else(|| {
+                                    EmissionError::UnsupportedProtoShape {
+                                        shape: "Window::frame_spec::missing_boundary"
+                                            .to_owned(),
+                                        reason: "frame boundary missing".to_owned(),
+                                    }
+                                })?;
+                                use pwf::frame_boundary::Boundary as PB;
+                                match b.boundary.as_ref() {
+                                    Some(PB::CurrentRow(_)) => Ok(VFB::CurrentRow),
+                                    Some(PB::Unbounded(_)) => Ok(if is_lower {
+                                        VFB::UnboundedPreceding
+                                    } else {
+                                        VFB::UnboundedFollowing
+                                    }),
+                                    Some(PB::Value(v)) => {
+                                        let expr = self.convert(v)?;
+                                        // Spark encodes offsets as signed
+                                        // numeric literals: negative = PRECEDING,
+                                        // positive = FOLLOWING. Match here.
+                                        if let Expression::Literal(l) = &expr {
+                                            use thunderduck_core::transpiler_v2::expression::LiteralValue as LV;
+                                            let sign: Option<i64> = match &l.value {
+                                                LV::Int(i) => Some(*i as i64),
+                                                LV::Long(i) => Some(*i),
+                                                _ => None,
+                                            };
+                                            if let Some(n) = sign {
+                                                let abs_expr = Expression::Literal(
+                                                    thunderduck_core::transpiler_v2::expression::Literal {
+                                                        value: LV::Long(n.abs()),
+                                                        data_type: thunderduck_core::types::DataType::Long,
+                                                    },
+                                                );
+                                                return Ok(if n < 0 {
+                                                    VFB::Preceding(Box::new(abs_expr))
+                                                } else {
+                                                    VFB::Following(Box::new(abs_expr))
+                                                });
+                                            }
+                                        }
+                                        Ok(if is_lower {
+                                            VFB::Preceding(Box::new(expr))
+                                        } else {
+                                            VFB::Following(Box::new(expr))
+                                        })
+                                    }
+                                    None => Err(EmissionError::UnsupportedProtoShape {
+                                        shape: "Window::frame_boundary::None"
+                                            .to_owned(),
+                                        reason: "frame boundary carries no shape"
+                                            .to_owned(),
+                                    }),
+                                }
+                            };
+                        let lower = convert_boundary(fs.lower.as_deref(), true)?;
+                        let upper = convert_boundary(fs.upper.as_deref(), false)?;
+                        Some(VWF {
+                            unit,
+                            lower,
+                            upper,
+                        })
+                    }
+                    None => None,
+                };
                 Ok(Expression::Window(
                     thunderduck_core::transpiler_v2::expression::WindowFunction {
                         func: Box::new(func),
                         partition_by,
                         order_by,
-                        frame: None,
+                        frame,
                     },
                 ))
             }

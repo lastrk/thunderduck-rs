@@ -1089,10 +1089,37 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
                 }
                 had_content = true;
             }
-            // Frame emission deferred — Spark corpus cases so far exercise
-            // only PARTITION BY / ORDER BY. When a frame-bearing case
-            // surfaces it becomes its own diagnostic pass.
-            let _ = &w.frame;
+            // Frame clause emission.
+            if let Some(frame) = &w.frame {
+                use crate::transpiler_v2::expression::{FrameBoundary, FrameUnit};
+                if had_content {
+                    over.push(' ');
+                }
+                let unit_kw = match frame.unit {
+                    FrameUnit::Rows => "ROWS",
+                    FrameUnit::Range => "RANGE",
+                };
+                let render_bound = |b: &FrameBoundary, is_lower: bool| -> Result<String, EmissionError> {
+                    match b {
+                        FrameBoundary::UnboundedPreceding => Ok("UNBOUNDED PRECEDING".to_owned()),
+                        FrameBoundary::UnboundedFollowing => Ok("UNBOUNDED FOLLOWING".to_owned()),
+                        FrameBoundary::CurrentRow => Ok("CURRENT ROW".to_owned()),
+                        FrameBoundary::Preceding(e) => {
+                            let n = render_expr(e, schema)?;
+                            let _ = is_lower;
+                            Ok(format!("{n} PRECEDING"))
+                        }
+                        FrameBoundary::Following(e) => {
+                            let n = render_expr(e, schema)?;
+                            let _ = is_lower;
+                            Ok(format!("{n} FOLLOWING"))
+                        }
+                    }
+                };
+                let lo = render_bound(&frame.lower, true)?;
+                let up = render_bound(&frame.upper, false)?;
+                over.push_str(&format!("{unit_kw} BETWEEN {lo} AND {up}"));
+            }
             let _ = had_content;
             over.push(')');
             Ok(format!("{func_sql} {over}"))

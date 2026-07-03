@@ -647,6 +647,19 @@ impl TypeInferenceEngine {
             | "datediff" | "unix_timestamp" | "unix_micros" | "unix_millis"
             | "unix_seconds" | "extract" => Integer,
 
+            // ── Array/List constructors and simple operations ───────────
+            "array" | "list_value" | "make_array" | "list" => match first_arg_type {
+                Some(dt) => DataType::Array(Box::new(dt.clone()), true),
+                None => DataType::Array(Box::new(Unresolved), true),
+            },
+            "map" | "map_from_arrays" | "create_map" | "map_from_entries" => {
+                DataType::Map {
+                    key: Box::new(String),
+                    value: Box::new(String),
+                    value_nullable: true,
+                }
+            }
+
             // ── Higher-order array/map functions ─────────────────────────
             // Return type = first-arg type (the collection) for filters;
             // transform / zip_with produce a NEW array but at this

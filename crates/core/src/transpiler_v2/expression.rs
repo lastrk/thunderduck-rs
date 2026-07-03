@@ -719,6 +719,12 @@ impl Expression {
             "isnull" | "isnan" | "isnotnull" | "isnotnan" | "is_nan" | "isinf" => false,
             "concat_ws" => false,
             "typeof" | "spark_partition_id" | "monotonically_increasing_id" => false,
+            // Spark scalars declared nullable regardless of arg nullability
+            // (overflow / parse-fail / undefined-domain producers).
+            "factorial" | "url_encode" | "url_decode" | "parse_url"
+            | "to_number" | "try_to_number" | "to_date_ntz"
+            | "map_from_entries" | "try_add" | "try_subtract"
+            | "try_multiply" | "try_divide" | "try_element_at" => true,
             "greatest" | "least" => f.args.iter().all(|a| a.nullable(schema)),
             "nvl2" => {
                 f.args.get(1).is_none_or(|a| a.nullable(schema))

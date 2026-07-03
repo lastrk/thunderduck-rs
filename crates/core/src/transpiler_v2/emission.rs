@@ -1310,6 +1310,18 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let haystack = render_expr(&f.args[1], schema)?;
             return Ok(format!("strpos({haystack}, {needle})"));
         }
+        // Spark's `dayofweek(x)` returns 1..7 (Sunday=1); DuckDB's returns
+        // 0..6 (Sunday=0). Add 1 to align with Spark.
+        "dayofweek" => {
+            if f.args.len() != 1 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`dayofweek` requires exactly 1 argument".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            return Ok(format!("(dayofweek({a}) + 1)"));
+        }
         // Spark's `date_format(date, fmt)` → DuckDB `strftime(date, fmt)`.
         // Note: Spark uses Java SimpleDateFormat tokens (yyyy/MM/dd) while
         // DuckDB uses strftime tokens (%Y/%m/%d). We do a best-effort

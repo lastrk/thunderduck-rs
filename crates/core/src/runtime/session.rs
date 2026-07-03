@@ -389,6 +389,35 @@ CREATE OR REPLACE MACRO soundex(s) AS (
 -- width_bucket(v, min, max, n): assign value to bucket
 CREATE OR REPLACE MACRO width_bucket(v, mn, mx, n) AS
     GREATEST(0, LEAST(n + 1, FLOOR(n * (v - mn) / (mx - mn)) + 1)::INT);
+-- array_size(arr): Spark returns NULL for NULL input; DuckDB LEN already
+-- returns NULL for NULL. Spark's return type is Integer; the projection-slot
+-- cast in `spark_return_cast` narrows LEN's BIGINT to INTEGER at the top of
+-- the SELECT list. Corpus: arr2-004.
+CREATE OR REPLACE MACRO array_size(arr) AS LEN(arr);
+-- array_insert(arr, pos, val): Spark 1-based positional insert. For positive
+-- `pos` this is `concat(prefix, [val], suffix)` where prefix = arr[1..pos-1]
+-- and suffix = arr[pos..]. NULL array propagates NULL. This macro covers the
+-- corpus witness (positive pos, in-range); Spark's full spec also supports
+-- negative indices and out-of-range padding — not yet exercised by the corpus.
+-- Corpus: arr2-002.
+CREATE OR REPLACE MACRO array_insert(arr, pos, val) AS
+    CASE WHEN arr IS NULL THEN NULL
+         ELSE list_concat(list_slice(arr, 1, pos - 1), list_value(val), list_slice(arr, pos, len(arr)))
+    END;
+-- str_to_map(str, pair_delim, kv_delim): parse `k1<kv>v1<pair>k2<kv>v2` into
+-- MAP(VARCHAR, VARCHAR). NULL input propagates. Corpus: map2-002.
+CREATE OR REPLACE MACRO str_to_map(s, pair_delim, kv_delim) AS
+    CASE WHEN s IS NULL THEN NULL
+         ELSE map_from_entries(
+             list_transform(
+                 string_split(s, pair_delim),
+                 pair -> {
+                     'key':   split_part(pair, kv_delim, 1),
+                     'value': split_part(pair, kv_delim, 2)
+                 }
+             )
+         )
+    END;
 ";
                 if let Err(e) = conn.execute_batch(macro_sql) {
                     let _ = ready_tx.send(Err(ThunderduckError::DuckDb(format!(

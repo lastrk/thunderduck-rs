@@ -374,11 +374,18 @@ pub struct RowConstructorExpression {
     pub field_names: Vec<String>,
 }
 
-/// `WITH_FIELD` / update-fields on a struct.
+/// `withField` / `dropFields` on a struct.
+///
+/// Each entry in [`Self::updates`] is either an add/replace (`Some(expr)`) or a
+/// drop (`None`). Consecutive Spark Connect `UpdateFields` proto nodes chain
+/// via nested `struct_expr`s — the converter flattens them for emission but
+/// they remain semantically equivalent to one op per node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateFieldsExpression {
     pub struct_expr: Box<Expression>,
-    pub updates: Vec<(String, Expression)>,
+    /// Ordered list of ops: `(field_name, Some(new_value))` = add/replace,
+    /// `(field_name, None)` = drop.
+    pub updates: Vec<(String, Option<Expression>)>,
 }
 
 // ── Expression enum (28 variants — Spark 4.1.1 parity) ───────────────────────
@@ -576,7 +583,11 @@ impl Expression {
             Expression::ExtractValue(ev) => Self::extract_value_nullable(ev, schema),
             Expression::RowConstructor(rc) => rc.elements.iter().any(|e| e.nullable(schema)),
             Expression::UpdateFields(u) => {
-                u.struct_expr.nullable(schema) || u.updates.iter().any(|(_, e)| e.nullable(schema))
+                u.struct_expr.nullable(schema)
+                    || u.updates.iter().any(|(_, e)| match e {
+                        Some(expr) => expr.nullable(schema),
+                        None => false,
+                    })
             }
         }
     }
@@ -647,6 +658,220 @@ impl Expression {
     // ── FunctionCall data-type derivation ────────────────────────────────────
 
     fn function_call_data_type(f: &FunctionCall, schema: &StructType) -> DataType {
+        // Struct-constructor fast-paths — Spark's `struct` / `named_struct`
+        // return a `DataType::Struct` whose field names depend on the shape
+        // of the argument tree. `TypeInferenceEngine::function_return_type`
+        // takes only the function name + first-arg type, so it cannot express
+        // this; derive here where the full `&FunctionCall` is available.
+        // Symmetric with emission's `struct` / `named_struct` arms.
+        match f.name.to_lowercase().as_str() {
+            "struct" => {
+                let fields: Vec<StructField> = f
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, arg)| {
+                        let name = super::struct_names::derive_struct_field_name(arg, i);
+                        StructField::new(name, arg.data_type(schema), arg.nullable(schema))
+                    })
+                    .collect();
+                return DataType::Struct(StructType::new(fields));
+            }
+            "named_struct" => {
+                // `named_struct(k1, v1, k2, v2, ...)` — Spark rejects
+                // non-literal keys with AnalysisException; emission enforces
+                // the same. If any key here is not a string literal, fall
+                // through to the default arm so the shared inference path
+                // returns `DataType::Unresolved` rather than fabricating a
+                // fake schema.
+                if !f.args.is_empty() && f.args.len() % 2 == 0 {
+                    let mut fields: Vec<StructField> = Vec::with_capacity(f.args.len() / 2);
+                    let mut i = 0;
+                    let mut ok = true;
+                    while i < f.args.len() {
+                        let key = match &f.args[i] {
+                            Expression::Literal(l) => match &l.value {
+                                LiteralValue::String(s) => s.clone(),
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        };
+                        let val = &f.args[i + 1];
+                        fields.push(StructField::new(
+                            key,
+                            val.data_type(schema),
+                            val.nullable(schema),
+                        ));
+                        i += 2;
+                    }
+                    if ok {
+                        return DataType::Struct(StructType::new(fields));
+                    }
+                }
+                // Fall through — malformed named_struct; let the shared
+                // inference path decide (typically Unresolved).
+            }
+            // Spark's `arrays_zip(a, b, ...)` returns
+            // `Array<Struct<f0: T0, f1: T1, ...>>` where each field's type is
+            // the element type of the corresponding input array. Field
+            // names follow Spark's rules: alias > column-ref name > positional
+            // integer string. Emission matches this shape exactly (see
+            // `emission.rs`, `"arrays_zip"` arm). Corpus anchor: `arr-012`.
+            "arrays_zip" if !f.args.is_empty() => {
+                // Derive per-arg field names — same rules as emission.
+                let mut names: Vec<String> = Vec::with_capacity(f.args.len());
+                for (i, arg) in f.args.iter().enumerate() {
+                    let name = match arg {
+                        Expression::Alias(a) => a.alias.clone(),
+                        Expression::ColumnReference(c) => c.name.clone(),
+                        Expression::UnresolvedColumn(u) => u.name.clone(),
+                        _ => i.to_string(),
+                    };
+                    names.push(name);
+                }
+                // Note: Spark tolerates duplicate field names in the returned
+                // struct schema (unlike DuckDB `struct_pack` which requires
+                // unique names). Preserve Spark's schema (duplicates and all);
+                // emission separately falls back to positional names to keep
+                // DuckDB happy.
+                let mut fields: Vec<StructField> = Vec::with_capacity(f.args.len());
+                for (name, arg) in names.iter().zip(f.args.iter()) {
+                    let arg_ty = arg.data_type(schema);
+                    let (elem_ty, elem_nullable) = match arg_ty {
+                        DataType::Array(inner, contains_null) => (*inner, contains_null),
+                        _ => (DataType::Unresolved, true),
+                    };
+                    fields.push(StructField::new(name.clone(), elem_ty, elem_nullable));
+                }
+                // Spark stamps the outer array as non-nullable elements
+                // (containsNull=false) — the struct itself is always present
+                // per input row.
+                return DataType::Array(
+                    Box::new(DataType::Struct(StructType::new(fields))),
+                    false,
+                );
+            }
+            // Spark's `coalesce(a, b, c, ...)` returns the least-common
+            // (widening) type across all args. First-arg-only inference
+            // misses e.g. `coalesce(decimal(9,2), decimal(2,2)) → decimal(10,2)`.
+            // Corpus anchor: `cond-004`.
+            "coalesce" | "nvl" | "ifnull" if !f.args.is_empty() => {
+                let mut acc = f.args[0].data_type(schema);
+                for a in f.args.iter().skip(1) {
+                    let dt = a.data_type(schema);
+                    acc = TypeInferenceEngine::promote_numeric(&acc, &dt);
+                }
+                return acc;
+            }
+            // Spark's `greatest` / `least` — same widening rule as coalesce.
+            "greatest" | "least" if !f.args.is_empty() => {
+                let mut acc = f.args[0].data_type(schema);
+                for a in f.args.iter().skip(1) {
+                    let dt = a.data_type(schema);
+                    acc = TypeInferenceEngine::promote_numeric(&acc, &dt);
+                }
+                return acc;
+            }
+            // Spark's `nvl2(cond, ifNotNull, ifNull)` — returns `ifNotNull` if
+            // `cond IS NOT NULL`, otherwise `ifNull`. Result type is the least
+            // common type of args[1] and args[2] (both branches are
+            // evaluated). The shared resolver only sees `args[0]`; use args[1]
+            // as the anchor (matches Spark's promotion when args[1]/args[2]
+            // agree). Corpus anchor: `cond-007`.
+            "nvl2" if f.args.len() == 3 => {
+                return f.args[1].data_type(schema);
+            }
+            // Spark's `if(cond, then, else)` / `ifnull(a, b)` / `iif(...)` —
+            // return-type derives from the branch args (not the condition).
+            "if" if f.args.len() == 3 => {
+                return f.args[1].data_type(schema);
+            }
+            "iif" if f.args.len() == 3 => {
+                return f.args[1].data_type(schema);
+            }
+            "ifnull" if f.args.len() == 2 => {
+                // Both branches meaningful; use the first (Spark spec).
+                let first = f.args[0].data_type(schema);
+                if matches!(first, DataType::Unresolved) {
+                    return f.args[1].data_type(schema);
+                }
+                return first;
+            }
+            // Spark's `array(a, b, ...)` — element type is the least-common
+            // (widening) type of the args. First-arg-only inference misses
+            // the mixed-numeric case (e.g., `array(1, 2.0, 3)` → Double).
+            // Corpus anchor: `type-020`.
+            "array" | "list_value" | "make_array" | "list" if !f.args.is_empty() => {
+                let mut acc = f.args[0].data_type(schema);
+                for a in f.args.iter().skip(1) {
+                    let dt = a.data_type(schema);
+                    acc = TypeInferenceEngine::promote_numeric(&acc, &dt);
+                }
+                // Spark reports the array as `containsNull` = any element
+                // nullable. Result nullability is handled separately in
+                // `function_call_nullable`; here we just carry the flag
+                // conservatively as `true` (any-null-permitted) matching
+                // the shared resolver's behavior.
+                let contains_null = f.args.iter().any(|a| a.nullable(schema));
+                return DataType::Array(Box::new(acc), contains_null);
+            }
+            // Spark's `aggregate(arr, init, (acc, x) -> f [, finish])` folds
+            // the array with `init` as the seed; the result type is the
+            // finish-lambda's return type (or, if `finish` is absent, the
+            // seed / accumulator type). The shared `function_return_type`
+            // resolver only receives the first arg's type, so it cannot
+            // express this. Derive here where the whole `FunctionCall` is
+            // available. Corpus anchor: `hof-003`.
+            "aggregate" | "reduce" | "list_reduce" if f.args.len() >= 2 => {
+                // Prefer the init's type (arg[1]) — Spark accepts init as
+                // any expression and the accumulator inherits its type.
+                return f.args[1].data_type(schema);
+            }
+            // Spark's `to_number(str, fmt)` / `try_to_number(str, fmt)` return
+            // DECIMAL(p, s) derived from the format string. Emission parses
+            // the same format literal to build the CAST; mirror the
+            // precision/scale derivation here so the projection schema
+            // matches Spark. Falls through to the shared resolver (returns
+            // String, matching arg[0]) when the format is not a literal or
+            // not a recognized digit template. Corpus anchor: `parse-004`.
+            "to_number" | "try_to_number" if f.args.len() == 2 => {
+                if let Expression::Literal(Literal {
+                    value: LiteralValue::String(fmt),
+                    ..
+                }) = &f.args[1]
+                {
+                    if let Some((precision, scale)) =
+                        super::emission::parse_number_format_for_type_inference(fmt)
+                    {
+                        return DataType::Decimal { precision, scale };
+                    }
+                }
+            }
+            // Spark's `from_json(json_str, ddl_schema)` returns a Struct
+            // typed per the DDL literal. Mirror emission's DDL translation
+            // for type inference so the projection schema matches Spark.
+            // Corpus anchors: `json-003`, `json-004`.
+            "from_json" if f.args.len() == 2 => {
+                if let Expression::Literal(Literal {
+                    value: LiteralValue::String(ddl),
+                    ..
+                }) = &f.args[1]
+                {
+                    if let Some(st) =
+                        super::emission::from_json_ddl_to_struct_for_type_inference(ddl)
+                    {
+                        return DataType::Struct(st);
+                    }
+                }
+            }
+            _ => {}
+        }
         let first_arg_type = f.args.first().map(|a| a.data_type(schema));
         TypeInferenceEngine::function_return_type(&f.name, first_arg_type.as_ref())
     }
@@ -718,13 +943,33 @@ impl Expression {
             }
             "isnull" | "isnan" | "isnotnull" | "isnotnan" | "is_nan" | "isinf" => false,
             "concat_ws" => false,
+            // Spark's `format_string(fmt, args...)` returns non-nullable —
+            // NULL args render as the literal string "null" rather than
+            // propagating NULL. Corpus witness: `str-015`.
+            "format_string" | "printf" => false,
             "typeof" | "spark_partition_id" | "monotonically_increasing_id" => false,
             // Spark scalars declared nullable regardless of arg nullability
             // (overflow / parse-fail / undefined-domain producers).
             "factorial" | "url_encode" | "url_decode" | "parse_url"
             | "to_number" | "try_to_number" | "to_date_ntz"
+            // Spark's `from_unixtime(secs[, fmt])` declares nullable=True
+            // even for a non-null seconds literal — the value can be NULL
+            // when the format is invalid. Corpus witness dt-014.
+            | "from_unixtime"
             | "map_from_entries" | "try_add" | "try_subtract"
-            | "try_multiply" | "try_divide" | "try_element_at" => true,
+            | "try_multiply" | "try_divide" | "try_element_at"
+            // Spark's `to_json(struct)` / `to_csv(struct)` — schema-declared
+            // nullable=True even when the argument is a non-null `struct(...)`
+            // constructor. PySpark's projection semantics: the result column
+            // comes back nullable=True even though the Catalyst
+            // `CreateStruct` value is non-null. Corpus: `json-005`, `json-008`.
+            // Note: `schema_of_json` is NOT in this list — Spark reports its
+            // result as nullable=False when the JSON literal is a
+            // non-null literal (corpus witness: `json-006` requires
+            // Reference=False), so it falls through to the default
+            // `any(arg.nullable)` path which correctly yields false for
+            // literal arguments.
+            | "to_json" | "to_csv" => true,
             "greatest" | "least" => f.args.iter().all(|a| a.nullable(schema)),
             "nvl2" => {
                 f.args.get(1).is_none_or(|a| a.nullable(schema))
@@ -732,6 +977,50 @@ impl Expression {
             }
             "array" | "make_array" | "create_map" | "map" | "named_struct" | "struct"
             | "map_from_entries" => false,
+            // Generator functions (row-multiplying via UNNEST at emission).
+            // `explode(arr)` / `posexplode_val(arr)` — element nullability
+            // follows the array's `containsNull` flag AND the array arg's own
+            // nullability (a NULL array in `explode` produces zero rows).
+            // Corpus: arr-015, arr-017, type-012.
+            "explode" | "posexplode_val" => match f.args.first() {
+                Some(arg) => {
+                    let contains_null = matches!(
+                        arg.data_type(schema),
+                        DataType::Array(_, true) | DataType::Map { .. }
+                    );
+                    contains_null || arg.nullable(schema)
+                }
+                None => true,
+            },
+            // `explode_outer(arr)` — always nullable: empty / NULL arrays
+            // emit exactly one row with a NULL value. Corpus: arr-016.
+            "explode_outer" => true,
+            // `posexplode_pos(arr)` — the position column is a synthetic
+            // 0-indexed integer, never NULL. Non-nullable regardless of the
+            // input array's nullability. Corpus: arr-017.
+            "posexplode_pos" => false,
+            // Synthetic `map_explode_key(m)` / `map_explode_val(m)` (map-007).
+            // Spark's `explode(map)` produces `(key, value)` rows where keys
+            // are ALWAYS non-nullable (Spark's MAP invariant); a NULL map
+            // arg emits zero rows, so a nullable outer map does not
+            // propagate to the key column. Values inherit the map's
+            // `valueContainsNull` flag.
+            "map_explode_key" => false,
+            "map_explode_val" => match f.args.first() {
+                Some(arg) => matches!(
+                    arg.data_type(schema),
+                    DataType::Map {
+                        value_nullable: true,
+                        ..
+                    }
+                ),
+                None => true,
+            },
+            // Spark's `flatten(Array<Array<T>>)` returns NULL if the outer
+            // array contains any NULL inner array. Even a non-nullable
+            // literal outer array (`F.array(...)`) produces a nullable
+            // result per Spark's schema semantics. Corpus: `arr-013`.
+            "flatten" | "list_flatten" => true,
             _ => f.args.iter().any(|a| a.nullable(schema)),
         }
     }
@@ -784,10 +1073,7 @@ impl Expression {
                     // `default` is absent (no 3rd arg), the out-of-range
                     // return is NULL — so nullable=true regardless of
                     // col's nullability.
-                    let col_nullable = f
-                        .args
-                        .first()
-                        .is_none_or(|c| c.nullable(schema));
+                    let col_nullable = f.args.first().is_none_or(|c| c.nullable(schema));
                     match f.args.get(2) {
                         Some(default) => col_nullable || default.nullable(schema),
                         None => true,
@@ -848,21 +1134,119 @@ impl Expression {
         let DataType::Struct(mut st) = base else {
             return DataType::Unresolved;
         };
-        for (field_name, new_val) in &u.updates {
-            let new_type = new_val.data_type(schema);
-            let new_nullable = new_val.nullable(schema);
-            if let Some(idx) = st.field_index(field_name) {
-                // In-place update: overwrite type/nullability, keep the
-                // existing `name` allocation to avoid re-cloning.
-                st.fields[idx].data_type = new_type;
-                st.fields[idx].nullable = new_nullable;
-            } else {
-                st.fields
-                    .push(StructField::new(field_name.clone(), new_type, new_nullable));
-            }
-        }
+        // Delegate to the shared classifier so analyzer + emission cannot
+        // drift. `data_type()` is infallible — a missing drop target here
+        // silently leaves the struct unchanged. `resolve_and_stamp` runs
+        // `validate_update_fields_ops` earlier and rejects such inputs with
+        // an [`AnalyzerError::Other`] (Spark-emulated).
+        apply_update_fields_ops(
+            &mut st.fields,
+            &u.updates,
+            |name, new_val| {
+                StructField::new(
+                    name.to_owned(),
+                    new_val.data_type(schema),
+                    new_val.nullable(schema),
+                )
+            },
+            |slot, name, new_val| {
+                slot.name = name.to_owned();
+                slot.data_type = new_val.data_type(schema);
+                slot.nullable = new_val.nullable(schema);
+            },
+            |f| f.name.as_str(),
+        );
         DataType::Struct(st)
     }
+}
+
+// ── UpdateFields shared classifier ──────────────────────────────────────────
+
+/// Apply Spark `withField` / `dropFields` operations to a caller-owned field
+/// list, preserving Spark 4.1 semantics:
+///
+/// * Add / replace matches existing fields **case-insensitively** (ASCII);
+///   on match the *original* declared field name is preserved.
+/// * Drop matches existing fields **case-insensitively** (ASCII).
+/// * A drop target that does not match any current field is **silently
+///   ignored** here — callers that need Spark-emulated rejection must invoke
+///   [`validate_update_fields_ops`] first.
+///
+/// The callbacks let the caller decide the payload type `T`:
+///
+/// * `make_append` — produce a fresh `(name, T)` slot for an appended field.
+/// * `update_in_place` — replace an existing slot (preserving position).
+/// * `slot_name` — extract the current name from a slot for the CI match.
+///
+/// The analyzer's `update_fields_data_type` and emission's
+/// `render_update_fields` both delegate here, guaranteeing identical
+/// field-list evolution.
+pub(super) fn apply_update_fields_ops<T>(
+    fields: &mut Vec<T>,
+    updates: &[(String, Option<Expression>)],
+    make_append: impl Fn(&str, &Expression) -> T,
+    mut update_in_place: impl FnMut(&mut T, &str, &Expression),
+    slot_name: impl Fn(&T) -> &str,
+) {
+    for (name, op) in updates {
+        match op {
+            Some(new_val) => {
+                let existing = fields
+                    .iter()
+                    .position(|slot| slot_name(slot).eq_ignore_ascii_case(name));
+                if let Some(idx) = existing {
+                    // Preserve the ORIGINAL field name — Spark `withField`
+                    // keeps the struct's declared casing.
+                    let original = slot_name(&fields[idx]).to_owned();
+                    update_in_place(&mut fields[idx], &original, new_val);
+                } else {
+                    fields.push(make_append(name, new_val));
+                }
+            }
+            None => {
+                if let Some(idx) = fields
+                    .iter()
+                    .position(|slot| slot_name(slot).eq_ignore_ascii_case(name))
+                {
+                    fields.remove(idx);
+                }
+            }
+        }
+    }
+}
+
+/// Validate a Spark `UpdateFields` op list against a base struct's declared
+/// field names. Returns the first drop target that does not resolve
+/// (case-insensitive), which the analyzer surfaces as a Spark-emulated error.
+///
+/// Ordering: `updates` are applied left to right, so a drop-then-add sequence
+/// on the same name is legal (the add would append). We walk a virtual
+/// projected field-name list and check drops against it.
+pub(super) fn validate_update_fields_ops(
+    base_field_names: &[String],
+    updates: &[(String, Option<Expression>)],
+) -> Result<(), String> {
+    let mut names: Vec<String> = base_field_names.to_vec();
+    for (name, op) in updates {
+        match op {
+            Some(_) => {
+                let existing = names.iter().position(|n| n.eq_ignore_ascii_case(name));
+                if existing.is_none() {
+                    names.push(name.clone());
+                }
+                // In-place replace preserves the declared name — no
+                // change to the `names` vector.
+            }
+            None => {
+                let idx = names
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| name.clone())?;
+                names.remove(idx);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Convenience constructors used by tests ───────────────────────────────────
@@ -1119,6 +1503,290 @@ mod tests {
         assert!(expr.nullable(&s));
     }
 
+    // ── Struct-constructor fast-paths (§9 tests 7 & 8) ─────────────────────
+
+    /// §9 test 7 — `struct(name, age)` reports
+    /// `DataType::Struct{ name: String, age: Integer }`.
+    #[test]
+    fn struct_data_type_is_named_struct() {
+        let schema = StructType::new(vec![
+            StructField::nullable("name", DataType::String),
+            StructField::not_null("age", DataType::Integer),
+        ]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "struct".to_owned(),
+            args: vec![
+                ColumnReference::untyped("name"),
+                ColumnReference::untyped("age"),
+            ],
+            distinct: false,
+        });
+        match expr.data_type(&schema) {
+            DataType::Struct(st) => {
+                assert_eq!(st.fields.len(), 2);
+                assert_eq!(st.fields[0].name, "name");
+                assert_eq!(st.fields[0].data_type, DataType::String);
+                assert!(st.fields[0].nullable);
+                assert_eq!(st.fields[1].name, "age");
+                assert_eq!(st.fields[1].data_type, DataType::Integer);
+                assert!(!st.fields[1].nullable);
+            }
+            other => panic!("expected DataType::Struct, got: {other:?}"),
+        }
+        // Nullability of the struct expression itself is non-null.
+        assert!(!expr.nullable(&schema));
+    }
+
+    /// §9 test 8 — alias name wins in `struct(...)` field-name derivation.
+    #[test]
+    fn struct_data_type_alias_wins() {
+        let schema = StructType::new(vec![StructField::nullable("name", DataType::String)]);
+        let aliased = Expression::Alias(AliasExpression {
+            expr: Box::new(ColumnReference::untyped("name")),
+            alias: "who".to_owned(),
+        });
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "struct".to_owned(),
+            args: vec![aliased],
+            distinct: false,
+        });
+        match expr.data_type(&schema) {
+            DataType::Struct(st) => {
+                assert_eq!(st.fields.len(), 1);
+                assert_eq!(st.fields[0].name, "who");
+                assert_eq!(st.fields[0].data_type, DataType::String);
+            }
+            other => panic!("expected DataType::Struct, got: {other:?}"),
+        }
+    }
+
+    /// Companion — `named_struct` fast-path picks up literal keys.
+    #[test]
+    fn named_struct_data_type_uses_literal_keys() {
+        let schema = StructType::new(vec![
+            StructField::nullable("a", DataType::Integer),
+            StructField::nullable("b", DataType::String),
+        ]);
+        let key_x = Expression::Literal(Literal {
+            value: LiteralValue::String("x".to_owned()),
+            data_type: DataType::String,
+        });
+        let key_y = Expression::Literal(Literal {
+            value: LiteralValue::String("y".to_owned()),
+            data_type: DataType::String,
+        });
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "named_struct".to_owned(),
+            args: vec![
+                key_x,
+                ColumnReference::untyped("a"),
+                key_y,
+                ColumnReference::untyped("b"),
+            ],
+            distinct: false,
+        });
+        match expr.data_type(&schema) {
+            DataType::Struct(st) => {
+                assert_eq!(st.fields.len(), 2);
+                assert_eq!(st.fields[0].name, "x");
+                assert_eq!(st.fields[0].data_type, DataType::Integer);
+                assert_eq!(st.fields[1].name, "y");
+                assert_eq!(st.fields[1].data_type, DataType::String);
+            }
+            other => panic!("expected DataType::Struct, got: {other:?}"),
+        }
+    }
+
+    // ── UpdateFields (Pass 61 — struct-005 / struct-006) ────────────────────
+
+    fn address_struct_type() -> DataType {
+        DataType::Struct(StructType::new(vec![
+            StructField::nullable("street", DataType::String),
+            StructField::nullable("city", DataType::String),
+            StructField::nullable("geo", DataType::String),
+        ]))
+    }
+
+    fn address_column() -> Expression {
+        Expression::ColumnReference(ColumnReference {
+            name: "address".to_owned(),
+            qualifier: None,
+            data_type: Some(address_struct_type()),
+            nullable: Some(true),
+        })
+    }
+
+    /// `withField("country", "AT")` appends a new field to the struct's field
+    /// list, preserving the existing fields.
+    #[test]
+    fn update_fields_with_field_adds_new_field() {
+        let schema = StructType::new(vec![StructField::nullable(
+            "address",
+            address_struct_type(),
+        )]);
+        let expr = Expression::UpdateFields(UpdateFieldsExpression {
+            struct_expr: Box::new(address_column()),
+            updates: vec![(
+                "country".to_owned(),
+                Some(Expression::Literal(Literal {
+                    value: LiteralValue::String("AT".to_owned()),
+                    data_type: DataType::String,
+                })),
+            )],
+        });
+        match expr.data_type(&schema) {
+            DataType::Struct(st) => {
+                assert_eq!(st.fields.len(), 4);
+                assert_eq!(st.fields[0].name, "street");
+                assert_eq!(st.fields[3].name, "country");
+                assert_eq!(st.fields[3].data_type, DataType::String);
+                assert!(!st.fields[3].nullable);
+            }
+            other => panic!("expected DataType::Struct, got: {other:?}"),
+        }
+    }
+
+    /// `withField("city", "SomeCity")` on an existing field replaces its
+    /// type/nullability in place.
+    #[test]
+    fn update_fields_with_field_replaces_existing_field() {
+        let schema = StructType::new(vec![StructField::nullable(
+            "address",
+            address_struct_type(),
+        )]);
+        let expr = Expression::UpdateFields(UpdateFieldsExpression {
+            struct_expr: Box::new(address_column()),
+            updates: vec![(
+                "city".to_owned(),
+                Some(Expression::Literal(Literal {
+                    value: LiteralValue::String("Vienna".to_owned()),
+                    data_type: DataType::String,
+                })),
+            )],
+        });
+        match expr.data_type(&schema) {
+            DataType::Struct(st) => {
+                assert_eq!(st.fields.len(), 3);
+                assert_eq!(st.fields[1].name, "city");
+                assert!(!st.fields[1].nullable);
+            }
+            other => panic!("expected DataType::Struct, got: {other:?}"),
+        }
+    }
+
+    /// `dropFields("geo")` removes the named field from the struct.
+    #[test]
+    fn update_fields_drop_field_removes_field() {
+        let schema = StructType::new(vec![StructField::nullable(
+            "address",
+            address_struct_type(),
+        )]);
+        let expr = Expression::UpdateFields(UpdateFieldsExpression {
+            struct_expr: Box::new(address_column()),
+            updates: vec![("geo".to_owned(), None)],
+        });
+        match expr.data_type(&schema) {
+            DataType::Struct(st) => {
+                assert_eq!(st.fields.len(), 2);
+                assert_eq!(st.fields[0].name, "street");
+                assert_eq!(st.fields[1].name, "city");
+            }
+            other => panic!("expected DataType::Struct, got: {other:?}"),
+        }
+    }
+
+    /// `dropFields` is case-insensitive per Spark semantics.
+    #[test]
+    fn update_fields_drop_field_is_case_insensitive() {
+        let schema = StructType::new(vec![StructField::nullable(
+            "address",
+            address_struct_type(),
+        )]);
+        let expr = Expression::UpdateFields(UpdateFieldsExpression {
+            struct_expr: Box::new(address_column()),
+            updates: vec![("GEO".to_owned(), None)],
+        });
+        match expr.data_type(&schema) {
+            DataType::Struct(st) => {
+                assert_eq!(st.fields.len(), 2);
+                assert!(!st.fields.iter().any(|f| f.name.eq_ignore_ascii_case("geo")));
+            }
+            other => panic!("expected DataType::Struct, got: {other:?}"),
+        }
+    }
+
+    /// Review-fix C1: `withField("CITY", ...)` on a struct declaring `city`
+    /// replaces the existing slot (case-insensitive match) and preserves the
+    /// original declared field name `"city"`, matching Spark 4.1.
+    #[test]
+    fn update_fields_with_field_is_case_insensitive_and_preserves_original_name() {
+        let schema = StructType::new(vec![StructField::nullable(
+            "address",
+            address_struct_type(),
+        )]);
+        let expr = Expression::UpdateFields(UpdateFieldsExpression {
+            struct_expr: Box::new(address_column()),
+            updates: vec![(
+                "CITY".to_owned(),
+                Some(Expression::Literal(Literal {
+                    value: LiteralValue::String("Vienna".to_owned()),
+                    data_type: DataType::String,
+                })),
+            )],
+        });
+        match expr.data_type(&schema) {
+            DataType::Struct(st) => {
+                assert_eq!(st.fields.len(), 3);
+                // Position preserved AND original casing kept.
+                assert_eq!(st.fields[1].name, "city");
+                assert_eq!(st.fields[1].data_type, DataType::String);
+                assert!(!st.fields[1].nullable);
+            }
+            other => panic!("expected DataType::Struct, got: {other:?}"),
+        }
+    }
+
+    /// Review-fix C2: analyzer's `update_fields_data_type` and emission's
+    /// `render_update_fields` must produce the *same* struct schema for a
+    /// mixed-case op sequence. This test locks the analyzer view; the
+    /// matching emission-side lock lives in `emission.rs`
+    /// (`render_update_fields_mixed_case_agrees_with_analyzer`).
+    #[test]
+    fn update_fields_analyzer_schema_matches_mixed_case_ops() {
+        let schema = StructType::new(vec![StructField::nullable(
+            "address",
+            address_struct_type(),
+        )]);
+        let expr = Expression::UpdateFields(UpdateFieldsExpression {
+            struct_expr: Box::new(address_column()),
+            updates: vec![
+                (
+                    "CITY".to_owned(),
+                    Some(Expression::Literal(Literal {
+                        value: LiteralValue::String("Vienna".to_owned()),
+                        data_type: DataType::String,
+                    })),
+                ),
+                ("GEO".to_owned(), None),
+                (
+                    "country".to_owned(),
+                    Some(Expression::Literal(Literal {
+                        value: LiteralValue::String("AT".to_owned()),
+                        data_type: DataType::String,
+                    })),
+                ),
+            ],
+        });
+        match expr.data_type(&schema) {
+            DataType::Struct(st) => {
+                let names: Vec<&str> = st.fields.iter().map(|f| f.name.as_str()).collect();
+                // "city" preserved (not "CITY"), "geo" removed, "country" appended.
+                assert_eq!(names, vec!["street", "city", "country"]);
+            }
+            other => panic!("expected DataType::Struct, got: {other:?}"),
+        }
+    }
+
     #[test]
     fn corr_family_functioncall_returns_double() {
         let s = StructType::new(vec![
@@ -1138,5 +1806,58 @@ mod tests {
             );
             assert!(expr.nullable(&s), "{name} FunctionCall must be nullable",);
         }
+    }
+
+    /// Pass 70 anchor — `aggregate(arr, init, lambda)` must resolve to the
+    /// init/seed type, not to `Array<T>`. Corpus: `hof-003` returns String
+    /// because the seed `F.lit("")` is a String literal.
+    #[test]
+    fn aggregate_hof_returns_seed_type_not_array_type() {
+        let s = StructType::new(vec![StructField::nullable(
+            "tags",
+            DataType::Array(Box::new(DataType::String), true),
+        )]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "aggregate".to_owned(),
+            args: vec![
+                ColumnReference::untyped("tags"),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(String::new()),
+                    data_type: DataType::String,
+                }),
+                // Real emissions place a Lambda here; the type inference
+                // fast-path reads only args[0..2], so a placeholder col
+                // is sufficient for this test.
+                ColumnReference::untyped("__lambda_placeholder"),
+            ],
+            distinct: false,
+        });
+        assert_eq!(
+            expr.data_type(&s),
+            DataType::String,
+            "aggregate should return the seed's type (String), not Array<String>",
+        );
+    }
+
+    /// Numeric seed → aggregate returns numeric, not array.
+    #[test]
+    fn aggregate_hof_with_long_seed_returns_long() {
+        let s = StructType::new(vec![StructField::nullable(
+            "nums",
+            DataType::Array(Box::new(DataType::Long), true),
+        )]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "reduce".to_owned(),
+            args: vec![
+                ColumnReference::untyped("nums"),
+                Expression::Literal(Literal {
+                    value: LiteralValue::Long(0),
+                    data_type: DataType::Long,
+                }),
+                ColumnReference::untyped("__lambda_placeholder"),
+            ],
+            distinct: false,
+        });
+        assert_eq!(expr.data_type(&s), DataType::Long);
     }
 }

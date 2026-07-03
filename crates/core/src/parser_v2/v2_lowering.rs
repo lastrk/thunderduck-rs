@@ -553,11 +553,31 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
             }))
         }
         Expr::Value(vw) => lower_value(vw),
-        Expr::BinaryOp { left, op, right } => Ok(Expression::Binary(BinaryExpression {
-            op: lower_binary_op(op)?,
-            left: Box::new(lower_expr(*left)?),
-            right: Box::new(lower_expr(*right)?),
-        })),
+        Expr::BinaryOp { left, op, right } => {
+            // Spark's `a DIV b` integer-division operator lowers to a truncating
+            // integer divide. Emit as `CAST(a / b AS BIGINT)` — DuckDB's `/`
+            // on integer operands truncates, matching Spark's semantics for
+            // integral inputs. The projection-slot Spark-return-cast keeps
+            // the outer type consistent. Corpus witness: `type-007`.
+            if matches!(op, BinaryOperator::MyIntegerDivide) {
+                let l = lower_expr(*left)?;
+                let r = lower_expr(*right)?;
+                return Ok(Expression::Cast(CastExpression {
+                    expr: Box::new(Expression::Binary(BinaryExpression {
+                        op: BinaryOp::Div,
+                        left: Box::new(l),
+                        right: Box::new(r),
+                    })),
+                    to_type: DataType::Long,
+                    try_cast: false,
+                }));
+            }
+            Ok(Expression::Binary(BinaryExpression {
+                op: lower_binary_op(op)?,
+                left: Box::new(lower_expr(*left)?),
+                right: Box::new(lower_expr(*right)?),
+            }))
+        }
         Expr::UnaryOp { op, expr } => match op {
             UnaryOperator::Not => Ok(Expression::Unary(UnaryExpression {
                 op: UnaryOp::Not,
@@ -641,6 +661,51 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
             case_insensitive: false,
         })),
         Expr::Wildcard(_) => Ok(Expression::Star(StarExpression { qualifier: None })),
+        // Spark's `EXTRACT(<field> FROM <expr>)` and `DATE_PART(<field>, <expr>)`
+        // parse to `Expr::Extract`. Lower to a FunctionCall of
+        // `date_part('<field>', <expr>)` — DuckDB accepts this form for all
+        // date/timestamp fields (year, month, day, hour, ...). Corpus
+        // witness: `dt-016` (`extract(YEAR FROM hire_date)`).
+        Expr::Extract { field, expr, .. } => {
+            // Spark's `EXTRACT(<field> FROM <expr>)` lowers to a direct
+            // function call — `year(x)`, `month(x)`, `day(x)`, etc. — so
+            // that the existing type_inference / emission arms for those
+            // functions apply (they return INTEGER, matching Spark).
+            // Fall back to `date_part('<field>', <expr>)` (DOUBLE return)
+            // only for fields without a dedicated Spark function name.
+            // Corpus witness: `dt-016` (`extract(YEAR FROM hire_date)`).
+            let field_str = format!("{field}").to_lowercase();
+            let inner = lower_expr(*expr)?;
+            let (fn_name, use_date_part) = match field_str.as_str() {
+                "year" => ("year", false),
+                "month" => ("month", false),
+                "day" | "dayofmonth" => ("day", false),
+                "hour" => ("hour", false),
+                "minute" => ("minute", false),
+                "second" => ("second", false),
+                "quarter" => ("quarter", false),
+                "week" | "weekofyear" => ("weekofyear", false),
+                "dayofweek" => ("dayofweek", false),
+                "dayofyear" => ("dayofyear", false),
+                _ => ("date_part", true),
+            };
+            let args = if use_date_part {
+                vec![
+                    Expression::Literal(Literal {
+                        value: LiteralValue::String(field_str),
+                        data_type: DataType::String,
+                    }),
+                    inner,
+                ]
+            } else {
+                vec![inner]
+            };
+            Ok(Expression::FunctionCall(FunctionCall {
+                name: fn_name.to_owned(),
+                args,
+                distinct: false,
+            }))
+        }
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::expr::{}", expr_kind(&other)),
             reason: "expression shape not supported at Slice A.2".to_owned(),
@@ -1046,6 +1111,44 @@ mod tests {
             result,
             Err(EmissionError::UnsupportedProtoShape { .. })
         ));
+    }
+
+    #[test]
+    fn parse_div_keyword_lowers_to_integer_divide_cast() {
+        // Pass 73: SparkSQL's `a DIV b` — the SparkDialect's `parse_infix`
+        // registers DIV as an integer-division operator; v2_lowering
+        // wraps the resulting binary in a `CAST(... AS BIGINT)`.
+        let plan = parse("SELECT a div 2 FROM t").expect("should parse");
+        match plan.op {
+            CommonOp::Project { projections, .. } => {
+                assert_eq!(projections.len(), 1);
+                assert!(
+                    matches!(&projections[0], Expression::Cast(c)
+                        if matches!(&*c.expr, Expression::Binary(b) if b.op == BinaryOp::Div)
+                    ),
+                    "expected Cast(Binary(Div)) for `a DIV 2`, got {:?}",
+                    projections[0]
+                );
+            }
+            _ => panic!("expected Project"),
+        }
+    }
+
+    #[test]
+    fn parse_extract_year_lowers_to_year_function() {
+        // Pass 73: `EXTRACT(YEAR FROM col)` lowers to a FunctionCall to
+        // `year(col)` (INTEGER return-type, matching Spark).
+        let plan = parse("SELECT EXTRACT(YEAR FROM d) FROM t").expect("should parse");
+        match plan.op {
+            CommonOp::Project { projections, .. } => match &projections[0] {
+                Expression::FunctionCall(fc) => {
+                    assert_eq!(fc.name.to_lowercase(), "year");
+                    assert_eq!(fc.args.len(), 1);
+                }
+                other => panic!("expected FunctionCall, got {other:?}"),
+            },
+            _ => panic!("expected Project"),
+        }
     }
 
     #[test]

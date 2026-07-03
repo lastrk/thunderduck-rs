@@ -26,22 +26,80 @@ use std::collections::HashSet;
 
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, ListArray,
+    Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, ListArray,
     MapArray, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::DataType as ArrowDT;
 use arrow_ipc::reader::StreamReader;
-use thunderduck_core::transpiler_v2::EmissionError;
 use thunderduck_core::transpiler_v2::ast::{CommonAst, CommonOp, FileFormat, JoinType};
 use thunderduck_core::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
     FunctionCall, InListExpression, Literal, LiteralValue, NullOrdering, SortDirection, SortOrder,
     StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
+use thunderduck_core::transpiler_v2::EmissionError;
 use thunderduck_core::types::{DataType, StructField, StructType};
 
 use crate::converter::type_converter::{parse_type_str, proto_to_data_type};
 use crate::proto::spark::connect as proto;
+
+/// Normalize a decimal literal's `(precision, scale)` to the value's actual
+/// digit shape, mirroring what Spark does on the server side. PySpark sends
+/// coarse `(precision=10, scale=0)` even for values like `"0.00"`; Spark
+/// re-types the literal to a tight-fitting `(precision, scale)` so that
+/// downstream `findTightestCommonType` widening (used by `coalesce`, `CASE
+/// WHEN`, etc.) matches what a Spark user expects.
+///
+/// Returns the tight-fit `(precision, scale)`, but never smaller than the
+/// server-supplied values (which sometimes over-report scale).
+///
+/// Corpus anchor: `cond-004` (Pass 77) — Spark widens
+/// `coalesce(Decimal(10,2), lit(Decimal("0.00")))` to `Decimal(10,2)`, which
+/// requires the literal to normalize to `Decimal(2,2)` (tight-fit), not the
+/// PySpark-wire `Decimal(10,0)`.
+fn normalize_decimal_literal(
+    value: &str,
+    server_precision: Option<u8>,
+    server_scale: Option<u8>,
+) -> (u8, u8) {
+    // Strip sign and split on '.'
+    let trimmed = value.trim_start_matches(['+', '-']);
+    let (int_part, frac_part) = match trimmed.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (trimmed, ""),
+    };
+    let leading_int_digits = int_part
+        .trim_start_matches('0')
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .count() as u8;
+    let frac_digits = frac_part.chars().filter(|c| c.is_ascii_digit()).count() as u8;
+    // Spark tight-fit: scale = frac_digits; precision = max(1, int_digits +
+    // frac_digits) where int_digits excludes leading zeros. For "0.00":
+    // frac_digits=2, int_digits=0 → precision=max(1, 2)=2, scale=2.
+    let derived_scale = frac_digits;
+    let derived_precision = leading_int_digits
+        .saturating_add(frac_digits)
+        .max(derived_scale)
+        .max(1);
+    // Case A: server didn't supply precision/scale — use derived.
+    let (sp, ss) = match (server_precision, server_scale) {
+        (Some(p), Some(s)) => (p, s),
+        _ => {
+            let p = derived_precision.min(38);
+            return (p.max(derived_scale).max(1), derived_scale);
+        }
+    };
+    // Case B: server-supplied scale disagrees with the value's fractional
+    // shape (classic PySpark artifact: `Decimal("0.00")` → (10, 0)). Prefer
+    // the tight-fit derived from the value string.
+    if ss != derived_scale {
+        let p = derived_precision.min(38);
+        return (p.max(derived_scale).max(1), derived_scale);
+    }
+    // Case C: server-supplied precision/scale are consistent — keep them.
+    (sp.min(38).max(ss).max(1), ss)
+}
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
@@ -101,12 +159,11 @@ impl V2RelationConverter {
             RelType::FillNa(f) => self.convert_fill_na(f),
             RelType::DropNa(d) => self.convert_drop_na(d),
             RelType::Replace(r) => self.convert_replace(r),
+            RelType::Unpivot(u) => self.convert_unpivot(u),
             // Cosmetic ops per Spark 4 semantics — semantically no-op.
             // Thunderduck ignores them and continues with the input relation
             // (ADR-001 "result-irrelevant cosmetic" carve-out).
-            RelType::Hint(h) => {
-                self.convert_input(h.input.as_deref(), "Hint")
-            }
+            RelType::Hint(h) => self.convert_input(h.input.as_deref(), "Hint"),
             RelType::RepartitionByExpression(r) => {
                 self.convert_input(r.input.as_deref(), "RepartitionByExpression")
             }
@@ -176,18 +233,20 @@ impl V2RelationConverter {
             thunderduck_core::transpiler_v2::Expression,
         )> = Vec::with_capacity(r.replacements.len());
         for rep in &r.replacements {
-            let old_lit = rep.old_value.as_ref().ok_or_else(|| {
-                EmissionError::UnsupportedProtoShape {
-                    shape: "NaReplace::old_value::None".to_owned(),
-                    reason: "NaReplace replacement missing old_value".to_owned(),
-                }
-            })?;
-            let new_lit = rep.new_value.as_ref().ok_or_else(|| {
-                EmissionError::UnsupportedProtoShape {
-                    shape: "NaReplace::new_value::None".to_owned(),
-                    reason: "NaReplace replacement missing new_value".to_owned(),
-                }
-            })?;
+            let old_lit =
+                rep.old_value
+                    .as_ref()
+                    .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                        shape: "NaReplace::old_value::None".to_owned(),
+                        reason: "NaReplace replacement missing old_value".to_owned(),
+                    })?;
+            let new_lit =
+                rep.new_value
+                    .as_ref()
+                    .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                        shape: "NaReplace::new_value::None".to_owned(),
+                        reason: "NaReplace replacement missing new_value".to_owned(),
+                    })?;
             let old_expr = proto::Expression {
                 expr_type: Some(proto::expression::ExprType::Literal(old_lit.clone())),
                 ..Default::default()
@@ -205,10 +264,51 @@ impl V2RelationConverter {
         }))
     }
 
-    fn convert_deduplicate(
-        &mut self,
-        d: &proto::Deduplicate,
-    ) -> Result<CommonAst, EmissionError> {
+    fn convert_unpivot(&mut self, u: &proto::Unpivot) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(u.input.as_deref(), "Unpivot")?;
+
+        // Extract id column names — the τ AST stores column names (mirrors
+        // legacy `logical::Unpivot`). Anything richer than a bare
+        // `UnresolvedAttribute` is a Thunderduck-boundary shape.
+        let mut ids: Vec<String> = Vec::with_capacity(u.ids.len());
+        for e in &u.ids {
+            ids.push(extract_column_name(e).ok_or_else(|| {
+                EmissionError::UnsupportedProtoShape {
+                    shape: "Unpivot::id::non_attribute".to_owned(),
+                    reason: "Unpivot id columns must be bare column references".to_owned(),
+                }
+            })?);
+        }
+
+        // Extract value column names; None ⇒ analyzer expands to all non-id
+        // input columns per Spark's default.
+        let values: Vec<String> = match u.values.as_ref() {
+            Some(v) => {
+                let mut out = Vec::with_capacity(v.values.len());
+                for e in &v.values {
+                    out.push(extract_column_name(e).ok_or_else(|| {
+                        EmissionError::UnsupportedProtoShape {
+                            shape: "Unpivot::value::non_attribute".to_owned(),
+                            reason: "Unpivot value columns must be bare column references"
+                                .to_owned(),
+                        }
+                    })?);
+                }
+                out
+            }
+            None => Vec::new(),
+        };
+
+        Ok(CommonAst::new(CommonOp::Unpivot {
+            input: Box::new(input),
+            ids,
+            values,
+            variable_column_name: u.variable_column_name.clone(),
+            value_column_name: u.value_column_name.clone(),
+        }))
+    }
+
+    fn convert_deduplicate(&mut self, d: &proto::Deduplicate) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(d.input.as_deref(), "Deduplicate")?;
         // `all_columns_as_keys=true` → dedupe on all columns (empty on_columns).
         // Otherwise use column_names.
@@ -251,10 +351,7 @@ impl V2RelationConverter {
         }))
     }
 
-    fn convert_set_op(
-        &mut self,
-        so: &proto::SetOperation,
-    ) -> Result<CommonAst, EmissionError> {
+    fn convert_set_op(&mut self, so: &proto::SetOperation) -> Result<CommonAst, EmissionError> {
         use proto::set_operation::SetOpType;
         use thunderduck_core::transpiler_v2::analyzer::SetOpKind;
         let left = self.convert_input(so.left_input.as_deref(), "SetOp::left")?;
@@ -300,8 +397,7 @@ impl V2RelationConverter {
                 _ => {
                     return Err(EmissionError::UnsupportedProtoShape {
                         shape: "Drop::column::non_attribute".to_owned(),
-                        reason: "Drop.columns must be bare column references"
-                            .to_owned(),
+                        reason: "Drop.columns must be bare column references".to_owned(),
                     });
                 }
             }
@@ -326,17 +422,18 @@ impl V2RelationConverter {
                 _ => {
                     return Err(EmissionError::UnsupportedProtoShape {
                         shape: "WithColumns::Alias::multi_name".to_owned(),
-                        reason: "WithColumns aliases must carry exactly one name part"
-                            .to_owned(),
+                        reason: "WithColumns aliases must carry exactly one name part".to_owned(),
                     });
                 }
             };
-            let expr_proto = alias.expr.as_deref().ok_or_else(|| {
-                EmissionError::UnsupportedProtoShape {
-                    shape: "WithColumns::Alias::missing_expr".to_owned(),
-                    reason: "WithColumns alias has no expression".to_owned(),
-                }
-            })?;
+            let expr_proto =
+                alias
+                    .expr
+                    .as_deref()
+                    .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                        shape: "WithColumns::Alias::missing_expr".to_owned(),
+                        reason: "WithColumns alias has no expression".to_owned(),
+                    })?;
             let expr = self.expr.convert(expr_proto)?;
             assignments.push((name, expr));
         }
@@ -351,11 +448,23 @@ impl V2RelationConverter {
             Some(i) => self.convert(i)?,
             None => CommonAst::new(CommonOp::SingleRow),
         };
-        let projections = p
-            .expressions
-            .iter()
-            .map(|e| self.expr.convert(e))
-            .collect::<Result<Vec<_>, _>>()?;
+        // Spark's `F.posexplode(arr).alias("pos", "val")` arrives as a single
+        // proto `Alias(name=[pos, val], expr=UnresolvedFunction("posexplode", [arr]))`.
+        // A one-slot projection needs to yield two SELECT-list expressions
+        // (position + value). Detect the multi-name posexplode Alias here and
+        // expand into two synthetic FunctionCall projections that
+        // `emission::render_function_call` renders as `generate_subscripts(arr, 1) - 1`
+        // and `UNNEST(arr)` respectively. Corpus: arr-017.
+        let mut projections: Vec<Expression> = Vec::with_capacity(p.expressions.len());
+        for e in &p.expressions {
+            if let Some(pair) = self.expr.try_convert_posexplode_multi_alias(e)? {
+                let (pos_proj, val_proj) = pair;
+                projections.push(pos_proj);
+                projections.push(val_proj);
+            } else {
+                projections.push(self.expr.convert(e)?);
+            }
+        }
         Ok(CommonAst::new(CommonOp::Project {
             input: Box::new(input),
             projections,
@@ -416,17 +525,18 @@ impl V2RelationConverter {
     fn convert_aggregate(&mut self, a: &proto::Aggregate) -> Result<CommonAst, EmissionError> {
         use proto::aggregate::GroupType;
         use thunderduck_core::transpiler_v2::ast::GroupingKind;
+        // Pass 60: PIVOT is a first-class CommonOp — not an Aggregate.
+        // Bail into the dedicated pivot conversion before the GroupType
+        // discriminator collapses into GroupingKind (which has no Pivot arm).
+        if a.group_type() == GroupType::Pivot {
+            return self.convert_pivot(a);
+        }
         let grouping_kind = match a.group_type() {
             GroupType::Unspecified | GroupType::Groupby => GroupingKind::GroupBy,
             GroupType::Rollup => GroupingKind::Rollup,
             GroupType::Cube => GroupingKind::Cube,
             GroupType::GroupingSets => GroupingKind::GroupingSets,
-            GroupType::Pivot => {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "Aggregate::Pivot".to_owned(),
-                    reason: "PIVOT deferred to Slice G".to_owned(),
-                });
-            }
+            GroupType::Pivot => unreachable!("handled by convert_pivot above"),
         };
         let input = self.convert_input(a.input.as_deref(), "Aggregate")?;
         let grouping = a
@@ -444,6 +554,55 @@ impl V2RelationConverter {
             grouping,
             aggregates,
             grouping_kind,
+        }))
+    }
+
+    /// Convert `Aggregate` protos whose `group_type` is `PIVOT` into a
+    /// [`CommonOp::Pivot`]. Grouping expressions map 1:1; the pivot column
+    /// and (optional) pivot value literals live in the proto `pivot` sub-msg.
+    /// Aggregate expressions come from `aggregate_expressions`. Empty
+    /// `pivot_values` is legal — signals "eager discovery" per Spark
+    /// semantics; DuckDB PIVOT will auto-materialise distinct values at
+    /// execution.
+    fn convert_pivot(&mut self, a: &proto::Aggregate) -> Result<CommonAst, EmissionError> {
+        let pivot_proto = a
+            .pivot
+            .as_ref()
+            .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                shape: "Aggregate::Pivot::missing_pivot".to_owned(),
+                reason: "PIVOT Aggregate has no `pivot` sub-message".to_owned(),
+            })?;
+        let pivot_col_proto =
+            pivot_proto
+                .col
+                .as_ref()
+                .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                    shape: "Aggregate::Pivot::missing_col".to_owned(),
+                    reason: "PIVOT Aggregate::pivot has no `col`".to_owned(),
+                })?;
+        let input = self.convert_input(a.input.as_deref(), "Aggregate[Pivot]")?;
+        let pivot_column = self.expr.convert(pivot_col_proto)?;
+        let grouping = a
+            .grouping_expressions
+            .iter()
+            .map(|e| self.expr.convert(e))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pivot_values = pivot_proto
+            .values
+            .iter()
+            .map(|lit| self.expr.convert_literal(lit))
+            .collect::<Result<Vec<_>, _>>()?;
+        let aggregates = a
+            .aggregate_expressions
+            .iter()
+            .map(|e| self.expr.convert(e))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CommonAst::new(CommonOp::Pivot {
+            input: Box::new(input),
+            grouping,
+            pivot_column,
+            pivot_values,
+            aggregates,
         }))
     }
 
@@ -579,16 +738,28 @@ impl V2ExpressionConverter {
             ExprType::UnresolvedFunction(func) => self.convert_unresolved_function(func),
             ExprType::Alias(alias) => self.convert_alias(alias),
             ExprType::Cast(cast) => self.convert_cast(cast),
-            ExprType::UnresolvedStar(star) => Ok(Expression::Star(StarExpression {
-                qualifier: star.unparsed_target.clone(),
-            })),
-            ExprType::LambdaFunction(lf) => {
-                let func_proto = lf.function.as_deref().ok_or_else(|| {
-                    EmissionError::UnsupportedProtoShape {
-                        shape: "LambdaFunction::function::None".to_owned(),
-                        reason: "LambdaFunction missing body".to_owned(),
+            ExprType::UnresolvedStar(star) => {
+                // Spark's `select("address.*")` sends `unparsed_target = "address.*"`
+                // (including the trailing `.*`). The analyzer wants just the
+                // qualifier (`"address"`) — strip the star suffix. A bare `*`
+                // arrives as `None`. Corpus witness: `struct-008`.
+                let qualifier = star.unparsed_target.as_ref().map(|s| {
+                    if let Some(base) = s.strip_suffix(".*") {
+                        base.to_owned()
+                    } else {
+                        s.clone()
                     }
-                })?;
+                });
+                Ok(Expression::Star(StarExpression { qualifier }))
+            }
+            ExprType::LambdaFunction(lf) => {
+                let func_proto =
+                    lf.function
+                        .as_deref()
+                        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                            shape: "LambdaFunction::function::None".to_owned(),
+                            reason: "LambdaFunction missing body".to_owned(),
+                        })?;
                 let body = self.convert(func_proto)?;
                 let mut params: Vec<String> = Vec::with_capacity(lf.arguments.len());
                 for arg in &lf.arguments {
@@ -597,8 +768,7 @@ impl V2ExpressionConverter {
                         _ => {
                             return Err(EmissionError::UnsupportedProtoShape {
                                 shape: "LambdaFunction::arg::multi_part".to_owned(),
-                                reason: "lambda argument name must be a single part"
-                                    .to_owned(),
+                                reason: "lambda argument name must be a single part".to_owned(),
                             });
                         }
                     };
@@ -633,14 +803,12 @@ impl V2ExpressionConverter {
                     }
                 })?;
                 let func = self.convert(func_proto)?;
-                let mut partition_by: Vec<Expression> =
-                    Vec::with_capacity(w.partition_spec.len());
+                let mut partition_by: Vec<Expression> = Vec::with_capacity(w.partition_spec.len());
                 for p in &w.partition_spec {
                     partition_by.push(self.convert(p)?);
                 }
-                let mut order_by: Vec<
-                    thunderduck_core::transpiler_v2::expression::SortOrder,
-                > = Vec::with_capacity(w.order_spec.len());
+                let mut order_by: Vec<thunderduck_core::transpiler_v2::expression::SortOrder> =
+                    Vec::with_capacity(w.order_spec.len());
                 for so in &w.order_spec {
                     order_by.push(self.convert_sort_order(so)?);
                 }
@@ -672,13 +840,11 @@ impl V2ExpressionConverter {
                             |b_opt: Option<&pwf::FrameBoundary>,
                              is_lower: bool|
                              -> Result<VFB, EmissionError> {
-                                let b = b_opt.ok_or_else(|| {
-                                    EmissionError::UnsupportedProtoShape {
-                                        shape: "Window::frame_spec::missing_boundary"
-                                            .to_owned(),
+                                let b =
+                                    b_opt.ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                                        shape: "Window::frame_spec::missing_boundary".to_owned(),
                                         reason: "frame boundary missing".to_owned(),
-                                    }
-                                })?;
+                                    })?;
                                 use pwf::frame_boundary::Boundary as PB;
                                 match b.boundary.as_ref() {
                                     Some(PB::CurrentRow(_)) => Ok(VFB::CurrentRow),
@@ -720,20 +886,14 @@ impl V2ExpressionConverter {
                                         })
                                     }
                                     None => Err(EmissionError::UnsupportedProtoShape {
-                                        shape: "Window::frame_boundary::None"
-                                            .to_owned(),
-                                        reason: "frame boundary carries no shape"
-                                            .to_owned(),
+                                        shape: "Window::frame_boundary::None".to_owned(),
+                                        reason: "frame boundary carries no shape".to_owned(),
                                     }),
                                 }
                             };
                         let lower = convert_boundary(fs.lower.as_deref(), true)?;
                         let upper = convert_boundary(fs.upper.as_deref(), false)?;
-                        Some(VWF {
-                            unit,
-                            lower,
-                            upper,
-                        })
+                        Some(VWF { unit, lower, upper })
                     }
                     None => None,
                 };
@@ -747,12 +907,13 @@ impl V2ExpressionConverter {
                 ))
             }
             ExprType::UnresolvedExtractValue(uev) => {
-                let child = uev.child.as_deref().ok_or_else(|| {
-                    EmissionError::UnsupportedProtoShape {
-                        shape: "UnresolvedExtractValue::child::None".to_owned(),
-                        reason: "ExtractValue missing child expression".to_owned(),
-                    }
-                })?;
+                let child =
+                    uev.child
+                        .as_deref()
+                        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                            shape: "UnresolvedExtractValue::child::None".to_owned(),
+                            reason: "ExtractValue missing child expression".to_owned(),
+                        })?;
                 let extraction = uev.extraction.as_deref().ok_or_else(|| {
                     EmissionError::UnsupportedProtoShape {
                         shape: "UnresolvedExtractValue::extraction::None".to_owned(),
@@ -777,6 +938,34 @@ impl V2ExpressionConverter {
                 // PySpark would reject the response with
                 // `PySparkValueError: data type unparsed`).
                 thunderduck_core::parser_v2::SparkSqlParserV2::parse_expression(&es.expression)
+            }
+            ExprType::UpdateFields(uf) => {
+                // Spark Connect chains withField / dropFields as nested
+                // `UpdateFields` protos — each carries one op and points at
+                // its predecessor via `struct_expression`. Flatten into a
+                // single [`UpdateFieldsExpression`] with an ordered
+                // `updates: Vec<(String, Option<Expression>)>`.
+                let (base_proto, ops) = flatten_update_fields(uf);
+                let base_proto =
+                    base_proto.ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                        shape: "UpdateFields::struct_expression::None".to_owned(),
+                        reason: "UpdateFields missing struct_expression".to_owned(),
+                    })?;
+                let struct_expr = self.convert(base_proto)?;
+                let mut updates: Vec<(String, Option<Expression>)> = Vec::with_capacity(ops.len());
+                for (field_name, maybe_value) in ops {
+                    let converted_value = match maybe_value {
+                        Some(v) => Some(self.convert(v)?),
+                        None => None,
+                    };
+                    updates.push((field_name, converted_value));
+                }
+                Ok(Expression::UpdateFields(
+                    thunderduck_core::transpiler_v2::expression::UpdateFieldsExpression {
+                        struct_expr: Box::new(struct_expr),
+                        updates,
+                    },
+                ))
             }
             other => Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("Expression::{}", expr_type_kind(other)),
@@ -874,8 +1063,10 @@ impl V2ExpressionConverter {
                 data_type: DataType::TimestampNtz,
             }),
             LiteralType::Decimal(d) => {
-                let precision = d.precision.unwrap_or(38) as u8;
-                let scale = d.scale.unwrap_or(18) as u8;
+                let server_precision = d.precision.map(|p| p as u8);
+                let server_scale = d.scale.map(|s| s as u8);
+                let (precision, scale) =
+                    normalize_decimal_literal(&d.value, server_precision, server_scale);
                 Expression::Literal(Literal {
                     value: LiteralValue::Decimal {
                         value: d.value.clone(),
@@ -1037,6 +1228,90 @@ impl V2ExpressionConverter {
         }))
     }
 
+    /// If `e` is `Alias(name=[a, b], expr=posexplode(arr))` (or
+    /// `posexplode_outer`), return the two synthetic projections
+    /// `Alias(posexplode_pos(arr), a)` and `Alias(posexplode_val(arr), b)`.
+    /// Otherwise return `Ok(None)` — the caller falls back to normal
+    /// single-expression conversion. Corpus: arr-017.
+    ///
+    /// Encapsulated here (in the expression converter) so `convert_project`
+    /// can splice the two-projection expansion without knowing the proto shape.
+    fn try_convert_posexplode_multi_alias(
+        &mut self,
+        e: &proto::Expression,
+    ) -> Result<Option<(Expression, Expression)>, EmissionError> {
+        use proto::expression::ExprType;
+        let Some(ExprType::Alias(alias)) = e.expr_type.as_ref() else {
+            return Ok(None);
+        };
+        // Only two-name aliases participate; single-name aliases route through
+        // the normal `convert_alias` path.
+        if alias.name.len() != 2 {
+            return Ok(None);
+        }
+        let Some(inner) = alias.expr.as_deref() else {
+            return Ok(None);
+        };
+        let Some(ExprType::UnresolvedFunction(func)) = inner.expr_type.as_ref() else {
+            return Ok(None);
+        };
+        let name_lower = func.function_name.to_ascii_lowercase();
+        // `posexplode(arr).alias(pos, val)` → two synthetic projections
+        // `posexplode_pos(arr) AS pos` + `posexplode_val(arr) AS val`.
+        //
+        // `explode(map).alias(k, v)` → two synthetic projections
+        // `map_explode_key(m) AS k` + `map_explode_val(m) AS v`. Spark's
+        // `explode` on a MAP fans out one row per key/value pair; the
+        // two-name Alias is Spark's signal that the operand is a MAP (arrays
+        // reject two-name aliases). Emission converts the synthetic
+        // `map_explode_key/val(m)` names to `UNNEST(map_keys/map_values(m))`.
+        //
+        // Corpus: arr-017 (posexplode), map-007 (map explode).
+        let is_pos = matches!(name_lower.as_str(), "posexplode" | "posexplode_outer");
+        let is_map_explode = matches!(name_lower.as_str(), "explode" | "explode_outer");
+        if !is_pos && !is_map_explode {
+            return Ok(None);
+        }
+        if func.arguments.len() != 1 {
+            return Err(EmissionError::UnsupportedProtoShape {
+                shape: format!("{}::arity", name_lower),
+                reason: format!(
+                    "`{}` with a two-name Alias requires exactly 1 argument, got {}",
+                    func.function_name,
+                    func.arguments.len()
+                ),
+            });
+        }
+        let arg = self.convert(&func.arguments[0])?;
+        let a_name = alias.name[0].clone();
+        let b_name = alias.name[1].clone();
+        let (a_fn_name, b_fn_name) = if is_pos {
+            ("posexplode_pos", "posexplode_val")
+        } else {
+            ("map_explode_key", "map_explode_val")
+        };
+        let a_fn = Expression::FunctionCall(FunctionCall {
+            name: a_fn_name.to_owned(),
+            args: vec![arg.clone()],
+            distinct: false,
+        });
+        let b_fn = Expression::FunctionCall(FunctionCall {
+            name: b_fn_name.to_owned(),
+            args: vec![arg],
+            distinct: false,
+        });
+        Ok(Some((
+            Expression::Alias(AliasExpression {
+                expr: Box::new(a_fn),
+                alias: a_name,
+            }),
+            Expression::Alias(AliasExpression {
+                expr: Box::new(b_fn),
+                alias: b_name,
+            }),
+        )))
+    }
+
     fn convert_cast(
         &mut self,
         cast: &proto::expression::Cast,
@@ -1074,6 +1349,18 @@ impl V2ExpressionConverter {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+/// Extract a column name from a proto `Expression` if it's a bare
+/// `UnresolvedAttribute`. Returns `None` for anything more elaborate — the
+/// caller decides whether to surface a Thunderduck-boundary error.
+fn extract_column_name(expr: &proto::Expression) -> Option<String> {
+    match expr.expr_type.as_ref()? {
+        proto::expression::ExprType::UnresolvedAttribute(attr) => {
+            Some(attr.unparsed_identifier.clone())
+        }
+        _ => None,
+    }
+}
 
 fn null_literal() -> Expression {
     Expression::Literal(Literal {
@@ -1178,6 +1465,42 @@ fn literal_kind(lt: &proto::expression::literal::LiteralType) -> &'static str {
         SpecializedArray(_) => "SpecializedArray",
         Time(_) => "Time",
     }
+}
+
+/// Flatten a chain of nested `UpdateFields` protos into `(base, ops)`.
+///
+/// Spark Connect emits `df.col("s").withField("a", va).withField("b", vb)` as
+/// `UpdateFields(field="b", value=Some(vb), struct=UpdateFields(field="a",
+/// value=Some(va), struct=<col "s">))`. The outermost proto is the *most
+/// recent* op; the innermost `struct_expression` that is NOT an `UpdateFields`
+/// is the base struct. Returns ops in **application order** — the innermost
+/// (oldest) op is index 0, the outermost (newest) is last.
+fn flatten_update_fields(
+    outer: &proto::expression::UpdateFields,
+) -> (
+    Option<&proto::Expression>,
+    Vec<(String, Option<&proto::Expression>)>,
+) {
+    use proto::expression::ExprType;
+    let mut ops_rev: Vec<(String, Option<&proto::Expression>)> = Vec::new();
+    let mut cursor: &proto::expression::UpdateFields = outer;
+    let base: Option<&proto::Expression> = loop {
+        ops_rev.push((
+            cursor.field_name.clone(),
+            cursor.value_expression.as_deref(),
+        ));
+        match cursor.struct_expression.as_deref() {
+            Some(next) => match &next.expr_type {
+                Some(ExprType::UpdateFields(inner)) => {
+                    cursor = inner;
+                }
+                _ => break Some(next),
+            },
+            None => break None,
+        }
+    };
+    ops_rev.reverse();
+    (base, ops_rev)
 }
 
 fn classify_file_format(
@@ -1908,7 +2231,10 @@ mod tests {
     }
 
     #[test]
-    fn convert_aggregate_pivot_returns_unsupported_proto_shape() {
+    fn convert_aggregate_pivot_without_pivot_sub_message_rejects_loudly() {
+        // Pass 60: PIVOT is now first-class, but a proto whose group_type is
+        // PIVOT yet carries no `pivot` sub-message is malformed — reject
+        // with a specific UnsupportedProtoShape rather than silently defaulting.
         let input = table_scan_rel("t");
         let a = rel(proto::relation::RelType::Aggregate(Box::new(
             proto::Aggregate {
@@ -1921,10 +2247,84 @@ mod tests {
             },
         )));
         let mut c = V2RelationConverter::new();
-        assert!(matches!(
-            c.convert(&a).unwrap_err(),
-            EmissionError::UnsupportedProtoShape { .. }
-        ));
+        match c.convert(&a).unwrap_err() {
+            EmissionError::UnsupportedProtoShape { shape, .. } => {
+                assert_eq!(shape, "Aggregate::Pivot::missing_pivot");
+            }
+            other => panic!("expected UnsupportedProtoShape(missing_pivot), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_aggregate_pivot_with_explicit_values_round_trips_to_common_op_pivot() {
+        // Pass 60 anchor for grp-004: PIVOT with explicit value literals maps
+        // 1:1 into CommonOp::Pivot — grouping / pivot_column / pivot_values /
+        // aggregates all preserved.
+        let input = table_scan_rel("emp");
+        let true_lit = proto::expression::Literal {
+            data_type: None,
+            literal_type: Some(proto::expression::literal::LiteralType::Boolean(true)),
+        };
+        let false_lit = proto::expression::Literal {
+            data_type: None,
+            literal_type: Some(proto::expression::literal::LiteralType::Boolean(false)),
+        };
+        let pivot_sub = proto::aggregate::Pivot {
+            col: Some(unresolved_attr("active")),
+            values: vec![true_lit, false_lit],
+        };
+        let a = rel(proto::relation::RelType::Aggregate(Box::new(
+            proto::Aggregate {
+                input: Some(Box::new(input)),
+                group_type: proto::aggregate::GroupType::Pivot as i32,
+                grouping_expressions: vec![unresolved_attr("dept_id")],
+                aggregate_expressions: vec![int_literal(1)],
+                pivot: Some(pivot_sub),
+                grouping_sets: vec![],
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&a).expect("convert Pivot");
+        match out.op {
+            CommonOp::Pivot {
+                grouping,
+                pivot_values,
+                aggregates,
+                ..
+            } => {
+                assert_eq!(grouping.len(), 1);
+                assert_eq!(pivot_values.len(), 2);
+                assert_eq!(aggregates.len(), 1);
+            }
+            _ => panic!("expected CommonOp::Pivot"),
+        }
+    }
+
+    #[test]
+    fn convert_aggregate_pivot_without_values_produces_empty_pivot_values() {
+        // Pass 60 anchor for grp-005: PIVOT with empty values → analyzer /
+        // emission handle "eager discovery" downstream.
+        let input = table_scan_rel("emp");
+        let pivot_sub = proto::aggregate::Pivot {
+            col: Some(unresolved_attr("dept_id")),
+            values: vec![],
+        };
+        let a = rel(proto::relation::RelType::Aggregate(Box::new(
+            proto::Aggregate {
+                input: Some(Box::new(input)),
+                group_type: proto::aggregate::GroupType::Pivot as i32,
+                grouping_expressions: vec![unresolved_attr("active")],
+                aggregate_expressions: vec![int_literal(1)],
+                pivot: Some(pivot_sub),
+                grouping_sets: vec![],
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&a).expect("convert implicit Pivot");
+        match out.op {
+            CommonOp::Pivot { pivot_values, .. } => assert!(pivot_values.is_empty()),
+            _ => panic!("expected CommonOp::Pivot"),
+        }
     }
 
     #[test]
@@ -2232,6 +2632,69 @@ mod tests {
                  catch-all — use EmissionError::UnsupportedProtoShape instead.",
                 n + 1
             );
+        }
+    }
+
+    // ── Unpivot conversion (piv-004 / piv-005) ─────────────────────────────
+
+    #[test]
+    fn convert_unpivot_round_trip_maps_proto_fields_to_common_op() {
+        // Anchor: piv-004 shape — ids=[id], values=[age, salary], names
+        // "metric"/"value". The proto → AST mapping must preserve column
+        // names exactly (`extract_column_name` accepts bare
+        // UnresolvedAttribute only).
+        let input = table_scan_rel("emp");
+        let unpivot = rel(proto::relation::RelType::Unpivot(Box::new(
+            proto::Unpivot {
+                input: Some(Box::new(input)),
+                ids: vec![unresolved_attr("id")],
+                values: Some(proto::unpivot::Values {
+                    values: vec![unresolved_attr("age"), unresolved_attr("salary")],
+                }),
+                variable_column_name: "metric".to_owned(),
+                value_column_name: "value".to_owned(),
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&unpivot).expect("convert Unpivot");
+        match out.op {
+            CommonOp::Unpivot {
+                input,
+                ids,
+                values,
+                variable_column_name,
+                value_column_name,
+            } => {
+                assert!(matches!(input.op, CommonOp::TableScan { .. }));
+                assert_eq!(ids, vec!["id".to_owned()]);
+                assert_eq!(values, vec!["age".to_owned(), "salary".to_owned()]);
+                assert_eq!(variable_column_name, "metric");
+                assert_eq!(value_column_name, "value");
+            }
+            _ => panic!("expected Unpivot"),
+        }
+    }
+
+    #[test]
+    fn convert_unpivot_absent_values_carries_empty_list_for_analyzer_expansion() {
+        // When the proto omits the `values` field, Spark's default is "all
+        // non-id columns". τ leaves `values` empty in the AST and expects
+        // the analyzer to materialise the expansion.
+        let input = table_scan_rel("emp");
+        let unpivot = rel(proto::relation::RelType::Unpivot(Box::new(
+            proto::Unpivot {
+                input: Some(Box::new(input)),
+                ids: vec![unresolved_attr("id")],
+                values: None,
+                variable_column_name: "metric".to_owned(),
+                value_column_name: "value".to_owned(),
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&unpivot).expect("convert Unpivot");
+        match out.op {
+            CommonOp::Unpivot { values, .. } => assert!(values.is_empty()),
+            _ => panic!("expected Unpivot"),
         }
     }
 }

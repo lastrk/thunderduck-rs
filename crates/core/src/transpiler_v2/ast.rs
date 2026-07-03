@@ -37,7 +37,7 @@ impl CommonAst {
 /// FileScan / Values / LocalRelation / Join / TableFunction / Unnest /
 /// SingleRow). Deferred plan shapes (SetOp, SubqueryAlias, WithColumns,
 /// Distinct, Sample, ShowString, Tail, DropColumns, ToDataFrame, NA family,
-/// Pivot/Unpivot, Stat family, Repartition/Hint passthrough) surface as
+/// Pivot, Stat family, Repartition/Hint passthrough) surface as
 /// [`super::EmissionError::UnsupportedProtoShape`] until later slices grow
 /// their variants. There is **no** opaque `Sql` variant — parser_v2 owns SQL
 /// text (Open Decision 1 Option 1b).
@@ -233,6 +233,60 @@ pub enum CommonOp {
         cols: Vec<String>,
         /// (old, new) pairs.
         replacements: Vec<(Expression, Expression)>,
+    },
+
+    /// `df.unpivot(ids, values, variable_column_name, value_column_name)` /
+    /// `df.melt(...)` (PySpark alias). Wide → long transformation.
+    ///
+    /// **Semantics:** produces `<ids>` columns unchanged plus two new columns:
+    /// `variable_column_name` (STRING NOT NULL, the source column name) and
+    /// `value_column_name` (Spark-widened common type across all `values`
+    /// columns, nullable if any source value column is nullable).
+    ///
+    /// `ids` and `values` are column *names* (mirror legacy
+    /// `logical::Unpivot`). When `values` is empty, Spark defaults to "all
+    /// non-id columns"; the analyzer materialises that expansion so the
+    /// emission stage sees a fully-resolved column list.
+    Unpivot {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// Id columns — preserved verbatim in the output.
+        ids: Vec<String>,
+        /// Value columns to unpivot. Empty ⇒ analyzer expands to all
+        /// non-id input columns per Spark semantics.
+        values: Vec<String>,
+        /// The name of the output variable column (source-column names).
+        variable_column_name: String,
+        /// The name of the output value column (source-column values).
+        value_column_name: String,
+    },
+
+    /// `df.groupBy(...).pivot(col, [values]).agg(...)` — rotate rows to
+    /// columns. Grouping columns remain as rows; the pivot column's distinct
+    /// values (either supplied explicitly or discovered eagerly at runtime by
+    /// DuckDB's PIVOT operator when `pivot_values` is empty) become new column
+    /// headers, one per aggregate per pivot value.
+    ///
+    /// **Semantics:** the output schema is `<grouping> + <pivot_value_i × agg_j>`.
+    /// When multiple aggregates are supplied, output column names follow
+    /// Spark's `<pivot_value>_<agg_alias>` convention; when a single aggregate
+    /// is supplied, output columns are named after the pivot values verbatim.
+    /// Empty `pivot_values` (implicit / "eager discovery" per Spark) is a
+    /// Thunderduck-boundary case per ADR-022 — the τ analyzer rejects with
+    /// `PuntedOperator("Pivot[implicit-values]")` because implementing it
+    /// needs a session-injected DISTINCT-query hook (Slice G).
+    Pivot {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// Grouping columns (preserved as rows).
+        grouping: Vec<Expression>,
+        /// The column whose distinct values become new column headers.
+        pivot_column: Expression,
+        /// Explicit list of pivot values (Literal expressions). Empty ⇒
+        /// DuckDB eagerly discovers values at PIVOT execution.
+        pivot_values: Vec<Expression>,
+        /// One or more aggregate expressions applied per pivot cell.
+        aggregates: Vec<Expression>,
     },
 
     /// `df.dropDuplicates([cols])` / `df.distinct()`. `on_columns` empty ⇒
@@ -488,6 +542,120 @@ mod tests {
                 assert_eq!(children.len(), 2);
             }
             _ => panic!("expected SetOp"),
+        }
+    }
+
+    #[test]
+    fn common_op_unpivot_carries_ids_values_and_output_names() {
+        // Anchor: Unpivot variant lands with `ids` + `values` as column names
+        // (mirrors legacy `logical::Unpivot`), plus explicit variable/value
+        // column names for the two new output columns.
+        let plan = CommonAst::new(CommonOp::Unpivot {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            ids: vec!["id".to_owned()],
+            values: vec!["age".to_owned(), "salary".to_owned()],
+            variable_column_name: "metric".to_owned(),
+            value_column_name: "value".to_owned(),
+        });
+        match plan.op {
+            CommonOp::Unpivot {
+                ids,
+                values,
+                variable_column_name,
+                value_column_name,
+                ..
+            } => {
+                assert_eq!(ids, vec!["id".to_owned()]);
+                assert_eq!(values, vec!["age".to_owned(), "salary".to_owned()]);
+                assert_eq!(variable_column_name, "metric");
+                assert_eq!(value_column_name, "value");
+            }
+            _ => panic!("expected Unpivot"),
+        }
+    }
+
+    #[test]
+    fn common_op_pivot_carries_grouping_pivot_column_values_and_aggregates() {
+        // Anchor (Pass 60): Pivot variant lands with `grouping`,
+        // `pivot_column`, `pivot_values` (empty ⇒ implicit / DuckDB-eager),
+        // and `aggregates` — mirrors the legacy `logical::Pivot` shape.
+        use super::super::expression::{Literal, LiteralValue, UnresolvedColumn};
+        let group = Expression::UnresolvedColumn(UnresolvedColumn {
+            name: "dept_id".to_owned(),
+            qualifier: None,
+            plan_id: None,
+        });
+        let pivot_col = Expression::UnresolvedColumn(UnresolvedColumn {
+            name: "active".to_owned(),
+            qualifier: None,
+            plan_id: None,
+        });
+        let v_true = Expression::Literal(Literal {
+            value: LiteralValue::Boolean(true),
+            data_type: DataType::Boolean,
+        });
+        let v_false = Expression::Literal(Literal {
+            value: LiteralValue::Boolean(false),
+            data_type: DataType::Boolean,
+        });
+        let agg = Expression::UnresolvedColumn(UnresolvedColumn {
+            name: "n".to_owned(),
+            qualifier: None,
+            plan_id: None,
+        });
+        let plan = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            grouping: vec![group.clone()],
+            pivot_column: pivot_col.clone(),
+            pivot_values: vec![v_true.clone(), v_false.clone()],
+            aggregates: vec![agg.clone()],
+        });
+        match plan.op {
+            CommonOp::Pivot {
+                grouping,
+                pivot_column,
+                pivot_values,
+                aggregates,
+                ..
+            } => {
+                assert_eq!(grouping, vec![group]);
+                assert_eq!(pivot_column, pivot_col);
+                assert_eq!(pivot_values, vec![v_true, v_false]);
+                assert_eq!(aggregates, vec![agg]);
+            }
+            _ => panic!("expected Pivot"),
+        }
+    }
+
+    #[test]
+    fn common_op_pivot_empty_values_signals_implicit_discovery() {
+        // Anchor (Pass 60): empty `pivot_values` ⇒ DuckDB PIVOT eagerly
+        // discovers distinct values at runtime (grp-005 semantics).
+        use super::super::expression::UnresolvedColumn;
+        let plan = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            grouping: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "active".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            })],
+            pivot_column: Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "dept_id".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            }),
+            pivot_values: vec![],
+            aggregates: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "salary".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            })],
+        });
+        match plan.op {
+            CommonOp::Pivot { pivot_values, .. } => {
+                assert!(pivot_values.is_empty());
+            }
+            _ => panic!("expected Pivot"),
         }
     }
 

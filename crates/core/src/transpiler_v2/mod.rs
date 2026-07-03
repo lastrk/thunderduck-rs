@@ -22,11 +22,12 @@ pub mod error;
 pub mod expression;
 pub mod invariants;
 pub mod rewrites;
+mod struct_names;
 pub mod type_inference;
 
 pub use analyzer::{
-    AnalyzerError, HasSchema, Schema, SetOpKind, TypedAst, TypedAttr, TypedOp, analyze,
-    has_resolved_schema,
+    analyze, has_resolved_schema, AnalyzerError, HasSchema, Schema, SetOpKind, TypedAst, TypedAttr,
+    TypedOp,
 };
 pub use ast::{CommonAst, CommonOp};
 pub use base_types::BaseTypes;

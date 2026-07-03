@@ -7,8 +7,10 @@
 //! the parser layer so `parser_v2/` remains structurally independent of the
 //! legacy tree.
 
+use sqlparser::ast::{BinaryOperator, Expr};
 use sqlparser::dialect::Dialect;
 use sqlparser::keywords::Keyword;
+use sqlparser::parser::{Parser, ParserError};
 
 /// Spark SQL dialect for sqlparser-rs.
 #[derive(Debug, Default)]
@@ -46,5 +48,30 @@ impl Dialect for SparkDialect {
         // We only keep INTERVAL as reserved (needed for INTERVAL literal syntax).
         // EXISTS, STRUCT, TRIM can be function names in Spark.
         matches!(kw, Keyword::INTERVAL)
+    }
+
+    /// Parse Spark's `a DIV b` integer-division operator (identical to MySQL).
+    /// sqlparser-rs recognizes `DIV` as a keyword but does not register an
+    /// infix parser by default — the MySQL dialect provides one and we
+    /// replicate that behavior here. Corpus witness: `type-007`.
+    fn parse_infix(
+        &self,
+        parser: &mut Parser,
+        expr: &Expr,
+        _precedence: u8,
+    ) -> Option<Result<Expr, ParserError>> {
+        if parser.parse_keyword(Keyword::DIV) {
+            let right = match parser.parse_expr() {
+                Ok(e) => e,
+                Err(err) => return Some(Err(err)),
+            };
+            Some(Ok(Expr::BinaryOp {
+                left: Box::new(expr.clone()),
+                op: BinaryOperator::MyIntegerDivide,
+                right: Box::new(right),
+            }))
+        } else {
+            None
+        }
     }
 }

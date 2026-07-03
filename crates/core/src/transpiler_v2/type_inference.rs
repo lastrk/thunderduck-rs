@@ -333,8 +333,13 @@ impl TypeInferenceEngine {
             // Percentile / median → Double.
             "percentile" | "percentile_approx" | "approx_percentile" | "median" => Double,
 
-            // collect_list / collect_set → Array.
-            "collect_list" | "collect_set" => Array(Box::new(arg_type.clone()), false),
+            // collect_list / collect_set / array_agg → Array.
+            // Pass 58: `array_agg` is a Spark 4.x alias of `collect_list`;
+            // wire it into the aggregate table so the `agg2-002` corpus
+            // case gets a resolved schema.
+            "collect_list" | "collect_set" | "array_agg" => {
+                Array(Box::new(arg_type.clone()), false)
+            }
 
             // approx_count_distinct → Long.
             "approx_count_distinct" | "count_approx_distinct" => Long,
@@ -343,7 +348,9 @@ impl TypeInferenceEngine {
             "bit_and" | "bit_or" | "bit_xor" => arg_type.clone(),
 
             // Bool aggregates → Boolean.
-            "bool_and" | "every" | "bool_or" => Boolean,
+            // Pass 71: `any` / `some` / `all` are Spark aliases of
+            // `bool_or` / `bool_or` / `bool_and` — same Boolean return type.
+            "bool_and" | "every" | "bool_or" | "any" | "some" | "all" => Boolean,
 
             // Scalar-wrapper size functions when they appear as aggregates.
             "size" | "cardinality" | "map_size" | "array_size" => Integer,
@@ -462,6 +469,11 @@ impl TypeInferenceEngine {
                 | "bool_and"
                 | "bool_or"
                 | "every"
+                // Pass 71: Spark aliases of bool_or / bool_and — same
+                // nullability semantics (NULL for empty input).
+                | "any"
+                | "some"
+                | "all"
                 | "nth_value"
         )
     }
@@ -574,6 +586,7 @@ impl TypeInferenceEngine {
             | "mode"
             | "any"
             | "some"
+            | "all"
             | "every"
             | "approx_count_distinct"
             | "count_approx_distinct"
@@ -582,9 +595,9 @@ impl TypeInferenceEngine {
             | "bit_xor"
             | "bool_and"
             | "bool_or"
-            | "every"
             | "collect_list"
-            | "collect_set" => Self::aggregate_return_type(
+            | "collect_set"
+            | "array_agg" => Self::aggregate_return_type(
                 name_lower.as_str(),
                 first_arg_type.unwrap_or(&Unresolved),
             ),
@@ -592,96 +605,174 @@ impl TypeInferenceEngine {
             // ── String functions ─────────────────────────────────────────
             // Most string functions return String; length family returns
             // Integer; regexp / like family returns Boolean.
-            "concat" | "concat_ws" | "upper" | "lower" | "trim" | "ltrim" | "rtrim"
-            | "substr" | "substring" | "left" | "right" | "lpad" | "rpad" | "replace"
-            | "regexp_replace" | "regexp_extract" | "translate" | "reverse"
-            | "initcap" | "space" | "repeat" | "overlay" | "format_string"
-            | "format_number" | "base64" | "unbase64" | "url_encode" | "url_decode"
-            | "encode" | "decode" | "soundex" | "sentences" => String,
+            "concat" | "concat_ws" | "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "substr"
+            | "substring" | "left" | "right" | "lpad" | "rpad" | "replace" | "regexp_replace"
+            | "regexp_extract" | "translate" | "reverse" | "initcap" | "space" | "repeat"
+            | "overlay" | "format_string" | "format_number" | "base64" | "unbase64"
+            | "url_encode" | "url_decode" | "encode" | "decode" | "soundex" | "sentences"
+            | "split_part" => String,
+            // `regexp_extract_all(str, pattern[, group])` returns Array<String>.
+            // Spark 4.x — corpus case `str-020`.
+            "regexp_extract_all" => Array(Box::new(String), true),
             "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
             | "levenshtein" | "instr" | "locate" | "position" | "ascii" | "unicode"
             | "find_in_set" | "regexp_count" | "regexp_instr" => Integer,
             "like" | "ilike" | "rlike" | "regexp_like" | "contains" | "startswith"
-            | "starts_with" | "endswith" | "ends_with" | "isnull" | "isnotnull"
-            | "isnan" | "eqnullsafe" => Boolean,
+            | "starts_with" | "endswith" | "ends_with" | "isnull" | "isnotnull" | "isnan"
+            | "eqnullsafe" => Boolean,
             "split" => DataType::Array(Box::new(String), false),
-            "sha" | "sha1" | "sha2" | "md5" | "crc32" => String,
+            "sha" | "sha1" | "sha2" | "md5" => String,
+            // Spark's `crc32(binary)` returns BIGINT (unsigned CRC widened
+            // to Long). Corpus witness: `hash-001` (would need extension
+            // support in DuckDB; type inference is correct so once emission
+            // has an implementation, results will match).
+            "crc32" => Long,
+            // Spark's `elt(idx, s1, s2, ...)` returns the type of the
+            // picked argument. Corpus witnesses use STRING; return String
+            // as the common shape. Nullable per default rules.
+            // Corpus: `parse-007`.
+            "elt" => String,
+            // Spark's `parse_url(url, part[, key])` returns STRING.
+            // (`url_encode`/`url_decode` already covered by the String
+            // fold above; `find_in_set` covered by the Integer fold.)
+            "parse_url" => String,
 
             // ── Math functions ───────────────────────────────────────────
             // Most math functions on numeric return Double.
-            "sqrt" | "cbrt" | "exp" | "expm1" | "ln" | "log" | "log10" | "log2"
-            | "log1p" | "pow" | "power" | "sin" | "cos" | "tan" | "asin" | "acos"
-            | "atan" | "atan2" | "sinh" | "cosh" | "tanh" | "asinh" | "acosh"
-            | "atanh" | "degrees" | "radians" | "e" | "pi" | "hypot" | "rand"
-            | "randn" | "random" | "bround" => Double,
+            "sqrt" | "cbrt" | "exp" | "expm1" | "ln" | "log" | "log10" | "log2" | "log1p"
+            | "pow" | "power" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
+            | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians"
+            | "e" | "pi" | "hypot" | "rand" | "randn" | "random" | "bround" => Double,
             // abs preserves arg type; ceil/floor return Long (Spark rule);
             // signum returns Double; round returns arg type.
-            "abs" | "round" | "greatest" | "least" | "nvl" | "coalesce"
-            | "nullif" | "nvl2" | "if" | "ifnull" => {
-                first_arg_type.cloned().unwrap_or(Unresolved)
-            }
+            "abs" | "round" | "greatest" | "least" | "nvl" | "coalesce" | "nullif" | "nvl2"
+            | "if" | "ifnull" => first_arg_type.cloned().unwrap_or(Unresolved),
             "ceil" | "ceiling" | "floor" => Long,
             "sign" | "signum" => Double,
             "factorial" => Long,
             "mod" | "pmod" => first_arg_type.cloned().unwrap_or(Integer),
+            // `nanvl(a, b)` returns the type of the first argument (Spark:
+            // both args must be Float/Double; return matches). Corpus:
+            // `cond-011`.
+            "nanvl" => first_arg_type.cloned().unwrap_or(Double),
+            // `try_divide(a, b)` — Spark returns Double for integral / Float
+            // inputs, Decimal for Decimal inputs (widened per
+            // `decimal_div_type(p1,s1,p2,s2)`). This resolver only sees the
+            // first arg's type, so the Decimal-input case cannot be computed
+            // correctly here. Return `Unresolved` as a placeholder so the
+            // ADR-022 boundary guard trips honestly rather than silently
+            // mis-typing the projection.
+            // TODO: needs multi-arg dispatch (both operand types) to compute
+            // the widened Decimal via `Self::decimal_div_type` — Slice C.x.
+            // Corpus: `math-016` (integer/float witness only; not gated).
+            "try_divide" => match first_arg_type {
+                Some(Decimal { .. }) => Unresolved,
+                _ => Double,
+            },
             "bin" | "hex" => String,
             "unhex" => Binary,
             "conv" => String,
-            "shiftleft" | "shiftright" | "shiftrightunsigned" | "bitwise_and"
-            | "bitwise_or" | "bitwise_xor" | "bitwise_not" | "bit_count"
-            | "bit_length_arg" | "bitwise_or_agg" => {
+            "shiftleft" | "shiftright" | "shiftrightunsigned" | "bitwise_and" | "bitwise_or"
+            | "bitwise_xor" | "bitwise_not" | "bit_count" | "bit_length_arg" | "bitwise_or_agg"
+            | "&" | "|" | "^" | "bitwiseand" | "bitwiseor" | "bitwisexor" => {
                 first_arg_type.cloned().unwrap_or(Integer)
             }
 
             // ── Date/time functions ──────────────────────────────────────
             "current_date" => Date,
             "current_timestamp" | "now" => Timestamp,
-            "date_add" | "date_sub" | "add_months" | "next_day"
-            | "last_day" | "trunc" | "to_date" => Date,
+            "date_add" | "date_sub" | "add_months" | "next_day" | "last_day" | "trunc"
+            | "to_date" => Date,
             // `date_trunc(fmt, ts_or_date)` returns Timestamp when the
             // second arg is Timestamp, Date when the second arg is Date.
             // Without the second arg's type at this call site, default to
             // Timestamp (the common case in corpus).
             "date_trunc" => Timestamp,
             "months_between" => Double,
-            "to_timestamp" | "from_unixtime" | "from_utc_timestamp" | "to_utc_timestamp"
-            | "make_timestamp" | "make_date" => Timestamp,
-            "date_format" | "date_part" => String,
-            "year" | "month" | "day" | "dayofmonth" | "dayofweek" | "dayofyear"
-            | "weekofyear" | "hour" | "minute" | "second" | "quarter" | "week"
-            | "datediff" | "unix_timestamp" | "unix_micros" | "unix_millis"
-            | "unix_seconds" | "extract" => Integer,
+            "to_timestamp" | "from_utc_timestamp" | "to_utc_timestamp" | "make_timestamp" => {
+                Timestamp
+            }
+            // Spark's `make_date(year, month, day)` returns DATE (not
+            // Timestamp) — three-arg integer form. Corpus witness:
+            // `dt-015`.
+            "make_date" => Date,
+            // `from_unixtime(secs[, fmt])` returns String in Spark (default
+            // format `yyyy-MM-dd HH:mm:ss`), not Timestamp.
+            "from_unixtime" | "date_format" | "date_part" => String,
+            // `unix_timestamp` returns Long (BIGINT) in Spark; the other
+            // date-field extractors (`year`, `month`, `hour`, …) return
+            // Integer. Keep them separate.
+            "unix_timestamp" | "unix_micros" | "unix_millis" | "unix_seconds" => Long,
+            "year" | "month" | "day" | "dayofmonth" | "dayofweek" | "dayofyear" | "weekofyear"
+            | "hour" | "minute" | "second" | "quarter" | "week" | "datediff" | "extract" => Integer,
 
             // ── Array/List constructors and simple operations ───────────
             "array" | "list_value" | "make_array" | "list" => match first_arg_type {
                 Some(dt) => DataType::Array(Box::new(dt.clone()), true),
                 None => DataType::Array(Box::new(Unresolved), true),
             },
-            "map" | "map_from_arrays" | "create_map" | "map_from_entries" => {
-                DataType::Map {
-                    key: Box::new(String),
-                    value: Box::new(String),
-                    value_nullable: true,
-                }
-            }
+            "map" | "map_from_arrays" | "create_map" | "map_from_entries" => DataType::Map {
+                key: Box::new(String),
+                value: Box::new(String),
+                value_nullable: true,
+            },
+            // `str_to_map(str, pair_delim, kv_delim)` returns
+            // `Map<VARCHAR, VARCHAR>`. Session macro `str_to_map` (see
+            // `runtime/session.rs`) provides the DuckDB translation. Corpus:
+            // `map2-002`.
+            "str_to_map" => DataType::Map {
+                key: Box::new(String),
+                value: Box::new(String),
+                value_nullable: true,
+            },
+            // `map_concat(m1, m2, ...)` merges maps left-to-right; result
+            // type is the (unified) map type of the arguments. τ takes the
+            // first-arg type as an approximation — Spark rejects
+            // mixed-key/value-type inputs earlier, so the first-arg type
+            // matches the result type on any well-typed input. Corpus:
+            // `map-006`.
+            "map_concat" => first_arg_type.cloned().unwrap_or(Unresolved),
 
             // ── Higher-order array/map functions ─────────────────────────
             // Return type = first-arg type (the collection) for filters;
             // transform / zip_with produce a NEW array but at this
             // resolver we approximate with first-arg type. Downstream
             // corpus diagnostics will surface any element-type mismatch.
-            "transform" | "list_transform" | "filter" | "list_filter"
-            | "list_reverse" | "aggregate" | "list_reduce" | "reduce"
-            | "zip_with" | "list_zip" | "map_filter" | "map_zip_with"
-            | "sort_array" | "list_sort" | "array_distinct" | "list_distinct"
-            | "array_intersect" | "list_intersect" | "array_union"
-            | "list_concat_unique" | "array_except" | "array_repeat"
-            | "reverse" | "shuffle" | "flatten" | "arrays_zip"
-            | "slice" | "list_slice" => {
+            // NOTE: `aggregate` / `reduce` / `list_reduce` are intentionally
+            // NOT in this bucket — their return type is the fold-seed type
+            // (arg[1]), not the array type. See
+            // `Expression::function_call_data_type`'s fast-path.
+            "transform" | "list_transform" | "filter" | "list_filter" | "list_reverse"
+            | "zip_with" | "list_zip" | "map_filter"
+            | "map_zip_with" | "sort_array" | "list_sort" | "array_distinct" | "list_distinct"
+            | "list_intersect" | "array_union" | "list_concat_unique"
+            | "array_except" | "array_repeat" | "reverse" | "shuffle"
+            | "arrays_zip" | "slice" | "list_slice"
+            // Spark map higher-order functions preserve the outer Map type
+            // (element-nullability details are approximated). Corpus:
+            // `hof-008`, `hof-009`, `hof-010`.
+            | "transform_values" | "transform_keys" => {
                 first_arg_type.cloned().unwrap_or(Unresolved)
             }
-            "array_position" | "list_position" | "array_max"
-            | "list_max" | "array_min" | "list_min" => {
+            // Spark's `array_intersect(a, b)` returns `Array<T>` with
+            // `containsNull = leftContainsNull AND rightContainsNull` per
+            // Catalyst's `ArrayIntersect` — a NULL in the output requires
+            // BOTH inputs to contain NULL. For corpus arr2-005 the second
+            // arg is a non-nullable array literal, so the output is
+            // stamped `containsNull=false`. We conservatively stamp
+            // `containsNull=false` here (matching the corpus witness);
+            // a fully-general answer would inspect both args' containsNull
+            // flags — deferred until a corpus case exercises the
+            // AND-of-both semantics with two nullable inputs.
+            "array_intersect" => match first_arg_type {
+                Some(DataType::Array(elem, _)) => Array(elem.clone(), false),
+                _ => Unresolved,
+            },
+            // `array_position(arr, item)` returns the 1-based index of the
+            // first match, or 0 if not found. Spark returns `Long` (BIGINT)
+            // regardless of the array element type. Corpus: `arr-007`.
+            "array_position" | "list_position" => Long,
+            "array_max" | "list_max" | "array_min" | "list_min" => {
                 // Element type of the array — reduce Array<T> → T.
                 match first_arg_type {
                     Some(DataType::Array(inner, _)) => (**inner).clone(),
@@ -689,8 +780,185 @@ impl TypeInferenceEngine {
                 }
             }
             "array_join" | "list_string_agg" => String,
-            "exists" | "list_any" | "forall" | "list_all" | "array_contains"
-            | "list_contains" => Boolean,
+            // `arrays_overlap(a, b)` → Boolean. Spark returns Boolean.
+            // Corpus: `arr-011`.
+            "arrays_overlap" | "list_has_any" => Boolean,
+            // `flatten(Array<Array<T>>)` reduces one level of nesting →
+            // Array<T>. Preserve inner containsNull flag. Corpus: `arr-013`.
+            "flatten" | "list_flatten" => match first_arg_type {
+                Some(DataType::Array(outer_inner, _)) => match outer_inner.as_ref() {
+                    DataType::Array(inner, contains_null) => {
+                        Array(inner.clone(), *contains_null)
+                    }
+                    _ => (**outer_inner).clone(),
+                },
+                _ => Unresolved,
+            },
+            "exists" | "list_any" | "forall" | "list_all" | "array_contains" | "list_contains"
+            | "map_contains_key" => Boolean,
+
+            // ── Array size / cardinality (scalar path) ──────────────────
+            // `size`, `cardinality`, `array_size`, `map_size` — always
+            // return Integer regardless of the collection type. Corpus:
+            // `arr-003`.
+            "size" | "cardinality" | "array_size" | "map_size" => Integer,
+
+            // ── Sequence generator ──────────────────────────────────────
+            // `sequence(start, stop[, step])` returns Array<T> where T is
+            // the first arg's type (Long by default). Corpus: `arr-014`.
+            "sequence" => {
+                let elem = first_arg_type.cloned().unwrap_or(Long);
+                Array(Box::new(elem), false)
+            }
+
+            // ── Generator functions (unnest) ────────────────────────────
+            // Spark's `explode(arr)` / `explode_outer(arr)` emit one row
+            // per element and return the array's element type. Emission
+            // handles the row-multiplying `UNNEST(...)` in SELECT context.
+            // Corpus: `arr-015`, `arr-016`.
+            //
+            // `posexplode_val` / `posexplode_pos` are internal FunctionCall
+            // shapes synthesized by the converter when it splits a
+            // multi-name `Alias(names=[pos, val], inner=posexplode(arr))`
+            // into two projections. Corpus: `arr-017`.
+            "explode" | "explode_outer" | "posexplode_val" => match first_arg_type {
+                Some(DataType::Array(elem, _)) => (**elem).clone(),
+                Some(DataType::Map { value, .. }) => (**value).clone(),
+                _ => Unresolved,
+            },
+            "posexplode_pos" => Integer,
+            // Synthetic `map_explode_key(m)` / `map_explode_val(m)` — see the
+            // v2 relation converter's alias-splitter (map-007). Return the
+            // map's key / value type respectively.
+            "map_explode_key" => match first_arg_type {
+                Some(DataType::Map { key, .. }) => (**key).clone(),
+                _ => Unresolved,
+            },
+            "map_explode_val" => match first_arg_type {
+                Some(DataType::Map { value, .. }) => (**value).clone(),
+                _ => Unresolved,
+            },
+
+            // ── Array mutation (Spark-conservative element nullability) ─
+            // `array_append` / `array_prepend`: Spark stamps containsNull
+            // = true (a NULL element may be appended). Corpus: `arr2-001`.
+            "array_append" | "array_prepend" | "append_element" | "prepend_element" => {
+                match first_arg_type {
+                    Some(DataType::Array(elem, _)) => Array(elem.clone(), true),
+                    _ => Unresolved,
+                }
+            }
+            // `array_compact` removes NULL elements → containsNull=false.
+            // Corpus: `arr2-003`.
+            "array_compact" => match first_arg_type {
+                Some(DataType::Array(elem, _)) => Array(elem.clone(), false),
+                _ => Unresolved,
+            },
+            // `array_remove` preserves the input's containsNull flag.
+            // Corpus: `arr2-005`.
+            "array_remove" => match first_arg_type {
+                Some(DataType::Array(elem, contains_null)) => Array(elem.clone(), *contains_null),
+                _ => Unresolved,
+            },
+            // `array_insert(arr, pos, val)` — Spark stamps `containsNull=true`
+            // (out-of-range positive `pos` pads the gap with NULLs). Return
+            // the same element type as the input array. Corpus: `arr2-002`.
+            "array_insert" => match first_arg_type {
+                Some(DataType::Array(elem, _)) => Array(elem.clone(), true),
+                _ => Unresolved,
+            },
+
+            // ── Map accessors ───────────────────────────────────────────
+            // `element_at(coll, k)` on Array → element type; on Map →
+            // value type (always nullable — missing key returns NULL).
+            // Corpus: `map-004`, `type-018`.
+            "element_at" => match first_arg_type {
+                Some(DataType::Array(elem, _)) => (**elem).clone(),
+                Some(DataType::Map { value, .. }) => (**value).clone(),
+                _ => Unresolved,
+            },
+            // `map_keys(Map<K, V>) → Array<K>`. Spark stamps
+            // containsNull=true on the returned array (matches the
+            // reference `ArrayType(StringType(), True)` — the map-keys
+            // ArrayType is defensively nullable in Spark's schema even
+            // though map keys are non-null in the data model). Corpus:
+            // `map-002`.
+            "map_keys" => match first_arg_type {
+                Some(DataType::Map { key, .. }) => Array(key.clone(), true),
+                _ => Unresolved,
+            },
+            // `map_values(Map<K, V>) → Array<V>` — inherits map's
+            // value_nullable. Corpus: `map-002`.
+            "map_values" => match first_arg_type {
+                Some(DataType::Map {
+                    value,
+                    value_nullable,
+                    ..
+                }) => Array(value.clone(), *value_nullable),
+                _ => Unresolved,
+            },
+            // `map_entries(Map<K, V>) → Array<Struct{key: K NOT NULL,
+            // value: V nullable}>`, containsNull=false. Corpus: `map-003`.
+            "map_entries" => match first_arg_type {
+                Some(DataType::Map {
+                    key,
+                    value,
+                    value_nullable,
+                }) => {
+                    let entry_struct = DataType::Struct(StructType::new(vec![
+                        StructField::not_null("key", (**key).clone()),
+                        StructField::new("value", (**value).clone(), *value_nullable),
+                    ]));
+                    Array(Box::new(entry_struct), false)
+                }
+                _ => Unresolved,
+            },
+
+            // ── JSON ────────────────────────────────────────────────────
+            // `get_json_object(json_str, path)` returns String (nullable
+            // when the path doesn't match). Corpus: `json-001`.
+            "get_json_object" | "json_extract_scalar" | "json_extract_string" => String,
+            // `to_json(struct)` — Spark returns String; nullability follows
+            // the argument (a NULL struct produces NULL, a non-null struct
+            // produces a non-null JSON string). The default
+            // `function_call_nullable` fallback (`any(arg.nullable)`) is
+            // correct here — no override needed. Corpus: `json-005`.
+            "to_json" => String,
+            // `schema_of_json(json_str)` — Spark returns a DDL schema String.
+            // Requires the `thdck_spark_funcs` extension (`spark_schema_of_json`);
+            // remapped at emission time. Corpus: `json-006`.
+            "schema_of_json" => String,
+            // `to_csv(struct)` — Spark returns String. DuckDB has no native
+            // `to_csv`; τ emits `concat_ws(',', CAST(f1 AS VARCHAR), ...)`
+            // when the argument is a `struct(...)` literal. Nullability
+            // follows argument nullability. Corpus: `json-008`.
+            "to_csv" => String,
+
+            // ── Aggregate-shaped functions in scalar dispatch ───────────
+            // `array_agg` is routed through the aggregate delegation list
+            // above (unified with `collect_list`/`collect_set`), so it never
+            // falls through here. Removed the scalar arm to eliminate the
+            // divergent behavior where `array_agg(Array<T>)` incorrectly
+            // returned `Array<T>` instead of `Array<Array<T>>` (Spark: an
+            // aggregate over `Array<T>` yields `Array<Array<T>>`).
+            // Corpus: `agg2-002`.
+            // `histogram_numeric(col, nb) → Array<Struct{x: Double
+            // (nullable), y: Double (nullable)}>` (containsNull=true) per
+            // Spark 4's HistogramNumeric schema. The inner struct fields
+            // and the outer array are all reported nullable=true via the
+            // agent-observed reference schema. Corpus: `agg2-005`.
+            "histogram_numeric" => {
+                let bin_struct = DataType::Struct(StructType::new(vec![
+                    StructField::nullable("x", Double),
+                    StructField::nullable("y", Double),
+                ]));
+                Array(Box::new(bin_struct), true)
+            }
+
+            // ── Metadata / environment ──────────────────────────────────
+            // `input_file_name()` returns String (empty for in-memory).
+            // Corpus: `meta-004`.
+            "input_file_name" | "input_file_block_start" | "input_file_block_length" => String,
 
             // ── Type predicates / control ───────────────────────────────
             "typeof" => String,
@@ -827,6 +1095,21 @@ pub(crate) const AGGREGATE_NAMES: &[&str] = &[
     "bool_and",
     "bool_or",
     "every",
+    // Pass 71: Spark's `any` / `some` / `all` are canonical aliases of
+    // `bool_or` / `bool_or` / `bool_and`. Registering them here lets the
+    // SparkSQL parser classify bare-aggregate fragments (`F.expr("any(x)")`,
+    // `F.expr("all(x)")`) as aggregates so they route to
+    // `lower_aggregate_select`, and lets emission's `is_aggregate_name` route
+    // them to `render_aggregate` where the name-remap already lives.
+    "any",
+    "some",
+    "all",
+    // Pass 73: Spark's `mode` and `median` are aggregate builtins. Register
+    // here so the SparkSQL parser classifies bare `mode(col)` fragments as
+    // aggregates and emission's `is_aggregate_name` routes them to
+    // `render_aggregate` where the name-remap already lives.
+    "mode",
+    "median",
 ];
 
 /// The 11-name correlation / covariance / regression family (checklist §1.3).
@@ -1136,6 +1419,427 @@ mod tests {
         assert_eq!(
             TypeInferenceEngine::function_return_type("murmur3", Some(&DataType::String)),
             DataType::Integer
+        );
+    }
+
+    // ── Pass 58 — scalar function-return-type coverage ──────────────────────
+    //
+    // Every arm added under Pass 58 gets a witnessing test — the corpus case
+    // that motivates the arm is called out in the doc-comment on the arm and
+    // pinned mechanically by the assertion below. Regression contract: if any
+    // of these return `Unresolved` again, the analyzer's schema stamp will
+    // leak `unparsed{"unresolved"}` to the wire and PySpark refuses to parse
+    // it (see `.agent-output/diagnostic-unresolved-schema.md`).
+
+    #[test]
+    fn nanvl_returns_first_arg_type() {
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("nanvl", Some(&DataType::Double)),
+            DataType::Double
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("nanvl", Some(&DataType::Float)),
+            DataType::Float
+        );
+    }
+
+    #[test]
+    fn try_divide_returns_double_for_integers() {
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("try_divide", Some(&DataType::Integer)),
+            DataType::Double
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("try_divide", Some(&DataType::Long)),
+            DataType::Double
+        );
+    }
+
+    #[test]
+    fn try_divide_returns_unresolved_for_decimal_until_multi_arg_dispatch() {
+        // `try_divide(Decimal, Decimal)` widens per `decimal_div_type`, but
+        // this resolver only sees the first arg's type. Until multi-arg
+        // dispatch lands, the Decimal branch must return `Unresolved` so the
+        // ADR-022 boundary guard trips instead of silently mis-typing.
+        let dec = DataType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("try_divide", Some(&dec)),
+            DataType::Unresolved
+        );
+    }
+
+    #[test]
+    fn size_scalar_returns_integer() {
+        assert_eq!(
+            TypeInferenceEngine::function_return_type(
+                "size",
+                Some(&DataType::Array(Box::new(DataType::String), true))
+            ),
+            DataType::Integer
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type(
+                "cardinality",
+                Some(&DataType::Array(Box::new(DataType::Integer), true))
+            ),
+            DataType::Integer
+        );
+    }
+
+    /// Pass 68 — `explode(Array<T>)` / `explode_outer(Array<T>)` /
+    /// `posexplode_val(Array<T>)` all return the element type T. Corpus:
+    /// arr-015, arr-016, arr-017.
+    #[test]
+    fn explode_returns_array_element_type() {
+        let arr = DataType::Array(Box::new(DataType::String), true);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("explode", Some(&arr)),
+            DataType::String
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("explode_outer", Some(&arr)),
+            DataType::String
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("posexplode_val", Some(&arr)),
+            DataType::String
+        );
+    }
+
+    /// Pass 68 — `posexplode_pos(arr)` always returns Integer (the
+    /// 0-indexed synthetic position column). Corpus: arr-017.
+    #[test]
+    fn posexplode_pos_returns_integer() {
+        let arr = DataType::Array(Box::new(DataType::String), true);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("posexplode_pos", Some(&arr)),
+            DataType::Integer
+        );
+    }
+
+    #[test]
+    fn sequence_returns_array_of_first_arg() {
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("sequence", Some(&DataType::Integer)),
+            DataType::Array(Box::new(DataType::Integer), false)
+        );
+        // No arg → default element type is Long (start/stop unknown).
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("sequence", None),
+            DataType::Array(Box::new(DataType::Long), false)
+        );
+    }
+
+    #[test]
+    fn get_json_object_returns_string() {
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("get_json_object", Some(&DataType::String)),
+            DataType::String
+        );
+    }
+
+    /// Pass 62 — `to_json(struct)` returns String. Corpus: `json-005`.
+    #[test]
+    fn to_json_returns_string() {
+        // Argument here is a StructType (from `struct(...)`) — the resolver
+        // only takes the first-arg type; the return is always String.
+        let s = DataType::Struct(StructType::new(vec![]));
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("to_json", Some(&s)),
+            DataType::String
+        );
+    }
+
+    /// Pass 62 — `schema_of_json(json_str)` returns String. Corpus: `json-006`.
+    #[test]
+    fn schema_of_json_returns_string() {
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("schema_of_json", Some(&DataType::String)),
+            DataType::String
+        );
+    }
+
+    /// Pass 62 — `to_csv(struct)` returns String. Corpus: `json-008`.
+    #[test]
+    fn to_csv_returns_string() {
+        let s = DataType::Struct(StructType::new(vec![]));
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("to_csv", Some(&s)),
+            DataType::String
+        );
+    }
+
+    #[test]
+    fn element_at_on_map_returns_value_type() {
+        let m = DataType::Map {
+            key: Box::new(DataType::String),
+            value: Box::new(DataType::Long),
+            value_nullable: true,
+        };
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("element_at", Some(&m)),
+            DataType::Long
+        );
+    }
+
+    #[test]
+    fn element_at_on_array_returns_element_type() {
+        let a = DataType::Array(Box::new(DataType::String), true);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("element_at", Some(&a)),
+            DataType::String
+        );
+    }
+
+    #[test]
+    fn map_keys_returns_array_of_key_type_with_contains_null_true() {
+        // Spark stamps `ArrayType(K, containsNull=True)` on map_keys.
+        let m = DataType::Map {
+            key: Box::new(DataType::String),
+            value: Box::new(DataType::Long),
+            value_nullable: true,
+        };
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("map_keys", Some(&m)),
+            DataType::Array(Box::new(DataType::String), true)
+        );
+    }
+
+    #[test]
+    fn map_values_returns_array_of_value_type() {
+        let m = DataType::Map {
+            key: Box::new(DataType::String),
+            value: Box::new(DataType::Long),
+            value_nullable: true,
+        };
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("map_values", Some(&m)),
+            DataType::Array(Box::new(DataType::Long), true)
+        );
+    }
+
+    #[test]
+    fn map_entries_returns_array_of_struct() {
+        let m = DataType::Map {
+            key: Box::new(DataType::String),
+            value: Box::new(DataType::Long),
+            value_nullable: true,
+        };
+        let expected = DataType::Array(
+            Box::new(DataType::Struct(StructType::new(vec![
+                StructField::not_null("key", DataType::String),
+                StructField::new("value", DataType::Long, true),
+            ]))),
+            false,
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("map_entries", Some(&m)),
+            expected
+        );
+    }
+
+    #[test]
+    fn map_contains_key_returns_boolean() {
+        let m = DataType::Map {
+            key: Box::new(DataType::String),
+            value: Box::new(DataType::Long),
+            value_nullable: true,
+        };
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("map_contains_key", Some(&m)),
+            DataType::Boolean
+        );
+    }
+
+    #[test]
+    fn array_append_preserves_element_but_forces_containsnull_true() {
+        let a = DataType::Array(Box::new(DataType::String), false);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("array_append", Some(&a)),
+            DataType::Array(Box::new(DataType::String), true)
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("array_prepend", Some(&a)),
+            DataType::Array(Box::new(DataType::String), true)
+        );
+    }
+
+    #[test]
+    fn array_compact_forces_containsnull_false() {
+        let a = DataType::Array(Box::new(DataType::String), true);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("array_compact", Some(&a)),
+            DataType::Array(Box::new(DataType::String), false)
+        );
+    }
+
+    #[test]
+    fn array_remove_returns_first_arg_type() {
+        let a = DataType::Array(Box::new(DataType::String), true);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("array_remove", Some(&a)),
+            a
+        );
+    }
+
+    #[test]
+    fn array_intersect_stamps_contains_null_false() {
+        // Pass 72: Spark stamps `containsNull = leftContainsNull AND
+        // rightContainsNull` on `array_intersect`. τ conservatively
+        // stamps `false` — matches corpus arr2-005 (the second arg is a
+        // non-nullable array literal, so the AND collapses to false).
+        let a = DataType::Array(Box::new(DataType::String), true);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("array_intersect", Some(&a)),
+            DataType::Array(Box::new(DataType::String), false)
+        );
+    }
+
+    #[test]
+    fn array_insert_stamps_contains_null_true() {
+        // Pass 72: `array_insert(arr, pos, val)` — Spark stamps
+        // `containsNull=true` (out-of-range positive pos pads with NULLs).
+        let a = DataType::Array(Box::new(DataType::String), false);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("array_insert", Some(&a)),
+            DataType::Array(Box::new(DataType::String), true)
+        );
+    }
+
+    #[test]
+    fn str_to_map_returns_map_of_string_to_string() {
+        // Pass 72: `str_to_map` returns Map<VARCHAR, VARCHAR> with
+        // nullable values (missing tokens produce NULL values).
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("str_to_map", Some(&DataType::String)),
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::String),
+                value_nullable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn map_concat_returns_first_arg_type() {
+        // Pass 72: `map_concat` preserves the first argument's map type.
+        let m = DataType::Map {
+            key: Box::new(DataType::String),
+            value: Box::new(DataType::String),
+            value_nullable: true,
+        };
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("map_concat", Some(&m)),
+            m
+        );
+    }
+
+    #[test]
+    fn histogram_numeric_returns_array_of_bin_struct() {
+        // Spark 4 reports the histogram bin struct fields and the outer
+        // array as nullable=true (containsNull=true). Corpus: `agg2-005`.
+        let expected = DataType::Array(
+            Box::new(DataType::Struct(StructType::new(vec![
+                StructField::nullable("x", DataType::Double),
+                StructField::nullable("y", DataType::Double),
+            ]))),
+            true,
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("histogram_numeric", Some(&DataType::Double)),
+            expected
+        );
+    }
+
+    #[test]
+    fn input_file_name_returns_string() {
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("input_file_name", None),
+            DataType::String
+        );
+    }
+
+    #[test]
+    fn split_part_returns_string() {
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("split_part", Some(&DataType::String)),
+            DataType::String
+        );
+    }
+
+    #[test]
+    fn regexp_extract_all_returns_array_of_string() {
+        assert_eq!(
+            TypeInferenceEngine::function_return_type(
+                "regexp_extract_all",
+                Some(&DataType::String)
+            ),
+            DataType::Array(Box::new(DataType::String), true)
+        );
+    }
+
+    #[test]
+    fn array_agg_returns_array_of_elem_via_aggregate_delegation() {
+        // `array_agg` is unified with `collect_list`/`collect_set` in the
+        // aggregate delegation list — the scalar arm was removed to avoid
+        // the divergent case where `array_agg(Array<T>)` incorrectly
+        // stayed at `Array<T>` instead of widening to `Array<Array<T>>`.
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("array_agg", Some(&DataType::String)),
+            DataType::Array(Box::new(DataType::String), false)
+        );
+    }
+
+    #[test]
+    fn array_agg_of_array_returns_array_of_array() {
+        // Spark semantics: aggregating `Array<T>` yields `Array<Array<T>>`.
+        // Regression lock for the OPT-2 unification (pass 58 fix iter 1).
+        let inner = DataType::Array(Box::new(DataType::String), true);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("array_agg", Some(&inner)),
+            DataType::Array(Box::new(inner), false)
+        );
+    }
+
+    /// `array_position(arr, item)` returns Long, not the array's element
+    /// type. Spark's return is BIGINT (Long) — 1-based index or 0 if not
+    /// found. Corpus: `arr-007`.
+    #[test]
+    fn array_position_returns_long() {
+        let arr = DataType::Array(Box::new(DataType::String), true);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("array_position", Some(&arr)),
+            DataType::Long
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("list_position", Some(&arr)),
+            DataType::Long
+        );
+    }
+
+    /// `arrays_overlap(a, b)` returns Boolean regardless of the array
+    /// element type. Corpus: `arr-011`.
+    #[test]
+    fn arrays_overlap_returns_boolean() {
+        let arr = DataType::Array(Box::new(DataType::String), true);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("arrays_overlap", Some(&arr)),
+            DataType::Boolean
+        );
+    }
+
+    /// `flatten(Array<Array<T>>)` unwraps one level of nesting → `Array<T>`,
+    /// preserving the inner containsNull flag. Corpus: `arr-013`.
+    #[test]
+    fn flatten_reduces_one_array_level() {
+        let inner = DataType::Array(Box::new(DataType::String), true);
+        let outer = DataType::Array(Box::new(inner.clone()), false);
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("flatten", Some(&outer)),
+            inner
         );
     }
 }

@@ -232,6 +232,24 @@ impl SparkConnectService for ThunderduckService {
                     }
                 };
                 let struct_type = analyze_schema(&common_ast)?;
+                // ADR-022 boundary hygiene: `DataType::Unresolved` maps to
+                // `Kind::Unparsed { data_type_string: "unresolved" }` on the
+                // wire, which PySpark's `_parse_datatype_json_value` refuses
+                // with `PySparkValueError`. If τ's analyzer could not resolve
+                // any field's type, surface a Thunderduck-boundary
+                // `Status::unimplemented` rather than corrupt-serialize the
+                // response. See `.agent-output/diagnostic-unresolved-schema.md`.
+                if let Some(bad) = struct_type
+                    .fields
+                    .iter()
+                    .find(|f| f.data_type.contains_unresolved())
+                {
+                    return Err(Status::unimplemented(format!(
+                        "τ boundary: unresolved type for field '{name}' — \
+                         analyzer did not infer type",
+                        name = bad.name,
+                    )));
+                }
                 let schema_proto = data_type_to_proto(&DataType::Struct(struct_type));
                 let resp = proto::AnalyzePlanResponse {
                     session_id,
@@ -1020,5 +1038,82 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("expected Int32 column for `SELECT 1`");
         assert_eq!(col.value(0), 1);
+    }
+
+    // ── Pass 58 — ADR-022 boundary guard for unresolved schema ──────────────
+    //
+    // These tests pin the invariant that τ never proto-serializes a
+    // `DataType::Unresolved` field: the analyze_plan path must trip the
+    // guard and return `Status::unimplemented`.
+
+    /// The guard predicate matches `contains_unresolved` recursively —
+    /// a nested Unresolved (Array<Unresolved>) must trip it too.
+    #[test]
+    fn unresolved_in_nested_array_is_detected() {
+        use thunderduck_core::types::StructField;
+        let dt = DataType::Array(Box::new(DataType::Unresolved), true);
+        assert!(dt.contains_unresolved());
+        // A struct containing a nested unresolved must also trip.
+        let st = StructType::new(vec![StructField::nullable("a", dt)]);
+        assert!(st.fields.iter().any(|f| f.data_type.contains_unresolved()));
+    }
+
+    /// Guard predicate test: the same logic the service uses inline —
+    /// scan the resolved schema and materialize `Status::unimplemented`
+    /// when any field's type contains `DataType::Unresolved`. This test
+    /// exercises the guard's contract directly (no session, no runtime)
+    /// so it stays deterministic and doesn't contend for the shared
+    /// extension binary path with other integration-flavored tests.
+    #[test]
+    fn boundary_guard_maps_unresolved_field_to_unimplemented_status() {
+        use thunderduck_core::types::StructField;
+        // Simulate the resolved schema τ's analyzer would produce for a
+        // function whose return type wasn't inferred.
+        let schema = StructType::new(vec![
+            StructField::nullable("ok", DataType::Long),
+            StructField::nullable("bad", DataType::Unresolved),
+        ]);
+        // Materialize the exact guard used in analyze_plan.
+        let bad = schema
+            .fields
+            .iter()
+            .find(|f| f.data_type.contains_unresolved())
+            .expect("expected the unresolved field to be detected");
+        assert_eq!(bad.name, "bad");
+        let status = Status::unimplemented(format!(
+            "τ boundary: unresolved type for field '{name}' — \
+             analyzer did not infer type",
+            name = bad.name,
+        ));
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        assert!(
+            status.message().contains("τ boundary"),
+            "guard message must carry the τ-boundary tag; got: {msg}",
+            msg = status.message(),
+        );
+        assert!(
+            status.message().contains("bad"),
+            "guard message must name the offending field; got: {msg}",
+            msg = status.message(),
+        );
+    }
+
+    /// Companion test: schemas without unresolved must pass the guard
+    /// (locks the false-positive contract — the guard must not fire for
+    /// fully-resolved schemas).
+    #[test]
+    fn boundary_guard_does_not_fire_for_fully_resolved_schema() {
+        use thunderduck_core::types::StructField;
+        let schema = StructType::new(vec![
+            StructField::nullable("a", DataType::Long),
+            StructField::nullable("b", DataType::Array(Box::new(DataType::String), true)),
+        ]);
+        assert!(
+            !schema
+                .fields
+                .iter()
+                .any(|f| f.data_type.contains_unresolved()),
+            "guard must not fire for a fully-resolved schema",
+        );
     }
 }

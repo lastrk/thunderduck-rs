@@ -32,7 +32,7 @@ fn inv1_byte_identical_input() {
 #[test]
 fn inv2_dispatch_is_only_sql_writer() {
     use super::emission::{EMIT_TAP, EMIT_TAP_MUTEX};
-    use super::{BaseTypes, CommonAst, CommonOp, generate};
+    use super::{generate, BaseTypes, CommonAst, CommonOp};
     use std::sync::atomic::Ordering;
 
     let _guard = EMIT_TAP_MUTEX.lock().expect("EMIT_TAP_MUTEX poisoned");

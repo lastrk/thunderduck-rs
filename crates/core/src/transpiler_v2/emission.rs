@@ -572,6 +572,8 @@ fn render_join(
     use crate::transpiler_v2::ast::JoinType;
     let left_sql = dispatch_op(&left.op, &left.resolved_schema)?;
     let right_sql = dispatch_op(&right.op, &right.resolved_schema)?;
+    let left_alias = "__td_jl".to_owned();
+    let right_alias = "__td_jr".to_owned();
     let kind = match join_type {
         JoinType::Inner => "INNER JOIN",
         JoinType::Left => "LEFT OUTER JOIN",
@@ -609,9 +611,7 @@ fn render_join(
     // (see `analyzer.rs::CommonOp::Join` output-schema block for the
     // canonical order). Without this, `SELECT *` on a USING-joined
     // relation returns columns in DuckDB's order, which diverges from the
-    // analyzer's declared order once the SEMI/ANTI restriction or extra
-    // implicit resolutions kick in — the arrow batch then decodes with
-    // Spark's expected schema and hits type-mismatch failures downstream.
+    // analyzer's declared order.
     let is_semi_or_anti = matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
     let using_lower: std::collections::HashSet<String> = using_columns
         .iter()
@@ -626,6 +626,8 @@ fn render_join(
         *first = false;
         slots.push_str(&s);
     };
+    let left_alias_q = quote_ident(&left_alias);
+    let right_alias_q = quote_ident(&right_alias);
     // USING columns first (Spark hoists them).
     for c in using_columns {
         push(&mut slots, &mut first, quote_ident(c).into_owned());
@@ -633,7 +635,7 @@ fn render_join(
     // Left's non-USING columns in declared order.
     for f in &left.resolved_schema.fields {
         if !using_lower.contains(&f.name.to_lowercase()) {
-            let qualified = format!("__td_jl.{}", quote_ident(&f.name));
+            let qualified = format!("{}.{}", left_alias_q, quote_ident(&f.name));
             push(&mut slots, &mut first, qualified);
         }
     }
@@ -642,7 +644,7 @@ fn render_join(
     if !is_semi_or_anti {
         for f in &right.resolved_schema.fields {
             if !using_lower.contains(&f.name.to_lowercase()) {
-                let qualified = format!("__td_jr.{}", quote_ident(&f.name));
+                let qualified = format!("{}.{}", right_alias_q, quote_ident(&f.name));
                 push(&mut slots, &mut first, qualified);
             }
         }
@@ -652,7 +654,7 @@ fn render_join(
         slots.push('*');
     }
     Ok(format!(
-        "SELECT {slots} FROM ({left_sql}) AS __td_jl {kind} ({right_sql}) AS __td_jr{clause}"
+        "SELECT {slots} FROM ({left_sql}) AS {left_alias_q} {kind} ({right_sql}) AS {right_alias_q}{clause}"
     ))
 }
 
@@ -1482,9 +1484,13 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         "count" | "sum" | "avg" | "mean" | "min" | "max" | "first" | "last"
         | "first_value" | "last_value" | "any_value" | "approx_count_distinct"
         | "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp"
-        | "var_pop" | "bit_and" | "bit_or" | "bit_xor" | "bool_and" | "bool_or" => {
+        | "var_pop" | "bit_and" | "bit_or" | "bit_xor" | "bool_and" | "bool_or"
+        | "skewness" | "kurtosis" | "corr" | "covar_samp" | "covar_pop"
+        | "regr_slope" | "regr_r2" | "regr_intercept" | "regr_avgx" | "regr_avgy"
+        | "regr_sxx" | "regr_sxy" | "regr_syy" | "median" => {
             (lower.as_str(), false)
         }
+        "std" => ("stddev", false), // Spark alias for stddev
         // Spark's `mean` is an alias for `avg`; DuckDB accepts both — treat
         // both identically above. `count_distinct` and `sum_distinct` lower
         // to DISTINCT-flagged calls.

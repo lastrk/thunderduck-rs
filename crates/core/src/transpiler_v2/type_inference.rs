@@ -667,9 +667,23 @@ impl TypeInferenceEngine {
             // corpus diagnostics will surface any element-type mismatch.
             "transform" | "list_transform" | "filter" | "list_filter"
             | "list_reverse" | "aggregate" | "list_reduce" | "reduce"
-            | "zip_with" | "list_zip" | "map_filter" | "map_zip_with" => {
+            | "zip_with" | "list_zip" | "map_filter" | "map_zip_with"
+            | "sort_array" | "list_sort" | "array_distinct" | "list_distinct"
+            | "array_intersect" | "list_intersect" | "array_union"
+            | "list_concat_unique" | "array_except" | "array_repeat"
+            | "reverse" | "shuffle" | "flatten" | "arrays_zip"
+            | "slice" | "list_slice" => {
                 first_arg_type.cloned().unwrap_or(Unresolved)
             }
+            "array_position" | "list_position" | "array_max"
+            | "list_max" | "array_min" | "list_min" => {
+                // Element type of the array — reduce Array<T> → T.
+                match first_arg_type {
+                    Some(DataType::Array(inner, _)) => (**inner).clone(),
+                    _ => Unresolved,
+                }
+            }
+            "array_join" | "list_string_agg" => String,
             "exists" | "list_any" | "forall" | "list_all" | "array_contains"
             | "list_contains" => Boolean,
 

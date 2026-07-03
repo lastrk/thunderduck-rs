@@ -1442,6 +1442,32 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         "zip_with" => "list_zip",
         "map_filter" => "map_filter",
         "map_zip_with" => "map_zip_with",
+        // Spark's `sort_array(arr[, asc])` — DuckDB's `list_sort(arr[,
+        // 'ASC'|'DESC'])` takes a string order token, not a boolean.
+        "sort_array" if f.args.len() == 2 => {
+            let arr = render_expr(&f.args[0], schema)?;
+            // Second arg: Spark boolean literal (True=ASC, False=DESC).
+            // Try to extract literal; otherwise use CASE.
+            let order = match &f.args[1] {
+                Expression::Literal(l) => match &l.value {
+                    crate::transpiler_v2::expression::LiteralValue::Boolean(true) => {
+                        "'ASC'".to_owned()
+                    }
+                    crate::transpiler_v2::expression::LiteralValue::Boolean(false) => {
+                        "'DESC'".to_owned()
+                    }
+                    _ => {
+                        let b = render_expr(&f.args[1], schema)?;
+                        format!("CASE WHEN {b} THEN 'ASC' ELSE 'DESC' END")
+                    }
+                },
+                _ => {
+                    let b = render_expr(&f.args[1], schema)?;
+                    format!("CASE WHEN {b} THEN 'ASC' ELSE 'DESC' END")
+                }
+            };
+            return Ok(format!("list_sort({arr}, {order})"));
+        }
         // Spark array/list remaps — DuckDB uses `list_*` prefix.
         "sort_array" => "list_sort",
         "slice" => "list_slice",

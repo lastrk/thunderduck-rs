@@ -1110,6 +1110,35 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let haystack = render_expr(&f.args[1], schema)?;
             return Ok(format!("strpos({haystack}, {needle})"));
         }
+        // Spark null-handling remaps (DuckDB uses coalesce).
+        "nvl" => "coalesce",
+        "nvl2" => {
+            // Spark's `nvl2(a, b, c)` = if a is not null then b else c.
+            if f.args.len() != 3 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`nvl2` requires exactly 3 arguments".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            let b = render_expr(&f.args[1], schema)?;
+            let c = render_expr(&f.args[2], schema)?;
+            return Ok(format!(
+                "CASE WHEN {a} IS NOT NULL THEN {b} ELSE {c} END"
+            ));
+        }
+        "ifnull" => "coalesce",
+        // Spark's `unix_timestamp(x)` → seconds-since-epoch. DuckDB uses
+        // `epoch(x)`.
+        "unix_timestamp" => "epoch",
+        // Spark's `startswith`/`endswith`/`contains` — DuckDB spells them
+        // `starts_with`/`ends_with`/`contains` (contains is fine, others
+        // need underscore).
+        "startswith" => "starts_with",
+        "endswith" => "ends_with",
+        // Spark's `substr` — DuckDB canonical form is `substring` (both
+        // spellings accepted actually, but standardize).
+        "substr" => "substring",
         // Spark's `date_add(date, n)` / `date_sub(date, n)` — DuckDB's
         // versions expect INTERVAL args. Rewrite to arithmetic form.
         "date_add" => {

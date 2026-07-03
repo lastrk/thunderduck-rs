@@ -104,11 +104,15 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             aggregates,
         } => render_aggregate_op(input, grouping, aggregates),
 
-        // ── Slice E owns ──────────────────────────────────────────────────
-        TypedOp::Join { .. } => Err(EmissionError::UnsupportedOp {
-            op: "Join".to_owned(),
-            reason: "join emission lands in Slice E".to_owned(),
-        }),
+        // ── Join ─────────────────────────────────────────────────────────
+        TypedOp::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            using_columns,
+            ..
+        } => render_join(left, right, *join_type, condition.as_ref(), using_columns),
         TypedOp::SetOp { kind, .. } => Err(EmissionError::UnsupportedOp {
             op: format!("SetOp[{}]", set_op_kind_name(*kind)),
             reason: "set-op emission lands in Slice E".to_owned(),
@@ -436,6 +440,108 @@ fn render_distinct(input: &TypedAst) -> Result<String, EmissionError> {
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     Ok(format!(
         "SELECT DISTINCT * FROM ({child_sql}) AS __td_distinct"
+    ))
+}
+
+/// Render a binary `Join`. Emits
+/// `SELECT * FROM (left) AS __td_jl <JOIN_KIND> JOIN (right) AS __td_jr
+/// [ON <cond> | USING (<cols>)]`. DuckDB accepts `INNER`, `LEFT`, `RIGHT`,
+/// `FULL`, `CROSS`, `SEMI`, `ANTI` — the last two WITHOUT the `LEFT` prefix
+/// (checklist §5 / CLAUDE.md Known Gotcha #5). SEMI/ANTI join emission never
+/// produces right-side columns (semantically absent); the analyzer already
+/// computes the output schema accordingly (LeftSemi/LeftAnti → left schema
+/// only).
+fn render_join(
+    left: &TypedAst,
+    right: &TypedAst,
+    join_type: crate::transpiler_v2::ast::JoinType,
+    condition: Option<&Expression>,
+    using_columns: &[String],
+) -> Result<String, EmissionError> {
+    use crate::transpiler_v2::ast::JoinType;
+    let left_sql = dispatch_op(&left.op, &left.resolved_schema)?;
+    let right_sql = dispatch_op(&right.op, &right.resolved_schema)?;
+    let kind = match join_type {
+        JoinType::Inner => "INNER JOIN",
+        JoinType::Left => "LEFT OUTER JOIN",
+        JoinType::Right => "RIGHT OUTER JOIN",
+        JoinType::Full => "FULL OUTER JOIN",
+        JoinType::Cross => "CROSS JOIN",
+        // DuckDB requires SEMI JOIN / ANTI JOIN WITHOUT the `LEFT` prefix
+        // (CLAUDE.md Known Gotcha #5).
+        JoinType::LeftSemi => "SEMI JOIN",
+        JoinType::LeftAnti => "ANTI JOIN",
+    };
+    // Build the join clause. USING wins over ON when both are present per
+    // Spark semantics (Spark's `on="col"` maps to USING).
+    let clause = if !using_columns.is_empty() {
+        let mut cols = String::new();
+        for (i, c) in using_columns.iter().enumerate() {
+            if i > 0 {
+                cols.push_str(", ");
+            }
+            cols.push_str(&quote_ident(c));
+        }
+        format!(" USING ({cols})")
+    } else if let Some(cond) = condition {
+        let cond_sql = render_expr(cond, &left.resolved_schema)?;
+        format!(" ON {cond_sql}")
+    } else if matches!(join_type, JoinType::Cross) {
+        String::new()
+    } else {
+        return Err(EmissionError::UnsupportedOp {
+            op: "Join".to_owned(),
+            reason: "non-cross join without ON or USING clause".to_owned(),
+        });
+    };
+    // Emit an EXPLICIT column list mirroring the analyzer's output schema
+    // (see `analyzer.rs::CommonOp::Join` output-schema block for the
+    // canonical order). Without this, `SELECT *` on a USING-joined
+    // relation returns columns in DuckDB's order, which diverges from the
+    // analyzer's declared order once the SEMI/ANTI restriction or extra
+    // implicit resolutions kick in — the arrow batch then decodes with
+    // Spark's expected schema and hits type-mismatch failures downstream.
+    let is_semi_or_anti = matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
+    let using_lower: std::collections::HashSet<String> = using_columns
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    let mut slots = String::new();
+    let mut first = true;
+    let push = |slots: &mut String, first: &mut bool, s: String| {
+        if !*first {
+            slots.push_str(", ");
+        }
+        *first = false;
+        slots.push_str(&s);
+    };
+    // USING columns first (Spark hoists them).
+    for c in using_columns {
+        push(&mut slots, &mut first, quote_ident(c).into_owned());
+    }
+    // Left's non-USING columns in declared order.
+    for f in &left.resolved_schema.fields {
+        if !using_lower.contains(&f.name.to_lowercase()) {
+            let qualified = format!("__td_jl.{}", quote_ident(&f.name));
+            push(&mut slots, &mut first, qualified);
+        }
+    }
+    // Right's non-USING columns — only when NOT semi/anti (which suppresses
+    // right side).
+    if !is_semi_or_anti {
+        for f in &right.resolved_schema.fields {
+            if !using_lower.contains(&f.name.to_lowercase()) {
+                let qualified = format!("__td_jr.{}", quote_ident(&f.name));
+                push(&mut slots, &mut first, qualified);
+            }
+        }
+    }
+    if slots.is_empty() {
+        // Fallback for SEMI/ANTI on identical USING columns only.
+        slots.push('*');
+    }
+    Ok(format!(
+        "SELECT {slots} FROM ({left_sql}) AS __td_jl {kind} ({right_sql}) AS __td_jr{clause}"
     ))
 }
 

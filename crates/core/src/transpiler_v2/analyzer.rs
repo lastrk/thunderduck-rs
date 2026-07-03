@@ -734,9 +734,59 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                 &typed_right.resolved_schema,
                 join_type,
             );
-            let output_schema = match join_type {
-                JoinType::LeftSemi | JoinType::LeftAnti => derived_left_schema.clone(),
-                _ => StructType::merge(&derived_left_schema, &derived_right_schema),
+            // Output schema by join kind:
+            //   SEMI/ANTI  → left schema only (right's columns are semantically absent).
+            //   USING(...) → the USING columns appear ONCE (deduped), then
+            //                left's remaining columns, then right's remaining
+            //                columns. Matches DuckDB `SELECT * FROM l JOIN r
+            //                USING (k1, k2)` output shape and Spark's
+            //                `join(other, on=[...])`.
+            //   Otherwise  → simple concatenation.
+            // Output schema by join kind (Spark-parity — verified against
+            // corpus join cases). For USING joins, Spark hoists the USING
+            // columns to position 0, then left's non-USING cols, then
+            // right's non-USING cols.
+            //   SEMI/ANTI + USING     → USING first, then left's non-USING.
+            //   SEMI/ANTI (no USING)  → left schema unchanged.
+            //   INNER/LEFT/RIGHT/FULL + USING → USING first, left non-USING, right non-USING.
+            //   Otherwise             → simple concatenation.
+            let build_using_prefix = |using: &[String]| -> Vec<StructField> {
+                let mut fields = Vec::with_capacity(using.len());
+                for n in using {
+                    if let Some(f) = derived_left_schema
+                        .fields
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(n))
+                    {
+                        fields.push(f.clone());
+                    }
+                }
+                fields
+            };
+            let output_schema = if !using_columns.is_empty() {
+                let using_lower: std::collections::HashSet<String> = using_columns
+                    .iter()
+                    .map(|s| s.to_lowercase())
+                    .collect();
+                let mut fields = build_using_prefix(&using_columns);
+                for f in &derived_left_schema.fields {
+                    if !using_lower.contains(&f.name.to_lowercase()) {
+                        fields.push(f.clone());
+                    }
+                }
+                if !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+                    for f in &derived_right_schema.fields {
+                        if !using_lower.contains(&f.name.to_lowercase()) {
+                            fields.push(f.clone());
+                        }
+                    }
+                }
+                StructType::new(fields)
+            } else {
+                match join_type {
+                    JoinType::LeftSemi | JoinType::LeftAnti => derived_left_schema.clone(),
+                    _ => StructType::merge(&derived_left_schema, &derived_right_schema),
+                }
             };
 
             Ok(TypedAst {

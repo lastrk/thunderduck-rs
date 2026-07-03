@@ -116,10 +116,13 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             using_columns,
             ..
         } => render_join(left, right, *join_type, condition.as_ref(), using_columns),
-        TypedOp::SetOp { kind, .. } => Err(EmissionError::UnsupportedOp {
-            op: format!("SetOp[{}]", set_op_kind_name(*kind)),
-            reason: "set-op emission lands in Slice E".to_owned(),
-        }),
+        TypedOp::SetOp {
+            kind,
+            all,
+            by_name,
+            children,
+            widened_schema,
+        } => render_set_op(*kind, *all, *by_name, children, widened_schema),
 
         // ── Slice F owns (analyzer PuntedOperator today; defensive) ──────
         TypedOp::TableFunction { name, .. } => Err(EmissionError::UnsupportedOp {
@@ -138,13 +141,6 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
     result
 }
 
-fn set_op_kind_name(kind: SetOpKind) -> &'static str {
-    match kind {
-        SetOpKind::Union => "Union",
-        SetOpKind::Intersect => "Intersect",
-        SetOpKind::Except => "Except",
-    }
-}
 
 // ── Operator renderers ───────────────────────────────────────────────────────
 
@@ -444,6 +440,69 @@ fn render_distinct(input: &TypedAst) -> Result<String, EmissionError> {
     Ok(format!(
         "SELECT DISTINCT * FROM ({child_sql}) AS __td_distinct"
     ))
+}
+
+/// Render a `SetOp` (UNION / INTERSECT / EXCEPT). Each child is wrapped
+/// with a per-column `CAST(col AS <widened_type>)` projection so the union'd
+/// column types match the analyzer's widened schema (per ADR-006 refinement
+/// + Open Decision 5). `UNION BY NAME` is deferred (analyzer surfaces it as
+/// `PuntedOperator`); it never reaches this renderer.
+fn render_set_op(
+    kind: crate::transpiler_v2::ast::SetOpKind,
+    all: bool,
+    by_name: bool,
+    children: &[TypedAst],
+    widened_schema: &StructType,
+) -> Result<String, EmissionError> {
+    use crate::transpiler_v2::ast::SetOpKind;
+    if by_name {
+        return Err(EmissionError::UnsupportedOp {
+            op: "SetOp[BY NAME]".to_owned(),
+            reason: "UNION BY NAME emission is Slice G territory".to_owned(),
+        });
+    }
+    if children.is_empty() {
+        return Err(EmissionError::UnsupportedOp {
+            op: "SetOp".to_owned(),
+            reason: "set-op with no children".to_owned(),
+        });
+    }
+    let op_kw = match (kind, all) {
+        (SetOpKind::Union, true) => "UNION ALL",
+        (SetOpKind::Union, false) => "UNION",
+        (SetOpKind::Intersect, true) => "INTERSECT ALL",
+        (SetOpKind::Intersect, false) => "INTERSECT",
+        (SetOpKind::Except, true) => "EXCEPT ALL",
+        (SetOpKind::Except, false) => "EXCEPT",
+    };
+    let mut parts: Vec<String> = Vec::with_capacity(children.len());
+    for child in children {
+        let child_sql = dispatch_op(&child.op, &child.resolved_schema)?;
+        // Per-column CAST to widened parent schema. Children are guaranteed
+        // to have identical arity by the analyzer (arity mismatch surfaces
+        // as `AnalyzerError::Other` upstream).
+        let mut slots = String::new();
+        for (i, (child_field, widened_field)) in child
+            .resolved_schema
+            .fields
+            .iter()
+            .zip(widened_schema.fields.iter())
+            .enumerate()
+        {
+            if i > 0 {
+                slots.push_str(", ");
+            }
+            let ty = render_data_type(&widened_field.data_type);
+            let col = quote_ident(&child_field.name);
+            let widened_name = quote_ident(&widened_field.name);
+            slots.push_str(&format!("CAST({col} AS {ty}) AS {widened_name}"));
+        }
+        parts.push(format!("SELECT {slots} FROM ({child_sql}) AS __td_setop"));
+    }
+    // Wrap the union expression in an outer SELECT so downstream operators
+    // can wrap it as `FROM (...)` without DuckDB parse errors on the
+    // UNION-composed subquery.
+    Ok(parts.join(&format!(" {op_kw} ")))
 }
 
 /// Render a binary `Join`. Emits

@@ -87,6 +87,7 @@ impl V2RelationConverter {
             RelType::Join(j) => self.convert_join(j),
             RelType::WithColumns(wc) => self.convert_with_columns(wc),
             RelType::Drop(d) => self.convert_drop(d),
+            RelType::SetOp(so) => self.convert_set_op(so),
             RelType::Sql(_) => Err(EmissionError::UnsupportedProtoShape {
                 shape: "RelType::Sql".to_owned(),
                 reason: "SQL text is owned by parser_v2, not V2RelationConverter".to_owned(),
@@ -114,6 +115,33 @@ impl V2RelationConverter {
                 reason: format!("{ctx} has no input relation"),
             }),
         }
+    }
+
+    fn convert_set_op(
+        &mut self,
+        so: &proto::SetOperation,
+    ) -> Result<CommonAst, EmissionError> {
+        use proto::set_operation::SetOpType;
+        use thunderduck_core::transpiler_v2::analyzer::SetOpKind;
+        let left = self.convert_input(so.left_input.as_deref(), "SetOp::left")?;
+        let right = self.convert_input(so.right_input.as_deref(), "SetOp::right")?;
+        let kind = match SetOpType::try_from(so.set_op_type).unwrap_or(SetOpType::Unspecified) {
+            SetOpType::Union => SetOpKind::Union,
+            SetOpType::Intersect => SetOpKind::Intersect,
+            SetOpType::Except => SetOpKind::Except,
+            SetOpType::Unspecified => {
+                return Err(EmissionError::UnsupportedProtoShape {
+                    shape: "SetOp::Unspecified".to_owned(),
+                    reason: "SetOp proto has SET_OP_TYPE_UNSPECIFIED".to_owned(),
+                });
+            }
+        };
+        Ok(CommonAst::new(CommonOp::SetOp {
+            kind,
+            all: so.is_all.unwrap_or(false),
+            by_name: so.by_name.unwrap_or(false),
+            children: vec![left, right],
+        }))
     }
 
     fn convert_drop(&mut self, d: &proto::Drop) -> Result<CommonAst, EmissionError> {

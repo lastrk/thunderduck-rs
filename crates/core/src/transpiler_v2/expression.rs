@@ -520,10 +520,31 @@ impl Expression {
             Expression::FunctionCall(f) => Self::function_call_nullable(f, schema),
             Expression::Cast(c) => {
                 if c.try_cast {
-                    true
-                } else {
-                    c.expr.nullable(schema)
+                    return true;
                 }
+                // Spark rule: casting a String to a non-String type may
+                // fail silently and return NULL for unparseable inputs
+                // (Date, Timestamp, numeric types). Result is nullable
+                // even if the source expression is non-nullable.
+                let src = c.expr.data_type(schema);
+                let src_is_string = matches!(src, DataType::String);
+                let dst_may_fail = matches!(
+                    c.to_type,
+                    DataType::Date
+                        | DataType::Timestamp
+                        | DataType::TimestampNtz
+                        | DataType::Integer
+                        | DataType::Long
+                        | DataType::Short
+                        | DataType::Byte
+                        | DataType::Float
+                        | DataType::Double
+                        | DataType::Decimal { .. }
+                );
+                if src_is_string && dst_may_fail {
+                    return true;
+                }
+                c.expr.nullable(schema)
             }
             Expression::CaseWhen(cw) => {
                 cw.else_expr.is_none()

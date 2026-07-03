@@ -628,6 +628,19 @@ impl TypeInferenceEngine {
             | "datediff" | "unix_timestamp" | "unix_micros" | "unix_millis"
             | "unix_seconds" | "extract" => Integer,
 
+            // ── Higher-order array/map functions ─────────────────────────
+            // Return type = first-arg type (the collection) for filters;
+            // transform / zip_with produce a NEW array but at this
+            // resolver we approximate with first-arg type. Downstream
+            // corpus diagnostics will surface any element-type mismatch.
+            "transform" | "list_transform" | "filter" | "list_filter"
+            | "list_reverse" | "aggregate" | "list_reduce" | "reduce"
+            | "zip_with" | "list_zip" | "map_filter" | "map_zip_with" => {
+                first_arg_type.cloned().unwrap_or(Unresolved)
+            }
+            "exists" | "list_any" | "forall" | "list_all" | "array_contains"
+            | "list_contains" => Boolean,
+
             // ── Type predicates / control ───────────────────────────────
             "typeof" | "spark_partition_id" => String,
             "monotonically_increasing_id" => Long,

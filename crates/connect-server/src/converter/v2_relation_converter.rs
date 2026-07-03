@@ -575,6 +575,49 @@ impl V2ExpressionConverter {
             ExprType::UnresolvedStar(star) => Ok(Expression::Star(StarExpression {
                 qualifier: star.unparsed_target.clone(),
             })),
+            ExprType::LambdaFunction(lf) => {
+                let func_proto = lf.function.as_deref().ok_or_else(|| {
+                    EmissionError::UnsupportedProtoShape {
+                        shape: "LambdaFunction::function::None".to_owned(),
+                        reason: "LambdaFunction missing body".to_owned(),
+                    }
+                })?;
+                let body = self.convert(func_proto)?;
+                let mut params: Vec<String> = Vec::with_capacity(lf.arguments.len());
+                for arg in &lf.arguments {
+                    let name = match arg.name_parts.as_slice() {
+                        [n] => n.clone(),
+                        _ => {
+                            return Err(EmissionError::UnsupportedProtoShape {
+                                shape: "LambdaFunction::arg::multi_part".to_owned(),
+                                reason: "lambda argument name must be a single part"
+                                    .to_owned(),
+                            });
+                        }
+                    };
+                    params.push(name);
+                }
+                Ok(Expression::Lambda(
+                    thunderduck_core::transpiler_v2::expression::LambdaExpression {
+                        params,
+                        body: Box::new(body),
+                    },
+                ))
+            }
+            ExprType::UnresolvedNamedLambdaVariable(v) => {
+                let name = match v.name_parts.as_slice() {
+                    [n] => n.clone(),
+                    _ => {
+                        return Err(EmissionError::UnsupportedProtoShape {
+                            shape: "UnresolvedNamedLambdaVariable::multi_part".to_owned(),
+                            reason: "lambda variable name must be a single part".to_owned(),
+                        });
+                    }
+                };
+                Ok(Expression::LambdaVariable(
+                    thunderduck_core::transpiler_v2::expression::LambdaVariableExpression { name },
+                ))
+            }
             ExprType::Window(w) => {
                 let func_proto = w.window_function.as_deref().ok_or_else(|| {
                     EmissionError::UnsupportedProtoShape {

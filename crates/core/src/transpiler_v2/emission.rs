@@ -1014,14 +1014,24 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
             shape: "ScalarSubquery".to_owned(),
             reason: "scalar subqueries land in Slice F".to_owned(),
         }),
-        Expression::Lambda(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "Lambda".to_owned(),
-            reason: "HOF lambdas land in Slice F".to_owned(),
-        }),
-        Expression::LambdaVariable(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "LambdaVariable".to_owned(),
-            reason: "HOF lambdas land in Slice F".to_owned(),
-        }),
+        Expression::Lambda(l) => {
+            let body = render_expr(&l.body, schema)?;
+            let params = if l.params.len() == 1 {
+                quote_ident(&l.params[0]).into_owned()
+            } else {
+                let mut buf = String::from("(");
+                for (i, p) in l.params.iter().enumerate() {
+                    if i > 0 {
+                        buf.push_str(", ");
+                    }
+                    buf.push_str(&quote_ident(p));
+                }
+                buf.push(')');
+                buf
+            };
+            Ok(format!("({params} -> {body})"))
+        }
+        Expression::LambdaVariable(lv) => Ok(quote_ident(&lv.name).into_owned()),
         Expression::RawSql(r) => Ok(r.sql.clone()),
         Expression::ArrayLiteral(a) => render_array_literal(a, schema),
         Expression::MapLiteral(m) => render_map_literal(m, schema),
@@ -1205,6 +1215,15 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `substr` — DuckDB canonical form is `substring` (both
         // spellings accepted actually, but standardize).
         "substr" => "substring",
+        // Spark HOF (higher-order function) remaps — DuckDB uses `list_*`.
+        "transform" => "list_transform",
+        "filter" => "list_filter",
+        "exists" => "list_any",
+        "forall" => "list_all",
+        "aggregate" | "reduce" => "list_reduce",
+        "zip_with" => "list_zip",
+        "map_filter" => "map_filter",
+        "map_zip_with" => "map_zip_with",
         // Spark array/list remaps — DuckDB uses `list_*` prefix.
         "sort_array" => "list_sort",
         "slice" => "list_slice",

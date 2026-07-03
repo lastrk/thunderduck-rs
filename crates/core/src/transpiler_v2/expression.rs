@@ -718,6 +718,7 @@ impl Expression {
             }
             "isnull" | "isnan" | "isnotnull" | "isnotnan" | "is_nan" | "isinf" => false,
             "concat_ws" => false,
+            "typeof" | "spark_partition_id" | "monotonically_increasing_id" => false,
             "greatest" | "least" => f.args.iter().all(|a| a.nullable(schema)),
             "nvl2" => {
                 f.args.get(1).is_none_or(|a| a.nullable(schema))

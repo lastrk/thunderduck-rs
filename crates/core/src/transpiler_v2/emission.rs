@@ -1140,8 +1140,14 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
         }),
         Expression::Lambda(l) => {
             let body = render_expr(&l.body, schema)?;
-            let params = if l.params.len() == 1 {
-                quote_ident(&l.params[0]).into_owned()
+            // DuckDB lambda syntax:
+            //   single-arg: `x -> body`
+            //   multi-arg:  `(x, y) -> body`
+            // Do NOT wrap the whole lambda in outer parens — DuckDB parses
+            // `((x, y) -> ...)` as `row(x, y)` and treats `->` differently.
+            if l.params.len() == 1 {
+                let p = quote_ident(&l.params[0]);
+                Ok(format!("{p} -> {body}"))
             } else {
                 let mut buf = String::from("(");
                 for (i, p) in l.params.iter().enumerate() {
@@ -1151,9 +1157,8 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
                     buf.push_str(&quote_ident(p));
                 }
                 buf.push(')');
-                buf
-            };
-            Ok(format!("({params} -> {body})"))
+                Ok(format!("{buf} -> {body}"))
+            }
         }
         Expression::LambdaVariable(lv) => Ok(quote_ident(&lv.name).into_owned()),
         Expression::RawSql(r) => Ok(r.sql.clone()),
@@ -1438,10 +1443,22 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         "filter" => "list_filter",
         "exists" => "list_any",
         "forall" => "list_all",
-        "aggregate" | "reduce" => "list_reduce",
         "zip_with" => "list_zip",
         "map_filter" => "map_filter",
         "map_zip_with" => "map_zip_with",
+        // Spark's `aggregate(arr, init, (acc, x) -> f [, finish])` folds
+        // with an initial value. DuckDB's `list_reduce(list, lambda)` has
+        // no init parameter — it uses the first element as init. Prepend
+        // init to the list to simulate.
+        "aggregate" | "reduce" if f.args.len() >= 3 => {
+            let arr = render_expr(&f.args[0], schema)?;
+            let init = render_expr(&f.args[1], schema)?;
+            let lambda = render_expr(&f.args[2], schema)?;
+            return Ok(format!(
+                "list_reduce(list_prepend({init}, {arr}), {lambda})"
+            ));
+        }
+        "aggregate" | "reduce" => "list_reduce",
         // Spark's `sort_array(arr[, asc])` — DuckDB's `list_sort(arr[,
         // 'ASC'|'DESC'])` takes a string order token, not a boolean.
         "sort_array" if f.args.len() == 2 => {

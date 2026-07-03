@@ -1283,6 +1283,13 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let haystack = render_expr(&f.args[1], schema)?;
             return Ok(format!("strpos({haystack}, {needle})"));
         }
+        // Spark's `trunc(date, format)` → DuckDB `date_trunc(format, date)`.
+        // Spark's arg order is (date, fmt); DuckDB's is (fmt, date).
+        "trunc" if f.args.len() == 2 => {
+            let d = render_expr(&f.args[0], schema)?;
+            let fmt = render_expr(&f.args[1], schema)?;
+            return Ok(format!("date_trunc({fmt}, {d})"));
+        }
         // Spark's `regexp_replace(str, pat, repl)` replaces ALL matches.
         // DuckDB's `regexp_replace(str, pat, repl)` replaces only the FIRST;
         // the 4th arg 'g' flag makes it global.

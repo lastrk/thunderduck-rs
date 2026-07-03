@@ -1901,6 +1901,76 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
 /// through unchanged — aggregate-return casts are the responsibility of the
 /// aggregate function arm itself (via [`spark_aggregate_return_cast`], wired
 /// per checklist §5.7 when needed).
+/// Rewrite `grouping_id()` (no-arg) inside an expression tree to
+/// `grouping_id(<grouping cols>)`. Recurses into common expression
+/// containers used by the aggregate slot.
+fn rewrite_grouping_id(expr: &Expression, grouping: &[Expression]) -> Expression {
+    use crate::transpiler_v2::expression::{
+        AliasExpression, CaseWhenExpression, CastExpression, FunctionCall,
+    };
+    match expr {
+        Expression::FunctionCall(f) => {
+            let name_lower = f.name.to_lowercase();
+            if (name_lower == "grouping_id" || name_lower == "grouping")
+                && f.args.is_empty()
+                && !grouping.is_empty()
+            {
+                // Take bare column references from `grouping` (strip alias
+                // wrappers for the GROUP BY reference).
+                let new_args: Vec<Expression> = grouping
+                    .iter()
+                    .map(|g| match g {
+                        Expression::Alias(a) => a.expr.as_ref().clone(),
+                        other => other.clone(),
+                    })
+                    .collect();
+                Expression::FunctionCall(FunctionCall {
+                    name: f.name.clone(),
+                    args: new_args,
+                    distinct: f.distinct,
+                })
+            } else {
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| rewrite_grouping_id(a, grouping))
+                    .collect();
+                Expression::FunctionCall(FunctionCall {
+                    name: f.name.clone(),
+                    args,
+                    distinct: f.distinct,
+                })
+            }
+        }
+        Expression::Alias(a) => Expression::Alias(AliasExpression {
+            alias: a.alias.clone(),
+            expr: Box::new(rewrite_grouping_id(&a.expr, grouping)),
+        }),
+        Expression::Cast(c) => Expression::Cast(CastExpression {
+            expr: Box::new(rewrite_grouping_id(&c.expr, grouping)),
+            to_type: c.to_type.clone(),
+            try_cast: c.try_cast,
+        }),
+        Expression::CaseWhen(cw) => Expression::CaseWhen(CaseWhenExpression {
+            branches: cw
+                .branches
+                .iter()
+                .map(|(cond, then)| {
+                    (
+                        rewrite_grouping_id(cond, grouping),
+                        rewrite_grouping_id(then, grouping),
+                    )
+                })
+                .collect(),
+            else_expr: cw
+                .else_expr
+                .as_ref()
+                .map(|e| Box::new(rewrite_grouping_id(e, grouping))),
+        }),
+        other => other.clone(),
+    }
+}
+
 fn render_aggregate_op(
     input: &TypedAst,
     grouping: &[Expression],
@@ -1945,6 +2015,13 @@ fn render_aggregate_op(
         || group_names
             .iter()
             .all(|gn| !gn.is_empty() && agg_names.iter().any(|an| an.eq_ignore_ascii_case(gn)));
+    // Rewrite any `grouping_id()` (no-arg) calls inside `aggregates` to
+    // pass the current grouping columns as explicit args — DuckDB requires
+    // them. This is a small tree-walk local to render_aggregate_op scope.
+    let rewritten_aggregates: Vec<Expression> = aggregates
+        .iter()
+        .map(|a| rewrite_grouping_id(a, grouping))
+        .collect();
     let mut slots = String::new();
     let mut first = true;
     if !already_folded {
@@ -1956,7 +2033,7 @@ fn render_aggregate_op(
             slots.push_str(&render_projection_slot(g, input_schema)?);
         }
     }
-    for agg in aggregates {
+    for agg in &rewritten_aggregates {
         if !first {
             slots.push_str(", ");
         }

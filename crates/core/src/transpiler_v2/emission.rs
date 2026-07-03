@@ -333,22 +333,119 @@ fn render_file_scan(
 }
 
 fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let input_schema = &input.resolved_schema;
-    let slots_sql = if projections.is_empty() {
-        "*".to_owned()
-    } else {
-        let mut buf = String::new();
-        for (i, p) in projections.iter().enumerate() {
-            if i > 0 {
-                buf.push_str(", ");
-            }
-            buf.push_str(&render_projection_slot(p, input_schema)?);
-        }
-        buf
-    };
+    // Project-over-Join inlining: when the child is a Join, emit the
+    // projections directly against the Join's FROM/ON clauses rather than
+    // wrapping the join output as a subquery. This preserves outer-level
+    // access to user aliases (`df.alias("e").join(...).select(e.name)`)
+    // and matches Spark's plan-tree shape.
+    if let TypedOp::Join {
+        left,
+        right,
+        join_type,
+        condition,
+        using_columns,
+        ..
+    } = &input.op
+    {
+        return render_project_over_join(
+            projections,
+            input_schema,
+            left,
+            right,
+            *join_type,
+            condition.as_ref(),
+            using_columns,
+        );
+    }
+    // AliasedRelation is transparent for Project too — inline through it.
+    if let TypedOp::AliasedRelation { input: inner, alias } = &input.op {
+        let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
+        let slots_sql = render_projection_slots(projections, input_schema)?;
+        let a = quote_ident(alias);
+        return Ok(format!("SELECT {slots_sql} FROM ({inner_sql}) AS {a}"));
+    }
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    let slots_sql = render_projection_slots(projections, input_schema)?;
     Ok(format!(
         "SELECT {slots_sql} FROM ({child_sql}) AS __td_proj"
+    ))
+}
+
+fn render_projection_slots(
+    projections: &[Expression],
+    input_schema: &Schema,
+) -> Result<String, EmissionError> {
+    if projections.is_empty() {
+        return Ok("*".to_owned());
+    }
+    let mut buf = String::new();
+    for (i, p) in projections.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(", ");
+        }
+        buf.push_str(&render_projection_slot(p, input_schema)?);
+    }
+    Ok(buf)
+}
+
+/// Render a Project whose child is a Join. Inline the Join's FROM/ON so
+/// user aliases (`df.alias("e")`) remain in scope for the projection list.
+fn render_project_over_join(
+    projections: &[Expression],
+    project_input_schema: &Schema,
+    left: &TypedAst,
+    right: &TypedAst,
+    join_type: crate::transpiler_v2::ast::JoinType,
+    condition: Option<&Expression>,
+    using_columns: &[String],
+) -> Result<String, EmissionError> {
+    use crate::transpiler_v2::ast::JoinType;
+    // Pick subquery aliases: user AliasedRelation names take precedence.
+    let (left_ast, left_alias) = match &left.op {
+        TypedOp::AliasedRelation { input, alias } => (input.as_ref(), alias.clone()),
+        _ => (left, "__td_jl".to_owned()),
+    };
+    let (right_ast, right_alias) = match &right.op {
+        TypedOp::AliasedRelation { input, alias } => (input.as_ref(), alias.clone()),
+        _ => (right, "__td_jr".to_owned()),
+    };
+    let left_sql = dispatch_op(&left_ast.op, &left_ast.resolved_schema)?;
+    let right_sql = dispatch_op(&right_ast.op, &right_ast.resolved_schema)?;
+    let kind = match join_type {
+        JoinType::Inner => "INNER JOIN",
+        JoinType::Left => "LEFT OUTER JOIN",
+        JoinType::Right => "RIGHT OUTER JOIN",
+        JoinType::Full => "FULL OUTER JOIN",
+        JoinType::Cross => "CROSS JOIN",
+        JoinType::LeftSemi => "SEMI JOIN",
+        JoinType::LeftAnti => "ANTI JOIN",
+    };
+    let clause = if !using_columns.is_empty() {
+        let mut cols = String::new();
+        for (i, c) in using_columns.iter().enumerate() {
+            if i > 0 {
+                cols.push_str(", ");
+            }
+            cols.push_str(&quote_ident(c));
+        }
+        format!(" USING ({cols})")
+    } else if let Some(cond) = condition {
+        let cond_sql = render_expr(cond, project_input_schema)?;
+        format!(" ON {cond_sql}")
+    } else if matches!(join_type, JoinType::Cross) {
+        String::new()
+    } else {
+        return Err(EmissionError::UnsupportedOp {
+            op: "Join".to_owned(),
+            reason: "non-cross join without ON or USING clause".to_owned(),
+        });
+    };
+    let slots_sql = render_projection_slots(projections, project_input_schema)?;
+    let la = quote_ident(&left_alias);
+    let ra = quote_ident(&right_alias);
+    Ok(format!(
+        "SELECT {slots_sql} FROM ({left_sql}) AS {la} {kind} ({right_sql}) AS {ra}{clause}"
     ))
 }
 

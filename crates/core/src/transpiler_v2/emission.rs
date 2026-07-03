@@ -460,47 +460,75 @@ fn render_set_op(
     widened_schema: &StructType,
 ) -> Result<String, EmissionError> {
     use crate::transpiler_v2::ast::SetOpKind;
-    if by_name {
-        return Err(EmissionError::UnsupportedOp {
-            op: "SetOp[BY NAME]".to_owned(),
-            reason: "UNION BY NAME emission is Slice G territory".to_owned(),
-        });
-    }
     if children.is_empty() {
         return Err(EmissionError::UnsupportedOp {
             op: "SetOp".to_owned(),
             reason: "set-op with no children".to_owned(),
         });
     }
-    let op_kw = match (kind, all) {
-        (SetOpKind::Union, true) => "UNION ALL",
-        (SetOpKind::Union, false) => "UNION",
-        (SetOpKind::Intersect, true) => "INTERSECT ALL",
-        (SetOpKind::Intersect, false) => "INTERSECT",
-        (SetOpKind::Except, true) => "EXCEPT ALL",
-        (SetOpKind::Except, false) => "EXCEPT",
+    let op_kw = match (kind, all, by_name) {
+        // BY NAME variants (DuckDB supports UNION [ALL] BY NAME only).
+        (SetOpKind::Union, true, true) => "UNION ALL BY NAME",
+        (SetOpKind::Union, false, true) => "UNION BY NAME",
+        (SetOpKind::Union, true, false) => "UNION ALL",
+        (SetOpKind::Union, false, false) => "UNION",
+        (SetOpKind::Intersect, true, false) => "INTERSECT ALL",
+        (SetOpKind::Intersect, false, false) => "INTERSECT",
+        (SetOpKind::Except, true, false) => "EXCEPT ALL",
+        (SetOpKind::Except, false, false) => "EXCEPT",
+        (kind, _, true) => {
+            return Err(EmissionError::UnsupportedOp {
+                op: format!("SetOp[{kind:?} BY NAME]"),
+                reason: "DuckDB supports BY NAME only for UNION".to_owned(),
+            });
+        }
     };
     let mut parts: Vec<String> = Vec::with_capacity(children.len());
     for child in children {
         let child_sql = dispatch_op(&child.op, &child.resolved_schema)?;
-        // Per-column CAST to widened parent schema. Children are guaranteed
-        // to have identical arity by the analyzer (arity mismatch surfaces
-        // as `AnalyzerError::Other` upstream).
+        // Per-column CAST to widened parent schema.
+        //   - by-position: children have identical arity (analyzer verified);
+        //     zip position-wise, CAST each column to widened_schema[i] and
+        //     rename to the widened column name.
+        //   - by-name: children have identical name SETS but possibly
+        //     different orders (analyzer verified). For each name in the
+        //     widened schema, find the child's matching field, CAST to the
+        //     widened type, keep the widened name. DuckDB's `UNION BY NAME`
+        //     matches on the aliased output name — so keeping the widened
+        //     name across children is what makes the union coherent.
         let mut slots = String::new();
-        for (i, (child_field, widened_field)) in child
-            .resolved_schema
-            .fields
-            .iter()
-            .zip(widened_schema.fields.iter())
-            .enumerate()
-        {
-            if i > 0 {
-                slots.push_str(", ");
+        if by_name {
+            for (i, widened_field) in widened_schema.fields.iter().enumerate() {
+                if i > 0 {
+                    slots.push_str(", ");
+                }
+                let child_field = child
+                    .resolved_schema
+                    .fields
+                    .iter()
+                    .find(|f| f.name.eq_ignore_ascii_case(&widened_field.name))
+                    .expect("analyzer guaranteed name match");
+                let ty = render_data_type(&widened_field.data_type);
+                let col = quote_ident(&child_field.name);
+                let widened_name = quote_ident(&widened_field.name);
+                slots.push_str(&format!("CAST({col} AS {ty}) AS {widened_name}"));
             }
-            let ty = render_data_type(&widened_field.data_type);
-            let col = quote_ident(&child_field.name);
-            let widened_name = quote_ident(&widened_field.name);
-            slots.push_str(&format!("CAST({col} AS {ty}) AS {widened_name}"));
+        } else {
+            for (i, (child_field, widened_field)) in child
+                .resolved_schema
+                .fields
+                .iter()
+                .zip(widened_schema.fields.iter())
+                .enumerate()
+            {
+                if i > 0 {
+                    slots.push_str(", ");
+                }
+                let ty = render_data_type(&widened_field.data_type);
+                let col = quote_ident(&child_field.name);
+                let widened_name = quote_ident(&widened_field.name);
+                slots.push_str(&format!("CAST({col} AS {ty}) AS {widened_name}"));
+            }
         }
         parts.push(format!("SELECT {slots} FROM ({child_sql}) AS __td_setop"));
     }

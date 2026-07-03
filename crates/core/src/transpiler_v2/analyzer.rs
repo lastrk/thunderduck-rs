@@ -923,10 +923,13 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             by_name,
             children,
         } => {
-            if by_name {
+            // UNION BY NAME is analyzed by name-matching each column across
+            // children; INTERSECT / EXCEPT BY NAME are not supported by
+            // DuckDB itself so we still punt those to a future slice.
+            if by_name && !matches!(kind, SetOpKind::Union) {
                 return Err(AnalyzerError::PuntedOperator {
-                    op: "SetOp[UNION BY NAME]".to_owned(),
-                    reason: "by-name set-op widening lands in Slice G".to_owned(),
+                    op: format!("SetOp[{kind:?} BY NAME]"),
+                    reason: "by-name INTERSECT/EXCEPT unsupported in DuckDB".to_owned(),
                 });
             }
             if children.is_empty() {
@@ -940,42 +943,90 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                 .collect::<Result<Vec<_>, _>>()?;
 
             // set-op widening sub-sweep (§5):
-            //   1. verify column-count agreement.
-            //   2. per-column unify types across all children.
-            //   3. widened nullable = any child nullable.
-            //   4. push CAST wrappers into terminal Project projections.
-            let first_len = typed_children[0].resolved_schema.len();
-            for (idx, child) in typed_children.iter().enumerate().skip(1) {
-                if child.resolved_schema.len() != first_len {
-                    // Arity is the mismatch — not a per-column type mismatch —
-                    // so use `Other` (still `[SPARK-EMULATED]`) rather than
-                    // shoehorning `TypeMismatch` with placeholder types.
-                    return Err(AnalyzerError::Other {
-                        reason: format!(
-                            "set-op arity mismatch: child 0 has {} columns, child {idx} has {}",
-                            first_len,
-                            child.resolved_schema.len()
-                        ),
-                    });
+            // By-position (default): verify arity + per-column-index type
+            // unify. By-name (UNION only): match columns across children by
+            // NAME (case-insensitive) — each child must have the same NAME
+            // SET; per-name type unify.
+            let widened_schema = if by_name {
+                // First child's name order is canonical (Spark semantics).
+                let first_schema = &typed_children[0].resolved_schema;
+                let first_names_lower: std::collections::HashSet<String> = first_schema
+                    .fields
+                    .iter()
+                    .map(|f| f.name.to_lowercase())
+                    .collect();
+                for (idx, child) in typed_children.iter().enumerate().skip(1) {
+                    let child_names_lower: std::collections::HashSet<String> = child
+                        .resolved_schema
+                        .fields
+                        .iter()
+                        .map(|f| f.name.to_lowercase())
+                        .collect();
+                    if child_names_lower != first_names_lower {
+                        return Err(AnalyzerError::Other {
+                            reason: format!(
+                                "unionByName column-name mismatch: child 0 has {:?}, child {idx} has {:?}",
+                                first_names_lower, child_names_lower
+                            ),
+                        });
+                    }
                 }
-            }
-            let mut widened_fields: Vec<StructField> = Vec::with_capacity(first_len);
-            for col_idx in 0..first_len {
-                let first_field = &typed_children[0].resolved_schema.fields[col_idx];
-                let mut widened_type = first_field.data_type.clone();
-                let mut widened_nullable = first_field.nullable;
-                for child in typed_children.iter().skip(1) {
-                    let f = &child.resolved_schema.fields[col_idx];
-                    widened_type = TypeInferenceEngine::unify_types(&widened_type, &f.data_type);
-                    widened_nullable = widened_nullable || f.nullable;
+                let mut widened_fields: Vec<StructField> =
+                    Vec::with_capacity(first_schema.fields.len());
+                for f0 in &first_schema.fields {
+                    let mut widened_type = f0.data_type.clone();
+                    let mut widened_nullable = f0.nullable;
+                    for child in typed_children.iter().skip(1) {
+                        if let Some(fk) = child
+                            .resolved_schema
+                            .fields
+                            .iter()
+                            .find(|f| f.name.eq_ignore_ascii_case(&f0.name))
+                        {
+                            widened_type =
+                                TypeInferenceEngine::unify_types(&widened_type, &fk.data_type);
+                            widened_nullable = widened_nullable || fk.nullable;
+                        }
+                    }
+                    widened_fields.push(StructField::new(
+                        f0.name.clone(),
+                        widened_type,
+                        widened_nullable,
+                    ));
                 }
-                widened_fields.push(StructField::new(
-                    first_field.name.clone(),
-                    widened_type,
-                    widened_nullable,
-                ));
-            }
-            let widened_schema = StructType::new(widened_fields);
+                StructType::new(widened_fields)
+            } else {
+                let first_len = typed_children[0].resolved_schema.len();
+                for (idx, child) in typed_children.iter().enumerate().skip(1) {
+                    if child.resolved_schema.len() != first_len {
+                        return Err(AnalyzerError::Other {
+                            reason: format!(
+                                "set-op arity mismatch: child 0 has {} columns, child {idx} has {}",
+                                first_len,
+                                child.resolved_schema.len()
+                            ),
+                        });
+                    }
+                }
+                let mut widened_fields: Vec<StructField> = Vec::with_capacity(first_len);
+                for col_idx in 0..first_len {
+                    let first_field = &typed_children[0].resolved_schema.fields[col_idx];
+                    let mut widened_type = first_field.data_type.clone();
+                    let mut widened_nullable = first_field.nullable;
+                    for child in typed_children.iter().skip(1) {
+                        let f = &child.resolved_schema.fields[col_idx];
+                        widened_type =
+                            TypeInferenceEngine::unify_types(&widened_type, &f.data_type);
+                        widened_nullable = widened_nullable || f.nullable;
+                    }
+                    widened_fields.push(StructField::new(
+                        first_field.name.clone(),
+                        widened_type,
+                        widened_nullable,
+                    ));
+                }
+                StructType::new(widened_fields)
+            };
 
             // Downward push (§5.4): wrap terminal projections with CAST when
             // their column-type differs from the widened type. Only touches

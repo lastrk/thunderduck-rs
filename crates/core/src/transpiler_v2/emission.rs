@@ -1818,6 +1818,17 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         let n = render_expr(&f.args[1], schema)?;
         return Ok(format!("nth_value({col}, {n})"));
     }
+    // Spark's `percentile_approx(col, quantile [, accuracy])` maps to
+    // DuckDB's `approx_quantile(col, quantile::FLOAT)`. Drop accuracy;
+    // CAST the quantile to FLOAT since Spark sends it as Decimal.
+    // Checklist §3.2 anchor.
+    if (lower == "percentile_approx" || lower == "approx_percentile")
+        && f.args.len() >= 2
+    {
+        let col = render_expr(&f.args[0], schema)?;
+        let q = render_expr(&f.args[1], schema)?;
+        return Ok(format!("approx_quantile({col}, CAST({q} AS FLOAT))"));
+    }
     let (duck_name, force_distinct) = match lower.as_str() {
         // Direct pass-through — DuckDB accepts the Spark name unchanged.
         "count" | "sum" | "avg" | "mean" | "min" | "max" | "first" | "last"
@@ -1835,6 +1846,12 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         // Spark's `kurtosis` uses the population formula; DuckDB has
         // `kurtosis_pop` for that (native, not via extension).
         "kurtosis" => ("kurtosis_pop", false),
+        // Additional aggregates: percentile_approx / approx_percentile /
+        // mode / any / every / some / all.
+        // percentile_approx handled with an explicit arm below.
+        "mode" => ("mode", false),
+        "any" | "some" => ("bool_or", false),
+        "every" | "all" => ("bool_and", false),
         // `try_sum` / `try_avg` — ext6 extension arms.
         "try_sum" => ("spark_try_sum", false),
         "try_avg" => ("spark_try_avg", false),

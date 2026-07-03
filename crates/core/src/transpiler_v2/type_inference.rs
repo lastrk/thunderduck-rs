@@ -330,8 +330,8 @@ impl TypeInferenceEngine {
             | "regr_slope" | "regr_r2" | "regr_intercept" | "regr_avgx" | "regr_avgy"
             | "regr_sxx" | "regr_sxy" | "regr_syy" => Double,
 
-            // Percentile → Double.
-            "percentile" | "percentile_approx" | "approx_percentile" => Double,
+            // Percentile / median → Double.
+            "percentile" | "percentile_approx" | "approx_percentile" | "median" => Double,
 
             // collect_list / collect_set → Array.
             "collect_list" | "collect_set" => Array(Box::new(arg_type.clone()), false),
@@ -570,6 +570,11 @@ impl TypeInferenceEngine {
             | "percentile"
             | "percentile_approx"
             | "approx_percentile"
+            | "median"
+            | "mode"
+            | "any"
+            | "some"
+            | "every"
             | "approx_count_distinct"
             | "count_approx_distinct"
             | "bit_and"

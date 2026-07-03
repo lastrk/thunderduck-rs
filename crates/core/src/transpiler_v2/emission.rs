@@ -1191,6 +1191,30 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         // Spark's `date_add(date, n)` / `date_sub(date, n)` — DuckDB's
         // versions expect INTERVAL args. Rewrite to arithmetic form.
+        // Spark's `datediff(end, start)` (2 args, days-diff) → DuckDB's
+        // `datediff('day', start, end)` (3 args, unit-prefixed).
+        "datediff" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`datediff` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let end = render_expr(&f.args[0], schema)?;
+            let start = render_expr(&f.args[1], schema)?;
+            return Ok(format!("datediff('day', {start}, {end})"));
+        }
+        "months_between" => {
+            if f.args.len() < 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`months_between` requires at least 2 arguments".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            let b = render_expr(&f.args[1], schema)?;
+            return Ok(format!("datediff('month', {b}, {a})"));
+        }
         "date_add" => {
             if f.args.len() != 2 {
                 return Err(EmissionError::UnsupportedFunction {

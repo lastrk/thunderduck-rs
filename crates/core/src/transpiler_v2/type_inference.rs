@@ -615,7 +615,8 @@ impl TypeInferenceEngine {
             }
 
             // ── Date/time functions ──────────────────────────────────────
-            "current_date" | "current_timestamp" | "now" => Timestamp,
+            "current_date" => Date,
+            "current_timestamp" | "now" => Timestamp,
             "date_add" | "date_sub" | "add_months" | "months_between" | "next_day"
             | "last_day" | "trunc" | "date_trunc" | "to_date" => Date,
             "to_timestamp" | "from_unixtime" | "from_utc_timestamp" | "to_utc_timestamp"

@@ -42,8 +42,8 @@ use super::ast::{CommonAst, CommonOp, FileFormat, JoinType};
 use super::base_types::BaseTypes;
 use super::error::EmissionError;
 use super::expression::{
-    AliasExpression, CastExpression, ColumnReference, Expression, SortOrder, StarExpression,
-    UnresolvedColumn,
+    AliasExpression, BinaryExpression, CaseWhenExpression, CastExpression, ColumnReference,
+    Expression, FunctionCall, SortOrder, StarExpression, UnaryExpression, UnresolvedColumn,
 };
 use super::type_inference::TypeInferenceEngine;
 use crate::types::{DataType, StructField, StructType};
@@ -950,8 +950,25 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             // its comment). Any unqualified reference — whether in the join
             // condition here, or in projections/filters/sort keys above —
             // that resolves to more than one field raises `AmbiguousColumn`.
+            //
+            // BUT: proto `Expression.Attribute.plan_id` is Spark's mechanism
+            // to disambiguate `emp.dept_id == dept.dept_id` — the two refs
+            // share a name but carry different plan_ids. Pre-process the
+            // condition to synthesize the emission-facing qualifier
+            // (`__td_jl` / `__td_jr`) from plan_id membership; that turns a
+            // plan_id-tagged unqualified reference into a "trust the
+            // caller" qualified reference that `resolve_column` accepts and
+            // emission renders as `__td_jl.dept_id` — matching the aliases
+            // `render_join` emits.
             let condition = match condition {
-                Some(c) => Some(resolve_and_stamp(c, &combined_input_schema)?),
+                Some(c) => {
+                    let qualified =
+                        qualify_plan_id_refs(c, &left_plan_ids, &right_plan_ids);
+                    Some(resolve_and_stamp(
+                        qualified,
+                        &combined_input_schema,
+                    )?)
+                }
                 None => None,
             };
 
@@ -1335,6 +1352,92 @@ fn resolve_expr_list(
         .collect()
 }
 
+/// Synthetic qualifier attached to plan_id-tagged column refs during Join
+/// condition analysis. Emission renders `ColumnReference { qualifier:
+/// Some(TD_JOIN_LEFT), .. }` as `__td_jl.<col>`, which matches the
+/// left/right subquery aliases `render_join` emits.
+pub(crate) const TD_JOIN_LEFT: &str = "__td_jl";
+pub(crate) const TD_JOIN_RIGHT: &str = "__td_jr";
+
+/// Walk an expression and replace `UnresolvedColumn { qualifier: None,
+/// plan_id: Some(N) }` with `UnresolvedColumn { qualifier: Some("__td_jl"),
+/// .. }` or `Some("__td_jr")` based on which side `N` belongs to. Leaves
+/// qualifier-set references and plan_id-free references untouched.
+fn qualify_plan_id_refs(
+    expr: Expression,
+    left_ids: &[i64],
+    right_ids: &[i64],
+) -> Expression {
+    fn walk(e: Expression, left_ids: &[i64], right_ids: &[i64]) -> Expression {
+        match e {
+            Expression::UnresolvedColumn(u) if u.qualifier.is_none() => {
+                let synth = match u.plan_id {
+                    Some(pid) if left_ids.contains(&pid) => {
+                        Some(TD_JOIN_LEFT.to_owned())
+                    }
+                    Some(pid) if right_ids.contains(&pid) => {
+                        Some(TD_JOIN_RIGHT.to_owned())
+                    }
+                    _ => None,
+                };
+                if let Some(q) = synth {
+                    Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: u.name,
+                        qualifier: Some(q),
+                        plan_id: u.plan_id,
+                    })
+                } else {
+                    Expression::UnresolvedColumn(u)
+                }
+            }
+            Expression::Binary(b) => Expression::Binary(BinaryExpression {
+                op: b.op,
+                left: Box::new(walk(*b.left, left_ids, right_ids)),
+                right: Box::new(walk(*b.right, left_ids, right_ids)),
+            }),
+            Expression::Unary(u) => Expression::Unary(UnaryExpression {
+                op: u.op,
+                operand: Box::new(walk(*u.operand, left_ids, right_ids)),
+            }),
+            Expression::FunctionCall(f) => Expression::FunctionCall(FunctionCall {
+                name: f.name,
+                args: f
+                    .args
+                    .into_iter()
+                    .map(|a| walk(a, left_ids, right_ids))
+                    .collect(),
+                distinct: f.distinct,
+            }),
+            Expression::Cast(c) => Expression::Cast(CastExpression {
+                expr: Box::new(walk(*c.expr, left_ids, right_ids)),
+                to_type: c.to_type,
+                try_cast: c.try_cast,
+            }),
+            Expression::CaseWhen(cw) => Expression::CaseWhen(CaseWhenExpression {
+                branches: cw
+                    .branches
+                    .into_iter()
+                    .map(|(c, v)| {
+                        (
+                            walk(c, left_ids, right_ids),
+                            walk(v, left_ids, right_ids),
+                        )
+                    })
+                    .collect(),
+                else_expr: cw
+                    .else_expr
+                    .map(|e| Box::new(walk(*e, left_ids, right_ids))),
+            }),
+            Expression::Alias(a) => Expression::Alias(AliasExpression {
+                alias: a.alias,
+                expr: Box::new(walk(*a.expr, left_ids, right_ids)),
+            }),
+            other => other,
+        }
+    }
+    walk(expr, left_ids, right_ids)
+}
+
 fn resolve_column(u: UnresolvedColumn, schema: &StructType) -> Result<Expression, AnalyzerError> {
     // Qualified: `qualifier.name` — the analyzer accepts both a top-level
     // qualifier column (a struct field access) and a direct match on the
@@ -1348,6 +1451,15 @@ fn resolve_column(u: UnresolvedColumn, schema: &StructType) -> Result<Expression
     // it catches ambiguity everywhere a column reference is resolved
     // (projections, filters, sort keys, join conditions, ...), not just in
     // join conditions.
+    // Synthetic __td_jl / __td_jr qualifiers set by `qualify_plan_id_refs`
+    // are "trust the caller" markers — resolve type/nullable against the
+    // merged schema by name alone, and preserve the qualifier for
+    // emission. The merged schema by construction has the field on the
+    // corresponding side; picking the first match by name is correct.
+    let is_synthetic_join_qualifier = matches!(
+        u.qualifier.as_deref(),
+        Some(TD_JOIN_LEFT) | Some(TD_JOIN_RIGHT)
+    );
     if u.qualifier.is_none() {
         let matches: Vec<&StructField> = schema
             .fields
@@ -1362,9 +1474,28 @@ fn resolve_column(u: UnresolvedColumn, schema: &StructType) -> Result<Expression
             });
         }
     }
-    let dt = TypeInferenceEngine::qualified_column_type(&u.name, u.qualifier.as_deref(), schema);
-    let nullable =
-        TypeInferenceEngine::qualified_column_nullable(&u.name, u.qualifier.as_deref(), schema);
+    let dt = if is_synthetic_join_qualifier {
+        // Resolve by NAME against the merged schema (qualifier isn't a
+        // real schema field, it's an emission-side alias).
+        schema
+            .fields
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(&u.name))
+            .map(|f| f.data_type.clone())
+            .unwrap_or(DataType::Unresolved)
+    } else {
+        TypeInferenceEngine::qualified_column_type(&u.name, u.qualifier.as_deref(), schema)
+    };
+    let nullable = if is_synthetic_join_qualifier {
+        schema
+            .fields
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(&u.name))
+            .map(|f| f.nullable)
+            .unwrap_or(true)
+    } else {
+        TypeInferenceEngine::qualified_column_nullable(&u.name, u.qualifier.as_deref(), schema)
+    };
     if matches!(dt, DataType::Unresolved) {
         return Err(AnalyzerError::UnknownColumn {
             name: u.name,

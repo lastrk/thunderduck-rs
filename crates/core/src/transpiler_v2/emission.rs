@@ -1191,6 +1191,18 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         // Spark's `date_add(date, n)` / `date_sub(date, n)` — DuckDB's
         // versions expect INTERVAL args. Rewrite to arithmetic form.
+        // Spark's `add_months(date, n)` — DuckDB uses `date + INTERVAL n MONTH`.
+        "add_months" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`add_months` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let d = render_expr(&f.args[0], schema)?;
+            let n = render_expr(&f.args[1], schema)?;
+            return Ok(format!("({d} + INTERVAL ({n}) MONTH)"));
+        }
         // Spark's `datediff(end, start)` (2 args, days-diff) → DuckDB's
         // `datediff('day', start, end)` (3 args, unit-prefixed).
         "datediff" => {

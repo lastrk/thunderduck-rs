@@ -801,14 +801,50 @@ fn is_aggregate_name(name: &str) -> bool {
     AGGREGATE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
 
-/// C.1 stub: every scalar function call boundary-errors as
-/// [`EmissionError::UnsupportedFunction`]. Slice C.2 populates the emission
-/// table with real arms.
-fn render_function_call(f: &FunctionCall, _schema: &Schema) -> Result<String, EmissionError> {
-    Err(EmissionError::UnsupportedFunction {
-        name: f.name.clone(),
-        reason: "scalar function arms land in Slice C.2".to_owned(),
-    })
+/// Render a scalar function call. The Spark → DuckDB scalar-function
+/// vocabulary is *large*; rather than enumerating hundreds of arms
+/// individually, this arm applies a **pass-through by default** strategy —
+/// DuckDB's parser accepts most Spark scalar function names verbatim, and
+/// where semantics diverge the corpus diff harness surfaces the mismatch
+/// case-by-case for follow-up diagnostic passes.
+///
+/// Cases where τ REMAPS or REJECTS the Spark name are enumerated explicitly:
+///   `starts_with`   → `starts_with` (native DuckDB); Spark also accepts
+///                     `startswith` which is likewise DuckDB-valid.
+///   `substr`        → `substring` (DuckDB canonical form; both accepted).
+///   `signum`        → `sign` (DuckDB has both; passthrough).
+/// Unhandled proto expression shapes (Window/Lambda) never reach here;
+/// they surface as `UnsupportedProtoShape` in `V2ExpressionConverter`.
+fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
+    let name_lower = f.name.to_ascii_lowercase();
+    // Aggregate-name overlap check — if the analyzer classified a FunctionCall
+    // as aggregate, `render_expr` routes to `render_aggregate` before this
+    // function; anything reaching here is scalar by construction. Defense in
+    // depth: any name matching AGGREGATE_NAMES should never be seen here.
+    let mut args_sql = String::new();
+    for (i, arg) in f.args.iter().enumerate() {
+        if i > 0 {
+            args_sql.push_str(", ");
+        }
+        args_sql.push_str(&render_expr(arg, schema)?);
+    }
+    // Handful of Spark-name → DuckDB-name remappings where the direct
+    // pass-through wouldn't work. Everything else passes through unchanged.
+    let duck_name: &str = match name_lower.as_str() {
+        // DuckDB parses `not` as a keyword; Spark sends unary NOT as a
+        // function. Emit as a keyword expression.
+        "not" => {
+            if f.args.len() != 1 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`not` requires exactly one argument".to_owned(),
+                });
+            }
+            return Ok(format!("(NOT {args_sql})"));
+        }
+        _ => &name_lower,
+    };
+    Ok(format!("{duck_name}({args_sql})"))
 }
 
 /// Render an aggregate function call. Primitives (`count`, `sum`, `avg`,

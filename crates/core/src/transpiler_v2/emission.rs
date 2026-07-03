@@ -1191,6 +1191,63 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         // Spark's `date_add(date, n)` / `date_sub(date, n)` — DuckDB's
         // versions expect INTERVAL args. Rewrite to arithmetic form.
+        // Spark's `nanvl(a, b)` — if a is NaN, return b; else a.
+        "nanvl" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`nanvl` requires exactly 2 arguments".to_owned(),
+                });
+            }
+            let a = render_expr(&f.args[0], schema)?;
+            let b = render_expr(&f.args[1], schema)?;
+            return Ok(format!(
+                "CASE WHEN isnan({a}) THEN {b} ELSE {a} END"
+            ));
+        }
+        // Spark's `named_struct(k1, v1, k2, v2, ...)` → DuckDB
+        // `struct_pack(k1 := v1, k2 := v2, ...)`.
+        "named_struct" => {
+            if f.args.len() % 2 != 0 || f.args.is_empty() {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`named_struct` requires an even, non-zero arg count".to_owned(),
+                });
+            }
+            let mut parts = String::new();
+            let mut i = 0;
+            while i < f.args.len() {
+                if i > 0 {
+                    parts.push_str(", ");
+                }
+                let key = match &f.args[i] {
+                    Expression::Literal(l) => match &l.value {
+                        crate::transpiler_v2::expression::LiteralValue::String(s) => s.clone(),
+                        _ => {
+                            return Err(EmissionError::UnsupportedFunction {
+                                name: f.name.clone(),
+                                reason: "`named_struct` keys must be string literals"
+                                    .to_owned(),
+                            });
+                        }
+                    },
+                    _ => {
+                        return Err(EmissionError::UnsupportedFunction {
+                            name: f.name.clone(),
+                            reason: "`named_struct` keys must be string literals".to_owned(),
+                        });
+                    }
+                };
+                let val = render_expr(&f.args[i + 1], schema)?;
+                let key_q = quote_ident(&key);
+                parts.push_str(&format!("{key_q} := {val}"));
+                i += 2;
+            }
+            return Ok(format!("struct_pack({parts})"));
+        }
+        // Spark's `map_contains_key(m, k)` → DuckDB
+        // `map_contains(m, k)` (renamed in some DuckDB versions).
+        "map_contains_key" => "map_contains",
         // Spark's `isnull`/`isnotnull` — DuckDB uses `IS NULL`/`IS NOT NULL`.
         "isnull" => {
             if f.args.len() != 1 {
@@ -1384,9 +1441,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let n = render_expr(&f.args[1], schema)?;
             return Ok(format!("({d} - INTERVAL ({n}) DAY)"));
         }
-        // Spark's `overlay(str, replacement, position[, length])` maps to
-        // the SQL-standard `OVERLAY(str PLACING replacement FROM position
-        // [FOR length])` keyword form.
+        // Spark's `overlay(str, replacement, position[, length])`. DuckDB
+        // has neither the OVERLAY keyword nor an `overlay` scalar; emit
+        // via substring/concat: prefix := substring(str, 1, position-1),
+        // suffix := substring(str, position + length_of_replaced), where
+        // length_of_replaced defaults to length(replacement).
         "overlay" => {
             if !(3..=4).contains(&f.args.len()) {
                 return Err(EmissionError::UnsupportedFunction {
@@ -1397,12 +1456,14 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let s = render_expr(&f.args[0], schema)?;
             let r = render_expr(&f.args[1], schema)?;
             let p = render_expr(&f.args[2], schema)?;
-            if f.args.len() == 4 {
-                let l = render_expr(&f.args[3], schema)?;
-                return Ok(format!("OVERLAY({s} PLACING {r} FROM {p} FOR {l})"));
+            let length_expr = if f.args.len() == 4 {
+                render_expr(&f.args[3], schema)?
             } else {
-                return Ok(format!("OVERLAY({s} PLACING {r} FROM {p})"));
-            }
+                format!("length({r})")
+            };
+            return Ok(format!(
+                "(substring({s}, 1, ({p}) - 1) || {r} || substring({s}, ({p}) + ({length_expr})))"
+            ));
         }
         _ => &name_lower,
     };

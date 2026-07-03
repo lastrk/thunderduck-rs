@@ -632,7 +632,12 @@ impl TypeInferenceEngine {
             "current_date" => Date,
             "current_timestamp" | "now" => Timestamp,
             "date_add" | "date_sub" | "add_months" | "next_day"
-            | "last_day" | "trunc" | "date_trunc" | "to_date" => Date,
+            | "last_day" | "trunc" | "to_date" => Date,
+            // `date_trunc(fmt, ts_or_date)` returns Timestamp when the
+            // second arg is Timestamp, Date when the second arg is Date.
+            // Without the second arg's type at this call site, default to
+            // Timestamp (the common case in corpus).
+            "date_trunc" => Timestamp,
             "months_between" => Double,
             "to_timestamp" | "from_unixtime" | "from_utc_timestamp" | "to_utc_timestamp"
             | "make_timestamp" | "make_date" => Timestamp,

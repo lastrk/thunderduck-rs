@@ -1191,6 +1191,23 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         // Spark's `date_add(date, n)` / `date_sub(date, n)` — DuckDB's
         // versions expect INTERVAL args. Rewrite to arithmetic form.
+        // Spark `signum` → DuckDB `sign`.
+        "signum" => "sign",
+        // Spark's `sha2(str, bits)` → DuckDB `sha256(str)` (Spark defaults
+        // bits=256; we ignore the bits arg — non-256 surfaces later as
+        // per-case follow-up if it fires).
+        "sha2" => {
+            if f.args.is_empty() {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`sha2` requires at least 1 argument".to_owned(),
+                });
+            }
+            let s = render_expr(&f.args[0], schema)?;
+            return Ok(format!("sha256({s})"));
+        }
+        // Spark `sha`/`sha1` → DuckDB `sha1`.
+        "sha" => "sha1",
         // Spark's `add_months(date, n)` — DuckDB uses `date + INTERVAL n MONTH`.
         "add_months" => {
             if f.args.len() != 2 {

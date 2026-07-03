@@ -1283,6 +1283,21 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let haystack = render_expr(&f.args[1], schema)?;
             return Ok(format!("strpos({haystack}, {needle})"));
         }
+        // Spark's `regexp_replace(str, pat, repl)` replaces ALL matches.
+        // DuckDB's `regexp_replace(str, pat, repl)` replaces only the FIRST;
+        // the 4th arg 'g' flag makes it global.
+        "regexp_replace" => {
+            if !(3..=4).contains(&f.args.len()) {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`regexp_replace` requires 3 or 4 arguments".to_owned(),
+                });
+            }
+            let s = render_expr(&f.args[0], schema)?;
+            let p = render_expr(&f.args[1], schema)?;
+            let r = render_expr(&f.args[2], schema)?;
+            return Ok(format!("regexp_replace({s}, {p}, {r}, 'g')"));
+        }
         // Spark null-handling remaps (DuckDB uses coalesce).
         "nvl" => "coalesce",
         "nvl2" => {

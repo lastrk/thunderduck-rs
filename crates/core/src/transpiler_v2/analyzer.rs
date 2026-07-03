@@ -994,15 +994,37 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             //   SEMI/ANTI (no USING)  → left schema unchanged.
             //   INNER/LEFT/RIGHT/FULL + USING → USING first, left non-USING, right non-USING.
             //   Otherwise             → simple concatenation.
+            // USING-column donor rules (Spark-parity):
+            //   INNER / LEFT / SEMI / ANTI → left side (unchanged).
+            //   RIGHT                       → right side (right is dominant).
+            //   FULL                        → left side by name, but with
+            //                                 nullable = left.nullable AND
+            //                                 right.nullable (COALESCE
+            //                                 semantics: non-null iff either
+            //                                 side is non-null).
+            //   CROSS                       → USING never applies.
             let build_using_prefix = |using: &[String]| -> Vec<StructField> {
                 let mut fields = Vec::with_capacity(using.len());
                 for n in using {
-                    if let Some(f) = derived_left_schema
+                    let left_field = derived_left_schema
                         .fields
                         .iter()
-                        .find(|f| f.name.eq_ignore_ascii_case(n))
-                    {
-                        fields.push(f.clone());
+                        .find(|f| f.name.eq_ignore_ascii_case(n));
+                    let right_field = derived_right_schema
+                        .fields
+                        .iter()
+                        .find(|f| f.name.eq_ignore_ascii_case(n));
+                    match (join_type, left_field, right_field) {
+                        (JoinType::Right, _, Some(rf)) => fields.push(rf.clone()),
+                        (JoinType::Full, Some(lf), Some(rf)) => {
+                            // Non-null iff EITHER side is non-null.
+                            let mut coalesced = lf.clone();
+                            coalesced.nullable = lf.nullable && rf.nullable;
+                            fields.push(coalesced);
+                        }
+                        (_, Some(lf), _) => fields.push(lf.clone()),
+                        (_, None, Some(rf)) => fields.push(rf.clone()),
+                        _ => {}
                     }
                 }
                 fields

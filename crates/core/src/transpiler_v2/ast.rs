@@ -256,6 +256,15 @@ pub enum CommonOp {
         alias: String,
     },
 
+    /// `df.toDF(new1, new2, ...)` — positional rename all columns.
+    /// Analyzer must have input schema to zip positional names.
+    ToDf {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// The new positional names.
+        column_names: Vec<String>,
+    },
+
     /// `df.withColumnsRenamed({old: new, ...})` — rename columns.
     /// Column identity + types + nullability are preserved.
     WithColumnsRenamed {

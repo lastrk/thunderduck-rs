@@ -891,6 +891,44 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             })
         }
 
+        // ── ToDf (Spark `df.toDF(new1, new2, ...)`) ──────────────────────
+        CommonOp::ToDf { input, column_names } => {
+            let typed_input = analyze_node(*input, base_types)?;
+            let input_fields = &typed_input.resolved_schema.fields;
+            if input_fields.len() != column_names.len() {
+                return Err(AnalyzerError::Other {
+                    reason: format!(
+                        "toDF arity mismatch: input has {} columns, got {} names",
+                        input_fields.len(),
+                        column_names.len()
+                    ),
+                });
+            }
+            let mut output_fields: Vec<StructField> =
+                Vec::with_capacity(input_fields.len());
+            for (f, new_name) in input_fields.iter().zip(column_names.iter()) {
+                output_fields.push(StructField::new(
+                    new_name.clone(),
+                    f.data_type.clone(),
+                    f.nullable,
+                ));
+            }
+            // Convert to WithColumnsRenamed for emission simplicity.
+            let renames: Vec<(String, String)> = input_fields
+                .iter()
+                .zip(column_names.iter())
+                .map(|(f, n)| (f.name.clone(), n.clone()))
+                .collect();
+            let output_schema = StructType::new(output_fields);
+            Ok(TypedAst {
+                op: TypedOp::WithColumnsRenamed {
+                    input: Box::new(typed_input),
+                    renames,
+                },
+                resolved_schema: output_schema,
+            })
+        }
+
         // ── AliasedRelation (Spark `df.alias(name)`) ─────────────────────
         CommonOp::AliasedRelation { input, alias } => {
             let typed_input = analyze_node(*input, base_types)?;

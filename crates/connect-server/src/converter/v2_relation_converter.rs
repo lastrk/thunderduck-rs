@@ -90,6 +90,13 @@ impl V2RelationConverter {
             RelType::SetOp(so) => self.convert_set_op(so),
             RelType::SubqueryAlias(sa) => self.convert_subquery_alias(sa),
             RelType::WithColumnsRenamed(wcr) => self.convert_with_columns_renamed(wcr),
+            RelType::ToDf(td) => {
+                let input = self.convert_input(td.input.as_deref(), "ToDf")?;
+                Ok(CommonAst::new(CommonOp::ToDf {
+                    input: Box::new(input),
+                    column_names: td.column_names.clone(),
+                }))
+            }
             RelType::Deduplicate(d) => self.convert_deduplicate(d),
             RelType::FillNa(f) => self.convert_fill_na(f),
             RelType::DropNa(d) => self.convert_drop_na(d),

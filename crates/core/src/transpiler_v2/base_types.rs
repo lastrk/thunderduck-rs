@@ -103,6 +103,7 @@ pub fn plan_has_empty_scan(plan: &CommonAst) -> bool {
         | CommonOp::DropColumns { input, .. }
         | CommonOp::AliasedRelation { input, .. }
         | CommonOp::WithColumnsRenamed { input, .. }
+        | CommonOp::ToDf { input, .. }
         | CommonOp::Deduplicate { input, .. }
         | CommonOp::NaFill { input, .. }
         | CommonOp::NaDrop { input, .. }
@@ -137,6 +138,7 @@ fn collect_empty_scan_tables(plan: &CommonAst, out: &mut Vec<String>) {
         | CommonOp::DropColumns { input, .. }
         | CommonOp::AliasedRelation { input, .. }
         | CommonOp::WithColumnsRenamed { input, .. }
+        | CommonOp::ToDf { input, .. }
         | CommonOp::Deduplicate { input, .. }
         | CommonOp::NaFill { input, .. }
         | CommonOp::NaDrop { input, .. }

@@ -171,3 +171,5 @@ toward 324 (the corpus total) without regressing the `core` (legacy) suite.
 | 2026-07-04T11:27:05Z | 5adc30d |    299 |     25 |   324 |       n/a |
 | 2026-07-04T11:38:00Z | 5adc30d |    299 |     25 |   324 |       n/a |
 | 2026-07-04T11:48:19Z | 8f4d8ec |    299 |     25 |   324 |       n/a |
+| 2026-07-04T12:13:43Z | e41fcdc |    300 |     24 |   324 |       n/a |
+| 2026-07-04T12:25:02Z | e41fcdc |    300 |     24 |   324 |       n/a |

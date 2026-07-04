@@ -128,6 +128,11 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             cols,
             statistics,
         } => render_summary(input, cols, statistics),
+        TypedOp::FreqItems {
+            input,
+            cols,
+            support,
+        } => render_freq_items(input, cols, *support),
         TypedOp::Pivot {
             input,
             grouping,
@@ -1104,6 +1109,62 @@ fn render_summary(
     statistics: &[String],
 ) -> Result<String, EmissionError> {
     render_stats_union(input, cols, statistics)
+}
+
+/// Render `df.stat.freqItems(cols, support)` — one `ARRAY<T>` output column
+/// per input col via a correlated `LIST(...)` subquery filtered by
+/// `HAVING COUNT(*) >= support * total_rows`, matching Spark's contract.
+///
+/// Emission shape:
+/// ```sql
+/// WITH __freq_input__ AS MATERIALIZED (<child>)
+/// SELECT
+///   (SELECT LIST("col" ORDER BY "col") FROM (
+///      SELECT "col", COUNT(*) AS __cnt FROM __freq_input__
+///      WHERE "col" IS NOT NULL GROUP BY "col"
+///      HAVING COUNT(*) >= <support> * (SELECT COUNT(*) FROM __freq_input__)
+///   )) AS "col_freqItems",
+///   ...
+/// ```
+///
+/// The `AS MATERIALIZED` CTE prevents multi-scan of the child (Pass 80 lesson).
+fn render_freq_items(
+    input: &TypedAst,
+    cols: &[String],
+    support: f64,
+) -> Result<String, EmissionError> {
+    if cols.is_empty() {
+        // Defensive guard — PySpark client rejects empty cols on the client
+        // side, but keep the emission stage honest.
+        return Err(EmissionError::UnsupportedOp {
+            op: "FreqItems".to_owned(),
+            reason: "freqItems requires at least one column".to_owned(),
+        });
+    }
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    let subqueries: Vec<String> = cols
+        .iter()
+        .map(|col| {
+            let qcol = quote_ident(col);
+            let alias_name = format!("{col}_freqItems");
+            let qalias = quote_ident(&alias_name);
+            // Use f64 debug formatting (`{support:?}`): `{:?}` preserves the
+            // trailing `.0` on whole-number f64 values (e.g. `1.0` vs `1`),
+            // which DuckDB parses correctly in both cases; using Debug form
+            // avoids ambiguity and keeps small values round-trip lossless.
+            format!(
+                "(SELECT LIST({qcol} ORDER BY {qcol}) FROM (\
+                 SELECT {qcol}, COUNT(*) AS __cnt FROM __freq_input__ \
+                 WHERE {qcol} IS NOT NULL GROUP BY {qcol} \
+                 HAVING COUNT(*) >= {support:?} * (SELECT COUNT(*) FROM __freq_input__)\
+                 )) AS {qalias}"
+            )
+        })
+        .collect();
+    let projections = subqueries.join(", ");
+    Ok(format!(
+        "WITH __freq_input__ AS MATERIALIZED ({child_sql}) SELECT {projections}"
+    ))
 }
 
 /// Shared helper for Describe/Summary emission. Emits
@@ -6539,6 +6600,87 @@ mod tests {
             "got: {sql}"
         );
         assert!(sql.contains("'75%' AS summary"), "got: {sql}");
+    }
+
+    // ── FreqItems emission (Pass 82) ─────────────────────────────────────
+
+    #[test]
+    fn render_freq_items_single_col_wraps_child_in_materialized_cte_with_list_having() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::FreqItems {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            cols: vec!["dept_id".to_owned()],
+            support: 0.3,
+        });
+        let sql = generate(&ast, &bt).expect("generate freqItems");
+        assert!(
+            sql.starts_with("WITH __freq_input__ AS MATERIALIZED ("),
+            "got: {sql}"
+        );
+        // LIST(...) ORDER BY correlated subquery, output aliased with
+        // {col}_freqItems (quote_ident leaves the safe identifier bare).
+        assert!(
+            sql.contains("(SELECT LIST(dept_id ORDER BY dept_id) FROM ("),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains("SELECT dept_id, COUNT(*) AS __cnt FROM __freq_input__"),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains("WHERE dept_id IS NOT NULL GROUP BY dept_id"),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains("HAVING COUNT(*) >= 0.3 * (SELECT COUNT(*) FROM __freq_input__)"),
+            "got: {sql}"
+        );
+        assert!(sql.contains("AS dept_id_freqItems"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_freq_items_multi_col_emits_one_correlated_subquery_per_col() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::FreqItems {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            cols: vec!["dept_id".to_owned(), "salary".to_owned()],
+            support: 0.01,
+        });
+        let sql = generate(&ast, &bt).expect("generate freqItems multi");
+        // One "LIST(<col> ORDER BY <col>)" per input col.
+        assert_eq!(sql.matches("LIST(dept_id ORDER BY dept_id)").count(), 1);
+        assert_eq!(sql.matches("LIST(salary ORDER BY salary)").count(), 1);
+        // Two output aliases joined by ", ".
+        assert!(sql.contains("AS dept_id_freqItems, "), "got: {sql}");
+        assert!(sql.contains("AS salary_freqItems"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_freq_items_empty_cols_returns_unsupported_op_defensive_guard() {
+        // The analyzer path never yields empty cols (PySpark client rejects
+        // client-side, and `materialise_stats_cols` expands empty to all
+        // input columns). We call `render_freq_items` directly to exercise
+        // the defensive guard.
+        let typed_input = TypedAst {
+            op: TypedOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            },
+            resolved_schema: StructType::empty(),
+        };
+        let err = super::render_freq_items(&typed_input, &[], 0.01).unwrap_err();
+        match err {
+            EmissionError::UnsupportedOp { op, .. } => assert_eq!(op, "FreqItems"),
+            other => panic!("expected UnsupportedOp, got {other:?}"),
+        }
     }
 
     // ── UpdateFields emission (Pass 61 — struct-005 / struct-006) ────────

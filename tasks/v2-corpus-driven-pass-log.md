@@ -402,6 +402,33 @@ the summary below records the corpus deltas by pass number.
 - Findings not blocking: reviewer 2 Low (HashMap-vs-HashSet idiom; caller-casing preservation in materialised cols — non-corpus-witnessed), perf 1 LOW + 3 INFO (all cold-path style notes; not prescribed).
 - Compiler warning delta: 36 → 36 (0 new).
 - Quality Gate: PASS (cargo check both crates, rustfmt clean, connect-server 64/0, core 9 new τ tests pass individually).
+- Commit SHA: 8f4d8ec.
+
+## Pass 81 — 2026-07-04 tech-debt sweep
+- Trigger: 5th pass in /goal invocation (every-5th cadence).
+- Sweep verdict: mostly CLEAN. 1 cheap action applied: `materialise_stats_cols` uses `HashSet<String>` instead of `HashMap<String, ()>`.
+- Compiler warnings: 36 → 36 (baseline; zero new across passes 77-80).
+- No TODO/FIXME/dbg!/println!/HACK markers in 4-pass diff.
+- INV3/INV10 clean.
+- Queued follow-ups stayed queued (all require architectural or cross-repo work).
+- Corpus: 299 → 299 (behaviour-neutral).
+- Commit SHA: e41fcdc.
+
+## Pass 82 — 2026-07-04T (in progress)
+- Case cluster: **BUNDLED** — misc-007 (`freqItems`) implement + misc-006 (`crosstab`) punt.
+- Diagnostic: `.agent-output/diagnostic-pass-82.md` (split along ADR-022: freqItems has static schema — portable; crosstab schema depends on DISTINCT of col2 at runtime — needs Slice-G session-injected DISTINCT hook, same blocker as Pivot[implicit-values]).
+- Architecture: `.agent-output/architecture-pass-82.md` (Pass-80 shape port for freqItems; `TypedOp::Crosstab` intentionally omitted since analyzer punts before construction — no dead arms).
+- Layer(s) touched: AST (`CommonOp::{FreqItems,Crosstab}` variants), converter (`convert_freq_items` with default support=0.01, `convert_crosstab`), analyzer (`TypedOp::FreqItems`, `analyze_freq_items` — per-col `Array<source_type>` with `contains_null=true` matching Spark's `ArrayType(t)` default; `CommonOp::Crosstab` arm punts with `PuntedOperator("Crosstab[dynamic-values]", ...)`), base_types (2 walker arms), emission (`render_freq_items` — WITH __freq_input__ AS MATERIALIZED, per-col LIST subquery with `HAVING COUNT(*) >= support * total`, defensive empty-cols guard).
+- ADR citations: ADR-003 (CommonAst extension), ADR-015 (Spark parity — Array<source_type> element type; ArrayType(t) default contains_null=true; fixes legacy `Array<String>` hardcode bug), ADR-020 (stock DuckDB — no extension needed), ADR-022 (Crosstab punt is correct boundary posture).
+- Corpus signal: 299 → **300** (+1). misc-007 GREEN; misc-006 stays RED but with correct `[TDCK-BOUNDARY]` shape (`Crosstab[dynamic-values]`).
+- Files: `crates/core/src/transpiler_v2/{ast.rs, analyzer.rs, base_types.rs, emission.rs}`, `crates/connect-server/src/converter/v2_relation_converter.rs`.
+- Tests added: 12 (2 ast, 4 analyzer including per-element-type array test defending against legacy hardcode, 3 emission, 3 converter).
+- Deviations from plan:
+  1. Outer `freqItems` output column stamped `NOT NULL` (initial plan said nullable) — corpus signaled Reference=False; `LIST(...)` never returns NULL. Documented in-source.
+- Findings CLOSE_NOW_IN_THIS_PASS: 2 (review M: inner Array `contains_null=true` matching Spark's `ArrayType(t)` default rather than mirror source nullability — one-line fix + doc comment rewrite; review L: emission f64 comment mischaracterised {:?} vs {} behavior — comment rewrite).
+- Findings queued as follow-up: none new this pass.
+- Compiler warning delta: 36 → 36 (0 new).
+- Quality Gate: PASS (cargo check both crates, rustfmt clean, freq_items tests 7/7 after M-fix, connect-server 67/67, corpus 300).
 - Commit SHA: pending.
 
 

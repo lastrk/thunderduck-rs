@@ -278,6 +278,25 @@ pub enum TypedOp {
         /// The materialised statistics list (never empty here).
         statistics: Vec<String>,
     },
+    /// `df.stat.freqItems(cols, support)`. Analyzer materialises `cols`
+    /// (case-insensitive per Spark) and stamps the output schema as one
+    /// `ARRAY<T>` column per input col — where `T` is the source column's
+    /// declared [`DataType`] (Spark parity per ADR-015). The output column
+    /// name is `{col}_freqItems`, using the caller's casing.
+    ///
+    /// Analyzer punts `Crosstab` (mirror-image of `Pivot[implicit-values]`)
+    /// before ever constructing a `TypedOp` for it — so there is no
+    /// `TypedOp::Crosstab` variant. When Slice G lifts the punt, that variant
+    /// lands here alongside this one.
+    FreqItems {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// The materialised column list (case-insensitive resolved; never
+        /// empty here — the emission stage additionally guards against empty).
+        cols: Vec<String>,
+        /// The minimum item frequency.
+        support: f64,
+    },
     /// `df.dropDuplicates` / `df.distinct`. Schema-transparent.
     Deduplicate {
         /// The input relation.
@@ -564,7 +583,8 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
         | TypedOp::NaReplace { input, .. }
         | TypedOp::Unpivot { input, .. }
         | TypedOp::Describe { input, .. }
-        | TypedOp::Summary { input, .. } => has_resolved_schema(input),
+        | TypedOp::Summary { input, .. }
+        | TypedOp::FreqItems { input, .. } => has_resolved_schema(input),
         // Pivot: explicit-values Pivot has a fully-stamped schema (group
         // cols + pivot_value × aggregate columns). Implicit-values Pivot
         // never reaches this arm — `analyze_pivot` punts with a
@@ -983,6 +1003,22 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
 
         // ── Summary (Spark `df.summary(...)`) ───────────────────────────
         CommonOp::Summary { input, statistics } => analyze_summary(*input, statistics, base_types),
+
+        // ── FreqItems (Spark `df.stat.freqItems(...)`) ──────────────────
+        CommonOp::FreqItems {
+            input,
+            cols,
+            support,
+        } => analyze_freq_items(*input, cols, support, base_types),
+
+        // ── Crosstab — Thunderduck-boundary (ADR-022) ───────────────────
+        // Output columns are DISTINCT(col2) — unknowable at plan time.
+        // Mirror-image of Pivot[implicit-values]: same session-hook blocker
+        // (Slice G). Reject loudly rather than stamp a partial schema.
+        CommonOp::Crosstab { .. } => Err(AnalyzerError::PuntedOperator {
+            op: "Crosstab[dynamic-values]".to_owned(),
+            reason: "requires session-injected DISTINCT-query hook (Slice G)".to_owned(),
+        }),
 
         // ── Pivot (Spark `df.groupBy(...).pivot(...).agg(...)`) ─────────
         CommonOp::Pivot {
@@ -2301,6 +2337,66 @@ fn analyze_summary(
             statistics: materialised_stats,
         },
         resolved_schema: output_schema,
+    })
+}
+
+/// Analyze `CommonOp::FreqItems`: resolve the input, materialise `cols`
+/// (case-insensitive; unresolved names raise `AnalyzerError::UnknownColumn`),
+/// and stamp the output schema as one `ARRAY<T>` NON-NULLABLE column per
+/// input col — where `T` is the source column's declared [`DataType`].
+/// Spark parity per ADR-015: the legacy `logical::FreqItems` path hardcoded
+/// `Array<String>` for every column, which is a bug τ fixes at the port point.
+///
+/// **Spark parity — outer nullability.** Spark's `StatFunctions.freqItems`
+/// stamps every output column non-nullable: the aggregate always returns a
+/// value (empty array when no rows meet the support threshold), never NULL.
+///
+/// **Spark parity — element `contains_null`.** Element type mirrors the source
+/// col type; `contains_null=true` per Spark's `ArrayType(t)` default. Spark
+/// builds each output column as `ArrayType(v._2)` and the single-arg
+/// `ArrayType` apply defaults `containsNull=true` regardless of source
+/// nullability — τ matches Spark's schema oracle here (not DuckDB's runtime
+/// materialisation).
+///
+/// Column names use `{col}_freqItems` (preserving the caller's casing).
+fn analyze_freq_items(
+    input: CommonAst,
+    cols: Vec<String>,
+    support: f64,
+    base_types: &BaseTypes,
+) -> Result<TypedAst, AnalyzerError> {
+    let typed_input = analyze_node(input, base_types)?;
+    let materialised = materialise_stats_cols(cols, &typed_input.resolved_schema)?;
+    let output_fields: Vec<StructField> = materialised
+        .iter()
+        .map(|c| {
+            // `materialise_stats_cols` already validated `c` case-insensitively;
+            // `field_by_name` uses the same case-insensitive lookup.
+            let src = typed_input
+                .resolved_schema
+                .field_by_name(c)
+                .expect("materialise_stats_cols already validated");
+            // Element type mirrors source col type; contains_null=true per
+            // Spark's ArrayType(t) default. Spark's `StatFunctions.freqItems`
+            // builds each output column as `ArrayType(v._2)` — the single-arg
+            // `ArrayType` apply defaults `containsNull=true` regardless of
+            // source nullability, so τ matches Spark's schema oracle here
+            // (not DuckDB's runtime materialisation). Outer column stays
+            // non-nullable: the aggregate always returns a value (empty array
+            // when no rows meet the support threshold), never NULL.
+            StructField::not_null(
+                format!("{c}_freqItems"),
+                DataType::Array(Box::new(src.data_type.clone()), true),
+            )
+        })
+        .collect();
+    Ok(TypedAst {
+        op: TypedOp::FreqItems {
+            input: Box::new(typed_input),
+            cols: materialised,
+            support,
+        },
+        resolved_schema: StructType::new(output_fields),
     })
 }
 
@@ -4548,6 +4644,158 @@ mod tests {
             }
             _ => panic!("expected TypedOp::Summary"),
         }
+    }
+
+    // ── FreqItems / Crosstab analysis (Pass 82) ──────────────────────────
+
+    /// Fixture with a stats-shaped schema that exercises all four
+    /// element-type variants (Integer, String, Double, Decimal). This is the
+    /// anti-legacy-bug shape per ADR-015: legacy `logical::FreqItems` stamped
+    /// `Array<String>` for every column regardless of source; τ must stamp
+    /// `Array<source_type>`.
+    fn base_types_with_stats() -> BaseTypes {
+        let stats_schema = StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("salary", DataType::Double),
+            StructField::nullable(
+                "bonus",
+                DataType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                },
+            ),
+        ]);
+        let plan = CommonAst::new(CommonOp::TableScan {
+            table: "stats".to_owned(),
+            alias: None,
+        });
+        BaseTypes::build_from_plan(&plan, |name| match name {
+            "stats" => Some(stats_schema.clone()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn analyze_freq_items_stamps_array_of_source_type_per_col_no_legacy_string_hardcode() {
+        let bt = base_types_with_stats();
+        let ast = CommonAst::new(CommonOp::FreqItems {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "stats".to_owned(),
+                alias: None,
+            })),
+            cols: vec![
+                "dept_id".to_owned(),
+                "name".to_owned(),
+                "salary".to_owned(),
+                "bonus".to_owned(),
+            ],
+            support: 0.3,
+        });
+        let typed = analyze(ast, &bt).expect("analyze freqItems");
+        // Schema arity: one column per input col (no `summary` prefix — Spark
+        // freqItems doesn't emit a summary label column).
+        assert_eq!(typed.resolved_schema.fields.len(), 4);
+        // Anti-legacy-bug check: each element type mirrors the source col.
+        let expected: &[(&str, DataType)] = &[
+            ("dept_id_freqItems", DataType::Integer),
+            ("name_freqItems", DataType::String),
+            ("salary_freqItems", DataType::Double),
+            (
+                "bonus_freqItems",
+                DataType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                },
+            ),
+        ];
+        for (idx, (want_name, want_elem)) in expected.iter().enumerate() {
+            let f = &typed.resolved_schema.fields[idx];
+            assert_eq!(f.name, *want_name, "field #{idx} name");
+            match &f.data_type {
+                DataType::Array(elem, _contains_null) => {
+                    assert_eq!(
+                        elem.as_ref(),
+                        want_elem,
+                        "field #{idx} element type must mirror source col (ADR-015)"
+                    );
+                }
+                other => panic!("field #{idx} expected Array<{want_elem:?}>, got {other:?}"),
+            }
+            assert!(
+                !f.nullable,
+                "field #{idx} must be non-nullable per Spark parity — LIST(...) never returns NULL"
+            );
+        }
+        match typed.op {
+            TypedOp::FreqItems { cols, support, .. } => {
+                assert_eq!(cols.len(), 4);
+                assert!((support - 0.3).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected TypedOp::FreqItems"),
+        }
+    }
+
+    #[test]
+    fn analyze_freq_items_case_insensitive_column_lookup() {
+        let bt = base_types_with_stats();
+        let ast = CommonAst::new(CommonOp::FreqItems {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "stats".to_owned(),
+                alias: None,
+            })),
+            // `Dept_ID` must resolve to `dept_id`.
+            cols: vec!["Dept_ID".to_owned()],
+            support: 0.01,
+        });
+        let typed = analyze(ast, &bt).expect("case-insensitive freqItems must analyze");
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        // Output name preserves caller casing (matches Describe/Summary).
+        assert_eq!(typed.resolved_schema.fields[0].name, "Dept_ID_freqItems");
+        // Element type still resolves to Integer via field_by_name (also
+        // case-insensitive).
+        match &typed.resolved_schema.fields[0].data_type {
+            DataType::Array(elem, _) => assert_eq!(elem.as_ref(), &DataType::Integer),
+            other => panic!("expected Array<Integer>, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_freq_items_unknown_column_surfaces_spark_emulated_error() {
+        let bt = base_types_with_stats();
+        let ast = CommonAst::new(CommonOp::FreqItems {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "stats".to_owned(),
+                alias: None,
+            })),
+            cols: vec!["nope".to_owned()],
+            support: 0.01,
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
+        assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
+    }
+
+    #[test]
+    fn analyze_crosstab_returns_punted_operator_thunderduck_boundary() {
+        let bt = base_types_with_stats();
+        let ast = CommonAst::new(CommonOp::Crosstab {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "stats".to_owned(),
+                alias: None,
+            })),
+            col1: "dept_id".to_owned(),
+            col2: "salary".to_owned(),
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        match &err {
+            AnalyzerError::PuntedOperator { op, .. } => {
+                assert_eq!(op, "Crosstab[dynamic-values]");
+            }
+            other => panic!("expected PuntedOperator, got {other:?}"),
+        }
+        assert!(err.to_string().starts_with("[TDCK-BOUNDARY]"));
     }
 
     #[test]

@@ -320,6 +320,36 @@ pub enum CommonOp {
         statistics: Vec<String>,
     },
 
+    /// `df.stat.freqItems(cols, support)` — Spark's `StatFunctions.freqItems`.
+    /// Emits one `ARRAY<T>` output column per input col, named
+    /// `{col}_freqItems`, where `T` matches the source column's declared
+    /// [`crate::types::DataType`] (Spark parity per ADR-015 — legacy hardcoded
+    /// `Array<String>` for every column, which is a bug τ fixes at the
+    /// port point).
+    FreqItems {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// The column names to search frequent items in.
+        cols: Vec<String>,
+        /// The minimum item frequency (`0.01` by default per PySpark client).
+        /// `HAVING COUNT(*) >= support * total_rows` at emission.
+        support: f64,
+    },
+
+    /// `df.stat.crosstab(col1, col2)` — Spark's `StatFunctions.crossTabulate`.
+    /// The output column list is `DISTINCT(col2)` — unknowable at plan time —
+    /// so the τ analyzer rejects with `PuntedOperator("Crosstab[dynamic-values]")`
+    /// mirroring `Pivot[implicit-values]` per ADR-022. The variant exists so
+    /// Slice G can lift the punt with a session-injected DISTINCT hook.
+    Crosstab {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// The first column — distinct values become row keys.
+        col1: String,
+        /// The second column — distinct values become column headers.
+        col2: String,
+    },
+
     /// `df.dropDuplicates([cols])` / `df.distinct()`. `on_columns` empty ⇒
     /// dedupe on the full row (`SELECT DISTINCT *`). Non-empty ⇒
     /// `SELECT DISTINCT ON (cols) * FROM ...`.
@@ -718,6 +748,38 @@ mod tests {
                 assert_eq!(statistics, vec!["count".to_owned(), "25%".to_owned()]);
             }
             _ => panic!("expected Summary"),
+        }
+    }
+
+    #[test]
+    fn common_op_freq_items_carries_input_cols_and_support() {
+        let plan = CommonAst::new(CommonOp::FreqItems {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            cols: vec!["dept_id".to_owned(), "salary".to_owned()],
+            support: 0.3,
+        });
+        match plan.op {
+            CommonOp::FreqItems { cols, support, .. } => {
+                assert_eq!(cols, vec!["dept_id".to_owned(), "salary".to_owned()]);
+                assert!((support - 0.3).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected FreqItems"),
+        }
+    }
+
+    #[test]
+    fn common_op_crosstab_carries_input_and_two_col_names() {
+        let plan = CommonAst::new(CommonOp::Crosstab {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            col1: "dept_id".to_owned(),
+            col2: "active".to_owned(),
+        });
+        match plan.op {
+            CommonOp::Crosstab { col1, col2, .. } => {
+                assert_eq!(col1, "dept_id");
+                assert_eq!(col2, "active");
+            }
+            _ => panic!("expected Crosstab"),
         }
     }
 

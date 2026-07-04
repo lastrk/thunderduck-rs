@@ -168,6 +168,8 @@ impl V2RelationConverter {
             RelType::Unpivot(u) => self.convert_unpivot(u),
             RelType::Describe(d) => self.convert_describe(d),
             RelType::Summary(s) => self.convert_summary(s),
+            RelType::FreqItems(f) => self.convert_freq_items(f),
+            RelType::Crosstab(c) => self.convert_crosstab(c),
             // Cosmetic ops per Spark 4 semantics — semantically no-op.
             // Thunderduck ignores them and continues with the input relation
             // (ADR-001 "result-irrelevant cosmetic" carve-out).
@@ -329,6 +331,32 @@ impl V2RelationConverter {
         Ok(CommonAst::new(CommonOp::Summary {
             input: Box::new(input),
             statistics: s.statistics.clone(),
+        }))
+    }
+
+    /// Convert `proto::StatFreqItems`. The proto's `support` is optional; the
+    /// PySpark client default is `0.01` (per
+    /// `pyspark/sql/dataframe.py::freqItems`) which τ substitutes when the
+    /// field is None.
+    fn convert_freq_items(&mut self, f: &proto::StatFreqItems) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(f.input.as_deref(), "FreqItems")?;
+        let support = f.support.unwrap_or(0.01);
+        Ok(CommonAst::new(CommonOp::FreqItems {
+            input: Box::new(input),
+            cols: f.cols.clone(),
+            support,
+        }))
+    }
+
+    /// Convert `proto::StatCrosstab`. The analyzer rejects this variant as a
+    /// Thunderduck-boundary punt (`Crosstab[dynamic-values]`) — output
+    /// columns are `DISTINCT(col2)` which is unknowable at plan time.
+    fn convert_crosstab(&mut self, c: &proto::StatCrosstab) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(c.input.as_deref(), "Crosstab")?;
+        Ok(CommonAst::new(CommonOp::Crosstab {
+            input: Box::new(input),
+            col1: c.col1.clone(),
+            col2: c.col2.clone(),
         }))
     }
 
@@ -2796,6 +2824,79 @@ mod tests {
         let mut c = V2RelationConverter::new();
         let err = c.convert(&summary).unwrap_err();
         assert!(matches!(err, EmissionError::UnsupportedProtoShape { .. }));
+    }
+
+    // ── FreqItems / Crosstab (Pass 82) ────────────────────────────────────
+
+    #[test]
+    fn convert_freq_items_defaults_support_to_pyspark_0_01_when_proto_none() {
+        let input = table_scan_rel("emp");
+        let fi = rel(proto::relation::RelType::FreqItems(Box::new(
+            proto::StatFreqItems {
+                input: Some(Box::new(input)),
+                cols: vec!["dept_id".to_owned()],
+                support: None,
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&fi).expect("convert FreqItems");
+        match out.op {
+            CommonOp::FreqItems {
+                input: _,
+                cols,
+                support,
+            } => {
+                assert_eq!(cols, vec!["dept_id".to_owned()]);
+                assert!((support - 0.01).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected CommonOp::FreqItems"),
+        }
+    }
+
+    #[test]
+    fn convert_freq_items_explicit_support_passes_through() {
+        let input = table_scan_rel("emp");
+        let fi = rel(proto::relation::RelType::FreqItems(Box::new(
+            proto::StatFreqItems {
+                input: Some(Box::new(input)),
+                cols: vec!["a".to_owned(), "b".to_owned()],
+                support: Some(0.42),
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&fi).expect("convert FreqItems");
+        match out.op {
+            CommonOp::FreqItems { cols, support, .. } => {
+                assert_eq!(cols, vec!["a".to_owned(), "b".to_owned()]);
+                assert!((support - 0.42).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected CommonOp::FreqItems"),
+        }
+    }
+
+    #[test]
+    fn convert_crosstab_carries_input_and_two_col_names() {
+        let input = table_scan_rel("emp");
+        let ct = rel(proto::relation::RelType::Crosstab(Box::new(
+            proto::StatCrosstab {
+                input: Some(Box::new(input)),
+                col1: "dept_id".to_owned(),
+                col2: "active".to_owned(),
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&ct).expect("convert Crosstab");
+        match out.op {
+            CommonOp::Crosstab {
+                input: _,
+                col1,
+                col2,
+            } => {
+                assert_eq!(col1, "dept_id");
+                assert_eq!(col2, "active");
+            }
+            _ => panic!("expected CommonOp::Crosstab"),
+        }
     }
 
     #[test]

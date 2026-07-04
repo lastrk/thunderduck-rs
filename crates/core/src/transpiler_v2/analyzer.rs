@@ -38,7 +38,7 @@
 //!   that signal Thunderduck's incomplete implementation —
 //!   `PuntedOperator`, `UnsupportedRule`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::ast::{CommonAst, CommonOp, FileFormat, JoinType};
 use super::base_types::BaseTypes;
@@ -2232,13 +2232,13 @@ fn materialise_stats_cols(
     if cols.is_empty() {
         Ok(input_schema.fields.iter().map(|f| f.name.clone()).collect())
     } else {
-        let lowercase_names: HashMap<String, ()> = input_schema
+        let lowercase_names: HashSet<String> = input_schema
             .fields
             .iter()
-            .map(|f| (f.name.to_ascii_lowercase(), ()))
+            .map(|f| f.name.to_ascii_lowercase())
             .collect();
         for c in &cols {
-            if !lowercase_names.contains_key(&c.to_ascii_lowercase()) {
+            if !lowercase_names.contains(&c.to_ascii_lowercase()) {
                 return Err(AnalyzerError::UnknownColumn {
                     name: c.clone(),
                     qualifier: None,

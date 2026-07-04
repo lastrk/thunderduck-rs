@@ -628,7 +628,7 @@ the summary below records the corpus deltas by pass number.
 - Findings queued as follow-up: null-ts row divergence (τ does not filter null timestamps before struct rewrite; Spark `TimeWindowing` optimizer rule does — not witnessed).
 - Compiler warning delta: baseline preserved.
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 587/28 — +10 net passing from prior baseline 577/28, `cargo test -p thunderduck-connect-server --tests` 83/0, `v2-progress.sh` 310/14/324 with win2-002 PASSED and no regressions).
-- Commit SHA: pending.
+- Commit SHA: 1484604.
 
 
 

@@ -630,6 +630,18 @@ the summary below records the corpus deltas by pass number.
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 587/28 — +10 net passing from prior baseline 577/28, `cargo test -p thunderduck-connect-server --tests` 83/0, `v2-progress.sh` 310/14/324 with win2-002 PASSED and no regressions).
 - Commit SHA: 1484604.
 
+## Pass 94 — 2026-07-04 — τ ANSI divide/mod-by-zero throw (math-010 + math-011) — integrated via merge
+- Cases: `math-010` (`%` and `pmod`) + `math-011` (`/` int/int) — both cases tagged with `expected_error` in the corpus (REMAINDER_BY_ZERO / DIVIDE_BY_ZERO) by commit `7043acf` (tri-state harness comparator, landed mid-/goal). This pass integrates commit `933908c` (from branch `feat/v2-tau-ansi-throw`) which supplies τ's ANSI-throw substrate — Option-B design from the reused `.agent-output/{diagnostic,architecture}-pass-94.md` (originally Pass 88 math-DEFERRED).
+- Layer(s) touched (per merged commit): τ core emission (ansi_zero_guard + Spark-verbatim message constants + is_nonzero_literal skip + wire into render_binary Div/IntDiv/Mod + render_function_call pmod/mod arms), τ core error (new `ThunderduckError::SparkRuntime{class,message}` variant + `classify_spark_runtime_error` [TOKEN]-extractor + `reclassified_spark_runtime`), runtime session (`DuckDbSession::execute` re-wraps DuckDB errors into SparkRuntime), connect-server (manual `From<ThunderduckError>` routes SparkRuntime to a status whose message leads with `[CLASS]`), differential harness (`spark_error_class` reads the gRPC rendezvous details for τ's re-wrapped errors).
+- ADR citations: ADR-006 (error emulation contract — first runtime data-dependent Spark-emulated error), ADR-015 (Spark parity — byte-identical message text), ADR-020 (long-term route: `spark_div`/`spark_pmod` extension fns, documented as follow-up), ADR-022 (τ-only path — this is category-1 Spark-emulated).
+- Corpus signal: 310 → **312** (+2). math-010 + math-011 GREEN via error-parity.
+- Files: `crates/core/src/transpiler_v2/emission.rs`, `crates/core/src/error.rs`, `crates/connect-server/src/error.rs`, `crates/core/src/runtime/session.rs`, `tests/integration/utils/dataframe_diff.py`.
+- Tests added (per merged commit): emission guard shapes, classifier/reclassify unit tests, runtime-error-surfacing contract test.
+- Integration mechanics: fast-forward merge of `feat/v2-tau-ansi-throw` into `feat/v2-transpiler`. My own aborted Pass 94 coder-session work on emission.rs::pmod was stashed and dropped (superseded). Release binary rebuilt post-merge to observe corpus flip. Final report at `.agent-output/final-report.md` supersedes as the pipeline is now known-not-terminated.
+- Follow-up recorded on merged commit: `spark_div`/`spark_pmod` in `thdck_spark_funcs` for throw-at-source semantics; decimal-div left as TODO(ADR-006).
+- Quality Gate: PASS (cargo build --release clean, `v2-progress.sh` 312/12/324 with math-010 + math-011 GREEN via error-parity, no regressions on prior 310 green cases).
+- Commit SHA: 933908c (integrated by fast-forward merge into feat/v2-transpiler).
+
 
 
 

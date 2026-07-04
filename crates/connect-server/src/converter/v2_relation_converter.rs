@@ -43,62 +43,68 @@ use thunderduck_core::types::{DataType, StructField, StructType};
 use crate::converter::type_converter::{parse_type_str, proto_to_data_type};
 use crate::proto::spark::connect as proto;
 
-/// Normalize a decimal literal's `(precision, scale)` to the value's actual
-/// digit shape, mirroring what Spark does on the server side. PySpark sends
-/// coarse `(precision=10, scale=0)` even for values like `"0.00"`; Spark
-/// re-types the literal to a tight-fitting `(precision, scale)` so that
-/// downstream `findTightestCommonType` widening (used by `coalesce`, `CASE
-/// WHEN`, etc.) matches what a Spark user expects.
+/// Normalize a decimal literal's `(precision, scale)` to what Spark's
+/// `LiteralValueProtoConverter.decodeDecimal` would compute on the server
+/// side. PySpark sends a `Decimal` proto carrying the raw value string plus
+/// (optionally) the wire-supplied `precision`/`scale`; Spark reconciles the
+/// two by taking the **maximum** of the value-derived shape and the
+/// wire-supplied shape, then clamping to `DecimalType.MAX_PRECISION = 38`.
 ///
-/// Returns the tight-fit `(precision, scale)`, but never smaller than the
-/// server-supplied values (which sometimes over-report scale).
+/// Algorithm (mirrors Spark line-for-line):
+/// 1. Parse `value` → `(vp, vs)` where `vs` is the fractional-digit count
+///    and `vp = max(int_digits_excluding_leading_zeros + vs, vs, 1)` — this
+///    matches `Decimal.set(BigDecimal)` bumping `_precision` up to
+///    `max(bigDecimal.precision, bigDecimal.scale)`.
+/// 2. `p_wire = server_precision.unwrap_or(vp)`.
+/// 3. `s_wire = server_scale.unwrap_or(vs)`.
+/// 4. `p_out = min(38, max(vp, p_wire))` — DecimalType.MAX_PRECISION clamp.
+/// 5. `s_out = max(vs, s_wire)`.
+/// 6. If `s_out > p_out` bump `p_out = min(s_out, 38)` to preserve the
+///    `precision >= scale` invariant on malformed wire input.
 ///
-/// Corpus anchor: `cond-004` (Pass 77) — Spark widens
-/// `coalesce(Decimal(10,2), lit(Decimal("0.00")))` to `Decimal(10,2)`, which
-/// requires the literal to normalize to `Decimal(2,2)` (tight-fit), not the
-/// PySpark-wire `Decimal(10,0)`.
+/// Sources: Apache Spark 4.1.1
+/// `sql/connect/common/src/main/scala/org/apache/spark/sql/connect/common/LiteralValueProtoConverter.scala:555-571`
+/// and `sql/api/src/main/scala/org/apache/spark/sql/types/Decimal.scala:138-151`.
+///
+/// Corpus anchor: `cond-004` — Spark widens
+/// `coalesce(Decimal(10,2), lit(Decimal("0.00")))` to `Decimal(10,2)`.
+/// PySpark sends `(value="0.00", precision=10, scale=0)`; value-derived is
+/// `(2, 2)`; the max-of-value-and-wire rule yields `(10, 2)`, which unifies
+/// with `Decimal(10,2)` as-is.
 fn normalize_decimal_literal(
     value: &str,
     server_precision: Option<u8>,
     server_scale: Option<u8>,
 ) -> (u8, u8) {
-    // Strip sign and split on '.'
+    // Step 1: parse `value` into (vp, vs). Strip sign, split on '.'.
     let trimmed = value.trim_start_matches(['+', '-']);
     let (int_part, frac_part) = match trimmed.split_once('.') {
         Some((i, f)) => (i, f),
         None => (trimmed, ""),
     };
-    let leading_int_digits = int_part
+    let raw_int_digits = int_part
         .trim_start_matches('0')
         .chars()
         .filter(|c| c.is_ascii_digit())
         .count() as u8;
-    let frac_digits = frac_part.chars().filter(|c| c.is_ascii_digit()).count() as u8;
-    // Spark tight-fit: scale = frac_digits; precision = max(1, int_digits +
-    // frac_digits) where int_digits excludes leading zeros. For "0.00":
-    // frac_digits=2, int_digits=0 → precision=max(1, 2)=2, scale=2.
-    let derived_scale = frac_digits;
-    let derived_precision = leading_int_digits
-        .saturating_add(frac_digits)
-        .max(derived_scale)
-        .max(1);
-    // Case A: server didn't supply precision/scale — use derived.
-    let (sp, ss) = match (server_precision, server_scale) {
-        (Some(p), Some(s)) => (p, s),
-        _ => {
-            let p = derived_precision.min(38);
-            return (p.max(derived_scale).max(1), derived_scale);
-        }
-    };
-    // Case B: server-supplied scale disagrees with the value's fractional
-    // shape (classic PySpark artifact: `Decimal("0.00")` → (10, 0)). Prefer
-    // the tight-fit derived from the value string.
-    if ss != derived_scale {
-        let p = derived_precision.min(38);
-        return (p.max(derived_scale).max(1), derived_scale);
+    let vs = frac_part.chars().filter(|c| c.is_ascii_digit()).count() as u8;
+    // Spark's Decimal.set() bumps precision up to max(precision, scale) and
+    // never below 1 (the smallest legal DecimalType precision).
+    let vp = raw_int_digits.saturating_add(vs).max(vs).max(1);
+
+    // Steps 2-3: wire fields default to the value-derived shape.
+    let p_wire = server_precision.unwrap_or(vp);
+    let s_wire = server_scale.unwrap_or(vs);
+
+    // Steps 4-5: max-of-value-and-wire, clamped to MAX_PRECISION = 38.
+    let mut p_out = vp.max(p_wire).min(38);
+    let s_out = vs.max(s_wire);
+
+    // Step 6: preserve `precision >= scale` on malformed wire input.
+    if s_out > p_out {
+        p_out = s_out.min(38);
     }
-    // Case C: server-supplied precision/scale are consistent — keep them.
-    (sp.min(38).max(ss).max(1), ss)
+    (p_out, s_out)
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -2697,5 +2703,50 @@ mod tests {
             CommonOp::Unpivot { values, .. } => assert!(values.is_empty()),
             _ => panic!("expected Unpivot"),
         }
+    }
+
+    // ── normalize_decimal_literal (Spark parity, LiteralValueProtoConverter) ─
+
+    /// cond-004 anchor: PySpark sends `(value="0.00", precision=10, scale=0)`.
+    /// Value-derived is `(2, 2)`; max-of-value-and-wire yields `(10, 2)`,
+    /// matching what Spark's `LiteralValueProtoConverter.decodeDecimal`
+    /// computes.
+    #[test]
+    fn normalize_decimal_literal_cond004_anchor_pyspark_zero_dot_zero_zero() {
+        assert_eq!(
+            normalize_decimal_literal("0.00", Some(10), Some(0)),
+            (10, 2)
+        );
+    }
+
+    /// Wire precision/scale smaller than the value-derived shape: `max`
+    /// selects the value-derived side (`(5, 2)` vs `(3, 1)` → `(5, 2)`).
+    #[test]
+    fn normalize_decimal_literal_wire_smaller_than_value_takes_value_side() {
+        assert_eq!(
+            normalize_decimal_literal("123.45", Some(3), Some(1)),
+            (5, 2)
+        );
+    }
+
+    /// Wire absent on both fields: falls back to the value-derived shape
+    /// (`(5, 2)` for `"123.45"`).
+    #[test]
+    fn normalize_decimal_literal_wire_absent_uses_value_derived() {
+        assert_eq!(normalize_decimal_literal("123.45", None, None), (5, 2));
+    }
+
+    /// Zero-value edge: `"0"` has no fractional digits and no non-zero
+    /// integer digits; the `.max(1)` guard on `vp` yields `(1, 0)`.
+    #[test]
+    fn normalize_decimal_literal_zero_value_no_wire_yields_one_zero() {
+        assert_eq!(normalize_decimal_literal("0", None, None), (1, 0));
+    }
+
+    /// Invariant safety: malformed wire (`p_wire < s_wire`) is clamped so
+    /// `precision >= scale` still holds post-normalization.
+    #[test]
+    fn normalize_decimal_literal_malformed_wire_clamps_to_preserve_invariant() {
+        assert_eq!(normalize_decimal_literal("0", Some(3), Some(5)), (5, 5));
     }
 }

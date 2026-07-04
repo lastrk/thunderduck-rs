@@ -349,6 +349,21 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 36 → 36 (0 new on touched files).
 - Quality Gate: PASS (cargo check both crates, rustfmt clean, `cargo test -p thunderduck-core --lib --tests` 503/20 vs 497/20 baseline — 6 new tests pass, 20 pre-existing INV10 cascade unchanged, `cargo test -p thunderduck-connect-server --tests` 54/0).
 - Journal: `.agent-output/pass-journal.md`.
+- Commit SHA: 383b90c.
+
+## Pass 78 — 2026-07-04T (in progress)
+- Case: `cond-004` — coalesce Decimal precision mismatch. Spark returns Decimal(10,2); τ returned Decimal(9,2). Prior deep-dive mis-classified as "τ analyzer bug" — actual root cause was one layer earlier at the converter.
+- Diagnostic: `.agent-output/diagnostic-pass-78.md` (`normalize_decimal_literal` at `v2_relation_converter.rs:60-102` used tight-fit case-analysis; Spark's `LiteralValueProtoConverter.scala:555-571` uses `max(value-derived, wire-supplied)`).
+- Architecture: `.agent-output/architecture-pass-78.md` (single-function body rewrite, signature unchanged, doc corrected, 5 unit tests).
+- Layer(s) touched: converter only. Downstream widening in `type_inference.rs::unify_decimal` (:853-857) and analyzer coalesce arm (`expression.rs:764-771`) were already Spark-correct — fed the right literal type they produce the right result.
+- ADR citations: ADR-015 (differential oracle: τ boundary mirrors Spark byte-for-byte), ADR-016 (Spark 4.1.1 ANSI mode pin), ADR-022 (τ-only path; no changes outside τ).
+- Corpus signal: 295 → **296** (+1). cond-004 GREEN; cond-005 no regression.
+- Files: `crates/connect-server/src/converter/v2_relation_converter.rs`.
+- Tests added: 5 (Spark-anchor for cond-004, wire-smaller, wire-absent, zero-value, invariant clamp).
+- Findings CLOSE_NOW_IN_THIS_PASS: 0 blocking. Reviewer APPROVED (0 Critical + 0 High + 3 Low non-blocking, all in the malformed-wire regime the plan explicitly flagged as out-of-scope); Perf OPTIMIZED (0 HIGH + 0 MEDIUM, 4 INFO cold-path notes).
+- Findings queued as follow-up: 1 — malformed-wire error-class parity (Spark throws for `p_wire < s_wire`; τ clamps). Open question 1 in the plan; ADR-016 error-emulation contract candidate.
+- Compiler warning delta: 36 → 36 (0 new).
+- Quality Gate: PASS (cargo check both crates clean, rustfmt clean on touched file, `cargo test -p thunderduck-connect-server --tests` 59/0).
 - Commit SHA: pending.
 
 

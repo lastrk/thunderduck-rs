@@ -908,6 +908,34 @@ impl Expression {
                     }
                 }
             }
+            // Pass 90 — synthetic per-field FunctionCall names produced by
+            // the analyzer's Project pre-pass for `F.inline` / `F.inline_outer`
+            // (see `analyzer::expand_inline_projections`). `args[0]` is the
+            // resolved `Array<Struct<...>>`; `args[1]` is a `Literal::String`
+            // carrying the target field name. Return type = struct field's
+            // type (case-insensitive lookup, matching Spark). Corpus: inl-001,
+            // inl-002.
+            "inline_field" | "inline_outer_field" if f.args.len() == 2 => {
+                if let (
+                    arr,
+                    Expression::Literal(Literal {
+                        value: LiteralValue::String(field_name),
+                        ..
+                    }),
+                ) = (&f.args[0], &f.args[1])
+                {
+                    if let DataType::Array(inner, _) = arr.data_type(schema) {
+                        if let DataType::Struct(st) = *inner {
+                            for field in &st.fields {
+                                if field.name.eq_ignore_ascii_case(field_name) {
+                                    return field.data_type.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+                return DataType::Unresolved;
+            }
             _ => {}
         }
         let first_arg_type = f.args.first().map(|a| a.data_type(schema));
@@ -1037,6 +1065,51 @@ impl Expression {
             // 0-indexed integer, never NULL. Non-nullable regardless of the
             // input array's nullability. Corpus: arr-017.
             "posexplode_pos" => false,
+            // Pass 90 — synthetic per-field FunctionCalls for
+            // `F.inline` / `F.inline_outer` (analyzer's Project pre-pass —
+            // `expand_inline_projections`). Args: (arr, field_name_literal).
+            //
+            // `inline_field` — nullability follows Spark's `Inline`:
+            //   * struct field's own nullability (case-insensitive lookup),
+            //   * OR the array's `containsNull` flag,
+            //   * OR the array arg's nullability (a NULL array yields zero
+            //     rows for the inner variant, so array-nullability doesn't
+            //     truly propagate to the produced column; keep the
+            //     conservative disjunction — matches `explode`'s posexplode_val
+            //     arm above for parity).
+            // Corpus: inl-001.
+            "inline_field" => match (f.args.first(), f.args.get(1)) {
+                (
+                    Some(arr),
+                    Some(Expression::Literal(Literal {
+                        value: LiteralValue::String(field_name),
+                        ..
+                    })),
+                ) => {
+                    let arr_ty = arr.data_type(schema);
+                    let (contains_null, field_nullable) = match &arr_ty {
+                        DataType::Array(inner, cn) => match inner.as_ref() {
+                            DataType::Struct(st) => {
+                                let field_null = st
+                                    .fields
+                                    .iter()
+                                    .find(|f0| f0.name.eq_ignore_ascii_case(field_name))
+                                    .map(|f0| f0.nullable)
+                                    .unwrap_or(true);
+                                (*cn, field_null)
+                            }
+                            _ => (true, true),
+                        },
+                        _ => (true, true),
+                    };
+                    arr.nullable(schema) || contains_null || field_nullable
+                }
+                _ => true,
+            },
+            // `inline_outer_field` — always nullable: the empty / NULL array
+            // sentinel row is all-NULL by construction. Mirrors
+            // `explode_outer`'s arm above. Corpus: inl-002.
+            "inline_outer_field" => true,
             // Synthetic `map_explode_key(m)` / `map_explode_val(m)` (map-007).
             // Spark's `explode(map)` produces `(key, value)` rows where keys
             // are ALWAYS non-nullable (Spark's MAP invariant); a NULL map
@@ -1925,5 +1998,127 @@ mod tests {
             distinct: false,
         });
         assert_eq!(expr.data_type(&s), DataType::Long);
+    }
+
+    // ── Pass 90 — inline_field / inline_outer_field type + nullability ──────
+
+    /// Schema holding a single `arr : Array<Struct<name STRING?, age INT?>>`
+    /// column — the canonical Pass-90 fixture.
+    fn inline_test_schema(arr_contains_null: bool) -> StructType {
+        let element = DataType::Struct(StructType::new(vec![
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("age", DataType::Integer),
+        ]));
+        StructType::new(vec![StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(element), arr_contains_null),
+        )])
+    }
+
+    fn inline_field_call(arr_col: &str, field: &str, outer: bool) -> Expression {
+        Expression::FunctionCall(FunctionCall {
+            name: if outer {
+                "inline_outer_field".to_owned()
+            } else {
+                "inline_field".to_owned()
+            },
+            args: vec![
+                ColumnReference::untyped(arr_col),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(field.to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        })
+    }
+
+    /// `inline_field(arr, "name")` returns the struct field's own type.
+    #[test]
+    fn inline_field_data_type_is_struct_field_type() {
+        let s = inline_test_schema(true);
+        assert_eq!(
+            inline_field_call("arr", "name", false).data_type(&s),
+            DataType::String
+        );
+        assert_eq!(
+            inline_field_call("arr", "age", false).data_type(&s),
+            DataType::Integer
+        );
+    }
+
+    /// Field lookup is case-insensitive (Spark's `StructType.fieldNames` uses
+    /// case-insensitive resolution by default under ANSI mode).
+    #[test]
+    fn inline_field_data_type_case_insensitive_field_lookup() {
+        let s = inline_test_schema(true);
+        assert_eq!(
+            inline_field_call("arr", "NAME", false).data_type(&s),
+            DataType::String
+        );
+        assert_eq!(
+            inline_field_call("arr", "AgE", false).data_type(&s),
+            DataType::Integer
+        );
+    }
+
+    /// `inline_outer_field` is always nullable (sentinel row is all-NULL).
+    #[test]
+    fn inline_outer_field_is_always_nullable() {
+        // Every struct field non-nullable, containsNull=false, arr non-nullable.
+        // Even with every input dimension "not null", outer still yields
+        // nullable=true because the sentinel row is synthesized as all-NULL.
+        let element = DataType::Struct(StructType::new(vec![
+            StructField::not_null("name", DataType::String),
+            StructField::not_null("age", DataType::Integer),
+        ]));
+        let s = StructType::new(vec![StructField::not_null(
+            "arr",
+            DataType::Array(Box::new(element), false),
+        )]);
+        assert!(inline_field_call("arr", "name", true).nullable(&s));
+        assert!(inline_field_call("arr", "age", true).nullable(&s));
+    }
+
+    /// `inline_field` nullability is the disjunction of arr nullability,
+    /// arr's containsNull flag, and the struct field's own nullability.
+    #[test]
+    fn inline_field_nullable_propagates_from_arr() {
+        // Case 1: everything not-null → not nullable.
+        let element_notnull = DataType::Struct(StructType::new(vec![
+            StructField::not_null("name", DataType::String),
+            StructField::not_null("age", DataType::Integer),
+        ]));
+        let s1 = StructType::new(vec![StructField::not_null(
+            "arr",
+            DataType::Array(Box::new(element_notnull.clone()), false),
+        )]);
+        assert!(!inline_field_call("arr", "name", false).nullable(&s1));
+
+        // Case 2: containsNull=true → nullable.
+        let s2 = StructType::new(vec![StructField::not_null(
+            "arr",
+            DataType::Array(Box::new(element_notnull.clone()), true),
+        )]);
+        assert!(inline_field_call("arr", "name", false).nullable(&s2));
+
+        // Case 3: struct field itself nullable → nullable.
+        let element_field_null = DataType::Struct(StructType::new(vec![
+            StructField::nullable("name", DataType::String),
+            StructField::not_null("age", DataType::Integer),
+        ]));
+        let s3 = StructType::new(vec![StructField::not_null(
+            "arr",
+            DataType::Array(Box::new(element_field_null), false),
+        )]);
+        assert!(inline_field_call("arr", "name", false).nullable(&s3));
+        assert!(!inline_field_call("arr", "age", false).nullable(&s3));
+
+        // Case 4: arr nullable → nullable.
+        let s4 = StructType::new(vec![StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(element_notnull), false),
+        )]);
+        assert!(inline_field_call("arr", "name", false).nullable(&s4));
     }
 }

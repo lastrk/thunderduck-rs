@@ -2462,6 +2462,101 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let m = render_expr(&f.args[0], schema)?;
             return Ok(format!("UNNEST(map_values({m}))"));
         }
+        // Pass 90 — synthetic FunctionCall names produced by the analyzer's
+        // Project pre-pass (`expand_inline_projections`) when it fans
+        // `F.inline(arr)` / `F.inline_outer(arr)` out into N per-struct-field
+        // projections. Args: `(arr : Array<Struct<...>>, field_name : STRING)`.
+        // Sibling `UNNEST(<arr>)` calls in a SELECT are consolidated by
+        // DuckDB into a single row-multiplication (empirically verified —
+        // see Pass 90 smoke). Corpus: inl-001, inl-002.
+        "inline_field" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`inline_field` requires exactly 2 arguments (arr, field_name)"
+                        .to_owned(),
+                });
+            }
+            let arr_sql = render_expr(&f.args[0], schema)?;
+            let field_name = match &f.args[1] {
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(s),
+                    ..
+                }) => s,
+                _ => {
+                    return Err(EmissionError::UnsupportedFunction {
+                        name: f.name.clone(),
+                        reason: "`inline_field` second argument must be a string literal"
+                            .to_owned(),
+                    });
+                }
+            };
+            let field_q = quote_ident(field_name);
+            return Ok(format!("UNNEST({arr_sql}).{field_q}"));
+        }
+        "inline_outer_field" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`inline_outer_field` requires exactly 2 arguments (arr, field_name)"
+                        .to_owned(),
+                });
+            }
+            let arr_sql = render_expr(&f.args[0], schema)?;
+            let field_name = match &f.args[1] {
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(s),
+                    ..
+                }) => s,
+                _ => {
+                    return Err(EmissionError::UnsupportedFunction {
+                        name: f.name.clone(),
+                        reason: "`inline_outer_field` second argument must be a string literal"
+                            .to_owned(),
+                    });
+                }
+            };
+            // Build the struct-typed NULL sentinel from the resolved
+            // `Array<Struct<...>>` schema so a NULL / empty array yields
+            // exactly one all-NULL row (mirrors `explode_outer`'s
+            // `[NULL]` sentinel, specialised to structs).
+            let arr_ty = f.args[0].data_type(schema);
+            let struct_fields = match &arr_ty {
+                DataType::Array(inner, _) => match inner.as_ref() {
+                    DataType::Struct(st) => &st.fields,
+                    other => {
+                        return Err(EmissionError::UnsupportedFunction {
+                            name: f.name.clone(),
+                            reason: format!(
+                                "`inline_outer_field` requires `Array<Struct<...>>`, got `Array<{other:?}>`"
+                            ),
+                        });
+                    }
+                },
+                other => {
+                    return Err(EmissionError::UnsupportedFunction {
+                        name: f.name.clone(),
+                        reason: format!(
+                            "`inline_outer_field` requires `Array<Struct<...>>`, got `{other:?}`"
+                        ),
+                    });
+                }
+            };
+            let mut sentinel = String::from("struct_pack(");
+            for (i, f0) in struct_fields.iter().enumerate() {
+                if i > 0 {
+                    sentinel.push_str(", ");
+                }
+                let name_q = quote_ident(&f0.name);
+                let ty = render_data_type(&f0.data_type);
+                sentinel.push_str(&format!("{name_q} := CAST(NULL AS {ty})"));
+            }
+            sentinel.push(')');
+            let field_q = quote_ident(field_name);
+            return Ok(format!(
+                "UNNEST(CASE WHEN {arr_sql} IS NULL OR len({arr_sql}) = 0 THEN [{sentinel}] ELSE {arr_sql} END).{field_q}"
+            ));
+        }
         // Spark → thdck_spark_funcs extension remaps (readiness map §4.1).
         // These functions require the ext6 extension, loaded at session
         // start by `DuckDbSession`.
@@ -9251,6 +9346,98 @@ mod tests {
             sql.contains(" UNION ALL "),
             "expected UNION ALL combinator, got: {sql}"
         );
+    }
+
+    // ── Pass 90 — inline_field / inline_outer_field emission ────────────
+
+    /// Schema with an `arr : Array<Struct<name STRING?, dept_id INT?, salary DOUBLE?>>`
+    /// column — enough surface to test both plain and sentinel-wrapped forms.
+    fn arr_of_struct_schema() -> StructType {
+        let element = DataType::Struct(StructType::new(vec![
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("salary", DataType::Double),
+        ]));
+        StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("arr", DataType::Array(Box::new(element), true)),
+        ])
+    }
+
+    fn inline_field_call_render(field: &str, outer: bool) -> FunctionCall {
+        FunctionCall {
+            name: if outer {
+                "inline_outer_field".to_owned()
+            } else {
+                "inline_field".to_owned()
+            },
+            args: vec![
+                Expression::ColumnReference(ColumnReference {
+                    name: "arr".to_owned(),
+                    qualifier: None,
+                    data_type: None,
+                    nullable: None,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(field.to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        }
+    }
+
+    /// Plain `inline_field(arr, "name")` renders as `UNNEST(arr).name`.
+    #[test]
+    fn render_inline_field_emits_unnest_dot_field() {
+        let schema = arr_of_struct_schema();
+        let f = inline_field_call_render("name", false);
+        let sql = render_function_call(&f, &schema).expect("render inline_field");
+        assert_eq!(sql, "UNNEST(arr).name");
+    }
+
+    /// `inline_outer_field(arr, "dept_id")` renders with the struct-typed
+    /// NULL sentinel guard so a NULL / empty array yields one all-NULL row.
+    /// Snapshot pins the exact sentinel shape.
+    #[test]
+    fn render_inline_outer_field_emits_case_guard_with_typed_null() {
+        let schema = arr_of_struct_schema();
+        let f = inline_field_call_render("dept_id", true);
+        let sql = render_function_call(&f, &schema).expect("render inline_outer_field");
+        assert_eq!(
+            sql,
+            "UNNEST(CASE WHEN arr IS NULL OR len(arr) = 0 \
+             THEN [struct_pack(\
+             name := CAST(NULL AS VARCHAR), \
+             dept_id := CAST(NULL AS INTEGER), \
+             salary := CAST(NULL AS DOUBLE))] \
+             ELSE arr END).dept_id",
+        );
+    }
+
+    /// Wrong arity → `UnsupportedFunction` (internal-corruption signal — the
+    /// analyzer's contract is 2 args, so this should never fire in practice).
+    #[test]
+    fn render_inline_field_rejects_wrong_arity() {
+        let schema = arr_of_struct_schema();
+        let f = FunctionCall {
+            name: "inline_field".to_owned(),
+            args: vec![Expression::ColumnReference(ColumnReference {
+                name: "arr".to_owned(),
+                qualifier: None,
+                data_type: None,
+                nullable: None,
+            })],
+            distinct: false,
+        };
+        let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
+        match err {
+            EmissionError::UnsupportedFunction { name, reason } => {
+                assert_eq!(name, "inline_field");
+                assert!(reason.contains("2 arguments"), "reason: {reason}");
+            }
+            other => panic!("expected UnsupportedFunction, got {other:?}"),
+        }
     }
 
     /// Pass 76 — `parse_number_format` recognizes digit templates.

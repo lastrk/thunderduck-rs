@@ -1355,6 +1355,14 @@ impl V2ExpressionConverter {
     ///
     /// Encapsulated here (in the expression converter) so `convert_project`
     /// can splice the two-projection expansion without knowing the proto shape.
+    ///
+    /// **`F.inline` / `F.inline_outer` boundary (Pass 90).** Unlike
+    /// `posexplode`, inline/inline_outer are NOT split at the converter — the
+    /// N-column widening depends on the resolved `Array<Struct<...>>` schema,
+    /// which is only available inside the analyzer. Inline projections reach
+    /// the analyzer as a plain `FunctionCall("inline"|"inline_outer", [arr])`
+    /// and are expanded by `analyzer::expand_inline_projections` (τ's Project
+    /// pre-pass, next to `expand_regex_projections`). Corpus: inl-001, inl-002.
     fn try_convert_posexplode_multi_alias(
         &mut self,
         e: &proto::Expression,

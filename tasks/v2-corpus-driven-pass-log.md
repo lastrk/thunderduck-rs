@@ -550,6 +550,22 @@ the summary below records the corpus deltas by pass number.
 - Findings queued as follow-up: case-insensitive options parsing (Spark accepts `True`/`TRUE`/`true`); `serde_json` in-place `Map::retain` if hot in future.
 - Compiler warning delta: baseline preserved.
 - Quality Gate: PASS (cargo check clean, rustfmt clean on touched files, `cargo test -p thunderduck-core --lib` 554/29 — +9 net passing from baseline 545/29, no new failures, `v2-progress.sh` 306/18/324 with json-005 PASSED, no regressions).
+- Commit SHA: 71947c6.
+
+## Pass 90 — 2026-07-04T
+- Case: `inl-001` + `inl-002` cluster — `F.inline(array<struct>)` / `F.inline_outer(...)`. Table generator that fans one array-of-struct row into N-field rows (one per array element); outer variant emits one all-NULL row for NULL/empty arrays.
+- Diagnostic: `.agent-output/diagnostic-pass-90.md` — three-arm gap mirroring posexplode: (a) analyzer Project pre-pass expands `inline(arr)` into N synthetic per-field projections, (b) type_inference/nullable arms for the synthetic name, (c) emission arm rendering `UNNEST(arr).<field>` (inner) or sentinel-guarded UNNEST (outer). τ was emitting `inline(...)` verbatim → DuckDB catalog error.
+- Architecture: `.agent-output/architecture-pass-90.md` — synthetic `Alias(inline_field(arr, "<name>"), "<name>")` projections; outer wraps arg in `CASE WHEN arr IS NULL OR LEN(arr)=0 THEN [struct_pack(f1 := CAST(NULL AS T1), ...)] ELSE arr END`; non-`Array<Struct>` arg → Thunderduck-boundary. Empirical DuckDB verification confirmed sibling `UNNEST(arr).f` calls with identical arg fold into one row-multiplier (no N-square blowup).
+- Layer(s) touched: analyzer (`expand_inline_projections` + Project wire-up), expression (type/nullability arms for `inline_field`/`inline_outer_field`), emission (`render_function_call` new arms), converter (code comment only near `try_convert_posexplode_multi_alias` documenting analyzer-side expansion boundary).
+- ADR citations: ADR-003 (CommonAst extension via synthetic per-field FunctionCall), ADR-005 (τ owns Spark type inference — outer's always-nullable rule), ADR-015 (Spark parity: sentinel guard emits exactly one all-NULL row like Spark's inline_outer), ADR-022 (non-Array<Struct> arg and unresolved-element-type arg surface `AnalyzerError::UnsupportedRule` with `[TDCK-BOUNDARY]` Display tag — category-2 τ-not-implemented).
+- Corpus signal: 306 → **308** (+2). inl-001 + inl-002 GREEN.
+- Files: `crates/core/src/transpiler_v2/{analyzer.rs, expression.rs, emission.rs}`, `crates/connect-server/src/converter/v2_relation_converter.rs` (comment).
+- Tests added: 13 (5 analyzer expansion + 4 type/nullability + 3 emission + 1 sibling boundary for inline_outer).
+- Findings CLOSE_NOW_IN_THIS_PASS: 1 (review HIGH — `AnalyzerError::Other` prefixes `[SPARK-EMULATED]`, should be `[TDCK-BOUNDARY]` per ADR-022. Fixed both boundary sites to `AnalyzerError::UnsupportedRule { rule: "inline{,_outer}-expansion", reason }`; new/updated tests positively assert `[TDCK-BOUNDARY]` prefix).
+- Findings not blocking: review 3 Medium (inline in non-Project contexts falls through to DuckDB catalog error; unresolved column arg misclassified as `[TAU-UNIMPLEMENTED]` because pre-pass runs before `resolve_and_stamp`; one other). Perf 0 HIGH/MEDIUM (2 LOW DEFER: CTE-hoist for computed arr in outer sentinel + `String::with_capacity` micro-opt — no witness).
+- Findings queued as follow-up: non-Project-context guard for `inline` (withColumn/agg/join.on/filter → boundary reject); pre-pass ordering so unresolved-column errors classify as SPARK-EMULATED; outer sentinel N-copy blowup on computed `arr` args.
+- Compiler warning delta: baseline preserved.
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 567/29 — +13 net passing from baseline 554/29, no new failures, `cargo test -p thunderduck-connect-server --tests` 83/0, `v2-progress.sh` 308/16/324 with inl-001 + inl-002 PASSED and no regressions).
 - Commit SHA: pending.
 
 

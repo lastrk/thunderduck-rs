@@ -738,6 +738,13 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             // resolution. Each `UnresolvedRegex` becomes N `UnresolvedColumn`
             // refs (one per matching input field, schema order preserved).
             let projections = expand_regex_projections(projections, &typed_input.resolved_schema)?;
+            // Pass 90 — expand `F.inline(arr)` / `F.inline_outer(arr)`
+            // projections into N synthetic per-struct-field projections. Each
+            // becomes `Alias(inline_field(arr, "<name>"), "<name>")` (inner)
+            // or `Alias(inline_outer_field(arr, "<name>"), "<name>")` (outer).
+            // Runs BEFORE `resolve_and_stamp` — the synthesized args are
+            // resolved by the outer walk. Corpus: inl-001, inl-002.
+            let projections = expand_inline_projections(projections, &typed_input.resolved_schema)?;
             let projections = projections
                 .into_iter()
                 .map(|e| resolve_and_stamp(e, &typed_input.resolved_schema))
@@ -1618,6 +1625,141 @@ fn expand_regex_projections(
                 }
             }
             other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
+/// Expand every top-level `F.inline(arr)` / `F.inline_outer(arr)` projection
+/// into N synthetic per-struct-field projections. Non-inline projections pass
+/// through unchanged in place. Schema order is preserved.
+///
+/// Each `inline(arr)` where `arr : Array<Struct<f1: T1, ..., fN: TN>>`
+/// becomes:
+///
+/// ```text
+/// Alias(inline_field(arr, "f1"), "f1"), ..., Alias(inline_field(arr, "fN"), "fN")
+/// ```
+///
+/// `inline_outer(arr)` uses `inline_outer_field(...)` — same shape, but the
+/// emission arm wraps `arr` in a struct-typed-NULL sentinel guard so a NULL
+/// or empty array still emits one all-NULL row (matches Spark's `Inline`
+/// with `outer=true`).
+///
+/// Errors (ADR-022 two-category):
+///
+/// * **Spark-emulated** ([`AnalyzerError::TypeMismatch`]) — argument is
+///   proven not `Array<Struct<...>>` (e.g. `Array<Long>` or `String`). Spark
+///   rejects the same input at analysis time.
+/// * **Thunderduck-boundary** ([`AnalyzerError::UnsupportedRule`], Display
+///   prefix `[TDCK-BOUNDARY]`) — argument's type could not be statically
+///   resolved (e.g. `F.inline(F.transform(arr, lam))` with an unresolvable
+///   lambda body). Honest ADR-022 non-implementation, not a silent DuckDB
+///   catalog error.
+/// * **Spark-emulated** ([`AnalyzerError::Other`]) — arity ≠ 1.
+///
+/// Called by `analyze_node`'s `CommonOp::Project` arm AFTER
+/// [`expand_regex_projections`] and BEFORE [`resolve_and_stamp`] so
+/// downstream analysis never sees a top-level `inline` / `inline_outer`.
+fn expand_inline_projections(
+    projections: Vec<Expression>,
+    input_schema: &StructType,
+) -> Result<Vec<Expression>, AnalyzerError> {
+    let mut out = Vec::with_capacity(projections.len());
+    for proj in projections {
+        // Only fire on a bare top-level `FunctionCall("inline"|"inline_outer",...)`.
+        // Aliased or nested forms fall through unchanged (multi-alias
+        // `.alias("f1","f2",...)` and non-Project contexts are non-goals per
+        // the Pass-90 plan §Non-goals — they surface as boundary errors
+        // downstream if the corpus ever exercises them).
+        let (name_lower, args, is_outer) = match &proj {
+            Expression::FunctionCall(f) => {
+                let n = f.name.to_ascii_lowercase();
+                match n.as_str() {
+                    "inline" => (n, f.args.clone(), false),
+                    "inline_outer" => (n, f.args.clone(), true),
+                    _ => {
+                        out.push(proj);
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                out.push(proj);
+                continue;
+            }
+        };
+        if args.len() != 1 {
+            return Err(AnalyzerError::Other {
+                reason: format!(
+                    "`{name_lower}` requires exactly 1 argument, got {}",
+                    args.len()
+                ),
+            });
+        }
+        let arr = args.into_iter().next().expect("checked len == 1 above");
+        let arg_ty = arr.data_type(input_schema);
+        let (elem_struct, contains_null) = match arg_ty {
+            DataType::Array(inner, cn) => match *inner {
+                DataType::Struct(st) => (st, cn),
+                DataType::Unresolved => {
+                    return Err(AnalyzerError::UnsupportedRule {
+                        rule: format!("{name_lower}-expansion"),
+                        reason: format!(
+                            "`{name_lower}` argument's element type could not be statically resolved — τ requires a resolved `Array<Struct<...>>` schema"
+                        ),
+                    });
+                }
+                other => {
+                    return Err(AnalyzerError::TypeMismatch {
+                        expected: DataType::Struct(StructType::new(vec![])),
+                        actual: other,
+                        context: format!("`{name_lower}` argument element type"),
+                    });
+                }
+            },
+            DataType::Unresolved => {
+                return Err(AnalyzerError::UnsupportedRule {
+                    rule: format!("{name_lower}-expansion"),
+                    reason: format!(
+                        "`{name_lower}` argument's type could not be statically resolved — τ requires a resolved `Array<Struct<...>>` schema"
+                    ),
+                });
+            }
+            other => {
+                return Err(AnalyzerError::TypeMismatch {
+                    expected: DataType::Array(
+                        Box::new(DataType::Struct(StructType::new(vec![]))),
+                        true,
+                    ),
+                    actual: other,
+                    context: format!("`{name_lower}` argument"),
+                });
+            }
+        };
+        // `contains_null` is carried on the synthesized arr's `DataType`
+        // itself via `Expression::data_type` at emission / nullability time;
+        // no need to thread it through the synthetic call's args.
+        let _ = contains_null;
+        let synthetic_name = if is_outer {
+            "inline_outer_field"
+        } else {
+            "inline_field"
+        };
+        for field in &elem_struct.fields {
+            let field_name_lit = Expression::Literal(Literal {
+                value: LiteralValue::String(field.name.clone()),
+                data_type: DataType::String,
+            });
+            let call = Expression::FunctionCall(FunctionCall {
+                name: synthetic_name.to_owned(),
+                args: vec![arr.clone(), field_name_lit],
+                distinct: false,
+            });
+            out.push(Expression::Alias(AliasExpression {
+                expr: Box::new(call),
+                alias: field.name.clone(),
+            }));
         }
     }
     Ok(out)
@@ -5176,5 +5318,251 @@ mod tests {
             plan_id: None,
         });
         assert!(!expression_is_fully_resolved(&expr));
+    }
+
+    // ── Pass 90 — expand_inline_projections ──────────────────────────────
+
+    /// Helper — build `F.array(F.struct(col("name"), col("salary")))` shape
+    /// exactly as the ingress converter produces it for the corpus witness.
+    /// Uses fields present in this file's `emp_schema` fixture (`name` STRING?,
+    /// `salary` DOUBLE?) so `resolve_and_stamp` finds them at analysis time.
+    fn array_of_struct_name_salary() -> Expression {
+        let struct_call = Expression::FunctionCall(FunctionCall {
+            name: "struct".to_owned(),
+            args: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "name".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "salary".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+            ],
+            distinct: false,
+        });
+        Expression::FunctionCall(FunctionCall {
+            name: "array".to_owned(),
+            args: vec![struct_call],
+            distinct: false,
+        })
+    }
+
+    fn inline_call(outer: bool, arg: Expression) -> Expression {
+        Expression::FunctionCall(FunctionCall {
+            name: if outer { "inline_outer" } else { "inline" }.to_owned(),
+            args: vec![arg],
+            distinct: false,
+        })
+    }
+
+    /// Canonical inl-001 shape: `select("id", inline(array(struct(name, age))))`
+    /// widens into `[id, name, age]` — one projection per struct field, with
+    /// synthesized `Alias(inline_field(arr, "<n>"), "<n>")` shape.
+    #[test]
+    fn expand_inline_projections_widens_into_n_fields() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            projections: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+                inline_call(false, array_of_struct_name_salary()),
+            ],
+        });
+        let typed = analyze(ast, &bt).expect("analyze ok");
+        // Output schema: [id, name, salary].
+        assert_eq!(
+            typed
+                .resolved_schema
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "name", "salary"],
+        );
+        // name field is String, salary field is Double.
+        assert_eq!(typed.resolved_schema.fields[1].data_type, DataType::String);
+        assert_eq!(typed.resolved_schema.fields[2].data_type, DataType::Double);
+        // Post-expansion tree: three projections, latter two are
+        // Alias(inline_field(arr, "<n>"), "<n>").
+        match &typed.op {
+            TypedOp::Project { projections, .. } => {
+                assert_eq!(projections.len(), 3);
+                for (i, expected) in ["name", "salary"].iter().enumerate() {
+                    match &projections[i + 1] {
+                        Expression::Alias(a) => {
+                            assert_eq!(a.alias, *expected);
+                            match a.expr.as_ref() {
+                                Expression::FunctionCall(f) => {
+                                    assert_eq!(f.name, "inline_field");
+                                    assert_eq!(f.args.len(), 2);
+                                    match &f.args[1] {
+                                        Expression::Literal(Literal {
+                                            value: LiteralValue::String(s),
+                                            ..
+                                        }) => assert_eq!(s, *expected),
+                                        other => {
+                                            panic!("expected string literal, got {other:?}")
+                                        }
+                                    }
+                                }
+                                other => panic!("expected FunctionCall, got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected Alias, got {other:?}"),
+                    }
+                }
+            }
+            _ => panic!("expected Project op"),
+        }
+    }
+
+    /// `inline_outer` widens the same way, but every output field is nullable
+    /// (Spark's `Inline` with `outer=true` — sentinel all-NULL row).
+    #[test]
+    fn expand_inline_outer_projections_marks_all_nullable() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            projections: vec![inline_call(true, array_of_struct_name_salary())],
+        });
+        let typed = analyze(ast, &bt).expect("analyze ok");
+        assert_eq!(typed.resolved_schema.fields.len(), 2);
+        for f in &typed.resolved_schema.fields {
+            assert!(
+                f.nullable,
+                "inline_outer output field `{}` must be nullable",
+                f.name
+            );
+        }
+    }
+
+    /// Prefix + suffix projections around an `inline` are preserved in place
+    /// — mirrors `expand_regex_projections_preserves_non_regex_projections_in_place`.
+    #[test]
+    fn expand_inline_preserves_prefix_and_suffix_projections() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            projections: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+                inline_call(false, array_of_struct_name_salary()),
+                Expression::Literal(Literal {
+                    value: LiteralValue::Int(1),
+                    data_type: DataType::Integer,
+                }),
+            ],
+        });
+        let typed = analyze(ast, &bt).expect("analyze ok");
+        // Layout: [id, name, salary, <literal_output_name>].
+        let names: Vec<&str> = typed
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 4);
+        assert_eq!(names[0], "id");
+        assert_eq!(names[1], "name");
+        assert_eq!(names[2], "salary");
+        // 4th field is the literal; the specific name is
+        // `expression_output_name`'s convention (not the focus of this test).
+    }
+
+    /// Non-`Array<Struct<...>>` argument → Spark-emulated TypeMismatch. The
+    /// element is INT, not STRUCT — Spark's `Inline` rejects at analysis time.
+    #[test]
+    fn expand_inline_rejects_non_array_of_struct() {
+        // `arr : Array<Integer>` — element is not a struct.
+        let bad_arg = Expression::FunctionCall(FunctionCall {
+            name: "array".to_owned(),
+            args: vec![Expression::Literal(Literal {
+                value: LiteralValue::Int(1),
+                data_type: DataType::Integer,
+            })],
+            distinct: false,
+        });
+        let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
+        let err = expand_inline_projections(vec![inline_call(false, bad_arg)], &schema)
+            .expect_err("must reject non-Array<Struct<...>>");
+        assert!(matches!(err, AnalyzerError::TypeMismatch { .. }));
+        assert!(
+            err.to_string().starts_with("[SPARK-EMULATED]"),
+            "err: {err}"
+        );
+    }
+
+    /// Unresolvable arg → Thunderduck-boundary [`AnalyzerError::UnsupportedRule`]
+    /// (Display prefix `[TDCK-BOUNDARY]`). The message must be honest — no
+    /// silent fallthrough to a DuckDB catalog error. ADR-022 category-2.
+    #[test]
+    fn expand_inline_boundary_rejects_unresolved_element_type() {
+        // Reference a column that doesn't exist in the schema — data_type
+        // returns `Unresolved`, which we treat as a boundary case.
+        let unresolved_arg = Expression::UnresolvedColumn(UnresolvedColumn {
+            name: "no_such_col".to_owned(),
+            qualifier: None,
+            plan_id: None,
+        });
+        let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
+        let err = expand_inline_projections(vec![inline_call(false, unresolved_arg)], &schema)
+            .expect_err("must reject Unresolved arg type");
+        match &err {
+            AnalyzerError::UnsupportedRule { rule, reason } => {
+                assert_eq!(rule, "inline-expansion");
+                assert!(
+                    reason.contains("could not be statically resolved"),
+                    "reason must diagnose the unresolved type; got: {reason}"
+                );
+            }
+            other => panic!("expected AnalyzerError::UnsupportedRule, got {other:?}"),
+        }
+        assert!(
+            err.to_string().starts_with("[TDCK-BOUNDARY]"),
+            "boundary error must carry `[TDCK-BOUNDARY]` Display prefix per ADR-022; got: {err}"
+        );
+    }
+
+    /// Sibling boundary — same rule name for `inline_outer` (used to distinguish
+    /// the `[TDCK-BOUNDARY]` origin in reviewer / operator diagnostics).
+    #[test]
+    fn expand_inline_outer_boundary_rejects_unresolved_element_type_with_tdck_prefix() {
+        let unresolved_arg = Expression::UnresolvedColumn(UnresolvedColumn {
+            name: "no_such_col".to_owned(),
+            qualifier: None,
+            plan_id: None,
+        });
+        let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
+        let err = expand_inline_projections(vec![inline_call(true, unresolved_arg)], &schema)
+            .expect_err("must reject Unresolved arg type for inline_outer");
+        match &err {
+            AnalyzerError::UnsupportedRule { rule, .. } => {
+                assert_eq!(rule, "inline_outer-expansion");
+            }
+            other => panic!("expected AnalyzerError::UnsupportedRule, got {other:?}"),
+        }
+        assert!(
+            err.to_string().starts_with("[TDCK-BOUNDARY]"),
+            "boundary error must carry `[TDCK-BOUNDARY]` Display prefix per ADR-022; got: {err}"
+        );
     }
 }

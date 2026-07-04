@@ -1,4 +1,5 @@
 mod arrow_ipc;
+mod arrow_schema_stamp;
 mod converter;
 mod error;
 mod service;

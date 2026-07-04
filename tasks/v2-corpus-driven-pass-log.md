@@ -517,6 +517,22 @@ the summary below records the corpus deltas by pass number.
 - Known deviation in-source: manual split ignores CSV quoting rules (embedded commas, quoted strings, escapes). Corpus witness uses simple unquoted values; queued.
 - Compiler warning delta: 36 → 36.
 - Quality Gate: PASS (cargo check both crates, rustfmt clean on additions, `cargo test -- from_csv from_json` 9/9, release build 36 warnings, json-007 PASSED).
+- Commit SHA: 27b9211.
+
+## Pass 88 — 2026-07-04T (in progress)
+- Case: `arr-012` — `F.arrays_zip("tags", "tags")` — Spark preserves input column names in the struct, allowing duplicates (`Array<Struct<tags,tags>>`); τ was surfacing DuckDB's substrate positional names (`Array<Struct<tags_0,tags_1>>`).
+- Diagnostic: `.agent-output/diagnostic-pass-88.md` — τ analyzer and emission both correct individually; the gap is at the service boundary. ExecutePlan streams DuckDB Arrow schema verbatim; PySpark's `createDataFrame(rows, df.schema)` disambiguates the mismatch.
+- Architecture: `.agent-output/architecture-pass-88.md` — new metadata-only Arrow-schema stamp between `session.execute` and `batches_to_responses`, driven by τ's `resolved_schema`. Rejects boundary-error alternative per ADR-022 (input is supported) and per-function schema-rewrite arms per ADR-003 (once-only boundary transform).
+- Layer(s) touched: connect-server (NEW `arrow_schema_stamp.rs` — recursive Field-rename walk with debug_assert + release soft-fallback), converter (depth-aware JSON schema parser closing dormant nested-nullable bug), τ core (`generate_with_schema` fused entry point sharing one analyzer run; `render_data_type::Struct` dedup helper).
+- ADR citations: ADR-003 (`resolved_schema` is authoritative), ADR-005 (τ owns Spark type inference), ADR-015 (differential oracle), ADR-020 (`struct_pack("0" :=..)` remains only DuckDB-legal substrate for duplicate Spark field names), ADR-022 (τ-only path, boundary hygiene not a boundary error). Candidate new invariant INV11 flagged for future ADR-023 ("Arrow schema returned by connect server IS τ's resolved_schema view").
+- Corpus signal: 304 → **305** (+1). arr-012 GREEN.
+- Files: NEW `crates/connect-server/src/arrow_schema_stamp.rs`; MOD `crates/connect-server/src/{main.rs, service.rs, converter/relation_converter.rs, converter/v2_relation_converter.rs}`; MOD `crates/core/src/transpiler_v2/{mod.rs, emission.rs, expression.rs}` (last is rustfmt reflow only).
+- Tests added: 15 total — 10 stamp unit tests (primitive passthrough / struct rename / arr-012 duplicate-name / triple-nested list-struct / map traversal / two shape-mismatch probes / debug-assert `#[should_panic]` / data-buffer preservation / empty-input); 3 emission tests (struct dedup / unique-name no-op / array-of-struct dedup); 2 relation_converter tests (outer-vs-inner nullable + PySpark key-order round-trip).
+- Findings CLOSE_NOW_IN_THIS_PASS: 2 (review High #1 — depth-blind JSON nullable lookup pre-existing but activated by Pass 88's inbound JSON-schema preference, fixed via depth-aware `top_level_bool_value`/`top_level_string_value`; perf HIGH #1 — double `analyze()` per ExecutePlan, fixed via fused `generate_with_schema(plan, base_types) -> (String, StructType)` and removal of dead `finalize_with_schema` helper).
+- Findings not blocking: review 5 Medium + 3 Low (dedup helper duplicated across arrow_schema_stamp/emission — belongs-at-crate-boundary, acceptable; various style/doc gaps). Perf 3 Low + 4 Info (per-batch `Arc::clone` acceptable; per-row `render_data_type` in `render_local_relation` is pre-existing, defer; JSON parser micro-alloc; all sub-µs on corpus workloads).
+- Findings queued as follow-up: unify `dedup_names` into a shared helper module (if a third caller appears); `render_local_relation` per-row `render_data_type` optimization.
+- Compiler warning delta: baseline preserved (no new warnings on touched files).
+- Quality Gate: PASS (cargo check both crates clean, rustfmt clean on all touched files, `cargo test -p thunderduck-connect-server --tests` 83/0, `cargo test -p thunderduck-core --lib` 545/29 identical to baseline, `v2-progress.sh` 305/19/324 with arr-012 PASSED and no regressions).
 - Commit SHA: pending.
 
 

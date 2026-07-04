@@ -3856,8 +3856,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         "from_csv" if f.args.len() != 2 => {
             return Err(EmissionError::UnsupportedFunction {
                 name: f.name.clone(),
-                reason: "`from_csv` options-map form (3-arg) not supported — τ boundary"
-                    .to_owned(),
+                reason: "`from_csv` options-map form (3-arg) not supported — τ boundary".to_owned(),
             });
         }
         "from_csv" if f.args.len() == 2 => {
@@ -5351,17 +5350,67 @@ fn render_data_type(dt: &DataType) -> String {
             )
         }
         DataType::Struct(st) => {
+            // DuckDB's `STRUCT(name TYPE, …)` CAST syntax rejects duplicate
+            // field names (`Binder Error: Duplicate STRUCT type argument
+            // name`). Spark's `StructType` permits duplicates (e.g.
+            // `arrays_zip("tags","tags")` → `Struct<tags, tags>`), so dedup
+            // to substrate-safe names before emission. Convention matches
+            // PySpark's `_dedup_names` (`tags`, `tags` → `tags_0`, `tags_1`)
+            // so the same dedup convention applies uniformly across:
+            //   - this CAST target,
+            //   - the outbound Arrow-schema stamp in `connect-server`,
+            //   - PySpark's client-side `ArrowTableToRowsConversion.convert`.
+            // The τ analyzer's `resolved_schema` still carries the original
+            // duplicate names (Spark-visible); dedup happens ONLY on the
+            // DuckDB-substrate SQL side.
+            let names: Vec<&str> = st.fields.iter().map(|f| f.name.as_str()).collect();
+            let deduped = dedup_struct_field_names(&names);
             let inner: Vec<String> = st
                 .fields
                 .iter()
-                .map(|f: &StructField| {
-                    let name_q = quote_ident(&f.name);
+                .zip(deduped.iter())
+                .map(|(f, name)| {
+                    let name_q = quote_ident(name);
                     format!("{name_q} {}", render_data_type(&f.data_type))
                 })
                 .collect();
             format!("STRUCT({})", inner.join(", "))
         }
     }
+}
+
+/// PySpark parity: dedup a list of struct field names identically to
+/// `pyspark.sql.pandas.types._dedup_names`. Names that appear more than
+/// once are suffixed with `_{i}` where `i` counts from 0 in the order the
+/// name appears. Names that appear once are unchanged.
+///
+/// Example: `["tags", "tags", "id"]` → `["tags_0", "tags_1", "id"]`.
+///
+/// Used by [`render_data_type`] so the DuckDB substrate for
+/// `CAST(x AS STRUCT(...))` never carries duplicate field names, which
+/// DuckDB's binder refuses. The outbound Arrow-schema stamp in the
+/// `connect-server` crate uses the same dedup convention, so DuckDB's
+/// substrate names and the stamp's target names line up bit-for-bit.
+fn dedup_struct_field_names(names: &[&str]) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for n in names {
+        *counts.entry(*n).or_insert(0) += 1;
+    }
+    let mut running: HashMap<&str, usize> = HashMap::new();
+    names
+        .iter()
+        .map(|n| {
+            if counts.get(*n).copied().unwrap_or(0) > 1 {
+                let i = running.entry(*n).or_insert(0);
+                let out = format!("{n}_{i}");
+                *i += 1;
+                out
+            } else {
+                (*n).to_owned()
+            }
+        })
+        .collect()
 }
 
 // ── Extension allow-list (§4.1 stub — populated by Slice D) ──────────────────
@@ -5725,6 +5774,75 @@ mod tests {
         assert!(sql.contains("CAST(1 AS INTEGER)"), "got: {sql}");
         assert!(sql.contains("'x'"), "got: {sql}");
         assert!(sql.contains("__td_local(a, b)"), "got: {sql}");
+    }
+
+    // ── 12b. render_data_type — Struct with duplicate field names ────────
+
+    /// arr-012 boundary hygiene: `render_data_type` on
+    /// `Struct<tags, tags>` MUST dedup the substrate field names because
+    /// DuckDB's `CAST(x AS STRUCT("tags" VARCHAR, "tags" VARCHAR))` raises
+    /// `Binder Error: Duplicate STRUCT type argument name`. The τ analyzer
+    /// still records the Spark-visible duplicates in `resolved_schema` — the
+    /// dedup only affects the DuckDB-substrate SQL, and the outbound
+    /// Arrow-schema stamp in `connect-server` uses the same convention so
+    /// the round-trip re-materialises the duplicates on the client.
+    #[test]
+    fn render_data_type_struct_dedups_duplicate_field_names_arr012_shape() {
+        use crate::types::StructField as CoreStructField;
+        let dup_struct = DataType::Struct(StructType::new(vec![
+            CoreStructField::nullable("tags", DataType::String),
+            CoreStructField::nullable("tags", DataType::String),
+        ]));
+        let sql = render_data_type(&dup_struct);
+        // Substrate must not contain duplicate `tags` field names — DuckDB
+        // rejects `Binder Error: Duplicate STRUCT type argument name`.
+        assert!(
+            sql.contains("tags_0") && sql.contains("tags_1"),
+            "expected dedup'd names `tags_0`,`tags_1`; got: {sql}",
+        );
+        assert!(
+            sql.starts_with("STRUCT("),
+            "expected STRUCT(...); got: {sql}"
+        );
+    }
+
+    /// Companion: unique names must NOT be renamed — the dedup is a no-op
+    /// when there are no collisions. Pins the false-positive contract.
+    #[test]
+    fn render_data_type_struct_preserves_unique_field_names() {
+        use crate::types::StructField as CoreStructField;
+        let uniq_struct = DataType::Struct(StructType::new(vec![
+            CoreStructField::nullable("a", DataType::Long),
+            CoreStructField::nullable("b", DataType::String),
+        ]));
+        let sql = render_data_type(&uniq_struct);
+        assert!(
+            sql.contains("a ") || sql.contains("\"a\""),
+            "expected unique field `a` unchanged; got: {sql}",
+        );
+        assert!(
+            !sql.contains("a_0") && !sql.contains("b_0"),
+            "unique names must NOT be suffixed; got: {sql}",
+        );
+    }
+
+    /// Nested case: `Array<Struct<tags, tags>>` — the arr-012 wire shape.
+    /// The inner struct's field names must be dedup'd; the outer array
+    /// wrapper is untouched.
+    #[test]
+    fn render_data_type_array_of_struct_dedups_inner_names() {
+        use crate::types::StructField as CoreStructField;
+        let inner = DataType::Struct(StructType::new(vec![
+            CoreStructField::nullable("tags", DataType::String),
+            CoreStructField::nullable("tags", DataType::String),
+        ]));
+        let arr = DataType::Array(Box::new(inner), true);
+        let sql = render_data_type(&arr);
+        assert!(sql.ends_with("[]"), "expected trailing `[]`; got: {sql}");
+        assert!(
+            sql.contains("tags_0") && sql.contains("tags_1"),
+            "nested struct field names must dedup; got: {sql}",
+        );
     }
 
     // ── 13. render_file_scan ─────────────────────────────────────────────

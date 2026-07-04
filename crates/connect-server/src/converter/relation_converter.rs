@@ -1977,7 +1977,7 @@ fn parse_ddl_schema(s: &str) -> crate::error::Result<StructType> {
 }
 
 /// Parse Spark JSON schema format: {"type":"struct","fields":[...]}
-fn parse_json_schema(json: &str) -> crate::error::Result<StructType> {
+pub(super) fn parse_json_schema(json: &str) -> crate::error::Result<StructType> {
     // Find "fields":[ and extract the array content
     let fields_key = match json.find("\"fields\"") {
         Some(p) => p,
@@ -2002,9 +2002,17 @@ fn parse_json_schema(json: &str) -> crate::error::Result<StructType> {
         if obj.is_empty() {
             continue;
         }
-        let name = json_string_value(obj, "name").unwrap_or_default();
-        let nullable = json_bool_value(obj, "nullable").unwrap_or(true);
-        // "type" can be a quoted string or a nested object
+        // Depth-aware lookups — a struct-typed field's JSON body contains
+        // nested `"name"` and `"nullable"` keys inside `type.fields[…]`.
+        // PySpark's serializer happens to emit keys in alphabetical order so
+        // depth-blind lookup returned the OUTER value in practice, but any
+        // future client (or a struct-of-struct with a client that orders
+        // `type` before `nullable`) would silently pick up an INNER field's
+        // `nullable` / `name` as the outer value. Use the depth-aware
+        // helpers introduced by pass 88 so this can't happen.
+        let name = top_level_string_value(obj, "name").unwrap_or_default();
+        let nullable = top_level_bool_value(obj, "nullable").unwrap_or(true);
+        // "type" can be a quoted string or a nested object.
         let dt = json_type_value(obj);
         if nullable {
             fields.push(StructField::nullable(name, dt));
@@ -2093,57 +2101,178 @@ fn json_bool_value(obj: &str, key: &str) -> Option<bool> {
 
 /// Extract the DataType from the "type" field of a Spark JSON field object.
 /// The type can be a simple string ("integer") or a nested object ({"type":"array",...}).
+/// Delegates to [`parse_json_type_field`] which also handles nested-object
+/// recursion so `array<struct<…>>` etc. round-trip correctly.
 fn json_type_value(obj: &str) -> DataType {
-    let needle = "\"type\"";
-    // Find the "type" key — skip the outermost "type":"struct" if this is the root
-    // We want the FIRST occurrence of "type" after the opening {
-    let pos = match obj.find(needle) {
-        Some(p) => p,
-        None => return DataType::Unresolved,
-    };
-    let after_key = &obj[pos + needle.len()..];
-    let after_colon = after_key.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
-    if after_colon.starts_with('"') {
-        // Simple type string
-        let inner = &after_colon[1..];
-        let end = inner.find('"').unwrap_or(inner.len());
-        let type_str = &inner[..end];
-        parse_type_str(type_str)
-    } else if after_colon.starts_with('{') {
-        // Nested type object — parse it
-        parse_json_type_object(after_colon)
-    } else {
-        DataType::Unresolved
-    }
+    parse_json_type_field(obj, "type")
 }
 
 /// Parse a nested Spark JSON type object like {"type":"array","elementType":"integer",...}.
+/// Nested type-valued keys (`elementType`, `keyType`, `valueType`, `fields`) recurse.
+///
+/// Depth-aware — top-level keys are located by scanning the outermost object
+/// and skipping over nested `{…}`, `[…]`, and string literals. Naive
+/// substring lookup would collide with nested `"type"` keys (e.g. inside
+/// `fields`) and return the wrong value.
 fn parse_json_type_object(obj: &str) -> DataType {
-    // Extract "type" from within this object
-    let type_name = json_string_value(obj, "type").unwrap_or_default();
+    let type_name = top_level_string_value(obj, "type").unwrap_or_default();
     match type_name.as_str() {
         "array" => {
-            let elem = json_string_value(obj, "elementType")
-                .map(|t| parse_type_str(&t))
-                .unwrap_or(DataType::Unresolved);
-            DataType::Array(Box::new(elem), true)
+            let elem = parse_json_type_field(obj, "elementType");
+            let contains_null = top_level_bool_value(obj, "containsNull").unwrap_or(true);
+            DataType::Array(Box::new(elem), contains_null)
         }
         "map" => {
-            let key_dt = json_string_value(obj, "keyType")
-                .map(|t| parse_type_str(&t))
-                .unwrap_or(DataType::Unresolved);
-            let val_dt = json_string_value(obj, "valueType")
-                .map(|t| parse_type_str(&t))
-                .unwrap_or(DataType::Unresolved);
+            let key_dt = parse_json_type_field(obj, "keyType");
+            let val_dt = parse_json_type_field(obj, "valueType");
+            let value_nullable = top_level_bool_value(obj, "valueContainsNull").unwrap_or(true);
             DataType::Map {
                 key: Box::new(key_dt),
                 value: Box::new(val_dt),
-                value_nullable: true,
+                value_nullable,
             }
         }
-        "struct" => DataType::Struct(StructType::new(vec![])),
+        "struct" => match parse_json_schema(obj) {
+            Ok(st) => DataType::Struct(st),
+            Err(_) => DataType::Unresolved,
+        },
         _ => DataType::Unresolved,
     }
+}
+
+/// Extract the value of `key` (`elementType`, `keyType`, `valueType`, or `type`)
+/// as a `DataType`. Handles both quoted-string values (`"long"`) and nested
+/// object values (`{"type":"struct","fields":[…]}`). Depth-aware so nested
+/// keys with the same name don't collide.
+fn parse_json_type_field(obj: &str, key: &str) -> DataType {
+    match top_level_value_slice(obj, key) {
+        Some(v) => {
+            let v = v.trim_start();
+            if v.starts_with('"') {
+                let inner = &v[1..];
+                let end = inner.find('"').unwrap_or(inner.len());
+                parse_type_str(&inner[..end])
+            } else if v.starts_with('{') {
+                let obj_str = extract_json_braced_object(v);
+                parse_json_type_object(obj_str)
+            } else {
+                DataType::Unresolved
+            }
+        }
+        None => DataType::Unresolved,
+    }
+}
+
+/// Return the value slice (everything after `:` up to the next top-level `,`
+/// or the closing `}`) for the top-level `key` of a JSON object. Skips
+/// nested `{…}`, `[…]`, and string literals so `"type"` inside `fields`
+/// does not shadow the outer `"type"` key.
+fn top_level_value_slice<'a>(obj: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{}\"", key);
+    // Find the object body (everything after the leading `{`).
+    let body_start = obj.find('{')? + 1;
+    let body = &obj[body_start..];
+    // Scan body character-by-character at depth 0.
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0;
+    let bytes = body.as_bytes();
+    while i < bytes.len() {
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        let c = bytes[i] as char;
+        if in_string {
+            match c {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if depth == 0 {
+            // At depth 0 of the object body, check if this position starts
+            // with our target key.
+            if body[i..].starts_with(&needle) {
+                let after_key = &body[i + needle.len()..];
+                let after_colon =
+                    after_key.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+                return Some(after_colon);
+            }
+        }
+        match c {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Depth-aware version of [`json_string_value`] — returns the quoted-string
+/// value of a top-level key, ignoring same-named keys inside nested objects.
+fn top_level_string_value(obj: &str, key: &str) -> Option<String> {
+    let v = top_level_value_slice(obj, key)?;
+    let v = v.trim_start();
+    if !v.starts_with('"') {
+        return None;
+    }
+    let inner = &v[1..];
+    let end = inner.find('"')?;
+    Some(inner[..end].to_string())
+}
+
+/// Depth-aware version of [`json_bool_value`].
+fn top_level_bool_value(obj: &str, key: &str) -> Option<bool> {
+    let v = top_level_value_slice(obj, key)?;
+    let v = v.trim_start();
+    if v.starts_with("true") {
+        Some(true)
+    } else if v.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Return the substring from the leading `{` through its matching `}`.
+/// String literals in the JSON are skipped so `{"a":"}"}` matches correctly.
+fn extract_json_braced_object(s: &str) -> &str {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            match c {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &s[..=i];
+                }
+            }
+            _ => {}
+        }
+    }
+    s
 }
 
 fn parse_ddl_schema_inner(s: &str) -> crate::error::Result<StructType> {
@@ -2930,6 +3059,83 @@ mod tests {
             name: name.to_string(),
             qualifier: None,
         })
+    }
+
+    // ── parse_json_schema — depth-aware nullable / name lookups (rev-fix 1) ──
+    //
+    // Regression for the review's High #1: a struct-typed field's JSON body
+    // carries nested `"name"` / `"nullable"` keys inside `type.fields[…]`;
+    // depth-blind lookup returned an INNER field's value if it came first
+    // in the source ordering. Pass 88 activated the JSON schema preference
+    // path in `convert_local_relation`, exposing this pre-existing bug on
+    // any `StructField("parent", StructType([StructField(..., False)]), True)`
+    // shape. The test constructs that exact shape (using key ordering that
+    // WOULD have tripped the depth-blind version — nested `nullable=false`
+    // appearing before the outer `nullable=true` in the source string) and
+    // asserts the outer nullability wins.
+
+    #[test]
+    fn parse_json_schema_reads_outer_nullable_not_inner_when_nested_field_is_non_null() {
+        // Handcrafted JSON with the nested `"nullable":false` positioned so
+        // depth-blind `.find()` would (incorrectly) see it BEFORE the outer
+        // `"nullable":true`. The `type` key is placed before the outer
+        // `nullable` key to force this ordering.
+        let json = r#"{
+          "type":"struct",
+          "fields":[
+            {
+              "name":"parent",
+              "type":{
+                "fields":[
+                  {"name":"child","type":"integer","nullable":false,"metadata":{}}
+                ],
+                "type":"struct"
+              },
+              "nullable":true,
+              "metadata":{}
+            }
+          ]
+        }"#;
+        let st = parse_json_schema(json).expect("parse must succeed");
+        assert_eq!(st.fields.len(), 1);
+        let parent = &st.fields[0];
+        assert_eq!(parent.name, "parent");
+        assert!(
+            parent.nullable,
+            "outer `parent` field must inherit its OWN `nullable=true`, \
+             not the nested `child` field's `nullable=false`",
+        );
+        let inner = match &parent.data_type {
+            thunderduck_core::types::DataType::Struct(s) => s,
+            other => panic!("expected Struct type for parent, got {other:?}"),
+        };
+        assert_eq!(inner.fields.len(), 1);
+        assert_eq!(inner.fields[0].name, "child");
+        assert!(
+            !inner.fields[0].nullable,
+            "inner `child` field must retain its declared `nullable=false`",
+        );
+    }
+
+    /// Companion: PySpark's alphabetised key ordering (what the corpus
+    /// actually exercises) still parses correctly — pin the no-regression
+    /// contract for the happy path.
+    #[test]
+    fn parse_json_schema_pyspark_alphabetised_key_order_round_trips() {
+        // Matches `_schema.json()` output for
+        // `Struct<parent: Struct<child: int nullable=false> nullable=true>`.
+        let json = r#"{"fields":[{"metadata":{},"name":"parent","nullable":true,"type":{"fields":[{"metadata":{},"name":"child","nullable":false,"type":"integer"}],"type":"struct"}}],"type":"struct"}"#;
+        let st = parse_json_schema(json).expect("parse must succeed");
+        assert_eq!(st.fields.len(), 1);
+        assert!(st.fields[0].nullable, "outer parent must be nullable");
+        let inner = match &st.fields[0].data_type {
+            thunderduck_core::types::DataType::Struct(s) => s,
+            other => panic!("expected Struct, got {other:?}"),
+        };
+        assert!(
+            !inner.fields[0].nullable,
+            "inner child must be non-nullable",
+        );
     }
 
     fn bare_cast(inner: Expression, to_type: DataType) -> Expression {

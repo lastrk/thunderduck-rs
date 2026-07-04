@@ -52,7 +52,7 @@ static SERVER_SESSION_ID: std::sync::LazyLock<String> =
 /// so intercepting here keeps the two front-ends peer.
 pub(crate) fn transpile_relation(
     relation: &proto::Relation,
-) -> Result<(CommonAst, String), Status> {
+) -> Result<(CommonAst, String, StructType), Status> {
     use proto::relation::RelType;
     let common_ast = match &relation.rel_type {
         Some(RelType::Sql(sql_relation)) => SparkSqlParserV2::parse(&sql_relation.query)
@@ -64,35 +64,45 @@ pub(crate) fn transpile_relation(
                 .map_err(|e| Status::from(ConnectError::from(e)))?
         }
     };
-    let sql = finalize(&common_ast)?;
-    Ok((common_ast, sql))
+    let (sql, schema) = finalize(&common_ast)?;
+    Ok((common_ast, sql, schema))
 }
 
 /// Convert a raw SparkSQL string into a [`CommonAst`] and finalize it into
 /// DuckDB SQL via τ.
 ///
 /// Used by the deprecated `SqlCommand.sql` text field on older clients.
-pub(crate) fn transpile_raw_sql(sql_text: &str) -> Result<(CommonAst, String), Status> {
+pub(crate) fn transpile_raw_sql(sql_text: &str) -> Result<(CommonAst, String, StructType), Status> {
     let common_ast =
         SparkSqlParserV2::parse(sql_text).map_err(|e| Status::from(ConnectError::from(e)))?;
-    let sql = finalize(&common_ast)?;
-    Ok((common_ast, sql))
+    let (sql, schema) = finalize(&common_ast)?;
+    Ok((common_ast, sql, schema))
 }
 
-/// Build the per-path `BaseTypes` overlay and run τ's emission entry point.
+/// Build the per-path `BaseTypes` overlay and run τ's fused emit-and-schema
+/// entry point in ONE analyzer pass.
+///
+/// Returns both the emitted DuckDB SQL and the analyzer's root
+/// `resolved_schema` — the schema drives the outbound Arrow-schema stamp in
+/// `execute_streaming_query` (see `arrow_schema_stamp::stamp_batch_schemas`).
+/// Fusing avoids the second `analyze()` call that pass 88's initial wiring
+/// incurred (perf review HIGH #1).
 ///
 /// The catalog closure returns `None` at Slice A.3 — the overlay exists to
 /// satisfy the dispatch shape; Slice B wires the actual catalog bridge over
 /// `DuckDbSession`.
-pub(crate) fn finalize(common_ast: &CommonAst) -> Result<String, Status> {
+pub(crate) fn finalize(common_ast: &CommonAst) -> Result<(String, StructType), Status> {
     let base_types = build_base_types(common_ast);
-    transpiler_v2::generate(common_ast, &base_types)
+    transpiler_v2::generate_with_schema(common_ast, &base_types)
         .map_err(|e| Status::from(ConnectError::from(e)))
 }
 
 /// Run τ's analyzer on a `CommonAst` and return the root-node resolved schema.
+///
 /// Used by `AnalyzePlan(Schema)` (E.0 addendum — Slice B analyzer wiring for
-/// the schema-analyze surface).
+/// the schema-analyze surface). The `ExecutePlan` streaming-query path takes
+/// its schema from [`finalize`]'s fused return instead of re-running the
+/// analyzer.
 pub(crate) fn analyze_schema(common_ast: &CommonAst) -> Result<StructType, Status> {
     let base_types = build_base_types(common_ast);
     transpiler_v2::analyze_schema(common_ast, &base_types)
@@ -148,7 +158,7 @@ impl SparkConnectService for ThunderduckService {
 
         let responses: Vec<proto::ExecutePlanResponse> = match plan.op_type {
             Some(proto::plan::OpType::Root(relation)) => {
-                let (common_ast, sql) = transpile_relation(&relation)?;
+                let (common_ast, sql, resolved_schema) = transpile_relation(&relation)?;
                 // Slice A.3: `finalize()` errors unconditionally, so the
                 // downstream classification / streaming helpers are only
                 // reachable when Slices C/E begin lighting up emission arms.
@@ -160,8 +170,8 @@ impl SparkConnectService for ThunderduckService {
                     PlanKind::Query => {
                         return execute_streaming_query(
                             &session,
-                            &common_ast,
                             &sql,
+                            &resolved_schema,
                             &session_id,
                             &operation_id,
                         )
@@ -219,6 +229,13 @@ impl SparkConnectService for ThunderduckService {
                 // calling `dispatch_op`. Errors surface via the same
                 // two-category bridge `finalize` uses (AnalyzerError →
                 // EmissionError → ConnectError → Status).
+                //
+                // ExecutePlan/AnalyzePlan symmetry: this path serializes τ's
+                // `resolved_schema` verbatim (via `data_type_to_proto`), so
+                // AnalyzePlan already surfaces the Spark-visible view.
+                // ExecutePlan achieves the same on the response path via
+                // `arrow_schema_stamp::stamp_batch_schemas` in
+                // `execute_streaming_query`. Do not modify this arm.
                 let common_ast = match &relation.rel_type {
                     Some(proto::relation::RelType::Sql(sql_relation)) => {
                         SparkSqlParserV2::parse(&sql_relation.query)
@@ -358,12 +375,12 @@ async fn handle_command(
             let relation = view_cmd
                 .input
                 .ok_or_else(|| Status::invalid_argument("CreateTempView missing input"))?;
-            let (common_ast, _sql) = transpile_relation(&relation)?;
+            let (common_ast, _sql, _schema) = transpile_relation(&relation)?;
             handle_create_dataframe_view(session, session_id, operation_id, &common_ast).await
         }
         Some(CommandType::SqlCommand(sql_cmd)) => {
             let common_ast = if let Some(input_rel) = sql_cmd.input {
-                let (ast, _sql) = transpile_relation(&input_rel)?;
+                let (ast, _sql, _schema) = transpile_relation(&input_rel)?;
                 ast
             } else {
                 // Preserved fallback path for older clients using the
@@ -376,7 +393,7 @@ async fn handle_command(
                         "SqlCommand missing both input relation and sql text",
                     ));
                 }
-                let (ast, _sql) = transpile_raw_sql(&text)?;
+                let (ast, _sql, _schema) = transpile_raw_sql(&text)?;
                 ast
             };
             handle_sql_command(session, session_id, operation_id, &common_ast).await
@@ -386,7 +403,7 @@ async fn handle_command(
                 .input
                 .take()
                 .ok_or_else(|| Status::invalid_argument("WriteOperation missing input"))?;
-            let (common_ast, _sql) = transpile_relation(&input_rel)?;
+            let (common_ast, _sql, _schema) = transpile_relation(&input_rel)?;
             handle_write_operation(session, session_id, operation_id, &common_ast, &write_cmd).await
         }
         _ => Err(Status::unimplemented("Unsupported command type")),
@@ -465,18 +482,28 @@ async fn execute_ddl(
 ///      into the `ExecutePlanStream` shape.
 async fn execute_streaming_query(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    _common_ast: &CommonAst,
     sql: &str,
+    resolved_schema: &StructType,
     session_id: &str,
     operation_id: &str,
 ) -> Result<Response<<ThunderduckService as SparkConnectService>::ExecutePlanStream>, Status> {
+    // `resolved_schema` was produced by the SAME `analyze` call that emitted
+    // `sql` (via `transpiler_v2::generate_with_schema`, see `finalize`). Perf
+    // review HIGH #1: the earlier wiring re-ran the analyzer here — dropped.
+    // Its Spark-visible view drives the outbound Arrow-schema stamp; see
+    // `arrow_schema_stamp` for the "why" (arr-012 duplicate-struct-field-name
+    // substrate gap + boundary hygiene).
     let batches = session
         .execute(sql)
         .await
         .map_err(|e| Status::from(ConnectError::from(e)))?;
 
+    // Metadata-only rename: buffer identity is preserved (see
+    // `arrow_schema_stamp::stamp_batch_schemas` doc).
+    let stamped = crate::arrow_schema_stamp::stamp_batch_schemas(batches, resolved_schema);
+
     let responses =
-        batches_to_responses(session_id, operation_id, &batches).map_err(Status::from)?;
+        batches_to_responses(session_id, operation_id, &stamped).map_err(Status::from)?;
 
     let stream = stream::iter(responses.into_iter().map(Ok));
     Ok(Response::new(Box::pin(stream)))
@@ -853,7 +880,7 @@ mod tests {
         // The routing anchor (SQL → parser_v2, not converter) is still enforced:
         // a routing bug would have surfaced `RelType::Sql` as an
         // `UnsupportedProtoShape` error before reaching τ's emission.
-        let (_common_ast, sql) =
+        let (_common_ast, sql, _schema) =
             transpile_relation(&sql_rel).expect("τ must emit SQL for `SELECT 1`");
         assert!(
             sql.contains("SELECT"),
@@ -928,7 +955,7 @@ mod tests {
         // A `SingleRow` plan carries no `TableScan` → `plan_has_empty_scan`
         // is false → `BaseTypes::empty()` (no closure invocation) → τ emits.
         let plan = CommonAst::new(CommonOp::SingleRow);
-        let sql = finalize(&plan).expect("τ must emit for SingleRow");
+        let (sql, _schema) = finalize(&plan).expect("τ must emit for SingleRow");
         // Subquery-safe shape — see `emission::render_single_row`.
         assert_eq!(sql, "SELECT 1");
     }

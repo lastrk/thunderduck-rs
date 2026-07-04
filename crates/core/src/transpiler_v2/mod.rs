@@ -44,9 +44,30 @@ pub use type_inference::TypeInferenceEngine;
 /// errors carry `[TDCK-BOUNDARY]`). Emission errors for un-wired arms are
 /// Thunderduck-boundary per ADR-022.
 pub fn generate(plan: &CommonAst, base_types: &BaseTypes) -> Result<String, EmissionError> {
+    generate_with_schema(plan, base_types).map(|(sql, _schema)| sql)
+}
+
+/// τ's fused emit-and-schema entry point.
+///
+/// Runs [`analyze`] once and returns BOTH the emitted DuckDB SQL AND the
+/// analyzer's root `resolved_schema`. Used by the Spark Connect ExecutePlan
+/// streaming-query path in `connect-server::service::execute_streaming_query`
+/// so it can drive the post-execute Arrow-schema stamp (see
+/// `connect-server::arrow_schema_stamp`) without re-running the analyzer.
+///
+/// The lone-`analyze`-plus-dispatch shape is identical to [`generate`], so
+/// error semantics (Spark-emulated vs Thunderduck-boundary, per ADR-022) are
+/// preserved bit-for-bit. Callers that don't need the schema should stay on
+/// [`generate`]; callers that only need the schema should use
+/// [`analyze_schema`]. The three entry points share the same analyzer.
+pub fn generate_with_schema(
+    plan: &CommonAst,
+    base_types: &BaseTypes,
+) -> Result<(String, crate::types::StructType), EmissionError> {
     let typed = analyzer::analyze(plan.clone(), base_types)
         .map_err(analyzer::analyzer_error_to_emission_error)?;
-    emission::dispatch_op(&typed.op, &typed.resolved_schema)
+    let sql = emission::dispatch_op(&typed.op, &typed.resolved_schema)?;
+    Ok((sql, typed.resolved_schema))
 }
 
 /// τ's schema-analyze entry point.

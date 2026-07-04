@@ -757,15 +757,25 @@ impl V2RelationConverter {
         &self,
         lr: &proto::LocalRelation,
     ) -> Result<CommonAst, EmissionError> {
-        let (schema, rows) = match &lr.data {
-            Some(data) if !data.is_empty() => arrow_ipc_to_schema_and_rows(data)?,
-            _ => {
-                let schema = match lr.schema.as_deref().filter(|s| !s.trim().is_empty()) {
-                    Some(s) => parse_type_str_to_struct(s),
-                    None => StructType::empty(),
-                };
-                (schema, vec![])
+        let (arrow_schema, rows) = match &lr.data {
+            Some(data) if !data.is_empty() => {
+                let (s, r) = arrow_ipc_to_schema_and_rows(data)?;
+                (Some(s), r)
             }
+            _ => (None, vec![]),
+        };
+        // Prefer the Spark-visible JSON schema (from `_schema.json()`) over
+        // the Arrow-derived schema. PySpark's client dedups struct field
+        // names for the Arrow wire (`_deduplicate_field_names`) but sends the
+        // ORIGINAL Spark schema in `lr.schema` — the JSON path preserves
+        // duplicate field names (e.g. `arrays_zip("tags","tags")` →
+        // `Struct<tags, tags>`), which the round-trip through
+        // `sparkSession.createDataFrame(rows, df.schema)` needs to match
+        // Spark's reference behaviour on arr-012. Fall back to the Arrow
+        // schema only when no `lr.schema` is provided.
+        let schema = match lr.schema.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(s) => parse_type_str_to_struct(s),
+            None => arrow_schema.unwrap_or_else(StructType::empty),
         };
         Ok(CommonAst::new(CommonOp::LocalRelation { schema, rows }))
     }
@@ -1683,8 +1693,22 @@ fn classify_file_format(
 }
 
 fn parse_type_str_to_struct(s: &str) -> StructType {
-    // Reuse the existing DDL/JSON parser via type_converter. `parse_type_str`
-    // returns a `DataType`; StructType requires unwrapping.
+    // PySpark sends the LocalRelation `schema` field as a JSON-serialized
+    // Spark type when the client calls `createDataFrame(rows, schema)` —
+    // `_schema.json()` emits `{"type":"struct","fields":[…]}`. Delegate JSON
+    // parsing to the sibling legacy helper (which we retain until Slice K —
+    // see CLAUDE.md §"τ is the only path"). This path preserves duplicate
+    // struct field names (`Struct<tags, tags>` from `arrays_zip`), which the
+    // Arrow-IPC-derived schema lacks because PySpark's client dedups struct
+    // field names before wire serialization.
+    let trimmed = s.trim();
+    if trimmed.starts_with('{') {
+        if let Ok(st) = super::relation_converter::parse_json_schema(trimmed) {
+            return st;
+        }
+    }
+    // Fallback: legacy simple-string DDL parser (e.g. `STRUCT<id: BIGINT>` or
+    // scalar type names).
     let dt = parse_type_str(s);
     match dt {
         DataType::Struct(st) => st,

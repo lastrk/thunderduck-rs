@@ -778,10 +778,7 @@ impl Expression {
                 // Spark stamps the outer array as non-nullable elements
                 // (containsNull=false) — the struct itself is always present
                 // per input row.
-                return DataType::Array(
-                    Box::new(DataType::Struct(StructType::new(fields))),
-                    false,
-                );
+                return DataType::Array(Box::new(DataType::Struct(StructType::new(fields))), false);
             }
             // Spark's `coalesce(a, b, c, ...)` returns the least-common
             // (widening) type across all args. First-arg-only inference

@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use super::analyzer::{Schema, TypedAst, TypedOp};
-use super::ast::{FileFormat, SetOpKind};
+use super::ast::FileFormat;
 use super::error::EmissionError;
 use super::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
@@ -452,7 +452,7 @@ fn render_project_over_join(
     condition: Option<&Expression>,
     using_columns: &[String],
 ) -> Result<String, EmissionError> {
-    use crate::transpiler_v2::ast::JoinType;
+    use super::ast::JoinType;
     // Pick subquery aliases: user AliasedRelation names take precedence.
     let (left_ast, left_alias) = match &left.op {
         TypedOp::AliasedRelation { input, alias } => (input.as_ref(), alias.clone()),
@@ -625,7 +625,7 @@ fn render_set_op(
     children: &[TypedAst],
     widened_schema: &StructType,
 ) -> Result<String, EmissionError> {
-    use crate::transpiler_v2::ast::SetOpKind;
+    use super::ast::SetOpKind;
     if children.is_empty() {
         return Err(EmissionError::UnsupportedOp {
             op: "SetOp".to_owned(),
@@ -745,7 +745,7 @@ fn render_join(
     condition: Option<&Expression>,
     using_columns: &[String],
 ) -> Result<String, EmissionError> {
-    use crate::transpiler_v2::ast::JoinType;
+    use super::ast::JoinType;
     let left_sql = dispatch_op(&left.op, &left.resolved_schema)?;
     let right_sql = dispatch_op(&right.op, &right.resolved_schema)?;
     let left_alias = "__td_jl".to_owned();
@@ -1611,7 +1611,7 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
             }
             // Frame clause emission.
             if let Some(frame) = &w.frame {
-                use crate::transpiler_v2::expression::{FrameBoundary, FrameUnit};
+                use super::expression::{FrameBoundary, FrameUnit};
                 if had_content {
                     over.push(' ');
                 }
@@ -4501,9 +4501,7 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
 /// `grouping_id(<grouping cols>)`. Recurses into common expression
 /// containers used by the aggregate slot.
 fn rewrite_grouping_id(expr: &Expression, grouping: &[Expression]) -> Expression {
-    use crate::transpiler_v2::expression::{
-        AliasExpression, CaseWhenExpression, CastExpression, FunctionCall,
-    };
+    use super::expression::{AliasExpression, CaseWhenExpression, CastExpression, FunctionCall};
     match expr {
         Expression::FunctionCall(f) => {
             let name_lower = f.name.to_lowercase();
@@ -4573,7 +4571,7 @@ fn render_aggregate_op(
     aggregates: &[Expression],
     grouping_kind: crate::transpiler_v2::ast::GroupingKind,
 ) -> Result<String, EmissionError> {
-    use crate::transpiler_v2::ast::GroupingKind;
+    use super::ast::GroupingKind;
     if matches!(grouping_kind, GroupingKind::GroupingSets) {
         return Err(EmissionError::UnsupportedOp {
             op: "Aggregate[GroupingSets]".to_owned(),
@@ -5813,7 +5811,7 @@ pub(crate) fn extension_targets() -> HashSet<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transpiler_v2::ast::{CommonAst, CommonOp};
+    use crate::transpiler_v2::ast::{CommonAst, CommonOp, SetOpKind};
     use crate::transpiler_v2::base_types::BaseTypes;
     use crate::transpiler_v2::expression::{
         AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
@@ -6463,19 +6461,6 @@ mod tests {
         assert_eq!(render_star(&qstar).expect("render"), "t.*");
     }
 
-    // ── 23. Unsupported function ─────────────────────────────────────────
-
-    #[test]
-    fn render_expr_function_call_stub_returns_unsupported_function() {
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "sha3".to_owned(),
-            args: vec![int_lit(1)],
-            distinct: false,
-        });
-        let err = render_expr(&expr, &empty_schema()).unwrap_err();
-        assert!(matches!(err, EmissionError::UnsupportedFunction { .. }));
-    }
-
     // ── Pass 85 — defensive UnresolvedRegex arm ─────────────────────────
 
     #[test]
@@ -6492,19 +6477,6 @@ mod tests {
             }
             other => panic!("expected UnsupportedExpression, got {other:?}"),
         }
-    }
-
-    // ── 24. Unsupported aggregate ────────────────────────────────────────
-
-    #[test]
-    fn render_expr_aggregate_stub_returns_unsupported_op() {
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "sum".to_owned(),
-            args: vec![int_lit(1)],
-            distinct: false,
-        });
-        let err = render_expr(&expr, &empty_schema()).unwrap_err();
-        assert!(matches!(err, EmissionError::UnsupportedOp { .. }));
     }
 
     // ── DUCKDB_RESERVED invariants — required by the binary_search shape
@@ -6678,22 +6650,26 @@ mod tests {
     fn emit_tap_does_not_increment_on_err_dispatch() {
         let _g = tap_guard();
         let before = EMIT_TAP.load(Ordering::Relaxed);
-        // Aggregate is unimplemented at C.1 → UnsupportedOp.
+        // Sample WITH REPLACEMENT is a permanent Thunderduck-boundary error
+        // (ADR-022 — DuckDB has no row-level sampling with replacement), so it
+        // is a stable erroring dispatch that won't bit-rot as coverage grows.
         let bt = base_types_with_emp();
-        let ast = CommonAst::new(CommonOp::Aggregate {
+        let ast = CommonAst::new(CommonOp::Sample {
             input: Box::new(CommonAst::new(CommonOp::TableScan {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            grouping: vec![],
-            aggregates: vec![Expression::FunctionCall(FunctionCall {
-                name: "count".to_owned(),
-                args: vec![],
-                distinct: false,
-            })],
-            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            lower_bound: 0.0,
+            upper_bound: 0.5,
+            with_replacement: true,
+            seed: Some(11),
         });
-        let _ = generate(&ast, &bt);
+        let result = generate(&ast, &bt);
+        assert!(
+            result.is_err(),
+            "sample-with-replacement must fail dispatch; if this becomes \
+             supported, pick another Thunderduck-boundary op for this test",
+        );
         let after = EMIT_TAP.load(Ordering::Relaxed);
         assert_eq!(after - before, 0);
     }
@@ -7264,7 +7240,6 @@ mod tests {
 
     // ── Unpivot emission ────────────────────────────────────────────────
 
-    #[test]
     /// grp-004 shape — emits conditional-aggregate SQL that matches Spark's
     /// PIVOT semantics (empty COUNT buckets → NULL, not 0). Pass 60 anchor.
     #[test]
@@ -7385,6 +7360,7 @@ mod tests {
         assert!(sql.contains(" AS \"1_c\""), "got: {sql}");
     }
 
+    #[test]
     fn render_unpivot_emits_duckdb_unpivot_shape() {
         // Anchor: piv-004 shape — emits
         //   UNPIVOT (SELECT <ids>,<values> FROM (<child>) AS __td_unpivot_src)

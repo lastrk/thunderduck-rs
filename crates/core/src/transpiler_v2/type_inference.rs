@@ -448,9 +448,8 @@ impl TypeInferenceEngine {
                 | "percentile"
                 | "percentile_approx"
                 | "approx_percentile"
-                | "collect_list"
-                | "collect_set"
-                | "array_agg"
+                | "median"
+                | "mode"
                 | "corr"
                 | "covar_pop"
                 | "covar_samp"
@@ -607,7 +606,7 @@ impl TypeInferenceEngine {
             // Integer; regexp / like family returns Boolean.
             "concat" | "concat_ws" | "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "substr"
             | "substring" | "left" | "right" | "lpad" | "rpad" | "replace" | "regexp_replace"
-            | "regexp_extract" | "translate" | "reverse" | "initcap" | "space" | "repeat"
+            | "regexp_extract" | "translate" | "initcap" | "space" | "repeat"
             | "overlay" | "format_string" | "format_number" | "base64" | "unbase64"
             | "url_encode" | "url_decode" | "encode" | "decode" | "soundex" | "sentences"
             | "split_part" => String,
@@ -744,6 +743,10 @@ impl TypeInferenceEngine {
             // NOT in this bucket — their return type is the fold-seed type
             // (arg[1]), not the array type. See
             // `Expression::function_call_data_type`'s fast-path.
+            // NOTE: `reverse` is polymorphic — `reverse(str)→String`,
+            // `reverse(array)→same array type`. First-arg-type covers both, so
+            // it must NOT be added to the String-function group above (doing so
+            // would mistype `reverse(array)` as String). Corpus: `str-014`.
             "transform" | "list_transform" | "filter" | "list_filter" | "list_reverse"
             | "zip_with" | "list_zip" | "map_filter"
             | "map_zip_with" | "sort_array" | "list_sort" | "array_distinct" | "list_distinct"

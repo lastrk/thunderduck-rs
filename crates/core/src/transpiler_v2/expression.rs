@@ -1050,8 +1050,7 @@ impl Expression {
                 f.args.get(1).is_none_or(|a| a.nullable(schema))
                     || f.args.get(2).is_none_or(|a| a.nullable(schema))
             }
-            "array" | "make_array" | "create_map" | "map" | "named_struct" | "struct"
-            | "map_from_entries" => false,
+            "array" | "make_array" | "create_map" | "map" | "named_struct" | "struct" => false,
             // `F.window(ts, dur)` — Spark's `TimeWindow` is rewritten by the
             // analyzer into `CreateNamedStruct(start := ..., end := ...)`
             // whose `nullable = false` (Spark's struct-construction is never

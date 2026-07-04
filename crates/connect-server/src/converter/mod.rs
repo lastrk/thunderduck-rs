@@ -1,10 +1,10 @@
-pub mod expression_converter;
-pub mod plan_converter;
 pub mod relation_converter;
 pub mod type_converter;
 pub mod v2_relation_converter;
 
-// `PlanConverter` re-export removed in Slice A.3 — dispatch relocated to the
-// τ boundary and no longer consumes the legacy converter. The module remains
-// (Slice K owns full legacy deletion) but is no longer part of the public
-// crate surface.
+// The legacy `plan_converter` / `expression_converter` modules and the
+// `RelationConverter` struct were deleted once the τ path
+// (`v2_relation_converter`) became the only production converter (ADR-022).
+// `relation_converter` now retains only `parse_json_schema`, still used by the
+// v2 path to decode `createDataFrame` schema payloads (Slice K tracks removing
+// that last dependency).

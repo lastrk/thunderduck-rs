@@ -870,10 +870,7 @@ mod tests {
             common: None,
             rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
                 query: "SELECT 1".to_owned(),
-                args: Default::default(),
-                pos_args: vec![],
-                named_arguments: Default::default(),
-                pos_arguments: vec![],
+                ..Default::default()
             })),
         };
         // Slice C.1 wired Project + SingleRow arms — `SELECT 1` now succeeds.
@@ -897,10 +894,7 @@ mod tests {
             common: None,
             rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
                 query: "NOT VALID SQL".to_owned(),
-                args: Default::default(),
-                pos_args: vec![],
-                named_arguments: Default::default(),
-                pos_arguments: vec![],
+                ..Default::default()
             })),
         };
         let err = transpile_relation(&sql_rel).expect_err("syntax error must surface");
@@ -1001,10 +995,7 @@ mod tests {
                 common: None,
                 rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
                     query: "SELECT 1".to_owned(),
-                    args: Default::default(),
-                    pos_args: vec![],
-                    named_arguments: Default::default(),
-                    pos_arguments: vec![],
+                    ..Default::default()
                 })),
             })),
         };

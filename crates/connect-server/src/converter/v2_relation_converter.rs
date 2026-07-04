@@ -2143,9 +2143,8 @@ mod tests {
     fn rel_with_plan_id(rt: proto::relation::RelType, plan_id: i64) -> proto::Relation {
         proto::Relation {
             common: Some(proto::RelationCommon {
-                source_info: String::new(),
                 plan_id: Some(plan_id),
-                origin: None,
+                ..Default::default()
             }),
             rel_type: Some(rt),
         }
@@ -2638,10 +2637,7 @@ mod tests {
         // §2.2 anchor.
         let s = rel(proto::relation::RelType::Sql(proto::Sql {
             query: "SELECT 1".to_owned(),
-            args: Default::default(),
-            pos_args: vec![],
-            named_arguments: Default::default(),
-            pos_arguments: vec![],
+            ..Default::default()
         }));
         let mut c = V2RelationConverter::new();
         let err = c.convert(&s).unwrap_err();

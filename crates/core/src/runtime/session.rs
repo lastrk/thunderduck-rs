@@ -721,7 +721,9 @@ impl DuckDbSession {
         {
             SessionResult::Batches(batches) => Ok(batches),
             SessionResult::Ok => Ok(vec![]),
-            SessionResult::Error(e) => Err(e),
+            // ADR-006: re-clothe a DuckDB engine throw carrying a τ-emitted
+            // Spark error-class token as a Spark-emulated runtime error.
+            SessionResult::Error(e) => Err(e.reclassified_spark_runtime()),
             SessionResult::Schema(_) => unreachable!("Execute never returns Schema"),
         }
     }
@@ -1213,6 +1215,25 @@ mod tests {
     fn query_i64(conn: &duckdb::Connection, sql: &str) -> i64 {
         conn.query_row::<i64, _, _>(sql, [], |row| row.get(0))
             .expect("query_row failed")
+    }
+
+    /// ADR-006 Piece B1 contract: a runtime error thrown *during result
+    /// materialisation* — DuckDB's `error()` fired by a row-dependent `CASE`,
+    /// exactly how τ's ANSI divide/mod guard works — MUST surface as
+    /// `Err(ThunderduckError::DuckDb(..))` carrying the emitted token, not be
+    /// swallowed by `arrow_stream.collect()`.
+    #[test]
+    fn runtime_error_during_iteration_surfaces_as_err() {
+        let conn = fresh_conn();
+        // Two rows; the `a = 0` row triggers error() mid-stream.
+        let sql = "SELECT CASE WHEN a = 0 THEN error('[DIVIDE_BY_ZERO] boom') ELSE a END \
+                   FROM (VALUES (1), (0)) t(a)";
+        let err = super::run_query(&conn, sql)
+            .expect_err("row-dependent error() must surface as Err, not be swallowed");
+        assert!(
+            err.to_string().contains("DIVIDE_BY_ZERO"),
+            "runtime error must carry the emitted token; got: {err}"
+        );
     }
 
     /// hash-001 primary oracle: `spark_crc32` session-macro matches

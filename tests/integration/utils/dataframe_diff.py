@@ -66,19 +66,27 @@ def collect_with_timeout(df: DataFrame, timeout: int, name: str) -> list:
 # ---------------------------------------------------------------------------
 
 _ERROR_TOKEN_RE = re.compile(r"^\s*\[([A-Z][A-Z0-9_.]*)\]")
+# Un-anchored variant: a raw gRPC ``_MultiThreadedRendezvous`` repr buries the
+# token on an indented ``details = "[TOKEN] ..."`` line, so a start-anchored
+# match misses it. Used only as the final fallback.
+_ERROR_TOKEN_SEARCH = re.compile(r"\[([A-Z][A-Z0-9_.]*)\]")
 
 
 def spark_error_class(exc: BaseException) -> Optional[str]:
     """Best-effort Spark error-class token for a PySpark Connect exception.
 
     Resolution order (first non-empty token wins):
-      1. ``exc.getCondition()``   — PySpark 4.x canonical accessor
-      2. ``exc.getErrorClass()``  — older/alternate accessor
-      3. regex ``^[TOKEN]`` on ``str(exc)`` — for DuckDB-passthrough / accessor-less
+      1. ``exc.getCondition()`` / ``exc.getErrorClass()`` — PySpark rich
+         exceptions (the Spark reference side).
+      2. ``exc.details()`` — a raw gRPC ``_MultiThreadedRendezvous`` (how τ's
+         re-wrapped runtime error reaches the client); the details string leads
+         with the ``[TOKEN]`` τ emitted.
+      3. regex on ``str(exc)`` — anchored, then un-anchored (the rendezvous repr
+         wraps the token on an indented ``details =`` line).
 
     Returns ``None`` when no class token can be recovered (e.g. a raw DuckDB
-    error string with no leading ``[TOKEN]``). ``None`` is a real divergence
-    signal, distinct from an empty string.
+    error string with no ``[TOKEN]``). ``None`` is a real divergence signal,
+    distinct from an empty string.
     """
     for accessor in ("getCondition", "getErrorClass"):
         fn = getattr(exc, accessor, None)
@@ -89,7 +97,22 @@ def spark_error_class(exc: BaseException) -> Optional[str]:
                 tok = None
             if tok:
                 return str(tok).strip().strip("[]")
-    m = _ERROR_TOKEN_RE.match(str(exc))
+
+    # Raw gRPC rendezvous: details() is the clean server-sent message, which
+    # leads with the [TOKEN] τ emitted.
+    details_fn = getattr(exc, "details", None)
+    if callable(details_fn):
+        try:
+            details = details_fn()
+        except Exception:
+            details = None
+        if details:
+            m = _ERROR_TOKEN_RE.match(str(details))
+            if m:
+                return m.group(1)
+
+    text = str(exc)
+    m = _ERROR_TOKEN_RE.match(text) or _ERROR_TOKEN_SEARCH.search(text)
     return m.group(1) if m else None
 
 

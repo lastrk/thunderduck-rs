@@ -4275,6 +4275,22 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 "(substring({s}, 1, ({p}) - 1) || {r} || substring({s}, ({p}) + ({length_expr})))"
             ));
         }
+        // ADR-006: Spark ANSI `pmod`/`mod` throw REMAINDER_BY_ZERO on a zero
+        // divisor; DuckDB's `pmod` macro / `mod` return NULL. Guard the call so
+        // a zero second argument raises Spark's error class.
+        "pmod" | "mod" if f.args.len() == 2 => {
+            let call = format!("{name_lower}({args_sql})");
+            if is_nonzero_literal(&f.args[1]) {
+                return Ok(call);
+            }
+            let divisor = render_expr(&f.args[1], schema)?;
+            return Ok(ansi_zero_guard(
+                &call,
+                &divisor,
+                "REMAINDER_BY_ZERO",
+                REMAINDER_BY_ZERO_MSG,
+            ));
+        }
         _ => &name_lower,
     };
     Ok(format!("{duck_name}({args_sql})"))
@@ -4718,6 +4734,53 @@ fn render_column_reference(c: &ColumnReference) -> Result<String, EmissionError>
     }
 }
 
+// ── ADR-006 ANSI divide/mod-by-zero guards ──────────────────────────────────
+//
+// Spark (ANSI, the corpus reference default) THROWS on divide/mod-by-zero;
+// DuckDB returns NULL/inf. τ wraps the emitted operator so a zero divisor
+// raises Spark's error class via DuckDB's `error()` scalar. The runtime layer
+// (`session.rs`) re-wraps that throw into a Spark-classed wire error, and the
+// differential harness keys on the leading `[TOKEN]`. The message text is
+// copied verbatim from Spark 4.1 so τ's error is byte-identical, not merely
+// class-identical.
+//
+// NOTE (ADR-006 follow-up): the architecturally cleaner home for these throws
+// is a `thdck_spark_funcs` extension function (`spark_div`/`spark_pmod`) that
+// raises with the class at the throw site, mirroring `spark_decimal_div` — it
+// avoids CASE-wrapping every division. The emitted-SQL guard below is the
+// in-repo interim; migrate when the extension gains those functions.
+const DIVIDE_BY_ZERO_MSG: &str = "Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
+const REMAINDER_BY_ZERO_MSG: &str = "Remainder by zero. Use `try_mod` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
+
+/// Wrap already-rendered division/modulo SQL so a zero `divisor` raises Spark's
+/// ANSI error instead of returning DuckDB's NULL/inf. A NULL divisor falls
+/// through to `inner` (`NULL = 0` is not TRUE), matching Spark (`a / NULL` =
+/// NULL, no throw).
+fn ansi_zero_guard(inner: &str, divisor: &str, class: &str, message: &str) -> String {
+    let escaped = message.replace('\'', "''");
+    format!("CASE WHEN ({divisor}) = 0 THEN error('[{class}] {escaped}') ELSE {inner} END")
+}
+
+/// True when `e` is a numeric literal that is provably non-zero, so the ANSI
+/// zero-guard can be skipped (the divisor can never be 0).
+fn is_nonzero_literal(e: &Expression) -> bool {
+    use super::expression::{Literal, LiteralValue as LV};
+    let Expression::Literal(Literal { value, .. }) = e else {
+        return false;
+    };
+    match value {
+        LV::Byte(v) => *v != 0,
+        LV::Short(v) => *v != 0,
+        LV::Int(v) => *v != 0,
+        LV::Long(v) => *v != 0,
+        LV::Float(v) => *v != 0.0,
+        LV::Double(v) => *v != 0.0,
+        // Decimal is carried as a string; non-zero unless every digit is 0.
+        LV::Decimal { value, .. } => value.bytes().any(|b| b.is_ascii_digit() && b != b'0'),
+        _ => false,
+    }
+}
+
 fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, EmissionError> {
     let l = render_expr(&b.left, schema)?;
     let r = render_expr(&b.right, schema)?;
@@ -4727,6 +4790,7 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
     // precision and violating the projection's declared type. Route to the
     // `thdck_spark_funcs` extension function `spark_decimal_div` which
     // implements Spark's rounding + scale semantics. Corpus: type-005.
+    // TODO(ADR-006): decimal divide-by-zero is not yet ANSI-guarded here.
     if matches!(b.op, BinaryOp::Div) {
         let lt = b.left.data_type(schema);
         let rt = b.right.data_type(schema);
@@ -4754,7 +4818,19 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
         BinaryOp::BitOr => "|",
         BinaryOp::BitXor => "#",
     };
-    Ok(format!("({l}) {op} ({r})"))
+    let inner = format!("({l}) {op} ({r})");
+    // ADR-006: guard divide/mod-by-zero with Spark's ANSI error class.
+    let guard = match b.op {
+        BinaryOp::Div | BinaryOp::IntDiv => Some(("DIVIDE_BY_ZERO", DIVIDE_BY_ZERO_MSG)),
+        BinaryOp::Mod => Some(("REMAINDER_BY_ZERO", REMAINDER_BY_ZERO_MSG)),
+        _ => None,
+    };
+    match guard {
+        Some((class, msg)) if !is_nonzero_literal(&b.right) => {
+            Ok(ansi_zero_guard(&inner, &r, class, msg))
+        }
+        _ => Ok(inner),
+    }
 }
 
 fn render_unary(u: &UnaryExpression, schema: &Schema) -> Result<String, EmissionError> {
@@ -6219,6 +6295,64 @@ mod tests {
         };
         let sql = render_binary(&b, &empty_schema()).expect("render");
         assert_eq!(sql, "(3) = (3)");
+    }
+
+    // ── ADR-006 ANSI divide/mod-by-zero guards (math-010/011) ────────────
+
+    #[test]
+    fn render_binary_div_column_divisor_guards_divide_by_zero() {
+        let b = BinaryExpression {
+            op: BinaryOp::Div,
+            left: Box::new(int_lit(6)),
+            right: Box::new(col_ref_expr("b")),
+        };
+        let sql = render_binary(&b, &empty_schema()).expect("render");
+        assert!(
+            sql.starts_with("CASE WHEN (b) = 0 THEN error('[DIVIDE_BY_ZERO]"),
+            "got: {sql}"
+        );
+        assert!(sql.ends_with("ELSE (6) / (b) END"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_binary_mod_column_divisor_guards_remainder_by_zero() {
+        let b = BinaryExpression {
+            op: BinaryOp::Mod,
+            left: Box::new(int_lit(6)),
+            right: Box::new(col_ref_expr("b")),
+        };
+        let sql = render_binary(&b, &empty_schema()).expect("render");
+        assert!(
+            sql.starts_with("CASE WHEN (b) = 0 THEN error('[REMAINDER_BY_ZERO]"),
+            "got: {sql}"
+        );
+        assert!(sql.ends_with("ELSE (6) % (b) END"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_binary_div_nonzero_literal_divisor_skips_guard() {
+        let b = BinaryExpression {
+            op: BinaryOp::Div,
+            left: Box::new(int_lit(6)),
+            right: Box::new(int_lit(2)),
+        };
+        let sql = render_binary(&b, &empty_schema()).expect("render");
+        assert_eq!(sql, "(6) / (2)");
+    }
+
+    #[test]
+    fn render_pmod_column_divisor_guards_remainder_by_zero() {
+        let f = FunctionCall {
+            name: "pmod".to_owned(),
+            args: vec![col_ref_expr("a"), col_ref_expr("b")],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render");
+        assert!(
+            sql.starts_with("CASE WHEN (b) = 0 THEN error('[REMAINDER_BY_ZERO]"),
+            "got: {sql}"
+        );
+        assert!(sql.ends_with("ELSE pmod(a, b) END"), "got: {sql}");
     }
 
     // ── 18. render_unary ─────────────────────────────────────────────────

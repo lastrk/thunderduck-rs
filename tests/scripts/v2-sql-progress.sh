@@ -1,33 +1,37 @@
 #!/usr/bin/env bash
-# Record the v2 transpiler's `core_v2` PASSED count, append a row to
-# tests/integration/v2_progress.md with the commit SHA and delta vs the
+# Record the τ SQL front-end's `sql_v2` PASSED count, append a row to
+# tests/integration/v2_sql_progress.md with the commit SHA and delta vs the
 # previous measurement.
 #
 # Usage:
-#     tests/scripts/v2-progress.sh
+#     tests/scripts/v2-sql-progress.sh
 #
 # Side effects:
-#     - Runs `tests/scripts/run-differential-tests.sh core_v2` (~1 min).
-#     - Appends one row to tests/integration/v2_progress.md (tracked in git).
+#     - Runs `tests/scripts/run-differential-tests.sh sql_v2` (~1 min).
+#     - Appends one row to tests/integration/v2_sql_progress.md (tracked in git).
 #
-# The goal is for the PASSED count to climb monotonically toward 324
-# (the corpus total) without regressing the `core` (legacy) suite.
+# The goal is for the PASSED count to climb monotonically toward the SQL corpus
+# total (`differential/sql_corpus.py` CASES) as τ grows temp-view registration,
+# the catalog bridge, and SQL grammar coverage. Sibling of `v2-progress.sh`
+# (which tracks the DataFrame-API `core_v2` corpus); the two milestones are
+# tracked in separate logs.
 
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-LOG_FILE="$WORKSPACE_DIR/tests/integration/v2_progress.md"
+LOG_FILE="$WORKSPACE_DIR/tests/integration/v2_sql_progress.md"
 
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
-echo "running core_v2 suite ..."
-# Tolerate non-zero exit — the suite is expected to fail until v2 lands all cases.
-"$SCRIPT_DIR/run-differential-tests.sh" core_v2 > "$TMP" 2>&1 || true
+echo "running sql_v2 suite ..."
+# Tolerate non-zero exit — the suite is expected to fail until τ lands the SQL
+# front-end (temp views, catalog bridge, grammar).
+"$SCRIPT_DIR/run-differential-tests.sh" sql_v2 > "$TMP" 2>&1 || true
 
 # Parse the pytest tail line, e.g.
-#   "================ 312 failed, 12 passed, 2 warnings in 60.24s ================"
+#   "================ 250 failed, 12 passed, 2 warnings in 60.24s ================"
 PASSED="$(grep -oE '[0-9]+ passed' "$TMP" | tail -1 | grep -oE '[0-9]+' || echo 0)"
 FAILED="$(grep -oE '[0-9]+ failed' "$TMP" | tail -1 | grep -oE '[0-9]+' || echo 0)"
 TOTAL="$((PASSED + FAILED))"
@@ -45,12 +49,13 @@ TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # Initialize the log file with a header on first run.
 if [ ! -f "$LOG_FILE" ]; then
     cat > "$LOG_FILE" <<EOF
-# v2 transpiler progress
+# τ SQL front-end progress
 
-One row per \`tests/scripts/v2-progress.sh\` invocation. Each row records the
-\`core_v2\` suite (DataFrame corpus run through τ) PASSED count at the given
-commit. The goal is for PASSED to climb monotonically toward $TOTAL (the corpus
-total).
+One row per \`tests/scripts/v2-sql-progress.sh\` invocation. Each row records the
+\`sql_v2\` suite (Spark SQL conformance corpus \`differential/sql_corpus.py\`,
+run through τ) PASSED count at the given commit. The goal is for PASSED to climb
+monotonically toward $TOTAL (the corpus total) as τ grows temp-view
+registration, the catalog bridge, and SQL grammar coverage.
 
 | Timestamp UTC        | Commit  | Passed | Failed | Total | Δ vs prev |
 | -------------------- | ------- | -----: | -----: | ----: | --------: |

@@ -14,8 +14,11 @@
 //! # the fast representative gate (DataFrame-only conformance corpus):
 //! cargo test -p thunderduck-connect-server --test differential core    -- --ignored --nocapture
 //!
-//! # same corpus routed through the v2 transpiler — the v2 development gate:
+//! # same corpus through τ — the v2 development gate:
 //! cargo test -p thunderduck-connect-server --test differential core_v2 -- --ignored --nocapture
+//!
+//! # Spark SQL conformance corpus (spark.sql) through τ — the SQL front-end gate:
+//! cargo test -p thunderduck-connect-server --test differential sql_v2  -- --ignored --nocapture
 //!
 //! # any single suite (use cargo's test-name filter to pick):
 //! cargo test -p thunderduck-connect-server --test differential tpch    -- --ignored --nocapture
@@ -72,13 +75,22 @@ fn core() {
     run_suite("core");
 }
 
-/// Same corpus, routed through `THUNDERDUCK_TRANSPILER=v2`. Today expect
-/// nearly all cases to fail with gRPC `Unimplemented` (v2 stub). Each commit
-/// growing the v2 dispatch table should turn one or more Case IDs green.
+/// Same DataFrame corpus through τ — the v2 development gate. Each commit
+/// growing τ's coverage should turn one or more Case IDs green.
 #[test]
 #[ignore]
 fn core_v2() {
     run_suite("core_v2");
+}
+
+/// Spark SQL conformance corpus (`spark.sql`) through τ — the SQL front-end
+/// gate. Today expect nearly all cases to fail (temp-view registration, the
+/// catalog bridge, and most grammar are unimplemented); each commit growing
+/// τ's SQL surface should turn one or more Case IDs green.
+#[test]
+#[ignore]
+fn sql_v2() {
+    run_suite("sql_v2");
 }
 
 #[test]

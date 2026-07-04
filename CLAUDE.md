@@ -20,6 +20,7 @@ The older [docs/architecture.md](docs/architecture.md) and [docs/adrs/](docs/adr
 
 **Practical implications:**
 - The DataFrame corpus (`tests/scripts/v2-progress.sh`, 324 cases) is the fitness function; TPC-H is temporarily red until τ covers its query surface.
+- The SQL corpus (`differential/sql_corpus.py`, 262 `spark.sql` cases) is the fitness function for the τ SQL front-end — run it with `./tests/scripts/run-differential-tests.sh sql_v2` (or `tests/scripts/v2-sql-progress.sh` to record a progress row in `tests/integration/v2_sql_progress.md`).
 - No new work in modules outside τ. `crates/core/src/{logical,expression,generator,functions}/` and `crates/connect-server/src/converter/{expression,plan,relation,type}_converter.rs` are not part of τ and are deletable at any point (see readiness map §Slice K).
 - Delete legacy files freely once nothing (test, runtime path, doc) references them; see `tasks/v2-adr-readiness-map.md` §Slice K.
 

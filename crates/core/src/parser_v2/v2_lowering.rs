@@ -29,8 +29,9 @@ use sqlparser::ast::{
 use crate::transpiler_v2::ast::{CommonAst, CommonOp, JoinType};
 use crate::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
-    FunctionCall, InListExpression, LikeExpression, Literal, LiteralValue, NullOrdering,
-    SortDirection, SortOrder, StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn,
+    FunctionCall, InListExpression, LambdaExpression, LambdaVariableExpression, LikeExpression,
+    Literal, LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, UnaryExpression,
+    UnaryOp, UnresolvedColumn,
 };
 use crate::transpiler_v2::type_inference::AGGREGATE_NAMES;
 use crate::transpiler_v2::EmissionError;
@@ -706,10 +707,152 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
                 distinct: false,
             }))
         }
+        Expr::Lambda(lambda) => {
+            let params: Vec<String> = lambda.params.iter().map(|p| p.value.clone()).collect();
+            let body = lower_expr(*lambda.body)?;
+            // SparkSQL parses lambda-body identifiers as regular columns
+            // (`Expr::Identifier("acc")` → `UnresolvedColumn(acc)`). The
+            // analyzer treats `Lambda` opaquely (analyzer.rs:1747), so those
+            // references never resolve. Rewrite them to `LambdaVariable`
+            // so emission (emission.rs:1681) renders them as DuckDB lambda
+            // parameters (`acc`, `x`). The protobuf front-end never hits this
+            // — it receives `UnresolvedNamedLambdaVariable` directly.
+            let body = rewrite_lambda_params_to_vars(body, &params);
+            Ok(Expression::Lambda(LambdaExpression {
+                params,
+                body: Box::new(body),
+            }))
+        }
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::expr::{}", expr_kind(&other)),
             reason: "expression shape not supported at Slice A.2".to_owned(),
         }),
+    }
+}
+
+/// Walk a lowered lambda body and replace every `UnresolvedColumn` whose name
+/// matches one of `params` (and whose qualifier is `None`) with a
+/// `LambdaVariable` of the same name. Handles nested Lambdas via shadowing:
+/// if an inner lambda re-binds one of our params, that param is removed from
+/// the "still-active" set for that subtree.
+fn rewrite_lambda_params_to_vars(body: Expression, params: &[String]) -> Expression {
+    if params.is_empty() {
+        return body;
+    }
+    match body {
+        Expression::UnresolvedColumn(u)
+            if u.qualifier.is_none() && params.iter().any(|p| p == &u.name) =>
+        {
+            Expression::LambdaVariable(LambdaVariableExpression { name: u.name })
+        }
+        Expression::Binary(b) => Expression::Binary(BinaryExpression {
+            op: b.op,
+            left: Box::new(rewrite_lambda_params_to_vars(*b.left, params)),
+            right: Box::new(rewrite_lambda_params_to_vars(*b.right, params)),
+        }),
+        Expression::Unary(u) => Expression::Unary(UnaryExpression {
+            op: u.op,
+            operand: Box::new(rewrite_lambda_params_to_vars(*u.operand, params)),
+        }),
+        Expression::FunctionCall(fc) => Expression::FunctionCall(FunctionCall {
+            name: fc.name,
+            args: fc
+                .args
+                .into_iter()
+                .map(|a| rewrite_lambda_params_to_vars(a, params))
+                .collect(),
+            distinct: fc.distinct,
+        }),
+        Expression::Cast(c) => Expression::Cast(CastExpression {
+            expr: Box::new(rewrite_lambda_params_to_vars(*c.expr, params)),
+            to_type: c.to_type,
+            try_cast: c.try_cast,
+        }),
+        Expression::CaseWhen(cw) => Expression::CaseWhen(CaseWhenExpression {
+            branches: cw
+                .branches
+                .into_iter()
+                .map(|(w, t)| {
+                    (
+                        rewrite_lambda_params_to_vars(w, params),
+                        rewrite_lambda_params_to_vars(t, params),
+                    )
+                })
+                .collect(),
+            else_expr: cw
+                .else_expr
+                .map(|e| Box::new(rewrite_lambda_params_to_vars(*e, params))),
+        }),
+        Expression::Alias(a) => Expression::Alias(AliasExpression {
+            expr: Box::new(rewrite_lambda_params_to_vars(*a.expr, params)),
+            alias: a.alias,
+        }),
+        Expression::Lambda(inner) => {
+            // Inner lambda's params shadow ours: drop them from the active set
+            // before descending into the inner body.
+            let remaining: Vec<String> = params
+                .iter()
+                .filter(|p| !inner.params.iter().any(|ip| ip == *p))
+                .cloned()
+                .collect();
+            let new_body = rewrite_lambda_params_to_vars(*inner.body, &remaining);
+            Expression::Lambda(LambdaExpression {
+                params: inner.params,
+                body: Box::new(new_body),
+            })
+        }
+        Expression::Between(b) => {
+            Expression::Between(crate::transpiler_v2::expression::BetweenExpression {
+                expr: Box::new(rewrite_lambda_params_to_vars(*b.expr, params)),
+                low: Box::new(rewrite_lambda_params_to_vars(*b.low, params)),
+                high: Box::new(rewrite_lambda_params_to_vars(*b.high, params)),
+                negated: b.negated,
+            })
+        }
+        Expression::InList(i) => Expression::InList(InListExpression {
+            expr: Box::new(rewrite_lambda_params_to_vars(*i.expr, params)),
+            list: i
+                .list
+                .into_iter()
+                .map(|e| rewrite_lambda_params_to_vars(e, params))
+                .collect(),
+            negated: i.negated,
+        }),
+        Expression::Like(l) => Expression::Like(LikeExpression {
+            value: Box::new(rewrite_lambda_params_to_vars(*l.value, params)),
+            pattern: Box::new(rewrite_lambda_params_to_vars(*l.pattern, params)),
+            escape: l.escape,
+            case_insensitive: l.case_insensitive,
+            negated: l.negated,
+        }),
+        Expression::IsDistinctFrom(d) => {
+            Expression::IsDistinctFrom(crate::transpiler_v2::expression::IsDistinctFromExpression {
+                left: Box::new(rewrite_lambda_params_to_vars(*d.left, params)),
+                right: Box::new(rewrite_lambda_params_to_vars(*d.right, params)),
+                negated: d.negated,
+            })
+        }
+        Expression::ExtractValue(ev) => {
+            Expression::ExtractValue(crate::transpiler_v2::expression::ExtractValueExpression {
+                child: Box::new(rewrite_lambda_params_to_vars(*ev.child, params)),
+                extraction: Box::new(rewrite_lambda_params_to_vars(*ev.extraction, params)),
+            })
+        }
+        Expression::ArrayLiteral(a) => {
+            Expression::ArrayLiteral(crate::transpiler_v2::expression::ArrayLiteralExpression {
+                element_type: a.element_type,
+                elements: a
+                    .elements
+                    .into_iter()
+                    .map(|e| rewrite_lambda_params_to_vars(e, params))
+                    .collect(),
+            })
+        }
+        // Leaf variants + shapes that don't carry column refs in typical
+        // lambda bodies: return unchanged. Subqueries/windows/etc. inside a
+        // Spark lambda body would themselves be `UnsupportedProtoShape` from
+        // upstream lower_expr — never reaching this rewrite.
+        other => other,
     }
 }
 
@@ -729,6 +872,7 @@ fn expr_kind(e: &Expr) -> &'static str {
         Expr::Rollup(_) => "rollup",
         Expr::Cube(_) => "cube",
         Expr::GroupingSets(_) => "grouping_sets",
+        Expr::Lambda(_) => "lambda",
         _ => "other",
     }
 }
@@ -1149,6 +1293,47 @@ mod tests {
             },
             _ => panic!("expected Project"),
         }
+    }
+
+    #[test]
+    fn single_arg_lambda_lowers_to_lambda_expression() {
+        // Pass 84: `x -> upper(x)` inside `transform(tags, ...)` must lower to
+        // `Expression::Lambda { params: ["x"], body: FunctionCall(upper) }`.
+        let plan = parse("SELECT transform(tags, x -> upper(x)) FROM emp").expect("should parse");
+        let CommonOp::Project { projections, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        let Expression::FunctionCall(fc) = &projections[0] else {
+            panic!("expected FunctionCall, got {:?}", projections[0]);
+        };
+        assert_eq!(fc.name.to_lowercase(), "transform");
+        assert_eq!(fc.args.len(), 2);
+        let Expression::Lambda(lambda) = &fc.args[1] else {
+            panic!("expected Lambda as second arg, got {:?}", fc.args[1]);
+        };
+        assert_eq!(lambda.params, vec!["x".to_owned()]);
+        assert!(matches!(&*lambda.body, Expression::FunctionCall(_)));
+    }
+
+    #[test]
+    fn multi_arg_lambda_lowers_to_lambda_expression() {
+        // Pass 84: `(acc, x) -> concat(acc, x)` inside `reduce(...)` must lower
+        // to `Expression::Lambda { params: ["acc", "x"], body: FunctionCall }`.
+        let plan = parse("SELECT reduce(tags, '', (acc, x) -> concat(acc, x)) FROM emp")
+            .expect("should parse");
+        let CommonOp::Project { projections, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        let Expression::FunctionCall(fc) = &projections[0] else {
+            panic!("expected FunctionCall, got {:?}", projections[0]);
+        };
+        assert_eq!(fc.name.to_lowercase(), "reduce");
+        assert_eq!(fc.args.len(), 3);
+        let Expression::Lambda(lambda) = &fc.args[2] else {
+            panic!("expected Lambda as third arg, got {:?}", fc.args[2]);
+        };
+        assert_eq!(lambda.params, vec!["acc".to_owned(), "x".to_owned()]);
+        assert!(matches!(&*lambda.body, Expression::FunctionCall(_)));
     }
 
     #[test]

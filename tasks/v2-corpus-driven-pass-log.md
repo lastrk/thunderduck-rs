@@ -445,6 +445,22 @@ the summary below records the corpus deltas by pass number.
   1. Harness-hardening pass: differential harness should exercise `nondeterministic`-flagged cases end-to-end (currently PySpark-local schema check bypasses τ), preventing future harness-loophole regressions.
 - Compiler warning delta: 36 → 36.
 - Quality Gate: PASS (cargo check both crates, rustfmt clean, 10 sample-related tests pass, connect-server 69/69, samp-001+samp-002 both PASSED individually).
+- Commit SHA: 5a603eb.
+
+## Pass 84 — 2026-07-04T (in progress)
+- Case: `struc-006` — `F.expr("reduce(tags, '', (acc, x) -> concat(acc, x))")`. SparkSQL parser lambda support gap.
+- Diagnostic: `.agent-output/diagnostic-pass-84.md` — `parser_v2/v2_lowering.rs:709` had no `Expr::Lambda` arm; falls through catch-all with mis-named `sql::expr::other` shape. Legacy has the arm at `parser/sql_converter.rs:1193-1200`.
+- Architecture: `.agent-output/architecture-pass-84.md` — single-file port; add `Expr::Lambda` arm + `expr_kind` update + `LambdaExpression` import.
+- Layer(s) touched: parser_v2 (`v2_lowering.rs`).
+- ADR citations: ADR-003 (front-end symmetry — protobuf front-end already emits `Expression::Lambda`; SparkSQL was missing), ADR-015 (Spark HOF `->` parity), ADR-022 (correctness — remove mis-named "sql::expr::other" wire error).
+- Corpus signal: 301 → **302** (+1). struc-006 GREEN. hof-003 (independent protobuf path) unchanged. Also unlocks all SparkSQL HOFs via `F.expr(...)` / `selectExpr(...)` — no other corpus witnesses today, but latent capability opened.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Tests added: 2 (single-arg + multi-arg lambda lowering).
+- **Deviation from plan**: plan claimed downstream was fully wired for `Expression::Lambda`. In practice, the analyzer treats `Lambda` opaquely, so `UnresolvedColumn(param)` refs inside the lambda body reach emission unresolved → `unsupported expression UnresolvedColumn`. Coder added a `rewrite_lambda_params_to_vars` helper (one function in the same file) that walks the body and rewrites `UnresolvedColumn(name)` → `LambdaVariable` when `name` matches a lambda param. Supports nested-lambda shadowing via `remaining = params \ inner.params` computation at each nested-Lambda descent. Legacy avoided this because its SqlGenerator was permissive enough to emit bare `UnresolvedColumn(name)` — τ's stricter contract requires the rewrite.
+- Findings CLOSE_NOW_IN_THIS_PASS: 0 blocking. Reviewer APPROVED (0 Critical + 0 High + 0 Medium + 3 Low: L1 unit tests don't verify rewrite fired — pure body-shape asserts; L2 no test for nested-lambda shadowing; L3 mixed inline vs top-of-file import style). Perf OPTIMIZED (0 HIGH + 0 MEDIUM; per-child recursion allocs are intrinsic to owned-value rewrite shape; cold path).
+- Findings queued as follow-up: 1 — add corpus-invariant tests that verify `rewrite_lambda_params_to_vars` fires (assert `LambdaVariable` in body) + nested-lambda shadowing test. Cheap; can bundle with next parser pass.
+- Compiler warning delta: 36 → 36 (0 new).
+- Quality Gate: PASS (cargo check both crates, rustfmt clean on touched file, `cargo test -- lambda` 6/6, corpus 302, no regression on hof-003).
 - Commit SHA: pending.
 
 

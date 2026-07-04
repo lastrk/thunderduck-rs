@@ -3330,11 +3330,36 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 // NULL on `[1]`, matching Spark's map miss semantics.
                 return Ok(format!("element_at({coll}, {key})[1]"));
             }
-            // Default (Array or unknown): use DuckDB's `list_extract`,
-            // which is 1-based and returns NULL on OOB (matches Spark
-            // non-ANSI behavior). Spark raises on OOB in ANSI mode;
-            // corpus `arr-008` is intentionally an error case on both
-            // sides (τ tracks the corpus in non-ANSI mode).
+            // Array (or unknown, which the type inferencer routes here by
+            // default): DuckDB's `list_extract` is 1-based but returns NULL
+            // silently on OOB / index-0 / negative-OOB. Spark 4.1 ANSI
+            // instead throws `INVALID_ARRAY_INDEX_IN_ELEMENT_AT`; wrap the
+            // call in a CASE so the guard raises at DuckDB level with the
+            // Spark-verbatim class + message. The parenthesization of `idx`
+            // and `arr` inside the CASE lets negative literals (`-4`) and
+            // arbitrary expressions bind correctly (see `error(...)`
+            // helper). NULL array short-circuits to NULL (Spark
+            // `nullSafeEval`). Corpus: `arr-008`.
+            let err = array_index_error_expr(&key, &coll);
+            return Ok(format!(
+                "CASE WHEN ({coll}) IS NULL THEN NULL WHEN ({key}) = 0 OR abs(({key})) > len(({coll})) THEN {err} ELSE list_extract(({coll}), ({key})) END"
+            ));
+        }
+        // Spark's `try_element_at(coll, k)` is the never-throw variant of
+        // `element_at` — OOB / invalid index yields NULL instead of raising
+        // `INVALID_ARRAY_INDEX_IN_ELEMENT_AT`. DuckDB's `list_extract`
+        // matches that non-throwing semantic natively (see the Array arm
+        // above); Map preserves the unwrap. No corpus witness today, but
+        // the nullability arm at `expression.rs:1035` already declares
+        // `try_element_at` — colocated here so future adds work
+        // end-to-end.
+        "try_element_at" if f.args.len() == 2 => {
+            let coll = render_expr(&f.args[0], schema)?;
+            let key = render_expr(&f.args[1], schema)?;
+            let coll_ty = f.args[0].data_type(schema);
+            if let DataType::Map { .. } = coll_ty {
+                return Ok(format!("element_at({coll}, {key})[1]"));
+            }
             return Ok(format!("list_extract({coll}, {key})"));
         }
         // Spark's `typeof(x)` returns lowercase type strings (`double`,
@@ -4749,6 +4774,32 @@ fn render_column_reference(c: &ColumnReference) -> Result<String, EmissionError>
 // in-repo interim; migrate when the extension gains those functions.
 const DIVIDE_BY_ZERO_MSG: &str = "Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
 const REMAINDER_BY_ZERO_MSG: &str = "Remainder by zero. Use `try_mod` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
+
+// Spark 4.1's `INVALID_ARRAY_INDEX_IN_ELEMENT_AT` message is runtime-templated
+// — the index value and array size are interpolated per row. The three
+// fragments below bracket the two `||`-concatenated substitutions:
+//
+//   HEAD || (idx)::VARCHAR || MID || len(arr)::VARCHAR || TAIL
+//
+// The backticks around `try_element_at` are safe inside a SQL single-quoted
+// string literal (only apostrophes need `''` escaping) — verified in DuckDB.
+const INVALID_ARRAY_INDEX_MSG_HEAD: &str = "[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index ";
+const INVALID_ARRAY_INDEX_MSG_MID: &str = " is out of bounds. The array has ";
+const INVALID_ARRAY_INDEX_MSG_TAIL: &str = " elements. Use `try_element_at` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003";
+
+/// Build the DuckDB `error('[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index N is
+/// out of bounds. The array has M elements. Use `try_element_at` ... SQLSTATE:
+/// 22003')` call, interpolating `idx` and `len(arr)` at runtime. Callers must
+/// pass already-rendered SQL fragments; both are wrapped in parens so negative
+/// literals (`-4::VARCHAR` binds as `-(4::VARCHAR)`) survive the cast.
+fn array_index_error_expr(idx_sql: &str, arr_sql: &str) -> String {
+    format!(
+        "error('{head}' || ({idx_sql})::VARCHAR || '{mid}' || len(({arr_sql}))::VARCHAR || '{tail}')",
+        head = INVALID_ARRAY_INDEX_MSG_HEAD,
+        mid = INVALID_ARRAY_INDEX_MSG_MID,
+        tail = INVALID_ARRAY_INDEX_MSG_TAIL,
+    )
+}
 
 /// Wrap already-rendered division/modulo SQL so a zero `divisor` raises Spark's
 /// ANSI error instead of returning DuckDB's NULL/inf. A NULL divisor falls
@@ -9188,10 +9239,13 @@ mod tests {
         assert_eq!(sql, "element_at(attrs, 'team')[1]");
     }
 
-    /// `arr-008` behavioral test — `element_at(ARRAY, i)` uses
-    /// `list_extract` (1-based, NULL on OOB in non-ANSI mode).
+    /// Pass 95 (`arr-008` ANSI throw) — `element_at(ARRAY, i)` wraps the
+    /// underlying `list_extract` in a CASE that raises Spark's
+    /// `INVALID_ARRAY_INDEX_IN_ELEMENT_AT` on OOB / index-0. The message
+    /// must be byte-identical to Spark 4.1's runtime template (with
+    /// runtime-interpolated `idx` and `len(arr)`).
     #[test]
-    fn render_element_at_array_uses_list_extract() {
+    fn render_element_at_array_wraps_with_ansi_oob_guard() {
         let arr_col = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
@@ -9210,7 +9264,131 @@ mod tests {
             distinct: false,
         };
         let sql = render_function_call(&f, &empty_schema()).expect("render element_at array");
+        // Spark class token — the runtime classifier keys on this.
+        assert!(
+            sql.contains("[INVALID_ARRAY_INDEX_IN_ELEMENT_AT]"),
+            "expected Spark class token, got: {sql}"
+        );
+        // Underlying extractor still routes to DuckDB's list_extract.
+        assert!(
+            sql.contains("list_extract((tags), (1))"),
+            "expected list_extract fall-through in ELSE, got: {sql}"
+        );
+        // Verbatim message fragments (bracket the runtime substitutions).
+        assert!(
+            sql.contains(INVALID_ARRAY_INDEX_MSG_HEAD),
+            "expected HEAD fragment, got: {sql}"
+        );
+        assert!(
+            sql.contains(INVALID_ARRAY_INDEX_MSG_MID),
+            "expected MID fragment, got: {sql}"
+        );
+        assert!(
+            sql.contains(INVALID_ARRAY_INDEX_MSG_TAIL),
+            "expected TAIL fragment, got: {sql}"
+        );
+        // Full guard shape (NULL short-circuit + idx=0/OOB throw + ELSE fall-through).
+        assert_eq!(
+            sql,
+            "CASE WHEN (tags) IS NULL THEN NULL WHEN (1) = 0 OR abs((1)) > len((tags)) \
+             THEN error('[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index ' || (1)::VARCHAR \
+             || ' is out of bounds. The array has ' || len((tags))::VARCHAR \
+             || ' elements. Use `try_element_at` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003') \
+             ELSE list_extract((tags), (1)) END"
+        );
+    }
+
+    /// Pass 95 — a positive integer literal is NOT provably in-bounds
+    /// because the array length is only known at runtime (`tags` is a
+    /// column, not an ArrayLiteral). The guard must still fire; do not
+    /// short-circuit on `is_nonzero_literal`-style predicates.
+    #[test]
+    fn render_element_at_positive_literal_still_guarded_since_len_unknown() {
+        let arr_col = Expression::ColumnReference(ColumnReference {
+            name: "tags".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
+            nullable: Some(true),
+        });
+        let f = FunctionCall {
+            name: "element_at".to_owned(),
+            args: vec![
+                arr_col,
+                Expression::Literal(super::super::expression::Literal {
+                    value: super::super::expression::LiteralValue::Int(1),
+                    data_type: DataType::Integer,
+                }),
+            ],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render element_at array");
+        assert!(
+            sql.starts_with("CASE WHEN"),
+            "expected CASE guard even for positive literal, got: {sql}"
+        );
+        assert!(
+            sql.contains("error("),
+            "expected error() call inside guard, got: {sql}"
+        );
+    }
+
+    /// Pass 95 — `try_element_at(arr, k)` is the never-throw alias; it
+    /// emits bare `list_extract` without the ANSI guard so DuckDB's
+    /// silent-NULL semantics for OOB propagate to the caller.
+    #[test]
+    fn render_try_element_at_omits_guard() {
+        let arr_col = Expression::ColumnReference(ColumnReference {
+            name: "tags".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
+            nullable: Some(true),
+        });
+        let f = FunctionCall {
+            name: "try_element_at".to_owned(),
+            args: vec![
+                arr_col,
+                Expression::Literal(super::super::expression::Literal {
+                    value: super::super::expression::LiteralValue::Int(1),
+                    data_type: DataType::Integer,
+                }),
+            ],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render try_element_at");
         assert_eq!(sql, "list_extract(tags, 1)");
+        assert!(
+            !sql.contains("error("),
+            "try_element_at must NOT emit error() guard, got: {sql}"
+        );
+    }
+
+    /// Pass 95 — the Map arm of `element_at` is untouched: it still emits
+    /// the singleton-unwrap `element_at(MAP, key)[1]`. Spark does not throw
+    /// on missing map keys (returns NULL); the ANSI OOB guard applies only
+    /// to Array collections.
+    #[test]
+    fn render_element_at_map_unchanged() {
+        let map_col = Expression::ColumnReference(ColumnReference {
+            name: "attrs".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::String),
+                value_nullable: true,
+            }),
+            nullable: Some(true),
+        });
+        let f = FunctionCall {
+            name: "element_at".to_owned(),
+            args: vec![map_col, str_lit("missing")],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render element_at map");
+        assert_eq!(sql, "element_at(attrs, 'missing')[1]");
+        assert!(
+            !sql.contains("INVALID_ARRAY_INDEX_IN_ELEMENT_AT"),
+            "Map arm must not carry Array ANSI guard, got: {sql}"
+        );
     }
 
     /// `meta-003` regression — `typeof(x)` wraps in `lower(...)` for

@@ -642,6 +642,21 @@ the summary below records the corpus deltas by pass number.
 - Quality Gate: PASS (cargo build --release clean, `v2-progress.sh` 312/12/324 with math-010 + math-011 GREEN via error-parity, no regressions on prior 310 green cases).
 - Commit SHA: 933908c (integrated by fast-forward merge into feat/v2-transpiler).
 
+## Pass 95 — 2026-07-04T
+- Case: `arr-008` — `F.element_at("tags", 1)` on rows where `tags` is empty. Spark 4.1.1 ANSI throws `[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] SQLSTATE: 22003`; τ was silently returning NULL. Now tagged with `expected_error="INVALID_ARRAY_INDEX_IN_ELEMENT_AT"`.
+- Diagnostic: `.agent-output/diagnostic-pass-95.md` — single-arm modification at `emission.rs:3333-3338` (`element_at` Array branch). Reuses the exact Pass 94 pattern: `error('[CLASS] ... SQLSTATE: ...')` wrapped in CASE, `ThunderduckError::SparkRuntime` catch-and-rewrap seam already end-to-end.
+- Architecture: skipped — pattern well-established from Pass 94 (`933908c`); diagnostic sufficed for coder handoff.
+- Layer(s) touched: τ core emission (`element_at` Array arm now `CASE WHEN arr IS NULL THEN NULL WHEN idx=0 OR abs(idx)>len(arr) THEN error(dynamic-message) ELSE list_extract(arr,idx) END`; new `try_element_at` arm emits bare `list_extract` per Spark's try_* semantics), corpus tag.
+- ADR citations: ADR-006 (error emulation contract — second data-dependent Spark-emulated error, mirrors math-010/011 substrate), ADR-015 (Spark parity — byte-identical message text via runtime concat), ADR-022 (τ-only, category-1 Spark-emulated).
+- Corpus signal: 312 → **313** (+1). arr-008 GREEN via error-parity.
+- Files: `crates/core/src/transpiler_v2/emission.rs`, `tests/integration/differential/dataframe_corpus.py`.
+- Tests added: 4 (1 renamed + 3 new — assert exact SPARK message const, positive-literal still guarded, try_element_at bare, Map arm untouched).
+- Findings CLOSE_NOW_IN_THIS_PASS: 0 blocking. Reviewer 0 Critical + 0 High + 0 Medium + 2 Low (apostrophe-escape defensive hardening in `array_index_error_expr`; known-length ArrayLiteral guard-skip follow-up). Perf 0 HIGH/MEDIUM (INFO: `len()` is O(1) on DuckDB LIST, sub-µs per row; SQL-length repetition is emission-time; DuckDB CSE handles runtime deterministic refs).
+- Findings queued as follow-up: `spark_element_at` extension fn for throw-at-source semantics (parallel to Pass 94's queued `spark_div`/`spark_pmod` — same ADR-006 note); known-length ArrayLiteral guard skip.
+- Compiler warning delta: baseline preserved.
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 625/0, `cargo test -p thunderduck-connect-server --tests` 69/0, release build clean, `v2-progress.sh` 313/11/324 with arr-008 PASSED, no regressions).
+- Commit SHA: pending.
+
 
 
 

@@ -116,8 +116,11 @@ Evidence:      <experiments confirming + ones eliminating alternatives>
 3. Predict side effects (other transformation steps? public API?).
 4. Verify: `cargo check`, `cargo clippy -- -D warnings`, `cargo test`.
 5. **Cleanup**: remove every `dbg!()`, diagnostic assertion, temporary
-   type annotation. Check with `grep -rn "dbg!" src/` and
-   `grep -rn "// DIAGNOSTIC" src/`.
+   type annotation. Check via the Bash tool with
+   `grep -rn "dbg!" src/` and `grep -rn "// DIAGNOSTIC" src/` — Claude
+   Code v2.1.117+ removed the standalone `Grep`/`Glob` tools on native
+   macOS/Linux builds; shell `grep` (invoked through `Bash`) is the
+   canonical replacement.
 
 ## Architectural stop rule
 

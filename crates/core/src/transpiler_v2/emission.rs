@@ -1558,6 +1558,10 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
             shape: "UnresolvedColumn".to_owned(),
             reason: format!("analyzer must resolve column `{}` before emission", u.name),
         }),
+        Expression::UnresolvedRegex(_) => Err(EmissionError::UnsupportedExpression {
+            shape: "UnresolvedRegex".to_owned(),
+            reason: "analyzer must expand regex projections in Project pre-pass".to_owned(),
+        }),
         Expression::Binary(b) => render_binary(b, schema),
         Expression::Unary(u) => render_unary(u, schema),
         Expression::FunctionCall(f) => {
@@ -5812,6 +5816,24 @@ mod tests {
         });
         let err = render_expr(&expr, &empty_schema()).unwrap_err();
         assert!(matches!(err, EmissionError::UnsupportedFunction { .. }));
+    }
+
+    // ── Pass 85 — defensive UnresolvedRegex arm ─────────────────────────
+
+    #[test]
+    fn render_expr_on_unresolved_regex_returns_unsupported_expression() {
+        use crate::transpiler_v2::expression::UnresolvedRegexExpression;
+        let expr = Expression::UnresolvedRegex(UnresolvedRegexExpression {
+            pattern: ".*_id".to_owned(),
+            plan_id: None,
+        });
+        let err = render_expr(&expr, &empty_schema()).unwrap_err();
+        match err {
+            EmissionError::UnsupportedExpression { shape, .. } => {
+                assert_eq!(shape, "UnresolvedRegex");
+            }
+            other => panic!("expected UnsupportedExpression, got {other:?}"),
+        }
     }
 
     // ── 24. Unsupported aggregate ────────────────────────────────────────

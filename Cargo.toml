@@ -27,6 +27,7 @@ clap       = { version = "4", features = ["derive"] }
 uuid       = { version = "1", features = ["v4"] }
 futures    = "0.3"
 sqlparser  = "0.61"
+regex      = "1"
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

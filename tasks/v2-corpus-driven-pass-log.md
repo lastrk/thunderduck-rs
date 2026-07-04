@@ -461,6 +461,21 @@ the summary below records the corpus deltas by pass number.
 - Findings queued as follow-up: 1 — add corpus-invariant tests that verify `rewrite_lambda_params_to_vars` fires (assert `LambdaVariable` in body) + nested-lambda shadowing test. Cheap; can bundle with next parser pass.
 - Compiler warning delta: 36 → 36 (0 new).
 - Quality Gate: PASS (cargo check both crates, rustfmt clean on touched file, `cargo test -- lambda` 6/6, corpus 302, no regression on hof-003).
+- Commit SHA: 2a1c580.
+
+## Pass 85 — 2026-07-04T (in progress)
+- Case: `struc-002` — `df.colRegex("\`.*_id\`")` — regex-based column selection.
+- Diagnostic: `.agent-output/diagnostic-pass-85.md` — `V2ExpressionConverter::convert` had no `ExprType::UnresolvedRegex` arm; no τ `Expression` variant; expansion is schema-dependent so must happen in analyzer.
+- Architecture: `.agent-output/architecture-pass-85.md` — analyzer-driven expansion (mirrors `Expression::Star`); reject Java's `COLUMNS('pattern')` shortcut per ADR-015 (needs real schema in AnalyzePlan).
+- Layer(s) touched: expression AST (new `Expression::UnresolvedRegex` variant + defensive `data_type`/`nullable` arms), analyzer (`expand_regex_projections` pre-pass in `CommonOp::Project`, opaque `resolve_and_stamp` arm, `expression_is_fully_resolved` returns false), emission (defensive `UnsupportedExpression` arm — never fires in happy path), converter (`convert_unresolved_regex` + `strip_regex_backticks`), Cargo.toml (new `regex = "1"` workspace dep).
+- ADR citations: ADR-003 (CommonAst extension), ADR-015 (analyzer expansion → real schema in AnalyzePlan), ADR-022 (retires 1 Thunderduck-boundary; introduces 2 Spark-emulated errors: invalid regex, no-match).
+- Corpus signal: 302 → **303** (+1). struc-002 GREEN.
+- Files: `crates/core/src/transpiler_v2/{expression.rs, analyzer.rs, emission.rs}`, `crates/connect-server/src/converter/v2_relation_converter.rs`, `Cargo.toml`, `crates/core/Cargo.toml`.
+- Tests added: 10 (2 expression, 5 analyzer, 1 emission, 2 converter).
+- Findings CLOSE_NOW_IN_THIS_PASS: 0 blocking. Reviewer APPROVED (0 Critical + 0 High + 0 Medium + 2 Low/informational: N1 Rust `is_match` is partial-match vs Spark `Pattern.matcher.matches()` full-match — not corpus-witnessed, consistent with Java Thunderduck reference which used DuckDB COLUMNS() also partial; N2 backtick-strip requires both — deliberate). Perf OPTIMIZED (0 HIGH + 0 MEDIUM + 0 LOW + 6 INFO; all analysis-time cold-path).
+- Findings queued as follow-up: 1 — N1 partial-vs-full match latent divergence; anchor to Spark parity when a witness surfaces.
+- Compiler warning delta: 36 → 36 (0 new).
+- Quality Gate: PASS (cargo check both crates clean, rustfmt on touched files, `cargo test -- regex` passes, release build 36 warnings, struc-002 PASSED).
 - Commit SHA: pending.
 
 

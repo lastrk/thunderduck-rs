@@ -734,6 +734,10 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
         // ── Unary ─────────────────────────────────────────────────────────
         CommonOp::Project { input, projections } => {
             let typed_input = analyze_node(*input, base_types)?;
+            // Pass 85 — expand `df.colRegex("`.*_id`")` projections BEFORE
+            // resolution. Each `UnresolvedRegex` becomes N `UnresolvedColumn`
+            // refs (one per matching input field, schema order preserved).
+            let projections = expand_regex_projections(projections, &typed_input.resolved_schema)?;
             let projections = projections
                 .into_iter()
                 .map(|e| resolve_and_stamp(e, &typed_input.resolved_schema))
@@ -1570,6 +1574,55 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
 
 // ── Expression resolution helpers ───────────────────────────────────────────
 
+/// Expand every top-level [`Expression::UnresolvedRegex`] projection into N
+/// [`Expression::UnresolvedColumn`] refs — one per `input_schema` field whose
+/// name matches the pattern. Non-regex projections pass through unchanged in
+/// place. Schema order is preserved.
+///
+/// Errors:
+///
+/// * Invalid regex → [`AnalyzerError::Other`] (Spark-emulated — Spark rejects
+///   the same input with `PatternSyntaxException`).
+/// * Zero matches → [`AnalyzerError::UnknownColumn`] with the pattern as the
+///   column name (mirrors Spark's `AnalysisException: cannot resolve regex`).
+///
+/// Called by `analyze_node`'s `CommonOp::Project` arm BEFORE
+/// [`resolve_and_stamp`] so downstream analysis never sees `UnresolvedRegex`.
+fn expand_regex_projections(
+    projections: Vec<Expression>,
+    input_schema: &StructType,
+) -> Result<Vec<Expression>, AnalyzerError> {
+    let mut out = Vec::with_capacity(projections.len());
+    for proj in projections {
+        match proj {
+            Expression::UnresolvedRegex(r) => {
+                let re = regex::Regex::new(&r.pattern).map_err(|e| AnalyzerError::Other {
+                    reason: format!("invalid regex `{}`: {e}", r.pattern),
+                })?;
+                let mut matched = 0usize;
+                for f in &input_schema.fields {
+                    if re.is_match(&f.name) {
+                        matched += 1;
+                        out.push(Expression::UnresolvedColumn(UnresolvedColumn {
+                            name: f.name.clone(),
+                            qualifier: None,
+                            plan_id: r.plan_id,
+                        }));
+                    }
+                }
+                if matched == 0 {
+                    return Err(AnalyzerError::UnknownColumn {
+                        name: r.pattern,
+                        qualifier: None,
+                    });
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
 /// Resolve every `UnresolvedColumn` in `expr` against `schema` and stamp
 /// resolved `ColumnReference`s with `data_type` and `nullable`.
 fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression, AnalyzerError> {
@@ -1748,6 +1801,11 @@ fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression
         | Expression::LambdaVariable(_)
         | Expression::RawSql(_)
         | Expression::Interval(_) => Ok(expr),
+        // Defensive — Pass 85's `expand_regex_projections` pre-pass in
+        // `CommonOp::Project` rewrites this variant before we walk here.
+        // Any residual (e.g. nested inside another expression) is passed
+        // through opaquely; emission's defensive arm surfaces the error.
+        Expression::UnresolvedRegex(_) => Ok(expr),
     }
 }
 
@@ -2072,6 +2130,10 @@ fn expression_is_fully_resolved(expr: &Expression) -> bool {
         | Expression::Lambda(_)
         | Expression::RawSql(_)
         | Expression::Interval(_) => true,
+        // Pass 85 — pattern-driven column expander; expanded away by
+        // `expand_regex_projections` in the `CommonOp::Project` pre-pass.
+        // If it survives to this check, treat it as unresolved.
+        Expression::UnresolvedRegex(_) => false,
     }
 }
 
@@ -2798,7 +2860,7 @@ mod tests {
     use super::super::analyzer_fixtures;
     use super::super::ast::CommonAst;
     use super::super::expression::{
-        BinaryExpression, BinaryOp, FunctionCall, Literal, LiteralValue,
+        BinaryExpression, BinaryOp, FunctionCall, Literal, LiteralValue, UnresolvedRegexExpression,
     };
     use super::*;
 
@@ -5008,5 +5070,111 @@ mod tests {
             }
             _ => panic!("expected TypedOp::Summary"),
         }
+    }
+
+    // ── Pass 85 — expand_regex_projections + resolution predicate ────────
+
+    fn regex_test_schema() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("customer_id", DataType::Long),
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("order_id", DataType::Long),
+        ])
+    }
+
+    #[test]
+    fn expand_regex_projections_matches_2_of_3_fields_in_schema_order() {
+        let schema = regex_test_schema();
+        let projections = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
+            pattern: ".*_id".to_owned(),
+            plan_id: Some(9),
+        })];
+        let expanded = expand_regex_projections(projections, &schema).expect("expand ok");
+        assert_eq!(expanded.len(), 2);
+        match &expanded[0] {
+            Expression::UnresolvedColumn(u) => {
+                assert_eq!(u.name, "customer_id");
+                assert_eq!(u.plan_id, Some(9));
+            }
+            _ => panic!("expected UnresolvedColumn"),
+        }
+        match &expanded[1] {
+            Expression::UnresolvedColumn(u) => assert_eq!(u.name, "order_id"),
+            _ => panic!("expected UnresolvedColumn"),
+        }
+    }
+
+    #[test]
+    fn expand_regex_projections_invalid_regex_returns_other_error() {
+        let schema = regex_test_schema();
+        let projections = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
+            // Unbalanced `[` — invalid on both java.util.regex and Rust regex.
+            pattern: "[unclosed".to_owned(),
+            plan_id: None,
+        })];
+        let err = expand_regex_projections(projections, &schema).unwrap_err();
+        assert!(matches!(err, AnalyzerError::Other { .. }));
+        assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
+    }
+
+    #[test]
+    fn expand_regex_projections_zero_match_returns_unknown_column() {
+        let schema = regex_test_schema();
+        let projections = vec![Expression::UnresolvedRegex(UnresolvedRegexExpression {
+            pattern: "no_such_.*_col".to_owned(),
+            plan_id: None,
+        })];
+        let err = expand_regex_projections(projections, &schema).unwrap_err();
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "no_such_.*_col");
+                assert!(qualifier.is_none());
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_regex_projections_preserves_non_regex_projections_in_place() {
+        let schema = regex_test_schema();
+        let non_regex_before = Expression::UnresolvedColumn(UnresolvedColumn {
+            name: "name".to_owned(),
+            qualifier: None,
+            plan_id: None,
+        });
+        let non_regex_after = Expression::Literal(Literal {
+            value: LiteralValue::Int(1),
+            data_type: DataType::Integer,
+        });
+        let projections = vec![
+            non_regex_before.clone(),
+            Expression::UnresolvedRegex(UnresolvedRegexExpression {
+                pattern: ".*_id".to_owned(),
+                plan_id: None,
+            }),
+            non_regex_after.clone(),
+        ];
+        let expanded = expand_regex_projections(projections, &schema).expect("expand ok");
+        // Layout: [name, customer_id, order_id, literal_1]
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded[0], non_regex_before);
+        match &expanded[1] {
+            Expression::UnresolvedColumn(u) => assert_eq!(u.name, "customer_id"),
+            _ => panic!("expected UnresolvedColumn at [1]"),
+        }
+        match &expanded[2] {
+            Expression::UnresolvedColumn(u) => assert_eq!(u.name, "order_id"),
+            _ => panic!("expected UnresolvedColumn at [2]"),
+        }
+        assert_eq!(expanded[3], non_regex_after);
+    }
+
+    #[test]
+    fn expression_is_fully_resolved_returns_false_for_unresolved_regex() {
+        let expr = Expression::UnresolvedRegex(UnresolvedRegexExpression {
+            pattern: ".*".to_owned(),
+            plan_id: None,
+        });
+        assert!(!expression_is_fully_resolved(&expr));
     }
 }

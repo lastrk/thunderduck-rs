@@ -35,7 +35,7 @@ use thunderduck_core::transpiler_v2::ast::{CommonAst, CommonOp, FileFormat, Join
 use thunderduck_core::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
     FunctionCall, InListExpression, Literal, LiteralValue, NullOrdering, SortDirection, SortOrder,
-    StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn,
+    StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UnresolvedRegexExpression,
 };
 use thunderduck_core::transpiler_v2::EmissionError;
 use thunderduck_core::types::{DataType, StructField, StructType};
@@ -1075,6 +1075,7 @@ impl V2ExpressionConverter {
                     },
                 ))
             }
+            ExprType::UnresolvedRegex(ur) => Ok(convert_unresolved_regex(ur)),
             other => Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("Expression::{}", expr_type_kind(other)),
                 reason: "expression shape not covered by V2ExpressionConverter at Slice A.2"
@@ -1475,6 +1476,35 @@ fn null_literal() -> Expression {
         value: LiteralValue::Null,
         data_type: DataType::Null,
     })
+}
+
+/// Convert Spark Connect `ExprType::UnresolvedRegex` into τ's
+/// `Expression::UnresolvedRegex`. Mirrors Java Thunderduck's
+/// `RegexColumnExpression.stripBackticks`: if `col_name` begins with a single
+/// `` ` `` AND ends with a single `` ` `` (and has room for both), the
+/// backticks are stripped; otherwise `col_name` passes through verbatim.
+///
+/// The pattern MUST be a Rust `regex` crate expression once the analyzer's
+/// `expand_regex_projections` pre-pass receives it — invalid patterns surface
+/// as `AnalyzerError::Other` (Spark-emulated).
+fn convert_unresolved_regex(ur: &proto::expression::UnresolvedRegex) -> Expression {
+    let pattern = strip_regex_backticks(&ur.col_name);
+    Expression::UnresolvedRegex(UnresolvedRegexExpression {
+        pattern,
+        plan_id: ur.plan_id,
+    })
+}
+
+/// Strip a single leading `` ` `` AND a single trailing `` ` `` from `name`
+/// when both are present and `name.len() >= 2`. All other inputs pass through
+/// unchanged.
+fn strip_regex_backticks(name: &str) -> String {
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 && bytes.first() == Some(&b'`') && bytes.last() == Some(&b'`') {
+        name[1..name.len() - 1].to_owned()
+    } else {
+        name.to_owned()
+    }
 }
 
 fn rel_type_kind(rt: &proto::relation::RelType) -> &'static str {
@@ -3114,5 +3144,40 @@ mod tests {
     #[test]
     fn normalize_decimal_literal_malformed_wire_clamps_to_preserve_invariant() {
         assert_eq!(normalize_decimal_literal("0", Some(3), Some(5)), (5, 5));
+    }
+
+    // ── Pass 85 — UnresolvedRegex conversion ────────────────────────────────
+
+    #[test]
+    fn convert_unresolved_regex_strips_matching_backticks() {
+        let ur = proto::expression::UnresolvedRegex {
+            col_name: "`.*_id`".to_owned(),
+            plan_id: None,
+        };
+        let out = super::convert_unresolved_regex(&ur);
+        match out {
+            Expression::UnresolvedRegex(r) => {
+                assert_eq!(r.pattern, ".*_id");
+                assert!(r.plan_id.is_none());
+            }
+            other => panic!("expected UnresolvedRegex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_unresolved_regex_preserves_plan_id() {
+        let ur = proto::expression::UnresolvedRegex {
+            col_name: "col_.*".to_owned(),
+            plan_id: Some(1234),
+        };
+        let out = super::convert_unresolved_regex(&ur);
+        match out {
+            Expression::UnresolvedRegex(r) => {
+                // Bare (no wrapping backticks) — passes through as-is.
+                assert_eq!(r.pattern, "col_.*");
+                assert_eq!(r.plan_id, Some(1234));
+            }
+            other => panic!("expected UnresolvedRegex, got {other:?}"),
+        }
     }
 }

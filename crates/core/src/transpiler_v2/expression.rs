@@ -192,6 +192,23 @@ pub struct UnresolvedColumn {
     pub plan_id: Option<i64>,
 }
 
+/// Pattern-driven column expander (Spark `df.colRegex("`.*_id`")`).
+///
+/// Produced by the Spark Connect converter for `ExprType::UnresolvedRegex`.
+/// The analyzer's `Project` pre-pass expands this variant into N
+/// `UnresolvedColumn` references — one per input-schema field whose name
+/// matches [`Self::pattern`], preserving schema order. This variant MUST NOT
+/// reach emission; the defensive arm in `render_expr` returns
+/// `UnsupportedExpression` if it does.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnresolvedRegexExpression {
+    /// The regex pattern, backticks already stripped by the converter.
+    pub pattern: String,
+    /// Optional Spark Connect plan_id — propagated to every synthesized
+    /// [`UnresolvedColumn`] the analyzer produces.
+    pub plan_id: Option<i64>,
+}
+
 /// Binary expression: left OP right.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BinaryExpression {
@@ -396,6 +413,7 @@ pub enum Expression {
     Literal(Literal),
     ColumnReference(ColumnReference),
     UnresolvedColumn(UnresolvedColumn),
+    UnresolvedRegex(UnresolvedRegexExpression),
     Binary(BinaryExpression),
     Unary(UnaryExpression),
     FunctionCall(FunctionCall),
@@ -435,6 +453,10 @@ impl Expression {
             Expression::UnresolvedColumn(u) => {
                 TypeInferenceEngine::qualified_column_type(&u.name, u.qualifier.as_deref(), schema)
             }
+            // Analyzer's Project pre-pass expands this variant before any
+            // downstream inference; a defensive Unresolved is returned in the
+            // unreachable case that it escapes.
+            Expression::UnresolvedRegex(_) => DataType::Unresolved,
             Expression::Binary(b) => Self::binary_data_type(b, schema),
             Expression::Unary(u) => match u.op {
                 UnaryOp::Not
@@ -519,6 +541,10 @@ impl Expression {
                 u.qualifier.as_deref(),
                 schema,
             ),
+            // Analyzer's Project pre-pass expands this variant before any
+            // downstream inference; conservatively nullable in the unreachable
+            // escape case.
+            Expression::UnresolvedRegex(_) => true,
             Expression::Binary(b) => b.left.nullable(schema) || b.right.nullable(schema),
             Expression::Unary(u) => match u.op {
                 UnaryOp::IsNull | UnaryOp::IsNotNull | UnaryOp::IsNaN | UnaryOp::IsNotNaN => false,
@@ -1452,6 +1478,34 @@ mod tests {
             plan_id: Some(42),
         };
         assert_eq!(u.plan_id, Some(42));
+    }
+
+    // ── Pass 85 — UnresolvedRegex variant ────────────────────────────────
+
+    #[test]
+    fn unresolved_regex_variant_construction() {
+        let expr = Expression::UnresolvedRegex(UnresolvedRegexExpression {
+            pattern: ".*_id".to_owned(),
+            plan_id: Some(7),
+        });
+        match &expr {
+            Expression::UnresolvedRegex(r) => {
+                assert_eq!(r.pattern, ".*_id");
+                assert_eq!(r.plan_id, Some(7));
+            }
+            _ => panic!("expected UnresolvedRegex variant"),
+        }
+    }
+
+    #[test]
+    fn unresolved_regex_data_type_is_unresolved_and_nullable_true() {
+        let s = StructType::empty();
+        let expr = Expression::UnresolvedRegex(UnresolvedRegexExpression {
+            pattern: ".*".to_owned(),
+            plan_id: None,
+        });
+        assert_eq!(expr.data_type(&s), DataType::Unresolved);
+        assert!(expr.nullable(&s));
     }
 
     #[test]

@@ -957,6 +957,18 @@ impl TypeInferenceEngine {
                 Array(Box::new(bin_struct), true)
             }
 
+            // `F.window(ts, duration)` — tumbling time-window. Spark's
+            // `TimeWindow.dataType` is a fixed
+            // `Struct{start: TimestampType, end: TimestampType}` with both
+            // fields nullable (Spark's `StructField` default). The struct
+            // itself is nullable iff `ts` is nullable — that's handled by the
+            // default `any(arg.nullable)` fallback in
+            // `Expression::function_call_nullable`. Corpus: `win2-002`.
+            "window" => DataType::Struct(StructType::new(vec![
+                StructField::nullable("start", Timestamp),
+                StructField::nullable("end", Timestamp),
+            ])),
+
             // ── Metadata / environment ──────────────────────────────────
             // `input_file_name()` returns String (empty for in-memory).
             // Corpus: `meta-004`.
@@ -1842,6 +1854,33 @@ mod tests {
         assert_eq!(
             TypeInferenceEngine::function_return_type("flatten", Some(&outer)),
             inner
+        );
+    }
+
+    /// `F.window(ts, duration)` → `Struct{start: Timestamp, end: Timestamp}`
+    /// with both fields nullable (Spark's `TimeWindow.dataType` uses
+    /// `StructField` default nullable). Return type is arg-independent so
+    /// `first_arg_type = None` returns the same fixed struct. Corpus:
+    /// `win2-002`.
+    #[test]
+    fn window_returns_struct_of_two_nullable_timestamps() {
+        let expected = DataType::Struct(StructType::new(vec![
+            StructField::nullable("start", DataType::Timestamp),
+            StructField::nullable("end", DataType::Timestamp),
+        ]));
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("window", Some(&DataType::Timestamp)),
+            expected,
+        );
+        // Arg-independent — no arg-type context should give the same schema.
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("window", None),
+            expected,
+        );
+        // Case-insensitive dispatch.
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("Window", Some(&DataType::Timestamp)),
+            expected,
         );
     }
 }

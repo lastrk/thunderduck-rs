@@ -2931,6 +2931,68 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             };
             return Ok(format!("(INTERVAL ({y}) YEAR + INTERVAL ({m}) MONTH)"));
         }
+        // Spark's `F.window(ts, "N unit")` — tumbling time-window over a
+        // Timestamp column. Returns a `Struct{start: Timestamp, end: Timestamp}`
+        // representing the bucket the row belongs to. τ transliterates to a
+        // DuckDB `struct_pack` over `time_bucket` (unix-epoch aligned origin
+        // matches Spark's `TimeWindow` default for tumbling `slide == window`,
+        // `startTime == 0`). Corpus anchor: `win2-002`.
+        //
+        // Scope (2-arg tumbling only):
+        //  - `args[1]` MUST be `Expression::Literal(String("N unit"))`; parsed
+        //    via [`parse_window_duration_literal`].
+        //  - 3+ arg (sliding / offset), non-literal duration, compound
+        //    (`"1 day 3 hours"`), month/year (variable-length buckets diverge
+        //    from `time_bucket`'s fixed-width semantics), signed / fractional /
+        //    empty / unknown unit → boundary reject with `[TDCK-BOUNDARY]`.
+        //
+        // `"end"` is a DuckDB reserved keyword — quoted via `quote_ident`,
+        // proven-safe idiom (same pattern as `named_struct` at ~L3667).
+        "window" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "[TDCK-BOUNDARY] `window`: only the 2-arg tumbling form \
+                             (window(ts, duration)) is implemented; sliding / offset \
+                             forms are not"
+                        .to_owned(),
+                });
+            }
+            let dur_str = match &f.args[1] {
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(s),
+                    ..
+                }) => s.clone(),
+                _ => {
+                    return Err(EmissionError::UnsupportedFunction {
+                        name: f.name.clone(),
+                        reason: "[TDCK-BOUNDARY] `window`: duration must be a string \
+                                 literal (`\"N unit\"` for {second,minute,hour,day,week})"
+                            .to_owned(),
+                    });
+                }
+            };
+            let (n, unit) = parse_window_duration_literal(&dur_str).ok_or_else(|| {
+                EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: format!(
+                        "[TDCK-BOUNDARY] `window`: unsupported duration literal \
+                         `{dur_str}`; accepted grammar is `\"N unit\"` where N is a \
+                         positive integer and unit is one of \
+                         {{second,minute,hour,day,week}} (singular or plural). \
+                         Compound / month / year / fractional / signed / empty forms \
+                         are not implemented."
+                    ),
+                }
+            })?;
+            let ts_sql = render_expr(&f.args[0], schema)?;
+            let start_q = quote_ident("start");
+            let end_q = quote_ident("end");
+            return Ok(format!(
+                "struct_pack({start_q} := time_bucket(INTERVAL '{n} {unit}', {ts_sql}), \
+                 {end_q} := time_bucket(INTERVAL '{n} {unit}', {ts_sql}) + INTERVAL '{n} {unit}')"
+            ));
+        }
         // Spark's `to_utc_timestamp(ts, tz)` treats `ts` as a local timestamp
         // in time zone `tz` and returns the equivalent UTC timestamp.
         // DuckDB has no `to_utc_timestamp` scalar. Emission strategy:
@@ -5240,6 +5302,52 @@ fn parse_to_json_ignore_null_fields(e: &Expression) -> Option<bool> {
 /// Pass 76: corpus witness `parse-004`.
 pub(crate) fn parse_number_format_for_type_inference(fmt: &str) -> Option<(u8, u8)> {
     parse_number_format(fmt)
+}
+
+/// Parse Spark's `F.window` duration-literal grammar for the 2-arg tumbling
+/// form: `"N unit"` where `N` is a positive integer and `unit ∈
+/// {second, minute, hour, day, week}` (singular or plural, case-insensitive).
+///
+/// Returns `Some((n, canonical_unit))` on success. Canonical unit is the
+/// singular form emitted into the DuckDB `INTERVAL '{n} {unit}'` literal.
+///
+/// Returns `None` for any rejection:
+/// - compound (`"1 day 3 hours"`)
+/// - month / year (variable-length buckets — Spark accepts them, but
+///   `time_bucket` semantics diverge on month boundaries; boundary-reject
+///   per ADR-015 rather than emit divergent SQL)
+/// - signed (`"-1 day"`) or fractional (`"0.5 day"`)
+/// - empty / whitespace-only / trailing garbage
+/// - unknown unit (`"1 fortnight"`)
+///
+/// Caller wraps `None` in a Thunderduck-boundary
+/// `EmissionError::UnsupportedFunction` per ADR-022 (τ-boundary error).
+///
+/// Corpus witness: `win2-002`.
+pub(crate) fn parse_window_duration_literal(s: &str) -> Option<(u64, &'static str)> {
+    let mut it = s.trim().split_ascii_whitespace();
+    let n_tok = it.next()?;
+    let unit_tok = it.next()?;
+    // Trailing garbage / compound intervals → reject.
+    if it.next().is_some() {
+        return None;
+    }
+    // Reject signs and fractional forms explicitly — `u64::from_str` already
+    // rejects them, but this makes the intent explicit and future-proof.
+    if n_tok.starts_with('-') || n_tok.starts_with('+') || n_tok.contains('.') {
+        return None;
+    }
+    let n: u64 = n_tok.parse().ok()?;
+    let unit = unit_tok.to_ascii_lowercase();
+    let canonical: &'static str = match unit.as_str() {
+        "second" | "seconds" => "second",
+        "minute" | "minutes" => "minute",
+        "hour" | "hours" => "hour",
+        "day" | "days" => "day",
+        "week" | "weeks" => "week",
+        _ => return None,
+    };
+    Some((n, canonical))
 }
 
 /// Parse a Spark DDL field-list schema string (e.g.
@@ -8690,6 +8798,221 @@ mod tests {
         };
         let sql = render_function_call(&f, &empty_schema()).expect("render make_ym_interval");
         assert_eq!(sql, "(INTERVAL (1) YEAR + INTERVAL (6) MONTH)");
+    }
+
+    // ── `F.window(ts, "N unit")` — tumbling time-window (win2-002) ──────
+
+    fn ts_col_ref(name: &str) -> Expression {
+        Expression::ColumnReference(ColumnReference {
+            name: name.to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Timestamp),
+            nullable: Some(true),
+        })
+    }
+
+    /// Duration parser — accepts every {second,minute,hour,day,week} form.
+    #[test]
+    fn parse_window_duration_literal_accepts_standard_units() {
+        let cases: &[(&str, u64, &str)] = &[
+            ("1 second", 1, "second"),
+            ("2 seconds", 2, "second"),
+            ("3 minute", 3, "minute"),
+            ("4 minutes", 4, "minute"),
+            ("5 hour", 5, "hour"),
+            ("6 hours", 6, "hour"),
+            ("7 day", 7, "day"),
+            ("8 days", 8, "day"),
+            ("9 week", 9, "week"),
+            ("10 weeks", 10, "week"),
+            ("1 DAY", 1, "day"),
+            ("1 Day", 1, "day"),
+            ("  1   day  ", 1, "day"),
+        ];
+        for (input, n, unit) in cases {
+            let got =
+                parse_window_duration_literal(input).unwrap_or_else(|| panic!("failed on {input}"));
+            assert_eq!(got, (*n, *unit), "input {input}");
+        }
+    }
+
+    /// Duration parser rejects month/year (Spark accepts them, but
+    /// variable-length buckets diverge from `time_bucket` — boundary reject
+    /// per ADR-015 / ADR-022).
+    #[test]
+    fn parse_window_duration_literal_rejects_month_year() {
+        for s in &["1 month", "1 months", "1 year", "1 years", "12 months"] {
+            assert!(
+                parse_window_duration_literal(s).is_none(),
+                "expected reject for {s}"
+            );
+        }
+    }
+
+    /// Duration parser rejects compound / fractional / signed / empty /
+    /// unknown-unit / bare-number / trailing-garbage forms.
+    #[test]
+    fn parse_window_duration_literal_rejects_malformed() {
+        for s in &[
+            "1 day 3 hours",
+            "0.5 day",
+            "-1 day",
+            "+1 day",
+            "",
+            "day",
+            "1",
+            "1 fortnight",
+            "1 millisecond",
+            "1 microsecond",
+            "1 day extra",
+        ] {
+            assert!(
+                parse_window_duration_literal(s).is_none(),
+                "expected reject for {s}"
+            );
+        }
+    }
+
+    /// `win2-002` core: `window(last_login, "1 day")` emits struct_pack over
+    /// `time_bucket` with a quoted `"end"` field name (reserved keyword).
+    #[test]
+    fn render_window_emits_struct_pack_time_bucket_1_day() {
+        let f = FunctionCall {
+            name: "window".to_owned(),
+            args: vec![ts_col_ref("last_login"), str_lit("1 day")],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render window");
+        assert_eq!(
+            sql,
+            "struct_pack(start := time_bucket(INTERVAL '1 day', last_login), \
+             \"end\" := time_bucket(INTERVAL '1 day', last_login) + INTERVAL '1 day')"
+        );
+    }
+
+    /// Hour + week variants — confirms canonical-unit passthrough and
+    /// N carries through unchanged.
+    #[test]
+    fn render_window_emits_correct_sql_for_hour_and_week_units() {
+        for (dur, n, unit) in &[
+            ("1 hour", 1, "hour"),
+            ("2 hours", 2, "hour"),
+            ("3 weeks", 3, "week"),
+        ] {
+            let f = FunctionCall {
+                name: "window".to_owned(),
+                args: vec![ts_col_ref("ts"), str_lit(dur)],
+                distinct: false,
+            };
+            let sql = render_function_call(&f, &empty_schema()).expect("render window");
+            let expected = format!(
+                "struct_pack(start := time_bucket(INTERVAL '{n} {unit}', ts), \
+                 \"end\" := time_bucket(INTERVAL '{n} {unit}', ts) + INTERVAL '{n} {unit}')"
+            );
+            assert_eq!(sql, expected, "dur={dur}");
+        }
+    }
+
+    /// 3-arg (sliding) form → boundary reject per ADR-022.
+    #[test]
+    fn render_window_boundary_rejects_three_arg_form() {
+        let f = FunctionCall {
+            name: "window".to_owned(),
+            args: vec![
+                ts_col_ref("last_login"),
+                str_lit("1 day"),
+                str_lit("30 minutes"),
+            ],
+            distinct: false,
+        };
+        let err = render_function_call(&f, &empty_schema()).expect_err("three-arg reject");
+        match err {
+            EmissionError::UnsupportedFunction { name, reason } => {
+                assert_eq!(name, "window");
+                assert!(reason.contains("[TDCK-BOUNDARY]"), "reason: {reason}");
+                assert!(reason.contains("tumbling"), "reason: {reason}");
+            }
+            other => panic!("expected UnsupportedFunction, got {other:?}"),
+        }
+    }
+
+    /// Compound / month duration → boundary reject.
+    #[test]
+    fn render_window_boundary_rejects_compound_duration() {
+        for dur in &["1 day 3 hours", "1 month"] {
+            let f = FunctionCall {
+                name: "window".to_owned(),
+                args: vec![ts_col_ref("ts"), str_lit(dur)],
+                distinct: false,
+            };
+            let err = render_function_call(&f, &empty_schema()).expect_err("compound reject");
+            match err {
+                EmissionError::UnsupportedFunction { name, reason } => {
+                    assert_eq!(name, "window");
+                    assert!(reason.contains("[TDCK-BOUNDARY]"), "reason: {reason}");
+                }
+                other => panic!("expected UnsupportedFunction, got {other:?}"),
+            }
+        }
+    }
+
+    /// Non-literal `args[1]` (e.g. column reference) → boundary reject —
+    /// Spark's `F.window` accepts a compile-time string, not a runtime
+    /// expression, and τ can only translate literals.
+    #[test]
+    fn render_window_boundary_rejects_non_literal_duration() {
+        let f = FunctionCall {
+            name: "window".to_owned(),
+            args: vec![ts_col_ref("last_login"), col_ref_expr("dur_col")],
+            distinct: false,
+        };
+        let err = render_function_call(&f, &empty_schema()).expect_err("non-literal reject");
+        match err {
+            EmissionError::UnsupportedFunction { name, reason } => {
+                assert_eq!(name, "window");
+                assert!(reason.contains("[TDCK-BOUNDARY]"), "reason: {reason}");
+                assert!(reason.contains("string literal"), "reason: {reason}");
+            }
+            other => panic!("expected UnsupportedFunction, got {other:?}"),
+        }
+    }
+
+    /// Empirical smoke: the emitted SQL must actually parse and execute
+    /// against DuckDB (verifies `struct_pack("end" := ...)` accepts the
+    /// quoted reserved keyword field name AND that GROUP BY on the struct
+    /// value folds correctly). Uses a fresh in-memory connection (no
+    /// extension dependency).
+    #[test]
+    fn render_window_sql_parses_and_groups_correctly_in_duckdb() {
+        let conn = duckdb::Connection::open_in_memory().expect("in-memory conn");
+        let ddl = "CREATE TABLE emp(ts TIMESTAMP);";
+        conn.execute_batch(ddl).expect("ddl");
+        let insert = "INSERT INTO emp VALUES \
+                      (TIMESTAMP '2024-01-15 10:30:00'), \
+                      (TIMESTAMP '2024-01-15 22:00:00'), \
+                      (TIMESTAMP '2024-01-16 05:00:00');";
+        conn.execute_batch(insert).expect("insert");
+        // Emit the same SQL our arm produces, verbatim.
+        let sql = "SELECT struct_pack(start := time_bucket(INTERVAL '1 day', ts), \
+                   \"end\" := time_bucket(INTERVAL '1 day', ts) + INTERVAL '1 day')::VARCHAR AS w, \
+                   COUNT(*) AS n FROM emp \
+                   GROUP BY struct_pack(start := time_bucket(INTERVAL '1 day', ts), \
+                   \"end\" := time_bucket(INTERVAL '1 day', ts) + INTERVAL '1 day') \
+                   ORDER BY 1";
+        let mut stmt = conn.prepare(sql).expect("prepare");
+        let rows: Vec<(String, i64)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("query_map")
+            .map(|r| r.expect("row"))
+            .collect();
+        assert_eq!(rows.len(), 2, "expected two day-buckets, got {rows:?}");
+        assert_eq!(rows[0].1, 2, "Jan 15 bucket count");
+        assert_eq!(rows[1].1, 1, "Jan 16 bucket count");
+        // The stringified struct must include both field names.
+        assert!(rows[0].0.contains("start"), "struct repr: {}", rows[0].0);
+        assert!(rows[0].0.contains("end"), "struct repr: {}", rows[0].0);
     }
 
     /// `dt-017` regression: `to_utc_timestamp(ts, 'CET')` — DuckDB has no

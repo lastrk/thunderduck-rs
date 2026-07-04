@@ -1052,6 +1052,15 @@ impl Expression {
             }
             "array" | "make_array" | "create_map" | "map" | "named_struct" | "struct"
             | "map_from_entries" => false,
+            // `F.window(ts, dur)` — Spark's `TimeWindow` is rewritten by the
+            // analyzer into `CreateNamedStruct(start := ..., end := ...)`
+            // whose `nullable = false` (Spark's struct-construction is never
+            // null; only the fields inside carry per-field nullability).
+            // τ's default `any(arg.nullable)` fallback would incorrectly
+            // propagate the timestamp arg's nullable into the struct itself;
+            // pin `false` here to match Spark's observable schema. Corpus:
+            // `win2-002`.
+            "window" => false,
             // Generator functions (row-multiplying via UNNEST at emission).
             // `explode(arr)` / `posexplode_val(arr)` — element nullability
             // follows the array's `containsNull` flag AND the array arg's own
@@ -1480,6 +1489,32 @@ mod tests {
                  FunctionCall::nullable returned true",
             );
         }
+    }
+
+    /// `F.window(ts, dur)` — Spark's `TimeWindow` rewrites to
+    /// `CreateNamedStruct`, whose `nullable = false`. τ must report the
+    /// struct itself as non-nullable regardless of the timestamp arg's own
+    /// nullability (only the inner `start` / `end` fields carry
+    /// per-field nullability). Corpus: `win2-002`.
+    #[test]
+    fn window_function_call_is_never_nullable() {
+        // Nullable timestamp arg — struct itself must still be non-null.
+        let schema = StructType::new(vec![StructField::nullable("ts", DataType::Timestamp)]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "window".to_owned(),
+            args: vec![
+                ColumnReference::untyped("ts"),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("1 day".to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        });
+        assert!(!expr.nullable(&schema));
+        // Also non-nullable when the timestamp arg is non-null.
+        let schema_nn = StructType::new(vec![StructField::not_null("ts", DataType::Timestamp)]);
+        assert!(!expr.nullable(&schema_nn));
     }
 
     /// §8.3 — the hash family must be in the FunctionCall non-nullable literal list.

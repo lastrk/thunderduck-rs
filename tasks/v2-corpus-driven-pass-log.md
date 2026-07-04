@@ -613,6 +613,21 @@ the summary below records the corpus deltas by pass number.
 - Tests added: 0.
 - Corpus: 309 → 309 (behaviour-neutral).
 - Warning delta: 0 new.
+- Commit SHA: 8b35361.
+
+## Pass 93 — 2026-07-04T
+- Case: `win2-002` — `F.window("last_login", "1 day")` in a groupBy — tumbling time-window aggregate. Spark returns `Struct<start: Timestamp, end: Timestamp>` non-nullable (via `CreateNamedStruct`); τ was emitting `window(...)` verbatim → DuckDB parser error because `WINDOW` is a reserved keyword.
+- Diagnostic: `.agent-output/diagnostic-pass-93.md` — no dispatch at any layer; single emission arm + type-inference arm + non-nullable-list addition close the gap.
+- Architecture: `.agent-output/architecture-pass-93.md` — substrate `struct_pack(start := time_bucket(INTERVAL 'N unit', ts), "end" := time_bucket(INTERVAL 'N unit', ts) + INTERVAL 'N unit')`; `"end"` quoted via existing `quote_ident` helper (DuckDB reserved); Pass 88 arrow-schema stamp handles Spark-visible name restoration on the wire. Duration parser accepts `{second,minute,hour,day,week}` singular/plural case-insensitive; rejects compound/month/year/fractional/signed/non-literal via `EmissionError::UnsupportedFunction` with `[TDCK-BOUNDARY]` prefix.
+- Layer(s) touched: τ core emission (`render_function_call` new `window` arm + `parse_window_duration_literal` helper), type-inference (`function_return_type` arm returning `Struct<start,end: Timestamp>`), expression (`window` added to non-nullable-literal list per Spark `CreateNamedStruct.nullable = false` invariant — plan deviation warranted by corpus witness). No converter or analyzer changes.
+- ADR citations: ADR-005 (τ owns Spark type inference — struct return type), ADR-015 (Spark parity — non-nullable per `CreateNamedStruct`), ADR-020 (uses existing DuckDB `time_bucket` — no extension work needed), ADR-022 (3+ arg sliding/offset forms, month/year buckets, compound/fractional/signed durations, non-literal args → boundary reject `[TDCK-BOUNDARY]`).
+- Corpus signal: 309 → **310** (+1). win2-002 GREEN.
+- Files: `crates/core/src/transpiler_v2/{emission.rs, type_inference.rs, expression.rs}`.
+- Tests added: 11 (9 emission — including a DuckDB-embedded smoke test locking substrate against version bumps + duration parser negative tests; 1 type-inference; 1 nullability).
+- Findings CLOSE_NOW_IN_THIS_PASS: 0 blocking. Reviewer 0 Critical + 0 High + 0 Medium + 2 Low (stale comment reference / latent null-ts row divergence — corpus witness pre-filters). Perf 0 HIGH/MEDIUM.
+- Findings queued as follow-up: null-ts row divergence (τ does not filter null timestamps before struct rewrite; Spark `TimeWindowing` optimizer rule does — not witnessed).
+- Compiler warning delta: baseline preserved.
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 587/28 — +10 net passing from prior baseline 577/28, `cargo test -p thunderduck-connect-server --tests` 83/0, `v2-progress.sh` 310/14/324 with win2-002 PASSED and no regressions).
 - Commit SHA: pending.
 
 

@@ -265,7 +265,29 @@ Source: release [`ext6`](https://github.com/nubank/thunderduck-duckdb-extension/
 2. **Existing architecture** (`docs/architecture.md`) — architectural decisions for the current implementation (ADRs 1–21); links to individual files in `docs/adrs/`. Valid for the existing path; superseded by item 1 where they conflict.
 3. **Dev journal** (`docs/dev-journal-toc.md`) — chronological development history; entries in `docs/dev_journal/`
 4. **Agent context** (`docs/context/`) — condensed reference (architecture, build commands, coding standards, dependencies, gotchas, testing) for the current codebase
-5. **Task tracking** (`tasks/`) — active work items and lessons learned
+5. **Dev cheatsheets** (`docs/dev-cheatsheets/`) — portable, project-agnostic technique libraries loaded by the language-specialized subagents (see §Agent Cheatsheets below)
+6. **Task tracking** (`tasks/`) — active work items and lessons learned
+
+## Agent Cheatsheets
+
+Language-specialized subagents (`rust-coder`, `rust-diagnostician`, `rust-reviewer`, `rust-perf`, `rust-architect`) load their persona from `.claude/agents/*.md` (kept small — memento headlines only) and their technique library from portable cheatsheets under `docs/dev-cheatsheets/`. Every subagent MUST read the linked cheatsheet AND this file before starting work; project rules here and in the ADRs override any generic idiom in the cheatsheets.
+
+- Debugging methodology → [`docs/dev-cheatsheets/rust-debugging.md`](docs/dev-cheatsheets/rust-debugging.md)
+- Implementation patterns → [`docs/dev-cheatsheets/rust-implementation.md`](docs/dev-cheatsheets/rust-implementation.md)
+- Review checklist → [`docs/dev-cheatsheets/rust-review.md`](docs/dev-cheatsheets/rust-review.md)
+- Performance analysis → [`docs/dev-cheatsheets/rust-perf.md`](docs/dev-cheatsheets/rust-perf.md)
+- Architecture plan shape → [`docs/dev-cheatsheets/rust-architecture.md`](docs/dev-cheatsheets/rust-architecture.md)
+
+The `docs-updater` subagent is language-agnostic and has no cheatsheet; its policy comes entirely from this file.
+
+## Spark Specification Lookup
+
+When a task involves Spark compatibility (type inference, nullability, decimal precision, function behavior, schema propagation, error semantics), consult **Apache Spark 4.1.1 in ANSI mode** (`spark.sql.ansi.enabled=true`, per ADR-016) as the authoritative specification:
+
+- **Spark source is authoritative.** Use `WebSearch` / `WebFetch` on the `apache/spark` GitHub repo for the relevant source (`DecimalPrecision.scala`, `TypeCoercion.scala`, `HiveResult.scala`, `ArithmeticExpression.scala`, `UpdateFields.scala`, etc.). Spark's behavior in these files defines "correct" for τ.
+- **`.reference/` is the Java Thunderduck implementation of the same functionality.** When the Rust port diverges from `.reference/`, that divergence is usually the bug. Grep `.reference/` for the equivalent function/type before proposing a fix; note where the Rust port drops or reorders logic.
+- **Spark parity wins over DuckDB-native ergonomics** (ADR-015). If DuckDB offers a shorter emission that changes Spark's observable behavior (return type, nullability, error class, precision, sort order), don't take the shortcut.
+- **ANSI-mode error semantics matter.** Division / mod by zero, `element_at` OOB, cast overflow, and `to_number` format mismatches THROW in ANSI mode (see ADR-016 error-emulation contract). τ must re-wrap DuckDB engine throws with Spark's error class before crossing the wire — never surface an opaque DuckDB error string.
 
 ## Git Commit Workflow
 

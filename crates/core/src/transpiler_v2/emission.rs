@@ -2231,6 +2231,12 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         "hash" | "murmur3" => "spark_hash",
         "xxhash64" => "spark_xxhash64",
         "try_divide" => "spark_try_divide",
+        // Spark's `crc32(binary)` — no `spark_crc32` in `thdck_spark_funcs`
+        // ext6, so τ ships a bit-exact CRC-32-IEEE session macro
+        // (`java.util.zip.CRC32` emulation) registered by
+        // `DuckDbSession::spawn`. Long-term the C++ extension may absorb this;
+        // the dispatch arm stays either way. Corpus: `hash-001`.
+        "crc32" => "spark_crc32",
         "spark_hash" => "spark_hash",
         "spark_xxhash64" => "spark_xxhash64",
         "spark_try_divide" => "spark_try_divide",
@@ -5926,6 +5932,20 @@ mod tests {
             sql, "to_json(struct_pack(name := name, age := age))",
             "to_json wraps the DuckDB struct_pack unchanged",
         );
+    }
+
+    /// hash-001 anchor: `crc32(col)` is remapped to `spark_crc32(col)`
+    /// (session macro registered by `DuckDbSession::spawn`; NOT the
+    /// `thdck_spark_funcs` extension). Defends the dispatch-arm shape.
+    #[test]
+    fn render_crc32_remaps_to_spark_crc32() {
+        let f = FunctionCall {
+            name: "crc32".to_owned(),
+            args: vec![col_ref_expr("name")],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render crc32");
+        assert_eq!(sql, "spark_crc32(name)");
     }
 
     /// json-006 anchor: `schema_of_json(...)` is remapped to

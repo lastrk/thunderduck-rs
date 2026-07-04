@@ -364,6 +364,27 @@ the summary below records the corpus deltas by pass number.
 - Findings queued as follow-up: 1 — malformed-wire error-class parity (Spark throws for `p_wire < s_wire`; τ clamps). Open question 1 in the plan; ADR-016 error-emulation contract candidate.
 - Compiler warning delta: 36 → 36 (0 new).
 - Quality Gate: PASS (cargo check both crates clean, rustfmt clean on touched file, `cargo test -p thunderduck-connect-server --tests` 59/0).
+- Commit SHA: 47e5d51.
+
+## Pass 79 — 2026-07-04T (in progress)
+- Case: `hash-001` — `F.crc32(name.cast('binary'))`. Failed with `DuckDB error: Catalog Error: Scalar Function with name crc32 does not exist`.
+- Diagnostic: `.agent-output/diagnostic-pass-79.md` (`crc32` had no remap arm in emission; generic passthrough at `:3728` leaked to DuckDB; type inference at `type_inference.rs:625-629` already returned `Long` correctly with a comment flagging the emission gap).
+- Architecture: `.agent-output/architecture-pass-79.md` (session-macro emulation of Spark's `java.util.zip.CRC32` — CRC-32-IEEE, poly `0xedb88320`, init/final XOR `0xFFFFFFFF` — via 256-entry lookup table + `list_reduce`).
+- Layer(s) touched: runtime (`SPARK_CRC32_MACRO_SQL` const + registration in `DuckDbSession::spawn`), emission (`"crc32" => "spark_crc32"` dispatch arm), type-inference (docs-only comment refresh).
+- ADR citations: ADR-015 (Spark parity — bit-exact against `java.util.zip.CRC32`), ADR-020 (`thdck_spark_funcs` ext6 does not export `spark_crc32`; session macro emulates until extension update), ADR-022 (τ-only, no changes outside τ).
+- Corpus signal: 296 → **297** (+1). hash-001 GREEN.
+- Files: `crates/core/src/runtime/session.rs`, `crates/core/src/transpiler_v2/emission.rs`, `crates/core/src/transpiler_v2/type_inference.rs`.
+- Tests added: 4 (3 runtime — bit-exact vs Python `binascii.crc32` for `test`/`Spark`/empty/NULL — plus 1 emission dispatch-shape).
+- Deviations from plan (all documented in-source):
+  1. 2-arg `list_reduce` with `list_prepend(init, ...)` — plan's fallback option (DuckDB 1.5.x prefers this form).
+  2. Decimal literals for the 256-entry table (DuckDB parser rejected `0xNN::UINTEGER` inside a list initializer).
+  3. Byte extraction via `('0x' || substr(hex(b), i*2+1, 2))::INTEGER` — DuckDB lacks `get_byte(BLOB, i)`; project shadows built-in `octet_length` with a bit_length-based macro that fails on BLOB.
+- Findings CLOSE_NOW_IN_THIS_PASS: 0 blocking. Reviewer APPROVED (0 Critical + 0 High + 0 Medium + 5 Low, all docs/test-coverage-extension); Perf 0 HIGH + 2 MEDIUM (both explicitly routed by perf agent to follow-up — "cold-path status confirmed, correct long-term fix is C++ extension").
+- Findings queued as follow-up passes:
+  1. **Perf MEDIUM-1**: `_spark_crc32_table()` hoisting risk. Requires `EXPLAIN ANALYZE` verification + long-term C++ extension implementation of `spark_crc32` in `thdck_spark_funcs`. Cross-repo.
+  2. **Perf MEDIUM-2**: `hex(b)` evaluated twice — try `octet_length(BLOB)` if unshadowed. Single-line fix; can bundle with the extension-migration pass.
+- Compiler warning delta: 36 → 36 (0 new on touched files).
+- Quality Gate: PASS (cargo check both crates, rustfmt on touched files, `cargo test -- spark_crc32` 4/4, `cargo test -p thunderduck-connect-server --tests` 59/0).
 - Commit SHA: pending.
 
 

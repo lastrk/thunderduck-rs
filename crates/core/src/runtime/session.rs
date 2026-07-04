@@ -425,6 +425,18 @@ CREATE OR REPLACE MACRO str_to_map(s, pair_delim, kv_delim) AS
                     ))));
                     return;
                 }
+                // `spark_crc32` lives in its own `execute_batch` so the unit
+                // tests can register just this fragment on a plain
+                // `duckdb::Connection` without pulling in the mandatory
+                // `thdck_spark_funcs` extension (extension load requires the
+                // release-build binary; the macros are pure SQL and
+                // self-contained). Corpus: hash-001.
+                if let Err(e) = conn.execute_batch(SPARK_CRC32_MACRO_SQL) {
+                    let _ = ready_tx.send(Err(ThunderduckError::DuckDb(format!(
+                        "spark_crc32 macro registration failed: {e}"
+                    ))));
+                    return;
+                }
 
                 // Load the mandatory thdck_spark_funcs extension.
                 if let Err(e) = extension_loader::load(&conn) {
@@ -451,7 +463,131 @@ CREATE OR REPLACE MACRO str_to_map(s, pair_delim, kv_delim) AS
 
         Ok(DuckDbSession { cmd_tx })
     }
+}
 
+/// SQL fragment that registers the `_spark_crc32_table()` lookup-table macro
+/// and the `spark_crc32(BLOB)` macro. Bit-exact `java.util.zip.CRC32`
+/// emulation. Kept as a module-level constant so unit tests can register the
+/// same SQL on a plain `duckdb::Connection` without spawning a full
+/// `DuckDbSession` (which requires the `thdck_spark_funcs` extension binary
+/// at runtime).
+///
+/// Corpus: `hash-001`. See `crates/core/src/transpiler_v2/emission.rs`
+/// dispatch arm `"crc32" => "spark_crc32"` for the emission side.
+pub(crate) const SPARK_CRC32_MACRO_SQL: &str = "
+-- CRC-32-IEEE lookup table (poly 0xedb88320). 256 UINTEGER entries.
+-- Zero-arg macro so callers reference by name; DuckDB inlines the list.
+-- Values are decimal (DuckDB's SQL parser rejects `0x...` hex literals
+-- inside a list initializer).
+CREATE OR REPLACE MACRO _spark_crc32_table() AS [
+    0::UINTEGER, 1996959894::UINTEGER, 3993919788::UINTEGER, 2567524794::UINTEGER,
+    124634137::UINTEGER, 1886057615::UINTEGER, 3915621685::UINTEGER, 2657392035::UINTEGER,
+    249268274::UINTEGER, 2044508324::UINTEGER, 3772115230::UINTEGER, 2547177864::UINTEGER,
+    162941995::UINTEGER, 2125561021::UINTEGER, 3887607047::UINTEGER, 2428444049::UINTEGER,
+    498536548::UINTEGER, 1789927666::UINTEGER, 4089016648::UINTEGER, 2227061214::UINTEGER,
+    450548861::UINTEGER, 1843258603::UINTEGER, 4107580753::UINTEGER, 2211677639::UINTEGER,
+    325883990::UINTEGER, 1684777152::UINTEGER, 4251122042::UINTEGER, 2321926636::UINTEGER,
+    335633487::UINTEGER, 1661365465::UINTEGER, 4195302755::UINTEGER, 2366115317::UINTEGER,
+    997073096::UINTEGER, 1281953886::UINTEGER, 3579855332::UINTEGER, 2724688242::UINTEGER,
+    1006888145::UINTEGER, 1258607687::UINTEGER, 3524101629::UINTEGER, 2768942443::UINTEGER,
+    901097722::UINTEGER, 1119000684::UINTEGER, 3686517206::UINTEGER, 2898065728::UINTEGER,
+    853044451::UINTEGER, 1172266101::UINTEGER, 3705015759::UINTEGER, 2882616665::UINTEGER,
+    651767980::UINTEGER, 1373503546::UINTEGER, 3369554304::UINTEGER, 3218104598::UINTEGER,
+    565507253::UINTEGER, 1454621731::UINTEGER, 3485111705::UINTEGER, 3099436303::UINTEGER,
+    671266974::UINTEGER, 1594198024::UINTEGER, 3322730930::UINTEGER, 2970347812::UINTEGER,
+    795835527::UINTEGER, 1483230225::UINTEGER, 3244367275::UINTEGER, 3060149565::UINTEGER,
+    1994146192::UINTEGER, 31158534::UINTEGER, 2563907772::UINTEGER, 4023717930::UINTEGER,
+    1907459465::UINTEGER, 112637215::UINTEGER, 2680153253::UINTEGER, 3904427059::UINTEGER,
+    2013776290::UINTEGER, 251722036::UINTEGER, 2517215374::UINTEGER, 3775830040::UINTEGER,
+    2137656763::UINTEGER, 141376813::UINTEGER, 2439277719::UINTEGER, 3865271297::UINTEGER,
+    1802195444::UINTEGER, 476864866::UINTEGER, 2238001368::UINTEGER, 4066508878::UINTEGER,
+    1812370925::UINTEGER, 453092731::UINTEGER, 2181625025::UINTEGER, 4111451223::UINTEGER,
+    1706088902::UINTEGER, 314042704::UINTEGER, 2344532202::UINTEGER, 4240017532::UINTEGER,
+    1658658271::UINTEGER, 366619977::UINTEGER, 2362670323::UINTEGER, 4224994405::UINTEGER,
+    1303535960::UINTEGER, 984961486::UINTEGER, 2747007092::UINTEGER, 3569037538::UINTEGER,
+    1256170817::UINTEGER, 1037604311::UINTEGER, 2765210733::UINTEGER, 3554079995::UINTEGER,
+    1131014506::UINTEGER, 879679996::UINTEGER, 2909243462::UINTEGER, 3663771856::UINTEGER,
+    1141124467::UINTEGER, 855842277::UINTEGER, 2852801631::UINTEGER, 3708648649::UINTEGER,
+    1342533948::UINTEGER, 654459306::UINTEGER, 3188396048::UINTEGER, 3373015174::UINTEGER,
+    1466479909::UINTEGER, 544179635::UINTEGER, 3110523913::UINTEGER, 3462522015::UINTEGER,
+    1591671054::UINTEGER, 702138776::UINTEGER, 2966460450::UINTEGER, 3352799412::UINTEGER,
+    1504918807::UINTEGER, 783551873::UINTEGER, 3082640443::UINTEGER, 3233442989::UINTEGER,
+    3988292384::UINTEGER, 2596254646::UINTEGER, 62317068::UINTEGER, 1957810842::UINTEGER,
+    3939845945::UINTEGER, 2647816111::UINTEGER, 81470997::UINTEGER, 1943803523::UINTEGER,
+    3814918930::UINTEGER, 2489596804::UINTEGER, 225274430::UINTEGER, 2053790376::UINTEGER,
+    3826175755::UINTEGER, 2466906013::UINTEGER, 167816743::UINTEGER, 2097651377::UINTEGER,
+    4027552580::UINTEGER, 2265490386::UINTEGER, 503444072::UINTEGER, 1762050814::UINTEGER,
+    4150417245::UINTEGER, 2154129355::UINTEGER, 426522225::UINTEGER, 1852507879::UINTEGER,
+    4275313526::UINTEGER, 2312317920::UINTEGER, 282753626::UINTEGER, 1742555852::UINTEGER,
+    4189708143::UINTEGER, 2394877945::UINTEGER, 397917763::UINTEGER, 1622183637::UINTEGER,
+    3604390888::UINTEGER, 2714866558::UINTEGER, 953729732::UINTEGER, 1340076626::UINTEGER,
+    3518719985::UINTEGER, 2797360999::UINTEGER, 1068828381::UINTEGER, 1219638859::UINTEGER,
+    3624741850::UINTEGER, 2936675148::UINTEGER, 906185462::UINTEGER, 1090812512::UINTEGER,
+    3747672003::UINTEGER, 2825379669::UINTEGER, 829329135::UINTEGER, 1181335161::UINTEGER,
+    3412177804::UINTEGER, 3160834842::UINTEGER, 628085408::UINTEGER, 1382605366::UINTEGER,
+    3423369109::UINTEGER, 3138078467::UINTEGER, 570562233::UINTEGER, 1426400815::UINTEGER,
+    3317316542::UINTEGER, 2998733608::UINTEGER, 733239954::UINTEGER, 1555261956::UINTEGER,
+    3268935591::UINTEGER, 3050360625::UINTEGER, 752459403::UINTEGER, 1541320221::UINTEGER,
+    2607071920::UINTEGER, 3965973030::UINTEGER, 1969922972::UINTEGER, 40735498::UINTEGER,
+    2617837225::UINTEGER, 3943577151::UINTEGER, 1913087877::UINTEGER, 83908371::UINTEGER,
+    2512341634::UINTEGER, 3803740692::UINTEGER, 2075208622::UINTEGER, 213261112::UINTEGER,
+    2463272603::UINTEGER, 3855990285::UINTEGER, 2094854071::UINTEGER, 198958881::UINTEGER,
+    2262029012::UINTEGER, 4057260610::UINTEGER, 1759359992::UINTEGER, 534414190::UINTEGER,
+    2176718541::UINTEGER, 4139329115::UINTEGER, 1873836001::UINTEGER, 414664567::UINTEGER,
+    2282248934::UINTEGER, 4279200368::UINTEGER, 1711684554::UINTEGER, 285281116::UINTEGER,
+    2405801727::UINTEGER, 4167216745::UINTEGER, 1634467795::UINTEGER, 376229701::UINTEGER,
+    2685067896::UINTEGER, 3608007406::UINTEGER, 1308918612::UINTEGER, 956543938::UINTEGER,
+    2808555105::UINTEGER, 3495958263::UINTEGER, 1231636301::UINTEGER, 1047427035::UINTEGER,
+    2932959818::UINTEGER, 3654703836::UINTEGER, 1088359270::UINTEGER, 936918000::UINTEGER,
+    2847714899::UINTEGER, 3736837829::UINTEGER, 1202900863::UINTEGER, 817233897::UINTEGER,
+    3183342108::UINTEGER, 3401237130::UINTEGER, 1404277552::UINTEGER, 615818150::UINTEGER,
+    3134207493::UINTEGER, 3453421203::UINTEGER, 1423857449::UINTEGER, 601450431::UINTEGER,
+    3009837614::UINTEGER, 3294710456::UINTEGER, 1567103746::UINTEGER, 711928724::UINTEGER,
+    3020668471::UINTEGER, 3272380065::UINTEGER, 1510334235::UINTEGER, 755167117::UINTEGER
+];
+-- spark_crc32(b): Spark-compatible CRC-32-IEEE (java.util.zip.CRC32).
+-- Signed BIGINT (Long) return, always non-negative (CRC-32 fits in 32 bits).
+-- NULL input propagates. Algorithm: reflected input/output, poly 0xedb88320,
+-- init/final XOR 0xFFFFFFFF (= 4294967295). Uses the 2-arg
+-- `list_reduce(list, lambda)` form with `list_prepend(init, bytes)` so the
+-- initial CRC register is folded in as the first list element (mirrors the
+-- pattern already used for `aggregate` / `reduce` at emission.rs:2668).
+CREATE OR REPLACE MACRO spark_crc32(b) AS
+    CASE WHEN b IS NULL THEN NULL
+         ELSE xor(
+                  list_reduce(
+                      list_prepend(
+                          4294967295::UINTEGER,
+                          -- Byte extraction: DuckDB lacks `get_byte(BLOB, i)`,
+                          -- and our own `octet_length` macro shadows the
+                          -- built-in with a VARCHAR-only definition (see the
+                          -- macro at the top of `SPARK_MACRO_SQL`). Compute
+                          -- byte count from `length(hex(b)) / 2` — `hex(b)`
+                          -- returns exactly 2 chars per byte. Extract each
+                          -- byte via `'0x' || <hh>` → INTEGER → UINTEGER.
+                          -- Verified: `hex(b'test') = '74657374'`,
+                          -- `CAST('0x74' AS INTEGER) = 116`.
+                          list_transform(
+                              range(0, (length(hex(b)) / 2)::INTEGER),
+                              i -> CAST(
+                                  ('0x' || substr(hex(b), i::INTEGER * 2 + 1, 2))
+                                  AS INTEGER
+                              )::UINTEGER
+                          )
+                      ),
+                      (crc, byte) -> xor(
+                          crc >> 8,
+                          _spark_crc32_table()[
+                              ((xor(crc, byte) & 255::UINTEGER)::INTEGER) + 1
+                          ]
+                      )
+                  ),
+                  4294967295::UINTEGER
+              )::BIGINT
+    END;
+";
+
+impl DuckDbSession {
     /// Execute a SQL statement and collect all result Arrow batches.
     pub async fn execute(&self, sql: &str) -> Result<Vec<RecordBatch>> {
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -938,9 +1074,73 @@ fn run_query(conn: &duckdb::Connection, sql: &str) -> Result<Vec<RecordBatch>> {
 #[cfg(test)]
 mod tests {
     use super::configure_s3_credential_chain;
+    use super::SPARK_CRC32_MACRO_SQL;
 
     fn fresh_conn() -> duckdb::Connection {
         duckdb::Connection::open_in_memory().expect("in-memory connection")
+    }
+
+    /// Open a plain in-memory DuckDB connection and register the CRC-32
+    /// macros. Deliberately avoids `DuckDbSession::spawn` so the test does
+    /// not depend on the `thdck_spark_funcs` extension binary (which is
+    /// version-locked at build time). The macros are pure SQL — they only
+    /// reference stdlib DuckDB primitives (`xor`, `list_reduce`,
+    /// `list_prepend`, `list_transform`, `range`, `length`, `get_byte`).
+    fn conn_with_crc32() -> duckdb::Connection {
+        let conn = fresh_conn();
+        conn.execute_batch(SPARK_CRC32_MACRO_SQL)
+            .expect("register spark_crc32 macros");
+        conn
+    }
+
+    /// Query a single BIGINT value.
+    fn query_i64(conn: &duckdb::Connection, sql: &str) -> i64 {
+        conn.query_row::<i64, _, _>(sql, [], |row| row.get(0))
+            .expect("query_row failed")
+    }
+
+    /// hash-001 primary oracle: `spark_crc32` session-macro matches
+    /// `java.util.zip.CRC32` bit-exactly. Verified against Python's
+    /// `binascii.crc32(b'test') == 3632233996` and the Spark
+    /// `ExpressionDescription` example `crc32('Spark') == 1557323817`.
+    #[test]
+    fn spark_crc32_matches_java_util_zip_crc32() {
+        let conn = conn_with_crc32();
+        assert_eq!(
+            query_i64(&conn, "SELECT spark_crc32(CAST('test' AS BLOB))"),
+            3_632_233_996,
+            "spark_crc32(b'test') must equal java.util.zip.CRC32 of the same bytes",
+        );
+        assert_eq!(
+            query_i64(&conn, "SELECT spark_crc32(CAST('Spark' AS BLOB))"),
+            1_557_323_817,
+            "spark_crc32(b'Spark') must match Spark's documented example",
+        );
+    }
+
+    /// Empty BLOB: Spark's `crc32(cast('' as binary))` is 0.
+    #[test]
+    fn spark_crc32_empty_blob_is_zero() {
+        let conn = conn_with_crc32();
+        assert_eq!(
+            query_i64(&conn, "SELECT spark_crc32(CAST('' AS BLOB))"),
+            0,
+            "spark_crc32(empty) must be 0",
+        );
+    }
+
+    /// NULL-in / NULL-out contract for `spark_crc32`.
+    #[test]
+    fn spark_crc32_null_input_yields_null() {
+        let conn = conn_with_crc32();
+        let is_null: bool = conn
+            .query_row(
+                "SELECT spark_crc32(CAST(NULL AS BLOB)) IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query_row failed");
+        assert!(is_null, "spark_crc32(NULL) must be NULL");
     }
 
     /// Unset env var is a no-op — must not touch the connection.

@@ -623,9 +623,11 @@ impl TypeInferenceEngine {
             "split" => DataType::Array(Box::new(String), false),
             "sha" | "sha1" | "sha2" | "md5" => String,
             // Spark's `crc32(binary)` returns BIGINT (unsigned CRC widened
-            // to Long). Corpus witness: `hash-001` (would need extension
-            // support in DuckDB; type inference is correct so once emission
-            // has an implementation, results will match).
+            // to Long). Emission side lives in the `spark_crc32` session
+            // macro (registered by `DuckDbSession::spawn` — bit-exact
+            // `java.util.zip.CRC32` emulation with a 256-entry lookup
+            // table); dispatch arm at `emission.rs` remaps `crc32` →
+            // `spark_crc32`. Corpus: `hash-001`.
             "crc32" => Long,
             // Spark's `elt(idx, s1, s2, ...)` returns the type of the
             // picked argument. Corpus witnesses use STRING; return String

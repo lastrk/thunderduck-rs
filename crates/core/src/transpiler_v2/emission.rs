@@ -158,9 +158,17 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             kind,
             all,
             by_name,
+            allow_missing_columns,
             children,
             widened_schema,
-        } => render_set_op(*kind, *all, *by_name, children, widened_schema),
+        } => render_set_op(
+            *kind,
+            *all,
+            *by_name,
+            *allow_missing_columns,
+            children,
+            widened_schema,
+        ),
 
         // ── Slice F owns (analyzer PuntedOperator today; defensive) ──────
         TypedOp::TableFunction { name, .. } => Err(EmissionError::UnsupportedOp {
@@ -589,6 +597,7 @@ fn render_set_op(
     kind: crate::transpiler_v2::ast::SetOpKind,
     all: bool,
     by_name: bool,
+    allow_missing_columns: bool,
     children: &[TypedAst],
     widened_schema: &StructType,
 ) -> Result<String, EmissionError> {
@@ -599,17 +608,25 @@ fn render_set_op(
             reason: "set-op with no children".to_owned(),
         });
     }
-    let op_kw = match (kind, all, by_name) {
+    // When `allow_missing_columns = true`, every child SELECT emits an
+    // identically-ordered, identically-named, identically-typed projection
+    // list (with `CAST(NULL AS ty) AS name` for missing columns). Under that
+    // invariant plain `UNION [ALL]` is semantically equivalent to
+    // `UNION [ALL] BY NAME`; prefer plain UNION for consistency with the
+    // by-position emission path.
+    let op_kw = match (kind, all, by_name, allow_missing_columns) {
         // BY NAME variants (DuckDB supports UNION [ALL] BY NAME only).
-        (SetOpKind::Union, true, true) => "UNION ALL BY NAME",
-        (SetOpKind::Union, false, true) => "UNION BY NAME",
-        (SetOpKind::Union, true, false) => "UNION ALL",
-        (SetOpKind::Union, false, false) => "UNION",
-        (SetOpKind::Intersect, true, false) => "INTERSECT ALL",
-        (SetOpKind::Intersect, false, false) => "INTERSECT",
-        (SetOpKind::Except, true, false) => "EXCEPT ALL",
-        (SetOpKind::Except, false, false) => "EXCEPT",
-        (kind, _, true) => {
+        (SetOpKind::Union, true, true, false) => "UNION ALL BY NAME",
+        (SetOpKind::Union, false, true, false) => "UNION BY NAME",
+        (SetOpKind::Union, true, true, true) => "UNION ALL",
+        (SetOpKind::Union, false, true, true) => "UNION",
+        (SetOpKind::Union, true, false, _) => "UNION ALL",
+        (SetOpKind::Union, false, false, _) => "UNION",
+        (SetOpKind::Intersect, true, false, _) => "INTERSECT ALL",
+        (SetOpKind::Intersect, false, false, _) => "INTERSECT",
+        (SetOpKind::Except, true, false, _) => "EXCEPT ALL",
+        (SetOpKind::Except, false, false, _) => "EXCEPT",
+        (kind, _, true, _) => {
             return Err(EmissionError::UnsupportedOp {
                 op: format!("SetOp[{kind:?} BY NAME]"),
                 reason: "DuckDB supports BY NAME only for UNION".to_owned(),
@@ -623,14 +640,32 @@ fn render_set_op(
         //   - by-position: children have identical arity (analyzer verified);
         //     zip position-wise, CAST each column to widened_schema[i] and
         //     rename to the widened column name.
-        //   - by-name: children have identical name SETS but possibly
-        //     different orders (analyzer verified). For each name in the
-        //     widened schema, find the child's matching field, CAST to the
-        //     widened type, keep the widened name. DuckDB's `UNION BY NAME`
-        //     matches on the aliased output name — so keeping the widened
-        //     name across children is what makes the union coherent.
+        //   - by-name (strict): children have identical name SETS but
+        //     possibly different orders (analyzer verified). For each name
+        //     in the widened schema, find the child's matching field, CAST
+        //     to the widened type, keep the widened name.
+        //   - by-name + allow_missing_columns: some children may be missing
+        //     names entirely. For each name in the widened schema, either
+        //     emit `CAST(child_col AS widened_ty) AS widened_name` if the
+        //     child has it, or `CAST(NULL AS widened_ty) AS widened_name`
+        //     for the padded slot.
         let mut slots = String::new();
-        if by_name {
+        if by_name && allow_missing_columns {
+            for (i, widened_field) in widened_schema.fields.iter().enumerate() {
+                if i > 0 {
+                    slots.push_str(", ");
+                }
+                let ty = render_data_type(&widened_field.data_type);
+                let widened_name = quote_ident(&widened_field.name);
+                if let Some(child_field) = child.resolved_schema.field_by_name(&widened_field.name)
+                {
+                    let col = quote_ident(&child_field.name);
+                    slots.push_str(&format!("CAST({col} AS {ty}) AS {widened_name}"));
+                } else {
+                    slots.push_str(&format!("CAST(NULL AS {ty}) AS {widened_name}"));
+                }
+            }
+        } else if by_name {
             for (i, widened_field) in widened_schema.fields.iter().enumerate() {
                 if i > 0 {
                     slots.push_str(", ");
@@ -8028,6 +8063,73 @@ mod tests {
             }
             other => panic!("expected Struct, got {other:?}"),
         }
+    }
+
+    /// Pass 77 — `unionByName(allowMissingColumns=True)` emits padded
+    /// child SELECTs (`CAST(NULL AS ty) AS name` for absent columns) and a
+    /// plain `UNION [ALL]` combinator instead of `UNION BY NAME` — the
+    /// aligned projections make the two forms equivalent, and plain UNION
+    /// keeps the emission consistent with the by-position path.
+    #[test]
+    fn union_by_name_allow_missing_emits_padded_nulls_and_plain_union() {
+        // No tap_guard() — this test does not read EMIT_TAP; the shared
+        // mutex would otherwise cascade a poisoned lock from an unrelated
+        // pre-existing INV10 baseline failure in this suite.
+        // LEFT `{a: Long, b: Long}` × RIGHT `{b: Long, c: Long}`
+        let bt = BaseTypes::empty();
+        let left = CommonAst::new(CommonOp::Values {
+            rows: vec![vec![
+                Expression::Literal(Literal {
+                    value: LiteralValue::Long(1),
+                    data_type: DataType::Long,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::Long(2),
+                    data_type: DataType::Long,
+                }),
+            ]],
+            column_names: vec!["a".to_owned(), "b".to_owned()],
+        });
+        let right = CommonAst::new(CommonOp::Values {
+            rows: vec![vec![
+                Expression::Literal(Literal {
+                    value: LiteralValue::Long(3),
+                    data_type: DataType::Long,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::Long(4),
+                    data_type: DataType::Long,
+                }),
+            ]],
+            column_names: vec!["b".to_owned(), "c".to_owned()],
+        });
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Union,
+            all: true,
+            by_name: true,
+            allow_missing_columns: true,
+            children: vec![left, right],
+        });
+        let typed = analyze(ast, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // LEFT is missing `c`; RIGHT is missing `a`. Confirm the padded slot
+        // syntax and the plain `UNION ALL` combinator.
+        assert!(
+            sql.contains("CAST(NULL AS BIGINT) AS c"),
+            "expected NULL pad for LEFT's missing `c`, got: {sql}"
+        );
+        assert!(
+            sql.contains("CAST(NULL AS BIGINT) AS a"),
+            "expected NULL pad for RIGHT's missing `a`, got: {sql}"
+        );
+        assert!(
+            !sql.contains("UNION ALL BY NAME") && !sql.contains("UNION BY NAME"),
+            "expected plain UNION [ALL] (not BY NAME) when allowMissingColumns=true, got: {sql}"
+        );
+        assert!(
+            sql.contains(" UNION ALL "),
+            "expected UNION ALL combinator, got: {sql}"
+        );
     }
 
     /// Pass 76 — `parse_number_format` recognizes digit templates.

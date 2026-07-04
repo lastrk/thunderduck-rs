@@ -336,6 +336,22 @@ the summary below records the corpus deltas by pass number.
 - Compiler warnings: 37 → 34 (-3).
 - Zero-DEFER discipline: findings closed in-pass or explicitly routed to dedicated follow-up passes (queued in each entry's "Findings queued as follow-up pass" line).
 
+## Pass 77 — 2026-07-04T (in progress)
+- Case: `set-004` — `unionByName(other, allowMissingColumns=True)`; previously mis-classified as "Group A / not fixable" in the 2026-07-03 blocker deep-dive but confirmed real τ analyzer bug (Spark accepts the input; τ was rejecting it).
+- Diagnostic: `.agent-output/diagnostic-pass-77.md` (root cause: `allow_missing_columns` proto field dropped at every τ layer — converter/CommonAst/TypedAst/emission).
+- Architecture: `.agent-output/architecture-pass-77.md` (single-bit plumbing extension across 4 layers + analyzer schema-alignment rewrite for ordered union-of-names).
+- Layer(s) touched: converter (v2_relation_converter — reads `allow_missing_columns`), AST (`CommonOp::SetOp` field), analyzer (`TypedOp::SetOp` field + ordered-union schema + type widening + nullable extras), emission (padded-SELECT + plain UNION [ALL] when flag=true).
+- ADR citations: ADR-003 (CommonAst extension), ADR-005/006 (schema-threading analyzer sub-sweep), ADR-015 (`TypeCoercion.WidenSetOperationTypes` + `ResolveUnion.scala` parity), ADR-022 (defect was runtime-correctness; `[SPARK-EMULATED]` wire label was mis-attribution — now removed for the flag=true path).
+- Corpus signal: 294 → **295** (+1). set-004 GREEN; set-003 (strict by-name path) no regression.
+- Files: `crates/core/src/transpiler_v2/{ast.rs, analyzer.rs, analyzer_fixtures.rs, emission.rs}`, `crates/connect-server/src/converter/v2_relation_converter.rs`.
+- Tests added: 6 (5 analyzer + 1 emission covering shared/left-extra/right-extra/both-extra/nullable-propagation).
+- Findings CLOSE_NOW_IN_THIS_PASS: 0 blocking. Reviewer APPROVED (0 Critical + 0 High + 0 Medium + 4 Low non-blocking); Perf OPTIMIZED (0 HIGH + 0 MEDIUM, 7 INFO cold-path notes).
+- Compiler warning delta: 36 → 36 (0 new on touched files).
+- Quality Gate: PASS (cargo check both crates, rustfmt clean, `cargo test -p thunderduck-core --lib --tests` 503/20 vs 497/20 baseline — 6 new tests pass, 20 pre-existing INV10 cascade unchanged, `cargo test -p thunderduck-connect-server --tests` 54/0).
+- Journal: `.agent-output/pass-journal.md`.
+- Commit SHA: pending.
+
+
 
 
 

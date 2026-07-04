@@ -198,6 +198,11 @@ pub enum CommonOp {
         all: bool,
         /// Whether column matching is by-name (`UNION BY NAME`) or by-position.
         by_name: bool,
+        /// Spark's `allowMissingColumns` flag on `unionByName`. Meaningful
+        /// only when `by_name = true` and `kind = Union` (proto contract;
+        /// PySpark's `DataFrame.unionByName` always ships `by_name = true`
+        /// alongside). `false` for every other set-op form.
+        allow_missing_columns: bool,
         /// The n-ary children of the set operation.
         children: Vec<CommonAst>,
     },
@@ -527,6 +532,7 @@ mod tests {
             kind: SetOpKind::Union,
             all: true,
             by_name: false,
+            allow_missing_columns: false,
             children: vec![child_a, child_b],
         });
         match plan.op {
@@ -534,11 +540,13 @@ mod tests {
                 kind,
                 all,
                 by_name,
+                allow_missing_columns,
                 children,
             } => {
                 assert_eq!(kind, SetOpKind::Union);
                 assert!(all);
                 assert!(!by_name);
+                assert!(!allow_missing_columns);
                 assert_eq!(children.len(), 2);
             }
             _ => panic!("expected SetOp"),

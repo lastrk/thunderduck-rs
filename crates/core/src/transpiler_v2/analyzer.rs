@@ -154,9 +154,15 @@ pub enum TypedOp {
         all: bool,
         /// By-name matching (Slice G).
         by_name: bool,
+        /// Mirrors [`CommonOp::SetOp::allow_missing_columns`]. Retained on
+        /// the typed AST so the emitter knows the child projections may need
+        /// `CAST(NULL AS <ty>) AS <col>` padding.
+        allow_missing_columns: bool,
         /// The typed children.
         children: Vec<TypedAst>,
         /// The widened output schema — the analyzer's post-sub-sweep result.
+        /// When `allow_missing_columns = true`, this is the ordered union of
+        /// column names across all children (LEFT-first, then RIGHT's extras).
         widened_schema: StructType,
     },
     /// A relation with exactly one row and zero columns.
@@ -1216,6 +1222,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             kind,
             all,
             by_name,
+            allow_missing_columns,
             children,
         } => {
             // UNION BY NAME is analyzed by name-matching each column across
@@ -1225,6 +1232,14 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                 return Err(AnalyzerError::PuntedOperator {
                     op: format!("SetOp[{kind:?} BY NAME]"),
                     reason: "by-name INTERSECT/EXCEPT unsupported in DuckDB".to_owned(),
+                });
+            }
+            // Spark's Dataset API forbids `allowMissingColumns` without
+            // by-name matching (PySpark's `unionByName` unconditionally sets
+            // both). Reject as Spark-emulated.
+            if allow_missing_columns && !by_name {
+                return Err(AnalyzerError::Other {
+                    reason: "allowMissingColumns requires by-name matching".to_owned(),
                 });
             }
             if children.is_empty() {
@@ -1240,56 +1255,110 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             // set-op widening sub-sweep (§5):
             // By-position (default): verify arity + per-column-index type
             // unify. By-name (UNION only): match columns across children by
-            // NAME (case-insensitive) — each child must have the same NAME
-            // SET; per-name type unify.
+            // NAME (case-insensitive). When `allow_missing_columns = false`,
+            // each child must have the same NAME SET (Spark's strict
+            // unionByName). When `allow_missing_columns = true`, the widened
+            // schema is the ordered union of names — LEFT's columns first in
+            // declared order, followed by RIGHT's extras in declared order
+            // (Spark `ResolveUnion` rule); columns missing from a child
+            // become unconditionally nullable.
             let widened_schema = if by_name {
                 // First child's name order is canonical (Spark semantics).
                 let first_schema = &typed_children[0].resolved_schema;
-                let first_names_lower: std::collections::HashSet<String> = first_schema
-                    .fields
-                    .iter()
-                    .map(|f| f.name.to_lowercase())
-                    .collect();
-                for (idx, child) in typed_children.iter().enumerate().skip(1) {
-                    let child_names_lower: std::collections::HashSet<String> = child
-                        .resolved_schema
+                if allow_missing_columns {
+                    // Build the ordered union of names across all children.
+                    // Case-insensitive dedup with first-seen casing preserved
+                    // (matches `StructType::field_by_name`).
+                    let mut ordered_names: Vec<String> =
+                        Vec::with_capacity(first_schema.fields.len());
+                    let mut seen_lower: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for child in typed_children.iter() {
+                        for f in &child.resolved_schema.fields {
+                            let lower = f.name.to_lowercase();
+                            if seen_lower.insert(lower) {
+                                ordered_names.push(f.name.clone());
+                            }
+                        }
+                    }
+                    let mut widened_fields: Vec<StructField> =
+                        Vec::with_capacity(ordered_names.len());
+                    for name in &ordered_names {
+                        let mut widened_type: Option<DataType> = None;
+                        let mut widened_nullable = false;
+                        let mut any_child_missing = false;
+                        for child in typed_children.iter() {
+                            if let Some(fk) = child.resolved_schema.field_by_name(name) {
+                                widened_type = Some(match widened_type {
+                                    Some(t) => TypeInferenceEngine::unify_types(&t, &fk.data_type),
+                                    None => fk.data_type.clone(),
+                                });
+                                widened_nullable = widened_nullable || fk.nullable;
+                            } else {
+                                any_child_missing = true;
+                            }
+                        }
+                        // `widened_type` must be Some — the name came from
+                        // some child so at least one child has it.
+                        let ty = widened_type.ok_or_else(|| AnalyzerError::Other {
+                            reason: format!(
+                                "internal: union-of-names produced orphan name {name:?}"
+                            ),
+                        })?;
+                        // Extras present in only one child become
+                        // unconditionally nullable — the other child pads
+                        // with NULL. Stronger than the OR rule.
+                        let nullable = widened_nullable || any_child_missing;
+                        widened_fields.push(StructField::new(name.clone(), ty, nullable));
+                    }
+                    StructType::new(widened_fields)
+                } else {
+                    let first_names_lower: std::collections::HashSet<String> = first_schema
                         .fields
                         .iter()
                         .map(|f| f.name.to_lowercase())
                         .collect();
-                    if child_names_lower != first_names_lower {
-                        return Err(AnalyzerError::Other {
-                            reason: format!(
-                                "unionByName column-name mismatch: child 0 has {:?}, child {idx} has {:?}",
-                                first_names_lower, child_names_lower
-                            ),
-                        });
-                    }
-                }
-                let mut widened_fields: Vec<StructField> =
-                    Vec::with_capacity(first_schema.fields.len());
-                for f0 in &first_schema.fields {
-                    let mut widened_type = f0.data_type.clone();
-                    let mut widened_nullable = f0.nullable;
-                    for child in typed_children.iter().skip(1) {
-                        if let Some(fk) = child
+                    for (idx, child) in typed_children.iter().enumerate().skip(1) {
+                        let child_names_lower: std::collections::HashSet<String> = child
                             .resolved_schema
                             .fields
                             .iter()
-                            .find(|f| f.name.eq_ignore_ascii_case(&f0.name))
-                        {
-                            widened_type =
-                                TypeInferenceEngine::unify_types(&widened_type, &fk.data_type);
-                            widened_nullable = widened_nullable || fk.nullable;
+                            .map(|f| f.name.to_lowercase())
+                            .collect();
+                        if child_names_lower != first_names_lower {
+                            return Err(AnalyzerError::Other {
+                                reason: format!(
+                                    "unionByName column-name mismatch: child 0 has {:?}, child {idx} has {:?}",
+                                    first_names_lower, child_names_lower
+                                ),
+                            });
                         }
                     }
-                    widened_fields.push(StructField::new(
-                        f0.name.clone(),
-                        widened_type,
-                        widened_nullable,
-                    ));
+                    let mut widened_fields: Vec<StructField> =
+                        Vec::with_capacity(first_schema.fields.len());
+                    for f0 in &first_schema.fields {
+                        let mut widened_type = f0.data_type.clone();
+                        let mut widened_nullable = f0.nullable;
+                        for child in typed_children.iter().skip(1) {
+                            if let Some(fk) = child
+                                .resolved_schema
+                                .fields
+                                .iter()
+                                .find(|f| f.name.eq_ignore_ascii_case(&f0.name))
+                            {
+                                widened_type =
+                                    TypeInferenceEngine::unify_types(&widened_type, &fk.data_type);
+                                widened_nullable = widened_nullable || fk.nullable;
+                            }
+                        }
+                        widened_fields.push(StructField::new(
+                            f0.name.clone(),
+                            widened_type,
+                            widened_nullable,
+                        ));
+                    }
+                    StructType::new(widened_fields)
                 }
-                StructType::new(widened_fields)
             } else {
                 let first_len = typed_children[0].resolved_schema.len();
                 for (idx, child) in typed_children.iter().enumerate().skip(1) {
@@ -1347,6 +1416,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                     kind,
                     all,
                     by_name,
+                    allow_missing_columns,
                     children: typed_children,
                     widened_schema: widened_schema.clone(),
                 },
@@ -2937,6 +3007,7 @@ mod tests {
             kind: SetOpKind::Union,
             all: true,
             by_name: false,
+            allow_missing_columns: false,
             children: vec![tiny_int_plan(), tiny_double_plan()],
         });
         let typed = analyze(ast, &bt).unwrap();
@@ -2955,6 +3026,7 @@ mod tests {
             kind: SetOpKind::Intersect,
             all: false,
             by_name: false,
+            allow_missing_columns: false,
             children: vec![tiny_int_plan(), tiny_long_plan()],
         });
         let typed = analyze(ast, &bt).unwrap();
@@ -2985,6 +3057,7 @@ mod tests {
             kind: SetOpKind::Except,
             all: false,
             by_name: false,
+            allow_missing_columns: false,
             children: vec![short_plan, tiny_long_plan()],
         });
         let typed = analyze(ast, &bt).unwrap();
@@ -3021,6 +3094,7 @@ mod tests {
             kind: SetOpKind::Union,
             all: true,
             by_name: false,
+            allow_missing_columns: false,
             children: vec![tiny_int_plan(), two_col],
         });
         let err = analyze(ast, &bt).unwrap_err();
@@ -3046,6 +3120,7 @@ mod tests {
             kind: SetOpKind::Intersect,
             all: true,
             by_name: true,
+            allow_missing_columns: false,
             children: vec![tiny_int_plan(), tiny_int_plan()],
         });
         let err = analyze(ast, &bt).unwrap_err();
@@ -3095,6 +3170,7 @@ mod tests {
             kind: SetOpKind::Union,
             all: true,
             by_name: true,
+            allow_missing_columns: false,
             children: vec![left, right],
         });
         let typed = analyze(ast, &bt).unwrap();
@@ -3124,6 +3200,186 @@ mod tests {
         assert_eq!(child_schemas[0].fields[0].data_type, DataType::Integer);
         assert_eq!(child_schemas[1].fields[0].name, "y");
         assert_eq!(child_schemas[1].fields[0].data_type, DataType::String);
+    }
+
+    // ── unionByName(allowMissingColumns=True) — Pass 77 (set-004) ────────
+
+    /// Build a single-row `Values` plan with the given `(name, ty, value)`
+    /// triples. Column nullability follows Spark's Literal semantics (all
+    /// non-null unless the LiteralValue is `Null`).
+    fn values_row(cols: &[(&str, DataType, LiteralValue)]) -> CommonAst {
+        let row: Vec<Expression> = cols
+            .iter()
+            .map(|(_, ty, v)| {
+                Expression::Literal(Literal {
+                    value: v.clone(),
+                    data_type: ty.clone(),
+                })
+            })
+            .collect();
+        let names: Vec<String> = cols.iter().map(|(n, _, _)| (*n).to_owned()).collect();
+        CommonAst::new(CommonOp::Values {
+            rows: vec![row],
+            column_names: names,
+        })
+    }
+
+    #[test]
+    fn union_by_name_allow_missing_partial_overlap_produces_ordered_union() {
+        // LEFT `{a: Long, b: Long}` × RIGHT `{b: Long, c: Long}`
+        // Expected widened schema: `{a nullable, b, c nullable}`.
+        let bt = BaseTypes::empty();
+        let left = values_row(&[
+            ("a", DataType::Long, LiteralValue::Long(1)),
+            ("b", DataType::Long, LiteralValue::Long(2)),
+        ]);
+        let right = values_row(&[
+            ("b", DataType::Long, LiteralValue::Long(3)),
+            ("c", DataType::Long, LiteralValue::Long(4)),
+        ]);
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Union,
+            all: true,
+            by_name: true,
+            allow_missing_columns: true,
+            children: vec![left, right],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        let widened = match &typed.op {
+            TypedOp::SetOp { widened_schema, .. } => widened_schema.clone(),
+            other => panic!("expected SetOp, got {other:?}"),
+        };
+        assert_eq!(widened.fields.len(), 3);
+        assert_eq!(widened.fields[0].name, "a");
+        assert!(widened.fields[0].nullable, "a is padded on RIGHT");
+        assert_eq!(widened.fields[1].name, "b");
+        assert!(
+            !widened.fields[1].nullable,
+            "b present in both non-null children"
+        );
+        assert_eq!(widened.fields[2].name, "c");
+        assert!(widened.fields[2].nullable, "c is padded on LEFT");
+    }
+
+    #[test]
+    fn union_by_name_allow_missing_disjoint_schemas() {
+        // LEFT `{a, b, c}` × RIGHT `{d, e, f}` → `{a, b, c, d, e, f}`,
+        // every field nullable.
+        let bt = BaseTypes::empty();
+        let left = values_row(&[
+            ("a", DataType::Long, LiteralValue::Long(1)),
+            ("b", DataType::Long, LiteralValue::Long(2)),
+            ("c", DataType::Long, LiteralValue::Long(3)),
+        ]);
+        let right = values_row(&[
+            ("d", DataType::String, LiteralValue::String("x".to_owned())),
+            ("e", DataType::String, LiteralValue::String("y".to_owned())),
+            ("f", DataType::String, LiteralValue::String("z".to_owned())),
+        ]);
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Union,
+            all: true,
+            by_name: true,
+            allow_missing_columns: true,
+            children: vec![left, right],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        let widened = match &typed.op {
+            TypedOp::SetOp { widened_schema, .. } => widened_schema.clone(),
+            other => panic!("expected SetOp, got {other:?}"),
+        };
+        let names: Vec<_> = widened.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c", "d", "e", "f"]);
+        assert!(widened.fields.iter().all(|f| f.nullable));
+    }
+
+    #[test]
+    fn union_by_name_allow_missing_widens_shared_column_type() {
+        // LEFT `{x: Integer}` × RIGHT `{x: Double, y: Integer}` →
+        // `{x: Double, y: Integer nullable}`.
+        let bt = BaseTypes::empty();
+        let left = values_row(&[("x", DataType::Integer, LiteralValue::Int(1))]);
+        let right = values_row(&[
+            ("x", DataType::Double, LiteralValue::Double(1.5)),
+            ("y", DataType::Integer, LiteralValue::Int(2)),
+        ]);
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Union,
+            all: true,
+            by_name: true,
+            allow_missing_columns: true,
+            children: vec![left, right],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        let widened = match &typed.op {
+            TypedOp::SetOp { widened_schema, .. } => widened_schema.clone(),
+            other => panic!("expected SetOp, got {other:?}"),
+        };
+        assert_eq!(widened.fields[0].name, "x");
+        assert_eq!(widened.fields[0].data_type, DataType::Double);
+        assert_eq!(widened.fields[1].name, "y");
+        assert_eq!(widened.fields[1].data_type, DataType::Integer);
+        assert!(
+            widened.fields[1].nullable,
+            "y is padded on LEFT, must be nullable"
+        );
+    }
+
+    #[test]
+    fn union_by_name_allow_missing_rejected_without_by_name() {
+        // `allow_missing_columns = true` with `by_name = false` is
+        // Spark-emulated (Spark's Dataset API forbids the combination).
+        let bt = BaseTypes::empty();
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Union,
+            all: true,
+            by_name: false,
+            allow_missing_columns: true,
+            children: vec![tiny_int_plan(), tiny_int_plan()],
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        match err {
+            AnalyzerError::Other { ref reason } => {
+                assert!(
+                    reason.contains("allowMissingColumns"),
+                    "expected reason to mention allowMissingColumns, got: {reason}"
+                );
+            }
+            other => panic!("expected AnalyzerError::Other, got {other:?}"),
+        }
+        assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
+    }
+
+    #[test]
+    fn union_by_name_allow_missing_identical_name_sets_matches_strict() {
+        // Degenerate case: same names in both children — the widened schema
+        // must match the strict by-name path (Spark parity + set-003 shape).
+        let bt = BaseTypes::empty();
+        let left = values_row(&[
+            ("a", DataType::Long, LiteralValue::Long(1)),
+            ("b", DataType::Long, LiteralValue::Long(2)),
+        ]);
+        let right = values_row(&[
+            ("a", DataType::Long, LiteralValue::Long(3)),
+            ("b", DataType::Long, LiteralValue::Long(4)),
+        ]);
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Union,
+            all: true,
+            by_name: true,
+            allow_missing_columns: true,
+            children: vec![left, right],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        let widened = match &typed.op {
+            TypedOp::SetOp { widened_schema, .. } => widened_schema.clone(),
+            other => panic!("expected SetOp, got {other:?}"),
+        };
+        assert_eq!(widened.fields.len(), 2);
+        assert_eq!(widened.fields[0].name, "a");
+        assert_eq!(widened.fields[1].name, "b");
+        assert!(!widened.fields[0].nullable);
+        assert!(!widened.fields[1].nullable);
     }
 
     // ── Display prefix categorization ────────────────────────────────────

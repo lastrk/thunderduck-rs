@@ -371,6 +371,7 @@ impl V2RelationConverter {
             kind,
             all: so.is_all.unwrap_or(false),
             by_name: so.by_name.unwrap_or(false),
+            allow_missing_columns: so.allow_missing_columns.unwrap_or(false),
             children: vec![left, right],
         }))
     }

@@ -278,6 +278,7 @@ fn union_widens_int_and_decimal() -> Fixture {
         kind: SetOpKind::Union,
         all: true,
         by_name: false,
+        allow_missing_columns: false,
         children: vec![child_int, child_dec],
     });
     // Integer × Decimal(10,2) → Decimal(unify): Integer → Decimal(10,0),
@@ -306,6 +307,7 @@ fn intersect_widens_int_and_double() -> Fixture {
         kind: SetOpKind::Intersect,
         all: false,
         by_name: false,
+        allow_missing_columns: false,
         children: vec![child_int, child_dbl],
     });
     let expected = StructType::new(vec![StructField::not_null("x", DataType::Double)]);
@@ -324,6 +326,7 @@ fn except_widens_short_and_long() -> Fixture {
         kind: SetOpKind::Except,
         all: false,
         by_name: false,
+        allow_missing_columns: false,
         children: vec![child_short, child_long],
     });
     let expected = StructType::new(vec![StructField::not_null("x", DataType::Long)]);

@@ -581,6 +581,38 @@ the summary below records the corpus deltas by pass number.
 - Findings queued as follow-up: analyze/emission unsafe-char predicate deduplication; per-row `json_extract_string` re-parses JSON for each key (Focus 3 — pre-existing pattern, not corpus-witnessed at scale); non-Project context guard (inherited from Pass 90).
 - Compiler warning delta: baseline preserved.
 - Quality Gate: PASS (cargo check clean, rustfmt clean, thunderduck-core lib tests + connect-server tests clean, `v2-progress.sh` 309/15/324 with json-002 PASSED and no regressions).
+- Commit SHA: 1170856.
+
+## Pass 92 — 2026-07-04 tech-debt sweep (5th /goal pass)
+- Trigger: 5th pass in /goal invocation (every-5th cadence). First sweep of this /goal.
+- Diff scope: 4 corpus passes (88-91) since PIPELINE_START_SHA `27b9211`; corpus 304 → 309 (+5 cases: arr-012, json-005, inl-001, inl-002, json-002).
+- Sweep verdict: **NO_ACTIONS**. Zero new compiler warnings, zero new TODO/FIXME/dbg!/println!, zero legacy imports, no source edits needed.
+- Compiler warnings: 36 → 31 (net -5 incidental improvements, zero new introductions on files touched by Passes 88-91).
+- INV3/INV10: clean — no `use crate::legacy` or cross-module imports breaking τ-only-path.
+- Cargo.toml drift: `duckdb` `vscalar` feature + `serde_json` (with `preserve_order`) added in Pass 89, minimally scoped to `crates/core/src/runtime/session.rs`; no duplicate declarations, no version conflicts.
+- Two new `.expect()` calls introduced in Passes 88-91, both with invariant comments referencing upstream length/type guards; no new raw `.unwrap()`.
+- Cross-pass duplication (all rule-of-two, queued):
+  1. `dedup_names` PySpark-parity helper at `crates/connect-server/src/arrow_schema_stamp.rs:50` (Pass 88) + `crates/core/src/transpiler_v2/emission.rs:5596` (Pass 88 gap 3). Two callers, one in each crate — shared helper would require a common crate; below threshold.
+  2. Unsafe-char predicate at `crates/core/src/transpiler_v2/analyzer.rs:1781` (Pass 91 analyzer) + `crates/core/src/transpiler_v2/emission.rs:2598` (Pass 91 emission). Same crate, two callers — trivial to extract when the third emerges.
+  3. Non-Project generator context guard — `inline` (Pass 90) + `json_tuple` (Pass 91) both silently pass through to DuckDB catalog error outside a Project. Two witnesses; a third from `stack`/`explode_generic` would trigger the visitor.
+- Cross-pass invariant candidates surfaced:
+  1. **ADR-023 candidate — "analyzer materialises schema-transforming operators".** 7 witnesses (Unpivot, Pivot, Describe/Summary, FreqItems, UnresolvedRegex, inline, json_tuple). Well past rule of three. Docs-only.
+  2. Pre-pass ordering skews Spark error-class parity across 3 pre-passes (regex, inline, json_tuple). Cross-cutting architectural refactor candidate.
+  3. Methodology note: "τ carries Spark-visible information the DuckDB substrate lacks" (arr-012 arrow-schema stamp, json-005 UDF for ignoreNullFields, inline UNNEST with sentinel, json_tuple positional names).
+- Actions applied this pass: none.
+- Follow-ups that stay queued:
+  1. ADR-023 authoring — "analyzer is the schema-expansion boundary" (7 witnesses).
+  2. Pre-pass ordering fix for Spark error-class parity (Pass 90 reviewer M2).
+  3. Non-Project-context generator visitor guard (Pass 90 M1, Pass 91).
+  4. Dedup `dedup_names` and unsafe-char predicate when rule of three lands.
+  5. Case-sensitivity in `parse_to_json_ignore_null_fields` (Pass 89 M).
+  6. Per-row `json_extract_string` re-parse cost (Pass 91 perf INFO).
+  7. Wide-struct per-row `render_data_type` in `render_local_relation` (Pass 88 LOW).
+  8. Empty-string key edge case in `expand_json_tuple_projections` (Pass 91 L).
+- Files: tasks/v2-corpus-driven-pass-log.md (this entry), .agent-output/tech-debt-sweep-pass-92.md (full report).
+- Tests added: 0.
+- Corpus: 309 → 309 (behaviour-neutral).
+- Warning delta: 0 new.
 - Commit SHA: pending.
 
 

@@ -476,6 +476,32 @@ the summary below records the corpus deltas by pass number.
 - Findings queued as follow-up: 1 — N1 partial-vs-full match latent divergence; anchor to Spark parity when a witness surfaces.
 - Compiler warning delta: 36 → 36 (0 new).
 - Quality Gate: PASS (cargo check both crates clean, rustfmt on touched files, `cargo test -- regex` passes, release build 36 warnings, struc-002 PASSED).
+- Commit SHA: 6f18370.
+
+## Pass 86 — 2026-07-04 tech-debt sweep (10th /goal pass)
+- Trigger: 10th pass in /goal invocation (every-5th cadence). Second sweep of this /goal; first was Pass 81 at commit `e41fcdc`.
+- Diff scope: 4 corpus passes (82-85) since Pass 81.
+- Sweep verdict: **ACTIONS_QUEUED (2 cheap fixes) applied in-pass; all else stays queued**.
+- Compiler warnings: 36 → 36 (zero new across Passes 82-85).
+- INV3/INV10: clean — no legacy imports.
+- No new TODO/FIXME/dbg!/println! markers.
+- Cargo.toml diff limited to `regex = "1"` (Pass 85, correctly scoped to thunderduck-core).
+- Cross-pass duplication: `WITH __*_input__ AS MATERIALIZED (...)` pattern at 2 sites (Pass 80 stats_union + Pass 82 freq_items). Below rule-of-three; extraction deferred until Pass 87+ adds a third.
+- Cross-pass invariant surfacing: "schema-transforming operators materialise expansion in the analyzer, not the converter" now has 5 examples (Unpivot, Pivot, Describe/Summary, FreqItems, UnresolvedRegex). Candidate for ADR-023 or ADR-003 note in future docs pass.
+- **Actions applied this pass:**
+  1. Pass 84 L1: strengthened `single_arg_lambda_lowers_to_lambda_expression` and `multi_arg_lambda_lowers_to_lambda_expression` — now unwrap the lambda body's FunctionCall and assert arguments are `Expression::LambdaVariable`, not `UnresolvedColumn`. Previously identity-function `rewrite_lambda_params_to_vars` would have passed.
+  2. Pass 84 L2: new `nested_lambda_shadowing_preserved` test — asserts outer `x` reaches through inner-lambda body as `LambdaVariable("x")` (surviving `params \ inner.params = ["x"] \ ["y"] = ["x"]`) while inner `y` is `LambdaVariable("y")`. Locks the shadow-filter's set-subtraction against naive clear-on-inner regressions.
+- **Follow-ups that stay queued** (all architectural / cross-repo / awaiting Spark witness):
+  1. Pass 77 M1: `unify_types` String-fallback → AnalyzerError (systemic across Unpivot/SetOp/TableFunction).
+  2. Pass 78 open Q1: malformed-wire error-class parity (ADR-016 error-emulation extension).
+  3. Pass 79 Perf M1/M2: `spark_crc32` C++ extension migration; `hex(b)` double-eval (cross-repo).
+  4. Pass 80 perf INFO: `stat_to_agg_expr` allocation (cold-path only).
+  5. Pass 83 harness-hardening: nondeterministic-flag cases should exercise τ end-to-end (harness gap).
+  6. Pass 85 N1: Rust `is_match` partial vs Spark `Pattern.matches()` full-match parity.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs` (test-only additions).
+- Tests added: 1 new + 2 strengthened.
+- Corpus: 303 → 303 (behaviour-neutral).
+- Warning delta: 0.
 - Commit SHA: pending.
 
 

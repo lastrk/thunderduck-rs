@@ -1299,6 +1299,8 @@ mod tests {
     fn single_arg_lambda_lowers_to_lambda_expression() {
         // Pass 84: `x -> upper(x)` inside `transform(tags, ...)` must lower to
         // `Expression::Lambda { params: ["x"], body: FunctionCall(upper) }`.
+        // Pass 86 L1 witness: the identifier `x` inside the body must be
+        // rewritten to `LambdaVariable("x")` — not left as `UnresolvedColumn`.
         let plan = parse("SELECT transform(tags, x -> upper(x)) FROM emp").expect("should parse");
         let CommonOp::Project { projections, .. } = plan.op else {
             panic!("expected Project");
@@ -1312,13 +1314,23 @@ mod tests {
             panic!("expected Lambda as second arg, got {:?}", fc.args[1]);
         };
         assert_eq!(lambda.params, vec!["x".to_owned()]);
-        assert!(matches!(&*lambda.body, Expression::FunctionCall(_)));
+        let Expression::FunctionCall(body_fc) = &*lambda.body else {
+            panic!("expected FunctionCall body, got {:?}", lambda.body);
+        };
+        assert_eq!(body_fc.name.to_lowercase(), "upper");
+        assert_eq!(body_fc.args.len(), 1);
+        match &body_fc.args[0] {
+            Expression::LambdaVariable(lv) => assert_eq!(lv.name, "x"),
+            other => panic!("expected LambdaVariable(x), got {other:?}"),
+        }
     }
 
     #[test]
     fn multi_arg_lambda_lowers_to_lambda_expression() {
         // Pass 84: `(acc, x) -> concat(acc, x)` inside `reduce(...)` must lower
         // to `Expression::Lambda { params: ["acc", "x"], body: FunctionCall }`.
+        // Pass 86 L1 witness: both `acc` and `x` inside the body must be
+        // rewritten to `LambdaVariable` — not left as `UnresolvedColumn`.
         let plan = parse("SELECT reduce(tags, '', (acc, x) -> concat(acc, x)) FROM emp")
             .expect("should parse");
         let CommonOp::Project { projections, .. } = plan.op else {
@@ -1333,7 +1345,76 @@ mod tests {
             panic!("expected Lambda as third arg, got {:?}", fc.args[2]);
         };
         assert_eq!(lambda.params, vec!["acc".to_owned(), "x".to_owned()]);
-        assert!(matches!(&*lambda.body, Expression::FunctionCall(_)));
+        let Expression::FunctionCall(body_fc) = &*lambda.body else {
+            panic!("expected FunctionCall body, got {:?}", lambda.body);
+        };
+        assert_eq!(body_fc.name.to_lowercase(), "concat");
+        assert_eq!(body_fc.args.len(), 2);
+        match &body_fc.args[0] {
+            Expression::LambdaVariable(lv) => assert_eq!(lv.name, "acc"),
+            other => panic!("expected LambdaVariable(acc), got {other:?}"),
+        }
+        match &body_fc.args[1] {
+            Expression::LambdaVariable(lv) => assert_eq!(lv.name, "x"),
+            other => panic!("expected LambdaVariable(x), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_lambda_shadowing_preserved() {
+        // Pass 86 L2: nested-lambda shadowing witness. In
+        // `transform(arr1, x -> transform(arr2, y -> concat(x, y)))`, the
+        // inner-lambda body references BOTH the outer's `x` and the inner's
+        // `y`. After lowering, both must be rewritten to `LambdaVariable`:
+        // outer's `x` reaches through the inner-Lambda arm because
+        // `remaining = params \ inner.params = ["x"] \ ["y"] = ["x"]` (the
+        // outer param survives the shadow-filter). Inner's `y` is rewritten
+        // by the inner-lambda pass itself.
+        let plan = parse("SELECT transform(arr1, x -> transform(arr2, y -> concat(x, y))) FROM t")
+            .expect("should parse");
+        let CommonOp::Project { projections, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        // Outer FunctionCall("transform", [_, outer_lambda]).
+        let Expression::FunctionCall(outer_fc) = &projections[0] else {
+            panic!("expected outer FunctionCall, got {:?}", projections[0]);
+        };
+        assert_eq!(outer_fc.name.to_lowercase(), "transform");
+        assert_eq!(outer_fc.args.len(), 2);
+        let Expression::Lambda(outer_lambda) = &outer_fc.args[1] else {
+            panic!("expected outer Lambda, got {:?}", outer_fc.args[1]);
+        };
+        assert_eq!(outer_lambda.params, vec!["x".to_owned()]);
+        // Outer body is `transform(arr2, y -> concat(x, y))`.
+        let Expression::FunctionCall(inner_transform) = &*outer_lambda.body else {
+            panic!(
+                "expected inner transform FunctionCall, got {:?}",
+                outer_lambda.body
+            );
+        };
+        assert_eq!(inner_transform.name.to_lowercase(), "transform");
+        assert_eq!(inner_transform.args.len(), 2);
+        let Expression::Lambda(inner_lambda) = &inner_transform.args[1] else {
+            panic!("expected inner Lambda, got {:?}", inner_transform.args[1]);
+        };
+        assert_eq!(inner_lambda.params, vec!["y".to_owned()]);
+        // Inner body is `concat(x, y)` — both must be LambdaVariable.
+        let Expression::FunctionCall(concat_fc) = &*inner_lambda.body else {
+            panic!(
+                "expected concat FunctionCall in inner body, got {:?}",
+                inner_lambda.body
+            );
+        };
+        assert_eq!(concat_fc.name.to_lowercase(), "concat");
+        assert_eq!(concat_fc.args.len(), 2);
+        match &concat_fc.args[0] {
+            Expression::LambdaVariable(lv) => assert_eq!(lv.name, "x"),
+            other => panic!("expected outer LambdaVariable(x), got {other:?}"),
+        }
+        match &concat_fc.args[1] {
+            Expression::LambdaVariable(lv) => assert_eq!(lv.name, "y"),
+            other => panic!("expected inner LambdaVariable(y), got {other:?}"),
+        }
     }
 
     #[test]

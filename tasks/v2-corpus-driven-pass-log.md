@@ -655,7 +655,13 @@ the summary below records the corpus deltas by pass number.
 - Findings queued as follow-up: `spark_element_at` extension fn for throw-at-source semantics (parallel to Pass 94's queued `spark_div`/`spark_pmod` — same ADR-006 note); known-length ArrayLiteral guard skip.
 - Compiler warning delta: baseline preserved.
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 625/0, `cargo test -p thunderduck-connect-server --tests` 69/0, release build clean, `v2-progress.sh` 313/11/324 with arr-008 PASSED, no regressions).
-- Commit SHA: pending.
+- Commit SHA: 3458b75.
+
+## Pass 96 attempt — parse-003 (to_number format mismatch) — DEFERRED as still-unsolvable
+- Case: `to_number("9.99", "9,999.99")` — Spark throws `INVALID_FORMAT.MISMATCH_INPUT` SQLSTATE 42601 because input doesn't match format's thousands separator; expected_error tag not yet applied.
+- Investigation: τ has a `try_to_number` arm at `emission.rs:4167-4191` handling only `9`/`0`/`.` templates; grouping (`,`) currently rejected as `Thunderduck-boundary`. Adding a `to_number` throwing arm requires Spark's `ToNumberParser` grammar coverage — full parity means either (a) a Rust `VScalar` UDF walking the format/input pair (analog: Pass 89's json_strip_nulls) or (b) a τ-side format-to-regex translator emitting `regexp_matches(input, '^<pattern>$')`-gated `try_cast`. Both are moderate-scope work beyond a single-arm guard.
+- Decision: NOT executed. Corpus stays at 313/11/324. Case reclassified in `.agent-output/unsolvable.md` from "Category A — Harness needs tri-state comparator" (now resolved for math/element_at via merged Pass 94 substrate) to "Category A′ — Rich Spark parity still-in-scope" (needs its own future pass).
+- Terminating this /goal at 313/324 with 11 cases still red — Categories A′ (parse-003), B (Slice-G, 3 cases), C (PySpark Arrow interval, 4 cases), D (parser Slice A.2, 2 cases), E (analyzer keyword-arg, 1 case). Final report updated at `.agent-output/final-report.md`; superseded predecessor was written at commit `692e7b0` (pre-merge).
 
 
 

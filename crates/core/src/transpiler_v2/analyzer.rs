@@ -350,6 +350,31 @@ pub enum TypedOp {
         /// The name of the output value column.
         value_column_name: String,
     },
+    /// `df.sample(...)` post-analysis. Schema-preserving.
+    Sample {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// The inclusive lower bound of the sampling range.
+        lower_bound: f64,
+        /// The exclusive upper bound of the sampling range.
+        upper_bound: f64,
+        /// Whether rows may be sampled with replacement.
+        with_replacement: bool,
+        /// Optional RNG seed.
+        seed: Option<i64>,
+    },
+    /// `df.sampleBy(col, fractions, seed)` post-analysis. `col` is resolved
+    /// (ColumnReference); `fractions` remain literal. Schema-preserving.
+    SampleBy {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// The resolved stratum column expression.
+        col: Expression,
+        /// Per-stratum `(literal, fraction)` pairs.
+        fractions: Vec<(Literal, f64)>,
+        /// Optional RNG seed.
+        seed: Option<i64>,
+    },
     /// `df.groupBy(...).pivot(col, [values]).agg(...)`. See
     /// [`CommonOp::Pivot`] for the semantic contract. The analyzer resolves
     /// grouping / pivot column / aggregates against the input schema and
@@ -584,7 +609,11 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
         | TypedOp::Unpivot { input, .. }
         | TypedOp::Describe { input, .. }
         | TypedOp::Summary { input, .. }
-        | TypedOp::FreqItems { input, .. } => has_resolved_schema(input),
+        | TypedOp::FreqItems { input, .. }
+        | TypedOp::Sample { input, .. } => has_resolved_schema(input),
+        TypedOp::SampleBy { input, col, .. } => {
+            has_resolved_schema(input) && expression_is_fully_resolved(col)
+        }
         // Pivot: explicit-values Pivot has a fully-stamped schema (group
         // cols + pivot_value × aggregate columns). Implicit-values Pivot
         // never reaches this arm — `analyze_pivot` punts with a
@@ -1044,6 +1073,49 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                 op: TypedOp::Deduplicate {
                     input: Box::new(typed_input),
                     on_columns,
+                },
+                resolved_schema: output_schema,
+            })
+        }
+
+        // ── Sample (Spark `df.sample(...)`) ─────────────────────────────
+        CommonOp::Sample {
+            input,
+            lower_bound,
+            upper_bound,
+            with_replacement,
+            seed,
+        } => {
+            let typed_input = analyze_node(*input, base_types)?;
+            let output_schema = typed_input.resolved_schema.clone();
+            Ok(TypedAst {
+                op: TypedOp::Sample {
+                    input: Box::new(typed_input),
+                    lower_bound,
+                    upper_bound,
+                    with_replacement,
+                    seed,
+                },
+                resolved_schema: output_schema,
+            })
+        }
+
+        // ── SampleBy (Spark `df.sampleBy(col, fractions, seed)`) ───────
+        CommonOp::SampleBy {
+            input,
+            col,
+            fractions,
+            seed,
+        } => {
+            let typed_input = analyze_node(*input, base_types)?;
+            let col = resolve_and_stamp(col, &typed_input.resolved_schema)?;
+            let output_schema = typed_input.resolved_schema.clone();
+            Ok(TypedAst {
+                op: TypedOp::SampleBy {
+                    input: Box::new(typed_input),
+                    col,
+                    fractions,
+                    seed,
                 },
                 resolved_schema: output_schema,
             })
@@ -4796,6 +4868,120 @@ mod tests {
             other => panic!("expected PuntedOperator, got {other:?}"),
         }
         assert!(err.to_string().starts_with("[TDCK-BOUNDARY]"));
+    }
+
+    // ── Sample / SampleBy analysis (Pass 83) ─────────────────────────────
+
+    #[test]
+    fn analyze_sample_schema_passthrough() {
+        // Anchor: `df.sample(0.5, seed=11)` produces the same schema as the
+        // input relation — Sample is schema-preserving.
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Sample {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            lower_bound: 0.0,
+            upper_bound: 0.5,
+            with_replacement: false,
+            seed: Some(11),
+        });
+        let typed = analyze(ast, &bt).expect("analyze Sample");
+        assert_eq!(typed.resolved_schema, emp_schema());
+        match &typed.op {
+            TypedOp::Sample {
+                lower_bound,
+                upper_bound,
+                with_replacement,
+                seed,
+                ..
+            } => {
+                assert!((*lower_bound - 0.0).abs() < f64::EPSILON);
+                assert!((*upper_bound - 0.5).abs() < f64::EPSILON);
+                assert!(!with_replacement);
+                assert_eq!(*seed, Some(11));
+            }
+            other => panic!("expected TypedOp::Sample, got {other:?}"),
+        }
+        assert!(has_resolved_schema(&typed));
+    }
+
+    #[test]
+    fn analyze_sample_with_replacement_flag_is_accepted_by_analyzer() {
+        // `with_replacement = true` is a Thunderduck-boundary case rejected by
+        // the emission stage, not the analyzer. This test pins the analyzer's
+        // schema-only responsibility.
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Sample {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            lower_bound: 0.0,
+            upper_bound: 0.5,
+            with_replacement: true,
+            seed: None,
+        });
+        let typed = analyze(ast, &bt).expect("analyzer does not reject with_replacement=true");
+        assert_eq!(typed.resolved_schema, emp_schema());
+    }
+
+    #[test]
+    fn analyze_sample_by_resolves_col_and_passes_schema() {
+        // Anchor — samp-002: `sampleBy("dept_id", {10:0.5,...})` resolves the
+        // stratum column against the input schema and preserves the schema.
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::SampleBy {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            col: Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "dept_id".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            }),
+            fractions: vec![
+                (
+                    Literal {
+                        value: LiteralValue::Int(10),
+                        data_type: DataType::Integer,
+                    },
+                    0.5,
+                ),
+                (
+                    Literal {
+                        value: LiteralValue::Int(20),
+                        data_type: DataType::Integer,
+                    },
+                    1.0,
+                ),
+            ],
+            seed: Some(11),
+        });
+        let typed = analyze(ast, &bt).expect("analyze SampleBy");
+        assert_eq!(typed.resolved_schema, emp_schema());
+        match &typed.op {
+            TypedOp::SampleBy {
+                col,
+                fractions,
+                seed,
+                ..
+            } => {
+                match col {
+                    Expression::ColumnReference(c) => {
+                        assert_eq!(c.name, "dept_id");
+                        assert_eq!(c.data_type.as_ref(), Some(&DataType::Integer));
+                    }
+                    other => panic!("expected ColumnReference, got {other:?}"),
+                }
+                assert_eq!(fractions.len(), 2);
+                assert_eq!(*seed, Some(11));
+            }
+            other => panic!("expected TypedOp::SampleBy, got {other:?}"),
+        }
+        assert!(has_resolved_schema(&typed));
     }
 
     #[test]

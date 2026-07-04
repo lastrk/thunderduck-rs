@@ -147,6 +147,19 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             aggregates,
             schema,
         ),
+        TypedOp::Sample {
+            input,
+            lower_bound,
+            upper_bound,
+            with_replacement,
+            seed,
+        } => render_sample(input, *lower_bound, *upper_bound, *with_replacement, *seed),
+        TypedOp::SampleBy {
+            input,
+            col,
+            fractions,
+            seed,
+        } => render_sample_by(input, col, fractions, *seed),
 
         // ── Aggregate (operator + primitive function arms) ───────────────
         TypedOp::Aggregate {
@@ -1403,6 +1416,71 @@ fn build_conditional_aggregate(
     } else {
         call
     })
+}
+
+/// Render `df.sample(fraction, seed)` → DuckDB `TABLESAMPLE BERNOULLI(...
+/// PERCENT) [REPEATABLE(seed)]`. `with_replacement = true` is a permanent
+/// Thunderduck-boundary case per ADR-022 — DuckDB has no row-level sampling
+/// with replacement.
+fn render_sample(
+    input: &TypedAst,
+    lower_bound: f64,
+    upper_bound: f64,
+    with_replacement: bool,
+    seed: Option<i64>,
+) -> Result<String, EmissionError> {
+    if with_replacement {
+        return Err(EmissionError::UnsupportedOp {
+            op: "Sample[with_replacement]".to_owned(),
+            reason: "df.sample(withReplacement=True) is not supported; \
+                     DuckDB has no row-level sampling with replacement"
+                .to_owned(),
+        });
+    }
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    let pct = (upper_bound - lower_bound) * 100.0;
+    let seed_clause = match seed {
+        Some(s) => format!(" REPEATABLE({s})"),
+        None => String::new(),
+    };
+    Ok(format!(
+        "SELECT * FROM ({child_sql}) AS __td_sample TABLESAMPLE BERNOULLI({pct:.4} PERCENT){seed_clause}"
+    ))
+}
+
+/// Render `df.sampleBy(col, fractions, seed)` — stratified sampling as a
+/// `WHERE (col = k1 AND RANDOM() < f1) OR ...` filter. When `seed` is
+/// present, DuckDB's session RNG is seeded via
+/// `(SELECT setseed(seed_f)) IS NULL AND (...)`. Empty `fractions` degrades
+/// to `WHERE FALSE` (matches Spark: unspecified strata are dropped).
+fn render_sample_by(
+    input: &TypedAst,
+    col: &Expression,
+    fractions: &[(Literal, f64)],
+    seed: Option<i64>,
+) -> Result<String, EmissionError> {
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    let col_sql = render_expr(col, &input.resolved_schema)?;
+    if fractions.is_empty() {
+        return Ok(format!(
+            "SELECT * FROM ({child_sql}) AS __td_sample_by WHERE FALSE"
+        ));
+    }
+    let mut conditions: Vec<String> = Vec::with_capacity(fractions.len());
+    for (lit, frac) in fractions {
+        let lit_sql = render_expr(&Expression::Literal(lit.clone()), &input.resolved_schema)?;
+        conditions.push(format!("({col_sql} = {lit_sql} AND RANDOM() < {frac})"));
+    }
+    let where_body = conditions.join(" OR ");
+    let where_clause = if let Some(s) = seed {
+        let seed_f = (s.rem_euclid(1_000_000) as f64) / 1_000_000.0;
+        format!("(SELECT setseed({seed_f:.6})) IS NULL AND ({where_body})")
+    } else {
+        where_body
+    };
+    Ok(format!(
+        "SELECT * FROM ({child_sql}) AS __td_sample_by WHERE {where_clause}"
+    ))
 }
 
 fn render_deduplicate(input: &TypedAst, on_columns: &[String]) -> Result<String, EmissionError> {
@@ -6681,6 +6759,156 @@ mod tests {
             EmissionError::UnsupportedOp { op, .. } => assert_eq!(op, "FreqItems"),
             other => panic!("expected UnsupportedOp, got {other:?}"),
         }
+    }
+
+    // ── Sample / SampleBy emission (Pass 83) ─────────────────────────────
+
+    #[test]
+    fn render_sample_emits_tablesample_bernoulli_with_percent() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Sample {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            lower_bound: 0.0,
+            upper_bound: 0.5,
+            with_replacement: false,
+            seed: None,
+        });
+        let sql = generate(&ast, &bt).expect("generate Sample");
+        assert!(
+            sql.contains("TABLESAMPLE BERNOULLI(50.0000 PERCENT)"),
+            "got: {sql}"
+        );
+        assert!(
+            !sql.contains("REPEATABLE"),
+            "no seed → no REPEATABLE clause"
+        );
+    }
+
+    #[test]
+    fn render_sample_with_seed_emits_repeatable_clause() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Sample {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            lower_bound: 0.0,
+            upper_bound: 0.5,
+            with_replacement: false,
+            seed: Some(11),
+        });
+        let sql = generate(&ast, &bt).expect("generate Sample with seed");
+        assert!(
+            sql.contains("TABLESAMPLE BERNOULLI(50.0000 PERCENT) REPEATABLE(11)"),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_sample_with_replacement_returns_unsupported_op() {
+        // ADR-022 Thunderduck-boundary: DuckDB has no row-level sampling
+        // with replacement. Emission surfaces `UnsupportedOp`.
+        let _g = tap_guard();
+        let typed_input = TypedAst {
+            op: TypedOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            },
+            resolved_schema: StructType::empty(),
+        };
+        let err = super::render_sample(&typed_input, 0.0, 0.5, true, Some(11)).unwrap_err();
+        match err {
+            EmissionError::UnsupportedOp { op, .. } => {
+                assert_eq!(op, "Sample[with_replacement]");
+            }
+            other => panic!("expected UnsupportedOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_sample_by_emits_per_stratum_or_chain_with_setseed_wrapper() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::SampleBy {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            col: Expression::UnresolvedColumn(crate::transpiler_v2::expression::UnresolvedColumn {
+                name: "dept_id".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            }),
+            fractions: vec![
+                (
+                    Literal {
+                        value: LiteralValue::Int(10),
+                        data_type: DataType::Integer,
+                    },
+                    0.5,
+                ),
+                (
+                    Literal {
+                        value: LiteralValue::Int(20),
+                        data_type: DataType::Integer,
+                    },
+                    0.5,
+                ),
+                (
+                    Literal {
+                        value: LiteralValue::Int(30),
+                        data_type: DataType::Integer,
+                    },
+                    1.0,
+                ),
+            ],
+            seed: Some(11),
+        });
+        let sql = generate(&ast, &bt).expect("generate SampleBy");
+        // Per-stratum OR chain.
+        assert!(
+            sql.contains("(dept_id = 10 AND RANDOM() < 0.5)"),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains("(dept_id = 20 AND RANDOM() < 0.5)"),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains("(dept_id = 30 AND RANDOM() < 1)"),
+            "got: {sql}"
+        );
+        // Seed → setseed wrapper.
+        assert!(sql.contains("(SELECT setseed("), "got: {sql}");
+        // Sanity: __td_sample_by alias.
+        assert!(sql.contains("__td_sample_by"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_sample_by_empty_fractions_emits_where_false() {
+        let _g = tap_guard();
+        let typed_input = TypedAst {
+            op: TypedOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            },
+            resolved_schema: emp_schema(),
+        };
+        let col_ref = Expression::ColumnReference(ColumnReference {
+            name: "dept_id".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Integer),
+            nullable: Some(true),
+        });
+        let sql =
+            super::render_sample_by(&typed_input, &col_ref, &[], None).expect("empty fractions ok");
+        assert!(sql.contains("WHERE FALSE"), "got: {sql}");
+        assert!(sql.contains("__td_sample_by"), "got: {sql}");
     }
 
     // ── UpdateFields emission (Pass 61 — struct-005 / struct-006) ────────

@@ -170,6 +170,8 @@ impl V2RelationConverter {
             RelType::Summary(s) => self.convert_summary(s),
             RelType::FreqItems(f) => self.convert_freq_items(f),
             RelType::Crosstab(c) => self.convert_crosstab(c),
+            RelType::Sample(s) => self.convert_sample(s),
+            RelType::SampleBy(s) => self.convert_sample_by(s),
             // Cosmetic ops per Spark 4 semantics — semantically no-op.
             // Thunderduck ignores them and continues with the input relation
             // (ADR-001 "result-irrelevant cosmetic" carve-out).
@@ -345,6 +347,59 @@ impl V2RelationConverter {
             input: Box::new(input),
             cols: f.cols.clone(),
             support,
+        }))
+    }
+
+    /// Convert `proto::Sample` — mirrors legacy `convert_sample`. Proto
+    /// `deterministic_order` (physical hint) is dropped at τ conversion.
+    fn convert_sample(&mut self, s: &proto::Sample) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(s.input.as_deref(), "Sample")?;
+        Ok(CommonAst::new(CommonOp::Sample {
+            input: Box::new(input),
+            lower_bound: s.lower_bound,
+            upper_bound: s.upper_bound,
+            with_replacement: s.with_replacement.unwrap_or(false),
+            seed: s.seed,
+        }))
+    }
+
+    /// Convert `proto::StatSampleBy` — mirrors legacy `convert_stat_sample_by`.
+    /// Each stratum must decode as an `Expression::Literal`; anything else is
+    /// a loud proto-shape error (defensive per the connect-server val() lesson
+    /// in CLAUDE.md gotcha #9).
+    fn convert_sample_by(&mut self, s: &proto::StatSampleBy) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(s.input.as_deref(), "SampleBy")?;
+        let col_proto = s
+            .col
+            .as_ref()
+            .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                shape: "SampleBy::col::None".to_owned(),
+                reason: "StatSampleBy missing col".to_owned(),
+            })?;
+        let col = self.expr.convert(col_proto)?;
+        let mut fractions: Vec<(Literal, f64)> = Vec::with_capacity(s.fractions.len());
+        for frac in &s.fractions {
+            let stratum_proto =
+                frac.stratum
+                    .as_ref()
+                    .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                        shape: "SampleBy::Fraction::stratum::None".to_owned(),
+                        reason: "SampleBy fraction missing stratum literal".to_owned(),
+                    })?;
+            let lit_expr = self.expr.convert_literal(stratum_proto)?;
+            let Expression::Literal(lit) = lit_expr else {
+                return Err(EmissionError::UnsupportedProtoShape {
+                    shape: "SampleBy::Fraction::stratum::non-literal".to_owned(),
+                    reason: "stratum did not decode as Expression::Literal".to_owned(),
+                });
+            };
+            fractions.push((lit, frac.fraction));
+        }
+        Ok(CommonAst::new(CommonOp::SampleBy {
+            input: Box::new(input),
+            col,
+            fractions,
+            seed: s.seed,
         }))
     }
 
@@ -2896,6 +2951,104 @@ mod tests {
                 assert_eq!(col2, "active");
             }
             _ => panic!("expected CommonOp::Crosstab"),
+        }
+    }
+
+    // ── Sample / SampleBy converters (Pass 83) ────────────────────────────
+
+    #[test]
+    fn convert_sample_maps_bounds_and_seed() {
+        // samp-001 anchor — PySpark `df.sample(0.5, seed=11)` ships as
+        // `Sample { lower_bound: 0.0, upper_bound: 0.5, with_replacement:
+        // Some(false), seed: Some(11) }`.
+        let input = table_scan_rel("emp");
+        let s = rel(proto::relation::RelType::Sample(Box::new(proto::Sample {
+            input: Some(Box::new(input)),
+            lower_bound: 0.0,
+            upper_bound: 0.5,
+            with_replacement: Some(false),
+            seed: Some(11),
+            deterministic_order: false,
+        })));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&s).expect("convert Sample");
+        match out.op {
+            CommonOp::Sample {
+                input,
+                lower_bound,
+                upper_bound,
+                with_replacement,
+                seed,
+            } => {
+                assert!(matches!(input.op, CommonOp::TableScan { .. }));
+                assert!((lower_bound - 0.0).abs() < f64::EPSILON);
+                assert!((upper_bound - 0.5).abs() < f64::EPSILON);
+                assert!(!with_replacement);
+                assert_eq!(seed, Some(11));
+            }
+            _ => panic!("expected CommonOp::Sample"),
+        }
+    }
+
+    #[test]
+    fn convert_sample_by_extracts_literal_strata() {
+        // samp-002 anchor — three literal strata + fractions, seed=11.
+        fn int_lit(v: i32) -> proto::expression::Literal {
+            proto::expression::Literal {
+                data_type: None,
+                literal_type: Some(proto::expression::literal::LiteralType::Integer(v)),
+            }
+        }
+        fn col(name: &str) -> proto::Expression {
+            proto::Expression {
+                common: None,
+                expr_type: Some(proto::expression::ExprType::UnresolvedAttribute(
+                    proto::expression::UnresolvedAttribute {
+                        unparsed_identifier: name.to_owned(),
+                        plan_id: None,
+                        is_metadata_column: None,
+                    },
+                )),
+            }
+        }
+        let input = table_scan_rel("emp");
+        let s = rel(proto::relation::RelType::SampleBy(Box::new(
+            proto::StatSampleBy {
+                input: Some(Box::new(input)),
+                col: Some(col("dept_id")),
+                fractions: vec![
+                    proto::stat_sample_by::Fraction {
+                        stratum: Some(int_lit(10)),
+                        fraction: 0.5,
+                    },
+                    proto::stat_sample_by::Fraction {
+                        stratum: Some(int_lit(20)),
+                        fraction: 0.5,
+                    },
+                    proto::stat_sample_by::Fraction {
+                        stratum: Some(int_lit(30)),
+                        fraction: 1.0,
+                    },
+                ],
+                seed: Some(11),
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&s).expect("convert SampleBy");
+        match out.op {
+            CommonOp::SampleBy {
+                input,
+                col,
+                fractions,
+                seed,
+            } => {
+                assert!(matches!(input.op, CommonOp::TableScan { .. }));
+                assert!(matches!(col, Expression::UnresolvedColumn(_)));
+                assert_eq!(fractions.len(), 3);
+                assert!((fractions[2].1 - 1.0).abs() < f64::EPSILON);
+                assert_eq!(seed, Some(11));
+            }
+            _ => panic!("expected CommonOp::SampleBy"),
         }
     }
 

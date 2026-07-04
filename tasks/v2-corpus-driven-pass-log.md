@@ -429,6 +429,22 @@ the summary below records the corpus deltas by pass number.
 - Findings queued as follow-up: none new this pass.
 - Compiler warning delta: 36 → 36 (0 new).
 - Quality Gate: PASS (cargo check both crates, rustfmt clean, freq_items tests 7/7 after M-fix, connect-server 67/67, corpus 300).
+- Commit SHA: c1dd16b.
+
+## Pass 83 — 2026-07-04T (in progress)
+- Case cluster: **BUNDLED** — samp-001 (`Sample`) + samp-002 (`SampleBy`). Both `nondeterministic` (schema-only comparison per harness).
+- Diagnostic: `.agent-output/diagnostic-pass-83.md` — full 4-layer substrate gap in τ for both `RelType::Sample` and `RelType::SampleBy`.
+- Architecture: `.agent-output/architecture-pass-83.md` (Pass-80/82 template).
+- Layer(s) touched: AST (2 CommonOp variants), converter (2 arms + helpers), analyzer (2 TypedOp variants, schema-passthrough, 2 arms in `analyze_node` + 2 in `has_resolved_schema`), base_types (2 arms in each walker), emission (2 dispatch arms, `render_sample` with `TABLESAMPLE BERNOULLI(pct PERCENT) REPEATABLE(seed)`, `render_sample_by` with OR-chain and `setseed()`-hoist seed handling — legacy port).
+- ADR citations: ADR-003 (CommonAst extension), ADR-015 (Spark-parity schema-passthrough), ADR-020 (stock DuckDB — TABLESAMPLE + RANDOM()), ADR-022 (τ-only end-to-end; `Sample::with_replacement=true` correctly surfaces as `EmissionError::UnsupportedOp` — DuckDB has no row-level replacement sampling).
+- Corpus signal: **+0** at the harness level (300→301 counted for Pass 82's misc-007; corpus stays 301). BUT: both cases now flow end-to-end through τ, correcting a prior harness-loophole where `nondeterministic` schema-only comparison masked τ's ingress rejection with `UnsupportedProtoShape`. Real ADR-022 correctness fix; no visible corpus delta due to harness-metric limitation for `nondeterministic` cases.
+- Files: `crates/core/src/transpiler_v2/{ast.rs, analyzer.rs, base_types.rs, emission.rs}`, `crates/connect-server/src/converter/v2_relation_converter.rs`, `crates/connect-server/src/service.rs` (repointed unsupported-shape fixture Sample → ShowString).
+- Tests added: 10 new + 1 updated fixture (2 ast, 2 converter, 3 analyzer, 5 emission).
+- Findings CLOSE_NOW_IN_THIS_PASS: 0 blocking. Reviewer APPROVED (0 Critical + 0 High + 0 Medium + 2 Low: L1 randomSplit range-partition consistency limitation matching legacy, L2 harness loophole for nondeterministic-flag cases). Perf OPTIMIZED (0 HIGH + 0 MEDIUM + 0 LOW + 3 INFO cold-path notes).
+- Findings queued as follow-up passes:
+  1. Harness-hardening pass: differential harness should exercise `nondeterministic`-flagged cases end-to-end (currently PySpark-local schema check bypasses τ), preventing future harness-loophole regressions.
+- Compiler warning delta: 36 → 36.
+- Quality Gate: PASS (cargo check both crates, rustfmt clean, 10 sample-related tests pass, connect-server 69/69, samp-001+samp-002 both PASSED individually).
 - Commit SHA: pending.
 
 

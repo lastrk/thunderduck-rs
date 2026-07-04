@@ -891,21 +891,25 @@ mod tests {
     /// `Status::unimplemented`.
     #[test]
     fn transpile_relation_unsupported_proto_shape_surfaces() {
-        let sample = proto::Relation {
+        // ShowString is still in the converter's catch-all `other` arm — a
+        // deferred `RelType` that must surface as `UnsupportedProtoShape`.
+        // (Pass 83 wired `Sample` / `SampleBy`, which used to sit here.)
+        let show = proto::Relation {
             common: None,
-            rel_type: Some(proto::relation::RelType::Sample(Box::new(proto::Sample {
-                input: Some(Box::new(table_scan_relation("t"))),
-                lower_bound: 0.0,
-                upper_bound: 1.0,
-                with_replacement: None,
-                seed: None,
-                deterministic_order: false,
-            }))),
+            rel_type: Some(proto::relation::RelType::ShowString(Box::new(
+                proto::ShowString {
+                    input: Some(Box::new(table_scan_relation("t"))),
+                    num_rows: 20,
+                    truncate: 0,
+                    vertical: false,
+                },
+            ))),
         };
-        let err = transpile_relation(&sample).expect_err("deferred shape must error");
+        let err = transpile_relation(&show).expect_err("deferred shape must error");
         assert_eq!(err.code(), tonic::Code::Unimplemented);
         assert!(
-            err.message().contains("unsupported proto shape") || err.message().contains("Sample"),
+            err.message().contains("unsupported proto shape")
+                || err.message().contains("ShowString"),
             "expected UnsupportedProtoShape; got: {}",
             err.message()
         );

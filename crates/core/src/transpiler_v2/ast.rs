@@ -10,7 +10,7 @@
 //! resolution metadata (resolved schema, plan_id, etc.) without a source-wide
 //! refactor. Slice A.2 keeps the wrapper minimal.
 
-use super::expression::{Expression, SortOrder};
+use super::expression::{Expression, Literal, SortOrder};
 use crate::types::StructType;
 
 /// τ's canonical plan tree — a single wrapper around a [`CommonOp`] variant.
@@ -417,6 +417,50 @@ pub enum CommonOp {
         assignments: Vec<(String, Expression)>,
     },
 
+    // ── Sampling (Pass 83) ───────────────────────────────────────────────
+    /// `df.sample(fraction, seed)` / `df.sample(withReplacement, fraction, seed)`.
+    /// Schema-preserving.
+    ///
+    /// Mirrors proto `Sample` 1:1: `lower_bound` / `upper_bound` (the Spark
+    /// client converts `fraction` to `[0.0, fraction]`), plus `with_replacement`
+    /// and `seed`. Proto `deterministic_order` is a physical-execution hint
+    /// dropped at conversion.
+    ///
+    /// `with_replacement = true` is a permanent Thunderduck-boundary case per
+    /// ADR-022 — DuckDB has no row-level sampling with replacement. Emission
+    /// surfaces `EmissionError::UnsupportedOp`.
+    Sample {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// The inclusive lower bound of the sampling range.
+        lower_bound: f64,
+        /// The exclusive upper bound of the sampling range.
+        upper_bound: f64,
+        /// Whether rows may be sampled with replacement.
+        with_replacement: bool,
+        /// Optional RNG seed for deterministic sampling.
+        seed: Option<i64>,
+    },
+
+    /// `df.sampleBy(col, fractions, seed)` — stratified sampling.
+    /// Schema-preserving.
+    ///
+    /// `col` is the stratum column (resolved by the analyzer against the
+    /// input schema). `fractions` is a list of `(stratum literal, fraction)`
+    /// pairs — the fraction of rows to keep per stratum value. Strata missing
+    /// from `fractions` are dropped entirely (matches Spark: unspecified
+    /// fractions are treated as zero).
+    SampleBy {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// The stratum column expression.
+        col: Expression,
+        /// Per-stratum `(literal, fraction)` pairs.
+        fractions: Vec<(Literal, f64)>,
+        /// Optional RNG seed.
+        seed: Option<i64>,
+    },
+
     // ── Join with first-class plan_ids (§2.3) ────────────────────────────
     /// A binary join.
     ///
@@ -780,6 +824,75 @@ mod tests {
                 assert_eq!(col2, "active");
             }
             _ => panic!("expected Crosstab"),
+        }
+    }
+
+    #[test]
+    fn common_op_sample_carries_bounds_and_flags() {
+        // Pass 83 anchor — samp-001: `df.sample(0.5, seed=11)` lowers to
+        // `Sample { lower_bound: 0.0, upper_bound: 0.5, with_replacement: false,
+        // seed: Some(11) }`.
+        let plan = CommonAst::new(CommonOp::Sample {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            lower_bound: 0.0,
+            upper_bound: 0.5,
+            with_replacement: false,
+            seed: Some(11),
+        });
+        match plan.op {
+            CommonOp::Sample {
+                lower_bound,
+                upper_bound,
+                with_replacement,
+                seed,
+                ..
+            } => {
+                assert!((lower_bound - 0.0).abs() < f64::EPSILON);
+                assert!((upper_bound - 0.5).abs() < f64::EPSILON);
+                assert!(!with_replacement);
+                assert_eq!(seed, Some(11));
+            }
+            _ => panic!("expected CommonOp::Sample"),
+        }
+    }
+
+    #[test]
+    fn common_op_sample_by_carries_col_and_fractions() {
+        // Pass 83 anchor — samp-002: `df.sampleBy("dept_id", {10:0.5, 20:0.5,
+        // 30:1.0}, seed=11)` lowers with a resolved-later column expression
+        // and Vec<(Literal, f64)> fractions.
+        use super::super::expression::UnresolvedColumn;
+        let dept_lit = |v: i32| Literal {
+            value: LiteralValue::Int(v),
+            data_type: DataType::Integer,
+        };
+        let plan = CommonAst::new(CommonOp::SampleBy {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            col: Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "dept_id".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            }),
+            fractions: vec![
+                (dept_lit(10), 0.5),
+                (dept_lit(20), 0.5),
+                (dept_lit(30), 1.0),
+            ],
+            seed: Some(11),
+        });
+        match plan.op {
+            CommonOp::SampleBy {
+                col,
+                fractions,
+                seed,
+                ..
+            } => {
+                assert!(matches!(col, Expression::UnresolvedColumn(_)));
+                assert_eq!(fractions.len(), 3);
+                assert!((fractions[2].1 - 1.0).abs() < f64::EPSILON);
+                assert_eq!(seed, Some(11));
+            }
+            _ => panic!("expected CommonOp::SampleBy"),
         }
     }
 

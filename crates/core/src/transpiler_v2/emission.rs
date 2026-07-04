@@ -3802,10 +3802,20 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // takes a JSON-object schema (`'{"a": "INTEGER"}'`) instead — τ
         // translates the Spark DDL literal into DuckDB's JSON schema shape
         // for the common no-options case. Nested `STRUCT<...>` fields
-        // recurse. Corpus witnesses: `json-003`, `json-004`. Falls through
-        // to a Thunderduck-boundary error when the schema is non-literal or
-        // uses shapes τ does not currently translate (MAP, DECIMAL(p,s),
-        // three-arg options-map form).
+        // recurse. Corpus witnesses: `json-003`, `json-004`. Emits a
+        // Thunderduck-boundary error when the schema is non-literal or uses
+        // shapes τ does not currently translate (MAP, DECIMAL(p,s)). The
+        // three-arg options-map form is rejected explicitly by the
+        // `!= 2` guard below — otherwise it would silently pass through
+        // as literal `from_json(...)` and DuckDB would raise an opaque
+        // scalar-not-found error.
+        "from_json" if f.args.len() != 2 => {
+            return Err(EmissionError::UnsupportedFunction {
+                name: f.name.clone(),
+                reason: "`from_json` options-map form (3-arg) not supported — τ boundary"
+                    .to_owned(),
+            });
+        }
         "from_json" if f.args.len() == 2 => {
             let json_str = render_expr(&f.args[0], schema)?;
             if let Some(ddl) = literal_string_arg(&f.args[1]) {
@@ -3819,6 +3829,67 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 name: f.name.clone(),
                 reason: "`from_json` with a non-literal DDL schema or unsupported \
                          DDL shape (τ handles the digit-schema field-list form)"
+                    .to_owned(),
+            });
+        }
+        // Spark's `from_csv(csv_str, schema_ddl[, options])` parses a
+        // comma-separated string per a Spark DDL schema literal (e.g.
+        // `"qty INT, label STRING, price DOUBLE"`). DuckDB has no scalar
+        // `from_csv` — τ synthesizes an equivalent struct via
+        // `split_part(csv, ',', i)` per field plus `try_cast(..., '') AS T`
+        // for numerics and `nullif(..., '')` for strings (matching Spark's
+        // default `nullValue = ""`). The whole expression is guarded by
+        // `CASE WHEN csv IS NULL THEN NULL ELSE ... END` so a NULL input
+        // yields a NULL struct (not a struct-of-NULLs). Corpus witness:
+        // `json-007`. Emits a Thunderduck-boundary error when the schema
+        // is non-literal or uses shapes τ does not currently translate
+        // (nested STRUCT/ARRAY/MAP, DECIMAL(p,s)) — Spark's `from_csv`
+        // itself is a flat-primitive schema function, so the 2-arg surface
+        // covers the intended shape. The three-arg options-map form is
+        // rejected explicitly by the `!= 2` guard below — otherwise it
+        // would silently pass through as literal `from_csv(...)` and
+        // DuckDB would raise an opaque scalar-not-found error.
+        //
+        // KNOWN DEVIATION: this manual split ignores CSV quoting rules
+        // (embedded commas, quoted strings, escapes). The corpus witness
+        // uses simple unquoted values; documenting the gap for future work.
+        "from_csv" if f.args.len() != 2 => {
+            return Err(EmissionError::UnsupportedFunction {
+                name: f.name.clone(),
+                reason: "`from_csv` options-map form (3-arg) not supported — τ boundary"
+                    .to_owned(),
+            });
+        }
+        "from_csv" if f.args.len() == 2 => {
+            let csv_str = render_expr(&f.args[0], schema)?;
+            if let Some(ddl) = literal_string_arg(&f.args[1]) {
+                if let Some(st) = from_csv_ddl_to_struct(&ddl) {
+                    let mut parts = String::new();
+                    for (i, field) in st.fields.iter().enumerate() {
+                        if i > 0 {
+                            parts.push_str(", ");
+                        }
+                        let idx = i + 1;
+                        let split = format!("split_part({csv_str}, ',', {idx})");
+                        let name_q = quote_ident(&field.name);
+                        let field_expr = match &field.data_type {
+                            DataType::String => format!("nullif({split}, '')"),
+                            other => {
+                                let ty = render_data_type(other);
+                                format!("try_cast(nullif({split}, '') AS {ty})")
+                            }
+                        };
+                        parts.push_str(&format!("{name_q} := {field_expr}"));
+                    }
+                    return Ok(format!(
+                        "CASE WHEN ({csv_str}) IS NULL THEN NULL ELSE struct_pack({parts}) END"
+                    ));
+                }
+            }
+            return Err(EmissionError::UnsupportedFunction {
+                name: f.name.clone(),
+                reason: "`from_csv` with a non-literal DDL schema or unsupported \
+                         DDL shape (τ handles the flat primitive field-list form)"
                     .to_owned(),
             });
         }
@@ -4982,6 +5053,31 @@ pub(crate) fn from_json_ddl_to_struct_for_type_inference(ddl: &str) -> Option<St
     for field in &fields {
         let (name, ty) = split_field_name_type(field)?;
         let dt = spark_ddl_type_to_core_data_type(ty.trim())?;
+        out.push(StructField::new(name.trim().to_owned(), dt, true));
+    }
+    Some(StructType::new(out))
+}
+
+/// Parse a Spark DDL field-list schema string for `from_csv`. Spark's
+/// `from_csv` accepts only flat primitive schemas (no nested STRUCT / ARRAY
+/// / MAP) — this helper enforces that narrower surface so we fail loud on
+/// shapes Spark itself would reject. Returns `None` when τ cannot translate
+/// the DDL. Pass 87 witness: `json-007`.
+pub(crate) fn from_csv_ddl_to_struct(ddl: &str) -> Option<StructType> {
+    let fields = split_top_level_fields(ddl)?;
+    let mut out: Vec<StructField> = Vec::with_capacity(fields.len());
+    for field in &fields {
+        let (name, ty) = split_field_name_type(field)?;
+        let dt = spark_ddl_type_to_core_data_type(ty.trim())?;
+        // from_csv is flat-only: reject nested/composite types (Spark
+        // itself would reject these too — from_csv operates row-per-row on
+        // a single delimited line).
+        if matches!(
+            dt,
+            DataType::Struct(_) | DataType::Array(_, _) | DataType::Map { .. }
+        ) {
+            return None;
+        }
         out.push(StructField::new(name.trim().to_owned(), dt, true));
     }
     Some(StructType::new(out))
@@ -8633,6 +8729,170 @@ mod tests {
                 assert_eq!(inner.fields[0].data_type, DataType::Boolean);
             }
             other => panic!("expected Struct, got {other:?}"),
+        }
+    }
+
+    /// Pass 87 — `from_csv(csv_str, "qty INT, label STRING, price DOUBLE")`
+    /// emits a per-field `split_part` synthesis wrapped in a NULL guard so
+    /// a NULL input yields a NULL struct (not a struct-of-NULLs).
+    /// Corpus witness: `json-007`.
+    #[test]
+    fn render_from_csv_emits_split_part_struct_pack_with_null_guard() {
+        let f = FunctionCall {
+            name: "from_csv".to_owned(),
+            args: vec![
+                Expression::ColumnReference(ColumnReference {
+                    name: "csv_str".to_owned(),
+                    qualifier: None,
+                    data_type: Some(DataType::String),
+                    nullable: Some(true),
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("qty INT, label STRING, price DOUBLE".to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render from_csv");
+        // NULL guard on the entire input.
+        assert!(
+            sql.starts_with("CASE WHEN (csv_str) IS NULL THEN NULL ELSE struct_pack("),
+            "got: {sql}"
+        );
+        // Per-field synthesis: numerics get try_cast + nullif; strings get nullif only.
+        assert!(
+            sql.contains("qty := try_cast(nullif(split_part(csv_str, ',', 1), '') AS INTEGER)"),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains("label := nullif(split_part(csv_str, ',', 2), '')"),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains("price := try_cast(nullif(split_part(csv_str, ',', 3), '') AS DOUBLE)"),
+            "got: {sql}"
+        );
+    }
+
+    /// Pass 87 — DDL parsed into a flat `StructType` for τ's projection
+    /// schema inference. Nested composite types are rejected (Spark's own
+    /// `from_csv` accepts only flat primitives).
+    #[test]
+    fn from_csv_ddl_resolves_to_flat_struct_type() {
+        let st = from_csv_ddl_to_struct("qty INT, label STRING, price DOUBLE").unwrap();
+        assert_eq!(st.fields.len(), 3);
+        assert_eq!(st.fields[0].name, "qty");
+        assert_eq!(st.fields[0].data_type, DataType::Integer);
+        assert_eq!(st.fields[1].name, "label");
+        assert_eq!(st.fields[1].data_type, DataType::String);
+        assert_eq!(st.fields[2].name, "price");
+        assert_eq!(st.fields[2].data_type, DataType::Double);
+        // Nested composite types → None (Spark's from_csv rejects them).
+        assert!(from_csv_ddl_to_struct("a STRUCT<b:INT>").is_none());
+        assert!(from_csv_ddl_to_struct("a ARRAY<INT>").is_none());
+    }
+
+    /// Pass 87 review M2 — Spark's `from_csv(csv_str, schema_ddl, options_map)`
+    /// three-arg options form is a Thunderduck-boundary error. Prior to the
+    /// fix, the arm's `if f.args.len() == 2` guard silently declined to match
+    /// and DuckDB got literal `from_csv(...)` back, producing an opaque
+    /// scalar-not-found error. Now the `!= 2` arm emits a τ-boundary
+    /// `UnsupportedFunction` upfront.
+    #[test]
+    fn render_from_csv_three_arg_is_boundary_error() {
+        let f = FunctionCall {
+            name: "from_csv".to_owned(),
+            args: vec![
+                Expression::ColumnReference(ColumnReference {
+                    name: "csv_str".to_owned(),
+                    qualifier: None,
+                    data_type: Some(DataType::String),
+                    nullable: Some(true),
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("qty INT, label STRING".to_owned()),
+                    data_type: DataType::String,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("sep=,".to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        };
+        let err = render_function_call(&f, &empty_schema()).expect_err("expected boundary error");
+        match err {
+            EmissionError::UnsupportedFunction { name, reason } => {
+                assert_eq!(name, "from_csv");
+                assert!(reason.contains("options-map"), "got: {reason}");
+            }
+            other => panic!("expected UnsupportedFunction, got {other:?}"),
+        }
+    }
+
+    /// Pass 87 review M2 — Spark's `from_json(json_str, schema_ddl, options_map)`
+    /// three-arg options form is likewise a Thunderduck-boundary error. The
+    /// `!= 2` arm intercepts before the fallthrough could hand DuckDB a
+    /// literal `from_json(...)` with an unrecognized options arg.
+    #[test]
+    fn render_from_json_three_arg_is_boundary_error() {
+        let f = FunctionCall {
+            name: "from_json".to_owned(),
+            args: vec![
+                Expression::ColumnReference(ColumnReference {
+                    name: "json_str".to_owned(),
+                    qualifier: None,
+                    data_type: Some(DataType::String),
+                    nullable: Some(true),
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("a INT, b STRING".to_owned()),
+                    data_type: DataType::String,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("mode=PERMISSIVE".to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        };
+        let err = render_function_call(&f, &empty_schema()).expect_err("expected boundary error");
+        match err {
+            EmissionError::UnsupportedFunction { name, reason } => {
+                assert_eq!(name, "from_json");
+                assert!(reason.contains("options-map"), "got: {reason}");
+            }
+            other => panic!("expected UnsupportedFunction, got {other:?}"),
+        }
+    }
+
+    /// Pass 87 — a non-literal schema argument is a Thunderduck-boundary
+    /// error, mirroring `from_json`'s behavior.
+    #[test]
+    fn render_from_csv_non_literal_schema_is_boundary_error() {
+        let f = FunctionCall {
+            name: "from_csv".to_owned(),
+            args: vec![
+                Expression::ColumnReference(ColumnReference {
+                    name: "csv_str".to_owned(),
+                    qualifier: None,
+                    data_type: Some(DataType::String),
+                    nullable: Some(true),
+                }),
+                Expression::ColumnReference(ColumnReference {
+                    name: "schema_col".to_owned(),
+                    qualifier: None,
+                    data_type: Some(DataType::String),
+                    nullable: Some(true),
+                }),
+            ],
+            distinct: false,
+        };
+        let err = render_function_call(&f, &empty_schema()).expect_err("expected boundary error");
+        match err {
+            EmissionError::UnsupportedFunction { name, .. } => assert_eq!(name, "from_csv"),
+            other => panic!("expected UnsupportedFunction, got {other:?}"),
         }
     }
 

@@ -896,6 +896,21 @@ impl Expression {
                     }
                 }
             }
+            // Spark's `from_csv(csv_str, ddl_schema)` returns a Struct typed
+            // per the DDL literal (flat primitives only — Spark's own
+            // surface). Mirror emission's DDL translation so the projection
+            // schema matches Spark. Corpus anchor: `json-007`.
+            "from_csv" if f.args.len() == 2 => {
+                if let Expression::Literal(Literal {
+                    value: LiteralValue::String(ddl),
+                    ..
+                }) = &f.args[1]
+                {
+                    if let Some(st) = super::emission::from_csv_ddl_to_struct(ddl) {
+                        return DataType::Struct(st);
+                    }
+                }
+            }
             _ => {}
         }
         let first_arg_type = f.args.first().map(|a| a.data_type(schema));

@@ -502,6 +502,21 @@ the summary below records the corpus deltas by pass number.
 - Tests added: 1 new + 2 strengthened.
 - Corpus: 303 → 303 (behaviour-neutral).
 - Warning delta: 0.
+- Commit SHA: 3461e4c.
+
+## Pass 87 — 2026-07-04T (in progress)
+- Case: `json-007` — `F.from_csv(str, "qty INT, label STRING, price DOUBLE")`.
+- Approach: port Pass 76's from_json DDL parser to from_csv. Manual `split_part(csv, ',', i)::type` per field wrapped in `struct_pack`.
+- Layer(s) touched: emission (new `from_csv` arm + `from_csv_ddl_to_struct` helper — flat-DDL only, rejects composite types), expression (type-inference arm returning `DataType::Struct` from literal DDL).
+- ADR citations: ADR-013 (typed AST), ADR-015 (Spark-parity: `try_cast + nullif` mirrors Spark permissive mode default), ADR-022 (rejects composite DDL + non-literal schema arg + 3-arg options-map form as Thunderduck-boundary).
+- Corpus signal: 303 → **304** (+1). json-007 GREEN.
+- Files: `crates/core/src/transpiler_v2/{emission.rs, expression.rs}`.
+- Tests added: 3 initial + 2 review-fix (5 total): render shape, DDL parser resolves flat struct, non-literal schema boundary, from_csv 3-arg boundary, from_json 3-arg boundary.
+- Findings CLOSE_NOW_IN_THIS_PASS: 1 (review M2 — from_csv AND from_json had misleading "3-arg is boundary" comments while actual guard was `len==2`, silently falling through to DuckDB. Added defensive `!= 2` arms returning `EmissionError::UnsupportedFunction` with honest boundary reason).
+- Findings not blocking: reviewer 1 Medium (csv_str evaluated N+1 times — no corpus impact for simple col refs), 2 Low (whitespace trimming; DATE/TIMESTAMP inherit DuckDB parsing vs Spark dateFormat). Perf 0 prescriptions (per-row `split_part` re-scan is theoretical; needs benchmark to justify alternate emission).
+- Known deviation in-source: manual split ignores CSV quoting rules (embedded commas, quoted strings, escapes). Corpus witness uses simple unquoted values; queued.
+- Compiler warning delta: 36 → 36.
+- Quality Gate: PASS (cargo check both crates, rustfmt clean on additions, `cargo test -- from_csv from_json` 9/9, release build 36 warnings, json-007 PASSED).
 - Commit SHA: pending.
 
 

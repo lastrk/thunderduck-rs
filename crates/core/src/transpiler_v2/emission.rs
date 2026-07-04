@@ -122,6 +122,12 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             variable_column_name,
             value_column_name,
         } => render_unpivot(input, ids, values, variable_column_name, value_column_name),
+        TypedOp::Describe { input, cols } => render_describe(input, cols),
+        TypedOp::Summary {
+            input,
+            cols,
+            statistics,
+        } => render_summary(input, cols, statistics),
         TypedOp::Pivot {
             input,
             grouping,
@@ -1078,6 +1084,94 @@ fn render_unpivot(
     Ok(format!(
         "UNPIVOT (SELECT {select_list} FROM ({child_sql}) AS __td_unpivot_src) ON {value_cols} INTO NAME {var_col} VALUE {val_col}"
     ))
+}
+
+/// Render `df.describe(cols...)` — a `UNION ALL` of five aggregate rows
+/// (`count`, `mean`, `stddev`, `min`, `max`) over the materialised `cols`.
+fn render_describe(input: &TypedAst, cols: &[String]) -> Result<String, EmissionError> {
+    const DESCRIBE_STATS: &[&str] = &["count", "mean", "stddev", "min", "max"];
+    let stats: Vec<String> = DESCRIBE_STATS.iter().map(|s| (*s).to_owned()).collect();
+    render_stats_union(input, cols, &stats)
+}
+
+/// Render `df.summary(statistics...)` — a `UNION ALL` of one aggregate row
+/// per statistic over the full input column list. Analyzer materialises
+/// both `cols` (always full schema) and `statistics` (empty ⇒
+/// `DEFAULT_SUMMARY_STATS`) before this arm sees them.
+fn render_summary(
+    input: &TypedAst,
+    cols: &[String],
+    statistics: &[String],
+) -> Result<String, EmissionError> {
+    render_stats_union(input, cols, statistics)
+}
+
+/// Shared helper for Describe/Summary emission. Emits
+/// `WITH __stats_input__ AS (<child>) SELECT '<stat>' AS summary, <agg>...
+/// FROM __stats_input__ UNION ALL ...` with one row per statistic.
+fn render_stats_union(
+    input: &TypedAst,
+    cols: &[String],
+    stats: &[String],
+) -> Result<String, EmissionError> {
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    let rows: Vec<String> = stats
+        .iter()
+        .map(|stat| {
+            let col_exprs: Vec<String> = cols
+                .iter()
+                .map(|col| {
+                    let q = quote_ident(col);
+                    format!("{} AS {q}", stat_to_agg_expr(stat, &q))
+                })
+                .collect();
+            let summary_lit = format!("'{}'", stat.replace('\'', "''"));
+            let cols_sql = if col_exprs.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", col_exprs.join(", "))
+            };
+            format!("SELECT {summary_lit} AS summary{cols_sql} FROM __stats_input__")
+        })
+        .collect();
+    Ok(format!(
+        "WITH __stats_input__ AS MATERIALIZED ({child_sql}) {}",
+        rows.join(" UNION ALL ")
+    ))
+}
+
+/// Map a statistic name to the aggregate SQL expression for a single column.
+///
+/// Mirrors legacy `generator::mod::stat_to_agg_expr` with one adjustment:
+/// percentile stats emit `quantile_disc(TRY_CAST(col AS DOUBLE), frac)`
+/// (function-call form) instead of `PERCENTILE_DISC WITHIN GROUP (ORDER BY
+/// ...)` — same DuckDB function chosen for τ's `percentile_approx` at
+/// Pass 74 (`emission.rs::render_function_call`).
+///
+/// Uses `TRY_CAST(col AS DOUBLE)` for numeric aggregates so that non-numeric
+/// columns return NULL instead of erroring (matches Spark's behaviour).
+fn stat_to_agg_expr(stat: &str, quoted_col: &str) -> String {
+    match stat {
+        "count" => format!("CAST(COUNT({quoted_col}) AS VARCHAR)"),
+        "mean" => format!("CAST(AVG(TRY_CAST({quoted_col} AS DOUBLE)) AS VARCHAR)"),
+        "stddev" => format!("CAST(STDDEV_SAMP(TRY_CAST({quoted_col} AS DOUBLE)) AS VARCHAR)"),
+        "min" => format!("CAST(MIN({quoted_col}) AS VARCHAR)"),
+        "max" => format!("CAST(MAX({quoted_col}) AS VARCHAR)"),
+        "count_distinct" => format!("CAST(COUNT(DISTINCT {quoted_col}) AS VARCHAR)"),
+        "approx_count_distinct" => {
+            format!("CAST(APPROX_COUNT_DISTINCT({quoted_col}) AS VARCHAR)")
+        }
+        s if s.ends_with('%') => match s.trim_end_matches('%').parse::<f64>() {
+            Ok(p) => {
+                let frac = p / 100.0;
+                format!(
+                    "CAST(quantile_disc(TRY_CAST({quoted_col} AS DOUBLE), {frac:.17}) AS VARCHAR)"
+                )
+            }
+            Err(_) => "CAST(NULL AS VARCHAR)".to_owned(),
+        },
+        _ => "CAST(NULL AS VARCHAR)".to_owned(),
+    }
 }
 
 /// Render a Pivot as conditional-aggregate SQL that matches Spark's PIVOT
@@ -6380,6 +6474,71 @@ mod tests {
         assert!(sql.contains(" ON dept_id, salary"), "got: {sql}");
         assert!(sql.contains("INTO NAME metric VALUE value"), "got: {sql}",);
         assert!(sql.contains("__td_unpivot_src"), "got: {sql}");
+    }
+
+    // ── Describe / Summary emission (Pass 80) ────────────────────────────
+
+    #[test]
+    fn render_describe_wraps_child_in_cte_and_emits_union_all_rows() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Describe {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            cols: vec!["dept_id".to_owned(), "salary".to_owned()],
+        });
+        let sql = generate(&ast, &bt).expect("generate describe");
+        assert!(
+            sql.starts_with("WITH __stats_input__ AS MATERIALIZED ("),
+            "got: {sql}"
+        );
+        // Five stat rows joined by UNION ALL (count, mean, stddev, min, max).
+        assert_eq!(sql.matches(" UNION ALL ").count(), 4, "got: {sql}");
+        assert!(sql.contains("'count' AS summary"), "got: {sql}");
+        assert!(sql.contains("'mean' AS summary"), "got: {sql}");
+        assert!(sql.contains("'stddev' AS summary"), "got: {sql}");
+        assert!(sql.contains("'min' AS summary"), "got: {sql}");
+        assert!(sql.contains("'max' AS summary"), "got: {sql}");
+        // Per-col aggregate uses TRY_CAST(... AS DOUBLE) for the mean row.
+        assert!(
+            sql.contains("CAST(AVG(TRY_CAST(dept_id AS DOUBLE)) AS VARCHAR) AS dept_id"),
+            "got: {sql}"
+        );
+        assert!(sql.contains("FROM __stats_input__"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_summary_emits_percentile_via_quantile_disc_try_cast() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Summary {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            statistics: vec![
+                "count".to_owned(),
+                "min".to_owned(),
+                "25%".to_owned(),
+                "75%".to_owned(),
+                "max".to_owned(),
+            ],
+        });
+        let sql = generate(&ast, &bt).expect("generate summary");
+        assert!(
+            sql.starts_with("WITH __stats_input__ AS MATERIALIZED ("),
+            "got: {sql}"
+        );
+        assert_eq!(sql.matches(" UNION ALL ").count(), 4, "got: {sql}");
+        assert!(sql.contains("'25%' AS summary"), "got: {sql}");
+        // Percentile stats emit quantile_disc(TRY_CAST(...)).
+        assert!(
+            sql.contains("quantile_disc(TRY_CAST(salary AS DOUBLE),"),
+            "got: {sql}"
+        );
+        assert!(sql.contains("'75%' AS summary"), "got: {sql}");
     }
 
     // ── UpdateFields emission (Pass 61 — struct-005 / struct-006) ────────

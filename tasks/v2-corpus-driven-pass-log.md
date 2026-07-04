@@ -385,6 +385,23 @@ the summary below records the corpus deltas by pass number.
   2. **Perf MEDIUM-2**: `hex(b)` evaluated twice — try `octet_length(BLOB)` if unshadowed. Single-line fix; can bundle with the extension-migration pass.
 - Compiler warning delta: 36 → 36 (0 new on touched files).
 - Quality Gate: PASS (cargo check both crates, rustfmt on touched files, `cargo test -- spark_crc32` 4/4, `cargo test -p thunderduck-connect-server --tests` 59/0).
+- Commit SHA: 5adc30d.
+
+## Pass 80 — 2026-07-04T (in progress)
+- Case cluster: **BUNDLED** — `misc-001` (`df.describe(cols)`) + `misc-002` (`df.summary(stats)`). Identical shape; 5-file substrate slice; corpus +2 vs +1 for the same touch set.
+- Diagnostic: `.agent-output/diagnostic-pass-80.md` (full substrate gap — no `CommonOp` variant, no converter arm, no analyzer, no emission; legacy port available at `generator/mod.rs::gen_describe`+`gen_stats_union`+`stat_to_agg_expr` and `relation_converter.rs::convert_describe`/`convert_summary`).
+- Architecture: `.agent-output/architecture-pass-80.md` (Option A: two `CommonOp` variants + two `TypedOp` variants + shared `render_stats_union` emission helper; `DEFAULT_SUMMARY_STATS` constant for empty-stats expansion; analyzer applies expansion at the analyze step per Unpivot precedent).
+- Layer(s) touched: converter (v2_relation_converter — `convert_describe`, `convert_summary`, 2 `RelType` arms), AST (`CommonOp::{Describe,Summary}`), analyzer (`TypedOp::{Describe,Summary}`, `analyze_describe`, `analyze_summary`, `DEFAULT_SUMMARY_STATS`, `build_stats_output_schema`, `materialise_stats_cols`, 2 arms in `analyze_node`, 2 in `has_resolved_schema`), base_types (2 arms in each of two walkers), emission (`render_describe`, `render_summary`, `render_stats_union` with `AS MATERIALIZED` CTE, `stat_to_agg_expr` with 9 branches including `quantile_disc(TRY_CAST(col AS DOUBLE), q)` for percentile, 2 arms in `dispatch_op`).
+- ADR citations: ADR-003 (CommonAst incremental extension — task text said ADR-013 which was a typo; ADR-013 covers external/lakehouse tables), ADR-015 (differential + AnalyzePlan schema oracle — reviewer verified `summary` column is nullable per Spark), ADR-022 (Thunderduck-boundary → Spark-emulated after this pass).
+- Corpus signal: 297 → **299** (+2). misc-001 GREEN, misc-002 GREEN.
+- Files: `crates/core/src/transpiler_v2/{ast.rs, analyzer.rs, base_types.rs, emission.rs}`, `crates/connect-server/src/converter/v2_relation_converter.rs`.
+- Tests added: 14 (2 ast, 5 analyzer, 2 emission [initial] + 2 emission-shape adjustments for MATERIALIZED, 5 converter).
+- Deviations from plan (documented in-source):
+  1. `summary` column changed from NOT NULL to nullable — reviewer verified against differential oracle; Reference=True. Spark-parity per ADR-015. Test assertions inverted.
+- Findings CLOSE_NOW_IN_THIS_PASS: 1 (perf M1: `AS MATERIALIZED` on the CTE — prevents DuckDB from inlining the child 5-8× per UNION branch; one-word emission change + 2 test updates).
+- Findings not blocking: reviewer 2 Low (HashMap-vs-HashSet idiom; caller-casing preservation in materialised cols — non-corpus-witnessed), perf 1 LOW + 3 INFO (all cold-path style notes; not prescribed).
+- Compiler warning delta: 36 → 36 (0 new).
+- Quality Gate: PASS (cargo check both crates, rustfmt clean, connect-server 64/0, core 9 new τ tests pass individually).
 - Commit SHA: pending.
 
 

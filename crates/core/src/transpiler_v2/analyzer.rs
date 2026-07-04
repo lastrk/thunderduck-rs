@@ -54,6 +54,11 @@ use crate::types::{DataType, StructField, StructType};
 // Re-export SetOpKind so downstream callers can use `analyzer::SetOpKind`.
 pub use super::ast::SetOpKind;
 
+/// The eight Spark defaults for `df.summary()` when no statistics list is
+/// supplied — matches `Dataset.summary()` in Apache Spark 4.x.
+pub(super) const DEFAULT_SUMMARY_STATS: &[&str] =
+    &["count", "mean", "stddev", "min", "25%", "50%", "75%", "max"];
+
 /// τ's schema type alias — points at the shared `StructType`.
 pub type Schema = StructType;
 
@@ -251,6 +256,27 @@ pub enum TypedOp {
         input: Box<TypedAst>,
         /// Old-name → new-name renames.
         renames: Vec<(String, String)>,
+    },
+    /// `df.describe(...)`. Analyzer materialises `cols` (empty ⇒ all input
+    /// columns in schema order) and stamps the output schema as `summary`
+    /// (STRING NOT NULL) + one STRING NULLABLE per materialised col.
+    Describe {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// The materialised column list (never empty here).
+        cols: Vec<String>,
+    },
+    /// `df.summary(...)`. Analyzer materialises both `cols` (always the full
+    /// input schema — proto `StatSummary` carries no `cols` field) and
+    /// `statistics` (empty ⇒ [`DEFAULT_SUMMARY_STATS`]). Output schema is
+    /// identical to [`TypedOp::Describe`].
+    Summary {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// The materialised column list (never empty here).
+        cols: Vec<String>,
+        /// The materialised statistics list (never empty here).
+        statistics: Vec<String>,
     },
     /// `df.dropDuplicates` / `df.distinct`. Schema-transparent.
     Deduplicate {
@@ -536,7 +562,9 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
         TypedOp::NaFill { input, .. }
         | TypedOp::NaDrop { input, .. }
         | TypedOp::NaReplace { input, .. }
-        | TypedOp::Unpivot { input, .. } => has_resolved_schema(input),
+        | TypedOp::Unpivot { input, .. }
+        | TypedOp::Describe { input, .. }
+        | TypedOp::Summary { input, .. } => has_resolved_schema(input),
         // Pivot: explicit-values Pivot has a fully-stamped schema (group
         // cols + pivot_value × aggregate columns). Implicit-values Pivot
         // never reaches this arm — `analyze_pivot` punts with a
@@ -949,6 +977,12 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             value_column_name,
             base_types,
         ),
+
+        // ── Describe (Spark `df.describe(...)`) ─────────────────────────
+        CommonOp::Describe { input, cols } => analyze_describe(*input, cols, base_types),
+
+        // ── Summary (Spark `df.summary(...)`) ───────────────────────────
+        CommonOp::Summary { input, statistics } => analyze_summary(*input, statistics, base_types),
 
         // ── Pivot (Spark `df.groupBy(...).pivot(...).agg(...)`) ─────────
         CommonOp::Pivot {
@@ -2162,6 +2196,109 @@ fn analyze_unpivot(
             values: materialised_values,
             variable_column_name,
             value_column_name,
+        },
+        resolved_schema: output_schema,
+    })
+}
+
+// ── Describe / Summary analysis (Pass 80) ───────────────────────────────────
+
+/// Build the shared output schema for `describe` / `summary`: a `summary`
+/// STRING NOT NULL column followed by one STRING NULLABLE column per
+/// materialised input col. Per-col stats can produce NULL (`TRY_CAST` on a
+/// non-numeric col returns NULL) so every stat column is nullable.
+fn build_stats_output_schema(cols: &[String]) -> StructType {
+    let mut fields: Vec<StructField> = Vec::with_capacity(cols.len() + 1);
+    // Spark stamps `summary` as nullable=true even though every value is a
+    // string literal — see `Dataset.summary()` output schema. Spark parity
+    // (ADR-015: schema oracle wins) requires we match, not the STRING NOT
+    // NULL that the emission's `'count'` literal would justify.
+    fields.push(StructField::nullable("summary", DataType::String));
+    for c in cols {
+        fields.push(StructField::nullable(c.clone(), DataType::String));
+    }
+    StructType::new(fields)
+}
+
+/// Materialise a caller-supplied `cols` list against `input_schema`:
+///   - empty ⇒ all input columns in schema order (Spark default);
+///   - non-empty ⇒ each name resolves case-insensitively or
+///     [`AnalyzerError::UnknownColumn`] is returned. The output preserves the
+///     caller's casing (matches legacy `logical::Describe.cols` behaviour).
+fn materialise_stats_cols(
+    cols: Vec<String>,
+    input_schema: &StructType,
+) -> Result<Vec<String>, AnalyzerError> {
+    if cols.is_empty() {
+        Ok(input_schema.fields.iter().map(|f| f.name.clone()).collect())
+    } else {
+        let lowercase_names: HashMap<String, ()> = input_schema
+            .fields
+            .iter()
+            .map(|f| (f.name.to_ascii_lowercase(), ()))
+            .collect();
+        for c in &cols {
+            if !lowercase_names.contains_key(&c.to_ascii_lowercase()) {
+                return Err(AnalyzerError::UnknownColumn {
+                    name: c.clone(),
+                    qualifier: None,
+                });
+            }
+        }
+        Ok(cols)
+    }
+}
+
+/// Analyze `CommonOp::Describe`: resolve the input, materialise `cols`
+/// (empty ⇒ all input columns in schema order), stamp the shared stats
+/// output schema.
+fn analyze_describe(
+    input: CommonAst,
+    cols: Vec<String>,
+    base_types: &BaseTypes,
+) -> Result<TypedAst, AnalyzerError> {
+    let typed_input = analyze_node(input, base_types)?;
+    let materialised = materialise_stats_cols(cols, &typed_input.resolved_schema)?;
+    let output_schema = build_stats_output_schema(&materialised);
+    Ok(TypedAst {
+        op: TypedOp::Describe {
+            input: Box::new(typed_input),
+            cols: materialised,
+        },
+        resolved_schema: output_schema,
+    })
+}
+
+/// Analyze `CommonOp::Summary`: resolve the input, materialise the full
+/// column list from the input schema (proto `StatSummary` has no `cols`
+/// field), and materialise the statistics list (empty ⇒
+/// [`DEFAULT_SUMMARY_STATS`]).
+fn analyze_summary(
+    input: CommonAst,
+    statistics: Vec<String>,
+    base_types: &BaseTypes,
+) -> Result<TypedAst, AnalyzerError> {
+    let typed_input = analyze_node(input, base_types)?;
+    let materialised_cols: Vec<String> = typed_input
+        .resolved_schema
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    let materialised_stats: Vec<String> = if statistics.is_empty() {
+        DEFAULT_SUMMARY_STATS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+    } else {
+        statistics
+    };
+    let output_schema = build_stats_output_schema(&materialised_cols);
+    Ok(TypedAst {
+        op: TypedOp::Summary {
+            input: Box::new(typed_input),
+            cols: materialised_cols,
+            statistics: materialised_stats,
         },
         resolved_schema: output_schema,
     })
@@ -4300,5 +4437,142 @@ mod tests {
         });
         // Successful analysis is the assertion.
         analyze(ast, &bt).expect("case-insensitive drop must analyze cleanly");
+    }
+
+    // ── Describe / Summary analysis (Pass 80) ────────────────────────────
+
+    fn base_types_with_emp() -> BaseTypes {
+        let plan = CommonAst::new(CommonOp::TableScan {
+            table: "emp".to_owned(),
+            alias: None,
+        });
+        BaseTypes::build_from_plan(&plan, |name| match name {
+            "emp" => Some(emp_schema()),
+            _ => None,
+        })
+    }
+
+    fn assert_stats_output_schema(schema: &StructType, expected_col_names: &[&str]) {
+        assert_eq!(
+            schema.fields.len(),
+            expected_col_names.len() + 1,
+            "stats output schema has 1 (summary) + N stat cols",
+        );
+        assert_eq!(schema.fields[0].name, "summary");
+        assert_eq!(schema.fields[0].data_type, DataType::String);
+        // Spark parity: `summary` is stamped nullable in Spark's schema even
+        // though every emitted value is a literal string.
+        assert!(
+            schema.fields[0].nullable,
+            "`summary` column must be nullable per Spark parity"
+        );
+        for (idx, want) in expected_col_names.iter().enumerate() {
+            let f = &schema.fields[idx + 1];
+            assert_eq!(f.name, *want, "field #{idx} name");
+            assert_eq!(f.data_type, DataType::String, "field #{idx} is STRING");
+            assert!(f.nullable, "field #{idx} must be nullable");
+        }
+    }
+
+    #[test]
+    fn analyze_describe_stamps_summary_col_plus_string_nullable_per_input_col() {
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Describe {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            cols: vec!["dept_id".to_owned(), "salary".to_owned()],
+        });
+        let typed = analyze(ast, &bt).expect("analyze describe");
+        assert_stats_output_schema(&typed.resolved_schema, &["dept_id", "salary"]);
+        match typed.op {
+            TypedOp::Describe { cols, .. } => {
+                assert_eq!(cols, vec!["dept_id".to_owned(), "salary".to_owned()]);
+            }
+            _ => panic!("expected TypedOp::Describe"),
+        }
+    }
+
+    #[test]
+    fn analyze_describe_empty_cols_expands_to_all_input_cols_in_order() {
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Describe {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            cols: vec![],
+        });
+        let typed = analyze(ast, &bt).expect("analyze describe");
+        assert_stats_output_schema(&typed.resolved_schema, &["id", "name", "dept_id", "salary"]);
+    }
+
+    #[test]
+    fn analyze_describe_unknown_column_surfaces_spark_emulated_error() {
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Describe {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            cols: vec!["missing".to_owned()],
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
+        assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
+    }
+
+    #[test]
+    fn analyze_summary_empty_statistics_applies_default_eight_stats() {
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Summary {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            statistics: vec![],
+        });
+        let typed = analyze(ast, &bt).expect("analyze summary");
+        // Schema always covers the full input column list.
+        assert_stats_output_schema(&typed.resolved_schema, &["id", "name", "dept_id", "salary"]);
+        match typed.op {
+            TypedOp::Summary { statistics, .. } => {
+                assert_eq!(
+                    statistics,
+                    DEFAULT_SUMMARY_STATS
+                        .iter()
+                        .map(|s| (*s).to_owned())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            _ => panic!("expected TypedOp::Summary"),
+        }
+    }
+
+    #[test]
+    fn analyze_summary_explicit_statistics_are_preserved() {
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Summary {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            statistics: vec![
+                "count".to_owned(),
+                "min".to_owned(),
+                "25%".to_owned(),
+                "75%".to_owned(),
+                "max".to_owned(),
+            ],
+        });
+        let typed = analyze(ast, &bt).expect("analyze summary");
+        match typed.op {
+            TypedOp::Summary { statistics, .. } => {
+                assert_eq!(statistics.len(), 5);
+                assert_eq!(statistics[2], "25%");
+            }
+            _ => panic!("expected TypedOp::Summary"),
+        }
     }
 }

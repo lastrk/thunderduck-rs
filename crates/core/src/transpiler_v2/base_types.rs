@@ -109,7 +109,9 @@ pub fn plan_has_empty_scan(plan: &CommonAst) -> bool {
         | CommonOp::NaDrop { input, .. }
         | CommonOp::NaReplace { input, .. }
         | CommonOp::Unpivot { input, .. }
-        | CommonOp::Pivot { input, .. } => plan_has_empty_scan(input),
+        | CommonOp::Pivot { input, .. }
+        | CommonOp::Describe { input, .. }
+        | CommonOp::Summary { input, .. } => plan_has_empty_scan(input),
         CommonOp::Join { left, right, .. } => {
             plan_has_empty_scan(left) || plan_has_empty_scan(right)
         }
@@ -146,7 +148,9 @@ fn collect_empty_scan_tables(plan: &CommonAst, out: &mut Vec<String>) {
         | CommonOp::NaDrop { input, .. }
         | CommonOp::NaReplace { input, .. }
         | CommonOp::Unpivot { input, .. }
-        | CommonOp::Pivot { input, .. } => collect_empty_scan_tables(input, out),
+        | CommonOp::Pivot { input, .. }
+        | CommonOp::Describe { input, .. }
+        | CommonOp::Summary { input, .. } => collect_empty_scan_tables(input, out),
         CommonOp::Join { left, right, .. } => {
             collect_empty_scan_tables(left, out);
             collect_empty_scan_tables(right, out);

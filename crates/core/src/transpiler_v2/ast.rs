@@ -294,6 +294,32 @@ pub enum CommonOp {
         aggregates: Vec<Expression>,
     },
 
+    /// `df.describe(col1, col2, ...)` — Spark's `describe` StatFunction. Emits
+    /// a summary relation with a `summary` STRING NOT NULL column plus one
+    /// STRING NULLABLE column per input `cols` entry. Empty `cols` ⇒ analyzer
+    /// expands to all input columns in schema order (Spark default).
+    Describe {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// Explicit column names to describe. Empty ⇒ analyzer expands to
+        /// all input columns per Spark semantics.
+        cols: Vec<String>,
+    },
+
+    /// `df.summary(stat1, stat2, ...)` — Spark's `summary` StatFunction. Emits
+    /// a summary relation with a `summary` STRING NOT NULL column plus one
+    /// STRING NULLABLE column per input column (analyzer always expands
+    /// because proto `StatSummary` has no `cols` field). Empty `statistics`
+    /// ⇒ analyzer applies the eight Spark defaults (`count`, `mean`,
+    /// `stddev`, `min`, `25%`, `50%`, `75%`, `max`).
+    Summary {
+        /// The input relation.
+        input: Box<CommonAst>,
+        /// Statistics to compute. Empty ⇒ analyzer applies the
+        /// `DEFAULT_SUMMARY_STATS` list.
+        statistics: Vec<String>,
+    },
+
     /// `df.dropDuplicates([cols])` / `df.distinct()`. `on_columns` empty ⇒
     /// dedupe on the full row (`SELECT DISTINCT *`). Non-empty ⇒
     /// `SELECT DISTINCT ON (cols) * FROM ...`.
@@ -664,6 +690,34 @@ mod tests {
                 assert!(pivot_values.is_empty());
             }
             _ => panic!("expected Pivot"),
+        }
+    }
+
+    #[test]
+    fn common_op_describe_carries_input_and_cols() {
+        let plan = CommonAst::new(CommonOp::Describe {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            cols: vec!["age".to_owned(), "salary".to_owned()],
+        });
+        match plan.op {
+            CommonOp::Describe { cols, .. } => {
+                assert_eq!(cols, vec!["age".to_owned(), "salary".to_owned()]);
+            }
+            _ => panic!("expected Describe"),
+        }
+    }
+
+    #[test]
+    fn common_op_summary_carries_input_and_statistics() {
+        let plan = CommonAst::new(CommonOp::Summary {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            statistics: vec!["count".to_owned(), "25%".to_owned()],
+        });
+        match plan.op {
+            CommonOp::Summary { statistics, .. } => {
+                assert_eq!(statistics, vec!["count".to_owned(), "25%".to_owned()]);
+            }
+            _ => panic!("expected Summary"),
         }
     }
 

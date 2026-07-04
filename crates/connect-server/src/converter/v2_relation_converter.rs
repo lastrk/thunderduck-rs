@@ -166,6 +166,8 @@ impl V2RelationConverter {
             RelType::DropNa(d) => self.convert_drop_na(d),
             RelType::Replace(r) => self.convert_replace(r),
             RelType::Unpivot(u) => self.convert_unpivot(u),
+            RelType::Describe(d) => self.convert_describe(d),
+            RelType::Summary(s) => self.convert_summary(s),
             // Cosmetic ops per Spark 4 semantics — semantically no-op.
             // Thunderduck ignores them and continues with the input relation
             // (ADR-001 "result-irrelevant cosmetic" carve-out).
@@ -311,6 +313,22 @@ impl V2RelationConverter {
             values,
             variable_column_name: u.variable_column_name.clone(),
             value_column_name: u.value_column_name.clone(),
+        }))
+    }
+
+    fn convert_describe(&mut self, d: &proto::StatDescribe) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(d.input.as_deref(), "Describe")?;
+        Ok(CommonAst::new(CommonOp::Describe {
+            input: Box::new(input),
+            cols: d.cols.clone(),
+        }))
+    }
+
+    fn convert_summary(&mut self, s: &proto::StatSummary) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(s.input.as_deref(), "Summary")?;
+        Ok(CommonAst::new(CommonOp::Summary {
+            input: Box::new(input),
+            statistics: s.statistics.clone(),
         }))
     }
 
@@ -2702,6 +2720,100 @@ mod tests {
         match out.op {
             CommonOp::Unpivot { values, .. } => assert!(values.is_empty()),
             _ => panic!("expected Unpivot"),
+        }
+    }
+
+    // ── Describe / Summary conversion (Pass 80) ───────────────────────────
+
+    #[test]
+    fn convert_describe_preserves_input_and_cols() {
+        let input = table_scan_rel("emp");
+        let describe = rel(proto::relation::RelType::Describe(Box::new(
+            proto::StatDescribe {
+                input: Some(Box::new(input)),
+                cols: vec!["age".to_owned(), "salary".to_owned()],
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&describe).expect("convert Describe");
+        match out.op {
+            CommonOp::Describe { input, cols } => {
+                assert!(matches!(input.op, CommonOp::TableScan { .. }));
+                assert_eq!(cols, vec!["age".to_owned(), "salary".to_owned()]);
+            }
+            _ => panic!("expected CommonOp::Describe"),
+        }
+    }
+
+    #[test]
+    fn convert_describe_missing_input_surfaces_unsupported_proto_shape() {
+        let describe = rel(proto::relation::RelType::Describe(Box::new(
+            proto::StatDescribe {
+                input: None,
+                cols: vec![],
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let err = c.convert(&describe).unwrap_err();
+        assert!(matches!(err, EmissionError::UnsupportedProtoShape { .. }));
+    }
+
+    #[test]
+    fn convert_summary_preserves_input_and_statistics() {
+        let input = table_scan_rel("emp");
+        let summary = rel(proto::relation::RelType::Summary(Box::new(
+            proto::StatSummary {
+                input: Some(Box::new(input)),
+                statistics: vec![
+                    "count".to_owned(),
+                    "min".to_owned(),
+                    "25%".to_owned(),
+                    "75%".to_owned(),
+                    "max".to_owned(),
+                ],
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&summary).expect("convert Summary");
+        match out.op {
+            CommonOp::Summary { input, statistics } => {
+                assert!(matches!(input.op, CommonOp::TableScan { .. }));
+                assert_eq!(statistics.len(), 5);
+                assert_eq!(statistics[2], "25%");
+            }
+            _ => panic!("expected CommonOp::Summary"),
+        }
+    }
+
+    #[test]
+    fn convert_summary_missing_input_surfaces_unsupported_proto_shape() {
+        let summary = rel(proto::relation::RelType::Summary(Box::new(
+            proto::StatSummary {
+                input: None,
+                statistics: vec![],
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let err = c.convert(&summary).unwrap_err();
+        assert!(matches!(err, EmissionError::UnsupportedProtoShape { .. }));
+    }
+
+    #[test]
+    fn convert_summary_empty_statistics_preserved_for_analyzer_defaulting() {
+        let input = table_scan_rel("emp");
+        let summary = rel(proto::relation::RelType::Summary(Box::new(
+            proto::StatSummary {
+                input: Some(Box::new(input)),
+                statistics: vec![],
+            },
+        )));
+        let mut c = V2RelationConverter::new();
+        let out = c.convert(&summary).expect("convert Summary");
+        match out.op {
+            CommonOp::Summary { statistics, .. } => {
+                assert!(statistics.is_empty());
+            }
+            _ => panic!("expected CommonOp::Summary"),
         }
     }
 

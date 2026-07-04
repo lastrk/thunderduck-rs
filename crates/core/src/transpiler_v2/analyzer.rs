@@ -745,6 +745,13 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             // Runs BEFORE `resolve_and_stamp` — the synthesized args are
             // resolved by the outer walk. Corpus: inl-001, inl-002.
             let projections = expand_inline_projections(projections, &typed_input.resolved_schema)?;
+            // Pass 91 — expand `F.json_tuple(json, k1, ..., kN)` projections
+            // into N synthetic per-key projections. Each becomes
+            // `Alias(json_tuple_field(json, "<ki>"), "c<i>")` — positional
+            // names per Spark's `Generator.elementSchema`, NOT the key
+            // literals. Runs after inline expansion, before
+            // `resolve_and_stamp`. Corpus: json-002.
+            let projections = expand_json_tuple_projections(projections)?;
             let projections = projections
                 .into_iter()
                 .map(|e| resolve_and_stamp(e, &typed_input.resolved_schema))
@@ -1759,6 +1766,123 @@ fn expand_inline_projections(
             out.push(Expression::Alias(AliasExpression {
                 expr: Box::new(call),
                 alias: field.name.clone(),
+            }));
+        }
+    }
+    Ok(out)
+}
+
+/// Character set rejected inside a `json_tuple` key literal. See
+/// [`expand_json_tuple_projections`] for rationale.
+fn json_tuple_key_char_is_unsafe(c: char) -> bool {
+    // Quoting hazards for a single-quoted SQL literal, plus JSONPath tokens
+    // that would change Spark's flat-key lookup semantics if forwarded to
+    // DuckDB's `json_extract_string`.
+    matches!(c, '\'' | '"' | '\\' | '.' | '[' | ']') || c.is_ascii_control()
+}
+
+/// Expand every top-level `F.json_tuple(json, k1, ..., kN)` projection into
+/// N synthetic per-key projections. Non-`json_tuple` projections pass through
+/// unchanged in place. Schema order is preserved.
+///
+/// Each `json_tuple(j, k1, ..., kN)` becomes:
+///
+/// ```text
+/// Alias(json_tuple_field(j, "k1"), "c0"), ..., Alias(json_tuple_field(j, "kN"), "cN-1")
+/// ```
+///
+/// Names are POSITIONAL (`c0, c1, ..., c<N-1>`) — matches Spark's
+/// `Generator.elementSchema`, NOT the key literals. Verified against
+/// PySpark docstring `pyspark/sql/functions/builtin.py:20737`. Corpus witness
+/// `json-002` uses bare (no `.alias(...)`) `json_tuple`.
+///
+/// Errors (ADR-022 two-category):
+///
+/// * **Spark-emulated** ([`AnalyzerError::Other`]) — arity < 2 (Spark rejects
+///   `json_tuple(x)` with zero keys at analysis time).
+/// * **Spark-emulated** ([`AnalyzerError::TypeMismatch`]) — a key arg is not
+///   a `Literal::String` (Catalyst's `JsonTuple.checkInputDataTypes` rejects
+///   non-literal field names).
+/// * **Thunderduck-boundary** ([`AnalyzerError::UnsupportedRule`], Display
+///   prefix `[TDCK-BOUNDARY]`, `rule = "json_tuple-expansion"`) — a key
+///   contains a character in `json_tuple_key_char_is_unsafe`. `'` / `\` / `"`
+///   / ASCII control would break the bare single-quoted SQL literal; `.` /
+///   `[` / `]` would cause DuckDB's `json_extract_string('$.<key>')` to
+///   path-walk whereas Spark treats those characters as flat key literals.
+///
+/// Called by `analyze_node`'s `CommonOp::Project` arm AFTER
+/// [`expand_inline_projections`] and BEFORE [`resolve_and_stamp`], so
+/// downstream analysis never sees a top-level `json_tuple`.
+fn expand_json_tuple_projections(
+    projections: Vec<Expression>,
+) -> Result<Vec<Expression>, AnalyzerError> {
+    let mut out = Vec::with_capacity(projections.len());
+    for proj in projections {
+        // Only fire on a bare top-level `FunctionCall("json_tuple", ...)`.
+        // Aliased or nested forms fall through unchanged (multi-alias
+        // `.alias("k1", ...)` and non-Project contexts are non-goals per
+        // the Pass-91 plan §Non-goals — they surface as boundary errors
+        // downstream if the corpus ever exercises them).
+        let args = match &proj {
+            Expression::FunctionCall(f) if f.name.eq_ignore_ascii_case("json_tuple") => {
+                f.args.clone()
+            }
+            _ => {
+                out.push(proj);
+                continue;
+            }
+        };
+        if args.len() < 2 {
+            return Err(AnalyzerError::Other {
+                reason: format!(
+                    "`json_tuple` requires at least 2 arguments (json_str, key_1, ...), got {}",
+                    args.len()
+                ),
+            });
+        }
+        let mut args_iter = args.into_iter();
+        let json_expr = args_iter.next().expect("checked args.len() >= 2 above");
+        let key_args: Vec<Expression> = args_iter.collect();
+        for (i, key_arg) in key_args.into_iter().enumerate() {
+            let key = match &key_arg {
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(s),
+                    ..
+                }) => s.clone(),
+                other => {
+                    return Err(AnalyzerError::TypeMismatch {
+                        expected: DataType::String,
+                        actual: other.data_type(&StructType::new(vec![])),
+                        context: format!(
+                            "`json_tuple` field-name at position {} must be a string literal",
+                            i + 1
+                        ),
+                    });
+                }
+            };
+            if key.chars().any(json_tuple_key_char_is_unsafe) {
+                return Err(AnalyzerError::UnsupportedRule {
+                    rule: "json_tuple-expansion".to_owned(),
+                    reason: format!(
+                        "`json_tuple` key `{key}` contains a character τ does not \
+                         safely forward to DuckDB's `json_extract_string` — reject \
+                         to avoid diverging from Spark's flat-key semantics or \
+                         breaking the SQL string literal"
+                    ),
+                });
+            }
+            let key_lit = Expression::Literal(Literal {
+                value: LiteralValue::String(key),
+                data_type: DataType::String,
+            });
+            let call = Expression::FunctionCall(FunctionCall {
+                name: "json_tuple_field".to_owned(),
+                args: vec![json_expr.clone(), key_lit],
+                distinct: false,
+            });
+            out.push(Expression::Alias(AliasExpression {
+                expr: Box::new(call),
+                alias: format!("c{i}"),
             }));
         }
     }
@@ -5564,5 +5688,221 @@ mod tests {
             err.to_string().starts_with("[TDCK-BOUNDARY]"),
             "boundary error must carry `[TDCK-BOUNDARY]` Display prefix per ADR-022; got: {err}"
         );
+    }
+
+    // ── Pass 91 — expand_json_tuple_projections ──────────────────────────
+
+    fn json_tuple_call(json_col: &str, keys: &[&str]) -> Expression {
+        let mut args: Vec<Expression> = Vec::with_capacity(keys.len() + 1);
+        args.push(Expression::UnresolvedColumn(UnresolvedColumn {
+            name: json_col.to_owned(),
+            qualifier: None,
+            plan_id: None,
+        }));
+        for k in keys {
+            args.push(Expression::Literal(Literal {
+                value: LiteralValue::String((*k).to_owned()),
+                data_type: DataType::String,
+            }));
+        }
+        Expression::FunctionCall(FunctionCall {
+            name: "json_tuple".to_owned(),
+            args,
+            distinct: false,
+        })
+    }
+
+    fn raw_schema_with_json_str() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("json_str", DataType::String),
+        ])
+    }
+
+    fn base_types_with_raw() -> BaseTypes {
+        let plan = CommonAst::new(CommonOp::TableScan {
+            table: "raw".to_owned(),
+            alias: None,
+        });
+        BaseTypes::build_from_plan(&plan, |name| match name {
+            "raw" => Some(raw_schema_with_json_str()),
+            _ => None,
+        })
+    }
+
+    /// Canonical json-002 shape: `select("id", json_tuple("json_str", "a", "e"))`
+    /// widens into `[id, c0, c1]` — positional names, both nullable STRING.
+    #[test]
+    fn expand_json_tuple_widens_into_n_fields_with_positional_names() {
+        let bt = base_types_with_raw();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "raw".to_owned(),
+                alias: None,
+            })),
+            projections: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+                json_tuple_call("json_str", &["a", "e"]),
+            ],
+        });
+        let typed = analyze(ast, &bt).expect("analyze ok");
+        // Output schema: [id, c0, c1].
+        let names: Vec<&str> = typed
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["id", "c0", "c1"]);
+        // Both fanout fields are String, nullable.
+        assert_eq!(typed.resolved_schema.fields[1].data_type, DataType::String);
+        assert!(typed.resolved_schema.fields[1].nullable);
+        assert_eq!(typed.resolved_schema.fields[2].data_type, DataType::String);
+        assert!(typed.resolved_schema.fields[2].nullable);
+        // Post-expansion tree: three projections, latter two are
+        // Alias(json_tuple_field(json_str, "<k>"), "c<i>").
+        match &typed.op {
+            TypedOp::Project { projections, .. } => {
+                assert_eq!(projections.len(), 3);
+                for (i, expected_key) in ["a", "e"].iter().enumerate() {
+                    match &projections[i + 1] {
+                        Expression::Alias(a) => {
+                            assert_eq!(a.alias, format!("c{i}"));
+                            match a.expr.as_ref() {
+                                Expression::FunctionCall(f) => {
+                                    assert_eq!(f.name, "json_tuple_field");
+                                    assert_eq!(f.args.len(), 2);
+                                    match &f.args[1] {
+                                        Expression::Literal(Literal {
+                                            value: LiteralValue::String(s),
+                                            ..
+                                        }) => assert_eq!(s, *expected_key),
+                                        other => {
+                                            panic!("expected string literal, got {other:?}")
+                                        }
+                                    }
+                                }
+                                other => panic!("expected FunctionCall, got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected Alias, got {other:?}"),
+                    }
+                }
+            }
+            _ => panic!("expected Project op"),
+        }
+    }
+
+    /// Prefix + suffix projections around a `json_tuple` are preserved in
+    /// place — mirrors `expand_inline_preserves_prefix_and_suffix_projections`.
+    #[test]
+    fn expand_json_tuple_preserves_prefix_and_suffix_projections() {
+        let bt = base_types_with_raw();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "raw".to_owned(),
+                alias: None,
+            })),
+            projections: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+                json_tuple_call("json_str", &["a", "e"]),
+                Expression::Literal(Literal {
+                    value: LiteralValue::Int(1),
+                    data_type: DataType::Integer,
+                }),
+            ],
+        });
+        let typed = analyze(ast, &bt).expect("analyze ok");
+        let names: Vec<&str> = typed
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 4);
+        assert_eq!(names[0], "id");
+        assert_eq!(names[1], "c0");
+        assert_eq!(names[2], "c1");
+        // The 4th field is the literal; its exact name follows
+        // `expression_output_name`'s convention (not the focus of this test).
+    }
+
+    /// Zero keys (`json_tuple(json)`) → Spark-emulated `Other` error.
+    #[test]
+    fn expand_json_tuple_rejects_zero_keys() {
+        let err = expand_json_tuple_projections(vec![json_tuple_call("json_str", &[])])
+            .expect_err("must reject arity < 2");
+        assert!(matches!(err, AnalyzerError::Other { .. }));
+        assert!(
+            err.to_string().starts_with("[SPARK-EMULATED]"),
+            "err: {err}"
+        );
+    }
+
+    /// Non-literal key arg → Spark-emulated `TypeMismatch`.
+    #[test]
+    fn expand_json_tuple_rejects_non_literal_key() {
+        let bad_call = Expression::FunctionCall(FunctionCall {
+            name: "json_tuple".to_owned(),
+            args: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "json_str".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "k".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+            ],
+            distinct: false,
+        });
+        let err =
+            expand_json_tuple_projections(vec![bad_call]).expect_err("must reject non-literal key");
+        assert!(matches!(err, AnalyzerError::TypeMismatch { .. }));
+        assert!(
+            err.to_string().starts_with("[SPARK-EMULATED]"),
+            "err: {err}"
+        );
+    }
+
+    /// Boundary-reject unsafe key chars → `[TDCK-BOUNDARY]` prefix,
+    /// `rule = "json_tuple-expansion"`.
+    #[test]
+    fn expand_json_tuple_boundary_rejects_unsafe_key_chars() {
+        // Single-quote in key would break the emitted SQL string literal.
+        let err = expand_json_tuple_projections(vec![json_tuple_call("json_str", &["a'b"])])
+            .expect_err("must reject key containing '");
+        match &err {
+            AnalyzerError::UnsupportedRule { rule, .. } => {
+                assert_eq!(rule, "json_tuple-expansion");
+            }
+            other => panic!("expected AnalyzerError::UnsupportedRule, got {other:?}"),
+        }
+        assert!(
+            err.to_string().starts_with("[TDCK-BOUNDARY]"),
+            "boundary error must carry `[TDCK-BOUNDARY]` Display prefix per ADR-022; got: {err}"
+        );
+        // Dot / bracket in key would path-walk in DuckDB's json_extract_string
+        // but Spark treats them as flat key chars → boundary reject.
+        for bad_key in ["a.b", "a[0]"] {
+            let err = expand_json_tuple_projections(vec![json_tuple_call("json_str", &[bad_key])])
+                .expect_err("must reject JSONPath metachars in key");
+            match &err {
+                AnalyzerError::UnsupportedRule { rule, .. } => {
+                    assert_eq!(rule, "json_tuple-expansion");
+                }
+                other => panic!("expected AnalyzerError::UnsupportedRule, got {other:?}"),
+            }
+        }
     }
 }

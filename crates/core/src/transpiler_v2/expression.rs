@@ -936,6 +936,15 @@ impl Expression {
                 }
                 return DataType::Unresolved;
             }
+            // Pass 91 — synthetic per-key FunctionCall names produced by the
+            // analyzer's Project pre-pass for `F.json_tuple` (see
+            // `analyzer::expand_json_tuple_projections`). `args[0]` is the
+            // JSON string expression; `args[1]` is a `Literal::String`
+            // carrying the target key. Return type is always `String` per
+            // Spark's `JsonTuple.elementSchema`. Corpus: json-002.
+            "json_tuple_field" if f.args.len() == 2 => {
+                return DataType::String;
+            }
             _ => {}
         }
         let first_arg_type = f.args.first().map(|a| a.data_type(schema));
@@ -1110,6 +1119,11 @@ impl Expression {
             // sentinel row is all-NULL by construction. Mirrors
             // `explode_outer`'s arm above. Corpus: inl-002.
             "inline_outer_field" => true,
+            // Pass 91 — synthetic `json_tuple_field(json, "<key>")` produced
+            // by the analyzer's Project pre-pass (`expand_json_tuple_projections`).
+            // Always nullable — Spark returns NULL for missing key OR JSON
+            // null value OR NULL `json_str`. Corpus: json-002.
+            "json_tuple_field" => true,
             // Synthetic `map_explode_key(m)` / `map_explode_val(m)` (map-007).
             // Spark's `explode(map)` produces `(key, value)` rows where keys
             // are ALWAYS non-nullable (Spark's MAP invariant); a NULL map
@@ -2120,5 +2134,43 @@ mod tests {
             DataType::Array(Box::new(element_notnull), false),
         )]);
         assert!(inline_field_call("arr", "name", false).nullable(&s4));
+    }
+
+    // ── Pass 91 — json_tuple_field type + nullability ────────────────────
+
+    fn json_tuple_field_call(json_col: &str, key: &str) -> Expression {
+        Expression::FunctionCall(FunctionCall {
+            name: "json_tuple_field".to_owned(),
+            args: vec![
+                ColumnReference::untyped(json_col),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(key.to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        })
+    }
+
+    /// `json_tuple_field(json_str, "<key>")` is always STRING per Spark's
+    /// `JsonTuple.elementSchema`.
+    #[test]
+    fn json_tuple_field_data_type_is_string() {
+        // json_str typed as String, non-null — return type STRING regardless.
+        let s = StructType::new(vec![StructField::not_null("json_str", DataType::String)]);
+        assert_eq!(
+            json_tuple_field_call("json_str", "a").data_type(&s),
+            DataType::String
+        );
+    }
+
+    /// `json_tuple_field` is always nullable — missing key OR JSON null OR
+    /// NULL `json_str` all yield NULL.
+    #[test]
+    fn json_tuple_field_is_always_nullable() {
+        // Even with a non-nullable `json_str`, the field lookup can miss →
+        // nullable=true.
+        let s = StructType::new(vec![StructField::not_null("json_str", DataType::String)]);
+        assert!(json_tuple_field_call("json_str", "a").nullable(&s));
     }
 }

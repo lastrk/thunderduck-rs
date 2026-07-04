@@ -1363,6 +1363,15 @@ impl V2ExpressionConverter {
     /// the analyzer as a plain `FunctionCall("inline"|"inline_outer", [arr])`
     /// and are expanded by `analyzer::expand_inline_projections` (τ's Project
     /// pre-pass, next to `expand_regex_projections`). Corpus: inl-001, inl-002.
+    ///
+    /// **`F.json_tuple` boundary (Pass 91).** Same shape: `json_tuple(json,
+    /// k1, ..., kN)` reaches the analyzer as a plain `FunctionCall` and is
+    /// expanded by `analyzer::expand_json_tuple_projections` into N synthetic
+    /// `Alias(json_tuple_field(json, "<ki>"), "c<i>")` projections
+    /// (positional `c0, c1, ...` names, matching Spark's
+    /// `Generator.elementSchema`). Multi-alias `json_tuple(...).alias(a, b)`
+    /// is a follow-up — corpus witness (json-002) uses positional names.
+    /// Corpus: json-002.
     fn try_convert_posexplode_multi_alias(
         &mut self,
         e: &proto::Expression,

@@ -2557,6 +2557,57 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 "UNNEST(CASE WHEN {arr_sql} IS NULL OR len({arr_sql}) = 0 THEN [{sentinel}] ELSE {arr_sql} END).{field_q}"
             ));
         }
+        // Pass 91 — synthetic FunctionCall produced by the analyzer's Project
+        // pre-pass (`expand_json_tuple_projections`) when it fans
+        // `F.json_tuple(json, k1, ..., kN)` out into N per-key projections.
+        // Args: `(json_expr, key : STRING literal)`. Emit
+        // `json_extract_string(<json>, '$.<key>')` — same substrate as the
+        // `get_json_object` session macro (matches Spark's `JsonTuple`
+        // scalar-value semantics: quotes stripped, JSON null → NULL, missing
+        // key → NULL). Analyzer pre-pass rejects unsafe key chars, so the
+        // interpolated key is a safe single-quoted SQL literal. Corpus: json-002.
+        "json_tuple_field" => {
+            if f.args.len() != 2 {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`json_tuple_field` requires exactly 2 arguments (json, key)"
+                        .to_owned(),
+                });
+            }
+            let json_sql = render_expr(&f.args[0], schema)?;
+            let key = match &f.args[1] {
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(s),
+                    ..
+                }) => s,
+                _ => {
+                    return Err(EmissionError::UnsupportedFunction {
+                        name: f.name.clone(),
+                        reason: "`json_tuple_field` second argument must be a string literal"
+                            .to_owned(),
+                    });
+                }
+            };
+            // Defense in depth: the analyzer pre-pass has already rejected
+            // any key containing single-quote or path-walk metachars, so the
+            // `escape_sql_string` call below is defensive rather than
+            // load-bearing. Reject at emission on the outside chance a
+            // future refactor drops the analyzer guard.
+            if key
+                .chars()
+                .any(|c| matches!(c, '\'' | '"' | '\\' | '.' | '[' | ']') || c.is_ascii_control())
+            {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: format!(
+                        "`json_tuple_field` key `{key}` contains an unsafe character; \
+                         analyzer pre-pass should have rejected it"
+                    ),
+                });
+            }
+            let key_lit = sql_string_literal(&format!("$.{key}"));
+            return Ok(format!("json_extract_string({json_sql}, {key_lit})"));
+        }
         // Spark → thdck_spark_funcs extension remaps (readiness map §4.1).
         // These functions require the ext6 extension, loaded at session
         // start by `DuckDbSession`.
@@ -9434,6 +9485,70 @@ mod tests {
         match err {
             EmissionError::UnsupportedFunction { name, reason } => {
                 assert_eq!(name, "inline_field");
+                assert!(reason.contains("2 arguments"), "reason: {reason}");
+            }
+            other => panic!("expected UnsupportedFunction, got {other:?}"),
+        }
+    }
+
+    // ── Pass 91 — json_tuple_field emission ─────────────────────────────
+
+    fn json_str_schema() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("json_str", DataType::String),
+        ])
+    }
+
+    fn json_tuple_field_call_render(key: &str) -> FunctionCall {
+        FunctionCall {
+            name: "json_tuple_field".to_owned(),
+            args: vec![
+                Expression::ColumnReference(ColumnReference {
+                    name: "json_str".to_owned(),
+                    qualifier: None,
+                    data_type: None,
+                    nullable: None,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(key.to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        }
+    }
+
+    /// `json_tuple_field(json_str, "a")` renders as
+    /// `json_extract_string(json_str, '$.a')` — same substrate as the
+    /// `get_json_object` session macro (session.rs:344).
+    #[test]
+    fn render_json_tuple_field_emits_json_extract_string() {
+        let schema = json_str_schema();
+        let f = json_tuple_field_call_render("a");
+        let sql = render_function_call(&f, &schema).expect("render json_tuple_field");
+        assert_eq!(sql, "json_extract_string(json_str, '$.a')");
+    }
+
+    /// Wrong arity → `UnsupportedFunction` (internal-corruption signal — the
+    /// analyzer's contract is 2 args).
+    #[test]
+    fn render_json_tuple_field_rejects_wrong_arity() {
+        let schema = json_str_schema();
+        let f = FunctionCall {
+            name: "json_tuple_field".to_owned(),
+            args: vec![Expression::ColumnReference(ColumnReference {
+                name: "json_str".to_owned(),
+                qualifier: None,
+                data_type: None,
+                nullable: None,
+            })],
+            distinct: false,
+        };
+        let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
+        match err {
+            EmissionError::UnsupportedFunction { name, reason } => {
+                assert_eq!(name, "json_tuple_field");
                 assert!(reason.contains("2 arguments"), "reason: {reason}");
             }
             other => panic!("expected UnsupportedFunction, got {other:?}"),

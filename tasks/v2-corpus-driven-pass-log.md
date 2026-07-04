@@ -566,6 +566,21 @@ the summary below records the corpus deltas by pass number.
 - Findings queued as follow-up: non-Project-context guard for `inline` (withColumn/agg/join.on/filter → boundary reject); pre-pass ordering so unresolved-column errors classify as SPARK-EMULATED; outer sentinel N-copy blowup on computed `arr` args.
 - Compiler warning delta: baseline preserved.
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 567/29 — +13 net passing from baseline 554/29, no new failures, `cargo test -p thunderduck-connect-server --tests` 83/0, `v2-progress.sh` 308/16/324 with inl-001 + inl-002 PASSED and no regressions).
+- Commit SHA: 1eb5770.
+
+## Pass 91 — 2026-07-04T
+- Case: `json-002` — `F.json_tuple("json_str", "a", "e")` — Spark table generator extracting N fields from a JSON string into N columns (default positional names `c0, c1, ..., cN-1`).
+- Diagnostic: `.agent-output/diagnostic-pass-91.md` — same-shape as Pass 90 inline generator; τ had no dispatch for `json_tuple` at any layer.
+- Architecture: `.agent-output/architecture-pass-91.md` — three-arm change mirroring Pass 90: analyzer pre-pass expands `json_tuple(j, k1..kN)` into N `Alias(json_tuple_field(j, "<ki>"), "c<i>")` (POSITIONAL names, verified via PySpark docstring), type-inference returns always-nullable `String`, emission renders `json_extract_string(<j>, '$.<key>')` using the existing JSON extension substrate (same as `get_json_object` session macro).
+- Layer(s) touched: analyzer (`expand_json_tuple_projections` + Project wire-up after `expand_inline_projections`), expression (type/nullability arms for `json_tuple_field`), emission (`render_function_call` new arm with unsafe-char boundary reject), converter (code comment only).
+- ADR citations: ADR-003 (synthetic per-field FunctionCall), ADR-005 (always-nullable String matches Spark semantics — NULL for both missing key and JSON-null value), ADR-015 (positional `c0, c1` names match Spark default), ADR-022 (unsafe key chars `'`, `"`, `\`, `.`, `[`, `]`, LF/CR/ASCII-control → `AnalyzerError::UnsupportedRule` with `[TDCK-BOUNDARY]` prefix; caller-side type errors → `AnalyzerError::TypeMismatch` with `[SPARK-EMULATED]`).
+- Corpus signal: 308 → **309** (+1). json-002 GREEN.
+- Files: `crates/core/src/transpiler_v2/{analyzer.rs, expression.rs, emission.rs}`, `crates/connect-server/src/converter/v2_relation_converter.rs` (comment only).
+- Tests added: 9 (5 analyzer expansion + 2 type/nullability + 2 emission — including positive `[TDCK-BOUNDARY]` prefix assertion, unsafe-key rejection).
+- Findings CLOSE_NOW_IN_THIS_PASS: 0 blocking. Reviewer 0 Critical + 0 High + 0 Medium + 4 Low (all queued: empty-string key edge, `TypeMismatch.actual` shows `Unresolved`, duplicated unsafe-char predicate between analyzer/emission, plan `_input_schema` param dropped). Perf 0 HIGH/MEDIUM + 2 LOW DEFER + 6 INFO.
+- Findings queued as follow-up: analyze/emission unsafe-char predicate deduplication; per-row `json_extract_string` re-parses JSON for each key (Focus 3 — pre-existing pattern, not corpus-witnessed at scale); non-Project context guard (inherited from Pass 90).
+- Compiler warning delta: baseline preserved.
+- Quality Gate: PASS (cargo check clean, rustfmt clean, thunderduck-core lib tests + connect-server tests clean, `v2-progress.sh` 309/15/324 with json-002 PASSED and no regressions).
 - Commit SHA: pending.
 
 

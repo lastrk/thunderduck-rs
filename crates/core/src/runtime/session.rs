@@ -4,6 +4,11 @@ use std::sync::Arc;
 
 use duckdb::arrow::datatypes::{Field, Schema};
 use duckdb::arrow::record_batch::RecordBatch;
+use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
+use duckdb::ffi::duckdb_string_t;
+use duckdb::types::DuckString;
+use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
+use duckdb::vtab::arrow::WritableVector;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Result, ThunderduckError};
@@ -154,6 +159,100 @@ pub(crate) enum SessionResult {
     Error(ThunderduckError),
 }
 
+// ── json_strip_nulls UDF ───────────────────────────────────────────────────────
+
+/// DuckDB scalar UDF that drops object keys whose value is JSON `null`,
+/// recursively, matching Spark's `to_json` default
+/// (`SQLConf.JSON_GENERATOR_IGNORE_NULL_FIELDS=true`).
+///
+/// DuckDB v1.5.1 has no native `json_strip_nulls`. τ wraps every `to_json(x)`
+/// emission with `json_strip_nulls(to_json(x))` (see
+/// `transpiler_v2/emission.rs`), and this UDF is registered at session
+/// startup. Correctness contract:
+///
+/// - **Object**: entries whose value is JSON `null` are dropped at every
+///   nesting depth (`{}` is preserved when all keys strip away).
+/// - **Array**: `null` elements are kept as-is — Spark's `ignoreNullFields`
+///   applies only to STRUCT fields, never to array elements.
+/// - **Primitives** (string, number, boolean, `null`, JSON literal): returned
+///   unchanged.
+/// - **NULL row**: propagates as NULL.
+/// - **Malformed JSON input**: returned unchanged (defensive; upstream is
+///   always DuckDB's `to_json` output, so this branch is unreachable in
+///   practice).
+///
+/// Field order is preserved via `serde_json`'s `preserve_order` feature
+/// (backing map is `IndexMap`, not `BTreeMap`), so the output field order
+/// matches DuckDB's `to_json(struct_pack(...))` insertion order — which in
+/// turn matches Spark's struct field order. Pass 89: `json-005`.
+struct JsonStripNulls;
+
+impl VScalar for JsonStripNulls {
+    type State = ();
+
+    fn invoke(
+        _: &Self::State,
+        input: &mut DataChunkHandle,
+        output: &mut dyn WritableVector,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let len = input.len();
+        let input_vec = input.flat_vector(0);
+        // SAFETY: DuckDB guarantees the VARCHAR column's storage is
+        // `duckdb_string_t` and the batch carries exactly `len` rows.
+        let values = unsafe { input_vec.as_slice_with_len::<duckdb_string_t>(len) };
+        let mut out_vec = output.flat_vector();
+        for i in 0..len {
+            if input_vec.row_is_null(i as u64) {
+                out_vec.set_null(i);
+                continue;
+            }
+            // `DuckString::as_str` borrows through the mutable `string_t`
+            // descriptor; copy the descriptor to a local so we do not alias
+            // the input slice.
+            let mut str_t = values[i];
+            let borrowed = DuckString::new(&mut str_t).as_str();
+            let raw: &str = borrowed.as_ref();
+            let stripped = match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(v) => strip_nulls(v).to_string(),
+                // Defensive: upstream always emits DuckDB `to_json`, which is
+                // valid JSON. If we ever receive something else, return it
+                // untouched rather than fail the whole query.
+                Err(_) => raw.to_owned(),
+            };
+            out_vec.insert(i, stripped.as_str());
+        }
+        Ok(())
+    }
+
+    fn signatures() -> Vec<ScalarFunctionSignature> {
+        vec![ScalarFunctionSignature::exact(
+            vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)],
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        )]
+    }
+}
+
+/// Recursive JSON `null`-value key stripper. Public within the crate so the
+/// UDF's semantics can be pinned by unit tests without spinning up DuckDB.
+pub(crate) fn strip_nulls(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map {
+                if val.is_null() {
+                    continue;
+                }
+                out.insert(k, strip_nulls(val));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.into_iter().map(strip_nulls).collect())
+        }
+        other => other,
+    }
+}
+
 // ── DuckDbSession ──────────────────────────────────────────────────────────────
 
 /// An async handle to a DuckDB session running on a dedicated OS thread.
@@ -243,6 +342,9 @@ CREATE OR REPLACE MACRO size(x) AS len(x);
 CREATE OR REPLACE MACRO startswith(s, prefix) AS starts_with(s, prefix);
 CREATE OR REPLACE MACRO endswith(s, suffix) AS ends_with(s, suffix);
 CREATE OR REPLACE MACRO get_json_object(j, p) AS json_extract_string(j, p);
+-- json_strip_nulls(j) is registered by the Rust UDF below; see the
+-- `JsonStripNulls` VScalar impl. Spark to_json defaults to
+-- ignoreNullFields=true, and DuckDB v1.5.1 has no native equivalent. Pass 89.
 CREATE OR REPLACE MACRO array_remove(arr, elem) AS
     list_filter(arr, x -> x IS DISTINCT FROM elem);
 CREATE OR REPLACE MACRO array_compact(arr) AS
@@ -422,6 +524,20 @@ CREATE OR REPLACE MACRO str_to_map(s, pair_delim, kv_delim) AS
                 if let Err(e) = conn.execute_batch(macro_sql) {
                     let _ = ready_tx.send(Err(ThunderduckError::DuckDb(format!(
                         "macro registration failed: {e}"
+                    ))));
+                    return;
+                }
+                // Register the `json_strip_nulls(VARCHAR) -> VARCHAR` scalar
+                // UDF that powers Spark's `to_json` default
+                // (`ignoreNullFields=true`). DuckDB v1.5.1's JSON extension
+                // has no native equivalent; τ wraps every `to_json(x)`
+                // emission with `json_strip_nulls(to_json(x))`. Pass 89:
+                // `json-005`.
+                if let Err(e) =
+                    conn.register_scalar_function::<JsonStripNulls>("json_strip_nulls")
+                {
+                    let _ = ready_tx.send(Err(ThunderduckError::DuckDb(format!(
+                        "json_strip_nulls UDF registration failed: {e}"
                     ))));
                     return;
                 }
@@ -1174,5 +1290,82 @@ mod tests {
         configure_s3_credential_chain(&conn, Some("true".into()));
         configure_s3_credential_chain(&conn, Some("TRUE".into()));
         configure_s3_credential_chain(&conn, Some("True".into()));
+    }
+
+    // ── json_strip_nulls UDF semantics (Pass 89, json-005) ─────────────
+
+    use super::strip_nulls;
+
+    fn strip_str(s: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(s).expect("test input must be valid JSON");
+        strip_nulls(v).to_string()
+    }
+
+    /// Object entries with JSON-null values are dropped; the shape and the
+    /// insertion order of the surviving entries are preserved (courtesy of
+    /// serde_json `preserve_order`).
+    #[test]
+    fn json_strip_nulls_drops_null_valued_keys_and_preserves_order() {
+        assert_eq!(strip_str(r#"{"a":1,"b":null,"c":2}"#), r#"{"a":1,"c":2}"#,);
+        assert_eq!(strip_str(r#"{"a":null,"b":1}"#), r#"{"b":1}"#);
+        assert_eq!(strip_str(r#"{"a":1,"b":null}"#), r#"{"a":1}"#);
+    }
+
+    /// A struct whose every field is null becomes `{}` — Spark keeps the
+    /// empty-object container (`ignoreNullFields` drops entries with JSON
+    /// null values, never containers). Corpus witness: json-005 Heidi row.
+    #[test]
+    fn json_strip_nulls_keeps_empty_object_when_all_keys_are_null() {
+        assert_eq!(strip_str(r#"{"a":null,"b":null}"#), r#"{}"#);
+        assert_eq!(
+            strip_str(r#"{"outer":{"a":null,"b":null}}"#),
+            r#"{"outer":{}}"#,
+        );
+    }
+
+    /// Recursion covers every nesting depth in one call — nested struct in
+    /// struct, struct in map, etc. All null-valued keys strip regardless of
+    /// depth.
+    #[test]
+    fn json_strip_nulls_recurses_through_nested_objects() {
+        assert_eq!(
+            strip_str(r#"{"a":{"b":{"c":null,"d":1}}}"#),
+            r#"{"a":{"b":{"d":1}}}"#,
+        );
+    }
+
+    /// Array `null` elements are preserved — Spark's `ignoreNullFields`
+    /// applies only to STRUCT / object fields, never to array elements.
+    #[test]
+    fn json_strip_nulls_keeps_null_array_elements() {
+        assert_eq!(strip_str(r#"[1,null,2]"#), r#"[1,null,2]"#);
+        assert_eq!(
+            strip_str(r#"{"xs":[1,null,{"a":null,"b":2}]}"#),
+            r#"{"xs":[1,null,{"b":2}]}"#,
+        );
+    }
+
+    /// Regression against the earlier regex-based prototype: a string value
+    /// that contains an escaped `"` followed by `:null` MUST NOT be
+    /// corrupted. `serde_json`'s tokenizer treats the escape correctly, so
+    /// the raw string content is preserved intact. Pass 89 review-fix pin.
+    #[test]
+    fn json_strip_nulls_preserves_string_values_with_embedded_quote_and_null_token() {
+        // The JSON source literal is `{"raw":"foo\":null,bar","b":1}`. The
+        // decoded string value is `foo":null,bar`. After stripping (no
+        // top-level null-valued keys), the round-trip re-encodes the string
+        // with the same escape sequence.
+        let src = r#"{"raw":"foo\":null,bar","b":1}"#;
+        assert_eq!(strip_str(src), src);
+    }
+
+    /// Primitives at the root pass through unchanged; the UDF only special-
+    /// cases object entries and array descent.
+    #[test]
+    fn json_strip_nulls_returns_primitives_unchanged() {
+        assert_eq!(strip_str("null"), "null");
+        assert_eq!(strip_str("42"), "42");
+        assert_eq!(strip_str(r#""hello""#), r#""hello""#);
+        assert_eq!(strip_str("true"), "true");
     }
 }

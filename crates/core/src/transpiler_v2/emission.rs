@@ -2484,17 +2484,46 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // equivalent that returns Spark-DDL. The `thdck_spark_funcs`
         // extension provides `spark_schema_of_json`. Corpus: `json-006`.
         "schema_of_json" => "spark_schema_of_json",
-        // KNOWN DEVIATION (τ-boundary, Spark-parity gap) — `to_json`:
-        // `to_json` has no explicit remap arm; it passes through as
-        // DuckDB's native `to_json`. Spark's `to_json` and DuckDB's
-        // `to_json` diverge on value-level formatting for nested
-        // structs / maps (key ordering, whitespace, numeric formatting,
-        // null-field emission). Corpus witness json-005 currently fails
-        // on value-level differences of this shape. Tracked as follow-up
-        // pass "Spark-parity JSON emission" — options:
-        //   (a) post-process the DuckDB JSON string to match Spark's
-        //       canonical form,
-        //   (b) new `spark_to_json` extension function in `thdck_spark_funcs`.
+        // Spark's `to_json(col[, options])` runs `JacksonGenerator` with
+        // `SQLConf.JSON_GENERATOR_IGNORE_NULL_FIELDS=true` by default, which
+        // omits object entries whose value is JSON `null` at every nesting
+        // level (array elements that are null are preserved as `null`, and
+        // empty-object containers stay as `{}`). DuckDB's native `to_json`
+        // has no such option, so wrap the call with DuckDB's recursive
+        // `json_strip_nulls` (JSON extension, already loaded at session
+        // start per ADR-020) to match Spark exactly. When the caller
+        // passes an explicit `MapLiteral{'ignoreNullFields': 'false'}`
+        // options map, emit the bare `to_json` instead. Any other options
+        // key or non-`MapLiteral` second argument is a Thunderduck-boundary
+        // error (ADR-022). Corpus: `json-005`.
+        "to_json" => match f.args.len() {
+            1 => {
+                let a = render_expr(&f.args[0], schema)?;
+                return Ok(format!("json_strip_nulls(to_json({a}))"));
+            }
+            2 => {
+                let a = render_expr(&f.args[0], schema)?;
+                match parse_to_json_ignore_null_fields(&f.args[1]) {
+                    Some(true) => return Ok(format!("json_strip_nulls(to_json({a}))")),
+                    Some(false) => return Ok(format!("to_json({a})")),
+                    None => {
+                        return Err(EmissionError::UnsupportedFunction {
+                            name: f.name.clone(),
+                            reason: "`to_json` options: only \
+                                     {'ignoreNullFields': 'true'|'false'} is supported \
+                                     — τ boundary"
+                                .to_owned(),
+                        });
+                    }
+                }
+            }
+            _ => {
+                return Err(EmissionError::UnsupportedFunction {
+                    name: f.name.clone(),
+                    reason: "`to_json` requires 1 or 2 arguments".to_owned(),
+                });
+            }
+        },
         // Spark's `to_csv(struct)` — DuckDB has no `to_csv` scalar.
         // When the argument is a `struct(...)` (Spark's `F.struct` /
         // Catalyst `CreateStruct`), unpack the fields and emit
@@ -5029,6 +5058,33 @@ fn literal_string_arg(e: &Expression) -> Option<String> {
     }
 }
 
+/// Recognise the one Spark option τ supports on `to_json`: a `MapLiteral`
+/// with exactly one entry `('ignoreNullFields', 'true' | 'false')`. Returns
+/// `Some(true|false)` for the recognised shape and `None` for anything else
+/// (unrecognised key, non-string literal value, multi-entry map, or a
+/// non-`MapLiteral` expression). Case-sensitive to match Spark's
+/// `JSONOptions` parsing. Callers surface `None` as a Thunderduck-boundary
+/// error (ADR-022). Pass 89 witness: `json-005`.
+fn parse_to_json_ignore_null_fields(e: &Expression) -> Option<bool> {
+    let m = match e {
+        Expression::MapLiteral(m) => m,
+        _ => return None,
+    };
+    if m.entries.len() != 1 {
+        return None;
+    }
+    let (k, v) = &m.entries[0];
+    let key = literal_string_arg(k)?;
+    if key != "ignoreNullFields" {
+        return None;
+    }
+    match literal_string_arg(v)?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Parse a Spark numeric format string (as used by `to_number` /
 /// `try_to_number`) into `(precision, scale)`. Supports only the common
 /// digit-template shape composed of `9` and `0` optionally split by a
@@ -5433,7 +5489,7 @@ mod tests {
         AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
         CastExpression, ColumnReference, FunctionCall, InListExpression, IntervalExpression,
         LambdaExpression, LambdaVariableExpression, LikeExpression, Literal, LiteralValue,
-        StarExpression, UnaryExpression, UnaryOp, UpdateFieldsExpression,
+        MapLiteralExpression, StarExpression, UnaryExpression, UnaryOp, UpdateFieldsExpression,
     };
     use crate::transpiler_v2::{analyze, generate};
 
@@ -6382,10 +6438,13 @@ mod tests {
 
     // ── JSON / CSV cluster (Pass 62) ────────────────────────────────────
 
-    /// json-005 anchor: `to_json(struct(...))` passes through unchanged to
-    /// DuckDB's native `to_json`.
+    /// json-005 anchor: 1-arg `to_json(struct(...))` wraps DuckDB's native
+    /// `to_json` with `json_strip_nulls` so Spark's default
+    /// `ignoreNullFields=true` semantics are preserved (null-valued object
+    /// keys dropped recursively; array `null`s and empty-object containers
+    /// preserved). Corpus: `json-005`.
     #[test]
-    fn render_to_json_of_struct_passes_through() {
+    fn render_to_json_wraps_with_json_strip_nulls() {
         let struct_arg = Expression::FunctionCall(FunctionCall {
             name: "struct".to_owned(),
             args: vec![col_ref_expr("name"), col_ref_expr("age")],
@@ -6398,9 +6457,122 @@ mod tests {
         };
         let sql = render_function_call(&f, &empty_schema()).expect("render to_json");
         assert_eq!(
-            sql, "to_json(struct_pack(name := name, age := age))",
-            "to_json wraps the DuckDB struct_pack unchanged",
+            sql, "json_strip_nulls(to_json(struct_pack(name := name, age := age)))",
+            "1-arg to_json wraps DuckDB's to_json with json_strip_nulls",
         );
+    }
+
+    /// Nested structs must not double-wrap: DuckDB's `json_strip_nulls` is
+    /// already recursive, so τ emits the wrapper exactly once at the
+    /// outermost `to_json` call. Guards against a future refactor
+    /// accidentally re-wrapping inside `render_expr` recursion.
+    #[test]
+    fn render_to_json_of_nested_struct_still_wraps_once() {
+        let inner_struct = Expression::FunctionCall(FunctionCall {
+            name: "struct".to_owned(),
+            args: vec![col_ref_expr("city"), col_ref_expr("zip")],
+            distinct: false,
+        });
+        let outer_struct = Expression::FunctionCall(FunctionCall {
+            name: "struct".to_owned(),
+            args: vec![col_ref_expr("name"), inner_struct],
+            distinct: false,
+        });
+        let f = FunctionCall {
+            name: "to_json".to_owned(),
+            args: vec![outer_struct],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render to_json");
+        assert_eq!(
+            sql.matches("json_strip_nulls(").count(),
+            1,
+            "wrapper must appear exactly once (outermost); got: {sql}",
+        );
+        assert!(
+            sql.starts_with("json_strip_nulls(to_json("),
+            "wrapper must be the outermost call; got: {sql}",
+        );
+    }
+
+    /// Explicit `to_json(x, {'ignoreNullFields': 'false'})` disables Spark's
+    /// default null-key stripping — τ must emit the bare DuckDB `to_json`
+    /// (no wrapper), letting DuckDB retain null-valued keys verbatim.
+    #[test]
+    fn render_to_json_with_ignore_null_fields_false_option_omits_wrapper() {
+        let struct_arg = Expression::FunctionCall(FunctionCall {
+            name: "struct".to_owned(),
+            args: vec![col_ref_expr("name"), col_ref_expr("age")],
+            distinct: false,
+        });
+        let options = Expression::MapLiteral(MapLiteralExpression {
+            entries: vec![(
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("ignoreNullFields".to_owned()),
+                    data_type: DataType::String,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("false".to_owned()),
+                    data_type: DataType::String,
+                }),
+            )],
+            key_type: DataType::String,
+            value_type: DataType::String,
+        });
+        let f = FunctionCall {
+            name: "to_json".to_owned(),
+            args: vec![struct_arg, options],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render to_json");
+        assert_eq!(
+            sql, "to_json(struct_pack(name := name, age := age))",
+            "explicit ignoreNullFields=false must emit bare to_json (no wrapper)",
+        );
+    }
+
+    /// Any options key other than `ignoreNullFields` is a
+    /// Thunderduck-boundary error (ADR-022): τ does not silently drop
+    /// unsupported JSON options. Guards the dead-arm rot on the options
+    /// match.
+    #[test]
+    fn render_to_json_with_unsupported_option_is_boundary_error() {
+        let struct_arg = Expression::FunctionCall(FunctionCall {
+            name: "struct".to_owned(),
+            args: vec![col_ref_expr("ts")],
+            distinct: false,
+        });
+        let options = Expression::MapLiteral(MapLiteralExpression {
+            entries: vec![(
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("timestampFormat".to_owned()),
+                    data_type: DataType::String,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("yyyy-MM-dd".to_owned()),
+                    data_type: DataType::String,
+                }),
+            )],
+            key_type: DataType::String,
+            value_type: DataType::String,
+        });
+        let f = FunctionCall {
+            name: "to_json".to_owned(),
+            args: vec![struct_arg, options],
+            distinct: false,
+        };
+        let err = render_function_call(&f, &empty_schema())
+            .expect_err("unsupported to_json option must be a boundary error");
+        match err {
+            EmissionError::UnsupportedFunction { name, reason } => {
+                assert_eq!(name, "to_json");
+                assert!(
+                    reason.contains("ignoreNullFields"),
+                    "reason must cite the supported option; got: {reason}",
+                );
+            }
+            other => panic!("expected UnsupportedFunction, got: {other:?}"),
+        }
     }
 
     /// hash-001 anchor: `crc32(col)` is remapped to `spark_crc32(col)`

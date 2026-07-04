@@ -533,6 +533,23 @@ the summary below records the corpus deltas by pass number.
 - Findings queued as follow-up: unify `dedup_names` into a shared helper module (if a third caller appears); `render_local_relation` per-row `render_data_type` optimization.
 - Compiler warning delta: baseline preserved (no new warnings on touched files).
 - Quality Gate: PASS (cargo check both crates clean, rustfmt clean on all touched files, `cargo test -p thunderduck-connect-server --tests` 83/0, `cargo test -p thunderduck-core --lib` 545/29 identical to baseline, `v2-progress.sh` 305/19/324 with arr-012 PASSED and no regressions).
+- Commit SHA: 8eb3d69.
+
+## Pass 89 — 2026-07-04T
+- Case: `json-005` — `F.to_json(F.struct("name","age","address"))` — Spark's `to_json` uses `ignoreNullFields=true` by default (`JacksonGenerator` in `SQLConf.scala:3872-3880`); DuckDB's native `to_json` keeps null keys. Corpus witness: nested `address: Struct<city, zip, geo>` where individual fields can be NULL — Spark emits `{"name":"Carol",…,"address":{"city":"Vienna","geo":{…}}}` (zip omitted); τ was emitting the full skeleton with `"zip":null`.
+- Diagnostic: `.agent-output/diagnostic-pass-89.md` — one-arm gap in emission; type-inference and expression layers already correct (return type `String`, `nullable=true`).
+- Architecture: `.agent-output/architecture-pass-89.md` — wrap `to_json(x)` → `json_strip_nulls(to_json(x))`. Handle 2-arg options-map form (`ignoreNullFields=false` bypass; unknown options → ADR-022 boundary reject). Initially planned to use DuckDB's native `json_strip_nulls`.
+- Substrate pivot: DuckDB v1.5.1 (bundled) has NO `json_strip_nulls` function (added in later upstream). First implementation used a two-pass regex SQL macro in session startup — reviewer flagged as HIGH: regex fires inside quoted string values containing `\":null` (silently corrupts user data). Pivoted to Rust UDF via `duckdb` crate's `vscalar` feature — `JsonStripNulls` implementing `VScalar`, using `serde_json` with `preserve_order` to keep field-insertion order. Fallback path (`json_object`-based emission) verified unnecessary — DuckDB v1.5.1's `json_object` skips null-KEY entries but keeps null-VALUE entries, so it would not have solved the gap.
+- Layer(s) touched: τ core emission (`to_json` arm at `emission.rs:2487`, helper `parse_to_json_ignore_null_fields`), runtime session (`JsonStripNulls` UDF registration in `session.rs`), workspace dependencies (`serde_json` with `preserve_order`, `duckdb` `vscalar` feature).
+- ADR citations: ADR-015 (Spark parity wins), ADR-020 (extension mandatory — `thdck_spark_funcs` is C++ yyjson-based; adding cross-repo work here would be disproportionate — Rust UDF fits the boundary), ADR-022 (options-map non-witnesses = Thunderduck-boundary).
+- Corpus signal: 305 → **306** (+1). json-005 GREEN.
+- Files: `crates/core/src/transpiler_v2/emission.rs`, `crates/core/src/runtime/session.rs`, `Cargo.toml`, `crates/core/Cargo.toml`.
+- Tests added: 11 (4 emission unit tests — wraps with strip / nested still wraps once / options-map bypass / unsupported option boundary; 6 UDF-semantics tests — round-trip identity / recursive nested-null strip / empty-object preservation / array-null preservation / escape-quote regression pin `foo\\":null,bar` byte-identical / malformed input passthrough; 1 renamed).
+- Findings CLOSE_NOW_IN_THIS_PASS: 1 (review HIGH — regex fragility on quoted strings containing `\":null`). No perf blockers.
+- Findings not blocking: review 1 Medium (case-sensitivity on `ignoreNullFields` key/value), 1 Low (unconditional wrap on scalar `to_json` args). Perf 3 Low + 6 Info — batched UDF (per-DataChunk, not per-row FFI), in-place strip micro-opts available but not corpus-witnessed at scale.
+- Findings queued as follow-up: case-insensitive options parsing (Spark accepts `True`/`TRUE`/`true`); `serde_json` in-place `Map::retain` if hot in future.
+- Compiler warning delta: baseline preserved.
+- Quality Gate: PASS (cargo check clean, rustfmt clean on touched files, `cargo test -p thunderduck-core --lib` 554/29 — +9 net passing from baseline 545/29, no new failures, `v2-progress.sh` 306/18/324 with json-005 PASSED, no regressions).
 - Commit SHA: pending.
 
 

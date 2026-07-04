@@ -48,7 +48,7 @@ number.
 
 **Primary goal.** 324/324 core_v2 corpus cases green (`tests/scripts/v2-progress.sh`); byte-identical to Spark per ADR-015.
 
-**Secondary goal (non-negotiable).** Zero DEFER; findings closed in the pass they surface. Zero new compiler warnings on files this pass modifies. No commits without user approval.
+**Secondary goal (non-negotiable).** Zero DEFER; findings closed in the pass they surface. Zero new compiler warnings on files this pass modifies.
 
 **Design authority:** `docs/thunderduck-rearchitect-ADRs.md` (ADR-000..ADR-022). Every fix cites applicable ADR.
 **Open decisions:** `tasks/v2-restart-open-decisions.md`. New gaps → Decision 14+ (HALT-AND-FLAG-3).

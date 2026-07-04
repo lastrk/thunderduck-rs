@@ -7,11 +7,13 @@ and Thunderduck, with clear diff output for mismatches.
 
 import math
 import os
+import re
 import threading
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, List, Optional, Tuple
 
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, Row
 from pyspark.sql.types import StructType
 
 
@@ -51,6 +53,133 @@ def collect_with_timeout(df: DataFrame, timeout: int, name: str) -> list:
         raise exception[0]
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Tri-state error-parity comparator (ADR-006 "Error emulation contract")
+#
+# The differential oracle must compare error paths symmetrically:
+#   both return values, equal            -> PASS (normal row diff)
+#   both throw with matching error class -> PASS
+#   one throws, one returns values       -> FAIL (divergence)
+#   both throw with different classes    -> FAIL (divergence)
+# ---------------------------------------------------------------------------
+
+_ERROR_TOKEN_RE = re.compile(r"^\s*\[([A-Z][A-Z0-9_.]*)\]")
+
+
+def spark_error_class(exc: BaseException) -> Optional[str]:
+    """Best-effort Spark error-class token for a PySpark Connect exception.
+
+    Resolution order (first non-empty token wins):
+      1. ``exc.getCondition()``   — PySpark 4.x canonical accessor
+      2. ``exc.getErrorClass()``  — older/alternate accessor
+      3. regex ``^[TOKEN]`` on ``str(exc)`` — for DuckDB-passthrough / accessor-less
+
+    Returns ``None`` when no class token can be recovered (e.g. a raw DuckDB
+    error string with no leading ``[TOKEN]``). ``None`` is a real divergence
+    signal, distinct from an empty string.
+    """
+    for accessor in ("getCondition", "getErrorClass"):
+        fn = getattr(exc, accessor, None)
+        if callable(fn):
+            try:
+                tok = fn()
+            except Exception:
+                tok = None
+            if tok:
+                return str(tok).strip().strip("[]")
+    m = _ERROR_TOKEN_RE.match(str(exc))
+    return m.group(1) if m else None
+
+
+@dataclass
+class SideOutcome:
+    """Result of evaluating ONE engine's DataFrame to completion."""
+
+    rows: Optional[List[Row]] = None
+    error: Optional[BaseException] = None
+    error_class: Optional[str] = None
+
+    @property
+    def threw(self) -> bool:
+        return self.error is not None
+
+
+def capture_outcome(df: DataFrame, timeout: int, name: str) -> SideOutcome:
+    """Evaluate one side to either collected rows or a captured exception.
+
+    Reuses :func:`collect_with_timeout` so the daemon-thread timeout budget
+    still applies (a hung engine cannot wedge the suite). ``TimeoutError`` is
+    captured as a throw with no recoverable class, which surfaces as an honest
+    divergence in :func:`reconcile_error_parity`.
+    """
+    try:
+        rows = collect_with_timeout(df, timeout, name)
+        return SideOutcome(rows=rows)
+    except Exception as exc:  # noqa: BLE001 — any collect error becomes an outcome
+        return SideOutcome(error=exc, error_class=spark_error_class(exc))
+
+
+def reconcile_error_parity(
+    ref: SideOutcome,
+    td: SideOutcome,
+    case_id: str,
+    expected_class: Optional[str] = None,
+) -> Optional[Tuple[List[Row], List[Row]]]:
+    """Apply the ADR-006 tri-state table to a pair of :class:`SideOutcome`.
+
+    Returns:
+        ``(ref.rows, td.rows)`` when BOTH sides returned values — the caller
+        performs the normal row comparison.
+        ``None`` when both threw a matching (and, if declared, expected) class
+        — PASS, nothing further to compare.
+
+    Raises:
+        AssertionError: on any divergence.
+    """
+    # 1. both returned VALUES -> hand back to the caller's row-compare
+    if not ref.threw and not td.threw:
+        return (ref.rows, td.rows)
+
+    # 2. exactly one threw -> divergence
+    if ref.threw and not td.threw:
+        raise AssertionError(
+            f"[{case_id}] error-parity divergence: Spark raised "
+            f"{ref.error_class or type(ref.error).__name__}; τ returned "
+            f"{len(td.rows)} rows (expected τ to raise the same Spark error "
+            f"class) — τ ANSI-throw emulation not yet implemented (ADR-006). "
+            f"Spark error: {ref.error}"
+        )
+    if td.threw and not ref.threw:
+        raise AssertionError(
+            f"[{case_id}] error-parity divergence: τ raised "
+            f"{td.error_class or type(td.error).__name__} but Spark returned "
+            f"{len(ref.rows)} rows. τ error: {td.error}"
+        )
+
+    # 3. BOTH threw -> classes must match (and match the declaration, if any)
+    rc, tc = ref.error_class, td.error_class
+    if expected_class is not None:
+        if rc != expected_class:
+            raise AssertionError(
+                f"[{case_id}] reference did not raise the declared class: expected "
+                f"[{expected_class}], Spark raised [{rc}]. Fix the corpus "
+                f"declaration or the Spark pin. Spark error: {ref.error}"
+            )
+        if tc != expected_class:
+            raise AssertionError(
+                f"[{case_id}] error-class divergence: expected [{expected_class}], "
+                f"τ raised [{tc}]. τ error: {td.error}"
+            )
+        return None
+
+    if rc is None or tc is None or rc != tc:
+        raise AssertionError(
+            f"[{case_id}] error-class divergence: Spark raised [{rc}], τ "
+            f"raised [{tc}]. τ error: {td.error}"
+        )
+    return None
 
 
 class DataFrameDiff:

@@ -17,6 +17,7 @@ Running:
     cargo test -p thunderduck-connect-server --test differential core    -- --ignored --nocapture
     cargo test -p thunderduck-connect-server --test differential core_v2 -- --ignored --nocapture
 """
+import os
 import sys
 from pathlib import Path
 
@@ -26,7 +27,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 
-from utils.dataframe_diff import DataFrameDiff, assert_dataframes_equal
+from utils.dataframe_diff import (
+    DataFrameDiff,
+    assert_dataframes_equal,
+    capture_outcome,
+    reconcile_error_parity,
+)
 from differential.dataframe_corpus import CASES, Case
 
 
@@ -69,6 +75,27 @@ def test_case(case: Case, corpus_inputs_reference, corpus_inputs_thunderduck):
     """
     ref_df = case.build(corpus_inputs_reference)
     td_df = case.build(corpus_inputs_thunderduck)
+
+    # ── ADR-006 tri-state error-parity branch ──────────────────────────────
+    # For cases that declare an expected Spark error class, collect BOTH sides
+    # independently (the normal path collects Spark first, so a Spark-side throw
+    # would abort before τ is exercised) and reconcile via the tri-state table.
+    if case.expected_error is not None:
+        timeout = int(os.environ.get("DIFFERENTIAL_TIMEOUT", "60"))
+        ref = capture_outcome(ref_df, timeout, "Spark Reference")
+        td = capture_outcome(td_df, timeout, "Thunderduck")
+        outcome = reconcile_error_parity(
+            ref, td, case.id, expected_class=case.expected_error
+        )
+        if outcome is None:
+            return  # both threw a matching class → PASS
+        ref_rows, td_rows = outcome  # both returned values → normal row diff
+        assert_dataframes_equal(
+            ref_df.sparkSession.createDataFrame(sorted(ref_rows, key=repr), ref_df.schema),
+            td_df.sparkSession.createDataFrame(sorted(td_rows, key=repr), td_df.schema),
+            query_name=case.id,
+        )
+        return
 
     schema_only = "schema_only" in case.flags or "nondeterministic" in case.flags
     if schema_only:

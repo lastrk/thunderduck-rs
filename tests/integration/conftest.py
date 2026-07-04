@@ -316,6 +316,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "joins: mark test as join test"
     )
+    config.addinivalue_line(
+        "markers",
+        "error_parity: ADR-006 tri-state error-class parity case (declares expected_error)",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -332,6 +336,14 @@ def pytest_collection_modifyitems(config, items):
         # Add sql marker to tests with 'sql' in name
         if '_sql' in item.nodeid.lower():
             item.add_marker(pytest.mark.sql)
+
+        # Add error_parity marker to corpus cases that declare an expected
+        # Spark error class, so the tri-state subset is selectable via -m.
+        callspec = getattr(item, "callspec", None)
+        if callspec is not None:
+            case_obj = callspec.params.get("case")
+            if getattr(case_obj, "expected_error", None) is not None:
+                item.add_marker(pytest.mark.error_parity)
 
 
 # TPC-DS Fixtures

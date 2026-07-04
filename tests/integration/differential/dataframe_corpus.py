@@ -62,7 +62,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -199,13 +199,18 @@ class Case:
     description: str
     build: Callable[[Dict[str, DataFrame]], DataFrame]
     flags: Tuple[str, ...] = ()
+    # Declared Spark error-class token (e.g. "DIVIDE_BY_ZERO"). When set, the
+    # harness applies the ADR-006 tri-state error-parity comparator instead of a
+    # value diff: both engines must raise this class to PASS. See
+    # utils.dataframe_diff.reconcile_error_parity.
+    expected_error: Optional[str] = None
 
 
 CASES: List[Case] = []
 
 
-def case(id, category, description, build, flags=()):
-    CASES.append(Case(id, category, description, build, tuple(flags)))
+def case(id, category, description, build, flags=(), expected_error=None):
+    CASES.append(Case(id, category, description, build, tuple(flags), expected_error))
 
 
 # ── 1. Projection & column manipulation ────────────────────────────────────
@@ -309,8 +314,8 @@ case("math-006", "math", "pow / hypot", lambda I: I["nums"].select(F.pow("y", F.
 case("math-007", "math", "trig (sin/cos/tan/atan2)", lambda I: I["nums"].select(F.sin("y").alias("s"), F.cos("y").alias("c"), F.atan2("y", "x").alias("a2")))
 case("math-008", "math", "degrees / radians", lambda I: I["nums"].select(F.degrees("y").alias("deg"), F.radians("y").alias("rad")))
 case("math-009", "math", "greatest / least (null handling)", lambda I: I["nums"].select(F.greatest("a", "b", F.lit(4)).alias("g"), F.least("a", "b").alias("l")))
-case("math-010", "math", "mod / pmod", lambda I: I["nums"].select((F.col("a") % F.col("b")).alias("m"), F.pmod("a", "b").alias("pm")))
-case("math-011", "math", "int/int division -> double (Spark semantics)", lambda I: I["nums"].select((F.col("a") / F.col("b")).alias("div")))
+case("math-010", "math", "mod / pmod", lambda I: I["nums"].select((F.col("a") % F.col("b")).alias("m"), F.pmod("a", "b").alias("pm")), expected_error="REMAINDER_BY_ZERO")
+case("math-011", "math", "int/int division -> double (Spark semantics)", lambda I: I["nums"].select((F.col("a") / F.col("b")).alias("div")), expected_error="DIVIDE_BY_ZERO")
 case("math-012", "math", "bitwise and/or/xor + shifts", lambda I: I["nums"].select(F.col("a").bitwiseAND(F.col("b")).alias("and"), F.shiftleft(F.col("a"), 2).alias("shl")))
 case("math-013", "math", "hex / unhex / conv", lambda I: I["nums"].select(F.hex("a").alias("hx"), F.conv(F.col("a").cast("string"), 10, 2).alias("bin")))
 case("math-014", "math", "factorial", lambda I: I["nums"].select(F.factorial(F.lit(5)).alias("fact")))

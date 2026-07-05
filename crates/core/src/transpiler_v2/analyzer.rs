@@ -3085,6 +3085,11 @@ fn derive_implicit_grouping(
 /// Recursively collect the (lowercased) names of every column referenced by an
 /// expression tree into `acc`. A bare `Star` contributes nothing (so
 /// `count(*)` references no column). Used by [`derive_implicit_grouping`].
+///
+/// MAINTENANCE CONTRACT: the match below is exhaustive over `Expression` (a new
+/// *variant* is a compile error). It does NOT catch a new sub-expression *field*
+/// on an existing variant — if you add one, recurse into it here (and in the
+/// sibling walker `base_types::collect_scan_tables_in_expr`).
 fn collect_referenced_columns(expr: &Expression, acc: &mut HashSet<String>) {
     match expr {
         Expression::ColumnReference(c) => {

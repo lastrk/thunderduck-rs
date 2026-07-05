@@ -323,6 +323,11 @@ fn for_each_node_expr(op: &CommonOp, f: &mut dyn FnMut(&Expression)) {
 /// at base-types collection time), collect its inner plan's empty-scan tables.
 /// Recurses through every composite expression so a subquery nested inside a
 /// binary op / CASE / function call is still reached.
+///
+/// MAINTENANCE CONTRACT: the match below is exhaustive over `Expression`, so a
+/// new *variant* is a compile error here. It does NOT catch a new sub-expression
+/// *field* added to an existing variant — if you add one, recurse into it here
+/// (and in the sibling walker `analyzer::collect_referenced_columns`).
 fn collect_scan_tables_in_expr(e: &Expression, out: &mut Vec<String>) {
     match e {
         Expression::ScalarSubquery(s) => collect_subquery_plan_tables(&s.subquery, out),

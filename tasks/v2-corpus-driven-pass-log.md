@@ -858,3 +858,12 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 705/0, `sql_v2` 169/93/262, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 110 — 2026-07-05 — SQL corpus: tech-debt sweep (passes 106–109) [run 2, 2nd sweep]
+- **Tech-debt sweep** (every-5th-pass, 10th of run 2): rust-reviewer over `git diff 14e450a..HEAD` (uncorrelated subqueries + SubqueryPlan/Seam D; PIVOT/UNPIVOT + PivotGrouping/UnpivotIds; typed DATE/TIMESTAMP/decimal literals; IS TRUE/FALSE). Nothing Critical/High/Medium; 0 compiler warnings.
+- Verified clean (reviewer): the THREE exhaustive `Expression` walkers (`collect_scan_tables_in_expr`, `collect_referenced_columns`, resolve pass) all cover the 29 variants with no `_` (new variant → compile error); the 2-variant marker enums (SubqueryPlan Unanalyzed/Analyzed, PivotGrouping/UnpivotIds Explicit/Implicit) have only exhaustive matches; no dead code / stale Slice labels; date parser robust.
+- Fixed: **L3** — added a MAINTENANCE CONTRACT doc comment to both new exhaustive walkers noting that exhaustiveness catches a new *variant* but NOT a new sub-expression *field* on an existing variant (must recurse manually + keep the sibling walker in sync).
+- Deferred (Low, reviewer-recommended-optional): L1 (`IsDistinctFrom` construction repeated across 7 lower_expr arms — cosmetic; the error-prone `negated` polarity still needs per-arm reasoning a helper can't remove); L2 (Spark decimal precision/scale rule duplicated in core `decimal_literal_precision_scale` vs connect-server `normalize_decimal_literal` — both tested + documented as mirrors; a future hoist to a shared core fn).
+- Files: `crates/core/src/transpiler_v2/{base_types,analyzer}.rs` (comments only; behavior-preserving; corpus stays 169).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, 0 warnings).
+- Commit SHA: (this commit).

@@ -25,10 +25,10 @@ use sqlparser::ast::{
     ExactNumberInfo, Expr, ExprWithAlias, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, GroupByExpr, Interval, JoinConstraint, JoinOperator,
     LimitClause, NamedWindowDefinition, NamedWindowExpr, NullInclusion, ObjectName, ObjectNamePart,
-    OrderByExpr, OrderByKind, PivotValueSource, Query, Select, SelectItem, SetExpr, SetOperator,
-    SetQuantifier, Statement, TableFactor, TableWithJoins, TrimWhereField, TypedString,
-    UnaryOperator, Value, ValueWithSpan, WindowFrame as SqlWindowFrame, WindowFrameBound,
-    WindowFrameUnits, WindowSpec, WindowType,
+    OrderByExpr, OrderByKind, OrderByOptions, PivotValueSource, Query, Select, SelectItem, SetExpr,
+    SetOperator, SetQuantifier, Statement, TableFactor, TableWithJoins, TrimWhereField,
+    TypedString, UnaryOperator, Value, ValueWithSpan, WindowFrame as SqlWindowFrame,
+    WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 
 use crate::transpiler_v2::ast::{
@@ -123,12 +123,11 @@ fn lower_query(query: Query, cte_scope: &CteScope) -> Result<CommonAst, Emission
     let order_by_exprs: Vec<OrderByExpr> = match &query.order_by {
         Some(ob) => match &ob.kind {
             OrderByKind::Expressions(exprs) => exprs.clone(),
-            OrderByKind::All(_) => {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::order_by_all".to_owned(),
-                    reason: "ORDER BY ALL not supported at Slice A.2".to_owned(),
-                });
-            }
+            // Spark `ORDER BY ALL` orders by every output column, left to right,
+            // applying the clause's asc/desc + nulls options uniformly. Build a
+            // sort key per projection item (query.body is still borrowable here;
+            // it is moved at `lower_set_expr(*query.body)` below).
+            OrderByKind::All(options) => order_by_all_exprs(&query.body, options)?,
         },
         None => vec![],
     };
@@ -143,6 +142,43 @@ fn lower_query(query: Query, cte_scope: &CteScope) -> Result<CommonAst, Emission
         offset_expr_opt,
         effective_scope,
     )
+}
+
+/// Synthesize `ORDER BY ALL` into one sort key per SELECT output column, each
+/// carrying the clause's asc/desc + nulls options. Only supported over a plain
+/// `SELECT` body (not set ops / VALUES); `*` projections are rejected.
+fn order_by_all_exprs(
+    body: &SetExpr,
+    options: &OrderByOptions,
+) -> Result<Vec<OrderByExpr>, EmissionError> {
+    let select = match body {
+        SetExpr::Select(s) => s,
+        _ => {
+            return Err(EmissionError::UnsupportedProtoShape {
+                shape: "sql::order_by_all".to_owned(),
+                reason: "ORDER BY ALL is only supported over a SELECT body".to_owned(),
+            });
+        }
+    };
+    let mut out: Vec<OrderByExpr> = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => e.clone(),
+            SelectItem::ExprWithAlias { expr, .. } => expr.clone(),
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                return Err(EmissionError::UnsupportedProtoShape {
+                    shape: "sql::order_by_all_wildcard".to_owned(),
+                    reason: "ORDER BY ALL over `*` projection not supported".to_owned(),
+                });
+            }
+        };
+        out.push(OrderByExpr {
+            expr,
+            options: options.clone(),
+            with_fill: None,
+        });
+    }
+    Ok(out)
 }
 
 fn extract_limit_offset(
@@ -359,11 +395,34 @@ fn lower_aggregate_select(
                 (plain, GroupingKind::GroupBy)
             }
         }
-        GroupByExpr::All(_) => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: "sql::group_by_all".to_owned(),
-                reason: "GROUP BY ALL deferred past Slice A.2".to_owned(),
-            });
+        GroupByExpr::All(modifiers) => {
+            if !modifiers.is_empty() {
+                return Err(EmissionError::UnsupportedProtoShape {
+                    shape: "sql::group_by_all_modifiers".to_owned(),
+                    reason: "GROUP BY ALL with ROLLUP/CUBE/GROUPING SETS modifiers not supported"
+                        .to_owned(),
+                });
+            }
+            // Spark `GROUP BY ALL` groups by every SELECT item that is NOT an
+            // aggregate expression (the aggregates come from the projection fold
+            // as usual). Compute the grouping from the projection here.
+            let mut grouping: Vec<Expression> = Vec::new();
+            for item in &projection {
+                let expr = match item {
+                    SelectItem::UnnamedExpr(e) => e,
+                    SelectItem::ExprWithAlias { expr, .. } => expr,
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                        return Err(EmissionError::UnsupportedProtoShape {
+                            shape: "sql::group_by_all_wildcard".to_owned(),
+                            reason: "GROUP BY ALL over `*` projection not supported".to_owned(),
+                        });
+                    }
+                };
+                if !expr_has_aggregate(expr) {
+                    grouping.push(lower_expr(expr.clone(), cte_scope)?);
+                }
+            }
+            (grouping, GroupingKind::GroupBy)
         }
     };
 
@@ -2548,6 +2607,36 @@ mod tests {
                 assert_eq!(grouping.len(), 2);
             }
             _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn parse_group_by_all_groups_by_non_aggregate_items() {
+        // GROUP BY ALL groups by the non-aggregate SELECT items (a, b), not count(*).
+        let plan = parse("SELECT a, b, COUNT(*) FROM t GROUP BY ALL").expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate {
+                grouping,
+                grouping_kind,
+                aggregates,
+                ..
+            } => {
+                assert_eq!(grouping_kind, GroupingKind::GroupBy);
+                assert_eq!(grouping.len(), 2, "GROUP BY ALL groups by a, b");
+                assert_eq!(aggregates.len(), 3, "projection is a, b, count(*)");
+            }
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn parse_order_by_all_orders_by_every_output_column() {
+        let plan = parse("SELECT a, b FROM t ORDER BY ALL").expect("should parse");
+        match plan.op {
+            CommonOp::Sort { order, .. } => {
+                assert_eq!(order.len(), 2, "ORDER BY ALL orders by both output columns");
+            }
+            _ => panic!("expected Sort over the projection"),
         }
     }
 

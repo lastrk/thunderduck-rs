@@ -37,6 +37,12 @@ impl Dialect for SparkDialect {
         true
     }
 
+    /// Spark 3.4+ supports `ORDER BY ALL` / `GROUP BY ALL`. Without this the
+    /// parser treats `ALL` as a column named "all".
+    fn supports_order_by_all(&self) -> bool {
+        true
+    }
+
     fn supports_lambda_functions(&self) -> bool {
         true
     }

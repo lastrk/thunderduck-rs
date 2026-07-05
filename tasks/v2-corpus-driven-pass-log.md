@@ -896,3 +896,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 712/0, `sql_v2` 172/90/262, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 113 — 2026-07-05 — SQL corpus: GROUP BY ALL / ORDER BY ALL (ord-007) [run 2]
+- **Corpus: SQL front-end.** Targets: ord-007 (`ORDER BY ALL`), agg-009 (`GROUP BY ALL`). Both `spark4`-flagged. Lowering + a dialect flag.
+- Architecture: inline — `SparkDialect::supports_order_by_all() -> true` (else the parser treats `ALL` as a column named "all"); `GroupByExpr::All` → group by non-aggregate projection items (via `expr_has_aggregate`, projection already in `lower_aggregate_select`); `OrderByKind::All(opts)` → `order_by_all_exprs(&query.body, opts)` synthesizing one sort key per SELECT output column (peeking `query.body` before it's moved) with the clause options; `*` projections + non-SELECT bodies → boundary reject.
+- Layer(s) touched: τ SQL front-end (`parser_v2/v2_lowering.rs` + `parser_v2/dialect.rs`). No emission/analyzer/ast change.
+- ADR citations: ADR-004 (SQL → common AST), ADR-015 (GROUP BY ALL = non-aggregate items; ORDER BY ALL = all output cols), ADR-022 (`*`/non-SELECT-body ALL → boundary reject).
+- Corpus signal: 172 → **173** (+1). ord-007 GREEN. agg-009 fails on a SEPARATE analyzer bug (`cannot resolve column 'emp.emp.*'` — a doubly-qualified-star resolution issue, unrelated to the GROUP BY ALL lowering which is unit-test-verified to group by [dept_id, active]). No regression.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`, `crates/core/src/parser_v2/dialect.rs`.
+- Tests added: 2 (GROUP BY ALL → grouping [a,b] len 2 non-aggregate; ORDER BY ALL → Sort order len 2).
+- **PROCESS INCIDENT:** the first coder for this pass wrote its edits to `/workspace/crates/...` (the MAIN checkout on `feat/v2-transpiler`) instead of the worktree — detected via a mismatched test count (634 vs the worktree's 712) and `/workspace` paths in its report. My worktree was intact (712, pass 112); `/workspace` already had ~500 lines of PRE-EXISTING uncommitted work (another source) so I did NOT touch it (revert would destroy it). Re-implemented directly in the worktree. Lesson: verify `git rev-parse --show-toplevel` and test-count baseline before trusting a subagent's edits landed in the right tree.
+- Findings queued as follow-up: agg-009 (`emp.emp.*` doubly-qualified-star analyzer resolution); correlated subqueries (emission alias fix); GROUPING SETS emission; HAVING-agg emission; tuples; lateral view; interval types.
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 714/0, `sql_v2` 173/89/262, no regressions).
+- Commit SHA: (this commit).

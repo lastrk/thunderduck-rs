@@ -341,6 +341,14 @@ cargo test -- --nocapture
 
 ### Integration / Differential Tests
 
+> **Spark IS INSTALLED** — vendored in the **main checkout** at `/workspace/.spark/spark-4.1.1`
+> (with its venv at `/workspace/.venv`). The runner's default probe (`$HOME/spark/current`)
+> misses it, and worktrees have no in-tree `.spark/`. From a worktree, export the paths first:
+> ```bash
+> export SPARK_HOME=/workspace/.spark/spark-4.1.1 THUNDERDUCK_VENV_DIR=/workspace/.venv
+> ```
+> Do **not** re-run `setup-differential-testing.sh` — Spark is already present.
+
 ```bash
 # Full differential test suite (all 41 test files)
 ./tests/scripts/run-differential-tests.sh all

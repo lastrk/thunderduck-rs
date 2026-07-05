@@ -675,6 +675,30 @@ fn passthrough_schema_arm(
     })
 }
 
+/// Bounded schema-passthrough variant of [`passthrough_schema_arm`] for
+/// operators that first resolve an op-specific value `T` against the input
+/// schema (Filter → `Expression` condition, Sort → `Vec<SortOrder>`), then
+/// pass the schema through unchanged.
+///
+/// `resolve_t` runs against the analyzed input schema; `build_op` receives
+/// the typed input and the resolved `T`, and yields the concrete
+/// [`TypedOp`] variant.
+fn analyze_input_with_schema_passthrough<T>(
+    input: CommonAst,
+    base_types: &BaseTypes,
+    resolve_t: impl FnOnce(&StructType) -> Result<T, AnalyzerError>,
+    build_op: impl FnOnce(TypedAst, T) -> TypedOp,
+) -> Result<TypedAst, AnalyzerError> {
+    let typed_input = analyze_node(input, base_types)?;
+    let resolved = resolve_t(&typed_input.resolved_schema)?;
+    let resolved_schema = typed_input.resolved_schema.clone();
+    let op = build_op(typed_input, resolved);
+    Ok(TypedAst {
+        op,
+        resolved_schema,
+    })
+}
+
 fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, AnalyzerError> {
     match ast.op {
         // ── Leaves ────────────────────────────────────────────────────────
@@ -797,59 +821,58 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             })
         }
 
-        CommonOp::Filter { input, condition } => {
-            let typed_input = analyze_node(*input, base_types)?;
-            let condition = resolve_and_stamp(condition, &typed_input.resolved_schema)?;
-            let cond_type = condition.data_type(&typed_input.resolved_schema);
-            if !matches!(
-                cond_type,
-                DataType::Boolean | DataType::Unresolved | DataType::Null
-            ) {
-                return Err(AnalyzerError::TypeMismatch {
-                    expected: DataType::Boolean,
-                    actual: cond_type,
-                    context: "filter-condition".to_owned(),
-                });
-            }
-            let output_schema = typed_input.resolved_schema.clone();
-            Ok(TypedAst {
-                op: TypedOp::Filter {
-                    input: Box::new(typed_input),
-                    condition,
-                },
-                resolved_schema: output_schema,
-            })
-        }
+        CommonOp::Filter { input, condition } => analyze_input_with_schema_passthrough(
+            *input,
+            base_types,
+            |schema| {
+                let condition = resolve_and_stamp(condition, schema)?;
+                let cond_type = condition.data_type(schema);
+                if !matches!(
+                    cond_type,
+                    DataType::Boolean | DataType::Unresolved | DataType::Null
+                ) {
+                    return Err(AnalyzerError::TypeMismatch {
+                        expected: DataType::Boolean,
+                        actual: cond_type,
+                        context: "filter-condition".to_owned(),
+                    });
+                }
+                Ok(condition)
+            },
+            |ti, condition| TypedOp::Filter {
+                input: Box::new(ti),
+                condition,
+            },
+        ),
 
         CommonOp::Sort {
             input,
             order,
             limit,
             offset,
-        } => {
-            let typed_input = analyze_node(*input, base_types)?;
-            let order = order
-                .into_iter()
-                .map(|so| {
-                    let expr = resolve_and_stamp(*so.expr, &typed_input.resolved_schema)?;
-                    Ok::<SortOrder, AnalyzerError>(SortOrder {
-                        expr: Box::new(expr),
-                        direction: so.direction,
-                        null_ordering: so.null_ordering,
+        } => analyze_input_with_schema_passthrough(
+            *input,
+            base_types,
+            |schema| {
+                order
+                    .into_iter()
+                    .map(|so| {
+                        let expr = resolve_and_stamp(*so.expr, schema)?;
+                        Ok::<SortOrder, AnalyzerError>(SortOrder {
+                            expr: Box::new(expr),
+                            direction: so.direction,
+                            null_ordering: so.null_ordering,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let output_schema = typed_input.resolved_schema.clone();
-            Ok(TypedAst {
-                op: TypedOp::Sort {
-                    input: Box::new(typed_input),
-                    order,
-                    limit,
-                    offset,
-                },
-                resolved_schema: output_schema,
-            })
-        }
+                    .collect::<Result<Vec<_>, _>>()
+            },
+            |ti, order| TypedOp::Sort {
+                input: Box::new(ti),
+                order,
+                limit,
+                offset,
+            },
+        ),
 
         CommonOp::Limit {
             input,

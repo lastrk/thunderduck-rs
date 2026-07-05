@@ -587,3 +587,47 @@ Deviations from the plan's target list (10 arms):
 - **Warnings.** No delta.
 - **Gate.** `cargo test -p thunderduck-core --lib`: 453 pass / 0
   fail. Scoped fmt clean.
+
+## Pass 15 — OPP-II (2026-07-05)
+
+Introduce the bounded schema-passthrough resolver
+`analyze_input_with_schema_passthrough<T>` in
+`crates/core/src/transpiler_v2/analyzer.rs`. Signature:
+
+```rust
+fn analyze_input_with_schema_passthrough<T>(
+    input: CommonAst,
+    base_types: &BaseTypes,
+    resolve_t: impl FnOnce(&StructType) -> Result<T, AnalyzerError>,
+    build_op: impl FnOnce(TypedAst, T) -> TypedOp,
+) -> Result<TypedAst, AnalyzerError>
+```
+
+`resolve_t` runs against the analyzed input schema; `build_op`
+receives the typed input and the resolved `T`, and yields the
+concrete `TypedOp` variant. Complements Pass 14's
+`passthrough_schema_arm` (which requires no `T`) by covering the
+"resolve, then passthrough" pattern.
+
+**2 arms migrated:**
+- `Filter` — `T = Expression` (condition, includes the Boolean
+  type-check inline in `resolve_t`; wire error preserved).
+- `Sort` — `T = Vec<SortOrder>`.
+
+Interaction with Pass 14's helper: SEPARATE, not layered. Pass 15's
+arms never touch `passthrough_schema_arm`; they jump straight to the
+layered helper. Both helpers coexist.
+
+Deviation from plan's 3-arm target: `Limit` stayed on Pass 14's
+`passthrough_schema_arm` because it has no `T` to resolve — forcing
+it through Pass 15 with `T = ()` + a `|ti, ()|` build closure adds
+1 LOC and 2 lines of noise for zero benefit. The plan constraint
+"reconsider the helper shape if signature is longer than the arm it
+replaced" favors Pass 14 for `Limit`.
+
+- **LOC delta.** analyzer.rs +24 helper + ~−6 across Filter/Sort
+  migration. Structural DRYness gained; raw LOC near-flat.
+- **Corpus.** 314 → 314 (behavior-preserving).
+- **Warnings.** No delta.
+- **Gate.** `cargo test -p thunderduck-core --lib`: 453 pass / 0
+  fail. Scoped `rustfmt --edition 2021 --check` clean.

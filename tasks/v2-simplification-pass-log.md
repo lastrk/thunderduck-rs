@@ -74,3 +74,30 @@ callers; τ's emission uses `render_data_type` in
   thunderduck-core --lib --tests` → 446 pass / 0 fail / 4 ignored
   (lib, −2 vs Pass 1 = removed TypeMapper unit tests) + 1 pass / 0
   fail / 4 ignored (runtime_integration).
+
+## Pass 3 — OPP-MMM (2026-07-05)
+
+Delete `crates/core/src/runtime/schema_inferrer.rs` and its single
+consumer test `crates/core/tests/runtime_integration.rs::struct_field_
+name_case_is_preserved`. The load-bearing property (STRUCT field-name
+round-trip through DuckDB's Arrow schema) is already covered by the
+differential DataFrame corpus (arr-*, struc-*, map-* cases).
+
+- **Files touched.**
+  - `crates/core/src/runtime/schema_inferrer.rs` — deleted (−117 LOC).
+  - `crates/core/src/runtime/mod.rs` — drop `pub mod schema_inferrer;`
+    + `pub use schema_inferrer::SchemaInferrer;` (−2 lines).
+  - `crates/core/tests/runtime_integration.rs` — drop
+    `struct_field_name_case_is_preserved` (−83 LOC).
+- **LOC delta.** −202.
+- **Corpus.** 314 → 314 (unchanged — dead-code deletion; the removed
+  test was `runtime_integration`, not part of the DataFrame corpus).
+- **Warnings.** No delta on touched files. `PipeIfUnresolved` warning
+  persists (Pass 4's target).
+- **Verify grep.** `git grep 'SchemaInferrer\|schema_inferrer' crates/`
+  returns zero hits.
+- **Gate.** `cargo check -p thunderduck-core` clean. Scoped
+  `rustfmt --edition 2021 --check` clean. `cargo test -p
+  thunderduck-core --lib --tests` → 446 pass / 0 fail / 4 ignored
+  (lib, unchanged) + 0 pass / 0 fail / 4 ignored
+  (runtime_integration, −1 = removed test).

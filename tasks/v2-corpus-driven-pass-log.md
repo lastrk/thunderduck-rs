@@ -843,3 +843,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 701/0, `sql_v2` 168/94/262, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 109 — 2026-07-05 — SQL corpus: IS [NOT] TRUE / IS [NOT] FALSE (pr-006) [run 2]
+- **Corpus: SQL front-end.** Target: pr-006 `... WHERE active IS TRUE AND (age > 100) IS FALSE` (`sql::expr::other`). Lowering-only, reuses the pass-103 `IsDistinctFrom` substrate.
+- (Note: this pass initially targeted gx-008 [duplicated grouping columns under CUBE with a computed key]. Diagnosis found the real bug is the `already_folded` name-based fold detection; two coder attempts at a structural/pre-resolution fix passed unit tests but did NOT green gx-008 — the raw grouping vs aggregate exprs differ in a field (qualifier/plan_id) even pre-resolution, so the fold match fails for the real SQL path. Reverted [no regression] and deferred gx-008; gx-007 is a separate HAVING-with-aggregate emission bug [`WHERE clause cannot contain aggregates`]. Retargeted pr-006.)
+- Diagnostic/Architecture: `.agent-output/architecture-pass-109.md` — `x IS TRUE` ⟺ `x IS NOT DISTINCT FROM TRUE` (3VL: NULL IS TRUE = false). 4 arms → IsDistinctFrom with a non-null Boolean literal and the right `negated` polarity.
+- Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`). No emission/analyzer/ast change.
+- ADR citations: ADR-004 (reuse IsDistinctFrom substrate), ADR-015 (3VL parity — verified truth table), ADR-022 (now supported).
+- Corpus signal: 168 → **169** (+1). pr-006 GREEN. No regressions.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Tests added: 4 ((literal, negated) polarity assertions for IS TRUE/NOT TRUE/FALSE/NOT FALSE).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (3VL polarity verified via full truth table incl. NULL cells). Perf negligible.
+- Findings queued as follow-up: gx-008 (fold-detection — needs the raw-expr mismatch root cause understood, or lowering to declare the fold explicitly); gx-007 (HAVING-with-aggregate → HAVING/QUALIFY emission, not WHERE); pr-003/004 (LIKE ANY/ALL — tuples), pr-005 (multi-col IN — `sql::expr::tuple` row-values), pr-007 (lateral column alias — analyzer).
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 705/0, `sql_v2` 169/93/262, no regressions).
+- Commit SHA: (this commit).

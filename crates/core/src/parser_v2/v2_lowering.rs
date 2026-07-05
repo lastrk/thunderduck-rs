@@ -847,6 +847,15 @@ fn is_aggregate_function_name(name: &str) -> bool {
     AGGREGATE_NAMES.iter().any(|a| name.eq_ignore_ascii_case(a))
 }
 
+/// Build a non-null boolean literal expression — used to lower `IS [NOT] TRUE`
+/// / `IS [NOT] FALSE` onto τ's `IsDistinctFrom` substrate.
+fn bool_literal(b: bool) -> Expression {
+    Expression::Literal(Literal {
+        value: LiteralValue::Boolean(b),
+        data_type: DataType::Boolean,
+    })
+}
+
 fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionError> {
     match expr {
         Expr::Identifier(ident) => Ok(Expression::UnresolvedColumn(UnresolvedColumn {
@@ -996,6 +1005,32 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             left: Box::new(lower_expr(*a, cte_scope)?),
             right: Box::new(lower_expr(*b, cte_scope)?),
             negated: true,
+        })),
+        // `x IS [NOT] TRUE` / `x IS [NOT] FALSE` — 3VL boolean tests yielding a
+        // non-null boolean. Lower onto τ's `IsDistinctFrom` substrate:
+        //   `x IS TRUE`      ⟺ `x IS NOT DISTINCT FROM TRUE`  (negated: true)
+        //   `x IS NOT TRUE`  ⟺ `x IS DISTINCT FROM TRUE`      (negated: false)
+        // and likewise for FALSE. NULL IS TRUE = false, NULL IS NOT TRUE = true.
+        // Corpus witness: `pr-006`.
+        Expr::IsTrue(e) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
+            left: Box::new(lower_expr(*e, cte_scope)?),
+            right: Box::new(bool_literal(true)),
+            negated: true,
+        })),
+        Expr::IsNotTrue(e) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
+            left: Box::new(lower_expr(*e, cte_scope)?),
+            right: Box::new(bool_literal(true)),
+            negated: false,
+        })),
+        Expr::IsFalse(e) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
+            left: Box::new(lower_expr(*e, cte_scope)?),
+            right: Box::new(bool_literal(false)),
+            negated: true,
+        })),
+        Expr::IsNotFalse(e) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
+            left: Box::new(lower_expr(*e, cte_scope)?),
+            right: Box::new(bool_literal(false)),
+            negated: false,
         })),
         Expr::Like {
             expr,
@@ -2308,6 +2343,48 @@ mod tests {
             Expression::IsDistinctFrom(idf) => assert!(idf.negated),
             other => panic!("expected IsDistinctFrom, got {other:?}"),
         }
+    }
+
+    /// Assert the `where_predicate` is an `IsDistinctFrom` whose right operand
+    /// is a boolean literal `expected_bool` and whose `negated` flag matches.
+    fn assert_bool_test(plan: &CommonAst, expected_bool: bool, expected_negated: bool) {
+        match where_predicate(plan) {
+            Expression::IsDistinctFrom(idf) => {
+                assert_eq!(idf.negated, expected_negated);
+                match idf.right.as_ref() {
+                    Expression::Literal(Literal {
+                        value: LiteralValue::Boolean(b),
+                        data_type: DataType::Boolean,
+                    }) => assert_eq!(*b, expected_bool),
+                    other => panic!("expected Boolean literal, got {other:?}"),
+                }
+            }
+            other => panic!("expected IsDistinctFrom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_is_true() {
+        let plan = parse("SELECT * FROM t WHERE a IS TRUE").expect("should parse");
+        assert_bool_test(&plan, true, true);
+    }
+
+    #[test]
+    fn parse_is_not_true() {
+        let plan = parse("SELECT * FROM t WHERE a IS NOT TRUE").expect("should parse");
+        assert_bool_test(&plan, true, false);
+    }
+
+    #[test]
+    fn parse_is_false() {
+        let plan = parse("SELECT * FROM t WHERE a IS FALSE").expect("should parse");
+        assert_bool_test(&plan, false, true);
+    }
+
+    #[test]
+    fn parse_is_not_false() {
+        let plan = parse("SELECT * FROM t WHERE a IS NOT FALSE").expect("should parse");
+        assert_bool_test(&plan, false, false);
     }
 
     #[test]

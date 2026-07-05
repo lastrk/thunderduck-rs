@@ -528,10 +528,21 @@ fn lower_table_factor(
                     alias,
                 }))
             } else {
-                Ok(CommonAst::new(CommonOp::TableScan {
-                    table,
-                    alias: alias.map(|a| a.name.value),
-                }))
+                // Normalize an aliased bare table to
+                // `AliasedRelation { TableScan { alias: None }, alias }`, matching
+                // the DataFrame front-end (`df.alias("e")`) so both front-ends
+                // produce the same CommonAST node for the same meaning (INV7,
+                // ADR-004). Emission's alias-hoisting recognizes `AliasedRelation`;
+                // the old `TableScan { alias: Some(..) }` form buried the user
+                // alias inside a synthetic subquery. Mirrors the CTE branch above.
+                let scan = CommonAst::new(CommonOp::TableScan { table, alias: None });
+                match alias {
+                    Some(a) => Ok(CommonAst::new(CommonOp::AliasedRelation {
+                        input: Box::new(scan),
+                        alias: a.name.value,
+                    })),
+                    None => Ok(scan),
+                }
             }
         }
         TableFactor::Derived {
@@ -2828,6 +2839,49 @@ mod tests {
             matches!(right.op, CommonOp::AliasedRelation { ref alias, .. } if alias == "mgr"),
             "right side should be AliasedRelation aliased mgr, got {:?}",
             right.op
+        );
+    }
+
+    #[test]
+    fn parse_aliased_bare_table_yields_aliased_relation() {
+        // INV7 (ADR-004): an aliased bare table (`emp e`) lowers to the same
+        // node the DataFrame front-end produces for `df.alias("e")` —
+        // `AliasedRelation { input: TableScan { alias: None }, alias: "e" }` —
+        // not the old `TableScan { alias: Some("e") }`.
+        let plan = parse("SELECT e.id FROM emp e").expect("should parse");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        let CommonOp::AliasedRelation { alias, input } = input.op else {
+            panic!("expected AliasedRelation over the scan, got {:?}", input.op);
+        };
+        assert_eq!(alias, "e");
+        assert!(
+            matches!(
+                input.op,
+                CommonOp::TableScan { ref table, alias: None } if table == "emp"
+            ),
+            "expected TableScan {{ table: emp, alias: None }} under the \
+             AliasedRelation, got {:?}",
+            input.op
+        );
+    }
+
+    #[test]
+    fn parse_unaliased_bare_table_stays_table_scan() {
+        // Without an alias, a bare table stays a plain `TableScan` (no
+        // AliasedRelation wrapping) — the normalization only triggers on alias.
+        let plan = parse("SELECT * FROM emp").expect("should parse");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        assert!(
+            matches!(
+                input.op,
+                CommonOp::TableScan { ref table, alias: None } if table == "emp"
+            ),
+            "expected bare TableScan, got {:?}",
+            input.op
         );
     }
 

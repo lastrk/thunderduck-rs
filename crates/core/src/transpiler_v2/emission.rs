@@ -406,6 +406,39 @@ fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String
             using_columns,
         );
     }
+    // Project-over-Filter-over-Join inlining: a comma-join lowers to
+    // `Project → Filter → Join`, so the aliases sit two subquery levels below
+    // the projection. Collapse all three into one `SELECT ... FROM <join> WHERE
+    // <cond>` so user aliases stay in scope for both the WHERE and the slots.
+    // Filter is schema-passthrough, so `input_schema` (Project input) and the
+    // Join's `resolved_schema` carry identical fields.
+    if let TypedOp::Filter {
+        input: filter_input,
+        condition: filter_cond,
+    } = &input.op
+    {
+        if let TypedOp::Join {
+            left,
+            right,
+            join_type,
+            condition: join_cond,
+            using_columns,
+            ..
+        } = &filter_input.op
+        {
+            let from = render_join_from(
+                left,
+                right,
+                *join_type,
+                join_cond.as_ref(),
+                using_columns,
+                &filter_input.resolved_schema,
+            )?;
+            let slots_sql = render_projection_slots(projections, input_schema)?;
+            let cond_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
+            return Ok(format!("SELECT {slots_sql} FROM {from} WHERE {cond_sql}"));
+        }
+    }
     // AliasedRelation is transparent for Project too — inline through it.
     if let TypedOp::AliasedRelation {
         input: inner,
@@ -452,6 +485,31 @@ fn render_project_over_join(
     condition: Option<&Expression>,
     using_columns: &[String],
 ) -> Result<String, EmissionError> {
+    let from = render_join_from(
+        left,
+        right,
+        join_type,
+        condition,
+        using_columns,
+        project_input_schema,
+    )?;
+    let slots_sql = render_projection_slots(projections, project_input_schema)?;
+    Ok(format!("SELECT {slots_sql} FROM {from}"))
+}
+
+/// Render the `FROM` body of a join — the two aliased sides and the
+/// `ON`/`USING`/`CROSS` clause — without an enclosing `SELECT`. Hoists user
+/// `AliasedRelation` names into the subquery aliases so alias-qualified refs
+/// in the enclosing clause bind; falls back to synthetic `__td_jl`/`__td_jr`.
+/// `cond_schema` resolves the ON-condition expression.
+fn render_join_from(
+    left: &TypedAst,
+    right: &TypedAst,
+    join_type: crate::transpiler_v2::ast::JoinType,
+    condition: Option<&Expression>,
+    using_columns: &[String],
+    cond_schema: &Schema,
+) -> Result<String, EmissionError> {
     use super::ast::JoinType;
     // Pick subquery aliases: user AliasedRelation names take precedence.
     let (left_ast, left_alias) = match &left.op {
@@ -483,18 +541,17 @@ fn render_project_over_join(
         }
         format!(" USING ({cols})")
     } else if let Some(cond) = condition {
-        let cond_sql = render_expr(cond, project_input_schema)?;
+        let cond_sql = render_expr(cond, cond_schema)?;
         format!(" ON {cond_sql}")
     } else if matches!(join_type, JoinType::Cross) {
         String::new()
     } else {
         bail_boundary_op!("Join", "non-cross join without ON or USING clause");
     };
-    let slots_sql = render_projection_slots(projections, project_input_schema)?;
     let la = quote_ident(&left_alias);
     let ra = quote_ident(&right_alias);
     Ok(format!(
-        "SELECT {slots_sql} FROM ({left_sql}) AS {la} {kind} ({right_sql}) AS {ra}{clause}"
+        "({left_sql}) AS {la} {kind} ({right_sql}) AS {ra}{clause}"
     ))
 }
 
@@ -5665,7 +5722,9 @@ pub(crate) fn extension_targets() -> HashSet<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transpiler_v2::ast::{CommonAst, CommonOp, PivotGrouping, SetOpKind, UnpivotIds};
+    use crate::transpiler_v2::ast::{
+        CommonAst, CommonOp, JoinType, PivotGrouping, SetOpKind, UnpivotIds,
+    };
     use crate::transpiler_v2::base_types::BaseTypes;
     use crate::transpiler_v2::expression::{
         AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
@@ -5871,6 +5930,114 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(sql.starts_with("SELECT id FROM ("), "got: {sql}");
         assert!(sql.contains("SELECT * FROM emp"), "got: {sql}");
+    }
+
+    // ── Aliased-join inlining (jn-001/002/003 root fix) ──────────────────
+
+    fn dept_schema() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("dept_id", DataType::Integer),
+            StructField::nullable("dept_name", DataType::String),
+        ])
+    }
+
+    fn base_types_emp_dept(plan: &CommonAst) -> BaseTypes {
+        BaseTypes::build_from_plan(plan, |name| match name {
+            "emp" => Some(emp_schema()),
+            "dept" => Some(dept_schema()),
+            _ => None,
+        })
+    }
+
+    /// `AliasedRelation { TableScan { alias: None }, alias }` — the node both
+    /// front-ends now produce for an aliased table (INV7).
+    fn aliased_scan(table: &str, alias: &str) -> CommonAst {
+        CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: table.to_owned(),
+                alias: None,
+            })),
+            alias: alias.to_owned(),
+        })
+    }
+
+    fn qcol(qualifier: &str, name: &str) -> Expression {
+        Expression::UnresolvedColumn(crate::transpiler_v2::expression::UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: Some(qualifier.to_owned()),
+            plan_id: None,
+        })
+    }
+
+    #[test]
+    fn render_project_over_join_hoists_user_aliases() {
+        let _g = tap_guard();
+        // SELECT e.name, d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(join),
+            projections: vec![qcol("e", "name"), qcol("d", "dept_name")],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze project-over-join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // User aliases hoisted into the subquery aliases; no synthetic alias,
+        // so the ON clause and projection bind against `e` / `d`.
+        assert!(sql.contains(") AS e INNER JOIN ("), "got: {sql}");
+        assert!(sql.contains(") AS d ON "), "got: {sql}");
+        assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
+        assert!(!sql.contains("__td_jl"), "got: {sql}");
+        assert!(!sql.contains("__td_jr"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_project_over_filter_over_join_inlines_to_single_select() {
+        let _g = tap_guard();
+        // SELECT e.name, d.dept_name FROM emp e, dept d WHERE e.dept_id = d.dept_id
+        // lowers to Project → Filter → CrossJoin.
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Cross,
+            condition: None,
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(join),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            }),
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(filter),
+            projections: vec![qcol("e", "name"), qcol("d", "dept_name")],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze project-over-filter-over-join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // Project→Filter→Join collapses into one SELECT: aliases hoisted, the
+        // predicate lands as an outer WHERE (not a buried subquery filter).
+        assert!(sql.contains(") AS e CROSS JOIN ("), "got: {sql}");
+        assert!(sql.contains(") AS d WHERE "), "got: {sql}");
+        assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
+        assert!(!sql.contains("__td_filter"), "got: {sql}");
+        assert!(!sql.contains("__td_proj"), "got: {sql}");
     }
 
     #[test]

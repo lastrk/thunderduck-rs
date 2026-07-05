@@ -931,3 +931,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 714/0, `sql_v2` 173/89/262, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 114 — 2026-07-05 — SQL corpus: aliased joins (jn-001/002/003)
+- **Corpus: SQL front-end ↔ emission.** Targets: jn-001 (INNER JOIN ON), jn-002 (implicit comma join + WHERE), jn-003 (LEFT JOIN) — all aliased-table joins (`emp e JOIN dept d ON e.dept_id = d.dept_id`). Same-shape cluster, one root cause.
+- Root cause (diagnostic-pass-114.md): **INV7 representation mismatch**. SQL lowering emitted `TableScan{alias:Some("e")}` while the DataFrame front-end emits `AliasedRelation{input,alias}`; emission's alias-hoisting (`render_project_over_join`) only recognized `AliasedRelation`, so the SQL-path alias fell into the `_` arm, got the synthetic `__td_jl`/`__td_jr` subquery alias, and the user alias was buried → DuckDB binder "Referenced table \"e\" not found".
+- Architecture (architecture-pass-114.md): **Stage A** — normalize `lower_table_factor` to emit `AliasedRelation{input:TableScan{alias:None}, alias}` for aliased tables (restores INV7; schema-neutral because `apply_alias_to_schema` is a no-op → zero-regression). **Stage B** — extract `render_join_from` helper from `render_project_over_join` (verbatim) and add a Project-over-Filter-over-Join collapse branch in `render_project` for the `Project→Filter→CrossJoin` shape of jn-002.
+- Layer(s) touched: τ SQL front-end (`parser_v2/v2_lowering.rs`) + emission (`transpiler_v2/emission.rs`). No AST/analyzer/type-inference change.
+- ADR citations: ADR-004/INV7 (two-front-end AST parity — the fix RESTORES it), ADR-003 (reuse existing `AliasedRelation`, no AST extension), ADR-022 (Thunderduck-boundary → make τ emit bindable SQL).
+- Corpus signal: 173 → **184** (+11). jn-001/002/003 GREEN. Bonus: jn cluster 2→10 (jn-004/005/011/012/014 also flipped) + 3 non-`jn-` aliased-join cases. No regressions (173 green preserved).
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`, `crates/core/src/transpiler_v2/emission.rs`.
+- Tests added: 4 — v2_lowering: `parse_aliased_bare_table_yields_aliased_relation`, `parse_unaliased_bare_table_stays_table_scan`; emission: `render_project_over_join_hoists_user_aliases`, `render_project_over_filter_over_join_inlines_to_single_select`.
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED). 1 review MEDIUM (latent): USING-join + WHERE + `SELECT *` routes through `render_join_from` which lacks `render_join`'s explicit analyzer-ordered column list — corpus-gated, zero regression in current 262, deferred to durable follow-up (arch open-Q #2).
+- Findings queued as follow-up: durable alias-scope strategy (jn-013 nested-join, jn-015 Aggregate-over-Join, general `SELECT e.x FROM emp e WHERE e.x>0` Filter-over-aliased-scan; likely new ADR); adopt `render_join_from` alias-hoisting in standalone `render_join` (closes the MEDIUM); jn-006 (join-output nullability mismatch, now binds); jn-008 (NATURAL join); jn-009/010 (`e.*`→`e.e.*` star-resolution); agg-009 same `emp.emp.*` bug.
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean on touched files, `cargo test -p thunderduck-core --lib` 540/0, `sql_v2` 184/78/262, no regressions).
+- Commit SHA: (this commit).

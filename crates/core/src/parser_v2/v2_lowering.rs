@@ -30,7 +30,7 @@ use sqlparser::ast::{
     WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 
-use crate::transpiler_v2::ast::{CommonAst, CommonOp, JoinType, SetOpKind};
+use crate::transpiler_v2::ast::{CommonAst, CommonOp, GroupingKind, JoinType, SetOpKind};
 use crate::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
     FrameBoundary, FrameUnit, FunctionCall, InListExpression, IntervalExpression, LambdaExpression,
@@ -215,7 +215,7 @@ fn lower_aggregate_select(
     group_by: GroupByExpr,
     having: Option<Expr>,
 ) -> Result<CommonAst, EmissionError> {
-    let grouping = match group_by {
+    let (grouping, grouping_kind) = match group_by {
         GroupByExpr::Expressions(exprs, modifiers) => {
             if !modifiers.is_empty() {
                 return Err(EmissionError::UnsupportedProtoShape {
@@ -224,19 +224,62 @@ fn lower_aggregate_select(
                         .to_owned(),
                 });
             }
-            let mut plain: Vec<Expression> = Vec::with_capacity(exprs.len());
-            for e in exprs {
-                match e {
-                    Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => {
-                        return Err(EmissionError::UnsupportedProtoShape {
-                            shape: "sql::grouping_sets".to_owned(),
-                            reason: "ROLLUP / CUBE / GROUPING SETS deferred to Slice G".to_owned(),
-                        });
-                    }
-                    other => plain.push(lower_expr(other)?),
+            // Prefix-form `ROLLUP (...)` / `CUBE (...)` parses to a single
+            // `Expr::Rollup`/`Expr::Cube` holding `Vec<Vec<Expr>>` grouping
+            // terms (`ROLLUP (a, b)` → `[[a], [b]]`). Flatten the terms into
+            // τ's flat grouping list and thread the kind — mirroring the
+            // DataFrame path in `v2_relation_converter::convert_aggregate`,
+            // where the grouping list is flat and the direction lives in the
+            // `GroupingKind`. Spark's ROLLUP/CUBE always wraps the whole
+            // grouping list, so a single wrapper element is the expected shape.
+            if exprs.len() == 1 && matches!(exprs[0], Expr::Rollup(_) | Expr::Cube(_)) {
+                let (sets, kind) = match exprs.into_iter().next() {
+                    Some(Expr::Rollup(sets)) => (sets, GroupingKind::Rollup),
+                    Some(Expr::Cube(sets)) => (sets, GroupingKind::Cube),
+                    // The `len() == 1 && matches!` guard above guarantees the
+                    // first (only) element is `Rollup` or `Cube`.
+                    _ => unreachable!("single ROLLUP/CUBE guaranteed by guard"),
+                };
+                // sqlparser preserves parenthesized grouping terms: `ROLLUP
+                // ((a, b), c)` → `[[a, b], [c]]`, which Spark treats as a
+                // distinct set of levels that a flat `ROLLUP(a, b, c)` does NOT
+                // reproduce. τ's grouping list is flat (one column per level),
+                // so a multi-column term can't be represented — reject rather
+                // than silently flatten to the wrong grouping sets (ADR-022,
+                // loud-fail). Simple `ROLLUP (a, b)` = `[[a],[b]]` is unaffected.
+                if sets.iter().any(|term| term.len() != 1) {
+                    return Err(EmissionError::UnsupportedProtoShape {
+                        shape: "sql::grouping_sets".to_owned(),
+                        reason: "nested ROLLUP/CUBE grouping terms deferred to Slice G".to_owned(),
+                    });
                 }
+                let mut flat: Vec<Expression> = Vec::new();
+                for term in sets {
+                    for e in term {
+                        flat.push(lower_expr(e)?);
+                    }
+                }
+                (flat, kind)
+            } else {
+                // Plain GROUP BY, or an unsupported shape: bare GROUPING SETS,
+                // or a ROLLUP/CUBE mixed with other terms / repeated (Spark
+                // wraps the whole list in one wrapper — anything else is a
+                // Slice-G boundary reject).
+                let mut plain: Vec<Expression> = Vec::with_capacity(exprs.len());
+                for e in exprs {
+                    match e {
+                        Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => {
+                            return Err(EmissionError::UnsupportedProtoShape {
+                                shape: "sql::grouping_sets".to_owned(),
+                                reason: "GROUPING SETS / mixed ROLLUP/CUBE deferred to Slice G"
+                                    .to_owned(),
+                            });
+                        }
+                        other => plain.push(lower_expr(other)?),
+                    }
+                }
+                (plain, GroupingKind::GroupBy)
             }
-            plain
         }
         GroupByExpr::All(_) => {
             return Err(EmissionError::UnsupportedProtoShape {
@@ -257,7 +300,7 @@ fn lower_aggregate_select(
         input: Box::new(input),
         grouping,
         aggregates: projections,
-        grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+        grouping_kind,
     });
 
     if let Some(h) = having {
@@ -1489,6 +1532,68 @@ mod tests {
         let plan = parse("SELECT dept, COUNT(*) FROM t GROUP BY dept").expect("should parse");
         // Top-level is Aggregate (has GROUP BY).
         assert!(matches!(plan.op, CommonOp::Aggregate { .. }));
+    }
+
+    #[test]
+    fn parse_group_by_rollup() {
+        let plan =
+            parse("SELECT a, b, COUNT(*) FROM t GROUP BY ROLLUP (a, b)").expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate {
+                grouping,
+                grouping_kind,
+                ..
+            } => {
+                assert_eq!(grouping_kind, GroupingKind::Rollup);
+                // `ROLLUP (a, b)` flattens to two flat grouping columns.
+                assert_eq!(grouping.len(), 2);
+            }
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn parse_group_by_cube() {
+        let plan =
+            parse("SELECT a, b, COUNT(*) FROM t GROUP BY CUBE (a, b)").expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate {
+                grouping,
+                grouping_kind,
+                ..
+            } => {
+                assert_eq!(grouping_kind, GroupingKind::Cube);
+                assert_eq!(grouping.len(), 2);
+            }
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn parse_group_by_grouping_sets_rejected() {
+        // GROUPING SETS still needs set-membership substrate (Slice G) — reject.
+        let err = parse("SELECT a, b, COUNT(*) FROM t GROUP BY GROUPING SETS ((a), (b))")
+            .expect_err("GROUPING SETS should be rejected");
+        match err {
+            EmissionError::UnsupportedProtoShape { shape, .. } => {
+                assert_eq!(shape, "sql::grouping_sets");
+            }
+            other => panic!("expected UnsupportedProtoShape(sql::grouping_sets), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_group_by_nested_rollup_term_rejected() {
+        // `ROLLUP ((a, b), c)` has a multi-column grouping term Spark treats as
+        // a distinct level; τ's flat grouping can't represent it — reject rather
+        // than silently flatten to `ROLLUP(a, b, c)` (ADR-022 loud-fail).
+        let err = parse("SELECT a, b, COUNT(*) FROM t GROUP BY ROLLUP ((a, b), c)")
+            .expect_err("nested ROLLUP term should be rejected");
+        assert!(
+            matches!(err, EmissionError::UnsupportedProtoShape { ref shape, .. }
+                if shape == "sql::grouping_sets"),
+            "expected UnsupportedProtoShape(sql::grouping_sets), got {err:?}",
+        );
     }
 
     #[test]

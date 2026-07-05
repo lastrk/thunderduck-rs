@@ -716,3 +716,18 @@ the summary below records the corpus deltas by pass number.
 - Files: `crates/connect-server/src/service.rs`. No behavior change (refactor); corpus stays 132.
 - Quality Gate: PASS (cargo check --workspace --all-targets 0 warnings, rustfmt clean, `cargo test -p thunderduck-connect-server --bins` 74/0 serially).
 - Commit SHA: (this commit).
+
+## Pass 100 — 2026-07-05 — SQL corpus: ROLLUP / CUBE lowering (gx cluster) [final feature pass]
+- **Corpus: SQL front-end.** Target: `gx-*` GROUP BY extensions. Diagnostic split the cluster three ways: ROLLUP/CUBE (lowering-only, substrate green via DataFrame path), GROUPING SETS (needs set-membership emission — Slice G), `WITH ROLLUP` Hive suffix (dialect gap).
+- Diagnostic: `.agent-output/diagnostic-pass-100.md` — reject at `v2_lowering.rs` `lower_aggregate_select`; `GroupingKind::{Rollup,Cube}` + native emission (emission.rs:4678) + analyzer + `grouping()`/`grouping_id()` rewrite all already done and green via DataFrame grp-001/002/003/006.
+- Architecture: `.agent-output/architecture-pass-100.md` — flatten `Expr::Rollup/Cube` (`Vec<Vec<Expr>>`) into τ's flat `grouping` list + set `grouping_kind`, mirroring `v2_relation_converter.rs:642`. Keep rejecting GROUPING SETS.
+- Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`). No analyzer/emission/ast change.
+- ADR citations: ADR-004 (SQL onto existing Rollup/Cube substrate), ADR-005/006 (analyzer grouping, unchanged), ADR-022 (GROUPING SETS, nested ROLLUP/CUBE terms, WITH ROLLUP → loud boundary reject).
+- Corpus signal: 132 → **137** (+5). `gx-001/002/005/006/009` GREEN (ROLLUP, CUBE, grouping(), grouping_id(), ROLLUP+ORDER-BY). No regressions.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Tests added: 4 (rollup, cube, GROUPING-SETS reject, nested-ROLLUP-term reject).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + **1 High CLOSED** (H1: nested grouping terms `ROLLUP((a,b),c)` were silently flattened to `ROLLUP(a,b,c)` — different grouping sets, silent wrong result on valid Spark input; now loud-rejects `sql::grouping_sets` + regression test). Perf negligible (parse-time).
+- Findings queued as follow-up: **gx-007/gx-008 fail on an ANALYZER-nullability gap** — Spark marks GROUP-BY-ROLLUP/CUBE grouping columns nullable (subtotal rows carry NULL); τ's analyzer keeps them non-nullable (schema mismatch). Same class as the set-op nullability gap (set-004/006/008). gx-003/004 GROUPING SETS (set-membership emission, Slice G); gx-010 `WITH ROLLUP` (SparkDialect `supports_group_by_with_modifier` override + modifier lowering).
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 640/0, `sql_v2` differential 137/125/262 with 5 gx cases GREEN, no regressions).
+- Commit SHA: (this commit).

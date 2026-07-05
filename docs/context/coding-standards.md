@@ -1,6 +1,6 @@
 # Coding Standards
 
-> **Scope: universal — applies to both legacy and v2 code.** These are language-level rules (Rust hygiene, error-type conventions, borrow patterns, commit workflow) that hold across the legacy and v2 trees. Substrate-independence questions (whether v2 imports legacy types) are covered by INV10 in `docs/thunderduck-rearchitect-ADRs.md` — beyond the scope of this file.
+> **Scope: τ (the only production path per ADR-022).** These are language-level rules (Rust hygiene, error-type conventions, borrow patterns, commit workflow). Substrate-independence questions are covered by INV10 in `docs/thunderduck-rearchitect-ADRs.md`.
 
 ## Rust Standards
 

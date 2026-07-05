@@ -5,9 +5,9 @@ template at `tasks/v2-corpus-driven-goal-prompt-template.md`. This file
 is the externalized "how" so the `/goal` prompt itself stays lean
 (≤4000 chars).
 
-Analogous in shape to `tasks/v2-slice-iteration-methodology.md` (the
-slice-era methodology, retired 2026-07-02) but scoped to corpus cases
-rather than sub-slice deliverables.
+Scoped to corpus cases (τ fitness gate) rather than the retired
+slice-era deliverables. The prior slice-based methodology is archived
+at `tasks/archive/v2-slice-iteration-methodology.md`.
 
 ## Objective
 

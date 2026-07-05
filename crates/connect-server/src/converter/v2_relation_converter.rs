@@ -188,11 +188,11 @@ impl V2RelationConverter {
             }),
             RelType::Catalog(_) => Err(EmissionError::UnsupportedProtoShape {
                 shape: "RelType::Catalog".to_owned(),
-                reason: "catalog operations deferred to Slice H".to_owned(),
+                reason: "catalog operations deferred to future τ work".to_owned(),
             }),
             other => Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("RelType::{}", rel_type_kind(other)),
-                reason: "relation shape not covered by V2RelationConverter at Slice A.2".to_owned(),
+                reason: "relation shape not covered by V2RelationConverter".to_owned(),
             }),
         }
     }
@@ -281,9 +281,9 @@ impl V2RelationConverter {
     fn convert_unpivot(&mut self, u: &proto::Unpivot) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(u.input.as_deref(), "Unpivot")?;
 
-        // Extract id column names — the τ AST stores column names (mirrors
-        // legacy `logical::Unpivot`). Anything richer than a bare
-        // `UnresolvedAttribute` is a Thunderduck-boundary shape.
+        // Extract id column names — the τ AST stores column names. Anything
+        // richer than a bare `UnresolvedAttribute` is a Thunderduck-boundary
+        // shape.
         let mut ids: Vec<String> = Vec::with_capacity(u.ids.len());
         for e in &u.ids {
             ids.push(extract_column_name(e).ok_or_else(|| {
@@ -352,8 +352,8 @@ impl V2RelationConverter {
         }))
     }
 
-    /// Convert `proto::Sample` — mirrors legacy `convert_sample`. Proto
-    /// `deterministic_order` (physical hint) is dropped at τ conversion.
+    /// Convert `proto::Sample`. Proto `deterministic_order` (physical hint) is
+    /// dropped at τ conversion.
     fn convert_sample(&mut self, s: &proto::Sample) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(s.input.as_deref(), "Sample")?;
         Ok(CommonAst::new(CommonOp::Sample {
@@ -365,10 +365,9 @@ impl V2RelationConverter {
         }))
     }
 
-    /// Convert `proto::StatSampleBy` — mirrors legacy `convert_stat_sample_by`.
-    /// Each stratum must decode as an `Expression::Literal`; anything else is
-    /// a loud proto-shape error (defensive per the connect-server val() lesson
-    /// in CLAUDE.md gotcha #9).
+    /// Convert `proto::StatSampleBy`. Each stratum must decode as an
+    /// `Expression::Literal`; anything else is a loud proto-shape error
+    /// (defensive per the connect-server val() lesson in CLAUDE.md gotcha #9).
     fn convert_sample_by(&mut self, s: &proto::StatSampleBy) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(s.input.as_deref(), "SampleBy")?;
         let col_proto = s
@@ -449,7 +448,6 @@ impl V2RelationConverter {
     ) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(wcr.input.as_deref(), "WithColumnsRenamed")?;
         // Proto 3.4+ uses `rename_columns_map` (repeated Rename with existing/new).
-        // Older uses `rename_columns_map` legacy — check field shape.
         let mut renames: Vec<(String, String)> = Vec::new();
         for r in &wcr.renames {
             renames.push((r.col_name.clone(), r.new_col_name.clone()));
@@ -1090,7 +1088,7 @@ impl V2ExpressionConverter {
             ExprType::UnresolvedRegex(ur) => Ok(convert_unresolved_regex(ur)),
             other => Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("Expression::{}", expr_type_kind(other)),
-                reason: "expression shape not covered by V2ExpressionConverter at Slice A.2"
+                reason: "expression shape not covered by V2ExpressionConverter"
                     .to_owned(),
             }),
         }
@@ -1200,7 +1198,7 @@ impl V2ExpressionConverter {
             other => {
                 return Err(EmissionError::UnsupportedProtoShape {
                     shape: format!("Literal::{}", literal_kind(other)),
-                    reason: "literal type not covered by V2ExpressionConverter at Slice A.2"
+                    reason: "literal type not covered by V2ExpressionConverter"
                         .to_owned(),
                 });
             }
@@ -1685,7 +1683,7 @@ fn classify_file_format(
         Some(other) => {
             return Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("Read::DataSource::format::{other}"),
-                reason: "file format not supported at Slice A.2".to_owned(),
+                reason: "file format not supported by τ\'s SparkSQL parser".to_owned(),
             });
         }
     };
@@ -1715,19 +1713,18 @@ fn parse_type_str_to_struct(s: &str) -> StructType {
     // PySpark sends the LocalRelation `schema` field as a JSON-serialized
     // Spark type when the client calls `createDataFrame(rows, schema)` —
     // `_schema.json()` emits `{"type":"struct","fields":[…]}`. Delegate JSON
-    // parsing to the sibling legacy helper (which we retain until Slice K —
-    // see CLAUDE.md §"τ is the only path"). This path preserves duplicate
-    // struct field names (`Struct<tags, tags>` from `arrays_zip`), which the
-    // Arrow-IPC-derived schema lacks because PySpark's client dedups struct
-    // field names before wire serialization.
+    // parsing to the shared helper in `relation_converter`. This path
+    // preserves duplicate struct field names (`Struct<tags, tags>` from
+    // `arrays_zip`), which the Arrow-IPC-derived schema lacks because
+    // PySpark's client dedups struct field names before wire serialization.
     let trimmed = s.trim();
     if trimmed.starts_with('{') {
         if let Ok(st) = super::relation_converter::parse_json_schema(trimmed) {
             return st;
         }
     }
-    // Fallback: legacy simple-string DDL parser (e.g. `STRUCT<id: BIGINT>` or
-    // scalar type names).
+    // Fallback: simple-string DDL parser (e.g. `STRUCT<id: BIGINT>` or scalar
+    // type names).
     let dt = parse_type_str(s);
     match dt {
         DataType::Struct(st) => st,
@@ -1847,7 +1844,7 @@ fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, EmissionError> {
         other => {
             return Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("arrow_schema::{other:?}"),
-                reason: "Arrow schema data type not supported at Slice A.2".to_owned(),
+                reason: "Arrow schema data type not supported by τ\'s SparkSQL parser".to_owned(),
             });
         }
     })
@@ -1857,9 +1854,9 @@ fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, EmissionError> {
 ///
 /// **§2.1 loud-fail contract:** every unhandled Arrow data type returns
 /// [`EmissionError::UnsupportedProtoShape`]. There is NO `Ok("NULL")` or
-/// `Ok(null_literal())` catch-all — silent NULL substitution turned every
-/// unhandled type into wrong-answer data corruption in the legacy path
-/// (see the DECIMAL bug documented in `local_relation_to_values_sql`).
+/// `Ok(null_literal())` catch-all — silent NULL substitution would turn every
+/// unhandled type into wrong-answer data corruption (see the DECIMAL bug
+/// documented in `local_relation_to_values_sql`).
 fn arrow_val_to_literal(array: &dyn Array, row: usize) -> Result<Expression, EmissionError> {
     if array.is_null(row) {
         return Ok(null_literal());
@@ -2053,9 +2050,6 @@ fn downcast<T: Array + 'static>(array: &dyn Array) -> Result<&T, EmissionError> 
 
 /// Format an unscaled Arrow Decimal128 value at the given scale as a
 /// canonical decimal string.
-///
-/// Duplicated from the legacy path (`converter/relation_converter.rs`) per
-/// INV10 — τ's converter never imports from `crate::` legacy modules.
 fn format_decimal128(unscaled: i128, scale: i8) -> String {
     if scale <= 0 {
         // For non-positive scale, the value is an integer; append zeros.

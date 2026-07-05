@@ -14,7 +14,8 @@
 //! # the fast representative gate (DataFrame-only conformance corpus):
 //! cargo test -p thunderduck-connect-server --test differential core    -- --ignored --nocapture
 //!
-//! # same corpus through τ — the v2 development gate:
+//! # same corpus, alias suite name (retained for tooling that already
+//! # references it — the τ fitness gate):
 //! cargo test -p thunderduck-connect-server --test differential core_v2 -- --ignored --nocapture
 //!
 //! # Spark SQL conformance corpus (spark.sql) through τ — the SQL front-end gate:
@@ -68,15 +69,17 @@ fn run_suite(suite: &str) {
 
 /// Conformance corpus (DataFrame API only, ~324 cases biased toward
 /// Spark/DuckDB type-and-nullability divergence). The fast, representative
-/// gate; should be green on the legacy transpiler.
+/// τ fitness gate.
 #[test]
 #[ignore]
 fn core() {
     run_suite("core");
 }
 
-/// Same DataFrame corpus through τ — the v2 development gate. Each commit
-/// growing τ's coverage should turn one or more Case IDs green.
+/// Same corpus as `core`, retained as an alias for tooling (notably
+/// `tests/scripts/v2-progress.sh` and the tracked
+/// `tests/integration/v2_progress.md` log) that already references
+/// `core_v2` by name. Both suites route through τ.
 #[test]
 #[ignore]
 fn core_v2() {

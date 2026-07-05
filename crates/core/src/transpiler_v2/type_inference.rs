@@ -1,15 +1,13 @@
-//! τ's own TypeInferenceEngine — Spark-compatible type inference.
+//! τ's TypeInferenceEngine — Spark-compatible type inference.
 //!
-//! This is an **independent** re-implementation of the type engine (INV10:
-//! τ imports only `DataType`, `StructField`, `StructType` from `crate::types`;
-//! no re-use of `crate::types::TypeInferenceEngine`). Shape mirrors the legacy
-//! engine so cross-checking is straightforward.
+//! Owned by τ (INV10: τ imports only `DataType`, `StructField`, `StructType`
+//! from `crate::types`).
 
 use crate::types::{DataType, StructField, StructType};
 
 /// τ's Spark-compatible type inference engine.
 ///
-/// Unit struct with associated functions — matches legacy shape.
+/// Unit struct with associated functions.
 pub struct TypeInferenceEngine;
 
 impl TypeInferenceEngine {
@@ -284,7 +282,7 @@ impl TypeInferenceEngine {
             "count" | "count_distinct" | "count_if" => Long,
 
             // SUM family: integer types → Long, float → Double, decimal → wider.
-            // `try_sum` mirrors `sum` — Slice B checklist §1.4 adds it here.
+            // `try_sum` mirrors `sum` — τ's analyzer checklist §1.4 adds it here.
             "sum" | "sum_distinct" | "try_sum" => match arg_type {
                 Byte | Short | Integer | Long => Long,
                 Float => Double,
@@ -300,7 +298,7 @@ impl TypeInferenceEngine {
             },
 
             // AVG family: integer types → Double, decimal → wider.
-            // `try_avg` mirrors `avg` — Slice B checklist §1.4 adds it here.
+            // `try_avg` mirrors `avg` — τ's analyzer checklist §1.4 adds it here.
             "avg" | "mean" | "try_avg" => match arg_type {
                 Byte | Short | Integer | Long => Double,
                 Float | Double => Double,
@@ -514,20 +512,20 @@ impl TypeInferenceEngine {
         )
     }
 
-    // ── Function return types (Slice A.1 seed) ──────────────────────────────
+    // ── Function return types (τ seed) ──────────────────────────────
 
     /// Infer the return type of a scalar/table function.
     ///
-    /// At Slice A.1, all seeded arms need at most the first argument's type
+    /// At τ, all seeded arms need at most the first argument's type
     /// (aggregate delegation) or nothing at all (hash/grouping). The signature
     /// takes `first_arg_type: Option<&DataType>` to avoid materializing an
     /// intermediate `Vec<DataType>` for arg types the current arms never read.
-    /// Slice C.2 may grow additional signatures if scalar arms need multi-arg
+    /// future τ work may grow additional signatures if scalar arms need multi-arg
     /// awareness.
     ///
-    /// **Slice A.1 seed:** returns `DataType::Unresolved` for anything the
-    /// aggregate roster does not handle. Slice C.2 grows the scalar arms.
-    /// The count / hash / grouping arms that Slice A.1's checklist tests
+    /// **τ seed:** returns `DataType::Unresolved` for anything the
+    /// aggregate roster does not handle. future τ work grows the scalar arms.
+    /// The count / hash / grouping arms that τ's checklist tests
     /// exercise are wired here.
     pub fn function_return_type(name: &str, first_arg_type: Option<&DataType>) -> DataType {
         use DataType::*;
@@ -664,7 +662,7 @@ impl TypeInferenceEngine {
             // ADR-022 boundary guard trips honestly rather than silently
             // mis-typing the projection.
             // TODO: needs multi-arg dispatch (both operand types) to compute
-            // the widened Decimal via `Self::decimal_div_type` — Slice C.x.
+            // the widened Decimal via `Self::decimal_div_type`.
             // Corpus: `math-016` (integer/float witness only; not gated).
             "try_divide" => match first_arg_type {
                 Some(Decimal { .. }) => Unresolved,
@@ -982,7 +980,7 @@ impl TypeInferenceEngine {
             "spark_partition_id" => Integer,
             "monotonically_increasing_id" => Long,
 
-            // Slice A.1 seed: everything else is unresolved.
+            // τ seed: everything else is unresolved.
             _ => Unresolved,
         }
     }
@@ -1048,7 +1046,7 @@ impl TypeInferenceEngine {
 /// (§8 of the plan). Every entry must appear in exactly one of
 /// `aggregate_is_non_nullable` XOR `aggregate_is_always_nullable`.
 ///
-/// Promoted from `#[cfg(test)]` in Slice A.2's fix pass (review M3): the
+/// Promoted from `#[cfg(test)]`.2's fix pass (review M3): the
 /// SparkSQL front-end (`parser_v2::v2_lowering::is_aggregate_function_name`)
 /// needs the canonical list at compile time to decide whether a projection
 /// requires an `Aggregate` plan node. INV10-compliant — the constant lives
@@ -1330,7 +1328,7 @@ mod tests {
         );
     }
 
-    // ── Slice B checklist §1.4 — try_sum / try_avg (aggregate) ──────────────
+    // ── τ's analyzer checklist §1.4 — try_sum / try_avg (aggregate) ──────────────
 
     /// `try_sum` and `try_avg` must be present in `AGGREGATE_NAMES` so the
     /// SparkSQL classifier (`is_aggregate_function_name`) picks them up.

@@ -1,11 +1,4 @@
-//! Spark SQL dialect for sqlparser-rs — τ's copy.
-//!
-//! Duplicated from `crate::parser::dialect` per Open Decision 1 Option 1b
-//! (Slice A.2). Do not remove before Slice K deletes legacy — see ADR-022.
-//!
-//! **INV10:** duplication (rather than re-export) preserves the barrier at
-//! the parser layer so `parser_v2/` remains structurally independent of the
-//! legacy tree.
+//! Spark SQL dialect for sqlparser-rs.
 
 use sqlparser::ast::{BinaryOperator, Expr};
 use sqlparser::dialect::Dialect;

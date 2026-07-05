@@ -360,7 +360,7 @@ impl TypeInferenceEngine {
 
             // STDDEV / VARIANCE / CORR / COVAR / REGR → Double
             //
-            // Slice D Phase 2 (2026-07-01) added the correlation / covariance /
+            // τ's extension-target wiring Phase 2 (2026-07-01) added the correlation / covariance /
             // regression family here. Previously these fell through to the
             // arg-type default, which for INTEGER-typed columns caused an
             // Integer schema/query-type mismatch (agg-012 symmetric-omission).

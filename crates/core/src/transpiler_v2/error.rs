@@ -1,15 +1,16 @@
 //! τ emission errors — Thunderduck-boundary category per ADR-022.
 //!
 //! `EmissionError` is exclusively **Thunderduck-boundary**. Spark-emulated
-//! errors (unknown column, ambiguous column, type mismatch) live in Slice B's
+//! errors (unknown column, ambiguous column, type mismatch) live in τ's analyzer's
 //! `AnalyzerError` and are not part of this type. No variant of
 //! `EmissionError` may ever signal a fallback path — under ADR-022 there is
 //! no fallback. Callers see boundary errors verbatim.
 
 /// The categories of errors τ can surface at emission time.
 ///
-/// All three variants are Thunderduck-boundary. Slice A.1 only exercises
-/// `UnsupportedOp`; the other two variants are reserved for Slice C.
+/// All three variants are Thunderduck-boundary. `UnsupportedOp` is the
+/// primary variant; `UnsupportedExpression` and `UnsupportedFunction`
+/// surface when emission arms discover un-seeded shapes.
 #[derive(thiserror::Error, Debug)]
 pub enum EmissionError {
     /// The top-level operator of the input plan is not yet supported by τ.
@@ -23,8 +24,7 @@ pub enum EmissionError {
 
     /// The expression shape is not yet supported by τ.
     ///
-    /// Reserved for Slice C when emission arms discover un-seeded expression
-    /// forms.
+    /// Surfaces when emission arms discover un-seeded expression forms.
     #[error("τ: unsupported expression `{shape}`: {reason}")]
     UnsupportedExpression {
         /// Human-readable expression shape (e.g. `"Lambda"`, `"ScalarSubquery"`).
@@ -35,7 +35,7 @@ pub enum EmissionError {
 
     /// The function name has no τ emission arm (native or extension).
     ///
-    /// Reserved for Slice C.2 / D.
+    /// Reserved for future τ work / D.
     #[error("τ: unsupported function `{name}`: {reason}")]
     UnsupportedFunction {
         /// Spark function name.

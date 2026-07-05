@@ -443,7 +443,7 @@ case("arr-004", "array", "sort_array asc/desc", lambda I: I["emp"].select(F.sort
 case("arr-005", "array", "array_distinct", lambda I: I["emp"].select(F.array_distinct(F.array("tags", "tags")).alias("d")), flags=("schema_only",))
 case("arr-006", "array", "array_max / array_min", lambda I: I["emp"].select(F.array_max("tags").alias("mx"), F.array_min("tags").alias("mn")))
 case("arr-007", "array", "array_position", lambda I: I["emp"].select(F.array_position("tags", "rust").alias("pos")))
-case("arr-008", "array", "element_at (1-based) on array", lambda I: I["emp"].select(F.element_at("tags", 1).alias("first")))
+case("arr-008", "array", "element_at (1-based) on array", lambda I: I["emp"].select(F.element_at("tags", 1).alias("first")), expected_error="INVALID_ARRAY_INDEX_IN_ELEMENT_AT")
 case("arr-009", "array", "slice", lambda I: I["emp"].select(F.slice("tags", 1, 2).alias("sl")))
 case("arr-010", "array", "array_join", lambda I: I["emp"].select(F.array_join("tags", ",", "NULL").alias("j")))
 case("arr-011", "array", "arrays_overlap / array_union", lambda I: I["emp"].select(F.arrays_overlap("tags", F.array(F.lit("rust"))).alias("ov"), F.array_union("tags", F.array(F.lit("x"))).alias("u")))

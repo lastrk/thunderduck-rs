@@ -161,7 +161,7 @@ pub enum LiteralValue {
 }
 
 // LiteralValue contains f32/f64, so PartialOrd / Hash / Eq are not derivable.
-// We do not need them for Slice A.1; the derives above are minimal.
+// We do not need them for τ; the derives above are minimal.
 
 /// A typed literal expression.
 #[derive(Debug, Clone, PartialEq)]
@@ -182,10 +182,9 @@ pub struct ColumnReference {
 /// An unresolved (pre-analysis) column reference.
 ///
 /// `plan_id` is first-class per §2.3 — it identifies the proto DataFrame /
-/// plan node the reference belongs to, replacing the legacy path's
-/// string-encoded `__plan_id_N__` qualifier. Slice B's analyzer uses this
-/// field as a resolution hint on join-side disambiguation. SparkSQL entries
-/// set `plan_id = None` (Open Decision 12).
+/// plan node the reference belongs to. τ's analyzer uses this field as a
+/// resolution hint on join-side disambiguation. SparkSQL entries set
+/// `plan_id = None` (Open Decision 12).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UnresolvedColumn {
     pub name: String,

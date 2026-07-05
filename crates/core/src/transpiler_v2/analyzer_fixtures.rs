@@ -1,11 +1,11 @@
-//! Slice B fixtures — 5 input relations + 11 mini-fixtures for INV4 / INV5.
+//! τ's analyzer fixtures — 5 input relations + 11 mini-fixtures for INV4 / INV5.
 //!
 //! **INV10:** this module imports ONLY `crate::types::{DataType, StructField,
 //! StructType}` and intra-τ modules.
 //!
 //! The five input-relation schemas mirror
 //! `tests/integration/differential/dataframe_corpus.py::build_inputs`,
-//! reduced to Slice B types (arrays / maps / structs kept for `emp.address`).
+//! reduced to τ's analyzer types (arrays / maps / structs kept for `emp.address`).
 //!
 //! [`all_fixtures`] yields Ok-path fixtures only — used by
 //! `invariants::inv4_inference_validated_in_isolation` and
@@ -176,7 +176,7 @@ fn table_scan_chain(names: &[&str]) -> CommonAst {
 /// A ready-to-analyze fixture record.
 pub(crate) type Fixture = (&'static str, CommonAst, BaseTypes, StructType);
 
-/// Yield every Ok-path Slice B fixture.
+/// Yield every Ok-path τ's analyzer fixture.
 ///
 /// Ordering matches plan §7 §11 — error-path fixtures (`AmbiguousColumn`) are
 /// exercised directly in `analyzer.rs::tests`, not here.
@@ -454,7 +454,7 @@ fn nested_struct_field_access() -> Fixture {
 fn plan_id_disambiguates_self_join() -> Fixture {
     // `emp AS e1 JOIN emp AS e2 ON e1.id = e2.manager_id` — we use aliases
     // so the join condition columns can be resolved to distinct sides via
-    // qualifier. plan_ids are attached to signal Slice E's downstream use.
+    // qualifier. plan_ids are attached to signal future τ work's downstream use.
     let cond = Expression::Binary(BinaryExpression {
         op: BinaryOp::Eq,
         left: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
@@ -515,7 +515,7 @@ fn sparksql_no_plan_id_resolves_by_qualifier() -> Fixture {
     // Reference `emp.id` with no plan_id — the analyzer must resolve via
     // the qualifier (a struct-field lookup falls through to the top-level
     // column if the qualifier matches an operand alias / column).
-    // Slice B's `resolve_column` uses `qualified_column_type` which
+    // τ's analyzer's `resolve_column` uses `qualified_column_type` which
     // returns Long for `id` from `emp`.
     let ast = CommonAst::new(CommonOp::Project {
         input: Box::new(table_scan("emp")),

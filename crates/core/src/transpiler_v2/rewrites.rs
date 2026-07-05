@@ -1,1 +1,1 @@
-//! B-layer home for future SQL desugarings (Slice G will populate).
+//! B-layer home for future SQL desugarings (future τ work will populate).

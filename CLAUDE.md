@@ -8,21 +8,20 @@ This file contains project-specific rules and guidelines for working with thunde
 
 ### Authoritative architecture
 
-[**docs/thunderduck-rearchitect-ADRs.md**](docs/thunderduck-rearchitect-ADRs.md) (ADR-000 → ADR-022 + Cross-Validation) is the **authoritative** architecture source for the transpiler going forward. It records a principled redesign of the Spark → DuckDB transliterator (`τ`): a common AST fed by both front-ends, an owned type/nullability analyzer over that AST, a declarative compiled emission table, extension functions as minimal gap-fillers, and a differential + AnalyzePlan test architecture.
+[**docs/thunderduck-rearchitect-ADRs.md**](docs/thunderduck-rearchitect-ADRs.md) (ADR-000 → ADR-022 + Cross-Validation) is the **authoritative** architecture source for the transpiler. It records the design of the Spark → DuckDB transliterator (`τ`): a common AST fed by both front-ends, an owned type/nullability analyzer over that AST, a declarative compiled emission table, extension functions as minimal gap-fillers, and a differential + AnalyzePlan test architecture.
 
-The older [docs/architecture.md](docs/architecture.md) and [docs/adrs/](docs/adrs/) describe the **existing** implementation and remain valid reference for it, but where they contradict the rearchitecture ADRs, **the rearchitecture ADRs win.**
+Older ADRs under [docs/adrs/legacy-transpiler/](docs/adrs/legacy-transpiler/) are marked **SUPERSEDED** — they describe the retired v1 transpiler stack and are kept only for historical reference.
 
 ### τ is the only path (per ADR-022)
 
-τ (the v2 transpiler at `crates/core/src/transpiler_v2/`, `crates/connect-server/src/converter/v2_relation_converter.rs`, and `crates/core/src/parser_v2/`) is the only production path. Every Spark Connect request flows to τ; τ's output is the response. If τ has not implemented a given operator, τ produces a Thunderduck-boundary error (`Unsupported*`) directly to the caller. There is no fallback, no dispatch flag, no alternate implementation.
+τ (the transpiler at `crates/core/src/transpiler_v2/`, `crates/connect-server/src/converter/v2_relation_converter.rs`, and `crates/core/src/parser_v2/`) is the only production path. Every Spark Connect request flows to τ; τ's output is the response. If τ has not implemented a given operator, τ produces a Thunderduck-boundary error (`Unsupported*`) directly to the caller. There is no fallback, no dispatch flag, no alternate implementation.
 
 **Two error categories** (ADR-022): (1) **Spark-emulated errors** — inputs Spark itself would reject; τ matches Spark's error semantics. (2) **Thunderduck-boundary errors** — inputs Spark accepts but τ has not implemented; honest "not implemented in Thunderduck."
 
 **Practical implications:**
 - The DataFrame corpus (`tests/scripts/v2-progress.sh`, 324 cases) is the fitness function; TPC-H is temporarily red until τ covers its query surface.
 - The SQL corpus (`differential/sql_corpus.py`, 262 `spark.sql` cases) is the fitness function for the τ SQL front-end — run it with `./tests/scripts/run-differential-tests.sh sql_v2` (or `tests/scripts/v2-sql-progress.sh` to record a progress row in `tests/integration/v2_sql_progress.md`).
-- No new work in modules outside τ. `crates/core/src/{logical,expression,generator,functions}/` and `crates/connect-server/src/converter/{expression,plan,relation,type}_converter.rs` are not part of τ and are deletable at any point (see readiness map §Slice K).
-- Delete legacy files freely once nothing (test, runtime path, doc) references them; see `tasks/v2-adr-readiness-map.md` §Slice K.
+- The v1 transpiler modules (`crates/core/src/{logical,expression,generator,functions,parser}/`) were deleted on 2026-07-05. INV3/INV10 in `crates/core/src/transpiler_v2/invariants.rs` mechanically enforce that τ does not import from those (now-absent) prefixes.
 
 ## Workflow Orchestration
 
@@ -43,7 +42,7 @@ Never mark a task complete without proving it works. For any non-trivial change,
 1. **Format** — `cargo fmt --check` must be clean.
 2. **Lint** — `cargo clippy -- -D warnings` must be clean (zero warnings).
 3. **Unit tests** — `cargo test` must pass across all crates.
-4. **TPC-H differential (DEFERRED during the τ reimplementation per ADR-022)** — `./tests/scripts/run-differential-tests.sh tpch` is *not* a required gate right now. The DataFrame corpus (`tests/scripts/v2-progress.sh`, 324 cases) is the fitness function; TPC-H is temporarily red until τ covers its query surface. TPC-H rejoins this step as mandatory once τ covers its query surface (see readiness map, post-Slice-G).
+4. **TPC-H differential (DEFERRED during the τ reimplementation per ADR-022)** — `./tests/scripts/run-differential-tests.sh tpch` is *not* a required gate right now. The DataFrame corpus (`tests/scripts/v2-progress.sh`, 324 cases) is the fitness function; TPC-H is temporarily red until τ covers its query surface. TPC-H rejoins this step as mandatory once τ covers its query surface.
 5. **Full differential (when SQL-relevant)** — DEFERRED for the same reason as step 4. The `all` suite exercises TPC-H + TPC-DS through the non-τ path, which is not maintained. Use `./tests/scripts/v2-progress.sh` to measure τ progress on the DataFrame corpus.
 
 A task is **not** done if any step is red. Do not commit, do not declare success, do not move on. If a step is intentionally skipped (e.g., docs-only change skips clippy, or TPC-H is deferred per ADR-022 above), state which step and why.
@@ -133,24 +132,31 @@ These are non-negotiable constraints governing all SQL generation and type handl
 
 ## Architecture Quick-Reference
 
-See [docs/architecture.md](docs/architecture.md) for full decisions. Key summary:
+See [docs/thunderduck-rearchitect-ADRs.md](docs/thunderduck-rearchitect-ADRs.md) for full decisions. Key summary:
 
 ### Crate Structure
 
 ```
-crates/core/            # Pure translation engine (no gRPC)
-  logical/              # LogicalPlan enum (29 variants, exhaustive match enforced)
-  expression/           # Expression enum (21+ variants)
-  types/                # DataType enum, StructType, TypeInferenceEngine
-  generator/            # SqlGenerator (match-based visitor)
-  functions/            # FunctionRegistry (500+ Spark→DuckDB mappings)
-  parser/               # SparkSQL parser (sqlparser-rs + SparkDialect)
-  runtime/              # DuckDB session, Arrow streaming, extension loading
+crates/core/                        # Pure translation engine (no gRPC)
+  transpiler_v2/                    # τ: CommonAst, analyzer, emission, INV enforcement
+    ast.rs                          # CommonAst + CommonOp (shared IR)
+    analyzer.rs                     # Resolve + type + nullability over CommonAst → TypedAst
+    emission.rs                     # TypedAst → DuckDB SQL
+    expression.rs                   # τ Expression enum
+    type_inference.rs               # Spark-parity type inference
+    invariants.rs                   # INV1-10 mechanical enforcement (grep barriers, todo! gates)
+  parser_v2/                        # SparkSQL parser (sqlparser-rs + SparkDialect) → CommonAst
+  types/                            # DataType, StructField, StructType
+  runtime/                          # DuckDB session, Arrow streaming, extension loading
 
-crates/connect-server/  # gRPC binary (tonic)
-  service/              # SparkConnectService (tonic)
-  session/              # SessionManager (DashMap + per-session OS threads)
-  converter/            # Protobuf → LogicalPlan (RelationConverter, ExpressionConverter)
+crates/connect-server/              # gRPC binary (tonic)
+  service.rs                        # SparkConnectService (tonic)
+  session/                          # SessionManager (DashMap + per-session OS threads)
+  converter/
+    v2_relation_converter.rs        # Protobuf Relation → CommonAst
+    relation_converter.rs           # parse_json_schema helper (LocalRelation schema decode)
+    type_converter.rs               # DataType ↔ proto DataType
+  arrow_schema_stamp.rs             # Arrow-schema re-stamp so wire schema == τ's resolved_schema
 ```
 
 ### Key Types
@@ -159,19 +165,19 @@ crates/connect-server/  # gRPC binary (tonic)
 |-------|------|----------------|
 | **Service** | `SparkConnectService` | tonic gRPC service: receives Spark Connect requests |
 | **Session** | `SessionManager` | Manages sessions; each session owns a DuckDB Connection on a dedicated OS thread |
-| **Converter** | `RelationConverter` | Spark Connect protobuf Relation → `LogicalPlan` |
-| **Converter** | `ExpressionConverter` | Spark Connect protobuf Expression → `Expression` |
-| **Parser** | `SparkSqlParser` | sqlparser-rs based Spark SQL parser (raw SQL path) |
-| **Logical** | `LogicalPlan` (enum) | 29 variants — exhaustive match at compile time |
-| **Expression** | `Expression` (enum) | 21+ variants — `to_sql()`, `data_type()`, `nullable()` |
-| **Generator** | `SqlGenerator` | Traverses LogicalPlan tree, produces DuckDB SQL |
+| **Converter** | `V2RelationConverter` | Spark Connect protobuf Relation → `CommonAst` |
+| **Converter** | `V2ExpressionConverter` | Spark Connect protobuf Expression → τ `Expression` |
+| **Parser** | `SparkSqlParserV2` | sqlparser-rs based Spark SQL parser (raw SQL path) → `CommonAst` |
+| **IR** | `CommonAst` / `CommonOp` (enum) | Shared IR — same tree fed by both front-ends |
+| **Expression** | τ `Expression` (enum) | τ's Spark-parity expression types with `data_type()` / `nullable()` |
+| **Analyzer** | `analyze()` | `CommonAst` + `BaseTypes` → `TypedAst { op, resolved_schema }` |
+| **Emission** | `dispatch_op()` / `render_expr()` | Traverses `TypedAst`, produces DuckDB SQL |
 | **Runtime** | `DuckDbSession` | Owns `duckdb::Connection` on its dedicated OS thread |
-| **Functions** | `FunctionRegistry` | Maps Spark function names → DuckDB equivalents |
 | **Types** | `TypeInferenceEngine` | Resolves expression types following Spark semantics |
 
 ### CRITICAL: `to_sql()` vs `Display`
 
-Expression rendering **MUST** use `to_sql()`, not `Display` / `Debug`. The `Display` implementation is for debug logging only. This is a recurring bug class in the Java reference; the Rust port must not repeat it.
+Expression rendering **MUST** use dedicated emission functions (`render_expr`, `dispatch_op`), not `Display` / `Debug`. The `Display` implementation is for debug logging only. This is a recurring bug class; do not repeat it.
 
 ### DuckDB Threading Model
 
@@ -182,15 +188,7 @@ tokio task → mpsc::Sender<SessionCommand> → session thread (owns Connection)
 session thread → oneshot::Sender<SessionResult> → tokio task → gRPC stream
 ```
 
-### Dual SQL Generation Paths for Joins
-
-When modifying join SQL generation, check BOTH paths:
-- `gen_join()` — primary path, emits native DuckDB `SEMI JOIN` / `ANTI JOIN` directly (no EXISTS-subquery conversion).
-- Flat-chain rendering inside `gen_join()` (the natural-flat-join branch) — must break at SEMI/ANTI to preserve the tree shape; the chain cannot fold across a semi/anti boundary.
-
-Aggregate SQL generation uses a **single canonical path** through `gen_aggregate()`.
-
-### Expression Hierarchy (key types)
+### Expression Hierarchy (key types — τ `Expression` enum)
 
 ```
 Expression (enum)
@@ -199,7 +197,7 @@ Expression (enum)
   UnresolvedColumn      # unresolved (pre-resolution)
   Binary(BinaryExpression)   # left OP right
   Unary(UnaryExpression)     # OP operand
-  FunctionCall          # func(args) — uses FunctionRegistry for translation
+  FunctionCall          # func(args) — τ owns its Spark-parity translation table
   Cast(CastExpression)  # CAST(expr AS type)
   CaseWhen              # CASE WHEN ... THEN ... END
   Window(WindowFunction)     # ROW_NUMBER, RANK, LAG, LEAD, etc.
@@ -217,9 +215,9 @@ Expression (enum)
 
 2. **`duckdb::Connection` is `!Send`**: Never attempt to move a Connection across thread boundaries or hold it across `.await` points. Use the session thread model.
 
-3. **Composite aggregate expressions**: When adding expression types that can appear inside aggregates, ensure `RelationConverter::convert_aggregate()` handles them. A default `_` arm silently drops unknown cases.
+3. **Composite aggregate expressions**: When adding expression types that can appear inside aggregates, ensure `V2RelationConverter::convert_aggregate()` handles them. A default `_` arm silently drops unknown cases.
 
-4. **Semi/Anti join in flat chains**: `gen_join()` emits native `SEMI JOIN` / `ANTI JOIN`. The flat-chain rendering branch inside `gen_join()` must break at semi/anti boundaries — folding the chain across a semi/anti would change the tree shape and reorder filtering semantics.
+4. **Semi/Anti join in flat chains**: τ emits native `SEMI JOIN` / `ANTI JOIN` in `render_join`. The flat-chain rendering branch must break at semi/anti boundaries — folding the chain across a semi/anti would change the tree shape and reorder filtering semantics.
 
 5. **DuckDB SEMI JOIN syntax**: DuckDB uses `SEMI JOIN` and `ANTI JOIN` (without `LEFT` prefix). `LEFT SEMI JOIN` is a parser error.
 
@@ -229,7 +227,7 @@ Expression (enum)
 
 8. **Schema inference vs DESCRIBE**: Prefer `plan.infer_schema()` for schema analysis. Only fall back to issuing `DESCRIBE` queries to DuckDB when plan-level inference is impossible.
 
-9. **Loud-fail on unhandled Arrow types in `local_relation_to_values_sql`**: `crates/connect-server/src/converter/relation_converter.rs::val()` used to have a silent `_ => Ok("NULL")` catch-all that mapped every unhandled Arrow type (including `Decimal128`) to SQL literal `NULL`, corrupting `createDataFrame` payloads. Since 2026-07-01 (Slice C.3-4) the catch-all is a loud `Err`; adding a new Arrow-type payload requires a real match arm, not a silent NULL. Rule: no catch-all `Ok` fallbacks for typed dispatch in the connect-server converter.
+9. **Loud-fail on unhandled Arrow types in `local_relation_to_values_sql`**: τ's LocalRelation converter has a loud-fail rule: no catch-all `Ok` fallbacks on typed dispatch. Silent `_ => Ok("NULL")` catch-alls used to map every unhandled Arrow type (including `Decimal128`) to SQL literal `NULL`, corrupting `createDataFrame` payloads. Adding a new Arrow-type payload requires a real match arm, not a silent NULL.
 
 ## Spark Parity Requirements
 
@@ -262,12 +260,12 @@ Source: release [`ext6`](https://github.com/nubank/thunderduck-duckdb-extension/
 
 ## Documentation Structure
 
-1. **Rearchitecture ADRs** (`docs/thunderduck-rearchitect-ADRs.md`) — **authoritative** architecture for the transpiler redesign (ADR-000 → ADR-022 + Cross-Validation). Source of truth on any contradiction.
-2. **Existing architecture** (`docs/architecture.md`) — architectural decisions for the current implementation (ADRs 1–21); links to individual files in `docs/adrs/`. Valid for the existing path; superseded by item 1 where they conflict.
+1. **Rearchitecture ADRs** (`docs/thunderduck-rearchitect-ADRs.md`) — **authoritative** architecture (ADR-000 → ADR-022 + Cross-Validation). Source of truth on any contradiction.
+2. **Legacy ADRs** (`docs/adrs/legacy-transpiler/`) — SUPERSEDED, historical reference only. Describe the retired v1 transpiler.
 3. **Dev journal** (`docs/dev-journal-toc.md`) — chronological development history; entries in `docs/dev_journal/`
-4. **Agent context** (`docs/context/`) — condensed reference (architecture, build commands, coding standards, dependencies, gotchas, testing) for the current codebase
+4. **Agent context** (`docs/context/`) — condensed reference (architecture, build commands, coding standards, dependencies, gotchas, testing) for τ
 5. **Dev cheatsheets** (`docs/dev-cheatsheets/`) — portable, project-agnostic technique libraries loaded by the language-specialized subagents (see §Agent Cheatsheets below)
-6. **Task tracking** (`tasks/`) — active work items and lessons learned
+6. **Task tracking** (`tasks/`) — active work items and lessons learned; retired plans under `tasks/archive/`
 
 ## Agent Cheatsheets
 
@@ -286,7 +284,7 @@ The `docs-updater` subagent is language-agnostic and has no cheatsheet; its poli
 When a task involves Spark compatibility (type inference, nullability, decimal precision, function behavior, schema propagation, error semantics), consult **Apache Spark 4.1.1 in ANSI mode** (`spark.sql.ansi.enabled=true`, per ADR-016) as the authoritative specification:
 
 - **Spark source is authoritative.** Use `WebSearch` / `WebFetch` on the `apache/spark` GitHub repo for the relevant source (`DecimalPrecision.scala`, `TypeCoercion.scala`, `HiveResult.scala`, `ArithmeticExpression.scala`, `UpdateFields.scala`, etc.). Spark's behavior in these files defines "correct" for τ.
-- **`.reference/` is the Java Thunderduck implementation of the same functionality.** When the Rust port diverges from `.reference/`, that divergence is usually the bug. Search `.reference/` (via `Bash: grep -rn ...`) for the equivalent function/type before proposing a fix; note where the Rust port drops or reorders logic.
+- **`.reference/` is the Java Thunderduck implementation** (only if present in the working copy). When looking there for equivalent behaviour, note that its structure and function boundaries may differ from τ's — use it as a Spark-parity cross-check, not a template.
 - **Spark parity wins over DuckDB-native ergonomics** (ADR-015). If DuckDB offers a shorter emission that changes Spark's observable behavior (return type, nullability, error class, precision, sort order), don't take the shortcut.
 - **ANSI-mode error semantics matter.** Division / mod by zero, `element_at` OOB, cast overflow, and `to_number` format mismatches THROW in ANSI mode (see ADR-016 error-emulation contract). τ must re-wrap DuckDB engine throws with Spark's error class before crossing the wire — never surface an opaque DuckDB error string.
 
@@ -335,7 +333,7 @@ cargo test
 cargo test -p thunderduck-core -- types::
 
 # Single test
-cargo test -p thunderduck-core -- generator::tests::test_project_to_sql
+cargo test -p thunderduck-core -- transpiler_v2::emission::tests::render_project
 
 # With output
 cargo test -- --nocapture
@@ -394,8 +392,7 @@ Run in this order; each must pass before the next is meaningful. See [Verificati
 - `cargo fmt --check`
 - `cargo clippy -- -D warnings`
 - `cargo test`
-- `./tests/scripts/run-differential-tests.sh tpch` (always, for non-trivial changes)
-- `./tests/scripts/run-differential-tests.sh all` (when the change touches SQL generation)
+- `./tests/scripts/v2-progress.sh` (DataFrame corpus — the τ fitness gate)
 
 ### Code Style & Invariants
 - No `.unwrap()` in library code. `.expect()` only for proven invariants.

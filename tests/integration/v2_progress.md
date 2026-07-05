@@ -1,9 +1,9 @@
-# v2 transpiler progress
+# τ corpus progress
 
 One row per `tests/scripts/v2-progress.sh` invocation. Each row records the
-`core_v2` suite (DataFrame corpus run through τ) PASSED count at the given
-commit. The goal is for PASSED to climb monotonically toward 324 (the corpus
-total).
+`core_v2` suite (DataFrame corpus — the τ fitness gate) PASSED count at the
+given commit. The goal is for PASSED to climb monotonically toward 324 (the
+corpus total).
 
 | Timestamp UTC        | Commit  | Passed | Failed | Total | Δ vs prev |
 | -------------------- | ------- | -----: | -----: | ----: | --------: |
@@ -203,3 +203,5 @@ total).
 | 2026-07-04T22:56:41Z | 692e7b0 |    310 |     14 |   324 |       n/a |
 | 2026-07-04T23:08:49Z | 933908c |    310 |     14 |   324 |       n/a |
 | 2026-07-04T23:11:53Z | 933908c |    312 |     12 |   324 |       n/a |
+| 2026-07-04T23:26:58Z | 97cae00 |    313 |     11 |   324 |       n/a |
+| 2026-07-05T19:15:23Z | 55d5fe6 |    314 |     10 |   324 |       n/a |

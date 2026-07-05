@@ -1,4 +1,4 @@
-//! τ's analyzer (Slice B) — resolve, assign types, derive nullability.
+//! τ's analyzer — resolve, assign types, derive nullability.
 //!
 //! Rearchitect ADR-005 / ADR-006 / ADR-021 / ADR-022.
 //!
@@ -122,7 +122,7 @@ pub enum TypedOp {
         input: Box<TypedAst>,
         /// Grouping expressions.
         grouping: Vec<Expression>,
-        /// Aggregate expressions (may fold grouping columns per Slice A.2
+        /// Aggregate expressions (may fold grouping columns
         /// invariant — see [`CommonOp::Aggregate`]).
         aggregates: Vec<Expression>,
         /// GROUP BY variant.
@@ -145,10 +145,10 @@ pub enum TypedOp {
         /// Plan-ids appearing anywhere under the right side.
         right_plan_ids: Vec<i64>,
         /// The left side's per-column schema **after** outer-join nullability
-        /// flipping. Retained for Slice E's join emitter.
+        /// flipping. Retained for future τ work's join emitter.
         derived_left_schema: StructType,
         /// The right side's per-column schema **after** outer-join
-        /// nullability flipping. Retained for Slice E's join emitter.
+        /// nullability flipping. Retained for future τ work's join emitter.
         derived_right_schema: StructType,
     },
     /// A set operation (UNION / INTERSECT / EXCEPT).
@@ -157,7 +157,7 @@ pub enum TypedOp {
         kind: SetOpKind,
         /// Whether duplicates are preserved.
         all: bool,
-        /// By-name matching (Slice G).
+        /// By-name matching.
         by_name: bool,
         /// Mirrors [`CommonOp::SetOp::allow_missing_columns`]. Retained on
         /// the typed AST so the emitter knows the child projections may need
@@ -193,19 +193,19 @@ pub enum TypedOp {
         /// One expression list per row.
         rows: Vec<Vec<Expression>>,
     },
-    /// A file-format scan (declared-schema only at Slice B; schema-less
-    /// forms surface as `PuntedOperator("FileScan", "Slice F")`).
+    /// A file-format scan (declared-schema only; schema-less
+    /// forms surface as `PuntedOperator("FileScan", "future τ work")`).
     FileScan {
         /// The file format.
         format: FileFormat,
         /// One or more file paths / globs.
         paths: Vec<String>,
-        /// The declared schema (required at Slice B).
+        /// The declared schema (required).
         schema: StructType,
         /// Format-specific options.
         options: Vec<(String, String)>,
     },
-    /// A table-valued function call — Slice B punts (Slice F).
+    /// A table-valued function call — τ's analyzer punts.
     TableFunction {
         /// The function name.
         name: String,
@@ -214,7 +214,7 @@ pub enum TypedOp {
         /// Whether to emit an ordinality column.
         with_ordinality: bool,
     },
-    /// `UNNEST(expr) [WITH ORDINALITY]` — Slice B punts (Slice F).
+    /// `UNNEST(expr) [WITH ORDINALITY]` — τ's analyzer punts.
     Unnest {
         /// The array/map expression being unnested.
         expr: Expression,
@@ -286,7 +286,7 @@ pub enum TypedOp {
     ///
     /// Analyzer punts `Crosstab` (mirror-image of `Pivot[implicit-values]`)
     /// before ever constructing a `TypedOp` for it — so there is no
-    /// `TypedOp::Crosstab` variant. When Slice G lifts the punt, that variant
+    /// `TypedOp::Crosstab` variant. When future τ work lifts the punt, that variant
     /// lands here alongside this one.
     FreqItems {
         /// The input relation.
@@ -402,9 +402,9 @@ pub enum TypedOp {
 /// A typed attribute — the resolved shape of a single output column.
 ///
 /// Currently a projection over [`StructField`] with an optional `qualifier`
-/// and `plan_id`. Slice B does not thread `TypedAttr` through the tree — the
+/// and `plan_id`. τ's analyzer does not thread `TypedAttr` through the tree — the
 /// per-node `resolved_schema: StructType` carries the same information at
-/// coarser granularity. `TypedAttr` is retained so Slice E can attach
+/// coarser granularity. `TypedAttr` is retained so future τ work can attach
 /// per-column disambiguation metadata when the emitter needs it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedAttr {
@@ -710,7 +710,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             }),
             None => Err(AnalyzerError::PuntedOperator {
                 op: "FileScan".to_owned(),
-                reason: "schema-less FileScan (parquet inference) lands in Slice F".to_owned(),
+                reason: "schema-less FileScan (parquet inference) (not implemented in τ)".to_owned(),
             }),
         },
 
@@ -720,7 +720,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             with_ordinality: _,
         } => Err(AnalyzerError::PuntedOperator {
             op: format!("TableFunction[{name}]"),
-            reason: "table-function analysis lands in Slice F".to_owned(),
+            reason: "table-function analysis (not implemented in τ)".to_owned(),
         }),
 
         CommonOp::Unnest {
@@ -728,7 +728,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             with_ordinality: _,
         } => Err(AnalyzerError::PuntedOperator {
             op: "Unnest".to_owned(),
-            reason: "unnest analysis lands in Slice F".to_owned(),
+            reason: "unnest analysis (not implemented in τ)".to_owned(),
         }),
 
         // ── Unary ─────────────────────────────────────────────────────────
@@ -1063,10 +1063,10 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
         // ── Crosstab — Thunderduck-boundary (ADR-022) ───────────────────
         // Output columns are DISTINCT(col2) — unknowable at plan time.
         // Mirror-image of Pivot[implicit-values]: same session-hook blocker
-        // (Slice G). Reject loudly rather than stamp a partial schema.
+        //. Reject loudly rather than stamp a partial schema.
         CommonOp::Crosstab { .. } => Err(AnalyzerError::PuntedOperator {
             op: "Crosstab[dynamic-values]".to_owned(),
-            reason: "requires session-injected DISTINCT-query hook (Slice G)".to_owned(),
+            reason: "requires session-injected DISTINCT-query hook".to_owned(),
         }),
 
         // ── Pivot (Spark `df.groupBy(...).pivot(...).agg(...)`) ─────────
@@ -1581,7 +1581,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             // Downward push (§5.4): wrap terminal projections with CAST when
             // their column-type differs from the widened type. Only touches
             // direct `Project` children; opaque children (e.g. TableScan)
-            // rely on Slice E to emit the CAST at render time.
+            // rely on future τ work to emit the CAST at render time.
             //
             // BY NAME: the emission wrapper (see `render_set_op`) already
             // emits per-name `CAST(<child_col> AS <widened_ty>) AS
@@ -2315,7 +2315,7 @@ fn resolve_column(u: UnresolvedColumn, schema: &StructType) -> Result<Expression
     // Qualified: `qualifier.name` — the analyzer accepts both a top-level
     // qualifier column (a struct field access) and a direct match on the
     // outer name; ambiguity is not surfaced for qualified references at
-    // Slice B (the plan_id + qualifier disambiguation lands in Slice E's
+    // τ's analyzer (the plan_id + qualifier disambiguation lands in future τ work's
     // rendering; here we resolve type/nullability).
     //
     // Unqualified: surface `AmbiguousColumn` whenever more than one field
@@ -2497,8 +2497,8 @@ fn schema_has_unresolved(schema: &StructType) -> bool {
 }
 
 fn apply_alias_to_schema(schema: &StructType, alias: Option<&str>) -> StructType {
-    // At Slice B, we don't rewrite field qualifiers into names — the alias
-    // is preserved on the operator itself. Slice E's renderer handles the
+    // At τ's analyzer, we don't rewrite field qualifiers into names — the alias
+    // is preserved on the operator itself. future τ work's renderer handles the
     // alias projection.
     let _ = alias;
     schema.clone()
@@ -2513,7 +2513,7 @@ fn project_output_schema(
         match expr {
             Expression::Star(s) => {
                 // Star: expand at schema level. Qualified star: filter by
-                // struct field / qualifier (Slice B keeps it simple —
+                // struct field / qualifier (τ's analyzer keeps it simple —
                 // qualifier match against field name).
                 match &s.qualifier {
                     None => {
@@ -2775,7 +2775,7 @@ fn build_stats_output_schema(cols: &[String]) -> StructType {
 ///   - empty ⇒ all input columns in schema order (Spark default);
 ///   - non-empty ⇒ each name resolves case-insensitively or
 ///     [`AnalyzerError::UnknownColumn`] is returned. The output preserves the
-///     caller's casing (matches legacy `logical::Describe.cols` behaviour).
+///     caller's casing (Spark parity).
 fn materialise_stats_cols(
     cols: Vec<String>,
     input_schema: &StructType,
@@ -2859,8 +2859,8 @@ fn analyze_summary(
 /// (case-insensitive; unresolved names raise `AnalyzerError::UnknownColumn`),
 /// and stamp the output schema as one `ARRAY<T>` NON-NULLABLE column per
 /// input col — where `T` is the source column's declared [`DataType`].
-/// Spark parity per ADR-015: the legacy `logical::FreqItems` path hardcoded
-/// `Array<String>` for every column, which is a bug τ fixes at the port point.
+/// Spark parity per ADR-015: the element type of each `ARRAY<T>` matches the
+/// source column's declared `DataType` (never a hardcoded `Array<String>`).
 ///
 /// **Spark parity — outer nullability.** Spark's `StatFunctions.freqItems`
 /// stamps every output column non-nullable: the aggregate always returns a
@@ -2937,7 +2937,7 @@ fn analyze_freq_items(
 /// **Empty `pivot_values`.** τ rejects loudly with a Thunderduck-boundary
 /// `PuntedOperator("Pivot[implicit-values]")` per ADR-022. Spark's Analyzer
 /// resolves the value list via an eager `SELECT DISTINCT pivot_col FROM
-/// input`; τ has no session-injected DISTINCT-query hook at Slice G, so
+/// input`; τ has no session-injected DISTINCT-query hook, so
 /// stamping a partial schema here would mismatch DuckDB's runtime output
 /// and confuse PySpark's `df.schema` / `df.collect()` contract. Explicit-
 /// values pivot is fully supported.
@@ -2951,7 +2951,7 @@ fn analyze_pivot(
 ) -> Result<TypedAst, AnalyzerError> {
     // Thunderduck-boundary (ADR-022): implicit pivot values require an
     // eager DISTINCT query against DuckDB (Spark's Analyzer does this
-    // eagerly). τ's analyzer has no session hook at Slice G — implementing
+    // eagerly). τ's analyzer has no session hook — implementing
     // it needs the base_types overlay extended with a value-query closure.
     // Reject loudly with a Thunderduck-boundary error rather than stamping
     // an incorrect schema. See Pass 60 notes for the follow-up work.
@@ -2959,7 +2959,7 @@ fn analyze_pivot(
         return Err(AnalyzerError::PuntedOperator {
             op: "Pivot[implicit-values]".to_owned(),
             reason:
-                "pivot without explicit values requires eager DISTINCT query; τ needs a session-injected value-discovery hook (Slice G)"
+                "pivot without explicit values requires eager DISTINCT query; τ needs a session-injected value-discovery hook"
                     .to_owned(),
         });
     }
@@ -3280,7 +3280,7 @@ fn expression_output_name(expr: &Expression) -> String {
 fn push_setop_casts(ast: &mut TypedAst, widened_schema: &StructType) {
     // Only push CASTs into direct `Project` children whose projection list
     // matches the widened schema column-by-column. Non-Project inputs
-    // (TableScan, Values, ...) receive their CAST at emission time (Slice E).
+    // (TableScan, Values, ...) receive their CAST at emission time.
     if let TypedOp::Project { projections, .. } = &mut ast.op {
         if projections.len() != widened_schema.fields.len() {
             return;
@@ -5024,7 +5024,7 @@ mod tests {
     }
 
     /// Implicit-values Pivot (empty pivot_values) is a Thunderduck-boundary
-    /// case per ADR-022. τ has no eager-DISTINCT hook at Slice G.
+    /// case per ADR-022. τ has no eager-DISTINCT hook
     #[test]
     fn analyze_pivot_implicit_values_returns_boundary_punted_operator() {
         let bt = base_types_with_emp_dept();
@@ -5886,10 +5886,9 @@ mod tests {
     // ── FreqItems / Crosstab analysis (Pass 82) ──────────────────────────
 
     /// Fixture with a stats-shaped schema that exercises all four
-    /// element-type variants (Integer, String, Double, Decimal). This is the
-    /// anti-legacy-bug shape per ADR-015: legacy `logical::FreqItems` stamped
-    /// `Array<String>` for every column regardless of source; τ must stamp
-    /// `Array<source_type>`.
+    /// element-type variants (Integer, String, Double, Decimal). Pins ADR-015
+    /// Spark parity: freqItems must stamp `Array<source_type>` per column
+    /// (never a hardcoded `Array<String>`).
     fn base_types_with_stats() -> BaseTypes {
         let stats_schema = StructType::new(vec![
             StructField::not_null("id", DataType::Long),
@@ -5915,7 +5914,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_freq_items_stamps_array_of_source_type_per_col_no_legacy_string_hardcode() {
+    fn analyze_freq_items_stamps_array_of_source_type_per_col() {
         let bt = base_types_with_stats();
         let ast = CommonAst::new(CommonOp::FreqItems {
             input: Box::new(CommonAst::new(CommonOp::TableScan {
@@ -5934,7 +5933,7 @@ mod tests {
         // Schema arity: one column per input col (no `summary` prefix — Spark
         // freqItems doesn't emit a summary label column).
         assert_eq!(typed.resolved_schema.fields.len(), 4);
-        // Anti-legacy-bug check: each element type mirrors the source col.
+        // Spark parity: each element type mirrors the source col.
         let expected: &[(&str, DataType)] = &[
             ("dept_id_freqItems", DataType::Integer),
             ("name_freqItems", DataType::String),

@@ -1,11 +1,13 @@
-//! τ's emission substrate — Slice C.1.
+//! τ's emission substrate.
 //!
 //! ADR-009 (Approach A hand-written match arms, permanent per Open Decision 7),
 //! ADR-021 (τ owns substrate), ADR-022 (τ is the only path; two error
-//! categories). Inheritance-checklist §4.2 first item, §5.1, §5.3, §5.4, §5.6.
+//! categories).
 //!
-//! **INV3 grep barrier:** no imports from the legacy `generator` or
-//! `functions` modules are permitted inside this file.
+//! **INV3 grep barrier:** no imports from the retired v1 modules
+//! (generator / functions / logical / parser) are permitted inside this
+//! file. The modules were deleted 2026-07-05; the barrier prevents
+//! re-introduction. See `inv3_no_forbidden_use_in_emission` for the check.
 //!
 //! **INV10:** imports only τ-internal modules + `crate::types::{DataType,
 //! StructField, StructType}`.
@@ -49,7 +51,7 @@ use crate::types::{DataType, StructField, StructType};
 // ── INV2 companion (§5.3) ────────────────────────────────────────────────────
 
 /// Monotonic counter — incremented once per successful SQL string returned by
-/// [`dispatch_op`]. Slice C.1 activates INV2 via
+/// [`dispatch_op`]. τ's emission substrate activates INV2 via
 /// `invariants::inv2_dispatch_is_only_sql_writer`.
 pub(crate) static EMIT_TAP: AtomicU64 = AtomicU64::new(0);
 
@@ -194,14 +196,14 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             widened_schema,
         ),
 
-        // ── Slice F owns (analyzer PuntedOperator today; defensive) ──────
+        // ── future τ work owns (analyzer PuntedOperator today; defensive) ──────
         TypedOp::TableFunction { name, .. } => Err(EmissionError::UnsupportedOp {
             op: format!("TableFunction[{name}]"),
-            reason: "table-function emission lands in Slice F".to_owned(),
+            reason: "table-function emission (not implemented in τ)".to_owned(),
         }),
         TypedOp::Unnest { .. } => Err(EmissionError::UnsupportedOp {
             op: "Unnest".to_owned(),
-            reason: "unnest emission lands in Slice F".to_owned(),
+            reason: "unnest emission (not implemented in τ)".to_owned(),
         }),
     };
 
@@ -585,7 +587,7 @@ fn render_limit(
 
 // ── Unwired renderers (Decision 13-A) ────────────────────────────────────────
 //
-// These six renderers do not have `TypedOp` sinks in Slice B's substrate. They
+// These six renderers do not have `TypedOp` sinks in τ's analyzer's substrate. They
 // exist so the §5.4 CTE anchor for `render_tail` (and its sibling helpers)
 // live in code today; when a future substrate slice adds the missing
 // `TypedOp` variants, wiring is a one-line `dispatch_op` arm each.
@@ -1045,8 +1047,7 @@ fn render_na_replace(
 
 /// Render `df.unpivot(ids, values, var_col, val_col)`.
 ///
-/// Emits DuckDB's `UNPIVOT` shape (mirrors the legacy generator's
-/// `gen_unpivot`):
+/// Emits DuckDB's `UNPIVOT` shape:
 /// ```sql
 /// UNPIVOT (SELECT <ids>, <values> FROM (<child>)) ON <values>
 ///   INTO NAME <var_col> VALUE <val_col>
@@ -1216,8 +1217,7 @@ fn render_stats_union(
 
 /// Map a statistic name to the aggregate SQL expression for a single column.
 ///
-/// Mirrors legacy `generator::mod::stat_to_agg_expr` with one adjustment:
-/// percentile stats emit `quantile_disc(TRY_CAST(col AS DOUBLE), frac)`
+/// Percentile stats emit `quantile_disc(TRY_CAST(col AS DOUBLE), frac)`
 /// (function-call form) instead of `PERCENTILE_DISC WITHIN GROUP (ORDER BY
 /// ...)` — same DuckDB function chosen for τ's `percentile_approx` at
 /// Pass 74 (`emission.rs::render_function_call`).
@@ -1778,7 +1778,7 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
         }
         Expression::RowConstructor(_) => Err(EmissionError::UnsupportedExpression {
             shape: "RowConstructor".to_owned(),
-            reason: "complex-type emission lands in Slice F".to_owned(),
+            reason: "complex-type emission (not implemented in τ)".to_owned(),
         }),
         Expression::UpdateFields(u) => render_update_fields(u, schema),
     }
@@ -1786,7 +1786,7 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
 
 fn is_aggregate_name(name: &str) -> bool {
     // `AGGREGATE_NAMES` (in `type_inference.rs`) is all-lowercase ASCII per
-    // Slice B; case-insensitive byte comparison matches without allocating the
+    // τ's analyzer; case-insensitive byte comparison matches without allocating the
     // per-call lowercased `String` this function used to build.
     AGGREGATE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
@@ -3357,11 +3357,36 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 // NULL on `[1]`, matching Spark's map miss semantics.
                 return Ok(format!("element_at({coll}, {key})[1]"));
             }
-            // Default (Array or unknown): use DuckDB's `list_extract`,
-            // which is 1-based and returns NULL on OOB (matches Spark
-            // non-ANSI behavior). Spark raises on OOB in ANSI mode;
-            // corpus `arr-008` is intentionally an error case on both
-            // sides (τ tracks the corpus in non-ANSI mode).
+            // Array (or unknown, which the type inferencer routes here by
+            // default): DuckDB's `list_extract` is 1-based but returns NULL
+            // silently on OOB / index-0 / negative-OOB. Spark 4.1 ANSI
+            // instead throws `INVALID_ARRAY_INDEX_IN_ELEMENT_AT`; wrap the
+            // call in a CASE so the guard raises at DuckDB level with the
+            // Spark-verbatim class + message. The parenthesization of `idx`
+            // and `arr` inside the CASE lets negative literals (`-4`) and
+            // arbitrary expressions bind correctly (see `error(...)`
+            // helper). NULL array short-circuits to NULL (Spark
+            // `nullSafeEval`). Corpus: `arr-008`.
+            let err = array_index_error_expr(&key, &coll);
+            return Ok(format!(
+                "CASE WHEN ({coll}) IS NULL THEN NULL WHEN ({key}) = 0 OR abs(({key})) > len(({coll})) THEN {err} ELSE list_extract(({coll}), ({key})) END"
+            ));
+        }
+        // Spark's `try_element_at(coll, k)` is the never-throw variant of
+        // `element_at` — OOB / invalid index yields NULL instead of raising
+        // `INVALID_ARRAY_INDEX_IN_ELEMENT_AT`. DuckDB's `list_extract`
+        // matches that non-throwing semantic natively (see the Array arm
+        // above); Map preserves the unwrap. No corpus witness today, but
+        // the nullability arm at `expression.rs:1035` already declares
+        // `try_element_at` — colocated here so future adds work
+        // end-to-end.
+        "try_element_at" if f.args.len() == 2 => {
+            let coll = render_expr(&f.args[0], schema)?;
+            let key = render_expr(&f.args[1], schema)?;
+            let coll_ty = f.args[0].data_type(schema);
+            if let DataType::Map { .. } = coll_ty {
+                return Ok(format!("element_at({coll}, {key})[1]"));
+            }
             return Ok(format!("list_extract({coll}, {key})"));
         }
         // Spark's `typeof(x)` returns lowercase type strings (`double`,
@@ -4602,7 +4627,7 @@ fn render_aggregate_op(
     if matches!(grouping_kind, GroupingKind::GroupingSets) {
         return Err(EmissionError::UnsupportedOp {
             op: "Aggregate[GroupingSets]".to_owned(),
-            reason: "GROUPING SETS emission requires set-membership metadata; Slice G territory"
+            reason: "GROUPING SETS emission requires set-membership metadata; (not implemented in τ)"
                 .to_owned(),
         });
     }
@@ -4777,6 +4802,32 @@ fn render_column_reference(c: &ColumnReference) -> Result<String, EmissionError>
 const DIVIDE_BY_ZERO_MSG: &str = "Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
 const REMAINDER_BY_ZERO_MSG: &str = "Remainder by zero. Use `try_mod` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
 
+// Spark 4.1's `INVALID_ARRAY_INDEX_IN_ELEMENT_AT` message is runtime-templated
+// — the index value and array size are interpolated per row. The three
+// fragments below bracket the two `||`-concatenated substitutions:
+//
+//   HEAD || (idx)::VARCHAR || MID || len(arr)::VARCHAR || TAIL
+//
+// The backticks around `try_element_at` are safe inside a SQL single-quoted
+// string literal (only apostrophes need `''` escaping) — verified in DuckDB.
+const INVALID_ARRAY_INDEX_MSG_HEAD: &str = "[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index ";
+const INVALID_ARRAY_INDEX_MSG_MID: &str = " is out of bounds. The array has ";
+const INVALID_ARRAY_INDEX_MSG_TAIL: &str = " elements. Use `try_element_at` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003";
+
+/// Build the DuckDB `error('[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index N is
+/// out of bounds. The array has M elements. Use `try_element_at` ... SQLSTATE:
+/// 22003')` call, interpolating `idx` and `len(arr)` at runtime. Callers must
+/// pass already-rendered SQL fragments; both are wrapped in parens so negative
+/// literals (`-4::VARCHAR` binds as `-(4::VARCHAR)`) survive the cast.
+fn array_index_error_expr(idx_sql: &str, arr_sql: &str) -> String {
+    format!(
+        "error('{head}' || ({idx_sql})::VARCHAR || '{mid}' || len(({arr_sql}))::VARCHAR || '{tail}')",
+        head = INVALID_ARRAY_INDEX_MSG_HEAD,
+        mid = INVALID_ARRAY_INDEX_MSG_MID,
+        tail = INVALID_ARRAY_INDEX_MSG_TAIL,
+    )
+}
+
 /// Wrap already-rendered division/modulo SQL so a zero `divisor` raises Spark's
 /// ANSI error instead of returning DuckDB's NULL/inf. A NULL divisor falls
 /// through to `inner` (`NULL = 0` is not TRUE), matching Spark (`a / NULL` =
@@ -4946,7 +4997,7 @@ pub(crate) fn render_cast(c: &CastExpression, schema: &Schema) -> Result<String,
 //   Map   : `MAP { k1: v1, k2: v2 }` (or `MAP()` for empty).
 //   Struct: `{'name1': v1, 'name2': v2, ...}`.
 // Full complex-type ops (HOF `transform`/`filter`, `explode`, struct-field
-// access) remain Slice F territory.
+// access) remain future τ work territory.
 
 fn render_array_literal(
     a: &crate::transpiler_v2::expression::ArrayLiteralExpression,
@@ -5090,7 +5141,7 @@ fn render_struct_literal(
 ///
 /// Wraps `expr_sql` in `CAST(... AS T)` iff the expression's Spark-typed
 /// result type requires a cast that DuckDB won't apply automatically. At
-/// Slice C.1 this handles integer-integer division (Spark → Double); Slice
+/// τ's emission substrate this handles integer-integer division (Spark → Double); Slice
 /// C.2 extends it with the scalar-function Spark-parity table.
 ///
 /// **§5.1 anchor.** MUST NOT share body with [`spark_aggregate_return_cast`].
@@ -5824,11 +5875,11 @@ fn dedup_struct_field_names(names: &[&str]) -> Vec<String> {
         .collect()
 }
 
-// ── Extension allow-list (§4.1 stub — populated by Slice D) ──────────────────
+// ── Extension allow-list (§4.1 stub — populated by τ's extension-target wiring) ──────────────────
 
-/// The set of DuckDB extension function names τ emits. **Empty at Slice C.1**;
-/// Slice D populates with the ext6 allow-list and activates INV6.
-#[allow(dead_code)] // Slice D wires call sites; Slice C.1 exposes the surface.
+/// The set of DuckDB extension function names τ emits. **Empty.1**;
+/// τ's extension-target wiring populates with the ext6 allow-list and activates INV6.
+#[allow(dead_code)] // τ's extension-target wiring wires call sites; τ's emission substrate exposes the surface.
 pub(crate) fn extension_targets() -> HashSet<&'static str> {
     HashSet::new()
 }
@@ -6648,12 +6699,12 @@ mod tests {
         assert_eq!(out2, "\"a\"\"b\"");
     }
 
-    // ── 28. INV3 — no legacy `use` inside emission.rs ────────────────────
+    // ── 28. INV3 — no forbidden `use` inside emission.rs ─────────────────
 
     #[test]
-    fn inv3_no_legacy_use_in_emission() {
+    fn inv3_no_forbidden_use_in_emission() {
         // Only scan the non-test region of emission.rs; the tests themselves
-        // legitimately name legacy paths inside their assertion literals.
+        // legitimately name forbidden prefixes inside their assertion literals.
         let this_file = include_str!("emission.rs");
         // The `#[cfg(test)]` module below carries the offending literals; cut
         // at its start marker.
@@ -6663,8 +6714,12 @@ mod tests {
             None => this_file,
         };
         // Build needles at runtime so this test's source doesn't self-match.
-        let legacy_bases = ["generator", "functions", "logical", "parser", "runtime"];
-        for base in legacy_bases {
+        // The first four prefixes name retired v1 modules deleted 2026-07-05
+        // (barrier prevents accidental re-introduction). `runtime` is active
+        // but must not be imported into emission — that's an INV10 concern
+        // enforced here for defence in depth.
+        let forbidden_prefixes = ["generator", "functions", "logical", "parser", "runtime"];
+        for base in forbidden_prefixes {
             let use_form = format!("use crate::{base}::");
             let path_form = format!("crate::{base}::");
             assert!(
@@ -6746,7 +6801,7 @@ mod tests {
     // ── 32. extension_targets is empty at C.1 ────────────────────────────
 
     #[test]
-    fn extension_targets_is_empty_at_slice_c1() {
+    fn extension_targets_is_empty_by_default() {
         assert!(extension_targets().is_empty());
     }
 
@@ -7524,7 +7579,7 @@ mod tests {
         // Anchor: piv-004 shape — emits
         //   UNPIVOT (SELECT <ids>,<values> FROM (<child>) AS __td_unpivot_src)
         //     ON <values> INTO NAME "metric" VALUE "value"
-        // per the legacy `gen_unpivot` SQL contract.
+        // per τ's UNPIVOT emission contract (see `gen_unpivot` above).
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Unpivot {
@@ -9347,10 +9402,13 @@ mod tests {
         assert_eq!(sql, "element_at(attrs, 'team')[1]");
     }
 
-    /// `arr-008` behavioral test — `element_at(ARRAY, i)` uses
-    /// `list_extract` (1-based, NULL on OOB in non-ANSI mode).
+    /// Pass 95 (`arr-008` ANSI throw) — `element_at(ARRAY, i)` wraps the
+    /// underlying `list_extract` in a CASE that raises Spark's
+    /// `INVALID_ARRAY_INDEX_IN_ELEMENT_AT` on OOB / index-0. The message
+    /// must be byte-identical to Spark 4.1's runtime template (with
+    /// runtime-interpolated `idx` and `len(arr)`).
     #[test]
-    fn render_element_at_array_uses_list_extract() {
+    fn render_element_at_array_wraps_with_ansi_oob_guard() {
         let arr_col = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
@@ -9369,7 +9427,131 @@ mod tests {
             distinct: false,
         };
         let sql = render_function_call(&f, &empty_schema()).expect("render element_at array");
+        // Spark class token — the runtime classifier keys on this.
+        assert!(
+            sql.contains("[INVALID_ARRAY_INDEX_IN_ELEMENT_AT]"),
+            "expected Spark class token, got: {sql}"
+        );
+        // Underlying extractor still routes to DuckDB's list_extract.
+        assert!(
+            sql.contains("list_extract((tags), (1))"),
+            "expected list_extract fall-through in ELSE, got: {sql}"
+        );
+        // Verbatim message fragments (bracket the runtime substitutions).
+        assert!(
+            sql.contains(INVALID_ARRAY_INDEX_MSG_HEAD),
+            "expected HEAD fragment, got: {sql}"
+        );
+        assert!(
+            sql.contains(INVALID_ARRAY_INDEX_MSG_MID),
+            "expected MID fragment, got: {sql}"
+        );
+        assert!(
+            sql.contains(INVALID_ARRAY_INDEX_MSG_TAIL),
+            "expected TAIL fragment, got: {sql}"
+        );
+        // Full guard shape (NULL short-circuit + idx=0/OOB throw + ELSE fall-through).
+        assert_eq!(
+            sql,
+            "CASE WHEN (tags) IS NULL THEN NULL WHEN (1) = 0 OR abs((1)) > len((tags)) \
+             THEN error('[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index ' || (1)::VARCHAR \
+             || ' is out of bounds. The array has ' || len((tags))::VARCHAR \
+             || ' elements. Use `try_element_at` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003') \
+             ELSE list_extract((tags), (1)) END"
+        );
+    }
+
+    /// Pass 95 — a positive integer literal is NOT provably in-bounds
+    /// because the array length is only known at runtime (`tags` is a
+    /// column, not an ArrayLiteral). The guard must still fire; do not
+    /// short-circuit on `is_nonzero_literal`-style predicates.
+    #[test]
+    fn render_element_at_positive_literal_still_guarded_since_len_unknown() {
+        let arr_col = Expression::ColumnReference(ColumnReference {
+            name: "tags".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
+            nullable: Some(true),
+        });
+        let f = FunctionCall {
+            name: "element_at".to_owned(),
+            args: vec![
+                arr_col,
+                Expression::Literal(super::super::expression::Literal {
+                    value: super::super::expression::LiteralValue::Int(1),
+                    data_type: DataType::Integer,
+                }),
+            ],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render element_at array");
+        assert!(
+            sql.starts_with("CASE WHEN"),
+            "expected CASE guard even for positive literal, got: {sql}"
+        );
+        assert!(
+            sql.contains("error("),
+            "expected error() call inside guard, got: {sql}"
+        );
+    }
+
+    /// Pass 95 — `try_element_at(arr, k)` is the never-throw alias; it
+    /// emits bare `list_extract` without the ANSI guard so DuckDB's
+    /// silent-NULL semantics for OOB propagate to the caller.
+    #[test]
+    fn render_try_element_at_omits_guard() {
+        let arr_col = Expression::ColumnReference(ColumnReference {
+            name: "tags".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
+            nullable: Some(true),
+        });
+        let f = FunctionCall {
+            name: "try_element_at".to_owned(),
+            args: vec![
+                arr_col,
+                Expression::Literal(super::super::expression::Literal {
+                    value: super::super::expression::LiteralValue::Int(1),
+                    data_type: DataType::Integer,
+                }),
+            ],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render try_element_at");
         assert_eq!(sql, "list_extract(tags, 1)");
+        assert!(
+            !sql.contains("error("),
+            "try_element_at must NOT emit error() guard, got: {sql}"
+        );
+    }
+
+    /// Pass 95 — the Map arm of `element_at` is untouched: it still emits
+    /// the singleton-unwrap `element_at(MAP, key)[1]`. Spark does not throw
+    /// on missing map keys (returns NULL); the ANSI OOB guard applies only
+    /// to Array collections.
+    #[test]
+    fn render_element_at_map_unchanged() {
+        let map_col = Expression::ColumnReference(ColumnReference {
+            name: "attrs".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::String),
+                value_nullable: true,
+            }),
+            nullable: Some(true),
+        });
+        let f = FunctionCall {
+            name: "element_at".to_owned(),
+            args: vec![map_col, str_lit("missing")],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render element_at map");
+        assert_eq!(sql, "element_at(attrs, 'missing')[1]");
+        assert!(
+            !sql.contains("INVALID_ARRAY_INDEX_IN_ELEMENT_AT"),
+            "Map arm must not carry Array ANSI guard, got: {sql}"
+        );
     }
 
     /// `meta-003` regression — `typeof(x)` wraps in `lower(...)` for

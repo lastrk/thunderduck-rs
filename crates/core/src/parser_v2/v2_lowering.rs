@@ -33,10 +33,10 @@ use sqlparser::ast::{
 use crate::transpiler_v2::ast::{CommonAst, CommonOp, GroupingKind, JoinType, SetOpKind};
 use crate::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
-    FrameBoundary, FrameUnit, FunctionCall, InListExpression, IntervalExpression, LambdaExpression,
-    LambdaVariableExpression, LikeExpression, Literal, LiteralValue, NullOrdering, SortDirection,
-    SortOrder, StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn, WindowFrame,
-    WindowFunction,
+    FrameBoundary, FrameUnit, FunctionCall, InListExpression, IntervalExpression,
+    IsDistinctFromExpression, LambdaExpression, LambdaVariableExpression, LikeExpression, Literal,
+    LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, UnaryExpression, UnaryOp,
+    UnresolvedColumn, WindowFrame, WindowFunction,
 };
 use crate::transpiler_v2::type_inference::AGGREGATE_NAMES;
 use crate::transpiler_v2::EmissionError;
@@ -719,6 +719,19 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
                     try_cast: false,
                 }));
             }
+            // Spark's null-safe equality `a <=> b` is defined as `NOT DISTINCT
+            // FROM` — it returns a non-null boolean and treats `NULL <=> NULL`
+            // as true. Lower directly onto τ's `IsDistinctFrom` substrate with
+            // `negated: true` rather than routing through `lower_binary_op`
+            // (which yields a `BinaryOp` enum and can't produce this shape).
+            // Corpus witness: `whr-015`.
+            if matches!(op, BinaryOperator::Spaceship) {
+                return Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
+                    left: Box::new(lower_expr(*left)?),
+                    right: Box::new(lower_expr(*right)?),
+                    negated: true,
+                }));
+            }
             Ok(Expression::Binary(BinaryExpression {
                 op: lower_binary_op(op)?,
                 left: Box::new(lower_expr(*left)?),
@@ -793,6 +806,20 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
         Expr::IsNotNull(e) => Ok(Expression::Unary(UnaryExpression {
             op: UnaryOp::IsNotNull,
             operand: Box::new(lower_expr(*e)?),
+        })),
+        // `a IS [NOT] DISTINCT FROM b` — null-safe (in)equality yielding a
+        // non-null boolean. Lower onto τ's `IsDistinctFrom` substrate; the
+        // `IS NOT` form sets `negated: true`. Corpus witnesses: `pr-001`,
+        // `pr-002`.
+        Expr::IsDistinctFrom(a, b) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
+            left: Box::new(lower_expr(*a)?),
+            right: Box::new(lower_expr(*b)?),
+            negated: false,
+        })),
+        Expr::IsNotDistinctFrom(a, b) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
+            left: Box::new(lower_expr(*a)?),
+            right: Box::new(lower_expr(*b)?),
+            negated: true,
         })),
         Expr::Like {
             expr,
@@ -1648,6 +1675,44 @@ mod tests {
                 _ => panic!("expected Filter under Project"),
             },
             _ => panic!("expected Project"),
+        }
+    }
+
+    /// Extract the `Filter` predicate immediately under a top-level `Project`.
+    fn where_predicate(plan: &CommonAst) -> &Expression {
+        match &plan.op {
+            CommonOp::Project { input, .. } => match &input.op {
+                CommonOp::Filter { condition, .. } => condition,
+                _ => panic!("expected Filter under Project"),
+            },
+            _ => panic!("expected Project"),
+        }
+    }
+
+    #[test]
+    fn parse_is_distinct_from() {
+        let plan = parse("SELECT * FROM t WHERE a IS DISTINCT FROM b").expect("should parse");
+        match where_predicate(&plan) {
+            Expression::IsDistinctFrom(idf) => assert!(!idf.negated),
+            other => panic!("expected IsDistinctFrom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_is_not_distinct_from() {
+        let plan = parse("SELECT * FROM t WHERE a IS NOT DISTINCT FROM b").expect("should parse");
+        match where_predicate(&plan) {
+            Expression::IsDistinctFrom(idf) => assert!(idf.negated),
+            other => panic!("expected IsDistinctFrom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_null_safe_equals_spaceship() {
+        let plan = parse("SELECT * FROM t WHERE a <=> b").expect("should parse");
+        match where_predicate(&plan) {
+            Expression::IsDistinctFrom(idf) => assert!(idf.negated),
+            other => panic!("expected IsDistinctFrom, got {other:?}"),
         }
     }
 

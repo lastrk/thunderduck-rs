@@ -761,3 +761,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 652/0, `sql_v2` differential 147/115/262, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 103 — 2026-07-05 — SQL corpus: IS [NOT] DISTINCT FROM + `<=>` (pr-001 cluster) [run 2]
+- **Corpus: SQL front-end.** Target: pr-001 (`IS DISTINCT FROM`), pr-002 (`IS NOT DISTINCT FROM`), whr-015 (`<=>` null-safe equality). Failed as `sql::expr::other` / `sql::binary_op::Spaceship`.
+- Diagnostic: `.agent-output/diagnostic-pass-103.md` — pure lowering; τ `Expression::IsDistinctFrom(IsDistinctFromExpression{left,right,negated})` already analyzer-typed (Boolean) + emission-rendered (`IS [NOT] DISTINCT FROM`). SQL front-end didn't lower the forms.
+- Architecture: `.agent-output/architecture-pass-103.md` — 2 lower_expr arms (IsDistinctFrom negated:false, IsNotDistinctFrom negated:true) + Spaceship short-circuit in the Expr::BinaryOp handler → negated:true (Spark `<=>` = null-safe equal = NOT DISTINCT FROM).
+- Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`). No emission/analyzer/ast change.
+- ADR citations: ADR-004 (SQL onto existing IsDistinctFrom substrate), ADR-015 (`<=>` = NOT DISTINCT FROM; NULL<=>NULL true), ADR-022 (now supported).
+- Corpus signal: 147 → **150** (+3). pr-001/pr-002/whr-015 GREEN. No regressions.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Tests added: 3 (with `negated` polarity assertions).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (polarity verified against emission — negated:true renders IS NOT DISTINCT FROM; Spaceship short-circuit correctly placed before lower_binary_op's catch-all; 1 Low: cosmetic arm merge). Perf negligible.
+- Findings queued as follow-up: more `sql::expr::other` — LIKE ANY/ALL (pr-003/004), IS TRUE/FALSE (pr-006), multi-col IN tuple (pr-005), array/map literals (cx-001/002), DATE/TIMESTAMP literals (lit-001/002).
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 655/0, `sql_v2` differential 150/112/262, no regressions).
+- Commit SHA: (this commit).

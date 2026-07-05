@@ -1,6 +1,6 @@
 # SQL Generation Correctness Rules
 
-> **Status: current — cross-cutting SQL-generation invariants.** These constraints govern the legacy path and are echoed, for v2, by the spine's cross-cutting invariants **INV1–INV10** (esp. INV2 node-locality, INV3 single-source-of-truth) and ADR-001. ADR index: [`../README.md`](../README.md) · v2 spine: [`../../thunderduck-rearchitect-ADRs.md`](../../thunderduck-rearchitect-ADRs.md).
+> **Status: current — cross-cutting SQL-generation invariants.** These constraints are echoed by the τ spine's cross-cutting invariants **INV1–INV10** (esp. INV2 node-locality, INV3 single-source-of-truth) and ADR-001. ADR index: [`../README.md`](../README.md) · τ spine: [`../../thunderduck-rearchitect-ADRs.md`](../../thunderduck-rearchitect-ADRs.md).
 
 These constraints are inherited from the Java reference and are architecture-level invariants:
 

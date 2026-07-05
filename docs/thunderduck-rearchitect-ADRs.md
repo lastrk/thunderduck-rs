@@ -363,7 +363,7 @@ The two access modes are the central structural content:
 
 **Refinement hooks.** Define the resolution-decision instrumentation (which inference rule fired). Decide how much trust to place in DuckDB's own test suite for the excluded bucket. Specify the triage decision tree.
 
-**Seam-and-drain pattern for sub-slice cross-cuts.** A sub-slice within a slice's iteration may deliberately keep a specific cross-cut to an upstream sub-slice as an acknowledged seam **iff the next sub-slice's core deliverable is to drain that seam**. Constraints: (a) the seam MUST be marked in source with a `TODO Slice <target-sub-slice>:` comment naming the drain sub-slice; (b) any invariant relaxed to permit the seam MUST be tightened back to full strength when the drain sub-slice completes; (c) an unnamed drain is contamination, not a seam. The pattern applies within v2's own iteration; there is no cross-implementation seam because there is no other implementation (ADR-022).
+**Seam-and-drain pattern for cross-cuts.** A pass may deliberately keep a specific cross-cut to an upstream unimplemented feature as an acknowledged seam **iff the next pass's core deliverable is to drain that seam**. Constraints: (a) the seam MUST be marked in source with a `TODO:` comment naming the drain; (b) any invariant relaxed to permit the seam MUST be tightened back to full strength when the drain completes; (c) an unnamed drain is contamination, not a seam. There is no cross-implementation seam because there is no other implementation (ADR-022).
 
 **INV3 + INV10 bracket τ's substrate boundary.** INV3 (the *emission-side* single-source-of-truth rule) and INV10 (the *input-side* barrier: τ imports only value-level types from outside its own module tree) together enforce that τ's substrate stays clean. See §CV.5 for the grep checks.
 
@@ -623,7 +623,7 @@ Neither category triggers a runtime fallback. Both surface directly to the clien
 - **Timing of non-τ source cleanup** is a scheduling decision, not an ADR one — delete once no test, no CI job, and no build step references it. Incremental per-slice deletion is permitted.
 - **Boundary-error precision.** Over time, the set of `Unsupported*` variants shrinks as τ grows. A future ADR (post-corpus-green) may enumerate the residual *permanent* unsupported set — inputs Spark accepts that τ will never support (e.g. distributed-only operators). Until then, boundary errors are pragmatic — "not yet" is a valid reason.
 
-**Carve-out register (for permanent Thunderduck-boundary errors).** *Currently empty.* When a boundary error is deemed permanent (Thunderduck will not implement this feature), it is recorded here with a written justification. Non-permanent "not yet" boundary errors are tracked by the readiness map's slice targets, not here.
+**Carve-out register (for permanent Thunderduck-boundary errors).** *Currently empty.* When a boundary error is deemed permanent (Thunderduck will not implement this feature), it is recorded here with a written justification. Non-permanent "not yet" boundary errors are the ADR-022 category-2 default (surfaced to the caller with an honest `Unsupported*` reason) — they are not tracked here.
 
 ---
 
@@ -741,14 +741,14 @@ Properties that span ADRs. Any refinement must preserve all of these; a change t
 
 ### CV.5.1 — Invariant scoping conventions
 
-**Sub-invariants.** Some INV<N> paragraphs cover invariants with multiple orthogonal dimensions. Each dimension is a distinct property to preserve; each activates in whichever slice owns the substrate that realizes it. The invariant paragraph is the canonical statement of the property; the sub-invariant dimensions are the enumerable properties that fill it. A slice's completion is measured against the sub-invariants it *claims* to activate, not against the invariant paragraph as a whole. The readiness map's invariant-activation table names the owning slice for each dimension.
+**Sub-invariants.** Some INV<N> paragraphs cover invariants with multiple orthogonal dimensions. Each dimension is a distinct property to preserve; each activates once the τ substrate that realizes it lands. The invariant paragraph is the canonical statement of the property; the sub-invariant dimensions are the enumerable properties that fill it. A pass's completion is measured against the sub-invariants it *claims* to activate, not against the invariant paragraph as a whole.
 
 **Two-marker convention** for the stubs in `crates/core/src/transpiler_v2/invariants.rs`:
 
 - `TODO INV<N>:` — within-current-slice unblocking work. A `git grep 'TODO INV<N>'` returning empty is the completion signal for that invariant (or sub-invariant) at the current slice.
 - `DEFER INV<N> → <owning-slice>:` — the invariant (or sub-invariant) is reassigned to the named future slice; the stub is replaced when that slice's substrate lands. Deferred markers do NOT trip `git grep 'TODO INV<N>'`.
 
-When a reassignment happens, the slice performing it updates BOTH the marker in source AND the readiness-map activation row for that invariant to name the new owning slice.
+When a reassignment happens, the pass performing it updates the marker in source.
 
 **Cross-check.** `git grep 'TODO INV'` returning empty crate-wide is the load-bearing completion check for whatever slice is currently landing. `git grep 'DEFER INV'` returning entries is expected: each entry is a claim of ownership by a named future slice, not un-owned unblocking work.
 
@@ -764,19 +764,6 @@ Review premise-first, then spine, then substrate, then consequences, then the en
 6. **ADR-020** (strict-only extension), **ADR-021** (τ owns substrate), and **ADR-022** (τ is the only path). ADR-020 consolidates the emission target; ADR-021 pins the substrate boundary (τ owns its protobuf converter, Expression, TypeInferenceEngine); ADR-022 pins the runtime position (τ is the only path; two error categories; no fallback). Together with ADR-000's premise, these three shape every implementation slice.
 
 Defer no ADR's *ratification* past the point where something depending on it is ratified — the matrix in CV.2 gives the order. The two highest-value review items are **ADR-000's no-JVM premise** (widest blast radius; if it moves, Alternative 1 deletes ADR-005/006) and **ADR-005's scope together with LB1** (where the implementation cost and risk concentrate).
-
-## CV.7 — Slice sub-split legitimacy
-
-The iteration methodology (`tasks/v2-slice-iteration-methodology.md`, §Loop step 4) permits the architect of a slice's Pass 1 to propose a further sub-split when the slice as scoped is too large for a single `/new-feature` pipeline pass.
-
-Codified rules:
-
-- **A sub-split is a load-bearing architectural decision, not a scope-punt.** The architect must justify the decomposition in the Pass 1 architecture plan's §0 (or equivalent named section), pick which sub-slice this pass tackles, and enumerate the deferred sub-slice(s)' scopes at the same level of specificity as the original slice's scope.
-- **Each sub-slice runs as its own pass** under the iteration methodology. The methodology's `pass ≤ 5` hard cap counts sub-slice passes; a slice that legitimately sub-splits into three sub-slices consumes three of its five available passes.
-- **Reviewer approval of the sub-splitting Pass 1's architecture plan constitutes assent to the split.** The next sub-slice's Pass N+1 prompt inherits the previous sub-slice's CLOSE_NOW carryover per methodology §Loop step 5.
-- **Sub-split proposals MUST be surfaced textually.** The architect writes "PROPOSED FURTHER SPLIT" in bold near the top of their plan document, so the iteration driver (whether `/goal`-based or manual) can detect and honor the split without ambiguity.
-- **Sub-splits are not deferments.** A `DEFER_LATER_SLICE` classification (per methodology §Classification) reassigns work to a later *slice*. A sub-split creates a new *pass within the current slice*. The two are orthogonal — a Pass 2 that closes CLOSE_NOW items from a sub-split may still produce its own DEFER items for future slices.
-- **A sub-split that adds no measurable coverage nor closes a load-bearing invariant is cosmetic, not substantive.** The next slice's iteration should either re-integrate the cosmetic sub-slice or recalibrate.
 
 ---
 

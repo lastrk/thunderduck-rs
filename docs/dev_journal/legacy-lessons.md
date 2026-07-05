@@ -1,10 +1,14 @@
-# Lessons & Gotchas
+# Lessons & Gotchas — Legacy v1 transpiler
 
-> **Scope: LEGACY path.** These gotchas were discovered while building and debugging the legacy `SqlGenerator` / `LogicalPlan` / `Expression` / `TypeInferenceEngine` / `RelationConverter` stack. They apply to the currently-active legacy path in `main`.
+> **SUPERSEDED — DO NOT USE AS GUIDANCE — HISTORICAL REFERENCE ONLY.**
+> These gotchas were discovered while building and debugging the retired
+> v1 `SqlGenerator` / `LogicalPlan` / `Expression` / `TypeInferenceEngine`
+> / `RelationConverter` stack. The v1 Rust modules were deleted on
+> 2026-07-05. τ (`crates/core/src/transpiler_v2/`) is now the only
+> production path per ADR-022; its live gotchas live in `CLAUDE.md`
+> §"Known Gotchas".
 >
-> **v2 has its own inheritance checklist** at `tasks/v2-restart-inheritance-checklist.md`, which distills the concrete bugs the morph-track v2 debugging arc surfaced (analyzer symmetric-omissions on `count_if`/`corr`/`covar_samp`/`regr_*`, `hash`/`xxhash64`/`murmur3` nullability, Decimal128 marshalling in the RelationConverter, `sha` arg-stripping, `percentile_approx` FLOAT CAST). The Slice A architect must cite that checklist during v2 restart, not this file. Some legacy gotchas below (e.g., `duckdb::Connection` threading, HUGEINT overflow, extension version pinning) are universal and apply to v2 too; the file-scope-legacy label attaches to the *examples*, not the *rules*.
-
-Review before working on SQL generation, expression handling, threading, extension integration, or aggregate paths **in the legacy tree**.
+> Kept here as a historical record of the v1 debugging arc.
 
 ## `to_sql()` vs `Display`
 

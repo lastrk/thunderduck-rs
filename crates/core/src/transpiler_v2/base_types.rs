@@ -131,6 +131,15 @@ pub fn plan_has_empty_scan(plan: &CommonAst) -> bool {
     }
 }
 
+/// Enumerate every empty-scan `TableScan` table name in `plan`, in tree order
+/// (may contain duplicates). Public so the request handler can pre-fetch
+/// session-catalog schemas before building the sync overlay closure.
+pub fn empty_scan_tables(plan: &CommonAst) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_empty_scan_tables(plan, &mut out);
+    out
+}
+
 /// Walk `plan` and push every `TableScan.table` name into `out`.
 fn collect_empty_scan_tables(plan: &CommonAst, out: &mut Vec<String>) {
     match &plan.op {

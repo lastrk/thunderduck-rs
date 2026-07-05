@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -50,7 +51,8 @@ static SERVER_SESSION_ID: std::sync::LazyLock<String> =
 /// through `parser_v2`, structured relations through `V2RelationConverter`.
 /// `V2RelationConverter` refuses `RelType::Sql` with `UnsupportedProtoShape`,
 /// so intercepting here keeps the two front-ends peer.
-pub(crate) fn transpile_relation(
+pub(crate) async fn transpile_relation(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     relation: &proto::Relation,
 ) -> Result<(CommonAst, String, StructType), Status> {
     use proto::relation::RelType;
@@ -64,7 +66,7 @@ pub(crate) fn transpile_relation(
                 .map_err(|e| Status::from(ConnectError::from(e)))?
         }
     };
-    let (sql, schema) = finalize(&common_ast)?;
+    let (sql, schema) = finalize(session, &common_ast).await?;
     Ok((common_ast, sql, schema))
 }
 
@@ -77,11 +79,13 @@ pub(crate) fn transpile_relation(
 /// Fusing avoids the second `analyze()` call that pass 88's initial wiring
 /// incurred (perf review HIGH #1).
 ///
-/// The catalog closure returns `None` at Slice A.3 — the overlay exists to
-/// satisfy the dispatch shape; Slice B wires the actual catalog bridge over
-/// `DuckDbSession`.
-pub(crate) fn finalize(common_ast: &CommonAst) -> Result<(String, StructType), Status> {
-    let base_types = build_base_types(common_ast);
+/// The catalog closure resolves empty-scan `TableScan` schemas from the
+/// session's temp-view cache (Slice B — the runtime→analyzer bridge).
+pub(crate) async fn finalize(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    common_ast: &CommonAst,
+) -> Result<(String, StructType), Status> {
+    let base_types = build_base_types(session, common_ast).await;
     transpiler_v2::generate_with_schema(common_ast, &base_types)
         .map_err(|e| Status::from(ConnectError::from(e)))
 }
@@ -92,23 +96,41 @@ pub(crate) fn finalize(common_ast: &CommonAst) -> Result<(String, StructType), S
 /// the schema-analyze surface). The `ExecutePlan` streaming-query path takes
 /// its schema from [`finalize`]'s fused return instead of re-running the
 /// analyzer.
-pub(crate) fn analyze_schema(common_ast: &CommonAst) -> Result<StructType, Status> {
-    let base_types = build_base_types(common_ast);
+pub(crate) async fn analyze_schema(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    common_ast: &CommonAst,
+) -> Result<StructType, Status> {
+    let base_types = build_base_types(session, common_ast).await;
     transpiler_v2::analyze_schema(common_ast, &base_types)
         .map_err(|e| Status::from(ConnectError::from(e)))
 }
 
 /// Build the per-path `BaseTypes` overlay for a `CommonAst`.
 ///
-/// The catalog closure returns `None` at Slice A.3 — the overlay exists to
-/// satisfy the dispatch shape; Slice B wires the actual catalog bridge over
-/// `DuckDbSession`.
-fn build_base_types(common_ast: &CommonAst) -> BaseTypes {
-    if plan_has_empty_scan(common_ast) {
-        BaseTypes::build_from_plan(common_ast, |_table_name| None::<StructType>)
-    } else {
-        BaseTypes::empty()
+/// Slice B: the catalog closure resolves each empty-scan `TableScan` from the
+/// session's temp-view schema cache. `get_view_schema` is async and
+/// `build_from_plan`'s closure is sync, so we pre-fetch every table's schema
+/// into a map first, then feed `build_from_plan` a synchronous
+/// `|name| map.get(name).cloned()`. The closure stays the sole runtime→analyzer
+/// bridge (INV10). Short-circuits to `BaseTypes::empty()` when the plan carries
+/// no empty scan (ADR-012 request-handler seeding short-circuit).
+async fn build_base_types(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    common_ast: &CommonAst,
+) -> BaseTypes {
+    if !plan_has_empty_scan(common_ast) {
+        return BaseTypes::empty();
     }
+    let mut map: HashMap<String, StructType> = HashMap::new();
+    for table in thunderduck_core::transpiler_v2::base_types::empty_scan_tables(common_ast) {
+        if map.contains_key(&table) {
+            continue;
+        }
+        if let Some(schema) = session.get_view_schema(&table).await {
+            map.insert(table, schema);
+        }
+    }
+    BaseTypes::build_from_plan(common_ast, |name| map.get(name).cloned())
 }
 
 // ── gRPC service impl ─────────────────────────────────────────────────────────
@@ -147,7 +169,8 @@ impl SparkConnectService for ThunderduckService {
 
         let responses: Vec<proto::ExecutePlanResponse> = match plan.op_type {
             Some(proto::plan::OpType::Root(relation)) => {
-                let (common_ast, sql, resolved_schema) = transpile_relation(&relation)?;
+                let (common_ast, sql, resolved_schema) =
+                    transpile_relation(&session, &relation).await?;
                 // Slice A.3: `finalize()` errors unconditionally, so the
                 // downstream classification / streaming helpers are only
                 // reachable when Slices C/E begin lighting up emission arms.
@@ -206,8 +229,9 @@ impl SparkConnectService for ThunderduckService {
                         ));
                     }
                 };
-                // Warm the session so subsequent slices can reach it.
-                let _session = self
+                // Session carries the temp-view catalog the analyzer resolves
+                // `TableScan` schemas from (Slice B catalog bridge).
+                let session = self
                     .session_manager
                     .get_or_create(&session_id)
                     .await
@@ -237,7 +261,7 @@ impl SparkConnectService for ThunderduckService {
                             .map_err(|e| Status::from(ConnectError::from(e)))?
                     }
                 };
-                let struct_type = analyze_schema(&common_ast)?;
+                let struct_type = analyze_schema(&session, &common_ast).await?;
                 // ADR-022 boundary hygiene: `DataType::Unresolved` maps to
                 // `Kind::Unparsed { data_type_string: "unresolved" }` on the
                 // wire, which PySpark's `_parse_datatype_json_value` refuses
@@ -364,8 +388,17 @@ async fn handle_command(
             let relation = view_cmd
                 .input
                 .ok_or_else(|| Status::invalid_argument("CreateTempView missing input"))?;
-            let (common_ast, _sql, _schema) = transpile_relation(&relation)?;
-            handle_create_dataframe_view(session, session_id, operation_id, &common_ast).await
+            let (_ast, sql, schema) = transpile_relation(session, &relation).await?;
+            handle_create_dataframe_view(
+                session,
+                session_id,
+                operation_id,
+                &view_cmd.name,
+                view_cmd.is_global,
+                sql,
+                schema,
+            )
+            .await
         }
         Some(CommandType::SqlCommand(sql_cmd)) => {
             // Modern clients (PySpark 4.1.1) carry the query as a typed
@@ -401,7 +434,7 @@ async fn handle_command(
             // (`spark.sql("CREATE VIEW ...")`) and non-deterministic
             // re-evaluation (`rand()`, `current_timestamp()`) require eager
             // execution to a `LocalRelation` — out of scope for this pass.
-            let _ = transpile_relation(&input_rel)?;
+            let _ = transpile_relation(session, &input_rel).await?;
             handle_sql_command(session, session_id, operation_id, input_rel).await
         }
         Some(CommandType::WriteOperation(mut write_cmd)) => {
@@ -409,7 +442,7 @@ async fn handle_command(
                 .input
                 .take()
                 .ok_or_else(|| Status::invalid_argument("WriteOperation missing input"))?;
-            let (common_ast, _sql, _schema) = transpile_relation(&input_rel)?;
+            let (common_ast, _sql, _schema) = transpile_relation(session, &input_rel).await?;
             handle_write_operation(session, session_id, operation_id, &common_ast, &write_cmd).await
         }
         _ => Err(Status::unimplemented("Unsupported command type")),
@@ -517,16 +550,31 @@ async fn execute_streaming_query(
 
 /// Handle `CreateDataframeView` after successful transpile.
 ///
-/// **Slice B (owner):** schema inference over `CommonAst` for `CREATE VIEW`.
+/// **Slice B (owner):** register the temp view in the session — both in DuckDB
+/// (so `SELECT * FROM <name>` executes) and in the session's Spark-schema cache
+/// (so the analyzer's catalog bridge can resolve the view's columns +
+/// nullabilities, which DuckDB's `CREATE VIEW` loses). Returns a lone
+/// `ResultComplete` (ADR-011 command-arm response shape).
+///
+/// `is_global` (global temp views) is out of scope for Slice B: the view is
+/// registered session-local and a warning is logged.
 async fn handle_create_dataframe_view(
-    _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    _session_id: &str,
-    _operation_id: &str,
-    _common_ast: &CommonAst,
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    session_id: &str,
+    operation_id: &str,
+    name: &str,
+    is_global: bool,
+    sql: String,
+    schema: StructType,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
-    Err(Status::unimplemented(
-        "Slice B: schema inference for CreateView over CommonAst",
-    ))
+    if is_global {
+        tracing::warn!(view = %name, "global temp view registered as session-local (Slice B)");
+    }
+    session
+        .create_temp_view_with_schema(name, &sql, schema)
+        .await
+        .map_err(|e| Status::from(ConnectError::from(e)))?;
+    Ok(vec![result_complete_response(session_id, operation_id)])
 }
 
 /// Handle `SqlCommand` (both `input`-bearing and deprecated text paths).
@@ -752,6 +800,19 @@ mod tests {
         })
     }
 
+    /// Build a real, warmed `DuckDbSession` for the async dispatch-helper
+    /// tests. INV10 forbids `use thunderduck_core::runtime::` in this file, so
+    /// the paths are fully qualified inline.
+    async fn test_session(session_id: &str) -> Arc<thunderduck_core::runtime::DuckDbSession> {
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
+            thunderduck_core::runtime::StreamingConfig::default(),
+        ));
+        session_manager
+            .get_or_create(session_id)
+            .await
+            .expect("session must be creatable")
+    }
+
     /// Regression for nubank/thunderduck#33: GetOption must emit one KeyValue per
     /// requested key (value=None when not configured). spark-connect-client-jvm
     /// 4.1.x calls this on every analyze; returning 0 pairs trips its
@@ -841,8 +902,9 @@ mod tests {
     /// A structurally-valid `Project` relation reaches τ and surfaces the
     /// emission boundary as `Status::unimplemented` (not `internal`) — this
     /// pins `ConnectError::TranspilerV2Emission → Status::unimplemented`.
-    #[test]
-    fn transpile_relation_project_returns_unsupported_op() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transpile_relation_project_returns_unsupported_op() {
+        let session = test_session("test-transpile-project").await;
         let input = table_scan_relation("t");
         let project = proto::Relation {
             common: None,
@@ -853,7 +915,9 @@ mod tests {
                 },
             ))),
         };
-        let err = transpile_relation(&project).expect_err("τ emission must error at A.3");
+        let err = transpile_relation(&session, &project)
+            .await
+            .expect_err("τ emission must error at A.3");
         assert_eq!(
             err.code(),
             tonic::Code::Unimplemented,
@@ -883,8 +947,9 @@ mod tests {
     /// unsupported proto shape. Instead, `parser_v2` parses the SQL and τ's
     /// `generate()` emits DuckDB SQL (Slice C.1 wired the Project + SingleRow
     /// arms — `SELECT 1` is a Project over SingleRow of a literal).
-    #[test]
-    fn transpile_relation_sql_routes_to_parser_v2_not_converter() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transpile_relation_sql_routes_to_parser_v2_not_converter() {
+        let session = test_session("test-transpile-sql-route").await;
         let sql_rel = proto::Relation {
             common: None,
             rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
@@ -896,8 +961,9 @@ mod tests {
         // The routing anchor (SQL → parser_v2, not converter) is still enforced:
         // a routing bug would have surfaced `RelType::Sql` as an
         // `UnsupportedProtoShape` error before reaching τ's emission.
-        let (_common_ast, sql, _schema) =
-            transpile_relation(&sql_rel).expect("τ must emit SQL for `SELECT 1`");
+        let (_common_ast, sql, _schema) = transpile_relation(&session, &sql_rel)
+            .await
+            .expect("τ must emit SQL for `SELECT 1`");
         assert!(
             sql.contains("SELECT"),
             "expected DuckDB SELECT emission; got: {sql}",
@@ -907,8 +973,9 @@ mod tests {
     /// SparkSQL syntax errors surface via `parser_v2`'s boundary policy
     /// (`UnsupportedProtoShape { shape: "sql::parse_error", ... }`), which
     /// maps to `Status::unimplemented` per `ConnectError::TranspilerV2Emission`.
-    #[test]
-    fn transpile_relation_sql_syntax_error_surfaces_from_parser_v2() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transpile_relation_sql_syntax_error_surfaces_from_parser_v2() {
+        let session = test_session("test-transpile-syntax-err").await;
         let sql_rel = proto::Relation {
             common: None,
             rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
@@ -916,7 +983,9 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let err = transpile_relation(&sql_rel).expect_err("syntax error must surface");
+        let err = transpile_relation(&session, &sql_rel)
+            .await
+            .expect_err("syntax error must surface");
         assert_eq!(err.code(), tonic::Code::Unimplemented);
         assert!(
             err.message().contains("sql::parse_error")
@@ -929,8 +998,9 @@ mod tests {
     /// A deferred proto shape (e.g. `Sample`) surfaces via
     /// `V2RelationConverter`'s `UnsupportedProtoShape` and maps to
     /// `Status::unimplemented`.
-    #[test]
-    fn transpile_relation_unsupported_proto_shape_surfaces() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transpile_relation_unsupported_proto_shape_surfaces() {
+        let session = test_session("test-transpile-unsupported-shape").await;
         // ShowString is still in the converter's catch-all `other` arm — a
         // deferred `RelType` that must surface as `UnsupportedProtoShape`.
         // (Pass 83 wired `Sample` / `SampleBy`, which used to sit here.)
@@ -945,7 +1015,9 @@ mod tests {
                 },
             ))),
         };
-        let err = transpile_relation(&show).expect_err("deferred shape must error");
+        let err = transpile_relation(&session, &show)
+            .await
+            .expect_err("deferred shape must error");
         assert_eq!(err.code(), tonic::Code::Unimplemented);
         assert!(
             err.message().contains("unsupported proto shape")
@@ -962,13 +1034,16 @@ mod tests {
     /// that finalize returns the emitted SQL for a plan with no empty scan
     /// (proving the short-circuit path builds `BaseTypes::empty()` without
     /// blocking emission).
-    #[test]
-    fn finalize_short_circuits_on_plans_without_empty_scan() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finalize_short_circuits_on_plans_without_empty_scan() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
+        let session = test_session("test-finalize-short-circuit").await;
         // A `SingleRow` plan carries no `TableScan` → `plan_has_empty_scan`
         // is false → `BaseTypes::empty()` (no closure invocation) → τ emits.
         let plan = CommonAst::new(CommonOp::SingleRow);
-        let (sql, _schema) = finalize(&plan).expect("τ must emit for SingleRow");
+        let (sql, _schema) = finalize(&session, &plan)
+            .await
+            .expect("τ must emit for SingleRow");
         // Subquery-safe shape — see `emission::render_single_row`.
         assert_eq!(sql, "SELECT 1");
     }
@@ -1316,6 +1391,230 @@ mod tests {
                 .iter()
                 .any(|f| f.data_type.contains_unresolved()),
             "guard must not fire for a fully-resolved schema",
+        );
+    }
+
+    // ── Pass 96 — Slice-B temp-view registration + catalog bridge ────────────
+    //
+    // These tests pin the two compounding fixes: (1) the catalog closure now
+    // resolves an empty-scan `TableScan` from the session's temp-view schema
+    // cache, and (2) `handle_create_dataframe_view` registers the view.
+
+    /// Drain an `ExecutePlanStream` into a flat `Vec` of response frames.
+    async fn drain(
+        resp: Response<<ThunderduckService as SparkConnectService>::ExecutePlanStream>,
+    ) -> Vec<proto::ExecutePlanResponse> {
+        use futures::StreamExt;
+        let mut stream = resp.into_inner();
+        let mut frames = Vec::new();
+        while let Some(item) = stream.next().await {
+            frames.push(item.expect("stream frame must be Ok"));
+        }
+        frames
+    }
+
+    fn sql_plan(query: &str) -> proto::Plan {
+        proto::Plan {
+            op_type: Some(proto::plan::OpType::Root(proto::Relation {
+                common: None,
+                rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
+                    query: query.to_owned(),
+                    ..Default::default()
+                })),
+            })),
+        }
+    }
+
+    /// A registered temp view resolves through the analyzer's catalog bridge:
+    /// `create_temp_view_with_schema("emp", ...)` then `SELECT * FROM emp` on
+    /// the SAME session succeeds (no `UnknownTable`), yields an `ArrowBatch` +
+    /// trailing `ResultComplete`, and the stamped schema field names match.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_bridge_resolves_registered_view() {
+        use arrow_ipc::reader::StreamReader;
+        use std::io::Cursor;
+        use thunderduck_core::types::StructField;
+
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
+            thunderduck_core::runtime::StreamingConfig::default(),
+        ));
+        let session = session_manager
+            .get_or_create("catalog-bridge-session")
+            .await
+            .expect("session must be creatable");
+
+        let schema = StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("name", DataType::String),
+        ]);
+        session
+            .create_temp_view_with_schema(
+                "emp",
+                "SELECT * FROM (VALUES (1,'a'),(2,'b')) AS t(id, name)",
+                schema,
+            )
+            .await
+            .expect("view registration must succeed");
+
+        let svc = ThunderduckService::new(Arc::clone(&session_manager));
+        let req = proto::ExecutePlanRequest {
+            session_id: "catalog-bridge-session".to_owned(),
+            operation_id: Some("test-op".to_owned()),
+            plan: Some(sql_plan("SELECT * FROM emp")),
+            ..Default::default()
+        };
+        let resp = svc
+            .execute_plan(Request::new(req))
+            .await
+            .expect("SELECT * FROM emp must resolve the registered view");
+        let frames = drain(resp).await;
+
+        let arrow_frame = frames
+            .iter()
+            .find_map(|f| match &f.response_type {
+                Some(proto::execute_plan_response::ResponseType::ArrowBatch(ab)) => Some(ab),
+                _ => None,
+            })
+            .expect("expected an ArrowBatch frame");
+        let has_complete = frames.last().is_some_and(|f| {
+            matches!(
+                f.response_type,
+                Some(proto::execute_plan_response::ResponseType::ResultComplete(
+                    _
+                ))
+            )
+        });
+        assert!(has_complete, "final frame must be ResultComplete");
+
+        let reader = StreamReader::try_new(Cursor::new(arrow_frame.data.as_slice()), None)
+            .expect("StreamReader::try_new must succeed on valid IPC bytes");
+        let batches: Vec<_> = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("IPC stream must decode without error");
+        assert!(!batches.is_empty(), "expected at least one RecordBatch");
+        let names: Vec<String> = batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().to_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["id".to_owned(), "name".to_owned()],
+            "stamped schema field names must match the registered view",
+        );
+    }
+
+    /// `CreateDataframeView` registers the view and returns a lone
+    /// `ResultComplete`; a subsequent `SELECT` then resolves it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_view_command_returns_result_complete() {
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
+            thunderduck_core::runtime::StreamingConfig::default(),
+        ));
+        let svc = ThunderduckService::new(Arc::clone(&session_manager));
+
+        // A light view body (`SELECT 1 AS id`) — Project over SingleRow, no
+        // Arrow LocalRelation payload to construct.
+        let create = proto::Plan {
+            op_type: Some(proto::plan::OpType::Command(proto::Command {
+                command_type: Some(proto::command::CommandType::CreateDataframeView(
+                    proto::CreateDataFrameViewCommand {
+                        input: Some(proto::Relation {
+                            common: None,
+                            rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
+                                query: "SELECT 1 AS id".to_owned(),
+                                ..Default::default()
+                            })),
+                        }),
+                        name: "emp2".to_owned(),
+                        is_global: false,
+                        replace: true,
+                    },
+                )),
+            })),
+        };
+        let req = proto::ExecutePlanRequest {
+            session_id: "create-view-session".to_owned(),
+            operation_id: Some("test-op".to_owned()),
+            plan: Some(create),
+            ..Default::default()
+        };
+        let frames = drain(
+            svc.execute_plan(Request::new(req))
+                .await
+                .expect("CreateDataframeView must succeed"),
+        )
+        .await;
+        assert_eq!(frames.len(), 1, "command arm returns a lone frame");
+        assert!(
+            matches!(
+                frames[0].response_type,
+                Some(proto::execute_plan_response::ResponseType::ResultComplete(
+                    _
+                ))
+            ),
+            "the lone frame must be ResultComplete",
+        );
+
+        // The view now resolves on the same session.
+        let sel = proto::ExecutePlanRequest {
+            session_id: "create-view-session".to_owned(),
+            operation_id: Some("test-op-2".to_owned()),
+            plan: Some(sql_plan("SELECT * FROM emp2")),
+            ..Default::default()
+        };
+        let frames = drain(
+            svc.execute_plan(Request::new(sel))
+                .await
+                .expect("SELECT * FROM emp2 must resolve the registered view"),
+        )
+        .await;
+        assert!(
+            frames.iter().any(|f| matches!(
+                f.response_type,
+                Some(proto::execute_plan_response::ResponseType::ArrowBatch(_))
+            )),
+            "SELECT over the view must stream an ArrowBatch",
+        );
+    }
+
+    /// Regression guard: a catalog-free plan (`SELECT 1`) still round-trips —
+    /// `plan_has_empty_scan == false` short-circuits `build_base_types` to
+    /// `BaseTypes::empty()` with zero session round-trips.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn select_literal_makes_no_catalog_call_short_circuit() {
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
+            thunderduck_core::runtime::StreamingConfig::default(),
+        ));
+        let svc = ThunderduckService::new(session_manager);
+        let req = proto::ExecutePlanRequest {
+            session_id: "short-circuit-session".to_owned(),
+            operation_id: Some("test-op".to_owned()),
+            plan: Some(sql_plan("SELECT 1")),
+            ..Default::default()
+        };
+        let frames = drain(
+            svc.execute_plan(Request::new(req))
+                .await
+                .expect("SELECT 1 must still round-trip"),
+        )
+        .await;
+        assert!(
+            frames.iter().any(|f| matches!(
+                f.response_type,
+                Some(proto::execute_plan_response::ResponseType::ArrowBatch(_))
+            )),
+            "SELECT 1 must stream an ArrowBatch",
+        );
+        assert!(
+            frames.last().is_some_and(|f| matches!(
+                f.response_type,
+                Some(proto::execute_plan_response::ResponseType::ResultComplete(
+                    _
+                ))
+            )),
+            "final frame must be ResultComplete",
         );
     }
 }

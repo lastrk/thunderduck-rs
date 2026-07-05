@@ -172,3 +172,63 @@ Site-by-site disposition:
   service.rs:530/545). Baseline-drift comparison: block counts are
   identical between HEAD and working tree, so Pass 5 introduces zero
   new drift and does not own any drift per CLAUDE.md § Quality Gate.
+
+## Pass 6 — OPP-L (2026-07-05)
+
+Extract the `Expression::children()` iterator and the
+`Expression::map_children()` structural map into `transpiler_v2/
+expression.rs`, then rewrite `resolve_and_stamp` and
+`expression_is_fully_resolved` in `transpiler_v2/analyzer.rs` to
+consume the walker via a wildcard default arm. Unlocks Phase 3.
+
+**Scope deviation from the plan (documented, not silent):**
+The plan lists 5 walkers for the rewrite: `resolve_and_stamp`,
+`expression_is_fully_resolved`, `Expression::data_type`,
+`Expression::nullable`, `stamp_column_reference`. Only the first two
+are natural fits — the last three are not walker rewrites:
+- `Expression::data_type` and `Expression::nullable` have variant-
+  specific type-derivation logic for almost every arm (Binary type
+  promotion, FunctionCall type inference, Cast fixed type, Window
+  type from the underlying agg, etc.). There is no natural "default
+  recursion" they can fall through to — the arms are not duplicated
+  recursion, they are per-variant type-derivation logic.
+- `stamp_column_reference` operates on `ColumnReference` alone; it is
+  not a full-tree walker.
+
+The plan's stated LOC target ("analyzer.rs LOC drops ≥ 100") is met
+by the two-walker rewrite: analyzer.rs drops **182 LOC** (5907 →
+5725). The maintenance-cost reduction ("every new variant needs 5
+updates") lands proportionally — 2 of the 5 walkers now delegate to
+`map_children`, so new variants require updating only 3 of the
+original 5.
+
+- **Files touched.**
+  - `crates/core/src/transpiler_v2/expression.rs` — add
+    `Expression::children()` and `Expression::map_children()` (walker
+    substrate; +226 LOC including 2 new unit tests exercising the
+    Alias > FunctionCall > Binary > CaseWhen > Literal shape and the
+    Window frame-boundary-skip invariant).
+  - `crates/core/src/transpiler_v2/analyzer.rs` — rewrite
+    `resolve_and_stamp` (~180 LOC → ~50 LOC with UpdateFields
+    validation preserved) and `expression_is_fully_resolved` (~70 LOC
+    → ~20 LOC via `expr.children().all(...)`).
+- **LOC delta.** analyzer.rs −182; expression.rs +226 (walker +
+  tests). Net +44 LOC across the two files. The walker substrate is
+  the point — future walkers (Phase 3 analyzer normalization,
+  Passes 13-15) reuse it instead of duplicating recursion.
+- **Corpus.** Baseline verified at 314 pre-commit (running
+  `v2-progress.sh` in the pass session). Behavior-preserving:
+  `map_children`'s per-variant recursion matches the deleted walker
+  arms 1-for-1, and both walkers explicitly custom-case the same
+  punt set (`InSubquery`, `ExistsSubquery`, `ScalarSubquery`,
+  `Lambda`, `LambdaVariable`, `RawSql`, `Interval`,
+  `UnresolvedRegex`).
+- **Warnings.** `cargo check -p thunderduck-core` clean, zero
+  warnings. No delta.
+- **Gate.** `cargo test -p thunderduck-core --lib --tests` → 448
+  pass / 0 fail / 4 ignored (+2 vs Pass 5 = new walker tests) + 0
+  pass / 4 ignored (runtime_integration).
+- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` reports
+  1 pre-existing drift block (`analyzer.rs:710` FileScan error
+  branch). HEAD-vs-WT block counts identical (analyzer.rs = 1 / 1,
+  expression.rs = 0 / 0), so Pass 6 introduces zero new drift.

@@ -1898,180 +1898,50 @@ fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression
             let stamped = stamp_column_reference(c, schema);
             Ok(Expression::ColumnReference(stamped))
         }
-        Expression::Literal(_) | Expression::Star(_) => Ok(expr),
-        Expression::Binary(mut b) => {
-            b.left = Box::new(resolve_and_stamp(*b.left, schema)?);
-            b.right = Box::new(resolve_and_stamp(*b.right, schema)?);
-            Ok(Expression::Binary(b))
-        }
-        Expression::Unary(mut u) => {
-            u.operand = Box::new(resolve_and_stamp(*u.operand, schema)?);
-            Ok(Expression::Unary(u))
-        }
-        Expression::FunctionCall(mut f) => {
-            f.args = f
-                .args
-                .into_iter()
-                .map(|a| resolve_and_stamp(a, schema))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Expression::FunctionCall(f))
-        }
-        Expression::Cast(mut c) => {
-            c.expr = Box::new(resolve_and_stamp(*c.expr, schema)?);
-            Ok(Expression::Cast(c))
-        }
-        Expression::CaseWhen(mut cw) => {
-            cw.branches = cw
-                .branches
-                .into_iter()
-                .map(|(w, t)| {
-                    let w = resolve_and_stamp(w, schema)?;
-                    let t = resolve_and_stamp(t, schema)?;
-                    Ok::<_, AnalyzerError>((w, t))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if let Some(e) = cw.else_expr {
-                cw.else_expr = Some(Box::new(resolve_and_stamp(*e, schema)?));
-            }
-            Ok(Expression::CaseWhen(cw))
-        }
-        Expression::Window(mut w) => {
-            w.func = Box::new(resolve_and_stamp(*w.func, schema)?);
-            w.partition_by = w
-                .partition_by
-                .into_iter()
-                .map(|e| resolve_and_stamp(e, schema))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut new_order = Vec::with_capacity(w.order_by.len());
-            for so in w.order_by {
-                let e = resolve_and_stamp(*so.expr, schema)?;
-                new_order.push(SortOrder {
-                    expr: Box::new(e),
-                    direction: so.direction,
-                    null_ordering: so.null_ordering,
-                });
-            }
-            w.order_by = new_order;
-            Ok(Expression::Window(w))
-        }
-        Expression::Alias(mut a) => {
-            a.expr = Box::new(resolve_and_stamp(*a.expr, schema)?);
-            Ok(Expression::Alias(a))
-        }
-        Expression::Between(mut b) => {
-            b.expr = Box::new(resolve_and_stamp(*b.expr, schema)?);
-            b.low = Box::new(resolve_and_stamp(*b.low, schema)?);
-            b.high = Box::new(resolve_and_stamp(*b.high, schema)?);
-            Ok(Expression::Between(b))
-        }
-        Expression::InList(mut i) => {
-            i.expr = Box::new(resolve_and_stamp(*i.expr, schema)?);
-            i.list = i
-                .list
-                .into_iter()
-                .map(|e| resolve_and_stamp(e, schema))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Expression::InList(i))
-        }
-        Expression::Like(mut l) => {
-            l.value = Box::new(resolve_and_stamp(*l.value, schema)?);
-            l.pattern = Box::new(resolve_and_stamp(*l.pattern, schema)?);
-            Ok(Expression::Like(l))
-        }
-        Expression::IsDistinctFrom(mut d) => {
-            d.left = Box::new(resolve_and_stamp(*d.left, schema)?);
-            d.right = Box::new(resolve_and_stamp(*d.right, schema)?);
-            Ok(Expression::IsDistinctFrom(d))
-        }
-        Expression::ExtractValue(mut ev) => {
-            ev.child = Box::new(resolve_and_stamp(*ev.child, schema)?);
-            ev.extraction = Box::new(resolve_and_stamp(*ev.extraction, schema)?);
-            Ok(Expression::ExtractValue(ev))
-        }
-        Expression::ArrayLiteral(mut a) => {
-            a.elements = a
-                .elements
-                .into_iter()
-                .map(|e| resolve_and_stamp(e, schema))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Expression::ArrayLiteral(a))
-        }
-        Expression::MapLiteral(mut m) => {
-            m.entries = m
-                .entries
-                .into_iter()
-                .map(|(k, v)| {
-                    let k = resolve_and_stamp(k, schema)?;
-                    let v = resolve_and_stamp(v, schema)?;
-                    Ok::<_, AnalyzerError>((k, v))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Expression::MapLiteral(m))
-        }
-        Expression::StructLiteral(mut s) => {
-            s.fields = s
-                .fields
-                .into_iter()
-                .map(|(n, e)| Ok::<_, AnalyzerError>((n, resolve_and_stamp(e, schema)?)))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Expression::StructLiteral(s))
-        }
-        Expression::RowConstructor(mut rc) => {
-            rc.elements = rc
-                .elements
-                .into_iter()
-                .map(|e| resolve_and_stamp(e, schema))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Expression::RowConstructor(rc))
-        }
-        Expression::UpdateFields(mut u) => {
-            u.struct_expr = Box::new(resolve_and_stamp(*u.struct_expr, schema)?);
-            u.updates = u
-                .updates
-                .into_iter()
-                .map(|(n, e)| {
-                    let resolved = match e {
-                        Some(expr) => Some(resolve_and_stamp(expr, schema)?),
-                        None => None,
-                    };
-                    Ok::<_, AnalyzerError>((n, resolved))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            // Spark 4.1 rejects `dropFields("X")` when field `X` does not
-            // exist (case-insensitive) with `AnalysisException: Field name
-            // X does not exist`. We surface the same as a Spark-emulated
-            // error at analysis time so emission never runs on invalid ops.
-            // See Catalyst `UpdateFields.scala::checkInputDataTypes`.
-            if let DataType::Struct(base_st) = u.struct_expr.data_type(schema) {
-                let base_names: Vec<String> =
-                    base_st.fields.iter().map(|f| f.name.clone()).collect();
-                if let Err(missing) =
-                    super::expression::validate_update_fields_ops(&base_names, &u.updates)
-                {
-                    return Err(AnalyzerError::Other {
-                        reason: format!(
-                            "cannot resolve field `{missing}` in dropFields — not present in struct"
-                        ),
-                    });
-                }
-            }
-            Ok(Expression::UpdateFields(u))
-        }
-        // Subquery / lambda / raw-sql / interval — τ's analyzer leaves them
-        // opaque. The subquery's inner CommonAst is not re-analyzed here;
-        // future τ work owns subquery analysis.
+        // τ's analyzer leaves these opaque. Subquery bodies (CommonAst) are
+        // owned by future τ work; Lambda bodies close over lambda variables
+        // and are analyzed lazily by their consumer function; RawSql and
+        // Interval carry their own types. Pass 85's `expand_regex_projections`
+        // rewrites any UnresolvedRegex before it reaches this walker, so
+        // residuals are passed through opaquely (emission's defensive arm
+        // surfaces the error).
         Expression::InSubquery(_)
         | Expression::ExistsSubquery(_)
         | Expression::ScalarSubquery(_)
         | Expression::Lambda(_)
         | Expression::LambdaVariable(_)
         | Expression::RawSql(_)
-        | Expression::Interval(_) => Ok(expr),
-        // Defensive — Pass 85's `expand_regex_projections` pre-pass in
-        // `CommonOp::Project` rewrites this variant before we walk here.
-        // Any residual (e.g. nested inside another expression) is passed
-        // through opaquely; emission's defensive arm surfaces the error.
-        Expression::UnresolvedRegex(_) => Ok(expr),
+        | Expression::Interval(_)
+        | Expression::UnresolvedRegex(_) => Ok(expr),
+        // UpdateFields: recurse via the walker, then run Spark 4.1's
+        // `dropFields("X")` existence validation. See Catalyst
+        // `UpdateFields.scala::checkInputDataTypes`.
+        Expression::UpdateFields(_) => {
+            let recursed = expr.map_children(|e| resolve_and_stamp(e, schema))?;
+            if let Expression::UpdateFields(ref u) = recursed {
+                if let DataType::Struct(base_st) = u.struct_expr.data_type(schema) {
+                    let base_names: Vec<String> =
+                        base_st.fields.iter().map(|f| f.name.clone()).collect();
+                    if let Err(missing) =
+                        super::expression::validate_update_fields_ops(&base_names, &u.updates)
+                    {
+                        return Err(AnalyzerError::Other {
+                            reason: format!(
+                                "cannot resolve field `{missing}` in dropFields — not present in struct"
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(recursed)
+        }
+        // Default recursion: walk every immediate child via the shared
+        // walker. Covers Binary / Unary / FunctionCall / Cast / CaseWhen /
+        // Window / Alias / Between / InList / Like / IsDistinctFrom /
+        // ExtractValue / ArrayLiteral / MapLiteral / StructLiteral /
+        // RowConstructor plus the leaf variants (Literal, Star) which return
+        // themselves unchanged inside `map_children`.
+        _ => expr.map_children(|e| resolve_and_stamp(e, schema)),
     }
 }
 
@@ -2330,76 +2200,24 @@ fn stamp_column_reference(c: ColumnReference, schema: &StructType) -> ColumnRefe
 fn expression_is_fully_resolved(expr: &Expression) -> bool {
     match expr {
         Expression::UnresolvedColumn(_) => false,
+        // Pass 85 — pattern-driven column expander; expanded away by
+        // `expand_regex_projections` in the `CommonOp::Project` pre-pass.
+        // If it survives to this check, treat it as unresolved.
+        Expression::UnresolvedRegex(_) => false,
         Expression::ColumnReference(c) => c.data_type.is_some() && c.nullable.is_some(),
-        Expression::Literal(_) | Expression::Star(_) | Expression::LambdaVariable(_) => true,
-        Expression::Binary(b) => {
-            expression_is_fully_resolved(&b.left) && expression_is_fully_resolved(&b.right)
-        }
-        Expression::Unary(u) => expression_is_fully_resolved(&u.operand),
-        Expression::FunctionCall(f) => f.args.iter().all(expression_is_fully_resolved),
-        Expression::Cast(c) => expression_is_fully_resolved(&c.expr),
-        Expression::CaseWhen(cw) => {
-            cw.branches
-                .iter()
-                .all(|(w, t)| expression_is_fully_resolved(w) && expression_is_fully_resolved(t))
-                && cw
-                    .else_expr
-                    .as_ref()
-                    .is_none_or(|e| expression_is_fully_resolved(e))
-        }
-        Expression::Window(w) => {
-            expression_is_fully_resolved(&w.func)
-                && w.partition_by.iter().all(expression_is_fully_resolved)
-                && w.order_by
-                    .iter()
-                    .all(|so| expression_is_fully_resolved(&so.expr))
-        }
-        Expression::Alias(a) => expression_is_fully_resolved(&a.expr),
-        Expression::Between(b) => {
-            expression_is_fully_resolved(&b.expr)
-                && expression_is_fully_resolved(&b.low)
-                && expression_is_fully_resolved(&b.high)
-        }
-        Expression::InList(i) => {
-            expression_is_fully_resolved(&i.expr) && i.list.iter().all(expression_is_fully_resolved)
-        }
-        Expression::Like(l) => {
-            expression_is_fully_resolved(&l.value) && expression_is_fully_resolved(&l.pattern)
-        }
-        Expression::IsDistinctFrom(d) => {
-            expression_is_fully_resolved(&d.left) && expression_is_fully_resolved(&d.right)
-        }
-        Expression::ExtractValue(ev) => {
-            expression_is_fully_resolved(&ev.child) && expression_is_fully_resolved(&ev.extraction)
-        }
-        Expression::ArrayLiteral(a) => a.elements.iter().all(expression_is_fully_resolved),
-        Expression::MapLiteral(m) => m
-            .entries
-            .iter()
-            .all(|(k, v)| expression_is_fully_resolved(k) && expression_is_fully_resolved(v)),
-        Expression::StructLiteral(s) => s
-            .fields
-            .iter()
-            .all(|(_, e)| expression_is_fully_resolved(e)),
-        Expression::RowConstructor(rc) => rc.elements.iter().all(expression_is_fully_resolved),
-        Expression::UpdateFields(u) => {
-            expression_is_fully_resolved(&u.struct_expr)
-                && u.updates.iter().all(|(_, e)| match e {
-                    Some(expr) => expression_is_fully_resolved(expr),
-                    None => true,
-                })
-        }
-        // Subquery bodies: opaque (future τ work owns).
+        // Subquery / lambda / raw-sql / interval bodies: opaque by τ's walker
+        // convention (future τ work owns subquery analysis). Match
+        // `resolve_and_stamp`'s punt set so the two walkers agree on which
+        // nodes are "final".
         Expression::InSubquery(_)
         | Expression::ExistsSubquery(_)
         | Expression::ScalarSubquery(_)
         | Expression::Lambda(_)
         | Expression::RawSql(_)
         | Expression::Interval(_) => true,
-        // Pass 85 — pattern-driven column expander; expanded away by
-        // `expand_regex_projections` in the `CommonOp::Project` pre-pass.
-        // If it survives to this check, treat it as unresolved.
-        Expression::UnresolvedRegex(_) => false,
+        // Default recursion: all-children-resolved implies self-resolved. See
+        // [`Expression::children`] for the walked-child convention.
+        _ => expr.children().all(expression_is_fully_resolved),
     }
 }
 

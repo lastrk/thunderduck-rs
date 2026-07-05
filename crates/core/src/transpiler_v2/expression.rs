@@ -617,6 +617,239 @@ impl Expression {
         }
     }
 
+    // ── Structural walker ───────────────────────────────────────────────────
+
+    /// Iterate over the immediate child expressions of this node.
+    ///
+    /// **τ walker convention (behavior-preserving):**
+    /// - Subquery-body children (`InSubquery.expr`, `Lambda.body`) are
+    ///   included so downstream `map_children` calls can walk them.
+    /// - `WindowFunction.frame` boundary expressions are NOT included —
+    ///   they are always literal offsets in practice and τ's transform
+    ///   walkers historically did not recurse into them.
+    /// - The `CommonAst` subquery bodies inside `InSubquery`,
+    ///   `ExistsSubquery`, and `ScalarSubquery` are opaque to expression
+    ///   walkers by contract (future τ work owns subquery analysis).
+    ///
+    /// Analyzer walkers that punt on entire variants (subquery / lambda /
+    /// raw-sql / interval — see [`Self::map_children`] doc) should
+    /// custom-case those variants BEFORE falling through to the walker
+    /// default, since `children()` still enumerates the structural
+    /// expression children.
+    pub fn children(&self) -> Box<dyn Iterator<Item = &Expression> + '_> {
+        use Expression::*;
+        match self {
+            Literal(_) | ColumnReference(_) | UnresolvedColumn(_) | UnresolvedRegex(_)
+            | Star(_) | LambdaVariable(_) | RawSql(_) | Interval(_) | ExistsSubquery(_)
+            | ScalarSubquery(_) => Box::new(std::iter::empty()),
+
+            Unary(u) => Box::new(std::iter::once(u.operand.as_ref())),
+            Cast(c) => Box::new(std::iter::once(c.expr.as_ref())),
+            Alias(a) => Box::new(std::iter::once(a.expr.as_ref())),
+            Lambda(l) => Box::new(std::iter::once(l.body.as_ref())),
+            InSubquery(i) => Box::new(std::iter::once(i.expr.as_ref())),
+
+            Binary(b) => Box::new([b.left.as_ref(), b.right.as_ref()].into_iter()),
+            Like(l) => Box::new([l.value.as_ref(), l.pattern.as_ref()].into_iter()),
+            IsDistinctFrom(d) => Box::new([d.left.as_ref(), d.right.as_ref()].into_iter()),
+            ExtractValue(ev) => Box::new([ev.child.as_ref(), ev.extraction.as_ref()].into_iter()),
+            Between(b) => Box::new([b.expr.as_ref(), b.low.as_ref(), b.high.as_ref()].into_iter()),
+
+            FunctionCall(f) => Box::new(f.args.iter()),
+            ArrayLiteral(a) => Box::new(a.elements.iter()),
+            RowConstructor(rc) => Box::new(rc.elements.iter()),
+
+            CaseWhen(cw) => Box::new(
+                cw.branches
+                    .iter()
+                    .flat_map(|(w, t)| [w, t])
+                    .chain(cw.else_expr.as_deref()),
+            ),
+            InList(i) => Box::new(std::iter::once(i.expr.as_ref()).chain(i.list.iter())),
+            MapLiteral(m) => Box::new(m.entries.iter().flat_map(|(k, v)| [k, v])),
+            StructLiteral(s) => Box::new(s.fields.iter().map(|(_, e)| e)),
+
+            Window(w) => Box::new(
+                std::iter::once(w.func.as_ref())
+                    .chain(w.partition_by.iter())
+                    .chain(w.order_by.iter().map(|so| so.expr.as_ref())),
+            ),
+            UpdateFields(u) => Box::new(
+                std::iter::once(u.struct_expr.as_ref())
+                    .chain(u.updates.iter().filter_map(|(_, e)| e.as_ref())),
+            ),
+        }
+    }
+
+    /// Structural map: apply `f` to each immediate child expression,
+    /// preserving the node's structure.
+    ///
+    /// **Same child set as [`Self::children`]** (see its docstring for the
+    /// window-frame + subquery-body conventions).
+    ///
+    /// Transform walkers built on `map_children` should custom-case
+    /// variants that must be opaque to the transform (τ's
+    /// `resolve_and_stamp`, for example, treats `InSubquery`,
+    /// `ExistsSubquery`, `ScalarSubquery`, `Lambda`, `LambdaVariable`,
+    /// `RawSql`, and `Interval` as passthrough — matching semantics
+    /// preserved when `map_children` is called as the default arm).
+    pub fn map_children<E>(
+        self,
+        mut f: impl FnMut(Expression) -> Result<Expression, E>,
+    ) -> Result<Expression, E> {
+        use Expression::*;
+        match self {
+            Literal(_) | ColumnReference(_) | UnresolvedColumn(_) | UnresolvedRegex(_)
+            | Star(_) | LambdaVariable(_) | RawSql(_) | Interval(_) | ExistsSubquery(_)
+            | ScalarSubquery(_) => Ok(self),
+
+            Unary(mut u) => {
+                u.operand = Box::new(f(*u.operand)?);
+                Ok(Unary(u))
+            }
+            Cast(mut c) => {
+                c.expr = Box::new(f(*c.expr)?);
+                Ok(Cast(c))
+            }
+            Alias(mut a) => {
+                a.expr = Box::new(f(*a.expr)?);
+                Ok(Alias(a))
+            }
+            Lambda(mut l) => {
+                l.body = Box::new(f(*l.body)?);
+                Ok(Lambda(l))
+            }
+            InSubquery(mut i) => {
+                i.expr = Box::new(f(*i.expr)?);
+                Ok(InSubquery(i))
+            }
+
+            Binary(mut b) => {
+                b.left = Box::new(f(*b.left)?);
+                b.right = Box::new(f(*b.right)?);
+                Ok(Binary(b))
+            }
+            Like(mut l) => {
+                l.value = Box::new(f(*l.value)?);
+                l.pattern = Box::new(f(*l.pattern)?);
+                Ok(Like(l))
+            }
+            IsDistinctFrom(mut d) => {
+                d.left = Box::new(f(*d.left)?);
+                d.right = Box::new(f(*d.right)?);
+                Ok(IsDistinctFrom(d))
+            }
+            ExtractValue(mut ev) => {
+                ev.child = Box::new(f(*ev.child)?);
+                ev.extraction = Box::new(f(*ev.extraction)?);
+                Ok(ExtractValue(ev))
+            }
+            Between(mut b) => {
+                b.expr = Box::new(f(*b.expr)?);
+                b.low = Box::new(f(*b.low)?);
+                b.high = Box::new(f(*b.high)?);
+                Ok(Between(b))
+            }
+
+            FunctionCall(mut fc) => {
+                fc.args = fc
+                    .args
+                    .into_iter()
+                    .map(&mut f)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(FunctionCall(fc))
+            }
+            ArrayLiteral(mut a) => {
+                a.elements = a
+                    .elements
+                    .into_iter()
+                    .map(&mut f)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(ArrayLiteral(a))
+            }
+            RowConstructor(mut rc) => {
+                rc.elements = rc
+                    .elements
+                    .into_iter()
+                    .map(&mut f)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(RowConstructor(rc))
+            }
+
+            CaseWhen(mut cw) => {
+                cw.branches = cw
+                    .branches
+                    .into_iter()
+                    .map(|(w, t)| Ok::<_, E>((f(w)?, f(t)?)))
+                    .collect::<Result<Vec<_>, E>>()?;
+                if let Some(e) = cw.else_expr {
+                    cw.else_expr = Some(Box::new(f(*e)?));
+                }
+                Ok(CaseWhen(cw))
+            }
+            InList(mut i) => {
+                i.expr = Box::new(f(*i.expr)?);
+                i.list = i
+                    .list
+                    .into_iter()
+                    .map(&mut f)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(InList(i))
+            }
+            MapLiteral(mut m) => {
+                m.entries = m
+                    .entries
+                    .into_iter()
+                    .map(|(k, v)| Ok::<_, E>((f(k)?, f(v)?)))
+                    .collect::<Result<Vec<_>, E>>()?;
+                Ok(MapLiteral(m))
+            }
+            StructLiteral(mut s) => {
+                s.fields = s
+                    .fields
+                    .into_iter()
+                    .map(|(n, e)| Ok::<_, E>((n, f(e)?)))
+                    .collect::<Result<Vec<_>, E>>()?;
+                Ok(StructLiteral(s))
+            }
+
+            Window(mut w) => {
+                w.func = Box::new(f(*w.func)?);
+                w.partition_by = w
+                    .partition_by
+                    .into_iter()
+                    .map(&mut f)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut new_order = Vec::with_capacity(w.order_by.len());
+                for so in w.order_by {
+                    let e = f(*so.expr)?;
+                    new_order.push(SortOrder {
+                        expr: Box::new(e),
+                        direction: so.direction,
+                        null_ordering: so.null_ordering,
+                    });
+                }
+                w.order_by = new_order;
+                Ok(Window(w))
+            }
+            UpdateFields(mut u) => {
+                u.struct_expr = Box::new(f(*u.struct_expr)?);
+                u.updates = u
+                    .updates
+                    .into_iter()
+                    .map(|(n, opt_e)| {
+                        let mapped = match opt_e {
+                            Some(e) => Some(f(e)?),
+                            None => None,
+                        };
+                        Ok::<_, E>((n, mapped))
+                    })
+                    .collect::<Result<Vec<_>, E>>()?;
+                Ok(UpdateFields(u))
+            }
+        }
+    }
+
     // ── Binary data-type derivation ──────────────────────────────────────────
 
     fn binary_data_type(b: &BinaryExpression, schema: &StructType) -> DataType {
@@ -2194,5 +2427,122 @@ mod tests {
         // nullable=true.
         let s = StructType::new(vec![StructField::not_null("json_str", DataType::String)]);
         assert!(json_tuple_field_call("json_str", "a").nullable(&s));
+    }
+
+    // ── OPP-L — Expression::map_children / children walker ────────────────
+
+    /// Constructs a nested expression exercising the shapes actual analyzer
+    /// walkers care about — `Alias > FunctionCall > Binary > CaseWhen >
+    /// Literal` — and verifies `children()` reaches each immediate leaf
+    /// exactly once, and `map_children` visits the same immediate children
+    /// exactly once (identity mapping preserves the tree structure).
+    #[test]
+    fn map_children_visits_each_immediate_child_exactly_once() {
+        // Alias(FunctionCall("f", [Binary(Add, CaseWhen(when=Lit(1), then=Lit(2)) else=Lit(3), Lit(4))]))
+        let leaf_lit_1 = Expression::Literal(Literal {
+            value: LiteralValue::Int(1),
+            data_type: DataType::Integer,
+        });
+        let leaf_lit_2 = Expression::Literal(Literal {
+            value: LiteralValue::Int(2),
+            data_type: DataType::Integer,
+        });
+        let leaf_lit_3 = Expression::Literal(Literal {
+            value: LiteralValue::Int(3),
+            data_type: DataType::Integer,
+        });
+        let leaf_lit_4 = Expression::Literal(Literal {
+            value: LiteralValue::Int(4),
+            data_type: DataType::Integer,
+        });
+        let case_when = Expression::CaseWhen(CaseWhenExpression {
+            branches: vec![(leaf_lit_1, leaf_lit_2)],
+            else_expr: Some(Box::new(leaf_lit_3)),
+        });
+        let binary = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(case_when),
+            right: Box::new(leaf_lit_4),
+        });
+        let fcall = Expression::FunctionCall(FunctionCall {
+            name: "f".to_owned(),
+            args: vec![binary],
+            distinct: false,
+        });
+        let alias = Expression::Alias(AliasExpression {
+            expr: Box::new(fcall),
+            alias: "x".to_owned(),
+        });
+
+        // Alias has exactly one immediate child (the FunctionCall).
+        let children: Vec<&Expression> = alias.children().collect();
+        assert_eq!(
+            children.len(),
+            1,
+            "Alias should have exactly 1 immediate child (its inner expr)"
+        );
+        assert!(matches!(children[0], Expression::FunctionCall(_)));
+
+        // map_children on Alias should visit its one immediate child exactly
+        // once with the identity mapping and return an equal tree.
+        let mut visits = 0usize;
+        let mapped = alias
+            .clone()
+            .map_children(|e| {
+                visits += 1;
+                Ok::<_, ()>(e)
+            })
+            .expect("identity mapping cannot fail");
+        assert_eq!(
+            visits, 1,
+            "Alias::map_children should visit its immediate child exactly once"
+        );
+        assert_eq!(
+            mapped, alias,
+            "identity map_children must preserve structure"
+        );
+
+        // Recursive full-tree visit via a manual walker built on `map_children`.
+        // Verify the total leaf count (4 literals + 0 leaves visited by
+        // Alias/FunctionCall/Binary/CaseWhen internal recursion — each of
+        // those is an interior node) sums correctly.
+        fn count_leaves(e: &Expression) -> usize {
+            match e {
+                Expression::Literal(_) => 1,
+                _ => e.children().map(count_leaves).sum(),
+            }
+        }
+        assert_eq!(
+            count_leaves(&alias),
+            4,
+            "the tree contains exactly 4 leaf Literal nodes"
+        );
+    }
+
+    /// `Window::children` must reach `func + partition_by + order_by.expr`
+    /// but NOT into the frame boundary expressions (τ walker convention —
+    /// see [`Expression::children`] doc).
+    #[test]
+    fn window_children_skip_frame_boundary_expressions() {
+        let win = Expression::Window(WindowFunction {
+            func: Box::new(ColumnReference::untyped("a")),
+            partition_by: vec![ColumnReference::untyped("b")],
+            order_by: vec![SortOrder {
+                expr: Box::new(ColumnReference::untyped("c")),
+                direction: SortDirection::Ascending,
+                null_ordering: NullOrdering::NullsLast,
+            }],
+            frame: Some(WindowFrame {
+                unit: FrameUnit::Rows,
+                lower: FrameBoundary::Preceding(Box::new(Expression::Literal(Literal {
+                    value: LiteralValue::Int(1),
+                    data_type: DataType::Integer,
+                }))),
+                upper: FrameBoundary::CurrentRow,
+            }),
+        });
+        let children: Vec<&Expression> = win.children().collect();
+        // Exactly three children: func, one partition_by, one order_by.expr.
+        assert_eq!(children.len(), 3);
     }
 }

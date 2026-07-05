@@ -4594,32 +4594,12 @@ fn render_column_reference(c: &ColumnReference) -> Result<String, EmissionError>
 // raises with the class at the throw site, mirroring `spark_decimal_div` — it
 // avoids CASE-wrapping every division. The emitted-SQL guard below is the
 // in-repo interim; migrate when the extension gains those functions.
-// `pub(crate)` for Pass 10 (OPP-C): `spark_errors::SparkError::throw_expr`
-// references these consts. Pass 11 (OPP-J) will move the consts into
-// `spark_errors.rs` proper and drop the crate visibility here.
-pub(crate) const DIVIDE_BY_ZERO_MSG: &str = "Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
-pub(crate) const REMAINDER_BY_ZERO_MSG: &str = "Remainder by zero. Use `try_mod` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
-
-// Spark 4.1's `INVALID_ARRAY_INDEX_IN_ELEMENT_AT` message is runtime-templated
-// — the index value and array size are interpolated per row. The three
-// fragments below bracket the two `||`-concatenated substitutions:
-//
-//   HEAD || (idx)::VARCHAR || MID || len(arr)::VARCHAR || TAIL
-//
-// The backticks around `try_element_at` are safe inside a SQL single-quoted
-// string literal (only apostrophes need `''` escaping) — verified in DuckDB.
-// `pub(crate)` for Pass 10 (OPP-C): `spark_errors::SparkError::throw_expr`
-// references these fragments. Pass 11 (OPP-J) will relocate them.
-pub(crate) const INVALID_ARRAY_INDEX_MSG_HEAD: &str =
-    "[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index ";
-pub(crate) const INVALID_ARRAY_INDEX_MSG_MID: &str = " is out of bounds. The array has ";
-pub(crate) const INVALID_ARRAY_INDEX_MSG_TAIL: &str = " elements. Use `try_element_at` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003";
-
 // Pass 10 (OPP-C): the `array_index_error_expr` and `ansi_zero_guard` free
 // helpers were unified with [`super::spark_errors::SparkError`] +
 // [`super::spark_errors::ansi_throw_if`]. Call sites migrated inline; see
 // `render_element_at` (InvalidArrayIndex) and `render_binary` / pmod-mod
 // arm in `render_scalar_function_call` (DivideByZero / RemainderByZero).
+// Pass 11 (OPP-J) relocated the message-text consts into `spark_errors.rs`.
 
 /// True when `e` is a numeric literal that is provably non-zero, so the ANSI
 /// zero-guard can be skipped (the divisor can never be 0).
@@ -9148,6 +9128,9 @@ mod tests {
             "expected list_extract fall-through in ELSE, got: {sql}"
         );
         // Verbatim message fragments (bracket the runtime substitutions).
+        use super::super::spark_errors::{
+            INVALID_ARRAY_INDEX_MSG_HEAD, INVALID_ARRAY_INDEX_MSG_MID, INVALID_ARRAY_INDEX_MSG_TAIL,
+        };
         assert!(
             sql.contains(INVALID_ARRAY_INDEX_MSG_HEAD),
             "expected HEAD fragment, got: {sql}"

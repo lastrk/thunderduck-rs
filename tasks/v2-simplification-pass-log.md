@@ -466,3 +466,28 @@ is the pure move.
   --tests` → 69 pass / 0 fail + 14 ignored (matches HEAD).
 - **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` on
   touched files clean.
+
+## Pass 11 — OPP-J (2026-07-05)
+
+Move the Spark ANSI error-text constants (`DIVIDE_BY_ZERO_MSG`,
+`REMAINDER_BY_ZERO_MSG`, `INVALID_ARRAY_INDEX_MSG_{HEAD,MID,TAIL}`)
+from `emission.rs` (where Pass 10 left them as `pub(crate)` bridges)
+into `spark_errors.rs` proper. The consts now live next to the
+`SparkError` enum + `throw_expr()` / `ansi_throw_if` synthesis
+helpers that consume them.
+
+- **Files touched.**
+  - `crates/core/src/transpiler_v2/spark_errors.rs` — drop the
+    `use super::emission::{...}` bridge; consts now defined locally
+    with docstrings.
+  - `crates/core/src/transpiler_v2/emission.rs` — remove the 5 const
+    declarations (+ their comment blocks); test-side `sql.contains(...)`
+    assertions in `render_element_at_array_wraps_with_ansi_oob_guard`
+    now import the fragments via
+    `use super::super::spark_errors::{...}`.
+- **LOC delta.** −7 net (const bodies move; two comment blocks
+  slimmed).
+- **Corpus.** 314 → 314 (pure relocation; wire strings byte-identical).
+- **Warnings.** No delta.
+- **Gate.** `cargo test -p thunderduck-core --lib` → 452 pass / 0
+  fail. Scoped `rustfmt --edition 2021 --check` clean.

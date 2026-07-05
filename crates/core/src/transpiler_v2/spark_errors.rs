@@ -10,16 +10,31 @@
 //! plug in via one enum variant + one `throw_expr()` arm — no third
 //! near-duplicate helper.
 //!
-//! **Pass 10 (OPP-C) scope.** Only the enum + the two synthesis helpers move
-//! here; the const message strings intentionally stay in `emission.rs` for
-//! this pass (Pass 11 / OPP-J moves them). We reference them via
-//! `use super::emission::{...}` so the migration is a pure move, not a
-//! rewrite.
+//! **Pass 11 (OPP-J).** The const message strings live here now — adjacent
+//! to the enum + helpers that consume them. `emission.rs` test-side
+//! assertions (`sql.contains(INVALID_ARRAY_INDEX_MSG_HEAD)` etc.) import
+//! them via `use super::spark_errors::{...}`.
 
-use super::emission::{
-    DIVIDE_BY_ZERO_MSG, INVALID_ARRAY_INDEX_MSG_HEAD, INVALID_ARRAY_INDEX_MSG_MID,
-    INVALID_ARRAY_INDEX_MSG_TAIL, REMAINDER_BY_ZERO_MSG,
-};
+/// Spark ANSI-mode `[DIVIDE_BY_ZERO]` runtime message text. Interpolated
+/// into the DuckDB `error('[<CLASS>] <message>')` throw at emission time.
+pub(crate) const DIVIDE_BY_ZERO_MSG: &str = "Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
+
+/// Spark ANSI-mode `[REMAINDER_BY_ZERO]` runtime message text. Interpolated
+/// into the DuckDB `error('[<CLASS>] <message>')` throw at emission time.
+pub(crate) const REMAINDER_BY_ZERO_MSG: &str = "Remainder by zero. Use `try_mod` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
+
+// Spark 4.1's `INVALID_ARRAY_INDEX_IN_ELEMENT_AT` message is runtime-templated
+// — the index value and array size are interpolated per row. The three
+// fragments below bracket the two `||`-concatenated substitutions:
+//
+//   HEAD || (idx)::VARCHAR || MID || len(arr)::VARCHAR || TAIL
+//
+// The backticks around `try_element_at` are safe inside a SQL single-quoted
+// string literal (only apostrophes need `''` escaping) — verified in DuckDB.
+pub(crate) const INVALID_ARRAY_INDEX_MSG_HEAD: &str =
+    "[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index ";
+pub(crate) const INVALID_ARRAY_INDEX_MSG_MID: &str = " is out of bounds. The array has ";
+pub(crate) const INVALID_ARRAY_INDEX_MSG_TAIL: &str = " elements. Use `try_element_at` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003";
 
 /// Spark ANSI-mode throw classes τ emits at emission time.
 ///

@@ -527,3 +527,37 @@ STRUCT field cases). Extraction eliminates the sync tax.
 - **Gate.** `cargo test -p thunderduck-core --lib`: 453 pass / 0
   fail (baseline 452 + 1 new `pyspark_parity::tests`). Scoped
   `rustfmt --edition 2021 --check` clean.
+
+## Pass 13 — OPP-V (2026-07-05)
+
+Extract the 5 fattest `analyze_node` arms (SetOp, Join, NaFill,
+WithColumns, ToDf) into dedicated free functions matching
+`dispatch_op`'s uniform delegation shape.
+
+New free functions in `crates/core/src/transpiler_v2/analyzer.rs`:
+- `analyze_with_columns` — 56 LOC.
+- `analyze_na_fill` — 56 LOC.
+- `analyze_to_df` — 41 LOC.
+- `analyze_join` — 136 LOC (`#[allow(clippy::too_many_arguments)]`).
+- `analyze_set_op` — 217 LOC (biggest offender).
+
+Each corresponding `analyze_node` arm becomes a 3-8 line delegating
+call. Arm bodies moved verbatim; only the recursive `analyze_node
+(*input, base_types)` inside the arms adjusted to `analyze_node
+(input, base_types)` because the helpers accept unboxed
+`CommonAst` (matches the pre-existing `analyze_unpivot` /
+`analyze_describe` style).
+
+- **`analyze_node` LOC.** 940 → 500 (Δ −440).
+- **`analyzer.rs` total LOC.** 5741 → 5795 (Δ +54 — verbatim-extraction
+  floor: helper signatures + separator comment exceed savings from
+  the removed arm-scope braces). The plan's optimistic "~40 LOC
+  final `analyze_node`" projection assumed every arm collapse into a
+  single delegating line, but ~27 non-extracted arms retain their
+  destructure boilerplate. `dispatch_op`-uniform shape landed for
+  the 5 fat arms as intended.
+- **Corpus.** 314 → 314 (behavior-preserving; arm bodies moved
+  verbatim).
+- **Warnings.** No delta.
+- **Gate.** `cargo test -p thunderduck-core --lib --tests`: 453
+  pass / 0 fail. Scoped `rustfmt --edition 2021 --check` clean.

@@ -86,7 +86,7 @@ pub(crate) async fn transpile_relation(
 /// incurred (perf review HIGH #1).
 ///
 /// The catalog closure resolves empty-scan `TableScan` schemas from the
-/// session's temp-view cache (Slice B — the runtime→analyzer bridge).
+/// session's temp-view cache (the runtime→analyzer bridge).
 pub(crate) async fn finalize(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     common_ast: &CommonAst,
@@ -113,7 +113,7 @@ pub(crate) async fn analyze_schema(
 
 /// Build the per-path `BaseTypes` overlay for a `CommonAst`.
 ///
-/// Slice B: the catalog closure resolves each empty-scan `TableScan` from the
+/// The catalog closure resolves each empty-scan `TableScan` from the
 /// session's temp-view schema cache. `get_view_schema` is async and
 /// `build_from_plan`'s closure is sync, so we pre-fetch every table's schema
 /// into a map first, then feed `build_from_plan` a synchronous
@@ -181,7 +181,7 @@ impl SparkConnectService for ThunderduckService {
                 // `finalize` (inside `transpile_relation`) succeeds for every
                 // plan τ covers, so `execute_streaming_query` is live. DDL
                 // classification is still a placeholder — `classify_plan`
-                // always returns `Query` until Slice C.1 (see `execute_ddl`).
+                // always returns `Query` (see `execute_ddl`).
                 match classify_plan(&common_ast) {
                     PlanKind::Ddl => {
                         execute_ddl(&session, &common_ast, &sql, &session_id, &operation_id).await?
@@ -237,7 +237,7 @@ impl SparkConnectService for ThunderduckService {
                     }
                 };
                 // Session carries the temp-view catalog the analyzer resolves
-                // `TableScan` schemas from (Slice B catalog bridge).
+                // `TableScan` schemas from (catalog bridge).
                 let session = self
                     .session_manager
                     .get_or_create(&session_id)
@@ -245,7 +245,7 @@ impl SparkConnectService for ThunderduckService {
                     .map_err(|e| Status::internal(e.to_string()))?;
                 // E.0 addendum: route analyze_plan(Schema) through τ's
                 // analyzer. Parse the relation to CommonAst, then invoke
-                // `analyze_schema` — which runs the Slice-B analyzer without
+                // `analyze_schema` — which runs the analyzer without
                 // calling `dispatch_op`. Errors surface via the same
                 // two-category bridge `finalize` uses (AnalyzerError →
                 // EmissionError → ConnectError → Status).
@@ -426,7 +426,7 @@ async fn handle_command(
             // re-transpiles the echoed relation on `.collect()` via the Root
             // path.
             //
-            // TODO Slice C.1: eager DDL/DML side effects
+            // TODO: eager DDL/DML side effects
             // (`spark.sql("CREATE VIEW ...")`) and non-deterministic
             // re-evaluation (`rand()`, `current_timestamp()`) require eager
             // execution to a `LocalRelation` — out of scope for this pass.
@@ -449,7 +449,7 @@ async fn handle_command(
 //
 // These helpers consume `&CommonAst`. `execute_streaming_query` (the Query arm)
 // is live; `classify_plan` still collapses to `Query` and `execute_ddl` remains
-// an `unimplemented` placeholder until Slice C.1 wires DDL execution.
+// an `unimplemented` placeholder.
 
 /// Classification of a τ plan for execution routing.
 ///
@@ -542,13 +542,13 @@ async fn execute_streaming_query(
 
 /// Handle `CreateDataframeView` after successful transpile.
 ///
-/// **Slice B (owner):** register the temp view in the session — both in DuckDB
+/// Register the temp view in the session — both in DuckDB
 /// (so `SELECT * FROM <name>` executes) and in the session's Spark-schema cache
 /// (so the analyzer's catalog bridge can resolve the view's columns +
 /// nullabilities, which DuckDB's `CREATE VIEW` loses). Returns a lone
 /// `ResultComplete` (ADR-011 command-arm response shape).
 ///
-/// `is_global` (global temp views) is out of scope for Slice B: the view is
+/// `is_global` (global temp views) is out of scope: the view is
 /// registered session-local and a warning is logged.
 async fn handle_create_dataframe_view(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
@@ -560,7 +560,7 @@ async fn handle_create_dataframe_view(
     schema: StructType,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
     if is_global {
-        tracing::warn!(view = %name, "global temp view registered as session-local (Slice B)");
+        tracing::warn!(view = %name, "global temp view registered as session-local");
     }
     session
         .create_temp_view_with_schema(name, &sql, schema)
@@ -571,7 +571,7 @@ async fn handle_create_dataframe_view(
 
 /// Handle `SqlCommand` (both `input`-bearing and deprecated text paths).
 ///
-/// **Slice C.1 (owner):** SQL command execution over `CommonAst`.
+/// SQL command execution over `CommonAst`.
 ///
 /// Lazy-echo design (ADR-011 command-arm response shape): return a
 /// `SqlCommandResult` carrying the re-executable input relation verbatim,
@@ -1050,7 +1050,7 @@ mod tests {
 
     /// End-to-end smoke test for the future τ work.0 streaming-query wiring.
     ///
-    /// Marked `#[ignore]` because τ's Slice-C.1 `SingleRow` renderer emits a
+    /// Marked `#[ignore]` because τ's `SingleRow` renderer emits a
     /// bare `SELECT` (see `emission.rs::render_single_row`), which becomes
     /// `SELECT 1 FROM (SELECT) AS __td_proj` when wrapped by `render_project`
     /// — DuckDB rejects the bare `SELECT` subquery with "Parser Error: SELECT
@@ -1386,7 +1386,7 @@ mod tests {
         );
     }
 
-    // ── Pass 96 — Slice-B temp-view registration + catalog bridge ────────────
+    // ── Pass 96 — temp-view registration + catalog bridge ────────────────────
     //
     // These tests pin the two compounding fixes: (1) the catalog closure now
     // resolves an empty-scan `TableScan` from the session's temp-view schema

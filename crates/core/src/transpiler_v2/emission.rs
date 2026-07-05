@@ -27,8 +27,7 @@
 //! - The six unwired helpers under Decision 13-A (`render_tail`,
 //!   `render_distinct`, `render_with_columns`, `render_drop_columns`,
 //!   `render_aliased_relation`, `render_range_relation`) — private, marked
-//!   `#[allow(dead_code)]`, become one-line dispatch arms when the matching
-//!   `TypedOp` variants land in a future substrate slice.
+//!   `#[allow(dead_code)]`.
 //! - [`spark_return_cast`] (§5.1) and `spark_aggregate_return_cast` (§5.1,
 //!   `#[allow(dead_code)]` — wired by C.3) — two distinct `fn` items.
 
@@ -589,8 +588,7 @@ fn render_limit(
 //
 // These six renderers do not have `TypedOp` sinks in τ's analyzer's substrate. They
 // exist so the §5.4 CTE anchor for `render_tail` (and its sibling helpers)
-// live in code today; when a future substrate slice adds the missing
-// `TypedOp` variants, wiring is a one-line `dispatch_op` arm each.
+// live in code today.
 
 /// **§5.4 CTE rewrite.** DuckDB has no native TAIL operator; we synthesize it
 /// via `ROW_NUMBER() OVER ()` and select rows past `total_rows − n`. The child
@@ -2290,9 +2288,8 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `map()` literal — takes flat key/value pairs; DuckDB uses
         // `map { k: v, ... }` or `map_from_entries`. For a variable pair
         // count, emit via `map(list_value(k1,k2,...), list_value(v1,v2,...))`
-        // — but that requires splitting args. Punt for now: use the more
-        // permissive `map_from_entries` shape if args come pre-paired; the
-        // corpus-driven diagnostic will surface any residual case.
+        // — but that requires splitting args, so this uses the more
+        // permissive `map_from_entries` shape if args come pre-paired.
         // Spark's `create_map(k1, v1, k2, v2, ...)` (wire name `map`) builds
         // a MAP from interleaved key/value scalars. DuckDB's `map` expects
         // two lists (keys and values), so split the args and emit
@@ -2635,7 +2632,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let key_lit = sql_string_literal(&format!("$.{key}"));
             return Ok(format!("json_extract_string({json_sql}, {key_lit})"));
         }
-        // Spark → thdck_spark_funcs extension remaps (readiness map §4.1).
+        // Spark → thdck_spark_funcs extension remaps.
         // These functions require the ext6 extension, loaded at session
         // start by `DuckDbSession`.
         "hash" | "murmur3" => "spark_hash",
@@ -5141,8 +5138,8 @@ fn render_struct_literal(
 ///
 /// Wraps `expr_sql` in `CAST(... AS T)` iff the expression's Spark-typed
 /// result type requires a cast that DuckDB won't apply automatically. At
-/// τ's emission substrate this handles integer-integer division (Spark → Double); Slice
-/// C.2 extends it with the scalar-function Spark-parity table.
+/// τ's emission substrate this handles integer-integer division (Spark → Double)
+/// plus the scalar-function Spark-parity table.
 ///
 /// **§5.1 anchor.** MUST NOT share body with [`spark_aggregate_return_cast`].
 fn spark_return_cast(expr_sql: String, expr: &Expression, schema: &Schema) -> String {

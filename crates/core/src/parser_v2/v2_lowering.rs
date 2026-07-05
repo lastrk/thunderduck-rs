@@ -1,6 +1,6 @@
 //! sqlparser-rs AST → τ [`CommonAst`] lowering.
 //!
-//! Scope at Slice A.2 (per architecture plan §4):
+//! Scope (per architecture plan §4):
 //! - `SELECT expr, … FROM table WHERE … GROUP BY … ORDER BY … LIMIT n OFFSET m`
 //! - bare `SELECT literal`
 //! - `SELECT … FROM (VALUES ...)` and other subquery-in-FROM forms
@@ -60,7 +60,7 @@ pub fn lower_statement(stmt: Statement) -> Result<CommonAst, EmissionError> {
         Statement::Query(q) => lower_query(*q, &CteScope::new()),
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::{}", statement_kind(&other)),
-            reason: "parser_v2 only supports SELECT queries at Slice A.2".to_owned(),
+            reason: "parser_v2 only supports SELECT queries in τ".to_owned(),
         }),
     }
 }
@@ -202,7 +202,7 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
         SetExpr::Query(q) => lower_query(*q, cte_scope),
         SetExpr::Values(_) => Err(EmissionError::UnsupportedProtoShape {
             shape: "sql::values_top_level".to_owned(),
-            reason: "top-level VALUES not supported at Slice A.2 (only VALUES in FROM)".to_owned(),
+            reason: "top-level VALUES not supported in τ (only VALUES in FROM)".to_owned(),
         }),
         SetExpr::SetOperation {
             op,
@@ -244,7 +244,7 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
         }
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::set_expr::{other:?}"),
-            reason: "set expression not supported at Slice A.2".to_owned(),
+            reason: "set expression not supported in τ".to_owned(),
         }),
     }
 }
@@ -334,7 +334,7 @@ fn lower_aggregate_select(
             if !modifiers.is_empty() {
                 return Err(EmissionError::UnsupportedProtoShape {
                     shape: "sql::group_by_modifiers".to_owned(),
-                    reason: "GROUP BY modifiers (ROLLUP/CUBE/GROUPING SETS) deferred to Slice G"
+                    reason: "GROUP BY modifiers (ROLLUP/CUBE/GROUPING SETS) not supported in τ"
                         .to_owned(),
                 });
             }
@@ -364,7 +364,7 @@ fn lower_aggregate_select(
                 if sets.iter().any(|term| term.len() != 1) {
                     return Err(EmissionError::UnsupportedProtoShape {
                         shape: "sql::grouping_sets".to_owned(),
-                        reason: "nested ROLLUP/CUBE grouping terms deferred to Slice G".to_owned(),
+                        reason: "nested ROLLUP/CUBE grouping terms not supported in τ".to_owned(),
                     });
                 }
                 let mut flat: Vec<Expression> = Vec::new();
@@ -378,14 +378,14 @@ fn lower_aggregate_select(
                 // Plain GROUP BY, or an unsupported shape: bare GROUPING SETS,
                 // or a ROLLUP/CUBE mixed with other terms / repeated (Spark
                 // wraps the whole list in one wrapper — anything else is a
-                // Slice-G boundary reject).
+                // Thunderduck-boundary reject).
                 let mut plain: Vec<Expression> = Vec::with_capacity(exprs.len());
                 for e in exprs {
                     match e {
                         Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => {
                             return Err(EmissionError::UnsupportedProtoShape {
                                 shape: "sql::grouping_sets".to_owned(),
-                                reason: "GROUPING SETS / mixed ROLLUP/CUBE deferred to Slice G"
+                                reason: "GROUPING SETS / mixed ROLLUP/CUBE not supported in τ"
                                     .to_owned(),
                             });
                         }
@@ -431,8 +431,8 @@ fn lower_aggregate_select(
         .map(|item| lower_select_item(item, cte_scope))
         .collect();
     let projections = projections?;
-    // A.2 treats the aggregate projection list as the aggregate output list.
-    // Slice C.1 refines this into the {grouping, aggregates} split when the
+    // τ treats the aggregate projection list as the aggregate output list.
+    // This is refined into the {grouping, aggregates} split when the
     // canonical emission table lands; for now we push everything into
     // `aggregates` so the round-trip test can inspect the projection list.
     let aggregated = CommonAst::new(CommonOp::Aggregate {
@@ -524,7 +524,7 @@ fn lower_table_factor(
             subquery, alias: _, ..
         } => {
             // Subquery-in-FROM is lowered by inlining the inner plan. The
-            // derived-table alias is still dropped here (Slice A.2 scope), so a
+            // derived-table alias is still dropped here, so a
             // query that qualifies columns by the derived alias won't bind.
             // `AliasedRelation` IS live now (pass 101 wraps CTE references in it
             // with their alias) — preserving the derived alias the same way is a
@@ -537,7 +537,7 @@ fn lower_table_factor(
                 Expr::Function(f) => lower_table_function(f, cte_scope),
                 other => Err(EmissionError::UnsupportedProtoShape {
                     shape: format!("sql::table_function::{other:?}"),
-                    reason: "table function expr shape not supported at Slice A.2".to_owned(),
+                    reason: "table function expr shape not supported in τ".to_owned(),
                 }),
             }
         }
@@ -549,8 +549,7 @@ fn lower_table_factor(
             if array_exprs.len() != 1 {
                 return Err(EmissionError::UnsupportedProtoShape {
                     shape: "sql::unnest_multi_arg".to_owned(),
-                    reason: "UNNEST with multiple array arguments not supported at Slice A.2"
-                        .to_owned(),
+                    reason: "UNNEST with multiple array arguments not supported in τ".to_owned(),
                 });
             }
             let expr = array_exprs.into_iter().next().ok_or_else(|| {
@@ -622,12 +621,12 @@ fn lower_table_factor(
                     out
                 }
                 // ANY / subquery = dynamic pivot values; requires an eager
-                // DISTINCT query (Slice G) — Thunderduck-boundary (ADR-022),
+                // DISTINCT query — Thunderduck-boundary (ADR-022),
                 // mirrors the analyzer's `Pivot[implicit-values]` punt.
                 PivotValueSource::Any(_) | PivotValueSource::Subquery(_) => {
                     return Err(EmissionError::UnsupportedProtoShape {
                         shape: "sql::pivot::dynamic_values".to_owned(),
-                        reason: "dynamic PIVOT values (ANY / subquery) require an eager DISTINCT query (Slice G)".to_owned(),
+                        reason: "dynamic PIVOT values (ANY / subquery) require an eager DISTINCT query, not supported in τ".to_owned(),
                     });
                 }
             };
@@ -695,7 +694,7 @@ fn lower_table_factor(
         }
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::table_factor::{other:?}"),
-            reason: "table factor not supported at Slice A.2".to_owned(),
+            reason: "table factor not supported in τ".to_owned(),
         }),
     }
 }
@@ -746,7 +745,7 @@ fn lower_function_args(
         FunctionArguments::None => Ok(vec![]),
         FunctionArguments::Subquery(_) => Err(EmissionError::UnsupportedProtoShape {
             shape: "sql::function_args_subquery".to_owned(),
-            reason: "subquery function arguments deferred past Slice A.2".to_owned(),
+            reason: "subquery function arguments not supported in τ".to_owned(),
         }),
         FunctionArguments::List(list) => list
             .args
@@ -776,7 +775,7 @@ fn function_arg_to_expr(
         }
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::function_arg::{other:?}"),
-            reason: "function argument shape not supported at Slice A.2".to_owned(),
+            reason: "function argument shape not supported in τ".to_owned(),
         }),
     }
 }
@@ -796,7 +795,7 @@ fn lower_join_operator(
         other => {
             return Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("sql::join_operator::{other:?}"),
-                reason: "join operator not supported at Slice A.2".to_owned(),
+                reason: "join operator not supported in τ".to_owned(),
             });
         }
     };
@@ -850,7 +849,7 @@ fn select_item_has_aggregate(item: &SelectItem) -> bool {
 }
 
 fn expr_has_aggregate(expr: &Expr) -> bool {
-    // Slice A.2 fix pass (review M4): extend the walker to every composite
+    // Fix pass (review M4): extend the walker to every composite
     // shape the projection can contain. A missed shape used to mis-classify
     // e.g. `SELECT count(x) IN (1, 2)` as non-aggregate.
     match expr {
@@ -920,7 +919,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
 }
 
 fn is_aggregate_function_name(name: &str) -> bool {
-    // Slice A.2 fix pass (review M3 + perf OPT-5): defer to τ's canonical
+    // Fix pass (review M3 + perf OPT-5): defer to τ's canonical
     // aggregate roster (`transpiler_v2::type_inference::AGGREGATE_NAMES`)
     // instead of a locally-drifted 32-name subset. `eq_ignore_ascii_case`
     // avoids the per-call `String` allocation from `to_ascii_uppercase()`.
@@ -1010,7 +1009,7 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             UnaryOperator::Plus => lower_expr(*expr, cte_scope),
             other => Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("sql::unary_op::{other:?}"),
-                reason: "unary operator not supported at Slice A.2".to_owned(),
+                reason: "unary operator not supported in τ".to_owned(),
             }),
         },
         Expr::Nested(e) => lower_expr(*e, cte_scope),
@@ -1359,7 +1358,7 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
         Expr::TypedString(ts) => lower_typed_string(ts),
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::expr::{}", expr_kind(&other)),
-            reason: "expression shape not supported at Slice A.2".to_owned(),
+            reason: "expression shape not supported in τ".to_owned(),
         }),
     }
 }
@@ -1533,7 +1532,7 @@ fn lower_binary_op(op: BinaryOperator) -> Result<BinaryOp, EmissionError> {
         other => {
             return Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("sql::binary_op::{other:?}"),
-                reason: "binary operator not supported at Slice A.2".to_owned(),
+                reason: "binary operator not supported in τ".to_owned(),
             });
         }
     })
@@ -1559,7 +1558,7 @@ fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, Emiss
         FunctionArguments::Subquery(_) => {
             return Err(EmissionError::UnsupportedProtoShape {
                 shape: "sql::function_args_subquery".to_owned(),
-                reason: "subquery function arguments deferred past Slice A.2".to_owned(),
+                reason: "subquery function arguments not supported in τ".to_owned(),
             });
         }
     };
@@ -2053,7 +2052,7 @@ fn lower_value(vw: ValueWithSpan) -> Result<Expression, EmissionError> {
         })),
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::value::{other:?}"),
-            reason: "literal value shape not supported at Slice A.2".to_owned(),
+            reason: "literal value shape not supported in τ".to_owned(),
         }),
     }
 }
@@ -2076,7 +2075,7 @@ fn lower_data_type(dt: SqlDataType) -> Result<DataType, EmissionError> {
         other => {
             return Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("sql::data_type::{other:?}"),
-                reason: "data type not supported at Slice A.2".to_owned(),
+                reason: "data type not supported in τ".to_owned(),
             });
         }
     })
@@ -2172,7 +2171,7 @@ fn expr_to_i64(e: Expr) -> Result<i64, EmissionError> {
             }),
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::limit_offset_expr::{other:?}"),
-            reason: "LIMIT/OFFSET must be an integer literal at Slice A.2".to_owned(),
+            reason: "LIMIT/OFFSET must be an integer literal in τ".to_owned(),
         }),
     }
 }
@@ -2659,7 +2658,7 @@ mod tests {
 
     #[test]
     fn parse_group_by_grouping_sets_rejected() {
-        // GROUPING SETS still needs set-membership substrate (Slice G) — reject.
+        // GROUPING SETS still needs set-membership substrate — reject.
         let err = parse("SELECT a, b, COUNT(*) FROM t GROUP BY GROUPING SETS ((a), (b))")
             .expect_err("GROUPING SETS should be rejected");
         match err {

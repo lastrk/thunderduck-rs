@@ -1393,7 +1393,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
         } => {
             // UNION BY NAME is analyzed by name-matching each column across
             // children; INTERSECT / EXCEPT BY NAME are not supported by
-            // DuckDB itself so we still punt those to a future slice.
+            // DuckDB itself.
             if by_name && !matches!(kind, SetOpKind::Union) {
                 return Err(AnalyzerError::PuntedOperator {
                     op: format!("SetOp[{kind:?} BY NAME]"),
@@ -2093,8 +2093,7 @@ fn resolve_and_stamp(
         // `base_types` and carry the typed plan forward so emission renders it
         // node-local (ADR-007 A / INV2). A correlated inner ref to an outer
         // column is an `UnresolvedColumn` this isolated `analyze` cannot
-        // resolve → resolution error → honest Thunderduck boundary (ADR-022)
-        // until Slice F provides outer-before-inner staging.
+        // resolve → resolution error → honest Thunderduck boundary (ADR-022).
         Expression::ScalarSubquery(mut s) => {
             let inner = analyze_subquery_plan(s.subquery, base_types)?;
             if inner.resolved_schema.fields.len() != 1 {
@@ -2121,7 +2120,7 @@ fn resolve_and_stamp(
             e.subquery = SubqueryPlan::Analyzed(Box::new(inner));
             Ok(Expression::ExistsSubquery(e))
         }
-        // Lambda / raw-sql / interval — Slice B leaves them opaque.
+        // Lambda / raw-sql / interval — left opaque.
         Expression::Lambda(_)
         | Expression::LambdaVariable(_)
         | Expression::RawSql(_)
@@ -2469,7 +2468,7 @@ fn expression_is_fully_resolved(expr: &Expression) -> bool {
             expression_is_fully_resolved(&i.expr) && subquery_plan_is_resolved(&i.subquery)
         }
         Expression::ExistsSubquery(e) => subquery_plan_is_resolved(&e.subquery),
-        // Lambda / raw-sql / interval — opaque at Slice B.
+        // Lambda / raw-sql / interval — opaque.
         Expression::Lambda(_) | Expression::RawSql(_) | Expression::Interval(_) => true,
         // Pass 85 — pattern-driven column expander; expanded away by
         // `expand_regex_projections` in the `CommonOp::Project` pre-pass.

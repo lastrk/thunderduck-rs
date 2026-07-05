@@ -25,7 +25,7 @@ functions, and ROLLUP/CUBE.
 ## Architecture observations
 
 - **The catalog bridge (pass 96) was the keystone** — one pass greened 106 cases.
-  Almost all table-backed SQL was blocked on two Slice-B stubs (view registration
+  Almost all table-backed SQL was blocked on two analyzer stubs (view registration
   + the `|_| None` catalog closure), and the session already had the machinery.
 - **Most passes were lowering-only.** Per ADR-004 (SQL and DataFrame lower to the
   same common AST), the analyzer + emission substrate for set ops, windows,

@@ -120,7 +120,7 @@ the summary below records the corpus deltas by pass number.
 - Commit SHA: pending user approval.
 
 ## Pass 59 — 2026-07-03T (in progress)
-- Case cluster: `RelType::Unpivot` — piv-004 (`.unpivot(...)`), piv-005 (`.melt(...)`). Piv-006 (`stack()`) requires generator + multi-name-alias (Slice F territory), out of scope.
+- Case cluster: `RelType::Unpivot` — piv-004 (`.unpivot(...)`), piv-005 (`.melt(...)`). Piv-006 (`stack()`) requires generator + multi-name-alias (not yet implemented in τ), out of scope.
 - Diagnostic: `.agent-output/diagnostic-unpivot.md`
 - Architect verdict: APPROVED (fix iteration 1; review-fix iteration 1)
 - Layer(s) touched: AST (new CommonOp::Unpivot variant), converter (v2_relation_converter), analyzer (TypedOp::Unpivot, analyze_unpivot with Spark widening + empty-values expansion), emission (render_unpivot mirroring legacy UNPIVOT-with-pre-SELECT shape)
@@ -134,7 +134,7 @@ the summary below records the corpus deltas by pass number.
   - `emission::render_unpivot` — SQL shape `UNPIVOT (SELECT <ids,values> FROM <input>) ON <values> INTO NAME <var> VALUE <val>`; identifier quoting.
 - Files: `crates/core/src/transpiler_v2/{ast.rs, base_types.rs, analyzer.rs, emission.rs}`, `crates/connect-server/src/converter/v2_relation_converter.rs`.
 - Tests added: 10 (7 in initial impl + 3 in review-fix iteration for M2/M3 hardening).
-- Corpus signal: 220 → 222 (+2). Cluster: piv-004, piv-005. Piv-006 remains failing (generator work, Slice F).
+- Corpus signal: 220 → 222 (+2). Cluster: piv-004, piv-005. Piv-006 remains failing (generator work, a future τ effort).
 - Findings CLOSE_NOW_IN_THIS_PASS: 5 (M2 duplicate/overlap id+value name check, M3 variable/value col vs id name collision check, L2 test comment fix, OPT-1 HashMap-based O(F+I+V) resolution, OPT-3 String::with_capacity preallocation).
 - Findings queued as follow-up pass: 1 — **M1** "Spark-parity `unify_types` fallback → AnalyzerError" (systemic across Unpivot/SetOp/TableFunction; needs dedicated pass touching all three call sites).
 - Compiler warning delta: 36 → 36 (0 new on touched files).
@@ -145,7 +145,7 @@ the summary below records the corpus deltas by pass number.
 - Case cluster: `Aggregate::Pivot` — grp-004 (explicit pivot values), grp-005 (implicit / eager).
 - Layer(s) touched: AST (new CommonOp::Pivot), converter (v2_relation_converter), analyzer (TypedOp::Pivot, analyze_pivot with H1/H2 hardening), emission (render_pivot — conditional-aggregate SQL with NULLIF for COUNT-family, reads pivot names from analyzer-stamped schema).
 - ADR citations: ADR-013 (typed AST for Pivot), ADR-015 (Spark parity — column-name derivation for pivot values including float `1.0` formatting), ADR-022 (grp-005 implicit-values path punts as honest Thunderduck-boundary `PuntedOperator("Pivot[implicit-values]")` at analyzer, converted to `EmissionError::UnsupportedOp`).
-- Root cause: `Aggregate::Pivot` proto rejected at V2RelationConverter as "PIVOT deferred to Slice G". Legacy Pivot supports both explicit and implicit forms via session-scoped DISTINCT preloading.
+- Root cause: `Aggregate::Pivot` proto rejected at V2RelationConverter as "PIVOT not yet implemented in τ". Legacy Pivot supports both explicit and implicit forms via session-scoped DISTINCT preloading.
 - Fix: 
   - `CommonOp::Pivot { input, group_by, pivot_column, pivot_values, aggregates }` added.
   - Converter accepts explicit pivot_values; when values absent, still constructs the AST but analyzer punts.
@@ -164,7 +164,7 @@ the summary below records the corpus deltas by pass number.
 - Case cluster: `Expression::UpdateFields` — struct-005 (`.withField("country", lit("AT"))`), struct-006 (`.dropFields("geo")`).
 - Layer(s) touched: expression AST (UpdateFieldsExpression variant), converter (v2_relation_converter — ExprType::UpdateFields arm + flatten_update_fields), analyzer (resolve_and_stamp for UpdateFields + validate_update_fields_ops), emission (render_update_fields via struct_pack reconstruction).
 - ADR citations: ADR-013 (typed AST for UpdateFields), ADR-015 (Spark parity — case-insensitive field match; preserve original struct field casing; Spark 4.1 dropField-missing-target error), ADR-022 (missing drop target → Spark-emulated `AnalyzerError::Other`).
-- Root cause: `Expression::UpdateFields` was rejected at V2ExpressionConverter with "Slice A.2" gap.
+- Root cause: `Expression::UpdateFields` was rejected at V2ExpressionConverter with a substrate gap.
 - Fix:
   - `UpdateFieldsExpression { struct_expr, updates: Vec<(String, Option<Expression>)> }` in expression.rs (Some = withField / add-or-replace, None = dropField).
   - Converter flattens nested UpdateFields proto chain into single ordered ops list (oldest first).
@@ -416,7 +416,7 @@ the summary below records the corpus deltas by pass number.
 
 ## Pass 82 — 2026-07-04T (in progress)
 - Case cluster: **BUNDLED** — misc-007 (`freqItems`) implement + misc-006 (`crosstab`) punt.
-- Diagnostic: `.agent-output/diagnostic-pass-82.md` (split along ADR-022: freqItems has static schema — portable; crosstab schema depends on DISTINCT of col2 at runtime — needs Slice-G session-injected DISTINCT hook, same blocker as Pivot[implicit-values]).
+- Diagnostic: `.agent-output/diagnostic-pass-82.md` (split along ADR-022: freqItems has static schema — portable; crosstab schema depends on DISTINCT of col2 at runtime — needs a future τ session-injected DISTINCT hook, same blocker as Pivot[implicit-values]).
 - Architecture: `.agent-output/architecture-pass-82.md` (Pass-80 shape port for freqItems; `TypedOp::Crosstab` intentionally omitted since analyzer punts before construction — no dead arms).
 - Layer(s) touched: AST (`CommonOp::{FreqItems,Crosstab}` variants), converter (`convert_freq_items` with default support=0.01, `convert_crosstab`), analyzer (`TypedOp::FreqItems`, `analyze_freq_items` — per-col `Array<source_type>` with `contains_null=true` matching Spark's `ArrayType(t)` default; `CommonOp::Crosstab` arm punts with `PuntedOperator("Crosstab[dynamic-values]", ...)`), base_types (2 walker arms), emission (`render_freq_items` — WITH __freq_input__ AS MATERIALIZED, per-col LIST subquery with `HAVING COUNT(*) >= support * total`, defensive empty-cols guard).
 - ADR citations: ADR-003 (CommonAst extension), ADR-015 (Spark parity — Array<source_type> element type; ArrayType(t) default contains_null=true; fixes legacy `Array<String>` hardcode bug), ADR-020 (stock DuckDB — no extension needed), ADR-022 (Crosstab punt is correct boundary posture).
@@ -661,7 +661,7 @@ the summary below records the corpus deltas by pass number.
 - Case: `to_number("9.99", "9,999.99")` — Spark throws `INVALID_FORMAT.MISMATCH_INPUT` SQLSTATE 42601 because input doesn't match format's thousands separator; expected_error tag not yet applied.
 - Investigation: τ has a `try_to_number` arm at `emission.rs:4167-4191` handling only `9`/`0`/`.` templates; grouping (`,`) currently rejected as `Thunderduck-boundary`. Adding a `to_number` throwing arm requires Spark's `ToNumberParser` grammar coverage — full parity means either (a) a Rust `VScalar` UDF walking the format/input pair (analog: Pass 89's json_strip_nulls) or (b) a τ-side format-to-regex translator emitting `regexp_matches(input, '^<pattern>$')`-gated `try_cast`. Both are moderate-scope work beyond a single-arm guard.
 - Decision: NOT executed. Corpus stays at 313/11/324. Case reclassified in `.agent-output/unsolvable.md` from "Category A — Harness needs tri-state comparator" (now resolved for math/element_at via merged Pass 94 substrate) to "Category A′ — Rich Spark parity still-in-scope" (needs its own future pass).
-- Terminating this /goal at 313/324 with 11 cases still red — Categories A′ (parse-003), B (Slice-G, 3 cases), C (PySpark Arrow interval, 4 cases), D (parser Slice A.2, 2 cases), E (analyzer keyword-arg, 1 case). Final report updated at `.agent-output/final-report.md`; superseded predecessor was written at commit `692e7b0` (pre-merge).
+- Terminating this /goal at 313/324 with 11 cases still red — Categories A′ (parse-003), B (future τ work, 3 cases), C (PySpark Arrow interval, 4 cases), D (parser substrate, 2 cases), E (analyzer keyword-arg, 1 case). Final report updated at `.agent-output/final-report.md`; superseded predecessor was written at commit `692e7b0` (pre-merge).
 
 
 
@@ -670,23 +670,23 @@ the summary below records the corpus deltas by pass number.
 
 ## Pass 95 — 2026-07-05 — SQL corpus: spark.sql() SqlCommand execution (sel-007)
 - **Corpus: SQL front-end** (`differential/sql_corpus.py`, 262 cases via `spark.sql`, tracked by `tests/scripts/v2-sql-progress.sh` → `tests/integration/v2_sql_progress.md`). This is the first pass of the SQL-corpus pipeline (parallel to the DataFrame `core_v2` corpus).
-- Case: `sel-007` — `SELECT 1 AS one, 'x' AS s, true AS b` (catalog-free literal projection, no FROM). PySpark `spark.sql()` sends the query as a Spark Connect `SqlCommand` (whose `.input` is a `RelType::Sql` relation); `service.rs::handle_sql_command` was an `unimplemented("Slice C.1")` stub, so every `spark.sql()` failed before execution.
+- Case: `sel-007` — `SELECT 1 AS one, 'x' AS s, true AS b` (catalog-free literal projection, no FROM). PySpark `spark.sql()` sends the query as a Spark Connect `SqlCommand` (whose `.input` is a `RelType::Sql` relation); `service.rs::handle_sql_command` was an `unimplemented()` stub, so every `spark.sql()` failed before execution.
 - Diagnostic: `.agent-output/diagnostic-pass-95.md` — owning layer = connect-server service layer; the Root/relation path (`transpile_relation → execute_streaming_query`) already works; only the SqlCommand command arm was stubbed.
 - Architecture: `.agent-output/architecture-pass-95.md` — **lazy echo**: the command arm returns `SqlCommandResult { relation: Some(<input Sql relation>) }` + `ResultComplete`; PySpark's `CachedRelation` re-executes it as a Root plan on `.collect()` (zero new substrate, no Arrow→proto LocalRelation encoding). An eager `transpile_relation(&input_rel)?` in the arm forces parse+analyze at `sql()` time for Spark-parity `AnalysisException`. Deprecated `SqlCommand.sql` text branch synthesizes a `RelType::Sql`.
 - Layer(s) touched: connect-server service layer only (`service.rs`): `handle_sql_command` (stub → two-frame echo), `sql_command_result_response` (gains `relation` arg, drops `#[allow(dead_code)]`), the `SqlCommand` dispatch arm (obtain/synthesize input relation + eager validate). Removed the now-orphaned `transpile_raw_sql` helper. No τ core / analyzer / emission changes.
 - ADR citations: ADR-021 (typed `RelType::Sql` relation kept end-to-end — no SQL-string shortcut), ADR-022 (τ is the only path; eager validation routes both error categories through τ at command time), ADR-011 (fixes the command-vs-relation `ExecutePlanResponse` shape: `SqlCommandResult`+`ResultComplete`, not an ArrowBatch stream).
-- Corpus signal: 0 → **2** (+2). `sel-007` GREEN (target); the SqlCommand execution fix also unblocked one further catalog-free case (literal/VALUES). All `FROM <table>` cases remain red on the separate Slice-B catalog blocker ("table not found") — next pass.
+- Corpus signal: 0 → **2** (+2). `sel-007` GREEN (target); the SqlCommand execution fix also unblocked one further catalog-free case (literal/VALUES). All `FROM <table>` cases remain red on the separate analyzer catalog blocker ("table not found") — next pass.
 - Files: `crates/connect-server/src/service.rs`.
 - Tests added: 2 (`sql_command_select_literals_returns_echoed_relation` — modern-path echo fidelity + ResultComplete + no ArrowBatch; `sql_command_deprecated_text_synthesizes_sql_relation` — deprecated-text synthesis).
 - Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (+ 4 Low/informational: intended double-transpile, DDL-seam bounded by TODO, pre-existing parameterized-query gap, optional negative test). Perf 0 HIGH + 0 MEDIUM (LOW-1 needless `String` clone on the deprecated branch — fixed: clone → move).
-- Findings queued as follow-up: eager DDL/DML side effects (`spark.sql("CREATE VIEW ...")`) and non-deterministic re-evaluation require eager execution to a `LocalRelation` (marked `TODO Slice C.1:` in code); Slice-B temp-view registration + catalog bridge for `FROM <table>` cases.
+- Findings queued as follow-up: eager DDL/DML side effects (`spark.sql("CREATE VIEW ...")`) and non-deterministic re-evaluation require eager execution to a `LocalRelation` (marked `TODO:` in code); analyzer temp-view registration + catalog bridge for `FROM <table>` cases.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean on touched file, `cargo test -p thunderduck-connect-server --bins` 71/0 serially [pre-existing `/tmp` extension parallel flake], `v2-sql-progress.sh` 2/260/262 with sel-007 GREEN, no regressions — baseline was 0 green).
 - Commit SHA: (this commit).
 
-## Pass 96 — 2026-07-05 — SQL corpus: Slice-B temp-view registration + catalog bridge (sel-002)
+## Pass 96 — 2026-07-05 — SQL corpus: analyzer temp-view registration + catalog bridge (sel-002)
 - **Corpus: SQL front-end** (`differential/sql_corpus.py`). Target: `sel-002` — `SELECT * FROM emp`. The corpus registers 5 views via `createDataFrame(...).createOrReplaceTempView(...)` then queries them by name; every `FROM <table>` case failed with `[SPARK-EMULATED] table not found`.
-- Diagnostic: `.agent-output/diagnostic-pass-96.md` — TWO compounding stubs: (1) `service.rs::handle_create_dataframe_view` returned `unimplemented("Slice B")` (never registered the view), (2) `build_base_types` catalog closure was `|_| None` (analyzer could never resolve a table name). Session machinery `create_temp_view_with_schema` / `get_view_schema` already existed but was uncalled.
+- Diagnostic: `.agent-output/diagnostic-pass-96.md` — TWO compounding stubs: (1) `service.rs::handle_create_dataframe_view` returned `unimplemented()` (never registered the view), (2) `build_base_types` catalog closure was `|_| None` (analyzer could never resolve a table name). Session machinery `create_temp_view_with_schema` / `get_view_schema` already existed but was uncalled.
 - Architecture: `.agent-output/architecture-pass-96.md` — **pre-fetch map + sync closure** (blessed by ADR-012 line-318 short-circuit). `build_base_types` enumerates empty-scan table names, `await`s `session.get_view_schema` for each into a `HashMap`, then feeds `BaseTypes::build_from_plan` a sync `|name| map.get(name).cloned()` closure. Rejected `block_in_place`/channel-in-closure (deadlock risk — `duckdb::Connection` is `!Send`) and full-catalog snapshot (more machinery). Keeps the closure the sole INV10 runtime→analyzer bridge; no `transpiler_v2/` behavior change.
 - Layer(s) touched: connect-server service layer (`service.rs`): `handle_create_dataframe_view` (stub → `create_temp_view_with_schema` + ResultComplete), `build_base_types`/`finalize`/`analyze_schema`/`transpile_relation` became `async` + take `&Arc<DuckDbSession>`, catalog closure pre-fetches from the session. τ core: `base_types.rs` gained additive `pub fn empty_scan_tables` (wrapper over the private walker). No analyzer/emission change.
 - ADR citations: ADR-012 (narrow catalog overlay — commands write via `create_temp_view_with_schema`, resolution reads via the seeded closure; +line-318 `plan_has_empty_scan` short-circuit honored), ADR-011 (CreateDataframeView → `ResultComplete` only), ADR-021/INV10 (closure sole bridge; runtime types fully-qualified, no new `use` under τ), ADR-022 (`UnknownTable` stays Spark-emulated for unregistered names; registration failures → Thunderduck-boundary), ADR-005/006 (analyzer resolves TableScan from BaseTypes).
@@ -700,7 +700,7 @@ the summary below records the corpus deltas by pass number.
 - Commit SHA: (this commit).
 
 ## Pass 97 — 2026-07-05 — SQL corpus: set operations lowering (set-001 cluster)
-- **Corpus: SQL front-end.** Target: same-shape cluster `set-001..010` (UNION/INTERSECT/EXCEPT/MINUS × ALL/DISTINCT, n-ary, +ORDER BY). All 10 failed at one seam: `parser_v2` rejected set ops (`sql::set_operation::* deferred past Slice A.2`).
+- **Corpus: SQL front-end.** Target: same-shape cluster `set-001..010` (UNION/INTERSECT/EXCEPT/MINUS × ALL/DISTINCT, n-ary, +ORDER BY). All 10 failed at one seam: `parser_v2` rejected set ops (`sql::set_operation::*` unimplemented in the substrate).
 - Diagnostic: `.agent-output/diagnostic-pass-97.md` — LOWERING-ONLY. τ's `CommonOp::SetOp`/`SetOpKind`, the analyzer's set-op widening (ADR-006), and emission's `render_set_op` already exist and are green via the DataFrame path (`convert_set_op` builds the identical op). Only `v2_lowering::lower_set_expr` rejected `SetExpr::SetOperation`.
 - Architecture: `.agent-output/architecture-pass-97.md` — replace the reject arm with a mapping + binary recursion building `CommonOp::SetOp { kind, all, by_name:false, allow_missing_columns:false, children:[left,right] }`. `Except|Minus→Except`; `all` only on explicit `ALL`. n-ary via recursion (no flatten); ORDER BY already wrapped by `wrap_with_sort_limit`.
 - Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`, one arm). No analyzer/emission/ast change.
@@ -732,14 +732,14 @@ the summary below records the corpus deltas by pass number.
 
 ## Pass 99 — 2026-07-05 — SQL corpus: tech-debt sweep (passes 95–98)
 - **Tech-debt sweep** (every-5th-pass): rust-reviewer over `git diff 096c55d..HEAD` (SqlCommand exec, temp-view+catalog, set-op + window/interval lowering). No Critical/High debt; 0 compiler warnings pre-sweep.
-- Fixed: **M1** — extracted `relation_to_common_ast(relation) -> Result<CommonAst, Status>` (the RelType::Sql-vs-V2RelationConverter dispatch was duplicated verbatim in `transpile_relation` and the `AnalyzePlan(Schema)` arm; two copies would drift). **M2** — corrected 3 stale Slice-A.3 comment blocks that still claimed "`finalize()` errors unconditionally / τ returns UnsupportedOp for every input" (false since passes 95-96 — `execute_streaming_query` is live). **L1** — `build_base_types` dropped the redundant `plan_has_empty_scan` walk (now short-circuits on `empty_scan_tables(...).is_empty()`), and removed the resulting unused `plan_has_empty_scan` import (new warning fixed on the touched file).
-- Dismissed (reviewer-recommended): L3 (`map.remove` over `.cloned()` — trades a fragile single-invocation coupling for a negligible clone; keep `.cloned()`). Deferred (Low): L2 negative-lookup memoization, L4 `bool_batch_responses` dead scaffolding (intentional Slice C.1), L5 named-window errors should be Spark-emulated class (message-quality only), L6 error-shape prefix nit.
+- Fixed: **M1** — extracted `relation_to_common_ast(relation) -> Result<CommonAst, Status>` (the RelType::Sql-vs-V2RelationConverter dispatch was duplicated verbatim in `transpile_relation` and the `AnalyzePlan(Schema)` arm; two copies would drift). **M2** — corrected 3 stale comment blocks that still claimed "`finalize()` errors unconditionally / τ returns UnsupportedOp for every input" (false since passes 95-96 — `execute_streaming_query` is live). **L1** — `build_base_types` dropped the redundant `plan_has_empty_scan` walk (now short-circuits on `empty_scan_tables(...).is_empty()`), and removed the resulting unused `plan_has_empty_scan` import (new warning fixed on the touched file).
+- Dismissed (reviewer-recommended): L3 (`map.remove` over `.cloned()` — trades a fragile single-invocation coupling for a negligible clone; keep `.cloned()`). Deferred (Low): L2 negative-lookup memoization, L4 `bool_batch_responses` dead scaffolding (intentional), L5 named-window errors should be Spark-emulated class (message-quality only), L6 error-shape prefix nit.
 - Files: `crates/connect-server/src/service.rs`. No behavior change (refactor); corpus stays 132.
 - Quality Gate: PASS (cargo check --workspace --all-targets 0 warnings, rustfmt clean, `cargo test -p thunderduck-connect-server --bins` 74/0 serially).
 - Commit SHA: (this commit).
 
 ## Pass 100 — 2026-07-05 — SQL corpus: ROLLUP / CUBE lowering (gx cluster) [final feature pass]
-- **Corpus: SQL front-end.** Target: `gx-*` GROUP BY extensions. Diagnostic split the cluster three ways: ROLLUP/CUBE (lowering-only, substrate green via DataFrame path), GROUPING SETS (needs set-membership emission — Slice G), `WITH ROLLUP` Hive suffix (dialect gap).
+- **Corpus: SQL front-end.** Target: `gx-*` GROUP BY extensions. Diagnostic split the cluster three ways: ROLLUP/CUBE (lowering-only, substrate green via DataFrame path), GROUPING SETS (needs set-membership emission — a future τ effort), `WITH ROLLUP` Hive suffix (dialect gap).
 - Diagnostic: `.agent-output/diagnostic-pass-100.md` — reject at `v2_lowering.rs` `lower_aggregate_select`; `GroupingKind::{Rollup,Cube}` + native emission (emission.rs:4678) + analyzer + `grouping()`/`grouping_id()` rewrite all already done and green via DataFrame grp-001/002/003/006.
 - Architecture: `.agent-output/architecture-pass-100.md` — flatten `Expr::Rollup/Cube` (`Vec<Vec<Expr>>`) into τ's flat `grouping` list + set `grouping_kind`, mirroring `v2_relation_converter.rs:642`. Keep rejecting GROUPING SETS.
 - Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`). No analyzer/emission/ast change.
@@ -748,7 +748,7 @@ the summary below records the corpus deltas by pass number.
 - Files: `crates/core/src/parser_v2/v2_lowering.rs`.
 - Tests added: 4 (rollup, cube, GROUPING-SETS reject, nested-ROLLUP-term reject).
 - Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + **1 High CLOSED** (H1: nested grouping terms `ROLLUP((a,b),c)` were silently flattened to `ROLLUP(a,b,c)` — different grouping sets, silent wrong result on valid Spark input; now loud-rejects `sql::grouping_sets` + regression test). Perf negligible (parse-time).
-- Findings queued as follow-up: **gx-007/gx-008 fail on an ANALYZER-nullability gap** — Spark marks GROUP-BY-ROLLUP/CUBE grouping columns nullable (subtotal rows carry NULL); τ's analyzer keeps them non-nullable (schema mismatch). Same class as the set-op nullability gap (set-004/006/008). gx-003/004 GROUPING SETS (set-membership emission, Slice G); gx-010 `WITH ROLLUP` (SparkDialect `supports_group_by_with_modifier` override + modifier lowering).
+- Findings queued as follow-up: **gx-007/gx-008 fail on an ANALYZER-nullability gap** — Spark marks GROUP-BY-ROLLUP/CUBE grouping columns nullable (subtotal rows carry NULL); τ's analyzer keeps them non-nullable (schema mismatch). Same class as the set-op nullability gap (set-004/006/008). gx-003/004 GROUPING SETS (set-membership emission, a future τ effort); gx-010 `WITH ROLLUP` (SparkDialect `supports_group_by_with_modifier` override + modifier lowering).
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 640/0, `sql_v2` differential 137/125/262 with 5 gx cases GREEN, no regressions).
 - Commit SHA: (this commit).
@@ -815,7 +815,7 @@ the summary below records the corpus deltas by pass number.
 
 ## Pass 105 — 2026-07-05 — SQL corpus: tech-debt sweep (passes 101–104) [run 2]
 - **Tech-debt sweep** (every-5th-pass): rust-reviewer over `git diff 7b85190..HEAD` (CTE inlining + CteScope threading, SQL-syntax function forms, IS DISTINCT FROM/`<=>`, set-op operator-aware nullability). Nothing Critical/High/Medium; 0 compiler warnings.
-- Fixed: **L1** — stale comment on the `TableFactor::Derived` arm claiming `AliasedRelation` is a "deferred Slice C.1 variant" (false since pass 101 made it live for CTE references); reworded to note the derived-table alias is still dropped at Slice A.2 scope and preserving it (via AliasedRelation, now proven live) is a follow-up that would green tbl-010.
+- Fixed: **L1** — stale comment on the `TableFactor::Derived` arm claiming `AliasedRelation` is a "deferred variant" (false since pass 101 made it live for CTE references); reworded to note the derived-table alias is still dropped at the current substrate scope and preserving it (via AliasedRelation, now proven live) is a follow-up that would green tbl-010.
 - Verified clean (reviewer): CteScope threading complete/consistent (lower_expr correctly does NOT take the scope — expression-level subqueries reject wholesale, so no silent mis-resolution); entry-point `&CteScope::new()` cheap; shape-string naming consistent; analyzer set-op index accesses arity-guarded (no panic); by-name branch OR-fold correct (unionByName-only). Deferred L2 (minor lower_expr arm duplication — marginal churn, defensible to leave).
 - Files: `crates/core/src/parser_v2/v2_lowering.rs` (comment only; behavior-preserving; corpus stays 153).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, 0 warnings).
@@ -823,15 +823,15 @@ the summary below records the corpus deltas by pass number.
 
 ## Pass 106 — 2026-07-05 — SQL corpus: uncorrelated scalar/IN/EXISTS subqueries (sq-001 cluster) [run 2]
 - **Corpus: SQL front-end.** Target: uncorrelated subqueries sq-001 (scalar in SELECT), sq-002 (scalar in WHERE), sq-005 (EXISTS), sq-008 (IN), sq-009 (NOT IN + 3VL), sq-020 (scalar in CASE), sq-021 (IN over GROUP BY/HAVING). The biggest single bucket. NOT lowering-only.
-- Diagnostic: `.agent-output/diagnostic-pass-106.md` — the 3 τ subquery Expression variants exist but were STUBBED end-to-end (lowering catch-all rejects; analyzer opaque; emission UnsupportedExpression). FOUR seams needed. Correlated (10) need Slice-F outer-column staging → deferred; quantified ALL/ANY need a new variant → deferred.
+- Diagnostic: `.agent-output/diagnostic-pass-106.md` — the 3 τ subquery Expression variants exist but were STUBBED end-to-end (lowering catch-all rejects; analyzer opaque; emission UnsupportedExpression). FOUR seams needed. Correlated (10) need future τ outer-column staging → deferred; quantified ALL/ANY need a new variant → deferred.
 - Architecture: `.agent-output/architecture-pass-106.md` — option (a), ADR-007 A (analyzer annotates, emission node-local): `SubqueryPlan { Unanalyzed(Box<CommonAst>), Analyzed(Box<TypedAst>) }` on the 3 variants; lowering builds Unanalyzed; analyzer recurses `analyze(inner, base_types)` → Analyzed + types (scalar→inner col-0 nullable; IN→Bool 3VL; EXISTS→Bool); **Seam D** base_types descends into subqueries for catalog pre-fetch; emission renders node-local via dispatch_op.
 - Layer(s) touched: τ lowering + analyzer + base_types + emission + expression (5 files). Correlated → honest UnknownColumn boundary error.
-- ADR citations: ADR-007 A (analyzer annotates the node; emission renders node-local — SubqueryPlan carries the analyzed inner plan), ADR-008 (subqueries; correlated deferred to Slice F), ADR-022 (correlated/quantified → boundary), ADR-016 (3VL NOT IN — native emission preserves Spark/DuckDB parity).
+- ADR citations: ADR-007 A (analyzer annotates the node; emission renders node-local — SubqueryPlan carries the analyzed inner plan), ADR-008 (subqueries; correlated deferred to a future τ effort), ADR-022 (correlated/quantified → boundary), ADR-016 (3VL NOT IN — native emission preserves Spark/DuckDB parity).
 - Corpus signal: 153 → **160** (+7). sq-001/002/005/008/009/020 GREEN + 1 collateral. **core_v2 held at 313 (no regression** — base_types threading is inert for non-subquery expressions). sq-021 (GROUP BY/HAVING in subquery) still red.
 - Files: `crates/core/src/transpiler_v2/{expression,analyzer,base_types,emission}.rs`, `crates/core/src/parser_v2/v2_lowering.rs`.
 - Tests added: ~15 across the 5 files (SubqueryPlan states, lowering arms, analyzer typing + single-column boundary + correlated→boundary, Seam D collection, emission shapes, + `subquery_sees_outer_cte_scope`).
 - Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High. **M1 (Medium) CLOSED in-pass** — subquery arms initially lowered the inner query with an empty CteScope (silent-shadow risk: an outer CTE invisible in a subquery could read a same-named base table); fixed by threading `cte_scope` into `lower_expr` (13 signatures, ~45 call sites) so subqueries see outer CTEs (correct Spark shadowing). **L1 CLOSED** — `for_each_node_expr` `_ => {}` → exhaustive match (gotcha #9; future expr-bearing CommonOp now fails to compile until wired). Perf (reviewer): inner plan analyzed exactly once (idempotent); Seam D redundant-walk negligible at corpus scale (Low).
-- Findings queued as follow-up: correlated subqueries (10 cases, Slice F outer-col staging); quantified ALL/ANY (sq-011/012/013 — new variant); sq-021 (aggregate/HAVING-in-subquery diff); cte-006 (WITH-inside-subquery — separate); L2 (InSubquery nullability hard-true — projected-IN only); L3 (multi-col scalar error class); Seam D perf (bool short-circuit variant of plan_has_empty_scan).
+- Findings queued as follow-up: correlated subqueries (10 cases, future τ outer-col staging); quantified ALL/ANY (sq-011/012/013 — new variant); sq-021 (aggregate/HAVING-in-subquery diff); cte-006 (WITH-inside-subquery — separate); L2 (InSubquery nullability hard-true — projected-IN only); L3 (multi-col scalar error class); Seam D perf (bool short-circuit variant of plan_has_empty_scan).
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 677/0, `sql_v2` 160/102/262, `core_v2` 313/324 no regression).
 - Commit SHA: (this commit).
@@ -899,7 +899,7 @@ the summary below records the corpus deltas by pass number.
 - Files: `crates/core/src/parser_v2/v2_lowering.rs`.
 - Tests added: 4 (ILIKE case_insensitive + negated; RLIKE→rlike FunctionCall + NOT-wrap).
 - Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High. **1 Medium CLOSED** — `Expr::SimilarTo` was mapped to `rlike` (silent wrong semantics: SIMILAR TO is anchored/whole-string, rlike is unanchored; `'abc' SIMILAR TO 'b'` = FALSE but rlike = TRUE); changed to a Thunderduck-boundary reject (ADR-022). Low (deferred): SimilarTo/NOT-RLIKE differential coverage; ILIKE non-ASCII case-folding edge.
-- Findings queued as follow-up: correlated subqueries (biggest bucket — needs a wide emission alias-visibility fix + analyzer outer-scope stack, 2-pass Slice-F effort; design in `.agent-output/diagnostic-pass-111.md`); compound interval TYPES (YearMonth/DayTime + Arrow round-trip); gx-008 (fold declared at lowering); gx-007 (HAVING-agg emission); tuples/row-values; GROUPING SETS emission; lateral view; DISTINCT.
+- Findings queued as follow-up: correlated subqueries (biggest bucket — needs a wide emission alias-visibility fix + analyzer outer-scope stack, a 2-pass future τ effort; design in `.agent-output/diagnostic-pass-111.md`); compound interval TYPES (YearMonth/DayTime + Arrow round-trip); gx-008 (fold declared at lowering); gx-007 (HAVING-agg emission); tuples/row-values; GROUPING SETS emission; lateral view; DISTINCT.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 709/0, `sql_v2` 171/91/262, no regressions).
 - Commit SHA: (this commit).

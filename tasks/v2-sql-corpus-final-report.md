@@ -5,11 +5,14 @@
 **Result:** **0 → 173 / 262 (66%)** across 19 committed pipeline passes (`096c55d…80e166e`)
 **Status:** paused at checkpoint (per user direction, 2026-07-05)
 
-> The last verified differential run was **173 passed / 89 failed** (pass 113).
-> Spark is not installed in the current environment, so the per-case split below
-> is reconstructed from the 19-pass diagnostic record + the corpus taxonomy, not a
-> fresh live run. The **grouping is by *kind of work needed*** — which is what
-> matters for deciding the next phase — not a claim of exact live pass/fail per id.
+> **Numbers verified live.** Ran against reference Spark 4.1.1 on 2026-07-05:
+> `sql_v2` = **173 passed / 89 failed / 262**; `core_v2` (DataFrame) = **313 / 324**,
+> both exactly on baseline. The 89 failing case IDs below are **ground truth**, not
+> reconstruction. **Correction:** an earlier draft estimated the per-category split
+> *without* a live Spark run and got several clusters wrong — most importantly it
+> called joins and qualified-reference selects "delivered green" when **joins are
+> 2/16 (essentially red)** and basic qualified-ref/aliased selects fail. This
+> version is corrected against the live run.
 
 ---
 
@@ -22,150 +25,160 @@ review → perf → log → commit.
 That pipeline is implicitly a **lowering-driven** climb. Per **ADR-004**, the SQL
 front-end and the DataFrame API lower to the *same* common AST; the analyzer
 (ADR-005/006), the emission table (ADR-007), and the type system are **shared** and
-already green (proven by the DataFrame corpus, `core_v2`, held at 313 throughout).
-So the goal's working assumption was: *each failing SQL case = a lowering gap*,
-fixable by teaching `v2_lowering.rs` to translate one more piece of SQL syntax into
-the existing AST — a small, low-risk, single-pass unit of work.
+green *for the DataFrame surface* (`core_v2` held at 313 throughout). The working
+assumption was: *each failing SQL case = a lowering gap*, a small single-pass unit.
 
-**That assumption held for the first ~173 cases and is now exhausted.** The
-remaining 89 split into a shrinking set of true lowering gaps (within mandate) and a
-majority that need work in the *shared* layers the goal assumed complete — emission,
-the analyzer's scope/resolution, the type system, and new AST node kinds. Those are
-**architecturally larger, wider-blast-radius, multi-pass efforts** that the
-one-case-per-pass lowering pipeline is the wrong shape for.
+**That assumption was only partly right, and the live run shows why.** Many SQL
+constructs exercise emission/analyzer paths the DataFrame corpus never reaches —
+so "shared and green" did not transfer. The 89 remaining failures are dominated by
+whole clusters (joins, correlated subqueries, table expressions) that need
+emission/analyzer work, not one-line lowering arms.
 
 ---
 
-## 2. What was delivered (the green 173)
+## 2. What is actually green (173) — by section
 
-Fully or largely green sections (lowering-driven wins, all reviewed, no `core_v2`
-regression):
+Live per-section pass counts (green / total):
 
-- **Foundation keystone** — `SqlCommand` execution, temp-view registration, and the
-  catalog bridge / `build_base_types` pre-fetch (+106 in one pass — the entire
-  `FROM <view>` surface went from impossible to working).
-- **select / predicate / join / ordering / conditional** — projection, qualified &
-  backtick aliases, `DISTINCT`, arithmetic, boolean cols, `WHERE`/`HAVING` (basic),
-  all join types, `ORDER BY … NULLS`, `LIMIT`, `CASE`, null functions, `ORDER BY ALL`.
-- **aggregate** — `GROUP BY`, `ROLLUP`, `CUBE`, most aggregate functions.
-- **scalar_fn** — SQL-syntax functions (`SUBSTRING`/`TRIM`/`POSITION`/`OVERLAY`),
-  `IS DISTINCT FROM`, `<=>`, `IS TRUE/FALSE`, `ILIKE`/`RLIKE`, `a DIV b`.
-- **subquery (uncorrelated)** — `IN`/`EXISTS`/scalar subqueries with no outer ref.
-- **cte (non-recursive, uncorrelated)**, **window**, **set ops** (incl. `UNION BY NAME`
-  guard), **pivot/unpivot** (basic), **typed literals** (`DATE`/`TIMESTAMP`/decimal),
-  **numeric tower** (result-type pins).
+| Section | Green | Notes |
+|---|---|---|
+| **ordering** | **12 / 12** | fully green (incl. `ORDER BY ALL`) |
+| **window** | **16 / 16** | fully green |
+| numeric_tower | 26 / 32 | most per-type result pins hold |
+| scalar_fn | 17 / 20 | SQL-syntax fns, `IS DISTINCT FROM`, `<=>`, `ILIKE`/`RLIKE`, `DIV` |
+| predicate (WHERE) | 15 / 16 | |
+| aggregate | 12 / 20 | GROUP BY / ROLLUP / CUBE + common aggregates |
+| select | 12 / 16 | **4 fail** — see below |
+| conditional | 10 / 12 | |
+| setop | 9 / 10 | incl. `UNION BY NAME` guard |
+| complex_type | 7 / 14 | |
+| subquery | 7 / 22 | only the **uncorrelated** ones |
+| predicate_adv | 6 / 10 | |
+| cte | 5 / 10 | non-recursive, uncorrelated |
+| group_ext | 5 / 10 | plain GROUP BY / ROLLUP / CUBE (not GROUPING SETS) |
+| typed_literal | 5 / 10 | |
+| **table_expr** | **3 / 10** | mostly red |
+| **join** | **2 / 16** | **essentially red** (only `jn-007`, `jn-016` pass) |
 
-Plus two tech-debt sweeps and a set of reviewer-caught correctness fixes hardened in
-place (calendar-date validation, silent-wrong-semantics → boundary rejects, CTE-shadow
-resolution, exhaustive PIVOT reference collection).
-
----
-
-## 3. The remaining 89 — grouped by kind of work
-
-Legend: **[A] within mandate** (lowering gap, the pipeline's native shape) ·
-**[B] beyond mandate** (needs a shared layer the goal assumed done).
-
-### Group A — remaining lowering gaps  ·  *within mandate*  ·  ~10–15 cases
-Pure SQL-syntax the parser reaches but `v2_lowering.rs` doesn't yet translate, where
-emission/analyzer already support the target AST. These are the only cases the
-"keep grinding small cases" option would legitimately target.
-- Scattered `scalar_fn` (e.g. `fn-020` hex/binary literal `X'…'`), some `predicate` /
-  `conditional` / `table_expr` syntax variants.
-- **Why still within mandate:** the fix is one lowering arm; blast radius = one match arm.
-
-### Group B1 — correlated subqueries: emission alias-visibility + analyzer outer-scope  ·  *beyond mandate*  ·  ~10–14 cases
-Cases: the correlated members of `subquery` (`sq-*` — correlated `EXISTS`, correlated
-scalar, correlated `IN`) + `cte-001`/`cte-005` (CTE bodies that carry a correlation).
-- **Why beyond:** the SQL *lowers fine*. The defect is in the **WIDE emission path** and
-  the **analyzer scope model** — the two shared layers the goal assumed complete:
-  1. **Emission** buries the user's base-table alias under a synthetic wrapper —
-     `(SELECT * FROM emp e) AS __td_wrap` — so an inner correlated reference
-     `WHERE t.x = e.col` can no longer resolve `e`. Fixing this touches the emission
-     path used by **every** query → real regression risk to the green 173.
-  2. **Analyzer** has no outer-scope stack, so a correlated column can't be typed
-     against the enclosing query (ADR-008).
-- **Shape:** a dedicated **2-pass Slice-F effort** (emission alias fix, then analyzer
-  outer-scope stack), *not* a one-case lowering pass. Full design in
-  `.agent-output/diagnostic-pass-111.md`. This is the single **biggest lever** left.
-
-### Group B2 — GROUPING SETS / grouping() emission  ·  *beyond mandate*  ·  ~4–6 cases
-Cases: `gx-007` (`GROUPING SETS`), `gx-008` (`grouping()` / `grouping_id()`), and kin.
-- **Why beyond:** needs **new emission** for the `GROUPING SETS` grouping construct and
-  the `grouping()/grouping_id()` bit-mask functions (likely an extension function per
-  ADR-020). The `gx-008` attempt (pass 109) was reverted: fold-detection is
-  *structural* — raw grouping exprs vs aggregate exprs differ in fields
-  (qualifier/plan_id) even pre-resolution, so it can't be patched in lowering.
-
-### Group B3 — tuple / row-value expressions  ·  *beyond mandate*  ·  ~3 cases
-Cases: `pr-003`/`pr-004`/`pr-005` (`(a,b) IN ((1,2),(3,4))`, row comparisons).
-- **Why beyond:** requires a **new AST node** (Tuple/RowValue) plus its **emission** and
-  type/nullability rules — not a lowering-only change.
-
-### Group B4 — interval *type system* (YEAR-MONTH vs DAY-SECOND)  ·  *beyond mandate*  ·  ~2 cases
-Cases: `lit-004` (`INTERVAL '1-2' YEAR TO MONTH`), `lit-005` (`… DAY TO SECOND`).
-- **Why beyond:** the compound interval **lowers correctly** (pass 111) but fails at the
-  **Arrow round-trip** — Spark returns *distinct* `INTERVAL YEAR TO MONTH` /
-  `INTERVAL DAY TO SECOND` types; τ has one generic interval. Needs **type-system +
-  Arrow type-mapping** work. Reverted in pass 111 for exactly this reason.
-
-### Group B5 — analyzer star / qualifier resolution  ·  *beyond mandate*  ·  ~2–4 cases
-Cases: `agg-009` (`GROUP BY ALL`, blocked by a doubly-qualified-star
-`cannot resolve column 'emp.emp.*'`), and qualified-star edge cases.
-- **Why beyond:** the GROUP BY ALL *lowering is correct* (unit-tested — groups by
-  `[dept_id, active]`); the failure is the **analyzer's star/qualifier resolution**
-  producing `emp.emp.*`. Analyzer work, not lowering.
-
-### Group B6 — complex types / LATERAL VIEW  ·  *mixed*  ·  ~5–8 cases
-Cases: subset of `complex_type` (`cx-*`) — `LATERAL VIEW explode/posexplode`, inline
-tables, map/array/struct construction edge cases.
-- **Why mixed:** some are relation-level **lowering** (within mandate); `LATERAL VIEW`
-  specifically needs a relation-construct lowering **plus emission** support and is
-  beyond a one-arm lowering pass.
-
-### Group B7 — numeric-tower result-type pins  ·  *beyond mandate if failing*  ·  count uncertain
-Cases: subset of `numeric_tower` (`num-*`, 32 total, many `schema_only`).
-- **Why beyond:** these assert exact per-type built-in result types across the numeric
-  tower. Any that fail need **type-inference (analyzer)** tuning per type — not lowering.
-  (Many are believed green; the failing tail, if any, is analyzer work.)
+Plus the foundation keystone that made any of this possible: `SqlCommand`
+execution, temp-view registration, and the catalog bridge (`build_base_types`) —
+without which every `FROM <view>` case failed. Two tech-debt sweeps; reviewer-caught
+correctness fixes (calendar-date validation, silent-wrong-semantics → boundary
+rejects, CTE-shadow resolution, exhaustive PIVOT reference collection).
 
 ---
 
-## 4. Bottom line for the next phase
+## 3. The 89 failures — ground-truth grouping
 
-| Bucket | Cases (approx) | Layer | In goal's mandate? | Shape |
-|---|---|---|---|---|
-| A — lowering gaps | 10–15 | lowering | **yes** | 1 arm / pass |
-| B1 — correlated subq | 10–14 | emission + analyzer | no | 2-pass Slice-F |
-| B2 — grouping sets | 4–6 | emission (+ext) | no | feature |
-| B3 — tuples/row-values | 3 | new AST + emission | no | feature |
-| B4 — interval types | 2 | type system + Arrow | no | feature |
-| B5 — star resolution | 2–4 | analyzer | no | targeted fix |
-| B6 — complex/lateral | 5–8 | lowering + emission | mixed | feature |
-| B7 — numeric tower | uncertain | analyzer type-inf | no | tuning |
+Legend: **[diagnosed]** root cause known · **[undiagnosed]** cluster confirmed
+failing but not yet root-caused (owning layer is a hypothesis).
 
-**~60–70 of the 89 remaining cases need work in the shared layers the corpus-driven
-lowering pipeline assumed complete.** Continuing the one-case-per-pass loop would keep
-churning Group A (~10–15 cases) and then stall. The high-value next step is a
-**deliberate Slice-F effort** (Group B1 first — it unblocks the largest bucket and
-`cte-001/005`), planned and regression-gated as its own project, not smuggled through
-a lowering pass at the tail of a 19-pass marathon.
+### Joins — 14  ·  *undiagnosed, highest priority*
+`jn-001..006, jn-008..015` (every join type: INNER/LEFT/RIGHT/FULL/CROSS/NATURAL/
+SEMI/ANTI, multi-condition, non-equi, three-way, self, join-then-aggregate). Only
+`jn-007`/`jn-016` pass. **This is the single biggest surprise** and the biggest
+lever. Hypothesis: the SQL front-end's join lowering or **qualified-reference /
+table-alias emission** is systematically wrong (the alias-visibility defect flagged
+in `.agent-output/diagnostic-pass-111.md`, which also breaks correlated subqueries
+and qualified selects). Needs diagnosis before sizing — likely one or two root
+causes behind all 14.
 
-**Recommendation:** treat 66% as the SQL front-end's Milestone 1 (lowering coverage
-complete). Open Milestone 2 = "shared-layer SQL work" scoped as B1 → B5 → B2/B3/B4/B6.
+### Subqueries — 15  ·  *[diagnosed]* correlated / quantified
+`sq-003,004,006,007,010,015,016,017,018,019,021,022` (correlated scalar/EXISTS/IN/
+HAVING/nested, TPC-H Q17/Q18 shapes) + `sq-011,012,013` (`> ALL` / `> ANY` / `= ANY`
+quantified). Needs the emission alias-visibility fix + analyzer outer-scope stack
+(ADR-008); quantified forms need `ALL`/`ANY` desugaring. Ties in `cte-001/005/006`.
+
+### Aggregate — 8  ·  *mixed*
+`agg-007` GROUP BY expression, `agg-008` GROUP BY ordinal, `agg-009` GROUP BY ALL
+(lowering correct, blocked by star resolution — *[diagnosed]*), `agg-010/011`
+HAVING-on-aggregate (emission), `agg-017` aggregate `FILTER (WHERE)` (spark4),
+`agg-018` `collect_list`/`collect_set`, `agg-019` `percentile`/`median`.
+
+### Table expressions — 7  ·  *mixed*
+`tbl-001` inline `VALUES`, `tbl-002` VALUES→join, `tbl-005` LATERAL derived table,
+`tbl-006` `range()` TVF, `tbl-007` `explode()` TVF, `tbl-008` broadcast hint,
+`tbl-010` required subquery alias. Spans top-level VALUES lowering, table functions,
+LATERAL, hint handling.
+
+### Complex types — 7  ·  *mixed*
+`cx-001` array literal+access, `cx-002` map literal+access, `cx-004` struct field
+path, `cx-007/008/009` `LATERAL VIEW explode/outer/posexplode`, `cx-011` explode map.
+LATERAL VIEW needs relation-construct lowering + emission.
+
+### Numeric tower — 6  ·  *[diagnosed]* result-type pins
+`num-001` ceil→bigint, `num-002/003` ceil/floor→decimal, `num-005` round/bround
+decimal precision, `num-008` signum type, `num-012` mod type. Type-inference /
+emission result-type parity per numeric type.
+
+### Group extensions — 5  ·  *[diagnosed]* GROUPING SETS emission
+`gx-003/004` GROUPING SETS, `gx-007` ROLLUP+HAVING, `gx-008` CUBE(3), `gx-010`
+Hive `WITH ROLLUP`. Needs GROUPING SETS emission + `grouping()/grouping_id()`
+(the `gx-008` fold-detection attempt in pass 109 was reverted — structural).
+
+### CTE — 5  ·  *mixed*
+`cte-001/005/006` (correlation tie-in, see Subqueries), `cte-009/010` recursive CTE.
+
+### Typed literals — 5  ·  *[diagnosed]* interval types
+`lit-004/005` INTERVAL Y-M / D-S (lower correctly, fail Arrow round-trip: Spark
+distinct interval types vs τ's generic — reverted pass 111), `lit-006`
+`make_interval`, `lit-008` timestamp−timestamp→interval, `lit-009` string escape.
+
+### Advanced predicates — 4  ·  *[diagnosed]* tuples / quantified LIKE
+`pr-003` LIKE ANY, `pr-004` LIKE ALL, `pr-005` multi-column IN (new Tuple/RowValue
+AST node + emission), `pr-007` lateral column alias (spark4).
+
+### Select — 4  ·  *[diagnosed]* qualified-ref / naming
+`sel-003` qualified star, `sel-013` qualified column refs, `sel-015` table alias
+(all qualified-reference — same suspected root cause as joins), `sel-008`
+unaliased-expression output column naming (Spark-vs-DuckDB column-name parity).
+
+### Scalar functions — 3
+`fn-017` round/abs/ceil/floor, `fn-018` int/int→double, `fn-020` binary `X'..'`/hex.
+
+### Remaining singles/pairs — 6
+`cnd-002` simple CASE (expr WHEN val), `cnd-009` `IF()`, `pv-002` PIVOT count,
+`pv-006` `stack()`, `set-009` 3-way UNION ALL, `whr-007` BETWEEN.
 
 ---
 
-## 5. Housekeeping notes
+## 4. Bottom line
 
-- **Active `/goal` Stop hook** is session state (not a file); clear it with `/goal`
-  to fully release the loop — otherwise it will keep re-prompting for 100%.
-- **Process incident (pass 113):** a coder subagent wrote edits to `/workspace` (the
-  **main checkout on `feat/v2-transpiler`**), not this worktree. The worktree work is
-  correct and committed here; but **`/workspace` may carry stray uncommitted edits**
-  on `v2_lowering.rs`/`dialect.rs` on top of ~500 lines of *pre-existing* uncommitted
-  work from another source. Left untouched (reverting risked destroying the other
-  work) — **please review `/workspace`'s `git status` before your next session there.**
+| Cluster | Cases | Status | Owning layer (hypothesis where undiagnosed) |
+|---|---|---|---|
+| Joins | 14 | undiagnosed | SQL join lowering / qualified-ref emission — **diagnose first** |
+| Correlated + quantified subqueries | 15 | diagnosed | emission alias fix + analyzer outer-scope (ADR-008) |
+| Aggregate (mixed) | 8 | mixed | GROUP BY expr/ordinal lowering; HAVING/FILTER emission; agg fns |
+| Table expressions | 7 | mixed | VALUES lowering; TVFs; LATERAL; hints |
+| Complex types / LATERAL VIEW | 7 | mixed | literal access lowering; LATERAL VIEW emission |
+| Numeric tower | 6 | diagnosed | type-inference/emission result-type pins |
+| GROUPING SETS family | 5 | diagnosed | new emission (+ `grouping()` extension) |
+| CTE (correlated + recursive) | 5 | mixed | ties to subqueries; recursive CTE |
+| Interval types | 5 | diagnosed | type system + Arrow mapping |
+| Tuples / quantified LIKE | 4 | diagnosed | new AST node + emission |
+| Qualified-ref / naming selects | 4 | diagnosed | qualified-ref emission; column-name parity |
+| Scalar / conditional / pivot / setop / predicate | 9 | mixed | assorted lowering + emission |
+
+**~30 of the 89 are diagnosed** (correlated/quantified subqueries, GROUPING SETS,
+intervals, tuples, numeric pins, GROUP BY ALL/star, qualified-ref selects). **~59
+are in clusters that need diagnosis** — above all the **join cluster (14)**, whose
+root cause is unknown and which alone would move the number substantially.
+
+**Recommendation:** the next phase is *not* the one-case-per-pass lowering loop.
+Start by **diagnosing the join cluster** (14 cases, likely 1–2 root causes in
+qualified-reference/alias emission — which may also unlock the qualified-ref selects
+and correlated subqueries). Then the correlated-subquery emission fix (ADR-008),
+then GROUPING SETS / interval-type / tuple features. Treat 66% as SQL front-end
+Milestone 1 (partial lowering coverage); Milestone 2 = shared-layer SQL work.
+
+---
+
+## 5. Housekeeping
+
+- **Active `/goal` Stop hook** is session state; clear it with `/goal` to release the loop.
 - Per-pass detail: `tasks/v2-corpus-driven-pass-log.md`; progress rows:
-  `tests/integration/v2_sql_progress.md`; Slice-F design:
+  `tests/integration/v2_sql_progress.md`; subquery emission design:
   `.agent-output/diagnostic-pass-111.md`.
+- Live regression check (2026-07-05): the slice-taxonomy purge + deferred-comment
+  strip + the feat/v2-transpiler cleanup merge introduced **no regressions** —
+  `core_v2` 313, `sql_v2` 173.

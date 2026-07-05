@@ -14,10 +14,9 @@ suite). Inputs (`emp`, `dept`, `emp2`, `nums`, `raw`) are registered as temp
 views by the `sql_corpus_reference` / `sql_corpus_thunderduck` fixtures so the
 SQL can reference them by name.
 
-The τ SQL path is early (temp-view registration and the catalog bridge are
-Slice-B stubs; the grammar is Slice A.2), so this suite is *expected to be
-largely red* until those land — it is the fitness function that drives the SQL
-implementation, exactly as `core_v2` did for the DataFrame API.
+The τ SQL path is still maturing, so this suite is *expected to be partially
+red* until more of the SQL surface lands — it is the fitness function that
+drives the SQL implementation, exactly as `core_v2` did for the DataFrame API.
 
 Running:
     cargo test -p thunderduck-connect-server --test differential sql_v2 -- --ignored --nocapture

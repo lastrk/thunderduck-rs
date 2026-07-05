@@ -123,10 +123,10 @@ Both invocations MUST complete in-pass:
 ### 6. Close findings — ZERO DEFER
 
 Every review + perf finding is `CLOSE_NOW_IN_THIS_PASS`. If a finding
-proposes deferring to a "future slice" or "housekeeping":
-- **Reject the classification.** Corpus-driven, not slice-driven.
+proposes deferring to "future work" or "housekeeping":
+- **Reject the classification.** Corpus-driven.
 - If the finding truly touches unrelated code that shouldn't land in
-  this pass (e.g., a Slice-B analyzer bug surfacing here), convert it
+  this pass (e.g., an analyzer bug surfacing here), convert it
   to a dedicated follow-up pass queued **immediately after** — not
   deferred indefinitely.
 

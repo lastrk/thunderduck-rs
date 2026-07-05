@@ -651,7 +651,7 @@ def sql_corpus_reference(spark_reference):
 def sql_corpus_thunderduck(spark_thunderduck):
     """Register the SQL corpus's temp views on the Thunderduck session.
 
-    Tolerant by design: τ's temp-view registration is a Slice-B stub today, so
+    Tolerant by design: τ's temp-view registration may fail for some inputs, so
     `build_inputs` may raise. Swallow it here so setup does NOT abort the whole
     parametrized module with a fixture ERROR — instead each case fails
     individually when its `spark.sql(...)` can't resolve the (unregistered) view,

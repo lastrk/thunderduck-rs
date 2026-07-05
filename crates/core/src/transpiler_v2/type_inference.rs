@@ -765,8 +765,7 @@ impl TypeInferenceEngine {
             // stamped `containsNull=false`. We conservatively stamp
             // `containsNull=false` here (matching the corpus witness);
             // a fully-general answer would inspect both args' containsNull
-            // flags — deferred until a corpus case exercises the
-            // AND-of-both semantics with two nullable inputs.
+            // flags.
             "array_intersect" => match first_arg_type {
                 Some(DataType::Array(elem, _)) => Array(elem.clone(), false),
                 _ => Unresolved,

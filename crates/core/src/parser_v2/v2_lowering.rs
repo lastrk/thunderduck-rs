@@ -1045,6 +1045,61 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             negated,
             case_insensitive: false,
         })),
+        // `x ILIKE 'p'` — case-insensitive LIKE. Mirrors the `Expr::Like` arm
+        // but flags `case_insensitive: true`, which emission renders as
+        // `ILIKE`. `NOT ILIKE` rides the same `negated` field as `NOT LIKE`.
+        // Corpus witness: `whr-012` (`name ILIKE 'a%'`).
+        Expr::ILike {
+            expr,
+            pattern,
+            negated,
+            escape_char,
+            ..
+        } => Ok(Expression::Like(LikeExpression {
+            value: Box::new(lower_expr(*expr, cte_scope)?),
+            pattern: Box::new(lower_expr(*pattern, cte_scope)?),
+            escape: escape_char.and_then(value_to_escape_char),
+            negated,
+            case_insensitive: true,
+        })),
+        // `x RLIKE 'p'` / `x REGEXP 'p'` — regex match. Lower to a `rlike`
+        // FunctionCall; emission's `rlike | regexp_like | regexp` arm renders
+        // the Spark-correct regexp semantics. `NOT RLIKE` has no negated field
+        // on the FunctionCall, so wrap the call in a `NOT` unary (same
+        // substrate as `Expr::UnaryOp { Not, .. }`). Corpus witness: `whr-013`
+        // (`name RLIKE '^[A-D]'`).
+        Expr::RLike {
+            expr,
+            pattern,
+            negated,
+            ..
+        } => {
+            let call = Expression::FunctionCall(FunctionCall {
+                name: "rlike".to_owned(),
+                args: vec![
+                    lower_expr(*expr, cte_scope)?,
+                    lower_expr(*pattern, cte_scope)?,
+                ],
+                distinct: false,
+            });
+            if negated {
+                Ok(Expression::Unary(UnaryExpression {
+                    op: UnaryOp::Not,
+                    operand: Box::new(call),
+                }))
+            } else {
+                Ok(call)
+            }
+        }
+        // `x SIMILAR TO 'p'` — SQL-standard regex is WHOLE-STRING (anchored) and
+        // Spark has no `SIMILAR TO` operator at all. Borrowing `rlike`
+        // (unanchored Java-regex `find`) would silently give wrong answers (e.g.
+        // `'abc' SIMILAR TO 'b'` is FALSE but rlike would be TRUE). Reject as a
+        // Thunderduck-boundary error per ADR-022 rather than mis-lower.
+        Expr::SimilarTo { .. } => Err(EmissionError::UnsupportedProtoShape {
+            shape: "sql::expr::similar_to".to_owned(),
+            reason: "SIMILAR TO (anchored SQL-standard regex) has no Spark equivalent".to_owned(),
+        }),
         Expr::Wildcard(_) => Ok(Expression::Star(StarExpression { qualifier: None })),
         // Spark's `EXTRACT(<field> FROM <expr>)` and `DATE_PART(<field>, <expr>)`
         // parse to `Expr::Extract`. Lower to a FunctionCall of
@@ -3295,6 +3350,63 @@ mod tests {
                 assert_eq!(value_column_name, "val");
             }
             other => panic!("expected Unpivot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_ilike_sets_case_insensitive() {
+        // whr-012 shape: `name ILIKE 'a%'` → case-insensitive LIKE.
+        let plan = parse("SELECT id FROM t WHERE a ILIKE 'x%'").expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Like(l) => {
+                assert!(l.case_insensitive, "ILIKE must flag case_insensitive");
+                assert!(!l.negated);
+            }
+            other => panic!("expected Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_not_ilike_sets_negated() {
+        let plan = parse("SELECT id FROM t WHERE a NOT ILIKE 'x%'").expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Like(l) => {
+                assert!(l.case_insensitive);
+                assert!(l.negated, "NOT ILIKE must set negated");
+            }
+            other => panic!("expected Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_rlike_maps_to_rlike_function() {
+        // whr-013 shape: `name RLIKE 'p'` → rlike(name, 'p').
+        let plan = parse("SELECT id FROM t WHERE a RLIKE 'p'").expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::FunctionCall(f) => {
+                assert_eq!(f.name, "rlike");
+                assert_eq!(f.args.len(), 2);
+                assert!(!f.distinct);
+            }
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_not_rlike_wraps_in_not() {
+        let plan = parse("SELECT id FROM t WHERE a NOT RLIKE 'p'").expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Unary(u) => {
+                assert!(matches!(u.op, UnaryOp::Not));
+                match u.operand.as_ref() {
+                    Expression::FunctionCall(f) => {
+                        assert_eq!(f.name, "rlike");
+                        assert_eq!(f.args.len(), 2);
+                    }
+                    other => panic!("expected rlike FunctionCall, got {other:?}"),
+                }
+            }
+            other => panic!("expected Unary NOT, got {other:?}"),
         }
     }
 }

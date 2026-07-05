@@ -867,3 +867,18 @@ the summary below records the corpus deltas by pass number.
 - Files: `crates/core/src/transpiler_v2/{base_types,analyzer}.rs` (comments only; behavior-preserving; corpus stays 169).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, 0 warnings).
 - Commit SHA: (this commit).
+
+## Pass 111 — 2026-07-05 — SQL corpus: ILIKE / RLIKE (whr-012/013) [run 2]
+- **Corpus: SQL front-end.** Target: whr-012 (`name ILIKE 'a%'`), whr-013 (`name RLIKE '^[A-D]'`). `lower_expr` had `Expr::Like` but no ILike/RLike arm (→ catch-all). Lowering-only; emission already renders `case_insensitive`→ILIKE and has an `rlike` arm.
+- (Note: this pass first tried gx-008 [reverted — fold-detection raw-expr mismatch, deferred] then compound intervals [lit-004/005 — reverted: they lower correctly but Spark's distinct INTERVAL YEAR-MONTH / DAY-SECOND types don't round-trip through Arrow as τ's generic interval; a type-system issue, deferred]. Retargeted to the clean ILIKE/RLIKE lowering gap.)
+- Architecture: inline — mirror the `Expr::Like` arm for ILIKE (`case_insensitive: true`, reuse `negated`); RLIKE → `FunctionCall("rlike", [expr, pattern])` (emission's `rlike`→`regexp_matches` = Spark unanchored Java-regex `find`), wrap in `Unary(Not)` when negated.
+- Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`). No emission/analyzer/ast change.
+- ADR citations: ADR-004 (reuse Like/rlike substrate), ADR-015 (ILIKE 3VL + rlike unanchored-find parity), ADR-022 (`SIMILAR TO` — anchored SQL-standard regex with no Spark equivalent → boundary reject, NOT silently mapped to rlike).
+- Corpus signal: 169 → **171** (+2). whr-012/whr-013 GREEN. No regressions.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Tests added: 4 (ILIKE case_insensitive + negated; RLIKE→rlike FunctionCall + NOT-wrap).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High. **1 Medium CLOSED** — `Expr::SimilarTo` was mapped to `rlike` (silent wrong semantics: SIMILAR TO is anchored/whole-string, rlike is unanchored; `'abc' SIMILAR TO 'b'` = FALSE but rlike = TRUE); changed to a Thunderduck-boundary reject (ADR-022). Low (deferred): SimilarTo/NOT-RLIKE differential coverage; ILIKE non-ASCII case-folding edge.
+- Findings queued as follow-up: correlated subqueries (biggest bucket — needs a wide emission alias-visibility fix + analyzer outer-scope stack, 2-pass Slice-F effort; design in `.agent-output/diagnostic-pass-111.md`); compound interval TYPES (YearMonth/DayTime + Arrow round-trip); gx-008 (fold declared at lowering); gx-007 (HAVING-agg emission); tuples/row-values; GROUPING SETS emission; lateral view; DISTINCT.
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 709/0, `sql_v2` 171/91/262, no regressions).
+- Commit SHA: (this commit).

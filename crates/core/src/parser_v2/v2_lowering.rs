@@ -32,10 +32,11 @@ use sqlparser::ast::{
 
 use crate::transpiler_v2::ast::{CommonAst, CommonOp, GroupingKind, JoinType, SetOpKind};
 use crate::transpiler_v2::expression::{
-    AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
-    FrameBoundary, FrameUnit, FunctionCall, InListExpression, IntervalExpression,
-    IsDistinctFromExpression, LambdaExpression, LambdaVariableExpression, LikeExpression, Literal,
-    LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, UnaryExpression, UnaryOp,
+    AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
+    ExistsSubquery, Expression, FrameBoundary, FrameUnit, FunctionCall, InListExpression,
+    InSubquery, IntervalExpression, IsDistinctFromExpression, LambdaExpression,
+    LambdaVariableExpression, LikeExpression, Literal, LiteralValue, NullOrdering, ScalarSubquery,
+    SortDirection, SortOrder, StarExpression, SubqueryPlan, UnaryExpression, UnaryOp,
     UnresolvedColumn, WindowFrame, WindowFunction,
 };
 use crate::transpiler_v2::type_inference::AGGREGATE_NAMES;
@@ -132,7 +133,13 @@ fn lower_query(query: Query, cte_scope: &CteScope) -> Result<CommonAst, Emission
     let (limit_expr_opt, offset_expr_opt) = extract_limit_offset(query.limit_clause.as_ref())?;
 
     let body = lower_set_expr(*query.body, effective_scope)?;
-    wrap_with_sort_limit(body, order_by_exprs, limit_expr_opt, offset_expr_opt)
+    wrap_with_sort_limit(
+        body,
+        order_by_exprs,
+        limit_expr_opt,
+        offset_expr_opt,
+        effective_scope,
+    )
 }
 
 fn extract_limit_offset(
@@ -218,7 +225,7 @@ fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, E
     let filtered = if let Some(cond) = select.selection {
         CommonAst::new(CommonOp::Filter {
             input: Box::new(base),
-            condition: lower_expr(cond)?,
+            condition: lower_expr(cond, cte_scope)?,
         })
     } else {
         base
@@ -233,12 +240,18 @@ fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, E
             .any(|item| select_item_has_aggregate(item));
 
     let plan = if has_aggregates {
-        lower_aggregate_select(filtered, select.projection, select.group_by, select.having)?
+        lower_aggregate_select(
+            filtered,
+            select.projection,
+            select.group_by,
+            select.having,
+            cte_scope,
+        )?
     } else {
         let projections: Result<Vec<Expression>, EmissionError> = select
             .projection
             .into_iter()
-            .map(lower_select_item)
+            .map(|item| lower_select_item(item, cte_scope))
             .collect();
         CommonAst::new(CommonOp::Project {
             input: Box::new(filtered),
@@ -254,6 +267,7 @@ fn lower_aggregate_select(
     projection: Vec<SelectItem>,
     group_by: GroupByExpr,
     having: Option<Expr>,
+    cte_scope: &CteScope,
 ) -> Result<CommonAst, EmissionError> {
     let (grouping, grouping_kind) = match group_by {
         GroupByExpr::Expressions(exprs, modifiers) => {
@@ -296,7 +310,7 @@ fn lower_aggregate_select(
                 let mut flat: Vec<Expression> = Vec::new();
                 for term in sets {
                     for e in term {
-                        flat.push(lower_expr(e)?);
+                        flat.push(lower_expr(e, cte_scope)?);
                     }
                 }
                 (flat, kind)
@@ -315,7 +329,7 @@ fn lower_aggregate_select(
                                     .to_owned(),
                             });
                         }
-                        other => plain.push(lower_expr(other)?),
+                        other => plain.push(lower_expr(other, cte_scope)?),
                     }
                 }
                 (plain, GroupingKind::GroupBy)
@@ -329,8 +343,10 @@ fn lower_aggregate_select(
         }
     };
 
-    let projections: Result<Vec<Expression>, EmissionError> =
-        projection.into_iter().map(lower_select_item).collect();
+    let projections: Result<Vec<Expression>, EmissionError> = projection
+        .into_iter()
+        .map(|item| lower_select_item(item, cte_scope))
+        .collect();
     let projections = projections?;
     // A.2 treats the aggregate projection list as the aggregate output list.
     // Slice C.1 refines this into the {grouping, aggregates} split when the
@@ -346,7 +362,7 @@ fn lower_aggregate_select(
     if let Some(h) = having {
         Ok(CommonAst::new(CommonOp::Filter {
             input: Box::new(aggregated),
-            condition: lower_expr(h)?,
+            condition: lower_expr(h, cte_scope)?,
         }))
     } else {
         Ok(aggregated)
@@ -382,7 +398,8 @@ fn lower_table_with_joins(
     let mut plan = lower_table_factor(twj.relation, cte_scope)?;
     for join in twj.joins {
         let right = lower_table_factor(join.relation, cte_scope)?;
-        let (join_type, condition, using_columns) = lower_join_operator(join.join_operator)?;
+        let (join_type, condition, using_columns) =
+            lower_join_operator(join.join_operator, cte_scope)?;
         plan = CommonAst::new(CommonOp::Join {
             left: Box::new(plan),
             right: Box::new(right),
@@ -434,7 +451,7 @@ fn lower_table_factor(
         TableFactor::TableFunction { expr, alias: _ } => {
             // Only bare identifier / function-call table functions covered.
             match expr {
-                Expr::Function(f) => lower_table_function(f),
+                Expr::Function(f) => lower_table_function(f, cte_scope),
                 other => Err(EmissionError::UnsupportedProtoShape {
                     shape: format!("sql::table_function::{other:?}"),
                     reason: "table function expr shape not supported at Slice A.2".to_owned(),
@@ -460,7 +477,7 @@ fn lower_table_factor(
                 }
             })?;
             Ok(CommonAst::new(CommonOp::Unnest {
-                expr: lower_expr(expr)?,
+                expr: lower_expr(expr, cte_scope)?,
                 with_ordinality,
             }))
         }
@@ -473,7 +490,7 @@ fn lower_table_factor(
             let func_name = object_name_to_string(&name);
             let arg_exprs: Vec<Expression> = args
                 .into_iter()
-                .map(function_arg_to_expr)
+                .map(|a| function_arg_to_expr(a, cte_scope))
                 .collect::<Result<_, _>>()?;
             Ok(CommonAst::new(CommonOp::TableFunction {
                 name: func_name,
@@ -488,9 +505,9 @@ fn lower_table_factor(
     }
 }
 
-fn lower_table_function(f: Function) -> Result<CommonAst, EmissionError> {
+fn lower_table_function(f: Function, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
     let name = object_name_to_string(&f.name);
-    let args = lower_function_args(f.args)?;
+    let args = lower_function_args(f.args, cte_scope)?;
     Ok(CommonAst::new(CommonOp::TableFunction {
         name,
         args,
@@ -498,7 +515,10 @@ fn lower_table_function(f: Function) -> Result<CommonAst, EmissionError> {
     }))
 }
 
-fn lower_function_args(args: FunctionArguments) -> Result<Vec<Expression>, EmissionError> {
+fn lower_function_args(
+    args: FunctionArguments,
+    cte_scope: &CteScope,
+) -> Result<Vec<Expression>, EmissionError> {
     match args {
         FunctionArguments::None => Ok(vec![]),
         FunctionArguments::Subquery(_) => Err(EmissionError::UnsupportedProtoShape {
@@ -508,18 +528,21 @@ fn lower_function_args(args: FunctionArguments) -> Result<Vec<Expression>, Emiss
         FunctionArguments::List(list) => list
             .args
             .into_iter()
-            .map(function_arg_to_expr)
+            .map(|a| function_arg_to_expr(a, cte_scope))
             .collect::<Result<_, _>>(),
     }
 }
 
-fn function_arg_to_expr(arg: FunctionArg) -> Result<Expression, EmissionError> {
+fn function_arg_to_expr(
+    arg: FunctionArg,
+    cte_scope: &CteScope,
+) -> Result<Expression, EmissionError> {
     match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => lower_expr(e),
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => lower_expr(e, cte_scope),
         FunctionArg::Named {
             arg: FunctionArgExpr::Expr(e),
             ..
-        } => lower_expr(e),
+        } => lower_expr(e, cte_scope),
         FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
             Ok(Expression::Star(StarExpression { qualifier: None }))
         }
@@ -537,6 +560,7 @@ fn function_arg_to_expr(arg: FunctionArg) -> Result<Expression, EmissionError> {
 
 fn lower_join_operator(
     op: JoinOperator,
+    cte_scope: &CteScope,
 ) -> Result<(JoinType, Option<Expression>, Vec<String>), EmissionError> {
     let (join_type, constraint) = match op {
         JoinOperator::Join(c) | JoinOperator::Inner(c) => (JoinType::Inner, c),
@@ -553,15 +577,16 @@ fn lower_join_operator(
             });
         }
     };
-    let (cond, using) = lower_join_constraint(constraint)?;
+    let (cond, using) = lower_join_constraint(constraint, cte_scope)?;
     Ok((join_type, cond, using))
 }
 
 fn lower_join_constraint(
     constraint: JoinConstraint,
+    cte_scope: &CteScope,
 ) -> Result<(Option<Expression>, Vec<String>), EmissionError> {
     match constraint {
-        JoinConstraint::On(expr) => Ok((Some(lower_expr(expr)?), vec![])),
+        JoinConstraint::On(expr) => Ok((Some(lower_expr(expr, cte_scope)?), vec![])),
         JoinConstraint::Using(cols) => {
             let names: Vec<String> = cols.iter().map(object_name_to_string).collect();
             Ok((None, names))
@@ -570,11 +595,11 @@ fn lower_join_constraint(
     }
 }
 
-fn lower_select_item(item: SelectItem) -> Result<Expression, EmissionError> {
+fn lower_select_item(item: SelectItem, cte_scope: &CteScope) -> Result<Expression, EmissionError> {
     match item {
-        SelectItem::UnnamedExpr(expr) => lower_expr(expr),
+        SelectItem::UnnamedExpr(expr) => lower_expr(expr, cte_scope),
         SelectItem::ExprWithAlias { expr, alias } => {
-            let inner = lower_expr(expr)?;
+            let inner = lower_expr(expr, cte_scope)?;
             Ok(Expression::Alias(AliasExpression {
                 expr: Box::new(inner),
                 alias: alias.value,
@@ -679,7 +704,7 @@ fn is_aggregate_function_name(name: &str) -> bool {
     AGGREGATE_NAMES.iter().any(|a| name.eq_ignore_ascii_case(a))
 }
 
-fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
+fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionError> {
     match expr {
         Expr::Identifier(ident) => Ok(Expression::UnresolvedColumn(UnresolvedColumn {
             name: ident.value,
@@ -710,8 +735,8 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
             // integral inputs. The projection-slot Spark-return-cast keeps
             // the outer type consistent. Corpus witness: `type-007`.
             if matches!(op, BinaryOperator::MyIntegerDivide) {
-                let l = lower_expr(*left)?;
-                let r = lower_expr(*right)?;
+                let l = lower_expr(*left, cte_scope)?;
+                let r = lower_expr(*right, cte_scope)?;
                 return Ok(Expression::Cast(CastExpression {
                     expr: Box::new(Expression::Binary(BinaryExpression {
                         op: BinaryOp::Div,
@@ -730,33 +755,33 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
             // Corpus witness: `whr-015`.
             if matches!(op, BinaryOperator::Spaceship) {
                 return Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
-                    left: Box::new(lower_expr(*left)?),
-                    right: Box::new(lower_expr(*right)?),
+                    left: Box::new(lower_expr(*left, cte_scope)?),
+                    right: Box::new(lower_expr(*right, cte_scope)?),
                     negated: true,
                 }));
             }
             Ok(Expression::Binary(BinaryExpression {
                 op: lower_binary_op(op)?,
-                left: Box::new(lower_expr(*left)?),
-                right: Box::new(lower_expr(*right)?),
+                left: Box::new(lower_expr(*left, cte_scope)?),
+                right: Box::new(lower_expr(*right, cte_scope)?),
             }))
         }
         Expr::UnaryOp { op, expr } => match op {
             UnaryOperator::Not => Ok(Expression::Unary(UnaryExpression {
                 op: UnaryOp::Not,
-                operand: Box::new(lower_expr(*expr)?),
+                operand: Box::new(lower_expr(*expr, cte_scope)?),
             })),
             UnaryOperator::Minus => Ok(Expression::Unary(UnaryExpression {
                 op: UnaryOp::Negate,
-                operand: Box::new(lower_expr(*expr)?),
+                operand: Box::new(lower_expr(*expr, cte_scope)?),
             })),
-            UnaryOperator::Plus => lower_expr(*expr),
+            UnaryOperator::Plus => lower_expr(*expr, cte_scope),
             other => Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("sql::unary_op::{other:?}"),
                 reason: "unary operator not supported at Slice A.2".to_owned(),
             }),
         },
-        Expr::Nested(e) => lower_expr(*e),
+        Expr::Nested(e) => lower_expr(*e, cte_scope),
         Expr::Cast {
             kind,
             expr,
@@ -765,12 +790,12 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
         } => {
             let try_cast = matches!(kind, CastKind::TryCast | CastKind::SafeCast);
             Ok(Expression::Cast(CastExpression {
-                expr: Box::new(lower_expr(*expr)?),
+                expr: Box::new(lower_expr(*expr, cte_scope)?),
                 to_type: lower_data_type(data_type)?,
                 try_cast,
             }))
         }
-        Expr::Function(f) => lower_function(f),
+        Expr::Function(f) => lower_function(f, cte_scope),
         Expr::Case {
             conditions,
             else_result,
@@ -778,10 +803,15 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
         } => {
             let branches = conditions
                 .into_iter()
-                .map(|c| Ok((lower_expr(c.condition)?, lower_expr(c.result)?)))
+                .map(|c| {
+                    Ok((
+                        lower_expr(c.condition, cte_scope)?,
+                        lower_expr(c.result, cte_scope)?,
+                    ))
+                })
                 .collect::<Result<Vec<_>, EmissionError>>()?;
             let else_expr = else_result
-                .map(|e| lower_expr(*e))
+                .map(|e| lower_expr(*e, cte_scope))
                 .transpose()?
                 .map(Box::new);
             Ok(Expression::CaseWhen(CaseWhenExpression {
@@ -795,33 +825,33 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
             negated,
         } => {
             let converted_list: Result<Vec<Expression>, EmissionError> =
-                list.into_iter().map(lower_expr).collect();
+                list.into_iter().map(|e| lower_expr(e, cte_scope)).collect();
             Ok(Expression::InList(InListExpression {
-                expr: Box::new(lower_expr(*expr)?),
+                expr: Box::new(lower_expr(*expr, cte_scope)?),
                 list: converted_list?,
                 negated,
             }))
         }
         Expr::IsNull(e) => Ok(Expression::Unary(UnaryExpression {
             op: UnaryOp::IsNull,
-            operand: Box::new(lower_expr(*e)?),
+            operand: Box::new(lower_expr(*e, cte_scope)?),
         })),
         Expr::IsNotNull(e) => Ok(Expression::Unary(UnaryExpression {
             op: UnaryOp::IsNotNull,
-            operand: Box::new(lower_expr(*e)?),
+            operand: Box::new(lower_expr(*e, cte_scope)?),
         })),
         // `a IS [NOT] DISTINCT FROM b` — null-safe (in)equality yielding a
         // non-null boolean. Lower onto τ's `IsDistinctFrom` substrate; the
         // `IS NOT` form sets `negated: true`. Corpus witnesses: `pr-001`,
         // `pr-002`.
         Expr::IsDistinctFrom(a, b) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
-            left: Box::new(lower_expr(*a)?),
-            right: Box::new(lower_expr(*b)?),
+            left: Box::new(lower_expr(*a, cte_scope)?),
+            right: Box::new(lower_expr(*b, cte_scope)?),
             negated: false,
         })),
         Expr::IsNotDistinctFrom(a, b) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
-            left: Box::new(lower_expr(*a)?),
-            right: Box::new(lower_expr(*b)?),
+            left: Box::new(lower_expr(*a, cte_scope)?),
+            right: Box::new(lower_expr(*b, cte_scope)?),
             negated: true,
         })),
         Expr::Like {
@@ -831,8 +861,8 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
             escape_char,
             ..
         } => Ok(Expression::Like(LikeExpression {
-            value: Box::new(lower_expr(*expr)?),
-            pattern: Box::new(lower_expr(*pattern)?),
+            value: Box::new(lower_expr(*expr, cte_scope)?),
+            pattern: Box::new(lower_expr(*pattern, cte_scope)?),
             escape: escape_char.and_then(value_to_escape_char),
             negated,
             case_insensitive: false,
@@ -852,7 +882,7 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
             // only for fields without a dedicated Spark function name.
             // Corpus witness: `dt-016` (`extract(YEAR FROM hire_date)`).
             let field_str = format!("{field}").to_lowercase();
-            let inner = lower_expr(*expr)?;
+            let inner = lower_expr(*expr, cte_scope)?;
             let (fn_name, use_date_part) = match field_str.as_str() {
                 "year" => ("year", false),
                 "month" => ("month", false),
@@ -894,12 +924,12 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
             substring_for,
             ..
         } => {
-            let mut args = vec![lower_expr(*expr)?];
+            let mut args = vec![lower_expr(*expr, cte_scope)?];
             if let Some(from) = substring_from {
-                args.push(lower_expr(*from)?);
+                args.push(lower_expr(*from, cte_scope)?);
             }
             if let Some(for_) = substring_for {
-                args.push(lower_expr(*for_)?);
+                args.push(lower_expr(*for_, cte_scope)?);
             }
             Ok(Expression::FunctionCall(FunctionCall {
                 name: "substring".to_owned(),
@@ -924,9 +954,9 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
                 Some(TrimWhereField::Trailing) => "rtrim",
                 _ => "trim",
             };
-            let mut args = vec![lower_expr(*expr)?];
+            let mut args = vec![lower_expr(*expr, cte_scope)?];
             if let Some(what) = trim_what {
-                args.push(lower_expr(*what)?);
+                args.push(lower_expr(*what, cte_scope)?);
             }
             Ok(Expression::FunctionCall(FunctionCall {
                 name: name.to_owned(),
@@ -939,7 +969,7 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
         // scalar; `locate` emits 1-based `strpos`). Corpus witness: `fn-006`.
         Expr::Position { expr, r#in } => Ok(Expression::FunctionCall(FunctionCall {
             name: "locate".to_owned(),
-            args: vec![lower_expr(*expr)?, lower_expr(*r#in)?],
+            args: vec![lower_expr(*expr, cte_scope)?, lower_expr(*r#in, cte_scope)?],
             distinct: false,
         })),
         // Spark's `OVERLAY(<expr> PLACING <what> FROM <from> [FOR <for>])`
@@ -953,12 +983,12 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
             overlay_for,
         } => {
             let mut args = vec![
-                lower_expr(*expr)?,
-                lower_expr(*overlay_what)?,
-                lower_expr(*overlay_from)?,
+                lower_expr(*expr, cte_scope)?,
+                lower_expr(*overlay_what, cte_scope)?,
+                lower_expr(*overlay_from, cte_scope)?,
             ];
             if let Some(for_) = overlay_for {
-                args.push(lower_expr(*for_)?);
+                args.push(lower_expr(*for_, cte_scope)?);
             }
             Ok(Expression::FunctionCall(FunctionCall {
                 name: "overlay".to_owned(),
@@ -968,7 +998,7 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
         }
         Expr::Lambda(lambda) => {
             let params: Vec<String> = lambda.params.iter().map(|p| p.value.clone()).collect();
-            let body = lower_expr(*lambda.body)?;
+            let body = lower_expr(*lambda.body, cte_scope)?;
             // SparkSQL parses lambda-body identifiers as regular columns
             // (`Expr::Identifier("acc")` → `UnresolvedColumn(acc)`). The
             // analyzer treats `Lambda` opaquely (analyzer.rs:1747), so those
@@ -983,6 +1013,28 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
             }))
         }
         Expr::Interval(iv) => lower_interval(iv),
+        // Uncorrelated subqueries (scalar / IN / EXISTS). The inner plan is
+        // lowered with the enclosing query's CTE scope so a subquery's
+        // `FROM <cte>` inlines the CTE body rather than reading a same-named
+        // catalog table — Spark shadows the table with the CTE (cte-006).
+        // The analyzer rewrites `Unanalyzed` → `Analyzed` (correlated inner
+        // refs fail resolution → honest Thunderduck boundary, ADR-022).
+        Expr::Subquery(q) => Ok(Expression::ScalarSubquery(ScalarSubquery {
+            subquery: SubqueryPlan::Unanalyzed(Box::new(lower_query(*q, cte_scope)?)),
+        })),
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Ok(Expression::InSubquery(InSubquery {
+            expr: Box::new(lower_expr(*expr, cte_scope)?),
+            subquery: SubqueryPlan::Unanalyzed(Box::new(lower_query(*subquery, cte_scope)?)),
+            negated,
+        })),
+        Expr::Exists { subquery, negated } => Ok(Expression::ExistsSubquery(ExistsSubquery {
+            subquery: SubqueryPlan::Unanalyzed(Box::new(lower_query(*subquery, cte_scope)?)),
+            negated,
+        })),
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::expr::{}", expr_kind(&other)),
             reason: "expression shape not supported at Slice A.2".to_owned(),
@@ -1165,7 +1217,7 @@ fn lower_binary_op(op: BinaryOperator) -> Result<BinaryOp, EmissionError> {
     })
 }
 
-fn lower_function(f: Function) -> Result<Expression, EmissionError> {
+fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, EmissionError> {
     let name = object_name_to_string(&f.name);
     let over = f.over;
     let (distinct, args) = match f.args {
@@ -1176,8 +1228,10 @@ fn lower_function(f: Function) -> Result<Expression, EmissionError> {
             ..
         }) => {
             let distinct = matches!(duplicate_treatment, Some(DuplicateTreatment::Distinct));
-            let converted: Result<Vec<Expression>, EmissionError> =
-                args.into_iter().map(function_arg_to_expr).collect();
+            let converted: Result<Vec<Expression>, EmissionError> = args
+                .into_iter()
+                .map(|a| function_arg_to_expr(a, cte_scope))
+                .collect();
             (distinct, converted?)
         }
         FunctionArguments::Subquery(_) => {
@@ -1198,14 +1252,14 @@ fn lower_function(f: Function) -> Result<Expression, EmissionError> {
             let partition_by: Vec<Expression> = spec
                 .partition_by
                 .into_iter()
-                .map(lower_expr)
+                .map(|e| lower_expr(e, cte_scope))
                 .collect::<Result<_, _>>()?;
             let order_by: Vec<SortOrder> = spec
                 .order_by
                 .into_iter()
-                .map(lower_order_by_expr)
+                .map(|o| lower_order_by_expr(o, cte_scope))
                 .collect::<Result<_, _>>()?;
-            let frame = lower_window_frame(spec.window_frame)?;
+            let frame = lower_window_frame(spec.window_frame, cte_scope)?;
             Ok(Expression::Window(WindowFunction {
                 func: Box::new(call),
                 partition_by,
@@ -1228,7 +1282,10 @@ fn lower_function(f: Function) -> Result<Expression, EmissionError> {
 ///
 /// `None` → no frame clause (emission omits it; DuckDB's default matches
 /// Spark's). `GROUPS` frame units are a Thunderduck-boundary error (ADR-022).
-fn lower_window_frame(frame: Option<SqlWindowFrame>) -> Result<Option<WindowFrame>, EmissionError> {
+fn lower_window_frame(
+    frame: Option<SqlWindowFrame>,
+    cte_scope: &CteScope,
+) -> Result<Option<WindowFrame>, EmissionError> {
     let Some(SqlWindowFrame {
         units,
         start_bound,
@@ -1247,10 +1304,10 @@ fn lower_window_frame(frame: Option<SqlWindowFrame>) -> Result<Option<WindowFram
             });
         }
     };
-    let lower = lower_frame_bound(start_bound)?;
+    let lower = lower_frame_bound(start_bound, cte_scope)?;
     // Shorthand `ROWS N PRECEDING` (no BETWEEN) → upper bound is CURRENT ROW.
     let upper = match end_bound {
-        Some(b) => lower_frame_bound(b)?,
+        Some(b) => lower_frame_bound(b, cte_scope)?,
         None => FrameBoundary::CurrentRow,
     };
     Ok(Some(WindowFrame { unit, lower, upper }))
@@ -1260,13 +1317,20 @@ fn lower_window_frame(frame: Option<SqlWindowFrame>) -> Result<Option<WindowFram
 ///
 /// sqlparser encodes the direction in the variant (`Preceding` / `Following`),
 /// so the offset expression is the absolute magnitude — no sign re-application.
-fn lower_frame_bound(bound: WindowFrameBound) -> Result<FrameBoundary, EmissionError> {
+fn lower_frame_bound(
+    bound: WindowFrameBound,
+    cte_scope: &CteScope,
+) -> Result<FrameBoundary, EmissionError> {
     Ok(match bound {
         WindowFrameBound::CurrentRow => FrameBoundary::CurrentRow,
         WindowFrameBound::Preceding(None) => FrameBoundary::UnboundedPreceding,
         WindowFrameBound::Following(None) => FrameBoundary::UnboundedFollowing,
-        WindowFrameBound::Preceding(Some(e)) => FrameBoundary::Preceding(Box::new(lower_expr(*e)?)),
-        WindowFrameBound::Following(Some(e)) => FrameBoundary::Following(Box::new(lower_expr(*e)?)),
+        WindowFrameBound::Preceding(Some(e)) => {
+            FrameBoundary::Preceding(Box::new(lower_expr(*e, cte_scope)?))
+        }
+        WindowFrameBound::Following(Some(e)) => {
+            FrameBoundary::Following(Box::new(lower_expr(*e, cte_scope)?))
+        }
     })
 }
 
@@ -1527,6 +1591,7 @@ fn wrap_with_sort_limit(
     order_by: Vec<OrderByExpr>,
     limit: Option<Expr>,
     offset: Option<Expr>,
+    cte_scope: &CteScope,
 ) -> Result<CommonAst, EmissionError> {
     let limit_i = limit.map(expr_to_i64).transpose()?;
     let offset_i = offset.map(expr_to_i64).transpose()?;
@@ -1551,7 +1616,7 @@ fn wrap_with_sort_limit(
     }
     let order = order_by
         .into_iter()
-        .map(lower_order_by_expr)
+        .map(|o| lower_order_by_expr(o, cte_scope))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(CommonAst::new(CommonOp::Sort {
         input: Box::new(plan),
@@ -1561,7 +1626,7 @@ fn wrap_with_sort_limit(
     }))
 }
 
-fn lower_order_by_expr(ob: OrderByExpr) -> Result<SortOrder, EmissionError> {
+fn lower_order_by_expr(ob: OrderByExpr, cte_scope: &CteScope) -> Result<SortOrder, EmissionError> {
     let direction = match ob.options.asc {
         Some(true) | None => SortDirection::Ascending,
         Some(false) => SortDirection::Descending,
@@ -1575,7 +1640,7 @@ fn lower_order_by_expr(ob: OrderByExpr) -> Result<SortOrder, EmissionError> {
         },
     };
     Ok(SortOrder {
-        expr: Box::new(lower_expr(ob.expr)?),
+        expr: Box::new(lower_expr(ob.expr, cte_scope)?),
         direction,
         null_ordering,
     })
@@ -2422,5 +2487,99 @@ mod tests {
         let fc = first_function_call("SELECT overlay(name PLACING 'XX' FROM 1 FOR 2) FROM t");
         assert_eq!(fc.name, "overlay");
         assert_eq!(fc.args.len(), 4);
+    }
+
+    // ── Pass 106 — uncorrelated subquery lowering ────────────────────────
+
+    #[test]
+    fn scalar_subquery_lowers_to_unanalyzed_scalar_subquery() {
+        let plan = parse("SELECT (SELECT max(sal) FROM emp) AS gmax FROM emp").expect("parse");
+        match first_projection(plan) {
+            Expression::ScalarSubquery(s) => {
+                assert!(
+                    matches!(s.subquery, SubqueryPlan::Unanalyzed(_)),
+                    "front-end must emit an Unanalyzed inner plan"
+                );
+            }
+            other => panic!("expected ScalarSubquery, got {other:?}"),
+        }
+    }
+
+    /// Extract the WHERE condition of a `SELECT * FROM t WHERE …` plan, which
+    /// lowers to `Project(Star) → Filter → TableScan`.
+    fn filter_condition(plan: CommonAst) -> Expression {
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project as top-level");
+        };
+        let CommonOp::Filter { condition, .. } = input.op else {
+            panic!("expected Filter under Project");
+        };
+        condition
+    }
+
+    #[test]
+    fn in_subquery_lowers_and_preserves_negated() {
+        let plan = parse("SELECT * FROM emp WHERE dept_id NOT IN (SELECT dept_id FROM dept)")
+            .expect("parse");
+        match filter_condition(plan) {
+            Expression::InSubquery(i) => {
+                assert!(i.negated, "NOT IN → negated");
+                assert!(matches!(i.subquery, SubqueryPlan::Unanalyzed(_)));
+            }
+            other => panic!("expected InSubquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exists_subquery_lowers_to_unanalyzed_exists() {
+        let plan = parse("SELECT * FROM emp WHERE EXISTS (SELECT 1 FROM dept)").expect("parse");
+        match filter_condition(plan) {
+            Expression::ExistsSubquery(e) => {
+                assert!(!e.negated);
+                assert!(matches!(e.subquery, SubqueryPlan::Unanalyzed(_)));
+            }
+            other => panic!("expected ExistsSubquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subquery_sees_outer_cte_scope() {
+        // Review M1: a subquery's `FROM <cte>` must inline the outer CTE body
+        // (an AliasedRelation over the CTE's own plan), NOT a TableScan named
+        // `c`. If a real table `c` existed, a TableScan would silently read it
+        // instead of the CTE — Spark shadows the table with the CTE (cte-006).
+        let plan = parse(
+            "WITH c AS (SELECT dept_id FROM dept) \
+             SELECT * FROM emp WHERE dept_id IN (SELECT dept_id FROM c)",
+        )
+        .expect("parse");
+        let inner = match filter_condition(plan) {
+            Expression::InSubquery(i) => match i.subquery {
+                SubqueryPlan::Unanalyzed(inner) => *inner,
+                other => panic!("expected Unanalyzed inner plan, got {other:?}"),
+            },
+            other => panic!("expected InSubquery, got {other:?}"),
+        };
+        // Inner plan: Project(dept_id) → AliasedRelation("c", <CTE body>).
+        let CommonOp::Project { input, .. } = inner.op else {
+            panic!(
+                "expected Project as the subquery's top node, got {:?}",
+                inner.op
+            );
+        };
+        match input.op {
+            CommonOp::AliasedRelation { alias, input } => {
+                assert_eq!(alias, "c", "the CTE name is the AliasedRelation alias");
+                assert!(
+                    matches!(input.op, CommonOp::Project { .. }),
+                    "expected the inlined CTE body (a Project), got {:?}",
+                    input.op
+                );
+            }
+            other => panic!(
+                "expected AliasedRelation over the CTE body — a bare TableScan \
+                 would mean the CTE was invisible inside the subquery, got {other:?}"
+            ),
+        }
     }
 }

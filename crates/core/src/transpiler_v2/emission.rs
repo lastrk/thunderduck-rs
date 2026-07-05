@@ -41,7 +41,7 @@ use super::error::EmissionError;
 use super::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
     ColumnReference, Expression, FunctionCall, IntervalExpression, Literal, LiteralValue,
-    NullOrdering, SortDirection, SortOrder, StarExpression, UnaryExpression, UnaryOp,
+    NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan, UnaryExpression, UnaryOp,
 };
 use super::type_inference::AGGREGATE_NAMES;
 use crate::types::{DataType, StructField, StructType};
@@ -1549,6 +1549,19 @@ fn render_range_relation(
 
 // ── Expression rendering ─────────────────────────────────────────────────────
 
+/// Render a subquery's inner plan to a bare `SELECT …` string. The plan must
+/// be `Analyzed` — a stray `Unanalyzed` means the analyzer pass did not run
+/// (a τ bug, not a user input), surfaced as a defensive boundary error.
+fn render_subquery(plan: &SubqueryPlan) -> Result<String, EmissionError> {
+    match plan {
+        SubqueryPlan::Analyzed(inner) => dispatch_op(&inner.op, &inner.resolved_schema),
+        SubqueryPlan::Unanalyzed(_) => Err(EmissionError::UnsupportedExpression {
+            shape: "subquery".to_owned(),
+            reason: "inner plan not analyzed — analyzer pass did not run".to_owned(),
+        }),
+    }
+}
+
 /// Exhaustive match over the [`Expression`] enum.
 pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, EmissionError> {
     match expr {
@@ -1648,18 +1661,25 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
         }
         Expression::Alias(a) => render_alias(a, schema),
         Expression::Star(s) => render_star(s),
-        Expression::InSubquery(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "InSubquery".to_owned(),
-            reason: "correlated subqueries land in Slice F".to_owned(),
-        }),
-        Expression::ExistsSubquery(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "ExistsSubquery".to_owned(),
-            reason: "correlated subqueries land in Slice F".to_owned(),
-        }),
-        Expression::ScalarSubquery(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "ScalarSubquery".to_owned(),
-            reason: "scalar subqueries land in Slice F".to_owned(),
-        }),
+        // Uncorrelated subqueries render node-local from the analyzed inner
+        // plan carried in the variant (ADR-007 A / INV2). No SQL string
+        // pre/post-processing — the inner SELECT is built from its own typed
+        // AST via `dispatch_op` (SQL-gen principles #1/#2).
+        Expression::ScalarSubquery(s) => {
+            let inner = render_subquery(&s.subquery)?;
+            Ok(format!("({inner})"))
+        }
+        Expression::InSubquery(i) => {
+            let lhs = render_expr(&i.expr, schema)?;
+            let inner = render_subquery(&i.subquery)?;
+            let not = if i.negated { "NOT " } else { "" };
+            Ok(format!("{lhs} {not}IN ({inner})"))
+        }
+        Expression::ExistsSubquery(e) => {
+            let inner = render_subquery(&e.subquery)?;
+            let not = if e.negated { "NOT " } else { "" };
+            Ok(format!("{not}EXISTS ({inner})"))
+        }
         Expression::Lambda(l) => {
             let body = render_expr(&l.body, schema)?;
             // DuckDB lambda syntax:
@@ -5854,6 +5874,95 @@ mod tests {
             value: LiteralValue::Int(v),
             data_type: DataType::Integer,
         })
+    }
+
+    // ── Pass 106 — uncorrelated subquery emission ────────────────────────
+
+    fn analyzed_select_id_from_emp() -> SubqueryPlan {
+        let inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            projections: vec![ColumnReference::untyped("id")],
+        });
+        let typed = analyze(inner, &base_types_with_emp()).expect("analyze inner");
+        SubqueryPlan::Analyzed(Box::new(typed))
+    }
+
+    #[test]
+    fn scalar_subquery_renders_parenthesized_select() {
+        let _g = tap_guard();
+        use super::super::expression::ScalarSubquery;
+        let expr = Expression::ScalarSubquery(ScalarSubquery {
+            subquery: analyzed_select_id_from_emp(),
+        });
+        let sql = render_expr(&expr, &empty_schema()).expect("render scalar");
+        assert!(sql.starts_with("(SELECT"), "got: {sql}");
+        assert!(sql.ends_with(')'), "got: {sql}");
+        assert!(sql.contains("FROM emp"), "got: {sql}");
+    }
+
+    #[test]
+    fn in_subquery_renders_lhs_in_select() {
+        let _g = tap_guard();
+        use super::super::expression::InSubquery;
+        let expr = Expression::InSubquery(InSubquery {
+            expr: Box::new(int_lit(1)),
+            subquery: analyzed_select_id_from_emp(),
+            negated: false,
+        });
+        let sql = render_expr(&expr, &empty_schema()).expect("render IN");
+        assert!(sql.starts_with("1 IN (SELECT"), "got: {sql}");
+        assert!(sql.ends_with(')'), "got: {sql}");
+    }
+
+    #[test]
+    fn not_in_subquery_renders_lhs_not_in_select() {
+        let _g = tap_guard();
+        use super::super::expression::InSubquery;
+        let expr = Expression::InSubquery(InSubquery {
+            expr: Box::new(int_lit(1)),
+            subquery: analyzed_select_id_from_emp(),
+            negated: true,
+        });
+        let sql = render_expr(&expr, &empty_schema()).expect("render NOT IN");
+        assert!(sql.starts_with("1 NOT IN (SELECT"), "got: {sql}");
+    }
+
+    #[test]
+    fn exists_subquery_renders_exists_select() {
+        let _g = tap_guard();
+        use super::super::expression::ExistsSubquery;
+        let expr = Expression::ExistsSubquery(ExistsSubquery {
+            subquery: analyzed_select_id_from_emp(),
+            negated: false,
+        });
+        let sql = render_expr(&expr, &empty_schema()).expect("render EXISTS");
+        assert!(sql.starts_with("EXISTS (SELECT"), "got: {sql}");
+    }
+
+    #[test]
+    fn not_exists_subquery_renders_not_exists_select() {
+        let _g = tap_guard();
+        use super::super::expression::ExistsSubquery;
+        let expr = Expression::ExistsSubquery(ExistsSubquery {
+            subquery: analyzed_select_id_from_emp(),
+            negated: true,
+        });
+        let sql = render_expr(&expr, &empty_schema()).expect("render NOT EXISTS");
+        assert!(sql.starts_with("NOT EXISTS (SELECT"), "got: {sql}");
+    }
+
+    #[test]
+    fn unanalyzed_subquery_is_defensive_boundary_error() {
+        let _g = tap_guard();
+        use super::super::expression::ScalarSubquery;
+        let expr = Expression::ScalarSubquery(ScalarSubquery {
+            subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
+        });
+        let err = render_expr(&expr, &empty_schema()).expect_err("unanalyzed must error");
+        assert!(matches!(err, EmissionError::UnsupportedExpression { .. }));
     }
 
     // ── 1. dispatch_op — SingleRow ───────────────────────────────────────

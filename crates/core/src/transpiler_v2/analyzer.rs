@@ -46,7 +46,7 @@ use super::error::EmissionError;
 use super::expression::{
     AliasExpression, BinaryExpression, CaseWhenExpression, CastExpression, ColumnReference,
     Expression, ExtractValueExpression, FunctionCall, Literal, LiteralValue, SortOrder,
-    StarExpression, UnaryExpression, UnresolvedColumn,
+    StarExpression, SubqueryPlan, UnaryExpression, UnresolvedColumn,
 };
 use super::type_inference::TypeInferenceEngine;
 use crate::types::{DataType, StructField, StructType};
@@ -674,7 +674,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             let schema = infer_values_schema(&rows, &column_names)?;
             let typed_rows = rows
                 .into_iter()
-                .map(|row| resolve_expr_list(row, &schema))
+                .map(|row| resolve_expr_list(row, &schema, base_types))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(TypedAst {
                 op: TypedOp::Values {
@@ -754,7 +754,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             let projections = expand_json_tuple_projections(projections)?;
             let projections = projections
                 .into_iter()
-                .map(|e| resolve_and_stamp(e, &typed_input.resolved_schema))
+                .map(|e| resolve_and_stamp(e, &typed_input.resolved_schema, base_types))
                 .collect::<Result<Vec<_>, _>>()?;
             // Compute output schema — expand Star; take alias name if present.
             let output_schema = project_output_schema(&projections, &typed_input.resolved_schema)?;
@@ -769,7 +769,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
 
         CommonOp::Filter { input, condition } => {
             let typed_input = analyze_node(*input, base_types)?;
-            let condition = resolve_and_stamp(condition, &typed_input.resolved_schema)?;
+            let condition = resolve_and_stamp(condition, &typed_input.resolved_schema, base_types)?;
             let cond_type = condition.data_type(&typed_input.resolved_schema);
             if !matches!(
                 cond_type,
@@ -801,7 +801,8 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             let order = order
                 .into_iter()
                 .map(|so| {
-                    let expr = resolve_and_stamp(*so.expr, &typed_input.resolved_schema)?;
+                    let expr =
+                        resolve_and_stamp(*so.expr, &typed_input.resolved_schema, base_types)?;
                     Ok::<SortOrder, AnalyzerError>(SortOrder {
                         expr: Box::new(expr),
                         direction: so.direction,
@@ -845,8 +846,9 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             grouping_kind,
         } => {
             let typed_input = analyze_node(*input, base_types)?;
-            let grouping = resolve_expr_list(grouping, &typed_input.resolved_schema)?;
-            let aggregates = resolve_expr_list(aggregates, &typed_input.resolved_schema)?;
+            let grouping = resolve_expr_list(grouping, &typed_input.resolved_schema, base_types)?;
+            let aggregates =
+                resolve_expr_list(aggregates, &typed_input.resolved_schema, base_types)?;
             // Output schema construction:
             // SparkSQL path folds grouping cols into `aggregates` already
             // (per CommonOp::Aggregate invariant), so output = aggregates as-is.
@@ -897,7 +899,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             let mut resolved_assignments: Vec<(String, Expression)> =
                 Vec::with_capacity(assignments.len());
             for (name, expr) in assignments {
-                let resolved = resolve_and_stamp(expr, input_schema)?;
+                let resolved = resolve_and_stamp(expr, input_schema, base_types)?;
                 resolved_assignments.push((name, resolved));
             }
             // Output schema: walk input fields; if a field name matches an
@@ -1126,7 +1128,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             seed,
         } => {
             let typed_input = analyze_node(*input, base_types)?;
-            let col = resolve_and_stamp(col, &typed_input.resolved_schema)?;
+            let col = resolve_and_stamp(col, &typed_input.resolved_schema, base_types)?;
             let output_schema = typed_input.resolved_schema.clone();
             Ok(TypedAst {
                 op: TypedOp::SampleBy {
@@ -1275,7 +1277,11 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             let condition = match condition {
                 Some(c) => {
                     let qualified = qualify_plan_id_refs(c, &left_plan_ids, &right_plan_ids);
-                    Some(resolve_and_stamp(qualified, &combined_input_schema)?)
+                    Some(resolve_and_stamp(
+                        qualified,
+                        &combined_input_schema,
+                        base_types,
+                    )?)
                 }
                 None => None,
             };
@@ -1911,7 +1917,11 @@ fn expand_json_tuple_projections(
 
 /// Resolve every `UnresolvedColumn` in `expr` against `schema` and stamp
 /// resolved `ColumnReference`s with `data_type` and `nullable`.
-fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression, AnalyzerError> {
+fn resolve_and_stamp(
+    expr: Expression,
+    schema: &StructType,
+    base_types: &BaseTypes,
+) -> Result<Expression, AnalyzerError> {
     match expr {
         Expression::UnresolvedColumn(u) => resolve_column(u, schema),
         Expression::ColumnReference(c) => {
@@ -1920,24 +1930,24 @@ fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression
         }
         Expression::Literal(_) | Expression::Star(_) => Ok(expr),
         Expression::Binary(mut b) => {
-            b.left = Box::new(resolve_and_stamp(*b.left, schema)?);
-            b.right = Box::new(resolve_and_stamp(*b.right, schema)?);
+            b.left = Box::new(resolve_and_stamp(*b.left, schema, base_types)?);
+            b.right = Box::new(resolve_and_stamp(*b.right, schema, base_types)?);
             Ok(Expression::Binary(b))
         }
         Expression::Unary(mut u) => {
-            u.operand = Box::new(resolve_and_stamp(*u.operand, schema)?);
+            u.operand = Box::new(resolve_and_stamp(*u.operand, schema, base_types)?);
             Ok(Expression::Unary(u))
         }
         Expression::FunctionCall(mut f) => {
             f.args = f
                 .args
                 .into_iter()
-                .map(|a| resolve_and_stamp(a, schema))
+                .map(|a| resolve_and_stamp(a, schema, base_types))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expression::FunctionCall(f))
         }
         Expression::Cast(mut c) => {
-            c.expr = Box::new(resolve_and_stamp(*c.expr, schema)?);
+            c.expr = Box::new(resolve_and_stamp(*c.expr, schema, base_types)?);
             Ok(Expression::Cast(c))
         }
         Expression::CaseWhen(mut cw) => {
@@ -1945,26 +1955,26 @@ fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression
                 .branches
                 .into_iter()
                 .map(|(w, t)| {
-                    let w = resolve_and_stamp(w, schema)?;
-                    let t = resolve_and_stamp(t, schema)?;
+                    let w = resolve_and_stamp(w, schema, base_types)?;
+                    let t = resolve_and_stamp(t, schema, base_types)?;
                     Ok::<_, AnalyzerError>((w, t))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             if let Some(e) = cw.else_expr {
-                cw.else_expr = Some(Box::new(resolve_and_stamp(*e, schema)?));
+                cw.else_expr = Some(Box::new(resolve_and_stamp(*e, schema, base_types)?));
             }
             Ok(Expression::CaseWhen(cw))
         }
         Expression::Window(mut w) => {
-            w.func = Box::new(resolve_and_stamp(*w.func, schema)?);
+            w.func = Box::new(resolve_and_stamp(*w.func, schema, base_types)?);
             w.partition_by = w
                 .partition_by
                 .into_iter()
-                .map(|e| resolve_and_stamp(e, schema))
+                .map(|e| resolve_and_stamp(e, schema, base_types))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut new_order = Vec::with_capacity(w.order_by.len());
             for so in w.order_by {
-                let e = resolve_and_stamp(*so.expr, schema)?;
+                let e = resolve_and_stamp(*so.expr, schema, base_types)?;
                 new_order.push(SortOrder {
                     expr: Box::new(e),
                     direction: so.direction,
@@ -1975,44 +1985,44 @@ fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression
             Ok(Expression::Window(w))
         }
         Expression::Alias(mut a) => {
-            a.expr = Box::new(resolve_and_stamp(*a.expr, schema)?);
+            a.expr = Box::new(resolve_and_stamp(*a.expr, schema, base_types)?);
             Ok(Expression::Alias(a))
         }
         Expression::Between(mut b) => {
-            b.expr = Box::new(resolve_and_stamp(*b.expr, schema)?);
-            b.low = Box::new(resolve_and_stamp(*b.low, schema)?);
-            b.high = Box::new(resolve_and_stamp(*b.high, schema)?);
+            b.expr = Box::new(resolve_and_stamp(*b.expr, schema, base_types)?);
+            b.low = Box::new(resolve_and_stamp(*b.low, schema, base_types)?);
+            b.high = Box::new(resolve_and_stamp(*b.high, schema, base_types)?);
             Ok(Expression::Between(b))
         }
         Expression::InList(mut i) => {
-            i.expr = Box::new(resolve_and_stamp(*i.expr, schema)?);
+            i.expr = Box::new(resolve_and_stamp(*i.expr, schema, base_types)?);
             i.list = i
                 .list
                 .into_iter()
-                .map(|e| resolve_and_stamp(e, schema))
+                .map(|e| resolve_and_stamp(e, schema, base_types))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expression::InList(i))
         }
         Expression::Like(mut l) => {
-            l.value = Box::new(resolve_and_stamp(*l.value, schema)?);
-            l.pattern = Box::new(resolve_and_stamp(*l.pattern, schema)?);
+            l.value = Box::new(resolve_and_stamp(*l.value, schema, base_types)?);
+            l.pattern = Box::new(resolve_and_stamp(*l.pattern, schema, base_types)?);
             Ok(Expression::Like(l))
         }
         Expression::IsDistinctFrom(mut d) => {
-            d.left = Box::new(resolve_and_stamp(*d.left, schema)?);
-            d.right = Box::new(resolve_and_stamp(*d.right, schema)?);
+            d.left = Box::new(resolve_and_stamp(*d.left, schema, base_types)?);
+            d.right = Box::new(resolve_and_stamp(*d.right, schema, base_types)?);
             Ok(Expression::IsDistinctFrom(d))
         }
         Expression::ExtractValue(mut ev) => {
-            ev.child = Box::new(resolve_and_stamp(*ev.child, schema)?);
-            ev.extraction = Box::new(resolve_and_stamp(*ev.extraction, schema)?);
+            ev.child = Box::new(resolve_and_stamp(*ev.child, schema, base_types)?);
+            ev.extraction = Box::new(resolve_and_stamp(*ev.extraction, schema, base_types)?);
             Ok(Expression::ExtractValue(ev))
         }
         Expression::ArrayLiteral(mut a) => {
             a.elements = a
                 .elements
                 .into_iter()
-                .map(|e| resolve_and_stamp(e, schema))
+                .map(|e| resolve_and_stamp(e, schema, base_types))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expression::ArrayLiteral(a))
         }
@@ -2021,8 +2031,8 @@ fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression
                 .entries
                 .into_iter()
                 .map(|(k, v)| {
-                    let k = resolve_and_stamp(k, schema)?;
-                    let v = resolve_and_stamp(v, schema)?;
+                    let k = resolve_and_stamp(k, schema, base_types)?;
+                    let v = resolve_and_stamp(v, schema, base_types)?;
                     Ok::<_, AnalyzerError>((k, v))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2032,7 +2042,9 @@ fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression
             s.fields = s
                 .fields
                 .into_iter()
-                .map(|(n, e)| Ok::<_, AnalyzerError>((n, resolve_and_stamp(e, schema)?)))
+                .map(|(n, e)| {
+                    Ok::<_, AnalyzerError>((n, resolve_and_stamp(e, schema, base_types)?))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expression::StructLiteral(s))
         }
@@ -2040,18 +2052,18 @@ fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression
             rc.elements = rc
                 .elements
                 .into_iter()
-                .map(|e| resolve_and_stamp(e, schema))
+                .map(|e| resolve_and_stamp(e, schema, base_types))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expression::RowConstructor(rc))
         }
         Expression::UpdateFields(mut u) => {
-            u.struct_expr = Box::new(resolve_and_stamp(*u.struct_expr, schema)?);
+            u.struct_expr = Box::new(resolve_and_stamp(*u.struct_expr, schema, base_types)?);
             u.updates = u
                 .updates
                 .into_iter()
                 .map(|(n, e)| {
                     let resolved = match e {
-                        Some(expr) => Some(resolve_and_stamp(expr, schema)?),
+                        Some(expr) => Some(resolve_and_stamp(expr, schema, base_types)?),
                         None => None,
                     };
                     Ok::<_, AnalyzerError>((n, resolved))
@@ -2077,13 +2089,40 @@ fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression
             }
             Ok(Expression::UpdateFields(u))
         }
-        // Subquery / lambda / raw-sql / interval — Slice B leaves them
-        // opaque. The subquery's inner CommonAst is not re-analyzed here;
-        // Slice F owns subquery analysis.
-        Expression::InSubquery(_)
-        | Expression::ExistsSubquery(_)
-        | Expression::ScalarSubquery(_)
-        | Expression::Lambda(_)
+        // Uncorrelated subqueries: analyze the inner plan against the SAME
+        // `base_types` and carry the typed plan forward so emission renders it
+        // node-local (ADR-007 A / INV2). A correlated inner ref to an outer
+        // column is an `UnresolvedColumn` this isolated `analyze` cannot
+        // resolve → resolution error → honest Thunderduck boundary (ADR-022)
+        // until Slice F provides outer-before-inner staging.
+        Expression::ScalarSubquery(mut s) => {
+            let inner = analyze_subquery_plan(s.subquery, base_types)?;
+            if inner.resolved_schema.fields.len() != 1 {
+                return Err(AnalyzerError::Other {
+                    reason: "scalar subquery must return exactly one column".to_owned(),
+                });
+            }
+            s.subquery = SubqueryPlan::Analyzed(Box::new(inner));
+            Ok(Expression::ScalarSubquery(s))
+        }
+        Expression::InSubquery(mut i) => {
+            i.expr = Box::new(resolve_and_stamp(*i.expr, schema, base_types)?);
+            let inner = analyze_subquery_plan(i.subquery, base_types)?;
+            if inner.resolved_schema.fields.len() != 1 {
+                return Err(AnalyzerError::Other {
+                    reason: "IN subquery must return exactly one column".to_owned(),
+                });
+            }
+            i.subquery = SubqueryPlan::Analyzed(Box::new(inner));
+            Ok(Expression::InSubquery(i))
+        }
+        Expression::ExistsSubquery(mut e) => {
+            let inner = analyze_subquery_plan(e.subquery, base_types)?;
+            e.subquery = SubqueryPlan::Analyzed(Box::new(inner));
+            Ok(Expression::ExistsSubquery(e))
+        }
+        // Lambda / raw-sql / interval — Slice B leaves them opaque.
+        Expression::Lambda(_)
         | Expression::LambdaVariable(_)
         | Expression::RawSql(_)
         | Expression::Interval(_) => Ok(expr),
@@ -2098,11 +2137,25 @@ fn resolve_and_stamp(expr: Expression, schema: &StructType) -> Result<Expression
 fn resolve_expr_list(
     exprs: Vec<Expression>,
     schema: &StructType,
+    base_types: &BaseTypes,
 ) -> Result<Vec<Expression>, AnalyzerError> {
     exprs
         .into_iter()
-        .map(|e| resolve_and_stamp(e, schema))
+        .map(|e| resolve_and_stamp(e, schema, base_types))
         .collect()
+}
+
+/// Analyze an embedded subquery's inner plan against `base_types`. The plan is
+/// `Unanalyzed` when produced by the front-end; an already-`Analyzed` plan is
+/// returned unchanged (idempotent — the analyzer normally runs each plan once).
+fn analyze_subquery_plan(
+    plan: SubqueryPlan,
+    base_types: &BaseTypes,
+) -> Result<TypedAst, AnalyzerError> {
+    match plan {
+        SubqueryPlan::Unanalyzed(inner) => analyze(*inner, base_types),
+        SubqueryPlan::Analyzed(inner) => Ok(*inner),
+    }
 }
 
 /// Synthetic qualifier attached to plan_id-tagged column refs during Join
@@ -2409,17 +2462,28 @@ fn expression_is_fully_resolved(expr: &Expression) -> bool {
                     None => true,
                 })
         }
-        // Subquery bodies: opaque at Slice B (Slice F owns).
-        Expression::InSubquery(_)
-        | Expression::ExistsSubquery(_)
-        | Expression::ScalarSubquery(_)
-        | Expression::Lambda(_)
-        | Expression::RawSql(_)
-        | Expression::Interval(_) => true,
+        // Subquery bodies must be analyzed: the inner plan is fully resolved
+        // only once the analyzer has rewritten `Unanalyzed` → `Analyzed`.
+        Expression::ScalarSubquery(s) => subquery_plan_is_resolved(&s.subquery),
+        Expression::InSubquery(i) => {
+            expression_is_fully_resolved(&i.expr) && subquery_plan_is_resolved(&i.subquery)
+        }
+        Expression::ExistsSubquery(e) => subquery_plan_is_resolved(&e.subquery),
+        // Lambda / raw-sql / interval — opaque at Slice B.
+        Expression::Lambda(_) | Expression::RawSql(_) | Expression::Interval(_) => true,
         // Pass 85 — pattern-driven column expander; expanded away by
         // `expand_regex_projections` in the `CommonOp::Project` pre-pass.
         // If it survives to this check, treat it as unresolved.
         Expression::UnresolvedRegex(_) => false,
+    }
+}
+
+/// A subquery's inner plan is resolved only once the analyzer has stamped it
+/// (`Analyzed`) and every node under it carries a resolved schema.
+fn subquery_plan_is_resolved(plan: &SubqueryPlan) -> bool {
+    match plan {
+        SubqueryPlan::Analyzed(inner) => has_resolved_schema(inner),
+        SubqueryPlan::Unanalyzed(_) => false,
     }
 }
 
@@ -2870,13 +2934,13 @@ fn analyze_pivot(
     }
     let typed_input = analyze_node(input, base_types)?;
     let input_schema = &typed_input.resolved_schema;
-    let grouping = resolve_expr_list(grouping, input_schema)?;
-    let pivot_column = resolve_and_stamp(pivot_column, input_schema)?;
-    let aggregates = resolve_expr_list(aggregates, input_schema)?;
+    let grouping = resolve_expr_list(grouping, input_schema, base_types)?;
+    let pivot_column = resolve_and_stamp(pivot_column, input_schema, base_types)?;
+    let aggregates = resolve_expr_list(aggregates, input_schema, base_types)?;
     // Pivot values are literals; they only need type resolution against the
     // pivot column (Spark coerces them into that type at read). We defer
     // typing to the emission stage — literals carry their own type already.
-    let pivot_values = resolve_expr_list(pivot_values, input_schema)?;
+    let pivot_values = resolve_expr_list(pivot_values, input_schema, base_types)?;
 
     // Spark-emulated (Pass 60 H2): Catalyst rejects NULL pivot values with
     // "Literal expressions required for pivot values, found 'null'". Mirror
@@ -3146,7 +3210,8 @@ mod tests {
     use super::super::analyzer_fixtures;
     use super::super::ast::CommonAst;
     use super::super::expression::{
-        BinaryExpression, BinaryOp, FunctionCall, Literal, LiteralValue, UnresolvedRegexExpression,
+        BinaryExpression, BinaryOp, ExistsSubquery, FunctionCall, InSubquery, Literal,
+        LiteralValue, ScalarSubquery, UnresolvedRegexExpression,
     };
     use super::*;
 
@@ -3227,6 +3292,150 @@ mod tests {
                 qualifier: None,
                 plan_id: None,
             })],
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
+    }
+
+    // ── Pass 106 — uncorrelated subquery analysis ────────────────────────
+
+    fn emp_scan() -> CommonAst {
+        CommonAst::new(CommonOp::TableScan {
+            table: "emp".to_owned(),
+            alias: None,
+        })
+    }
+
+    /// Inner plan `SELECT <col> FROM emp` — a single-column subquery body.
+    fn inner_select_col(col: &str) -> CommonAst {
+        CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name: col.to_owned(),
+                qualifier: None,
+                plan_id: None,
+            })],
+        })
+    }
+
+    #[test]
+    fn scalar_subquery_types_to_inner_single_column_and_becomes_analyzed() {
+        let bt = base_types_with_emp_dept();
+        // SELECT (SELECT id FROM emp) AS s FROM emp
+        let scalar = Expression::ScalarSubquery(ScalarSubquery {
+            subquery: SubqueryPlan::Unanalyzed(Box::new(inner_select_col("id"))),
+        });
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![scalar],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        // `id` is Long; a scalar subquery is always nullable (no-row ⇒ NULL).
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
+        assert!(typed.resolved_schema.fields[0].nullable);
+        match &typed.op {
+            TypedOp::Project { projections, .. } => match &projections[0] {
+                Expression::ScalarSubquery(s) => {
+                    assert!(
+                        matches!(s.subquery, SubqueryPlan::Analyzed(_)),
+                        "analyzer must rewrite Unanalyzed → Analyzed"
+                    );
+                }
+                other => panic!("expected ScalarSubquery, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_subquery_two_columns_is_spark_emulated_error() {
+        let bt = base_types_with_emp_dept();
+        let inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "salary".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+            ],
+        });
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![Expression::ScalarSubquery(ScalarSubquery {
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+            })],
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(matches!(err, AnalyzerError::Other { .. }));
+    }
+
+    #[test]
+    fn exists_subquery_over_dept_analyzes_and_stays_boolean() {
+        let bt = base_types_with_emp_dept();
+        // SELECT * FROM emp WHERE EXISTS (SELECT dept_id FROM dept)
+        let inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "dept".to_owned(),
+                alias: None,
+            })),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "dept_id".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            })],
+        });
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(emp_scan()),
+            condition: Expression::ExistsSubquery(ExistsSubquery {
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+                negated: false,
+            }),
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        match &typed.op {
+            TypedOp::Filter { condition, .. } => match condition {
+                Expression::ExistsSubquery(e) => {
+                    assert!(matches!(e.subquery, SubqueryPlan::Analyzed(_)));
+                }
+                other => panic!("expected ExistsSubquery, got {other:?}"),
+            },
+            other => panic!("expected Filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_subquery_correlated_outer_ref_is_boundary_error() {
+        let bt = base_types_with_emp_dept();
+        // Inner references a column absent from `dept` — analyzed in isolation
+        // this fails resolution (the correlated boundary, ADR-022).
+        let inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "dept".to_owned(),
+                alias: None,
+            })),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "not_in_dept".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            })],
+        });
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(emp_scan()),
+            condition: Expression::InSubquery(InSubquery {
+                expr: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                })),
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+                negated: false,
+            }),
         });
         let err = analyze(ast, &bt).unwrap_err();
         assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));

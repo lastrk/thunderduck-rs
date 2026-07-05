@@ -5,6 +5,7 @@
 //! `crate::logical`, `crate::generator`, `crate::functions`, or
 //! `crate::types::TypeInferenceEngine`.
 
+use super::analyzer::TypedAst;
 use super::ast::CommonAst;
 use super::type_inference::TypeInferenceEngine;
 use crate::types::{DataType, StructField, StructType};
@@ -270,25 +271,40 @@ pub struct StarExpression {
     pub qualifier: Option<String>,
 }
 
+/// The two states an embedded subquery's inner plan can be in.
+///
+/// The front-end (lowering / proto-converter) produces the un-analyzed
+/// [`CommonAst`]; the analyzer (layer A) rewrites it into an analyzed
+/// [`TypedAst`] so emission can render it node-local via `dispatch_op`
+/// (ADR-007 A / INV2). Making the two states an enum keeps illegal states
+/// unrepresentable — the field is never both, never neither.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubqueryPlan {
+    /// Front-end output — not yet analyzed.
+    Unanalyzed(Box<CommonAst>),
+    /// Analyzer output — the typed inner plan, carried so emission renders it.
+    Analyzed(Box<TypedAst>),
+}
+
 /// `expr IN (subquery)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InSubquery {
     pub expr: Box<Expression>,
-    pub subquery: Box<CommonAst>,
+    pub subquery: SubqueryPlan,
     pub negated: bool,
 }
 
 /// `EXISTS (subquery)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExistsSubquery {
-    pub subquery: Box<CommonAst>,
+    pub subquery: SubqueryPlan,
     pub negated: bool,
 }
 
 /// `(scalar subquery)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScalarSubquery {
-    pub subquery: Box<CommonAst>,
+    pub subquery: SubqueryPlan,
 }
 
 /// Lambda expression `(x, y) -> body`.
@@ -473,7 +489,18 @@ impl Expression {
             Expression::Alias(a) => a.expr.data_type(schema),
             Expression::Star(_) => DataType::Unresolved,
             Expression::InSubquery(_) | Expression::ExistsSubquery(_) => DataType::Boolean,
-            Expression::ScalarSubquery(_) => DataType::Unresolved,
+            // Post-analysis the inner plan is `Analyzed` and its single output
+            // column's type is the scalar's type; pre-analysis it is still
+            // `Unresolved` (the analyzer must run first).
+            Expression::ScalarSubquery(s) => match &s.subquery {
+                SubqueryPlan::Analyzed(t) => t
+                    .resolved_schema
+                    .fields
+                    .first()
+                    .map(|f| f.data_type.clone())
+                    .unwrap_or(DataType::Unresolved),
+                SubqueryPlan::Unanalyzed(_) => DataType::Unresolved,
+            },
             Expression::Lambda(l) => l.body.data_type(schema),
             Expression::LambdaVariable(lv) => TypeInferenceEngine::column_type(&lv.name, schema),
             Expression::RawSql(r) => r.data_type.clone().unwrap_or(DataType::Unresolved),
@@ -587,7 +614,12 @@ impl Expression {
             Expression::Window(w) => Self::window_nullable(w, schema),
             Expression::Alias(a) => a.expr.nullable(schema),
             Expression::Star(_) => false,
-            Expression::InSubquery(_) | Expression::ExistsSubquery(_) => false,
+            // `x [NOT] IN (subquery)` is 3-valued: a NULL member (or NULL lhs)
+            // yields UNKNOWN, so the predicate result is nullable.
+            Expression::InSubquery(_) => true,
+            // `[NOT] EXISTS (subquery)` is always a non-null boolean.
+            Expression::ExistsSubquery(_) => false,
+            // A scalar subquery returns NULL when the inner plan yields no row.
             Expression::ScalarSubquery(_) => true,
             Expression::Lambda(_) => false,
             Expression::LambdaVariable(lv) => {
@@ -1652,18 +1684,18 @@ mod tests {
         assert!(u.plan_id.is_none());
     }
 
-    // ── §7 subquery variants carry CommonAst ─────────────────────────────
+    // ── §7 subquery variants carry a SubqueryPlan ────────────────────────
 
     #[test]
-    fn in_subquery_carries_common_ast() {
+    fn in_subquery_carries_unanalyzed_plan() {
         use super::super::ast::{CommonAst, CommonOp};
         let sub = CommonAst::new(CommonOp::SingleRow);
         let expr = Expression::InSubquery(InSubquery {
             expr: Box::new(ColumnReference::untyped("x")),
-            subquery: Box::new(sub),
+            subquery: SubqueryPlan::Unanalyzed(Box::new(sub)),
             negated: false,
         });
-        // Compile-only sanity; ensures the field type is Box<CommonAst>.
+        // Compile-only sanity; ensures the field type is `SubqueryPlan`.
         assert!(matches!(expr, Expression::InSubquery(_)));
     }
 
@@ -1672,7 +1704,7 @@ mod tests {
         use super::super::ast::{CommonAst, CommonOp};
         let s = StructType::empty();
         let expr = Expression::ExistsSubquery(ExistsSubquery {
-            subquery: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
             negated: false,
         });
         assert_eq!(expr.data_type(&s), DataType::Boolean);
@@ -1680,13 +1712,46 @@ mod tests {
     }
 
     #[test]
-    fn scalar_subquery_data_type_unresolved() {
+    fn in_subquery_is_nullable_three_valued() {
+        use super::super::ast::{CommonAst, CommonOp};
+        let s = StructType::empty();
+        let expr = Expression::InSubquery(InSubquery {
+            expr: Box::new(ColumnReference::untyped("x")),
+            subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
+            negated: true,
+        });
+        assert_eq!(expr.data_type(&s), DataType::Boolean);
+        // 3VL: a NULL member yields UNKNOWN → the predicate is nullable.
+        assert!(expr.nullable(&s));
+    }
+
+    #[test]
+    fn scalar_subquery_unanalyzed_data_type_unresolved() {
         use super::super::ast::{CommonAst, CommonOp};
         let s = StructType::empty();
         let expr = Expression::ScalarSubquery(ScalarSubquery {
-            subquery: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
         });
         assert_eq!(expr.data_type(&s), DataType::Unresolved);
+        assert!(expr.nullable(&s));
+    }
+
+    #[test]
+    fn scalar_subquery_analyzed_data_type_from_inner_col() {
+        use super::super::analyzer::{TypedAst, TypedOp};
+        let s = StructType::empty();
+        // A hand-built analyzed inner plan whose single output column is Long.
+        let inner = TypedAst {
+            op: TypedOp::SingleRow,
+            resolved_schema: StructType::new(vec![StructField::nullable(
+                "max_salary",
+                DataType::Long,
+            )]),
+        };
+        let expr = Expression::ScalarSubquery(ScalarSubquery {
+            subquery: SubqueryPlan::Analyzed(Box::new(inner)),
+        });
+        assert_eq!(expr.data_type(&s), DataType::Long);
         assert!(expr.nullable(&s));
     }
 

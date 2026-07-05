@@ -561,3 +561,29 @@ call. Arm bodies moved verbatim; only the recursive `analyze_node
 - **Warnings.** No delta.
 - **Gate.** `cargo test -p thunderduck-core --lib --tests`: 453
   pass / 0 fail. Scoped `rustfmt --edition 2021 --check` clean.
+
+## Pass 14 — OPP-WW (2026-07-05)
+
+Extract a shared `passthrough_schema_arm(input, base_types, |ti|
+build_op) -> Result<TypedAst, AnalyzerError>` helper in
+`crates/core/src/transpiler_v2/analyzer.rs`. Signature accepts a
+failable `build_op` closure so callers can `?`-propagate inside it.
+
+**7 arms migrated** to the helper (in file order): `Limit`, `NaDrop`,
+`NaReplace`, `Deduplicate`, `Sample`, `SampleBy`, `AliasedRelation`.
+Each arm shrunk from ~15 LOC to ~7-9 LOC (closure overhead + `Ok(...)`
+wrap eats some of the raw win, but every arm now follows one shape).
+
+Deviations from the plan's target list (10 arms):
+- `NaFill` uses schema-mutating `analyze_na_fill` (Pass 13); does not
+  fit passthrough — excluded.
+- `Filter` and `Sort` are deferred to Pass 15 (OPP-II bounded resolver)
+  since they need per-op `T` resolution beyond bare passthrough.
+
+- **LOC delta.** analyzer.rs net roughly flat (+22 helper vs −20
+  across 7 migrated arms). The point is the shared shape, not raw
+  LOC reduction.
+- **Corpus.** 314 → 314 (behavior-preserving).
+- **Warnings.** No delta.
+- **Gate.** `cargo test -p thunderduck-core --lib`: 453 pass / 0
+  fail. Scoped fmt clean.

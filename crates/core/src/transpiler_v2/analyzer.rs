@@ -653,6 +653,28 @@ pub(super) fn analyzer_error_to_emission_error(e: AnalyzerError) -> EmissionErro
 
 // ── Internal: single-pass bottom-up analyzer ────────────────────────────────
 
+/// Analyze `input`, clone its resolved schema, and wrap it in a caller-built
+/// [`TypedOp`] variant. The output schema is a straight passthrough — used by
+/// operators that neither add, drop, nor retype columns (Limit, Deduplicate,
+/// Sample, SampleBy, NaDrop, NaReplace, AliasedRelation).
+///
+/// The `build_op` closure receives the typed input by value so it can move it
+/// into a `Box`; it returns a `Result` so callers may perform failable
+/// resolution (`resolve_and_stamp`, etc.) inside the closure.
+fn passthrough_schema_arm(
+    input: CommonAst,
+    base_types: &BaseTypes,
+    build_op: impl FnOnce(TypedAst) -> Result<TypedOp, AnalyzerError>,
+) -> Result<TypedAst, AnalyzerError> {
+    let typed_input = analyze_node(input, base_types)?;
+    let resolved_schema = typed_input.resolved_schema.clone();
+    let op = build_op(typed_input)?;
+    Ok(TypedAst {
+        op,
+        resolved_schema,
+    })
+}
+
 fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, AnalyzerError> {
     match ast.op {
         // ── Leaves ────────────────────────────────────────────────────────
@@ -833,18 +855,13 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             input,
             limit,
             offset,
-        } => {
-            let typed_input = analyze_node(*input, base_types)?;
-            let output_schema = typed_input.resolved_schema.clone();
-            Ok(TypedAst {
-                op: TypedOp::Limit {
-                    input: Box::new(typed_input),
-                    limit,
-                    offset,
-                },
-                resolved_schema: output_schema,
+        } => passthrough_schema_arm(*input, base_types, |ti| {
+            Ok(TypedOp::Limit {
+                input: Box::new(ti),
+                limit,
+                offset,
             })
-        }
+        }),
 
         CommonOp::Aggregate {
             input,
@@ -910,34 +927,24 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             input,
             cols,
             min_non_nulls,
-        } => {
-            let typed_input = analyze_node(*input, base_types)?;
-            let output_schema = typed_input.resolved_schema.clone();
-            Ok(TypedAst {
-                op: TypedOp::NaDrop {
-                    input: Box::new(typed_input),
-                    cols,
-                    min_non_nulls,
-                },
-                resolved_schema: output_schema,
+        } => passthrough_schema_arm(*input, base_types, |ti| {
+            Ok(TypedOp::NaDrop {
+                input: Box::new(ti),
+                cols,
+                min_non_nulls,
             })
-        }
+        }),
         CommonOp::NaReplace {
             input,
             cols,
             replacements,
-        } => {
-            let typed_input = analyze_node(*input, base_types)?;
-            let output_schema = typed_input.resolved_schema.clone();
-            Ok(TypedAst {
-                op: TypedOp::NaReplace {
-                    input: Box::new(typed_input),
-                    cols,
-                    replacements,
-                },
-                resolved_schema: output_schema,
+        } => passthrough_schema_arm(*input, base_types, |ti| {
+            Ok(TypedOp::NaReplace {
+                input: Box::new(ti),
+                cols,
+                replacements,
             })
-        }
+        }),
 
         // ── Unpivot (Spark `df.unpivot(...)` / `df.melt(...)`) ──────────
         CommonOp::Unpivot {
@@ -995,14 +1002,11 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
 
         // ── Deduplicate (Spark `df.dropDuplicates` / `df.distinct`) ──────
         CommonOp::Deduplicate { input, on_columns } => {
-            let typed_input = analyze_node(*input, base_types)?;
-            let output_schema = typed_input.resolved_schema.clone();
-            Ok(TypedAst {
-                op: TypedOp::Deduplicate {
-                    input: Box::new(typed_input),
+            passthrough_schema_arm(*input, base_types, |ti| {
+                Ok(TypedOp::Deduplicate {
+                    input: Box::new(ti),
                     on_columns,
-                },
-                resolved_schema: output_schema,
+                })
             })
         }
 
@@ -1013,20 +1017,15 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             upper_bound,
             with_replacement,
             seed,
-        } => {
-            let typed_input = analyze_node(*input, base_types)?;
-            let output_schema = typed_input.resolved_schema.clone();
-            Ok(TypedAst {
-                op: TypedOp::Sample {
-                    input: Box::new(typed_input),
-                    lower_bound,
-                    upper_bound,
-                    with_replacement,
-                    seed,
-                },
-                resolved_schema: output_schema,
+        } => passthrough_schema_arm(*input, base_types, |ti| {
+            Ok(TypedOp::Sample {
+                input: Box::new(ti),
+                lower_bound,
+                upper_bound,
+                with_replacement,
+                seed,
             })
-        }
+        }),
 
         // ── SampleBy (Spark `df.sampleBy(col, fractions, seed)`) ───────
         CommonOp::SampleBy {
@@ -1034,20 +1033,15 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             col,
             fractions,
             seed,
-        } => {
-            let typed_input = analyze_node(*input, base_types)?;
-            let col = resolve_and_stamp(col, &typed_input.resolved_schema)?;
-            let output_schema = typed_input.resolved_schema.clone();
-            Ok(TypedAst {
-                op: TypedOp::SampleBy {
-                    input: Box::new(typed_input),
-                    col,
-                    fractions,
-                    seed,
-                },
-                resolved_schema: output_schema,
+        } => passthrough_schema_arm(*input, base_types, |ti| {
+            let col = resolve_and_stamp(col, &ti.resolved_schema)?;
+            Ok(TypedOp::SampleBy {
+                input: Box::new(ti),
+                col,
+                fractions,
+                seed,
             })
-        }
+        }),
 
         // ── ToDf (Spark `df.toDF(new1, new2, ...)`) ──────────────────────
         CommonOp::ToDf {
@@ -1057,14 +1051,11 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
 
         // ── AliasedRelation (Spark `df.alias(name)`) ─────────────────────
         CommonOp::AliasedRelation { input, alias } => {
-            let typed_input = analyze_node(*input, base_types)?;
-            let output_schema = typed_input.resolved_schema.clone();
-            Ok(TypedAst {
-                op: TypedOp::AliasedRelation {
-                    input: Box::new(typed_input),
+            passthrough_schema_arm(*input, base_types, |ti| {
+                Ok(TypedOp::AliasedRelation {
+                    input: Box::new(ti),
                     alias,
-                },
-                resolved_schema: output_schema,
+                })
             })
         }
 

@@ -66,8 +66,8 @@ if [ -f "$ENV_FILE" ]; then
     . "$ENV_FILE"
 fi
 
-# Fall back to the vendored in-tree install, then $HOME/spark/current for
-# legacy setups, before failing in the prerequisite check below.
+# Fall back to the vendored in-tree install, then $HOME/spark/current,
+# before failing in the prerequisite check below.
 SPARK_HOME="${SPARK_HOME:-$WORKSPACE_DIR/.spark/spark-4.1.1}"
 [ -d "$SPARK_HOME" ] || SPARK_HOME="$HOME/spark/current"
 
@@ -127,8 +127,8 @@ get_test_files() {
 
 get_test_description() {
     case "$1" in
-        core)        echo "Conformance corpus (DataFrame API only, biased to divergence) — legacy transpiler" ;;
-        core_v2)     echo "Same corpus, routed through THUNDERDUCK_TRANSPILER=v2 — v2 conformance gate" ;;
+        core)        echo "Conformance corpus (DataFrame API only, biased to divergence) — τ fitness gate" ;;
+        core_v2)     echo "Alias for 'core' (retained for tooling that references core_v2 by name)" ;;
         tpch)        echo "TPC-H SQL and DataFrame tests" ;;
         tpcds)       echo "TPC-DS SQL and DataFrame tests" ;;
         functions)   echo "DataFrame function parity tests" ;;
@@ -219,8 +219,8 @@ show_help() {
     echo "Test groups: core core_v2 tpch tpcds functions aggregations window datetime"
     echo "             conditional operations lambda joins statistics types schema dataframe all"
     echo ""
-    echo "  core     — DataFrame-only conformance corpus, legacy transpiler (the fast gate)"
-    echo "  core_v2  — same corpus, routed through THUNDERDUCK_TRANSPILER=v2 (v2 dev gate)"
+    echo "  core     — DataFrame-only conformance corpus (τ fitness gate)"
+    echo "  core_v2  — alias for 'core' (retained for tooling that references it by name)"
     echo "  all      — everything including core (the comprehensive gate)"
     exit 0
 }
@@ -260,19 +260,6 @@ echo ""
 
 export SPARK_HOME
 export THUNDERDUCK_BINARY="$BINARY_PATH"
-
-# Transpiler dispatch: `core_v2` routes through the v2 path; everything else
-# uses the legacy path. The env var is read by connect-server/main.rs and
-# selects the dispatch arm in service.rs::generate_sql.
-case "$TEST_GROUP" in
-    core_v2)
-        export THUNDERDUCK_TRANSPILER=v2
-        echo -e "    Transpiler:        ${CYAN}v2 (rearchitecture path)${NC}"
-        ;;
-    *)
-        unset THUNDERDUCK_TRANSPILER
-        ;;
-esac
 
 cd "$WORKSPACE_DIR/tests/integration"
 

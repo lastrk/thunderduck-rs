@@ -3,6 +3,13 @@
 Update after any user correction, review finding, or workflow-shape observation worth
 generalizing. Terse; one bullet per lesson; cite the concrete instance.
 
+> **Note on vocabulary.** Entries below dated 2026-07-01 through 2026-07-02 reference
+> the retired slice-based methodology (Slice A, Slice B, …) and the retired v1
+> transpiler; keep them as historical evidence but read them for the *lesson*, not
+> the process framing. Slice terminology retired 2026-07-02; the v1 transpiler
+> was deleted 2026-07-05. Current work is corpus-driven — see
+> `tasks/v2-corpus-driven-goal-prompt-template.md`.
+
 ---
 
 ## Workflow shape

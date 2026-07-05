@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Record the v2 transpiler's `core_v2` PASSED count, append a row to
+# Record τ's PASSED count on the DataFrame corpus, append a row to
 # tests/integration/v2_progress.md with the commit SHA and delta vs the
 # previous measurement.
 #
@@ -11,7 +11,7 @@
 #     - Appends one row to tests/integration/v2_progress.md (tracked in git).
 #
 # The goal is for the PASSED count to climb monotonically toward 324
-# (the corpus total) without regressing the `core` (legacy) suite.
+# (the corpus total).
 
 set -eu
 
@@ -22,8 +22,9 @@ LOG_FILE="$WORKSPACE_DIR/tests/integration/v2_progress.md"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
-echo "running core_v2 suite (THUNDERDUCK_TRANSPILER=v2) ..."
-# Tolerate non-zero exit — the suite is expected to fail until v2 lands all cases.
+echo "running core_v2 suite (DataFrame corpus, τ fitness gate) ..."
+# Tolerate non-zero exit — the suite is expected to be partially red while
+# τ grows coverage.
 "$SCRIPT_DIR/run-differential-tests.sh" core_v2 > "$TMP" 2>&1 || true
 
 # Parse the pytest tail line, e.g.
@@ -45,12 +46,12 @@ TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # Initialize the log file with a header on first run.
 if [ ! -f "$LOG_FILE" ]; then
     cat > "$LOG_FILE" <<EOF
-# v2 transpiler progress
+# τ corpus progress
 
 One row per \`tests/scripts/v2-progress.sh\` invocation. Each row records the
-\`core_v2\` suite (DataFrame corpus routed through \`THUNDERDUCK_TRANSPILER=v2\`)
-PASSED count at the given commit. The goal is for PASSED to climb monotonically
-toward $TOTAL (the corpus total) without regressing the \`core\` (legacy) suite.
+\`core_v2\` suite (DataFrame corpus — the τ fitness gate) PASSED count at the
+given commit. The goal is for PASSED to climb monotonically toward $TOTAL
+(the corpus total).
 
 | Timestamp UTC        | Commit  | Passed | Failed | Total | Δ vs prev |
 | -------------------- | ------- | -----: | -----: | ----: | --------: |

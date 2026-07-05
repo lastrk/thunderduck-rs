@@ -581,7 +581,7 @@ fn batches_to_responses(
 
 /// Create an ArrowBatch response with a single boolean `value` column = `val`.
 /// Used for DDL operations (DropTempView etc.) that must return a non-null table.
-#[allow(dead_code)]
+#[allow(dead_code)] // DDL classification helper; wired when τ's DDL classification lands (see `classify_plan`).
 fn bool_batch_responses(
     session_id: &str,
     operation_id: &str,
@@ -617,7 +617,7 @@ fn result_complete_response(session_id: &str, operation_id: &str) -> proto::Exec
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // DDL classification helper; wired when τ's DDL classification lands (see `classify_plan`).
 fn sql_command_result_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {
     proto::ExecutePlanResponse {
         session_id: session_id.to_string(),

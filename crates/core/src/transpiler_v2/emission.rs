@@ -59,8 +59,10 @@ pub(crate) static EMIT_TAP: AtomicU64 = AtomicU64::new(0);
 ///
 /// Referenced by `invariants::inv2_dispatch_is_only_sql_writer` and by
 /// `emission::tests`; the release build has no consumer, hence
-/// `#[allow(dead_code)]`.
-#[allow(dead_code)]
+/// `#[allow(dead_code)]`. This is the INV2 (EMIT_TAP companion) tap
+/// serializer — see rearchitect ADR-009 (Approach A dispatch shape) and
+/// `crates/core/src/transpiler_v2/invariants.rs::inv2_emit_tap_present`.
+#[allow(dead_code)] // INV2 companion (rearchitect ADR-009 test tap); release build has no consumer.
 pub(crate) static EMIT_TAP_MUTEX: Mutex<()> = Mutex::new(());
 
 // ── Dispatch (Approach A — hand-written match) ───────────────────────────────
@@ -5174,11 +5176,15 @@ fn spark_return_cast(expr_sql: String, expr: &Expression, schema: &Schema) -> St
 
 /// Aggregate Spark-parity return-type CAST.
 ///
-/// Applied inside `render_aggregate` at C.3. Handles integer SUM/AVG widening
-/// (BIGINT), decimal aggregate widening, etc.
+/// Handles integer SUM/AVG widening (BIGINT), decimal aggregate widening, etc.
+/// In practice τ delegates SUM/AVG to the `thdck_spark_funcs` extension
+/// (`spark_sum`, `spark_avg`) per rearchitect ADR-020, so this function is
+/// currently unwired — but the §5.1 anchor test
+/// (`spark_return_cast_and_spark_aggregate_return_cast_are_distinct`) requires
+/// it to exist as a distinct `fn` item from `spark_return_cast`.
 ///
 /// **§5.1 anchor.** MUST NOT share body with [`spark_return_cast`].
-#[allow(dead_code)] // wired in C.3
+#[allow(dead_code)] // §5.1 anchor requires the item; extension-delegated aggregates make it unwired.
 fn spark_aggregate_return_cast(agg_sql: String, agg: &FunctionCall, schema: &Schema) -> String {
     let lower = agg.name.to_lowercase();
     if let Some(arg) = agg.args.first() {
@@ -5850,9 +5856,11 @@ fn dedup_struct_field_names(names: &[&str]) -> Vec<String> {
 
 // ── Extension allow-list (§4.1 stub — populated by τ's extension-target wiring) ──────────────────
 
-/// The set of DuckDB extension function names τ emits. **Empty.1**;
-/// τ's extension-target wiring populates with the ext6 allow-list and activates INV6.
-#[allow(dead_code)] // τ's extension-target wiring wires call sites; τ's emission substrate exposes the surface.
+/// The set of DuckDB extension function names τ emits. Currently empty; τ's
+/// extension-target wiring will populate this with the ext6 allow-list and
+/// activate INV6 (`transpiler_v2/invariants.rs::inv6_extension_targets_exist`,
+/// currently DEFER-marked).
+#[allow(dead_code)] // INV6 activator (currently DEFER); populated when extension-target wiring lands.
 pub(crate) fn extension_targets() -> HashSet<&'static str> {
     HashSet::new()
 }

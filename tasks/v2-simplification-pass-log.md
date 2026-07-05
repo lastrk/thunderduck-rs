@@ -123,3 +123,52 @@ already surfaced this as a `dead_code` warning.
   Scoped `rustfmt --edition 2021 --check` clean. `cargo test -p
   thunderduck-core --lib --tests` → 446 pass / 0 fail / 4 ignored
   (lib, unchanged).
+
+## Pass 5 — OPP-OOO (2026-07-05)
+
+Audit the ~11 `#[allow(dead_code)]` sites in `crates/core` and
+`crates/connect-server`. Per the plan disposition rule: sites with no
+scheduled landing (no ADR / no open decision) are dead-forever and get
+deleted; sites with scheduled landings receive an ADR / invariant
+citation on the annotation.
+
+Site-by-site disposition:
+
+| File:line | Symbol | Disposition |
+|-----------|--------|-------------|
+| `emission.rs:63` | `EMIT_TAP_MUTEX` | ANNOTATE — INV2 companion (rearchitect ADR-009 test tap) |
+| `emission.rs:598` | `render_tail` | KEEP — Decision 13-A (dev journal 2026-07-02) |
+| `emission.rs:609` | `render_distinct` | KEEP — Decision 13-A |
+| `emission.rs:1537` | `render_range_relation` | KEEP — Decision 13-A |
+| `emission.rs:5181` | `spark_aggregate_return_cast` | ANNOTATE — §5.1 anchor test requires the item; extension-delegated aggregates (ADR-020) make it unwired |
+| `emission.rs:5855` | `extension_targets` | ANNOTATE — INV6 activator (currently DEFER) |
+| `expression.rs:965` | `is_non_nullable_function_name` | **DELETE** — pub(crate) wrapper of already-used `_lower`; zero callers; no scheduled landing |
+| `analyzer.rs:3119` | `_STAR` | KEEP — module doc anchor (comment above already documents) |
+| `service.rs:425` | `PlanKind::Ddl` | KEEP — "reintroduced when DDL classification lands" (see `classify_plan` docstring) |
+| `service.rs:584` | `bool_batch_responses` | ANNOTATE — DDL classification helper |
+| `service.rs:620` | `sql_command_result_response` | ANNOTATE — DDL classification helper |
+
+- **Files touched.**
+  - `crates/core/src/transpiler_v2/expression.rs` — delete
+    `is_non_nullable_function_name` (−13 LOC) and fold its docstring
+    (§1.1/§1.2 anchor) onto the `_lower` sibling.
+  - `crates/core/src/transpiler_v2/emission.rs` — three annotation
+    updates (`EMIT_TAP_MUTEX`, `spark_aggregate_return_cast`,
+    `extension_targets`).
+  - `crates/connect-server/src/service.rs` — two annotation updates
+    (`bool_batch_responses`, `sql_command_result_response`).
+- **LOC delta.** −13 (delete) + neutral annotation updates.
+- **Corpus.** 314 → 314 (unchanged — audit is annotation-and-delete of
+  dead code).
+- **Warnings.** No delta (all sites remain properly-annotated dead
+  code or become deleted code; no new warnings).
+- **Gate.** `cargo check -p thunderduck-core -p thunderduck-connect-server`
+  clean. `cargo test -p thunderduck-core --lib --tests` → 446 pass / 0
+  fail (unchanged) + 0 pass / 4 ignored (runtime_integration).
+  `cargo test -p thunderduck-connect-server --tests` → 14 ignored
+  (differential harness — expected).
+- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` on
+  touched files reports 3 pre-existing drift blocks (emission.rs:4602,
+  service.rs:530/545). Baseline-drift comparison: block counts are
+  identical between HEAD and working tree, so Pass 5 introduces zero
+  new drift and does not own any drift per CLAUDE.md § Quality Gate.

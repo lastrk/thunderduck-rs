@@ -954,24 +954,13 @@ impl Expression {
 
     /// Names in this list report `nullable = false` regardless of arg nullability.
     ///
-    /// Case-insensitive wrapper retained as the defensive surface for external
-    /// callers that have not yet normalized their input. Prefer
-    /// [`Self::is_non_nullable_function_name_lower`] on hot paths where the
-    /// caller has already lowercased the name.
+    /// **Precondition:** `name_lower` MUST already be lowercase. Debug builds
+    /// `debug_assert!` this; release builds trust the contract to avoid an
+    /// unnecessary allocation.
     ///
     /// Contains the count family (checklist §1.1) and the hash family
     /// (checklist §1.2). Extending this list requires adding to the
     /// symmetric-omission tests (§8) as well.
-    #[allow(dead_code)] // defensive API; internal τ callers use `_lower` variant.
-    pub(crate) fn is_non_nullable_function_name(name: &str) -> bool {
-        Self::is_non_nullable_function_name_lower(&name.to_lowercase())
-    }
-
-    /// Fast-path sibling of [`Self::is_non_nullable_function_name`].
-    ///
-    /// **Precondition:** `name_lower` MUST already be lowercase. Debug builds
-    /// `debug_assert!` this; release builds trust the contract to avoid an
-    /// unnecessary allocation.
     pub(crate) fn is_non_nullable_function_name_lower(name_lower: &str) -> bool {
         debug_assert!(
             name_lower.chars().all(|c| !c.is_ascii_uppercase()),

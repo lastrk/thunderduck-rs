@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use futures::stream;
 use thunderduck_core::parser_v2::SparkSqlParserV2;
-use thunderduck_core::transpiler_v2::base_types::plan_has_empty_scan;
 use thunderduck_core::transpiler_v2::{self, BaseTypes, CommonAst};
 use thunderduck_core::types::{DataType, StructType};
 use tonic::{Request, Response, Status};
@@ -39,33 +38,40 @@ static SERVER_SESSION_ID: std::sync::LazyLock<String> =
 
 // ── τ dispatch helpers (Slice A.3) ────────────────────────────────────────────
 
-/// Convert a Spark Connect [`proto::Relation`] into a [`CommonAst`] and finalize
-/// it into DuckDB SQL via τ.
+/// Route a Spark Connect [`proto::Relation`] to the correct τ front-end and
+/// produce a [`CommonAst`].
 ///
-/// At Slice A.3, `transpiler_v2::generate()` errors unconditionally, so this
-/// helper always surfaces `Status::unimplemented` for structurally-valid
-/// inputs (via `EmissionError::UnsupportedOp`). The dispatch shape is what
-/// matters; Slices B/C/D/E/F/G grow coverage behind this same boundary.
-///
-/// **Route by `RelType::Sql`** — Option (a) per plan §4: SQL text goes
-/// through `parser_v2`, structured relations through `V2RelationConverter`.
-/// `V2RelationConverter` refuses `RelType::Sql` with `UnsupportedProtoShape`,
-/// so intercepting here keeps the two front-ends peer.
-pub(crate) async fn transpile_relation(
-    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    relation: &proto::Relation,
-) -> Result<(CommonAst, String, StructType), Status> {
+/// **Route by `RelType::Sql`** — Option (a) per plan §4: SQL text goes through
+/// `parser_v2`, structured relations through `V2RelationConverter`.
+/// `V2RelationConverter` refuses `RelType::Sql` with `UnsupportedProtoShape`, so
+/// intercepting here keeps the two front-ends peer. Shared by
+/// [`transpile_relation`] (ExecutePlan) and the `AnalyzePlan(Schema)` arm.
+pub(crate) fn relation_to_common_ast(relation: &proto::Relation) -> Result<CommonAst, Status> {
     use proto::relation::RelType;
-    let common_ast = match &relation.rel_type {
+    match &relation.rel_type {
         Some(RelType::Sql(sql_relation)) => SparkSqlParserV2::parse(&sql_relation.query)
-            .map_err(|e| Status::from(ConnectError::from(e)))?,
+            .map_err(|e| Status::from(ConnectError::from(e))),
         _ => {
             let mut converter = V2RelationConverter::new();
             converter
                 .convert(relation)
-                .map_err(|e| Status::from(ConnectError::from(e)))?
+                .map_err(|e| Status::from(ConnectError::from(e)))
         }
-    };
+    }
+}
+
+/// Convert a Spark Connect [`proto::Relation`] into a [`CommonAst`] and finalize
+/// it into DuckDB SQL + resolved schema via τ.
+///
+/// `finalize` runs the analyzer + emission; it succeeds for every plan τ covers
+/// and returns a Thunderduck-boundary `Status` (`UnsupportedOp` /
+/// `UnsupportedProtoShape`) for shapes it does not. The emitted SQL feeds
+/// `execute_streaming_query`; the schema drives the outbound Arrow-schema stamp.
+pub(crate) async fn transpile_relation(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    relation: &proto::Relation,
+) -> Result<(CommonAst, String, StructType), Status> {
+    let common_ast = relation_to_common_ast(relation)?;
     let (sql, schema) = finalize(session, &common_ast).await?;
     Ok((common_ast, sql, schema))
 }
@@ -118,11 +124,12 @@ async fn build_base_types(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     common_ast: &CommonAst,
 ) -> BaseTypes {
-    if !plan_has_empty_scan(common_ast) {
+    let tables = thunderduck_core::transpiler_v2::base_types::empty_scan_tables(common_ast);
+    if tables.is_empty() {
         return BaseTypes::empty();
     }
     let mut map: HashMap<String, StructType> = HashMap::new();
-    for table in thunderduck_core::transpiler_v2::base_types::empty_scan_tables(common_ast) {
+    for table in tables {
         if map.contains_key(&table) {
             continue;
         }
@@ -171,10 +178,10 @@ impl SparkConnectService for ThunderduckService {
             Some(proto::plan::OpType::Root(relation)) => {
                 let (common_ast, sql, resolved_schema) =
                     transpile_relation(&session, &relation).await?;
-                // Slice A.3: `finalize()` errors unconditionally, so the
-                // downstream classification / streaming helpers are only
-                // reachable when Slices C/E begin lighting up emission arms.
-                // Signature-swapped helpers preserve the dispatch shape.
+                // `finalize` (inside `transpile_relation`) succeeds for every
+                // plan τ covers, so `execute_streaming_query` is live. DDL
+                // classification is still a placeholder — `classify_plan`
+                // always returns `Query` until Slice C.1 (see `execute_ddl`).
                 match classify_plan(&common_ast) {
                     PlanKind::Ddl => {
                         execute_ddl(&session, &common_ast, &sql, &session_id, &operation_id).await?
@@ -249,18 +256,7 @@ impl SparkConnectService for ThunderduckService {
                 // ExecutePlan achieves the same on the response path via
                 // `arrow_schema_stamp::stamp_batch_schemas` in
                 // `execute_streaming_query`. Do not modify this arm.
-                let common_ast = match &relation.rel_type {
-                    Some(proto::relation::RelType::Sql(sql_relation)) => {
-                        SparkSqlParserV2::parse(&sql_relation.query)
-                            .map_err(|e| Status::from(ConnectError::from(e)))?
-                    }
-                    _ => {
-                        let mut converter = V2RelationConverter::new();
-                        converter
-                            .convert(&relation)
-                            .map_err(|e| Status::from(ConnectError::from(e)))?
-                    }
-                };
+                let common_ast = relation_to_common_ast(&relation)?;
                 let struct_type = analyze_schema(&session, &common_ast).await?;
                 // ADR-022 boundary hygiene: `DataType::Unresolved` maps to
                 // `Kind::Unparsed { data_type_string: "unresolved" }` on the
@@ -449,13 +445,11 @@ async fn handle_command(
     }
 }
 
-// ── Signature-swapped downstream helpers (Slice A.3) ─────────────────────────
+// ── Plan-classification + DDL helpers ────────────────────────────────────────
 //
-// These helpers formerly consumed `&LogicalPlan`. At Slice A.3 they consume
-// `&CommonAst` and return `Err(Status::unimplemented(...))`. `transpile_relation`
-// errors before dispatch ever reaches them today (τ's `generate()` returns
-// `UnsupportedOp` for every input). Slices B/C/D/E/F/G grow the concrete
-// behaviour behind these signatures.
+// These helpers consume `&CommonAst`. `execute_streaming_query` (the Query arm)
+// is live; `classify_plan` still collapses to `Query` and `execute_ddl` remains
+// an `unimplemented` placeholder until Slice C.1 wires DDL execution.
 
 /// Classification of a τ plan for execution routing.
 ///

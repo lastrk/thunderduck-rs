@@ -708,3 +708,11 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 636/0, `sql_v2` differential 132/130/262 with all 16 win-* + 2 interval cases GREEN, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 99 — 2026-07-05 — SQL corpus: tech-debt sweep (passes 95–98)
+- **Tech-debt sweep** (every-5th-pass): rust-reviewer over `git diff 096c55d..HEAD` (SqlCommand exec, temp-view+catalog, set-op + window/interval lowering). No Critical/High debt; 0 compiler warnings pre-sweep.
+- Fixed: **M1** — extracted `relation_to_common_ast(relation) -> Result<CommonAst, Status>` (the RelType::Sql-vs-V2RelationConverter dispatch was duplicated verbatim in `transpile_relation` and the `AnalyzePlan(Schema)` arm; two copies would drift). **M2** — corrected 3 stale Slice-A.3 comment blocks that still claimed "`finalize()` errors unconditionally / τ returns UnsupportedOp for every input" (false since passes 95-96 — `execute_streaming_query` is live). **L1** — `build_base_types` dropped the redundant `plan_has_empty_scan` walk (now short-circuits on `empty_scan_tables(...).is_empty()`), and removed the resulting unused `plan_has_empty_scan` import (new warning fixed on the touched file).
+- Dismissed (reviewer-recommended): L3 (`map.remove` over `.cloned()` — trades a fragile single-invocation coupling for a negligible clone; keep `.cloned()`). Deferred (Low): L2 negative-lookup memoization, L4 `bool_batch_responses` dead scaffolding (intentional Slice C.1), L5 named-window errors should be Spark-emulated class (message-quality only), L6 error-shape prefix nit.
+- Files: `crates/connect-server/src/service.rs`. No behavior change (refactor); corpus stays 132.
+- Quality Gate: PASS (cargo check --workspace --all-targets 0 warnings, rustfmt clean, `cargo test -p thunderduck-connect-server --bins` 74/0 serially).
+- Commit SHA: (this commit).

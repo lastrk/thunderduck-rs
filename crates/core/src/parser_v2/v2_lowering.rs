@@ -29,6 +29,7 @@ use sqlparser::ast::{
 };
 use std::collections::HashMap;
 
+use crate::bail_boundary_proto;
 use crate::transpiler_v2::ast::{CommonAst, CommonOp, JoinType};
 use crate::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
@@ -45,10 +46,10 @@ use crate::types::DataType;
 pub fn lower_statement(stmt: Statement) -> Result<CommonAst, EmissionError> {
     match stmt {
         Statement::Query(q) => lower_query(*q),
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::{}", statement_kind(&other)),
-            reason: "parser_v2 only supports SELECT queries".to_owned(),
-        }),
+        other => bail_boundary_proto!(
+            format!("sql::{}", statement_kind(&other)),
+            "parser_v2 only supports SELECT queries",
+        ),
     }
 }
 
@@ -69,10 +70,10 @@ fn statement_kind(stmt: &Statement) -> &'static str {
 
 fn lower_query(query: Query) -> Result<CommonAst, EmissionError> {
     if query.with.is_some() {
-        return Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::cte".to_owned(),
-            reason: "CTEs (WITH clauses) not supported by τ\'s SparkSQL parser".to_owned(),
-        });
+        bail_boundary_proto!(
+            "sql::cte",
+            "CTEs (WITH clauses) not supported by τ\'s SparkSQL parser",
+        );
     }
 
     let order_by_exprs: Vec<OrderByExpr> = match &query.order_by {
@@ -120,10 +121,10 @@ fn order_by_all_exprs(
     let projection = match body {
         SetExpr::Select(sel) => &sel.projection,
         _ => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: "sql::order_by_all_non_select".to_owned(),
-                reason: "ORDER BY ALL requires a SELECT body".to_owned(),
-            });
+            bail_boundary_proto!(
+                "sql::order_by_all_non_select",
+                "ORDER BY ALL requires a SELECT body",
+            );
         }
     };
     let mut exprs: Vec<OrderByExpr> = Vec::with_capacity(projection.len());
@@ -131,10 +132,10 @@ fn order_by_all_exprs(
         let expr = match item {
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e.clone(),
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::order_by_all_wildcard".to_owned(),
-                    reason: "ORDER BY ALL over a `*` projection not supported".to_owned(),
-                });
+                bail_boundary_proto!(
+                    "sql::order_by_all_wildcard",
+                    "ORDER BY ALL over a `*` projection not supported",
+                );
             }
         };
         exprs.push(OrderByExpr {
@@ -150,27 +151,27 @@ fn lower_set_expr(body: SetExpr) -> Result<CommonAst, EmissionError> {
     match body {
         SetExpr::Select(sel) => lower_select(*sel),
         SetExpr::Query(q) => lower_query(*q),
-        SetExpr::Values(_) => Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::values_top_level".to_owned(),
-            reason: "top-level VALUES not supported (only VALUES in FROM)".to_owned(),
-        }),
+        SetExpr::Values(_) => bail_boundary_proto!(
+            "sql::values_top_level",
+            "top-level VALUES not supported (only VALUES in FROM)",
+        ),
         SetExpr::SetOperation { op, .. } => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::set_operation::{op:?}").to_ascii_lowercase(),
             reason: "UNION / INTERSECT / EXCEPT not implemented in τ\'s SparkSQL parser".to_owned(),
         }),
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::set_expr::{other:?}"),
-            reason: "set expression not supported by τ\'s SparkSQL parser".to_owned(),
-        }),
+        other => bail_boundary_proto!(
+            format!("sql::set_expr::{other:?}"),
+            "set expression not supported by τ\'s SparkSQL parser",
+        ),
     }
 }
 
 fn lower_select(mut select: Select) -> Result<CommonAst, EmissionError> {
     if select.distinct.is_some() {
-        return Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::select_distinct".to_owned(),
-            reason: "SELECT DISTINCT not implemented in τ\'s SparkSQL parser".to_owned(),
-        });
+        bail_boundary_proto!(
+            "sql::select_distinct",
+            "SELECT DISTINCT not implemented in τ\'s SparkSQL parser",
+        );
     }
     // Emission has no notion of a `WINDOW w AS (...)` clause, so resolve every
     // `OVER w` reference in the projection to its inline spec before lowering.
@@ -227,20 +228,19 @@ fn lower_aggregate_select(
     let grouping = match group_by {
         GroupByExpr::Expressions(exprs, modifiers) => {
             if !modifiers.is_empty() {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::group_by_modifiers".to_owned(),
-                    reason: "GROUP BY modifiers (ROLLUP/CUBE/GROUPING SETS) not implemented in τ"
-                        .to_owned(),
-                });
+                bail_boundary_proto!(
+                    "sql::group_by_modifiers",
+                    "GROUP BY modifiers (ROLLUP/CUBE/GROUPING SETS) not implemented in τ",
+                );
             }
             let mut plain: Vec<Expression> = Vec::with_capacity(exprs.len());
             for e in exprs {
                 match e {
                     Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => {
-                        return Err(EmissionError::UnsupportedProtoShape {
-                            shape: "sql::grouping_sets".to_owned(),
-                            reason: "ROLLUP / CUBE / GROUPING SETS not implemented in τ".to_owned(),
-                        });
+                        bail_boundary_proto!(
+                            "sql::grouping_sets",
+                            "ROLLUP / CUBE / GROUPING SETS not implemented in τ",
+                        );
                     }
                     other => plain.push(lower_expr(other)?),
                 }
@@ -249,11 +249,10 @@ fn lower_aggregate_select(
         }
         GroupByExpr::All(modifiers) => {
             if !modifiers.is_empty() {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::group_by_all_modifiers".to_owned(),
-                    reason: "GROUP BY ALL modifiers (WITH ROLLUP/CUBE/TOTALS) not implemented in τ"
-                        .to_owned(),
-                });
+                bail_boundary_proto!(
+                    "sql::group_by_all_modifiers",
+                    "GROUP BY ALL modifiers (WITH ROLLUP/CUBE/TOTALS) not implemented in τ",
+                );
             }
             // Spark `GROUP BY ALL` groups by every SELECT item that is not an
             // aggregate expression. Compute the grouping from the projection.
@@ -262,10 +261,10 @@ fn lower_aggregate_select(
                 let expr = match item {
                     SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                     SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
-                        return Err(EmissionError::UnsupportedProtoShape {
-                            shape: "sql::group_by_all_wildcard".to_owned(),
-                            reason: "GROUP BY ALL over a `*` projection not supported".to_owned(),
-                        });
+                        bail_boundary_proto!(
+                            "sql::group_by_all_wildcard",
+                            "GROUP BY ALL over a `*` projection not supported",
+                        );
                     }
                 };
                 if !expr_has_aggregate(expr) {
@@ -358,10 +357,10 @@ fn lower_table_factor(factor: TableFactor) -> Result<CommonAst, EmissionError> {
             // Only bare identifier / function-call table functions covered.
             match expr {
                 Expr::Function(f) => lower_table_function(f),
-                other => Err(EmissionError::UnsupportedProtoShape {
-                    shape: format!("sql::table_function::{other:?}"),
-                    reason: "table function expr shape not supported by τ\'s SparkSQL parser".to_owned(),
-                }),
+                other => bail_boundary_proto!(
+                    format!("sql::table_function::{other:?}"),
+                    "table function expr shape not supported by τ\'s SparkSQL parser",
+                ),
             }
         }
         TableFactor::UNNEST {
@@ -370,11 +369,10 @@ fn lower_table_factor(factor: TableFactor) -> Result<CommonAst, EmissionError> {
             ..
         } => {
             if array_exprs.len() != 1 {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::unnest_multi_arg".to_owned(),
-                    reason: "UNNEST with multiple array arguments not supported by τ\'s SparkSQL parser"
-                        .to_owned(),
-                });
+                bail_boundary_proto!(
+                    "sql::unnest_multi_arg",
+                    "UNNEST with multiple array arguments not supported by τ\'s SparkSQL parser",
+                );
             }
             let expr = array_exprs.into_iter().next().ok_or_else(|| {
                 EmissionError::UnsupportedProtoShape {
@@ -404,10 +402,10 @@ fn lower_table_factor(factor: TableFactor) -> Result<CommonAst, EmissionError> {
                 with_ordinality: false,
             }))
         }
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::table_factor::{other:?}"),
-            reason: "table factor not supported by τ\'s SparkSQL parser".to_owned(),
-        }),
+        other => bail_boundary_proto!(
+            format!("sql::table_factor::{other:?}"),
+            "table factor not supported by τ\'s SparkSQL parser",
+        ),
     }
 }
 
@@ -424,10 +422,10 @@ fn lower_table_function(f: Function) -> Result<CommonAst, EmissionError> {
 fn lower_function_args(args: FunctionArguments) -> Result<Vec<Expression>, EmissionError> {
     match args {
         FunctionArguments::None => Ok(vec![]),
-        FunctionArguments::Subquery(_) => Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::function_args_subquery".to_owned(),
-            reason: "subquery function arguments not implemented in τ\'s SparkSQL parser".to_owned(),
-        }),
+        FunctionArguments::Subquery(_) => bail_boundary_proto!(
+            "sql::function_args_subquery",
+            "subquery function arguments not implemented in τ\'s SparkSQL parser",
+        ),
         FunctionArguments::List(list) => list
             .args
             .into_iter()
@@ -451,10 +449,10 @@ fn function_arg_to_expr(arg: FunctionArg) -> Result<Expression, EmissionError> {
                 qualifier: Some(object_name_to_string(&name)),
             }))
         }
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::function_arg::{other:?}"),
-            reason: "function argument shape not supported by τ\'s SparkSQL parser".to_owned(),
-        }),
+        other => bail_boundary_proto!(
+            format!("sql::function_arg::{other:?}"),
+            "function argument shape not supported by τ\'s SparkSQL parser",
+        ),
     }
 }
 
@@ -470,10 +468,10 @@ fn lower_join_operator(
         JoinOperator::LeftSemi(c) => (JoinType::LeftSemi, c),
         JoinOperator::LeftAnti(c) => (JoinType::LeftAnti, c),
         other => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: format!("sql::join_operator::{other:?}"),
-                reason: "join operator not supported by τ\'s SparkSQL parser".to_owned(),
-            });
+            bail_boundary_proto!(
+                format!("sql::join_operator::{other:?}"),
+                "join operator not supported by τ\'s SparkSQL parser",
+            );
         }
     };
     let (cond, using) = lower_join_constraint(constraint)?;
@@ -661,10 +659,10 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
                 operand: Box::new(lower_expr(*expr)?),
             })),
             UnaryOperator::Plus => lower_expr(*expr),
-            other => Err(EmissionError::UnsupportedProtoShape {
-                shape: format!("sql::unary_op::{other:?}"),
-                reason: "unary operator not supported by τ\'s SparkSQL parser".to_owned(),
-            }),
+            other => bail_boundary_proto!(
+                format!("sql::unary_op::{other:?}"),
+                "unary operator not supported by τ\'s SparkSQL parser",
+            ),
         },
         Expr::Nested(e) => lower_expr(*e),
         Expr::Cast {
@@ -796,10 +794,10 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
                 body: Box::new(body),
             }))
         }
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::expr::{}", expr_kind(&other)),
-            reason: "expression shape not supported by τ\'s SparkSQL parser".to_owned(),
-        }),
+        other => bail_boundary_proto!(
+            format!("sql::expr::{}", expr_kind(&other)),
+            "expression shape not supported by τ\'s SparkSQL parser",
+        ),
     }
 }
 
@@ -970,10 +968,10 @@ fn lower_binary_op(op: BinaryOperator) -> Result<BinaryOp, EmissionError> {
         BinaryOperator::BitwiseOr => BinaryOp::BitOr,
         BinaryOperator::BitwiseXor => BinaryOp::BitXor,
         other => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: format!("sql::binary_op::{other:?}"),
-                reason: "binary operator not supported by τ\'s SparkSQL parser".to_owned(),
-            });
+            bail_boundary_proto!(
+                format!("sql::binary_op::{other:?}"),
+                "binary operator not supported by τ\'s SparkSQL parser",
+            );
         }
     })
 }
@@ -1019,10 +1017,10 @@ fn lower_call_args(args: FunctionArguments) -> Result<(bool, Vec<Expression>), E
                 args.into_iter().map(function_arg_to_expr).collect();
             Ok((distinct, converted?))
         }
-        FunctionArguments::Subquery(_) => Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::function_args_subquery".to_owned(),
-            reason: "subquery function arguments not implemented in τ\'s SparkSQL parser".to_owned(),
-        }),
+        FunctionArguments::Subquery(_) => bail_boundary_proto!(
+            "sql::function_args_subquery",
+            "subquery function arguments not implemented in τ\'s SparkSQL parser",
+        ),
     }
 }
 
@@ -1070,10 +1068,10 @@ fn lower_window_frame(frame: SqlWindowFrame) -> Result<WindowFrame, EmissionErro
         WindowFrameUnits::Rows => FrameUnit::Rows,
         WindowFrameUnits::Range => FrameUnit::Range,
         WindowFrameUnits::Groups => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: "sql::window_frame::groups".to_owned(),
-                reason: "GROUPS window frames are not supported".to_owned(),
-            });
+            bail_boundary_proto!(
+                "sql::window_frame::groups",
+                "GROUPS window frames are not supported",
+            );
         }
     };
     let lower = lower_frame_bound(start_bound)?;
@@ -1114,10 +1112,10 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
             reason: "INTERVAL without a unit is not supported".to_owned(),
         })?;
     if iv.last_field.is_some() {
-        return Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::interval::compound".to_owned(),
-            reason: "compound (e.g. YEAR TO MONTH) intervals are not supported".to_owned(),
-        });
+        bail_boundary_proto!(
+            "sql::interval::compound",
+            "compound (e.g. YEAR TO MONTH) intervals are not supported",
+        );
     }
     let n =
         extract_interval_int(&iv.value).ok_or_else(|| EmissionError::UnsupportedProtoShape {
@@ -1172,11 +1170,10 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
                 .ok_or_else(overflow)?,
         },
         other => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: format!("sql::interval::unit::{other:?}"),
-                reason: "interval unit not representable (only YEAR/MONTH/DAY/HOUR/MINUTE/SECOND)"
-                    .to_owned(),
-            });
+            bail_boundary_proto!(
+                format!("sql::interval::unit::{other:?}"),
+                "interval unit not representable (only YEAR/MONTH/DAY/HOUR/MINUTE/SECOND)",
+            );
         }
     };
     Ok(Expression::Interval(ie))
@@ -1221,10 +1218,10 @@ fn resolve_named_window(
     depth: usize,
 ) -> Result<WindowSpec, EmissionError> {
     if depth > 64 {
-        return Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::window::named_window_cycle".to_owned(),
-            reason: format!("window `{name}` forms a reference cycle"),
-        });
+        bail_boundary_proto!(
+            "sql::window::named_window_cycle",
+            format!("window `{name}` forms a reference cycle"),
+        );
     }
     let expr = raw
         .get(name)
@@ -1334,10 +1331,10 @@ fn lower_value(vw: ValueWithSpan) -> Result<Expression, EmissionError> {
             value: LiteralValue::Null,
             data_type: DataType::Null,
         })),
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::value::{other:?}"),
-            reason: "literal value shape not supported by τ\'s SparkSQL parser".to_owned(),
-        }),
+        other => bail_boundary_proto!(
+            format!("sql::value::{other:?}"),
+            "literal value shape not supported by τ\'s SparkSQL parser",
+        ),
     }
 }
 
@@ -1357,10 +1354,10 @@ fn lower_data_type(dt: SqlDataType) -> Result<DataType, EmissionError> {
         Timestamp(_, _) => DataType::Timestamp,
         Numeric(info) | Decimal(info) => decimal_from_exact_number(&info),
         other => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: format!("sql::data_type::{other:?}"),
-                reason: "data type not supported by τ\'s SparkSQL parser".to_owned(),
-            });
+            bail_boundary_proto!(
+                format!("sql::data_type::{other:?}"),
+                "data type not supported by τ\'s SparkSQL parser",
+            );
         }
     })
 }
@@ -1452,10 +1449,10 @@ fn expr_to_i64(e: Expr) -> Result<i64, EmissionError> {
                 shape: "sql::limit_offset_parse".to_owned(),
                 reason: format!("cannot parse LIMIT/OFFSET value `{s}` as i64"),
             }),
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::limit_offset_expr::{other:?}"),
-            reason: "LIMIT/OFFSET must be an integer literal".to_owned(),
-        }),
+        other => bail_boundary_proto!(
+            format!("sql::limit_offset_expr::{other:?}"),
+            "LIMIT/OFFSET must be an integer literal",
+        ),
     }
 }
 

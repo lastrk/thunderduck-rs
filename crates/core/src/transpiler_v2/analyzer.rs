@@ -49,6 +49,7 @@ use super::expression::{
     StarExpression, UnaryExpression, UnresolvedColumn,
 };
 use super::type_inference::TypeInferenceEngine;
+use crate::bail_boundary_rule;
 use crate::types::{DataType, StructField, StructType};
 
 // Re-export SetOpKind so downstream callers can use `analyzer::SetOpKind`.
@@ -710,7 +711,8 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             }),
             None => Err(AnalyzerError::PuntedOperator {
                 op: "FileScan".to_owned(),
-                reason: "schema-less FileScan (parquet inference) (not implemented in τ)".to_owned(),
+                reason: "schema-less FileScan (parquet inference) (not implemented in τ)"
+                    .to_owned(),
             }),
         },
 
@@ -1710,12 +1712,12 @@ fn expand_inline_projections(
             DataType::Array(inner, cn) => match *inner {
                 DataType::Struct(st) => (st, cn),
                 DataType::Unresolved => {
-                    return Err(AnalyzerError::UnsupportedRule {
-                        rule: format!("{name_lower}-expansion"),
-                        reason: format!(
+                    bail_boundary_rule!(
+                        format!("{name_lower}-expansion"),
+                        format!(
                             "`{name_lower}` argument's element type could not be statically resolved — τ requires a resolved `Array<Struct<...>>` schema"
                         ),
-                    });
+                    );
                 }
                 other => {
                     return Err(AnalyzerError::TypeMismatch {
@@ -1726,12 +1728,12 @@ fn expand_inline_projections(
                 }
             },
             DataType::Unresolved => {
-                return Err(AnalyzerError::UnsupportedRule {
-                    rule: format!("{name_lower}-expansion"),
-                    reason: format!(
+                bail_boundary_rule!(
+                    format!("{name_lower}-expansion"),
+                    format!(
                         "`{name_lower}` argument's type could not be statically resolved — τ requires a resolved `Array<Struct<...>>` schema"
                     ),
-                });
+                );
             }
             other => {
                 return Err(AnalyzerError::TypeMismatch {
@@ -1861,15 +1863,15 @@ fn expand_json_tuple_projections(
                 }
             };
             if key.chars().any(json_tuple_key_char_is_unsafe) {
-                return Err(AnalyzerError::UnsupportedRule {
-                    rule: "json_tuple-expansion".to_owned(),
-                    reason: format!(
+                bail_boundary_rule!(
+                    "json_tuple-expansion",
+                    format!(
                         "`json_tuple` key `{key}` contains a character τ does not \
                          safely forward to DuckDB's `json_extract_string` — reject \
                          to avoid diverging from Spark's flat-key semantics or \
                          breaking the SQL string literal"
                     ),
-                });
+                );
             }
             let key_lit = Expression::Literal(Literal {
                 value: LiteralValue::String(key),

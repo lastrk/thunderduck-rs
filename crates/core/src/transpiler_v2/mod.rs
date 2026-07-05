@@ -21,6 +21,7 @@ pub mod emission;
 pub mod error;
 pub mod expression;
 pub mod invariants;
+mod macros;
 pub mod rewrites;
 mod struct_names;
 pub mod type_inference;

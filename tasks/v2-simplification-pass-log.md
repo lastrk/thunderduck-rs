@@ -232,3 +232,77 @@ original 5.
   1 pre-existing drift block (`analyzer.rs:710` FileScan error
   branch). HEAD-vs-WT block counts identical (analyzer.rs = 1 / 1,
   expression.rs = 0 / 0), so Pass 6 introduces zero new drift.
+
+## Pass 7 — OPP-D (2026-07-05)
+
+Introduce five `bail_boundary_*!` macros in a new
+`crates/core/src/transpiler_v2/macros.rs`, then rewrite ~160
+hand-written `return Err(EmissionError::Unsupported*)` (and
+tail-`Err(...)` match arm) sites in `emission.rs`,
+`parser_v2/v2_lowering.rs`, `parser_v2/mod.rs`,
+`converter/v2_relation_converter.rs`, plus the three
+`AnalyzerError::UnsupportedRule` sites in `analyzer.rs`. Wire error
+`Display` output is byte-identical: each macro `$field.to_owned()`s
+its arguments and expands to the same struct literal the callers
+wrote by hand. The macros expand to `return Err(...)` **without**
+trailing semicolon so they compose both at statement position and as
+a match-arm tail expression (`Foo => bail_boundary_op!(...)` —
+`return` is `!` and coerces).
+
+**`bail_boundary_rule!` decision.** Added. `analyzer.rs` has exactly
+3 clean `return Err(AnalyzerError::UnsupportedRule { rule, reason })`
+sites — meets the ≥ 3-clean-site threshold. `PuntedOperator` (2
+sites) uses a different field shape (`op/reason` not `rule/reason`)
+and 2 < 3, so no dedicated `bail_boundary_punt!` was added.
+
+- **Files touched.**
+  - `crates/core/src/transpiler_v2/macros.rs` — **new**, +98 LOC.
+    Five `#[macro_export]` macros: `bail_boundary_op!`,
+    `bail_boundary_expr!`, `bail_boundary_fn!`,
+    `bail_boundary_proto!`, `bail_boundary_rule!`. Each accepts a
+    trailing comma (`$(,)?`) so `rustfmt`-multi-line invocations
+    parse.
+  - `crates/core/src/transpiler_v2/mod.rs` — +1 line: `mod macros;`.
+  - `crates/core/src/transpiler_v2/emission.rs` — 108 rewrites (102
+    return sites + 6 tail-`Err` match arms). INV10 positive test
+    `inv10_emission_imports_are_typed` widened to accept
+    `use crate::bail_boundary_*` alongside the existing
+    `use crate::types::*` allow-list.
+  - `crates/core/src/parser_v2/v2_lowering.rs` — 28 rewrites (16
+    return + 12 tail-`Err`).
+  - `crates/core/src/parser_v2/mod.rs` — 2 rewrites (1 return + 1
+    tail-`Err`).
+  - `crates/connect-server/src/converter/v2_relation_converter.rs` —
+    22 rewrites (14 return + 8 tail-`Err`). Imports as
+    `use thunderduck_core::bail_boundary_proto;`.
+  - `crates/core/src/transpiler_v2/analyzer.rs` — 3 rewrites (all
+    `AnalyzerError::UnsupportedRule` sites).
+- **LOC delta.** macros.rs +98; six touched files −190 net (495 ins
+  / 685 del). Net **−92 LOC** across the pass. 166 macro invocations
+  landed (111 emission + 28 v2_lowering + 2 parser_v2 + 22 converter
+  + 3 analyzer).
+- **Verify grep.** `git grep 'return Err(EmissionError::Unsupported'
+  crates/`: 133 → 0 (delta −133; plan target ≥ 40). Remaining
+  `EmissionError::Unsupported*` references (`.ok_or_else(|| …)` /
+  `.map_err(|e| …)` closure sites, doc comments, test-side
+  `matches!` patterns) are OPP-HHH's target (Pass 8).
+- **Sites left for OPP-H (Pass 9).** After Pass 9 merges the four
+  `EmissionError::Unsupported*` variants into a single
+  `Unsupported { kind, name, reason }`, the entire migration reduces
+  to a **one-line change per macro body** — the ~160 call sites do
+  not need to be touched again. That's the ordering benefit OPP-D
+  before OPP-H cites.
+- **Corpus.** 314 → 314 (unchanged — wire error strings are
+  byte-identical).
+- **Warnings.** No delta. `cargo check -p thunderduck-core -p
+  thunderduck-connect-server` clean.
+- **Gate.** `cargo test -p thunderduck-core --lib --tests` → 448
+  pass / 0 fail / 4 ignored. `cargo test -p
+  thunderduck-connect-server --tests` → 69 pass / 0 fail + 14
+  ignored differential — status matches HEAD.
+- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` on
+  touched files: **zero** drift blocks. Pass 7's rustfmt run
+  incidentally cleaned up 8 pre-existing drift blocks (2 in
+  converter, 4 in v2_lowering, 1 in analyzer, 1 in emission) — those
+  drifts landed in files this pass edited, so re-formatting them is
+  a natural side effect.

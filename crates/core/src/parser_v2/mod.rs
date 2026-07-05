@@ -12,6 +12,7 @@
 mod dialect;
 mod v2_lowering;
 
+use crate::bail_boundary_proto;
 use crate::transpiler_v2::ast::CommonAst;
 use crate::transpiler_v2::EmissionError;
 use dialect::SparkDialect;
@@ -39,10 +40,10 @@ impl SparkSqlParserV2 {
                 reason: e.to_string(),
             })?;
         if stmts.len() != 1 {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: "sql::multi_statement".to_owned(),
-                reason: format!("expected exactly one SQL statement, got {}", stmts.len()),
-            });
+            bail_boundary_proto!(
+                "sql::multi_statement",
+                format!("expected exactly one SQL statement, got {}", stmts.len()),
+            );
         }
         v2_lowering::lower_statement(stmts.remove(0))
     }
@@ -87,10 +88,10 @@ impl SparkSqlParserV2 {
             {
                 Ok(aggregates.remove(0))
             }
-            _ => Err(EmissionError::UnsupportedProtoShape {
-                shape: "ExpressionString::not_a_scalar".to_owned(),
-                reason: format!("expression fragment did not parse as a single scalar: {expr_sql}"),
-            }),
+            _ => bail_boundary_proto!(
+                "ExpressionString::not_a_scalar",
+                format!("expression fragment did not parse as a single scalar: {expr_sql}"),
+            ),
         }
     }
 }

@@ -47,6 +47,7 @@ use super::expression::{
 };
 use super::type_inference::AGGREGATE_NAMES;
 use crate::types::{DataType, StructField, StructType};
+use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
 
 // ── INV2 companion (§5.3) ────────────────────────────────────────────────────
 
@@ -245,10 +246,7 @@ fn render_values(
     schema: &Schema,
 ) -> Result<String, EmissionError> {
     if rows.is_empty() {
-        return Err(EmissionError::UnsupportedOp {
-            op: "Values".to_owned(),
-            reason: "empty VALUES relations are not supported".to_owned(),
-        });
+        bail_boundary_op!("Values", "empty VALUES relations are not supported");
     }
     let mut rendered_rows = String::new();
     for (i, row) in rows.iter().enumerate() {
@@ -281,10 +279,10 @@ fn render_local_relation(
     rows: &[Vec<Expression>],
 ) -> Result<String, EmissionError> {
     if schema_decl.fields.is_empty() {
-        return Err(EmissionError::UnsupportedOp {
-            op: "LocalRelation".to_owned(),
-            reason: "LocalRelation with empty schema is not representable".to_owned(),
-        });
+        bail_boundary_op!(
+            "LocalRelation",
+            "LocalRelation with empty schema is not representable"
+        );
     }
     // Special case: no rows → emit an empty relation with the correct schema.
     if rows.is_empty() {
@@ -338,10 +336,7 @@ fn render_file_scan(
     options: &[(String, String)],
 ) -> Result<String, EmissionError> {
     if paths.is_empty() {
-        return Err(EmissionError::UnsupportedOp {
-            op: "FileScan".to_owned(),
-            reason: "FileScan requires at least one path".to_owned(),
-        });
+        bail_boundary_op!("FileScan", "FileScan requires at least one path");
     }
     let paths_sql = if paths.len() == 1 {
         format!("'{}'", escape_sql_string(&paths[0]))
@@ -363,10 +358,10 @@ fn render_file_scan(
         FileFormat::Csv => "read_csv",
         FileFormat::Json => "read_json",
         FileFormat::Orc => {
-            return Err(EmissionError::UnsupportedOp {
-                op: "FileScan[Orc]".to_owned(),
-                reason: "ORC file scanning is not supported by DuckDB".to_owned(),
-            });
+            bail_boundary_op!(
+                "FileScan[Orc]",
+                "ORC file scanning is not supported by DuckDB"
+            );
         }
     };
     let opts_sql = if options.is_empty() {
@@ -492,10 +487,7 @@ fn render_project_over_join(
     } else if matches!(join_type, JoinType::Cross) {
         String::new()
     } else {
-        return Err(EmissionError::UnsupportedOp {
-            op: "Join".to_owned(),
-            reason: "non-cross join without ON or USING clause".to_owned(),
-        });
+        bail_boundary_op!("Join", "non-cross join without ON or USING clause");
     };
     let slots_sql = render_projection_slots(projections, project_input_schema)?;
     let la = quote_ident(&left_alias);
@@ -631,10 +623,7 @@ fn render_set_op(
 ) -> Result<String, EmissionError> {
     use super::ast::SetOpKind;
     if children.is_empty() {
-        return Err(EmissionError::UnsupportedOp {
-            op: "SetOp".to_owned(),
-            reason: "set-op with no children".to_owned(),
-        });
+        bail_boundary_op!("SetOp", "set-op with no children");
     }
     // When `allow_missing_columns = true`, every child SELECT emits an
     // identically-ordered, identically-named, identically-typed projection
@@ -655,10 +644,10 @@ fn render_set_op(
         (SetOpKind::Except, true, false, _) => "EXCEPT ALL",
         (SetOpKind::Except, false, false, _) => "EXCEPT",
         (kind, _, true, _) => {
-            return Err(EmissionError::UnsupportedOp {
-                op: format!("SetOp[{kind:?} BY NAME]"),
-                reason: "DuckDB supports BY NAME only for UNION".to_owned(),
-            });
+            bail_boundary_op!(
+                format!("SetOp[{kind:?} BY NAME]"),
+                "DuckDB supports BY NAME only for UNION",
+            );
         }
     };
     let mut parts: Vec<String> = Vec::with_capacity(children.len());
@@ -782,10 +771,7 @@ fn render_join(
     } else if matches!(join_type, JoinType::Cross) {
         String::new()
     } else {
-        return Err(EmissionError::UnsupportedOp {
-            op: "Join".to_owned(),
-            reason: "non-cross join without ON or USING clause".to_owned(),
-        });
+        bail_boundary_op!("Join", "non-cross join without ON or USING clause");
     };
     // Emit an EXPLICIT column list mirroring the analyzer's output schema
     // (see `analyzer.rs::CommonOp::Join` output-schema block for the
@@ -915,10 +901,7 @@ fn render_na_fill(
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let input_schema = &input.resolved_schema;
     if values.is_empty() {
-        return Err(EmissionError::UnsupportedOp {
-            op: "NaFill".to_owned(),
-            reason: "NaFill requires at least one fill value".to_owned(),
-        });
+        bail_boundary_op!("NaFill", "NaFill requires at least one fill value");
     }
     // Build a per-column value map.
     let value_for = |col_name: &str| -> Option<&Expression> {
@@ -1066,10 +1049,7 @@ fn render_unpivot(
     value_column_name: &str,
 ) -> Result<String, EmissionError> {
     if values.is_empty() {
-        return Err(EmissionError::UnsupportedOp {
-            op: "Unpivot".to_owned(),
-            reason: "unpivot requires at least one value column".to_owned(),
-        });
+        bail_boundary_op!("Unpivot", "unpivot requires at least one value column");
     }
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let var_col = quote_ident(variable_column_name);
@@ -1152,10 +1132,7 @@ fn render_freq_items(
     if cols.is_empty() {
         // Defensive guard — PySpark client rejects empty cols on the client
         // side, but keep the emission stage honest.
-        return Err(EmissionError::UnsupportedOp {
-            op: "FreqItems".to_owned(),
-            reason: "freqItems requires at least one column".to_owned(),
-        });
+        bail_boundary_op!("FreqItems", "freqItems requires at least one column");
     }
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let subqueries: Vec<String> = cols
@@ -1282,17 +1259,14 @@ fn render_pivot(
     output_schema: &Schema,
 ) -> Result<String, EmissionError> {
     if aggregates.is_empty() {
-        return Err(EmissionError::UnsupportedOp {
-            op: "Pivot".to_owned(),
-            reason: "PIVOT requires at least one aggregate expression".to_owned(),
-        });
+        bail_boundary_op!("Pivot", "PIVOT requires at least one aggregate expression");
     }
     if pivot_values.is_empty() {
         // Analyzer punts implicit-values as PuntedOperator; defensive guard here.
-        return Err(EmissionError::UnsupportedOp {
-            op: "Pivot[implicit-values]".to_owned(),
-            reason: "pivot without explicit values requires eager DISTINCT query".to_owned(),
-        });
+        bail_boundary_op!(
+            "Pivot[implicit-values]",
+            "pivot without explicit values requires eager DISTINCT query",
+        );
     }
     // Pass 60 M1: output column names for the (pivot_value × aggregate) pairs
     // are stamped by the analyzer into `output_schema.fields[grouping.len()..]`.
@@ -1302,9 +1276,9 @@ fn render_pivot(
     // truth = the analyzer.
     let expected_output_cols = grouping.len() + pivot_values.len() * aggregates.len();
     if output_schema.fields.len() != expected_output_cols {
-        return Err(EmissionError::UnsupportedOp {
-            op: "Pivot".to_owned(),
-            reason: format!(
+        bail_boundary_op!(
+            "Pivot",
+            format!(
                 "output schema arity mismatch: expected {expected_output_cols} fields (grouping={} \
                  + pivot_values×aggregates={}×{}), got {}",
                 grouping.len(),
@@ -1312,7 +1286,7 @@ fn render_pivot(
                 aggregates.len(),
                 output_schema.fields.len()
             ),
-        });
+        );
     }
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let input_schema = &input.resolved_schema;
@@ -1432,12 +1406,11 @@ fn render_sample(
     seed: Option<i64>,
 ) -> Result<String, EmissionError> {
     if with_replacement {
-        return Err(EmissionError::UnsupportedOp {
-            op: "Sample[with_replacement]".to_owned(),
-            reason: "df.sample(withReplacement=True) is not supported; \
-                     DuckDB has no row-level sampling with replacement"
-                .to_owned(),
-        });
+        bail_boundary_op!(
+            "Sample[with_replacement]",
+            "df.sample(withReplacement=True) is not supported; \
+                     DuckDB has no row-level sampling with replacement",
+        );
     }
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let pct = (upper_bound - lower_bound) * 100.0;
@@ -1556,14 +1529,14 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
     match expr {
         Expression::Literal(l) => render_literal(l),
         Expression::ColumnReference(c) => render_column_reference(c),
-        Expression::UnresolvedColumn(u) => Err(EmissionError::UnsupportedExpression {
-            shape: "UnresolvedColumn".to_owned(),
-            reason: format!("analyzer must resolve column `{}` before emission", u.name),
-        }),
-        Expression::UnresolvedRegex(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "UnresolvedRegex".to_owned(),
-            reason: "analyzer must expand regex projections in Project pre-pass".to_owned(),
-        }),
+        Expression::UnresolvedColumn(u) => bail_boundary_expr!(
+            "UnresolvedColumn",
+            format!("analyzer must resolve column `{}` before emission", u.name),
+        ),
+        Expression::UnresolvedRegex(_) => bail_boundary_expr!(
+            "UnresolvedRegex",
+            "analyzer must expand regex projections in Project pre-pass",
+        ),
         Expression::Binary(b) => render_binary(b, schema),
         Expression::Unary(u) => render_unary(u, schema),
         Expression::FunctionCall(f) => {
@@ -1650,18 +1623,16 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
         }
         Expression::Alias(a) => render_alias(a, schema),
         Expression::Star(s) => render_star(s),
-        Expression::InSubquery(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "InSubquery".to_owned(),
-            reason: "correlated subqueries land in future τ work".to_owned(),
-        }),
-        Expression::ExistsSubquery(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "ExistsSubquery".to_owned(),
-            reason: "correlated subqueries land in future τ work".to_owned(),
-        }),
-        Expression::ScalarSubquery(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "ScalarSubquery".to_owned(),
-            reason: "scalar subqueries land in future τ work".to_owned(),
-        }),
+        Expression::InSubquery(_) => {
+            bail_boundary_expr!("InSubquery", "correlated subqueries land in future τ work",)
+        }
+        Expression::ExistsSubquery(_) => bail_boundary_expr!(
+            "ExistsSubquery",
+            "correlated subqueries land in future τ work",
+        ),
+        Expression::ScalarSubquery(_) => {
+            bail_boundary_expr!("ScalarSubquery", "scalar subqueries land in future τ work",)
+        }
         Expression::Lambda(l) => {
             let body = render_expr(&l.body, schema)?;
             // DuckDB lambda syntax:
@@ -1751,10 +1722,10 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
                 }
             }
         }
-        Expression::RowConstructor(_) => Err(EmissionError::UnsupportedExpression {
-            shape: "RowConstructor".to_owned(),
-            reason: "complex-type emission (not implemented in τ)".to_owned(),
-        }),
+        Expression::RowConstructor(_) => bail_boundary_expr!(
+            "RowConstructor",
+            "complex-type emission (not implemented in τ)",
+        ),
         Expression::UpdateFields(u) => render_update_fields(u, schema),
     }
 }
@@ -2156,16 +2127,16 @@ fn render_map_hof(
 ) -> Result<String, EmissionError> {
     let m_sql = render_expr(&f.args[0], schema)?;
     let Expression::Lambda(lam) = &f.args[1] else {
-        return Err(EmissionError::UnsupportedFunction {
-            name: f.name.clone(),
-            reason: "map higher-order function requires a lambda argument".to_owned(),
-        });
+        bail_boundary_fn!(
+            f.name.clone(),
+            "map higher-order function requires a lambda argument"
+        );
     };
     if lam.params.len() != 2 {
-        return Err(EmissionError::UnsupportedFunction {
-            name: f.name.clone(),
-            reason: "map higher-order lambda must take exactly 2 arguments (key, value)".to_owned(),
-        });
+        bail_boundary_fn!(
+            f.name.clone(),
+            "map higher-order lambda must take exactly 2 arguments (key, value)",
+        );
     }
     // Fresh entry variable — DuckDB requires a single-arg lambda over
     // `map_entries`. The name is prefixed with `__mh_` to avoid collision
@@ -2251,10 +2222,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // function. Emit as a keyword expression.
         "not" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`not` requires exactly one argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`not` requires exactly one argument");
             }
             return Ok(format!("(NOT {args_sql})"));
         }
@@ -2282,10 +2250,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 return Ok("map([]::VARCHAR[], []::VARCHAR[])".to_owned());
             }
             if f.args.len() % 2 != 0 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`create_map` requires an even arg count".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`create_map` requires an even arg count");
             }
             let mut keys = String::from("list_value(");
             let mut vals = String::from("list_value(");
@@ -2338,10 +2303,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `strpos(haystack, needle)` (no start-position support).
         "locate" => {
             if f.args.len() < 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`locate` requires at least 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`locate` requires at least 2 arguments");
             }
             let needle = render_expr(&f.args[0], schema)?;
             let haystack = render_expr(&f.args[1], schema)?;
@@ -2351,10 +2313,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // 0..6 (Sunday=0). Add 1 to align with Spark.
         "dayofweek" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`dayofweek` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`dayofweek` requires exactly 1 argument");
             }
             let a = render_expr(&f.args[0], schema)?;
             return Ok(format!("(dayofweek({a}) + 1)"));
@@ -2389,20 +2348,17 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // arr-017.
         "explode" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`explode` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`explode` requires exactly 1 argument");
             }
             let a = render_expr(&f.args[0], schema)?;
             return Ok(format!("UNNEST({a})"));
         }
         "explode_outer" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`explode_outer` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`explode_outer` requires exactly 1 argument"
+                );
             }
             let a = render_expr(&f.args[0], schema)?;
             // Spark semantics: NULL arrays and empty arrays each produce one
@@ -2419,10 +2375,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `V2RelationConverter::convert_project`. Never emitted by user code.
         "posexplode_pos" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`posexplode_pos` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`posexplode_pos` requires exactly 1 argument"
+                );
             }
             let a = render_expr(&f.args[0], schema)?;
             // DuckDB's `generate_subscripts(list, 1)` is 1-indexed; Spark's
@@ -2431,10 +2387,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         "posexplode_val" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`posexplode_val` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`posexplode_val` requires exactly 1 argument"
+                );
             }
             let a = render_expr(&f.args[0], schema)?;
             return Ok(format!("UNNEST({a})"));
@@ -2446,20 +2402,20 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // so co-UNNESTed sibling projections stay row-aligned. Corpus: map-007.
         "map_explode_key" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`map_explode_key` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`map_explode_key` requires exactly 1 argument"
+                );
             }
             let m = render_expr(&f.args[0], schema)?;
             return Ok(format!("UNNEST(map_keys({m}))"));
         }
         "map_explode_val" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`map_explode_val` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`map_explode_val` requires exactly 1 argument"
+                );
             }
             let m = render_expr(&f.args[0], schema)?;
             return Ok(format!("UNNEST(map_values({m}))"));
@@ -2473,11 +2429,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // see Pass 90 smoke). Corpus: inl-001, inl-002.
         "inline_field" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`inline_field` requires exactly 2 arguments (arr, field_name)"
-                        .to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`inline_field` requires exactly 2 arguments (arr, field_name)",
+                );
             }
             let arr_sql = render_expr(&f.args[0], schema)?;
             let field_name = match &f.args[1] {
@@ -2486,11 +2441,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     ..
                 }) => s,
                 _ => {
-                    return Err(EmissionError::UnsupportedFunction {
-                        name: f.name.clone(),
-                        reason: "`inline_field` second argument must be a string literal"
-                            .to_owned(),
-                    });
+                    bail_boundary_fn!(
+                        f.name.clone(),
+                        "`inline_field` second argument must be a string literal",
+                    );
                 }
             };
             let field_q = quote_ident(field_name);
@@ -2498,11 +2452,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         "inline_outer_field" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`inline_outer_field` requires exactly 2 arguments (arr, field_name)"
-                        .to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`inline_outer_field` requires exactly 2 arguments (arr, field_name)",
+                );
             }
             let arr_sql = render_expr(&f.args[0], schema)?;
             let field_name = match &f.args[1] {
@@ -2511,11 +2464,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     ..
                 }) => s,
                 _ => {
-                    return Err(EmissionError::UnsupportedFunction {
-                        name: f.name.clone(),
-                        reason: "`inline_outer_field` second argument must be a string literal"
-                            .to_owned(),
-                    });
+                    bail_boundary_fn!(
+                        f.name.clone(),
+                        "`inline_outer_field` second argument must be a string literal",
+                    );
                 }
             };
             // Build the struct-typed NULL sentinel from the resolved
@@ -2527,21 +2479,21 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 DataType::Array(inner, _) => match inner.as_ref() {
                     DataType::Struct(st) => &st.fields,
                     other => {
-                        return Err(EmissionError::UnsupportedFunction {
-                            name: f.name.clone(),
-                            reason: format!(
+                        bail_boundary_fn!(
+                            f.name.clone(),
+                            format!(
                                 "`inline_outer_field` requires `Array<Struct<...>>`, got `Array<{other:?}>`"
                             ),
-                        });
+                        );
                     }
                 },
                 other => {
-                    return Err(EmissionError::UnsupportedFunction {
-                        name: f.name.clone(),
-                        reason: format!(
+                    bail_boundary_fn!(
+                        f.name.clone(),
+                        format!(
                             "`inline_outer_field` requires `Array<Struct<...>>`, got `{other:?}`"
                         ),
-                    });
+                    );
                 }
             };
             let mut sentinel = String::from("struct_pack(");
@@ -2570,11 +2522,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // interpolated key is a safe single-quoted SQL literal. Corpus: json-002.
         "json_tuple_field" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`json_tuple_field` requires exactly 2 arguments (json, key)"
-                        .to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`json_tuple_field` requires exactly 2 arguments (json, key)",
+                );
             }
             let json_sql = render_expr(&f.args[0], schema)?;
             let key = match &f.args[1] {
@@ -2583,11 +2534,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     ..
                 }) => s,
                 _ => {
-                    return Err(EmissionError::UnsupportedFunction {
-                        name: f.name.clone(),
-                        reason: "`json_tuple_field` second argument must be a string literal"
-                            .to_owned(),
-                    });
+                    bail_boundary_fn!(
+                        f.name.clone(),
+                        "`json_tuple_field` second argument must be a string literal",
+                    );
                 }
             };
             // Defense in depth: the analyzer pre-pass has already rejected
@@ -2599,13 +2549,13 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 .chars()
                 .any(|c| matches!(c, '\'' | '"' | '\\' | '.' | '[' | ']') || c.is_ascii_control())
             {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: format!(
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    format!(
                         "`json_tuple_field` key `{key}` contains an unsafe character; \
                          analyzer pre-pass should have rejected it"
                     ),
-                });
+                );
             }
             let key_lit = sql_string_literal(&format!("$.{key}"));
             return Ok(format!("json_extract_string({json_sql}, {key_lit})"));
@@ -2655,21 +2605,17 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     Some(true) => return Ok(format!("json_strip_nulls(to_json({a}))")),
                     Some(false) => return Ok(format!("to_json({a})")),
                     None => {
-                        return Err(EmissionError::UnsupportedFunction {
-                            name: f.name.clone(),
-                            reason: "`to_json` options: only \
+                        bail_boundary_fn!(
+                            f.name.clone(),
+                            "`to_json` options: only \
                                      {'ignoreNullFields': 'true'|'false'} is supported \
-                                     — τ boundary"
-                                .to_owned(),
-                        });
+                                     — τ boundary",
+                        );
                     }
                 }
             }
             _ => {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`to_json` requires 1 or 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`to_json` requires 1 or 2 arguments");
             }
         },
         // Spark's `to_csv(struct)` — DuckDB has no `to_csv` scalar.
@@ -2692,10 +2638,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         //   (b) new `spark_to_csv` extension function in `thdck_spark_funcs`.
         "to_csv" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`to_csv` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`to_csv` requires exactly 1 argument");
             }
             let struct_args = match &f.args[0] {
                 Expression::FunctionCall(inner)
@@ -2717,13 +2660,12 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     }
                 }
                 _ => {
-                    return Err(EmissionError::UnsupportedFunction {
-                        name: f.name.clone(),
-                        reason: "τ boundary: `to_csv` currently supports only \
+                    bail_boundary_fn!(
+                        f.name.clone(),
+                        "τ boundary: `to_csv` currently supports only \
                                  a literal `struct(...)` / `named_struct(...)` \
-                                 argument — got a different expression shape"
-                            .to_owned(),
-                    });
+                                 argument — got a different expression shape",
+                    );
                 }
             };
             let mut parts = String::new();
@@ -2745,10 +2687,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // the 4th arg 'g' flag makes it global.
         "regexp_replace" => {
             if !(3..=4).contains(&f.args.len()) {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`regexp_replace` requires 3 or 4 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`regexp_replace` requires 3 or 4 arguments");
             }
             let s = render_expr(&f.args[0], schema)?;
             let p = render_expr(&f.args[1], schema)?;
@@ -2760,10 +2699,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         "nvl2" => {
             // Spark's `nvl2(a, b, c)` = if a is not null then b else c.
             if f.args.len() != 3 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`nvl2` requires exactly 3 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`nvl2` requires exactly 3 arguments");
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -2831,10 +2767,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `math-003`.
         "ceil" | "ceiling" => {
             if f.args.is_empty() {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`ceil` requires at least 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`ceil` requires at least 1 argument");
             }
             let a = render_expr(&f.args[0], schema)?;
             return Ok(format!(
@@ -2845,10 +2778,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         "floor" => {
             if f.args.is_empty() {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`floor` requires at least 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`floor` requires at least 1 argument");
             }
             let a = render_expr(&f.args[0], schema)?;
             return Ok(format!(
@@ -2861,10 +2791,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // type. Cast to DOUBLE at emission.
         "sign" | "signum" => {
             if f.args.is_empty() {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`signum` requires at least 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`signum` requires at least 1 argument");
             }
             let a = render_expr(&f.args[0], schema)?;
             return Ok(format!("CAST(sign({a}) AS DOUBLE)"));
@@ -2876,10 +2803,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's documented behavior). Corpus anchor: `intv-003`.
         "make_dt_interval" => {
             if f.args.len() > 4 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`make_dt_interval` takes at most 4 arguments".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`make_dt_interval` takes at most 4 arguments"
+                );
             }
             let zero = "0".to_owned();
             let d = if f.args.is_empty() {
@@ -2915,10 +2842,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // INTERVAL. Same principle as `make_dt_interval`.
         "make_ym_interval" => {
             if f.args.len() > 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`make_ym_interval` takes at most 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`make_ym_interval` takes at most 2 arguments"
+                );
             }
             let zero = "0".to_owned();
             let y = if f.args.is_empty() {
@@ -2952,13 +2879,12 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // proven-safe idiom (same pattern as `named_struct` at ~L3667).
         "window" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "[TDCK-BOUNDARY] `window`: only the 2-arg tumbling form \
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "[TDCK-BOUNDARY] `window`: only the 2-arg tumbling form \
                              (window(ts, duration)) is implemented; sliding / offset \
-                             forms are not"
-                        .to_owned(),
-                });
+                             forms are not",
+                );
             }
             let dur_str = match &f.args[1] {
                 Expression::Literal(Literal {
@@ -2966,12 +2892,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     ..
                 }) => s.clone(),
                 _ => {
-                    return Err(EmissionError::UnsupportedFunction {
-                        name: f.name.clone(),
-                        reason: "[TDCK-BOUNDARY] `window`: duration must be a string \
-                                 literal (`\"N unit\"` for {second,minute,hour,day,week})"
-                            .to_owned(),
-                    });
+                    bail_boundary_fn!(
+                        f.name.clone(),
+                        "[TDCK-BOUNDARY] `window`: duration must be a string \
+                                 literal (`\"N unit\"` for {second,minute,hour,day,week})",
+                    );
                 }
             };
             let (n, unit) = parse_window_duration_literal(&dur_str).ok_or_else(|| {
@@ -3078,16 +3003,16 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let a_sql = render_expr(&f.args[0], schema)?;
             let b_sql = render_expr(&f.args[1], schema)?;
             let Expression::Lambda(lam) = &f.args[2] else {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`zip_with` requires a lambda third argument".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`zip_with` requires a lambda third argument"
+                );
             };
             if lam.params.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`zip_with` lambda must take exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`zip_with` lambda must take exactly 2 arguments",
+                );
             }
             // Fresh index variable — unlikely to collide with a Spark-emitted
             // lambda-var name (which uses `x_N` / `y_N`).
@@ -3370,10 +3295,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark parity. Corpus: `meta-003`.
         "typeof" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`typeof` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`typeof` requires exactly 1 argument");
             }
             let a = render_expr(&f.args[0], schema)?;
             return Ok(format!("lower(typeof({a}))"));
@@ -3405,10 +3327,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // DuckDB parses with `strptime` (strftime tokens) — translate + cast.
         "to_date" => {
             if !(1..=2).contains(&f.args.len()) {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`to_date` requires 1 or 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`to_date` requires 1 or 2 arguments");
             }
             let x = render_expr(&f.args[0], schema)?;
             if f.args.len() == 1 {
@@ -3425,10 +3344,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // (Spark's default, not TIMESTAMP WITH TIME ZONE).
         "to_timestamp" => {
             if !(1..=2).contains(&f.args.len()) {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`to_timestamp` requires 1 or 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`to_timestamp` requires 1 or 2 arguments");
             }
             let x = render_expr(&f.args[0], schema)?;
             if f.args.len() == 1 {
@@ -3448,10 +3364,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         //   cast. Uses the shared Spark→strftime format translation.
         "unix_timestamp" => {
             if !(1..=2).contains(&f.args.len()) {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`unix_timestamp` requires 1 or 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`unix_timestamp` requires 1 or 2 arguments");
             }
             // Spark serializes `F.unix_timestamp(col)` as a 2-arg call with a
             // default format `yyyy-MM-dd HH:mm:ss`; if the input is already
@@ -3478,10 +3391,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // renders it in the session TZ (UTC in test env), matching Spark.
         "from_unixtime" => {
             if !(1..=2).contains(&f.args.len()) {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`from_unixtime` requires 1 or 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`from_unixtime` requires 1 or 2 arguments");
             }
             let seconds = render_expr(&f.args[0], schema)?;
             let ts = format!("to_timestamp(CAST({seconds} AS DOUBLE))");
@@ -3498,10 +3408,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `nanvl(a, b)` — if a is NaN, return b; else a.
         "nanvl" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`nanvl` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`nanvl` requires exactly 2 arguments");
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -3515,10 +3422,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // NULL for x ≤ 0; guard the same way, on the value arg.
         "ln" | "log" | "log10" | "log2" => {
             if f.args.is_empty() || f.args.len() > 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: format!("`{}` requires 1 or 2 arguments", name_lower),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    format!("`{}` requires 1 or 2 arguments", name_lower),
+                );
             }
             // Spark `log(x)` is natural log (matches DuckDB `ln`); Spark
             // `log(base, x)` is log-base-b. DuckDB `log(x)` is log10, so
@@ -3555,10 +3462,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `spark_return_cast` handles the outer type match.
         "shiftleft" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`shiftleft` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`shiftleft` requires exactly 2 arguments");
             }
             let x = render_expr(&f.args[0], schema)?;
             let n = render_expr(&f.args[1], schema)?;
@@ -3572,10 +3476,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // legal for negative x (unlike `<<`), so we can pass through.
         "shiftright" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`shiftright` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`shiftright` requires exactly 2 arguments");
             }
             let x = render_expr(&f.args[0], schema)?;
             let n = render_expr(&f.args[1], schema)?;
@@ -3593,10 +3494,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // → 3.1 either way). Corpus witness: `math-002`.
         "bround" => {
             if !(1..=2).contains(&f.args.len()) {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`bround` requires 1 or 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`bround` requires 1 or 2 arguments");
             }
             let x = render_expr(&f.args[0], schema)?;
             let n = if f.args.len() == 2 {
@@ -3628,10 +3526,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // emit the inline form. Corpus witness: `math-006`.
         "hypot" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`hypot` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`hypot` requires exactly 2 arguments");
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -3650,10 +3545,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // witness: `math-013` uses `conv(str, 10, 2)`.
         "conv" => {
             if f.args.len() != 3 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`conv` requires exactly 3 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`conv` requires exactly 3 arguments");
             }
             let s = render_expr(&f.args[0], schema)?;
             let _from_base = render_expr(&f.args[1], schema)?;
@@ -3687,10 +3579,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     return Ok(format!("hex(CAST({s} AS BIGINT))"));
                 }
                 _ => {
-                    return Err(EmissionError::UnsupportedFunction {
-                        name: f.name.clone(),
-                        reason: "`conv` only implemented for to_base ∈ {2, 16}".to_owned(),
-                    });
+                    bail_boundary_fn!(
+                        f.name.clone(),
+                        "`conv` only implemented for to_base ∈ {2, 16}",
+                    );
                 }
             }
         }
@@ -3702,10 +3594,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `math-013`.
         "hex" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`hex` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`hex` requires exactly 1 argument");
             }
             let a = render_expr(&f.args[0], schema)?;
             // Only remap for integer types; DuckDB's hex(VARCHAR) already
@@ -3724,10 +3613,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `struct_pack(k1 := v1, k2 := v2, ...)`.
         "named_struct" => {
             if f.args.len() % 2 != 0 || f.args.is_empty() {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`named_struct` requires an even, non-zero arg count".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`named_struct` requires an even, non-zero arg count",
+                );
             }
             let mut parts = String::new();
             let mut i = 0;
@@ -3739,17 +3628,17 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     Expression::Literal(l) => match &l.value {
                         crate::transpiler_v2::expression::LiteralValue::String(s) => s.clone(),
                         _ => {
-                            return Err(EmissionError::UnsupportedFunction {
-                                name: f.name.clone(),
-                                reason: "`named_struct` keys must be string literals".to_owned(),
-                            });
+                            bail_boundary_fn!(
+                                f.name.clone(),
+                                "`named_struct` keys must be string literals",
+                            );
                         }
                     },
                     _ => {
-                        return Err(EmissionError::UnsupportedFunction {
-                            name: f.name.clone(),
-                            reason: "`named_struct` keys must be string literals".to_owned(),
-                        });
+                        bail_boundary_fn!(
+                            f.name.clone(),
+                            "`named_struct` keys must be string literals",
+                        );
                     }
                 };
                 let val = render_expr(&f.args[i + 1], schema)?;
@@ -3784,20 +3673,14 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `isnull`/`isnotnull` — DuckDB uses `IS NULL`/`IS NOT NULL`.
         "isnull" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`isnull` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`isnull` requires exactly 1 argument");
             }
             let a = render_expr(&f.args[0], schema)?;
             return Ok(format!("({a} IS NULL)"));
         }
         "isnotnull" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`isnotnull` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`isnotnull` requires exactly 1 argument");
             }
             let a = render_expr(&f.args[0], schema)?;
             return Ok(format!("({a} IS NOT NULL)"));
@@ -3807,10 +3690,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `regexp_matches(x, pattern)`.
         "like" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`like` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`like` requires exactly 2 arguments");
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -3818,10 +3698,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         "ilike" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`ilike` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`ilike` requires exactly 2 arguments");
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -3829,10 +3706,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         "rlike" | "regexp_like" | "regexp" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`rlike` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`rlike` requires exactly 2 arguments");
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -3841,10 +3715,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `<=>(a, b)` eqNullSafe — DuckDB uses IS NOT DISTINCT FROM.
         "eqnullsafe" | "<=>" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`eqNullSafe` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`eqNullSafe` requires exactly 2 arguments");
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -3855,10 +3726,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // limit; corpus cases pass -1 so this is safe).
         "split" => {
             if f.args.len() < 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`split` requires at least 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`split` requires at least 2 arguments");
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -3868,10 +3736,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // DuckDB uses operator form.
         "&" | "bitwise_and" | "bitwiseand" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`bitwiseAND` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`bitwiseAND` requires exactly 2 arguments");
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -3879,10 +3744,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         "|" | "bitwise_or" | "bitwiseor" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`bitwiseOR` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`bitwiseOR` requires exactly 2 arguments");
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -3890,10 +3752,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         "^" | "bitwise_xor" | "bitwisexor" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`bitwiseXOR` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`bitwiseXOR` requires exactly 2 arguments");
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -3905,10 +3764,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // per-case follow-up if it fires).
         "sha2" => {
             if f.args.is_empty() {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`sha2` requires at least 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`sha2` requires at least 1 argument");
             }
             let s = render_expr(&f.args[0], schema)?;
             return Ok(format!("sha256({s})"));
@@ -3918,10 +3774,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `add_months(date, n)` — DuckDB uses `date + INTERVAL n MONTH`.
         "add_months" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`add_months` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`add_months` requires exactly 2 arguments");
             }
             let d = render_expr(&f.args[0], schema)?;
             let n = render_expr(&f.args[1], schema)?;
@@ -3931,10 +3784,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `datediff('day', start, end)` (3 args, unit-prefixed).
         "datediff" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`datediff` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`datediff` requires exactly 2 arguments");
             }
             let end = render_expr(&f.args[0], schema)?;
             let start = render_expr(&f.args[1], schema)?;
@@ -3942,10 +3792,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         "months_between" => {
             if f.args.len() < 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`months_between` requires at least 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`months_between` requires at least 2 arguments"
+                );
             }
             let a = render_expr(&f.args[0], schema)?;
             let b = render_expr(&f.args[1], schema)?;
@@ -3962,10 +3812,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         "date_add" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`date_add` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`date_add` requires exactly 2 arguments");
             }
             let d = render_expr(&f.args[0], schema)?;
             let n = render_expr(&f.args[1], schema)?;
@@ -3973,10 +3820,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         "date_sub" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`date_sub` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`date_sub` requires exactly 2 arguments");
             }
             let d = render_expr(&f.args[0], schema)?;
             let n = render_expr(&f.args[1], schema)?;
@@ -4015,10 +3859,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // match Spark's non-null semantics. Corpus witness: `cond-010`.
         "isnan" | "is_nan" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`isnan` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`isnan` requires exactly 1 argument");
             }
             let a = render_expr(&f.args[0], schema)?;
             return Ok(format!("COALESCE(isnan({a}), FALSE)"));
@@ -4028,10 +3869,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `find_in_set`; emit `COALESCE(list_position(string_split(csv, ','), needle), 0)`.
         "find_in_set" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`find_in_set` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`find_in_set` requires exactly 2 arguments");
             }
             let needle = render_expr(&f.args[0], schema)?;
             let csv = render_expr(&f.args[1], schema)?;
@@ -4045,10 +3883,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // DuckDB list indexing is 1-based, so emit `[s1, s2, ...][idx]`.
         "elt" => {
             if f.args.len() < 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`elt` requires at least 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`elt` requires at least 2 arguments");
             }
             let idx = render_expr(&f.args[0], schema)?;
             let mut items = String::new();
@@ -4074,11 +3909,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // as literal `from_json(...)` and DuckDB would raise an opaque
         // scalar-not-found error.
         "from_json" if f.args.len() != 2 => {
-            return Err(EmissionError::UnsupportedFunction {
-                name: f.name.clone(),
-                reason: "`from_json` options-map form (3-arg) not supported — τ boundary"
-                    .to_owned(),
-            });
+            bail_boundary_fn!(
+                f.name.clone(),
+                "`from_json` options-map form (3-arg) not supported — τ boundary",
+            );
         }
         "from_json" if f.args.len() == 2 => {
             let json_str = render_expr(&f.args[0], schema)?;
@@ -4089,12 +3923,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     return Ok(format!("from_json({json_str}, '{duck_schema}')"));
                 }
             }
-            return Err(EmissionError::UnsupportedFunction {
-                name: f.name.clone(),
-                reason: "`from_json` with a non-literal DDL schema or unsupported \
-                         DDL shape (τ handles the digit-schema field-list form)"
-                    .to_owned(),
-            });
+            bail_boundary_fn!(
+                f.name.clone(),
+                "`from_json` with a non-literal DDL schema or unsupported \
+                         DDL shape (τ handles the digit-schema field-list form)",
+            );
         }
         // Spark's `from_csv(csv_str, schema_ddl[, options])` parses a
         // comma-separated string per a Spark DDL schema literal (e.g.
@@ -4118,10 +3951,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // (embedded commas, quoted strings, escapes). The corpus witness
         // uses simple unquoted values; documenting the gap for future work.
         "from_csv" if f.args.len() != 2 => {
-            return Err(EmissionError::UnsupportedFunction {
-                name: f.name.clone(),
-                reason: "`from_csv` options-map form (3-arg) not supported — τ boundary".to_owned(),
-            });
+            bail_boundary_fn!(
+                f.name.clone(),
+                "`from_csv` options-map form (3-arg) not supported — τ boundary",
+            );
         }
         "from_csv" if f.args.len() == 2 => {
             let csv_str = render_expr(&f.args[0], schema)?;
@@ -4149,12 +3982,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     ));
                 }
             }
-            return Err(EmissionError::UnsupportedFunction {
-                name: f.name.clone(),
-                reason: "`from_csv` with a non-literal DDL schema or unsupported \
-                         DDL shape (τ handles the flat primitive field-list form)"
-                    .to_owned(),
-            });
+            bail_boundary_fn!(
+                f.name.clone(),
+                "`from_csv` with a non-literal DDL schema or unsupported \
+                         DDL shape (τ handles the flat primitive field-list form)",
+            );
         }
         // Spark's `try_to_number(str, fmt)` parses `str` per the numeric
         // format string `fmt` (e.g. `'999.99'`), returning DECIMAL or NULL on
@@ -4168,10 +4000,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `parse-004`.
         "try_to_number" => {
             if f.args.len() != 2 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`try_to_number` requires exactly 2 arguments".to_owned(),
-                });
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`try_to_number` requires exactly 2 arguments"
+                );
             }
             let fmt = literal_string_arg(&f.args[1]).ok_or_else(|| {
                 EmissionError::UnsupportedFunction {
@@ -4197,10 +4029,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Bridge by post-substituting `%20 → +`. Corpus witness: `parse-002`.
         "url_encode" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`url_encode` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`url_encode` requires exactly 1 argument");
             }
             let s = render_expr(&f.args[0], schema)?;
             return Ok(format!("replace(url_encode({s}), '%20', '+')"));
@@ -4210,10 +4039,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // pre-substituting `+` → `%20` before decoding.
         "url_decode" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`url_decode` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`url_decode` requires exactly 1 argument");
             }
             let s = render_expr(&f.args[0], schema)?;
             return Ok(format!("url_decode(replace({s}, '+', '%20'))"));
@@ -4229,10 +4055,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Anchor: corpus parse-001.
         "parse_url" => {
             if !(2..=3).contains(&f.args.len()) {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`parse_url` requires 2 or 3 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`parse_url` requires 2 or 3 arguments");
             }
             let url = render_expr(&f.args[0], schema)?;
             let part = literal_string_arg(&f.args[1]).ok_or_else(|| {
@@ -4267,10 +4090,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 "AUTHORITY" => "^[^:]+://([^/?#]+)".to_owned(),
                 "USERINFO" => "^[^:]+://([^@/?#]+)@".to_owned(),
                 other => {
-                    return Err(EmissionError::UnsupportedFunction {
-                        name: f.name.clone(),
-                        reason: format!("`parse_url` part `{other}` not supported"),
-                    });
+                    bail_boundary_fn!(
+                        f.name.clone(),
+                        format!("`parse_url` part `{other}` not supported"),
+                    );
                 }
             };
             let pattern_lit = sql_string_literal(&pattern);
@@ -4285,10 +4108,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // length_of_replaced defaults to length(replacement).
         "overlay" => {
             if !(3..=4).contains(&f.args.len()) {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`overlay` requires 3 or 4 arguments".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`overlay` requires 3 or 4 arguments");
             }
             let s = render_expr(&f.args[0], schema)?;
             let r = render_expr(&f.args[1], schema)?;
@@ -4470,10 +4290,7 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         // `count_if` in recent versions, but safest to lower.
         "count_if" => {
             if f.args.len() != 1 {
-                return Err(EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`count_if` requires exactly 1 argument".to_owned(),
-                });
+                bail_boundary_fn!(f.name.clone(), "`count_if` requires exactly 1 argument");
             }
             let a = render_expr(&f.args[0], schema)?;
             return Ok(format!("SUM(CASE WHEN {a} THEN 1 ELSE 0 END)"));
@@ -4485,10 +4302,10 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         "sum_distinct" => ("sum", true),
         // Non-primitive aggregates surface as Thunderduck-boundary.
         _ => {
-            return Err(EmissionError::UnsupportedFunction {
-                name: f.name.clone(),
-                reason: "aggregate function not yet in the primitive arm set".to_owned(),
-            });
+            bail_boundary_fn!(
+                f.name.clone(),
+                "aggregate function not yet in the primitive arm set",
+            );
         }
     };
     let mut args_sql = String::new();
@@ -4497,10 +4314,7 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
     // the empty arg list.
     let zero_arg_ok = matches!(duck_name, "grouping_id" | "grouping") && f.args.is_empty();
     if f.args.is_empty() && !zero_arg_ok {
-        return Err(EmissionError::UnsupportedFunction {
-            name: f.name.clone(),
-            reason: "aggregate function call has no arguments".to_owned(),
-        });
+        bail_boundary_fn!(f.name.clone(), "aggregate function call has no arguments");
     }
     for (i, arg) in f.args.iter().enumerate() {
         if i > 0 {
@@ -4600,11 +4414,10 @@ fn render_aggregate_op(
 ) -> Result<String, EmissionError> {
     use super::ast::GroupingKind;
     if matches!(grouping_kind, GroupingKind::GroupingSets) {
-        return Err(EmissionError::UnsupportedOp {
-            op: "Aggregate[GroupingSets]".to_owned(),
-            reason: "GROUPING SETS emission requires set-membership metadata; (not implemented in τ)"
-                .to_owned(),
-        });
+        bail_boundary_op!(
+            "Aggregate[GroupingSets]",
+            "GROUPING SETS emission requires set-membership metadata; (not implemented in τ)",
+        );
     }
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let input_schema = &input.resolved_schema;
@@ -5030,11 +4843,10 @@ fn render_update_fields(
     // `DataType::Struct(_)` here (Pass 57 makes struct types visible).
     let base_type = u.struct_expr.data_type(schema);
     let DataType::Struct(base_struct) = base_type else {
-        return Err(EmissionError::UnsupportedExpression {
-            shape: "UpdateFields".to_owned(),
-            reason: "withField/dropFields requires the base expression to be a StructType"
-                .to_owned(),
-        });
+        bail_boundary_expr!(
+            "UpdateFields",
+            "withField/dropFields requires the base expression to be a StructType",
+        );
     };
     let base_sql = render_expr(&u.struct_expr, schema)?;
 
@@ -6631,8 +6443,12 @@ mod tests {
     fn inv10_emission_imports_are_typed() {
         // Positive shape check: the non-test region of emission.rs may only
         // `use crate::...` from `crate::types::{DataType, StructField,
-        // StructType}`. The `#[cfg(test)]` tests below legitimately import
-        // fixtures from `crate::transpiler_v2::…`.
+        // StructType}` — value-level types — or from the τ-owned
+        // `bail_boundary_*!` boundary-error macros (Pass 7 / OPP-D). Both are
+        // INV10-safe: the τ macros expand to `EmissionError::Unsupported*`
+        // constructors, which is exactly what the manual `Err(EmissionError::
+        // ...)` sites they replace did. The `#[cfg(test)]` tests below
+        // legitimately import fixtures from `crate::transpiler_v2::…`.
         let this_file = include_str!("emission.rs");
         let module_marker = "#[cfg(test)]\nmod tests {";
         let scan_slice = match this_file.find(module_marker) {
@@ -6644,8 +6460,11 @@ mod tests {
             if !trimmed.starts_with("use crate::") {
                 continue;
             }
+            let is_typed_import = trimmed.starts_with("use crate::types::");
+            let is_bail_macro_import = trimmed.starts_with("use crate::bail_boundary_")
+                || trimmed.starts_with("use crate::{bail_boundary_");
             assert!(
-                trimmed.starts_with("use crate::types::"),
+                is_typed_import || is_bail_macro_import,
                 "INV10 positive violation — unexpected `use crate::...` line: {trimmed}",
             );
         }

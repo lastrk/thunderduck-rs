@@ -2660,7 +2660,7 @@ fn build_stats_output_schema(cols: &[String]) -> StructType {
 ///   - empty ⇒ all input columns in schema order (Spark default);
 ///   - non-empty ⇒ each name resolves case-insensitively or
 ///     [`AnalyzerError::UnknownColumn`] is returned. The output preserves the
-///     caller's casing (matches legacy `logical::Describe.cols` behaviour).
+///     caller's casing (Spark parity).
 fn materialise_stats_cols(
     cols: Vec<String>,
     input_schema: &StructType,
@@ -2744,8 +2744,8 @@ fn analyze_summary(
 /// (case-insensitive; unresolved names raise `AnalyzerError::UnknownColumn`),
 /// and stamp the output schema as one `ARRAY<T>` NON-NULLABLE column per
 /// input col — where `T` is the source column's declared [`DataType`].
-/// Spark parity per ADR-015: the legacy `logical::FreqItems` path hardcoded
-/// `Array<String>` for every column, which is a bug τ fixes at the port point.
+/// Spark parity per ADR-015: the element type of each `ARRAY<T>` matches the
+/// source column's declared `DataType` (never a hardcoded `Array<String>`).
 ///
 /// **Spark parity — outer nullability.** Spark's `StatFunctions.freqItems`
 /// stamps every output column non-nullable: the aggregate always returns a
@@ -5049,10 +5049,9 @@ mod tests {
     // ── FreqItems / Crosstab analysis (Pass 82) ──────────────────────────
 
     /// Fixture with a stats-shaped schema that exercises all four
-    /// element-type variants (Integer, String, Double, Decimal). This is the
-    /// anti-legacy-bug shape per ADR-015: legacy `logical::FreqItems` stamped
-    /// `Array<String>` for every column regardless of source; τ must stamp
-    /// `Array<source_type>`.
+    /// element-type variants (Integer, String, Double, Decimal). Pins ADR-015
+    /// Spark parity: freqItems must stamp `Array<source_type>` per column
+    /// (never a hardcoded `Array<String>`).
     fn base_types_with_stats() -> BaseTypes {
         let stats_schema = StructType::new(vec![
             StructField::not_null("id", DataType::Long),
@@ -5078,7 +5077,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_freq_items_stamps_array_of_source_type_per_col_no_legacy_string_hardcode() {
+    fn analyze_freq_items_stamps_array_of_source_type_per_col() {
         let bt = base_types_with_stats();
         let ast = CommonAst::new(CommonOp::FreqItems {
             input: Box::new(CommonAst::new(CommonOp::TableScan {
@@ -5097,7 +5096,7 @@ mod tests {
         // Schema arity: one column per input col (no `summary` prefix — Spark
         // freqItems doesn't emit a summary label column).
         assert_eq!(typed.resolved_schema.fields.len(), 4);
-        // Anti-legacy-bug check: each element type mirrors the source col.
+        // Spark parity: each element type mirrors the source col.
         let expected: &[(&str, DataType)] = &[
             ("dept_id_freqItems", DataType::Integer),
             ("name_freqItems", DataType::String),

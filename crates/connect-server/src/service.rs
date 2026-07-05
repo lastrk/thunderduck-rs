@@ -420,11 +420,9 @@ async fn handle_command(
 
 /// Classification of a τ plan for execution routing.
 ///
-/// Slice A.3 collapses this to a two-arm placeholder (DDL vs. Query). Slice
-/// C.1 restores the meaningful classification over `CommonAst` (currently the
-/// legacy `DdlStatement` variant lives only in `LogicalPlan`, which τ never
-/// touches).
-#[allow(dead_code)] // `Ddl` reintroduced by Slice C.1.
+/// Currently a two-arm placeholder (DDL vs. Query) pending τ-side DDL
+/// classification over `CommonAst`.
+#[allow(dead_code)] // `Ddl` reintroduced when DDL classification lands.
 enum PlanKind {
     /// A DDL/DML statement — execute without result streaming.
     Ddl,

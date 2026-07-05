@@ -1,11 +1,4 @@
-//! Spark SQL dialect for sqlparser-rs — τ's copy.
-//!
-//! Duplicated from `crate::parser::dialect` per Open Decision 1 Option 1b
-//! (Slice A.2). Do not remove before Slice K deletes legacy — see ADR-022.
-//!
-//! **INV10:** duplication (rather than re-export) preserves the barrier at
-//! the parser layer so `parser_v2/` remains structurally independent of the
-//! legacy tree.
+//! Spark SQL dialect for sqlparser-rs.
 
 use sqlparser::ast::{BinaryOperator, Expr};
 use sqlparser::dialect::Dialect;
@@ -38,6 +31,13 @@ impl Dialect for SparkDialect {
     }
 
     fn supports_lambda_functions(&self) -> bool {
+        true
+    }
+
+    /// Spark supports `ORDER BY ALL` (order by every output column). Without
+    /// this the parser treats a trailing `ALL` as a column identifier. Corpus
+    /// witness: `ord-007`. (`GROUP BY ALL` is recognized dialect-independently.)
+    fn supports_order_by_all(&self) -> bool {
         true
     }
 

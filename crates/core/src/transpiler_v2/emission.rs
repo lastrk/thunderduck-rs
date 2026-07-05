@@ -1045,8 +1045,7 @@ fn render_na_replace(
 
 /// Render `df.unpivot(ids, values, var_col, val_col)`.
 ///
-/// Emits DuckDB's `UNPIVOT` shape (mirrors the legacy generator's
-/// `gen_unpivot`):
+/// Emits DuckDB's `UNPIVOT` shape:
 /// ```sql
 /// UNPIVOT (SELECT <ids>, <values> FROM (<child>)) ON <values>
 ///   INTO NAME <var_col> VALUE <val_col>
@@ -1216,8 +1215,7 @@ fn render_stats_union(
 
 /// Map a statistic name to the aggregate SQL expression for a single column.
 ///
-/// Mirrors legacy `generator::mod::stat_to_agg_expr` with one adjustment:
-/// percentile stats emit `quantile_disc(TRY_CAST(col AS DOUBLE), frac)`
+/// Percentile stats emit `quantile_disc(TRY_CAST(col AS DOUBLE), frac)`
 /// (function-call form) instead of `PERCENTILE_DISC WITHIN GROUP (ORDER BY
 /// ...)` — same DuckDB function chosen for τ's `percentile_approx` at
 /// Pass 74 (`emission.rs::render_function_call`).
@@ -7416,7 +7414,7 @@ mod tests {
         // Anchor: piv-004 shape — emits
         //   UNPIVOT (SELECT <ids>,<values> FROM (<child>) AS __td_unpivot_src)
         //     ON <values> INTO NAME "metric" VALUE "value"
-        // per the legacy `gen_unpivot` SQL contract.
+        // per τ's UNPIVOT emission contract (see `gen_unpivot` above).
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Unpivot {

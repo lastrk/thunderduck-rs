@@ -248,10 +248,9 @@ pub enum CommonOp {
     /// `value_column_name` (Spark-widened common type across all `values`
     /// columns, nullable if any source value column is nullable).
     ///
-    /// `ids` and `values` are column *names* (mirror legacy
-    /// `logical::Unpivot`). When `values` is empty, Spark defaults to "all
-    /// non-id columns"; the analyzer materialises that expansion so the
-    /// emission stage sees a fully-resolved column list.
+    /// `ids` and `values` are column *names*. When `values` is empty, Spark
+    /// defaults to "all non-id columns"; the analyzer materialises that
+    /// expansion so the emission stage sees a fully-resolved column list.
     Unpivot {
         /// The input relation.
         input: Box<CommonAst>,
@@ -323,9 +322,7 @@ pub enum CommonOp {
     /// `df.stat.freqItems(cols, support)` — Spark's `StatFunctions.freqItems`.
     /// Emits one `ARRAY<T>` output column per input col, named
     /// `{col}_freqItems`, where `T` matches the source column's declared
-    /// [`crate::types::DataType`] (Spark parity per ADR-015 — legacy hardcoded
-    /// `Array<String>` for every column, which is a bug τ fixes at the
-    /// port point).
+    /// [`crate::types::DataType`] (Spark parity per ADR-015).
     FreqItems {
         /// The input relation.
         input: Box<CommonAst>,
@@ -655,9 +652,9 @@ mod tests {
 
     #[test]
     fn common_op_unpivot_carries_ids_values_and_output_names() {
-        // Anchor: Unpivot variant lands with `ids` + `values` as column names
-        // (mirrors legacy `logical::Unpivot`), plus explicit variable/value
-        // column names for the two new output columns.
+        // Anchor: Unpivot variant lands with `ids` + `values` as column names,
+        // plus explicit variable/value column names for the two new output
+        // columns.
         let plan = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             ids: vec!["id".to_owned()],
@@ -686,7 +683,7 @@ mod tests {
     fn common_op_pivot_carries_grouping_pivot_column_values_and_aggregates() {
         // Anchor (Pass 60): Pivot variant lands with `grouping`,
         // `pivot_column`, `pivot_values` (empty ⇒ implicit / DuckDB-eager),
-        // and `aggregates` — mirrors the legacy `logical::Pivot` shape.
+        // and `aggregates`.
         use super::super::expression::{Literal, LiteralValue, UnresolvedColumn};
         let group = Expression::UnresolvedColumn(UnresolvedColumn {
             name: "dept_id".to_owned(),

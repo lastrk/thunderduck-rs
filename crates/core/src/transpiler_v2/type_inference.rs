@@ -1,15 +1,13 @@
-//! τ's own TypeInferenceEngine — Spark-compatible type inference.
+//! τ's TypeInferenceEngine — Spark-compatible type inference.
 //!
-//! This is an **independent** re-implementation of the type engine (INV10:
-//! τ imports only `DataType`, `StructField`, `StructType` from `crate::types`;
-//! no re-use of `crate::types::TypeInferenceEngine`). Shape mirrors the legacy
-//! engine so cross-checking is straightforward.
+//! Owned by τ (INV10: τ imports only `DataType`, `StructField`, `StructType`
+//! from `crate::types`).
 
 use crate::types::{DataType, StructField, StructType};
 
 /// τ's Spark-compatible type inference engine.
 ///
-/// Unit struct with associated functions — matches legacy shape.
+/// Unit struct with associated functions.
 pub struct TypeInferenceEngine;
 
 impl TypeInferenceEngine {

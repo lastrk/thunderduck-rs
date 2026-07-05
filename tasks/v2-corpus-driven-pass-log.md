@@ -746,3 +746,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 644/0, `sql_v2` differential 142/120/262 with 5 cte cases GREEN, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 102 — 2026-07-05 — SQL corpus: SQL-syntax function forms (fn-003 cluster) [run 2]
+- **Corpus: SQL front-end.** Target: fn-003 (`SUBSTRING(s FROM p FOR n)`), fn-004 (`substr`), fn-005 (`TRIM(BOTH x FROM s)`), fn-006 (`POSITION(sub IN s)`), fn-007 (`OVERLAY(s PLACING r FROM p FOR n)`). All hit `sql::expr::other` — sqlparser routes these special syntaxes to dedicated `Expr` variants that `lower_expr`'s catch-all rejected; the underlying functions already emit.
+- Diagnostic: `.agent-output/diagnostic-pass-102.md` — pure lowering; add 4 `lower_expr` arms → `Expression::FunctionCall`. Per-variant → function + arg-order mapping table; Position must map to `locate` (DuckDB has no `position` scalar). fn-004 `substr` also parses to `Expr::Substring` (shorthand) — same arm.
+- Architecture: `.agent-output/architecture-pass-102.md` — mirror the `Expr::Extract` arm; verify arg order against emission.
+- Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`). No emission/analyzer/type_inference/ast change.
+- ADR citations: ADR-004 (SQL onto existing function substrate), ADR-015 (Spark parity — verified arg order/name for each: trim `[str, chars]`, position→`locate` `[needle, str]`→`strpos(str,needle)` 1-based, overlay `[input, replace, pos, len]`, substring `[str, start, len]`), ADR-022 (now supported).
+- Corpus signal: 147 (142 → **147**, +5). fn-003/004/005/006/007 GREEN. No regressions.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Tests added: 8 (substring FROM/FOR + substr shorthand, trim BOTH/LEADING/TRAILING + bare trim, position→locate, overlay 4-arg) — with positional arg-order assertions for trim + position.
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (all arg orders verified end-to-end against emission arms; 1 Low: explicit `Both|None` match arm). Perf negligible (parse-time).
+- Findings queued as follow-up: fn-014 (date_add/datediff), fn-017 (round/abs/ceil/floor), fn-018 (int/int div) — schema/value diffs, separate; fn-020 (`X'..'` hex string literal — `sql::value::HexStringLiteral`).
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 652/0, `sql_v2` differential 147/115/262, no regressions).
+- Commit SHA: (this commit).

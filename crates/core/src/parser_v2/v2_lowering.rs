@@ -26,8 +26,8 @@ use sqlparser::ast::{
     FunctionArguments, GroupByExpr, Interval, JoinConstraint, JoinOperator, LimitClause,
     NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByExpr, OrderByKind,
     Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
-    TableWithJoins, UnaryOperator, Value, ValueWithSpan, WindowFrame as SqlWindowFrame,
-    WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
+    TableWithJoins, TrimWhereField, UnaryOperator, Value, ValueWithSpan,
+    WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 
 use crate::transpiler_v2::ast::{CommonAst, CommonOp, GroupingKind, JoinType, SetOpKind};
@@ -849,6 +849,89 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
             };
             Ok(Expression::FunctionCall(FunctionCall {
                 name: fn_name.to_owned(),
+                args,
+                distinct: false,
+            }))
+        }
+        // Spark's `SUBSTRING(<expr> FROM <from> [FOR <for>])` special syntax and
+        // the `SUBSTR(<expr>, <from>, <for>)` shorthand both parse to
+        // `Expr::Substring`. Lower to `substring(expr, from[, for])` — the
+        // existing `substring` type_inference / emission arms apply. Corpus
+        // witnesses: `fn-003` (SQL syntax), `fn-004` (`substr(...)`).
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let mut args = vec![lower_expr(*expr)?];
+            if let Some(from) = substring_from {
+                args.push(lower_expr(*from)?);
+            }
+            if let Some(for_) = substring_for {
+                args.push(lower_expr(*for_)?);
+            }
+            Ok(Expression::FunctionCall(FunctionCall {
+                name: "substring".to_owned(),
+                args,
+                distinct: false,
+            }))
+        }
+        // Spark's `TRIM([BOTH | LEADING | TRAILING] [<what> FROM] <expr>)`
+        // special syntax. Map the trim side to the DuckDB function name
+        // (`trim` / `ltrim` / `rtrim`) and emit `trim(expr[, what])`. DuckDB's
+        // `trim(string, characters)` takes the string first and the trim
+        // characters second, matching Spark's `TRIM(BOTH what FROM expr)` =
+        // "remove `what` from both ends of `expr`". Corpus witness: `fn-005`.
+        Expr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            ..
+        } => {
+            let name = match trim_where {
+                Some(TrimWhereField::Leading) => "ltrim",
+                Some(TrimWhereField::Trailing) => "rtrim",
+                _ => "trim",
+            };
+            let mut args = vec![lower_expr(*expr)?];
+            if let Some(what) = trim_what {
+                args.push(lower_expr(*what)?);
+            }
+            Ok(Expression::FunctionCall(FunctionCall {
+                name: name.to_owned(),
+                args,
+                distinct: false,
+            }))
+        }
+        // Spark's `POSITION(<substr> IN <str>)` special syntax. Lower to
+        // `locate(substr, str)` (NOT `position` — DuckDB has no `position`
+        // scalar; `locate` emits 1-based `strpos`). Corpus witness: `fn-006`.
+        Expr::Position { expr, r#in } => Ok(Expression::FunctionCall(FunctionCall {
+            name: "locate".to_owned(),
+            args: vec![lower_expr(*expr)?, lower_expr(*r#in)?],
+            distinct: false,
+        })),
+        // Spark's `OVERLAY(<expr> PLACING <what> FROM <from> [FOR <for>])`
+        // special syntax. Lower to `overlay(expr, what, from[, for])` — the
+        // existing `overlay` emission arm rewrites it via substring/concat.
+        // Corpus witness: `fn-007`.
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            let mut args = vec![
+                lower_expr(*expr)?,
+                lower_expr(*overlay_what)?,
+                lower_expr(*overlay_from)?,
+            ];
+            if let Some(for_) = overlay_for {
+                args.push(lower_expr(*for_)?);
+            }
+            Ok(Expression::FunctionCall(FunctionCall {
+                name: "overlay".to_owned(),
                 args,
                 distinct: false,
             }))
@@ -2191,5 +2274,85 @@ mod tests {
             }
             other => panic!("expected Interval, got {other:?}"),
         }
+    }
+
+    /// Extract the top-level projection as a `FunctionCall`, panicking otherwise.
+    fn first_function_call(sql: &str) -> FunctionCall {
+        let plan = parse(sql).expect("should parse");
+        match first_projection(plan) {
+            Expression::FunctionCall(fc) => fc,
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn substring_from_for_lowers_to_substring() {
+        let fc = first_function_call("SELECT substring(name FROM 1 FOR 2) FROM t");
+        assert_eq!(fc.name, "substring");
+        assert_eq!(fc.args.len(), 3);
+        assert!(!fc.distinct);
+    }
+
+    #[test]
+    fn substr_shorthand_lowers_to_substring() {
+        let fc = first_function_call("SELECT substr(name, 2, 3) FROM t");
+        assert_eq!(fc.name, "substring");
+        assert_eq!(fc.args.len(), 3);
+    }
+
+    #[test]
+    fn trim_both_lowers_to_trim_with_expr_first() {
+        let fc = first_function_call("SELECT trim(BOTH 'A' FROM name) FROM t");
+        assert_eq!(fc.name, "trim");
+        assert_eq!(fc.args.len(), 2);
+        // DuckDB `trim(string, characters)`: the trimmed value comes first,
+        // the trim characters second.
+        assert!(matches!(
+            fc.args[0],
+            Expression::UnresolvedColumn(ref c) if c.name == "name"
+        ));
+    }
+
+    #[test]
+    fn trim_leading_lowers_to_ltrim() {
+        let fc = first_function_call("SELECT trim(LEADING 'A' FROM name) FROM t");
+        assert_eq!(fc.name, "ltrim");
+        assert_eq!(fc.args.len(), 2);
+    }
+
+    #[test]
+    fn trim_trailing_lowers_to_rtrim() {
+        let fc = first_function_call("SELECT trim(TRAILING 'A' FROM name) FROM t");
+        assert_eq!(fc.name, "rtrim");
+        assert_eq!(fc.args.len(), 2);
+    }
+
+    #[test]
+    fn bare_trim_lowers_to_single_arg_trim() {
+        let fc = first_function_call("SELECT trim(name) FROM t");
+        assert_eq!(fc.name, "trim");
+        assert_eq!(fc.args.len(), 1);
+    }
+
+    #[test]
+    fn position_in_lowers_to_locate() {
+        let fc = first_function_call("SELECT position('a' IN name) FROM t");
+        assert_eq!(fc.name, "locate");
+        assert_eq!(fc.args.len(), 2);
+        // locate(substr, str): needle first, haystack second.
+        assert!(matches!(
+            fc.args[0],
+            Expression::Literal(Literal {
+                value: LiteralValue::String(ref s),
+                ..
+            }) if s == "a"
+        ));
+    }
+
+    #[test]
+    fn overlay_placing_lowers_to_overlay() {
+        let fc = first_function_call("SELECT overlay(name PLACING 'XX' FROM 1 FOR 2) FROM t");
+        assert_eq!(fc.name, "overlay");
+        assert_eq!(fc.args.len(), 4);
     }
 }

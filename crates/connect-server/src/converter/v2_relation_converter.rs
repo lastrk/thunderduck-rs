@@ -10,11 +10,11 @@
 //! **Anti-SQL anchor (§2.1):** `arrow_val_to_literal()` uses exhaustive
 //! typed dispatch on the Arrow value's data type and NEVER emits an
 //! `Ok("NULL")` catch-all. Unhandled Arrow types return
-//! [`EmissionError::UnsupportedProtoShape`]. This is mechanically enforced
+//! [`EmissionError::Unsupported`] with `kind: ProtoShape`. This is mechanically enforced
 //! by `arrow_val_no_catch_all_ok_null_source_grep`.
 //!
 //! **No `Sql` opaque variant (§2.2):** `RelType::Sql` surfaces as
-//! [`EmissionError::UnsupportedProtoShape`] — the SparkSQL path belongs to
+//! [`EmissionError::Unsupported`] (`kind: ProtoShape`) — the SparkSQL path belongs to
 //! `parser_v2`.
 //!
 //! **First-class plan_id (§2.3):** `CommonOp::Join` carries
@@ -33,6 +33,7 @@ use arrow::datatypes::DataType as ArrowDT;
 use arrow_ipc::reader::StreamReader;
 use thunderduck_core::bail_boundary_proto;
 use thunderduck_core::transpiler_v2::ast::{CommonAst, CommonOp, FileFormat, JoinType};
+use thunderduck_core::transpiler_v2::error::UnsupportedKind;
 use thunderduck_core::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
     FunctionCall, InListExpression, Literal, LiteralValue, NullOrdering, SortDirection, SortOrder,
@@ -276,12 +277,13 @@ impl V2RelationConverter {
         // shape.
         let mut ids: Vec<String> = Vec::with_capacity(u.ids.len());
         for e in &u.ids {
-            ids.push(extract_column_name(e).ok_or_else(|| {
-                EmissionError::UnsupportedProtoShape {
-                    shape: "Unpivot::id::non_attribute".to_owned(),
+            ids.push(
+                extract_column_name(e).ok_or_else(|| EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "Unpivot::id::non_attribute".to_owned(),
                     reason: "Unpivot id columns must be bare column references".to_owned(),
-                }
-            })?);
+                })?,
+            );
         }
 
         // Extract value column names; None ⇒ analyzer expands to all non-id
@@ -290,13 +292,14 @@ impl V2RelationConverter {
             Some(v) => {
                 let mut out = Vec::with_capacity(v.values.len());
                 for e in &v.values {
-                    out.push(extract_column_name(e).ok_or_else(|| {
-                        EmissionError::UnsupportedProtoShape {
-                            shape: "Unpivot::value::non_attribute".to_owned(),
+                    out.push(
+                        extract_column_name(e).ok_or_else(|| EmissionError::Unsupported {
+                            kind: UnsupportedKind::ProtoShape,
+                            name: "Unpivot::value::non_attribute".to_owned(),
                             reason: "Unpivot value columns must be bare column references"
                                 .to_owned(),
-                        }
-                    })?);
+                        })?,
+                    );
                 }
                 out
             }
@@ -476,12 +479,15 @@ impl V2RelationConverter {
         let mut drop_names: Vec<String> = d.column_names.clone();
         for col_expr in &d.columns {
             use proto::expression::ExprType;
-            let expr_type = col_expr.expr_type.as_ref().ok_or_else(|| {
-                EmissionError::UnsupportedProtoShape {
-                    shape: "Drop::column::None".to_owned(),
-                    reason: "Drop.columns entry has no expr_type".to_owned(),
-                }
-            })?;
+            let expr_type =
+                col_expr
+                    .expr_type
+                    .as_ref()
+                    .ok_or_else(|| EmissionError::Unsupported {
+                        kind: UnsupportedKind::ProtoShape,
+                        name: "Drop::column::None".to_owned(),
+                        reason: "Drop.columns entry has no expr_type".to_owned(),
+                    })?;
             match expr_type {
                 ExprType::UnresolvedAttribute(a) => {
                     drop_names.push(a.unparsed_identifier.clone());
@@ -869,12 +875,14 @@ impl V2ExpressionConverter {
                 ))
             }
             ExprType::Window(w) => {
-                let func_proto = w.window_function.as_deref().ok_or_else(|| {
-                    EmissionError::UnsupportedProtoShape {
-                        shape: "Window::window_function::None".to_owned(),
-                        reason: "Window missing window_function".to_owned(),
-                    }
-                })?;
+                let func_proto =
+                    w.window_function
+                        .as_deref()
+                        .ok_or_else(|| EmissionError::Unsupported {
+                            kind: UnsupportedKind::ProtoShape,
+                            name: "Window::window_function::None".to_owned(),
+                            reason: "Window missing window_function".to_owned(),
+                        })?;
                 let func = self.convert(func_proto)?;
                 let mut partition_by: Vec<Expression> = Vec::with_capacity(w.partition_spec.len());
                 for p in &w.partition_spec {
@@ -1399,8 +1407,9 @@ impl V2ExpressionConverter {
             .require_proto("Cast::missing_expr", "Cast has no inner expression")?;
         let to_type = match &cast.cast_to_type {
             Some(CastToType::Type(dt)) => {
-                proto_to_data_type(dt).map_err(|e| EmissionError::UnsupportedProtoShape {
-                    shape: "Cast::type".to_owned(),
+                proto_to_data_type(dt).map_err(|e| EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "Cast::type".to_owned(),
                     reason: format!("failed to convert cast type: {e}"),
                 })?
             }
@@ -1634,8 +1643,9 @@ fn classify_file_format(
     } else if lower.ends_with(".orc") {
         Ok(FileFormat::Orc)
     } else {
-        Err(EmissionError::UnsupportedProtoShape {
-            shape: "Read::DataSource::format::unknown".to_owned(),
+        Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "Read::DataSource::format::unknown".to_owned(),
             reason: format!(
                 "cannot determine file format for `{first_path}` (no format and unknown extension)"
             ),
@@ -1673,11 +1683,11 @@ fn arrow_ipc_to_schema_and_rows(
     data: &[u8],
 ) -> Result<(StructType, Vec<Vec<Expression>>), EmissionError> {
     let cursor = std::io::Cursor::new(data);
-    let reader =
-        StreamReader::try_new(cursor, None).map_err(|e| EmissionError::UnsupportedProtoShape {
-            shape: "LocalRelation::arrow_ipc".to_owned(),
-            reason: format!("Arrow IPC parse error: {e}"),
-        })?;
+    let reader = StreamReader::try_new(cursor, None).map_err(|e| EmissionError::Unsupported {
+        kind: UnsupportedKind::ProtoShape,
+        name: "LocalRelation::arrow_ipc".to_owned(),
+        reason: format!("Arrow IPC parse error: {e}"),
+    })?;
     let arrow_schema = reader.schema();
     let fields = arrow_schema
         .fields()
@@ -1695,8 +1705,9 @@ fn arrow_ipc_to_schema_and_rows(
     let schema = StructType::new(fields);
     let batches: Vec<arrow::record_batch::RecordBatch> = reader
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| EmissionError::UnsupportedProtoShape {
-            shape: "LocalRelation::arrow_ipc_collect".to_owned(),
+        .map_err(|e| EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "LocalRelation::arrow_ipc_collect".to_owned(),
             reason: format!("Arrow IPC collect error: {e}"),
         })?;
     // OPT-2: known row count → single bounded allocation.
@@ -1744,14 +1755,16 @@ fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, EmissionError> {
                 );
             };
             let key_field = fields.iter().find(|f| f.name() == "key").ok_or_else(|| {
-                EmissionError::UnsupportedProtoShape {
-                    shape: "arrow_schema::map_missing_key".to_owned(),
+                EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "arrow_schema::map_missing_key".to_owned(),
                     reason: "Arrow Map entries missing `key`".to_owned(),
                 }
             })?;
             let val_field = fields.iter().find(|f| f.name() == "value").ok_or_else(|| {
-                EmissionError::UnsupportedProtoShape {
-                    shape: "arrow_schema::map_missing_value".to_owned(),
+                EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "arrow_schema::map_missing_value".to_owned(),
                     reason: "Arrow Map entries missing `value`".to_owned(),
                 }
             })?;
@@ -1787,7 +1800,7 @@ fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, EmissionError> {
 /// Convert a single Arrow cell into an [`Expression::Literal`].
 ///
 /// **§2.1 loud-fail contract:** every unhandled Arrow data type returns
-/// [`EmissionError::UnsupportedProtoShape`]. There is NO `Ok("NULL")` or
+/// [`EmissionError::Unsupported`] (`kind: ProtoShape`). There is NO `Ok("NULL")` or
 /// `Ok(null_literal())` catch-all — silent NULL substitution would turn every
 /// unhandled type into wrong-answer data corruption (see the DECIMAL bug
 /// documented in `local_relation_to_values_sql`).
@@ -2353,7 +2366,11 @@ mod tests {
         )));
         let mut c = V2RelationConverter::new();
         match c.convert(&a).unwrap_err() {
-            EmissionError::UnsupportedProtoShape { shape, .. } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: shape,
+                ..
+            } => {
                 assert_eq!(shape, "Aggregate::Pivot::missing_pivot");
             }
             other => panic!("expected UnsupportedProtoShape(missing_pivot), got {other:?}"),
@@ -2569,7 +2586,11 @@ mod tests {
         let mut c = V2RelationConverter::new();
         let err = c.convert(&s).unwrap_err();
         match err {
-            EmissionError::UnsupportedProtoShape { shape, .. } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: shape,
+                ..
+            } => {
                 assert_eq!(shape, "RelType::Sql");
             }
             other => panic!("expected UnsupportedProtoShape, got {other:?}"),
@@ -2584,7 +2605,10 @@ mod tests {
         let mut c = V2RelationConverter::new();
         assert!(matches!(
             c.convert(&c_rel).unwrap_err(),
-            EmissionError::UnsupportedProtoShape { .. }
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                ..
+            }
         ));
     }
 
@@ -2696,7 +2720,13 @@ mod tests {
             .with_precision_and_scale(76, 2)
             .expect("decimal256");
         let err = arrow_val_to_literal(&arr, 0).unwrap_err();
-        assert!(matches!(err, EmissionError::UnsupportedProtoShape { .. }));
+        assert!(matches!(
+            err,
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                ..
+            }
+        ));
     }
 
     /// §2.1 source-file grep: the converter MUST NOT carry an `Ok("NULL")`
@@ -2731,7 +2761,7 @@ mod tests {
             assert!(
                 !trimmed.contains(&needle),
                 "line {}: {trimmed}\nτ's V2 converter must never emit the forbidden Ok(NULL) \
-                 catch-all — use EmissionError::UnsupportedProtoShape instead.",
+                 catch-all — use EmissionError::Unsupported (kind: ProtoShape) instead.",
                 n + 1
             );
         }
@@ -2832,7 +2862,13 @@ mod tests {
         )));
         let mut c = V2RelationConverter::new();
         let err = c.convert(&describe).unwrap_err();
-        assert!(matches!(err, EmissionError::UnsupportedProtoShape { .. }));
+        assert!(matches!(
+            err,
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2872,7 +2908,13 @@ mod tests {
         )));
         let mut c = V2RelationConverter::new();
         let err = c.convert(&summary).unwrap_err();
-        assert!(matches!(err, EmissionError::UnsupportedProtoShape { .. }));
+        assert!(matches!(
+            err,
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                ..
+            }
+        ));
     }
 
     // ── FreqItems / Crosstab (Pass 82) ────────────────────────────────────

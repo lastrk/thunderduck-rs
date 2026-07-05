@@ -7,7 +7,7 @@
 //! - basic joins (INNER / LEFT / RIGHT / FULL / CROSS / LEFT SEMI / LEFT ANTI)
 //! - `SELECT *`
 //!
-//! Deferred (surface as [`EmissionError::UnsupportedProtoShape`]):
+//! Deferred (surface as [`EmissionError::Unsupported`] with `kind: ProtoShape`):
 //! PIVOT, GROUPING SETS, ROLLUP, CUBE, LATERAL VIEW, TABLESAMPLE, CTE,
 //! UNION/INTERSECT/EXCEPT, window functions, HOFs, `json_tuple` rewrites,
 //! command statements.
@@ -31,6 +31,7 @@ use std::collections::HashMap;
 
 use crate::bail_boundary_proto;
 use crate::transpiler_v2::ast::{CommonAst, CommonOp, JoinType};
+use crate::transpiler_v2::error::UnsupportedKind;
 use crate::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
     FrameBoundary, FrameUnit, FunctionCall, InListExpression, IntervalExpression, LambdaExpression,
@@ -156,8 +157,9 @@ fn lower_set_expr(body: SetExpr) -> Result<CommonAst, EmissionError> {
             "sql::values_top_level",
             "top-level VALUES not supported (only VALUES in FROM)",
         ),
-        SetExpr::SetOperation { op, .. } => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::set_operation::{op:?}").to_ascii_lowercase(),
+        SetExpr::SetOperation { op, .. } => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: format!("sql::set_operation::{op:?}").to_ascii_lowercase(),
             reason: "UNION / INTERSECT / EXCEPT not implemented in τ\'s SparkSQL parser".to_owned(),
         }),
         other => bail_boundary_proto!(
@@ -375,12 +377,15 @@ fn lower_table_factor(factor: TableFactor) -> Result<CommonAst, EmissionError> {
                     "UNNEST with multiple array arguments not supported by τ\'s SparkSQL parser",
                 );
             }
-            let expr = array_exprs.into_iter().next().ok_or_else(|| {
-                EmissionError::UnsupportedProtoShape {
-                    shape: "sql::unnest_empty".to_owned(),
-                    reason: "UNNEST has no array argument".to_owned(),
-                }
-            })?;
+            let expr =
+                array_exprs
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| EmissionError::Unsupported {
+                        kind: UnsupportedKind::ProtoShape,
+                        name: "sql::unnest_empty".to_owned(),
+                        reason: "UNNEST has no array argument".to_owned(),
+                    })?;
             Ok(CommonAst::new(CommonOp::Unnest {
                 expr: lower_expr(expr)?,
                 with_ordinality,
@@ -996,8 +1001,9 @@ fn lower_function(f: Function) -> Result<Expression, EmissionError> {
         // the reference sat somewhere the inline pre-pass did not descend into
         // (or the window name was unknown). Surface an honest boundary error
         // rather than silently dropping the window semantics (ADR-022).
-        Some(WindowType::NamedWindow(ident)) => Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::window::unresolved_named_window".to_owned(),
+        Some(WindowType::NamedWindow(ident)) => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::window::unresolved_named_window".to_owned(),
             reason: format!("window `{}` referenced but not resolvable", ident.value),
         }),
     }
@@ -1124,8 +1130,9 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
     const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
     const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
 
-    let overflow = || EmissionError::UnsupportedProtoShape {
-        shape: "sql::interval::overflow".to_owned(),
+    let overflow = || EmissionError::Unsupported {
+        kind: UnsupportedKind::ProtoShape,
+        name: "sql::interval::overflow".to_owned(),
         reason: "INTERVAL magnitude overflows its normalized representation".to_owned(),
     };
 
@@ -1243,15 +1250,16 @@ fn inline_named_windows(
     match expr {
         Expr::Function(f) => {
             if let Some(WindowType::NamedWindow(ident)) = &f.over {
-                let spec = map.get(ident.value.as_str()).ok_or_else(|| {
-                    EmissionError::UnsupportedProtoShape {
-                        shape: "sql::window::unknown_named_window".to_owned(),
-                        reason: format!(
-                            "window `{}` is not defined in the WINDOW clause",
-                            ident.value
-                        ),
-                    }
-                })?;
+                let spec =
+                    map.get(ident.value.as_str())
+                        .ok_or_else(|| EmissionError::Unsupported {
+                            kind: UnsupportedKind::ProtoShape,
+                            name: "sql::window::unknown_named_window".to_owned(),
+                            reason: format!(
+                                "window `{}` is not defined in the WINDOW clause",
+                                ident.value
+                            ),
+                        })?;
                 f.over = Some(WindowType::WindowSpec(spec.clone()));
             }
             if let Some(filter) = &mut f.filter {
@@ -1306,8 +1314,9 @@ fn lower_value(vw: ValueWithSpan) -> Result<Expression, EmissionError> {
                     data_type: DataType::Double,
                 }))
             } else {
-                Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::number_parse".to_owned(),
+                Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::number_parse".to_owned(),
                     reason: format!("cannot parse numeric literal `{s}`"),
                 })
             }
@@ -1438,12 +1447,11 @@ fn expr_to_i64(e: Expr) -> Result<i64, EmissionError> {
         Expr::Value(ValueWithSpan {
             value: Value::Number(s, _),
             ..
-        }) => s
-            .parse::<i64>()
-            .map_err(|_| EmissionError::UnsupportedProtoShape {
-                shape: "sql::limit_offset_parse".to_owned(),
-                reason: format!("cannot parse LIMIT/OFFSET value `{s}` as i64"),
-            }),
+        }) => s.parse::<i64>().map_err(|_| EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::limit_offset_parse".to_owned(),
+            reason: format!("cannot parse LIMIT/OFFSET value `{s}` as i64"),
+        }),
         other => bail_boundary_proto!(
             format!("sql::limit_offset_expr::{other:?}"),
             "LIMIT/OFFSET must be an integer literal",
@@ -1482,8 +1490,9 @@ mod tests {
     fn parse(sql: &str) -> Result<CommonAst, EmissionError> {
         let dialect = SparkDialect::default();
         let mut stmts =
-            Parser::parse_sql(&dialect, sql).map_err(|e| EmissionError::UnsupportedOp {
-                op: "sql::parse".to_owned(),
+            Parser::parse_sql(&dialect, sql).map_err(|e| EmissionError::Unsupported {
+                kind: UnsupportedKind::Op,
+                name: "sql::parse".to_owned(),
                 reason: e.to_string(),
             })?;
         assert_eq!(stmts.len(), 1);
@@ -1619,8 +1628,13 @@ mod tests {
         let result = parse("SELECT * FROM t PIVOT (SUM(x) FOR y IN (1, 2))");
         assert!(matches!(
             result,
-            Err(EmissionError::UnsupportedProtoShape { .. })
-                | Err(EmissionError::UnsupportedOp { .. })
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                ..
+            }) | Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::Op,
+                ..
+            })
         ));
     }
 
@@ -1629,7 +1643,10 @@ mod tests {
         let result = parse("SELECT dept, COUNT(*) FROM t GROUP BY GROUPING SETS ((dept))");
         assert!(matches!(
             result,
-            Err(EmissionError::UnsupportedProtoShape { .. })
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                ..
+            })
         ));
     }
 
@@ -1638,7 +1655,10 @@ mod tests {
         let result = parse("SELECT 1 UNION SELECT 2");
         assert!(matches!(
             result,
-            Err(EmissionError::UnsupportedProtoShape { .. })
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                ..
+            })
         ));
     }
 
@@ -1811,7 +1831,11 @@ mod tests {
         use crate::parser_v2::SparkSqlParserV2;
         let result = SparkSqlParserV2::parse("SELCT bad");
         match result {
-            Err(EmissionError::UnsupportedProtoShape { shape, .. }) => {
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: shape,
+                ..
+            }) => {
                 assert_eq!(shape, "sql::parse_error");
             }
             other => panic!("expected UnsupportedProtoShape sql::parse_error, got {other:?}"),
@@ -1908,7 +1932,11 @@ mod tests {
              GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
         );
         match result {
-            Err(EmissionError::UnsupportedProtoShape { shape, .. }) => {
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: shape,
+                ..
+            }) => {
                 assert_eq!(shape, "sql::window_frame::groups");
             }
             other => panic!("expected GROUPS rejection, got {other:?}"),
@@ -1919,7 +1947,11 @@ mod tests {
     fn unknown_named_window_is_rejected() {
         let result = parse("SELECT rank() OVER missing FROM t WINDOW w AS (ORDER BY b)");
         match result {
-            Err(EmissionError::UnsupportedProtoShape { shape, .. }) => {
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: shape,
+                ..
+            }) => {
                 assert_eq!(shape, "sql::window::unknown_named_window");
             }
             other => panic!("expected unknown-window rejection, got {other:?}"),

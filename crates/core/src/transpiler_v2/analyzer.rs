@@ -42,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::ast::{CommonAst, CommonOp, FileFormat, JoinType};
 use super::base_types::BaseTypes;
-use super::error::EmissionError;
+use super::error::{EmissionError, UnsupportedKind};
 use super::expression::{
     AliasExpression, BinaryExpression, CaseWhenExpression, CastExpression, ColumnReference,
     Expression, ExtractValueExpression, FunctionCall, Literal, LiteralValue, SortOrder,
@@ -633,13 +633,19 @@ pub(super) fn analyzer_error_to_emission_error(e: AnalyzerError) -> EmissionErro
         | AnalyzerError::UnknownColumn { .. }
         | AnalyzerError::AmbiguousColumn { .. }
         | AnalyzerError::TypeMismatch { .. }
-        | AnalyzerError::Other { .. } => EmissionError::UnsupportedExpression {
-            shape: "analyzer-spark-emulated".to_owned(),
+        | AnalyzerError::Other { .. } => EmissionError::Unsupported {
+            kind: UnsupportedKind::Expression,
+            name: "analyzer-spark-emulated".to_owned(),
             reason: e.to_string(),
         },
-        AnalyzerError::PuntedOperator { op, reason } => EmissionError::UnsupportedOp { op, reason },
-        AnalyzerError::UnsupportedRule { rule, reason } => EmissionError::UnsupportedExpression {
-            shape: rule,
+        AnalyzerError::PuntedOperator { op, reason } => EmissionError::Unsupported {
+            kind: UnsupportedKind::Op,
+            name: op,
+            reason,
+        },
+        AnalyzerError::UnsupportedRule { rule, reason } => EmissionError::Unsupported {
+            kind: UnsupportedKind::Expression,
+            name: rule,
             reason,
         },
     }
@@ -4013,8 +4019,12 @@ mod tests {
         };
         let bridged = analyzer_error_to_emission_error(e);
         match bridged {
-            EmissionError::UnsupportedExpression { shape, reason } => {
-                assert_eq!(shape, "analyzer-spark-emulated");
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Expression,
+                name,
+                reason,
+            } => {
+                assert_eq!(name, "analyzer-spark-emulated");
                 assert!(reason.starts_with("[SPARK-EMULATED]"));
             }
             _ => panic!("expected UnsupportedExpression"),
@@ -4029,7 +4039,11 @@ mod tests {
         };
         let bridged = analyzer_error_to_emission_error(e);
         match bridged {
-            EmissionError::UnsupportedOp { op, .. } => assert_eq!(op, "FileScan"),
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Op,
+                name,
+                ..
+            } => assert_eq!(name, "FileScan"),
             _ => panic!("expected UnsupportedOp"),
         }
     }

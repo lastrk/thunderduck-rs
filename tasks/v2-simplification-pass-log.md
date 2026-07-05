@@ -356,3 +356,65 @@ impl<T> ProtoFieldExt<T> for Option<T> { … }
   --tests` → 69 pass / 0 fail + 14 ignored — matches HEAD.
 - **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` clean.
   All 4 touched files had 0 pre-existing drift blocks at HEAD.
+
+## Pass 9 — OPP-H (2026-07-05)
+
+Merge the four
+`EmissionError::Unsupported{Op,Expression,Function,ProtoShape}`
+variants — which shared the same `(name, reason)` shape and differed
+only in the Display prefix — into a single
+`EmissionError::Unsupported { kind: UnsupportedKind, name: String,
+reason: String }` variant. Prefix routing moves to
+`impl UnsupportedKind { fn display_prefix() -> &'static str }`, so
+the `#[error(...)]` attribute inlines the kind's prefix and the four
+legacy Display strings emit byte-identical output.
+
+**Ordering benefit realized.** Pass 7's `bail_boundary_*!` macros
+hide the enum name from ~160 call sites, so the migration reduces
+(as OPP-H's dependency note predicted) to a one-line change per
+macro body plus mechanical rewrites of the remaining struct-literal
+and `matches!`-pattern sites.
+
+- **Files touched.**
+  - `crates/core/src/transpiler_v2/error.rs` — replace the 4-variant
+    enum with `Unsupported { kind, name, reason }` + `UnsupportedKind`
+    sibling enum. Migrate 4 Display tests + 2 `From`-composition
+    tests to the new shape; assertions on Display strings unchanged.
+  - `crates/core/src/transpiler_v2/macros.rs` — 4 macro bodies
+    rewritten (`bail_boundary_op!`, `bail_boundary_expr!`,
+    `bail_boundary_fn!`, `bail_boundary_proto!`) plus
+    `ProtoFieldExt::require_proto`. `bail_boundary_rule!`
+    (`AnalyzerError`) untouched.
+  - `crates/core/src/transpiler_v2/analyzer.rs` —
+    `analyzer_error_to_emission_error` bridge migrated (3 arms) plus
+    2 unit tests updated to new pattern.
+  - `crates/core/src/transpiler_v2/emission.rs` — 6 constructor-form
+    closure sites + 16 test-side `matches!` pattern sites migrated;
+    2 doc-comment refs rewritten.
+  - `crates/core/src/parser_v2/v2_lowering.rs` — 8 constructor sites
+    + 7 `matches!` arms + 1 doc-comment ref.
+  - `crates/core/src/parser_v2/mod.rs` — 1 constructor + 2
+    doc-comments.
+  - `crates/connect-server/src/converter/v2_relation_converter.rs` —
+    10 constructor closures + 6 pattern sites + 3 doc-comments.
+    `UnsupportedKind` added to imports.
+  - `crates/core/src/transpiler_v2/mod.rs` — 1 test pattern.
+  - `crates/core/src/transpiler_v2/ast.rs` — 3 doc-comments.
+  - `crates/connect-server/src/service.rs` — 2 doc-comment
+    variant→kind rewrites.
+- **Site counts (old variant names in `crates/`).** 93 → 0 (emission
+  25→0; converter 20→0; v2_lowering 16→0; macros 14→0; error 6→0;
+  analyzer 5→0; ast + parser_v2/mod 3→0 each; service 2→0;
+  transpiler_v2/mod 1→0).
+- **Verify grep.** `git grep 'EmissionError::UnsupportedOp\|
+  EmissionError::UnsupportedExpression\|
+  EmissionError::UnsupportedFunction\|
+  EmissionError::UnsupportedProtoShape' crates/`: **93 → 0**.
+- **Corpus.** 314 → 314 (wire error strings byte-identical).
+- **Warnings.** No delta. `cargo check -p thunderduck-core -p
+  thunderduck-connect-server` clean, zero warnings.
+- **Gate.** `cargo test -p thunderduck-core --lib --tests` → 448
+  pass / 0 fail / 4 ignored. `cargo test -p thunderduck-connect-server
+  --tests` → 69 pass / 0 fail + 14 ignored — matches HEAD.
+- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` on
+  touched files: **zero** drift blocks.

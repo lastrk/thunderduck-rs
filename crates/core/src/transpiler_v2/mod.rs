@@ -91,6 +91,7 @@ pub fn analyze_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transpiler_v2::error::UnsupportedKind;
 
     #[test]
     fn generate_single_row_emits_subquery_safe_select() {
@@ -116,8 +117,12 @@ mod tests {
         let base_types = BaseTypes::empty();
         let result = generate(&plan, &base_types);
         match result {
-            Err(EmissionError::UnsupportedExpression { shape, reason }) => {
-                assert_eq!(shape, "analyzer-spark-emulated");
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::Expression,
+                name,
+                reason,
+            }) => {
+                assert_eq!(name, "analyzer-spark-emulated");
                 assert!(
                     reason.starts_with("[SPARK-EMULATED]"),
                     "expected `[SPARK-EMULATED]` prefix, got: {reason}",

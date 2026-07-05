@@ -43,7 +43,7 @@ static SERVER_SESSION_ID: std::sync::LazyLock<String> =
 ///
 /// At the τ dispatch site, `transpiler_v2::generate()` errors unconditionally, so this
 /// helper always surfaces `Status::unimplemented` for structurally-valid
-/// inputs (via `EmissionError::UnsupportedOp`). The dispatch shape is what
+/// inputs (via `EmissionError::Unsupported` with `kind: Op`). The dispatch shape is what
 /// matters; Slices B/C/D/E/F/G grow coverage behind this same boundary.
 ///
 /// **Route by `RelType::Sql`** — Option (a) per plan §4: SQL text goes
@@ -530,9 +530,7 @@ async fn handle_sql_command(
     _operation_id: &str,
     _common_ast: &CommonAst,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
-    Err(Status::unimplemented(
-        "SqlCommand execution over CommonAst",
-    ))
+    Err(Status::unimplemented("SqlCommand execution over CommonAst"))
 }
 
 /// Handle `WriteOperation` after successful transpile.
@@ -545,9 +543,7 @@ async fn handle_write_operation(
     _common_ast: &CommonAst,
     _write_cmd: &proto::WriteOperation,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
-    Err(Status::unimplemented(
-        "WriteOperation over CommonAst",
-    ))
+    Err(Status::unimplemented("WriteOperation over CommonAst"))
 }
 
 // ── Response builders (preserved) ────────────────────────────────────────────
@@ -783,7 +779,8 @@ mod tests {
 
     // ── the τ dispatch site dispatch tests ──────────────────────────────────────────────
     //
-    // At A.3, τ's `generate()` errors with `EmissionError::UnsupportedOp` on
+    // At A.3, τ's `generate()` errors with `EmissionError::Unsupported`
+    // (kind: Op) on
     // every input. These tests pin two properties of the dispatch shape:
     //   1. Structurally-valid inputs reach τ (via `V2RelationConverter` or
     //      `parser_v2`) and surface the emission boundary via

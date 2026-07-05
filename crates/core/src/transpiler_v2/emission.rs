@@ -39,7 +39,7 @@ use std::sync::Mutex;
 
 use super::analyzer::{Schema, TypedAst, TypedOp};
 use super::ast::FileFormat;
-use super::error::EmissionError;
+use super::error::{EmissionError, UnsupportedKind};
 use super::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
     ColumnReference, Expression, FunctionCall, IntervalExpression, Literal, LiteralValue,
@@ -200,12 +200,14 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
         ),
 
         // ── future τ work owns (analyzer PuntedOperator today; defensive) ──────
-        TypedOp::TableFunction { name, .. } => Err(EmissionError::UnsupportedOp {
-            op: format!("TableFunction[{name}]"),
+        TypedOp::TableFunction { name, .. } => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::Op,
+            name: format!("TableFunction[{name}]"),
             reason: "table-function emission (not implemented in τ)".to_owned(),
         }),
-        TypedOp::Unnest { .. } => Err(EmissionError::UnsupportedOp {
-            op: "Unnest".to_owned(),
+        TypedOp::Unnest { .. } => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::Op,
+            name: "Unnest".to_owned(),
             reason: "unnest emission (not implemented in τ)".to_owned(),
         }),
     };
@@ -2900,7 +2902,8 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 }
             };
             let (n, unit) = parse_window_duration_literal(&dur_str).ok_or_else(|| {
-                EmissionError::UnsupportedFunction {
+                EmissionError::Unsupported {
+                    kind: UnsupportedKind::Function,
                     name: f.name.clone(),
                     reason: format!(
                         "[TDCK-BOUNDARY] `window`: unsupported duration literal \
@@ -4005,15 +4008,15 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     "`try_to_number` requires exactly 2 arguments"
                 );
             }
-            let fmt = literal_string_arg(&f.args[1]).ok_or_else(|| {
-                EmissionError::UnsupportedFunction {
-                    name: f.name.clone(),
-                    reason: "`try_to_number` requires a string literal for the format argument"
-                        .to_owned(),
-                }
+            let fmt = literal_string_arg(&f.args[1]).ok_or_else(|| EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name: f.name.clone(),
+                reason: "`try_to_number` requires a string literal for the format argument"
+                    .to_owned(),
             })?;
             let (precision, scale) =
-                parse_number_format(&fmt).ok_or_else(|| EmissionError::UnsupportedFunction {
+                parse_number_format(&fmt).ok_or_else(|| EmissionError::Unsupported {
+                    kind: UnsupportedKind::Function,
                     name: f.name.clone(),
                     reason: format!(
                         "`try_to_number`: unsupported format string `{fmt}` (τ only \
@@ -4058,13 +4061,13 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 bail_boundary_fn!(f.name.clone(), "`parse_url` requires 2 or 3 arguments");
             }
             let url = render_expr(&f.args[0], schema)?;
-            let part = literal_string_arg(&f.args[1]).ok_or_else(|| {
-                EmissionError::UnsupportedFunction {
+            let part =
+                literal_string_arg(&f.args[1]).ok_or_else(|| EmissionError::Unsupported {
+                    kind: UnsupportedKind::Function,
                     name: f.name.clone(),
                     reason: "`parse_url` requires a string literal for the part argument"
                         .to_owned(),
-                }
-            })?;
+                })?;
             let part_upper = part.to_ascii_uppercase();
             let pattern: String = match part_upper.as_str() {
                 "HOST" => "^[^:]+://(?:[^@/]+@)?([^:/?#]+)".to_owned(),
@@ -4073,7 +4076,8 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 "QUERY" => {
                     if f.args.len() == 3 {
                         let key = literal_string_arg(&f.args[2]).ok_or_else(|| {
-                            EmissionError::UnsupportedFunction {
+                            EmissionError::Unsupported {
+                                kind: UnsupportedKind::Function,
                                 name: f.name.clone(),
                                 reason:
                                     "`parse_url` with 3 arguments requires a string literal key"
@@ -4146,8 +4150,8 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
 /// Render an aggregate function call. Primitives (`count`, `sum`, `avg`,
 /// `min`, `max`, `count_distinct`) pass through with Spark-parity CASTs
 /// applied by [`spark_aggregate_return_cast`]. Unknown aggregate names
-/// surface as Thunderduck-boundary [`EmissionError::UnsupportedFunction`]
-/// per ADR-022.
+/// surface as a `Function`-kinded Thunderduck-boundary
+/// [`EmissionError::Unsupported`] per ADR-022.
 fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
     let lower = f.name.to_ascii_lowercase();
     // Guard-based arms MUST come before the pass-through arm (else the
@@ -5263,8 +5267,8 @@ pub(crate) fn parse_number_format_for_type_inference(fmt: &str) -> Option<(u8, u
 /// - empty / whitespace-only / trailing garbage
 /// - unknown unit (`"1 fortnight"`)
 ///
-/// Caller wraps `None` in a Thunderduck-boundary
-/// `EmissionError::UnsupportedFunction` per ADR-022 (τ-boundary error).
+/// Caller wraps `None` in a `Function`-kinded Thunderduck-boundary
+/// `EmissionError::Unsupported` per ADR-022 (τ-boundary error).
 ///
 /// Corpus witness: `win2-002`.
 pub(crate) fn parse_window_duration_literal(s: &str) -> Option<(u64, &'static str)> {
@@ -6343,7 +6347,11 @@ mod tests {
         });
         let err = render_expr(&expr, &empty_schema()).unwrap_err();
         match err {
-            EmissionError::UnsupportedExpression { shape, .. } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Expression,
+                name: shape,
+                ..
+            } => {
                 assert_eq!(shape, "UnresolvedRegex");
             }
             other => panic!("expected UnsupportedExpression, got {other:?}"),
@@ -6810,7 +6818,11 @@ mod tests {
         let err = render_function_call(&f, &empty_schema())
             .expect_err("unsupported to_json option must be a boundary error");
         match err {
-            EmissionError::UnsupportedFunction { name, reason } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name,
+                reason,
+            } => {
                 assert_eq!(name, "to_json");
                 assert!(
                     reason.contains("ignoreNullFields"),
@@ -6921,7 +6933,11 @@ mod tests {
         let err = render_function_call(&f, &empty_schema())
             .expect_err("to_csv on non-struct arg must boundary-error");
         match err {
-            EmissionError::UnsupportedFunction { name, reason } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name,
+                reason,
+            } => {
                 assert_eq!(name, "to_csv");
                 assert!(reason.contains("struct"), "reason: {reason}");
             }
@@ -7410,7 +7426,11 @@ mod tests {
         };
         let err = super::render_freq_items(&typed_input, &[], 0.01).unwrap_err();
         match err {
-            EmissionError::UnsupportedOp { op, .. } => assert_eq!(op, "FreqItems"),
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Op,
+                name: op,
+                ..
+            } => assert_eq!(op, "FreqItems"),
             other => panic!("expected UnsupportedOp, got {other:?}"),
         }
     }
@@ -7477,7 +7497,11 @@ mod tests {
         };
         let err = super::render_sample(&typed_input, 0.0, 0.5, true, Some(11)).unwrap_err();
         match err {
-            EmissionError::UnsupportedOp { op, .. } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Op,
+                name: op,
+                ..
+            } => {
                 assert_eq!(op, "Sample[with_replacement]");
             }
             other => panic!("expected UnsupportedOp, got {other:?}"),
@@ -7906,7 +7930,11 @@ mod tests {
         });
         let err = render_expr(&expr, &schema).expect_err("must error on non-struct base");
         match err {
-            EmissionError::UnsupportedExpression { shape, .. } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Expression,
+                name: shape,
+                ..
+            } => {
                 assert_eq!(shape, "UpdateFields");
             }
             other => panic!("expected UnsupportedExpression, got: {other:?}"),
@@ -8182,7 +8210,11 @@ mod tests {
         let err =
             render_function_call(&f, &empty_schema()).expect_err("explode with 2 args must error");
         match err {
-            EmissionError::UnsupportedFunction { name, .. } => assert_eq!(name, "explode"),
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name,
+                ..
+            } => assert_eq!(name, "explode"),
             other => panic!("expected UnsupportedFunction, got {other:?}"),
         }
     }
@@ -8774,7 +8806,11 @@ mod tests {
         };
         let err = render_function_call(&f, &empty_schema()).expect_err("too many args");
         match err {
-            EmissionError::UnsupportedFunction { name, .. } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name,
+                ..
+            } => {
                 assert_eq!(name, "make_dt_interval");
             }
             other => panic!("expected UnsupportedFunction, got {other:?}"),
@@ -8919,7 +8955,11 @@ mod tests {
         };
         let err = render_function_call(&f, &empty_schema()).expect_err("three-arg reject");
         match err {
-            EmissionError::UnsupportedFunction { name, reason } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name,
+                reason,
+            } => {
                 assert_eq!(name, "window");
                 assert!(reason.contains("[TDCK-BOUNDARY]"), "reason: {reason}");
                 assert!(reason.contains("tumbling"), "reason: {reason}");
@@ -8939,7 +8979,11 @@ mod tests {
             };
             let err = render_function_call(&f, &empty_schema()).expect_err("compound reject");
             match err {
-                EmissionError::UnsupportedFunction { name, reason } => {
+                EmissionError::Unsupported {
+                    kind: UnsupportedKind::Function,
+                    name,
+                    reason,
+                } => {
                     assert_eq!(name, "window");
                     assert!(reason.contains("[TDCK-BOUNDARY]"), "reason: {reason}");
                 }
@@ -8960,7 +9004,11 @@ mod tests {
         };
         let err = render_function_call(&f, &empty_schema()).expect_err("non-literal reject");
         match err {
-            EmissionError::UnsupportedFunction { name, reason } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name,
+                reason,
+            } => {
                 assert_eq!(name, "window");
                 assert!(reason.contains("[TDCK-BOUNDARY]"), "reason: {reason}");
                 assert!(reason.contains("string literal"), "reason: {reason}");
@@ -9701,7 +9749,11 @@ mod tests {
         };
         let err = render_function_call(&f, &empty_schema()).expect_err("expected boundary error");
         match err {
-            EmissionError::UnsupportedFunction { name, reason } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name,
+                reason,
+            } => {
                 assert_eq!(name, "from_csv");
                 assert!(reason.contains("options-map"), "got: {reason}");
             }
@@ -9737,7 +9789,11 @@ mod tests {
         };
         let err = render_function_call(&f, &empty_schema()).expect_err("expected boundary error");
         match err {
-            EmissionError::UnsupportedFunction { name, reason } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name,
+                reason,
+            } => {
                 assert_eq!(name, "from_json");
                 assert!(reason.contains("options-map"), "got: {reason}");
             }
@@ -9769,7 +9825,11 @@ mod tests {
         };
         let err = render_function_call(&f, &empty_schema()).expect_err("expected boundary error");
         match err {
-            EmissionError::UnsupportedFunction { name, .. } => assert_eq!(name, "from_csv"),
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name,
+                ..
+            } => assert_eq!(name, "from_csv"),
             other => panic!("expected UnsupportedFunction, got {other:?}"),
         }
     }
@@ -9925,7 +9985,11 @@ mod tests {
         };
         let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
         match err {
-            EmissionError::UnsupportedFunction { name, reason } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name,
+                reason,
+            } => {
                 assert_eq!(name, "inline_field");
                 assert!(reason.contains("2 arguments"), "reason: {reason}");
             }
@@ -9989,7 +10053,11 @@ mod tests {
         };
         let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
         match err {
-            EmissionError::UnsupportedFunction { name, reason } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name,
+                reason,
+            } => {
                 assert_eq!(name, "json_tuple_field");
                 assert!(reason.contains("2 arguments"), "reason: {reason}");
             }

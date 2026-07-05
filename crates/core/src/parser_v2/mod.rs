@@ -2,7 +2,7 @@
 //!
 //! Owns the SQL text path in the τ substrate (Open Decision 1 Option 1b):
 //! `V2RelationConverter` refuses `RelType::Sql` with
-//! [`EmissionError::UnsupportedProtoShape`]; dispatch routes
+//! [`EmissionError::Unsupported`] (`kind: ProtoShape`); dispatch routes
 //! `Sql` here instead.
 //!
 //! **INV10:** this file imports ONLY value-level types from `crate::types`
@@ -26,17 +26,19 @@ impl SparkSqlParserV2 {
     /// τ scope: `SELECT` queries with `FROM`, `WHERE`, `GROUP BY`,
     /// `ORDER BY`, `LIMIT/OFFSET`, joins, and subqueries in `FROM`.
     /// Everything else surfaces as
-    /// [`EmissionError::UnsupportedProtoShape`].
+    /// [`EmissionError::Unsupported`] with `kind: ProtoShape`.
     pub fn parse(sql: &str) -> Result<CommonAst, EmissionError> {
+        use crate::transpiler_v2::error::UnsupportedKind;
         use sqlparser::parser::Parser;
         let dialect = SparkDialect::default();
         // τ fix pass (review M2): sqlparser errors are boundary
         // failures — the input never reached `CommonAst`, so the correct
-        // category is `UnsupportedProtoShape` (input τ can't ingest), not
-        // `UnsupportedOp` (emission arm not implemented).
+        // category is `ProtoShape` (input τ can't ingest), not `Op`
+        // (emission arm not implemented).
         let mut stmts =
-            Parser::parse_sql(&dialect, sql).map_err(|e| EmissionError::UnsupportedProtoShape {
-                shape: "sql::parse_error".to_owned(),
+            Parser::parse_sql(&dialect, sql).map_err(|e| EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: "sql::parse_error".to_owned(),
                 reason: e.to_string(),
             })?;
         if stmts.len() != 1 {

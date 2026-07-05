@@ -791,3 +791,11 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 659/0, `sql_v2` 153/109/262, `core_v2` 313/324 no regression).
 - Commit SHA: (this commit).
+
+## Pass 105 — 2026-07-05 — SQL corpus: tech-debt sweep (passes 101–104) [run 2]
+- **Tech-debt sweep** (every-5th-pass): rust-reviewer over `git diff 7b85190..HEAD` (CTE inlining + CteScope threading, SQL-syntax function forms, IS DISTINCT FROM/`<=>`, set-op operator-aware nullability). Nothing Critical/High/Medium; 0 compiler warnings.
+- Fixed: **L1** — stale comment on the `TableFactor::Derived` arm claiming `AliasedRelation` is a "deferred Slice C.1 variant" (false since pass 101 made it live for CTE references); reworded to note the derived-table alias is still dropped at Slice A.2 scope and preserving it (via AliasedRelation, now proven live) is a follow-up that would green tbl-010.
+- Verified clean (reviewer): CteScope threading complete/consistent (lower_expr correctly does NOT take the scope — expression-level subqueries reject wholesale, so no silent mis-resolution); entry-point `&CteScope::new()` cheap; shape-string naming consistent; analyzer set-op index accesses arity-guarded (no panic); by-name branch OR-fold correct (unionByName-only). Deferred L2 (minor lower_expr arm duplication — marginal churn, defensible to leave).
+- Files: `crates/core/src/parser_v2/v2_lowering.rs` (comment only; behavior-preserving; corpus stays 153).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, 0 warnings).
+- Commit SHA: (this commit).

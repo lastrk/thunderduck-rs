@@ -423,9 +423,12 @@ fn lower_table_factor(
         TableFactor::Derived {
             subquery, alias: _, ..
         } => {
-            // Slice A.2 lowers subquery-in-FROM by inlining the inner plan.
-            // AliasedRelation is a deferred variant (Slice C.1); the alias
-            // is discarded here — the analyzer (Slice B) will re-resolve.
+            // Subquery-in-FROM is lowered by inlining the inner plan. The
+            // derived-table alias is still dropped here (Slice A.2 scope), so a
+            // query that qualifies columns by the derived alias won't bind.
+            // `AliasedRelation` IS live now (pass 101 wraps CTE references in it
+            // with their alias) — preserving the derived alias the same way is a
+            // follow-up (would green e.g. tbl-010).
             lower_query(*subquery, cte_scope)
         }
         TableFactor::TableFunction { expr, alias: _ } => {

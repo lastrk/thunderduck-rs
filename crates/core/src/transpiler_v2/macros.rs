@@ -96,3 +96,51 @@ macro_rules! bail_boundary_rule {
         )
     };
 }
+
+/// Extension trait covering the closure-form of `bail_boundary_proto!`: the
+/// missing-proto-field unwrap idiom that turns `Option::None` into an
+/// [`EmissionError::UnsupportedProtoShape`]. `bail_boundary_proto!` cannot be
+/// used inside a `|| { ... }` closure (its `return` would leave the closure
+/// rather than the enclosing function), so the ~23 missing-field sites
+/// across `parser_v2` and the connect-server converter use this trait
+/// instead.
+///
+/// The wire message shape is byte-identical to the hand-written
+/// `Option::ok_or_else` form it replaces — same
+/// [`EmissionError::UnsupportedProtoShape`] variant, same `shape`/`reason`
+/// fields, same `.to_owned()` coercion.
+///
+/// # Example
+///
+/// ```ignore
+/// use thunderduck_core::transpiler_v2::macros::ProtoFieldExt;
+/// let x = obj.field.as_ref().require_proto("Shape", "Reason")?;
+/// ```
+///
+/// [`EmissionError::UnsupportedProtoShape`]: crate::transpiler_v2::error::EmissionError::UnsupportedProtoShape
+pub trait ProtoFieldExt<T> {
+    /// Unwrap `self`, returning [`EmissionError::UnsupportedProtoShape`] with
+    /// the given `shape` / `reason` when the option is `None`.
+    ///
+    /// [`EmissionError::UnsupportedProtoShape`]: crate::transpiler_v2::error::EmissionError::UnsupportedProtoShape
+    fn require_proto(
+        self,
+        shape: &str,
+        reason: &str,
+    ) -> Result<T, crate::transpiler_v2::error::EmissionError>;
+}
+
+impl<T> ProtoFieldExt<T> for Option<T> {
+    fn require_proto(
+        self,
+        shape: &str,
+        reason: &str,
+    ) -> Result<T, crate::transpiler_v2::error::EmissionError> {
+        self.ok_or_else(
+            || crate::transpiler_v2::error::EmissionError::UnsupportedProtoShape {
+                shape: shape.to_owned(),
+                reason: reason.to_owned(),
+            },
+        )
+    }
+}

@@ -306,3 +306,53 @@ and 2 < 3, so no dedicated `bail_boundary_punt!` was added.
   converter, 4 in v2_lowering, 1 in analyzer, 1 in emission) — those
   drifts landed in files this pass edited, so re-formatting them is
   a natural side effect.
+
+## Pass 8 — OPP-HHH (2026-07-05)
+
+Introduce `ProtoFieldExt` extension trait on `Option<T>` in
+`crates/core/src/transpiler_v2/macros.rs` (co-located with Pass 7's
+`bail_boundary_*!` macros — the file's docstring already frames
+itself as τ's boundary-error surface, and this trait is the
+missing-field companion). Trait exposes
+`.require_proto(shape, reason)?` — the closure form of
+`bail_boundary_proto!` that Pass 7 could not cover because its
+`return` would leave the enclosing closure, not the function.
+
+**Trait shape.** Generic over `T`; `.as_ref()` (`Option<&T>`) and
+`.as_deref()` unify at the call site — one impl covers all 24
+sites.
+
+```rust
+pub trait ProtoFieldExt<T> {
+    fn require_proto(self, shape: &str, reason: &str) -> Result<T, EmissionError>;
+}
+impl<T> ProtoFieldExt<T> for Option<T> { … }
+```
+
+**Module visibility.** `mod macros;` → `pub mod macros;` in
+`transpiler_v2/mod.rs` so the trait is importable via
+`use crate::transpiler_v2::macros::ProtoFieldExt;` (core) and
+`use thunderduck_core::transpiler_v2::macros::ProtoFieldExt;`
+(connect-server).
+
+- **Files touched.**
+  - `crates/core/src/transpiler_v2/macros.rs` — add `ProtoFieldExt`
+    trait + impl (+48 LOC including docstring with `# Example`).
+  - `crates/core/src/transpiler_v2/mod.rs` — `pub mod macros;`.
+  - `crates/core/src/parser_v2/v2_lowering.rs` — 3 rewrites.
+  - `crates/connect-server/src/converter/v2_relation_converter.rs` —
+    21 rewrites (20 inline-closure + 1 bracket-block sibling for
+    `UnresolvedExtractValue::extraction`).
+- **LOC delta.** macros.rs +48; v2_lowering.rs −6; converter −56.
+  Net **−14 LOC** across the pass. 24 sites migrated.
+- **Verify grep.** `git grep 'ok_or_else(|| EmissionError::UnsupportedProtoShape'
+  crates/`: **23 → 0** (all inline-closure sites migrated).
+- **Corpus.** 314 → 314 (unchanged — wire error strings
+  byte-identical).
+- **Warnings.** No delta. `cargo check -p thunderduck-core -p
+  thunderduck-connect-server` clean, zero warnings.
+- **Gate.** `cargo test -p thunderduck-core --lib --tests` → 448
+  pass / 0 fail / 4 ignored. `cargo test -p thunderduck-connect-server
+  --tests` → 69 pass / 0 fail + 14 ignored — matches HEAD.
+- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` clean.
+  All 4 touched files had 0 pre-existing drift blocks at HEAD.

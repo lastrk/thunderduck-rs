@@ -38,6 +38,7 @@ use crate::transpiler_v2::expression::{
     SortOrder, StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn, WindowFrame,
     WindowFunction,
 };
+use crate::transpiler_v2::macros::ProtoFieldExt;
 use crate::transpiler_v2::type_inference::AGGREGATE_NAMES;
 use crate::transpiler_v2::EmissionError;
 use crate::types::DataType;
@@ -1104,24 +1105,20 @@ fn lower_frame_bound(bound: SqlWindowFrameBound) -> Result<FrameBoundary, Emissi
 /// rejects shapes τ cannot represent with a boundary error instead of
 /// falling back to raw SQL.
 fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
-    let field = iv
-        .leading_field
-        .as_ref()
-        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-            shape: "sql::interval::no_leading_field".to_owned(),
-            reason: "INTERVAL without a unit is not supported".to_owned(),
-        })?;
+    let field = iv.leading_field.as_ref().require_proto(
+        "sql::interval::no_leading_field",
+        "INTERVAL without a unit is not supported",
+    )?;
     if iv.last_field.is_some() {
         bail_boundary_proto!(
             "sql::interval::compound",
             "compound (e.g. YEAR TO MONTH) intervals are not supported",
         );
     }
-    let n =
-        extract_interval_int(&iv.value).ok_or_else(|| EmissionError::UnsupportedProtoShape {
-            shape: "sql::interval::non_literal_value".to_owned(),
-            reason: "INTERVAL value must be an integer literal".to_owned(),
-        })?;
+    let n = extract_interval_int(&iv.value).require_proto(
+        "sql::interval::non_literal_value",
+        "INTERVAL value must be an integer literal",
+    )?;
 
     const MICROS_PER_SECOND: i64 = 1_000_000;
     const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
@@ -1223,12 +1220,10 @@ fn resolve_named_window(
             format!("window `{name}` forms a reference cycle"),
         );
     }
-    let expr = raw
-        .get(name)
-        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-            shape: "sql::window::unknown_named_window".to_owned(),
-            reason: format!("window `{name}` is not defined in the WINDOW clause"),
-        })?;
+    let expr = raw.get(name).require_proto(
+        "sql::window::unknown_named_window",
+        &format!("window `{name}` is not defined in the WINDOW clause"),
+    )?;
     match expr {
         NamedWindowExpr::WindowSpec(spec) => Ok(spec.clone()),
         NamedWindowExpr::NamedWindow(other) => {

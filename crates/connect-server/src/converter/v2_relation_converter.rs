@@ -38,6 +38,7 @@ use thunderduck_core::transpiler_v2::expression::{
     FunctionCall, InListExpression, Literal, LiteralValue, NullOrdering, SortDirection, SortOrder,
     StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UnresolvedRegexExpression,
 };
+use thunderduck_core::transpiler_v2::macros::ProtoFieldExt;
 use thunderduck_core::transpiler_v2::EmissionError;
 use thunderduck_core::types::{DataType, StructField, StructType};
 
@@ -132,14 +133,10 @@ impl V2RelationConverter {
     /// Convert a proto [`proto::Relation`] into a [`CommonAst`].
     pub fn convert(&mut self, relation: &proto::Relation) -> Result<CommonAst, EmissionError> {
         use proto::relation::RelType;
-        let rel_type =
-            relation
-                .rel_type
-                .as_ref()
-                .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                    shape: "Relation::rel_type::None".to_owned(),
-                    reason: "proto Relation carries no rel_type".to_owned(),
-                })?;
+        let rel_type = relation.rel_type.as_ref().require_proto(
+            "Relation::rel_type::None",
+            "proto Relation carries no rel_type",
+        )?;
         match rel_type {
             RelType::Project(p) => self.convert_project(p),
             RelType::Filter(f) => self.convert_filter(f),
@@ -246,20 +243,14 @@ impl V2RelationConverter {
             thunderduck_core::transpiler_v2::Expression,
         )> = Vec::with_capacity(r.replacements.len());
         for rep in &r.replacements {
-            let old_lit =
-                rep.old_value
-                    .as_ref()
-                    .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                        shape: "NaReplace::old_value::None".to_owned(),
-                        reason: "NaReplace replacement missing old_value".to_owned(),
-                    })?;
-            let new_lit =
-                rep.new_value
-                    .as_ref()
-                    .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                        shape: "NaReplace::new_value::None".to_owned(),
-                        reason: "NaReplace replacement missing new_value".to_owned(),
-                    })?;
+            let old_lit = rep.old_value.as_ref().require_proto(
+                "NaReplace::old_value::None",
+                "NaReplace replacement missing old_value",
+            )?;
+            let new_lit = rep.new_value.as_ref().require_proto(
+                "NaReplace::new_value::None",
+                "NaReplace replacement missing new_value",
+            )?;
             let old_expr = proto::Expression {
                 expr_type: Some(proto::expression::ExprType::Literal(old_lit.clone())),
                 ..Default::default()
@@ -372,20 +363,14 @@ impl V2RelationConverter {
         let col_proto = s
             .col
             .as_ref()
-            .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                shape: "SampleBy::col::None".to_owned(),
-                reason: "StatSampleBy missing col".to_owned(),
-            })?;
+            .require_proto("SampleBy::col::None", "StatSampleBy missing col")?;
         let col = self.expr.convert(col_proto)?;
         let mut fractions: Vec<(Literal, f64)> = Vec::with_capacity(s.fractions.len());
         for frac in &s.fractions {
-            let stratum_proto =
-                frac.stratum
-                    .as_ref()
-                    .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                        shape: "SampleBy::Fraction::stratum::None".to_owned(),
-                        reason: "SampleBy fraction missing stratum literal".to_owned(),
-                    })?;
+            let stratum_proto = frac.stratum.as_ref().require_proto(
+                "SampleBy::Fraction::stratum::None",
+                "SampleBy fraction missing stratum literal",
+            )?;
             let lit_expr = self.expr.convert_literal(stratum_proto)?;
             let Expression::Literal(lit) = lit_expr else {
                 bail_boundary_proto!(
@@ -533,14 +518,10 @@ impl V2RelationConverter {
                     );
                 }
             };
-            let expr_proto =
-                alias
-                    .expr
-                    .as_deref()
-                    .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                        shape: "WithColumns::Alias::missing_expr".to_owned(),
-                        reason: "WithColumns alias has no expression".to_owned(),
-                    })?;
+            let expr_proto = alias.expr.as_deref().require_proto(
+                "WithColumns::Alias::missing_expr",
+                "WithColumns alias has no expression",
+            )?;
             let expr = self.expr.convert(expr_proto)?;
             assignments.push((name, expr));
         }
@@ -669,21 +650,14 @@ impl V2RelationConverter {
     /// semantics; DuckDB PIVOT will auto-materialise distinct values at
     /// execution.
     fn convert_pivot(&mut self, a: &proto::Aggregate) -> Result<CommonAst, EmissionError> {
-        let pivot_proto = a
-            .pivot
-            .as_ref()
-            .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                shape: "Aggregate::Pivot::missing_pivot".to_owned(),
-                reason: "PIVOT Aggregate has no `pivot` sub-message".to_owned(),
-            })?;
-        let pivot_col_proto =
-            pivot_proto
-                .col
-                .as_ref()
-                .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                    shape: "Aggregate::Pivot::missing_col".to_owned(),
-                    reason: "PIVOT Aggregate::pivot has no `col`".to_owned(),
-                })?;
+        let pivot_proto = a.pivot.as_ref().require_proto(
+            "Aggregate::Pivot::missing_pivot",
+            "PIVOT Aggregate has no `pivot` sub-message",
+        )?;
+        let pivot_col_proto = pivot_proto.col.as_ref().require_proto(
+            "Aggregate::Pivot::missing_col",
+            "PIVOT Aggregate::pivot has no `col`",
+        )?;
         let input = self.convert_input(a.input.as_deref(), "Aggregate[Pivot]")?;
         let pivot_column = self.expr.convert(pivot_col_proto)?;
         let grouping = a
@@ -778,17 +752,11 @@ impl V2RelationConverter {
         let left_proto = j
             .left
             .as_deref()
-            .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                shape: "Join::missing_left".to_owned(),
-                reason: "Join has no left input".to_owned(),
-            })?;
-        let right_proto =
-            j.right
-                .as_deref()
-                .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                    shape: "Join::missing_right".to_owned(),
-                    reason: "Join has no right input".to_owned(),
-                })?;
+            .require_proto("Join::missing_left", "Join has no left input")?;
+        let right_proto = j
+            .right
+            .as_deref()
+            .require_proto("Join::missing_right", "Join has no right input")?;
         let join_type = match j.join_type() {
             ProtoJoinType::Inner | ProtoJoinType::Unspecified => JoinType::Inner,
             ProtoJoinType::FullOuter => JoinType::Full,
@@ -836,13 +804,10 @@ impl V2ExpressionConverter {
 
     fn convert(&mut self, expr: &proto::Expression) -> Result<Expression, EmissionError> {
         use proto::expression::ExprType;
-        let expr_type =
-            expr.expr_type
-                .as_ref()
-                .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                    shape: "Expression::None".to_owned(),
-                    reason: "proto Expression carries no expr_type".to_owned(),
-                })?;
+        let expr_type = expr
+            .expr_type
+            .as_ref()
+            .require_proto("Expression::None", "proto Expression carries no expr_type")?;
         match expr_type {
             ExprType::Literal(lit) => self.convert_literal(lit),
             ExprType::UnresolvedAttribute(attr) => self.convert_unresolved_attribute(attr),
@@ -864,13 +829,10 @@ impl V2ExpressionConverter {
                 Ok(Expression::Star(StarExpression { qualifier }))
             }
             ExprType::LambdaFunction(lf) => {
-                let func_proto =
-                    lf.function
-                        .as_deref()
-                        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                            shape: "LambdaFunction::function::None".to_owned(),
-                            reason: "LambdaFunction missing body".to_owned(),
-                        })?;
+                let func_proto = lf.function.as_deref().require_proto(
+                    "LambdaFunction::function::None",
+                    "LambdaFunction missing body",
+                )?;
                 let body = self.convert(func_proto)?;
                 let mut params: Vec<String> = Vec::with_capacity(lf.arguments.len());
                 for arg in &lf.arguments {
@@ -951,11 +913,10 @@ impl V2ExpressionConverter {
                             |b_opt: Option<&pwf::FrameBoundary>,
                              is_lower: bool|
                              -> Result<VFB, EmissionError> {
-                                let b =
-                                    b_opt.ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                                        shape: "Window::frame_spec::missing_boundary".to_owned(),
-                                        reason: "frame boundary missing".to_owned(),
-                                    })?;
+                                let b = b_opt.require_proto(
+                                    "Window::frame_spec::missing_boundary",
+                                    "frame boundary missing",
+                                )?;
                                 use pwf::frame_boundary::Boundary as PB;
                                 match b.boundary.as_ref() {
                                     Some(PB::CurrentRow(_)) => Ok(VFB::CurrentRow),
@@ -1018,19 +979,14 @@ impl V2ExpressionConverter {
                 ))
             }
             ExprType::UnresolvedExtractValue(uev) => {
-                let child =
-                    uev.child
-                        .as_deref()
-                        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                            shape: "UnresolvedExtractValue::child::None".to_owned(),
-                            reason: "ExtractValue missing child expression".to_owned(),
-                        })?;
-                let extraction = uev.extraction.as_deref().ok_or_else(|| {
-                    EmissionError::UnsupportedProtoShape {
-                        shape: "UnresolvedExtractValue::extraction::None".to_owned(),
-                        reason: "ExtractValue missing extraction expression".to_owned(),
-                    }
-                })?;
+                let child = uev.child.as_deref().require_proto(
+                    "UnresolvedExtractValue::child::None",
+                    "ExtractValue missing child expression",
+                )?;
+                let extraction = uev.extraction.as_deref().require_proto(
+                    "UnresolvedExtractValue::extraction::None",
+                    "ExtractValue missing extraction expression",
+                )?;
                 let child = self.convert(child)?;
                 let extraction = self.convert(extraction)?;
                 Ok(Expression::ExtractValue(
@@ -1057,11 +1013,10 @@ impl V2ExpressionConverter {
                 // single [`UpdateFieldsExpression`] with an ordered
                 // `updates: Vec<(String, Option<Expression>)>`.
                 let (base_proto, ops) = flatten_update_fields(uf);
-                let base_proto =
-                    base_proto.ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                        shape: "UpdateFields::struct_expression::None".to_owned(),
-                        reason: "UpdateFields missing struct_expression".to_owned(),
-                    })?;
+                let base_proto = base_proto.require_proto(
+                    "UpdateFields::struct_expression::None",
+                    "UpdateFields missing struct_expression",
+                )?;
                 let struct_expr = self.convert(base_proto)?;
                 let mut updates: Vec<(String, Option<Expression>)> = Vec::with_capacity(ops.len());
                 for (field_name, maybe_value) in ops {
@@ -1091,13 +1046,10 @@ impl V2ExpressionConverter {
         so: &proto::expression::SortOrder,
     ) -> Result<SortOrder, EmissionError> {
         use proto::expression::sort_order::{NullOrdering as ProtoNO, SortDirection as ProtoSD};
-        let child = so
-            .child
-            .as_deref()
-            .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                shape: "SortOrder::missing_child".to_owned(),
-                reason: "SortOrder has no child expression".to_owned(),
-            })?;
+        let child = so.child.as_deref().require_proto(
+            "SortOrder::missing_child",
+            "SortOrder has no child expression",
+        )?;
         let expr = self.convert(child)?;
         let direction = match so.direction() {
             ProtoSD::Descending => SortDirection::Descending,
@@ -1322,10 +1274,7 @@ impl V2ExpressionConverter {
         let inner = alias
             .expr
             .as_deref()
-            .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                shape: "Alias::missing_expr".to_owned(),
-                reason: "Alias has no inner expression".to_owned(),
-            })?;
+            .require_proto("Alias::missing_expr", "Alias has no inner expression")?;
         let expr = self.convert(inner)?;
         let name = alias
             .name
@@ -1447,10 +1396,7 @@ impl V2ExpressionConverter {
         let inner = cast
             .expr
             .as_deref()
-            .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                shape: "Cast::missing_expr".to_owned(),
-                reason: "Cast has no inner expression".to_owned(),
-            })?;
+            .require_proto("Cast::missing_expr", "Cast has no inner expression")?;
         let to_type = match &cast.cast_to_type {
             Some(CastToType::Type(dt)) => {
                 proto_to_data_type(dt).map_err(|e| EmissionError::UnsupportedProtoShape {
@@ -1981,10 +1927,10 @@ fn arrow_val_to_literal(array: &dyn Array, row: usize) -> Result<Expression, Emi
             let sa = entries
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                    shape: "arrow_value::map_entries".to_owned(),
-                    reason: "Arrow Map entries must be StructArray".to_owned(),
-                })?;
+                .require_proto(
+                    "arrow_value::map_entries",
+                    "Arrow Map entries must be StructArray",
+                )?;
             let keys = sa.column(0);
             let vals = sa.column(1);
             let mut entries_out: Vec<(Expression, Expression)> = Vec::with_capacity(keys.len());
@@ -2027,13 +1973,10 @@ fn arrow_val_to_literal(array: &dyn Array, row: usize) -> Result<Expression, Emi
 }
 
 fn downcast<T: Array + 'static>(array: &dyn Array) -> Result<&T, EmissionError> {
-    array
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-            shape: format!("arrow_downcast::{:?}", array.data_type()),
-            reason: format!("Arrow array downcast failed for {:?}", array.data_type()),
-        })
+    array.as_any().downcast_ref::<T>().require_proto(
+        &format!("arrow_downcast::{:?}", array.data_type()),
+        &format!("Arrow array downcast failed for {:?}", array.data_type()),
+    )
 }
 
 /// Format an unscaled Arrow Decimal128 value at the given scale as a

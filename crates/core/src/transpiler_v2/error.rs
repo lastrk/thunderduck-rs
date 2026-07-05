@@ -8,58 +8,62 @@
 
 /// The categories of errors τ can surface at emission time.
 ///
-/// All three variants are Thunderduck-boundary. `UnsupportedOp` is the
-/// primary variant; `UnsupportedExpression` and `UnsupportedFunction`
-/// surface when emission arms discover un-seeded shapes.
+/// A single [`EmissionError::Unsupported`] variant carries the four
+/// Thunderduck-boundary flavours through its [`UnsupportedKind`] tag:
+/// `Op` (top-level operator not yet emitted), `Expression`
+/// (un-seeded expression shape), `Function` (no emission arm for a Spark
+/// function name), and `ProtoShape` (input never reached [`CommonAst`]).
+///
+/// [`CommonAst`]: crate::transpiler_v2::ast::CommonAst
 #[derive(thiserror::Error, Debug)]
 pub enum EmissionError {
-    /// The top-level operator of the input plan is not yet supported by τ.
-    #[error("τ: unsupported operator `{op}`: {reason}")]
-    UnsupportedOp {
-        /// Human-readable operator name (e.g. `"Project"`, `"Join"`).
-        op: String,
-        /// Explanation for why this operator is not yet supported.
-        reason: String,
-    },
-
-    /// The expression shape is not yet supported by τ.
+    /// A τ-boundary reject: the referenced shape has no emission arm yet.
     ///
-    /// Surfaces when emission arms discover un-seeded expression forms.
-    #[error("τ: unsupported expression `{shape}`: {reason}")]
-    UnsupportedExpression {
-        /// Human-readable expression shape (e.g. `"Lambda"`, `"ScalarSubquery"`).
-        shape: String,
-        /// Explanation for why this expression is not yet supported.
-        reason: String,
-    },
-
-    /// The function name has no τ emission arm (native or extension).
-    ///
-    /// Reserved for future τ work / D.
-    #[error("τ: unsupported function `{name}`: {reason}")]
-    UnsupportedFunction {
-        /// Spark function name.
+    /// `kind` selects which Display prefix appears in the wire message; the
+    /// per-kind text is byte-identical to the four legacy variants
+    /// (`UnsupportedOp`, `UnsupportedExpression`, `UnsupportedFunction`,
+    /// `UnsupportedProtoShape`) this variant replaces.
+    #[error("τ: {} `{name}`: {reason}", kind.display_prefix())]
+    Unsupported {
+        /// Which flavour of τ-boundary reject this is.
+        kind: UnsupportedKind,
+        /// The specific operator / expression / function / proto shape name
+        /// that surfaced the reject.
         name: String,
-        /// Explanation for why this function is not yet supported.
+        /// Explanation for why the shape is not yet supported.
         reason: String,
     },
+}
 
-    /// The input proto (or SQL) shape is not (yet) representable as a
-    /// `CommonAst`. Emitted at the τ ingress boundary — `V2RelationConverter`
-    /// and `parser_v2` — when the caller hands us a proto/SQL construct that
-    /// the substrate has not yet grown a variant for.
+/// Discriminator for [`EmissionError::Unsupported`] — selects the Display
+/// prefix and encodes which category of τ-boundary reject fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedKind {
+    /// Top-level operator has no τ emission arm.
+    Op,
+    /// Expression shape has no τ emission arm.
+    Expression,
+    /// Function name has no emission arm (native or extension).
+    Function,
+    /// Input proto / SQL shape never reached [`CommonAst`].
     ///
-    /// Semantically distinct from [`Self::UnsupportedOp`], which signals "the
-    /// emission arm isn't there yet" for a valid `CommonAst`. This variant
-    /// says "the input never reached `CommonAst`."
-    #[error("τ: unsupported proto shape `{shape}`: {reason}")]
-    UnsupportedProtoShape {
-        /// Human-readable proto/SQL shape (e.g. `"RelType::Sql"`,
-        /// `"arrow_value::Decimal256"`, `"sql::pivot"`).
-        shape: String,
-        /// Explanation for why this shape has no lowering rule yet.
-        reason: String,
-    },
+    /// [`CommonAst`]: crate::transpiler_v2::ast::CommonAst
+    ProtoShape,
+}
+
+impl UnsupportedKind {
+    /// The Display prefix emitted in the wire message for this kind.
+    ///
+    /// The four returned literals match the legacy variants' Display strings
+    /// byte-for-byte so wire-error-string tests remain unchanged.
+    pub fn display_prefix(&self) -> &'static str {
+        match self {
+            Self::Op => "unsupported operator",
+            Self::Expression => "unsupported expression",
+            Self::Function => "unsupported function",
+            Self::ProtoShape => "unsupported proto shape",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -69,8 +73,9 @@ mod tests {
 
     #[test]
     fn unsupported_op_display() {
-        let e = EmissionError::UnsupportedOp {
-            op: "Project".to_owned(),
+        let e = EmissionError::Unsupported {
+            kind: UnsupportedKind::Op,
+            name: "Project".to_owned(),
             reason: "not seeded".to_owned(),
         };
         assert_eq!(
@@ -81,8 +86,9 @@ mod tests {
 
     #[test]
     fn unsupported_expression_display() {
-        let e = EmissionError::UnsupportedExpression {
-            shape: "Lambda".to_owned(),
+        let e = EmissionError::Unsupported {
+            kind: UnsupportedKind::Expression,
+            name: "Lambda".to_owned(),
             reason: "no emission arm".to_owned(),
         };
         assert_eq!(
@@ -93,7 +99,8 @@ mod tests {
 
     #[test]
     fn unsupported_function_display() {
-        let e = EmissionError::UnsupportedFunction {
+        let e = EmissionError::Unsupported {
+            kind: UnsupportedKind::Function,
             name: "sha3".to_owned(),
             reason: "not implemented".to_owned(),
         };
@@ -105,8 +112,9 @@ mod tests {
 
     #[test]
     fn unsupported_proto_shape_display() {
-        let e = EmissionError::UnsupportedProtoShape {
-            shape: "RelType::Sql".to_owned(),
+        let e = EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "RelType::Sql".to_owned(),
             reason: "parser_v2 owns SQL text".to_owned(),
         };
         assert_eq!(
@@ -117,8 +125,9 @@ mod tests {
 
     #[test]
     fn unsupported_proto_shape_composes_into_thunderduck_error() {
-        let e = EmissionError::UnsupportedProtoShape {
-            shape: "arrow_value::Decimal256".to_owned(),
+        let e = EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "arrow_value::Decimal256".to_owned(),
             reason: "no dispatch arm".to_owned(),
         };
         let composed: ThunderduckError = e.into();
@@ -130,8 +139,9 @@ mod tests {
 
     #[test]
     fn emission_error_from_composes_into_thunderduck_error() {
-        let e = EmissionError::UnsupportedOp {
-            op: "Project".to_owned(),
+        let e = EmissionError::Unsupported {
+            kind: UnsupportedKind::Op,
+            name: "Project".to_owned(),
             reason: "not seeded".to_owned(),
         };
         let composed: ThunderduckError = e.into();

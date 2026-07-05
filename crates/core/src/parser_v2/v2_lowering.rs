@@ -34,6 +34,7 @@ use sqlparser::ast::{
 use crate::transpiler_v2::ast::{
     CommonAst, CommonOp, GroupingKind, JoinType, PivotGrouping, SetOpKind, UnpivotIds,
 };
+use crate::transpiler_v2::error::UnsupportedKind;
 use crate::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
     ExistsSubquery, Expression, FrameBoundary, FrameUnit, FunctionCall, InListExpression,
@@ -58,8 +59,9 @@ type CteScope = HashMap<String, CommonAst>;
 pub fn lower_statement(stmt: Statement) -> Result<CommonAst, EmissionError> {
     match stmt {
         Statement::Query(q) => lower_query(*q, &CteScope::new()),
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::{}", statement_kind(&other)),
+        other => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: format!("sql::{}", statement_kind(&other)),
             reason: "parser_v2 only supports SELECT queries in τ".to_owned(),
         }),
     }
@@ -90,8 +92,9 @@ fn lower_query(query: Query, cte_scope: &CteScope) -> Result<CommonAst, Emission
     let effective_scope: &CteScope = match query.with {
         Some(with) => {
             if with.recursive {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::recursive_cte".to_owned(),
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::recursive_cte".to_owned(),
                     reason: "WITH RECURSIVE not supported".to_owned(),
                 });
             }
@@ -154,8 +157,9 @@ fn order_by_all_exprs(
     let select = match body {
         SetExpr::Select(s) => s,
         _ => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: "sql::order_by_all".to_owned(),
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: "sql::order_by_all".to_owned(),
                 reason: "ORDER BY ALL is only supported over a SELECT body".to_owned(),
             });
         }
@@ -166,8 +170,9 @@ fn order_by_all_exprs(
             SelectItem::UnnamedExpr(e) => e.clone(),
             SelectItem::ExprWithAlias { expr, .. } => expr.clone(),
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::order_by_all_wildcard".to_owned(),
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::order_by_all_wildcard".to_owned(),
                     reason: "ORDER BY ALL over `*` projection not supported".to_owned(),
                 });
             }
@@ -200,8 +205,9 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
     match body {
         SetExpr::Select(sel) => lower_select(*sel, cte_scope),
         SetExpr::Query(q) => lower_query(*q, cte_scope),
-        SetExpr::Values(_) => Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::values_top_level".to_owned(),
+        SetExpr::Values(_) => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::values_top_level".to_owned(),
             reason: "top-level VALUES not supported in τ (only VALUES in FROM)".to_owned(),
         }),
         SetExpr::SetOperation {
@@ -223,8 +229,9 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
                 set_quantifier,
                 SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName
             ) {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::set_operation::by_name".to_owned(),
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::set_operation::by_name".to_owned(),
                     reason: "UNION/INTERSECT/EXCEPT BY NAME not supported (positional only)"
                         .to_owned(),
                 });
@@ -242,8 +249,9 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
                 children: vec![left, right],
             }))
         }
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::set_expr::{other:?}"),
+        other => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: format!("sql::set_expr::{other:?}"),
             reason: "set expression not supported in τ".to_owned(),
         }),
     }
@@ -259,8 +267,9 @@ fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, E
         None | Some(Distinct::All) => false,
         Some(Distinct::Distinct) => true,
         Some(Distinct::On(_)) => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: "sql::distinct_on".to_owned(),
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: "sql::distinct_on".to_owned(),
                 reason: "SELECT DISTINCT ON is not valid Spark SQL".to_owned(),
             });
         }
@@ -332,8 +341,9 @@ fn lower_aggregate_select(
     let (grouping, grouping_kind) = match group_by {
         GroupByExpr::Expressions(exprs, modifiers) => {
             if !modifiers.is_empty() {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::group_by_modifiers".to_owned(),
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::group_by_modifiers".to_owned(),
                     reason: "GROUP BY modifiers (ROLLUP/CUBE/GROUPING SETS) not supported in τ"
                         .to_owned(),
                 });
@@ -362,8 +372,9 @@ fn lower_aggregate_select(
                 // than silently flatten to the wrong grouping sets (ADR-022,
                 // loud-fail). Simple `ROLLUP (a, b)` = `[[a],[b]]` is unaffected.
                 if sets.iter().any(|term| term.len() != 1) {
-                    return Err(EmissionError::UnsupportedProtoShape {
-                        shape: "sql::grouping_sets".to_owned(),
+                    return Err(EmissionError::Unsupported {
+                        kind: UnsupportedKind::ProtoShape,
+                        name: "sql::grouping_sets".to_owned(),
                         reason: "nested ROLLUP/CUBE grouping terms not supported in τ".to_owned(),
                     });
                 }
@@ -383,8 +394,9 @@ fn lower_aggregate_select(
                 for e in exprs {
                     match e {
                         Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => {
-                            return Err(EmissionError::UnsupportedProtoShape {
-                                shape: "sql::grouping_sets".to_owned(),
+                            return Err(EmissionError::Unsupported {
+                                kind: UnsupportedKind::ProtoShape,
+                                name: "sql::grouping_sets".to_owned(),
                                 reason: "GROUPING SETS / mixed ROLLUP/CUBE not supported in τ"
                                     .to_owned(),
                             });
@@ -397,8 +409,9 @@ fn lower_aggregate_select(
         }
         GroupByExpr::All(modifiers) => {
             if !modifiers.is_empty() {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::group_by_all_modifiers".to_owned(),
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::group_by_all_modifiers".to_owned(),
                     reason: "GROUP BY ALL with ROLLUP/CUBE/GROUPING SETS modifiers not supported"
                         .to_owned(),
                 });
@@ -412,8 +425,9 @@ fn lower_aggregate_select(
                     SelectItem::UnnamedExpr(e) => e,
                     SelectItem::ExprWithAlias { expr, .. } => expr,
                     SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
-                        return Err(EmissionError::UnsupportedProtoShape {
-                            shape: "sql::group_by_all_wildcard".to_owned(),
+                        return Err(EmissionError::Unsupported {
+                            kind: UnsupportedKind::ProtoShape,
+                            name: "sql::group_by_all_wildcard".to_owned(),
                             reason: "GROUP BY ALL over `*` projection not supported".to_owned(),
                         });
                     }
@@ -535,8 +549,9 @@ fn lower_table_factor(
             // Only bare identifier / function-call table functions covered.
             match expr {
                 Expr::Function(f) => lower_table_function(f, cte_scope),
-                other => Err(EmissionError::UnsupportedProtoShape {
-                    shape: format!("sql::table_function::{other:?}"),
+                other => Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: format!("sql::table_function::{other:?}"),
                     reason: "table function expr shape not supported in τ".to_owned(),
                 }),
             }
@@ -547,17 +562,21 @@ fn lower_table_factor(
             ..
         } => {
             if array_exprs.len() != 1 {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::unnest_multi_arg".to_owned(),
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::unnest_multi_arg".to_owned(),
                     reason: "UNNEST with multiple array arguments not supported in τ".to_owned(),
                 });
             }
-            let expr = array_exprs.into_iter().next().ok_or_else(|| {
-                EmissionError::UnsupportedProtoShape {
-                    shape: "sql::unnest_empty".to_owned(),
-                    reason: "UNNEST has no array argument".to_owned(),
-                }
-            })?;
+            let expr =
+                array_exprs
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| EmissionError::Unsupported {
+                        kind: UnsupportedKind::ProtoShape,
+                        name: "sql::unnest_empty".to_owned(),
+                        reason: "UNNEST has no array argument".to_owned(),
+                    })?;
             Ok(CommonAst::new(CommonOp::Unnest {
                 expr: lower_expr(expr, cte_scope)?,
                 with_ordinality,
@@ -593,15 +612,17 @@ fn lower_table_factor(
         } => {
             // Spark has no PIVOT `DEFAULT ON NULL` clause — boundary reject.
             if default_on_null.is_some() {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::pivot::default_on_null".to_owned(),
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::pivot::default_on_null".to_owned(),
                     reason: "PIVOT DEFAULT ON NULL has no Spark equivalent".to_owned(),
                 });
             }
             let input = Box::new(lower_table_factor(*table, cte_scope)?);
             if value_column.len() != 1 {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::pivot::multi_value_column".to_owned(),
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::pivot::multi_value_column".to_owned(),
                     reason: "PIVOT supports exactly one FOR column".to_owned(),
                 });
             }
@@ -624,8 +645,9 @@ fn lower_table_factor(
                 // DISTINCT query — Thunderduck-boundary (ADR-022),
                 // mirrors the analyzer's `Pivot[implicit-values]` punt.
                 PivotValueSource::Any(_) | PivotValueSource::Subquery(_) => {
-                    return Err(EmissionError::UnsupportedProtoShape {
-                        shape: "sql::pivot::dynamic_values".to_owned(),
+                    return Err(EmissionError::Unsupported {
+    kind: UnsupportedKind::ProtoShape,
+    name: "sql::pivot::dynamic_values".to_owned(),
                         reason: "dynamic PIVOT values (ANY / subquery) require an eager DISTINCT query, not supported in τ".to_owned(),
                     });
                 }
@@ -655,33 +677,35 @@ fn lower_table_factor(
             // τ's Unpivot variant has no include-nulls field; EXCLUDE NULLS is
             // the default. INCLUDE NULLS is unrepresentable — boundary reject.
             if matches!(null_inclusion, Some(NullInclusion::IncludeNulls)) {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::unpivot::include_nulls".to_owned(),
+                return Err(EmissionError::Unsupported {
+    kind: UnsupportedKind::ProtoShape,
+    name: "sql::unpivot::include_nulls".to_owned(),
                     reason: "UNPIVOT INCLUDE NULLS is not representable in τ (EXCLUDE NULLS is the default)".to_owned(),
                 });
             }
             let input = Box::new(lower_table_factor(*table, cte_scope)?);
-            let value_column_name = expr_to_ident_string(&value).ok_or_else(|| {
-                EmissionError::UnsupportedProtoShape {
-                    shape: "sql::unpivot::value_non_ident".to_owned(),
+            let value_column_name =
+                expr_to_ident_string(&value).ok_or_else(|| EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::unpivot::value_non_ident".to_owned(),
                     reason: "UNPIVOT value must be a bare column name".to_owned(),
-                }
-            })?;
+                })?;
             let variable_column_name = name.value;
             let mut values: Vec<String> = Vec::with_capacity(columns.len());
             for ewa in columns {
                 if ewa.alias.is_some() {
-                    return Err(EmissionError::UnsupportedProtoShape {
-                        shape: "sql::unpivot::column_alias".to_owned(),
+                    return Err(EmissionError::Unsupported {
+                        kind: UnsupportedKind::ProtoShape,
+                        name: "sql::unpivot::column_alias".to_owned(),
                         reason: "UNPIVOT columns cannot be aliased in τ".to_owned(),
                     });
                 }
-                let col = expr_to_ident_string(&ewa.expr).ok_or_else(|| {
-                    EmissionError::UnsupportedProtoShape {
-                        shape: "sql::unpivot::column_non_ident".to_owned(),
+                let col =
+                    expr_to_ident_string(&ewa.expr).ok_or_else(|| EmissionError::Unsupported {
+                        kind: UnsupportedKind::ProtoShape,
+                        name: "sql::unpivot::column_non_ident".to_owned(),
                         reason: "UNPIVOT columns must be bare column names".to_owned(),
-                    }
-                })?;
+                    })?;
                 values.push(col);
             }
             Ok(CommonAst::new(CommonOp::Unpivot {
@@ -692,8 +716,9 @@ fn lower_table_factor(
                 value_column_name,
             }))
         }
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::table_factor::{other:?}"),
+        other => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: format!("sql::table_factor::{other:?}"),
             reason: "table factor not supported in τ".to_owned(),
         }),
     }
@@ -743,8 +768,9 @@ fn lower_function_args(
 ) -> Result<Vec<Expression>, EmissionError> {
     match args {
         FunctionArguments::None => Ok(vec![]),
-        FunctionArguments::Subquery(_) => Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::function_args_subquery".to_owned(),
+        FunctionArguments::Subquery(_) => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::function_args_subquery".to_owned(),
             reason: "subquery function arguments not supported in τ".to_owned(),
         }),
         FunctionArguments::List(list) => list
@@ -773,8 +799,9 @@ fn function_arg_to_expr(
                 qualifier: Some(object_name_to_string(&name)),
             }))
         }
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::function_arg::{other:?}"),
+        other => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: format!("sql::function_arg::{other:?}"),
             reason: "function argument shape not supported in τ".to_owned(),
         }),
     }
@@ -793,8 +820,9 @@ fn lower_join_operator(
         JoinOperator::LeftSemi(c) => (JoinType::LeftSemi, c),
         JoinOperator::LeftAnti(c) => (JoinType::LeftAnti, c),
         other => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: format!("sql::join_operator::{other:?}"),
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: format!("sql::join_operator::{other:?}"),
                 reason: "join operator not supported in τ".to_owned(),
             });
         }
@@ -1007,8 +1035,9 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
                 operand: Box::new(lower_expr(*expr, cte_scope)?),
             })),
             UnaryOperator::Plus => lower_expr(*expr, cte_scope),
-            other => Err(EmissionError::UnsupportedProtoShape {
-                shape: format!("sql::unary_op::{other:?}"),
+            other => Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: format!("sql::unary_op::{other:?}"),
                 reason: "unary operator not supported in τ".to_owned(),
             }),
         },
@@ -1175,8 +1204,9 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
         // (unanchored Java-regex `find`) would silently give wrong answers (e.g.
         // `'abc' SIMILAR TO 'b'` is FALSE but rlike would be TRUE). Reject as a
         // Thunderduck-boundary error per ADR-022 rather than mis-lower.
-        Expr::SimilarTo { .. } => Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::expr::similar_to".to_owned(),
+        Expr::SimilarTo { .. } => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::expr::similar_to".to_owned(),
             reason: "SIMILAR TO (anchored SQL-standard regex) has no Spark equivalent".to_owned(),
         }),
         Expr::Wildcard(_) => Ok(Expression::Star(StarExpression { qualifier: None })),
@@ -1356,8 +1386,9 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
         // input and other typed-string data types stay a Thunderduck boundary
         // (ADR-022).
         Expr::TypedString(ts) => lower_typed_string(ts),
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::expr::{}", expr_kind(&other)),
+        other => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: format!("sql::expr::{}", expr_kind(&other)),
             reason: "expression shape not supported in τ".to_owned(),
         }),
     }
@@ -1530,8 +1561,9 @@ fn lower_binary_op(op: BinaryOperator) -> Result<BinaryOp, EmissionError> {
         BinaryOperator::BitwiseOr => BinaryOp::BitOr,
         BinaryOperator::BitwiseXor => BinaryOp::BitXor,
         other => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: format!("sql::binary_op::{other:?}"),
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: format!("sql::binary_op::{other:?}"),
                 reason: "binary operator not supported in τ".to_owned(),
             });
         }
@@ -1556,8 +1588,9 @@ fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, Emiss
             (distinct, converted?)
         }
         FunctionArguments::Subquery(_) => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: "sql::function_args_subquery".to_owned(),
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: "sql::function_args_subquery".to_owned(),
                 reason: "subquery function arguments not supported in τ".to_owned(),
             });
         }
@@ -1592,8 +1625,9 @@ fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, Emiss
         // `WindowSpec` by `resolve_named_windows_in_select` before lowering.
         // Reaching here means the reference was never defined (e.g. no WINDOW
         // clause at all) — a Thunderduck-boundary error (ADR-022).
-        Some(WindowType::NamedWindow(ident)) => Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::named_window::unresolved".to_owned(),
+        Some(WindowType::NamedWindow(ident)) => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::named_window::unresolved".to_owned(),
             reason: format!("window `{}` is not defined in a WINDOW clause", ident.value),
         }),
     }
@@ -1619,8 +1653,9 @@ fn lower_window_frame(
         WindowFrameUnits::Rows => FrameUnit::Rows,
         WindowFrameUnits::Range => FrameUnit::Range,
         WindowFrameUnits::Groups => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: "sql::window_frame::groups".to_owned(),
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: "sql::window_frame::groups".to_owned(),
                 reason: "GROUPS window frame units are not supported".to_owned(),
             });
         }
@@ -1670,8 +1705,9 @@ fn resolve_named_windows_in_select(select: &mut Select) -> Result<(), EmissionEr
             // `WINDOW w AS other_window` (alias-of-window) — not represented in
             // τ's substrate; boundary error rather than silent drop (ADR-022).
             NamedWindowExpr::NamedWindow(_) => {
-                return Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::named_window::alias_of_window".to_owned(),
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::named_window::alias_of_window".to_owned(),
                     reason: format!("named window `{}` aliases another window", ident.value),
                 });
             }
@@ -1698,15 +1734,16 @@ fn resolve_named_windows_in_expr(
     match expr {
         Expr::Function(f) => {
             if let Some(WindowType::NamedWindow(name)) = &f.over {
-                let spec =
-                    defs.get(&name.value)
-                        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-                            shape: "sql::named_window::unknown".to_owned(),
-                            reason: format!(
-                                "window `{}` is not defined in the WINDOW clause",
-                                name.value
-                            ),
-                        })?;
+                let spec = defs
+                    .get(&name.value)
+                    .ok_or_else(|| EmissionError::Unsupported {
+                        kind: UnsupportedKind::ProtoShape,
+                        name: "sql::named_window::unknown".to_owned(),
+                        reason: format!(
+                            "window `{}` is not defined in the WINDOW clause",
+                            name.value
+                        ),
+                    })?;
                 f.over = Some(WindowType::WindowSpec(spec.clone()));
             }
         }
@@ -1731,21 +1768,23 @@ fn resolve_named_windows_in_expr(
 /// Thunderduck-boundary errors (ADR-022), never a RawSql fallback.
 fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
     if iv.last_field.is_some() {
-        return Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::expr::interval::compound".to_owned(),
+        return Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::expr::interval::compound".to_owned(),
             reason: "compound `INTERVAL X TO Y` literals are not supported".to_owned(),
         });
     }
-    let n =
-        extract_interval_int(&iv.value).ok_or_else(|| EmissionError::UnsupportedProtoShape {
-            shape: "sql::expr::interval::non_literal".to_owned(),
-            reason: "interval value must be an integer literal".to_owned(),
-        })?;
+    let n = extract_interval_int(&iv.value).ok_or_else(|| EmissionError::Unsupported {
+        kind: UnsupportedKind::ProtoShape,
+        name: "sql::expr::interval::non_literal".to_owned(),
+        reason: "interval value must be an integer literal".to_owned(),
+    })?;
     let field = iv
         .leading_field
         .as_ref()
-        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-            shape: "sql::expr::interval::no_field".to_owned(),
+        .ok_or_else(|| EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::expr::interval::no_field".to_owned(),
             reason: "interval literal has no leading time field".to_owned(),
         })?;
 
@@ -1753,8 +1792,9 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
     const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
     const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
 
-    let overflow = |unit: &str| EmissionError::UnsupportedProtoShape {
-        shape: format!("sql::expr::interval::{unit}_overflow"),
+    let overflow = |unit: &str| EmissionError::Unsupported {
+        kind: UnsupportedKind::ProtoShape,
+        name: format!("sql::expr::interval::{unit}_overflow"),
         reason: format!("interval {unit} value overflows"),
     };
 
@@ -1796,8 +1836,9 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
                 .ok_or_else(|| overflow("second"))?,
         },
         other => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: "sql::expr::interval::unsupported_field".to_owned(),
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: "sql::expr::interval::unsupported_field".to_owned(),
                 reason: format!("interval field `{other}` is not representable"),
             });
         }
@@ -1826,8 +1867,9 @@ fn lower_typed_string(ts: TypedString) -> Result<Expression, EmissionError> {
         SqlDataType::Date => false,
         SqlDataType::Timestamp(_, _) => true,
         other => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: format!("sql::typed_string::{other:?}"),
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: format!("sql::typed_string::{other:?}"),
                 reason: "only DATE and TIMESTAMP typed-string literals are supported".to_owned(),
             });
         }
@@ -1835,24 +1877,24 @@ fn lower_typed_string(ts: TypedString) -> Result<Expression, EmissionError> {
     let value = ts
         .value
         .into_string()
-        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
-            shape: "sql::typed_string::non_string_value".to_owned(),
+        .ok_or_else(|| EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::typed_string::non_string_value".to_owned(),
             reason: "typed-string literal value must be a string".to_owned(),
         })?;
     let (literal, data_type) = if is_timestamp {
-        let micros = parse_timestamp_to_epoch_micros(&value).ok_or_else(|| {
-            EmissionError::UnsupportedProtoShape {
-                shape: "sql::typed_string::malformed".to_owned(),
+        let micros =
+            parse_timestamp_to_epoch_micros(&value).ok_or_else(|| EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: "sql::typed_string::malformed".to_owned(),
                 reason: format!("cannot parse TIMESTAMP literal `{value}`"),
-            }
-        })?;
+            })?;
         (LiteralValue::Timestamp(micros), DataType::Timestamp)
     } else {
-        let days = parse_date_to_epoch_days(&value).ok_or_else(|| {
-            EmissionError::UnsupportedProtoShape {
-                shape: "sql::typed_string::malformed".to_owned(),
-                reason: format!("cannot parse DATE literal `{value}`"),
-            }
+        let days = parse_date_to_epoch_days(&value).ok_or_else(|| EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::typed_string::malformed".to_owned(),
+            reason: format!("cannot parse DATE literal `{value}`"),
         })?;
         (LiteralValue::Date(days), DataType::Date)
     };
@@ -2030,8 +2072,9 @@ fn lower_value(vw: ValueWithSpan) -> Result<Expression, EmissionError> {
                     data_type: DataType::Double,
                 }))
             } else {
-                Err(EmissionError::UnsupportedProtoShape {
-                    shape: "sql::number_parse".to_owned(),
+                Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::number_parse".to_owned(),
                     reason: format!("cannot parse numeric literal `{s}`"),
                 })
             }
@@ -2050,8 +2093,9 @@ fn lower_value(vw: ValueWithSpan) -> Result<Expression, EmissionError> {
             value: LiteralValue::Null,
             data_type: DataType::Null,
         })),
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::value::{other:?}"),
+        other => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: format!("sql::value::{other:?}"),
             reason: "literal value shape not supported in τ".to_owned(),
         }),
     }
@@ -2073,8 +2117,9 @@ fn lower_data_type(dt: SqlDataType) -> Result<DataType, EmissionError> {
         Timestamp(_, _) => DataType::Timestamp,
         Numeric(info) | Decimal(info) => decimal_from_exact_number(&info),
         other => {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: format!("sql::data_type::{other:?}"),
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: format!("sql::data_type::{other:?}"),
                 reason: "data type not supported in τ".to_owned(),
             });
         }
@@ -2163,14 +2208,14 @@ fn expr_to_i64(e: Expr) -> Result<i64, EmissionError> {
         Expr::Value(ValueWithSpan {
             value: Value::Number(s, _),
             ..
-        }) => s
-            .parse::<i64>()
-            .map_err(|_| EmissionError::UnsupportedProtoShape {
-                shape: "sql::limit_offset_parse".to_owned(),
-                reason: format!("cannot parse LIMIT/OFFSET value `{s}` as i64"),
-            }),
-        other => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::limit_offset_expr::{other:?}"),
+        }) => s.parse::<i64>().map_err(|_| EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: "sql::limit_offset_parse".to_owned(),
+            reason: format!("cannot parse LIMIT/OFFSET value `{s}` as i64"),
+        }),
+        other => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: format!("sql::limit_offset_expr::{other:?}"),
             reason: "LIMIT/OFFSET must be an integer literal in τ".to_owned(),
         }),
     }
@@ -2207,8 +2252,9 @@ mod tests {
     fn parse(sql: &str) -> Result<CommonAst, EmissionError> {
         let dialect = SparkDialect::default();
         let mut stmts =
-            Parser::parse_sql(&dialect, sql).map_err(|e| EmissionError::UnsupportedOp {
-                op: "sql::parse".to_owned(),
+            Parser::parse_sql(&dialect, sql).map_err(|e| EmissionError::Unsupported {
+                kind: UnsupportedKind::Op,
+                name: "sql::parse".to_owned(),
                 reason: e.to_string(),
             })?;
         assert_eq!(stmts.len(), 1);
@@ -2295,7 +2341,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                EmissionError::UnsupportedProtoShape { ref shape, .. } if shape == "sql::distinct_on"
+                EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. } if shape == "sql::distinct_on"
             ),
             "expected sql::distinct_on boundary error, got {err:?}"
         );
@@ -2350,7 +2396,11 @@ mod tests {
     fn typed_string_malformed_date_is_boundary_error() {
         let err = parse("SELECT DATE 'nope' AS d").expect_err("should reject");
         match err {
-            EmissionError::UnsupportedProtoShape { shape, .. } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: shape,
+                ..
+            } => {
                 assert_eq!(shape, "sql::typed_string::malformed");
             }
             other => panic!("expected boundary error, got {other:?}"),
@@ -2398,14 +2448,24 @@ mod tests {
     fn typed_string_invalid_calendar_date_is_boundary_error() {
         let err = parse("SELECT DATE '2026-02-30' AS d").expect_err("should reject");
         match err {
-            EmissionError::UnsupportedProtoShape { shape, .. } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: shape,
+                ..
+            } => {
                 assert_eq!(shape, "sql::typed_string::malformed");
             }
             other => panic!("expected boundary error, got {other:?}"),
         }
         // Year out of range must also be a boundary error, not a panic.
         let err = parse("SELECT DATE '99999-01-01' AS d").expect_err("should reject");
-        assert!(matches!(err, EmissionError::UnsupportedProtoShape { .. }));
+        assert!(matches!(
+            err,
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2662,7 +2722,11 @@ mod tests {
         let err = parse("SELECT a, b, COUNT(*) FROM t GROUP BY GROUPING SETS ((a), (b))")
             .expect_err("GROUPING SETS should be rejected");
         match err {
-            EmissionError::UnsupportedProtoShape { shape, .. } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: shape,
+                ..
+            } => {
                 assert_eq!(shape, "sql::grouping_sets");
             }
             other => panic!("expected UnsupportedProtoShape(sql::grouping_sets), got {other:?}"),
@@ -2677,7 +2741,7 @@ mod tests {
         let err = parse("SELECT a, b, COUNT(*) FROM t GROUP BY ROLLUP ((a, b), c)")
             .expect_err("nested ROLLUP term should be rejected");
         assert!(
-            matches!(err, EmissionError::UnsupportedProtoShape { ref shape, .. }
+            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
                 if shape == "sql::grouping_sets"),
             "expected UnsupportedProtoShape(sql::grouping_sets), got {err:?}",
         );
@@ -2773,7 +2837,11 @@ mod tests {
         let err = parse("WITH RECURSIVE r(n) AS (SELECT 1) SELECT * FROM r")
             .expect_err("WITH RECURSIVE should be rejected");
         match err {
-            EmissionError::UnsupportedProtoShape { shape, .. } => {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: shape,
+                ..
+            } => {
                 assert_eq!(shape, "sql::recursive_cte");
             }
             other => panic!("expected UnsupportedProtoShape(sql::recursive_cte), got {other:?}"),
@@ -2799,7 +2867,10 @@ mod tests {
         let result = parse("SELECT dept, COUNT(*) FROM t GROUP BY GROUPING SETS ((dept))");
         assert!(matches!(
             result,
-            Err(EmissionError::UnsupportedProtoShape { .. })
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                ..
+            })
         ));
     }
 
@@ -2913,7 +2984,7 @@ mod tests {
         let err = parse("SELECT a, b FROM t UNION BY NAME SELECT b, a FROM u")
             .expect_err("UNION BY NAME must be rejected");
         assert!(
-            matches!(err, EmissionError::UnsupportedProtoShape { ref shape, .. }
+            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
                 if shape == "sql::set_operation::by_name"),
             "expected UnsupportedProtoShape(sql::set_operation::by_name), got {err:?}",
         );
@@ -3088,7 +3159,11 @@ mod tests {
         use crate::parser_v2::SparkSqlParserV2;
         let result = SparkSqlParserV2::parse("SELCT bad");
         match result {
-            Err(EmissionError::UnsupportedProtoShape { shape, .. }) => {
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: shape,
+                ..
+            }) => {
                 assert_eq!(shape, "sql::parse_error");
             }
             other => panic!("expected UnsupportedProtoShape sql::parse_error, got {other:?}"),
@@ -3191,7 +3266,7 @@ mod tests {
         )
         .expect_err("GROUPS frame must be rejected");
         assert!(
-            matches!(err, EmissionError::UnsupportedProtoShape { ref shape, .. }
+            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
                 if shape == "sql::window_frame::groups"),
             "expected UnsupportedProtoShape(sql::window_frame::groups), got {err:?}",
         );
@@ -3202,7 +3277,7 @@ mod tests {
         let err = parse("SELECT rank() OVER w FROM t WINDOW v AS (ORDER BY id)")
             .expect_err("unknown named window must be rejected");
         assert!(
-            matches!(err, EmissionError::UnsupportedProtoShape { ref shape, .. }
+            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
                 if shape == "sql::named_window::unknown"),
             "expected UnsupportedProtoShape(sql::named_window::unknown), got {err:?}",
         );

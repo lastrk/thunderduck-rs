@@ -2,7 +2,7 @@
 //!
 //! Owns the SQL text path in the τ substrate (Open Decision 1 Option 1b):
 //! `V2RelationConverter` refuses `RelType::Sql` with
-//! [`EmissionError::UnsupportedProtoShape`]; dispatch routes
+//! [`EmissionError::Unsupported`] (`kind: ProtoShape`); dispatch routes
 //! `Sql` here instead.
 //!
 //! **INV10:** this file imports ONLY value-level types from `crate::types`
@@ -12,6 +12,7 @@
 mod dialect;
 mod v2_lowering;
 
+use crate::bail_boundary_proto;
 use crate::transpiler_v2::ast::CommonAst;
 use crate::transpiler_v2::EmissionError;
 use dialect::SparkDialect;
@@ -25,24 +26,26 @@ impl SparkSqlParserV2 {
     /// τ scope: `SELECT` queries with `FROM`, `WHERE`, `GROUP BY`,
     /// `ORDER BY`, `LIMIT/OFFSET`, joins, and subqueries in `FROM`.
     /// Everything else surfaces as
-    /// [`EmissionError::UnsupportedProtoShape`].
+    /// [`EmissionError::Unsupported`] with `kind: ProtoShape`.
     pub fn parse(sql: &str) -> Result<CommonAst, EmissionError> {
+        use crate::transpiler_v2::error::UnsupportedKind;
         use sqlparser::parser::Parser;
         let dialect = SparkDialect::default();
         // τ fix pass (review M2): sqlparser errors are boundary
         // failures — the input never reached `CommonAst`, so the correct
-        // category is `UnsupportedProtoShape` (input τ can't ingest), not
-        // `UnsupportedOp` (emission arm not implemented).
+        // category is `ProtoShape` (input τ can't ingest), not `Op`
+        // (emission arm not implemented).
         let mut stmts =
-            Parser::parse_sql(&dialect, sql).map_err(|e| EmissionError::UnsupportedProtoShape {
-                shape: "sql::parse_error".to_owned(),
+            Parser::parse_sql(&dialect, sql).map_err(|e| EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: "sql::parse_error".to_owned(),
                 reason: e.to_string(),
             })?;
         if stmts.len() != 1 {
-            return Err(EmissionError::UnsupportedProtoShape {
-                shape: "sql::multi_statement".to_owned(),
-                reason: format!("expected exactly one SQL statement, got {}", stmts.len()),
-            });
+            bail_boundary_proto!(
+                "sql::multi_statement",
+                format!("expected exactly one SQL statement, got {}", stmts.len()),
+            );
         }
         v2_lowering::lower_statement(stmts.remove(0))
     }
@@ -87,10 +90,10 @@ impl SparkSqlParserV2 {
             {
                 Ok(aggregates.remove(0))
             }
-            _ => Err(EmissionError::UnsupportedProtoShape {
-                shape: "ExpressionString::not_a_scalar".to_owned(),
-                reason: format!("expression fragment did not parse as a single scalar: {expr_sql}"),
-            }),
+            _ => bail_boundary_proto!(
+                "ExpressionString::not_a_scalar",
+                format!("expression fragment did not parse as a single scalar: {expr_sql}"),
+            ),
         }
     }
 }

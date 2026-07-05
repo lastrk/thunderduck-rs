@@ -601,9 +601,7 @@ async fn handle_write_operation(
     _common_ast: &CommonAst,
     _write_cmd: &proto::WriteOperation,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
-    Err(Status::unimplemented(
-        "WriteOperation over CommonAst",
-    ))
+    Err(Status::unimplemented("WriteOperation over CommonAst"))
 }
 
 // ── Response builders (preserved) ────────────────────────────────────────────
@@ -637,7 +635,7 @@ fn batches_to_responses(
 
 /// Create an ArrowBatch response with a single boolean `value` column = `val`.
 /// Used for DDL operations (DropTempView etc.) that must return a non-null table.
-#[allow(dead_code)]
+#[allow(dead_code)] // DDL classification helper; wired when τ's DDL classification lands (see `classify_plan`).
 fn bool_batch_responses(
     session_id: &str,
     operation_id: &str,
@@ -857,14 +855,15 @@ mod tests {
 
     // ── the τ dispatch site dispatch tests ──────────────────────────────────────────────
     //
-    // At A.3, τ's `generate()` errors with `EmissionError::UnsupportedOp` on
+    // At A.3, τ's `generate()` errors with `EmissionError::Unsupported`
+    // (kind: Op) on
     // every input. These tests pin two properties of the dispatch shape:
     //   1. Structurally-valid inputs reach τ (via `V2RelationConverter` or
     //      `parser_v2`) and surface the emission boundary via
     //      `Status::unimplemented` — not `Status::internal`.
     //   2. `RelType::Sql` routes to `parser_v2`, never through
     //      `V2RelationConverter` (which would return
-    //      `UnsupportedProtoShape { shape: "RelType::Sql" }`).
+    //      `Unsupported { kind: ProtoShape, name: "RelType::Sql" }`).
 
     fn table_scan_relation(name: &str) -> proto::Relation {
         proto::Relation {
@@ -963,7 +962,7 @@ mod tests {
     }
 
     /// SparkSQL syntax errors surface via `parser_v2`'s boundary policy
-    /// (`UnsupportedProtoShape { shape: "sql::parse_error", ... }`), which
+    /// (`Unsupported { kind: ProtoShape, name: "sql::parse_error", ... }`), which
     /// maps to `Status::unimplemented` per `ConnectError::TranspilerV2Emission`.
     #[tokio::test(flavor = "multi_thread")]
     async fn transpile_relation_sql_syntax_error_surfaces_from_parser_v2() {

@@ -38,7 +38,7 @@ impl CommonAst {
 /// SingleRow). Deferred plan shapes (SetOp, SubqueryAlias, WithColumns,
 /// Distinct, Sample, ShowString, Tail, DropColumns, ToDataFrame, NA family,
 /// Pivot, Stat family, Repartition/Hint passthrough) surface as
-/// [`super::EmissionError::UnsupportedProtoShape`] until later slices grow
+/// [`super::EmissionError::Unsupported`] (`kind: ProtoShape`) until later slices grow
 /// their variants. There is **no** opaque `Sql` variant — parser_v2 owns SQL
 /// text (Open Decision 1 Option 1b).
 #[derive(Debug, Clone, PartialEq)]
@@ -90,7 +90,7 @@ pub enum CommonOp {
     /// `SELECT aggregates FROM input GROUP BY grouping`.
     ///
     /// **Primitive Aggregate only.** Rollup / Cube / GroupingSets / Pivot
-    /// surface as [`super::EmissionError::UnsupportedProtoShape`] and land
+    /// surface as [`super::EmissionError::Unsupported`] (`kind: ProtoShape`) and land
     ///
     ///
     /// # τ invariant on `aggregates`
@@ -429,7 +429,7 @@ pub enum CommonOp {
     ///
     /// `with_replacement = true` is a permanent Thunderduck-boundary case per
     /// ADR-022 — DuckDB has no row-level sampling with replacement. Emission
-    /// surfaces `EmissionError::UnsupportedOp`.
+    /// surfaces `EmissionError::Unsupported` with `kind: Op`.
     Sample {
         /// The input relation.
         input: Box<CommonAst>,

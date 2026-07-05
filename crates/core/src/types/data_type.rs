@@ -99,22 +99,6 @@ impl DataType {
     }
 }
 
-/// Helper trait for short-circuiting when a type is already resolved.
-/// Returns `self` if resolved, otherwise calls the fallback closure.
-pub(crate) trait PipeIfUnresolved {
-    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self;
-}
-
-impl PipeIfUnresolved for DataType {
-    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self {
-        if self == DataType::Unresolved {
-            f()
-        } else {
-            self
-        }
-    }
-}
-
 impl std::fmt::Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -1535,14 +1535,34 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                 let mut widened_fields: Vec<StructField> = Vec::with_capacity(first_len);
                 for col_idx in 0..first_len {
                     let first_field = &typed_children[0].resolved_schema.fields[col_idx];
+                    // Type widening (ADR-006) is operator-independent: unify the
+                    // i-th column type across every child regardless of `kind`.
                     let mut widened_type = first_field.data_type.clone();
-                    let mut widened_nullable = first_field.nullable;
                     for child in typed_children.iter().skip(1) {
                         let f = &child.resolved_schema.fields[col_idx];
                         widened_type =
                             TypeInferenceEngine::unify_types(&widened_type, &f.data_type);
-                        widened_nullable = widened_nullable || f.nullable;
                     }
+                    // Nullability is operator-aware (Spark
+                    // `basicLogicalOperators.scala`, ADR-015):
+                    //   * Union     → nullable if ANY child's i-th col is
+                    //                 nullable (OR-fold).
+                    //   * Intersect → nullable only if EVERY child's i-th col is
+                    //                 nullable (AND-fold — a value present in a
+                    //                 non-nullable side cannot be null in the
+                    //                 intersection).
+                    //   * Except    → the LEFT (first) child's nullability only;
+                    //                 output rows come from the left, so the
+                    //                 other children are ignored.
+                    let widened_nullable = match kind {
+                        SetOpKind::Union => typed_children
+                            .iter()
+                            .any(|child| child.resolved_schema.fields[col_idx].nullable),
+                        SetOpKind::Intersect => typed_children
+                            .iter()
+                            .all(|child| child.resolved_schema.fields[col_idx].nullable),
+                        SetOpKind::Except => first_field.nullable,
+                    };
                     widened_fields.push(StructField::new(
                         first_field.name.clone(),
                         widened_type,
@@ -3705,6 +3725,103 @@ mod tests {
             }
             _ => panic!("expected SetOp"),
         }
+    }
+
+    /// Project the `dept_id` column (present on both `emp` and `dept`, but
+    /// with opposite nullability — `emp.dept_id` nullable, `dept.dept_id`
+    /// not-null) from the named table so set-op children carry a single
+    /// column of a known nullability.
+    fn dept_id_from(table: &str) -> CommonAst {
+        CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: table.to_owned(),
+                alias: None,
+            })),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "dept_id".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            })],
+        })
+    }
+
+    /// INTERSECT nullability is an AND-fold (Spark `Intersect.computeOutput`):
+    /// nullable(emp.dept_id)=true ∧ non-nullable(dept.dept_id)=false ⇒ the
+    /// intersection column is **non-nullable**.
+    #[test]
+    fn setop_intersect_nullability_is_and_across_children() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Intersect,
+            all: false,
+            by_name: false,
+            allow_missing_columns: false,
+            children: vec![dept_id_from("emp"), dept_id_from("dept")],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        assert!(
+            !typed.resolved_schema.fields[0].nullable,
+            "INTERSECT of nullable ∩ non-nullable must be non-nullable (AND)"
+        );
+    }
+
+    /// EXCEPT nullability is the LEFT child's only (Spark `Except.output =
+    /// left.output`). Left non-nullable, right nullable ⇒ output non-nullable.
+    #[test]
+    fn setop_except_nullability_is_left_child_only_nonnull_left() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Except,
+            all: false,
+            by_name: false,
+            allow_missing_columns: false,
+            // Left = dept (non-nullable dept_id), Right = emp (nullable).
+            children: vec![dept_id_from("dept"), dept_id_from("emp")],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        assert!(
+            !typed.resolved_schema.fields[0].nullable,
+            "EXCEPT must take the non-nullable LEFT child's nullability, ignoring the nullable right"
+        );
+    }
+
+    /// EXCEPT with a nullable LEFT and non-nullable right ⇒ output nullable
+    /// (left-only rule — the right child's non-nullability is irrelevant).
+    #[test]
+    fn setop_except_nullability_is_left_child_only_nullable_left() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Except,
+            all: false,
+            by_name: false,
+            allow_missing_columns: false,
+            // Left = emp (nullable dept_id), Right = dept (non-nullable).
+            children: vec![dept_id_from("emp"), dept_id_from("dept")],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        assert!(
+            typed.resolved_schema.fields[0].nullable,
+            "EXCEPT must take the nullable LEFT child's nullability, ignoring the non-nullable right"
+        );
+    }
+
+    /// Regression guard for the unchanged Union OR-fold: nullable ∪
+    /// non-nullable ⇒ nullable.
+    #[test]
+    fn setop_union_nullability_is_or_across_children() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Union,
+            all: true,
+            by_name: false,
+            allow_missing_columns: false,
+            children: vec![dept_id_from("emp"), dept_id_from("dept")],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        assert!(
+            typed.resolved_schema.fields[0].nullable,
+            "UNION of nullable ∪ non-nullable must remain nullable (OR)"
+        );
     }
 
     #[test]

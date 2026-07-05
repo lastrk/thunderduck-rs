@@ -776,3 +776,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 655/0, `sql_v2` differential 150/112/262, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 104 — 2026-07-05 — SQL corpus: set-op output nullability (set-004 cluster) [run 2]
+- **Corpus: SQL front-end.** Target: set-004 (INTERSECT), set-006 (EXCEPT), set-008 (MINUS) — EXECUTE but fail on schema nullable-mismatch (Reference=False, Test=True). ANALYZER layer (not lowering).
+- Diagnostic: `.agent-output/diagnostic-pass-104.md` — `CommonOp::SetOp` per-column nullability fold (analyzer.rs:1544) ORed across all children regardless of operator. Spark rule (verified vs `basicLogicalOperators.scala`): Union=OR, Intersect=AND (`left.nullable && right.nullable`), Except/Minus=left child only (`output=left.output`). τ used OR for all → bug for Intersect/Except.
+- Architecture: `.agent-output/architecture-pass-104.md` — split the fold: type widening (unify_types, ADR-006) unchanged; nullability computed per `kind` (Union `.any`, Intersect `.all`, Except children[0]).
+- Layer(s) touched: τ analyzer (`analyzer.rs` SetOp arm). No lowering/emission change.
+- ADR citations: ADR-006 (type widening — type half untouched), ADR-015 (Spark parity — per-operator nullability), ADR-005 (analyzer owns nullability).
+- Corpus signal: 150 → **153** (+3). set-004/006/008 GREEN (all set-* now green except set-009 mixed-type union). No regressions. **core_v2 DataFrame suite 312 → 313** (the operator-aware rule also fixed a DataFrame set-op case; shared analyzer, no regression).
+- Files: `crates/core/src/transpiler_v2/analyzer.rs`.
+- Tests added: 4 (Intersect AND, Except left-only both directions [guards first/last index flip], Union OR regression guard).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (polarity + n-ary + no-panic verified; exhaustive `match kind` forces recompile on new variants). Perf negligible.
+- Findings queued as follow-up: gx-007/008 ROLLUP/CUBE grouping-key nullability (analogous analyzer fix — grouping cols nullable under rollup/cube); set-009 mixed-type 3-way union (emission).
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 659/0, `sql_v2` 153/109/262, `core_v2` 313/324 no regression).
+- Commit SHA: (this commit).

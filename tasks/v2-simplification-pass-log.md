@@ -50,3 +50,27 @@ that survived the 2026-07-05 cleanup). No production callers.
   `rustfmt --edition 2021 --check` on touched files clean. `cargo test
   -p thunderduck-core --lib --tests` → 448 pass / 0 fail / 4 ignored
   (lib) + 1 pass / 0 fail / 4 ignored (runtime_integration).
+
+## Pass 2 — OPP-LLL (2026-07-05)
+
+Delete unused `crates/core/src/types/type_mapper.rs`. `TypeMapper`
+(Spark → DuckDB type-string helper for CAST/DDL) has zero non-self
+callers; τ's emission uses `render_data_type` in
+`transpiler_v2/emission.rs`.
+
+- **Files touched.**
+  - `crates/core/src/types/type_mapper.rs` — deleted (−72 LOC,
+    including its two unit tests).
+  - `crates/core/src/types/mod.rs` — drop `mod type_mapper;` +
+    `pub use type_mapper::TypeMapper;` (−2 lines).
+- **LOC delta.** −74.
+- **Corpus.** 314 → 314 (unchanged — dead-code deletion).
+- **Warnings.** No delta on touched files. `PipeIfUnresolved` warning
+  persists (Pass 4's target).
+- **Verify grep.** `git grep 'TypeMapper' crates/` returns zero hits
+  (only dev-journal historical references remain, which are docs).
+- **Gate.** `cargo check -p thunderduck-core` clean. Scoped
+  `rustfmt --edition 2021 --check` clean. `cargo test -p
+  thunderduck-core --lib --tests` → 446 pass / 0 fail / 4 ignored
+  (lib, −2 vs Pass 1 = removed TypeMapper unit tests) + 1 pass / 0
+  fail / 4 ignored (runtime_integration).

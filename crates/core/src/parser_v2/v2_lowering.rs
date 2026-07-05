@@ -22,15 +22,18 @@ use std::collections::HashMap;
 
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType as SqlDataType, DateTimeField, DuplicateTreatment,
-    ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, GroupByExpr, Interval, JoinConstraint, JoinOperator, LimitClause,
-    NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByExpr, OrderByKind,
-    Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
-    TableWithJoins, TrimWhereField, UnaryOperator, Value, ValueWithSpan,
-    WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
+    ExactNumberInfo, Expr, ExprWithAlias, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentList, FunctionArguments, GroupByExpr, Interval, JoinConstraint, JoinOperator,
+    LimitClause, NamedWindowDefinition, NamedWindowExpr, NullInclusion, ObjectName, ObjectNamePart,
+    OrderByExpr, OrderByKind, PivotValueSource, Query, Select, SelectItem, SetExpr, SetOperator,
+    SetQuantifier, Statement, TableFactor, TableWithJoins, TrimWhereField, UnaryOperator, Value,
+    ValueWithSpan, WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec,
+    WindowType,
 };
 
-use crate::transpiler_v2::ast::{CommonAst, CommonOp, GroupingKind, JoinType, SetOpKind};
+use crate::transpiler_v2::ast::{
+    CommonAst, CommonOp, GroupingKind, JoinType, PivotGrouping, SetOpKind, UnpivotIds,
+};
 use crate::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
     ExistsSubquery, Expression, FrameBoundary, FrameUnit, FunctionCall, InListExpression,
@@ -498,10 +501,150 @@ fn lower_table_factor(
                 with_ordinality: false,
             }))
         }
+        // SQL `PIVOT` (BigQuery/Snowflake/Databricks). Unlike the DataFrame
+        // path, SQL supplies no grouping list — the analyzer derives it from
+        // the resolved input schema (`grouping: PivotGrouping::Implicit`).
+        TableFactor::Pivot {
+            table,
+            aggregate_functions,
+            value_column,
+            value_source,
+            default_on_null,
+            alias: _,
+        } => {
+            // Spark has no PIVOT `DEFAULT ON NULL` clause — boundary reject.
+            if default_on_null.is_some() {
+                return Err(EmissionError::UnsupportedProtoShape {
+                    shape: "sql::pivot::default_on_null".to_owned(),
+                    reason: "PIVOT DEFAULT ON NULL has no Spark equivalent".to_owned(),
+                });
+            }
+            let input = Box::new(lower_table_factor(*table, cte_scope)?);
+            if value_column.len() != 1 {
+                return Err(EmissionError::UnsupportedProtoShape {
+                    shape: "sql::pivot::multi_value_column".to_owned(),
+                    reason: "PIVOT supports exactly one FOR column".to_owned(),
+                });
+            }
+            let pivot_column = lower_expr(
+                value_column
+                    .into_iter()
+                    .next()
+                    .expect("value_column length checked == 1"),
+                cte_scope,
+            )?;
+            let pivot_values = match value_source {
+                PivotValueSource::List(vals) => {
+                    let mut out: Vec<Expression> = Vec::with_capacity(vals.len());
+                    for ewa in vals {
+                        out.push(lower_expr_with_alias(ewa, cte_scope)?);
+                    }
+                    out
+                }
+                // ANY / subquery = dynamic pivot values; requires an eager
+                // DISTINCT query (Slice G) — Thunderduck-boundary (ADR-022),
+                // mirrors the analyzer's `Pivot[implicit-values]` punt.
+                PivotValueSource::Any(_) | PivotValueSource::Subquery(_) => {
+                    return Err(EmissionError::UnsupportedProtoShape {
+                        shape: "sql::pivot::dynamic_values".to_owned(),
+                        reason: "dynamic PIVOT values (ANY / subquery) require an eager DISTINCT query (Slice G)".to_owned(),
+                    });
+                }
+            };
+            let mut aggregates: Vec<Expression> = Vec::with_capacity(aggregate_functions.len());
+            for ewa in aggregate_functions {
+                aggregates.push(lower_expr_with_alias(ewa, cte_scope)?);
+            }
+            Ok(CommonAst::new(CommonOp::Pivot {
+                input,
+                grouping: PivotGrouping::Implicit,
+                pivot_column,
+                pivot_values,
+                aggregates,
+            }))
+        }
+        // SQL `UNPIVOT`. SQL lists only value columns; the id columns are
+        // implicit (`input − values`), derived by the analyzer.
+        TableFactor::Unpivot {
+            table,
+            value,
+            name,
+            columns,
+            null_inclusion,
+            alias: _,
+        } => {
+            // τ's Unpivot variant has no include-nulls field; EXCLUDE NULLS is
+            // the default. INCLUDE NULLS is unrepresentable — boundary reject.
+            if matches!(null_inclusion, Some(NullInclusion::IncludeNulls)) {
+                return Err(EmissionError::UnsupportedProtoShape {
+                    shape: "sql::unpivot::include_nulls".to_owned(),
+                    reason: "UNPIVOT INCLUDE NULLS is not representable in τ (EXCLUDE NULLS is the default)".to_owned(),
+                });
+            }
+            let input = Box::new(lower_table_factor(*table, cte_scope)?);
+            let value_column_name = expr_to_ident_string(&value).ok_or_else(|| {
+                EmissionError::UnsupportedProtoShape {
+                    shape: "sql::unpivot::value_non_ident".to_owned(),
+                    reason: "UNPIVOT value must be a bare column name".to_owned(),
+                }
+            })?;
+            let variable_column_name = name.value;
+            let mut values: Vec<String> = Vec::with_capacity(columns.len());
+            for ewa in columns {
+                if ewa.alias.is_some() {
+                    return Err(EmissionError::UnsupportedProtoShape {
+                        shape: "sql::unpivot::column_alias".to_owned(),
+                        reason: "UNPIVOT columns cannot be aliased in τ".to_owned(),
+                    });
+                }
+                let col = expr_to_ident_string(&ewa.expr).ok_or_else(|| {
+                    EmissionError::UnsupportedProtoShape {
+                        shape: "sql::unpivot::column_non_ident".to_owned(),
+                        reason: "UNPIVOT columns must be bare column names".to_owned(),
+                    }
+                })?;
+                values.push(col);
+            }
+            Ok(CommonAst::new(CommonOp::Unpivot {
+                input,
+                ids: UnpivotIds::Implicit,
+                values,
+                variable_column_name,
+                value_column_name,
+            }))
+        }
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::table_factor::{other:?}"),
             reason: "table factor not supported at Slice A.2".to_owned(),
         }),
+    }
+}
+
+/// Lower a sqlparser [`ExprWithAlias`], wrapping the lowered expression in an
+/// [`Expression::Alias`] only when an alias is present (mirrors
+/// [`lower_select_item`]). Used for PIVOT aggregate functions and pivot
+/// values, where `true AS act` must carry the alias but bare `10` must not.
+fn lower_expr_with_alias(
+    ewa: ExprWithAlias,
+    cte_scope: &CteScope,
+) -> Result<Expression, EmissionError> {
+    let inner = lower_expr(ewa.expr, cte_scope)?;
+    Ok(match ewa.alias {
+        Some(a) => Expression::Alias(AliasExpression {
+            expr: Box::new(inner),
+            alias: a.value,
+        }),
+        None => inner,
+    })
+}
+
+/// Extract a bare column name from a sqlparser [`Expr`] that must be a single
+/// identifier (`UNPIVOT` value / column names are stored as plain strings in
+/// τ). Returns `None` for any richer expression shape.
+fn expr_to_ident_string(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        _ => None,
     }
 }
 
@@ -1971,15 +2114,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_pivot_returns_unsupported_proto_shape() {
-        // `SELECT * FROM t PIVOT (...)` — sqlparser recognizes PIVOT clauses.
-        // If the input doesn't parse, that's still a boundary error we detect.
-        let result = parse("SELECT * FROM t PIVOT (SUM(x) FOR y IN (1, 2))");
-        assert!(matches!(
-            result,
-            Err(EmissionError::UnsupportedProtoShape { .. })
-                | Err(EmissionError::UnsupportedOp { .. })
-        ));
+    fn parse_pivot_lowers_to_common_op_pivot() {
+        // Pass 107: `SELECT * FROM t PIVOT (...)` now lowers to a
+        // `CommonOp::Pivot` with implicit (schema-derived) grouping.
+        let plan =
+            parse("SELECT * FROM t PIVOT (SUM(x) FOR y IN (1, 2))").expect("PIVOT should lower");
+        match pivot_node(plan) {
+            CommonOp::Pivot { grouping, .. } => {
+                assert_eq!(grouping, PivotGrouping::Implicit);
+            }
+            other => panic!("expected Pivot, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2580,6 +2725,116 @@ mod tests {
                 "expected AliasedRelation over the CTE body — a bare TableScan \
                  would mean the CTE was invisible inside the subquery, got {other:?}"
             ),
+        }
+    }
+
+    // ── SQL PIVOT / UNPIVOT lowering (pass 107) ──────────────────────────
+
+    /// Find the `CommonOp::Pivot` node under the outer `SELECT * FROM (…) PIVOT`.
+    fn pivot_node(plan: CommonAst) -> CommonOp {
+        match plan.op {
+            CommonOp::Project { input, .. } => input.op,
+            other => panic!("expected Project over Pivot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_sql_pivot_marks_grouping_implicit_and_wraps_aliased_values() {
+        // pv-001 shape: aliased FOR values must round-trip as `Alias` exprs so
+        // the analyzer can name the output columns after the aliases.
+        let plan = parse(
+            "SELECT * FROM (SELECT dept_id, active, salary FROM emp) \
+             PIVOT (avg(salary) FOR active IN (true AS act, false AS inact))",
+        )
+        .expect("should parse+lower");
+        match pivot_node(plan) {
+            CommonOp::Pivot {
+                grouping,
+                pivot_column,
+                pivot_values,
+                aggregates,
+                ..
+            } => {
+                assert_eq!(grouping, PivotGrouping::Implicit);
+                // Pivot column is the FOR column.
+                assert!(
+                    matches!(pivot_column, Expression::UnresolvedColumn(ref u) if u.name == "active")
+                );
+                // Both values are Alias-wrapped (true AS act / false AS inact).
+                assert_eq!(pivot_values.len(), 2);
+                match &pivot_values[0] {
+                    Expression::Alias(a) => assert_eq!(a.alias, "act"),
+                    other => panic!("expected Alias value, got {other:?}"),
+                }
+                match &pivot_values[1] {
+                    Expression::Alias(a) => assert_eq!(a.alias, "inact"),
+                    other => panic!("expected Alias value, got {other:?}"),
+                }
+                assert_eq!(aggregates.len(), 1);
+            }
+            other => panic!("expected Pivot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_sql_pivot_bare_numeric_values_stay_bare() {
+        // pv-005 shape: no aliases ⇒ values must NOT be wrapped in Alias.
+        let plan = parse(
+            "SELECT * FROM (SELECT dept_id, salary FROM emp) \
+             PIVOT (avg(salary) FOR dept_id IN (10, 20, 30))",
+        )
+        .expect("should parse+lower");
+        match pivot_node(plan) {
+            CommonOp::Pivot {
+                grouping,
+                pivot_values,
+                ..
+            } => {
+                assert_eq!(grouping, PivotGrouping::Implicit);
+                assert_eq!(pivot_values.len(), 3);
+                for v in &pivot_values {
+                    assert!(
+                        matches!(v, Expression::Literal(_)),
+                        "bare pivot value must stay a Literal, got {v:?}"
+                    );
+                }
+            }
+            other => panic!("expected Pivot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_sql_pivot_dynamic_values_rejected() {
+        let err = parse(
+            "SELECT * FROM (SELECT dept_id, active, salary FROM emp) \
+             PIVOT (avg(salary) FOR active IN (ANY))",
+        );
+        // ANY / dynamic values are a Thunderduck-boundary reject.
+        assert!(err.is_err(), "dynamic PIVOT values must be rejected");
+    }
+
+    #[test]
+    fn lower_sql_unpivot_marks_ids_implicit_and_maps_names() {
+        // pv-004 shape: value/name/columns map through; ids are Implicit.
+        let plan = parse(
+            "SELECT id, metric, val FROM (SELECT id, age, salary FROM emp) \
+             UNPIVOT (val FOR metric IN (age, salary))",
+        )
+        .expect("should parse+lower");
+        match pivot_node(plan) {
+            CommonOp::Unpivot {
+                ids,
+                values,
+                variable_column_name,
+                value_column_name,
+                ..
+            } => {
+                assert_eq!(ids, UnpivotIds::Implicit);
+                assert_eq!(values, vec!["age".to_owned(), "salary".to_owned()]);
+                assert_eq!(variable_column_name, "metric");
+                assert_eq!(value_column_name, "val");
+            }
+            other => panic!("expected Unpivot, got {other:?}"),
         }
     }
 }

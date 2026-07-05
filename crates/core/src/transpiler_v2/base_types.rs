@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use super::ast::{CommonAst, CommonOp};
+use super::ast::{CommonAst, CommonOp, PivotGrouping};
 use super::expression::{Expression, SubqueryPlan};
 use crate::types::StructType;
 
@@ -266,7 +266,13 @@ fn for_each_node_expr(op: &CommonOp, f: &mut dyn FnMut(&Expression)) {
             aggregates,
             ..
         } => {
-            for e in grouping
+            // Only explicit grouping carries expressions to walk; an implicit
+            // (SQL PIVOT) grouping is derived from the schema by the analyzer.
+            let grouping_exprs: &[Expression] = match grouping {
+                PivotGrouping::Explicit(g) => g,
+                PivotGrouping::Implicit => &[],
+            };
+            for e in grouping_exprs
                 .iter()
                 .chain(std::iter::once(pivot_column))
                 .chain(pivot_values)

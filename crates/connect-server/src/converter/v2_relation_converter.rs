@@ -31,7 +31,9 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType as ArrowDT;
 use arrow_ipc::reader::StreamReader;
-use thunderduck_core::transpiler_v2::ast::{CommonAst, CommonOp, FileFormat, JoinType};
+use thunderduck_core::transpiler_v2::ast::{
+    CommonAst, CommonOp, FileFormat, JoinType, PivotGrouping, UnpivotIds,
+};
 use thunderduck_core::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
     FunctionCall, InListExpression, Literal, LiteralValue, NullOrdering, SortDirection, SortOrder,
@@ -313,7 +315,7 @@ impl V2RelationConverter {
 
         Ok(CommonAst::new(CommonOp::Unpivot {
             input: Box::new(input),
-            ids,
+            ids: UnpivotIds::Explicit(ids),
             values,
             variable_column_name: u.variable_column_name.clone(),
             value_column_name: u.value_column_name.clone(),
@@ -707,7 +709,7 @@ impl V2RelationConverter {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(CommonAst::new(CommonOp::Pivot {
             input: Box::new(input),
-            grouping,
+            grouping: PivotGrouping::Explicit(grouping),
             pivot_column,
             pivot_values,
             aggregates,
@@ -2470,7 +2472,10 @@ mod tests {
                 aggregates,
                 ..
             } => {
-                assert_eq!(grouping.len(), 1);
+                match grouping {
+                    PivotGrouping::Explicit(g) => assert_eq!(g.len(), 1),
+                    PivotGrouping::Implicit => panic!("expected explicit grouping"),
+                }
                 assert_eq!(pivot_values.len(), 2);
                 assert_eq!(aggregates.len(), 1);
             }
@@ -2841,7 +2846,7 @@ mod tests {
                 value_column_name,
             } => {
                 assert!(matches!(input.op, CommonOp::TableScan { .. }));
-                assert_eq!(ids, vec!["id".to_owned()]);
+                assert_eq!(ids, UnpivotIds::Explicit(vec!["id".to_owned()]));
                 assert_eq!(values, vec!["age".to_owned(), "salary".to_owned()]);
                 assert_eq!(variable_column_name, "metric");
                 assert_eq!(value_column_name, "value");

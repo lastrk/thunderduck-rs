@@ -40,7 +40,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::ast::{CommonAst, CommonOp, FileFormat, JoinType};
+use super::ast::{CommonAst, CommonOp, FileFormat, JoinType, PivotGrouping, UnpivotIds};
 use super::base_types::BaseTypes;
 use super::error::EmissionError;
 use super::expression::{
@@ -2568,7 +2568,7 @@ fn project_output_schema(
 /// column is nullable.
 fn analyze_unpivot(
     input: CommonAst,
-    ids: Vec<String>,
+    ids: UnpivotIds,
     values: Vec<String>,
     variable_column_name: String,
     value_column_name: String,
@@ -2588,6 +2588,37 @@ fn analyze_unpivot(
         .collect();
     let find_field = |name: &str| -> Option<&StructField> {
         field_index.get(&name.to_ascii_lowercase()).copied()
+    };
+
+    // Resolve the id list. The DataFrame path supplies ids explicitly; SQL
+    // `UNPIVOT` supplies only value columns, so the analyzer derives the ids as
+    // `input schema − value columns` (input order) per Spark parity (ADR-015).
+    let ids: Vec<String> = match ids {
+        UnpivotIds::Explicit(v) => v,
+        UnpivotIds::Implicit => {
+            if values.is_empty() {
+                return Err(AnalyzerError::Other {
+                    reason: "SQL UNPIVOT requires at least one value column".to_owned(),
+                });
+            }
+            // Validate each value column resolves before deriving ids from it.
+            for v in &values {
+                if find_field(v).is_none() {
+                    return Err(AnalyzerError::UnknownColumn {
+                        name: v.clone(),
+                        qualifier: None,
+                    });
+                }
+            }
+            let value_set: std::collections::HashSet<String> =
+                values.iter().map(|v| v.to_ascii_lowercase()).collect();
+            input_schema
+                .fields
+                .iter()
+                .filter(|f| !value_set.contains(&f.name.to_ascii_lowercase()))
+                .map(|f| f.name.clone())
+                .collect()
+        }
     };
 
     // Validate every id column resolves.
@@ -2912,7 +2943,7 @@ fn analyze_freq_items(
 /// values pivot is fully supported.
 fn analyze_pivot(
     input: CommonAst,
-    grouping: Vec<Expression>,
+    grouping: PivotGrouping,
     pivot_column: Expression,
     pivot_values: Vec<Expression>,
     aggregates: Vec<Expression>,
@@ -2934,9 +2965,20 @@ fn analyze_pivot(
     }
     let typed_input = analyze_node(input, base_types)?;
     let input_schema = &typed_input.resolved_schema;
-    let grouping = resolve_expr_list(grouping, input_schema, base_types)?;
+    // Resolve the pivot column and aggregates first: the implicit-grouping
+    // derivation needs to know which columns the aggregates reference.
     let pivot_column = resolve_and_stamp(pivot_column, input_schema, base_types)?;
     let aggregates = resolve_expr_list(aggregates, input_schema, base_types)?;
+    // The DataFrame path supplies grouping explicitly (from `groupBy`); SQL
+    // `PIVOT` supplies none, so the analyzer derives it as
+    // `input schema − pivot column − aggregate-referenced columns`, in input
+    // order, per Spark parity (ADR-015).
+    let grouping = match grouping {
+        PivotGrouping::Explicit(g) => resolve_expr_list(g, input_schema, base_types)?,
+        PivotGrouping::Implicit => {
+            derive_implicit_grouping(input_schema, &pivot_column, &aggregates)
+        }
+    };
     // Pivot values are literals; they only need type resolution against the
     // pivot column (Spark coerces them into that type at read). We defer
     // typing to the emission stage — literals carry their own type already.
@@ -3001,6 +3043,170 @@ fn analyze_pivot(
         },
         resolved_schema: output_schema,
     })
+}
+
+/// Spark's implicit PIVOT grouping: the input columns minus the pivot column
+/// minus every column referenced by the aggregate argument(s), preserved in
+/// input-schema order (Spark parity per ADR-015). Used for SQL `PIVOT`, which
+/// supplies no grouping list. `count(*)` references no column (its `Star`
+/// argument contributes nothing), so every non-pivot column remains grouped.
+fn derive_implicit_grouping(
+    input_schema: &StructType,
+    pivot_column: &Expression,
+    aggregates: &[Expression],
+) -> Vec<Expression> {
+    let mut excluded: HashSet<String> = HashSet::new();
+    // Exclude the columns the pivot expression REFERENCES (not its output
+    // name). For a simple `FOR dept_id` this is just `dept_id`; for an
+    // expression pivot like `FOR extract(year FROM d)` it is the underlying
+    // `d` (not the literal name "extract"); an aliased pivot column strips its
+    // alias via the helper's `Alias` arm. Uniform across simple-column,
+    // expression, and alias cases via the exhaustive helper below.
+    collect_referenced_columns(pivot_column, &mut excluded);
+    // Exclude every column referenced by the aggregate argument(s).
+    for agg in aggregates {
+        collect_referenced_columns(agg, &mut excluded);
+    }
+    input_schema
+        .fields
+        .iter()
+        .filter(|f| !excluded.contains(&f.name.to_ascii_lowercase()))
+        .map(|f| {
+            Expression::ColumnReference(ColumnReference {
+                name: f.name.clone(),
+                qualifier: None,
+                data_type: Some(f.data_type.clone()),
+                nullable: Some(f.nullable),
+            })
+        })
+        .collect()
+}
+
+/// Recursively collect the (lowercased) names of every column referenced by an
+/// expression tree into `acc`. A bare `Star` contributes nothing (so
+/// `count(*)` references no column). Used by [`derive_implicit_grouping`].
+fn collect_referenced_columns(expr: &Expression, acc: &mut HashSet<String>) {
+    match expr {
+        Expression::ColumnReference(c) => {
+            acc.insert(c.name.to_ascii_lowercase());
+        }
+        Expression::UnresolvedColumn(u) => {
+            acc.insert(u.name.to_ascii_lowercase());
+        }
+        Expression::Star(_) => {}
+        Expression::Alias(a) => collect_referenced_columns(&a.expr, acc),
+        Expression::Binary(b) => {
+            collect_referenced_columns(&b.left, acc);
+            collect_referenced_columns(&b.right, acc);
+        }
+        Expression::Unary(u) => collect_referenced_columns(&u.operand, acc),
+        Expression::Cast(c) => collect_referenced_columns(&c.expr, acc),
+        Expression::FunctionCall(f) => {
+            for arg in &f.args {
+                collect_referenced_columns(arg, acc);
+            }
+        }
+        Expression::CaseWhen(cw) => {
+            for (w, t) in &cw.branches {
+                collect_referenced_columns(w, acc);
+                collect_referenced_columns(t, acc);
+            }
+            if let Some(e) = &cw.else_expr {
+                collect_referenced_columns(e, acc);
+            }
+        }
+        Expression::Between(b) => {
+            collect_referenced_columns(&b.expr, acc);
+            collect_referenced_columns(&b.low, acc);
+            collect_referenced_columns(&b.high, acc);
+        }
+        Expression::InList(i) => {
+            collect_referenced_columns(&i.expr, acc);
+            for item in &i.list {
+                collect_referenced_columns(item, acc);
+            }
+        }
+        Expression::Like(l) => {
+            collect_referenced_columns(&l.value, acc);
+            collect_referenced_columns(&l.pattern, acc);
+        }
+        Expression::IsDistinctFrom(d) => {
+            collect_referenced_columns(&d.left, acc);
+            collect_referenced_columns(&d.right, acc);
+        }
+        Expression::Window(w) => {
+            collect_referenced_columns(&w.func, acc);
+            for p in &w.partition_by {
+                collect_referenced_columns(p, acc);
+            }
+            for o in &w.order_by {
+                collect_referenced_columns(&o.expr, acc);
+            }
+        }
+        Expression::ArrayLiteral(a) => {
+            for e in &a.elements {
+                collect_referenced_columns(e, acc);
+            }
+        }
+        Expression::MapLiteral(m) => {
+            for (k, v) in &m.entries {
+                collect_referenced_columns(k, acc);
+                collect_referenced_columns(v, acc);
+            }
+        }
+        Expression::StructLiteral(s) => {
+            for (_name, e) in &s.fields {
+                collect_referenced_columns(e, acc);
+            }
+        }
+        Expression::RowConstructor(r) => {
+            for e in &r.elements {
+                collect_referenced_columns(e, acc);
+            }
+        }
+        Expression::ExtractValue(x) => {
+            collect_referenced_columns(&x.child, acc);
+            collect_referenced_columns(&x.extraction, acc);
+        }
+        Expression::UpdateFields(u) => {
+            collect_referenced_columns(&u.struct_expr, acc);
+            for (_name, update) in &u.updates {
+                if let Some(e) = update {
+                    collect_referenced_columns(e, acc);
+                }
+            }
+        }
+        // `x IN (subquery)`: the outer `expr` is a genuine outer-scope column
+        // reference (e.g. `dept_id IN (…)` references `dept_id`), so recurse
+        // into it. The subquery's inner plan is a SEPARATE scope — τ does not
+        // support correlated pivot aggregates, so we do not recurse into it
+        // (a correlated outer ref inside the inner plan contributes nothing).
+        Expression::InSubquery(s) => collect_referenced_columns(&s.expr, acc),
+        // `EXISTS (subquery)` / `(scalar subquery)`: the only sub-expressions
+        // live inside the subquery's inner plan, which is a separate scope
+        // (see `InSubquery` above). τ does not support correlated pivot
+        // aggregates, so treat these as referencing nothing from the outer.
+        Expression::ExistsSubquery(_) | Expression::ScalarSubquery(_) => {}
+        // A lambda body can reference an outer column (e.g.
+        // `transform(arr, x -> x + outer_col)`). Recurse into it: the body's
+        // `LambdaVariable` refs are lambda-local (handled below) and add
+        // nothing, so only real outer column refs are collected.
+        Expression::Lambda(l) => collect_referenced_columns(&l.body, acc),
+        // Lambda-local variable — not a schema column, contributes nothing.
+        Expression::LambdaVariable(_) => {}
+        // Opaque raw SQL: τ cannot introspect column refs out of an unparsed
+        // SQL string, so it contributes nothing to the exclusion set. (This is
+        // a `spark.expr(...)` passthrough; not reachable in the pivot cases τ
+        // supports.)
+        Expression::RawSql(_) => {}
+        // Pattern-driven column expander: the analyzer's Project pre-pass
+        // expands it into concrete `UnresolvedColumn`s before inference, so it
+        // does not survive into a resolved aggregate. No enumerable name here.
+        Expression::UnresolvedRegex(_) => {}
+        // Leaves — no sub-expression can carry a column reference. (`Star` is
+        // handled above so `count(*)` references no column.)
+        Expression::Literal(_) | Expression::Interval(_) => {}
+    }
 }
 
 /// Spark's rendering of a pivot value literal to a column name. Boolean
@@ -3210,8 +3416,8 @@ mod tests {
     use super::super::analyzer_fixtures;
     use super::super::ast::CommonAst;
     use super::super::expression::{
-        BinaryExpression, BinaryOp, ExistsSubquery, FunctionCall, InSubquery, Literal,
-        LiteralValue, ScalarSubquery, UnresolvedRegexExpression,
+        BetweenExpression, BinaryExpression, BinaryOp, ExistsSubquery, FunctionCall, InSubquery,
+        Literal, LiteralValue, ScalarSubquery, UnresolvedRegexExpression,
     };
     use super::*;
 
@@ -4555,7 +4761,7 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            ids: vec!["id".to_owned()],
+            ids: UnpivotIds::Explicit(vec!["id".to_owned()]),
             values: vec!["dept_id".to_owned(), "salary".to_owned()],
             variable_column_name: "metric".to_owned(),
             value_column_name: "value".to_owned(),
@@ -4585,7 +4791,7 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            ids: vec!["id".to_owned()],
+            ids: UnpivotIds::Explicit(vec!["id".to_owned()]),
             values: vec![],
             variable_column_name: "metric".to_owned(),
             value_column_name: "value".to_owned(),
@@ -4614,7 +4820,7 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            ids: vec!["not_a_col".to_owned()],
+            ids: UnpivotIds::Explicit(vec!["not_a_col".to_owned()]),
             values: vec!["salary".to_owned()],
             variable_column_name: "metric".to_owned(),
             value_column_name: "value".to_owned(),
@@ -4637,7 +4843,7 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            ids: vec!["id".to_owned(), "salary".to_owned()],
+            ids: UnpivotIds::Explicit(vec!["id".to_owned(), "salary".to_owned()]),
             values: vec!["SALARY".to_owned(), "dept_id".to_owned()],
             variable_column_name: "metric".to_owned(),
             value_column_name: "value".to_owned(),
@@ -4668,7 +4874,7 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            ids: vec!["id".to_owned()],
+            ids: UnpivotIds::Explicit(vec!["id".to_owned()]),
             values: vec!["dept_id".to_owned(), "salary".to_owned()],
             variable_column_name: "ID".to_owned(),
             value_column_name: "value".to_owned(),
@@ -4694,7 +4900,7 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            ids: vec!["id".to_owned()],
+            ids: UnpivotIds::Explicit(vec!["id".to_owned()]),
             values: vec!["dept_id".to_owned(), "salary".to_owned()],
             variable_column_name: "metric".to_owned(),
             value_column_name: "Id".to_owned(),
@@ -4766,11 +4972,13 @@ mod tests {
         });
         let ast = CommonAst::new(CommonOp::Pivot {
             input: Box::new(with_active),
-            grouping: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-                name: "dept_id".to_owned(),
-                qualifier: None,
-                plan_id: None,
-            })],
+            grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
+                UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            )]),
             pivot_column: Expression::UnresolvedColumn(UnresolvedColumn {
                 name: "active".to_owned(),
                 qualifier: None,
@@ -4820,11 +5028,13 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            grouping: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-                name: "dept_id".to_owned(),
-                qualifier: None,
-                plan_id: None,
-            })],
+            grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
+                UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            )]),
             pivot_column: Expression::UnresolvedColumn(UnresolvedColumn {
                 name: "salary".to_owned(),
                 qualifier: None,
@@ -4861,11 +5071,13 @@ mod tests {
         });
         let ast = CommonAst::new(CommonOp::Pivot {
             input: Box::new(emp_scan),
-            grouping: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-                name: "dept_id".to_owned(),
-                qualifier: None,
-                plan_id: None,
-            })],
+            grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
+                UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            )]),
             pivot_column: Expression::UnresolvedColumn(UnresolvedColumn {
                 name: "dept_id".to_owned(),
                 qualifier: None,
@@ -4933,11 +5145,13 @@ mod tests {
         });
         let ast = CommonAst::new(CommonOp::Pivot {
             input: Box::new(emp_scan),
-            grouping: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-                name: "dept_id".to_owned(),
-                qualifier: None,
-                plan_id: None,
-            })],
+            grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
+                UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            )]),
             pivot_column: Expression::UnresolvedColumn(UnresolvedColumn {
                 name: "salary".to_owned(),
                 qualifier: None,
@@ -4991,11 +5205,13 @@ mod tests {
         });
         let ast = CommonAst::new(CommonOp::Pivot {
             input: Box::new(emp_scan),
-            grouping: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-                name: "dept_id".to_owned(),
-                qualifier: None,
-                plan_id: None,
-            })],
+            grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
+                UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            )]),
             pivot_column: Expression::UnresolvedColumn(UnresolvedColumn {
                 name: "salary".to_owned(),
                 qualifier: None,
@@ -5026,6 +5242,296 @@ mod tests {
                 assert!(
                     reason.contains("null"),
                     "expected null-rejection reason, got: {reason}"
+                );
+            }
+            other => panic!("expected AnalyzerError::Other, got {other:?}"),
+        }
+    }
+
+    // ── Implicit PIVOT grouping / UNPIVOT ids (pass 107, SQL front-end) ──
+
+    /// SQL PIVOT supplies no grouping list. The analyzer derives it as
+    /// `input − pivot column − aggregate-referenced columns`, in input order.
+    /// emp = {id, name, dept_id, salary}; pivot on dept_id, agg avg(salary)
+    /// ⇒ grouping {id, name}.
+    #[test]
+    fn analyze_pivot_implicit_grouping_excludes_pivot_and_agg_refs() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: PivotGrouping::Implicit,
+            pivot_column: Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "dept_id".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            }),
+            pivot_values: vec![
+                Expression::Literal(Literal {
+                    value: LiteralValue::Int(10),
+                    data_type: DataType::Integer,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::Int(20),
+                    data_type: DataType::Integer,
+                }),
+            ],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "avg".to_owned(),
+                args: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "salary".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                })],
+                distinct: false,
+            })],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        match &typed.op {
+            TypedOp::Pivot { grouping, .. } => {
+                let names: Vec<&str> = grouping
+                    .iter()
+                    .map(|g| match g {
+                        Expression::ColumnReference(c) => c.name.as_str(),
+                        other => panic!("expected resolved ColumnReference, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(names, vec!["id", "name"]);
+            }
+            other => panic!("expected TypedOp::Pivot, got {other:?}"),
+        }
+    }
+
+    /// `count(*)` references no column (its `Star` argument contributes
+    /// nothing), so every non-pivot column stays in the implicit grouping.
+    /// pivot on dept_id, agg count(*) ⇒ grouping {id, name, salary}.
+    #[test]
+    fn analyze_pivot_implicit_grouping_count_star_keeps_all_non_pivot_cols() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: PivotGrouping::Implicit,
+            pivot_column: Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "dept_id".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            }),
+            pivot_values: vec![
+                Expression::Literal(Literal {
+                    value: LiteralValue::Int(10),
+                    data_type: DataType::Integer,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::Int(20),
+                    data_type: DataType::Integer,
+                }),
+            ],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "count".to_owned(),
+                args: vec![Expression::Star(StarExpression { qualifier: None })],
+                distinct: false,
+            })],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        match &typed.op {
+            TypedOp::Pivot { grouping, .. } => {
+                let names: Vec<&str> = grouping
+                    .iter()
+                    .map(|g| match g {
+                        Expression::ColumnReference(c) => c.name.as_str(),
+                        other => panic!("expected resolved ColumnReference, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(names, vec!["id", "name", "salary"]);
+            }
+            other => panic!("expected TypedOp::Pivot, got {other:?}"),
+        }
+    }
+
+    /// M2 regression: a column referenced only through a nested `CASE` /
+    /// `BETWEEN` must still be excluded from the implicit grouping. Before the
+    /// exhaustive `collect_referenced_columns`, the `Between` node fell into a
+    /// `_ => {}` catch-all, so `id` leaked back into the grouping (silent wrong
+    /// result). Agg `sum(CASE WHEN id BETWEEN 1 AND 2 THEN salary END)` on a
+    /// pivot over dept_id references {id, salary}; excluding those plus the
+    /// pivot column leaves grouping {name}.
+    #[test]
+    fn analyze_pivot_implicit_grouping_excludes_column_referenced_through_case_between() {
+        let bt = base_types_with_emp_dept();
+        let case_between = Expression::CaseWhen(CaseWhenExpression {
+            branches: vec![(
+                Expression::Between(BetweenExpression {
+                    expr: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                        name: "id".to_owned(),
+                        qualifier: None,
+                        plan_id: None,
+                    })),
+                    low: Box::new(Expression::Literal(Literal {
+                        value: LiteralValue::Int(1),
+                        data_type: DataType::Integer,
+                    })),
+                    high: Box::new(Expression::Literal(Literal {
+                        value: LiteralValue::Int(2),
+                        data_type: DataType::Integer,
+                    })),
+                    negated: false,
+                }),
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "salary".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+            )],
+            else_expr: None,
+        });
+        let ast = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: PivotGrouping::Implicit,
+            pivot_column: Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "dept_id".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            }),
+            pivot_values: vec![Expression::Literal(Literal {
+                value: LiteralValue::Int(10),
+                data_type: DataType::Integer,
+            })],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "sum".to_owned(),
+                args: vec![case_between],
+                distinct: false,
+            })],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        match &typed.op {
+            TypedOp::Pivot { grouping, .. } => {
+                let names: Vec<&str> = grouping
+                    .iter()
+                    .map(|g| match g {
+                        Expression::ColumnReference(c) => c.name.as_str(),
+                        other => panic!("expected resolved ColumnReference, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(names, vec!["name"]);
+            }
+            other => panic!("expected TypedOp::Pivot, got {other:?}"),
+        }
+    }
+
+    /// M1 regression: pivoting on an EXPRESSION column must exclude the
+    /// underlying REFERENCED column, not the expression's output name. Pivot
+    /// over `abs(dept_id)` references `dept_id`; the old code excluded the
+    /// literal name "abs" (no such column) and left `dept_id` in the grouping.
+    /// With structural exclusion, agg `avg(salary)` ⇒ grouping {id, name}.
+    #[test]
+    fn analyze_pivot_implicit_grouping_expression_pivot_excludes_referenced_column() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: PivotGrouping::Implicit,
+            pivot_column: Expression::FunctionCall(FunctionCall {
+                name: "abs".to_owned(),
+                args: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                })],
+                distinct: false,
+            }),
+            pivot_values: vec![Expression::Literal(Literal {
+                value: LiteralValue::Int(10),
+                data_type: DataType::Integer,
+            })],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "avg".to_owned(),
+                args: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "salary".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                })],
+                distinct: false,
+            })],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        match &typed.op {
+            TypedOp::Pivot { grouping, .. } => {
+                let names: Vec<&str> = grouping
+                    .iter()
+                    .map(|g| match g {
+                        Expression::ColumnReference(c) => c.name.as_str(),
+                        other => panic!("expected resolved ColumnReference, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(names, vec!["id", "name"]);
+            }
+            other => panic!("expected TypedOp::Pivot, got {other:?}"),
+        }
+    }
+
+    /// SQL UNPIVOT lists only value columns; the analyzer derives ids as
+    /// `input − values`, in input order. values = {dept_id, salary}
+    /// ⇒ ids {id, name}.
+    #[test]
+    fn analyze_unpivot_implicit_ids_are_input_minus_values() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Unpivot {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            ids: UnpivotIds::Implicit,
+            values: vec!["dept_id".to_owned(), "salary".to_owned()],
+            variable_column_name: "metric".to_owned(),
+            value_column_name: "val".to_owned(),
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        match &typed.op {
+            TypedOp::Unpivot { ids, .. } => {
+                assert_eq!(ids, &vec!["id".to_owned(), "name".to_owned()]);
+            }
+            other => panic!("expected TypedOp::Unpivot, got {other:?}"),
+        }
+        // Output schema: <ids> + metric (STRING NN) + val (widened nullable).
+        let names: Vec<&str> = typed
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["id", "name", "metric", "val"]);
+    }
+
+    /// `UnpivotIds::Implicit` with an empty value list is nonsensical (both
+    /// axes implicit) — the analyzer rejects it.
+    #[test]
+    fn analyze_unpivot_implicit_ids_empty_values_rejected() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Unpivot {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            ids: UnpivotIds::Implicit,
+            values: vec![],
+            variable_column_name: "metric".to_owned(),
+            value_column_name: "val".to_owned(),
+        });
+        match analyze(ast, &bt) {
+            Err(AnalyzerError::Other { reason }) => {
+                assert!(
+                    reason.contains("value column"),
+                    "expected value-column reason, got: {reason}"
                 );
             }
             other => panic!("expected AnalyzerError::Other, got {other:?}"),

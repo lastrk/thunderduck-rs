@@ -814,3 +814,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 677/0, `sql_v2` 160/102/262, `core_v2` 313/324 no regression).
 - Commit SHA: (this commit).
+
+## Pass 107 — 2026-07-05 — SQL corpus: PIVOT / UNPIVOT (pv-001 cluster) [run 2]
+- **Corpus: SQL front-end.** Target: pv-001/002/003/005 (PIVOT single/count/multi-agg/numeric-IN), pv-004 (UNPIVOT). pv-006 (stack()) out. NOT lowering-only — 3 gaps beyond the table-factor lowering.
+- Diagnostic: `.agent-output/diagnostic-pass-107.md` — τ has `CommonOp::Pivot`/`Unpivot` + analyzer + emission (green via DataFrame path), but: G1 PIVOT implicit grouping (SQL has no grouping list; = input − pivot − agg-refs), G2 UNPIVOT implicit ids (= input − values), G3 PIVOT value-alias emission strip.
+- Architecture: `.agent-output/architecture-pass-107.md` — two closed-set AST markers `PivotGrouping{Explicit,Implicit}` / `UnpivotIds{Explicit,Implicit}` (empty≠implicit); SQL lowering sets Implicit, DataFrame `convert_pivot`/`convert_unpivot` set Explicit (behavior-neutral); analyzer computes implicit sets from resolved input schema; emission G3 one-line alias strip.
+- Layer(s) touched: τ ast + lowering + analyzer + emission + base_types + connect-server converter (6 files). ADR-005/006 (analyzer), ADR-022 (dynamic PIVOT values / INCLUDE NULLS / aliased unpivot cols → loud boundary reject), enums-for-closed-sets idiom.
+- Corpus signal: 160 → **164** (+4). pv-001/003/004/005 GREEN. **core_v2 held at 313 (no regression** — AST enum behavior-neutral for the Explicit/DataFrame path). pv-002 (count(*) pivot value diff) + pv-006 (stack generator) red.
+- Files: `crates/core/src/transpiler_v2/{ast,analyzer,emission,base_types}.rs`, `crates/core/src/parser_v2/v2_lowering.rs`, `crates/connect-server/src/converter/v2_relation_converter.rs`.
+- Tests added: ~13 (lowering PIVOT/UNPIVOT→Implicit + aliased values + dynamic-value reject; analyzer implicit grouping/ids; emission G3; + M1/M2 fix tests).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High. **M1 + M2 (Medium) CLOSED in-pass** — implicit-grouping reference collection was name-based (M1) and had a `_ => {}` catch-all silently dropping refs inside Between/InList/Window/etc. (M2, gotcha #3/#9 silent-wrong-result class). Fixed: `collect_referenced_columns` made EXHAUSTIVE over all 28 Expression variants (future variant now fails to compile); pivot column excluded structurally via it. Perf negligible.
+- Findings queued as follow-up: pv-002 (count(*) pivot value/schema diff); pv-006 stack() (generator, separate); L2/L3 (redundant unpivot validation; pivot-result alias qualification).
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean both crates, rustfmt clean, `cargo test -p thunderduck-core --lib` 688/0, `cargo test -p thunderduck-connect-server --bins` 74/0, `sql_v2` 164/98/262, `core_v2` 313/324 no regression).
+- Commit SHA: (this commit).

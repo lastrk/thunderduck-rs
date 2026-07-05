@@ -1338,7 +1338,14 @@ fn render_pivot(
 
     let mut out_idx = grouping.len();
     for pv in pivot_values {
-        let pv_sql = render_expr(pv, input_schema)?;
+        // Strip any wrapping Alias so the CASE comparison references the bare
+        // value; the alias only carries the output column name (already read
+        // from the analyzer-stamped output schema below).
+        let bare_pv = match pv {
+            Expression::Alias(a) => a.expr.as_ref(),
+            other => other,
+        };
+        let pv_sql = render_expr(bare_pv, input_schema)?;
         for a in aggregates {
             if !first {
                 slots.push_str(", ");
@@ -5831,7 +5838,7 @@ pub(crate) fn extension_targets() -> HashSet<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transpiler_v2::ast::{CommonAst, CommonOp, SetOpKind};
+    use crate::transpiler_v2::ast::{CommonAst, CommonOp, PivotGrouping, SetOpKind, UnpivotIds};
     use crate::transpiler_v2::base_types::BaseTypes;
     use crate::transpiler_v2::expression::{
         AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
@@ -7362,13 +7369,13 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            grouping: vec![Expression::UnresolvedColumn(
+            grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "dept_id".to_owned(),
                     qualifier: None,
                     plan_id: None,
                 },
-            )],
+            )]),
             pivot_column: Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "id".to_owned(),
@@ -7417,13 +7424,13 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            grouping: vec![Expression::UnresolvedColumn(
+            grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "dept_id".to_owned(),
                     qualifier: None,
                     plan_id: None,
                 },
-            )],
+            )]),
             pivot_column: Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "id".to_owned(),
@@ -7469,6 +7476,49 @@ mod tests {
         assert!(sql.contains(" AS \"1_c\""), "got: {sql}");
     }
 
+    /// G3 (pass 107): an Alias-wrapped pivot value (SQL `IN (1 AS one)`) must
+    /// have its alias stripped inside the CASE comparison — the alias only
+    /// names the output column (`AS "one"`), it must not leak into the CASE.
+    #[test]
+    fn render_pivot_strips_alias_from_pivot_value_in_case() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: PivotGrouping::Implicit,
+            pivot_column: Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            ),
+            pivot_values: vec![Expression::Alias(AliasExpression {
+                alias: "one".to_owned(),
+                expr: Box::new(int_lit(1)),
+            })],
+            aggregates: vec![Expression::Alias(AliasExpression {
+                alias: "n".to_owned(),
+                expr: Box::new(Expression::FunctionCall(FunctionCall {
+                    name: "count".to_owned(),
+                    args: vec![int_lit(1)],
+                    distinct: false,
+                })),
+            })],
+        });
+        let sql = generate(&ast, &bt).expect("generate aliased-value pivot");
+        // The CASE compares against the bare literal, not `1 AS one`.
+        assert!(
+            sql.contains("IS NOT DISTINCT FROM 1") && !sql.contains("IS NOT DISTINCT FROM 1 AS"),
+            "alias must be stripped inside the CASE; got: {sql}"
+        );
+        // The alias names the output column (a bare identifier needs no quotes).
+        assert!(sql.contains(" AS one "), "got: {sql}");
+    }
+
     #[test]
     fn render_unpivot_emits_duckdb_unpivot_shape() {
         // Anchor: piv-004 shape — emits
@@ -7482,7 +7532,7 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            ids: vec!["id".to_owned()],
+            ids: UnpivotIds::Explicit(vec!["id".to_owned()]),
             values: vec!["dept_id".to_owned(), "salary".to_owned()],
             variable_column_name: "metric".to_owned(),
             value_column_name: "value".to_owned(),

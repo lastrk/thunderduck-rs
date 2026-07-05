@@ -5610,38 +5610,16 @@ fn render_data_type(dt: &DataType) -> String {
     }
 }
 
-/// PySpark parity: dedup a list of struct field names identically to
-/// `pyspark.sql.pandas.types._dedup_names`. Names that appear more than
-/// once are suffixed with `_{i}` where `i` counts from 0 in the order the
-/// name appears. Names that appear once are unchanged.
-///
-/// Example: `["tags", "tags", "id"]` → `["tags_0", "tags_1", "id"]`.
+/// PySpark parity dedup for struct field names — thin call site for the
+/// shared [`crate::types::pyspark_parity::dedup_names`] helper.
 ///
 /// Used by [`render_data_type`] so the DuckDB substrate for
 /// `CAST(x AS STRUCT(...))` never carries duplicate field names, which
 /// DuckDB's binder refuses. The outbound Arrow-schema stamp in the
-/// `connect-server` crate uses the same dedup convention, so DuckDB's
+/// `connect-server` crate consumes the same helper, so DuckDB's
 /// substrate names and the stamp's target names line up bit-for-bit.
 fn dedup_struct_field_names(names: &[&str]) -> Vec<String> {
-    use std::collections::HashMap;
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for n in names {
-        *counts.entry(*n).or_insert(0) += 1;
-    }
-    let mut running: HashMap<&str, usize> = HashMap::new();
-    names
-        .iter()
-        .map(|n| {
-            if counts.get(*n).copied().unwrap_or(0) > 1 {
-                let i = running.entry(*n).or_insert(0);
-                let out = format!("{n}_{i}");
-                *i += 1;
-                out
-            } else {
-                (*n).to_owned()
-            }
-        })
-        .collect()
+    crate::types::pyspark_parity::dedup_names(names)
 }
 
 // ── Extension allow-list (§4.1 stub — populated by τ's extension-target wiring) ──────────────────

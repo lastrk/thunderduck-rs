@@ -33,40 +33,13 @@
 //! `Schema` included) so pyarrow's `Array.to_pylist()` succeeds and the
 //! dict keys line up with `_dedup_names(df.schema.names)`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType as ArrowDt, Field, Fields, Schema};
 use arrow::record_batch::RecordBatchOptions;
+use thunderduck_core::types::pyspark_parity::dedup_names;
 use thunderduck_core::types::{DataType as TdckDt, StructType as TdckStruct};
-
-/// PySpark parity: dedup a list of field names identically to
-/// `pyspark.sql.pandas.types._dedup_names`. Names that appear more than once
-/// are suffixed with `_{i}` where `i` counts from 0 in the order the name
-/// appears. Names that appear once are unchanged.
-///
-/// Example: `["tags", "tags", "id"]` → `["tags_0", "tags_1", "id"]`.
-fn dedup_names(names: &[&str]) -> Vec<String> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for n in names {
-        *counts.entry(*n).or_insert(0) += 1;
-    }
-    let mut running: HashMap<&str, usize> = HashMap::new();
-    names
-        .iter()
-        .map(|n| {
-            if counts.get(*n).copied().unwrap_or(0) > 1 {
-                let i = running.entry(*n).or_insert(0);
-                let out = format!("{n}_{i}");
-                *i += 1;
-                out
-            } else {
-                (*n).to_owned()
-            }
-        })
-        .collect()
-}
 
 /// A structural mismatch between τ's analyzer `resolved_schema` and the
 /// DuckDB-produced Arrow schema at some position in the schema tree.

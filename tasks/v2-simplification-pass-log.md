@@ -491,3 +491,39 @@ helpers that consume them.
 - **Warnings.** No delta.
 - **Gate.** `cargo test -p thunderduck-core --lib` → 452 pass / 0
   fail. Scoped `rustfmt --edition 2021 --check` clean.
+
+## Pass 12 — OPP-O (2026-07-05)
+
+Extract the duplicated `dedup_names` PySpark-parity helper into a
+shared, INV10-safe module `crates/core/src/types/pyspark_parity.rs`.
+Two copies existed: `crates/connect-server/src/arrow_schema_stamp.rs`
+(private) and `crates/core/src/transpiler_v2/emission.rs`
+(`dedup_struct_field_names`). Both are rule-of-two duplication with a
+documented sync invariant (τ substrate names + outbound Arrow stamp
+target names must match bit-for-bit for `arrays_zip` / duplicate
+STRUCT field cases). Extraction eliminates the sync tax.
+
+- **Files touched.**
+  - `crates/core/src/types/pyspark_parity.rs` — new, +91 LOC (fn +
+    5-case unit test suite pinning the PySpark rule).
+  - `crates/core/src/types/mod.rs` — `pub mod pyspark_parity;`.
+  - `crates/core/src/transpiler_v2/emission.rs` — replace 21-LOC
+    body of `dedup_struct_field_names` with a one-line delegation
+    to `crate::types::pyspark_parity::dedup_names(names)`. `Docstring
+    updated to name the shared helper.
+  - `crates/connect-server/src/arrow_schema_stamp.rs` — delete the
+    duplicate `dedup_names` fn (−26 LOC) + its local
+    `use std::collections::HashMap;` (no longer needed here). Import
+    via `use thunderduck_core::types::pyspark_parity::dedup_names;`.
+    Callers stay identical.
+- **LOC delta.** +91 new file; net −45 across the two consumer files
+  (both duplicate bodies collapse to a single import line each).
+  Total: +46 LOC across the pass, but the sync tax is now zero.
+- **INV10.** Safe. `dedup_names(&[&str]) -> Vec<String>` is
+  value-level in/out. No τ types cross the boundary.
+- **Corpus.** 314 → 314 (behavior-preserving; both call sites now
+  invoke the identical fn body).
+- **Warnings.** No delta.
+- **Gate.** `cargo test -p thunderduck-core --lib`: 453 pass / 0
+  fail (baseline 452 + 1 new `pyspark_parity::tests`). Scoped
+  `rustfmt --edition 2021 --check` clean.

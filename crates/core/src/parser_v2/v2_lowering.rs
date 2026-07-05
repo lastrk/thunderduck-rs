@@ -26,9 +26,9 @@ use sqlparser::ast::{
     FunctionArgumentList, FunctionArguments, GroupByExpr, Interval, JoinConstraint, JoinOperator,
     LimitClause, NamedWindowDefinition, NamedWindowExpr, NullInclusion, ObjectName, ObjectNamePart,
     OrderByExpr, OrderByKind, PivotValueSource, Query, Select, SelectItem, SetExpr, SetOperator,
-    SetQuantifier, Statement, TableFactor, TableWithJoins, TrimWhereField, UnaryOperator, Value,
-    ValueWithSpan, WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec,
-    WindowType,
+    SetQuantifier, Statement, TableFactor, TableWithJoins, TrimWhereField, TypedString,
+    UnaryOperator, Value, ValueWithSpan, WindowFrame as SqlWindowFrame, WindowFrameBound,
+    WindowFrameUnits, WindowSpec, WindowType,
 };
 
 use crate::transpiler_v2::ast::{
@@ -1178,6 +1178,15 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             subquery: SubqueryPlan::Unanalyzed(Box::new(lower_query(*subquery, cte_scope)?)),
             negated,
         })),
+        // Typed-string literals `DATE '...'` / `TIMESTAMP '...'` (lit-001,
+        // lit-002). Spark's DATE/TIMESTAMP literals are NON-NULL constants, so
+        // lower them to non-null `LiteralValue::Date`/`Timestamp` values (a
+        // Literal is non-null by construction) rather than a `CAST(str AS ..)`
+        // (nullable=TRUE). The string→epoch-days/-micros conversion is a
+        // self-contained proleptic-Gregorian parser (no chrono dep). Malformed
+        // input and other typed-string data types stay a Thunderduck boundary
+        // (ADR-022).
+        Expr::TypedString(ts) => lower_typed_string(ts),
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::expr::{}", expr_kind(&other)),
             reason: "expression shape not supported at Slice A.2".to_owned(),
@@ -1640,6 +1649,183 @@ fn extract_interval_int(expr: &Expr) -> Option<i32> {
     }
 }
 
+/// Lower a `DATE '...'` / `TIMESTAMP '...'` typed-string literal to a NON-NULL
+/// `LiteralValue::Date`/`Timestamp` value (Spark's DATE/TIMESTAMP literals are
+/// non-null constants). See the `Expr::TypedString` arm.
+fn lower_typed_string(ts: TypedString) -> Result<Expression, EmissionError> {
+    let is_timestamp = match &ts.data_type {
+        SqlDataType::Date => false,
+        SqlDataType::Timestamp(_, _) => true,
+        other => {
+            return Err(EmissionError::UnsupportedProtoShape {
+                shape: format!("sql::typed_string::{other:?}"),
+                reason: "only DATE and TIMESTAMP typed-string literals are supported".to_owned(),
+            });
+        }
+    };
+    let value = ts
+        .value
+        .into_string()
+        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+            shape: "sql::typed_string::non_string_value".to_owned(),
+            reason: "typed-string literal value must be a string".to_owned(),
+        })?;
+    let (literal, data_type) = if is_timestamp {
+        let micros = parse_timestamp_to_epoch_micros(&value).ok_or_else(|| {
+            EmissionError::UnsupportedProtoShape {
+                shape: "sql::typed_string::malformed".to_owned(),
+                reason: format!("cannot parse TIMESTAMP literal `{value}`"),
+            }
+        })?;
+        (LiteralValue::Timestamp(micros), DataType::Timestamp)
+    } else {
+        let days = parse_date_to_epoch_days(&value).ok_or_else(|| {
+            EmissionError::UnsupportedProtoShape {
+                shape: "sql::typed_string::malformed".to_owned(),
+                reason: format!("cannot parse DATE literal `{value}`"),
+            }
+        })?;
+        (LiteralValue::Date(days), DataType::Date)
+    };
+    Ok(Expression::Literal(Literal {
+        value: literal,
+        data_type,
+    }))
+}
+
+/// Parse a `YYYY-MM-DD` date string into days since the Unix epoch
+/// (1970-01-01), using the proleptic-Gregorian civil algorithm (Howard
+/// Hinnant `days_from_civil`). Returns `None` on malformed input.
+fn parse_date_to_epoch_days(s: &str) -> Option<i32> {
+    let parts: Vec<&str> = s.trim().split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let year: i64 = parts[0].parse().ok()?;
+    let month: i64 = parts[1].parse().ok()?;
+    let day: i64 = parts[2].parse().ok()?;
+    // Bound the year to Spark's DATE domain [1, 9999] (M1). This both matches
+    // Spark's supported range and keeps `days_from_civil` (era * 146097) and the
+    // downstream timestamp micros multiply (`days * 86_400_000_000`) far from
+    // i64 overflow — no panic in debug, no silent wrap in release.
+    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) {
+        return None;
+    }
+    // Validate the day against the actual length of the month, leap-year aware
+    // (H1). Spark ANSI rejects e.g. `2026-02-30`, `2026-04-31`, `2023-02-29`
+    // rather than silently rolling over to a wrong date.
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month: [i64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let max_day = days_in_month[(month - 1) as usize];
+    if !(1..=max_day).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) as i32)
+}
+
+/// Howard Hinnant's `days_from_civil`: days since 1970-01-01 for a
+/// proleptic-Gregorian `(year, month, day)` with `month ∈ [1,12]`.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// Parse a `YYYY-MM-DD HH:MM:SS[.ffffff]` timestamp string (space or `T`
+/// separator; optional fractional seconds) into microseconds since the Unix
+/// epoch. No timezone handling — treated as a session-local wall-clock instant,
+/// matching how τ's `Timestamp` literal is interpreted. Returns `None` on
+/// malformed input.
+fn parse_timestamp_to_epoch_micros(s: &str) -> Option<i64> {
+    let trimmed = s.trim();
+    let (date_part, time_part) = match trimmed.split_once(['T', ' ']) {
+        Some((d, t)) => (d, t),
+        None => (trimmed, "00:00:00"),
+    };
+    let days = parse_date_to_epoch_days(date_part)? as i64;
+
+    let (hms, frac) = match time_part.split_once('.') {
+        Some((h, f)) => (h, Some(f)),
+        None => (time_part, None),
+    };
+    let time_fields: Vec<&str> = hms.split(':').collect();
+    if time_fields.len() != 3 {
+        return None;
+    }
+    let hh: i64 = time_fields[0].parse().ok()?;
+    let mm: i64 = time_fields[1].parse().ok()?;
+    let ss: i64 = time_fields[2].parse().ok()?;
+    if !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || !(0..=60).contains(&ss) {
+        return None;
+    }
+
+    // Fractional seconds → microseconds: pad/truncate the digits to exactly 6.
+    let frac_micros: i64 = match frac {
+        None => 0,
+        Some(f) => {
+            if f.is_empty() || !f.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let mut digits: String = f.chars().take(6).collect();
+            while digits.len() < 6 {
+                digits.push('0');
+            }
+            digits.parse().ok()?
+        }
+    };
+
+    Some(days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss) * 1_000_000 + frac_micros)
+}
+
+/// Derive `(precision, scale)` for a bare SQL decimal literal, mirroring the
+/// value-derived branch of the connect-server `normalize_decimal_literal`
+/// (Apache Spark `Decimal.set()`): `scale` = fractional digits; `precision` =
+/// significant integer digits + scale, floored at `max(scale, 1)`. Sign and
+/// leading integer zeros are not significant. `100.25`→(5,2); `3.142`→(4,3);
+/// `0.00`→(2,2).
+fn decimal_literal_precision_scale(s: &str) -> (u8, u8) {
+    let trimmed = s.trim_start_matches(['+', '-']);
+    let (int_part, frac_part) = match trimmed.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (trimmed, ""),
+    };
+    let raw_int_digits = int_part
+        .trim_start_matches('0')
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .count() as u8;
+    let scale = frac_part.chars().filter(|c| c.is_ascii_digit()).count() as u8;
+    // Clamp precision to DECIMAL's MAX_PRECISION = 38 (M2), matching the mirrored
+    // `normalize_decimal_literal` in v2_relation_converter.rs. A literal with more
+    // than 38 significant digits must not yield `Decimal(precision > 38)`, which is
+    // invalid in both Spark and DuckDB.
+    let mut precision = raw_int_digits
+        .saturating_add(scale)
+        .max(scale)
+        .max(1)
+        .min(38);
+    if scale > precision {
+        precision = scale.min(38);
+    }
+    (precision, scale)
+}
+
 fn lower_value(vw: ValueWithSpan) -> Result<Expression, EmissionError> {
     match vw.value {
         Value::Number(s, _) => {
@@ -1655,6 +1841,20 @@ fn lower_value(vw: ValueWithSpan) -> Result<Expression, EmissionError> {
                         data_type: DataType::Long,
                     }))
                 }
+            } else if s.contains('.') && !s.contains(['e', 'E']) {
+                // Spark parses a fixed-point numeric literal (a `.` with no
+                // exponent) as DECIMAL, not DOUBLE — e.g. `100.25` is
+                // Decimal(5,2). Preserve the literal string to keep precision;
+                // exponent forms (`1.5e3`) still route to Double below (lit-007).
+                let (precision, scale) = decimal_literal_precision_scale(&s);
+                Ok(Expression::Literal(Literal {
+                    value: LiteralValue::Decimal {
+                        value: s,
+                        precision,
+                        scale,
+                    },
+                    data_type: DataType::Decimal { precision, scale },
+                }))
             } else if let Ok(d) = s.parse::<f64>() {
                 Ok(Expression::Literal(Literal {
                     value: LiteralValue::Double(d),
@@ -1887,6 +2087,189 @@ mod tests {
             },
             _ => panic!("expected Project"),
         }
+    }
+
+    /// Extract the single projection expression under a top-level `Project`.
+    fn single_projection(plan: &CommonAst) -> &Expression {
+        match &plan.op {
+            CommonOp::Project { projections, .. } => {
+                assert_eq!(projections.len(), 1);
+                &projections[0]
+            }
+            _ => panic!("expected Project"),
+        }
+    }
+
+    #[test]
+    fn typed_string_date_lowers_to_nonnull_date_literal() {
+        let plan = parse("SELECT DATE '2026-01-15' AS d").expect("should parse");
+        let inner = match single_projection(&plan) {
+            Expression::Alias(a) => a.expr.as_ref(),
+            other => panic!("expected Alias, got {other:?}"),
+        };
+        // 2026-01-15 is 20468 days after 1970-01-01 (non-null literal).
+        match inner {
+            Expression::Literal(Literal {
+                value: LiteralValue::Date(days),
+                data_type: DataType::Date,
+            }) => assert_eq!(*days, 20468),
+            other => panic!("expected Date literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_string_timestamp_lowers_to_nonnull_timestamp_literal() {
+        let plan = parse("SELECT TIMESTAMP '2026-01-15 10:30:00' AS ts").expect("should parse");
+        let inner = match single_projection(&plan) {
+            Expression::Alias(a) => a.expr.as_ref(),
+            other => panic!("expected Alias, got {other:?}"),
+        };
+        // 20468 days * 86_400_000_000 + (10*3600 + 30*60) * 1_000_000.
+        match inner {
+            Expression::Literal(Literal {
+                value: LiteralValue::Timestamp(micros),
+                data_type: DataType::Timestamp,
+            }) => assert_eq!(*micros, 1_768_473_000_000_000),
+            other => panic!("expected Timestamp literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_string_malformed_date_is_boundary_error() {
+        let err = parse("SELECT DATE 'nope' AS d").expect_err("should reject");
+        match err {
+            EmissionError::UnsupportedProtoShape { shape, .. } => {
+                assert_eq!(shape, "sql::typed_string::malformed");
+            }
+            other => panic!("expected boundary error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_date_to_epoch_days_known_anchors() {
+        assert_eq!(parse_date_to_epoch_days("1970-01-01"), Some(0));
+        assert_eq!(parse_date_to_epoch_days("2000-01-01"), Some(10957));
+        assert_eq!(parse_date_to_epoch_days("2026-01-15"), Some(20468));
+        assert_eq!(parse_date_to_epoch_days("nope"), None);
+    }
+
+    #[test]
+    fn parse_date_rejects_invalid_calendar_days() {
+        // H1: days that overrun the month must be rejected, not rolled over.
+        assert_eq!(parse_date_to_epoch_days("2026-02-30"), None);
+        assert_eq!(parse_date_to_epoch_days("2026-04-31"), None);
+        // 2023 is not a leap year → Feb 29 is invalid.
+        assert_eq!(parse_date_to_epoch_days("2023-02-29"), None);
+        // Month out of range.
+        assert_eq!(parse_date_to_epoch_days("2026-13-01"), None);
+        assert_eq!(parse_date_to_epoch_days("2026-00-01"), None);
+        // Day out of range.
+        assert_eq!(parse_date_to_epoch_days("2026-01-00"), None);
+    }
+
+    #[test]
+    fn parse_date_accepts_leap_day() {
+        // 2024 is a leap year → Feb 29 is valid. 2024-02-29 is 19782 days
+        // after 1970-01-01.
+        assert_eq!(parse_date_to_epoch_days("2024-02-29"), Some(19782));
+    }
+
+    #[test]
+    fn parse_date_rejects_out_of_range_year() {
+        // M1: years outside Spark's DATE domain [1, 9999] are rejected without
+        // overflow/panic in the civil-day arithmetic.
+        assert_eq!(parse_date_to_epoch_days("99999-01-01"), None);
+        assert_eq!(parse_date_to_epoch_days("0000-01-01"), None);
+    }
+
+    #[test]
+    fn typed_string_invalid_calendar_date_is_boundary_error() {
+        let err = parse("SELECT DATE '2026-02-30' AS d").expect_err("should reject");
+        match err {
+            EmissionError::UnsupportedProtoShape { shape, .. } => {
+                assert_eq!(shape, "sql::typed_string::malformed");
+            }
+            other => panic!("expected boundary error, got {other:?}"),
+        }
+        // Year out of range must also be a boundary error, not a panic.
+        let err = parse("SELECT DATE '99999-01-01' AS d").expect_err("should reject");
+        assert!(matches!(err, EmissionError::UnsupportedProtoShape { .. }));
+    }
+
+    #[test]
+    fn decimal_literal_lowers_with_precision_and_scale() {
+        let plan = parse("SELECT 100.25").expect("should parse");
+        match single_projection(&plan) {
+            Expression::Literal(Literal {
+                value:
+                    LiteralValue::Decimal {
+                        value,
+                        precision,
+                        scale,
+                    },
+                data_type,
+            }) => {
+                assert_eq!(value, "100.25");
+                assert_eq!(*precision, 5);
+                assert_eq!(*scale, 2);
+                assert_eq!(
+                    *data_type,
+                    DataType::Decimal {
+                        precision: 5,
+                        scale: 2
+                    }
+                );
+            }
+            other => panic!("expected Decimal literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal_literal_precision_scale_three_digit_fraction() {
+        let plan = parse("SELECT 3.142").expect("should parse");
+        match single_projection(&plan) {
+            Expression::Literal(Literal {
+                value:
+                    LiteralValue::Decimal {
+                        precision, scale, ..
+                    },
+                ..
+            }) => {
+                assert_eq!(*precision, 4);
+                assert_eq!(*scale, 3);
+            }
+            other => panic!("expected Decimal literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integer_literal_stays_integer_not_decimal() {
+        let plan = parse("SELECT 42").expect("should parse");
+        assert!(matches!(
+            single_projection(&plan),
+            Expression::Literal(Literal {
+                value: LiteralValue::Int(42),
+                data_type: DataType::Integer,
+            })
+        ));
+    }
+
+    #[test]
+    fn decimal_literal_precision_scale_helper_matches_spark() {
+        assert_eq!(decimal_literal_precision_scale("100.25"), (5, 2));
+        assert_eq!(decimal_literal_precision_scale("3.142"), (4, 3));
+        assert_eq!(decimal_literal_precision_scale("0.00"), (2, 2));
+    }
+
+    #[test]
+    fn decimal_literal_precision_clamped_to_max_38() {
+        // M2: a literal with more than 38 significant integer digits must not
+        // produce Decimal(precision > 38) — clamp to MAX_PRECISION = 38, matching
+        // normalize_decimal_literal in v2_relation_converter.rs.
+        let forty_digits = "1234567890123456789012345678901234567890.5";
+        let (precision, scale) = decimal_literal_precision_scale(forty_digits);
+        assert_eq!(precision, 38);
+        assert_eq!(scale, 1);
     }
 
     /// Extract the `Filter` predicate immediately under a top-level `Project`.

@@ -828,3 +828,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean both crates, rustfmt clean, `cargo test -p thunderduck-core --lib` 688/0, `cargo test -p thunderduck-connect-server --bins` 74/0, `sql_v2` 164/98/262, `core_v2` 313/324 no regression).
 - Commit SHA: (this commit).
+
+## Pass 108 — 2026-07-05 — SQL corpus: typed literals DATE/TIMESTAMP/decimal (lit-001 cluster) [run 2]
+- **Corpus: SQL front-end.** Target: lit-001 (DATE literal), lit-002 (TIMESTAMP literal), lit-007 (decimal literal arithmetic). All `sql::expr::other`. Lowering-only.
+- Diagnostic: `.agent-output/diagnostic-pass-108.md` — `lower_expr` has no `Expr::TypedString` arm; `lower_value` handles Number as i32/i64/f64 only (no decimal). τ has `LiteralValue::Date(i32)`/`Timestamp(i64)`/`Decimal{value,precision,scale}` — all render in emission. No string→epoch parser exists (no chrono dep).
+- Architecture: `.agent-output/architecture-pass-108.md` — TypedString→Date/Timestamp literal; decimal arm in lower_value. (Initial CAST approach abandoned — CAST gives nullable=true; Spark DATE/TIMESTAMP literals are non-null.)
+- Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`). Self-contained date/timestamp string parsers (Hinnant days_from_civil; no deps). No emission/analyzer/ast change.
+- ADR citations: ADR-004 (SQL literals → common AST), ADR-015 (Spark parity — non-null DATE/TIMESTAMP literals; decimal precision/scale + ADR-006 widening), ADR-016 (ANSI — invalid calendar dates/out-of-range years → boundary error, not silent rollover).
+- Corpus signal: 164 → **168** (+4). lit-001/002/007 GREEN + 1 collateral. No regressions.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Tests added: ~13 (TypedString→non-null Date(20468)/Timestamp; decimal precision/scale 100.25→(5,2), 3.142→(4,3); + review-fix tests: invalid calendar dates, leap day, out-of-range year, >38-digit clamp).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + **1 High CLOSED** (H1: invalid calendar dates `2026-02-30`/non-leap `2023-02-29` silently rolled over to a wrong date — Spark ANSI throws; fixed with leap-aware day-of-month validation → boundary error). **2 Medium CLOSED** (M1: unbounded year → i64 overflow panic/wrap — bounded to Spark's [1,9999] DATE domain; M2: decimal precision missing `.min(38)` clamp — added to match `normalize_decimal_literal`). Also fixed the nullability bug (CAST→non-null literal). Perf negligible.
+- Findings queued as follow-up: lit-008 (TIMESTAMP−TIMESTAMP→interval type inference); lit-004/005 (compound INTERVAL X TO Y); lit-006 (make_interval); lit-009 (string escape); large integer literal → Decimal(n,0) (L3).
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 701/0, `sql_v2` 168/94/262, no regressions).
+- Commit SHA: (this commit).

@@ -18,20 +18,25 @@
 //! **Plan-id policy (Open Decision 12):** every [`UnresolvedColumn`] emitted
 //! by this module has `plan_id = None`.
 
+use std::collections::HashMap;
+
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType as SqlDataType, DuplicateTreatment, ExactNumberInfo, Expr,
-    Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
-    JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByExpr,
-    OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
-    TableFactor, TableWithJoins, UnaryOperator, Value, ValueWithSpan,
+    BinaryOperator, CastKind, DataType as SqlDataType, DateTimeField, DuplicateTreatment,
+    ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    FunctionArguments, GroupByExpr, Interval, JoinConstraint, JoinOperator, LimitClause,
+    NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByExpr, OrderByKind,
+    Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
+    TableWithJoins, UnaryOperator, Value, ValueWithSpan, WindowFrame as SqlWindowFrame,
+    WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 
 use crate::transpiler_v2::ast::{CommonAst, CommonOp, JoinType, SetOpKind};
 use crate::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
-    FunctionCall, InListExpression, LambdaExpression, LambdaVariableExpression, LikeExpression,
-    Literal, LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, UnaryExpression,
-    UnaryOp, UnresolvedColumn,
+    FrameBoundary, FrameUnit, FunctionCall, InListExpression, IntervalExpression, LambdaExpression,
+    LambdaVariableExpression, LikeExpression, Literal, LiteralValue, NullOrdering, SortDirection,
+    SortOrder, StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn, WindowFrame,
+    WindowFunction,
 };
 use crate::transpiler_v2::type_inference::AGGREGATE_NAMES;
 use crate::transpiler_v2::EmissionError;
@@ -158,13 +163,16 @@ fn lower_set_expr(body: SetExpr) -> Result<CommonAst, EmissionError> {
     }
 }
 
-fn lower_select(select: Select) -> Result<CommonAst, EmissionError> {
+fn lower_select(mut select: Select) -> Result<CommonAst, EmissionError> {
     if select.distinct.is_some() {
         return Err(EmissionError::UnsupportedProtoShape {
             shape: "sql::select_distinct".to_owned(),
             reason: "SELECT DISTINCT deferred past Slice A.2".to_owned(),
         });
     }
+    // Inline named `WINDOW w AS (...)` references into their `WindowSpec` before
+    // lowering — τ's Window substrate has no named-window concept (win-012).
+    resolve_named_windows_in_select(&mut select)?;
     let base = lower_from(select.from)?;
 
     let filtered = if let Some(cond) = select.selection {
@@ -757,6 +765,7 @@ fn lower_expr(expr: Expr) -> Result<Expression, EmissionError> {
                 body: Box::new(body),
             }))
         }
+        Expr::Interval(iv) => lower_interval(iv),
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::expr::{}", expr_kind(&other)),
             reason: "expression shape not supported at Slice A.2".to_owned(),
@@ -940,13 +949,8 @@ fn lower_binary_op(op: BinaryOperator) -> Result<BinaryOp, EmissionError> {
 }
 
 fn lower_function(f: Function) -> Result<Expression, EmissionError> {
-    if f.over.is_some() {
-        return Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::window_function".to_owned(),
-            reason: "window functions deferred past Slice A.2".to_owned(),
-        });
-    }
     let name = object_name_to_string(&f.name);
+    let over = f.over;
     let (distinct, args) = match f.args {
         FunctionArguments::None => (false, vec![]),
         FunctionArguments::List(FunctionArgumentList {
@@ -966,11 +970,250 @@ fn lower_function(f: Function) -> Result<Expression, EmissionError> {
             });
         }
     };
-    Ok(Expression::FunctionCall(FunctionCall {
+    let call = Expression::FunctionCall(FunctionCall {
         name,
         args,
         distinct,
-    }))
+    });
+    match over {
+        None => Ok(call),
+        Some(WindowType::WindowSpec(spec)) => {
+            let partition_by: Vec<Expression> = spec
+                .partition_by
+                .into_iter()
+                .map(lower_expr)
+                .collect::<Result<_, _>>()?;
+            let order_by: Vec<SortOrder> = spec
+                .order_by
+                .into_iter()
+                .map(lower_order_by_expr)
+                .collect::<Result<_, _>>()?;
+            let frame = lower_window_frame(spec.window_frame)?;
+            Ok(Expression::Window(WindowFunction {
+                func: Box::new(call),
+                partition_by,
+                order_by,
+                frame,
+            }))
+        }
+        // Safety net: named-window references are normally rewritten into a
+        // `WindowSpec` by `resolve_named_windows_in_select` before lowering.
+        // Reaching here means the reference was never defined (e.g. no WINDOW
+        // clause at all) — a Thunderduck-boundary error (ADR-022).
+        Some(WindowType::NamedWindow(ident)) => Err(EmissionError::UnsupportedProtoShape {
+            shape: "sql::named_window::unresolved".to_owned(),
+            reason: format!("window `{}` is not defined in a WINDOW clause", ident.value),
+        }),
+    }
+}
+
+/// Map a sqlparser [`SqlWindowFrame`] into τ's [`WindowFrame`].
+///
+/// `None` → no frame clause (emission omits it; DuckDB's default matches
+/// Spark's). `GROUPS` frame units are a Thunderduck-boundary error (ADR-022).
+fn lower_window_frame(frame: Option<SqlWindowFrame>) -> Result<Option<WindowFrame>, EmissionError> {
+    let Some(SqlWindowFrame {
+        units,
+        start_bound,
+        end_bound,
+    }) = frame
+    else {
+        return Ok(None);
+    };
+    let unit = match units {
+        WindowFrameUnits::Rows => FrameUnit::Rows,
+        WindowFrameUnits::Range => FrameUnit::Range,
+        WindowFrameUnits::Groups => {
+            return Err(EmissionError::UnsupportedProtoShape {
+                shape: "sql::window_frame::groups".to_owned(),
+                reason: "GROUPS window frame units are not supported".to_owned(),
+            });
+        }
+    };
+    let lower = lower_frame_bound(start_bound)?;
+    // Shorthand `ROWS N PRECEDING` (no BETWEEN) → upper bound is CURRENT ROW.
+    let upper = match end_bound {
+        Some(b) => lower_frame_bound(b)?,
+        None => FrameBoundary::CurrentRow,
+    };
+    Ok(Some(WindowFrame { unit, lower, upper }))
+}
+
+/// Map a single sqlparser [`WindowFrameBound`] into τ's [`FrameBoundary`].
+///
+/// sqlparser encodes the direction in the variant (`Preceding` / `Following`),
+/// so the offset expression is the absolute magnitude — no sign re-application.
+fn lower_frame_bound(bound: WindowFrameBound) -> Result<FrameBoundary, EmissionError> {
+    Ok(match bound {
+        WindowFrameBound::CurrentRow => FrameBoundary::CurrentRow,
+        WindowFrameBound::Preceding(None) => FrameBoundary::UnboundedPreceding,
+        WindowFrameBound::Following(None) => FrameBoundary::UnboundedFollowing,
+        WindowFrameBound::Preceding(Some(e)) => FrameBoundary::Preceding(Box::new(lower_expr(*e)?)),
+        WindowFrameBound::Following(Some(e)) => FrameBoundary::Following(Box::new(lower_expr(*e)?)),
+    })
+}
+
+/// Build a `name → WindowSpec` map from the `WINDOW` clause and inline each
+/// `NamedWindow` reference in the projection into its `WindowSpec`.
+fn resolve_named_windows_in_select(select: &mut Select) -> Result<(), EmissionError> {
+    if select.named_window.is_empty() {
+        return Ok(());
+    }
+    let mut defs: HashMap<String, WindowSpec> = HashMap::with_capacity(select.named_window.len());
+    for NamedWindowDefinition(ident, expr) in &select.named_window {
+        match expr {
+            NamedWindowExpr::WindowSpec(spec) => {
+                defs.insert(ident.value.clone(), spec.clone());
+            }
+            // `WINDOW w AS other_window` (alias-of-window) — not represented in
+            // τ's substrate; boundary error rather than silent drop (ADR-022).
+            NamedWindowExpr::NamedWindow(_) => {
+                return Err(EmissionError::UnsupportedProtoShape {
+                    shape: "sql::named_window::alias_of_window".to_owned(),
+                    reason: format!("named window `{}` aliases another window", ident.value),
+                });
+            }
+        }
+    }
+    for item in &mut select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                resolve_named_windows_in_expr(e, &defs)?;
+            }
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite every `Expr::Function` whose `OVER` clause is a `NamedWindow`
+/// reference into an inline `WindowSpec`, descending through the composite
+/// expression shapes a projection can nest a window call inside.
+fn resolve_named_windows_in_expr(
+    expr: &mut Expr,
+    defs: &HashMap<String, WindowSpec>,
+) -> Result<(), EmissionError> {
+    match expr {
+        Expr::Function(f) => {
+            if let Some(WindowType::NamedWindow(name)) = &f.over {
+                let spec =
+                    defs.get(&name.value)
+                        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+                            shape: "sql::named_window::unknown".to_owned(),
+                            reason: format!(
+                                "window `{}` is not defined in the WINDOW clause",
+                                name.value
+                            ),
+                        })?;
+                f.over = Some(WindowType::WindowSpec(spec.clone()));
+            }
+        }
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
+            resolve_named_windows_in_expr(inner, defs)?;
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            resolve_named_windows_in_expr(left, defs)?;
+            resolve_named_windows_in_expr(right, defs)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Lower a sqlparser [`Interval`] literal into τ's [`IntervalExpression`].
+///
+/// Single-field intervals only (`INTERVAL '90' DAY`, `INTERVAL 3 YEAR`, …).
+/// Compound (`X TO Y`), non-literal, or unrepresentable-field shapes are
+/// Thunderduck-boundary errors (ADR-022), never a RawSql fallback.
+fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
+    if iv.last_field.is_some() {
+        return Err(EmissionError::UnsupportedProtoShape {
+            shape: "sql::expr::interval::compound".to_owned(),
+            reason: "compound `INTERVAL X TO Y` literals are not supported".to_owned(),
+        });
+    }
+    let n =
+        extract_interval_int(&iv.value).ok_or_else(|| EmissionError::UnsupportedProtoShape {
+            shape: "sql::expr::interval::non_literal".to_owned(),
+            reason: "interval value must be an integer literal".to_owned(),
+        })?;
+    let field = iv
+        .leading_field
+        .as_ref()
+        .ok_or_else(|| EmissionError::UnsupportedProtoShape {
+            shape: "sql::expr::interval::no_field".to_owned(),
+            reason: "interval literal has no leading time field".to_owned(),
+        })?;
+
+    const MICROS_PER_SECOND: i64 = 1_000_000;
+    const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
+    const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
+
+    let overflow = |unit: &str| EmissionError::UnsupportedProtoShape {
+        shape: format!("sql::expr::interval::{unit}_overflow"),
+        reason: format!("interval {unit} value overflows"),
+    };
+
+    let ie = match field {
+        DateTimeField::Year | DateTimeField::Years => IntervalExpression {
+            months: n.checked_mul(12).ok_or_else(|| overflow("year"))?,
+            days: 0,
+            microseconds: 0,
+        },
+        DateTimeField::Month | DateTimeField::Months => IntervalExpression {
+            months: n,
+            days: 0,
+            microseconds: 0,
+        },
+        DateTimeField::Day | DateTimeField::Days => IntervalExpression {
+            months: 0,
+            days: n,
+            microseconds: 0,
+        },
+        DateTimeField::Hour | DateTimeField::Hours => IntervalExpression {
+            months: 0,
+            days: 0,
+            microseconds: i64::from(n)
+                .checked_mul(MICROS_PER_HOUR)
+                .ok_or_else(|| overflow("hour"))?,
+        },
+        DateTimeField::Minute | DateTimeField::Minutes => IntervalExpression {
+            months: 0,
+            days: 0,
+            microseconds: i64::from(n)
+                .checked_mul(MICROS_PER_MINUTE)
+                .ok_or_else(|| overflow("minute"))?,
+        },
+        DateTimeField::Second | DateTimeField::Seconds => IntervalExpression {
+            months: 0,
+            days: 0,
+            microseconds: i64::from(n)
+                .checked_mul(MICROS_PER_SECOND)
+                .ok_or_else(|| overflow("second"))?,
+        },
+        other => {
+            return Err(EmissionError::UnsupportedProtoShape {
+                shape: "sql::expr::interval::unsupported_field".to_owned(),
+                reason: format!("interval field `{other}` is not representable"),
+            });
+        }
+    };
+    Ok(Expression::Interval(ie))
+}
+
+/// Extract a plain `i32` from an interval value expression — handles both
+/// `INTERVAL '3' DAY` (string literal) and `INTERVAL 3 DAY` (numeric literal).
+fn extract_interval_int(expr: &Expr) -> Option<i32> {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.parse::<i32>().ok(),
+            Value::Number(s, _) => s.parse::<i32>().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn lower_value(vw: ValueWithSpan) -> Result<Expression, EmissionError> {
@@ -1571,6 +1814,132 @@ mod tests {
                 assert_eq!(shape, "sql::parse_error");
             }
             other => panic!("expected UnsupportedProtoShape sql::parse_error, got {other:?}"),
+        }
+    }
+
+    /// Return the first projection expression of a `Project` plan, unwrapping a
+    /// top-level `Alias` if present.
+    fn first_projection(plan: CommonAst) -> Expression {
+        let CommonOp::Project {
+            mut projections, ..
+        } = plan.op
+        else {
+            panic!("expected Project as top-level");
+        };
+        assert!(!projections.is_empty());
+        match projections.remove(0) {
+            Expression::Alias(a) => *a.expr,
+            other => other,
+        }
+    }
+
+    #[test]
+    fn window_partition_order_no_frame() {
+        let plan = parse("SELECT rank() OVER (PARTITION BY dept ORDER BY sal) FROM t")
+            .expect("should parse");
+        match first_projection(plan) {
+            Expression::Window(w) => {
+                assert_eq!(w.partition_by.len(), 1);
+                assert_eq!(w.order_by.len(), 1);
+                assert!(w.frame.is_none(), "no frame clause → frame None");
+            }
+            other => panic!("expected Window, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_rows_unbounded_preceding_to_current_row() {
+        let plan = parse(
+            "SELECT sum(x) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             FROM t",
+        )
+        .expect("should parse");
+        match first_projection(plan) {
+            Expression::Window(w) => {
+                let frame = w.frame.expect("frame present");
+                assert_eq!(frame.unit, FrameUnit::Rows);
+                assert!(matches!(frame.lower, FrameBoundary::UnboundedPreceding));
+                assert!(matches!(frame.upper, FrameBoundary::CurrentRow));
+            }
+            other => panic!("expected Window, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_rows_between_one_preceding_and_one_following() {
+        let plan = parse(
+            "SELECT avg(x) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t",
+        )
+        .expect("should parse");
+        match first_projection(plan) {
+            Expression::Window(w) => {
+                let frame = w.frame.expect("frame present");
+                assert_eq!(frame.unit, FrameUnit::Rows);
+                match frame.lower {
+                    FrameBoundary::Preceding(e) => {
+                        assert!(matches!(*e, Expression::Literal(_)));
+                    }
+                    other => panic!("expected Preceding(1), got {other:?}"),
+                }
+                match frame.upper {
+                    FrameBoundary::Following(e) => {
+                        assert!(matches!(*e, Expression::Literal(_)));
+                    }
+                    other => panic!("expected Following(1), got {other:?}"),
+                }
+            }
+            other => panic!("expected Window, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_named_window_is_inlined() {
+        let plan =
+            parse("SELECT rank() OVER w FROM t WINDOW w AS (PARTITION BY dept ORDER BY sal)")
+                .expect("should parse");
+        match first_projection(plan) {
+            Expression::Window(w) => {
+                assert_eq!(w.partition_by.len(), 1, "named window PARTITION BY inlined");
+                assert_eq!(w.order_by.len(), 1, "named window ORDER BY inlined");
+            }
+            other => panic!("expected inlined Window, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_groups_frame_is_rejected() {
+        let err = parse(
+            "SELECT sum(x) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        )
+        .expect_err("GROUPS frame must be rejected");
+        assert!(
+            matches!(err, EmissionError::UnsupportedProtoShape { ref shape, .. }
+                if shape == "sql::window_frame::groups"),
+            "expected UnsupportedProtoShape(sql::window_frame::groups), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn unknown_named_window_is_rejected() {
+        let err = parse("SELECT rank() OVER w FROM t WINDOW v AS (ORDER BY id)")
+            .expect_err("unknown named window must be rejected");
+        assert!(
+            matches!(err, EmissionError::UnsupportedProtoShape { ref shape, .. }
+                if shape == "sql::named_window::unknown"),
+            "expected UnsupportedProtoShape(sql::named_window::unknown), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn interval_literal_day_lowers_to_interval_expression() {
+        let plan = parse("SELECT INTERVAL '90' DAY FROM t").expect("should parse");
+        match first_projection(plan) {
+            Expression::Interval(ie) => {
+                assert_eq!(ie.days, 90);
+                assert_eq!(ie.months, 0);
+                assert_eq!(ie.microseconds, 0);
+            }
+            other => panic!("expected Interval, got {other:?}"),
         }
     }
 }

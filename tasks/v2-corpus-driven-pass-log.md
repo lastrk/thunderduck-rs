@@ -692,3 +692,19 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 628/0 [+7 net], `sql_v2` differential 114/148/262 with 6 new set-op cases GREEN, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 98 — 2026-07-05 — SQL corpus: window functions + interval literals (win-001 cluster)
+- **Corpus: SQL front-end.** Target: `win-001..016` (ROW_NUMBER/RANK/DENSE_RANK/PERCENT_RANK/CUME_DIST/NTILE/LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE, running SUM, moving AVG, RANGE BETWEEN, no-order partition, named WINDOW, top-per-group, multiple windows, window-over-expr, RANGE BETWEEN INTERVAL). All 16 failed at `sql::window_function` reject.
+- Diagnostic: `.agent-output/diagnostic-pass-98.md` — LOWERING-ONLY (15/16). τ's `Expression::Window(WindowFunction{func,partition_by,order_by,frame})`, analyzer window typing, and `OVER(...)` emission are done + green via the DataFrame corpus (`v2_relation_converter.rs:916` builds the identical type). win-016 additionally needed a reusable `Expr::Interval` lowering arm.
+- Architecture: `.agent-output/architecture-pass-98.md` — replace the `f.over.is_some()` reject in `lower_function` with window lowering (partition_by via lower_expr, order_by via existing lower_order_by_expr, frame mapping); add `Expr::Interval`→`IntervalExpression` arm; named-window pre-pass in `lower_select` inlining `OVER w` → resolved `WindowSpec`. Frame bounds mirror the DataFrame path (offset = absolute magnitude, direction in the variant; Groups → reject; end_bound None → CurrentRow; frame None when absent).
+- Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`). No analyzer/emission/ast/expression-type change.
+- ADR citations: ADR-004 (SQL + DataFrame → same common AST; closes the SQL front-end onto the existing Window/Interval substrate), ADR-005/006 (analyzer window typing/nullability, unchanged), ADR-022 (Groups frame units, compound/non-literal/unrepresentable intervals, unresolved named windows → Thunderduck-boundary reject, not silent RawSql fallback).
+- Corpus signal: 114 → **132** (+18). All 16 win-* GREEN + collateral lit-003 (`INTERVAL '90' DAY`) and lit-010 (`INTERVAL '30' DAY` in WHERE). No regressions.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Tests added: 7 (window_partition_order_no_frame, window_rows_unbounded_preceding_to_current_row, window_rows_between_one_preceding_and_one_following, window_named_window_is_inlined, window_groups_frame_is_rejected, unknown_named_window_is_rejected, interval_literal_day_lowers_to_interval_expression).
+- Process note: the FIRST coder attempt reported success but its edits never persisted to disk (`git diff HEAD` empty, reject intact); caught by re-running the differential (no movement). Re-dispatched with a mandatory `git diff --stat HEAD` persistence check → 386 insertions confirmed. Lesson: verify subagent edits landed via git diff before trusting a green self-report.
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (+ 3 Low: named-window recursion doesn't descend CASE/args/ORDER-BY — but loud-rejects rather than silently mis-resolves; interval unit gaps WEEK/QUARTER/fractional → loud reject; one test doesn't assert magnitude==1 [covered end-to-end by win-009 differential]). Perf N/A (parse-time; named-window walk gated on `named_window` non-empty).
+- Findings queued as follow-up: named-window resolution in CASE/function-args/ORDER-BY; interval WEEK/QUARTER/fractional-second/year-month/day-second compound (lit-004/005/006); DATE/TIMESTAMP literals (lit-001/002).
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 636/0, `sql_v2` differential 132/130/262 with all 16 win-* + 2 interval cases GREEN, no regressions).
+- Commit SHA: (this commit).

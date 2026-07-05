@@ -646,3 +646,19 @@ the summary below records the corpus deltas by pass number.
 
 
 
+
+## Pass 95 — 2026-07-05 — SQL corpus: spark.sql() SqlCommand execution (sel-007)
+- **Corpus: SQL front-end** (`differential/sql_corpus.py`, 262 cases via `spark.sql`, tracked by `tests/scripts/v2-sql-progress.sh` → `tests/integration/v2_sql_progress.md`). This is the first pass of the SQL-corpus pipeline (parallel to the DataFrame `core_v2` corpus).
+- Case: `sel-007` — `SELECT 1 AS one, 'x' AS s, true AS b` (catalog-free literal projection, no FROM). PySpark `spark.sql()` sends the query as a Spark Connect `SqlCommand` (whose `.input` is a `RelType::Sql` relation); `service.rs::handle_sql_command` was an `unimplemented("Slice C.1")` stub, so every `spark.sql()` failed before execution.
+- Diagnostic: `.agent-output/diagnostic-pass-95.md` — owning layer = connect-server service layer; the Root/relation path (`transpile_relation → execute_streaming_query`) already works; only the SqlCommand command arm was stubbed.
+- Architecture: `.agent-output/architecture-pass-95.md` — **lazy echo**: the command arm returns `SqlCommandResult { relation: Some(<input Sql relation>) }` + `ResultComplete`; PySpark's `CachedRelation` re-executes it as a Root plan on `.collect()` (zero new substrate, no Arrow→proto LocalRelation encoding). An eager `transpile_relation(&input_rel)?` in the arm forces parse+analyze at `sql()` time for Spark-parity `AnalysisException`. Deprecated `SqlCommand.sql` text branch synthesizes a `RelType::Sql`.
+- Layer(s) touched: connect-server service layer only (`service.rs`): `handle_sql_command` (stub → two-frame echo), `sql_command_result_response` (gains `relation` arg, drops `#[allow(dead_code)]`), the `SqlCommand` dispatch arm (obtain/synthesize input relation + eager validate). Removed the now-orphaned `transpile_raw_sql` helper. No τ core / analyzer / emission changes.
+- ADR citations: ADR-021 (typed `RelType::Sql` relation kept end-to-end — no SQL-string shortcut), ADR-022 (τ is the only path; eager validation routes both error categories through τ at command time), ADR-011 (fixes the command-vs-relation `ExecutePlanResponse` shape: `SqlCommandResult`+`ResultComplete`, not an ArrowBatch stream).
+- Corpus signal: 0 → **2** (+2). `sel-007` GREEN (target); the SqlCommand execution fix also unblocked one further catalog-free case (literal/VALUES). All `FROM <table>` cases remain red on the separate Slice-B catalog blocker ("table not found") — next pass.
+- Files: `crates/connect-server/src/service.rs`.
+- Tests added: 2 (`sql_command_select_literals_returns_echoed_relation` — modern-path echo fidelity + ResultComplete + no ArrowBatch; `sql_command_deprecated_text_synthesizes_sql_relation` — deprecated-text synthesis).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (+ 4 Low/informational: intended double-transpile, DDL-seam bounded by TODO, pre-existing parameterized-query gap, optional negative test). Perf 0 HIGH + 0 MEDIUM (LOW-1 needless `String` clone on the deprecated branch — fixed: clone → move).
+- Findings queued as follow-up: eager DDL/DML side effects (`spark.sql("CREATE VIEW ...")`) and non-deterministic re-evaluation require eager execution to a `LocalRelation` (marked `TODO Slice C.1:` in code); Slice-B temp-view registration + catalog bridge for `FROM <table>` cases.
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean on touched file, `cargo test -p thunderduck-connect-server --bins` 71/0 serially [pre-existing `/tmp` extension parallel flake], `v2-sql-progress.sh` 2/260/262 with sel-007 GREEN, no regressions — baseline was 0 green).
+- Commit SHA: (this commit).

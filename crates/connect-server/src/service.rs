@@ -68,17 +68,6 @@ pub(crate) fn transpile_relation(
     Ok((common_ast, sql, schema))
 }
 
-/// Convert a raw SparkSQL string into a [`CommonAst`] and finalize it into
-/// DuckDB SQL via τ.
-///
-/// Used by the deprecated `SqlCommand.sql` text field on older clients.
-pub(crate) fn transpile_raw_sql(sql_text: &str) -> Result<(CommonAst, String, StructType), Status> {
-    let common_ast =
-        SparkSqlParserV2::parse(sql_text).map_err(|e| Status::from(ConnectError::from(e)))?;
-    let (sql, schema) = finalize(&common_ast)?;
-    Ok((common_ast, sql, schema))
-}
-
 /// Build the per-path `BaseTypes` overlay and run τ's fused emit-and-schema
 /// entry point in ONE analyzer pass.
 ///
@@ -379,24 +368,41 @@ async fn handle_command(
             handle_create_dataframe_view(session, session_id, operation_id, &common_ast).await
         }
         Some(CommandType::SqlCommand(sql_cmd)) => {
-            let common_ast = if let Some(input_rel) = sql_cmd.input {
-                let (ast, _sql, _schema) = transpile_relation(&input_rel)?;
-                ast
-            } else {
-                // Preserved fallback path for older clients using the
-                // deprecated `sql` text field (all SqlCommand text fields are
-                // proto-deprecated in favour of `input`).
-                #[allow(deprecated)]
-                let text = sql_cmd.sql.clone();
-                if text.is_empty() {
-                    return Err(Status::invalid_argument(
-                        "SqlCommand missing both input relation and sql text",
-                    ));
+            // Modern clients (PySpark 4.1.1) carry the query as a typed
+            // `RelType::Sql` relation in `sql_cmd.input`; older clients use the
+            // proto-deprecated `sql` text field. Synthesize a `RelType::Sql`
+            // relation for the latter so both paths echo a typed relation.
+            let input_rel = match sql_cmd.input {
+                Some(input_rel) => input_rel,
+                None => {
+                    #[allow(deprecated)]
+                    let text = sql_cmd.sql;
+                    if text.is_empty() {
+                        return Err(Status::invalid_argument(
+                            "SqlCommand missing both input relation and sql text",
+                        ));
+                    }
+                    proto::Relation {
+                        common: None,
+                        rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
+                            query: text,
+                            ..Default::default()
+                        })),
+                    }
                 }
-                let (ast, _sql, _schema) = transpile_raw_sql(&text)?;
-                ast
             };
-            handle_sql_command(session, session_id, operation_id, &common_ast).await
+            // Eager-validate (parse + analyze) at `sql()` time so Spark-emulated
+            // errors surface eagerly, matching Spark's `AnalysisException`. The
+            // emitted SQL / resolved schema are discarded — the client
+            // re-transpiles the echoed relation on `.collect()` via the Root
+            // path.
+            //
+            // TODO Slice C.1: eager DDL/DML side effects
+            // (`spark.sql("CREATE VIEW ...")`) and non-deterministic
+            // re-evaluation (`rand()`, `current_timestamp()`) require eager
+            // execution to a `LocalRelation` — out of scope for this pass.
+            let _ = transpile_relation(&input_rel)?;
+            handle_sql_command(session, session_id, operation_id, input_rel).await
         }
         Some(CommandType::WriteOperation(mut write_cmd)) => {
             let input_rel = write_cmd
@@ -414,9 +420,9 @@ async fn handle_command(
 //
 // These helpers formerly consumed `&LogicalPlan`. At Slice A.3 they consume
 // `&CommonAst` and return `Err(Status::unimplemented(...))`. `transpile_relation`
-// / `transpile_raw_sql` errors before dispatch ever reaches them today (τ's
-// `generate()` returns `UnsupportedOp` for every input). Slices B/C/D/E/F/G
-// grow the concrete behaviour behind these signatures.
+// errors before dispatch ever reaches them today (τ's `generate()` returns
+// `UnsupportedOp` for every input). Slices B/C/D/E/F/G grow the concrete
+// behaviour behind these signatures.
 
 /// Classification of a τ plan for execution routing.
 ///
@@ -526,15 +532,23 @@ async fn handle_create_dataframe_view(
 /// Handle `SqlCommand` (both `input`-bearing and deprecated text paths).
 ///
 /// **Slice C.1 (owner):** SQL command execution over `CommonAst`.
+///
+/// Lazy-echo design (ADR-011 command-arm response shape): return a
+/// `SqlCommandResult` carrying the re-executable input relation verbatim,
+/// followed by `ResultComplete`. PySpark wraps that relation in a
+/// `CachedRelation` and re-sends it as a `Root` plan on `.collect()`, flowing
+/// through the already-proven `transpile_relation → execute_streaming_query`
+/// path. The command arm never streams an `ArrowBatch`.
 async fn handle_sql_command(
     _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    _session_id: &str,
-    _operation_id: &str,
-    _common_ast: &CommonAst,
+    session_id: &str,
+    operation_id: &str,
+    result_rel: proto::Relation,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
-    Err(Status::unimplemented(
-        "Slice C.1: SqlCommand execution over CommonAst",
-    ))
+    Ok(vec![
+        sql_command_result_response(session_id, operation_id, result_rel),
+        result_complete_response(session_id, operation_id),
+    ])
 }
 
 /// Handle `WriteOperation` after successful transpile.
@@ -619,8 +633,11 @@ fn result_complete_response(session_id: &str, operation_id: &str) -> proto::Exec
     }
 }
 
-#[allow(dead_code)]
-fn sql_command_result_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {
+fn sql_command_result_response(
+    session_id: &str,
+    operation_id: &str,
+    relation: proto::Relation,
+) -> proto::ExecutePlanResponse {
     proto::ExecutePlanResponse {
         session_id: session_id.to_string(),
         server_side_session_id: SERVER_SESSION_ID.clone(),
@@ -628,7 +645,9 @@ fn sql_command_result_response(session_id: &str, operation_id: &str) -> proto::E
         response_id: format!("{operation_id}-cmd"),
         response_type: Some(
             proto::execute_plan_response::ResponseType::SqlCommandResult(
-                proto::execute_plan_response::SqlCommandResult { relation: None },
+                proto::execute_plan_response::SqlCommandResult {
+                    relation: Some(relation),
+                },
             ),
         ),
         ..Default::default()
@@ -1060,6 +1079,167 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("expected Int32 column for `SELECT 1`");
         assert_eq!(col.value(0), 1);
+    }
+
+    // ── Pass 95 — SqlCommand lazy-echo round-trip ───────────────────────────
+    //
+    // `spark.sql(...)` arrives as a `Command(SqlCommand)`. The command arm
+    // echoes the input `RelType::Sql` relation back in a `SqlCommandResult`
+    // frame (no `ArrowBatch`), followed by `ResultComplete`. PySpark
+    // re-executes the echoed relation lazily on `.collect()` via the Root path.
+
+    /// Modern PySpark path: `SqlCommand { input: Some(RelType::Sql{query}) }`.
+    /// The command arm echoes the input relation verbatim.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sql_command_select_literals_returns_echoed_relation() {
+        use futures::StreamExt;
+
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
+            thunderduck_core::runtime::StreamingConfig::default(),
+        ));
+        let svc = ThunderduckService::new(session_manager);
+
+        let query = "SELECT 1 AS one, 'x' AS s, true AS b";
+        let plan = proto::Plan {
+            op_type: Some(proto::plan::OpType::Command(proto::Command {
+                command_type: Some(proto::command::CommandType::SqlCommand(proto::SqlCommand {
+                    input: Some(proto::Relation {
+                        common: None,
+                        rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
+                            query: query.to_owned(),
+                            ..Default::default()
+                        })),
+                    }),
+                    ..Default::default()
+                })),
+            })),
+        };
+        let req = proto::ExecutePlanRequest {
+            session_id: "test-session".to_owned(),
+            operation_id: Some("test-op".to_owned()),
+            plan: Some(plan),
+            ..Default::default()
+        };
+
+        let resp = svc
+            .execute_plan(Request::new(req))
+            .await
+            .expect("execute_plan must succeed");
+        let mut stream = resp.into_inner();
+        let mut frames: Vec<proto::ExecutePlanResponse> = Vec::new();
+        while let Some(item) = stream.next().await {
+            frames.push(item.expect("stream frame must be Ok"));
+        }
+
+        // No ArrowBatch frame — the command arm does not stream data.
+        assert!(
+            !frames.iter().any(|f| matches!(
+                f.response_type,
+                Some(proto::execute_plan_response::ResponseType::ArrowBatch(_))
+            )),
+            "command arm must not emit an ArrowBatch frame",
+        );
+
+        // The SqlCommandResult frame echoes the original Sql relation.
+        let cmd_result = frames
+            .iter()
+            .find_map(|f| match &f.response_type {
+                Some(proto::execute_plan_response::ResponseType::SqlCommandResult(r)) => Some(r),
+                _ => None,
+            })
+            .expect("expected a SqlCommandResult frame");
+        let echoed = cmd_result
+            .relation
+            .as_ref()
+            .expect("SqlCommandResult must carry a relation");
+        match &echoed.rel_type {
+            Some(proto::relation::RelType::Sql(sql)) => {
+                assert_eq!(sql.query, query, "echoed relation must carry the query");
+            }
+            other => panic!("expected RelType::Sql, got {other:?}"),
+        }
+
+        // Final frame is ResultComplete.
+        let has_complete = frames.last().is_some_and(|f| {
+            matches!(
+                f.response_type,
+                Some(proto::execute_plan_response::ResponseType::ResultComplete(
+                    _
+                ))
+            )
+        });
+        assert!(has_complete, "final frame must be ResultComplete");
+    }
+
+    /// Deprecated text path: `SqlCommand { sql: "SELECT 1", input: None }`
+    /// synthesizes a `RelType::Sql` relation and echoes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sql_command_deprecated_text_synthesizes_sql_relation() {
+        use futures::StreamExt;
+
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
+            thunderduck_core::runtime::StreamingConfig::default(),
+        ));
+        let svc = ThunderduckService::new(session_manager);
+
+        #[allow(deprecated)]
+        let sql_cmd = proto::SqlCommand {
+            sql: "SELECT 1".to_owned(),
+            input: None,
+            ..Default::default()
+        };
+        let plan = proto::Plan {
+            op_type: Some(proto::plan::OpType::Command(proto::Command {
+                command_type: Some(proto::command::CommandType::SqlCommand(sql_cmd)),
+            })),
+        };
+        let req = proto::ExecutePlanRequest {
+            session_id: "test-session".to_owned(),
+            operation_id: Some("test-op".to_owned()),
+            plan: Some(plan),
+            ..Default::default()
+        };
+
+        let resp = svc
+            .execute_plan(Request::new(req))
+            .await
+            .expect("execute_plan must succeed");
+        let mut stream = resp.into_inner();
+        let mut frames: Vec<proto::ExecutePlanResponse> = Vec::new();
+        while let Some(item) = stream.next().await {
+            frames.push(item.expect("stream frame must be Ok"));
+        }
+
+        let cmd_result = frames
+            .iter()
+            .find_map(|f| match &f.response_type {
+                Some(proto::execute_plan_response::ResponseType::SqlCommandResult(r)) => Some(r),
+                _ => None,
+            })
+            .expect("expected a SqlCommandResult frame");
+        let echoed = cmd_result
+            .relation
+            .as_ref()
+            .expect("SqlCommandResult must carry a synthesized relation");
+        match &echoed.rel_type {
+            Some(proto::relation::RelType::Sql(sql)) => {
+                assert_eq!(
+                    sql.query, "SELECT 1",
+                    "synthesized relation carries the text"
+                );
+            }
+            other => panic!("expected synthesized RelType::Sql, got {other:?}"),
+        }
+
+        let has_complete = frames.last().is_some_and(|f| {
+            matches!(
+                f.response_type,
+                Some(proto::execute_plan_response::ResponseType::ResultComplete(
+                    _
+                ))
+            )
+        });
+        assert!(has_complete, "final frame must be ResultComplete");
     }
 
     // ── Pass 58 — ADR-022 boundary guard for unresolved schema ──────────────

@@ -101,3 +101,25 @@ differential DataFrame corpus (arr-*, struc-*, map-* cases).
   thunderduck-core --lib --tests` → 446 pass / 0 fail / 4 ignored
   (lib, unchanged) + 0 pass / 0 fail / 4 ignored
   (runtime_integration, −1 = removed test).
+
+## Pass 4 — OPP-NNN (2026-07-05)
+
+Delete unused `PipeIfUnresolved` trait +
+`impl PipeIfUnresolved for DataType` in
+`crates/core/src/types/data_type.rs`. Zero callers; the compiler
+already surfaced this as a `dead_code` warning.
+
+- **Files touched.**
+  - `crates/core/src/types/data_type.rs:102-116` — remove the
+    trait declaration + impl (−16 LOC).
+- **LOC delta.** −16.
+- **Corpus.** 314 → 314 (unchanged — dead-code deletion).
+- **Warnings.** `cargo check -p thunderduck-core` now emits **zero
+  warnings** (previously 1: "trait `PipeIfUnresolved` is never
+  used"). Delta: −1.
+- **Verify grep.** `git grep 'PipeIfUnresolved\|pipe_if_unresolved'
+  crates/` returns zero hits.
+- **Gate.** `cargo check -p thunderduck-core` clean, zero warnings.
+  Scoped `rustfmt --edition 2021 --check` clean. `cargo test -p
+  thunderduck-core --lib --tests` → 446 pass / 0 fail / 4 ignored
+  (lib, unchanged).

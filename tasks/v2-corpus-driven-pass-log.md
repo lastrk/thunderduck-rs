@@ -882,3 +882,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 709/0, `sql_v2` 171/91/262, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 112 — 2026-07-05 — SQL corpus: SELECT DISTINCT (sel-006) [run 2]
+- **Corpus: SQL front-end.** Target: sel-006 `SELECT DISTINCT dept_id, active FROM emp` (`sql::select_distinct` reject). Lowering-only; τ has `CommonOp::Deduplicate` (DataFrame `.distinct()`), analyzer + emission handle it.
+- Architecture: inline — `lower_select` captures `select.distinct.take()`, builds the plan normally, then wraps in `Deduplicate{on_columns: vec![]}` (empty = full-row DISTINCT). `Distinct::All` (SELECT ALL) → no wrap; `Distinct::On` (Postgres ext, not Spark) → boundary reject `sql::distinct_on`. Wrap inside lower_select gives Sort/Limit(Deduplicate(Project)) — dedupe before order/limit (Spark semantics).
+- Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`). No emission/analyzer/ast change.
+- ADR citations: ADR-004 (reuse Deduplicate substrate), ADR-015 (dedupe-then-order/limit parity), ADR-022 (DISTINCT ON → boundary reject).
+- Corpus signal: 171 → **172** (+1). sel-006 GREEN. No regressions.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Tests added: 3 (DISTINCT→Deduplicate wrap; DISTINCT+ORDER BY→Sort(Deduplicate); DISTINCT ON→reject).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (ordering/GROUP-BY/LIMIT/ALL/ON all verified; Deduplicate schema-transparent so ORDER-BY-on-non-selected-column correctly errors). 2 Low (error-class nuance; cosmetic nesting).
+- Findings queued as follow-up: correlated subqueries (biggest — emission alias fix + analyzer outer-scope stack); GROUPING SETS emission (gx-003/004); HAVING-agg emission (gx-007); tuples/row-values (pr-003/004/005); lateral view; interval types (lit-004/005/008); fn-014/017/018 (execute-but-diff); agg-009/ord-007 (GROUP BY/ORDER BY ALL); fn-020 (hex literal).
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 712/0, `sql_v2` 172/90/262, no regressions).
+- Commit SHA: (this commit).

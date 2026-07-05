@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType as SqlDataType, DateTimeField, DuplicateTreatment,
+    BinaryOperator, CastKind, DataType as SqlDataType, DateTimeField, Distinct, DuplicateTreatment,
     ExactNumberInfo, Expr, ExprWithAlias, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, GroupByExpr, Interval, JoinConstraint, JoinOperator,
     LimitClause, NamedWindowDefinition, NamedWindowExpr, NullInclusion, ObjectName, ObjectNamePart,
@@ -214,12 +214,21 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
 }
 
 fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
-    if select.distinct.is_some() {
-        return Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::select_distinct".to_owned(),
-            reason: "SELECT DISTINCT deferred past Slice A.2".to_owned(),
-        });
-    }
+    // Capture DISTINCT before building the projection plan; the plain
+    // `SELECT DISTINCT` lowers to a `Deduplicate` wrapping the final Project
+    // (empty `on_columns` = dedupe the whole output row). `SELECT ALL` is the
+    // default (keep duplicates) → no wrap. `DISTINCT ON (...)` is a Postgres
+    // extension Spark SQL does not accept → Thunderduck-boundary reject.
+    let dedupe = match select.distinct.take() {
+        None | Some(Distinct::All) => false,
+        Some(Distinct::Distinct) => true,
+        Some(Distinct::On(_)) => {
+            return Err(EmissionError::UnsupportedProtoShape {
+                shape: "sql::distinct_on".to_owned(),
+                reason: "SELECT DISTINCT ON is not valid Spark SQL".to_owned(),
+            });
+        }
+    };
     // Inline named `WINDOW w AS (...)` references into their `WindowSpec` before
     // lowering — τ's Window substrate has no named-window concept (win-012).
     resolve_named_windows_in_select(&mut select)?;
@@ -260,6 +269,18 @@ fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, E
             input: Box::new(filtered),
             projections: projections?,
         })
+    };
+
+    // Plain `SELECT DISTINCT` dedupes the final projection. Wrapping here (below
+    // `lower_query`'s `wrap_with_sort_limit`) yields `Sort(Deduplicate(Project))`
+    // for `SELECT DISTINCT ... ORDER BY ...` — dedupe first, then order.
+    let plan = if dedupe {
+        CommonAst::new(CommonOp::Deduplicate {
+            input: Box::new(plan),
+            on_columns: vec![],
+        })
+    } else {
+        plan
     };
 
     Ok(plan)
@@ -2177,6 +2198,49 @@ mod tests {
             },
             _ => panic!("expected Project"),
         }
+    }
+
+    #[test]
+    fn parse_select_distinct_wraps_project_in_deduplicate() {
+        let plan = parse("SELECT DISTINCT a, b FROM t").expect("should parse");
+        match plan.op {
+            CommonOp::Deduplicate { input, on_columns } => {
+                assert!(on_columns.is_empty(), "plain DISTINCT dedupes all columns");
+                assert!(
+                    matches!(input.op, CommonOp::Project { .. }),
+                    "Deduplicate must wrap the Project"
+                );
+            }
+            _ => panic!("expected Deduplicate over Project"),
+        }
+    }
+
+    #[test]
+    fn parse_select_distinct_with_order_by_sorts_deduplicate() {
+        let plan = parse("SELECT DISTINCT a FROM t ORDER BY a").expect("should parse");
+        // Dedupe first, then order: Sort(Deduplicate(Project)).
+        match plan.op {
+            CommonOp::Sort { input, .. } => match input.op {
+                CommonOp::Deduplicate { input, on_columns } => {
+                    assert!(on_columns.is_empty());
+                    assert!(matches!(input.op, CommonOp::Project { .. }));
+                }
+                _ => panic!("expected Deduplicate under Sort"),
+            },
+            _ => panic!("expected Sort over Deduplicate"),
+        }
+    }
+
+    #[test]
+    fn parse_select_distinct_on_rejected() {
+        let err = parse("SELECT DISTINCT ON (a) a, b FROM t").expect_err("DISTINCT ON is invalid");
+        assert!(
+            matches!(
+                err,
+                EmissionError::UnsupportedProtoShape { ref shape, .. } if shape == "sql::distinct_on"
+            ),
+            "expected sql::distinct_on boundary error, got {err:?}"
+        );
     }
 
     /// Extract the single projection expression under a top-level `Project`.

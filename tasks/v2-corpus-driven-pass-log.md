@@ -731,3 +731,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 640/0, `sql_v2` differential 137/125/262 with 5 gx cases GREEN, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 101 — 2026-07-05 — SQL corpus: CTEs via inlining (cte cluster) [run 2]
+- **Corpus: SQL front-end.** Target: `cte-001`..`cte-010` (WITH clauses). All failed at `sql::cte` reject.
+- Diagnostic: `.agent-output/diagnostic-pass-101.md` — τ has NO WithCte CommonOp; chose **INLINE** (reuse `AliasedRelation` + `ToDf` + the derived-table path — all green). No analyzer/emission change.
+- Architecture: `.agent-output/architecture-pass-101.md` — `lower_query` builds a `CteScope` (name→lowered body, incremental so nested CTEs see predecessors; explicit column list → `ToDf`); thread `&CteScope` through lower_query→lower_set_expr→lower_select→lower_from→…→lower_table_factor; at the FROM Table arm a CTE-named table becomes `AliasedRelation{clone(body), alias}` (reference alias wins). WITH RECURSIVE → loud reject.
+- Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`). No analyzer/emission/ast change.
+- ADR citations: ADR-004 (SQL → common AST; CTE inlines onto existing AliasedRelation/ToDf substrate — no new op), ADR-001 (transliterate — inlining IS the literal non-recursive-CTE semantics), ADR-022 (WITH RECURSIVE → `sql::recursive_cte` boundary reject).
+- Corpus signal: 137 → **142** (+5). `cte-002/003/004/005/007/008`… → GREEN: cte-002/003/004/007/008 (multiple, twice, nested, +window, unioned). No regressions.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Tests added: 4 (single-ref inlines as AliasedRelation, explicit-columns→ToDf, referenced-twice→2 clones, WITH RECURSIVE reject).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (2 Low: forward-ref error class = Thunderduck-boundary not Spark-emulated; adversarial nested-CTE exponential clone — inherent to ADR-004 inline, benign for corpus). Perf: per-reference deep clone, O(refs×body), corpus-bounded — no HIGH/MEDIUM.
+- Findings queued as follow-up (DIFFERENT layer — emission): **cte-001** `Binder Error: Referenced table "e"` — a plain aliased table (`emp e`) JOINed with an inlined subquery (AliasedRelation) loses its alias in join emission; **cte-005** `Binder Error: Referenced column "count"` — `ToDf` positional rename over an auto-named `count(*)` doesn't rename in emission. Both are emission-layer gaps exposed by CTE inlining. cte-006 needs `Expr::InSubquery` (separate); cte-009/010 recursive (rejected).
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 644/0, `sql_v2` differential 142/120/262 with 5 cte cases GREEN, no regressions).
+- Commit SHA: (this commit).

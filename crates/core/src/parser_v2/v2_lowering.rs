@@ -42,10 +42,18 @@ use crate::transpiler_v2::type_inference::AGGREGATE_NAMES;
 use crate::transpiler_v2::EmissionError;
 use crate::types::DataType;
 
+/// Immutable CTE scope: lowercased CTE name → its already-lowered body.
+///
+/// Threaded through the query-body lowering chain so that a `FROM <cte>`
+/// reference inlines the CTE body (ADR-004 — no new `CommonOp`) instead of a
+/// catalog `TableScan`. Bodies are lowered once, eagerly, in `cte_tables`
+/// order (each seeing its predecessors), and cloned per reference.
+type CteScope = HashMap<String, CommonAst>;
+
 /// Lower a parsed sqlparser [`Statement`] into a [`CommonAst`].
 pub fn lower_statement(stmt: Statement) -> Result<CommonAst, EmissionError> {
     match stmt {
-        Statement::Query(q) => lower_query(*q),
+        Statement::Query(q) => lower_query(*q, &CteScope::new()),
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::{}", statement_kind(&other)),
             reason: "parser_v2 only supports SELECT queries at Slice A.2".to_owned(),
@@ -68,13 +76,45 @@ fn statement_kind(stmt: &Statement) -> &'static str {
     }
 }
 
-fn lower_query(query: Query) -> Result<CommonAst, EmissionError> {
-    if query.with.is_some() {
-        return Err(EmissionError::UnsupportedProtoShape {
-            shape: "sql::cte".to_owned(),
-            reason: "CTEs (WITH clauses) not supported at Slice A.2".to_owned(),
-        });
-    }
+fn lower_query(query: Query, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
+    // Build the effective CTE scope: inherit the outer scope, then fold in
+    // this query's own `WITH` clause. Each CTE body is lowered with the scope
+    // built so far, so a nested CTE (`b AS (... FROM a ...)`) sees its
+    // predecessors. `WITH RECURSIVE` is not inlinable (self-reference) and is a
+    // Thunderduck-boundary reject (ADR-022).
+    let mut local_scope: CteScope;
+    let effective_scope: &CteScope = match query.with {
+        Some(with) => {
+            if with.recursive {
+                return Err(EmissionError::UnsupportedProtoShape {
+                    shape: "sql::recursive_cte".to_owned(),
+                    reason: "WITH RECURSIVE not supported".to_owned(),
+                });
+            }
+            local_scope = cte_scope.clone();
+            for cte in with.cte_tables {
+                let body = lower_query(*cte.query, &local_scope)?;
+                // Explicit column list `t(k, v)` → positional rename via ToDf.
+                let body = if cte.alias.columns.is_empty() {
+                    body
+                } else {
+                    let column_names = cte
+                        .alias
+                        .columns
+                        .into_iter()
+                        .map(|c| c.name.value)
+                        .collect();
+                    CommonAst::new(CommonOp::ToDf {
+                        input: Box::new(body),
+                        column_names,
+                    })
+                };
+                local_scope.insert(cte.alias.name.value.to_lowercase(), body);
+            }
+            &local_scope
+        }
+        None => cte_scope,
+    };
 
     let order_by_exprs: Vec<OrderByExpr> = match &query.order_by {
         Some(ob) => match &ob.kind {
@@ -91,7 +131,7 @@ fn lower_query(query: Query) -> Result<CommonAst, EmissionError> {
 
     let (limit_expr_opt, offset_expr_opt) = extract_limit_offset(query.limit_clause.as_ref())?;
 
-    let body = lower_set_expr(*query.body)?;
+    let body = lower_set_expr(*query.body, effective_scope)?;
     wrap_with_sort_limit(body, order_by_exprs, limit_expr_opt, offset_expr_opt)
 }
 
@@ -110,10 +150,10 @@ fn extract_limit_offset(
     }
 }
 
-fn lower_set_expr(body: SetExpr) -> Result<CommonAst, EmissionError> {
+fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
     match body {
-        SetExpr::Select(sel) => lower_select(*sel),
-        SetExpr::Query(q) => lower_query(*q),
+        SetExpr::Select(sel) => lower_select(*sel, cte_scope),
+        SetExpr::Query(q) => lower_query(*q, cte_scope),
         SetExpr::Values(_) => Err(EmissionError::UnsupportedProtoShape {
             shape: "sql::values_top_level".to_owned(),
             reason: "top-level VALUES not supported at Slice A.2 (only VALUES in FROM)".to_owned(),
@@ -146,8 +186,8 @@ fn lower_set_expr(body: SetExpr) -> Result<CommonAst, EmissionError> {
             // Spark defaults bare UNION/INTERSECT/EXCEPT to DISTINCT (`all = false`);
             // only the explicit `ALL` quantifier preserves duplicates.
             let all = matches!(set_quantifier, SetQuantifier::All);
-            let left = lower_set_expr(*left)?;
-            let right = lower_set_expr(*right)?;
+            let left = lower_set_expr(*left, cte_scope)?;
+            let right = lower_set_expr(*right, cte_scope)?;
             Ok(CommonAst::new(CommonOp::SetOp {
                 kind,
                 all,
@@ -163,7 +203,7 @@ fn lower_set_expr(body: SetExpr) -> Result<CommonAst, EmissionError> {
     }
 }
 
-fn lower_select(mut select: Select) -> Result<CommonAst, EmissionError> {
+fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
     if select.distinct.is_some() {
         return Err(EmissionError::UnsupportedProtoShape {
             shape: "sql::select_distinct".to_owned(),
@@ -173,7 +213,7 @@ fn lower_select(mut select: Select) -> Result<CommonAst, EmissionError> {
     // Inline named `WINDOW w AS (...)` references into their `WindowSpec` before
     // lowering — τ's Window substrate has no named-window concept (win-012).
     resolve_named_windows_in_select(&mut select)?;
-    let base = lower_from(select.from)?;
+    let base = lower_from(select.from, cte_scope)?;
 
     let filtered = if let Some(cond) = select.selection {
         CommonAst::new(CommonOp::Filter {
@@ -313,13 +353,13 @@ fn lower_aggregate_select(
     }
 }
 
-fn lower_from(from: Vec<TableWithJoins>) -> Result<CommonAst, EmissionError> {
+fn lower_from(from: Vec<TableWithJoins>, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
     if from.is_empty() {
         return Ok(CommonAst::new(CommonOp::SingleRow));
     }
     let mut plans: Vec<CommonAst> = from
         .into_iter()
-        .map(lower_table_with_joins)
+        .map(|twj| lower_table_with_joins(twj, cte_scope))
         .collect::<Result<_, _>>()?;
     let first = plans.remove(0);
     plans.into_iter().try_fold(first, |acc, next| {
@@ -335,10 +375,13 @@ fn lower_from(from: Vec<TableWithJoins>) -> Result<CommonAst, EmissionError> {
     })
 }
 
-fn lower_table_with_joins(twj: TableWithJoins) -> Result<CommonAst, EmissionError> {
-    let mut plan = lower_table_factor(twj.relation)?;
+fn lower_table_with_joins(
+    twj: TableWithJoins,
+    cte_scope: &CteScope,
+) -> Result<CommonAst, EmissionError> {
+    let mut plan = lower_table_factor(twj.relation, cte_scope)?;
     for join in twj.joins {
-        let right = lower_table_factor(join.relation)?;
+        let right = lower_table_factor(join.relation, cte_scope)?;
         let (join_type, condition, using_columns) = lower_join_operator(join.join_operator)?;
         plan = CommonAst::new(CommonOp::Join {
             left: Box::new(plan),
@@ -353,19 +396,37 @@ fn lower_table_with_joins(twj: TableWithJoins) -> Result<CommonAst, EmissionErro
     Ok(plan)
 }
 
-fn lower_table_factor(factor: TableFactor) -> Result<CommonAst, EmissionError> {
+fn lower_table_factor(
+    factor: TableFactor,
+    cte_scope: &CteScope,
+) -> Result<CommonAst, EmissionError> {
     match factor {
-        TableFactor::Table { name, alias, .. } => Ok(CommonAst::new(CommonOp::TableScan {
-            table: object_name_to_string(&name),
-            alias: alias.map(|a| a.name.value),
-        })),
+        TableFactor::Table { name, alias, .. } => {
+            let table = object_name_to_string(&name);
+            // A single-part name matching a CTE in scope inlines the CTE body
+            // (Spark: a CTE shadows a catalog table of the same name). The
+            // reference's own alias wins over the CTE name so qualified refs
+            // bind — `FROM e emp` → alias "emp" (cte-003).
+            if let Some(body) = cte_scope.get(&table.to_lowercase()) {
+                let alias = alias.map(|a| a.name.value).unwrap_or(table);
+                Ok(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(body.clone()),
+                    alias,
+                }))
+            } else {
+                Ok(CommonAst::new(CommonOp::TableScan {
+                    table,
+                    alias: alias.map(|a| a.name.value),
+                }))
+            }
+        }
         TableFactor::Derived {
             subquery, alias: _, ..
         } => {
             // Slice A.2 lowers subquery-in-FROM by inlining the inner plan.
             // AliasedRelation is a deferred variant (Slice C.1); the alias
             // is discarded here — the analyzer (Slice B) will re-resolve.
-            lower_query(*subquery)
+            lower_query(*subquery, cte_scope)
         }
         TableFactor::TableFunction { expr, alias: _ } => {
             // Only bare identifier / function-call table functions covered.
@@ -1606,6 +1667,90 @@ mod tests {
         match &projections[0] {
             Expression::UnresolvedColumn(u) => assert_eq!(u.plan_id, None),
             _ => panic!("expected UnresolvedColumn"),
+        }
+    }
+
+    #[test]
+    fn parse_cte_single_reference_inlines_as_aliased_relation() {
+        // A `FROM <cte>` reference lowers to an AliasedRelation over the CTE
+        // body — NOT a TableScan named x (the CTE shadows any catalog table).
+        let plan = parse("WITH x AS (SELECT id FROM t) SELECT * FROM x").expect("should parse");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        match input.op {
+            CommonOp::AliasedRelation { alias, input } => {
+                assert_eq!(alias, "x");
+                // The inlined body is the CTE's own Project, not a scan of `x`.
+                assert!(
+                    matches!(input.op, CommonOp::Project { .. }),
+                    "expected the inlined CTE body, got {:?}",
+                    input.op
+                );
+            }
+            other => panic!("expected AliasedRelation over the CTE body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cte_explicit_columns_wraps_in_todf() {
+        // `t(k, v)` — the explicit column list becomes a positional ToDf rename
+        // beneath the AliasedRelation.
+        let plan =
+            parse("WITH t(k, v) AS (SELECT a, COUNT(*) FROM u GROUP BY a) SELECT k, v FROM t")
+                .expect("should parse");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        let CommonOp::AliasedRelation { alias, input } = input.op else {
+            panic!("expected AliasedRelation over the CTE body");
+        };
+        assert_eq!(alias, "t");
+        match input.op {
+            CommonOp::ToDf { column_names, .. } => {
+                assert_eq!(column_names, vec!["k".to_owned(), "v".to_owned()]);
+            }
+            other => panic!("expected ToDf under the AliasedRelation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cte_referenced_twice_yields_two_aliased_relations() {
+        // A CTE referenced twice with distinct aliases inlines an independent
+        // AliasedRelation clone per reference (mirrors the self-join shape).
+        let plan = parse(
+            "WITH e AS (SELECT id, manager_id FROM emp) \
+             SELECT emp.id FROM e emp LEFT JOIN e mgr ON emp.manager_id = mgr.id",
+        )
+        .expect("should parse");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        let CommonOp::Join { left, right, .. } = input.op else {
+            panic!("expected Join");
+        };
+        assert!(
+            matches!(left.op, CommonOp::AliasedRelation { ref alias, .. } if alias == "emp"),
+            "left side should be AliasedRelation aliased emp, got {:?}",
+            left.op
+        );
+        assert!(
+            matches!(right.op, CommonOp::AliasedRelation { ref alias, .. } if alias == "mgr"),
+            "right side should be AliasedRelation aliased mgr, got {:?}",
+            right.op
+        );
+    }
+
+    #[test]
+    fn parse_recursive_cte_rejected() {
+        // WITH RECURSIVE is not inlinable (self-reference) — honest boundary.
+        let err = parse("WITH RECURSIVE r(n) AS (SELECT 1) SELECT * FROM r")
+            .expect_err("WITH RECURSIVE should be rejected");
+        match err {
+            EmissionError::UnsupportedProtoShape { shape, .. } => {
+                assert_eq!(shape, "sql::recursive_cte");
+            }
+            other => panic!("expected UnsupportedProtoShape(sql::recursive_cte), got {other:?}"),
         }
     }
 

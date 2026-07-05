@@ -3270,7 +3270,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             // arbitrary expressions bind correctly (see `error(...)`
             // helper). NULL array short-circuits to NULL (Spark
             // `nullSafeEval`). Corpus: `arr-008`.
-            let err = array_index_error_expr(&key, &coll);
+            let err = super::spark_errors::SparkError::InvalidArrayIndex {
+                idx_sql: key.clone(),
+                arr_sql: coll.clone(),
+            }
+            .throw_expr();
             return Ok(format!(
                 "CASE WHEN ({coll}) IS NULL THEN NULL WHEN ({key}) = 0 OR abs(({key})) > len(({coll})) THEN {err} ELSE list_extract(({coll}), ({key})) END"
             ));
@@ -4135,11 +4139,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 return Ok(call);
             }
             let divisor = render_expr(&f.args[1], schema)?;
-            return Ok(ansi_zero_guard(
+            return Ok(super::spark_errors::ansi_throw_if(
+                &format!("({divisor}) = 0"),
+                super::spark_errors::SparkError::RemainderByZero,
                 &call,
-                &divisor,
-                "REMAINDER_BY_ZERO",
-                REMAINDER_BY_ZERO_MSG,
             ));
         }
         _ => &name_lower,
@@ -4591,8 +4594,11 @@ fn render_column_reference(c: &ColumnReference) -> Result<String, EmissionError>
 // raises with the class at the throw site, mirroring `spark_decimal_div` — it
 // avoids CASE-wrapping every division. The emitted-SQL guard below is the
 // in-repo interim; migrate when the extension gains those functions.
-const DIVIDE_BY_ZERO_MSG: &str = "Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
-const REMAINDER_BY_ZERO_MSG: &str = "Remainder by zero. Use `try_mod` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
+// `pub(crate)` for Pass 10 (OPP-C): `spark_errors::SparkError::throw_expr`
+// references these consts. Pass 11 (OPP-J) will move the consts into
+// `spark_errors.rs` proper and drop the crate visibility here.
+pub(crate) const DIVIDE_BY_ZERO_MSG: &str = "Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
+pub(crate) const REMAINDER_BY_ZERO_MSG: &str = "Remainder by zero. Use `try_mod` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
 
 // Spark 4.1's `INVALID_ARRAY_INDEX_IN_ELEMENT_AT` message is runtime-templated
 // — the index value and array size are interpolated per row. The three
@@ -4602,32 +4608,18 @@ const REMAINDER_BY_ZERO_MSG: &str = "Remainder by zero. Use `try_mod` to tolerat
 //
 // The backticks around `try_element_at` are safe inside a SQL single-quoted
 // string literal (only apostrophes need `''` escaping) — verified in DuckDB.
-const INVALID_ARRAY_INDEX_MSG_HEAD: &str = "[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index ";
-const INVALID_ARRAY_INDEX_MSG_MID: &str = " is out of bounds. The array has ";
-const INVALID_ARRAY_INDEX_MSG_TAIL: &str = " elements. Use `try_element_at` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003";
+// `pub(crate)` for Pass 10 (OPP-C): `spark_errors::SparkError::throw_expr`
+// references these fragments. Pass 11 (OPP-J) will relocate them.
+pub(crate) const INVALID_ARRAY_INDEX_MSG_HEAD: &str =
+    "[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index ";
+pub(crate) const INVALID_ARRAY_INDEX_MSG_MID: &str = " is out of bounds. The array has ";
+pub(crate) const INVALID_ARRAY_INDEX_MSG_TAIL: &str = " elements. Use `try_element_at` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003";
 
-/// Build the DuckDB `error('[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index N is
-/// out of bounds. The array has M elements. Use `try_element_at` ... SQLSTATE:
-/// 22003')` call, interpolating `idx` and `len(arr)` at runtime. Callers must
-/// pass already-rendered SQL fragments; both are wrapped in parens so negative
-/// literals (`-4::VARCHAR` binds as `-(4::VARCHAR)`) survive the cast.
-fn array_index_error_expr(idx_sql: &str, arr_sql: &str) -> String {
-    format!(
-        "error('{head}' || ({idx_sql})::VARCHAR || '{mid}' || len(({arr_sql}))::VARCHAR || '{tail}')",
-        head = INVALID_ARRAY_INDEX_MSG_HEAD,
-        mid = INVALID_ARRAY_INDEX_MSG_MID,
-        tail = INVALID_ARRAY_INDEX_MSG_TAIL,
-    )
-}
-
-/// Wrap already-rendered division/modulo SQL so a zero `divisor` raises Spark's
-/// ANSI error instead of returning DuckDB's NULL/inf. A NULL divisor falls
-/// through to `inner` (`NULL = 0` is not TRUE), matching Spark (`a / NULL` =
-/// NULL, no throw).
-fn ansi_zero_guard(inner: &str, divisor: &str, class: &str, message: &str) -> String {
-    let escaped = message.replace('\'', "''");
-    format!("CASE WHEN ({divisor}) = 0 THEN error('[{class}] {escaped}') ELSE {inner} END")
-}
+// Pass 10 (OPP-C): the `array_index_error_expr` and `ansi_zero_guard` free
+// helpers were unified with [`super::spark_errors::SparkError`] +
+// [`super::spark_errors::ansi_throw_if`]. Call sites migrated inline; see
+// `render_element_at` (InvalidArrayIndex) and `render_binary` / pmod-mod
+// arm in `render_scalar_function_call` (DivideByZero / RemainderByZero).
 
 /// True when `e` is a numeric literal that is provably non-zero, so the ANSI
 /// zero-guard can be skipped (the divisor can never be 0).
@@ -4689,14 +4681,16 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
     let inner = format!("({l}) {op} ({r})");
     // ADR-006: guard divide/mod-by-zero with Spark's ANSI error class.
     let guard = match b.op {
-        BinaryOp::Div | BinaryOp::IntDiv => Some(("DIVIDE_BY_ZERO", DIVIDE_BY_ZERO_MSG)),
-        BinaryOp::Mod => Some(("REMAINDER_BY_ZERO", REMAINDER_BY_ZERO_MSG)),
+        BinaryOp::Div | BinaryOp::IntDiv => Some(super::spark_errors::SparkError::DivideByZero),
+        BinaryOp::Mod => Some(super::spark_errors::SparkError::RemainderByZero),
         _ => None,
     };
     match guard {
-        Some((class, msg)) if !is_nonzero_literal(&b.right) => {
-            Ok(ansi_zero_guard(&inner, &r, class, msg))
-        }
+        Some(err) if !is_nonzero_literal(&b.right) => Ok(super::spark_errors::ansi_throw_if(
+            &format!("({r}) = 0"),
+            err,
+            &inner,
+        )),
         _ => Ok(inner),
     }
 }

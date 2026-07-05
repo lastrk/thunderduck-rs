@@ -418,3 +418,51 @@ and `matches!`-pattern sites.
   --tests` → 69 pass / 0 fail + 14 ignored — matches HEAD.
 - **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` on
   touched files: **zero** drift blocks.
+
+## Pass 10 — OPP-C (2026-07-05)
+
+**Refactor.** Introduced `crates/core/src/transpiler_v2/spark_errors.rs`
+(170 LOC) housing the `SparkError` enum (`DivideByZero`,
+`RemainderByZero`, `InvalidArrayIndex { idx_sql, arr_sql }`) and two
+synthesis helpers: `SparkError::throw_expr()` renders the DuckDB
+`error('[CLASS] <message>')` fragment; `ansi_throw_if(cond, err,
+inner)` wraps it in the `CASE WHEN cond THEN throw ELSE inner END`
+shape. Byte-identity with the retired `ansi_zero_guard` /
+`array_index_error_expr` helpers is pinned by 4 unit tests inside
+the new module.
+
+**Call sites migrated:**
+- `emission::render_binary` Div/IntDiv/Mod arm →
+  `ansi_throw_if(.., SparkError::{DivideByZero, RemainderByZero}, ..)`.
+- `emission::render_scalar_function_call` `pmod`/`mod` arm →
+  `ansi_throw_if(.., SparkError::RemainderByZero, ..)`.
+- `emission::render_element_at` array arm →
+  `SparkError::InvalidArrayIndex { .. }.throw_expr()` (caller still
+  wraps in the 2-branch NULL-short-circuit CASE — `ansi_throw_if`
+  does not fit the two-WHEN shape, so `throw_expr()` is called
+  directly).
+
+**Legacy helpers.** `ansi_zero_guard` and `array_index_error_expr`
+deleted outright (no remaining callers).
+
+**Consts.** Pass 10 scope explicitly excludes moving
+`DIVIDE_BY_ZERO_MSG`, `REMAINDER_BY_ZERO_MSG`, and
+`INVALID_ARRAY_INDEX_MSG_{HEAD,MID,TAIL}` — they stay in `emission.rs`
+widened from private to `pub(crate)`, referenced from
+`spark_errors.rs` via `use super::emission::{...}`. Pass 11 (OPP-J)
+is the pure move.
+
+- **Files touched.**
+  - `crates/core/src/transpiler_v2/spark_errors.rs` — new, +170 LOC.
+  - `crates/core/src/transpiler_v2/mod.rs` — +1 line.
+  - `crates/core/src/transpiler_v2/emission.rs` — net roughly flat
+    (−22 retired helper LOC, +16 migrated call-site LOC, +6
+    doc/visibility comments).
+- **Corpus.** 314 → 314. math-010, math-011, arr-008 remain GREEN.
+- **Warnings.** No delta.
+- **Gate.** `cargo test -p thunderduck-core --lib --tests` → 452
+  pass / 0 fail / 4 ignored (baseline 448 + 4 new
+  `spark_errors::tests`). `cargo test -p thunderduck-connect-server
+  --tests` → 69 pass / 0 fail + 14 ignored (matches HEAD).
+- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` on
+  touched files clean.

@@ -23,6 +23,7 @@ pub mod expression;
 pub mod invariants;
 pub mod macros;
 pub mod rewrites;
+pub(crate) mod spark_errors;
 mod struct_names;
 pub mod type_inference;
 

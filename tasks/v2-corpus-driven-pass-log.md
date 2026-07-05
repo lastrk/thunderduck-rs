@@ -946,3 +946,15 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean, rustfmt clean on touched files, `cargo test -p thunderduck-core --lib` 540/0, `sql_v2` 184/78/262, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 115 — 2026-07-05 — TECH-DEBT SWEEP (post-merge + pass-114)
+- **Sweep** (every-5th cadence; prior sweep pass 110). rust-reviewer over the merge-affected + pass-114 code (analyzer.rs, emission.rs, v2_lowering.rs, service.rs, v2_relation_converter.rs).
+- Finding: the 17-commit OPP merge + pass-114 landed with **zero new compiler warnings**, no dead code, no unused imports, no conflict markers. Only debt: `parser_v2/v2_lowering.rs` was taken wholesale in the merge and mechanically enum-converted, so it never adopted the OPP-D `bail_boundary_proto!` / OPP-HHH `ProtoFieldExt::require_proto` idiom its siblings (`parser_v2/mod.rs`, `v2_relation_converter.rs`) use — two ways to build the identical error within one directory. Plus one stale intra-doc link to the deleted `UnsupportedProtoShape` variant.
+- Fix (zero behavior change — macros emit byte-identical Display): converted 39 sites in v2_lowering.rs — 18 `return Err` statement sites → `bail_boundary_proto!`, 12 return-position match-arm tails → `=> bail_boundary_proto!`, 9 `Option::ok_or_else` → `.require_proto`. Left value-producing/else-branch literals, the `overflow` closure + its call sites, `Result::map_err`, and `#[cfg(test)]` pattern-matches. Fixed the stale doc link.
+- Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`). −67 LOC net (258 del / 191 ins).
+- ADR citations: OPP-D/OPP-HHH idiom (CLAUDE.md §Idiomatic Rust); no behavior/ADR change.
+- Corpus signal: 184 → **184** (unchanged — pure refactor, as required).
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Compiler warning delta: 0 (both crates build silent).
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 540/0, `sql_v2` 184/78/262 no regression).
+- Commit SHA: (this commit).

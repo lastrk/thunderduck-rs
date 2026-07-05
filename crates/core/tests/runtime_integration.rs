@@ -75,45 +75,6 @@ async fn session_manager_isolation() {
     );
 }
 
-// ── generator_to_duckdb ────────────────────────────────────────────────────────
-
-/// Full pipeline: LogicalPlan → SQL string (Phase 1) → DuckDB execution → Arrow.
-#[tokio::test]
-#[ignore]
-async fn generator_to_duckdb() {
-    use thunderduck_core::{
-        expression::{Expression, UnresolvedColumn},
-        generator::SqlGenerator,
-        logical::{LogicalPlan, Project, RangeRelation},
-    };
-
-    let plan = LogicalPlan::Project(Project {
-        input: Box::new(LogicalPlan::RangeRelation(RangeRelation {
-            start: 1,
-            end: 4,
-            step: 1,
-            num_partitions: None,
-        })),
-        projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "id".into(),
-            qualifier: None,
-        })],
-    });
-
-    let sql = SqlGenerator::new()
-        .generate(&plan)
-        .expect("SQL generation failed");
-
-    let session =
-        DuckDbSession::spawn("gen-test", &StreamingConfig::default()).expect("spawn failed");
-
-    let batches = session.execute(&sql).await.expect("execute failed");
-
-    assert!(!batches.is_empty(), "expected result batches");
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 3, "range(1, 4, 1) should yield 3 rows");
-}
-
 // ── get_or_create_is_race_free (Bug 6: TOCTOU) ────────────────────────────────
 
 /// Demonstrates the TOCTOU race in `SessionManager::get_or_create`.

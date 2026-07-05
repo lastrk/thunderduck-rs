@@ -160,7 +160,7 @@ pub enum LiteralValue {
 }
 
 // LiteralValue contains f32/f64, so PartialOrd / Hash / Eq are not derivable.
-// We do not need them for Slice A.1; the derives above are minimal.
+// We do not need them for τ; the derives above are minimal.
 
 /// A typed literal expression.
 #[derive(Debug, Clone, PartialEq)]

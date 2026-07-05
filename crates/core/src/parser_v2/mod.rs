@@ -2,7 +2,7 @@
 //!
 //! Owns the SQL text path in the τ substrate (Open Decision 1 Option 1b):
 //! `V2RelationConverter` refuses `RelType::Sql` with
-//! [`EmissionError::UnsupportedProtoShape`]; dispatch (Slice A.3) routes
+//! [`EmissionError::UnsupportedProtoShape`]; dispatch routes
 //! `Sql` here instead.
 //!
 //! **INV10:** this file imports ONLY value-level types from `crate::types`
@@ -22,14 +22,14 @@ pub struct SparkSqlParserV2;
 impl SparkSqlParserV2 {
     /// Parse a raw Spark SQL string into a [`CommonAst`].
     ///
-    /// Slice A.2 scope: `SELECT` queries with `FROM`, `WHERE`, `GROUP BY`,
+    /// τ scope: `SELECT` queries with `FROM`, `WHERE`, `GROUP BY`,
     /// `ORDER BY`, `LIMIT/OFFSET`, joins, and subqueries in `FROM`.
     /// Everything else surfaces as
     /// [`EmissionError::UnsupportedProtoShape`].
     pub fn parse(sql: &str) -> Result<CommonAst, EmissionError> {
         use sqlparser::parser::Parser;
         let dialect = SparkDialect::default();
-        // Slice A.2 fix pass (review M2): sqlparser errors are boundary
+        // τ fix pass (review M2): sqlparser errors are boundary
         // failures — the input never reached `CommonAst`, so the correct
         // category is `UnsupportedProtoShape` (input τ can't ingest), not
         // `UnsupportedOp` (emission arm not implemented).

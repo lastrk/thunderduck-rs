@@ -186,11 +186,11 @@ impl V2RelationConverter {
             }),
             RelType::Catalog(_) => Err(EmissionError::UnsupportedProtoShape {
                 shape: "RelType::Catalog".to_owned(),
-                reason: "catalog operations deferred to Slice H".to_owned(),
+                reason: "catalog operations deferred to future τ work".to_owned(),
             }),
             other => Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("RelType::{}", rel_type_kind(other)),
-                reason: "relation shape not covered by V2RelationConverter at Slice A.2".to_owned(),
+                reason: "relation shape not covered by V2RelationConverter".to_owned(),
             }),
         }
     }
@@ -1086,7 +1086,7 @@ impl V2ExpressionConverter {
             ExprType::UnresolvedRegex(ur) => Ok(convert_unresolved_regex(ur)),
             other => Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("Expression::{}", expr_type_kind(other)),
-                reason: "expression shape not covered by V2ExpressionConverter at Slice A.2"
+                reason: "expression shape not covered by V2ExpressionConverter"
                     .to_owned(),
             }),
         }
@@ -1196,7 +1196,7 @@ impl V2ExpressionConverter {
             other => {
                 return Err(EmissionError::UnsupportedProtoShape {
                     shape: format!("Literal::{}", literal_kind(other)),
-                    reason: "literal type not covered by V2ExpressionConverter at Slice A.2"
+                    reason: "literal type not covered by V2ExpressionConverter"
                         .to_owned(),
                 });
             }
@@ -1681,7 +1681,7 @@ fn classify_file_format(
         Some(other) => {
             return Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("Read::DataSource::format::{other}"),
-                reason: "file format not supported at Slice A.2".to_owned(),
+                reason: "file format not supported by τ\'s SparkSQL parser".to_owned(),
             });
         }
     };
@@ -1842,7 +1842,7 @@ fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, EmissionError> {
         other => {
             return Err(EmissionError::UnsupportedProtoShape {
                 shape: format!("arrow_schema::{other:?}"),
-                reason: "Arrow schema data type not supported at Slice A.2".to_owned(),
+                reason: "Arrow schema data type not supported by τ\'s SparkSQL parser".to_owned(),
             });
         }
     })

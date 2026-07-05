@@ -4,30 +4,30 @@
 //! - active markers name the current slice; deletion is the completion signal.
 //! - deferred markers name the owning slice; not tripped by the current gate.
 //!
-//! At Slice A.1 only INV10 is active. All other INVs are deferred to their
+//! At τ only INV10 is active. All other INVs are deferred to their
 //! owning slice per the readiness map. INV7 is intentionally OMITTED (deleted
 //! per ADR-022 §CV.5); do not add an INV7 stub.
 
-// ── INV1 (Slice I — differential harness) ────────────────────────────────────
+// ── INV1 (deferred — differential harness) ────────────────────────────────────
 
-/// DEFER INV1 → Slice I: byte-identical-input principle validation.
+/// DEFER INV1: byte-identical-input principle validation.
 ///
-/// ADR-015: differential tests must feed the same input to legacy and τ paths
-/// and assert byte-identical SQL output when both paths handle the plan.
+/// ADR-015: differential tests must feed the same input to both engines
+/// (Spark reference + τ) and assert Spark-parity output.
 #[test]
 #[ignore]
 fn inv1_byte_identical_input() {
-    todo!("INV1 activation is Slice I's deliverable (differential harness)")
+    todo!("INV1 — activation deferred; not yet implemented")
 }
 
-// ── INV2 (ACTIVE — Slice C.1) ────────────────────────────────────────────────
+// ── INV2 (ACTIVE) ────────────────────────────────────────────────
 
 /// INV2: dispatch is the ONLY writer of SQL text — every emission arm must
-/// route through the dispatch table. Slice C.1 introduces `EMIT_TAP` +
+/// route through the dispatch table. τ's emission substrate introduces `EMIT_TAP` +
 /// `EMIT_TAP_MUTEX` in `emission.rs`; this test asserts that a successful
 /// `generate()` call increments the tap exactly once.
 ///
-/// The Slice J escape-hatch dimension extends this test (verifies emitting
+/// The future τ work escape-hatch dimension extends this test (verifies emitting
 /// via unregistered paths increments zero times).
 #[test]
 fn inv2_dispatch_is_only_sql_writer() {
@@ -48,13 +48,15 @@ fn inv2_dispatch_is_only_sql_writer() {
     );
 }
 
-// ── INV3 (ACTIVE — Slice C.1) ────────────────────────────────────────────────
+// ── INV3 (ACTIVE) ────────────────────────────────────────────────
 
 /// INV3: the emission table is the SINGLE source of truth for function →
-/// DuckDB mapping. Slice C.1's grep-barrier form: `emission.rs` MUST NOT
-/// import from `crate::generator::` or `crate::functions::` (legacy sources
-/// of function-name mappings). INV10's walker already checks intra-τ imports
-/// at the file level; this test asserts the specific emission-file constraint.
+/// DuckDB mapping. Grep-barrier form: `emission.rs` MUST NOT import from
+/// `crate::generator::` or `crate::functions::` (retired v1 sources of
+/// function-name mappings; the modules were deleted on 2026-07-05 and the
+/// barrier prevents accidental re-introduction). INV10's walker already
+/// checks intra-τ imports at the file level; this test asserts the specific
+/// emission-file constraint.
 #[test]
 fn inv3_emission_table_single_source_of_truth() {
     let root = find_workspace_root().expect("workspace root should be discoverable");
@@ -62,8 +64,8 @@ fn inv3_emission_table_single_source_of_truth() {
     let contents = std::fs::read_to_string(&emission)
         .unwrap_or_else(|_| panic!("cannot read {}", emission.display()));
     // Only scan the non-test region — the `#[cfg(test)]` module in
-    // emission.rs legitimately names legacy paths inside its assertion
-    // literals.
+    // emission.rs legitimately names forbidden prefixes inside its
+    // assertion literals.
     let module_marker = "#[cfg(test)]\nmod tests {";
     let scan_slice = match contents.find(module_marker) {
         Some(idx) => &contents[..idx],
@@ -84,13 +86,13 @@ fn inv3_emission_table_single_source_of_truth() {
     }
 }
 
-// ── INV4 (ACTIVE — Slice B) ──────────────────────────────────────────────────
+// ── INV4 (ACTIVE) ──────────────────────────────────────────────────
 
 /// INV4: inference is validated in isolation from emission — the analyzer's
 /// schema/nullability results are verifiable without running any SQL through
 /// DuckDB.
 ///
-/// Iterates the Slice B fixture registry and, for each Ok-path fixture,
+/// Iterates the τ's analyzer fixture registry and, for each Ok-path fixture,
 /// asserts the analyzed `resolved_schema` field-by-field matches the
 /// expected schema recorded in the fixture.
 #[test]
@@ -122,7 +124,7 @@ fn inv4_inference_validated_in_isolation() {
     }
 }
 
-// ── INV5 (ACTIVE — Slice B) ──────────────────────────────────────────────────
+// ── INV5 (ACTIVE) ──────────────────────────────────────────────────
 
 /// INV5: every plan node carries a resolved schema after analysis; no
 /// `DataType::Unresolved` remains and no `ColumnReference` has `data_type`
@@ -141,68 +143,65 @@ fn inv5_schema_everywhere() {
     }
 }
 
-// ── INV6 (Slice D — extension targets exist) ─────────────────────────────────
+// ── INV6 (deferred — extension targets exist) ─────────────────────────────────
 
-/// DEFER INV6 → Slice D: every entry in `extension_targets()` MUST resolve
-/// against `duckdb_functions()` in a loaded ext6 session. Slice D's Phase 2
+/// DEFER INV6: every entry in `extension_targets()` MUST resolve
+/// against `duckdb_functions()` in a loaded ext6 session. τ's extension-target wiring's Phase 2
 /// activation opens a session, loads the extension, and asserts the allow-list
 /// is a subset of the loaded function catalog.
 #[test]
 #[ignore]
 fn inv6_extension_targets_exist() {
-    todo!("INV6 activation requires extension_targets() + duckdb_functions() check (Slice D)")
+    todo!("INV6 activation requires extension_targets() + duckdb_functions() check")
 }
 
 // ── INV7 — OMITTED per ADR-022 §CV.5 ─────────────────────────────────────────
 
 // INV7 was deleted from the invariant set. Do not add an INV7 stub.
 
-// ── INV8 (Slice H — external access delegation) ──────────────────────────────
+// ── INV8 (deferred — external access delegation) ──────────────────────────────
 
-/// DEFER INV8 → Slice H: any read/write against external storage is delegated
+/// DEFER INV8: any read/write against external storage is delegated
 /// to a substrate adapter and NEVER inlined into emission arms.
 #[test]
 #[ignore]
 fn inv8_external_access_delegated() {
-    todo!("INV8 activation is Slice H's writes deliverable")
+    todo!("INV8 — activation deferred; not yet implemented")
 }
 
-// ── INV9 (Slice H — writes require attached provenance) ──────────────────────
+// ── INV9 (deferred — writes require attached provenance) ──────────────────────
 
-/// DEFER INV9 → Slice H: writable plans must carry attached provenance
+/// DEFER INV9: writable plans must carry attached provenance
 /// (source-of-writes) before emission; no writes emitted from unattached plans.
 #[test]
 #[ignore]
 fn inv9_writable_requires_attached_provenance() {
-    todo!("INV9 activation is Slice H's writes deliverable")
+    todo!("INV9 — activation deferred; not yet implemented")
 }
 
-// ── INV10 (ACTIVE — Slice A.2) ───────────────────────────────────────────────
+// ── INV10 (ACTIVE) ───────────────────────────────────────────────
 
 /// A τ walk root — a directory and an optional file filter.
 ///
 /// The filter exists so the connect-server crate can be walked without
-/// pulling legacy converter files (`relation_converter.rs`, etc.) which
-/// legitimately import from `crate::logical` / `crate::expression`. When
-/// `files == Some(names)`, only files whose basename appears in `names`
-/// contribute to the walk; when `files == None`, every `.rs` file under
-/// `dir` is walked.
+/// pulling files outside τ's converter boundary. When `files == Some(names)`,
+/// only files whose basename appears in `names` contribute to the walk;
+/// when `files == None`, every `.rs` file under `dir` is walked.
 #[cfg(test)]
 struct WalkRoot {
     dir: &'static str,
     files: Option<&'static [&'static str]>,
 }
 
-/// Root paths INV10 walks. Slice A.3 covers four roots:
+/// Root paths INV10 walks. The τ dispatch site covers four roots:
 ///
 /// - `crates/core/src/transpiler_v2/` — τ's substrate (unfiltered).
 /// - `crates/core/src/parser_v2/` — τ's SparkSQL front-end (unfiltered).
 /// - `crates/connect-server/src/converter/v2_relation_converter.rs` — τ's
-///   protobuf front-end (single-file filter — the sibling legacy converter
-///   files legitimately import from `crate::logical` etc.).
+///   protobuf front-end (single-file filter).
 /// - `crates/connect-server/src/service.rs` — the τ dispatch site (single-file
-///   filter; sibling files `main.rs`, `arrow_ipc.rs`, `error.rs` legitimately
-///   import from legacy paths and are excluded).
+///   filter; sibling files `main.rs`, `arrow_ipc.rs`, `error.rs` are
+///   excluded from the walk scope).
 #[cfg(test)]
 const WALK_ROOTS: &[WalkRoot] = &[
     WalkRoot {
@@ -325,7 +324,7 @@ fn find_workspace_root() -> Option<std::path::PathBuf> {
 /// INV10: enforce τ substrate independence — no imports from
 /// `crate::{logical,expression,generator,functions,parser,runtime}` and no
 /// re-use of `crate::types::TypeInferenceEngine` inside any file under a
-/// τ-owned tree. Extended in Slice A.2 to also cover the connect-server
+/// τ-owned tree. Extended to also cover the connect-server
 /// `v2_relation_converter.rs` file (reaching into `thunderduck_core::*`).
 ///
 /// Walks every `.rs` file matched by [`WALK_ROOTS`], splits each into lines,
@@ -396,7 +395,7 @@ fn inv10_walk_roots_all_exist() {
     assert!(missing.is_empty(), "missing walk-root dirs: {missing:?}");
 }
 
-/// Slice A.3 sanity: `crates/connect-server/src/service.rs` must be in the
+/// the τ dispatch site sanity: `crates/connect-server/src/service.rs` must be in the
 /// INV10 walk scope so τ-boundary discipline covers the dispatch site.
 #[test]
 fn inv10_service_rs_is_in_walk_scope() {
@@ -424,7 +423,7 @@ fn inv10_service_rs_is_in_walk_scope() {
     );
 }
 
-/// Slice A.3 anti-regression: no file under `crates/connect-server/src/`
+/// the τ dispatch site anti-regression: no file under `crates/connect-server/src/`
 /// (any file, not just `service.rs`) may reference `THUNDERDUCK_TRANSPILER`
 /// — the env-var no-op block was removed from `main.rs` at A.3.
 #[test]
@@ -463,7 +462,7 @@ fn inv10_filtered_root_only_walks_named_files() {
     let filtered: &WalkRoot = WALK_ROOTS
         .iter()
         .find(|w| w.files.is_some())
-        .expect("Slice A.2 must have at least one filtered walk root");
+        .expect("must have at least one filtered walk root");
     let dir = root.join(filtered.dir);
     if !dir.exists() {
         // The filtered root's directory should exist per

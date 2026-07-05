@@ -2,7 +2,7 @@
 //!
 //! ADR-021 (τ owns substrate) + ADR-022 (τ is the only path).
 //!
-//! At Slice C.1 this module tree carries the type substrate, the stable
+//! At τ's emission substrate this module tree carries the type substrate, the stable
 //! [`CommonAst`] + [`BaseTypes`] surface, the analyzer that turns a
 //! `CommonAst` into a [`TypedAst`] with resolved schemas and stamped column
 //! types / nullabilities, AND the emission substrate — [`emission::dispatch_op`]
@@ -37,7 +37,7 @@ pub use type_inference::TypeInferenceEngine;
 
 /// τ's top-level entry point.
 ///
-/// **Slice C.1 behavior:** invokes the analyzer via [`analyze`], then
+/// **τ's emission substrate behavior:** invokes the analyzer via [`analyze`], then
 /// dispatches through [`emission::dispatch_op`]. Errors from the analyzer
 /// surface with their two-category classification preserved (Spark-emulated
 /// errors carry the `[SPARK-EMULATED]` Display prefix; Thunderduck-boundary
@@ -105,9 +105,9 @@ mod tests {
     }
 
     #[test]
-    fn generate_surfaces_analyzer_error_before_slice_b_marker() {
+    fn generate_surfaces_analyzer_error_not_pipeline_marker() {
         // A plan referencing an unknown table must surface the analyzer's
-        // Spark-emulated error, not the Slice B marker.
+        // Spark-emulated error, not the τ's analyzer marker.
         let plan = CommonAst::new(CommonOp::TableScan {
             table: "no_such_table".to_owned(),
             alias: None,

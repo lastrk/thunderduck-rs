@@ -18,10 +18,10 @@ use crate::proto::spark::connect::spark_connect_service_server::SparkConnectServ
 
 type BoxStream<T> = Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
 
-// TODO(Slice B): re-add a plan-depth guard using `CommonAst::depth()` once
-// the substrate carries a depth query. Slice A.3 removed the legacy
-// `LogicalPlan::depth()` inspection when dispatch relocated to the τ
-// boundary; `MAX_PLAN_DEPTH` will return alongside that query.
+// TODO: re-add a plan-depth guard using `CommonAst::depth()` once
+// the substrate carries a depth query. The previous `LogicalPlan::depth()`
+// inspection was removed when dispatch relocated to the τ boundary;
+// `MAX_PLAN_DEPTH` will return alongside that query.
 
 pub struct ThunderduckService {
     session_manager: Arc<thunderduck_core::runtime::SessionManager>,
@@ -36,12 +36,12 @@ impl ThunderduckService {
 static SERVER_SESSION_ID: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
-// ── τ dispatch helpers (Slice A.3) ────────────────────────────────────────────
+// ── τ dispatch helpers ────────────────────────────────────────────
 
 /// Convert a Spark Connect [`proto::Relation`] into a [`CommonAst`] and finalize
 /// it into DuckDB SQL via τ.
 ///
-/// At Slice A.3, `transpiler_v2::generate()` errors unconditionally, so this
+/// At the τ dispatch site, `transpiler_v2::generate()` errors unconditionally, so this
 /// helper always surfaces `Status::unimplemented` for structurally-valid
 /// inputs (via `EmissionError::UnsupportedOp`). The dispatch shape is what
 /// matters; Slices B/C/D/E/F/G grow coverage behind this same boundary.
@@ -88,8 +88,8 @@ pub(crate) fn transpile_raw_sql(sql_text: &str) -> Result<(CommonAst, String, St
 /// Fusing avoids the second `analyze()` call that pass 88's initial wiring
 /// incurred (perf review HIGH #1).
 ///
-/// The catalog closure returns `None` at Slice A.3 — the overlay exists to
-/// satisfy the dispatch shape; Slice B wires the actual catalog bridge over
+/// The catalog closure returns `None` — the overlay exists to
+/// satisfy the dispatch shape; τ's analyzer wires the actual catalog bridge over
 /// `DuckDbSession`.
 pub(crate) fn finalize(common_ast: &CommonAst) -> Result<(String, StructType), Status> {
     let base_types = build_base_types(common_ast);
@@ -99,7 +99,7 @@ pub(crate) fn finalize(common_ast: &CommonAst) -> Result<(String, StructType), S
 
 /// Run τ's analyzer on a `CommonAst` and return the root-node resolved schema.
 ///
-/// Used by `AnalyzePlan(Schema)` (E.0 addendum — Slice B analyzer wiring for
+/// Used by `AnalyzePlan(Schema)` (E.0 addendum — τ's analyzer analyzer wiring for
 /// the schema-analyze surface). The `ExecutePlan` streaming-query path takes
 /// its schema from [`finalize`]'s fused return instead of re-running the
 /// analyzer.
@@ -111,8 +111,8 @@ pub(crate) fn analyze_schema(common_ast: &CommonAst) -> Result<StructType, Statu
 
 /// Build the per-path `BaseTypes` overlay for a `CommonAst`.
 ///
-/// The catalog closure returns `None` at Slice A.3 — the overlay exists to
-/// satisfy the dispatch shape; Slice B wires the actual catalog bridge over
+/// The catalog closure returns `None` — the overlay exists to
+/// satisfy the dispatch shape; τ's analyzer wires the actual catalog bridge over
 /// `DuckDbSession`.
 fn build_base_types(common_ast: &CommonAst) -> BaseTypes {
     if plan_has_empty_scan(common_ast) {
@@ -159,7 +159,7 @@ impl SparkConnectService for ThunderduckService {
         let responses: Vec<proto::ExecutePlanResponse> = match plan.op_type {
             Some(proto::plan::OpType::Root(relation)) => {
                 let (common_ast, sql, resolved_schema) = transpile_relation(&relation)?;
-                // Slice A.3: `finalize()` errors unconditionally, so the
+                // `finalize()` errors unconditionally, so the
                 // downstream classification / streaming helpers are only
                 // reachable when Slices C/E begin lighting up emission arms.
                 // Signature-swapped helpers preserve the dispatch shape.
@@ -410,9 +410,9 @@ async fn handle_command(
     }
 }
 
-// ── Signature-swapped downstream helpers (Slice A.3) ─────────────────────────
+// ── Signature-swapped downstream helpers ─────────────────────────
 //
-// These helpers formerly consumed `&LogicalPlan`. At Slice A.3 they consume
+// These helpers formerly consumed `&LogicalPlan`. At the τ dispatch site they consume
 // `&CommonAst` and return `Err(Status::unimplemented(...))`. `transpile_relation`
 // / `transpile_raw_sql` errors before dispatch ever reaches them today (τ's
 // `generate()` returns `UnsupportedOp` for every input). Slices B/C/D/E/F/G
@@ -432,16 +432,16 @@ enum PlanKind {
 
 /// Classify a τ plan as DDL or query.
 ///
-/// Slice A.3: always returns [`PlanKind::Query`]. The DDL classification is a
-/// Slice C.1 deliverable — `CommonAst` does not yet carry a DDL discriminant.
+/// always returns [`PlanKind::Query`]. The DDL classification is a
+/// τ's emission substrate deliverable — `CommonAst` does not yet carry a DDL discriminant.
 fn classify_plan(_common_ast: &CommonAst) -> PlanKind {
     PlanKind::Query
 }
 
 /// Execute a DDL statement and return appropriate responses.
 ///
-/// **Slice C.1 (owner):** DDL classification and execution over `CommonAst`.
-/// Slice A.3 body errors with `Status::unimplemented` because τ's
+/// **τ's emission substrate (owner):** DDL classification and execution over `CommonAst`.
+/// the τ dispatch site body errors with `Status::unimplemented` because τ's
 /// `finalize()` never reaches this point.
 async fn execute_ddl(
     _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
@@ -451,17 +451,17 @@ async fn execute_ddl(
     _operation_id: &str,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
     Err(Status::unimplemented(
-        "Slice C.1: DDL classification and execution over CommonAst",
+        "DDL classification and execution over CommonAst",
     ))
 }
 
 /// Execute a query plan and stream results back to the client.
 ///
-/// **Slice E.0 (owner):** streaming query execution over `CommonAst`.
+/// **future τ work.0 (owner):** streaming query execution over `CommonAst`.
 ///
 /// The `_common_ast` parameter is reserved for future use (per plan §8:
 /// `spark_names` / column-rename metadata) and is intentionally unused at
-/// Slice E.0. The τ pipeline has already produced fully-aliased DuckDB SQL by
+/// future τ work.0. The τ pipeline has already produced fully-aliased DuckDB SQL by
 /// this point (via `finalize()` at the dispatch seam), so E.0 only needs to
 /// submit that SQL to the session and wrap the resulting Arrow batches into
 /// `ExecutePlanResponse` frames.
@@ -509,7 +509,7 @@ async fn execute_streaming_query(
 
 /// Handle `CreateDataframeView` after successful transpile.
 ///
-/// **Slice B (owner):** schema inference over `CommonAst` for `CREATE VIEW`.
+/// **τ's analyzer (owner):** schema inference over `CommonAst` for `CREATE VIEW`.
 async fn handle_create_dataframe_view(
     _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     _session_id: &str,
@@ -517,13 +517,13 @@ async fn handle_create_dataframe_view(
     _common_ast: &CommonAst,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
     Err(Status::unimplemented(
-        "Slice B: schema inference for CreateView over CommonAst",
+        "schema inference for CreateView over CommonAst",
     ))
 }
 
 /// Handle `SqlCommand` (both `input`-bearing and deprecated text paths).
 ///
-/// **Slice C.1 (owner):** SQL command execution over `CommonAst`.
+/// **τ's emission substrate (owner):** SQL command execution over `CommonAst`.
 async fn handle_sql_command(
     _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     _session_id: &str,
@@ -531,13 +531,13 @@ async fn handle_sql_command(
     _common_ast: &CommonAst,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
     Err(Status::unimplemented(
-        "Slice C.1: SqlCommand execution over CommonAst",
+        "SqlCommand execution over CommonAst",
     ))
 }
 
 /// Handle `WriteOperation` after successful transpile.
 ///
-/// **Slice H (owner):** external write path over `CommonAst`.
+/// **future τ work (owner):** external write path over `CommonAst`.
 async fn handle_write_operation(
     _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     _session_id: &str,
@@ -546,7 +546,7 @@ async fn handle_write_operation(
     _write_cmd: &proto::WriteOperation,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
     Err(Status::unimplemented(
-        "Slice H: WriteOperation over CommonAst",
+        "WriteOperation over CommonAst",
     ))
 }
 
@@ -781,7 +781,7 @@ mod tests {
         assert_eq!(pairs[0].value.as_deref(), Some("200"));
     }
 
-    // ── Slice A.3 dispatch tests ──────────────────────────────────────────────
+    // ── the τ dispatch site dispatch tests ──────────────────────────────────────────────
     //
     // At A.3, τ's `generate()` errors with `EmissionError::UnsupportedOp` on
     // every input. These tests pin two properties of the dispatch shape:
@@ -840,16 +840,16 @@ mod tests {
         );
         // τ's emission boundary is what should be surfaced — NOT
         // `V2RelationConverter`'s `UnsupportedProtoShape` (the proto shape is
-        // supported). Since Slice B, this can be either the τ analyzer's
+        // supported). Since τ's analyzer, this can be either the τ analyzer's
         // Spark-emulated error (unknown table `t` — the test uses an empty
-        // BaseTypes overlay) or τ's `UnsupportedOp` (`<slice-b-analyzer-ok>`
+        // BaseTypes overlay) or τ's `UnsupportedOp` (`<tau-analyzer-ok>`
         // when the analyzer succeeds). Both signal we reached τ, not the
         // proto-shape gate.
         let message = err.message();
         assert!(
             message.contains("unsupported operator")
                 || message.contains("unsupported expression")
-                || message.contains("<slice-b-analyzer-ok>")
+                || message.contains("<tau-analyzer-ok>")
                 || message.contains("[SPARK-EMULATED]")
                 || message.contains("<a.2-substrate>"),
             "message must identify τ's boundary error; got: {message}",
@@ -860,7 +860,7 @@ mod tests {
     /// The failure mode we're guarding against: if dispatch fed `Sql` to
     /// `V2RelationConverter`, the error would identify `RelType::Sql` as the
     /// unsupported proto shape. Instead, `parser_v2` parses the SQL and τ's
-    /// `generate()` emits DuckDB SQL (Slice C.1 wired the Project + SingleRow
+    /// `generate()` emits DuckDB SQL (τ's emission substrate wired the Project + SingleRow
     /// arms — `SELECT 1` is a Project over SingleRow of a literal).
     #[test]
     fn transpile_relation_sql_routes_to_parser_v2_not_converter() {
@@ -871,7 +871,7 @@ mod tests {
                 ..Default::default()
             })),
         };
-        // Slice C.1 wired Project + SingleRow arms — `SELECT 1` now succeeds.
+        // τ's emission substrate wired Project + SingleRow arms — `SELECT 1` now succeeds.
         // The routing anchor (SQL → parser_v2, not converter) is still enforced:
         // a routing bug would have surfaced `RelType::Sql` as an
         // `UnsupportedProtoShape` error before reaching τ's emission.
@@ -937,7 +937,7 @@ mod tests {
     /// `finalize()` builds `BaseTypes::empty()` when the plan carries no
     /// empty-scan (short-circuit anchor at the service layer — the substrate
     /// test in `base_types::tests` already pins the closure-not-invoked
-    /// behavior). Slice C.1 wired SingleRow emission — this test now asserts
+    /// behavior). τ's emission substrate wired SingleRow emission — this test now asserts
     /// that finalize returns the emitted SQL for a plan with no empty scan
     /// (proving the short-circuit path builds `BaseTypes::empty()` without
     /// blocking emission).
@@ -952,7 +952,7 @@ mod tests {
         assert_eq!(sql, "SELECT 1");
     }
 
-    // ── Slice E.0 smoke test ─────────────────────────────────────────────────
+    // ── future τ work.0 smoke test ─────────────────────────────────────────────────
     //
     // Round-trips `SELECT 1` through the full gRPC path:
     // `execute_plan` → `transpile_relation` (parser_v2 → τ finalize) →
@@ -960,14 +960,14 @@ mod tests {
     // Arrow IPC stream. Verifies the E.0 wiring end-to-end at the service
     // layer without spinning up a network gRPC server.
 
-    /// End-to-end smoke test for the Slice E.0 streaming-query wiring.
+    /// End-to-end smoke test for the future τ work.0 streaming-query wiring.
     ///
     /// Marked `#[ignore]` because τ's Slice-C.1 `SingleRow` renderer emits a
     /// bare `SELECT` (see `emission.rs::render_single_row`), which becomes
     /// `SELECT 1 FROM (SELECT) AS __td_proj` when wrapped by `render_project`
     /// — DuckDB rejects the bare `SELECT` subquery with "Parser Error: SELECT
     /// clause without selection list". This is a τ emission concern (owned by
-    /// Slice C.1 / a later refinement), not an E.0 wiring defect: the E.0
+    /// τ's emission substrate / a later refinement), not an E.0 wiring defect: the E.0
     /// path successfully submits SQL to the session, receives the DuckDB
     /// error, and maps it through `ThunderduckError → ConnectError →
     /// Status::internal`, as designed. The E.0 wiring is validated at the

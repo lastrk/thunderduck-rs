@@ -4,7 +4,7 @@
 //! **INV10:** this file imports ONLY value-level types from `crate::types`
 //! (`StructType`) plus intra-τ modules. No `crate::runtime`,
 //! `crate::types::TypeInferenceEngine`. Catalog lookup is **injected** as a
-//! closure — the dispatch site (Slice A.3) constructs the closure that
+//! closure — the dispatch site constructs the closure that
 //! bridges `DuckDbSession` into this overlay.
 //!
 //! **Short-circuit invariant (checklist §5.5):** `build_from_plan()` walks
@@ -83,11 +83,11 @@ impl BaseTypes {
 
 /// Walk `plan` and return `true` iff any `TableScan` has an empty implicit
 /// schema requirement — the substrate distinguishes populated schemas from
-/// empty ones at Slice B; A.2 treats every `TableScan` as "empty" (i.e. the
+/// empty ones; A.2 treats every `TableScan` as "empty" (i.e. the
 /// analyzer will need a catalog lookup) because the substrate does not yet
 /// attach resolved schema to plan nodes.
 ///
-/// Slice A.2 semantic: every `TableScan` is empty (the analyzer resolves
+/// τ semantic: every `TableScan` is empty (the analyzer resolves
 /// schemas). This is intentional — the overlay populates once per unique
 /// table, and unpopulated tables carry no analyzer info, so a false positive
 /// costs at most one closure invocation per unique table name.

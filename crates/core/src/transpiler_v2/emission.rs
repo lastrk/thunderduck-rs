@@ -1,11 +1,13 @@
-//! τ's emission substrate — Slice C.1.
+//! τ's emission substrate.
 //!
 //! ADR-009 (Approach A hand-written match arms, permanent per Open Decision 7),
 //! ADR-021 (τ owns substrate), ADR-022 (τ is the only path; two error
-//! categories). Inheritance-checklist §4.2 first item, §5.1, §5.3, §5.4, §5.6.
+//! categories).
 //!
-//! **INV3 grep barrier:** no imports from the legacy `generator` or
-//! `functions` modules are permitted inside this file.
+//! **INV3 grep barrier:** no imports from the retired v1 modules
+//! (generator / functions / logical / parser) are permitted inside this
+//! file. The modules were deleted 2026-07-05; the barrier prevents
+//! re-introduction. See `inv3_no_forbidden_use_in_emission` for the check.
 //!
 //! **INV10:** imports only τ-internal modules + `crate::types::{DataType,
 //! StructField, StructType}`.
@@ -49,7 +51,7 @@ use crate::types::{DataType, StructField, StructType};
 // ── INV2 companion (§5.3) ────────────────────────────────────────────────────
 
 /// Monotonic counter — incremented once per successful SQL string returned by
-/// [`dispatch_op`]. Slice C.1 activates INV2 via
+/// [`dispatch_op`]. τ's emission substrate activates INV2 via
 /// `invariants::inv2_dispatch_is_only_sql_writer`.
 pub(crate) static EMIT_TAP: AtomicU64 = AtomicU64::new(0);
 
@@ -194,14 +196,14 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             widened_schema,
         ),
 
-        // ── Slice F owns (analyzer PuntedOperator today; defensive) ──────
+        // ── future τ work owns (analyzer PuntedOperator today; defensive) ──────
         TypedOp::TableFunction { name, .. } => Err(EmissionError::UnsupportedOp {
             op: format!("TableFunction[{name}]"),
-            reason: "table-function emission lands in Slice F".to_owned(),
+            reason: "table-function emission (not implemented in τ)".to_owned(),
         }),
         TypedOp::Unnest { .. } => Err(EmissionError::UnsupportedOp {
             op: "Unnest".to_owned(),
-            reason: "unnest emission lands in Slice F".to_owned(),
+            reason: "unnest emission (not implemented in τ)".to_owned(),
         }),
     };
 
@@ -585,7 +587,7 @@ fn render_limit(
 
 // ── Unwired renderers (Decision 13-A) ────────────────────────────────────────
 //
-// These six renderers do not have `TypedOp` sinks in Slice B's substrate. They
+// These six renderers do not have `TypedOp` sinks in τ's analyzer's substrate. They
 // exist so the §5.4 CTE anchor for `render_tail` (and its sibling helpers)
 // live in code today; when a future substrate slice adds the missing
 // `TypedOp` variants, wiring is a one-line `dispatch_op` arm each.
@@ -1648,15 +1650,15 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
         Expression::Star(s) => render_star(s),
         Expression::InSubquery(_) => Err(EmissionError::UnsupportedExpression {
             shape: "InSubquery".to_owned(),
-            reason: "correlated subqueries land in Slice F".to_owned(),
+            reason: "correlated subqueries land in future τ work".to_owned(),
         }),
         Expression::ExistsSubquery(_) => Err(EmissionError::UnsupportedExpression {
             shape: "ExistsSubquery".to_owned(),
-            reason: "correlated subqueries land in Slice F".to_owned(),
+            reason: "correlated subqueries land in future τ work".to_owned(),
         }),
         Expression::ScalarSubquery(_) => Err(EmissionError::UnsupportedExpression {
             shape: "ScalarSubquery".to_owned(),
-            reason: "scalar subqueries land in Slice F".to_owned(),
+            reason: "scalar subqueries land in future τ work".to_owned(),
         }),
         Expression::Lambda(l) => {
             let body = render_expr(&l.body, schema)?;
@@ -1749,7 +1751,7 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
         }
         Expression::RowConstructor(_) => Err(EmissionError::UnsupportedExpression {
             shape: "RowConstructor".to_owned(),
-            reason: "complex-type emission lands in Slice F".to_owned(),
+            reason: "complex-type emission (not implemented in τ)".to_owned(),
         }),
         Expression::UpdateFields(u) => render_update_fields(u, schema),
     }
@@ -1757,7 +1759,7 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
 
 fn is_aggregate_name(name: &str) -> bool {
     // `AGGREGATE_NAMES` (in `type_inference.rs`) is all-lowercase ASCII per
-    // Slice B; case-insensitive byte comparison matches without allocating the
+    // τ's analyzer; case-insensitive byte comparison matches without allocating the
     // per-call lowercased `String` this function used to build.
     AGGREGATE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
@@ -4598,7 +4600,7 @@ fn render_aggregate_op(
     if matches!(grouping_kind, GroupingKind::GroupingSets) {
         return Err(EmissionError::UnsupportedOp {
             op: "Aggregate[GroupingSets]".to_owned(),
-            reason: "GROUPING SETS emission requires set-membership metadata; Slice G territory"
+            reason: "GROUPING SETS emission requires set-membership metadata; (not implemented in τ)"
                 .to_owned(),
         });
     }
@@ -4968,7 +4970,7 @@ pub(crate) fn render_cast(c: &CastExpression, schema: &Schema) -> Result<String,
 //   Map   : `MAP { k1: v1, k2: v2 }` (or `MAP()` for empty).
 //   Struct: `{'name1': v1, 'name2': v2, ...}`.
 // Full complex-type ops (HOF `transform`/`filter`, `explode`, struct-field
-// access) remain Slice F territory.
+// access) remain future τ work territory.
 
 fn render_array_literal(
     a: &crate::transpiler_v2::expression::ArrayLiteralExpression,
@@ -5112,7 +5114,7 @@ fn render_struct_literal(
 ///
 /// Wraps `expr_sql` in `CAST(... AS T)` iff the expression's Spark-typed
 /// result type requires a cast that DuckDB won't apply automatically. At
-/// Slice C.1 this handles integer-integer division (Spark → Double); Slice
+/// τ's emission substrate this handles integer-integer division (Spark → Double); Slice
 /// C.2 extends it with the scalar-function Spark-parity table.
 ///
 /// **§5.1 anchor.** MUST NOT share body with [`spark_aggregate_return_cast`].
@@ -5846,11 +5848,11 @@ fn dedup_struct_field_names(names: &[&str]) -> Vec<String> {
         .collect()
 }
 
-// ── Extension allow-list (§4.1 stub — populated by Slice D) ──────────────────
+// ── Extension allow-list (§4.1 stub — populated by τ's extension-target wiring) ──────────────────
 
-/// The set of DuckDB extension function names τ emits. **Empty at Slice C.1**;
-/// Slice D populates with the ext6 allow-list and activates INV6.
-#[allow(dead_code)] // Slice D wires call sites; Slice C.1 exposes the surface.
+/// The set of DuckDB extension function names τ emits. **Empty.1**;
+/// τ's extension-target wiring populates with the ext6 allow-list and activates INV6.
+#[allow(dead_code)] // τ's extension-target wiring wires call sites; τ's emission substrate exposes the surface.
 pub(crate) fn extension_targets() -> HashSet<&'static str> {
     HashSet::new()
 }
@@ -6581,12 +6583,12 @@ mod tests {
         assert_eq!(out2, "\"a\"\"b\"");
     }
 
-    // ── 28. INV3 — no legacy `use` inside emission.rs ────────────────────
+    // ── 28. INV3 — no forbidden `use` inside emission.rs ─────────────────
 
     #[test]
-    fn inv3_no_legacy_use_in_emission() {
+    fn inv3_no_forbidden_use_in_emission() {
         // Only scan the non-test region of emission.rs; the tests themselves
-        // legitimately name legacy paths inside their assertion literals.
+        // legitimately name forbidden prefixes inside their assertion literals.
         let this_file = include_str!("emission.rs");
         // The `#[cfg(test)]` module below carries the offending literals; cut
         // at its start marker.
@@ -6596,8 +6598,12 @@ mod tests {
             None => this_file,
         };
         // Build needles at runtime so this test's source doesn't self-match.
-        let legacy_bases = ["generator", "functions", "logical", "parser", "runtime"];
-        for base in legacy_bases {
+        // The first four prefixes name retired v1 modules deleted 2026-07-05
+        // (barrier prevents accidental re-introduction). `runtime` is active
+        // but must not be imported into emission — that's an INV10 concern
+        // enforced here for defence in depth.
+        let forbidden_prefixes = ["generator", "functions", "logical", "parser", "runtime"];
+        for base in forbidden_prefixes {
             let use_form = format!("use crate::{base}::");
             let path_form = format!("crate::{base}::");
             assert!(
@@ -6679,7 +6685,7 @@ mod tests {
     // ── 32. extension_targets is empty at C.1 ────────────────────────────
 
     #[test]
-    fn extension_targets_is_empty_at_slice_c1() {
+    fn extension_targets_is_empty_by_default() {
         assert!(extension_targets().is_empty());
     }
 

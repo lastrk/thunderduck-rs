@@ -6,17 +6,17 @@
 //! `crate::generator`, `crate::functions`, `crate::runtime`,
 //! `crate::types::TypeInferenceEngine`.
 //!
-//! The wrapper `CommonAst { op: CommonOp }` exists so Slice B can attach
+//! The wrapper `CommonAst { op: CommonOp }` exists so τ's analyzer can attach
 //! resolution metadata (resolved schema, plan_id, etc.) without a source-wide
-//! refactor. Slice A.2 keeps the wrapper minimal.
+//! refactor. τ keeps the wrapper minimal.
 
 use super::expression::{Expression, Literal, SortOrder};
 use crate::types::StructType;
 
 /// τ's canonical plan tree — a single wrapper around a [`CommonOp`] variant.
 ///
-/// Slice B extends this wrapper (e.g. `pub resolved_schema: Option<StructType>`).
-/// Slice A.2 keeps it as a thin wrapper so the extension is additive.
+/// τ's analyzer extends this wrapper (e.g. `pub resolved_schema: Option<StructType>`).
+/// τ keeps it as a thin wrapper so the extension is additive.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommonAst {
     /// The plan operator this node represents.
@@ -32,7 +32,7 @@ impl CommonAst {
 
 /// The canonical plan operator set shared by every τ front-end.
 ///
-/// Slice A.2 covers the structured shapes needed by the round-trip tests
+/// τ covers the structured shapes needed by the round-trip tests
 /// (Project / Filter / Sort / Limit / Aggregate primitive / TableScan /
 /// FileScan / Values / LocalRelation / Join / TableFunction / Unnest /
 /// SingleRow). Deferred plan shapes (SetOp, SubqueryAlias, WithColumns,
@@ -91,32 +91,32 @@ pub enum CommonOp {
     ///
     /// **Primitive Aggregate only.** Rollup / Cube / GroupingSets / Pivot
     /// surface as [`super::EmissionError::UnsupportedProtoShape`] and land
-    /// in Slice G.
     ///
-    /// # Slice A.2 invariant on `aggregates`
     ///
-    /// The SparkSQL front-end at Slice A.2 (`parser_v2::v2_lowering::
+    /// # τ invariant on `aggregates`
+    ///
+    /// The SparkSQL front-end (`parser_v2::v2_lowering::
     /// lower_aggregate_select`) folds the SELECT projection list — grouping
     /// columns and aggregate calls both — into `aggregates` when the query
     /// has a GROUP BY, mirroring the raw projection. This matches the
     /// protobuf `Aggregate` semantics where `aggregate_expressions` already
-    /// carries the composite output list. Slice C.1's emission table will
+    /// carries the composite output list. τ's emission substrate's emission table will
     /// unfold this back into a strict `{grouping, aggregates}` split at
     /// emission time.
     ///
-    // TODO(Slice C.1): unfold parser-folded grouping columns from `aggregates`.
+    // TODO: unfold parser-folded grouping columns from `aggregates`.
     Aggregate {
         /// The input relation.
         input: Box<CommonAst>,
         /// The grouping expressions (may be empty for global aggregation).
         grouping: Vec<Expression>,
-        /// The aggregate expressions. See variant-level doc for the Slice A.2
+        /// The aggregate expressions. See variant-level doc for the τ
         /// folding invariant — the SparkSQL front-end may include grouping
-        /// columns here alongside the actual aggregate calls until Slice C.1
+        /// columns here alongside the actual aggregate calls until τ's emission substrate
         /// unfolds them.
         aggregates: Vec<Expression>,
         /// The grouping kind — GroupBy (default), Rollup, Cube, or
-        /// GroupingSets (Slice G — Pivot lives elsewhere).
+        /// GroupingSets (future τ work — Pivot lives elsewhere).
         grouping_kind: GroupingKind,
     },
 
@@ -182,13 +182,13 @@ pub enum CommonOp {
         with_ordinality: bool,
     },
 
-    // ── Set operations (Slice B) ─────────────────────────────────────────
+    // ── Set operations ─────────────────────────────────────────
     /// A n-ary set operation: UNION / INTERSECT / EXCEPT.
     ///
-    /// **Slice B adds this variant.** Set-op widening (analyzer's downward
+    /// **τ's analyzer adds this variant.** Set-op widening (analyzer's downward
     /// sub-sweep, per rearchitect ADR-006) runs across `children` to compute
     /// the widened schema; the resolved schema is stamped by the analyzer.
-    /// `UNION BY NAME` (`by_name = true`) is deferred to Slice G and surfaces
+    /// `UNION BY NAME` (`by_name = true`) is deferred to future τ work and surfaces
     /// as `AnalyzerError::PuntedOperator` today.
     SetOp {
         /// The kind of set operation.
@@ -278,7 +278,7 @@ pub enum CommonOp {
     /// Empty `pivot_values` (implicit / "eager discovery" per Spark) is a
     /// Thunderduck-boundary case per ADR-022 — the τ analyzer rejects with
     /// `PuntedOperator("Pivot[implicit-values]")` because implementing it
-    /// needs a session-injected DISTINCT-query hook (Slice G).
+    /// needs a session-injected DISTINCT-query hook.
     Pivot {
         /// The input relation.
         input: Box<CommonAst>,
@@ -337,7 +337,7 @@ pub enum CommonOp {
     /// The output column list is `DISTINCT(col2)` — unknowable at plan time —
     /// so the τ analyzer rejects with `PuntedOperator("Crosstab[dynamic-values]")`
     /// mirroring `Pivot[implicit-values]` per ADR-022. The variant exists so
-    /// Slice G can lift the punt with a session-injected DISTINCT hook.
+    /// future τ work can lift the punt with a session-injected DISTINCT hook.
     Crosstab {
         /// The input relation.
         input: Box<CommonAst>,
@@ -462,7 +462,7 @@ pub enum CommonOp {
     /// A binary join.
     ///
     /// `left_plan_ids` / `right_plan_ids` carry the set of proto `plan_id`s
-    /// that appear on each side of the join. Slice B's analyzer uses these
+    /// that appear on each side of the join. τ's analyzer's analyzer uses these
     /// to disambiguate column references on either side without string
     /// qualifier encoding.
     Join {
@@ -516,7 +516,7 @@ pub enum GroupingKind {
     Rollup,
     /// `GROUP BY CUBE(cols)`.
     Cube,
-    /// `GROUP BY GROUPING SETS((cols), (cols), ...)` — Slice G structured
+    /// `GROUP BY GROUPING SETS((cols), (cols), ...)` — future τ work structured
     /// form. The `grouping` list carries all distinct cols in first-appear
     /// order; the set membership is applied at emission time (not yet
     /// wired; punts as `UnsupportedOp` today).
@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn common_op_setop_construction() {
-        // Anchor: SetOp variant + SetOpKind enum land at Slice B.
+        // Anchor: SetOp variant + SetOpKind enum land
         let child_a = CommonAst::new(CommonOp::SingleRow);
         let child_b = CommonAst::new(CommonOp::SingleRow);
         let plan = CommonAst::new(CommonOp::SetOp {

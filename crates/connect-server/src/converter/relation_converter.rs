@@ -1,11 +1,8 @@
-//! Residual Spark JSON-schema parser.
+//! Spark JSON-schema parser.
 //!
-//! The legacy `RelationConverter` (proto → `LogicalPlan`) and its helpers were
-//! removed once the τ path (`V2RelationConverter`) became the only production
-//! converter (ADR-022). The sole survivor is [`parse_json_schema`], which the
-//! v2 path still calls to decode a `createDataFrame` payload's declared schema
-//! (`{"type":"struct","fields":[…]}`). Full deletion of the legacy converter
-//! module is tracked by Slice K; this file is what remains reachable.
+//! [`parse_json_schema`] decodes a `createDataFrame` payload's declared schema
+//! (`{"type":"struct","fields":[…]}`) — τ's `V2RelationConverter` uses it for
+//! the LocalRelation path.
 
 use thunderduck_core::types::{DataType, StructField, StructType};
 

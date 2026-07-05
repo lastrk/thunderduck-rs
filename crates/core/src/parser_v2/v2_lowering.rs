@@ -22,11 +22,11 @@ use sqlparser::ast::{
     BinaryOperator, CastKind, DataType as SqlDataType, DuplicateTreatment, ExactNumberInfo, Expr,
     Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr,
     JoinConstraint, JoinOperator, LimitClause, ObjectName, ObjectNamePart, OrderByExpr,
-    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
-    UnaryOperator, Value, ValueWithSpan,
+    OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
+    TableFactor, TableWithJoins, UnaryOperator, Value, ValueWithSpan,
 };
 
-use crate::transpiler_v2::ast::{CommonAst, CommonOp, JoinType};
+use crate::transpiler_v2::ast::{CommonAst, CommonOp, JoinType, SetOpKind};
 use crate::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
     FunctionCall, InListExpression, LambdaExpression, LambdaVariableExpression, LikeExpression,
@@ -113,10 +113,44 @@ fn lower_set_expr(body: SetExpr) -> Result<CommonAst, EmissionError> {
             shape: "sql::values_top_level".to_owned(),
             reason: "top-level VALUES not supported at Slice A.2 (only VALUES in FROM)".to_owned(),
         }),
-        SetExpr::SetOperation { op, .. } => Err(EmissionError::UnsupportedProtoShape {
-            shape: format!("sql::set_operation::{op:?}").to_ascii_lowercase(),
-            reason: "UNION / INTERSECT / EXCEPT deferred past Slice A.2".to_owned(),
-        }),
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            let kind = match op {
+                SetOperator::Union => SetOpKind::Union,
+                SetOperator::Intersect => SetOpKind::Intersect,
+                SetOperator::Except | SetOperator::Minus => SetOpKind::Except,
+            };
+            // `UNION BY NAME` is parseable in `SparkDialect` but positional
+            // lowering would silently align columns by position — a wrong
+            // result. Reject it as a Thunderduck-boundary error rather than
+            // mis-lower (ADR-022; loud-fail per CLAUDE.md gotcha #9).
+            if matches!(
+                set_quantifier,
+                SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName
+            ) {
+                return Err(EmissionError::UnsupportedProtoShape {
+                    shape: "sql::set_operation::by_name".to_owned(),
+                    reason: "UNION/INTERSECT/EXCEPT BY NAME not supported (positional only)"
+                        .to_owned(),
+                });
+            }
+            // Spark defaults bare UNION/INTERSECT/EXCEPT to DISTINCT (`all = false`);
+            // only the explicit `ALL` quantifier preserves duplicates.
+            let all = matches!(set_quantifier, SetQuantifier::All);
+            let left = lower_set_expr(*left)?;
+            let right = lower_set_expr(*right)?;
+            Ok(CommonAst::new(CommonOp::SetOp {
+                kind,
+                all,
+                by_name: false,
+                allow_missing_columns: false,
+                children: vec![left, right],
+            }))
+        }
         other => Err(EmissionError::UnsupportedProtoShape {
             shape: format!("sql::set_expr::{other:?}"),
             reason: "set expression not supported at Slice A.2".to_owned(),
@@ -1249,12 +1283,119 @@ mod tests {
     }
 
     #[test]
-    fn parse_union_returns_unsupported_proto_shape() {
-        let result = parse("SELECT 1 UNION SELECT 2");
-        assert!(matches!(
-            result,
-            Err(EmissionError::UnsupportedProtoShape { .. })
-        ));
+    fn parse_union_all_lowers_to_setop_union_all() {
+        let plan = parse("SELECT id FROM t UNION ALL SELECT id FROM u").expect("should parse");
+        match plan.op {
+            CommonOp::SetOp {
+                kind,
+                all,
+                by_name,
+                allow_missing_columns,
+                children,
+            } => {
+                assert_eq!(kind, SetOpKind::Union);
+                assert!(all);
+                assert!(!by_name);
+                assert!(!allow_missing_columns);
+                assert_eq!(children.len(), 2);
+            }
+            _ => panic!("expected SetOp as top-level"),
+        }
+    }
+
+    #[test]
+    fn parse_union_bare_is_distinct() {
+        let plan = parse("SELECT id FROM t UNION SELECT id FROM u").expect("should parse");
+        match plan.op {
+            CommonOp::SetOp { kind, all, .. } => {
+                assert_eq!(kind, SetOpKind::Union);
+                assert!(!all, "bare UNION is Spark-default DISTINCT");
+            }
+            _ => panic!("expected SetOp as top-level"),
+        }
+    }
+
+    #[test]
+    fn parse_intersect_lowers_to_setop_intersect() {
+        let plan = parse("SELECT id FROM t INTERSECT SELECT id FROM u").expect("should parse");
+        match plan.op {
+            CommonOp::SetOp { kind, all, .. } => {
+                assert_eq!(kind, SetOpKind::Intersect);
+                assert!(!all);
+            }
+            _ => panic!("expected SetOp as top-level"),
+        }
+    }
+
+    #[test]
+    fn parse_except_lowers_to_setop_except() {
+        let plan = parse("SELECT id FROM t EXCEPT SELECT id FROM u").expect("should parse");
+        match plan.op {
+            CommonOp::SetOp { kind, .. } => assert_eq!(kind, SetOpKind::Except),
+            _ => panic!("expected SetOp as top-level"),
+        }
+    }
+
+    #[test]
+    fn parse_minus_folds_to_setop_except() {
+        let plan = parse("SELECT id FROM t MINUS SELECT id FROM u").expect("should parse");
+        match plan.op {
+            CommonOp::SetOp { kind, .. } => assert_eq!(kind, SetOpKind::Except),
+            _ => panic!("expected SetOp as top-level"),
+        }
+    }
+
+    #[test]
+    fn parse_three_way_union_all_nests_setops() {
+        let plan = parse("SELECT id FROM t UNION ALL SELECT id FROM u UNION ALL SELECT id FROM v")
+            .expect("should parse");
+        match plan.op {
+            CommonOp::SetOp {
+                kind,
+                all,
+                children,
+                ..
+            } => {
+                assert_eq!(kind, SetOpKind::Union);
+                assert!(all);
+                assert_eq!(children.len(), 2);
+                // sqlparser left-nests: children[0] is itself a SetOp.
+                assert!(
+                    matches!(children[0].op, CommonOp::SetOp { .. }),
+                    "3-way UNION ALL should nest a SetOp as the left child"
+                );
+            }
+            _ => panic!("expected SetOp as top-level"),
+        }
+    }
+
+    #[test]
+    fn parse_setop_with_order_by_wraps_in_sort() {
+        let plan =
+            parse("SELECT id FROM t UNION SELECT id FROM u ORDER BY id").expect("should parse");
+        match plan.op {
+            CommonOp::Sort { input, .. } => {
+                assert!(
+                    matches!(input.op, CommonOp::SetOp { .. }),
+                    "ORDER BY over a set op wraps the SetOp in a Sort"
+                );
+            }
+            _ => panic!("expected Sort wrapping a SetOp"),
+        }
+    }
+
+    #[test]
+    fn parse_union_by_name_is_rejected_not_silently_positional() {
+        // `UNION BY NAME` parses in SparkDialect but has no positional
+        // lowering — must be a Thunderduck-boundary error, not a silent
+        // by-position union (ADR-022; loud-fail).
+        let err = parse("SELECT a, b FROM t UNION BY NAME SELECT b, a FROM u")
+            .expect_err("UNION BY NAME must be rejected");
+        assert!(
+            matches!(err, EmissionError::UnsupportedProtoShape { ref shape, .. }
+                if shape == "sql::set_operation::by_name"),
+            "expected UnsupportedProtoShape(sql::set_operation::by_name), got {err:?}",
+        );
     }
 
     #[test]

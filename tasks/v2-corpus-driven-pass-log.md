@@ -677,3 +677,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: baseline preserved (0 new).
 - Quality Gate: PASS (cargo check clean both crates, rustfmt clean, `cargo test -p thunderduck-connect-server --bins` 74/0 serially [pre-existing `/tmp` extension parallel flake], `sql_v2` differential 108/154/262 with sel-002 + FROM-table batch GREEN, no regressions).
 - Commit SHA: (this commit).
+
+## Pass 97 — 2026-07-05 — SQL corpus: set operations lowering (set-001 cluster)
+- **Corpus: SQL front-end.** Target: same-shape cluster `set-001..010` (UNION/INTERSECT/EXCEPT/MINUS × ALL/DISTINCT, n-ary, +ORDER BY). All 10 failed at one seam: `parser_v2` rejected set ops (`sql::set_operation::* deferred past Slice A.2`).
+- Diagnostic: `.agent-output/diagnostic-pass-97.md` — LOWERING-ONLY. τ's `CommonOp::SetOp`/`SetOpKind`, the analyzer's set-op widening (ADR-006), and emission's `render_set_op` already exist and are green via the DataFrame path (`convert_set_op` builds the identical op). Only `v2_lowering::lower_set_expr` rejected `SetExpr::SetOperation`.
+- Architecture: `.agent-output/architecture-pass-97.md` — replace the reject arm with a mapping + binary recursion building `CommonOp::SetOp { kind, all, by_name:false, allow_missing_columns:false, children:[left,right] }`. `Except|Minus→Except`; `all` only on explicit `ALL`. n-ary via recursion (no flatten); ORDER BY already wrapped by `wrap_with_sort_limit`.
+- Layer(s) touched: τ SQL front-end only (`parser_v2/v2_lowering.rs`, one arm). No analyzer/emission/ast change.
+- ADR citations: ADR-004 (SQL + DataFrame lower to the SAME common AST — closes the SQL front-end onto the existing SetOp substrate), ADR-006 (set-op widening, unchanged), ADR-022 (τ-only; `UNION BY NAME` rejected as Thunderduck-boundary rather than silently mis-lowered — reviewer MEDIUM, closed in-pass).
+- Corpus signal: 108 → **114** (+6). `set-001/002/003/005/007/010` GREEN (UNION distinct/all, UNION DISTINCT, INTERSECT ALL, EXCEPT ALL, set-op+ORDER BY). No regressions.
+- Files: `crates/core/src/parser_v2/v2_lowering.rs`.
+- Tests added: 8 (7 lowering shape tests: UNION ALL/bare, INTERSECT, EXCEPT, MINUS→Except, 3-way nested, ORDER-BY-over-SetOp; +1 negative: `UNION BY NAME` rejected).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High + **1 Medium CLOSED** (`UNION BY NAME`/`AllByName`/`DistinctByName` silently lowered positional → now returns `UnsupportedProtoShape(sql::set_operation::by_name)`; `all` narrowed to `SetQuantifier::All` only). Perf N/A (parse-time AST construction, no hot path).
+- Findings queued as follow-up (DIFFERENT root cause — not the lowering): `set-004`/`set-006`/`set-008` fail on **analyzer set-op nullability** for INTERSECT/EXCEPT-DISTINCT with mixed-nullability inputs (Spark output nullability = AND of inputs; `dept_id` Reference=False vs τ Test=True); `set-009` (3-way UNION ALL over Long+Long+Integer) fails with an execution error (mixed-type widening at emission). Next-pass candidates.
+- Compiler warning delta: baseline preserved (0 new).
+- Quality Gate: PASS (cargo check clean, rustfmt clean, `cargo test -p thunderduck-core --lib` 628/0 [+7 net], `sql_v2` differential 114/148/262 with 6 new set-op cases GREEN, no regressions).
+- Commit SHA: (this commit).

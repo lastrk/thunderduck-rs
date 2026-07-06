@@ -1158,3 +1158,15 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 614/0, `sql_v2` 224/38/262, `core_v2` 314 no regression).
 - Commit SHA: (this commit).
+
+## Pass 130 — 2026-07-06 — TECH-DEBT SWEEP (passes 126-129 + accumulated Lows)
+- **Sweep** (every-5th cadence; prior sweep pass 125). rust-reviewer over passes 126-129 additions + 3 flagged Lows.
+- Findings: passes 126-129 landed with ZERO new compiler warnings, no latent panics (the pass-129 ragged-VALUES guard confirmed present). Two "duplication" candidates (pretty_binary_symbol vs render_binary op-maps; pretty_literal vs literal_to_pivot_column_name) are INTENTIONALLY distinct (Spark .sql vs DuckDB symbols; Null→"NULL" vs unreachable!) — left as-is.
+- Fixes (behavior-preserving, LOW): (A.1) removed dead+misleading `"if"`/`"nvl2"` from the first-arg-type arm in type_inference.rs:729 (both intercepted earlier by the `len==3` pre-match → args[1]; mapping to first-arg [the predicate/cond] was dead & wrong); kept `ifnull` (real branch). (A.2) moved `iif` from the coalesce/ifnull/nvl `all(nullable)` arm to the `if` arm in expression.rs (iif = Spark If alias → nullable = args[1]||args[2], predicate excluded; type inference already If-like).
+- DEFERRED (documented): (A.3) VALUES/unify_types incompatible-type coercion (`(1),('a')`→STRING vs Spark throws) — unify_types is shared across 8 callers (set-op widening, array/map literals, coalesce/greatest/least, VALUES); making it reject "no common type" would thread a boundary decision through all callers and risk regressing green set-op/array cases with no witness. Known intentional coarseness (in-tree comment analyzer.rs:5020). Follow-up only.
+- Layer(s) touched: transpiler_v2/{type_inference,expression}.rs. No behavior change.
+- Corpus signal: 224 → **224** (unchanged — dead-code/no-witness cleanup).
+- Files: 2. Tests added: 1 (iif excludes predicate in nullability, mirroring if).
+- Compiler warning delta: 0 (both crates build silent).
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 615/0, `sql_v2` 224/38/262 no regression).
+- Commit SHA: (this commit).

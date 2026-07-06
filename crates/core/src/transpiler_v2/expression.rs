@@ -1380,7 +1380,7 @@ impl Expression {
             return true;
         }
         match lower.as_str() {
-            "coalesce" | "ifnull" | "nvl" | "iif" => f.args.iter().all(|a| a.nullable(schema)),
+            "coalesce" | "ifnull" | "nvl" => f.args.iter().all(|a| a.nullable(schema)),
             "when" => {
                 if f.args.len() % 2 == 0 {
                     true
@@ -1426,8 +1426,9 @@ impl Expression {
                     || f.args.get(2).is_none_or(|a| a.nullable(schema))
             }
             // Spark's `If.nullable = trueValue.nullable || falseValue.nullable`
-            // — the predicate (args[0]) is excluded. Corpus witness: cnd-009.
-            "if" => {
+            // — the predicate (args[0]) is excluded. `iif` is a Spark alias for
+            // `If`, so it shares the same nullability rule. Corpus witness: cnd-009.
+            "if" | "iif" => {
                 f.args.get(1).is_none_or(|a| a.nullable(schema))
                     || f.args.get(2).is_none_or(|a| a.nullable(schema))
             }
@@ -1877,6 +1878,38 @@ mod tests {
         let s = StructType::new(vec![StructField::nullable("salary", DataType::Long)]);
         let expr = Expression::FunctionCall(FunctionCall {
             name: "if".to_owned(),
+            args: vec![
+                // nullable predicate (references a nullable column)
+                Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Gt,
+                    left: Box::new(ColumnReference::untyped("salary")),
+                    right: Box::new(Expression::Literal(Literal {
+                        value: LiteralValue::Long(100_000),
+                        data_type: DataType::Long,
+                    })),
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("high".to_owned()),
+                    data_type: DataType::String,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("low".to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        });
+        assert!(!expr.nullable(&s));
+    }
+
+    /// `iif` is a Spark alias for `If`, so its nullability rule likewise
+    /// excludes the predicate — a nullable predicate with two non-null
+    /// branches is non-nullable.
+    #[test]
+    fn iif_with_nullable_predicate_and_non_null_branches_is_non_nullable() {
+        let s = StructType::new(vec![StructField::nullable("salary", DataType::Long)]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "iif".to_owned(),
             args: vec![
                 // nullable predicate (references a nullable column)
                 Expression::Binary(BinaryExpression {

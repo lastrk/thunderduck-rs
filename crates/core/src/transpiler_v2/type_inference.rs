@@ -726,8 +726,9 @@ impl TypeInferenceEngine {
             // abs preserves arg type; ceil/floor return Long (Spark rule);
             // signum returns Double. (round/bround are resolved earlier by the
             // `function_call_data_type` pre-pass, which reads the scale literal.)
-            "abs" | "greatest" | "least" | "nvl" | "coalesce" | "nullif" | "nvl2" | "if"
-            | "ifnull" => first_arg_type.cloned().unwrap_or(Unresolved),
+            "abs" | "greatest" | "least" | "nvl" | "coalesce" | "nullif" | "ifnull" => {
+                first_arg_type.cloned().unwrap_or(Unresolved)
+            }
             "ceil" | "ceiling" | "floor" => {
                 Self::ceil_floor_type(first_arg_type.unwrap_or(&Unresolved), None)
             }

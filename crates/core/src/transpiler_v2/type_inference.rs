@@ -841,6 +841,16 @@ impl TypeInferenceEngine {
                 Some(DataType::Map { value, .. }) => (**value).clone(),
                 _ => Unresolved,
             },
+            // Synthetic `stack_col(v1, v2, ..., vN)` — one per output
+            // column of Spark's `stack(N, ...) AS (...)`. Analyzer pre-pass
+            // (`expand_stack_projections`) fans a wrapped
+            // `stack_multi_alias(...)` projection out into K per-column
+            // `stack_col` calls with N row-values apiece. Every arg shares
+            // a type in Spark (Stack.checkInputDataTypes coerces across
+            // rows); take the first arg's type as the column type.
+            // Emission maps `stack_col(v1, ..., vN)` to `UNNEST([v1, ..., vN])`.
+            // Corpus: piv-006.
+            "stack_col" => first_arg_type.cloned().unwrap_or(Unresolved),
 
             // ── Array mutation (Spark-conservative element nullability) ─
             // `array_append` / `array_prepend`: Spark stamps containsNull

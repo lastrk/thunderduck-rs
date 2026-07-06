@@ -1375,6 +1375,11 @@ impl Expression {
             // literal outer array (`F.array(...)`) produces a nullable
             // result per Spark's schema semantics. Corpus: `arr-013`.
             "flatten" | "list_flatten" => true,
+            // piv-006 — synthetic per-column call from
+            // `expand_stack_projections`. Spark's `Stack.elementSchema`
+            // pins every output column to `nullable = true` regardless
+            // of whether the individual row-values are non-null literals.
+            "stack_col" => true,
             _ => f.args.iter().any(|a| a.nullable(schema)),
         }
     }

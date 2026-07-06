@@ -806,6 +806,12 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             // literals. Runs after inline expansion, before
             // `resolve_and_stamp`. Corpus: json-002.
             let projections = expand_json_tuple_projections(projections)?;
+            // piv-006 — expand `stack(N, v11, ..., vNK) AS (a1, ..., aK)`
+            // (wrapped by `parser_v2::SparkSqlParserV2::parse_expression` as
+            // `stack_multi_alias(<stack call>, "a1", ..., "aK")`) into K
+            // per-column projections `Alias(stack_col(v1i, v2i, ..., vNi),
+            // "ai")`. Emission maps `stack_col(...)` to `UNNEST([...])`.
+            let projections = expand_stack_projections(projections)?;
             let projections = projections
                 .into_iter()
                 .map(|e| resolve_and_stamp(e, &typed_input.resolved_schema))
@@ -1959,6 +1965,149 @@ fn expand_json_tuple_projections(
             out.push(Expression::Alias(AliasExpression {
                 expr: Box::new(call),
                 alias: format!("c{i}"),
+            }));
+        }
+    }
+    Ok(out)
+}
+
+/// Expand every top-level `stack_multi_alias(<stack call>, "a1", ..., "aK")`
+/// projection into K per-column projections
+/// `Alias(stack_col(v1i, v2i, ..., vNi), "ai")`.
+///
+/// The wrapper is synthesized by
+/// [`crate::parser_v2::SparkSqlParserV2::parse_expression`] when it detects a
+/// trailing multi-column alias `AS (a1, ..., aK)` on a `stack(...)` call — a
+/// shape sqlparser-rs 0.61's `SelectItem::ExprWithAlias { alias: Ident }`
+/// cannot represent. Non-`stack_multi_alias` projections pass through
+/// unchanged; schema order is preserved.
+///
+/// Errors (ADR-022 two-category):
+///
+/// * **Spark-emulated** ([`AnalyzerError::Other`]) — `stack`'s first argument
+///   is not a positive-integer literal `N`, or `stack`'s value-argument
+///   count is not `1 + N*K` (Spark's `Stack.checkInputDataTypes` matches
+///   this shape).
+/// * **Thunderduck-boundary** ([`AnalyzerError::UnsupportedRule`], Display
+///   prefix `[TDCK-BOUNDARY]`, `rule = "stack-multi-alias-expansion"`) — the
+///   wrapped inner expression is not a `stack(...)` FunctionCall (the parser
+///   wrap-site guards this, but the analyzer double-checks).
+///
+/// Called by `analyze_node`'s `CommonOp::Project` arm AFTER
+/// [`expand_json_tuple_projections`] and BEFORE [`resolve_and_stamp`], so
+/// downstream analysis only ever sees the fanned-out `stack_col` calls.
+///
+/// Corpus witness: `piv-006`.
+fn expand_stack_projections(
+    projections: Vec<Expression>,
+) -> Result<Vec<Expression>, AnalyzerError> {
+    let mut out = Vec::with_capacity(projections.len());
+    for proj in projections {
+        // Only fire on a bare top-level `FunctionCall("stack_multi_alias", ...)`.
+        // Aliased or nested forms fall through unchanged — non-Project
+        // contexts are Spark-invalid for generator functions and surface
+        // as boundary errors downstream.
+        let args = match &proj {
+            Expression::FunctionCall(f) if f.name.eq_ignore_ascii_case("stack_multi_alias") => {
+                f.args.clone()
+            }
+            _ => {
+                out.push(proj);
+                continue;
+            }
+        };
+        // args[0] = inner `stack` FunctionCall, args[1..] = K string-literal
+        // aliases.
+        if args.len() < 2 {
+            bail_boundary_rule!(
+                "stack-multi-alias-expansion",
+                format!(
+                    "`stack_multi_alias` wrapper must carry the inner stack call \
+                     plus at least one alias, got {} arg(s)",
+                    args.len()
+                ),
+            );
+        }
+        let mut args_iter = args.into_iter();
+        let inner = args_iter.next().expect("checked args.len() >= 2 above");
+        let aliases: Vec<String> = args_iter
+            .map(|a| match a {
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(s),
+                    ..
+                }) => Ok(s),
+                other => Err(AnalyzerError::Other {
+                    reason: format!(
+                        "`stack_multi_alias` alias slots must be string literals, got {other:?}"
+                    ),
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let k = aliases.len();
+
+        let stack_args = match inner {
+            Expression::FunctionCall(fc) if fc.name.eq_ignore_ascii_case("stack") => fc.args,
+            other => {
+                bail_boundary_rule!(
+                    "stack-multi-alias-expansion",
+                    format!(
+                        "multi-alias `AS ( ... )` on a non-`stack` generator is not \
+                         implemented in τ's SparkSQL path: got {other:?}"
+                    ),
+                );
+            }
+        };
+        if stack_args.is_empty() {
+            return Err(AnalyzerError::Other {
+                reason: "`stack` requires at least one argument (row count N)".to_owned(),
+            });
+        }
+        // stack_args[0] is the row-count literal N; validate it's a positive
+        // integer and that the remaining k*N value slots line up with the
+        // alias count.
+        let n = match &stack_args[0] {
+            Expression::Literal(Literal {
+                value: LiteralValue::Int(i),
+                ..
+            }) if *i >= 1 => *i as usize,
+            Expression::Literal(Literal {
+                value: LiteralValue::Long(i),
+                ..
+            }) if *i >= 1 => *i as usize,
+            other => {
+                return Err(AnalyzerError::Other {
+                    reason: format!(
+                        "`stack`'s first argument must be a positive integer literal, got {other:?}"
+                    ),
+                });
+            }
+        };
+        let values = &stack_args[1..];
+        if values.len() != n * k {
+            return Err(AnalyzerError::Other {
+                reason: format!(
+                    "`stack({n}, ...)` with a {k}-alias tail requires {} value arguments, got {}",
+                    n * k,
+                    values.len()
+                ),
+            });
+        }
+        // For column i in [0, k), gather values at positions [i, k+i, 2k+i,
+        // ..., (n-1)k+i] — Spark's `stack` is row-major, so the i-th column
+        // spans one slot per row.
+        for (i, alias) in aliases.into_iter().enumerate() {
+            let mut col_vals: Vec<Expression> = Vec::with_capacity(n);
+            for row in 0..n {
+                col_vals.push(values[row * k + i].clone());
+            }
+            let call = Expression::FunctionCall(FunctionCall {
+                name: "stack_col".to_owned(),
+                args: col_vals,
+                distinct: false,
+            });
+            out.push(Expression::Alias(AliasExpression {
+                expr: Box::new(call),
+                alias,
             }));
         }
     }

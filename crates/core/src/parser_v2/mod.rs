@@ -10,6 +10,7 @@
 //! `crate::expression`, `crate::generator`.
 
 mod dialect;
+mod multi_alias;
 mod v2_lowering;
 
 use crate::bail_boundary_proto;
@@ -64,10 +65,25 @@ impl SparkSqlParserV2 {
         // wrap with our own `AS`. Simply parse `SELECT <fragment>` and take
         // the single projection — the alias, if any, is preserved by the
         // parser as an `Expression::Alias`.
-        let wrapped = format!("SELECT {expr_sql}");
+        //
+        // Spark's generator-function multi-column alias
+        // (`stack(...) AS (metric, value)`) cannot be represented in
+        // sqlparser-rs's `SelectItem::ExprWithAlias { alias: Ident }`
+        // (single-ident slot) and the parser hard-fails at the `(` after
+        // `AS`. Pre-scan the token stream to strip a trailing
+        // `AS ( ident, ident+ )` alias list and remember the names.
+        let (stripped_sql, multi_aliases) = multi_alias::strip_trailing_multi_alias(expr_sql)?;
+        let wrapped = format!("SELECT {stripped_sql}");
         let plan = Self::parse(&wrapped)?;
         use crate::transpiler_v2::ast::CommonOp;
-        match plan.op {
+        // If the caller supplied a multi-column alias list, wrap the parsed
+        // expression in a synthetic `stack_multi_alias(<stack call>, "<a1>",
+        // …, "<aK>")` FunctionCall so the analyzer's Project pre-pass
+        // (`expand_stack_projections`) can fan it out into K per-column
+        // projections. piv-006 is the only witness — non-`stack` inner
+        // functions surface as a Thunderduck-boundary error inside the
+        // analyzer pre-pass.
+        let single = match plan.op {
             CommonOp::Project {
                 mut projections, ..
             } if projections.len() == 1 => Ok(projections.remove(0)),
@@ -94,8 +110,57 @@ impl SparkSqlParserV2 {
                 "ExpressionString::not_a_scalar",
                 format!("expression fragment did not parse as a single scalar: {expr_sql}"),
             ),
+        }?;
+        match multi_aliases {
+            None => Ok(single),
+            Some(aliases) => wrap_stack_multi_alias(single, aliases, expr_sql),
         }
     }
+}
+
+/// Wrap a parsed generator-call `Expression` in a synthetic
+/// `stack_multi_alias(<inner>, "<a1>", ..., "<aK>")` FunctionCall so
+/// [`crate::transpiler_v2::analyzer`]'s Project pre-pass can splice the
+/// K-alias list into K per-column projections.
+///
+/// Only accepts an inner `stack` call (piv-006 scope) — other generator
+/// functions (`posexplode`, `explode(map)`, `inline`, `json_tuple`) with a
+/// multi-alias on the SQL path surface as a Thunderduck-boundary error and
+/// remain a follow-up.
+fn wrap_stack_multi_alias(
+    inner: crate::transpiler_v2::Expression,
+    aliases: Vec<String>,
+    expr_sql: &str,
+) -> Result<crate::transpiler_v2::Expression, EmissionError> {
+    use crate::transpiler_v2::expression::{Expression, FunctionCall, Literal, LiteralValue};
+    use crate::types::DataType;
+
+    let is_stack = matches!(
+        &inner,
+        Expression::FunctionCall(fc) if fc.name.eq_ignore_ascii_case("stack")
+    );
+    if !is_stack {
+        bail_boundary_proto!(
+            "ExpressionString::multi_alias_non_stack",
+            format!(
+                "multi-column alias `AS ( ... )` on a non-`stack` generator is not \
+                 implemented in τ's SparkSQL path: {expr_sql}"
+            ),
+        );
+    }
+    let mut args: Vec<Expression> = Vec::with_capacity(1 + aliases.len());
+    args.push(inner);
+    for a in aliases {
+        args.push(Expression::Literal(Literal {
+            value: LiteralValue::String(a),
+            data_type: DataType::String,
+        }));
+    }
+    Ok(Expression::FunctionCall(FunctionCall {
+        name: "stack_multi_alias".to_owned(),
+        args,
+        distinct: false,
+    }))
 }
 
 #[cfg(test)]
@@ -206,5 +271,58 @@ mod tests {
             }
             other => panic!("expected Alias wrapping FunctionCall, got {other:?}"),
         }
+    }
+
+    // ── piv-006: `stack(...) AS (a, b, ...)` multi-column alias ────────────
+
+    #[test]
+    fn parse_expression_stack_multi_alias_lowers_to_wrapper() {
+        // piv-006 witness: `F.expr("stack(2, 'age', CAST(age AS DOUBLE),
+        // 'salary', salary) as (metric, value)")`. Before the fix,
+        // sqlparser-rs 0.61 hard-fails at the `(` after `AS`. After the fix,
+        // the multi-alias stripper strips the trailing alias list and the
+        // parser wraps the parsed `stack(...)` call in a synthetic
+        // `stack_multi_alias(<stack>, "metric", "value")` FunctionCall the
+        // analyzer's Project pre-pass fans out into two per-column
+        // projections.
+        use crate::transpiler_v2::expression::{FunctionCall, Literal, LiteralValue};
+        let parsed = SparkSqlParserV2::parse_expression(
+            "stack(2, 'age', CAST(age AS DOUBLE), 'salary', salary) as (metric, value)",
+        )
+        .expect("stack multi-alias must lower without EmissionError::Unsupported");
+        let FunctionCall {
+            name,
+            args,
+            distinct,
+        } = match parsed {
+            Expression::FunctionCall(fc) => fc,
+            other => panic!("expected FunctionCall(stack_multi_alias), got {other:?}"),
+        };
+        assert_eq!(name, "stack_multi_alias");
+        assert!(!distinct);
+        // args[0] is the inner stack call; args[1..] are the string-literal
+        // alias slots.
+        assert_eq!(args.len(), 3);
+        match &args[0] {
+            Expression::FunctionCall(fc) => {
+                assert!(
+                    fc.name.eq_ignore_ascii_case("stack"),
+                    "inner call name must be `stack`, got {:?}",
+                    fc.name
+                );
+            }
+            other => panic!("inner arg must be a FunctionCall(stack), got {other:?}"),
+        }
+        let mut alias_slots: Vec<&str> = Vec::new();
+        for a in &args[1..] {
+            match a {
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(s),
+                    ..
+                }) => alias_slots.push(s.as_str()),
+                other => panic!("expected string-literal alias slot, got {other:?}"),
+            }
+        }
+        assert_eq!(alias_slots, vec!["metric", "value"]);
     }
 }

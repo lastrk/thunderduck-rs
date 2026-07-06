@@ -2422,6 +2422,33 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let m = render_expr(&f.args[0], schema)?;
             return Ok(format!("UNNEST(map_values({m}))"));
         }
+        // piv-006 — synthetic per-column call produced by the analyzer's
+        // Project pre-pass (`expand_stack_projections`) when it fans out a
+        // `stack(N, ...) AS (a1, ..., aK)` fragment. Args are the K row
+        // values for one output column; emission emits
+        // `UNNEST([v1, v2, ..., vN])`. Sibling `stack_col` UNNESTs in a
+        // SELECT list co-multiply row-aligned, matching the `inline_field`
+        // consolidation observed in Pass 90 smoke tests.
+        //
+        // Type coercion across rows is Spark's job (`Stack.checkInputDataTypes`
+        // requires the K expressions per column to share a type; users write
+        // explicit `CAST` in the fragment). DuckDB's list-literal element
+        // widening handles the well-typed shape; a genuinely mixed-type
+        // input arrives here only if Spark itself would have rejected it,
+        // in which case DuckDB emits its own type-mismatch error.
+        "stack_col" => {
+            if f.args.is_empty() {
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`stack_col` requires at least 1 argument (one per stack row)"
+                );
+            }
+            let mut rendered = Vec::with_capacity(f.args.len());
+            for a in &f.args {
+                rendered.push(render_expr(a, schema)?);
+            }
+            return Ok(format!("UNNEST([{}])", rendered.join(", ")));
+        }
         // Pass 90 — synthetic FunctionCall names produced by the analyzer's
         // Project pre-pass (`expand_inline_projections`) when it fans
         // `F.inline(arr)` / `F.inline_outer(arr)` out into N per-struct-field

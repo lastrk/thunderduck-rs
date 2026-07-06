@@ -1001,3 +1001,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 566/0, `sql_v2` 192/70/262 no regression).
 - Commit SHA: (this commit).
+
+## Pass 119 — 2026-07-06 — SQL corpus: B1 correlated subqueries (sq-003/004/006/007/017/018/019/022)
+- **Corpus: emission only.** The B1 cluster — biggest lever. 8 correlated-subquery cases: sq-006/007 (correlated EXISTS/NOT EXISTS), sq-003/004/017/018/019/022 (correlated scalar in SELECT/WHERE/COALESCE, `<=>` null-safe eq, de-correlatable avg).
+- Root cause (diagnostic-pass-119.md): NOT an analyzer gap — the analyzer accepts these and stamps correct qualifiers. `render_filter` unconditionally re-wrapped its child as `(<child>) AS __td_filter`, re-burying the user alias that pass-114 preserved on AliasedRelation → DuckDB `Referenced table "e"/"d"/"e2" not found`. The correlated cases are Filter-over-AliasedRelation under Project (EXISTS) or Aggregate (scalar) — pass-114's explicitly-deferred trap.
+- Architecture (architecture-pass-119.md): two emission flatten branches mirroring pass-114's Project-over-Filter-over-Join flatten. (1) render_project: Project-over-Filter-over-AliasedRelation → `SELECT <slots> FROM (<inner>) AS <alias> WHERE <cond>`. (2) render_aggregate_op: lazy FROM for Aggregate-over-Filter-over-AliasedRelation → same shape + existing GROUP BY append. Zero analyzer change; DuckDB executes the flattened correlated form natively (the outer alias becomes the FROM table name so the subquery's correlated ref binds).
+- Layer(s) touched: transpiler_v2/emission.rs (2 branches). No AST/analyzer/type-inference change.
+- ADR citations: ADR-008 (correlated-subquery scoping — this is the emission half; the analyzer outer-scope stack is the deferred other half), ADR-022 (was a τ-boundary emit), SQL-gen #1/#2 (AST-only composition).
+- Corpus signal: 192 → **201** (+9). All 8 B1 targets GREEN + 1 bonus. No regressions (regression surface provably empty — no green case matched either new arm; single-relation `SELECT *` has no column-order hazard unlike the join case).
+- Files: 1. Tests added: 2 (Project-over-Filter-over-AliasedRelation inlines; Aggregate-over-Filter-over-AliasedRelation inlines).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED — the aggregate restructure is a net-beneficial lazy rework). 1 review Low (documented): correlated refs resolve BY-NAME (accidentally correct for these 8 since key name+type coincide); a future case with same-name/different-type correlated column would silently mis-type — deferred to the ADR-008 outer-scope-stack pass.
+- KNOWN LIMITATION (in code comments): by-name correlated resolution; sq-010 (`e.salary` ∉ dept) correctly rejected today, needs the real outer-scope stack.
+- Findings queued as follow-up: sq-010 (analyzer outer-scope stack — the correlation-correctness hardening + unblocks sq-010); cte-005 (count(*) output-naming bug); sq-016 unsolvable (added to unsolvable.md — Spark rejects 2-level grandparent correlation).
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 568/0, `sql_v2` 201/61/262 no regression).
+- Commit SHA: (this commit).

@@ -439,6 +439,35 @@ fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String
             let cond_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
             return Ok(format!("SELECT {slots_sql} FROM {from} WHERE {cond_sql}"));
         }
+        // Project-over-Filter-over-AliasedRelation inlining: correlated
+        // subqueries (EXISTS / scalar) lower to `Project → Filter →
+        // AliasedRelation`. `render_filter` would re-wrap the child as
+        // `(...) AS __td_filter`, re-burying the user alias so the WHERE's
+        // correlated qualifier (`e.dept_id`) no longer binds. Flatten all
+        // three into one `SELECT <slots> FROM (<inner>) AS <alias> WHERE
+        // <cond>` so the alias becomes the FROM table name and stays in scope
+        // for both slots and WHERE (mirrors the Project-over-Filter-over-Join
+        // branch above).
+        //
+        // KNOWN LIMITATION: the correlated outer reference resolves by-NAME
+        // against the inner schema — accidentally correct here because the
+        // correlation key's name+type coincide in both relations. When the
+        // correlated column is absent from the inner schema (sq-010:
+        // `e.salary` ∉ `dept`) the analyzer correctly rejects it today; a
+        // proper outer-scope stack is out of scope for this pass (ADR-008).
+        if let TypedOp::AliasedRelation {
+            input: inner,
+            alias,
+        } = &filter_input.op
+        {
+            let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
+            let slots_sql = render_projection_slots(projections, input_schema)?;
+            let cond_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
+            let a = quote_ident(alias);
+            return Ok(format!(
+                "SELECT {slots_sql} FROM ({inner_sql}) AS {a} WHERE {cond_sql}"
+            ));
+        }
     }
     // AliasedRelation is transparent for Project too — inline through it.
     if let TypedOp::AliasedRelation {
@@ -4551,7 +4580,47 @@ fn render_aggregate_op(
             "GROUPING SETS emission requires set-membership metadata; (not implemented in τ)",
         );
     }
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    // Aggregate-over-Filter-over-AliasedRelation inlining: correlated scalar
+    // subqueries (`SELECT max(e.salary) FROM emp e WHERE e.dept_id =
+    // d.dept_id`) lower to `Aggregate → Filter → AliasedRelation`. The default
+    // `(<child>) AS __td_agg` FROM (plus `render_filter`'s own `__td_filter`
+    // wrap) buries the user alias, so `max(e.salary)` and `WHERE e.dept_id`
+    // reference `e` at two different wrapper levels and neither binds. Collapse
+    // Filter + AliasedRelation into the aggregate's FROM so the alias is the
+    // table name and both slots and WHERE see it in a single SELECT (mirrors
+    // the Project-over-Filter-over-AliasedRelation branch in `render_project`).
+    //
+    // KNOWN LIMITATION: same by-name correlated resolution caveat as
+    // `render_project` — accidentally correct when the correlation key's
+    // name+type coincide; the analyzer rejects the absent-column case (sq-010).
+    // A proper outer-scope stack is out of scope for this pass (ADR-008).
+    let from_clause = match &input.op {
+        TypedOp::Filter {
+            input: filter_input,
+            condition,
+        } => match &filter_input.op {
+            TypedOp::AliasedRelation {
+                input: inner,
+                alias,
+            } => {
+                let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
+                let cond_sql = render_expr(condition, &filter_input.resolved_schema)?;
+                Some(format!(
+                    "({inner_sql}) AS {} WHERE {cond_sql}",
+                    quote_ident(alias)
+                ))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let from_clause = match from_clause {
+        Some(f) => f,
+        None => {
+            let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+            format!("({child_sql}) AS __td_agg")
+        }
+    };
     let input_schema = &input.resolved_schema;
     // Aggregates may include folded grouping columns at the SparkSQL path
     // (see `CommonOp::Aggregate` doc). For the DataFrame path, aggregates
@@ -4607,7 +4676,7 @@ fn render_aggregate_op(
         first = false;
         slots.push_str(&render_projection_slot(agg, input_schema)?);
     }
-    let mut sql = format!("SELECT {slots} FROM ({child_sql}) AS __td_agg");
+    let mut sql = format!("SELECT {slots} FROM {from_clause}");
     if !grouping.is_empty() {
         let mut group_sql = String::new();
         for (i, g) in grouping.iter().enumerate() {
@@ -6155,6 +6224,65 @@ mod tests {
         assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
         assert!(!sql.contains("__td_filter"), "got: {sql}");
         assert!(!sql.contains("__td_proj"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_project_over_filter_over_aliased_relation_inlines() {
+        let _g = tap_guard();
+        // Correlated EXISTS body: `SELECT * FROM emp e WHERE e.dept_id = ...`
+        // lowers to Project → Filter → AliasedRelation. The alias `e` must
+        // become the FROM table name so the WHERE's `e.dept_id` binds.
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(aliased_scan("emp", "e")),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(filter),
+            projections: vec![],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze project-over-filter-over-aliased");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains(") AS e WHERE "), "got: {sql}");
+        assert!(!sql.contains("__td_filter"), "got: {sql}");
+        assert!(!sql.contains("__td_proj"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_aggregate_over_filter_over_aliased_relation_inlines() {
+        let _g = tap_guard();
+        // Correlated scalar subquery body: `SELECT max(e.salary) FROM emp e
+        // WHERE e.dept_id = ...` lowers to Aggregate → Filter →
+        // AliasedRelation. Alias `e` must be the FROM name so both the
+        // aggregate arg and the WHERE bind to it in one SELECT.
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(aliased_scan("emp", "e")),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(filter),
+            grouping: vec![],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "max".to_owned(),
+                args: vec![qcol("e", "salary")],
+                distinct: false,
+            })],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze aggregate-over-filter-over-aliased");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains(") AS e WHERE "), "got: {sql}");
+        assert!(!sql.contains("__td_filter"), "got: {sql}");
+        assert!(!sql.contains("__td_agg"), "got: {sql}");
     }
 
     #[test]

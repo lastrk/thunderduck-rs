@@ -30,15 +30,15 @@ cargo check
 # Custom port
 ./target/release/thunderduck-connect-server --port 15002
 
-# Kill server
-pkill -f thunderduck-connect-server
+# Kill server (worktree-scoped; ownership-verified — never touches other worktrees)
+./tests/scripts/kill-test-servers.sh
 ```
 
 ## Change-and-Test Workflow
 
 ```bash
-pkill -f thunderduck-connect-server 2>/dev/null
+./tests/scripts/kill-test-servers.sh 2>/dev/null
 cargo build --release
 ./tests/scripts/v2-progress.sh
-pkill -f thunderduck-connect-server 2>/dev/null
+./tests/scripts/kill-test-servers.sh 2>/dev/null
 ```

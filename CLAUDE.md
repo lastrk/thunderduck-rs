@@ -368,9 +368,34 @@ cd tests/integration && python3 -m pytest \
 # Custom port
 ./target/release/thunderduck-connect-server --port 15002
 
-# Kill server
-pkill -f thunderduck-connect-server
+# Kill server (worktree-scoped; ownership-verified — see Per-worktree test isolation)
+./tests/scripts/kill-test-servers.sh
 ```
+
+### Per-worktree test isolation
+
+Multiple git worktrees run tests on one machine. Each worktree gets its own
+remembered server ports, isolated Spark daemon state, and scoped cleanup, so
+runs never clash and cleanup never kills another worktree's servers:
+
+- **Ports** are picked once (random free ports) and persisted to
+  `<worktree_root>/.thunderduck-test-env.json` by
+  `tests/integration/utils/test_env.py`; runs reuse them, so a manual PySpark
+  client connects to the right instance (`sc://localhost:<thunderduck_port>`)
+  and cleanup can locate dangling servers. Explicit `THUNDERDUCK_PORT` /
+  `SPARK_PORT` env vars still override.
+- **Spark reference** runs with per-worktree `SPARK_PID_DIR` / `SPARK_LOG_DIR` /
+  `SPARK_IDENT_STRING` and a `-Dthunderduck.worktree=<id>` JVM marker, so Spark's
+  (port-agnostic) class+instance daemon bookkeeping doesn't collide.
+- **Cleanup**: `./tests/scripts/kill-test-servers.sh` kills only *this*
+  worktree's servers after proving ownership (Thunderduck binary under this
+  worktree's `target/`, or the Spark JVM marker). `--all` sweeps every worktree
+  (still ownership-verified); `--stale` reaps only orphaned (ppid==1) servers;
+  `--list` / `--list-all` show status. **Never** use
+  `pkill -f thunderduck-connect-server` — it crosses worktrees.
+- **Unit tests** are already isolated (in-memory DuckDB, per-process extension
+  temp dir); `THUNDERDUCK_DUCKDB_EXTENSION_DIR` optionally points DuckDB's
+  `INSTALL` cache at a per-worktree dir to avoid a shared-`~/.duckdb` race.
 
 ### Key Data & SQL Paths
 

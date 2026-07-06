@@ -386,6 +386,18 @@ fn lower_aggregate_select(
                                 "GROUPING SETS / mixed ROLLUP/CUBE not supported in τ"
                             );
                         }
+                        // Spark `spark.sql.groupByOrdinal=true` (ANSI default):
+                        // a bare integer literal `N` is an ordinal referencing
+                        // the Nth (1-based) SELECT item, NOT a constant grouping
+                        // key. Resolve it to that item's underlying expression so
+                        // `GROUP BY 1` groups by `dept_id`, not the literal `1`.
+                        // Composite forms (`1 + 1`, `1.5`, `'x'`) are not bare
+                        // integer literals and fall through to `lower_expr`.
+                        Expr::Value(ref vw) if int_from_number_value(&vw.value).is_some() => {
+                            let n = int_from_number_value(&vw.value)
+                                .expect("guarded by matches arm above");
+                            plain.push(resolve_group_by_ordinal(n, &projection, cte_scope)?);
+                        }
                         other => plain.push(lower_expr(other, cte_scope)?),
                     }
                 }
@@ -838,7 +850,23 @@ fn lower_join_constraint(
 
 fn lower_select_item(item: SelectItem, cte_scope: &CteScope) -> Result<Expression, EmissionError> {
     match item {
-        SelectItem::UnnamedExpr(expr) => lower_expr(expr, cte_scope),
+        SelectItem::UnnamedExpr(expr) => {
+            let lowered = lower_expr(expr, cte_scope)?;
+            // SparkSQL default column naming diverges from the DataFrame path
+            // for `count(*)`: Spark rewrites `count(*)` to `count(1)` and the
+            // unaliased output column is therefore named `count(1)` (whereas
+            // the DataFrame `.count()` method names it `count`). The shared
+            // `expression_output_name` yields `count` for both, which is right
+            // for the DataFrame path but wrong here — so stamp the SparkSQL
+            // default name on the unaliased top-level select item.
+            match sparksql_default_select_name(&lowered) {
+                Some(name) => Ok(Expression::Alias(AliasExpression {
+                    expr: Box::new(lowered),
+                    alias: name,
+                })),
+                None => Ok(lowered),
+            }
+        }
         SelectItem::ExprWithAlias { expr, alias } => {
             let inner = lower_expr(expr, cte_scope)?;
             Ok(Expression::Alias(AliasExpression {
@@ -855,6 +883,77 @@ fn lower_select_item(item: SelectItem, cte_scope: &CteScope) -> Result<Expressio
             };
             Ok(Expression::Star(StarExpression { qualifier: Some(q) }))
         }
+    }
+}
+
+/// SparkSQL default output-column name for an unaliased top-level SELECT item,
+/// where it diverges from τ's shared `expression_output_name`.
+///
+/// Currently the one divergence τ needs is `count(*)`: Spark analyzes it to
+/// `count(1)` and names the column `count(1)`. Returns `None` for every other
+/// shape, letting the default name flow from `expression_output_name`.
+fn sparksql_default_select_name(expr: &Expression) -> Option<String> {
+    if let Expression::FunctionCall(f) = expr {
+        if f.name.eq_ignore_ascii_case("count")
+            && !f.distinct
+            && matches!(f.args.as_slice(), [Expression::Star(_)])
+        {
+            return Some("count(1)".to_owned());
+        }
+    }
+    None
+}
+
+/// Undo a synthetic SparkSQL default-name alias added by
+/// [`sparksql_default_select_name`], returning the bare underlying expression.
+///
+/// The `F.expr("...")` / `selectExpr("...")` fragment path
+/// ([`SparkSqlParserV2::parse_expression`]) must yield the raw expression with
+/// NO τ-synthesized alias — the DataFrame layer assigns the output name there.
+/// A user-written alias (or any other alias) is preserved untouched.
+pub(super) fn strip_synthetic_default_name(expr: Expression) -> Expression {
+    if let Expression::Alias(a) = &expr {
+        if sparksql_default_select_name(&a.expr).as_deref() == Some(a.alias.as_str()) {
+            return (*a.expr).clone();
+        }
+    }
+    expr
+}
+
+/// Resolve a Spark GROUP BY ordinal (1-based, `spark.sql.groupByOrdinal=true`)
+/// to the Nth SELECT item's alias-stripped underlying expression.
+///
+/// Out-of-range positions and positions referencing an aggregate select item
+/// are Spark-emulated errors; τ's lowering only produces `EmissionError`, so
+/// they surface as Thunderduck-boundary rejects (the `distinct_on` precedent).
+fn resolve_group_by_ordinal(
+    n: i32,
+    projection: &[SelectItem],
+    cte_scope: &CteScope,
+) -> Result<Expression, EmissionError> {
+    if n < 1 || (n as usize) > projection.len() {
+        bail_boundary_proto!(
+            "sql::group_by_position",
+            format!(
+                "GROUP BY position {n} is not in select list (valid range is [1, {}])",
+                projection.len()
+            )
+        );
+    }
+    let item = &projection[(n - 1) as usize];
+    if select_item_has_aggregate(item) {
+        bail_boundary_proto!(
+            "sql::group_by_position_aggregate",
+            format!("GROUP BY position {n} is an aggregate function; not allowed in GROUP BY")
+        );
+    }
+    match item {
+        SelectItem::UnnamedExpr(e) => lower_expr(e.clone(), cte_scope),
+        SelectItem::ExprWithAlias { expr, .. } => lower_expr(expr.clone(), cte_scope),
+        _ => bail_boundary_proto!(
+            "sql::group_by_position",
+            format!("GROUP BY position {n} references a wildcard select item")
+        ),
     }
 }
 
@@ -2826,6 +2925,72 @@ mod tests {
             }
             other => panic!("expected UnsupportedProtoShape(sql::grouping_sets), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_group_by_ordinal_resolves_to_select_item() {
+        // `spark.sql.groupByOrdinal=true`: `GROUP BY 1` groups by the 1st
+        // SELECT item (`dept_id`), NOT the literal `1`.
+        let plan = parse("SELECT dept_id, count(*) FROM emp GROUP BY 1").expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate { grouping, .. } => {
+                assert_eq!(grouping.len(), 1);
+                match &grouping[0] {
+                    Expression::UnresolvedColumn(u) => assert_eq!(u.name, "dept_id"),
+                    other => panic!("expected UnresolvedColumn(dept_id), got {other:?}"),
+                }
+            }
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn unaliased_count_star_gets_sparksql_count_one_name() {
+        // SparkSQL names an unaliased `count(*)` column `count(1)` (Spark
+        // rewrites `count(*)` → `count(1)`), diverging from the DataFrame
+        // `.count()` name. The last aggregate must be `count(*) AS count(1)`.
+        let plan = parse("SELECT dept_id, count(*) FROM emp GROUP BY 1").expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate { aggregates, .. } => {
+                let last = aggregates.last().expect("count aggregate present");
+                match last {
+                    Expression::Alias(a) => {
+                        assert_eq!(a.alias, "count(1)");
+                        assert!(
+                            matches!(a.expr.as_ref(), Expression::FunctionCall(f) if f.name.eq_ignore_ascii_case("count")),
+                            "aliased expr must be the count call, got {:?}",
+                            a.expr
+                        );
+                    }
+                    other => panic!("expected Alias(count(*), \"count(1)\"), got {other:?}"),
+                }
+            }
+            _ => panic!("expected Aggregate"),
+        }
+    }
+
+    #[test]
+    fn parse_group_by_ordinal_out_of_range_rejected() {
+        // `GROUP BY 5` with only 2 SELECT items is out of range.
+        let err = parse("SELECT dept_id, count(*) FROM emp GROUP BY 5")
+            .expect_err("out-of-range ordinal should be rejected");
+        assert!(
+            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
+                if shape == "sql::group_by_position"),
+            "expected UnsupportedProtoShape(sql::group_by_position), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn parse_group_by_ordinal_pointing_at_aggregate_rejected() {
+        // `GROUP BY 2` references `count(*)`, an aggregate select item.
+        let err = parse("SELECT dept_id, count(*) FROM emp GROUP BY 2")
+            .expect_err("ordinal at aggregate item should be rejected");
+        assert!(
+            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
+                if shape == "sql::group_by_position_aggregate"),
+            "expected UnsupportedProtoShape(sql::group_by_position_aggregate), got {err:?}",
+        );
     }
 
     #[test]

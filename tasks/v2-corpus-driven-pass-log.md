@@ -1044,3 +1044,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new (both crates build silent).
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core -p thunderduck-connect-server` 0 warnings, `cargo test -p thunderduck-core --lib` 574/0, `sql_v2` 205/57/262, `core_v2` 314 no regression).
 - Commit SHA: (this commit).
+
+## Pass 122 — 2026-07-06 — SQL corpus: GROUP BY expression fold + ordinal (agg-007/008)
+- **Corpus: analyzer + emission + lowering.** Targets: agg-007 (`GROUP BY age>=40` projected as `senior`), agg-008 (`GROUP BY 1` ordinal).
+- Root causes (diagnostic-pass-122.md): (agg-007) the `already_folded` prepend heuristic — DUPLICATED in analyzer + emission — was NAME-only; a grouped expression aliased differently isn't detected → spurious prepended column (3 vs 2). (agg-008) two roots: ordinal `1` not resolved to the 1st SELECT item (fell to Literal(1)); + same fold heuristic; AND a 3rd surfaced during fix — Spark names unaliased `count(*)` as `count(1)` while τ named it `count`.
+- Architecture (architecture-pass-122.md): (1) extract ONE shared `grouping_already_folded(grouping, aggregates)` helper (name-match OR alias-stripped structural PartialEq) in analyzer.rs, called by BOTH the analyzer Aggregate arm and emission — kills the pass-121-flagged duplication AND structurally eliminates the wire-schema-vs-column-count desync class. (2) `resolve_group_by_ordinal` at lowering: bare int literal → Nth (1-based) SELECT item's alias-stripped expr; guards out-of-range + aggregate-target + wildcard as boundary rejects.
+- Coder deviation (Spark-correct, flagged): a 3rd blocker (unaliased `count(*)` naming) needed `sparksql_default_select_name`/`strip_synthetic_default_name` — stamps `count(1)` on unaliased top-level count(*) (SparkSQL path only), stripped in `parse_expression` so `F.expr("count(*)")` stays a bare FunctionCall. Spark rewrites count(*)→Count(Literal(1)), output name `count(1)`.
+- Layer(s) touched: transpiler_v2/{analyzer,emission}.rs, parser_v2/{v2_lowering,mod}.rs. No AST change.
+- ADR citations: ADR-004 (one fold source of truth), ADR-016 (groupByOrdinal=true — bare int is always an ordinal), ADR-022 (ordinal guards → boundary reject per distinct_on precedent).
+- Corpus signal: 205 → **210** (+5). agg-007/008 GREEN + 3 bonus (the count(1) naming fix greened other unaliased-count(*) cases). No regressions — DataFrame corpus core_v2 held at 314 (the shared-helper unification: DataFrame aggregates never name/struct-match a grouping key → fold stays false → prepend preserved).
+- Files: 4. Tests added: 6 (analyzer: grouped-expr not-prepended → 2 fields; emission: no spurious slot; lowering: GROUP BY 1→dept_id, out-of-range→err, aggregate-ordinal→err, unaliased count(*)→count(1) name).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED — validated count(1) as Spark-correct; shared helper eliminates the desync class by construction). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED — 4 per-query Vec<String> → 2).
+- Findings queued as follow-up: 2 review Lows — (a) untested wildcard-ordinal reject arm (`SELECT * ... GROUP BY 1`) — add a one-line test next sweep; (b) pathological explicit `count(*) AS \`count(1)\`` alias silently re-derived (single absurd input, would need a synthetic-marker bit). Also: ROLLUP/CUBE ordinals still unresolved (pre-existing gap); broader unaliased-function default naming (avg(x) etc.).
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 580/0, `sql_v2` 210/52/262, `core_v2` 314 no regression).
+- Commit SHA: (this commit).

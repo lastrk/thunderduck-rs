@@ -67,10 +67,16 @@ impl SparkSqlParserV2 {
         let wrapped = format!("SELECT {expr_sql}");
         let plan = Self::parse(&wrapped)?;
         use crate::transpiler_v2::ast::CommonOp;
+        // The fragment path must return the raw expression: strip any
+        // τ-synthesized SparkSQL default-name alias (e.g. `count(*)` →
+        // `count(1)`) so `F.expr(...)`/`selectExpr(...)` see the bare shape;
+        // the DataFrame layer owns naming there.
         match plan.op {
             CommonOp::Project {
                 mut projections, ..
-            } if projections.len() == 1 => Ok(projections.remove(0)),
+            } if projections.len() == 1 => Ok(v2_lowering::strip_synthetic_default_name(
+                projections.remove(0),
+            )),
             // Pass 71: when the fragment is a bare aggregate call
             // (e.g. `try_sum(lng)`, `every(active)`), `lower_select`
             // routes it through `lower_aggregate_select` and produces
@@ -88,7 +94,9 @@ impl SparkSqlParserV2 {
                 && aggregates.len() == 1
                 && matches!(input.op, CommonOp::SingleRow) =>
             {
-                Ok(aggregates.remove(0))
+                Ok(v2_lowering::strip_synthetic_default_name(
+                    aggregates.remove(0),
+                ))
             }
             _ => bail_boundary_proto!(
                 "ExpressionString::not_a_scalar",

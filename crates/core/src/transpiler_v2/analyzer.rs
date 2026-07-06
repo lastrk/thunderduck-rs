@@ -927,12 +927,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             // the aggregates list already begins with the grouping's output
             // names; if not, prepend grouping. Empty grouping = global agg
             // (no unfolding needed).
-            let agg_names: Vec<String> = aggregates.iter().map(expression_output_name).collect();
-            let group_names: Vec<String> = grouping.iter().map(expression_output_name).collect();
-            let already_folded = grouping.is_empty()
-                || group_names
-                    .iter()
-                    .all(|gn| agg_names.iter().any(|an| an.eq_ignore_ascii_case(gn)));
+            let already_folded = grouping_already_folded(&grouping, &aggregates);
             let mut output_fields: Vec<StructField> = Vec::new();
             if !already_folded {
                 for g in &grouping {
@@ -3190,6 +3185,36 @@ fn expression_output_name(expr: &Expression) -> String {
     }
 }
 
+/// Strip a single wrapping `Alias`, returning the underlying expression.
+fn strip_alias(e: &Expression) -> &Expression {
+    match e {
+        Expression::Alias(a) => &a.expr,
+        other => other,
+    }
+}
+
+/// Whether the grouping keys are "already folded" into `aggregates` and so
+/// must NOT be re-prepended to the output schema / SELECT list.
+///
+/// True iff the grouping is empty (global aggregate), OR every grouping key
+/// either name-matches (case-insensitive, via [`expression_output_name`]) or
+/// structurally equals (alias-stripped) some entry in `aggregates`. This is
+/// the single source of truth shared by the analyzer's resolved-schema
+/// construction and emission's SELECT-list rendering — they MUST agree, or the
+/// wire schema desyncs from the emitted column count.
+pub(super) fn grouping_already_folded(grouping: &[Expression], aggregates: &[Expression]) -> bool {
+    grouping.is_empty() || {
+        let agg_names: Vec<String> = aggregates.iter().map(expression_output_name).collect();
+        grouping.iter().all(|gk| {
+            let name = expression_output_name(gk);
+            let name_match = agg_names.iter().any(|an| an.eq_ignore_ascii_case(&name));
+            let bare = strip_alias(gk);
+            let struct_match = aggregates.iter().any(|agg| strip_alias(agg) == bare);
+            name_match || struct_match
+        })
+    }
+}
+
 // ── Set-op widening (§5) ─────────────────────────────────────────────────────
 
 fn push_setop_casts(ast: &mut TypedAst, widened_schema: &StructType) {
@@ -4871,6 +4896,65 @@ mod tests {
         assert_eq!(typed.resolved_schema.fields.len(), 1);
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
         assert!(!typed.resolved_schema.fields[0].nullable);
+    }
+
+    #[test]
+    fn aggregate_grouping_expr_also_projected_is_not_prepended() {
+        // agg-007 shape: `GROUP BY <expr>` where the same expression is also
+        // projected under an alias. The grouping key is structurally equal to
+        // (the alias-stripped) first aggregate, so it is "already folded" and
+        // must NOT be re-prepended → resolved_schema has 2 fields, not 3.
+        let bt = base_types_with_emp_dept();
+        let senior = || {
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::GtEq,
+                left: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                })),
+                right: Box::new(Expression::Literal(Literal {
+                    value: LiteralValue::Int(40),
+                    data_type: DataType::Integer,
+                })),
+            })
+        };
+        let avg_salary = Expression::FunctionCall(FunctionCall {
+            name: "avg".to_owned(),
+            args: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "salary".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            })],
+            distinct: false,
+        });
+        let ast = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![senior()],
+            aggregates: vec![
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(senior()),
+                    alias: "senior".to_owned(),
+                }),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(avg_salary),
+                    alias: "s".to_owned(),
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            having: None,
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        assert_eq!(
+            typed.resolved_schema.fields.len(),
+            2,
+            "grouping expr already projected must not be prepended"
+        );
+        assert_eq!(typed.resolved_schema.fields[0].name, "senior");
+        assert_eq!(typed.resolved_schema.fields[1].name, "s");
     }
 
     #[test]

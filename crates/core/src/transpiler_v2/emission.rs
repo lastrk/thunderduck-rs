@@ -4630,26 +4630,7 @@ fn render_aggregate_op(
     // the aggregates list doesn't already start with the grouping cols'
     // output names, prepend them to the SELECT list so the emitted column
     // count matches the resolved schema.
-    let agg_names: Vec<String> = aggregates
-        .iter()
-        .map(|e| match e {
-            Expression::Alias(a) => a.alias.clone(),
-            Expression::ColumnReference(c) => c.name.clone(),
-            _ => String::new(),
-        })
-        .collect();
-    let group_names: Vec<String> = grouping
-        .iter()
-        .map(|e| match e {
-            Expression::Alias(a) => a.alias.clone(),
-            Expression::ColumnReference(c) => c.name.clone(),
-            _ => String::new(),
-        })
-        .collect();
-    let already_folded = grouping.is_empty()
-        || group_names
-            .iter()
-            .all(|gn| !gn.is_empty() && agg_names.iter().any(|an| an.eq_ignore_ascii_case(gn)));
+    let already_folded = super::analyzer::grouping_already_folded(grouping, aggregates);
     // Rewrite any `grouping_id()` (no-arg) calls inside `aggregates` to
     // pass the current grouping columns as explicit args — DuckDB requires
     // them. This is a small tree-walk local to render_aggregate_op scope.
@@ -6347,6 +6328,62 @@ mod tests {
         assert!(
             !sql.contains("__td_filter"),
             "no outer WHERE wrapper: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_aggregate_grouping_expr_also_projected_no_prepended_slot() {
+        let _g = tap_guard();
+        // agg-007 shape: `SELECT dept_id >= 40 AS senior, avg(salary) AS s
+        // FROM emp GROUP BY dept_id >= 40`. The grouping key structurally
+        // equals the alias-stripped first aggregate → already folded → the
+        // SELECT list must have exactly the 2 projected slots, with NO spurious
+        // leading `(dept_id >= 40)` slot.
+        let senior_expr = || {
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::GtEq,
+                left: Box::new(ucol("dept_id")),
+                right: Box::new(int_lit(40)),
+            })
+        };
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![senior_expr()],
+            aggregates: vec![
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(senior_expr()),
+                    alias: "senior".to_owned(),
+                }),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(Expression::FunctionCall(FunctionCall {
+                        name: "avg".to_owned(),
+                        args: vec![ucol("salary")],
+                        distinct: false,
+                    })),
+                    alias: "s".to_owned(),
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze folded aggregate");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // The select list (between SELECT and FROM) must be the 2 projected
+        // slots only: the grouping expr appears once in `senior` and once in
+        // GROUP BY = twice total. A spurious prepended slot would make it 3.
+        assert_eq!(
+            sql.matches("(dept_id) >= (40)").count(),
+            2,
+            "expected the grouping expr exactly twice (senior slot + GROUP BY), got: {sql}"
+        );
+        assert_eq!(
+            sql.matches(" AS senior").count(),
+            1,
+            "senior alias appears exactly once: {sql}"
         );
     }
 

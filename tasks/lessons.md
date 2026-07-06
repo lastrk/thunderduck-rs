@@ -192,7 +192,6 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   representation), no catch-all `Ok` fallbacks for typed dispatch. Every
   unhandled type surfaces as a loud error. Silent NULL substitution is
   worse than a loud panic in every case.
-
 - **A new function's front-end lowering fix is necessary but not sufficient — land the
   paired type-inference + emission arms in the same pass.** intv-006 (2026-07-06):
   `timestampadd(MONTH, 3, ts)` raised `UnknownColumn { name: "MONTH" }` because τ's
@@ -220,6 +219,52 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   toward-zero truncation. Rule: when an unsupported input reaches τ, the error category
   must reflect *why* it is unsupported (boundary, not Spark-emulated) — never let a
   parser/analyzer accident emit a fake Spark-rejection for input Spark would accept.
+
+- **Data-dependent output schemas resolve via a session-injected discovery
+  pre-pass in connect-server, never an inline analyzer query.** Values-less
+  `.pivot(col)` (2026-07-06) punted with `PuntedOperator("Pivot[implicit-values]")`
+  because its output schema (one column per distinct pivot value) is
+  data-dependent — unknowable from `&BaseTypes` alone — and the τ analyzer is a
+  pure, synchronous stage barred by INV10 from importing `crate::runtime`, so it
+  has nowhere to run Spark's eager `select(col).distinct().sort(col)`. The fix
+  mirrors Spark's analyzer *outside* τ: `resolve_implicit_pivots` /
+  `discover_pivot_values` in `crates/connect-server/src/service.rs` (which holds
+  the `DuckDbSession` and may import `crate::runtime`) emit the pivot's `input`
+  subtree, run `SELECT DISTINCT <col> FROM (<input>) ORDER BY 1 ASC NULLS FIRST
+  LIMIT pivotMaxValues+1` via the existing async `session.execute().await`,
+  convert rows to typed literals with the reused `arrow_val_to_literal`, enforce
+  `spark.sql.pivotMaxValues` (10000), and rewrite the `CommonOp::Pivot` node to
+  the explicit-values shape *before* `finalize`/`analyze` — downstream is
+  byte-identical to the passing explicit-values path (grp-004). This keeps the
+  analyzer pure (INV10) and the DuckDB threading model intact (session touched
+  only via its async channel; no `!Send` `Connection` crosses a thread). Two
+  Spark-parity subtleties, both verified against Spark 4.x source (not the Java
+  reference, which null-filters and diverges): (1) `distinct()` does *not*
+  null-filter, so a discovered NULL is a legitimate bucket that sorts first
+  (nulls-first) and is named `"null"` — τ's pre-existing NULL-pivot-value
+  rejection in `analyze_pivot` was therefore a parity *bug* on the explicit path
+  too, not a user-input safeguard, and was removed outright; (2) `ORDER BY … ASC
+  NULLS FIRST` is load-bearing for deterministic output-column order. Rule: any
+  op whose output schema depends on the *values* (not types) of its input —
+  Crosstab is the mirror image, same session-hook blocker — routes through this
+  same eager connect-server pre-pass, not a second mechanism and never a query
+  from inside the analyzer. Model "not yet discovered" distinctly from "empty
+  list" if you extend this (an empty input relation currently re-punts, because
+  a genuinely empty discovered `Vec` is indistinguishable from unresolved).
+
+- **A `schema_only` corpus flag can hide a value bug in an op whose schema is
+  identical but whose cell values diverge from Spark.** Realizing the crosstab
+  desugar (misc-006, 2026-07-06) via the pivot session-hook above, the first cut
+  built col0 as bare `Alias(Cast(col1 → String), "{col1}_{col2}")`. Its *schema*
+  (string, nullability-from-col1) matched Spark exactly, so misc-006's
+  `schema_only` gate was green — but Spark's `StatFunctions.crossTabulate` builds
+  col0 as `when(isnull(col1), "null").otherwise(col(col1).cast("string"))`, so a
+  NULL col1 row (the misc-006 fixture has one: "Eve") is relabeled to the literal
+  string `"null"`, not SQL `NULL`. The review caught it against Spark 4.1.1
+  source, not the gate. Lesson: when a fix rides an existing pass, re-derive the
+  target op's *value* semantics from Spark source, not just its schema; a
+  `schema_only`-flagged case proves nothing about cells. The CaseWhen relabel is
+  nullability-neutral (the else branch governs), so the schema stayed correct.
 
 ## Progress-signal calibration
 

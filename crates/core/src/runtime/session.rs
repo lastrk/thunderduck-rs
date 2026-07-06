@@ -71,6 +71,32 @@ fn detect_timezone() -> String {
 /// Failures are non-fatal: the server logs a warning and continues without S3
 /// access if `httpfs` / `aws` are unavailable. Workloads that don't touch S3
 /// must still start.
+/// Redirect DuckDB's extension install directory when
+/// `THUNDERDUCK_DUCKDB_EXTENSION_DIR` is set.
+///
+/// DuckDB `INSTALL` writes to the shared per-user `~/.duckdb/extensions` cache
+/// by default. When several git worktrees run tests concurrently on one machine
+/// they would race on that shared cache. The test harness points this env var
+/// at a per-worktree directory so each worktree owns its own extension cache.
+/// Unset → DuckDB's default (`~/.duckdb`), so plain `cargo test` is unaffected.
+/// (The mandatory `thdck_spark_funcs` extension is loaded from a per-process
+/// temp path via `extension_loader` and does not consult this setting; only
+/// `INSTALL` — e.g. the opt-in S3 `httpfs`/`aws` — does.)
+fn configure_extension_directory(conn: &duckdb::Connection) {
+    let Ok(dir) = std::env::var("THUNDERDUCK_DUCKDB_EXTENSION_DIR") else {
+        return;
+    };
+    if dir.is_empty() {
+        return;
+    }
+    let stmt = format!("SET extension_directory = '{}'", dir.replace('\'', "''"));
+    if let Err(e) = conn.execute_batch(&stmt) {
+        tracing::warn!("failed to set extension_directory to `{dir}`: {e}");
+    } else {
+        tracing::debug!("DuckDB extension_directory set to `{dir}`");
+    }
+}
+
 fn configure_s3_credential_chain(conn: &duckdb::Connection, enabled: Option<String>) {
     let Some(value) = enabled else { return };
     if !value.eq_ignore_ascii_case("true") {
@@ -559,6 +585,11 @@ CREATE OR REPLACE MACRO str_to_map(s, pair_delim, kv_delim) AS
                     let _ = ready_tx.send(Err(e));
                     return;
                 }
+
+                // Per-worktree extension cache (avoids cross-worktree races on
+                // the shared ~/.duckdb when INSTALL runs). Must precede any
+                // INSTALL below.
+                configure_extension_directory(&conn);
 
                 // Opt-in S3 credential_chain (IRSA-friendly auth on EKS).
                 configure_s3_credential_chain(

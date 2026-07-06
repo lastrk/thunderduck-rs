@@ -201,8 +201,8 @@ via `include_bytes!()` and loaded at every session's startup.
 # Custom port
 ./target/release/thunderduck-connect-server --port 15002
 
-# Kill the server
-pkill -f thunderduck-connect-server
+# Kill the server (worktree-scoped — never touches other worktrees' servers)
+./tests/scripts/kill-test-servers.sh
 ```
 
 ## Spark Compatibility Extension

@@ -479,8 +479,21 @@ def dual_server_manager():
     # Kill orphan servers from crashed previous runs (reads stale PID file)
     _cleanup_pid_file()
 
-    td_port = int(os.environ.get('THUNDERDUCK_PORT', 0)) or _allocate_free_port()
-    spark_port = int(os.environ.get('SPARK_PORT', 0)) or _allocate_free_port()
+    # Resolve deterministic, remembered ports for this worktree. test_env picks
+    # random free ports on first use and persists them to
+    # <worktree_root>/.thunderduck-test-env.json, so runs are repeatable, a
+    # manual PySpark client can reconnect, and cleanup can locate dangling
+    # servers. Explicit THUNDERDUCK_PORT/SPARK_PORT env vars still win.
+    import test_env
+    td_port, spark_port = test_env.resolve_ports()
+
+    # Per-worktree DuckDB extension cache, so concurrent test runs in different
+    # worktrees never race on the shared ~/.duckdb (only matters if an INSTALL
+    # runs, e.g. opt-in S3). Propagates to the server via os.environ.copy().
+    os.environ.setdefault(
+        "THUNDERDUCK_DUCKDB_EXTENSION_DIR",
+        str(test_env.worktree_root() / ".duckdb-ext"),
+    )
 
     # Register ports for signal/atexit cleanup
     _allocated_ports.add(td_port)

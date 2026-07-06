@@ -3393,56 +3393,51 @@ fn push_setop_casts(ast: &mut TypedAst, widened_schema: &StructType) {
         // Re-borrow to mutate.
         if let TypedOp::Project { projections, .. } = &mut ast.op {
             for (idx, proj) in projections.iter_mut().enumerate() {
-                let target = &widened_schema.fields[idx];
-                let current_type = proj.data_type(&input_schema);
-                if current_type != target.data_type && !matches!(current_type, DataType::Unresolved)
-                {
-                    // Wrap in CAST; preserve alias if present at the top.
-                    wrap_projection_with_cast(proj, target.data_type.clone());
+                // Star survives verbatim: the widened schema takes its names
+                // from `*`'s expansion and `* AS id` is invalid SQL.
+                if matches!(proj, Expression::Star(_)) {
+                    continue;
                 }
+                let target = &widened_schema.fields[idx];
+                // Type BEFORE stripping any alias (Alias delegates to inner).
+                let current_type = proj.data_type(&input_schema);
+                let cast_to = (current_type != target.data_type
+                    && !matches!(current_type, DataType::Unresolved))
+                .then(|| target.data_type.clone());
+                align_setop_projection(proj, &target.name, cast_to);
             }
         }
         ast.resolved_schema = widened_schema.clone();
     }
 }
 
-fn wrap_projection_with_cast(expr: &mut Expression, to_type: DataType) {
-    // If the projection is `Alias(inner)`, wrap inner and reattach alias.
-    match expr {
-        Expression::Alias(alias) => {
-            let inner = std::mem::replace(
-                &mut *alias.expr,
-                Expression::Literal(super::expression::Literal {
-                    value: super::expression::LiteralValue::Null,
-                    data_type: DataType::Null,
-                }),
-            );
-            let alias_name = alias.alias.clone();
-            let casted = Expression::Cast(CastExpression {
-                expr: Box::new(inner),
-                to_type,
-                try_cast: false,
-            });
-            *expr = Expression::Alias(AliasExpression {
-                expr: Box::new(casted),
-                alias: alias_name,
-            });
-        }
-        other => {
-            let owned = std::mem::replace(
-                other,
-                Expression::Literal(super::expression::Literal {
-                    value: super::expression::LiteralValue::Null,
-                    data_type: DataType::Null,
-                }),
-            );
-            *other = Expression::Cast(CastExpression {
-                expr: Box::new(owned),
-                to_type,
-                try_cast: false,
-            });
-        }
-    }
+/// Re-alias a set-op branch projection to `name` (Spark: union column names
+/// come from the first branch → the widened name always wins, so strip any
+/// existing top-level alias). Cast the value first when `cast_to` is `Some`;
+/// otherwise the aliased column keeps its type. Aligning every non-`Star`
+/// branch guarantees the child subquery's output column is named `name`, so
+/// `render_set_op`'s outer positional `CAST(<name> AS <ty>) AS <name>` binds.
+fn align_setop_projection(expr: &mut Expression, name: &str, cast_to: Option<DataType>) {
+    let placeholder = Expression::Literal(super::expression::Literal {
+        value: super::expression::LiteralValue::Null,
+        data_type: DataType::Null,
+    });
+    let inner = match std::mem::replace(expr, placeholder) {
+        Expression::Alias(a) => *a.expr,
+        other => other,
+    };
+    let valued = match cast_to {
+        Some(to_type) => Expression::Cast(CastExpression {
+            expr: Box::new(inner),
+            to_type,
+            try_cast: false,
+        }),
+        None => inner,
+    };
+    *expr = Expression::Alias(AliasExpression {
+        expr: Box::new(valued),
+        alias: name.to_owned(),
+    });
 }
 
 // ── Join helpers (§6) ────────────────────────────────────────────────────────
@@ -4492,6 +4487,100 @@ mod tests {
             other => panic!("expected AnalyzerError::Other, got {other:?}"),
         }
         assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
+    }
+
+    /// Project a single named column from `table` — a `Project` child so the
+    /// set-op positional-cast pushdown (`push_setop_casts`) applies.
+    fn project_col(table: &str, col: &str) -> CommonAst {
+        CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: table.to_owned(),
+                alias: None,
+            })),
+            projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name: col.to_owned(),
+                qualifier: None,
+                plan_id: None,
+            })],
+        })
+    }
+
+    /// Pass 133 — corpus `set-009`: a 3-way `UNION ALL` where the last branch
+    /// widens (INT→BIGINT). Each non-`Star` branch projection must be
+    /// re-aliased to the widened first-branch name (`id`), casting only the
+    /// mismatched branch. The dept child subquery therefore emits
+    /// `CAST(dept_id AS BIGINT) AS id`, so `render_set_op`'s outer positional
+    /// `... AS id` binds instead of failing "column id cannot be referenced".
+    #[test]
+    fn setop_union_three_way_widening_aliases_and_casts_mismatched_branch() {
+        // SELECT id FROM emp UNION ALL SELECT id FROM emp2
+        //   UNION ALL SELECT dept_id FROM dept
+        // emp.id / emp2.id = LONG, dept.dept_id = INT → widened LONG, name `id`.
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Union,
+            all: true,
+            by_name: false,
+            allow_missing_columns: false,
+            children: vec![
+                project_col("emp", "id"),
+                project_col("emp2", "id"),
+                project_col("dept", "dept_id"),
+            ],
+        });
+        let bt = BaseTypes::build_from_plan(&ast, |name| match name {
+            "emp" => Some(emp_schema()),
+            "emp2" => Some(StructType::new(vec![StructField::not_null(
+                "id",
+                DataType::Long,
+            )])),
+            "dept" => Some(dept_schema()),
+            _ => None,
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        let sql = super::super::emission::dispatch_op(&typed.op, &typed.resolved_schema).unwrap();
+        assert!(
+            sql.contains("CAST(dept_id AS BIGINT) AS id"),
+            "dept branch must cast INT→BIGINT and re-alias to widened name `id`; got:\n{sql}"
+        );
+    }
+
+    /// Pass 133 latent sibling: a same-type / different-name union. Both
+    /// branches are LONG, so NO cast is introduced, but the second branch's
+    /// `manager_id` must still be re-aliased to the widened first-branch name
+    /// `id` — otherwise its subquery output column is `manager_id` and the
+    /// outer positional `... AS id` cannot bind.
+    #[test]
+    fn setop_union_same_type_different_name_aliases_without_cast() {
+        // SELECT id FROM staff UNION ALL SELECT manager_id FROM staff
+        // both LONG → alias-only repair, no cast.
+        let staff = StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("manager_id", DataType::Long),
+        ]);
+        let ast = CommonAst::new(CommonOp::SetOp {
+            kind: SetOpKind::Union,
+            all: true,
+            by_name: false,
+            allow_missing_columns: false,
+            children: vec![
+                project_col("staff", "id"),
+                project_col("staff", "manager_id"),
+            ],
+        });
+        let bt = BaseTypes::build_from_plan(&ast, |name| match name {
+            "staff" => Some(staff.clone()),
+            _ => None,
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        let sql = super::super::emission::dispatch_op(&typed.op, &typed.resolved_schema).unwrap();
+        assert!(
+            sql.contains("manager_id AS id"),
+            "second branch must alias manager_id→id (widened name) without a cast; got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("CAST(manager_id"),
+            "same-type branch must NOT introduce a cast; got:\n{sql}"
+        );
     }
 
     /// Non-Union set-ops by-name are punted (DuckDB does not support

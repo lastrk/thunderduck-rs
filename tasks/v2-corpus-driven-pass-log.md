@@ -1199,3 +1199,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 623/0, `sql_v2` 228/34/262 no regression).
 - Commit SHA: (this commit).
+
+## Pass 133 — 2026-07-06 — SQL corpus: 3-way UNION set-op cast naming (set-009)
+- **Corpus: analyzer (shared SQL+DataFrame set-op code).** set-009 (`SELECT id FROM emp UNION ALL SELECT id FROM emp2 UNION ALL SELECT dept_id FROM dept`).
+- Root cause (diagnostic-pass-132.md): `push_setop_casts` pushed an UNALIASED `CAST(dept_id AS BIGINT)` into the dept Project child (whose output DuckDB auto-names `CAST(dept_id AS BIGINT)`) AND overwrote resolved_schema to claim name `id`; emission's render_set_op then re-wrapped as `CAST(id AS BIGINT) AS id` referencing a non-existent `id` → DuckDB "referenced before defined". Latent sibling: same-type/different-name branch (`... SELECT manager_id`) failed identically.
+- Architecture (architecture-pass-133.md): robust variant — in push_setop_casts, always re-alias each NON-Star branch projection to its widened name (`widened_schema.fields[idx].name`), casting conditionally (predicate unchanged). Renamed `wrap_projection_with_cast`→`align_setop_projection` (strip top-level Alias→inner, optional Cast, re-Alias). Skip Star (`* AS id` invalid).
+- Layer(s) touched: transpiler_v2/analyzer.rs. No emission/AST change (reuse Alias/Cast).
+- ADR citations: ADR-006 (set-op widening), ADR-015 (Spark parity — union names from first branch = widened name), ADR-022.
+- Corpus signal: 228 → **229** (+1). set-009 GREEN + closed the latent same-type/different-name sibling. set-001..008/010 held. core_v2 held at 314.
+- Files: 1. Tests added: 2 (cast+alias 3-way widening → `CAST(dept_id AS BIGINT) AS id`; alias-WITHOUT-cast same-type/different-name → `manager_id AS id` no CAST).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED — matched-name path is a genuine no-op `col AS col`; render_set_op already forces final AS widened_name; Star skip necessary; std::mem::replace correct). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED — mem::replace avoids clone; +1 Alias node/projection at translation-time negligible).
+- Regression-safe because: no green by-position set case has type-widening OR name-mismatch (all dept_id=INT, all id=LONG) → aliasing = no-op; non-Project + Star children skipped; unionByName (by_name=true) bypasses push_setop_casts entirely; core_v2 df.union same path (no-op for matched).
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 625/0, `sql_v2` 229/33/262, `core_v2` 314 no regression).
+- Commit SHA: (this commit).

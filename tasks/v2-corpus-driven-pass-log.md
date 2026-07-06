@@ -1115,3 +1115,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 598/0, `sql_v2` 219/43/262, `core_v2` 314 no regression).
 - Commit SHA: (this commit).
+
+## Pass 127 — 2026-07-06 — SQL corpus: Spark toPrettySQL default naming (sel-008) [fn-018 unsolvable]
+- **Corpus: analyzer only.** Initial cluster was fn-018 + sel-008 ("division"); diagnosis (diagnostic-pass-127.md) found: fn-018 UNSOLVABLE (Spark ANSI throws DIVIDE_BY_ZERO on the `nums` b=0 fixture row — reference-side, harness has no error-vs-error path; τ's division already correct — recorded in unsolvable.md); sel-008 was NAME-only (division type/value already correct).
+- Root cause: `expression_output_name`'s `_ => "expr"` fallback names ALL unaliased non-trivial projections `"expr"`; Spark names them via `toPrettySQL` (`age + 1` → `(age + 1)`, `salary / 1000` → `(salary / 1000)`). Shared analyzer gap (both front-ends name identically here — unlike pass-122's count(*) SQL-only divergence).
+- Architecture (architecture-pass-127.md): add a recursive value-aware `pretty_name(expr)` (+ `pretty_binary_symbol`/`pretty_literal`/`pretty_unary`) with its OWN exhaustive Spark-`.sql` BinaryOp symbol map (NOT DuckDB's); route ONLY the `_ => "expr"` fallback through it. Covers ColumnReference/UnresolvedColumn/Alias/Literal(value-aware, strings unquoted)/Binary/Unary/FunctionCall/Star/ExtractValue(leaf field name); leaves Cast + exotic variants at "expr" (Spark type-spelling would be differently-wrong).
+- Layer(s) touched: transpiler_v2/analyzer.rs (pretty_name + 1 fallback line) + analyzer_fixtures.rs:443 (inv4 fixture `address.geo.lat` "expr"→"lat", now ExtractValue is covered). No emission/AST change (arrow_schema_stamp names from resolved_schema — sole authority).
+- ADR citations: ADR-015/016 (Spark parity — toPrettySQL/usePrettyExpression naming), ADR-004 (shared analyzer, both front-ends).
+- Corpus signal: 219 → **220** (+1 sel-008; sel-014 was already green). core_v2 held at 314. No regressions — regression-free BY CONSTRUCTION: `_ => "expr"` is never a Spark-correct default name (Spark only names an expr "expr" via explicit `AS expr` → Alias arm), so no green case relied on the fallback.
+- Files: 2. Tests added: 9 pretty_name units + 1 analyzer projection-naming test.
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED — verified regression argument airtight for the naming path). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED — translation-time shallow-tree name builder).
+- Findings queued as follow-up (3 review Lows, all non-blocking): (a) grouping_already_folded name-match now path-dependent — empirically neutral (fitness gates confirm), latent fragility on an exotic GROUP-BY-computed-key shape not in corpus; (b) pretty_binary_symbol NotEq→`<>` / Concat→`||` diverge from Spark's `(NOT (a=b))`/`concat(a,b)` — cannot regress (only affects currently-red cases); (c) some pretty_name arms (Negate/IsNaN/qualified-Star/float/decimal literals) lack direct unit tests. Also: top-level unaliased scalar FunctionCall keeps `f.name` (separate divergence, own pass).
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 607/0 incl inv4, `sql_v2` 220/42/262, `core_v2` 314 no regression).
+- Commit SHA: (this commit).

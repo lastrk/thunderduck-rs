@@ -44,9 +44,9 @@ use super::ast::{CommonAst, CommonOp, FileFormat, JoinType, PivotGrouping, Unpiv
 use super::base_types::BaseTypes;
 use super::error::{EmissionError, UnsupportedKind};
 use super::expression::{
-    AliasExpression, BinaryExpression, CaseWhenExpression, CastExpression, ColumnReference,
-    Expression, ExtractValueExpression, FunctionCall, Literal, LiteralValue, SortOrder,
-    StarExpression, SubqueryPlan, UnaryExpression, UnresolvedColumn,
+    AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
+    ColumnReference, Expression, ExtractValueExpression, FunctionCall, Literal, LiteralValue,
+    SortOrder, StarExpression, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
 use super::type_inference::TypeInferenceEngine;
 use crate::bail_boundary_rule;
@@ -3222,7 +3222,120 @@ fn expression_output_name(expr: &Expression) -> String {
         Expression::UnresolvedColumn(u) => u.name.clone(),
         Expression::FunctionCall(f) => f.name.clone(),
         Expression::Literal(_) => "col".to_owned(),
+        _ => pretty_name(expr),
+    }
+}
+
+/// The Spark `.sql` symbol for a binary operator, matching Spark's
+/// `Expression.sql` / `toPrettySQL` rendering (NOT DuckDB's emission symbols —
+/// see `render_binary`). Exhaustive on purpose: a new [`BinaryOp`] must make a
+/// naming decision here rather than silently fall through.
+fn pretty_binary_symbol(op: &BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Mod => "%",
+        BinaryOp::IntDiv => "div",
+        BinaryOp::Eq => "=",
+        BinaryOp::NotEq => "<>",
+        BinaryOp::Lt => "<",
+        BinaryOp::LtEq => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::GtEq => ">=",
+        BinaryOp::And => "AND",
+        BinaryOp::Or => "OR",
+        BinaryOp::Concat => "||",
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::BitXor => "^",
+    }
+}
+
+/// Spark `toPrettySQL`-parity default column name for an unaliased projection
+/// expression (Spark `UnresolvedAlias` → `Column.named` → `toPrettySQL`).
+///
+/// This is deliberately distinct from both [`expression_output_name`] (which
+/// names top-level `Literal`s `"col"` and `FunctionCall`s by function name) and
+/// the emission `render_*` family (which uses DuckDB symbols, ANSI guards, and
+/// casts). It is value-aware — a literal renders its value, not its type — and
+/// recursive over the structural variants Spark inlines into a pretty name.
+///
+/// Variants Spark renders in a shape τ does not yet match exactly (`Cast`,
+/// `CaseWhen`, windows, subqueries, complex-type literals, …) keep the
+/// Thunderduck-boundary fallback name `"expr"`.
+fn pretty_name(expr: &Expression) -> String {
+    match expr {
+        Expression::ColumnReference(c) => c.name.clone(),
+        Expression::UnresolvedColumn(u) => u.name.clone(),
+        Expression::Alias(a) => a.alias.clone(),
+        Expression::Literal(l) => pretty_literal(&l.value),
+        Expression::Binary(b) => format!(
+            "({} {} {})",
+            pretty_name(&b.left),
+            pretty_binary_symbol(&b.op),
+            pretty_name(&b.right)
+        ),
+        Expression::Unary(u) => pretty_unary(u),
+        Expression::FunctionCall(f) => {
+            let args: Vec<String> = f.args.iter().map(pretty_name).collect();
+            format!("{}({})", f.name, args.join(", "))
+        }
+        Expression::Star(s) => match &s.qualifier {
+            Some(q) => format!("{q}.*"),
+            None => "*".to_owned(),
+        },
+        // Spark names a struct-field access by its leaf field name (the string
+        // extraction key), e.g. `address.geo.lat` → `lat`.
+        Expression::ExtractValue(e) => match e.extraction.as_ref() {
+            Expression::Literal(Literal {
+                value: LiteralValue::String(field),
+                ..
+            }) => field.clone(),
+            _ => "expr".to_owned(),
+        },
         _ => "expr".to_owned(),
+    }
+}
+
+/// Spark `.sql` rendering of a literal value for [`pretty_name`]. Strings are
+/// rendered UNQUOTED (Spark's pretty name drops the quotes), floats reuse
+/// [`format_float_pivot_name`] so an integral value keeps its `.0`.
+fn pretty_literal(value: &LiteralValue) -> String {
+    match value {
+        LiteralValue::Null => "NULL".to_owned(),
+        LiteralValue::Boolean(b) => {
+            if *b {
+                "true".to_owned()
+            } else {
+                "false".to_owned()
+            }
+        }
+        LiteralValue::Byte(v) => v.to_string(),
+        LiteralValue::Short(v) => v.to_string(),
+        LiteralValue::Int(v) => v.to_string(),
+        LiteralValue::Long(v) => v.to_string(),
+        LiteralValue::Float(v) => format_float_pivot_name(*v as f64),
+        LiteralValue::Double(v) => format_float_pivot_name(*v),
+        LiteralValue::Decimal { value, .. } => value.clone(),
+        LiteralValue::String(s) => s.clone(),
+        LiteralValue::Date(d) => d.to_string(),
+        LiteralValue::Timestamp(t) | LiteralValue::TimestampNtz(t) => t.to_string(),
+        LiteralValue::Binary(_) => "expr".to_owned(),
+    }
+}
+
+/// Spark `.sql` rendering of a unary expression for [`pretty_name`].
+fn pretty_unary(u: &UnaryExpression) -> String {
+    let x = pretty_name(&u.operand);
+    match u.op {
+        UnaryOp::Not => format!("(NOT {x})"),
+        UnaryOp::IsNull => format!("({x} IS NULL)"),
+        UnaryOp::IsNotNull => format!("({x} IS NOT NULL)"),
+        UnaryOp::Negate => format!("(- {x})"),
+        UnaryOp::IsNaN => format!("isnan({x})"),
+        UnaryOp::IsNotNaN => format!("(NOT isnan({x}))"),
     }
 }
 
@@ -6947,5 +7060,162 @@ mod tests {
                 other => panic!("expected AnalyzerError::UnsupportedRule, got {other:?}"),
             }
         }
+    }
+
+    // ── Pass 127 — Spark toPrettySQL default naming for unaliased exprs ───
+
+    fn unresolved_col(name: &str) -> Expression {
+        Expression::UnresolvedColumn(UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: None,
+            plan_id: None,
+        })
+    }
+
+    fn int_lit(v: i32) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Int(v),
+            data_type: DataType::Integer,
+        })
+    }
+
+    #[test]
+    fn pretty_name_binary_arithmetic() {
+        let expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(unresolved_col("age")),
+            right: Box::new(int_lit(1)),
+        });
+        assert_eq!(pretty_name(&expr), "(age + 1)");
+    }
+
+    #[test]
+    fn pretty_name_binary_division() {
+        let expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Div,
+            left: Box::new(unresolved_col("salary")),
+            right: Box::new(int_lit(1000)),
+        });
+        assert_eq!(pretty_name(&expr), "(salary / 1000)");
+    }
+
+    #[test]
+    fn pretty_name_nested_binary() {
+        let inner = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(unresolved_col("age")),
+            right: Box::new(int_lit(1)),
+        });
+        let expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Mul,
+            left: Box::new(inner),
+            right: Box::new(int_lit(2)),
+        });
+        assert_eq!(pretty_name(&expr), "((age + 1) * 2)");
+    }
+
+    #[test]
+    fn pretty_name_function_call() {
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "upper".to_owned(),
+            args: vec![unresolved_col("name")],
+            distinct: false,
+        });
+        assert_eq!(pretty_name(&expr), "upper(name)");
+    }
+
+    #[test]
+    fn pretty_name_unary_is_null() {
+        let expr = Expression::Unary(UnaryExpression {
+            op: UnaryOp::IsNull,
+            operand: Box::new(unresolved_col("x")),
+        });
+        assert_eq!(pretty_name(&expr), "(x IS NULL)");
+    }
+
+    #[test]
+    fn pretty_name_star_unqualified() {
+        let expr = Expression::Star(StarExpression { qualifier: None });
+        assert_eq!(pretty_name(&expr), "*");
+    }
+
+    #[test]
+    fn pretty_name_extract_value_leaf_field() {
+        let inner = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(unresolved_col("address")),
+            extraction: Box::new(Expression::Literal(Literal {
+                value: LiteralValue::String("geo".to_owned()),
+                data_type: DataType::String,
+            })),
+        });
+        let expr = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(inner),
+            extraction: Box::new(Expression::Literal(Literal {
+                value: LiteralValue::String("lat".to_owned()),
+                data_type: DataType::String,
+            })),
+        });
+        assert_eq!(pretty_name(&expr), "lat");
+    }
+
+    #[test]
+    fn pretty_name_literals() {
+        assert_eq!(pretty_name(&int_lit(1)), "1");
+        assert_eq!(
+            pretty_name(&Expression::Literal(Literal {
+                value: LiteralValue::String("hello".to_owned()),
+                data_type: DataType::String,
+            })),
+            "hello"
+        );
+        assert_eq!(
+            pretty_name(&Expression::Literal(Literal {
+                value: LiteralValue::Boolean(true),
+                data_type: DataType::Boolean,
+            })),
+            "true"
+        );
+        assert_eq!(
+            pretty_name(&Expression::Literal(Literal {
+                value: LiteralValue::Null,
+                data_type: DataType::Null,
+            })),
+            "NULL"
+        );
+    }
+
+    #[test]
+    fn sel_008_shaped_project_names_unaliased_computed_columns() {
+        let bt = base_types_with_emp_dept();
+        // SELECT id, dept_id + 1, salary / 1000 FROM emp — mirrors sel-008's
+        // shape (an id passthrough plus two unaliased computed projections),
+        // using columns present in `emp_schema`.
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            projections: vec![
+                unresolved_col("id"),
+                Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Add,
+                    left: Box::new(unresolved_col("dept_id")),
+                    right: Box::new(int_lit(1)),
+                }),
+                Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Div,
+                    left: Box::new(unresolved_col("salary")),
+                    right: Box::new(int_lit(1000)),
+                }),
+            ],
+        });
+        let typed = analyze(ast, &bt).expect("analyze sel-008-shaped project");
+        let names: Vec<&str> = typed
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["id", "(dept_id + 1)", "(salary / 1000)"]);
     }
 }

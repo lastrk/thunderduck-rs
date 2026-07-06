@@ -1185,3 +1185,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core -p thunderduck-connect-server` 0 warnings, `cargo test -p thunderduck-core --lib` 621/0, `sql_v2` 227/35/262, `core_v2` 314 no regression).
 - Commit SHA: (this commit).
+
+## Pass 132 — 2026-07-06 — SQL corpus: BETWEEN (whr-007)
+- **Corpus: SQL front-end (lowering — missing arm).** whr-007 (`SELECT * FROM emp WHERE age BETWEEN 30 AND 45`).
+- Root cause (diagnostic-pass-132.md): `lower_expr` had arms for InList/Like/IsDistinctFrom but NO `Expr::Between` arm → fell to the `other =>` boundary bail (`sql::expr::between`). Every other layer already supported Between: `Expression::Between(BetweenExpression)` exists, children() traverses, emission renders `({expr}) {NOT }BETWEEN ({low}) AND ({high})` (tested), expr_has_aggregate matches. Purely a lowering gap (the SELECT-*-over-Filter / pass-126 angle was a red herring — it errors before any plan is built).
+- Architecture (architecture-pass-132.md): add the `Expr::Between { expr, negated, low, high }` arm recursively lowering the 3 operands + preserving `negated`. ~6 lines, mirrors the InList arm.
+- Layer(s) touched: parser_v2/v2_lowering.rs. No emission/type/AST change.
+- ADR citations: ADR-015 (BETWEEN inclusive a<=x<=b, DuckDB-native — no >=/<= rewrite).
+- Corpus signal: 227 → **228** (+1). whr-007 GREEN. No regressions.
+- Files: 1. Tests added: 2 (BETWEEN → Between{negated:false}; NOT BETWEEN → negated:true).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED, 0 findings). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED).
+- Findings queued as follow-up: set-009 (3-way UNION ALL) — diagnosed as a SEPARATE analyzer bug (push_setop_casts pushes an UNALIASED CAST → child loses the column name → DuckDB "referenced before defined"; also a latent same-type/different-name sibling); wider blast radius (shared with DataFrame positional unions); own pass (133) with a widening+rename test.
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 623/0, `sql_v2` 228/34/262 no regression).
+- Commit SHA: (this commit).

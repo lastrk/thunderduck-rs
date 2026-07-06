@@ -38,12 +38,12 @@ use crate::transpiler_v2::ast::{
 };
 use crate::transpiler_v2::error::UnsupportedKind;
 use crate::transpiler_v2::expression::{
-    AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
-    ExistsSubquery, Expression, ExtractValueExpression, FrameBoundary, FrameUnit, FunctionCall,
-    InListExpression, InSubquery, IntervalExpression, IsDistinctFromExpression, LambdaExpression,
-    LambdaVariableExpression, LikeExpression, Literal, LiteralValue, NullOrdering, ScalarSubquery,
-    SortDirection, SortOrder, StarExpression, SubqueryPlan, UnaryExpression, UnaryOp,
-    UnresolvedColumn, WindowFrame, WindowFunction,
+    AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
+    CastExpression, ExistsSubquery, Expression, ExtractValueExpression, FrameBoundary, FrameUnit,
+    FunctionCall, InListExpression, InSubquery, IntervalExpression, IsDistinctFromExpression,
+    LambdaExpression, LambdaVariableExpression, LikeExpression, Literal, LiteralValue,
+    NullOrdering, ScalarSubquery, SortDirection, SortOrder, StarExpression, SubqueryPlan,
+    UnaryExpression, UnaryOp, UnresolvedColumn, WindowFrame, WindowFunction,
 };
 use crate::transpiler_v2::macros::ProtoFieldExt;
 use crate::transpiler_v2::type_inference::AGGREGATE_NAMES;
@@ -1286,6 +1286,17 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
                 negated,
             }))
         }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Ok(Expression::Between(BetweenExpression {
+            expr: Box::new(lower_expr(*expr, cte_scope)?),
+            low: Box::new(lower_expr(*low, cte_scope)?),
+            high: Box::new(lower_expr(*high, cte_scope)?),
+            negated,
+        })),
         Expr::IsNull(e) => Ok(Expression::Unary(UnaryExpression {
             op: UnaryOp::IsNull,
             operand: Box::new(lower_expr(*e, cte_scope)?),
@@ -4252,6 +4263,31 @@ mod tests {
                 assert!(l.negated, "NOT ILIKE must set negated");
             }
             other => panic!("expected Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_between_maps_to_between_not_negated() {
+        // whr-007 shape: `age BETWEEN 30 AND 45` → inclusive Between.
+        let plan =
+            parse("SELECT * FROM emp WHERE age BETWEEN 30 AND 45").expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Between(b) => {
+                assert!(!b.negated, "BETWEEN must not set negated");
+            }
+            other => panic!("expected Between, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_not_between_sets_negated() {
+        let plan =
+            parse("SELECT * FROM emp WHERE age NOT BETWEEN 30 AND 45").expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Between(b) => {
+                assert!(b.negated, "NOT BETWEEN must set negated");
+            }
+            other => panic!("expected Between, got {other:?}"),
         }
     }
 

@@ -1242,6 +1242,58 @@ impl Expression {
                     None => return DataType::Unresolved,
                 }
             }
+            // `round(x[, scale])` / `bround(x[, scale])` share Spark's
+            // `RoundBase.dataType`: for a Decimal child the scale (and
+            // precision) decrease per the literal target scale; a non-decimal
+            // child keeps its type unchanged (`case t => t`), independent of the
+            // scale argument. The shared `function_return_type` resolver only
+            // sees the first arg's type and cannot read the scale literal, so
+            // derive the Decimal branch here. A missing 2nd arg ⇒ scale 0; a
+            // non-literal scale on a Decimal child is a Thunderduck boundary →
+            // `Unresolved`. The Decimal branch is byte-identical to
+            // `ceil_floor_type(input, Some(scale))`. Corpus: `num-005`, `num-006`.
+            "round" | "bround" if !f.args.is_empty() => {
+                let input = f.args[0].data_type(schema);
+                if !matches!(input, DataType::Decimal { .. }) {
+                    // Non-decimal child keeps its type regardless of the scale
+                    // form (e.g. `round(sml, -1)` where `-1` is a unary-minus
+                    // expression, not an integer literal).
+                    return input;
+                }
+                let scale = match f.args.get(1) {
+                    Some(a) => int_literal_value(a),
+                    None => Some(0),
+                };
+                return match scale {
+                    Some(t) => TypeInferenceEngine::ceil_floor_type(&input, Some(t)),
+                    None => DataType::Unresolved,
+                };
+            }
+            // `mod(a, b)` / `pmod(a, b)` — when BOTH operands are Decimal,
+            // Spark's `Remainder`/`Pmod` result decimal type widens per
+            // `decimal_mod_type` (scale = max, precision = min(int digits) +
+            // scale). The first-arg-only `function_return_type` resolver
+            // returns the LEFT decimal, which is wrong for two decimals. Handle
+            // only the both-decimal case here; every other operand shape
+            // (int/int, bigint/int, …) falls through to the shared resolver
+            // that already types them correctly. Corpus: `num-012`.
+            "mod" | "pmod" if f.args.len() == 2 => {
+                let l = f.args[0].data_type(schema);
+                let r = f.args[1].data_type(schema);
+                if let (
+                    DataType::Decimal {
+                        precision: p1,
+                        scale: s1,
+                    },
+                    DataType::Decimal {
+                        precision: p2,
+                        scale: s2,
+                    },
+                ) = (&l, &r)
+                {
+                    return TypeInferenceEngine::decimal_mod_type(*p1, *s1, *p2, *s2);
+                }
+            }
             _ => {}
         }
         let first_arg_type = f.args.first().map(|a| a.data_type(schema));
@@ -2642,5 +2694,149 @@ mod tests {
         let children: Vec<&Expression> = win.children().collect();
         // Exactly three children: func, one partition_by, one order_by.expr.
         assert_eq!(children.len(), 3);
+    }
+
+    // ── round/bround/mod/pmod multi-arg type-inference pre-pass ──────────────
+    // (`function_call_data_type`; corpus num-005 round/bround, num-012 mod/pmod)
+
+    fn dec(precision: u8, scale: u8) -> DataType {
+        DataType::Decimal { precision, scale }
+    }
+
+    fn int_lit(v: i32) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Int(v),
+            data_type: DataType::Integer,
+        })
+    }
+
+    /// Resolve `name(args...)` against a single-column schema of `col_type`,
+    /// where `args[0]` references that column.
+    fn call_type(name: &str, args: Vec<Expression>, col_type: DataType) -> DataType {
+        let schema = StructType::new(vec![StructField::nullable("c", col_type)]);
+        Expression::FunctionCall(FunctionCall {
+            name: name.to_owned(),
+            args,
+            distinct: false,
+        })
+        .data_type(&schema)
+    }
+
+    #[test]
+    fn round_bround_decimal_scale_decreases() {
+        // RoundBase decimal branch: round(Decimal(10,2), 1) → Decimal(10,1).
+        assert_eq!(
+            call_type(
+                "round",
+                vec![ColumnReference::untyped("c"), int_lit(1)],
+                dec(10, 2)
+            ),
+            dec(10, 1)
+        );
+        // bround shares RoundBase: bround(Decimal(6,3), 2) → Decimal(6,2).
+        assert_eq!(
+            call_type(
+                "bround",
+                vec![ColumnReference::untyped("c"), int_lit(2)],
+                dec(6, 3)
+            ),
+            dec(6, 2)
+        );
+        // round(Decimal(38,6), 3): ild=33, ns=3 → min(36,38)=36 → Decimal(36,3).
+        assert_eq!(
+            call_type(
+                "round",
+                vec![ColumnReference::untyped("c"), int_lit(3)],
+                dec(38, 6)
+            ),
+            dec(36, 3)
+        );
+    }
+
+    #[test]
+    fn round_bround_non_decimal_type_unchanged() {
+        // RoundBase `case t => t`: a non-decimal child keeps its type.
+        assert_eq!(
+            call_type(
+                "round",
+                vec![ColumnReference::untyped("c"), int_lit(1)],
+                DataType::Double
+            ),
+            DataType::Double
+        );
+        assert_eq!(
+            call_type(
+                "bround",
+                vec![ColumnReference::untyped("c"), int_lit(2)],
+                DataType::Double
+            ),
+            DataType::Double
+        );
+    }
+
+    #[test]
+    fn round_one_arg_decimal_uses_scale_zero() {
+        // Missing 2nd arg ⇒ scale 0: round(Decimal(10,2)) → Decimal(9,0).
+        assert_eq!(
+            call_type("round", vec![ColumnReference::untyped("c")], dec(10, 2)),
+            dec(9, 0)
+        );
+    }
+
+    #[test]
+    fn round_non_literal_scale_is_unresolved() {
+        // A non-literal scale argument is a Thunderduck boundary → Unresolved.
+        assert_eq!(
+            call_type(
+                "round",
+                vec![ColumnReference::untyped("c"), ColumnReference::untyped("c"),],
+                dec(10, 2)
+            ),
+            DataType::Unresolved
+        );
+    }
+
+    #[test]
+    fn mod_pmod_both_decimal_widens() {
+        // mod(Decimal(10,2), Decimal(6,3)) → Decimal(6,3) per decimal_mod_type.
+        let schema = StructType::new(vec![
+            StructField::nullable("d1", dec(10, 2)),
+            StructField::nullable("d2", dec(6, 3)),
+        ]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "mod".to_owned(),
+            args: vec![
+                ColumnReference::untyped("d1"),
+                ColumnReference::untyped("d2"),
+            ],
+            distinct: false,
+        });
+        assert_eq!(expr.data_type(&schema), dec(6, 3));
+    }
+
+    #[test]
+    fn mod_non_decimal_delegates_to_first_arg_resolver() {
+        // int/int and bigint/int fall through to function_return_type, which
+        // types them via the first (wider) arg — the path that greens today.
+        let schema = StructType::new(vec![
+            StructField::nullable("a", DataType::Integer),
+            StructField::nullable("b", DataType::Integer),
+            StructField::nullable("lng", DataType::Long),
+        ]);
+        let mod_ii = Expression::FunctionCall(FunctionCall {
+            name: "mod".to_owned(),
+            args: vec![ColumnReference::untyped("a"), ColumnReference::untyped("b")],
+            distinct: false,
+        });
+        assert_eq!(mod_ii.data_type(&schema), DataType::Integer);
+        let mod_li = Expression::FunctionCall(FunctionCall {
+            name: "mod".to_owned(),
+            args: vec![
+                ColumnReference::untyped("lng"),
+                ColumnReference::untyped("a"),
+            ],
+            distinct: false,
+        });
+        assert_eq!(mod_li.data_type(&schema), DataType::Long);
     }
 }

@@ -973,3 +973,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new (both crates build silent).
 - Quality Gate: PASS (rustfmt clean on touched files, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 556/0, `sql_v2` 188/74/262 no regression).
 - Commit SHA: (this commit).
+
+## Pass 117 — 2026-07-06 — SQL corpus: round/bround, negative, mod/pmod (num-005/008/012)
+- **Corpus: type-inference only.** Targets: num-005 (round/bround decimal prec/scale), num-008 (signum→double [already ok] + negative preserves type), num-012 (mod/pmod; both-decimal coercion). All `schema_only` (compared via AnalyzePlan resolved_schema — no emission needed to green).
+- Root cause (diagnostic-pass-117.md): all parse as `Expr::Function → FunctionCall` (no lowering gap). num-005: no multi-arg pre-pass arm → bround mis-folded to Double, round ignored scale. num-008: `negative`/`negate` absent from `function_return_type` → Unresolved boundary. num-012: no pre-pass arm → both-decimal fell to first-arg fold (returned left decimal instead of coerced).
+- Architecture (architecture-pass-117.md): reuse existing helpers. num-005 → new `round|bround` pre-pass arm delegating Decimal to `ceil_floor_type(&input, Some(scale))` (RoundBase == pass-116's 2-arg branch), non-decimal returns input unchanged (`case t => t`); removed the now-dead `bround→Double`/`round→first_arg` folds. num-008 → `"negative"|"negate" => first_arg_type` (UnaryMinus preserves type). num-012 → both-decimal-only pre-pass arm reusing `decimal_mod_type`, delegating all non-both-decimal shapes to the existing (green) fall-through (Option A — avoids witness-less dead arms).
+- Layer(s) touched: transpiler_v2/expression.rs (2 pre-pass arms), transpiler_v2/type_inference.rs (negative arm + 2 dead-fold removals). No AST/analyzer/emission change.
+- ADR citations: ADR-016 (ANSI type rules — RoundBase/UnaryMinus/Remainder from mathExpressions.scala + arithmetic.scala), ADR-015 (Spark parity), ADR-022 (non-literal scale → boundary).
+- Corpus signal: 188 → **191** (+3). num-005/008/012 GREEN. num-004/num-006 regression guards stay green. No regressions.
+- Files: 2. Tests added: 7 (round/bround decimal scale-decrease ×3, non-decimal unchanged, 1-arg scale-0, non-literal→Unresolved; negative preserves type; mod both-decimal widens + non-decimal delegates).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED). Coder plan deviation (Spark-correct improvement): hoisted the non-Decimal early-return AHEAD of the scale-literal read so `round(short,-1)` (num-006; `-1` is a unary-minus expr, not an int literal) returns Short not Unresolved — matches RoundBase `case t => t`.
+- Findings queued as follow-up: 2 review Lows deferred — (a) unit test for the non-decimal+non-literal-scale deviation path (already corpus-guarded by num-006); (b) non-foldable-scale Spark-emulated-error parity (no witness). Emission companions for value-witness cases: bround/mod/pmod CAST to resolved decimal; `negative` has NO emission arm + DuckDB has no `negative()` → needs `(-(x))` mapping.
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 563/0, `sql_v2` 191/71/262 no regression).
+- Commit SHA: (this commit).

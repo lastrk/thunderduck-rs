@@ -722,15 +722,20 @@ impl TypeInferenceEngine {
             "sqrt" | "cbrt" | "exp" | "expm1" | "ln" | "log" | "log10" | "log2" | "log1p"
             | "pow" | "power" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
             | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians"
-            | "e" | "pi" | "hypot" | "rand" | "randn" | "random" | "bround" => Double,
+            | "e" | "pi" | "hypot" | "rand" | "randn" | "random" => Double,
             // abs preserves arg type; ceil/floor return Long (Spark rule);
-            // signum returns Double; round returns arg type.
-            "abs" | "round" | "greatest" | "least" | "nvl" | "coalesce" | "nullif" | "nvl2"
-            | "if" | "ifnull" => first_arg_type.cloned().unwrap_or(Unresolved),
+            // signum returns Double. (round/bround are resolved earlier by the
+            // `function_call_data_type` pre-pass, which reads the scale literal.)
+            "abs" | "greatest" | "least" | "nvl" | "coalesce" | "nullif" | "nvl2" | "if"
+            | "ifnull" => first_arg_type.cloned().unwrap_or(Unresolved),
             "ceil" | "ceiling" | "floor" => {
                 Self::ceil_floor_type(first_arg_type.unwrap_or(&Unresolved), None)
             }
             "sign" | "signum" => Double,
+            // `negative`/`negate` map to Spark's `UnaryMinus`, whose
+            // `dataType` equals the child type (int→int, decimal→decimal).
+            // Corpus: `num-008`.
+            "negative" | "negate" => first_arg_type.cloned().unwrap_or(Unresolved),
             "factorial" => Long,
             "mod" | "pmod" => first_arg_type.cloned().unwrap_or(Integer),
             // `nanvl(a, b)` returns the type of the first argument (Spark:
@@ -1648,6 +1653,23 @@ mod tests {
         assert_eq!(
             TypeInferenceEngine::function_return_type("nanvl", Some(&DataType::Float)),
             DataType::Float
+        );
+    }
+
+    #[test]
+    fn negative_preserves_arg_type() {
+        // `negative`/`negate` map to Spark's UnaryMinus: dataType == child.
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("negative", Some(&DataType::Integer)),
+            DataType::Integer
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("negative", Some(&dec(10, 2))),
+            dec(10, 2)
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("negate", Some(&DataType::Integer)),
+            DataType::Integer
         );
     }
 

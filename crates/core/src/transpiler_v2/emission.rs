@@ -40,11 +40,12 @@ use super::analyzer::{Schema, TypedAst, TypedOp};
 use super::ast::FileFormat;
 use super::error::{EmissionError, UnsupportedKind};
 use super::expression::{
-    AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
-    ColumnReference, Expression, FunctionCall, IntervalExpression, Literal, LiteralValue,
-    NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan, UnaryExpression, UnaryOp,
+    int_literal_value, AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
+    CastExpression, ColumnReference, Expression, FunctionCall, IntervalExpression, Literal,
+    LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan,
+    UnaryExpression, UnaryOp,
 };
-use super::type_inference::AGGREGATE_NAMES;
+use super::type_inference::{TypeInferenceEngine, AGGREGATE_NAMES};
 use crate::types::{DataType, StructField, StructType};
 use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
 
@@ -2249,6 +2250,66 @@ fn render_map_hof(
     }
 }
 
+/// Render Spark `ceil`/`floor` to DuckDB SQL. `duck_fn` is the DuckDB substrate
+/// (`"ceil"` / `"floor"`). The CAST target is derived from the SAME
+/// [`TypeInferenceEngine::ceil_floor_type`] the analyzer used, so the physical
+/// type equals `resolved_schema`.
+///
+/// - **Long** (integral / float / double, 1-arg): NaN-guarded `CAST(.. AS
+///   BIGINT)` — byte-identical to the historical emission (math-003 pin).
+/// - **Decimal, 1-arg**: `CAST(fn(a) AS DECIMAL(p, s))` (a DECIMAL can never be
+///   NaN, so no guard).
+/// - **Decimal, 2-arg, t >= 0**: `CAST(fn((a) * 10^t) / 10^t AS DECIMAL(p, s))`.
+/// - **2-arg negative scale**: Thunderduck boundary (no corpus witness).
+fn render_ceil_floor(
+    f: &FunctionCall,
+    schema: &Schema,
+    duck_fn: &str,
+) -> Result<String, EmissionError> {
+    if f.args.is_empty() {
+        bail_boundary_fn!(
+            f.name.clone(),
+            format!("`{}` requires at least 1 argument", f.name)
+        );
+    }
+    let a = render_expr(&f.args[0], schema)?;
+    let input_ty = f.args[0].data_type(schema);
+    let scale_opt = (f.args.len() == 2)
+        .then(|| int_literal_value(&f.args[1]))
+        .flatten();
+    match TypeInferenceEngine::ceil_floor_type(&input_ty, scale_opt) {
+        DataType::Long => Ok(format!(
+            "CASE WHEN ({a}) IS NULL THEN NULL \
+             WHEN isnan(CAST(({a}) AS DOUBLE)) THEN CAST(0 AS BIGINT) \
+             ELSE CAST({duck_fn}({a}) AS BIGINT) END"
+        )),
+        DataType::Decimal { precision, scale } => match scale_opt {
+            None => Ok(format!(
+                "CAST({duck_fn}({a}) AS DECIMAL({precision}, {scale}))"
+            )),
+            Some(t) if t >= 0 => {
+                // `t` is user-controlled; 10^t overflows i128 at t >= 39.
+                // Spark caps DECIMAL scale at 38, so a larger scale has no
+                // valid result — surface an honest boundary rather than panic.
+                let Some(pow) = 10i128.checked_pow(t as u32) else {
+                    bail_boundary_fn!(
+                        f.name.clone(),
+                        "ceil/floor target scale too large (exceeds DECIMAL max scale 38)"
+                    );
+                };
+                Ok(format!(
+                    "CAST({duck_fn}(({a}) * {pow}) / {pow} AS DECIMAL({precision}, {scale}))"
+                ))
+            }
+            Some(_) => bail_boundary_fn!(
+                f.name.clone(),
+                "ceil/floor with negative target scale not implemented in τ"
+            ),
+        },
+        _ => bail_boundary_fn!(f.name.clone(), "ceil/floor: unsupported argument type"),
+    }
+}
+
 fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
     let name_lower = f.name.to_ascii_lowercase();
     // Aggregate-name overlap check — if the analyzer classified a FunctionCall
@@ -2851,28 +2912,8 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // NULL. DuckDB's `CAST(nan AS BIGINT)` raises "Conversion Error",
         // so guard the cast: NULL → NULL, NaN → 0, else CAST. Corpus:
         // `math-003`.
-        "ceil" | "ceiling" => {
-            if f.args.is_empty() {
-                bail_boundary_fn!(f.name.clone(), "`ceil` requires at least 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            return Ok(format!(
-                "CASE WHEN ({a}) IS NULL THEN NULL \
-                 WHEN isnan(CAST(({a}) AS DOUBLE)) THEN CAST(0 AS BIGINT) \
-                 ELSE CAST(ceil({a}) AS BIGINT) END"
-            ));
-        }
-        "floor" => {
-            if f.args.is_empty() {
-                bail_boundary_fn!(f.name.clone(), "`floor` requires at least 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            return Ok(format!(
-                "CASE WHEN ({a}) IS NULL THEN NULL \
-                 WHEN isnan(CAST(({a}) AS DOUBLE)) THEN CAST(0 AS BIGINT) \
-                 ELSE CAST(floor({a}) AS BIGINT) END"
-            ));
-        }
+        "ceil" | "ceiling" => return render_ceil_floor(f, schema, "ceil"),
+        "floor" => return render_ceil_floor(f, schema, "floor"),
         // Spark `signum` returns Double; DuckDB `sign` returns the arg's
         // type. Cast to DOUBLE at emission.
         "sign" | "signum" => {
@@ -5767,6 +5808,82 @@ mod tests {
             value: LiteralValue::Int(v),
             data_type: DataType::Integer,
         })
+    }
+
+    fn double_lit(v: f64) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Double(v),
+            data_type: DataType::Double,
+        })
+    }
+
+    fn decimal_lit(value: &str, precision: u8, scale: u8) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Decimal {
+                value: value.to_owned(),
+                precision,
+                scale,
+            },
+            data_type: DataType::Decimal { precision, scale },
+        })
+    }
+
+    fn ceil_floor_call(name: &str, args: Vec<Expression>) -> FunctionCall {
+        FunctionCall {
+            name: name.to_owned(),
+            args,
+            distinct: false,
+        }
+    }
+
+    // ── ceil/floor emission (num-001/002/003) ────────────────────────────
+
+    #[test]
+    fn ceil_1arg_long_is_bigint_nan_guard() {
+        let _g = tap_guard();
+        // Integer input → Long → the NaN-guarded BIGINT shape (math-003 pin).
+        let f = ceil_floor_call("ceil", vec![int_lit(5)]);
+        let sql = render_function_call(&f, &empty_schema()).expect("render ceil");
+        assert_eq!(
+            sql,
+            "CASE WHEN (5) IS NULL THEN NULL \
+             WHEN isnan(CAST((5) AS DOUBLE)) THEN CAST(0 AS BIGINT) \
+             ELSE CAST(ceil(5) AS BIGINT) END"
+        );
+    }
+
+    #[test]
+    fn ceil_1arg_decimal_casts_to_scale0_decimal() {
+        let _g = tap_guard();
+        let f = ceil_floor_call("ceil", vec![decimal_lit("1.25", 10, 2)]);
+        let sql = render_function_call(&f, &empty_schema()).expect("render ceil");
+        assert!(sql.ends_with("AS DECIMAL(9, 0))"), "got: {sql}");
+        assert!(sql.starts_with("CAST(ceil("), "got: {sql}");
+    }
+
+    #[test]
+    fn floor_2arg_scaled_decimal() {
+        let _g = tap_guard();
+        // 2-arg over double → decimal(18,2), synthesized as fn((a)*100)/100.
+        let f = ceil_floor_call("ceil", vec![double_lit(1.5), int_lit(2)]);
+        let sql = render_function_call(&f, &empty_schema()).expect("render ceil");
+        assert!(sql.starts_with("CAST(ceil("), "got: {sql}");
+        assert!(sql.contains(") * 100) / 100"), "got: {sql}");
+        assert!(sql.ends_with("AS DECIMAL(18, 2))"), "got: {sql}");
+    }
+
+    #[test]
+    fn ceil_2arg_negative_scale_is_boundary() {
+        let _g = tap_guard();
+        let f = ceil_floor_call("ceil", vec![decimal_lit("1.25", 10, 2), int_lit(-1)]);
+        let err = render_function_call(&f, &empty_schema()).expect_err("negative scale");
+        assert!(matches!(
+            err,
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                ..
+            }
+        ));
     }
 
     // ── Pass 106 — uncorrelated subquery emission ────────────────────────

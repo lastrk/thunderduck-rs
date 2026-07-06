@@ -21,14 +21,14 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType as SqlDataType, DateTimeField, Distinct, DuplicateTreatment,
-    ExactNumberInfo, Expr, ExprWithAlias, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentList, FunctionArguments, GroupByExpr, Interval, JoinConstraint, JoinOperator,
-    LimitClause, NamedWindowDefinition, NamedWindowExpr, NullInclusion, ObjectName, ObjectNamePart,
-    OrderByExpr, OrderByKind, OrderByOptions, PivotValueSource, Query, Select, SelectItem, SetExpr,
-    SetOperator, SetQuantifier, Statement, TableFactor, TableWithJoins, TrimWhereField,
-    TypedString, UnaryOperator, Value, ValueWithSpan, WindowFrame as SqlWindowFrame,
-    WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
+    BinaryOperator, CastKind, CeilFloorKind, DataType as SqlDataType, DateTimeField, Distinct,
+    DuplicateTreatment, ExactNumberInfo, Expr, ExprWithAlias, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Interval,
+    JoinConstraint, JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr,
+    NullInclusion, ObjectName, ObjectNamePart, OrderByExpr, OrderByKind, OrderByOptions,
+    PivotValueSource, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
+    TableFactor, TableWithJoins, TrimWhereField, TypedString, UnaryOperator, Value, ValueWithSpan,
+    WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 
 use crate::bail_boundary_proto;
@@ -1357,10 +1357,73 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
         // input and other typed-string data types stay a Thunderduck boundary
         // (ADR-022).
         Expr::TypedString(ts) => lower_typed_string(ts),
+        // sqlparser parses `CEIL(x)` / `FLOOR(x)` (and the 2-arg
+        // `CEIL(x, s)` / `FLOOR(x, s)` and `... TO <field>` forms) into
+        // dedicated `Expr::Ceil` / `Expr::Floor` nodes, NOT `Expr::Function`.
+        // Lower them to the shared `FunctionCall("ceil"/"floor", ..)` shape so
+        // the existing type-inference / emission arms apply. Corpus: num-001,
+        // num-002, num-003.
+        Expr::Ceil { expr, field } => lower_ceil_floor("ceil", *expr, field, cte_scope),
+        Expr::Floor { expr, field } => lower_ceil_floor("floor", *expr, field, cte_scope),
         other => bail_boundary_proto!(
             format!("sql::expr::{}", expr_kind(&other)),
             "expression shape not supported in τ"
         ),
+    }
+}
+
+/// Lower a sqlparser `Expr::Ceil` / `Expr::Floor` node to a τ
+/// `FunctionCall("ceil"/"floor", ..)`.
+///
+/// - `CeilFloorKind::DateTimeField(NoDateTime)` → plain 1-arg `ceil(x)`.
+/// - `CeilFloorKind::Scale(n)` → 2-arg `ceil(x, n)` carrying the target scale as
+///   an `Int` literal (Spark `RoundCeil`/`RoundFloor`). A non-integer scale
+///   literal is a Thunderduck boundary.
+/// - `CeilFloorKind::DateTimeField(<field>)` (the `... TO <unit>` datetime form)
+///   is a separate Spark feature τ has not implemented — honest boundary.
+fn lower_ceil_floor(
+    name: &str,
+    expr: Expr,
+    field: CeilFloorKind,
+    cte_scope: &CteScope,
+) -> Result<Expression, EmissionError> {
+    let inner = lower_expr(expr, cte_scope)?;
+    let args = match field {
+        CeilFloorKind::DateTimeField(DateTimeField::NoDateTime) => vec![inner],
+        CeilFloorKind::Scale(v) => {
+            let Some(t) = int_from_number_value(&v) else {
+                bail_boundary_proto!(
+                    format!("sql::{name}::non_integer_scale"),
+                    "ceil/floor with a non-integer scale is not supported in τ"
+                );
+            };
+            vec![
+                inner,
+                Expression::Literal(Literal {
+                    value: LiteralValue::Int(t),
+                    data_type: DataType::Integer,
+                }),
+            ]
+        }
+        CeilFloorKind::DateTimeField(other) => bail_boundary_proto!(
+            format!("sql::{name}::datetime_field::{other:?}"),
+            "ceil/floor TO <datetime-field> not supported in τ"
+        ),
+    };
+    Ok(Expression::FunctionCall(FunctionCall {
+        name: name.to_owned(),
+        args,
+        distinct: false,
+    }))
+}
+
+/// Parse a sqlparser numeric [`Value`] into an `i32` scale (accepts negatives).
+/// Returns `None` for non-numeric values or numbers that are not integral / are
+/// out of `i32` range.
+fn int_from_number_value(v: &Value) -> Option<i32> {
+    match v {
+        Value::Number(s, _) => s.parse::<i32>().ok(),
+        _ => None,
     }
 }
 
@@ -2288,6 +2351,53 @@ mod tests {
                 EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. } if shape == "sql::distinct_on"
             ),
             "expected sql::distinct_on boundary error, got {err:?}"
+        );
+    }
+
+    // ── ceil/floor lowering (num-001/002/003) ────────────────────────────
+
+    #[test]
+    fn ceil_1arg_lowers_to_single_arg_function_call() {
+        let plan = parse("SELECT ceil(a) FROM t").expect("should parse");
+        match single_projection(&plan) {
+            Expression::FunctionCall(fc) => {
+                assert_eq!(fc.name, "ceil");
+                assert_eq!(fc.args.len(), 1);
+                assert!(matches!(fc.args[0], Expression::UnresolvedColumn(_)));
+            }
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn floor_2arg_lowers_carrying_int_scale_literal() {
+        let plan = parse("SELECT floor(x, 2) FROM t").expect("should parse");
+        match single_projection(&plan) {
+            Expression::FunctionCall(fc) => {
+                assert_eq!(fc.name, "floor");
+                assert_eq!(fc.args.len(), 2);
+                assert!(matches!(
+                    fc.args[1],
+                    Expression::Literal(Literal {
+                        value: LiteralValue::Int(2),
+                        data_type: DataType::Integer,
+                    })
+                ));
+            }
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ceil_to_datetime_field_is_boundary() {
+        let err = parse("SELECT ceil(ts TO DAY) FROM t").expect_err("TO <field> unsupported");
+        assert!(
+            matches!(
+                err,
+                EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
+                    if shape.starts_with("sql::ceil::datetime_field")
+            ),
+            "expected sql::ceil::datetime_field boundary, got {err:?}"
         );
     }
 

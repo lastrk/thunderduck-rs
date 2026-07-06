@@ -10,6 +10,24 @@ use super::ast::CommonAst;
 use super::type_inference::TypeInferenceEngine;
 use crate::types::{DataType, StructField, StructType};
 
+/// Extract a compile-time integer value from an integral [`Literal`] expression.
+///
+/// Returns `None` for any non-literal or non-integral expression. Used by the
+/// multi-arg type-inference pre-pass and by emission to read a function's
+/// literal scale argument (e.g. `ceil(x, 2)`).
+pub(crate) fn int_literal_value(expr: &Expression) -> Option<i32> {
+    match expr {
+        Expression::Literal(l) => match &l.value {
+            LiteralValue::Int(i) => Some(*i),
+            LiteralValue::Long(i) => i32::try_from(*i).ok(),
+            LiteralValue::Short(i) => Some(*i as i32),
+            LiteralValue::Byte(i) => Some(*i as i32),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 // ── Supporting sub-types ─────────────────────────────────────────────────────
 
 /// Binary arithmetic / comparison / logical / string / bitwise operators.
@@ -1208,6 +1226,21 @@ impl Expression {
             // Spark's `JsonTuple.elementSchema`. Corpus: json-002.
             "json_tuple_field" if f.args.len() == 2 => {
                 return DataType::String;
+            }
+            // Spark's 2-arg `ceil(x, t)` / `floor(x, t)` (`RoundCeil`/
+            // `RoundFloor`) implicitly cast the child to Decimal and return a
+            // scaled Decimal derived from the child type + literal target
+            // scale. The shared `function_return_type` resolver only sees the
+            // first arg's type and cannot read the scale literal, so derive it
+            // here where the whole `FunctionCall` is available. A non-literal
+            // scale is a Thunderduck boundary → `Unresolved`. 1-arg ceil/floor
+            // falls through to the shared resolver. Corpus: `num-003`.
+            "ceil" | "ceiling" | "floor" if f.args.len() == 2 => {
+                let input = f.args[0].data_type(schema);
+                match int_literal_value(&f.args[1]) {
+                    Some(t) => return TypeInferenceEngine::ceil_floor_type(&input, Some(t)),
+                    None => return DataType::Unresolved,
+                }
             }
             _ => {}
         }

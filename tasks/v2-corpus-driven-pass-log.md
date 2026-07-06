@@ -958,3 +958,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 (both crates build silent).
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 540/0, `sql_v2` 184/78/262 no regression).
 - Commit SHA: (this commit).
+
+## Pass 116 — 2026-07-06 — SQL corpus: ceil/floor (num-001/002/003)
+- **Corpus: SQL front-end + type-inference + emission.** Targets: num-001 (ceil over int/bigint/float/double → BIGINT), num-002 (ceil/floor over DECIMAL(p,s) → DECIMAL(p−s+1,0)), num-003 spark4 (2-arg ceil(x,2)/floor(d1,1) → scaled DECIMAL). All `schema_only`.
+- Root cause (diagnostic-pass-116.md): sqlparser-rs 0.61 parses CEIL/FLOOR into dedicated `Expr::Ceil{expr,field:CeilFloorKind}`/`Expr::Floor` nodes (NOT `Expr::Function`); `lower_expr` had no arm → catch-all `bail_boundary_proto!("sql::expr::other")`. Type-inference & emission never ran. SQL-front-end-only (DataFrame path sends ceil/floor as UnresolvedFunction, unaffected).
+- Architecture (architecture-pass-116.md): reuse `FunctionCall{name:"ceil"|"floor"}` (no AST extension, ADR-004). New single-source-of-truth `TypeInferenceEngine::ceil_floor_type(input, Option<scale>)` with rules pinned from Spark `mathExpressions.scala` @v4.1.1 (`Ceil.dataType` / `RoundBase.dataType` + `DecimalType.forType`). 2-arg precision = `min(p−s+1+min(s,t), 38)` (corrected from the diagnostic's simplified form). DuckDB ceil/floor are 1-arg only → 2-arg synthesized as `fn((a)*10^t)/10^t` with an outer CAST.
+- Layer(s) touched: parser_v2/v2_lowering.rs (lowering arm + `lower_ceil_floor`/`int_from_number_value`), transpiler_v2/type_inference.rs (`ceil_floor_type` + `decimal_form_for_ceil_floor`, 1-arg delegation), transpiler_v2/expression.rs (`int_literal_value` + 2-arg arm), transpiler_v2/emission.rs (`render_ceil_floor`). No AST/analyzer-structure change.
+- ADR citations: ADR-004 (reuse FunctionCall — one AST), ADR-016 (ANSI type rules), ADR-022 (datetime-field/non-int-scale/negative-scale/too-large-scale → honest boundary), SQL-gen #5 (emission CAST target == analyzer's declared type).
+- Corpus signal: 184 → **188** (+4). num-001/002/003 GREEN, +1 collateral. No regressions.
+- Files: 4 (above). Tests added: 16 — type_inference 9 (decimal 1-arg (10,2)→(9,0)/(6,3)→(4,0)/(38,6)→(33,0), decimal(_,0) unchanged, non-decimal→Long; 2-arg floor(d1,1)→(10,1)/ceil(dbl,2)→(18,2)/(Long,2)→(21,0)/t<0; unsupported→Unresolved), emission 4 (BIGINT guard, 1-arg decimal, 2-arg synth, negative-scale boundary), lowering 3 (1-arg/2-arg FnCall, datetime-field boundary).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED). Closed 1 review MEDIUM (unbounded `10i128.pow(t)` panicked at t≥39 → `checked_pow` + boundary) and 1 LOW (relocated the doc block that had detached from `pub fn function_return_type`) directly. Perf 0 HIGH + 0 MEDIUM (OPTIMIZED).
+- Plan deviation: 1-arg non-Decimal → `Long` (catch-all) rather than the plan's `Unresolved`-for-non-numeric — matches Spark's implicit non-decimal→Long, preserves the pre-existing String-proxy NaN-guard emission tests, and is not a regression (old arm was unconditional `=> Long`). 2-arg still returns `Unresolved` for non-numeric (honest boundary).
+- Findings queued as follow-up: 2-arg always-nullable parity (no witness); 2-arg negative-scale + double-path value fidelity (num-003 is schema_only); the sq-* correlated-subquery cluster (now largest failing group).
+- Compiler warning delta: 0 new (both crates build silent).
+- Quality Gate: PASS (rustfmt clean on touched files, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 556/0, `sql_v2` 188/74/262 no regression).
+- Commit SHA: (this commit).

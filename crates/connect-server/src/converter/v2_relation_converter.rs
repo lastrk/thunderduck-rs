@@ -647,6 +647,9 @@ impl V2RelationConverter {
             grouping,
             aggregates,
             grouping_kind,
+            // DataFrame path models post-aggregation filtering as a separate
+            // Filter over the Aggregate; HAVING is a SparkSQL-only concept.
+            having: None,
         }))
     }
 

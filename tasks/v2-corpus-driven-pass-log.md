@@ -1029,3 +1029,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 (both crates build silent).
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 568/0, `sql_v2` 201/61/262 no regression).
 - Commit SHA: (this commit).
+
+## Pass 121 — 2026-07-06 — SQL corpus: HAVING on aggregates (agg-010/011, gx-007)
+- **Corpus: AST + lowering + analyzer + emission.** Targets: agg-010 (`HAVING avg(salary)>80000`), agg-011 (`HAVING count(*)>1`), gx-007 (`GROUP BY ROLLUP(dept_id) HAVING count(*)>1`).
+- Root cause (diagnostic-pass-121.md): HAVING lowered to `Filter{input:Aggregate}` (Spark-faithful) but (a) emission's render_filter emitted an outer `WHERE <agg>` → DuckDB "WHERE cannot contain aggregates" (agg-011/gx-007); (b) analyzer resolved the condition against aggregate OUTPUT schema, so `avg(salary)` couldn't find input col `salary` (agg-010).
+- Architecture (architecture-pass-121.md): Option (b) — additive `having: Option<Expression>` on CommonOp::Aggregate + TypedOp::Aggregate. Chosen over special-casing Filter-over-Aggregate because that shape is AMBIGUOUS: the DataFrame `.groupBy().agg(..alias("s")).filter(col("s")>x)` path is an identically-shaped but OUTPUT-scoped, currently-green Filter-over-Aggregate that option (a) would regress. Lowering sets `having` (no Filter wrapper); analyzer resolves it against the aggregate INPUT schema via resolve_and_stamp (same scope as aggregates) with the Filter arm's boolean guard; emission appends `HAVING <cond>` after GROUP BY.
+- Layer(s) touched: transpiler_v2/{ast,analyzer,emission,base_types}.rs, parser_v2/v2_lowering.rs, connect-server/converter/v2_relation_converter.rs (having:None). AST extension (ADR-003 additive).
+- ADR citations: ADR-003 (incremental additive AST for a distinct Spark concept owned by the SQL front-end), ADR-004 (one-shape-per-meaning — HAVING ≠ DataFrame post-agg Filter), ADR-016 (HAVING boolean predicate), ADR-022 (output-alias HAVING → honest boundary).
+- Corpus signal: 201 → **205** (+4). agg-010/011/gx-007 GREEN + bonus sq-021 (IN+HAVING semi-join). No regressions — DataFrame corpus (core_v2) held at 314 (the #1 risk: post-agg-filter path untouched, converter sets having:None → new emission arm is dead code for DataFrame plans → byte-identical SQL).
+- Files: 6. Tests added: 6 (lowering: HAVING→Aggregate{having:Some} no Filter, no-HAVING→None; analyzer: avg(salary) resolves, non-bool→TypeMismatch; emission: HAVING-after-GROUP-BY not outer-WHERE, ROLLUP compose).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED — field moved, not cloned, through all stages). 1 review Low: boolean-guard duplication (Filter arm vs HAVING) — extract `ensure_boolean_predicate` helper IF a 3rd predicate site appears; non-blocking.
+- KNOWN LIMITATION (in field doc): HAVING referencing SELECT output aliases (`HAVING s > x`) resolves against input schema → honest boundary, not wrong result. No corpus witness; future merged-scope enhancement.
+- Findings queued as follow-up: sq-015 (correlated subquery in HAVING references FROM alias `e` hidden by __td_agg wrapper — needs the alias-scope/outer-scope work); sq-010 (correlated outer-scope stack, ADR-008); cte-005 (count(*) naming).
+- Compiler warning delta: 0 new (both crates build silent).
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core -p thunderduck-connect-server` 0 warnings, `cargo test -p thunderduck-core --lib` 574/0, `sql_v2` 205/57/262, `core_v2` 314 no regression).
+- Commit SHA: (this commit).

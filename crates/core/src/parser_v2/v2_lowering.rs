@@ -431,21 +431,20 @@ fn lower_aggregate_select(
     // This is refined into the {grouping, aggregates} split when the
     // canonical emission table lands; for now we push everything into
     // `aggregates` so the round-trip test can inspect the projection list.
-    let aggregated = CommonAst::new(CommonOp::Aggregate {
+    // SparkSQL HAVING lowers into the Aggregate's dedicated `having` field —
+    // NOT a Filter over the Aggregate. HAVING is post-aggregation group
+    // filtering that binds to the aggregate INPUT scope (aggregate exprs +
+    // grouping keys), which the analyzer + emission handle directly. Wrapping
+    // in a Filter would (a) resolve the predicate against the aggregate OUTPUT
+    // schema and (b) emit an outer `WHERE <agg>` that DuckDB rejects.
+    let having = having.map(|h| lower_expr(h, cte_scope)).transpose()?;
+    Ok(CommonAst::new(CommonOp::Aggregate {
         input: Box::new(input),
         grouping,
         aggregates: projections,
         grouping_kind,
-    });
-
-    if let Some(h) = having {
-        Ok(CommonAst::new(CommonOp::Filter {
-            input: Box::new(aggregated),
-            condition: lower_expr(h, cte_scope)?,
-        }))
-    } else {
-        Ok(aggregated)
-    }
+        having,
+    }))
 }
 
 fn lower_from(from: Vec<TableWithJoins>, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
@@ -2722,6 +2721,29 @@ mod tests {
         let plan = parse("SELECT dept, COUNT(*) FROM t GROUP BY dept").expect("should parse");
         // Top-level is Aggregate (has GROUP BY).
         assert!(matches!(plan.op, CommonOp::Aggregate { .. }));
+    }
+
+    #[test]
+    fn parse_group_by_having_lowers_into_aggregate_field_not_filter() {
+        // HAVING must lower into the Aggregate's `having` field, NOT a Filter
+        // wrapping the Aggregate.
+        let plan = parse("SELECT dept, COUNT(*) FROM t GROUP BY dept HAVING COUNT(*) > 1")
+            .expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate { having, .. } => {
+                assert!(having.is_some(), "HAVING should populate the having field");
+            }
+            other => panic!("expected top-level Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_group_by_no_having_leaves_having_none() {
+        let plan = parse("SELECT dept, COUNT(*) FROM t GROUP BY dept").expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate { having, .. } => assert!(having.is_none()),
+            other => panic!("expected top-level Aggregate, got {other:?}"),
+        }
     }
 
     #[test]

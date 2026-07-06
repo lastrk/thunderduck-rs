@@ -223,9 +223,10 @@ fn for_each_node_expr(op: &CommonOp, f: &mut dyn FnMut(&Expression)) {
         CommonOp::Aggregate {
             grouping,
             aggregates,
+            having,
             ..
         } => {
-            for e in grouping.iter().chain(aggregates) {
+            for e in grouping.iter().chain(aggregates).chain(having.iter()) {
                 f(e);
             }
         }
@@ -522,6 +523,7 @@ mod tests {
             grouping: vec![],
             aggregates: vec![],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            having: None,
         });
         assert!(plan_has_empty_scan(&with_agg));
     }

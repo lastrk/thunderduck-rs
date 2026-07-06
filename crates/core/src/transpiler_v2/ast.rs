@@ -118,6 +118,13 @@ pub enum CommonOp {
         /// The grouping kind — GroupBy (default), Rollup, Cube, or
         /// GroupingSets (future τ work — Pivot lives elsewhere).
         grouping_kind: GroupingKind,
+        /// SparkSQL `HAVING <pred>` — post-aggregation group filter. `None` for
+        /// the DataFrame path (models post-agg filtering as a separate Filter
+        /// over the Aggregate). Resolved against the aggregate INPUT schema
+        /// (aggregate exprs + grouping keys bind to input columns). Does NOT
+        /// resolve SELECT output-alias refs (`HAVING s > x`) — no corpus
+        /// witness; future merged-scope enhancement.
+        having: Option<Expression>,
     },
 
     // ── Leaves ───────────────────────────────────────────────────────────

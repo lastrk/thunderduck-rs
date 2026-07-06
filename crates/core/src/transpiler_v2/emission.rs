@@ -172,7 +172,8 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             grouping,
             aggregates,
             grouping_kind,
-        } => render_aggregate_op(input, grouping, aggregates, *grouping_kind),
+            having,
+        } => render_aggregate_op(input, grouping, aggregates, *grouping_kind, having.as_ref()),
 
         // ── Join ─────────────────────────────────────────────────────────
         TypedOp::Join {
@@ -4589,6 +4590,7 @@ fn render_aggregate_op(
     grouping: &[Expression],
     aggregates: &[Expression],
     grouping_kind: crate::transpiler_v2::ast::GroupingKind,
+    having: Option<&Expression>,
 ) -> Result<String, EmissionError> {
     use super::ast::GroupingKind;
     if matches!(grouping_kind, GroupingKind::GroupingSets) {
@@ -4695,6 +4697,13 @@ fn render_aggregate_op(
             GroupingKind::GroupingSets => unreachable!(), // returned early above
         };
         sql.push_str(&format!(" GROUP BY {group_sql}"));
+    }
+    // SparkSQL HAVING — emitted inside the aggregating SELECT (never an outer
+    // WHERE, which DuckDB rejects for aggregate predicates). Rendered against
+    // the aggregate input schema, same scope as the aggregate slots.
+    if let Some(h) = having {
+        let having_sql = render_expr(h, input_schema)?;
+        sql.push_str(&format!(" HAVING {having_sql}"));
     }
     Ok(sql)
 }
@@ -6273,6 +6282,7 @@ mod tests {
                 distinct: false,
             })],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            having: None,
         });
         let bt = base_types_emp_dept(&plan);
         let typed = analyze(plan, &bt).expect("analyze aggregate-over-filter-over-aliased");
@@ -6280,6 +6290,98 @@ mod tests {
         assert!(sql.contains(") AS e WHERE "), "got: {sql}");
         assert!(!sql.contains("__td_filter"), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
+    }
+
+    fn ucol(name: &str) -> Expression {
+        Expression::UnresolvedColumn(crate::transpiler_v2::expression::UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: None,
+            plan_id: None,
+        })
+    }
+
+    fn count_star_gt_one() -> Expression {
+        Expression::Binary(BinaryExpression {
+            op: BinaryOp::Gt,
+            left: Box::new(Expression::FunctionCall(FunctionCall {
+                name: "count".to_owned(),
+                args: vec![Expression::Star(StarExpression { qualifier: None })],
+                distinct: false,
+            })),
+            right: Box::new(int_lit(1)),
+        })
+    }
+
+    #[test]
+    fn render_aggregate_having_emits_group_by_having_not_outer_where() {
+        let _g = tap_guard();
+        // `SELECT dept_id, count(*) FROM emp GROUP BY dept_id HAVING count(*) > 1`
+        // — the HAVING predicate must fold into the aggregate SELECT as
+        // `GROUP BY … HAVING`, never an outer `WHERE` wrapper (which DuckDB
+        // rejects for aggregate predicates).
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![ucol("dept_id")],
+            aggregates: vec![
+                ucol("dept_id"),
+                Expression::FunctionCall(FunctionCall {
+                    name: "count".to_owned(),
+                    args: vec![Expression::Star(StarExpression { qualifier: None })],
+                    distinct: false,
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            having: Some(count_star_gt_one()),
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze aggregate with having");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("GROUP BY"), "expected GROUP BY, got: {sql}");
+        assert!(sql.contains("HAVING"), "expected HAVING, got: {sql}");
+        let group_pos = sql.find("GROUP BY").expect("GROUP BY present");
+        let having_pos = sql.find("HAVING").expect("HAVING present");
+        assert!(having_pos > group_pos, "HAVING must follow GROUP BY: {sql}");
+        assert!(
+            !sql.contains("__td_filter"),
+            "no outer WHERE wrapper: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_aggregate_having_composes_with_rollup() {
+        let _g = tap_guard();
+        // ROLLUP grouping + HAVING → `GROUP BY ROLLUP(dept_id) HAVING …`.
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![ucol("dept_id")],
+            aggregates: vec![
+                ucol("dept_id"),
+                Expression::FunctionCall(FunctionCall {
+                    name: "count".to_owned(),
+                    args: vec![Expression::Star(StarExpression { qualifier: None })],
+                    distinct: false,
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::Rollup,
+            having: Some(count_star_gt_one()),
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze rollup aggregate with having");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("ROLLUP("), "expected ROLLUP, got: {sql}");
+        assert!(sql.contains("HAVING"), "expected HAVING, got: {sql}");
+        let rollup_pos = sql.find("ROLLUP(").expect("ROLLUP present");
+        let having_pos = sql.find("HAVING").expect("HAVING present");
+        assert!(
+            having_pos > rollup_pos,
+            "HAVING must follow ROLLUP group clause: {sql}"
+        );
     }
 
     #[test]

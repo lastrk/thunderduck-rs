@@ -128,6 +128,10 @@ pub enum TypedOp {
         aggregates: Vec<Expression>,
         /// GROUP BY variant.
         grouping_kind: crate::transpiler_v2::ast::GroupingKind,
+        /// Resolved SparkSQL `HAVING <pred>` — see [`CommonOp::Aggregate`].
+        /// `None` for the DataFrame path. Resolved against the aggregate
+        /// INPUT schema.
+        having: Option<Expression>,
     },
     /// A binary join.
     Join {
@@ -891,11 +895,31 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             grouping,
             aggregates,
             grouping_kind,
+            having,
         } => {
             let typed_input = analyze_node(*input, base_types)?;
             let grouping = resolve_expr_list(grouping, &typed_input.resolved_schema, base_types)?;
             let aggregates =
                 resolve_expr_list(aggregates, &typed_input.resolved_schema, base_types)?;
+            // HAVING resolves against the aggregate INPUT schema (aggregate
+            // exprs + grouping keys bind to input columns), with the same
+            // boolean-type guard as Filter.
+            let having = having
+                .map(|h| resolve_and_stamp(h, &typed_input.resolved_schema, base_types))
+                .transpose()?;
+            if let Some(h) = &having {
+                let cond_type = h.data_type(&typed_input.resolved_schema);
+                if !matches!(
+                    cond_type,
+                    DataType::Boolean | DataType::Unresolved | DataType::Null
+                ) {
+                    return Err(AnalyzerError::TypeMismatch {
+                        expected: DataType::Boolean,
+                        actual: cond_type,
+                        context: "having-condition".to_owned(),
+                    });
+                }
+            }
             // Output schema construction:
             // SparkSQL path folds grouping cols into `aggregates` already
             // (per CommonOp::Aggregate invariant), so output = aggregates as-is.
@@ -931,6 +955,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                     grouping,
                     aggregates,
                     grouping_kind,
+                    having,
                 },
                 resolved_schema: output_schema,
             })
@@ -4840,11 +4865,99 @@ mod tests {
                 distinct: false,
             })],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            having: None,
         });
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(typed.resolved_schema.fields.len(), 1);
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
         assert!(!typed.resolved_schema.fields[0].nullable);
+    }
+
+    #[test]
+    fn aggregate_having_resolves_input_column_inside_aggregate_call() {
+        // `HAVING avg(salary) > 80000` — `salary` is an INPUT column not present
+        // in the aggregate OUTPUT. Resolving against the input schema must
+        // succeed (would fail if resolved against the output schema).
+        let bt = base_types_with_emp_dept();
+        let avg_salary = || {
+            Expression::FunctionCall(FunctionCall {
+                name: "avg".to_owned(),
+                args: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "salary".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                })],
+                distinct: false,
+            })
+        };
+        let having = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Gt,
+            left: Box::new(avg_salary()),
+            right: Box::new(Expression::Literal(Literal {
+                value: LiteralValue::Double(80000.0),
+                data_type: DataType::Double,
+            })),
+        });
+        let ast = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "dept_id".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            })],
+            aggregates: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+                avg_salary(),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            having: Some(having),
+        });
+        let typed = analyze(ast, &bt).expect("HAVING over input column should resolve");
+        match typed.op {
+            TypedOp::Aggregate { having, .. } => {
+                assert!(
+                    having.is_some(),
+                    "resolved having should be threaded through"
+                );
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregate_non_boolean_having_rejected() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "count".to_owned(),
+                args: vec![Expression::Star(StarExpression { qualifier: None })],
+                distinct: false,
+            })],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            // A bare integer literal is not a boolean predicate.
+            having: Some(Expression::Literal(Literal {
+                value: LiteralValue::Int(5),
+                data_type: DataType::Integer,
+            })),
+        });
+        match analyze(ast, &bt) {
+            Err(AnalyzerError::TypeMismatch { context, .. }) => {
+                assert_eq!(context, "having-condition");
+            }
+            other => panic!("expected TypeMismatch(having-condition), got {other:?}"),
+        }
     }
 
     // ── Pivot output schema (Pass 60) ───────────────────────────────────

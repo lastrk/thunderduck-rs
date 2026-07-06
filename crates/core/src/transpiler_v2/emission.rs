@@ -4845,8 +4845,14 @@ fn render_literal(lit: &Literal) -> Result<String, EmissionError> {
             Ok(format!("make_timestamp(CAST({micros} AS BIGINT))"))
         }
         LiteralValue::Binary(bytes) => {
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            Ok(format!("CAST(x'{hex}' AS BLOB)"))
+            // DuckDB does NOT accept `x'..'` as a blob literal — it parses that
+            // as the VARCHAR "x..". The canonical DuckDB blob literal is a
+            // single-quoted string of `\xHH` escapes cast to BLOB, e.g.
+            // `CAST('\x1F\x2A' AS BLOB)`. Every byte becomes exactly `\x` + two
+            // hex digits, so the string never contains a raw quote or backslash
+            // that would need further escaping.
+            let escaped: String = bytes.iter().map(|b| format!("\\x{b:02X}")).collect();
+            Ok(format!("CAST('{escaped}' AS BLOB)"))
         }
     }
 }
@@ -6200,6 +6206,19 @@ mod tests {
     }
 
     // ── 4-6. render_project ──────────────────────────────────────────────
+
+    #[test]
+    fn render_literal_binary_emits_duckdb_blob_escape() {
+        // Spark `X'1F2A'` lowers to a Binary literal; DuckDB's blob literal is a
+        // `\xHH`-escaped string cast to BLOB (NOT `x'..'`, which DuckDB parses as
+        // the VARCHAR "x.."). Corpus: fn-020.
+        let sql = render_literal(&Literal {
+            value: LiteralValue::Binary(vec![0x1F, 0x2A]),
+            data_type: DataType::Binary,
+        })
+        .expect("render");
+        assert_eq!(sql, r"CAST('\x1F\x2A' AS BLOB)");
+    }
 
     #[test]
     fn render_project_simple_select() {

@@ -1237,3 +1237,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 630/0, `sql_v2` 230/32/262 no regression).
 - Commit SHA: (this commit).
+
+## Pass 136 — 2026-07-06 — SQL corpus: hex/binary literal X'..' + hex() (fn-020)
+- **Corpus: SQL front-end (lowering) + emission.** fn-020 (`SELECT hex(X'1F2A') AS h, cast(X'41' AS string) AS s FROM emp`).
+- Root cause (diagnostic-pass-136.md): TWO layers. (1) `lower_value` had no `Value::HexStringLiteral` arm → catch-all boundary error `sql::value::HexStringLiteral("1F2A")`. (2) LATENT emission bug: `render_literal` Binary arm emitted `CAST(x'{hex}' AS BLOB)`, but DuckDB does NOT accept `x'..'` as a blob literal — it parses `x'1f2a'` as the VARCHAR "x1f2a" (verified: `hex(x'1f2a')` → '7831663261', `cast(x'41' AS VARCHAR)` → 'x41'). This arm was never exercised (no prior-green case used a Binary literal), so the bug lay dormant. The architect assumed emission was correct; it wasn't.
+- Architecture (architecture-pass-136.md): additive `Value::HexStringLiteral(s)` arm → hex-decode to `Vec<u8>` → `Literal { Binary(bytes), DataType::Binary }`; odd-length / non-hex → boundary error, never panic. Plus (added during coding after empirical DuckDB probe) fix the emission Binary arm to DuckDB's `\xHH`-escaped form `CAST('\x1F\x2A' AS BLOB)` (verified: `hex(...)` → '1F2A', `cast(... AS VARCHAR)` → 'A' — Spark-exact).
+- Layer(s) touched: parser_v2/v2_lowering.rs (lowering arm + decode_hex_literal helper), transpiler_v2/emission.rs (Binary literal emission escape).
+- ADR citations: ADR-004 (SQL→CommonAst lowering), ADR-015 (Spark parity — X'..' is BinaryType, hex(binary)→uppercase hex string, cast(binary AS string)→UTF-8 decode), ADR-016 (malformed-literal error semantics), ADR-022 (boundary vs Spark-emulated).
+- Corpus signal: 230 → **231** (+1). fn-020 GREEN (schema + values confirmed). No regressions; core_v2 unaffected (DataFrame path does not emit Binary literals via this route).
+- Files: 2. Tests added: 5 (hex-literal lowers to Binary bytes; decode pairs incl. empty; odd-length → boundary; non-hex digit → boundary; emission Binary → `CAST('\x1F\x2A' AS BLOB)`).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED — `\xHH` escaping safe across all 256 byte values: no raw quote/backslash injection, empty → empty blob; decode helper panic-free, bounds-safe). Perf 0 HIGH + 0 MEDIUM (both fns run once per literal, off the hot path; per-byte format! allocs are cold-path INFO only).
+- Findings queued as follow-up (review Medium + 2 Lows): (M) sqlparser tokenizes bare `0x1F` to the SAME `Value::HexStringLiteral` unconditionally (tokenizer.rs:1354-1360, not dialect-gated), so `SELECT 0x1F` — which Spark rejects — now silently lowers to `Binary([0x1F])` instead of erroring; the token doesn't carry which surface syntax produced it, so distinguishing needs a tokenizer/dialect change; no corpus witness. (L1) non-hex digit `X'GG'` categorized as boundary but Spark rejects it → should be Spark-emulated. (L2) Spark zero-pads odd-length `X'1'`→`[0x01]` rather than rejecting; τ punts (correct ADR-022 boundary category, but the "odd number of digits" message reads as if invalid).
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt --check clean on both touched files, `cargo test -p thunderduck-core --lib` 635/0, `sql_v2` 231/31/262, fn-020 GREEN, no regression).
+- Commit SHA: (this commit).

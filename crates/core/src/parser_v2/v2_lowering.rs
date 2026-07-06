@@ -2405,11 +2405,51 @@ fn lower_value(vw: ValueWithSpan) -> Result<Expression, EmissionError> {
             value: LiteralValue::Null,
             data_type: DataType::Null,
         })),
+        // Spark hex/binary literal `X'1F2A'` → a BINARY value carrying the
+        // decoded bytes (`[0x1F, 0x2A]`). sqlparser hands us the inner hex
+        // string ("1F2A"); decode it into a byte vector. Odd length or a
+        // non-hex digit is a malformed literal → boundary error, never panic.
+        Value::HexStringLiteral(s) => {
+            let bytes = decode_hex_literal(&s)?;
+            Ok(Expression::Literal(Literal {
+                value: LiteralValue::Binary(bytes),
+                data_type: DataType::Binary,
+            }))
+        }
         other => bail_boundary_proto!(
             format!("sql::value::{other:?}"),
             "literal value shape not supported in τ"
         ),
     }
+}
+
+/// Decode the inner text of a Spark hex/binary literal (`X'1F2A'` → `"1F2A"`)
+/// into its raw bytes. Hex digits are taken in pairs (each pair is one byte).
+/// An odd number of digits or any non-hex character is a malformed literal and
+/// yields a Thunderduck-boundary error rather than a panic.
+fn decode_hex_literal(s: &str) -> Result<Vec<u8>, EmissionError> {
+    if s.len() % 2 != 0 {
+        bail_boundary_proto!(
+            "sql::value::hex_odd_length",
+            format!("hex literal `X'{s}'` has an odd number of digits")
+        );
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    let digits = s.as_bytes();
+    let mut i = 0;
+    while i < digits.len() {
+        let hi = (digits[i] as char).to_digit(16);
+        let lo = (digits[i + 1] as char).to_digit(16);
+        match (hi, lo) {
+            (Some(h), Some(l)) => bytes.push((h * 16 + l) as u8),
+            _ => bail_boundary_proto!(
+                "sql::value::hex_invalid_digit",
+                format!("hex literal `X'{s}'` contains a non-hex character")
+            ),
+        }
+        i += 2;
+    }
+    Ok(bytes)
 }
 
 fn lower_data_type(dt: SqlDataType) -> Result<DataType, EmissionError> {
@@ -4587,6 +4627,64 @@ mod tests {
                 })
             ),
             "expected boundary error for FILTER on non-aggregate, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn hex_literal_lowers_to_binary_bytes() {
+        // Spark `X'1F2A'` is a 2-byte BINARY literal — [0x1F, 0x2A].
+        let plan = parse("SELECT X'1F2A' AS h").expect("should parse");
+        let projections = match plan.op {
+            CommonOp::Project { projections, .. } => projections,
+            other => panic!("expected Project, got {other:?}"),
+        };
+        let lit = match &projections[0] {
+            Expression::Alias(a) => &*a.expr,
+            other => panic!("expected Alias, got {other:?}"),
+        };
+        match lit {
+            Expression::Literal(Literal { value, data_type }) => {
+                assert_eq!(*value, LiteralValue::Binary(vec![0x1F, 0x2A]));
+                assert_eq!(*data_type, DataType::Binary);
+            }
+            other => panic!("expected Binary literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_hex_literal_decodes_pairs() {
+        assert_eq!(decode_hex_literal("1F2A").expect("valid"), vec![0x1F, 0x2A]);
+        assert_eq!(decode_hex_literal("41").expect("valid"), vec![0x41]);
+        assert_eq!(decode_hex_literal("").expect("valid"), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn decode_hex_literal_odd_length_is_boundary_error() {
+        let result = decode_hex_literal("1");
+        assert!(
+            matches!(
+                result,
+                Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    ..
+                })
+            ),
+            "expected boundary error for odd-length hex, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn decode_hex_literal_invalid_digit_is_boundary_error() {
+        let result = decode_hex_literal("1G");
+        assert!(
+            matches!(
+                result,
+                Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    ..
+                })
+            ),
+            "expected boundary error for non-hex digit, got {result:?}"
         );
     }
 }

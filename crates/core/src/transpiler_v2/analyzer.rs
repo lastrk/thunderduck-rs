@@ -815,7 +815,8 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                 .map(|e| resolve_and_stamp(e, &typed_input.resolved_schema, base_types))
                 .collect::<Result<Vec<_>, _>>()?;
             // Compute output schema — expand Star; take alias name if present.
-            let output_schema = project_output_schema(&projections, &typed_input.resolved_schema)?;
+            let output_schema =
+                project_output_schema(&projections, &typed_input.resolved_schema, &typed_input.op)?;
             Ok(TypedAst {
                 op: TypedOp::Project {
                     input: Box::new(typed_input),
@@ -2419,9 +2420,36 @@ fn apply_alias_to_schema(schema: &StructType, alias: Option<&str>) -> StructType
     schema.clone()
 }
 
+/// True iff the Project input exposes a SINGLE relation `q` binds to AND
+/// emission keeps that qualifier in scope: a bare `TableScan` (Fix B inlines
+/// `FROM t`), an `AliasedRelation` (render_project inline → `FROM (..) AS
+/// alias`), or the LEFT of a semi/anti `Join` (render_project_over_join).
+/// Multi-relation joins → false (deferred; flat StructType lacks per-column
+/// qualifiers). We deliberately do NOT descend Filter/Sort/Limit: schema
+/// passthrough there does not imply the emitter keeps the qualifier in scope
+/// (it re-buries the relation under a synthetic `__td_proj` alias), so a
+/// qualified star over them would emit an opaque DuckDB error — worse than the
+/// clean UnknownColumn we return today.
+fn input_relation_binds_qualifier(op: &TypedOp, q: &str) -> bool {
+    match op {
+        TypedOp::TableScan { table, alias } => {
+            table.eq_ignore_ascii_case(q)
+                || alias.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(q))
+        }
+        TypedOp::AliasedRelation { alias, .. } => alias.eq_ignore_ascii_case(q),
+        TypedOp::Join {
+            join_type: JoinType::LeftSemi | JoinType::LeftAnti,
+            left,
+            ..
+        } => input_relation_binds_qualifier(&left.op, q),
+        _ => false,
+    }
+}
+
 fn project_output_schema(
     projections: &[Expression],
     input_schema: &StructType,
+    input_op: &TypedOp,
 ) -> Result<StructType, AnalyzerError> {
     let mut fields: Vec<StructField> = Vec::with_capacity(projections.len());
     for expr in projections {
@@ -2449,6 +2477,14 @@ fn project_output_schema(
                                 }
                                 continue;
                             }
+                        }
+                        // Table-qualified star (`emp.*` / `e.*`) where `q`
+                        // binds the SINGLE input relation that emission keeps
+                        // in scope: expand to the full input schema, exactly
+                        // like the unqualified `*` branch above.
+                        if input_relation_binds_qualifier(input_op, q) {
+                            fields.extend(input_schema.fields.iter().cloned());
+                            continue;
                         }
                         // Unknown qualifier — do NOT silently expand as `*`.
                         // Surface as an UnknownColumn error so `SELECT
@@ -3447,6 +3483,77 @@ mod tests {
                 name: "not_a_column".to_owned(),
                 qualifier: None,
                 plan_id: None,
+            })],
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
+    }
+
+    // ── Pass 126 — table-qualified star (`t.*` / `alias.*`) ──────────────
+
+    #[test]
+    fn qualified_star_over_table_scan_expands_to_full_schema() {
+        let bt = base_types_with_emp_dept();
+        // SELECT emp.* FROM emp
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            projections: vec![Expression::Star(StarExpression {
+                qualifier: Some("emp".to_owned()),
+            })],
+        });
+        let typed = analyze(ast, &bt).expect("analyze emp.*");
+        assert_eq!(typed.resolved_schema, emp_schema());
+    }
+
+    #[test]
+    fn qualified_star_over_semi_join_binds_left_relation_schema() {
+        let bt = base_types_with_emp_dept();
+        // SELECT e.* FROM emp e LEFT SEMI JOIN dept d ON ...
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Join {
+                left: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(CommonAst::new(CommonOp::TableScan {
+                        table: "emp".to_owned(),
+                        alias: None,
+                    })),
+                    alias: "e".to_owned(),
+                })),
+                right: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(CommonAst::new(CommonOp::TableScan {
+                        table: "dept".to_owned(),
+                        alias: None,
+                    })),
+                    alias: "d".to_owned(),
+                })),
+                join_type: JoinType::LeftSemi,
+                condition: None,
+                using_columns: vec![],
+                left_plan_ids: vec![],
+                right_plan_ids: vec![],
+            })),
+            projections: vec![Expression::Star(StarExpression {
+                qualifier: Some("e".to_owned()),
+            })],
+        });
+        let typed = analyze(ast, &bt).expect("analyze e.* over semi join");
+        // Semi join yields only the left relation's columns; `e.*` binds them.
+        assert_eq!(typed.resolved_schema, emp_schema());
+    }
+
+    #[test]
+    fn qualified_star_with_unknown_qualifier_still_rejects() {
+        let bt = base_types_with_emp_dept();
+        // SELECT bogus.* FROM emp — qualifier binds no in-scope relation.
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            projections: vec![Expression::Star(StarExpression {
+                qualifier: Some("bogus".to_owned()),
             })],
         });
         let err = analyze(ast, &bt).unwrap_err();

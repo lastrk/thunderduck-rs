@@ -232,15 +232,23 @@ fn render_single_row() -> Result<String, EmissionError> {
     Ok("SELECT 1".to_owned())
 }
 
-fn render_table_scan(table: &str, alias: Option<&str>) -> Result<String, EmissionError> {
+/// The FROM-body for a table scan: the quoted table name, plus an optional
+/// `AS <alias>`. Shared by [`render_table_scan`] and the Project-over-
+/// TableScan inline branch in [`render_project`] so identifier quoting
+/// (schema-qualified / reserved names) is identical on both paths.
+fn table_scan_from_body(table: &str, alias: Option<&str>) -> String {
     let name = quote_ident(table);
     match alias {
-        Some(a) => {
-            let a = quote_ident(a);
-            Ok(format!("SELECT * FROM {name} AS {a}"))
-        }
-        None => Ok(format!("SELECT * FROM {name}")),
+        Some(a) => format!("{name} AS {}", quote_ident(a)),
+        None => name.into_owned(),
     }
+}
+
+fn render_table_scan(table: &str, alias: Option<&str>) -> Result<String, EmissionError> {
+    Ok(format!(
+        "SELECT * FROM {}",
+        table_scan_from_body(table, alias)
+    ))
 }
 
 fn render_values(
@@ -497,6 +505,15 @@ fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String
         let slots_sql = render_projection_slots(projections, input_schema)?;
         let a = quote_ident(alias);
         return Ok(format!("SELECT {slots_sql} FROM ({inner_sql}) AS {a}"));
+    }
+    // Project over a bare TableScan: inline `FROM t` (optionally `AS alias`)
+    // instead of wrapping the child in `(SELECT * FROM t) AS __td_proj`. This
+    // keeps the table name / alias in scope so qualified refs and qualified
+    // stars (`emp.col` / `emp.*`) bind (Fix A stamps the schema accordingly).
+    if let TypedOp::TableScan { table, alias } = &input.op {
+        let slots_sql = render_projection_slots(projections, input_schema)?;
+        let from = table_scan_from_body(table, alias.as_deref());
+        return Ok(format!("SELECT {slots_sql} FROM {from}"));
     }
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let slots_sql = render_projection_slots(projections, input_schema)?;
@@ -6168,8 +6185,32 @@ mod tests {
         });
         let typed = analyze(ast, &bt).expect("analyze");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.starts_with("SELECT id FROM ("), "got: {sql}");
-        assert!(sql.contains("SELECT * FROM emp"), "got: {sql}");
+        // Project over a bare TableScan inlines `FROM emp` (Fix B, pass 126) —
+        // no `__td_proj` wrap.
+        assert_eq!(sql, "SELECT id FROM emp");
+    }
+
+    #[test]
+    fn render_project_qualified_ref_binds_over_table_scan() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            projections: vec![Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: Some("emp".to_owned()),
+                    plan_id: None,
+                },
+            )],
+        });
+        let typed = analyze(ast, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(sql, "SELECT emp.id FROM emp");
+        assert!(!sql.contains("__td_proj"), "got: {sql}");
     }
 
     // ── Aliased-join inlining (jn-001/002/003 root fix) ──────────────────

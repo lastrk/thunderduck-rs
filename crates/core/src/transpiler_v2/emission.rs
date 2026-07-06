@@ -1870,24 +1870,9 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
                     let key = render_expr(&ev.extraction, schema)?;
                     Ok(format!("element_at(({child_sql}), ({key}))[1]"))
                 }
-                _ => {
-                    // Unresolved child: keep the extraction-shape heuristic
-                    // (String literal → struct `.field`; else → `[expr]`).
-                    match ev.extraction.as_ref() {
-                        Expression::Literal(l)
-                            if matches!(
-                                &l.value,
-                                crate::transpiler_v2::expression::LiteralValue::String(_)
-                            ) =>
-                        {
-                            extract_struct_field(&child_sql, &ev.extraction, schema)
-                        }
-                        _ => {
-                            let idx = render_expr(&ev.extraction, schema)?;
-                            Ok(format!("({child_sql})[{idx}]"))
-                        }
-                    }
-                }
+                // Unresolved child: reuse the struct-field heuristic
+                // (String literal → `.field`; else → `[expr]`).
+                _ => extract_struct_field(&child_sql, &ev.extraction, schema),
             }
         }
         Expression::RowConstructor(_) => bail_boundary_expr!(

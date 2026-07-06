@@ -1089,3 +1089,15 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS per coder verification (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 594/0, `sql_v2` 215/47/262, `core_v2` 314). Orchestrator corpus re-run blocked by external process interference (see ENVIRONMENT NOTE).
 - Commit SHA: (this commit).
+
+## Pass 125 — 2026-07-06 — TECH-DEBT SWEEP (passes 121-124 code)
+- **Sweep** (every-5th cadence; prior sweep pass 120; resumed after an environment interruption — a concurrent claude session's orphaned Spark procs, now cleared). rust-reviewer over passes-121-124 additions.
+- Finding: passes 121-124 landed with **zero new compiler warnings**, no dead code, no correctness smells. Two clean, test-covered DRY items.
+- Fix (behavior-preserving): (1) extracted `resolve_boolean_predicate(expr, schema, base_types, context)` in analyzer.rs — dedups the identical resolve+boolean-guard between the Filter arm and the HAVING block (only the context string differed); (2) collapsed the ExtractValue unresolved-child `_` fallback into `extract_struct_field` (emission.rs) — it re-implemented that helper's exact String-literal→`.field`/else→`[idx]` dispatch. Net −34 LOC.
+- Layer(s) touched: transpiler_v2/{analyzer,emission}.rs. No behavior change.
+- Left as-is (conscious): percentile_approx vs percentile arms (genuine Spark-semantics split — quantile_disc vs quantile_cont — with distinct corpus-witness comments; merging obscures); string_extraction_name micro-helper (7 lines, low value).
+- Corpus signal: 215 → **215** (unchanged — pure refactor). Context strings preserved (guard tests assert them).
+- Files: `crates/core/src/transpiler_v2/analyzer.rs`, `crates/core/src/transpiler_v2/emission.rs`.
+- Compiler warning delta: 0 (both crates build silent).
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 594/0, `sql_v2` 215/47/262 no regression — orchestrator re-verified after the environment was restored).
+- Commit SHA: (this commit).

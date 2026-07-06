@@ -828,21 +828,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
         CommonOp::Filter { input, condition } => analyze_input_with_schema_passthrough(
             *input,
             base_types,
-            |schema| {
-                let condition = resolve_and_stamp(condition, schema, base_types)?;
-                let cond_type = condition.data_type(schema);
-                if !matches!(
-                    cond_type,
-                    DataType::Boolean | DataType::Unresolved | DataType::Null
-                ) {
-                    return Err(AnalyzerError::TypeMismatch {
-                        expected: DataType::Boolean,
-                        actual: cond_type,
-                        context: "filter-condition".to_owned(),
-                    });
-                }
-                Ok(condition)
-            },
+            |schema| resolve_boolean_predicate(condition, schema, base_types, "filter-condition"),
             |ti, condition| TypedOp::Filter {
                 input: Box::new(ti),
                 condition,
@@ -905,21 +891,15 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             // exprs + grouping keys bind to input columns), with the same
             // boolean-type guard as Filter.
             let having = having
-                .map(|h| resolve_and_stamp(h, &typed_input.resolved_schema, base_types))
+                .map(|h| {
+                    resolve_boolean_predicate(
+                        h,
+                        &typed_input.resolved_schema,
+                        base_types,
+                        "having-condition",
+                    )
+                })
                 .transpose()?;
-            if let Some(h) = &having {
-                let cond_type = h.data_type(&typed_input.resolved_schema);
-                if !matches!(
-                    cond_type,
-                    DataType::Boolean | DataType::Unresolved | DataType::Null
-                ) {
-                    return Err(AnalyzerError::TypeMismatch {
-                        expected: DataType::Boolean,
-                        actual: cond_type,
-                        context: "having-condition".to_owned(),
-                    });
-                }
-            }
             // Output schema construction:
             // SparkSQL path folds grouping cols into `aggregates` already
             // (per CommonOp::Aggregate invariant), so output = aggregates as-is.
@@ -2008,6 +1988,31 @@ fn expand_json_tuple_projections(
         }
     }
     Ok(out)
+}
+
+/// Resolve `expr` against `schema` and enforce Spark's boolean-predicate guard
+/// shared by `Filter` conditions and `HAVING` clauses: the resolved type must be
+/// `Boolean` (or still `Unresolved`/`Null`), otherwise a `TypeMismatch` carrying
+/// `context` is returned. Preserves the caller-provided context string verbatim.
+fn resolve_boolean_predicate(
+    expr: Expression,
+    schema: &StructType,
+    base_types: &BaseTypes,
+    context: &str,
+) -> Result<Expression, AnalyzerError> {
+    let resolved = resolve_and_stamp(expr, schema, base_types)?;
+    let cond_type = resolved.data_type(schema);
+    if !matches!(
+        cond_type,
+        DataType::Boolean | DataType::Unresolved | DataType::Null
+    ) {
+        return Err(AnalyzerError::TypeMismatch {
+            expected: DataType::Boolean,
+            actual: cond_type,
+            context: context.to_owned(),
+        });
+    }
+    Ok(resolved)
 }
 
 /// Resolve every `UnresolvedColumn` in `expr` against `schema` and stamp

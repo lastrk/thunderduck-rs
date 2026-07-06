@@ -4752,7 +4752,18 @@ fn render_aggregate_op(
         slots.push_str(&render_projection_slot(agg, input_schema)?);
     }
     let mut sql = format!("SELECT {slots} FROM {from_clause}");
-    if !grouping.is_empty() {
+    // Emit a GROUP BY whenever there are flat grouping columns, OR when this is
+    // a GROUPING SETS aggregate with at least one set. The latter covers the
+    // all-empty case `GROUP BY GROUPING SETS ((), ())`: the flat grouping list
+    // is empty (no columns referenced) yet `grouping_sets` holds the empty
+    // sets, and each empty set is a distinct grand-total group (Spark returns
+    // one row per set). Without this the GROUP BY would be dropped and every
+    // set would collapse into a single grand-total row — a silent wrong
+    // row-count. DuckDB accepts `GROUP BY GROUPING SETS ((), ())` and returns
+    // the same per-set rows Spark does.
+    let emit_group_by = !grouping.is_empty()
+        || (matches!(grouping_kind, GroupingKind::GroupingSets) && !grouping_sets.is_empty());
+    if emit_group_by {
         // Render each flat grouping column once (alias-stripped — GROUP BY
         // doesn't take aliases, so `GROUP BY (expr) AS name` would be a parse
         // error). GROUPING SETS indexes into this list per set; the other
@@ -6519,6 +6530,39 @@ mod tests {
             sql.matches(" AS senior").count(),
             1,
             "senior alias appears exactly once: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_aggregate_all_empty_grouping_sets_emits_group_by() {
+        let _g = tap_guard();
+        // `GROUP BY GROUPING SETS ((), ())`: the flat grouping list is empty
+        // (no columns referenced) but `grouping_sets` holds two empty sets.
+        // Each empty set is a distinct grand-total group, so Spark returns one
+        // row per set. The GROUP BY must NOT be dropped (which would collapse
+        // both sets into a single grand-total row — a silent wrong row-count).
+        // DuckDB accepts `GROUP BY GROUPING SETS ((), ())`.
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "count".to_owned(),
+                args: vec![Expression::Star(StarExpression { qualifier: None })],
+                distinct: false,
+            })],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
+            grouping_sets: vec![vec![], vec![]],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze all-empty grouping sets");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("GROUP BY GROUPING SETS ((), ())"),
+            "expected GROUP BY GROUPING SETS ((), ()), got: {sql}"
         );
     }
 

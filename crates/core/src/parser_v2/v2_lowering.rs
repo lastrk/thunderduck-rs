@@ -1900,6 +1900,15 @@ fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, Emiss
     // `count(DISTINCT x) FILTER (WHERE p)` → `count(DISTINCT CASE WHEN p THEN x END)`.
     // Corpus witness: `agg-017`. Precedent: `count_if` desugars the same way.
     if let Some(pred) = filter {
+        // Spark only accepts `FILTER (WHERE …)` on aggregate functions; a
+        // scalar like `abs(x) FILTER (WHERE p)` is rejected. Guard the desugar
+        // so it never silently converts a non-aggregate into valid SQL.
+        if !is_aggregate_function_name(&name) {
+            bail_boundary_proto!(
+                "sql::filter_on_non_aggregate",
+                format!("FILTER (WHERE …) is only supported on aggregate functions, not `{name}`")
+            );
+        }
         let p = lower_expr(*pred, cte_scope)?;
         let wrap = |arg: Expression, cond: Expression| {
             Expression::CaseWhen(CaseWhenExpression {
@@ -4561,5 +4570,23 @@ mod tests {
             }
             other => panic!("expected FunctionCall(count), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn filter_on_non_aggregate_is_boundary_error() {
+        // Spark rejects `FILTER (WHERE …)` on a non-aggregate function; the
+        // desugar must not silently turn `abs(x) FILTER (WHERE p)` into valid
+        // SQL. τ surfaces an honest Thunderduck-boundary error instead.
+        let result = parse("SELECT abs(x) FILTER (WHERE x > 0) FROM emp");
+        assert!(
+            matches!(
+                result,
+                Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    ..
+                })
+            ),
+            "expected boundary error for FILTER on non-aggregate, got {result:?}"
+        );
     }
 }

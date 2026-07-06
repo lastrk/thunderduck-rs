@@ -3382,30 +3382,30 @@ fn push_setop_casts(ast: &mut TypedAst, widened_schema: &StructType) {
     // Only push CASTs into direct `Project` children whose projection list
     // matches the widened schema column-by-column. Non-Project inputs
     // (TableScan, Values, ...) receive their CAST at emission time.
-    if let TypedOp::Project { projections, .. } = &mut ast.op {
+    if let TypedOp::Project {
+        projections, input, ..
+    } = &mut ast.op
+    {
         if projections.len() != widened_schema.fields.len() {
             return;
         }
-        let input_schema = match &ast.op {
-            TypedOp::Project { input, .. } => input.resolved_schema.clone(),
-            _ => return,
-        };
-        // Re-borrow to mutate.
-        if let TypedOp::Project { projections, .. } = &mut ast.op {
-            for (idx, proj) in projections.iter_mut().enumerate() {
-                // Star survives verbatim: the widened schema takes its names
-                // from `*`'s expansion and `* AS id` is invalid SQL.
-                if matches!(proj, Expression::Star(_)) {
-                    continue;
-                }
-                let target = &widened_schema.fields[idx];
-                // Type BEFORE stripping any alias (Alias delegates to inner).
-                let current_type = proj.data_type(&input_schema);
-                let cast_to = (current_type != target.data_type
-                    && !matches!(current_type, DataType::Unresolved))
-                .then(|| target.data_type.clone());
-                align_setop_projection(proj, &target.name, cast_to);
+        // `projections` and `input` are disjoint fields of the same `Project`,
+        // and `ast.resolved_schema` is a disjoint field of `ast` — one
+        // `if let` binds them all without the re-borrow dance.
+        let input_schema = input.resolved_schema.clone();
+        for (idx, proj) in projections.iter_mut().enumerate() {
+            // Star survives verbatim: the widened schema takes its names
+            // from `*`'s expansion and `* AS id` is invalid SQL.
+            if matches!(proj, Expression::Star(_)) {
+                continue;
             }
+            let target = &widened_schema.fields[idx];
+            // Type BEFORE stripping any alias (Alias delegates to inner).
+            let current_type = proj.data_type(&input_schema);
+            let cast_to = (current_type != target.data_type
+                && !matches!(current_type, DataType::Unresolved))
+            .then(|| target.data_type.clone());
+            align_setop_projection(proj, &target.name, cast_to);
         }
         ast.resolved_schema = widened_schema.clone();
     }

@@ -1227,3 +1227,13 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 628/0, `sql_v2` 230/32/262, `core_v2` 314 no regression).
 - Commit SHA: (this commit).
+
+## Pass 135 — 2026-07-06 — TECH-DEBT SWEEP (passes 131-134 + Lows)
+- **Sweep** (every-5th cadence; prior sweep pass 130). rust-reviewer over passes 131-134 + 2 accumulated Lows. Both crates build ZERO warnings.
+- Fixes: (A.1) FILTER-on-non-aggregate guard — the pass-134 desugar fired for ANY function (`abs(x) FILTER (WHERE p)` silently valid); added `if !is_aggregate_function_name(&name) { bail_boundary_proto!("sql::filter_on_non_aggregate", ...) }` at the top of lower_function's filter block (Spark rejects FILTER on non-aggregates — ADR-022 category 1). (A.2) all-empty GROUPING SETS — `GROUPING SETS ((),())` had flat grouping empty but grouping_sets=[[],[]] → the `!grouping.is_empty()` guard skipped GROUP BY → collapsed to 1 grand-total row; verified DuckDB 1.5.0 ACCEPTS `GROUP BY GROUPING SETS ((),())` (returns 2 rows) → changed the guard to `!grouping.is_empty() || (GroupingSets && !grouping_sets.is_empty())` so it emits correctly. (B) push_setop_casts — collapsed 3 redundant `TypedOp::Project` matches into 1 disjoint-field `&mut` destructure (readability, behavior-preserving).
+- Layer(s) touched: parser_v2/v2_lowering.rs, transpiler_v2/{emission,analyzer}.rs.
+- Corpus signal: 230 → **230** (guards affect only invalid/witness-free inputs; agg-017/set-009/gx-003/004/010 held).
+- Files: 3. Tests added: 2 (FILTER-on-non-aggregate → boundary; all-empty GROUPING SETS → emits `GROUPING SETS ((), ())`).
+- Compiler warning delta: 0.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 630/0, `sql_v2` 230/32/262 no regression).
+- Commit SHA: (this commit).

@@ -1143,3 +1143,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 611/0, `sql_v2` 222/40/262, `core_v2` 314 no regression).
 - Commit SHA: (this commit).
+
+## Pass 129 — 2026-07-06 — SQL corpus: inline VALUES (tbl-001, tbl-002)
+- **Corpus: SQL front-end (lowering + dialect).** tbl-001 (`SELECT * FROM VALUES (1,'a'),(2,'b'),(3,'c') AS t(n,s)`), tbl-002 (`... JOIN (VALUES (10,'infra'),(20,'data')) AS v(did,label) ON ...`).
+- Root cause (diagnostic-pass-129.md): shared — the SparkSQL front-end never lowered `SetExpr::Values` → `CommonOp::Values`. That op is FULLY built (analyzer infer_values_schema/TypedOp::Values, emission render_values, base_types, unit tests) but had ZERO production producers. tbl-001 also failed to PARSE (bare `FROM VALUES` gated on a dialect flag SparkDialect didn't set); tbl-002 parsed to Derived{Query{Values}} then boundary-bailed in lower_set_expr.
+- Architecture (architecture-pass-129.md): (1) `SparkDialect::supports_values_as_table_factor() -> true` (enables bare FROM VALUES → same Derived{Query{Values}} shape). (2) replace the lower_set_expr `SetExpr::Values` bail with an arm building `CommonOp::Values { rows: lowered, column_names: col1..colN }`. `AS t(n,s)` aliases reuse the pass-118 Derived/ToDf path; the join reuses pass-114. Also retired the dead `sql::values_top_level` boundary (top-level `spark.sql("VALUES ..")` now works — Spark-correct).
+- Layer(s) touched: parser_v2/dialect.rs, parser_v2/v2_lowering.rs, + analyzer.rs (review-fix guard). No emission/AST change.
+- ADR citations: ADR-004 (reuse the existing CommonOp::Values — one AST), ADR-022 (ragged-rows → Spark-emulated error, not panic).
+- Corpus signal: 222 → **224** (+2). tbl-001/002 GREEN (full differential: 1→INT, 'a'→STRING, nullability false). core_v2 held at 314. No regressions.
+- Files: 3. Tests added: 3 (lowering: VALUES → Values{rows,col1..N}; `AS t(n,s)` → AliasedRelation/ToDf/Values; analyzer: ragged rows → Err not panic).
+- Review-fix iteration (closed 1 HIGH): reviewer found ragged VALUES (`VALUES (1,2),(3)`) would index-out-of-bounds PANIC in infer_values_schema (unreachable before — op had no producer; now reachable from arbitrary user SQL → session-killing crash on the !Send DuckDB thread). Fixed: ragged-rows guard returning `AnalyzerError::Other` (Spark rejects inconsistent-length VALUES cleanly); covers both shorter-later-row and reverse-truncation.
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 1 HIGH (ragged-rows panic — CLOSED). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED — guard is a cheap once-per-query scan).
+- Findings queued as follow-up (2 review Lows): incompatible-type VALUES (`(1),('a')`) coerces to STRING via unify_types vs Spark throws (pre-existing, no witness); empty-row VALUES edge.
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 614/0, `sql_v2` 224/38/262, `core_v2` 314 no regression).
+- Commit SHA: (this commit).

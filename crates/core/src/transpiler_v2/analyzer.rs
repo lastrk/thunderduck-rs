@@ -3475,6 +3475,17 @@ fn infer_values_schema(
         });
     }
     let ncols = rows[0].len();
+    if let Some(bad) = rows.iter().find(|r| r.len() != ncols) {
+        // Ragged VALUES rows (e.g. `VALUES (1,2),(3)`) would otherwise index
+        // out of bounds below on the shorter rows — a session-killing panic.
+        // Spark rejects inconsistent-length VALUES with an AnalysisException.
+        return Err(AnalyzerError::Other {
+            reason: format!(
+                "VALUES rows have inconsistent lengths: expected {ncols}, got {}",
+                bad.len()
+            ),
+        });
+    }
     if ncols != column_names.len() {
         // Arity mismatch, not a per-column type mismatch — see the set-op
         // path for the equivalent decision.
@@ -4310,6 +4321,37 @@ mod tests {
             }
             _ => panic!("expected SetOp"),
         }
+    }
+
+    #[test]
+    fn values_ragged_rows_returns_error_not_panic() {
+        // `VALUES (1,2),(3)` — a shorter later row must not index out of
+        // bounds (session-killing panic); Spark rejects with AnalysisException.
+        let bt = BaseTypes::empty();
+        let ast = CommonAst::new(CommonOp::Values {
+            rows: vec![
+                vec![
+                    Expression::Literal(Literal {
+                        value: LiteralValue::Int(1),
+                        data_type: DataType::Integer,
+                    }),
+                    Expression::Literal(Literal {
+                        value: LiteralValue::Int(2),
+                        data_type: DataType::Integer,
+                    }),
+                ],
+                vec![Expression::Literal(Literal {
+                    value: LiteralValue::Int(3),
+                    data_type: DataType::Integer,
+                })],
+            ],
+            column_names: vec!["a".to_owned(), "b".to_owned()],
+        });
+        let err = analyze(ast, &bt).expect_err("ragged VALUES must be rejected");
+        assert!(
+            matches!(err, AnalyzerError::Other { .. }),
+            "expected AnalyzerError::Other, got {err:?}"
+        );
     }
 
     /// Project the `dept_id` column (present on both `emp` and `dept`, but

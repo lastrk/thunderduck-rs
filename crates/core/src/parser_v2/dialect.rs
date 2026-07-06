@@ -40,6 +40,14 @@ impl Dialect for SparkDialect {
         true
     }
 
+    /// Spark allows `VALUES` as a bare table factor, e.g.
+    /// `SELECT * FROM VALUES (1, 'a'), (2, 'b') AS t(n, s)`. Without this the
+    /// parser only accepts the parenthesized `FROM (VALUES ...)` form and
+    /// fails at the second tuple of a bare `FROM VALUES`.
+    fn supports_values_as_table_factor(&self) -> bool {
+        true
+    }
+
     /// Allow `exists`, `struct`, `trim`, `interval` to be used as function
     /// names in SparkSQL. These are normally reserved but Spark uses them
     /// as built-in function identifiers.

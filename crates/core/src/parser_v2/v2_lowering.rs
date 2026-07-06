@@ -201,10 +201,24 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
     match body {
         SetExpr::Select(sel) => lower_select(*sel, cte_scope),
         SetExpr::Query(q) => lower_query(*q, cte_scope),
-        SetExpr::Values(_) => bail_boundary_proto!(
-            "sql::values_top_level",
-            "top-level VALUES not supported in τ (only VALUES in FROM)"
-        ),
+        SetExpr::Values(values) => {
+            // Lower an inline `VALUES (..), (..)` clause to `CommonOp::Values`.
+            // Default column names are `col1..colN`; an `AS t(a, b)` alias list
+            // (parsed as a `TableFactor::Derived` alias) overrides them via the
+            // existing `ToDf` rename arm in `lower_table_factor`.
+            let rows: Vec<Vec<Expression>> = values
+                .rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|e| lower_expr(e, cte_scope))
+                        .collect::<Result<_, _>>()
+                })
+                .collect::<Result<_, _>>()?;
+            let ncols = rows.first().map(|r| r.len()).unwrap_or(0);
+            let column_names = (1..=ncols).map(|i| format!("col{i}")).collect();
+            Ok(CommonAst::new(CommonOp::Values { rows, column_names }))
+        }
         SetExpr::SetOperation {
             op,
             set_quantifier,
@@ -2461,6 +2475,61 @@ mod tests {
                 ));
             }
             _ => panic!("expected Project over TableScan"),
+        }
+    }
+
+    #[test]
+    fn parse_inline_values_lowers_to_values_op() {
+        // Top-level `VALUES` lowers to `CommonOp::Values` with default
+        // `col1..colN` names (pass-129).
+        let plan = parse("VALUES (1, 'a'), (2, 'b')").expect("should parse");
+        match plan.op {
+            CommonOp::Values { rows, column_names } => {
+                assert_eq!(rows.len(), 2, "two rows");
+                assert_eq!(rows[0].len(), 2, "two columns per row");
+                assert_eq!(rows[1].len(), 2, "two columns per row");
+                assert_eq!(
+                    column_names,
+                    vec!["col1".to_owned(), "col2".to_owned()],
+                    "default column names"
+                );
+            }
+            _ => panic!("expected Values"),
+        }
+    }
+
+    #[test]
+    fn parse_bare_from_values_with_alias_columns_renames_via_todf() {
+        // `SELECT * FROM VALUES (..) AS t(n, s)` → Project over AliasedRelation
+        // over ToDf(["n","s"]) over Values (pass-129 + pass-118 Derived arm).
+        let plan = parse("SELECT * FROM VALUES (1, 'a') AS t(n, s)").expect("should parse");
+        let aliased = match plan.op {
+            CommonOp::Project { input, .. } => *input,
+            other => panic!("expected Project, got {other:?}"),
+        };
+        let todf = match aliased.op {
+            CommonOp::AliasedRelation { input, alias } => {
+                assert_eq!(alias, "t");
+                *input
+            }
+            other => panic!("expected AliasedRelation, got {other:?}"),
+        };
+        let values = match todf.op {
+            CommonOp::ToDf {
+                input,
+                column_names,
+            } => {
+                assert_eq!(column_names, vec!["n".to_owned(), "s".to_owned()]);
+                *input
+            }
+            other => panic!("expected ToDf, got {other:?}"),
+        };
+        match values.op {
+            CommonOp::Values { rows, column_names } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(column_names, vec!["col1".to_owned(), "col2".to_owned()]);
+            }
+            other => panic!("expected Values, got {other:?}"),
         }
     }
 

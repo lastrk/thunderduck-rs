@@ -704,6 +704,12 @@ impl TypeInferenceEngine {
             "unix_timestamp" | "unix_micros" | "unix_millis" | "unix_seconds" => Long,
             "year" | "month" | "day" | "dayofmonth" | "dayofweek" | "dayofyear" | "weekofyear"
             | "hour" | "minute" | "second" | "quarter" | "week" | "datediff" | "extract" => Integer,
+            // Spark's `timestampadd(unit, quantity, ts)` returns TIMESTAMP;
+            // `timestampdiff(unit, start, end)` returns BIGINT (Long). The
+            // leading UNIT is a string literal (demoted in the SparkSQL
+            // lowering / proto converter), not a column.
+            "timestampadd" => Timestamp,
+            "timestampdiff" => Long,
 
             // ── Array/List constructors and simple operations ───────────
             "array" | "list_value" | "make_array" | "list" => match first_arg_type {

@@ -987,6 +987,25 @@ fn lower_function(f: Function) -> Result<Expression, EmissionError> {
         name, args, over, ..
     } = f;
     let fn_name = object_name_to_string(&name);
+    // Spark's `timestampadd(unit, quantity, ts)` / `timestampdiff(unit, start,
+    // end)` carry the datetime-field UNIT (`MONTH`, `DAY`, …) as their first
+    // argument, which sqlparser parses as `Expr::Identifier("MONTH")`. The
+    // generic identifier arm (`lower_expr`, ~line 611) would lower that into an
+    // `UnresolvedColumn`, so the analyzer would raise a spurious
+    // `UnknownColumn { name: "MONTH" }`. Demote the unit to a string literal
+    // (mirrors the `Expr::Extract` arm) and lower the remaining args through
+    // the normal `function_arg_to_expr` path. Neither function takes an
+    // `OVER (...)` clause.
+    if fn_name.eq_ignore_ascii_case("timestampadd") || fn_name.eq_ignore_ascii_case("timestampdiff")
+    {
+        if over.is_some() {
+            bail_boundary_proto!(
+                format!("sql::window::{fn_name}"),
+                "OVER is not valid on timestampadd/timestampdiff",
+            );
+        }
+        return lower_timestamp_unit_fn(fn_name, args);
+    }
     let (distinct, call_args) = lower_call_args(args)?;
     let call = Expression::FunctionCall(FunctionCall {
         name: fn_name,
@@ -1006,6 +1025,83 @@ fn lower_function(f: Function) -> Result<Expression, EmissionError> {
             name: "sql::window::unresolved_named_window".to_owned(),
             reason: format!("window `{}` referenced but not resolvable", ident.value),
         }),
+    }
+}
+
+/// Lower `timestampadd(unit, quantity, ts)` / `timestampdiff(unit, start, end)`.
+///
+/// The leading datetime-field UNIT is demoted from the identifier/string it
+/// parses as into an `Expression::Literal(String)`, so the analyzer never
+/// mistakes it for a column reference. The remaining arguments lower through
+/// the normal [`function_arg_to_expr`] path.
+fn lower_timestamp_unit_fn(
+    fn_name: String,
+    args: FunctionArguments,
+) -> Result<Expression, EmissionError> {
+    let list = match args {
+        FunctionArguments::List(list) => list,
+        _ => bail_boundary_proto!(
+            format!("sql::{fn_name}::args"),
+            "timestampadd/timestampdiff require a positional argument list",
+        ),
+    };
+    let mut arg_iter = list.args.into_iter();
+    let unit_arg = arg_iter.next().ok_or_else(|| EmissionError::Unsupported {
+        kind: UnsupportedKind::ProtoShape,
+        name: format!("sql::{fn_name}::unit"),
+        reason: format!("`{fn_name}` requires a leading datetime unit argument"),
+    })?;
+    let mut lowered = Vec::with_capacity(3);
+    lowered.push(lower_timestamp_unit_arg(&fn_name, unit_arg)?);
+    for a in arg_iter {
+        lowered.push(function_arg_to_expr(a)?);
+    }
+    Ok(Expression::FunctionCall(FunctionCall {
+        name: fn_name,
+        args: lowered,
+        distinct: false,
+    }))
+}
+
+/// Lower the leading UNIT argument of `timestampadd` / `timestampdiff` into a
+/// string [`Literal`]. Accepts a bare field name (`MONTH`) — sqlparser's
+/// `Expr::Identifier` — or a quoted string literal (`'MONTH'`).
+fn lower_timestamp_unit_arg(fn_name: &str, arg: FunctionArg) -> Result<Expression, EmissionError> {
+    let expr = match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+        FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(e),
+            ..
+        } => e,
+        other => bail_boundary_proto!(
+            format!("sql::{fn_name}::unit::{other:?}"),
+            "datetime unit must be a bare field name or string literal",
+        ),
+    };
+    match expr {
+        Expr::Identifier(ident) => Ok(Expression::Literal(Literal {
+            value: LiteralValue::String(ident.value),
+            data_type: DataType::String,
+        })),
+        // A quoted string unit (`timestampadd('MONTH', …)`) lowers via the
+        // normal value path; accept it only if it yields a string literal.
+        other => {
+            let lowered = lower_expr(other)?;
+            if matches!(
+                lowered,
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(_),
+                    ..
+                })
+            ) {
+                Ok(lowered)
+            } else {
+                bail_boundary_proto!(
+                    format!("sql::{fn_name}::unit"),
+                    "datetime unit must be a bare field name or string literal",
+                )
+            }
+        }
     }
 }
 
@@ -1510,6 +1606,108 @@ mod tests {
             }
             _ => panic!("expected Project over SingleRow"),
         }
+    }
+
+    // ── timestampadd / timestampdiff unit demotion (intv-006 regression) ───
+    //
+    // sqlparser parses the leading datetime UNIT (`MONTH`, `DAY`, …) as an
+    // `Expr::Identifier`; the generic identifier arm would lower it to an
+    // `UnresolvedColumn`, and the analyzer would then raise a spurious
+    // `UnknownColumn { name: "MONTH" }`. These tests pin the fix: the unit is
+    // demoted to a string literal, and the plan analyzes to the Spark-parity
+    // return type (TIMESTAMP for add, BIGINT/Long for diff).
+
+    fn timestampadd_call(sql: &str) -> FunctionCall {
+        let plan = parse(sql).expect("should parse");
+        let CommonOp::Project { projections, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        match projections.into_iter().next() {
+            Some(Expression::FunctionCall(call)) => call,
+            other => panic!("expected FunctionCall projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_timestampadd_demotes_unit_to_string_literal() {
+        let call = timestampadd_call("SELECT timestampadd(MONTH, 3, last_login) FROM t");
+        assert!(call.name.eq_ignore_ascii_case("timestampadd"));
+        assert_eq!(call.args.len(), 3);
+        assert!(
+            matches!(
+                &call.args[0],
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(u),
+                    ..
+                }) if u == "MONTH"
+            ),
+            "unit must be a string literal, got {:?}",
+            call.args[0]
+        );
+        assert!(
+            !call
+                .args
+                .iter()
+                .any(|a| matches!(a, Expression::UnresolvedColumn(c) if c.name == "MONTH")),
+            "unit must NOT lower to an UnresolvedColumn(MONTH)"
+        );
+    }
+
+    #[test]
+    fn parse_timestampdiff_demotes_unit_to_string_literal() {
+        let call = timestampadd_call("SELECT timestampdiff(DAY, hire_date, last_login) FROM t");
+        assert!(call.name.eq_ignore_ascii_case("timestampdiff"));
+        assert_eq!(call.args.len(), 3);
+        assert!(
+            matches!(
+                &call.args[0],
+                Expression::Literal(Literal {
+                    value: LiteralValue::String(u),
+                    ..
+                }) if u == "DAY"
+            ),
+            "unit must be a string literal, got {:?}",
+            call.args[0]
+        );
+        assert!(
+            !call
+                .args
+                .iter()
+                .any(|a| matches!(a, Expression::UnresolvedColumn(c) if c.name == "DAY")),
+            "unit must NOT lower to an UnresolvedColumn(DAY)"
+        );
+    }
+
+    #[test]
+    fn timestampadd_and_timestampdiff_analyze_to_spark_return_types() {
+        use crate::transpiler_v2::analyzer::analyze;
+        use crate::transpiler_v2::base_types::BaseTypes;
+        use crate::types::{StructField, StructType};
+
+        fn emp() -> StructType {
+            StructType::new(vec![
+                StructField::nullable("last_login", DataType::Timestamp),
+                StructField::nullable("hire_date", DataType::Timestamp),
+            ])
+        }
+
+        // timestampadd → TIMESTAMP, with no UnknownColumn { name: "MONTH" }.
+        let plan = parse("SELECT timestampadd(MONTH, 3, last_login) FROM emp").expect("parse");
+        let bt = BaseTypes::build_from_plan(&plan, |n| (n == "emp").then(emp));
+        let typed = analyze(plan, &bt).expect("analyze must succeed (no UnknownColumn)");
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        assert_eq!(
+            typed.resolved_schema.fields[0].data_type,
+            DataType::Timestamp
+        );
+
+        // timestampdiff → BIGINT (Long), with no UnknownColumn { name: "DAY" }.
+        let plan =
+            parse("SELECT timestampdiff(DAY, hire_date, last_login) FROM emp").expect("parse");
+        let bt = BaseTypes::build_from_plan(&plan, |n| (n == "emp").then(emp));
+        let typed = analyze(plan, &bt).expect("analyze must succeed (no UnknownColumn)");
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
     }
 
     #[test]

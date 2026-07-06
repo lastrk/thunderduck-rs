@@ -2164,6 +2164,96 @@ fn render_map_hof(
     }
 }
 
+/// Extract a string-literal argument at `idx` from a function call, failing
+/// loudly if it is absent or not a string literal. Used for arguments that τ's
+/// front-ends demote to a literal (e.g. the datetime UNIT of `timestampadd` /
+/// `timestampdiff`), which must never reach emission as a column reference.
+fn string_literal_arg(f: &FunctionCall, idx: usize, what: &str) -> Result<String, EmissionError> {
+    match f.args.get(idx) {
+        Some(Expression::Literal(Literal {
+            value: LiteralValue::String(s),
+            ..
+        })) => Ok(s.clone()),
+        _ => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::Function,
+            name: f.name.clone(),
+            reason: format!("{what} must be a string literal"),
+        }),
+    }
+}
+
+/// Build the DuckDB interval expression for Spark's `timestampadd(unit, n, ts)`.
+/// DuckDB has no `QUARTER` interval keyword, so a quarter becomes `(n * 3)
+/// MONTH`. Unsupported units surface a Thunderduck-boundary error (ADR-022) —
+/// never a silent, wrong emission.
+fn spark_add_interval_sql(fn_name: &str, unit: &str, n: &str) -> Result<String, EmissionError> {
+    let duck_unit = match unit.to_ascii_uppercase().as_str() {
+        "YEAR" | "YEARS" => "YEAR",
+        "QUARTER" | "QUARTERS" => return Ok(format!("INTERVAL (({n}) * 3) MONTH")),
+        "MONTH" | "MONTHS" => "MONTH",
+        "WEEK" | "WEEKS" => "WEEK",
+        "DAY" | "DAYS" => "DAY",
+        "HOUR" | "HOURS" => "HOUR",
+        "MINUTE" | "MINUTES" => "MINUTE",
+        "SECOND" | "SECONDS" => "SECOND",
+        "MILLISECOND" | "MILLISECONDS" => "MILLISECOND",
+        "MICROSECOND" | "MICROSECONDS" => "MICROSECOND",
+        other => {
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name: fn_name.to_owned(),
+                reason: format!("`timestampadd` unit `{other}` is not supported by τ"),
+            });
+        }
+    };
+    Ok(format!("INTERVAL ({n}) {duck_unit}"))
+}
+
+/// Emit Spark's `timestampdiff(unit, start, end)` (BIGINT, truncated toward
+/// zero). Fixed-length units divide the microsecond delta by the unit's micros.
+/// Calendar units (MONTH/QUARTER/YEAR) require day-of-month-aware arithmetic τ
+/// does not yet emit — surface an honest Thunderduck-boundary error (ADR-022)
+/// rather than the boundary-counting `date_diff`, which diverges from Spark.
+fn spark_diff_sql(
+    fn_name: &str,
+    unit: &str,
+    start: &str,
+    end: &str,
+) -> Result<String, EmissionError> {
+    let delta = format!("(epoch_us({end}) - epoch_us({start}))");
+    let micros: i64 = match unit.to_ascii_uppercase().as_str() {
+        "MICROSECOND" | "MICROSECONDS" => return Ok(format!("CAST({delta} AS BIGINT)")),
+        "MILLISECOND" | "MILLISECONDS" => 1_000,
+        "SECOND" | "SECONDS" => 1_000_000,
+        "MINUTE" | "MINUTES" => 60_000_000,
+        "HOUR" | "HOURS" => 3_600_000_000,
+        "DAY" | "DAYS" => 86_400_000_000,
+        "WEEK" | "WEEKS" => 604_800_000_000,
+        other @ ("MONTH" | "MONTHS" | "QUARTER" | "QUARTERS" | "YEAR" | "YEARS") => {
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name: fn_name.to_owned(),
+                reason: format!(
+                    "`timestampdiff` calendar unit `{other}` is not yet implemented in τ \
+                     (Spark's day-of-month-aware calendar diff)"
+                ),
+            });
+        }
+        other => {
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name: fn_name.to_owned(),
+                reason: format!("`timestampdiff` unit `{other}` is not supported by τ"),
+            });
+        }
+    };
+    // `trunc` truncates toward zero (Spark's semantics for integral unit diff);
+    // the outer CAST converts the already-integral DOUBLE back to BIGINT.
+    Ok(format!(
+        "CAST(trunc(CAST({delta} AS DOUBLE) / {micros}.0) AS BIGINT)"
+    ))
+}
+
 fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
     let name_lower = f.name.to_ascii_lowercase();
     // Aggregate-name overlap check — if the analyzer classified a FunctionCall
@@ -3823,6 +3913,44 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let end = render_expr(&f.args[0], schema)?;
             let start = render_expr(&f.args[1], schema)?;
             return Ok(format!("datediff('day', {start}, {end})"));
+        }
+        // Spark's `timestampadd(unit, quantity, ts)` → `ts + n * INTERVAL 1 unit`.
+        // The leading UNIT is a string literal (demoted in the SparkSQL lowering /
+        // proto converter). DuckDB has no `QUARTER` interval keyword, so a quarter
+        // is emitted as `(n * 3) MONTH`. The projection-slot CAST stamps the
+        // Spark-parity TIMESTAMP return type. Corpus witness: `intv-006`
+        // (`timestampadd(MONTH, 3, last_login)`).
+        "timestampadd" => {
+            if f.args.len() != 3 {
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`timestampadd` requires exactly 3 arguments (unit, quantity, ts)",
+                );
+            }
+            let unit = string_literal_arg(f, 0, "timestampadd unit")?;
+            let n = render_expr(&f.args[1], schema)?;
+            let ts = render_expr(&f.args[2], schema)?;
+            let interval = spark_add_interval_sql(&f.name, &unit, &n)?;
+            return Ok(format!("({ts} + {interval})"));
+        }
+        // Spark's `timestampdiff(unit, start, end)` returns BIGINT — the whole
+        // number of `unit`s from `start` to `end`, truncated toward zero. For the
+        // fixed-length units this is `(epoch_us(end) - epoch_us(start)) / micros`.
+        // Calendar units (MONTH/QUARTER/YEAR) need day-of-month-aware calendar
+        // arithmetic that τ does not yet emit — surface an honest
+        // Thunderduck-boundary error (ADR-022) rather than the boundary-counting
+        // `date_diff`, which diverges from Spark for sub-unit remainders.
+        "timestampdiff" => {
+            if f.args.len() != 3 {
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "`timestampdiff` requires exactly 3 arguments (unit, start, end)",
+                );
+            }
+            let unit = string_literal_arg(f, 0, "timestampdiff unit")?;
+            let start = render_expr(&f.args[1], schema)?;
+            let end = render_expr(&f.args[2], schema)?;
+            return spark_diff_sql(&f.name, &unit, &start, &end);
         }
         "months_between" => {
             if f.args.len() < 2 {
@@ -5690,6 +5818,61 @@ mod tests {
             StructField::nullable("dept_id", DataType::Integer),
             StructField::nullable("salary", DataType::Double),
         ])
+    }
+
+    // ── timestampadd / timestampdiff emission (intv-006) ───────────────────
+    // Pure helpers — no schema, no EMIT_TAP; safe from the tap-mutex cascade.
+
+    #[test]
+    fn timestampadd_interval_sql_maps_units() {
+        assert_eq!(
+            spark_add_interval_sql("timestampadd", "MONTH", "3").unwrap(),
+            "INTERVAL (3) MONTH"
+        );
+        // Case-insensitive unit.
+        assert_eq!(
+            spark_add_interval_sql("timestampadd", "month", "3").unwrap(),
+            "INTERVAL (3) MONTH"
+        );
+        // DuckDB has no QUARTER interval keyword → 3 months.
+        assert_eq!(
+            spark_add_interval_sql("timestampadd", "QUARTER", "2").unwrap(),
+            "INTERVAL ((2) * 3) MONTH"
+        );
+        assert_eq!(
+            spark_add_interval_sql("timestampadd", "SECOND", "n").unwrap(),
+            "INTERVAL (n) SECOND"
+        );
+        // Unknown unit → honest Thunderduck-boundary error.
+        assert!(matches!(
+            spark_add_interval_sql("timestampadd", "FORTNIGHT", "1"),
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn timestampdiff_sql_fixed_units_and_calendar_boundary() {
+        assert_eq!(
+            spark_diff_sql("timestampdiff", "DAY", "a", "b").unwrap(),
+            "CAST(trunc(CAST((epoch_us(b) - epoch_us(a)) AS DOUBLE) / 86400000000.0) AS BIGINT)"
+        );
+        // Microsecond delta is exact — no division.
+        assert_eq!(
+            spark_diff_sql("timestampdiff", "MICROSECOND", "a", "b").unwrap(),
+            "CAST((epoch_us(b) - epoch_us(a)) AS BIGINT)"
+        );
+        // Calendar units need day-of-month-aware arithmetic τ does not emit yet
+        // → honest Thunderduck-boundary error (ADR-022), never wrong SQL.
+        assert!(matches!(
+            spark_diff_sql("timestampdiff", "MONTH", "a", "b"),
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                ..
+            })
+        ));
     }
 
     fn base_types_with_emp() -> BaseTypes {

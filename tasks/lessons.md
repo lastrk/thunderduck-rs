@@ -193,6 +193,34 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   unhandled type surfaces as a loud error. Silent NULL substitution is
   worse than a loud panic in every case.
 
+- **A new function's front-end lowering fix is necessary but not sufficient — land the
+  paired type-inference + emission arms in the same pass.** intv-006 (2026-07-06):
+  `timestampadd(MONTH, 3, ts)` raised `UnknownColumn { name: "MONTH" }` because τ's
+  SparkSQL lowering (`parser_v2/v2_lowering.rs::lower_function`) routed the leading
+  datetime UNIT — which sqlparser emits as `Expr::Identifier("MONTH")` — through the
+  generic identifier → `UnresolvedColumn` arm. The fix demotes the unit to a string
+  `Literal` (mirroring the existing `Expr::Extract` arm). But the lowering fix alone only
+  *relocates* the failure: with no `timestampadd`/`timestampdiff` arm in
+  `type_inference.rs`, the projection falls to the `_ => Unresolved` default, tripping
+  INV5 (`schema_has_unresolved`) and/or leaking an unparsed type into the
+  `AnalyzePlan(Schema)` response (PySpark `data type unparsed`). Rule: adding a Spark
+  function is a three-arm change — front-end lowering, `type_inference.rs` return type,
+  and `emission.rs` — in one pass; a lowering fix without the return-type arm converts a
+  resolve error into an `Unresolved`-leak, not a green case.
+
+- **A mis-lowering that fabricates a Spark-emulated error for valid input is an ADR-022
+  category bug, not just a coverage gap.** intv-006's pre-fix `UnknownColumn { name:
+  "MONTH" }` was doubly wrong: Spark *accepts* `timestampadd(MONTH, …)`, so a "column not
+  found" (Spark-emulated) error falsely signals the user's query is invalid. Any interim
+  not-yet-implemented state must be a Thunderduck-boundary `Unsupported*` (honest "not in
+  Thunderduck"). The fix keeps this discipline for the residue it does not cover:
+  calendar-unit `timestampdiff` (MONTH/QUARTER/YEAR, needing day-of-month-aware
+  arithmetic) and unknown units raise `EmissionError::Unsupported`; the `date_diff`
+  shortcut was rejected (ADR-015) because DuckDB's boundary-counting diverges from Spark's
+  toward-zero truncation. Rule: when an unsupported input reaches τ, the error category
+  must reflect *why* it is unsupported (boundary, not Spark-emulated) — never let a
+  parser/analyzer accident emit a fake Spark-rejection for input Spark would accept.
+
 ## Progress-signal calibration
 
 - **Per-slice progress-signal estimates are lagging indicators; recalibrate after each slice

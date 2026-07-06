@@ -46,6 +46,15 @@ impl Dialect for SparkDialect {
         true
     }
 
+    /// Spark supports aggregate `FILTER (WHERE <pred>)` clauses, e.g.
+    /// `count(*) FILTER (WHERE salary > 90000)`. sqlparser gates parsing of
+    /// the `FILTER` clause behind this flag (default `false`), so without the
+    /// override the parser treats the bare `FILTER` keyword as an implicit
+    /// alias and then fails on the following `(`. Corpus witness: `agg-017`.
+    fn supports_filter_during_aggregation(&self) -> bool {
+        true
+    }
+
     /// Spark allows `VALUES` as a bare table factor, e.g.
     /// `SELECT * FROM VALUES (1, 'a'), (2, 'b') AS t(n, s)`. Without this the
     /// parser only accepts the parenthesized `FROM (VALUES ...)` form and

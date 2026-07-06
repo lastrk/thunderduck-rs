@@ -1868,7 +1868,8 @@ fn lower_binary_op(op: BinaryOperator) -> Result<BinaryOp, EmissionError> {
 fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, EmissionError> {
     let name = object_name_to_string(&f.name);
     let over = f.over;
-    let (distinct, args) = match f.args {
+    let filter = f.filter;
+    let (distinct, mut args) = match f.args {
         FunctionArguments::None => (false, vec![]),
         FunctionArguments::List(FunctionArgumentList {
             duplicate_treatment,
@@ -1889,6 +1890,35 @@ fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, Emiss
             );
         }
     };
+    // Desugar an aggregate `FILTER (WHERE <pred>)` clause into a CASE inside
+    // each aggregate argument. `agg(a) FILTER (WHERE p)` aggregates only rows
+    // where `p` is TRUE, which is exactly `agg(CASE WHEN p THEN a END)` for
+    // every NULL-skipping aggregate (count/sum/avg/min/max/…): non-matching
+    // rows become NULL and are skipped. `count(*)`/`count()` has no argument
+    // to wrap, so synthesize a single `CASE WHEN p THEN 1 END` (the matching
+    // rows contribute a non-NULL `1`). `distinct` is preserved so
+    // `count(DISTINCT x) FILTER (WHERE p)` → `count(DISTINCT CASE WHEN p THEN x END)`.
+    // Corpus witness: `agg-017`. Precedent: `count_if` desugars the same way.
+    if let Some(pred) = filter {
+        let p = lower_expr(*pred, cte_scope)?;
+        let wrap = |arg: Expression, cond: Expression| {
+            Expression::CaseWhen(CaseWhenExpression {
+                branches: vec![(cond, arg)],
+                else_expr: None,
+            })
+        };
+        args = if args.is_empty() || matches!(args.as_slice(), [Expression::Star(_)]) {
+            vec![wrap(
+                Expression::Literal(Literal {
+                    value: LiteralValue::Int(1),
+                    data_type: DataType::Integer,
+                }),
+                p,
+            )]
+        } else {
+            args.into_iter().map(|a| wrap(a, p.clone())).collect()
+        };
+    }
     let call = Expression::FunctionCall(FunctionCall {
         name,
         args,
@@ -4420,6 +4450,116 @@ mod tests {
                 }
             }
             other => panic!("expected CaseWhen, got {other:?}"),
+        }
+    }
+
+    /// Extract the last aggregate expression from a top-level `Aggregate` op,
+    /// unwrapping a synthetic top-level `Alias` (the SparkSQL default name).
+    fn last_aggregate(plan: CommonAst) -> Expression {
+        let CommonOp::Aggregate { mut aggregates, .. } = plan.op else {
+            panic!("expected Aggregate as top-level");
+        };
+        match aggregates.pop().expect("at least one aggregate") {
+            Expression::Alias(a) => *a.expr,
+            other => other,
+        }
+    }
+
+    #[test]
+    fn agg_filter_count_star_desugars_to_case_when_one() {
+        // `count(*) FILTER (WHERE salary > 90000)` desugars to
+        // `count(CASE WHEN salary > 90000 THEN 1 END)` — the star arg has no
+        // value to wrap, so the matching rows contribute a non-NULL `1`.
+        // Corpus witness: `agg-017`.
+        let plan =
+            parse("SELECT count(*) FILTER (WHERE salary > 90000) FROM emp").expect("should parse");
+        match last_aggregate(plan) {
+            Expression::FunctionCall(fc) => {
+                assert!(fc.name.eq_ignore_ascii_case("count"));
+                assert!(!fc.distinct);
+                assert_eq!(fc.args.len(), 1, "single desugared arg");
+                match &fc.args[0] {
+                    Expression::CaseWhen(cw) => {
+                        assert_eq!(cw.branches.len(), 1);
+                        assert!(cw.else_expr.is_none(), "no ELSE — non-matching rows NULL");
+                        let (cond, then) = &cw.branches[0];
+                        assert!(
+                            matches!(cond, Expression::Binary(b) if b.op == BinaryOp::Gt),
+                            "predicate is `salary > 90000`"
+                        );
+                        assert!(
+                            matches!(
+                                then,
+                                Expression::Literal(Literal {
+                                    value: LiteralValue::Int(1),
+                                    data_type: DataType::Integer,
+                                })
+                            ),
+                            "count-star THEN branch is literal 1"
+                        );
+                    }
+                    other => panic!("expected CaseWhen arg, got {other:?}"),
+                }
+            }
+            other => panic!("expected FunctionCall(count), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agg_filter_sum_wraps_argument_in_case_when() {
+        // `sum(salary) FILTER (WHERE dept_id = 10)` desugars to
+        // `sum(CASE WHEN dept_id = 10 THEN salary END)`.
+        let plan =
+            parse("SELECT sum(salary) FILTER (WHERE dept_id = 10) FROM emp").expect("should parse");
+        match last_aggregate(plan) {
+            Expression::FunctionCall(fc) => {
+                assert!(fc.name.eq_ignore_ascii_case("sum"));
+                assert!(!fc.distinct);
+                assert_eq!(fc.args.len(), 1);
+                match &fc.args[0] {
+                    Expression::CaseWhen(cw) => {
+                        assert_eq!(cw.branches.len(), 1);
+                        assert!(cw.else_expr.is_none());
+                        let (cond, then) = &cw.branches[0];
+                        assert!(
+                            matches!(cond, Expression::Binary(b) if b.op == BinaryOp::Eq),
+                            "predicate is `dept_id = 10`"
+                        );
+                        assert!(
+                            matches!(then, Expression::UnresolvedColumn(c) if c.name == "salary"),
+                            "THEN branch is the wrapped `salary` argument"
+                        );
+                    }
+                    other => panic!("expected CaseWhen arg, got {other:?}"),
+                }
+            }
+            other => panic!("expected FunctionCall(sum), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agg_filter_preserves_distinct() {
+        // `count(DISTINCT id) FILTER (WHERE p)` keeps DISTINCT while wrapping the
+        // argument → `count(DISTINCT CASE WHEN p THEN id END)`.
+        let plan = parse("SELECT count(DISTINCT id) FILTER (WHERE dept_id = 10) FROM emp")
+            .expect("should parse");
+        match last_aggregate(plan) {
+            Expression::FunctionCall(fc) => {
+                assert!(fc.name.eq_ignore_ascii_case("count"));
+                assert!(fc.distinct, "DISTINCT is preserved through the desugar");
+                assert_eq!(fc.args.len(), 1);
+                match &fc.args[0] {
+                    Expression::CaseWhen(cw) => {
+                        let (_, then) = &cw.branches[0];
+                        assert!(
+                            matches!(then, Expression::UnresolvedColumn(c) if c.name == "id"),
+                            "THEN branch is the wrapped `id` argument"
+                        );
+                    }
+                    other => panic!("expected CaseWhen arg, got {other:?}"),
+                }
+            }
+            other => panic!("expected FunctionCall(count), got {other:?}"),
         }
     }
 }

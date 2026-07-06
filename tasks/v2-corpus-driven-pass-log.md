@@ -1213,3 +1213,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 625/0, `sql_v2` 229/33/262, `core_v2` 314 no regression).
 - Commit SHA: (this commit).
+
+## Pass 134 — 2026-07-06 — SQL corpus: aggregate FILTER (WHERE) (agg-017)
+- **Corpus: SQL front-end (dialect + lowering desugar).** agg-017 (`count(*) FILTER (WHERE salary > 90000)`).
+- Root cause (diagnostic-pass-134.md): PARSE error — SparkDialect didn't override `supports_filter_during_aggregation` (sqlparser gates FILTER parsing on it). Latent 2nd: lower_function dropped Function.filter (`..`), FunctionCall has no filter field.
+- Architecture (architecture-pass-134.md): Approach B (CASE-WHEN desugar) over Approach A (native filter field → ~203 construction sites). Dialect flag + lower_function reads filter and desugars `agg(x) FILTER (WHERE p)` → `agg(CASE WHEN p THEN x END)`, count(*) → `count(CASE WHEN p THEN 1 END)`, distinct preserved. No AST/analyzer/emission change. In-tree precedent: count_if already desugars to SUM(CASE...).
+- Layer(s) touched: parser_v2/{dialect,v2_lowering}.rs. 
+- ADR citations: ADR-015/016 (Spark parity — FILTER aggregates only p-TRUE rows; CASE WHEN p (no else) → NULL for both false AND null p → skipped by null-skipping aggs), ADR-004.
+- Corpus signal: 229 → **230** (+1). agg-017 GREEN (value confirmed). core_v2 held at 314. No regressions.
+- Files: 2. Tests added: 3 (count-star→CASE WHEN p THEN 1; sum arg-wrap; DISTINCT preserved).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED — desugar Spark-exact for the NULL-skipping set incl. p-is-NULL edge + collect_list interaction [pass-124 macros drop nulls]). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED — p.clone() bounded by arg count, once-per-lowering).
+- Findings queued as follow-up (2 review Lows): FILTER on a non-aggregate silently accepted (`abs(x) FILTER (WHERE p)` — Spark rejects; guard the desugar with is_aggregate_name in a sweep); unaliased count(*)-FILTER default naming (cosmetic, no single correct target).
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 628/0, `sql_v2` 230/32/262, `core_v2` 314 no regression).
+- Commit SHA: (this commit).

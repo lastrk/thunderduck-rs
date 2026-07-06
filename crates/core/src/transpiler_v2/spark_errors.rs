@@ -36,6 +36,25 @@ pub(crate) const INVALID_ARRAY_INDEX_MSG_HEAD: &str =
 pub(crate) const INVALID_ARRAY_INDEX_MSG_MID: &str = " is out of bounds. The array has ";
 pub(crate) const INVALID_ARRAY_INDEX_MSG_TAIL: &str = " elements. Use `try_element_at` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003";
 
+// Spark 4.1's `INVALID_FORMAT.MISMATCH_INPUT` message is runtime-templated
+// on the input value (rendered VARCHAR at eval time) — only the input string
+// requires per-row interpolation, so a single HEAD / TAIL pair brackets the
+// `||`-concatenated `(input)::VARCHAR` substitution. The format literal is
+// baked into HEAD at emission time. Shape:
+//
+//   HEAD || (input_sql)::VARCHAR || TAIL
+//
+// Spark's message is byte-verbatim (no template parens around `<input>` — the
+// parens seen in Spark diagnostics for input `(9.99)` are the input's own
+// characters, not the template):
+//   [INVALID_FORMAT.MISMATCH_INPUT] The format is invalid: <fmt>.
+//   The input "STRING" <input> does not match the format. SQLSTATE: 42601
+pub(crate) const INVALID_FORMAT_MISMATCH_MSG_HEAD_PREFIX: &str =
+    "[INVALID_FORMAT.MISMATCH_INPUT] The format is invalid: ";
+pub(crate) const INVALID_FORMAT_MISMATCH_MSG_HEAD_SUFFIX: &str = ". The input \"STRING\" ";
+pub(crate) const INVALID_FORMAT_MISMATCH_MSG_TAIL: &str =
+    " does not match the format. SQLSTATE: 42601";
+
 /// Spark ANSI-mode throw classes τ emits at emission time.
 ///
 /// Each variant carries just enough data to synthesise Spark's
@@ -56,6 +75,12 @@ pub(crate) enum SparkError {
     /// message body is runtime-templated on the index value AND the array
     /// length, so both are carried as already-rendered SQL fragments.
     InvalidArrayIndex { idx_sql: String, arr_sql: String },
+    /// `[INVALID_FORMAT.MISMATCH_INPUT]` — Spark ANSI class for
+    /// `to_number(str, fmt)` when the input string cannot be parsed under
+    /// the format template. The format literal is baked into the emitted
+    /// message at emission time; the input value is runtime-interpolated as
+    /// a rendered SQL fragment.
+    InvalidFormatMismatch { fmt: String, input_sql: String },
 }
 
 impl SparkError {
@@ -67,6 +92,7 @@ impl SparkError {
             Self::DivideByZero => "DIVIDE_BY_ZERO",
             Self::RemainderByZero => "REMAINDER_BY_ZERO",
             Self::InvalidArrayIndex { .. } => "INVALID_ARRAY_INDEX_IN_ELEMENT_AT",
+            Self::InvalidFormatMismatch { .. } => "INVALID_FORMAT.MISMATCH_INPUT",
         }
     }
 
@@ -97,6 +123,19 @@ impl SparkError {
                     head = INVALID_ARRAY_INDEX_MSG_HEAD,
                     mid = INVALID_ARRAY_INDEX_MSG_MID,
                     tail = INVALID_ARRAY_INDEX_MSG_TAIL,
+                )
+            }
+            Self::InvalidFormatMismatch { fmt, input_sql } => {
+                // The format literal is baked into HEAD (SQL-escape any
+                // embedded apostrophes for the enclosing single-quoted
+                // string literal). The input value is interpolated at
+                // eval time via `(input_sql)::VARCHAR`.
+                let fmt_escaped = fmt.replace('\'', "''");
+                format!(
+                    "error('{prefix}{fmt_escaped}{suffix}' || ({input_sql})::VARCHAR || '{tail}')",
+                    prefix = INVALID_FORMAT_MISMATCH_MSG_HEAD_PREFIX,
+                    suffix = INVALID_FORMAT_MISMATCH_MSG_HEAD_SUFFIX,
+                    tail = INVALID_FORMAT_MISMATCH_MSG_TAIL,
                 )
             }
         }
@@ -167,6 +206,43 @@ mod tests {
             "error('[INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index ' || (1)::VARCHAR \
              || ' is out of bounds. The array has ' || len((tags))::VARCHAR \
              || ' elements. Use `try_element_at` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003')"
+        );
+    }
+
+    /// InvalidFormatMismatch throw fragment bakes the format literal into
+    /// HEAD (apostrophes escaped) and interpolates the input value as
+    /// `(input_sql)::VARCHAR` at eval time. The rendered message matches
+    /// Spark 4.1's `[INVALID_FORMAT.MISMATCH_INPUT]` byte-verbatim.
+    #[test]
+    fn invalid_format_mismatch_throw_expr_matches_spark_message() {
+        let err = SparkError::InvalidFormatMismatch {
+            fmt: "9,999.99".to_owned(),
+            input_sql: "num_str".to_owned(),
+        };
+        // Byte-verbatim vs Spark 4.1's INVALID_FORMAT.MISMATCH_INPUT template:
+        // no template parens around <input> — for input `(9.99)` the parens
+        // in Spark's diagnostic come from the input value itself.
+        assert_eq!(
+            err.throw_expr(),
+            "error('[INVALID_FORMAT.MISMATCH_INPUT] The format is invalid: 9,999.99. \
+             The input \"STRING\" ' || (num_str)::VARCHAR || \
+             ' does not match the format. SQLSTATE: 42601')"
+        );
+        assert_eq!(err.class(), "INVALID_FORMAT.MISMATCH_INPUT");
+    }
+
+    /// Apostrophes in the format literal must be `''`-escaped so they
+    /// survive the single-quoted SQL string literal wrapping the message.
+    #[test]
+    fn invalid_format_mismatch_escapes_apostrophes_in_fmt() {
+        let err = SparkError::InvalidFormatMismatch {
+            fmt: "a'b".to_owned(),
+            input_sql: "x".to_owned(),
+        };
+        assert!(
+            err.throw_expr().contains("invalid: a''b."),
+            "got: {}",
+            err.throw_expr()
         );
     }
 

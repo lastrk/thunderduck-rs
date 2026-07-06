@@ -635,8 +635,19 @@ case("inl-002", "inline", "inline_outer (keeps null/empty array rows)", lambda I
 # ── 27. URL / number-format / set lookup parsing ────────────────────────────
 case("parse-001", "parsing", "parse_url (host/query/protocol)", lambda I: I["raw"].select(F.expr("parse_url(url, 'HOST')").alias("host"), F.expr("parse_url(url, 'QUERY', 'q')").alias("q")), flags=("spark4",))
 case("parse-002", "parsing", "url_encode / url_decode", lambda I: I["raw"].select(F.expr("url_encode('a b&c')").alias("enc")), flags=("spark4",))
-case("parse-003", "parsing", "to_number with format -> decimal", lambda I: I["raw"].select(F.expr("to_number(num_str, '9,999.99')").alias("n")), flags=("spark4",))
+case("parse-003", "parsing", "to_number with format -> decimal (row 2 mismatch throws ANSI)", lambda I: I["raw"].select(F.expr("to_number(num_str, '9,999.99')").alias("n")), flags=("spark4",), expected_error="INVALID_FORMAT.MISMATCH_INPUT")
 case("parse-004", "parsing", "try_to_number (null on bad input)", lambda I: I["raw"].select(F.expr("try_to_number(num_str, '999.99')").alias("n")), flags=("spark4",))
+# Grouping-separator value-parity witnesses (guard against the DuckDB
+# `try_cast` regression where '1,234.56' silently drops to NULL because
+# DuckDB's numeric cast does not strip `,`).  See ADR-015.
+# parse-003b uses a nullable column input (`num_str` filtered to the sole
+# valid grouping row) rather than a string literal — Spark reports
+# `to_number(<non-null literal>, <literal>)` as non-nullable, which is a
+# separate τ nullability inference gap outside the scope of the input-strip
+# fix.  Value parity is what this witness locks in.
+case("parse-003b", "parsing", "to_number(num_str, '9,999.99') on grouped input -> 1234.56", lambda I: I["raw"].filter(F.col("id") == 1).select(F.expr("to_number(num_str, '9,999.99')").alias("n")), flags=("spark4",))
+case("parse-004b", "parsing", "try_to_number literal with grouping -> DECIMAL(6,2) 1234.56", lambda I: I["raw"].select(F.expr("try_to_number('1,234.56', '9,999.99')").alias("n")), flags=("spark4",))
+case("parse-004c", "parsing", "try_to_number bogus input with grouping fmt -> NULL", lambda I: I["raw"].select(F.expr("try_to_number('bogus', '9,999.99')").alias("n")), flags=("spark4",))
 case("parse-005", "parsing", "find_in_set", lambda I: I["emp"].select(F.expr("find_in_set('rust', concat_ws(',', tags))").alias("pos")))
 case("parse-006", "parsing", "split_part (1-based field)", lambda I: I["raw"].select(F.expr("split_part(csv_str, ',', 2)").alias("field2")), flags=("spark4",))
 case("parse-007", "parsing", "elt (1-based pick from args)", lambda I: I["emp"].select(F.expr("elt(2, 'a', name, 'c')").alias("picked")))

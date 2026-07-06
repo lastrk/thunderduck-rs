@@ -4183,7 +4183,47 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     ),
                 })?;
             let s = render_expr(&f.args[0], schema)?;
-            return Ok(format!("try_cast({s} AS DECIMAL({precision}, {scale}))"));
+            return Ok(render_to_number_cast(&s, precision, scale, &fmt));
+        }
+        // Spark's `to_number(str, fmt)` mirrors `try_to_number` when parsing
+        // succeeds but ANSI-throws `[INVALID_FORMAT.MISMATCH_INPUT]` on
+        // format mismatch (row-level; Spark 4.1's ToNumberParser). τ
+        // emulates by wrapping `try_cast(str AS DECIMAL(p, s))` in a
+        // CASE guard: NULL input passes through (Spark's `nullSafeEval`),
+        // non-NULL input that fails `try_cast` raises the ANSI class.
+        // Corpus witness: `parse-003`.
+        "to_number" => {
+            if f.args.len() != 2 {
+                bail_boundary_fn!(f.name.clone(), "`to_number` requires exactly 2 arguments");
+            }
+            let fmt = literal_string_arg(&f.args[1]).ok_or_else(|| EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                name: f.name.clone(),
+                reason: "`to_number` requires a string literal for the format argument".to_owned(),
+            })?;
+            let (precision, scale) =
+                parse_number_format(&fmt).ok_or_else(|| EmissionError::Unsupported {
+                    kind: UnsupportedKind::Function,
+                    name: f.name.clone(),
+                    reason: format!(
+                        "`to_number`: unsupported format string `{fmt}` (τ only \
+                         handles `9`/`0`/`.`/`,` digit templates)"
+                    ),
+                })?;
+            let s = render_expr(&f.args[0], schema)?;
+            let cast = render_to_number_cast(&s, precision, scale, &fmt);
+            // IS NOT NULL guard AND error message reference the RAW input `s`
+            // (what the user passed), NOT the grouping-stripped form — so the
+            // reported input matches user-visible text and the guard doesn't
+            // trip on empty-string-after-strip artefacts.
+            let throw = super::spark_errors::SparkError::InvalidFormatMismatch {
+                fmt: fmt.clone(),
+                input_sql: s.clone(),
+            }
+            .throw_expr();
+            return Ok(format!(
+                "CASE WHEN ({s}) IS NOT NULL AND ({cast}) IS NULL THEN {throw} ELSE {cast} END"
+            ));
         }
         // Spark's `url_encode(s)` uses application/x-www-form-urlencoded
         // encoding: spaces become `+`, everything else is `%HH`. DuckDB's
@@ -5676,6 +5716,10 @@ fn parse_number_format(fmt: &str) -> Option<(u8, u8)> {
                 }
             }
             '.' if !seen_dot => seen_dot = true,
+            // Grouping separator (Spark's `G` / `,`): permitted only in the
+            // integer part; contributes no digit slot to precision or scale.
+            // Corpus witness: `parse-003` uses `'9,999.99'`.
+            ',' if !seen_dot => {}
             _ => return None,
         }
     }
@@ -5684,6 +5728,29 @@ fn parse_number_format(fmt: &str) -> Option<(u8, u8)> {
         return None;
     }
     Some((precision_u32 as u8, post as u8))
+}
+
+/// Render the `try_cast(<input> AS DECIMAL(p, s))` payload for the
+/// `to_number` / `try_to_number` emission arms.
+///
+/// When `fmt` carries a grouping separator (`,`), the raw input string is
+/// pre-processed with `replace(<input>, ',', '')` before the cast — DuckDB's
+/// numeric cast does not strip grouping separators, so a legitimately
+/// parseable Spark input like `'1,234.56'` under `'9,999.99'` would otherwise
+/// silently fall to NULL (`try_to_number`) or ANSI-throw
+/// `INVALID_FORMAT.MISMATCH_INPUT` (`to_number`). See ADR-015 (Spark parity
+/// is the only emission target).
+///
+/// The stripping happens **only** in the value fed to `try_cast`; callers
+/// still reference the RAW input in guard predicates and error messages so
+/// the reported input matches what the user passed.
+fn render_to_number_cast(input_sql: &str, precision: u8, scale: u8, fmt: &str) -> String {
+    let cast_input = if fmt.contains(',') {
+        format!("replace({input_sql}, ',', '')")
+    } else {
+        input_sql.to_owned()
+    };
+    format!("try_cast({cast_input} AS DECIMAL({precision}, {scale}))")
 }
 
 /// Escape the characters that carry regex meaning in a DuckDB regex pattern.
@@ -10236,10 +10303,49 @@ mod tests {
         assert_eq!(parse_number_format("999.99"), Some((5, 2)));
         assert_eq!(parse_number_format("9999"), Some((4, 0)));
         assert_eq!(parse_number_format("0.00"), Some((3, 2)));
-        // Grouping / sign markers → None (τ boundary).
-        assert_eq!(parse_number_format("9,999.99"), None);
+        // Grouping separator `,` is accepted in the integer part
+        // (contributes no digit slot). Corpus witness: `parse-003`.
+        assert_eq!(parse_number_format("9,999.99"), Some((6, 2)));
+        // Sign / currency / other markers → None (τ boundary).
         assert_eq!(parse_number_format("S999.99"), None);
         // Empty / all-zero-precision → None.
         assert_eq!(parse_number_format(""), None);
+    }
+
+    /// `to_number(col, '9,999.99')` on non-parseable input emits a
+    /// `CASE WHEN try_cast(...) IS NULL AND input IS NOT NULL THEN error(...)`
+    /// branch carrying the Spark `[INVALID_FORMAT.MISMATCH_INPUT]` class
+    /// token and the format literal `9,999.99`. Corpus witness: `parse-003`.
+    #[test]
+    fn render_to_number_emits_ansi_throw_on_mismatch() {
+        let f = FunctionCall {
+            name: "to_number".to_owned(),
+            args: vec![
+                col_ref_expr("num_str"),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("9,999.99".to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        };
+        let sql = render_function_call(&f, &empty_schema()).expect("render to_number");
+        // The DECIMAL(6, 2) precision/scale derives from the format
+        // `'9,999.99'` (comma is grouping, no digit slot; four `9`s pre-dot
+        // → precision 6, scale 2).
+        assert!(sql.contains("DECIMAL(6, 2)"), "got: {sql}");
+        assert!(sql.contains("try_cast("), "got: {sql}");
+        // ANSI throw branch is emitted with the Spark class + format text.
+        assert!(
+            sql.contains("[INVALID_FORMAT.MISMATCH_INPUT]"),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains("The format is invalid: 9,999.99."),
+            "got: {sql}"
+        );
+        // NULL input pass-through: the guard checks `IS NOT NULL` on the
+        // input before raising, matching Spark's `nullSafeEval` semantics.
+        assert!(sql.contains("IS NOT NULL"), "got: {sql}");
     }
 }

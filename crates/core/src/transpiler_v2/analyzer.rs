@@ -2808,11 +2808,146 @@ fn analyze_pivot(
     })
 }
 
+/// Desugar a `crosstab(col1, col2)` into a conditional-count
+/// [`CommonOp::Aggregate`], the Spark-parity contingency table.
+///
+/// Spark's `StatFunctions.crossTabulate` emits one output row per distinct
+/// `col1` value and one output column per distinct `col2` value, each cell a
+/// COUNT of the (col1, col2) co-occurrences. The `col2` column set is
+/// data-dependent, so τ's pure/synchronous analyzer (INV10 bars it from
+/// `crate::runtime`) cannot discover it — the connect-server discovery pass
+/// runs `SELECT DISTINCT col2` against the live session and hands the values
+/// in via `distinct_col2_values`.
+///
+/// The resulting `Aggregate`:
+/// - `grouping = [ Alias(CASE WHEN col1 IS NULL THEN 'null' ELSE CAST(col1 AS
+///   STRING) END, "{col1}_{col2}") ]` — col0 is named by joining the two column
+///   names with `_`; its value is the string form of col1, with a NULL col1
+///   relabeled to the literal string `"null"` (Spark parity). Nullability
+///   follows col1 (the else branch governs).
+/// - `aggregates = [ Alias(count(CASE WHEN predᵢ THEN 1 END), nameᵢ), … ]`,
+///   one per distinct col2 value `vᵢ`, where `nameᵢ =
+///   literal_to_pivot_column_name(vᵢ)` and `predᵢ = (col2 = vᵢ)` — or `col2 IS
+///   NULL` for the NULL bucket (a NULL is a real bucket, never dropped). The
+///   aggregates are sorted ascending by `nameᵢ` lexicographically as strings,
+///   matching Spark's crosstab column order (e.g. `'10','2','null'`). `count`
+///   is intrinsically non-null and 0-fills empty buckets, so each count column
+///   resolves to `bigint nullable=False`.
+///
+/// The grouping key is intentionally *not* folded into the aggregates, so
+/// `analyze_aggregate` prepends col0 (string, nullability from col1) ahead of
+/// the count columns.
+pub fn crosstab_to_aggregate(
+    input: CommonAst,
+    col1: &str,
+    col2: &str,
+    distinct_col2_values: Vec<Expression>,
+) -> CommonOp {
+    use super::ast::GroupingKind;
+    use super::expression::{BinaryOp, UnaryOp};
+
+    let col_ref = |name: &str| {
+        Expression::UnresolvedColumn(UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: None,
+            plan_id: None,
+        })
+    };
+
+    // col0: WHEN col1 IS NULL THEN 'null' ELSE CAST(col1 AS STRING) END
+    // AS "{col1}_{col2}". Spark's `StatFunctions.crossTabulate` relabels a NULL
+    // col1 row to the literal string "null" (not SQL NULL) in the contingency
+    // table. The else branch (`CAST(col1 AS STRING)`) governs nullability, so
+    // col0's nullability still follows col1.
+    let grouping = vec![Expression::Alias(AliasExpression {
+        expr: Box::new(Expression::CaseWhen(CaseWhenExpression {
+            branches: vec![(
+                Expression::Unary(UnaryExpression {
+                    op: UnaryOp::IsNull,
+                    operand: Box::new(col_ref(col1)),
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("null".to_owned()),
+                    data_type: DataType::String,
+                }),
+            )],
+            else_expr: Some(Box::new(Expression::Cast(CastExpression {
+                expr: Box::new(col_ref(col1)),
+                to_type: DataType::String,
+                try_cast: false,
+            }))),
+        })),
+        alias: format!("{col1}_{col2}"),
+    })];
+
+    // One conditional-count column per distinct col2 value.
+    let mut counts: Vec<(String, Expression)> = distinct_col2_values
+        .into_iter()
+        .map(|v| {
+            let name = literal_to_pivot_column_name(&v);
+            let is_null = matches!(
+                &v,
+                Expression::Literal(Literal {
+                    value: LiteralValue::Null,
+                    ..
+                })
+            );
+            let pred = if is_null {
+                Expression::Unary(UnaryExpression {
+                    op: UnaryOp::IsNull,
+                    operand: Box::new(col_ref(col2)),
+                })
+            } else {
+                Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Eq,
+                    left: Box::new(col_ref(col2)),
+                    right: Box::new(v),
+                })
+            };
+            let count = Expression::FunctionCall(FunctionCall {
+                name: "count".to_owned(),
+                args: vec![Expression::CaseWhen(CaseWhenExpression {
+                    branches: vec![(
+                        pred,
+                        Expression::Literal(Literal {
+                            value: LiteralValue::Int(1),
+                            data_type: DataType::Integer,
+                        }),
+                    )],
+                    else_expr: None,
+                })],
+                distinct: false,
+            });
+            (name, count)
+        })
+        .collect();
+    // Spark sorts crosstab count columns by the string form of the value
+    // (lexicographic, not numeric — e.g. '10','2','null').
+    counts.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let aggregates = counts
+        .into_iter()
+        .map(|(name, count)| {
+            Expression::Alias(AliasExpression {
+                expr: Box::new(count),
+                alias: name,
+            })
+        })
+        .collect();
+
+    CommonOp::Aggregate {
+        input: Box::new(input),
+        grouping,
+        aggregates,
+        grouping_kind: GroupingKind::GroupBy,
+    }
+}
+
 /// Spark's rendering of a pivot value literal to a column name. Boolean
 /// `true`/`false` render as `"true"`/`"false"`; integers as their decimal
 /// repr; strings verbatim. Non-literal expressions (should not happen —
 /// PySpark only sends literals) fall back to [`expression_output_name`].
-fn literal_to_pivot_column_name(expr: &Expression) -> String {
+pub(crate) fn literal_to_pivot_column_name(expr: &Expression) -> String {
     use super::expression::LiteralValue;
     if let Expression::Literal(lit) = expr {
         return match &lit.value {
@@ -5098,6 +5233,63 @@ mod tests {
             other => panic!("expected PuntedOperator, got {other:?}"),
         }
         assert!(err.to_string().starts_with("[TDCK-BOUNDARY]"));
+    }
+
+    /// The `crosstab(col1, col2)` desugar (`crosstab_to_aggregate`) produces
+    /// the Spark-parity contingency-table schema: col0 = `CAST(col1 AS STRING)`
+    /// named `{col1}_{col2}` (nullability from col1), then one `bigint`
+    /// non-null count column per distinct col2 value, named by the value's
+    /// string form and sorted lexicographically ascending as strings. Mirrors
+    /// misc-006 (`crosstab(dept_id, active)`).
+    #[test]
+    fn crosstab_desugar_produces_spark_parity_contingency_schema() {
+        let ct_schema = StructType::new(vec![
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("active", DataType::Boolean),
+        ]);
+        let scan = CommonAst::new(CommonOp::TableScan {
+            table: "ct".to_owned(),
+            alias: None,
+        });
+        let bt = BaseTypes::build_from_plan(&scan, |name| match name {
+            "ct" => Some(ct_schema.clone()),
+            _ => None,
+        });
+
+        // Hand the distinct values in "unsorted" (true before false) to prove
+        // the desugar re-sorts by the value's string form ('false' < 'true').
+        let bool_lit = |b: bool| {
+            Expression::Literal(Literal {
+                value: LiteralValue::Boolean(b),
+                data_type: DataType::Boolean,
+            })
+        };
+        let op = crosstab_to_aggregate(
+            scan,
+            "dept_id",
+            "active",
+            vec![bool_lit(true), bool_lit(false)],
+        );
+        let typed = analyze(CommonAst::new(op), &bt).unwrap();
+
+        let fields = &typed.resolved_schema.fields;
+        assert_eq!(fields.len(), 3, "col0 + one count col per distinct value");
+
+        assert_eq!(fields[0].name, "dept_id_active");
+        assert_eq!(fields[0].data_type, DataType::String);
+        assert!(
+            fields[0].nullable,
+            "col0 nullability follows col1 (dept_id)"
+        );
+
+        // Lexicographic string sort: 'false' before 'true'.
+        assert_eq!(fields[1].name, "false");
+        assert_eq!(fields[1].data_type, DataType::Long);
+        assert!(!fields[1].nullable, "count columns are bigint non-null");
+
+        assert_eq!(fields[2].name, "true");
+        assert_eq!(fields[2].data_type, DataType::Long);
+        assert!(!fields[2].nullable, "count columns are bigint non-null");
     }
 
     // ── Sample / SampleBy analysis (Pass 83) ─────────────────────────────

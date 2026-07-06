@@ -219,6 +219,34 @@ async fn resolve_implicit_pivots(
             *pivot_values = discover_pivot_values(input, pivot_column, session).await?;
         }
     }
+
+    // If THIS node is a crosstab, discover col2's distinct buckets from the
+    // live session and desugar it into a conditional-count `Aggregate` — the
+    // mirror image of the implicit-pivot rewrite above (col2's DISTINCT values
+    // are data-dependent, unknowable at plan time, so τ's pure analyzer punts
+    // and this async pass resolves it). See `analyzer::crosstab_to_aggregate`.
+    if matches!(ast.op, CommonOp::Crosstab { .. }) {
+        let op = std::mem::replace(&mut ast.op, CommonOp::SingleRow);
+        let CommonOp::Crosstab { input, col1, col2 } = op else {
+            unreachable!("guarded by the matches! above");
+        };
+        // Reuse the pivot discovery query (`SELECT DISTINCT col2 ... ORDER BY 1
+        // ASC NULLS FIRST`); no NULL-filtering — a NULL is a real bucket.
+        let col2_expr = thunderduck_core::transpiler_v2::Expression::UnresolvedColumn(
+            thunderduck_core::transpiler_v2::expression::UnresolvedColumn {
+                name: col2.clone(),
+                qualifier: None,
+                plan_id: None,
+            },
+        );
+        let distinct_values = discover_pivot_values(&input, &col2_expr, session).await?;
+        ast.op = thunderduck_core::transpiler_v2::analyzer::crosstab_to_aggregate(
+            *input,
+            &col1,
+            &col2,
+            distinct_values,
+        );
+    }
     Ok(())
 }
 
@@ -1370,6 +1398,91 @@ mod tests {
         };
         assert_eq!(as_str(&discovered[1]), "a");
         assert_eq!(as_str(&discovered[2]), "b");
+    }
+
+    /// End-to-end reproducer for misc-006 (`crosstab(col1, col2)`): the
+    /// discovery pass desugars a `Crosstab` into a conditional-count
+    /// `Aggregate` whose resolved schema is Spark's contingency table — col0 =
+    /// `CAST(col1 AS STRING)` named `{col1}_{col2}` (nullable), then one
+    /// `bigint` non-null count column per distinct col2 value, named by the
+    /// value's string form and sorted lexicographically. The emitted SQL must
+    /// also execute cleanly against DuckDB. Before the fix this punted with
+    /// `Crosstab[dynamic-values]` at τ's analyzer boundary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_implicit_pivots_desugars_crosstab_end_to_end() {
+        use thunderduck_core::transpiler_v2::ast::CommonOp;
+        use thunderduck_core::transpiler_v2::expression::{Expression, Literal, LiteralValue};
+
+        fn int_lit(v: i32) -> Expression {
+            Expression::Literal(Literal {
+                value: LiteralValue::Int(v),
+                data_type: DataType::Integer,
+            })
+        }
+        fn bool_lit(b: bool) -> Expression {
+            Expression::Literal(Literal {
+                value: LiteralValue::Boolean(b),
+                data_type: DataType::Boolean,
+            })
+        }
+
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
+            thunderduck_core::runtime::StreamingConfig::default(),
+        ));
+        let session = session_manager
+            .get_or_create("crosstab-desugar-session")
+            .await
+            .expect("session must be created");
+
+        // Inline data: dept_id ∈ {10, 20}, active ∈ {true, false}.
+        let values = CommonAst::new(CommonOp::Values {
+            rows: vec![
+                vec![int_lit(10), bool_lit(true)],
+                vec![int_lit(10), bool_lit(false)],
+                vec![int_lit(20), bool_lit(true)],
+                vec![int_lit(20), bool_lit(true)],
+            ],
+            column_names: vec!["dept_id".to_owned(), "active".to_owned()],
+        });
+        let mut ast = CommonAst::new(CommonOp::Crosstab {
+            input: Box::new(values),
+            col1: "dept_id".to_owned(),
+            col2: "active".to_owned(),
+        });
+
+        resolve_implicit_pivots(&mut ast, &session)
+            .await
+            .expect("crosstab desugar must succeed");
+        // The Crosstab node is replaced by the conditional-count Aggregate.
+        assert!(
+            matches!(ast.op, CommonOp::Aggregate { .. }),
+            "crosstab must desugar into an Aggregate; got {:?}",
+            ast.op
+        );
+
+        let (sql, schema) = finalize(&ast).expect("desugared crosstab must emit SQL");
+
+        // Spark-parity contingency schema: col0 + one count col per distinct
+        // col2 value, sorted lexicographically ('false' < 'true').
+        assert_eq!(schema.fields.len(), 3);
+        assert_eq!(schema.fields[0].name, "dept_id_active");
+        assert_eq!(schema.fields[0].data_type, DataType::String);
+        // col0 nullability follows col1: the inline `dept_id` literals are
+        // non-null, so col0 is non-null here (the analyzer unit test covers the
+        // nullable-source case that matches misc-006's `emp.dept_id`).
+        assert!(!schema.fields[0].nullable);
+        assert_eq!(schema.fields[1].name, "false");
+        assert_eq!(schema.fields[1].data_type, DataType::Long);
+        assert!(!schema.fields[1].nullable);
+        assert_eq!(schema.fields[2].name, "true");
+        assert_eq!(schema.fields[2].data_type, DataType::Long);
+        assert!(!schema.fields[2].nullable);
+
+        // The emitted SQL must run against DuckDB without error.
+        session
+            .execute(&sql)
+            .await
+            .expect("desugared crosstab SQL must execute in DuckDB");
     }
 
     /// Companion test: schemas without unresolved must pass the guard

@@ -225,6 +225,20 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   list" if you extend this (an empty input relation currently re-punts, because
   a genuinely empty discovered `Vec` is indistinguishable from unresolved).
 
+- **A `schema_only` corpus flag can hide a value bug in an op whose schema is
+  identical but whose cell values diverge from Spark.** Realizing the crosstab
+  desugar (misc-006, 2026-07-06) via the pivot session-hook above, the first cut
+  built col0 as bare `Alias(Cast(col1 → String), "{col1}_{col2}")`. Its *schema*
+  (string, nullability-from-col1) matched Spark exactly, so misc-006's
+  `schema_only` gate was green — but Spark's `StatFunctions.crossTabulate` builds
+  col0 as `when(isnull(col1), "null").otherwise(col(col1).cast("string"))`, so a
+  NULL col1 row (the misc-006 fixture has one: "Eve") is relabeled to the literal
+  string `"null"`, not SQL `NULL`. The review caught it against Spark 4.1.1
+  source, not the gate. Lesson: when a fix rides an existing pass, re-derive the
+  target op's *value* semantics from Spark source, not just its schema; a
+  `schema_only`-flagged case proves nothing about cells. The CaseWhen relabel is
+  nullability-neutral (the else branch governs), so the schema stayed correct.
+
 ## Progress-signal calibration
 
 - **Per-slice progress-signal estimates are lagging indicators; recalibrate after each slice

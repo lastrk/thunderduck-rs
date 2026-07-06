@@ -1425,6 +1425,12 @@ impl Expression {
                 f.args.get(1).is_none_or(|a| a.nullable(schema))
                     || f.args.get(2).is_none_or(|a| a.nullable(schema))
             }
+            // Spark's `If.nullable = trueValue.nullable || falseValue.nullable`
+            // — the predicate (args[0]) is excluded. Corpus witness: cnd-009.
+            "if" => {
+                f.args.get(1).is_none_or(|a| a.nullable(schema))
+                    || f.args.get(2).is_none_or(|a| a.nullable(schema))
+            }
             "array" | "make_array" | "create_map" | "map" | "named_struct" | "struct" => false,
             // `F.window(ts, dur)` — Spark's `TimeWindow` is rewritten by the
             // analyzer into `CreateNamedStruct(start := ..., end := ...)`
@@ -1862,6 +1868,62 @@ mod tests {
             distinct: false,
         });
         assert!(!expr.nullable(&s));
+    }
+
+    /// Spark `If.nullable` excludes the predicate — a nullable predicate with
+    /// two non-null branches is non-nullable. Corpus witness: cnd-009.
+    #[test]
+    fn if_with_nullable_predicate_and_non_null_branches_is_non_nullable() {
+        let s = StructType::new(vec![StructField::nullable("salary", DataType::Long)]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "if".to_owned(),
+            args: vec![
+                // nullable predicate (references a nullable column)
+                Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Gt,
+                    left: Box::new(ColumnReference::untyped("salary")),
+                    right: Box::new(Expression::Literal(Literal {
+                        value: LiteralValue::Long(100_000),
+                        data_type: DataType::Long,
+                    })),
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("high".to_owned()),
+                    data_type: DataType::String,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("low".to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        });
+        assert!(!expr.nullable(&s));
+    }
+
+    /// `if` with a nullable true-branch is nullable regardless of predicate.
+    #[test]
+    fn if_with_nullable_true_branch_is_nullable() {
+        let s = StructType::new(vec![StructField::nullable("v", DataType::String)]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "if".to_owned(),
+            args: vec![
+                // non-null predicate
+                Expression::Literal(Literal {
+                    value: LiteralValue::Boolean(true),
+                    data_type: DataType::Boolean,
+                }),
+                // nullable true-branch
+                ColumnReference::untyped("v"),
+                // non-null false-branch
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("low".to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        });
+        assert!(expr.nullable(&s));
     }
 
     // ── Complex-type constructor inference (cx-001 / cx-002) ───────────────

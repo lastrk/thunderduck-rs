@@ -1152,17 +1152,31 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
         }
         Expr::Function(f) => lower_function(f, cte_scope),
         Expr::Case {
+            operand,
             conditions,
             else_result,
             ..
         } => {
+            // Simple CASE (`CASE e WHEN vᵢ THEN rᵢ ... ELSE rd`): Spark's
+            // `AstBuilder.visitSimpleCase` rewrites each branch condition to
+            // `EqualTo(e, vᵢ)` — a null-UNSAFE `=`, so a NULL operand yields
+            // NULL comparisons and falls through to ELSE. Lower `e` once and
+            // reuse it (Expression is Clone) across the branches. Searched
+            // CASE (`operand: None`) keeps its raw predicate conditions.
+            let operand_expr = operand.map(|op| lower_expr(*op, cte_scope)).transpose()?;
             let branches = conditions
                 .into_iter()
                 .map(|c| {
-                    Ok((
-                        lower_expr(c.condition, cte_scope)?,
-                        lower_expr(c.result, cte_scope)?,
-                    ))
+                    let cond = lower_expr(c.condition, cte_scope)?;
+                    let cond = match &operand_expr {
+                        Some(op_expr) => Expression::Binary(BinaryExpression {
+                            op: BinaryOp::Eq,
+                            left: Box::new(op_expr.clone()),
+                            right: Box::new(cond),
+                        }),
+                        None => cond,
+                    };
+                    Ok((cond, lower_expr(c.result, cte_scope)?))
                 })
                 .collect::<Result<Vec<_>, EmissionError>>()?;
             let else_expr = else_result
@@ -4088,6 +4102,58 @@ mod tests {
                 assert_eq!(c.name, "geo.lat");
             }
             other => panic!("expected UnresolvedColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_simple_case_wraps_branch_condition_in_eq_of_operand() {
+        // `CASE x WHEN 10 THEN 'a' ELSE 'b' END` — Spark rewrites each branch
+        // condition to `EqualTo(x, 10)`.
+        let plan = parse("SELECT CASE x WHEN 10 THEN 'a' ELSE 'b' END FROM t")
+            .expect("should parse+lower");
+        match first_projection(plan) {
+            Expression::CaseWhen(cw) => {
+                let (cond, _) = &cw.branches[0];
+                match cond {
+                    Expression::Binary(b) => {
+                        assert_eq!(b.op, BinaryOp::Eq);
+                        assert!(
+                            matches!(b.left.as_ref(), Expression::UnresolvedColumn(c) if c.name == "x"),
+                            "left of Eq should be the CASE operand `x`, got {:?}",
+                            b.left
+                        );
+                        assert!(
+                            matches!(b.right.as_ref(), Expression::Literal(_)),
+                            "right of Eq should be the branch value literal, got {:?}",
+                            b.right
+                        );
+                    }
+                    other => panic!("expected Binary(Eq, ...) branch condition, got {other:?}"),
+                }
+            }
+            other => panic!("expected CaseWhen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_searched_case_keeps_raw_branch_predicate() {
+        // Searched CASE (`operand: None`) — branch condition stays the raw
+        // predicate, not wrapped in an operand Eq.
+        let plan = parse("SELECT CASE WHEN x > 10 THEN 'a' ELSE 'b' END FROM t")
+            .expect("should parse+lower");
+        match first_projection(plan) {
+            Expression::CaseWhen(cw) => {
+                let (cond, _) = &cw.branches[0];
+                match cond {
+                    Expression::Binary(b) => assert_eq!(
+                        b.op,
+                        BinaryOp::Gt,
+                        "searched CASE keeps its raw `>` predicate"
+                    ),
+                    other => panic!("expected raw Binary(Gt, ...) predicate, got {other:?}"),
+                }
+            }
+            other => panic!("expected CaseWhen, got {other:?}"),
         }
     }
 }

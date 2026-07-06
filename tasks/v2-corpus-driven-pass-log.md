@@ -1129,3 +1129,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 607/0 incl inv4, `sql_v2` 220/42/262, `core_v2` 314 no regression).
 - Commit SHA: (this commit).
+
+## Pass 128 — 2026-07-06 — SQL corpus: simple CASE + if() nullability (cnd-002, cnd-009)
+- **Corpus: lowering + nullability (two independent tiny fixes).** cnd-002 (`CASE dept_id WHEN 10 THEN 'infra'...`), cnd-009 (`if(salary>100000,'high','low')`).
+- Root causes (diagnostic returned inline): (cnd-002) the `Expr::Case` lowering arm matched `{conditions, else_result, ..}` — the `..` DROPPED the simple-CASE `operand`, so `CASE dept_id WHEN 10` became `CASE WHEN 10` (10 coerces truthy → always first branch → `infra` everywhere). (cnd-009) `if` had no arm in `function_call_nullable` → default any-arg-nullable counted the nullable predicate; Spark `If.nullable = trueVal.nullable || falseVal.nullable` (predicate excluded). Type/value/emission already correct for both.
+- Architecture (architecture-pass-128.md): (cnd-002) bind `operand`; Some → lower once + wrap each branch condition `Binary(Eq, op, v)` (Spark visitSimpleCase, null-unsafe `=` → NULL operand falls to ELSE), None → searched-CASE unchanged. (cnd-009) add `if` arm mirroring nvl2 (args[1]||args[2] nullable, predicate excluded).
+- Layer(s) touched: parser_v2/v2_lowering.rs (Expr::Case), transpiler_v2/expression.rs (function_call_nullable). No AST/emission change.
+- ADR citations: ADR-015/016 (Spark parity — visitSimpleCase EqualTo rewrite, If.nullable rule).
+- Corpus signal: 220 → **222** (+2). cnd-002/009 GREEN. cnd-001 searched-CASE regression guard green. core_v2 held at 314. No regressions.
+- Files: 2. Tests added: 4 (lowering: simple CASE → branch cond Binary(Eq); searched CASE unchanged; expression: if nullable-predicate+non-null-branches → false, nullable-true-branch → true).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED — simple-CASE reuses the analyzer's Eq path for free coercion/ANSI parity; if mirrors proven nvl2). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED — per-branch op_expr.clone bounded/once-per-query/semantically-required).
+- Findings queued as follow-up (2 review Lows for next sweep): (a) type_inference.rs:729 stale `if`→first_arg_type (Boolean predicate; not on stamping path so harmless, but misleading); (b) adjacent `iif` (Spark If alias) uses all(nullable) incl. predicate — should exclude like the new `if` arm (not in corpus).
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 611/0, `sql_v2` 222/40/262, `core_v2` 314 no regression).
+- Commit SHA: (this commit).

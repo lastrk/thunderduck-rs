@@ -21,14 +21,15 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{
-    BinaryOperator, CastKind, CeilFloorKind, DataType as SqlDataType, DateTimeField, Distinct,
-    DuplicateTreatment, ExactNumberInfo, Expr, ExprWithAlias, Function, FunctionArg,
+    AccessExpr, BinaryOperator, CastKind, CeilFloorKind, DataType as SqlDataType, DateTimeField,
+    Distinct, DuplicateTreatment, ExactNumberInfo, Expr, ExprWithAlias, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Interval,
     JoinConstraint, JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr,
     NullInclusion, ObjectName, ObjectNamePart, OrderByExpr, OrderByKind, OrderByOptions,
     PivotValueSource, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
-    TableFactor, TableWithJoins, TrimWhereField, TypedString, UnaryOperator, Value, ValueWithSpan,
-    WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
+    Subscript, TableFactor, TableWithJoins, TrimWhereField, TypedString, UnaryOperator, Value,
+    ValueWithSpan, WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec,
+    WindowType,
 };
 
 use crate::bail_boundary_proto;
@@ -38,8 +39,8 @@ use crate::transpiler_v2::ast::{
 use crate::transpiler_v2::error::UnsupportedKind;
 use crate::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
-    ExistsSubquery, Expression, FrameBoundary, FrameUnit, FunctionCall, InListExpression,
-    InSubquery, IntervalExpression, IsDistinctFromExpression, LambdaExpression,
+    ExistsSubquery, Expression, ExtractValueExpression, FrameBoundary, FrameUnit, FunctionCall,
+    InListExpression, InSubquery, IntervalExpression, IsDistinctFromExpression, LambdaExpression,
     LambdaVariableExpression, LikeExpression, Literal, LiteralValue, NullOrdering, ScalarSubquery,
     SortDirection, SortOrder, StarExpression, SubqueryPlan, UnaryExpression, UnaryOp,
     UnresolvedColumn, WindowFrame, WindowFunction,
@@ -1061,14 +1062,19 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             plan_id: None,
         })),
         Expr::CompoundIdentifier(parts) => {
+            // Lower a dotted reference as first-part qualifier / dotted
+            // remainder — mirroring the Spark Connect converter's `splitn(2,'.')`
+            // shape the analyzer's nested-struct rewrite (analyzer.rs
+            // `try_rewrite_nested_struct_path`) is written for. A 3-part struct
+            // path `address.geo.lat` becomes `UnresolvedColumn{qualifier:
+            // "address", name:"geo.lat"}` so the analyzer can walk the struct;
+            // 2-part refs `t.c` are byte-identical to before (parts[0] qualifier,
+            // parts[1] name). Corpus witness: cx-004.
             let values: Vec<String> = parts.iter().map(|i| i.value.clone()).collect();
-            let (qualifier, name) = if values.len() >= 2 {
-                (
-                    Some(values[values.len() - 2].clone()),
-                    values[values.len() - 1].clone(),
-                )
-            } else {
-                (None, values.into_iter().last().unwrap_or_default())
+            let (qualifier, name) = match values.len() {
+                0 => (None, String::new()),
+                1 => (None, values.into_iter().next().unwrap_or_default()),
+                _ => (Some(values[0].clone()), values[1..].join(".")),
             };
             Ok(Expression::UnresolvedColumn(UnresolvedColumn {
                 name,
@@ -1482,6 +1488,36 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
         // num-002, num-003.
         Expr::Ceil { expr, field } => lower_ceil_floor("ceil", *expr, field, cte_scope),
         Expr::Floor { expr, field } => lower_ceil_floor("floor", *expr, field, cte_scope),
+        // Bracket-chain field access: `array(1,2,3)[0]`, `map('a',1)['a']`.
+        // sqlparser parses these as `CompoundFieldAccess{root, access_chain}`.
+        // Fold each subscript into a nested `ExtractValue`; the analyzer resolves
+        // the extraction type from the child (array elem / map value / struct
+        // field) and emission dispatches on that child type. Only bracket
+        // `Subscript::Index` lands live (int index or string key — cx-001/cx-002);
+        // dot-in-bracket and slices are honest Thunderduck boundaries.
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            let mut expr = lower_expr(*root, cte_scope)?;
+            for acc in access_chain {
+                let extraction = match acc {
+                    AccessExpr::Subscript(Subscript::Index { index }) => {
+                        lower_expr(index, cte_scope)?
+                    }
+                    AccessExpr::Dot(_) => bail_boundary_proto!(
+                        "sql::field_access::dot",
+                        "dot-in-bracket-chain field access not supported in τ"
+                    ),
+                    AccessExpr::Subscript(Subscript::Slice { .. }) => bail_boundary_proto!(
+                        "sql::field_access::slice",
+                        "array slice not supported in τ"
+                    ),
+                };
+                expr = Expression::ExtractValue(ExtractValueExpression {
+                    child: Box::new(expr),
+                    extraction: Box::new(extraction),
+                });
+            }
+            Ok(expr)
+        }
         other => bail_boundary_proto!(
             format!("sql::expr::{}", expr_kind(&other)),
             "expression shape not supported in τ"
@@ -4004,6 +4040,54 @@ mod tests {
                 }
             }
             other => panic!("expected Unary NOT, got {other:?}"),
+        }
+    }
+
+    // ── Complex-type bracket access + nested struct paths (cx-001/002/004) ──
+
+    #[test]
+    fn lower_array_index_builds_extract_value_over_array() {
+        let plan = parse("SELECT array(1,2,3)[0]").expect("should parse+lower");
+        match first_projection(plan) {
+            Expression::ExtractValue(ev) => {
+                match ev.child.as_ref() {
+                    Expression::FunctionCall(f) => assert_eq!(f.name, "array"),
+                    other => panic!("expected array FunctionCall child, got {other:?}"),
+                }
+                match ev.extraction.as_ref() {
+                    Expression::Literal(l) => {
+                        assert!(matches!(l.value, LiteralValue::Int(0)));
+                    }
+                    other => panic!("expected Int(0) extraction, got {other:?}"),
+                }
+            }
+            other => panic!("expected ExtractValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_map_key_builds_extract_value_with_string_key() {
+        let plan = parse("SELECT map('a',1)['a']").expect("should parse+lower");
+        match first_projection(plan) {
+            Expression::ExtractValue(ev) => match ev.extraction.as_ref() {
+                Expression::Literal(l) => {
+                    assert!(matches!(&l.value, LiteralValue::String(s) if s == "a"));
+                }
+                other => panic!("expected String(\"a\") extraction, got {other:?}"),
+            },
+            other => panic!("expected ExtractValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_three_part_path_keeps_first_as_qualifier_and_dotted_remainder() {
+        let plan = parse("SELECT address.geo.lat FROM emp").expect("should parse+lower");
+        match first_projection(plan) {
+            Expression::UnresolvedColumn(c) => {
+                assert_eq!(c.qualifier.as_deref(), Some("address"));
+                assert_eq!(c.name, "geo.lat");
+            }
+            other => panic!("expected UnresolvedColumn, got {other:?}"),
         }
     }
 }

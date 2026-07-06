@@ -1832,28 +1832,61 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
         }
         Expression::ExtractValue(ev) => {
             let child_sql = render_expr(&ev.child, schema)?;
-            // Extraction shape distinguishes struct-field-name (String
-            // literal) vs array-index (Int literal) vs map-key (any
-            // literal). DuckDB uses `.field` for struct, `[expr]` for
-            // both array and map — the latter is a runtime-typed subscript.
-            match ev.extraction.as_ref() {
-                Expression::Literal(l) => match &l.value {
-                    crate::transpiler_v2::expression::LiteralValue::String(name) => {
-                        // Struct field access. DuckDB accepts `child.field`
-                        // when child's static type is struct.
-                        let field = quote_ident(name);
-                        Ok(format!("({child_sql}).{field}"))
-                    }
-                    _ => {
-                        // Numeric index or other literal: emit `[expr]`.
-                        let idx = render_expr(&ev.extraction, schema)?;
-                        Ok(format!("({child_sql})[{idx}]"))
-                    }
-                },
-                _ => {
-                    // Dynamic key/index — same subscript form.
+            // Dispatch on the CHILD's static type, mirroring
+            // `extract_value_data_type` (expression.rs) — Struct→field,
+            // Array→element, Map→value. Keying on the extraction literal shape
+            // alone (the prior behavior) mis-emitted a map string key as struct
+            // dot access. Corpus witnesses: cx-001 (array), cx-002 (map),
+            // struct-003 / json-004 (struct).
+            match ev.child.data_type(schema) {
+                DataType::Struct(_) => extract_struct_field(&child_sql, &ev.extraction, schema),
+                DataType::Array(_, _) => {
+                    // Spark GetArrayItem `arr[i]`: 0-indexed. In ANSI mode
+                    // (ADR-016) `GetArrayItem` sets `failOnError = true` and
+                    // THROWS `[INVALID_ARRAY_INDEX]` when `i < 0` or
+                    // `i >= numElements` — it does NOT return NULL (that is the
+                    // non-ANSI behavior). This is a DISTINCT class from
+                    // `element_at`'s `INVALID_ARRAY_INDEX_IN_ELEMENT_AT`. A NULL
+                    // array short-circuits to NULL (Spark `nullSafeEval`).
+                    // DuckDB `list_extract` is 1-based, so shift the in-bounds
+                    // index by +1. Corpus witness: cx-001 (`[0]`, in-bounds,
+                    // stays green).
                     let idx = render_expr(&ev.extraction, schema)?;
-                    Ok(format!("({child_sql})[{idx}]"))
+                    let err = super::spark_errors::SparkError::InvalidArrayIndexSubscript {
+                        idx_sql: idx.clone(),
+                        arr_sql: child_sql.clone(),
+                    }
+                    .throw_expr();
+                    Ok(format!(
+                        "CASE WHEN ({child_sql}) IS NULL THEN NULL \
+                         WHEN ({idx}) < 0 OR ({idx}) >= len(({child_sql})) THEN {err} \
+                         ELSE list_extract(({child_sql}), ({idx}) + 1) END"
+                    ))
+                }
+                DataType::Map { .. } => {
+                    // Spark GetMapValue `map[k]`: value or NULL on miss, never
+                    // throws. DuckDB `element_at(map, key)` returns a 1-element
+                    // list; `[1]` unwraps it to the scalar value (NULL on miss).
+                    let key = render_expr(&ev.extraction, schema)?;
+                    Ok(format!("element_at(({child_sql}), ({key}))[1]"))
+                }
+                _ => {
+                    // Unresolved child: keep the extraction-shape heuristic
+                    // (String literal → struct `.field`; else → `[expr]`).
+                    match ev.extraction.as_ref() {
+                        Expression::Literal(l)
+                            if matches!(
+                                &l.value,
+                                crate::transpiler_v2::expression::LiteralValue::String(_)
+                            ) =>
+                        {
+                            extract_struct_field(&child_sql, &ev.extraction, schema)
+                        }
+                        _ => {
+                            let idx = render_expr(&ev.extraction, schema)?;
+                            Ok(format!("({child_sql})[{idx}]"))
+                        }
+                    }
                 }
             }
         }
@@ -1862,6 +1895,33 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
             "complex-type emission (not implemented in τ)",
         ),
         Expression::UpdateFields(u) => render_update_fields(u, schema),
+    }
+}
+
+/// Emit a struct field access for an [`Expression::ExtractValue`] whose child
+/// is (statically or heuristically) a struct. A `String`-literal extraction is
+/// a field name → `(child).field`; any other extraction falls back to a
+/// runtime-typed `(child)[expr]` subscript.
+fn extract_struct_field(
+    child_sql: &str,
+    extraction: &Expression,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
+    match extraction {
+        Expression::Literal(l) => match &l.value {
+            crate::transpiler_v2::expression::LiteralValue::String(name) => {
+                let field = quote_ident(name);
+                Ok(format!("({child_sql}).{field}"))
+            }
+            _ => {
+                let idx = render_expr(extraction, schema)?;
+                Ok(format!("({child_sql})[{idx}]"))
+            }
+        },
+        _ => {
+            let idx = render_expr(extraction, schema)?;
+            Ok(format!("({child_sql})[{idx}]"))
+        }
     }
 }
 
@@ -3171,9 +3231,12 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `zip_with(a, b, (x, y) -> f)` — DuckDB has no direct
         // equivalent (`list_zip` in DuckDB is `arrays_zip`-style struct
         // packing, not a HOF). Emulate by index iteration:
-        //   list_transform(range(1, least(len(a), len(b)) + 1),
+        //   list_transform(range(0, least(len(a), len(b))),
         //                  i -> f_body[x → a[i], y → b[i]])
-        // DuckDB lists are 1-indexed. Corpus: `hof-006`.
+        // `a[i]` / `b[i]` are built as `ExtractValue` over array children, whose
+        // emission implements Spark's 0-based GetArrayItem (index+1 into DuckDB's
+        // 1-based `list_extract`, guarded). The iteration therefore ranges over
+        // 0-based indices `0..least(len(a), len(b))`. Corpus: `hof-006`.
         "zip_with" if f.args.len() == 3 => {
             let a_sql = render_expr(&f.args[0], schema)?;
             let b_sql = render_expr(&f.args[1], schema)?;
@@ -3209,7 +3272,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let final_body = substitute_lambda_var(&step1, &lam.params[1], &b_at_i);
             let body_sql = render_expr(&final_body, schema)?;
             return Ok(format!(
-                "list_transform(range(1, least(len({a_sql}), len({b_sql})) + 1), {idx_var} -> {body_sql})"
+                "list_transform(range(0, least(len({a_sql}), len({b_sql}))), {idx_var} -> {body_sql})"
             ));
         }
         // Spark's `map_filter(m, (k, v) -> pred)` — DuckDB has no
@@ -5825,9 +5888,10 @@ mod tests {
     use crate::transpiler_v2::base_types::BaseTypes;
     use crate::transpiler_v2::expression::{
         AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
-        CastExpression, ColumnReference, FunctionCall, InListExpression, IntervalExpression,
-        LambdaExpression, LambdaVariableExpression, LikeExpression, Literal, LiteralValue,
-        MapLiteralExpression, StarExpression, UnaryExpression, UnaryOp, UpdateFieldsExpression,
+        CastExpression, ColumnReference, ExtractValueExpression, FunctionCall, InListExpression,
+        IntervalExpression, LambdaExpression, LambdaVariableExpression, LikeExpression, Literal,
+        LiteralValue, MapLiteralExpression, StarExpression, UnaryExpression, UnaryOp,
+        UpdateFieldsExpression,
     };
     use crate::transpiler_v2::{analyze, generate};
 
@@ -6978,6 +7042,105 @@ mod tests {
             }
             other => panic!("expected UnsupportedExpression, got {other:?}"),
         }
+    }
+
+    // ── ExtractValue emission dispatches on child data_type (cx-001/002) ──
+
+    fn col_with_type(name: &str, dt: DataType) -> Expression {
+        Expression::ColumnReference(ColumnReference {
+            name: name.to_owned(),
+            qualifier: None,
+            data_type: Some(dt),
+            nullable: Some(true),
+        })
+    }
+
+    fn string_lit(s: &str) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::String(s.to_owned()),
+            data_type: DataType::String,
+        })
+    }
+
+    fn extract_value(child: Expression, extraction: Expression) -> Expression {
+        Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(child),
+            extraction: Box::new(extraction),
+        })
+    }
+
+    #[test]
+    fn extract_value_over_struct_child_emits_dot_field() {
+        // Regression: struct getField stays on the `.field` path.
+        let child = col_with_type(
+            "address",
+            DataType::Struct(StructType::new(vec![StructField::nullable(
+                "city",
+                DataType::String,
+            )])),
+        );
+        let ev = extract_value(child, string_lit("city"));
+        let sql = render_expr(&ev, &empty_schema()).unwrap();
+        assert_eq!(sql, "(address).city");
+    }
+
+    #[test]
+    fn extract_value_over_array_child_emits_ansi_throwing_list_extract() {
+        // Spark `arr[0]` (0-indexed, ANSI): in-bounds returns the element via
+        // DuckDB list_extract(.., idx+1); OOB/negative THROWS
+        // `[INVALID_ARRAY_INDEX]` (GetArrayItem failOnError=true), NOT NULL.
+        // A NULL array short-circuits to NULL.
+        let child = col_with_type("arr", DataType::Array(Box::new(DataType::Integer), false));
+        let ev = extract_value(child, int_lit(0));
+        let sql = render_expr(&ev, &empty_schema()).unwrap();
+        assert_eq!(
+            sql,
+            "CASE WHEN (arr) IS NULL THEN NULL \
+             WHEN (0) < 0 OR (0) >= len((arr)) THEN \
+             error('[INVALID_ARRAY_INDEX] The index ' || (0)::VARCHAR \
+             || ' is out of bounds. The array has ' || len((arr))::VARCHAR \
+             || ' elements. Use the SQL function `get()` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003') \
+             ELSE list_extract((arr), (0) + 1) END"
+        );
+    }
+
+    #[test]
+    fn extract_value_over_array_child_throws_on_negative_and_oob() {
+        // The OOB/negative branch must THROW `[INVALID_ARRAY_INDEX]` (never
+        // NULL) — distinct from element_at's `_IN_ELEMENT_AT` class — while the
+        // in-bounds ELSE branch still returns the element.
+        let child = col_with_type("arr", DataType::Array(Box::new(DataType::Integer), false));
+        let ev = extract_value(child, int_lit(-1));
+        let sql = render_expr(&ev, &empty_schema()).unwrap();
+        assert!(
+            sql.contains("error('[INVALID_ARRAY_INDEX] The index '"),
+            "missing INVALID_ARRAY_INDEX throw: {sql}"
+        );
+        assert!(
+            !sql.contains("INVALID_ARRAY_INDEX_IN_ELEMENT_AT"),
+            "must NOT use the element_at class: {sql}"
+        );
+        assert!(sql.contains("(-1) < 0"), "missing negative guard: {sql}");
+        assert!(
+            sql.contains("ELSE list_extract((arr), (-1) + 1) END"),
+            "in-bounds branch must still return the element: {sql}"
+        );
+    }
+
+    #[test]
+    fn extract_value_over_map_child_emits_element_at() {
+        // Spark `map[k]` → DuckDB element_at(map, k)[1] (scalar, NULL on miss).
+        let child = col_with_type(
+            "m",
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::Integer),
+                value_nullable: true,
+            },
+        );
+        let ev = extract_value(child, string_lit("a"));
+        let sql = render_expr(&ev, &empty_schema()).unwrap();
+        assert_eq!(sql, "element_at((m), ('a'))[1]");
     }
 
     // ── DUCKDB_RESERVED invariants — required by the binary_search shape
@@ -9023,7 +9186,8 @@ mod tests {
     }
 
     /// τ `zip_with(a, b, (x, y) -> body)` inlines to
-    /// `list_transform(range(1, least(len(a), len(b)) + 1), i -> body_at_i)`.
+    /// `list_transform(range(0, least(len(a), len(b))), i -> body_at_i)`, where
+    /// `a[i]` / `b[i]` render through the 0-based GetArrayItem ExtractValue arm.
     /// Corpus: `hof-006`.
     #[test]
     fn render_zip_with_emits_index_iteration() {
@@ -9056,12 +9220,20 @@ mod tests {
         };
         let sql = render_function_call(&f, &empty_schema()).expect("render zip_with");
         assert!(
-            sql.contains("list_transform(range(1, least("),
+            sql.contains("list_transform(range(0, least("),
             "range shape: {sql}"
         );
         assert!(sql.contains("__zw_i"), "fresh index var used: {sql}");
-        assert!(sql.contains("(tags)[__zw_i]"), "a[i] substitution: {sql}");
-        assert!(sql.contains("(tags2)[__zw_i]"), "b[i] substitution: {sql}");
+        // a[i] / b[i] render through the 0-based GetArrayItem ExtractValue arm:
+        // guarded `list_extract(child, i + 1)`.
+        assert!(
+            sql.contains("list_extract((tags), (__zw_i) + 1)"),
+            "a[i] substitution: {sql}"
+        );
+        assert!(
+            sql.contains("list_extract((tags2), (__zw_i) + 1)"),
+            "b[i] substitution: {sql}"
+        );
     }
 
     /// τ `map_filter(m, (k, v) -> pred)` emits `map_from_entries(list_filter(

@@ -1116,7 +1116,11 @@ impl Expression {
                 let mut acc = f.args[0].data_type(schema);
                 for a in f.args.iter().skip(1) {
                     let dt = a.data_type(schema);
-                    acc = TypeInferenceEngine::promote_numeric(&acc, &dt);
+                    // Spark's CreateArray element type = findWiderCommonType
+                    // over the args (τ's `unify_types`), NOT numeric-only
+                    // promotion — so heterogeneous non-numeric args (e.g.
+                    // `array(1, 'x')` → Array<String>) widen correctly.
+                    acc = TypeInferenceEngine::unify_types(&acc, &dt);
                 }
                 // Spark reports the array as `containsNull` = any element
                 // nullable. Result nullability is handled separately in
@@ -1125,6 +1129,39 @@ impl Expression {
                 // the shared resolver's behavior.
                 let contains_null = f.args.iter().any(|a| a.nullable(schema));
                 return DataType::Array(Box::new(acc), contains_null);
+            }
+            // Spark's `map(k1, v1, k2, v2, ...)` / `create_map(...)` — key type
+            // is the least-common type of the even-index args, value type the
+            // least-common type of the odd-index args, and `valueContainsNull`
+            // is true iff any value arg is nullable. The shared
+            // `function_return_type` resolver only sees the first arg and so
+            // hard-codes `Map<String, String>`; derive the real key/value types
+            // here where the whole arg list is available. Corpus anchor:
+            // cx-002. An empty or odd-length arg list falls through to the
+            // shared resolver.
+            "map" | "create_map" if !f.args.is_empty() && f.args.len() % 2 == 0 => {
+                let mut key_ty = f.args[0].data_type(schema);
+                let mut val_ty = f.args[1].data_type(schema);
+                let mut value_nullable = f.args[1].nullable(schema);
+                let mut i = 2;
+                while i < f.args.len() {
+                    // Spark's CreateMap key/value types = findWiderCommonType
+                    // (τ's `unify_types`), NOT numeric-only promotion — so
+                    // heterogeneous non-numeric args (e.g.
+                    // `map('a', 1, 'b', 'x')` → Map<String, String>) widen
+                    // correctly. The homogeneous cx-002 result is preserved.
+                    key_ty =
+                        TypeInferenceEngine::unify_types(&key_ty, &f.args[i].data_type(schema));
+                    val_ty =
+                        TypeInferenceEngine::unify_types(&val_ty, &f.args[i + 1].data_type(schema));
+                    value_nullable = value_nullable || f.args[i + 1].nullable(schema);
+                    i += 2;
+                }
+                return DataType::Map {
+                    key: Box::new(key_ty),
+                    value: Box::new(val_ty),
+                    value_nullable,
+                };
             }
             // Spark's `aggregate(arr, init, (acc, x) -> f [, finish])` folds
             // the array with `init` as the seed; the result type is the
@@ -1594,7 +1631,70 @@ impl Expression {
                 let field_nullable = st.field_by_name(name).map(|f| f.nullable).unwrap_or(true);
                 base_nullable || field_nullable
             }
+            // Spark `GetArrayItem.nullable` (complexTypeExtractors.scala +
+            // `GetArrayItemUtil.computeNullabilityFromArray`), ANSI
+            // failOnError=true:
+            //   * a foldable, non-null CONSTANT index into a `CreateArray`
+            //     literal child, in-bounds -> that element's nullability
+            //     (e.g. `array(1,2,3)[0]` -> non-null; corpus witness cx-001);
+            //   * a foldable constant index into ANY OTHER child (notably a
+            //     column `col[i]`) -> true;
+            //   * a non-constant index -> the array's `containsNull` flag.
+            // Spark's rule intentionally does NOT OR-in `child.nullable`, so a
+            // nullable array column still yields the above (the array-is-NULL
+            // row is handled by the null-safe eval, not the schema flag).
+            (DataType::Array(_, contains_null), _) => {
+                match Self::const_int_index(ev.extraction.as_ref()) {
+                    Some(i) => match Self::create_array_elements(ev.child.as_ref()) {
+                        Some(elems) if i >= 0 && (i as usize) < elems.len() => {
+                            elems[i as usize].nullable(schema)
+                        }
+                        // OOB constant index into a literal array (ANSI throws
+                        // at runtime) OR a non-literal-array child: Spark
+                        // yields `true`.
+                        _ => true,
+                    },
+                    None => *contains_null,
+                }
+            }
             _ => true,
+        }
+    }
+
+    /// The constant integer index of a foldable, non-null literal subscript
+    /// (Spark's `Literal(_: Int)` case in `computeNullabilityFromArray`), if
+    /// the extraction is one. Non-literal or non-integral extractions — which
+    /// Spark treats as non-foldable — return `None`.
+    fn const_int_index(extraction: &Expression) -> Option<i64> {
+        match extraction {
+            Expression::Literal(Literal { value, .. }) => match value {
+                LiteralValue::Byte(v) => Some(i64::from(*v)),
+                LiteralValue::Short(v) => Some(i64::from(*v)),
+                LiteralValue::Int(v) => Some(i64::from(*v)),
+                LiteralValue::Long(v) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The element expressions of a Spark `CreateArray`-equivalent child, i.e.
+    /// an `array(...)` literal. Both front-ends are covered: the DataFrame
+    /// path lowers to [`Expression::ArrayLiteral`]; the SQL path lowers
+    /// `array(...)` to an array-family [`Expression::FunctionCall`]. Any other
+    /// child (a column, another expression) returns `None`.
+    fn create_array_elements(child: &Expression) -> Option<&[Expression]> {
+        match child {
+            Expression::ArrayLiteral(a) => Some(&a.elements),
+            Expression::FunctionCall(f)
+                if matches!(
+                    f.name.as_str(),
+                    "array" | "list_value" | "make_array" | "list"
+                ) =>
+            {
+                Some(&f.args)
+            }
+            _ => None,
         }
     }
 
@@ -1762,6 +1862,82 @@ mod tests {
             distinct: false,
         });
         assert!(!expr.nullable(&s));
+    }
+
+    // ── Complex-type constructor inference (cx-001 / cx-002) ───────────────
+
+    fn int_literal(v: i32) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Int(v),
+            data_type: DataType::Integer,
+        })
+    }
+
+    fn str_literal(s: &str) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::String(s.to_owned()),
+            data_type: DataType::String,
+        })
+    }
+
+    #[test]
+    fn map_constructor_infers_key_and_value_types_from_args() {
+        // `map('a', 1, 'b', 2)` → Map<String, Integer> with non-null values,
+        // not the shared resolver's hard-coded Map<String, String>.
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "map".to_owned(),
+            args: vec![
+                str_literal("a"),
+                int_literal(1),
+                str_literal("b"),
+                int_literal(2),
+            ],
+            distinct: false,
+        });
+        match expr.data_type(&StructType::empty()) {
+            DataType::Map {
+                key,
+                value,
+                value_nullable,
+            } => {
+                assert_eq!(*key, DataType::String);
+                assert_eq!(*value, DataType::Integer);
+                assert!(!value_nullable);
+            }
+            other => panic!("expected Map<String, Integer>, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_value_over_map_returns_value_type() {
+        // `map('a', 1)['a']` → Integer (the map's value type).
+        let map = Expression::FunctionCall(FunctionCall {
+            name: "map".to_owned(),
+            args: vec![str_literal("a"), int_literal(1)],
+            distinct: false,
+        });
+        let ev = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(map),
+            extraction: Box::new(str_literal("a")),
+        });
+        assert_eq!(ev.data_type(&StructType::empty()), DataType::Integer);
+    }
+
+    #[test]
+    fn array_index_into_non_null_literal_array_is_non_nullable() {
+        // Spark `array(1, 2, 3)[0]` — the array is non-nullable with no null
+        // elements and the index is a literal, so GetArrayItem is non-nullable.
+        let arr = Expression::FunctionCall(FunctionCall {
+            name: "array".to_owned(),
+            args: vec![int_literal(1), int_literal(2), int_literal(3)],
+            distinct: false,
+        });
+        let ev = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(arr),
+            extraction: Box::new(int_literal(0)),
+        });
+        assert_eq!(ev.data_type(&StructType::empty()), DataType::Integer);
+        assert!(!ev.nullable(&StructType::empty()));
     }
 
     // ── Checklist §1.2 — hash family FunctionCall nullability ──────────────

@@ -1251,3 +1251,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt --check clean on both touched files, `cargo test -p thunderduck-core --lib` 635/0, `sql_v2` 231/31/262, fn-020 GREEN, no regression).
 - Commit SHA: (this commit).
+
+## Pass 137 — 2026-07-06 — SQL corpus: string-literal backslash escapes (lit-009)
+- **Corpus: SQL front-end (parser_v2 dialect).** lit-009 (`SELECT 'line1\nline2' AS s, 'tab\there' AS t`).
+- Root cause (diagnostic-pass-137.md): value mismatch (schema/types/nullability already matched). `SparkDialect` did not override `supports_string_literal_backslash_escape` (sqlparser default `false`), so the tokenizer kept `\n`/`\t` as literal two-char sequences while Spark 4.1.1 ANSI decodes them to LF/TAB.
+- Architecture (architecture-pass-137.md): Option A — flip the flag to `true`. Lowering unchanged (`Value::SingleQuotedString` → `LiteralValue::String` now holds decoded bytes); emission unchanged (DuckDB round-trips raw LF/TAB in single-quoted literals; escape_sql_string doubles only `'`). Deferred with no witness: `\%`/`\_` LIKE-preservation (needs `ignores_wildcard_escapes` + `LIKE … ESCAPE '\'`), `\a`/`\f`, `\uXXXX`/octal.
+- Layer(s) touched: parser_v2/dialect.rs (one trait-method override + doc). No AST/analyzer/emission change.
+- ADR citations: ADR-022 (category-1 Spark-emulated correctness), ADR-015 (differential oracle — match Spark's exact value though DuckDB literals don't decode; residual divergences = parity debt), ADR-016 (Spark 4.1.1 ANSI escape table), ADR-021 (τ owns its SparkSQL substrate). CLAUDE.md #1/#2 (parse-time, no SQL-string post-processing), INV10 (no new imports).
+- Corpus signal: 231 → **232** (+1). lit-009 GREEN (values confirmed). No regressions — byte-scan proved lit-009 is the ONLY backslash in the sql_v2 corpus; the one DataFrame `regexp_replace(r"\s+")` is on the protobuf path (V2ExpressionConverter) that never touches SparkDialect. core_v2 unaffected.
+- Files: 1 (+ test). Tests added: 1 (parser_v2: `'line1\nline2'`/`'tab\there'` lower to String literals holding real LF/TAB).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED — independently re-verified decode table matches Spark for `\n`/`\t`; only single-quoted literals affected (`"` is a delimited-identifier start in SparkDialect); no live token re-serialization path; backslash-free strings byte-identical). Perf 0 HIGH + 0 MEDIUM (parse-time only, no big-O change, off hot path).
+- Findings addressed this pass: reviewer Low (doc-comment imprecision) — tightened the dialect.rs comment to describe sqlparser's actual decode table (`\0 \a \b \f \n \r \t \Z` → control chars; `_ => *next` passthrough for `\\`/`\'`/`\"`) and the deferred `\a`/`\f`/`\%`/`\_`/`\u`/octal divergences.
+- Findings queued as follow-up: reviewer Low — stale premise in architecture doc (cited `multi_alias.rs`, which does not exist in this worktree; the architect's codegraph indexed the main tree) — informational, makes the regression surface smaller; known parity debt `\%`/`\_` LIKE deferred to a future witness case.
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt --check clean on touched files, `cargo check -p thunderduck-core` clean, `cargo test -p thunderduck-core --lib` 636/0, `sql_v2` 232/30/262, lit-009 GREEN, no regression).
+- Commit SHA: (this commit).

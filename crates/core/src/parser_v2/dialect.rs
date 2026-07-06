@@ -55,6 +55,22 @@ impl Dialect for SparkDialect {
         true
     }
 
+    /// Spark decodes C-style backslash escapes in single-quoted string
+    /// literals; sqlparser gates this decode behind this flag (default
+    /// `false`), so without the override `'line1\nline2'` keeps the literal
+    /// two-char `\n` instead of a newline and diverges from Spark's value.
+    /// Corpus witness: `lit-009`. sqlparser's decode table maps
+    /// `\0 \a \b \f \n \r \t \Z` to their control chars and passes every other
+    /// escape through as the char after the backslash (so `\\`→`\`, `\'`→`'`,
+    /// `\"`→`"`); this matches Spark for the escapes the corpus exercises
+    /// (`\n`, `\t`). Known Spark divergences with no corpus witness — deferred
+    /// (see architecture-pass-137.md): `\a`→BEL / `\f`→FF (Spark strips the
+    /// backslash to `a`/`f`), `\%`/`\_` LIKE-preservation (sqlparser strips
+    /// to `%`/`_` while `ignores_wildcard_escapes` is off), and `\uXXXX`/octal.
+    fn supports_string_literal_backslash_escape(&self) -> bool {
+        true
+    }
+
     /// Spark allows `VALUES` as a bare table factor, e.g.
     /// `SELECT * FROM VALUES (1, 'a'), (2, 'b') AS t(n, s)`. Without this the
     /// parser only accepts the parenthesized `FROM (VALUES ...)` form and

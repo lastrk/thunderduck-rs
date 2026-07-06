@@ -4652,6 +4652,35 @@ mod tests {
     }
 
     #[test]
+    fn string_literal_decodes_backslash_escapes() {
+        // Spark decodes C-style escapes in single-quoted literals: `\n`→LF,
+        // `\t`→TAB. With SparkDialect::supports_string_literal_backslash_escape
+        // the tokenizer decodes them, so the τ String literal holds the real
+        // control chars (not a literal backslash). Corpus witness: lit-009.
+        // NB: in this Rust source `\\n` is the two chars backslash-n in the SQL
+        // text; the expected value uses `\n` which is a real newline byte.
+        let plan = parse(r"SELECT 'line1\nline2' AS s, 'tab\there' AS t").expect("should parse");
+        let projections = match plan.op {
+            CommonOp::Project { projections, .. } => projections,
+            other => panic!("expected Project, got {other:?}"),
+        };
+        let string_of = |e: &Expression| -> String {
+            match e {
+                Expression::Alias(a) => match &*a.expr {
+                    Expression::Literal(Literal {
+                        value: LiteralValue::String(s),
+                        ..
+                    }) => s.clone(),
+                    other => panic!("expected String literal, got {other:?}"),
+                },
+                other => panic!("expected Alias, got {other:?}"),
+            }
+        };
+        assert_eq!(string_of(&projections[0]), "line1\nline2");
+        assert_eq!(string_of(&projections[1]), "tab\there");
+    }
+
+    #[test]
     fn decode_hex_literal_decodes_pairs() {
         assert_eq!(decode_hex_literal("1F2A").expect("valid"), vec![0x1F, 0x2A]);
         assert_eq!(decode_hex_literal("41").expect("valid"), vec![0x41]);

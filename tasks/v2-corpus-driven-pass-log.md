@@ -1016,3 +1016,16 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 568/0, `sql_v2` 201/61/262 no regression).
 - Commit SHA: (this commit).
+
+## Pass 120 — 2026-07-06 — TECH-DEBT SWEEP (passes 116-119 code)
+- **Sweep** (every-5th cadence; prior sweep pass 115). rust-reviewer over the passes-116-119 additions (emission flatten branches, ceil_floor_type/round/mod type-inference, derived-table lowering).
+- Finding: passes 116-119 landed with **zero new compiler warnings**, no dead code. `ceil_floor_type` is already the single source of truth (analyzer + emission both call it); round/bround correctly reuses it; ceil/floor vs round arms correctly NOT merged (distinct Spark semantics). One worthwhile DRY: the two pass-119 flatten branches (render_project + render_aggregate_op) duplicated the Filter-over-AliasedRelation FROM-fragment + a ~12-line KNOWN LIMITATION caveat comment.
+- Fix (behavior-preserving): extracted `render_filter_over_aliased_from(&TypedAst) -> Result<Option<String>, EmissionError>` (let-else; returns `(<inner>) AS <alias> WHERE <cond>` or None); adopted at both call sites. Filter-over-Join branch deliberately NOT folded in (render_aggregate_op must not start flattening Filter-over-Join — untested). Single caveat comment now in the helper doc.
+- Layer(s) touched: transpiler_v2/emission.rs only. Net −3 LOC.
+- Observable-diff note: helper renders WHERE cond before render_project renders slots (was slots-first) — only affects which boundary error surfaces first if both sub-renders fail. No successful-path SQL change.
+- Corpus signal: 201 → **201** (unchanged — pure refactor, as required).
+- Files: `crates/core/src/transpiler_v2/emission.rs`.
+- Left as-is (conscious): `decimal_form_for_ceil_floor` vs `integral_to_decimal` share 4 integral constants but differ in return type/coverage — merging splits Spark's forType across layers (net clarity loss).
+- Compiler warning delta: 0 (both crates build silent).
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 568/0, `sql_v2` 201/61/262 no regression).
+- Commit SHA: (this commit).

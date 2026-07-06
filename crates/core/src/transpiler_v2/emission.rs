@@ -381,6 +381,40 @@ fn render_file_scan(
     Ok(format!("SELECT * FROM {reader}({paths_sql}{opts_sql})"))
 }
 
+/// Flatten a `Filter` whose child is an `AliasedRelation` into the FROM-body
+/// `(<inner>) AS <alias> WHERE <cond>` shared by the correlated-subquery
+/// inlining in `render_project` and `render_aggregate_op`. Keeps the user
+/// alias as the FROM table name so both slots and the WHERE bind it in one
+/// SELECT. Returns `None` when the shape doesn't match (caller falls back to
+/// its own default wrap).
+///
+/// KNOWN LIMITATION: the correlated outer reference resolves by-NAME against
+/// the inner schema (accidentally correct when the correlation key's name+type
+/// coincide; the analyzer rejects the absent-column case, sq-010). A proper
+/// outer-scope stack is out of scope (ADR-008).
+fn render_filter_over_aliased_from(filter: &TypedAst) -> Result<Option<String>, EmissionError> {
+    let TypedOp::Filter {
+        input: filter_input,
+        condition,
+    } = &filter.op
+    else {
+        return Ok(None);
+    };
+    let TypedOp::AliasedRelation {
+        input: inner,
+        alias,
+    } = &filter_input.op
+    else {
+        return Ok(None);
+    };
+    let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
+    let cond_sql = render_expr(condition, &filter_input.resolved_schema)?;
+    Ok(Some(format!(
+        "({inner_sql}) AS {} WHERE {cond_sql}",
+        quote_ident(alias)
+    )))
+}
+
 fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String, EmissionError> {
     let input_schema = &input.resolved_schema;
     // Project-over-Join inlining: when the child is a Join, emit the
@@ -444,29 +478,12 @@ fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String
         // AliasedRelation`. `render_filter` would re-wrap the child as
         // `(...) AS __td_filter`, re-burying the user alias so the WHERE's
         // correlated qualifier (`e.dept_id`) no longer binds. Flatten all
-        // three into one `SELECT <slots> FROM (<inner>) AS <alias> WHERE
-        // <cond>` so the alias becomes the FROM table name and stays in scope
-        // for both slots and WHERE (mirrors the Project-over-Filter-over-Join
-        // branch above).
-        //
-        // KNOWN LIMITATION: the correlated outer reference resolves by-NAME
-        // against the inner schema — accidentally correct here because the
-        // correlation key's name+type coincide in both relations. When the
-        // correlated column is absent from the inner schema (sq-010:
-        // `e.salary` ∉ `dept`) the analyzer correctly rejects it today; a
-        // proper outer-scope stack is out of scope for this pass (ADR-008).
-        if let TypedOp::AliasedRelation {
-            input: inner,
-            alias,
-        } = &filter_input.op
-        {
-            let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
+        // three into one `SELECT <slots> FROM <from_where>` so the alias
+        // becomes the FROM table name and stays in scope for both slots and
+        // WHERE (mirrors the Project-over-Filter-over-Join branch above).
+        if let Some(from_where) = render_filter_over_aliased_from(input)? {
             let slots_sql = render_projection_slots(projections, input_schema)?;
-            let cond_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
-            let a = quote_ident(alias);
-            return Ok(format!(
-                "SELECT {slots_sql} FROM ({inner_sql}) AS {a} WHERE {cond_sql}"
-            ));
+            return Ok(format!("SELECT {slots_sql} FROM {from_where}"));
         }
     }
     // AliasedRelation is transparent for Project too — inline through it.
@@ -4594,28 +4611,8 @@ fn render_aggregate_op(
     // `render_project` — accidentally correct when the correlation key's
     // name+type coincide; the analyzer rejects the absent-column case (sq-010).
     // A proper outer-scope stack is out of scope for this pass (ADR-008).
-    let from_clause = match &input.op {
-        TypedOp::Filter {
-            input: filter_input,
-            condition,
-        } => match &filter_input.op {
-            TypedOp::AliasedRelation {
-                input: inner,
-                alias,
-            } => {
-                let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
-                let cond_sql = render_expr(condition, &filter_input.resolved_schema)?;
-                Some(format!(
-                    "({inner_sql}) AS {} WHERE {cond_sql}",
-                    quote_ident(alias)
-                ))
-            }
-            _ => None,
-        },
-        _ => None,
-    };
-    let from_clause = match from_clause {
-        Some(f) => f,
+    let from_clause = match render_filter_over_aliased_from(input)? {
+        Some(fw) => fw,
         None => {
             let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
             format!("({child_sql}) AS __td_agg")

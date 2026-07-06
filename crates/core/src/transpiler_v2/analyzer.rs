@@ -1233,6 +1233,25 @@ fn analyze_with_columns(
     })
 }
 
+/// Spark's `DataFrameNaFunctions.fillValue` type-compatibility rule.
+///
+/// When the client omits `subset` on `.na.fill(v)`, Spark silently applies the
+/// fill only to columns whose static type is compatible with the fill value's
+/// type — numeric-with-numeric, string-with-string, or boolean-with-boolean.
+/// All other columns pass through untouched (no COALESCE, nullability
+/// preserved). Both `analyze_na_fill` (nullability inference) and
+/// `render_na_fill` (SQL emission) MUST honour this predicate to keep the
+/// stamped schema and emitted SQL consistent with Spark parity.
+pub(super) fn na_fill_compatible(col_type: &DataType, value_type: &DataType) -> bool {
+    if col_type.is_numeric() && value_type.is_numeric() {
+        return true;
+    }
+    matches!(
+        (col_type, value_type),
+        (DataType::String, DataType::String) | (DataType::Boolean, DataType::Boolean)
+    )
+}
+
 fn analyze_na_fill(
     input: CommonAst,
     cols: Vec<String>,
@@ -1240,16 +1259,23 @@ fn analyze_na_fill(
     base_types: &BaseTypes,
 ) -> Result<TypedAst, AnalyzerError> {
     let typed_input = analyze_node(input, base_types)?;
-    // Columns filled with a non-null value become non-nullable.
-    // If the fill value itself is null (unusual), preserve
-    // nullability. Empty `cols` = fill all cols compatible with
-    // the (single) value's type — we widen to "make all cols with
-    // that type non-null" via a simple pass.
-    let filled = |col_name: &str| -> Option<&Expression> {
+    // Columns filled with a non-null value become non-nullable — but only
+    // for columns whose static type is compatible with the fill value's type
+    // (Spark's `fillValue` silently skips type-incompatible columns). Both
+    // the empty-`cols` "fill all" branch and the single-value subset branch
+    // apply the predicate; the multi-value form pairs by position without
+    // filtering (matches Spark's dict form).
+    let filled = |col_name: &str, col_type: &DataType| -> Option<&Expression> {
         if cols.is_empty() {
-            Some(&values[0])
+            if na_fill_compatible(col_type, &values[0].data_type(&typed_input.resolved_schema)) {
+                Some(&values[0])
+            } else {
+                None
+            }
         } else if values.len() == 1 {
-            if cols.iter().any(|c| c.eq_ignore_ascii_case(col_name)) {
+            if cols.iter().any(|c| c.eq_ignore_ascii_case(col_name))
+                && na_fill_compatible(col_type, &values[0].data_type(&typed_input.resolved_schema))
+            {
                 Some(&values[0])
             } else {
                 None
@@ -1266,7 +1292,7 @@ fn analyze_na_fill(
     let mut output_fields: Vec<StructField> =
         Vec::with_capacity(typed_input.resolved_schema.fields.len());
     for f in &typed_input.resolved_schema.fields {
-        let fill_expr = filled(&f.name);
+        let fill_expr = filled(&f.name, &f.data_type);
         let mut nf = f.clone();
         if let Some(v) = fill_expr {
             // If fill value is non-null (typical case), the output
@@ -6147,5 +6173,102 @@ mod tests {
                 other => panic!("expected AnalyzerError::UnsupportedRule, got {other:?}"),
             }
         }
+    }
+
+    // ── na_fill_compatible predicate ─────────────────────────────────────────
+
+    /// Direct unit coverage of the shared predicate used by both
+    /// `analyze_na_fill` and `render_na_fill`.
+    #[test]
+    fn na_fill_compatible_matches_spark_fill_value_rules() {
+        // Numeric ↔ numeric (all pairs) → true.
+        for c in [
+            DataType::Byte,
+            DataType::Short,
+            DataType::Integer,
+            DataType::Long,
+            DataType::Float,
+            DataType::Double,
+            DataType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        ] {
+            assert!(
+                na_fill_compatible(&c, &DataType::Long),
+                "{c:?} × Long should be compatible"
+            );
+        }
+        // Same-family scalars.
+        assert!(na_fill_compatible(&DataType::String, &DataType::String));
+        assert!(na_fill_compatible(&DataType::Boolean, &DataType::Boolean));
+        // Cross-family — the mismatches Spark silently skips.
+        assert!(!na_fill_compatible(&DataType::String, &DataType::Long));
+        assert!(!na_fill_compatible(&DataType::Long, &DataType::String));
+        assert!(!na_fill_compatible(&DataType::Boolean, &DataType::Long));
+        assert!(!na_fill_compatible(&DataType::String, &DataType::Boolean));
+        // Date / Timestamp never fill.
+        assert!(!na_fill_compatible(&DataType::Date, &DataType::Long));
+        assert!(!na_fill_compatible(&DataType::Timestamp, &DataType::Long));
+    }
+
+    /// Regression for `chain-002`: `.na.fill(0)` on a mixed schema must (a)
+    /// preserve original nullability on non-numeric columns, (b) flip
+    /// nullability only on numeric columns. This exercises the `analyze()`
+    /// entry (shared by `generate_with_schema` and `analyze_schema` — verified
+    /// in `crates/core/src/transpiler_v2/mod.rs::{generate_with_schema,
+    /// analyze_schema}`).
+    #[test]
+    fn analyze_na_fill_empty_cols_int_value_skips_non_numeric_columns() {
+        // Schema: mixed [string, long, double, boolean].
+        let mixed_schema = StructType::new(vec![
+            StructField::nullable("s", DataType::String),
+            StructField::nullable("l", DataType::Long),
+            StructField::nullable("d", DataType::Double),
+            StructField::nullable("b", DataType::Boolean),
+        ]);
+        let plan = CommonAst::new(CommonOp::TableScan {
+            table: "t".to_owned(),
+            alias: None,
+        });
+        let bt = BaseTypes::build_from_plan(&plan, |n| {
+            if n == "t" {
+                Some(mixed_schema.clone())
+            } else {
+                None
+            }
+        });
+        // NaFill { cols: [], values: [Int(0)] } — client's `.na.fill(0)` form.
+        let ast = CommonAst::new(CommonOp::NaFill {
+            input: Box::new(plan),
+            cols: vec![],
+            values: vec![Expression::Literal(Literal {
+                value: LiteralValue::Int(0),
+                data_type: DataType::Integer,
+            })],
+        });
+        let typed = analyze(ast, &bt).expect("analyze NaFill must succeed");
+        let fields = &typed.resolved_schema.fields;
+        assert_eq!(fields.len(), 4);
+        // Non-numeric columns preserve original nullability (nullable=true).
+        assert_eq!(fields[0].name, "s");
+        assert_eq!(fields[0].data_type, DataType::String);
+        assert!(
+            fields[0].nullable,
+            "String column must stay nullable (type-incompatible with Int fill)"
+        );
+        assert_eq!(fields[3].name, "b");
+        assert_eq!(fields[3].data_type, DataType::Boolean);
+        assert!(
+            fields[3].nullable,
+            "Boolean column must stay nullable (type-incompatible with Int fill)"
+        );
+        // Numeric columns become non-nullable (compatible fill).
+        assert_eq!(fields[1].name, "l");
+        assert_eq!(fields[1].data_type, DataType::Long);
+        assert!(!fields[1].nullable, "Long column must flip to non-null");
+        assert_eq!(fields[2].name, "d");
+        assert_eq!(fields[2].data_type, DataType::Double);
+        assert!(!fields[2].nullable, "Double column must flip to non-null");
     }
 }

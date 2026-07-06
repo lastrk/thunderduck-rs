@@ -37,7 +37,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use super::analyzer::{Schema, TypedAst, TypedOp};
+use super::analyzer::{na_fill_compatible, Schema, TypedAst, TypedOp};
 use super::ast::FileFormat;
 use super::error::{EmissionError, UnsupportedKind};
 use super::expression::{
@@ -905,14 +905,22 @@ fn render_na_fill(
     if values.is_empty() {
         bail_boundary_op!("NaFill", "NaFill requires at least one fill value");
     }
-    // Build a per-column value map.
-    let value_for = |col_name: &str| -> Option<&Expression> {
+    // Build a per-column value map. Per Spark's `fillValue` contract, the
+    // empty-`cols` and single-value subset branches skip type-incompatible
+    // columns silently (see [`na_fill_compatible`]) — a mixed-type COALESCE
+    // (e.g. `COALESCE(varchar_col, 0)`) would otherwise be a DuckDB binder
+    // error, whereas Spark silently passes such columns through unchanged.
+    let value_for = |col_name: &str, col_type: &DataType| -> Option<&Expression> {
         if cols.is_empty() {
-            // Fill all columns with the single value (Spark accepts this
-            // only when the fill value's type matches; we let DuckDB check).
-            Some(&values[0])
+            if na_fill_compatible(col_type, &values[0].data_type(input_schema)) {
+                Some(&values[0])
+            } else {
+                None
+            }
         } else if values.len() == 1 {
-            if cols.iter().any(|c| c.eq_ignore_ascii_case(col_name)) {
+            if cols.iter().any(|c| c.eq_ignore_ascii_case(col_name))
+                && na_fill_compatible(col_type, &values[0].data_type(input_schema))
+            {
                 Some(&values[0])
             } else {
                 None
@@ -932,7 +940,7 @@ fn render_na_fill(
             slots.push_str(", ");
         }
         let name_q = quote_ident(&f.name);
-        if let Some(v) = value_for(&f.name) {
+        if let Some(v) = value_for(&f.name, &f.data_type) {
             let v_sql = render_expr(v, input_schema)?;
             slots.push_str(&format!("COALESCE({name_q}, {v_sql}) AS {name_q}"));
         } else {
@@ -10347,5 +10355,63 @@ mod tests {
         // NULL input pass-through: the guard checks `IS NOT NULL` on the
         // input before raising, matching Spark's `nullSafeEval` semantics.
         assert!(sql.contains("IS NOT NULL"), "got: {sql}");
+    }
+
+    // ── render_na_fill — chain-002 regression ─────────────────────────────
+    //
+    // `.na.fill(0)` (single value, no subset) sends `NAFill.cols=[]` from the
+    // PySpark client. Spark's `DataFrameNaFunctions.fillValue` silently skips
+    // columns whose type does not match the fill value's type; τ must too, or
+    // DuckDB rejects `COALESCE(varchar, bigint)`. This test locks the emission
+    // shape: only numeric columns are COALESCEd; non-numeric pass through
+    // bare.
+    #[test]
+    fn render_na_fill_empty_cols_int_value_only_coalesces_numeric_columns() {
+        let _g = tap_guard();
+        let mixed_schema = StructType::new(vec![
+            StructField::nullable("s", DataType::String),
+            StructField::nullable("l", DataType::Long),
+            StructField::nullable("d", DataType::Double),
+            StructField::nullable("b", DataType::Boolean),
+        ]);
+        let plan = CommonAst::new(CommonOp::TableScan {
+            table: "t".to_owned(),
+            alias: None,
+        });
+        let bt = BaseTypes::build_from_plan(&plan, |n| {
+            if n == "t" {
+                Some(mixed_schema.clone())
+            } else {
+                None
+            }
+        });
+        let ast = CommonAst::new(CommonOp::NaFill {
+            input: Box::new(plan),
+            cols: vec![],
+            values: vec![int_lit(0)],
+        });
+        let sql = generate(&ast, &bt).expect("generate NaFill");
+        // Numeric columns get COALESCEd (quote_ident's fast path leaves
+        // simple identifiers unquoted).
+        assert!(
+            sql.contains("COALESCE(l, 0) AS l"),
+            "expected long col COALESCE, got: {sql}"
+        );
+        assert!(
+            sql.contains("COALESCE(d, 0) AS d"),
+            "expected double col COALESCE, got: {sql}"
+        );
+        // Non-numeric columns pass through bare — no COALESCE against them.
+        assert!(
+            !sql.contains("COALESCE(s"),
+            "String col must not be COALESCEd (Spark parity), got: {sql}"
+        );
+        assert!(
+            !sql.contains("COALESCE(b"),
+            "Boolean col must not be COALESCEd (Spark parity), got: {sql}"
+        );
+        // The bare column names still appear in the projection.
+        assert!(sql.contains("SELECT s,"), "got: {sql}");
+        assert!(sql.contains(", b FROM"), "got: {sql}");
     }
 }

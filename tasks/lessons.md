@@ -177,6 +177,27 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   "blocked on future slice X" note. The regression test locks the fix in for
   the moment the routing changes, and no non-goal edits sneak in.
 
+- **"Let DuckDB check the type" is an ADR-015 smell — the check belongs on τ.**
+  chain-002 (2026-07-06): `.na.fill(0)` on a mixed schema (Spark parity requires a
+  silent skip for non-numeric columns) surfaced a DuckDB `Cannot mix values of type
+  VARCHAR and BIGINT in COALESCE` binder error because `render_na_fill`'s
+  empty-`cols` branch delegated the type check to DuckDB (verbatim comment: "Spark
+  accepts this only when the fill value's type matches; we let DuckDB check"). Spark
+  does *not* accept — `DataFrameNaFunctions.fillValue` silently skips
+  type-incompatible columns. The PySpark Connect client sends `NAFill.cols = []` for
+  `.na.fill(value)` and expects the *server* to filter by type; delegating that
+  filter to DuckDB turns Spark's silent-skip into a hard binder error, and the
+  companion `analyze_na_fill` mis-flipped nullability on the same columns. Fix
+  landed a shared `pub(super) fn na_fill_compatible(&DataType, &DataType) -> bool`
+  in `analyzer.rs` consumed by both `analyze_na_fill` (nullability) and
+  `render_na_fill` (SQL) — one source of truth, symmetric across the
+  `generate_with_schema` and `analyze_schema` entries. Rule: any comment shaped like
+  "we let DuckDB check" or "DuckDB will error if…" is a smell in τ — ADR-015/016
+  says τ owns Spark parity, and a type mismatch DuckDB rejects is often a case
+  Spark silently accepts (or silently skips). Whenever a Spark Connect client
+  passes an empty subset / cols list, assume the server owns the filtering step;
+  do not punt it to the engine.
+
 - **Silent-NULL catch-alls in typed dispatch are data-corruption anti-patterns.**
   The Slice C.3-4 root cause was a single-line `_ => Ok("NULL".to_string())`
   at `relation_converter.rs:2513`. It silently mapped every unhandled Arrow

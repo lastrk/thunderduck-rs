@@ -1075,3 +1075,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new (both crates build silent).
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core -p thunderduck-connect-server` 0 warnings, `cargo test -p thunderduck-core --lib` 591/0, `sql_v2` 213/49/262, `core_v2` 314 no regression).
 - Commit SHA: (this commit).
+
+## Pass 124 — 2026-07-06 — SQL corpus: collect_list/collect_set + percentile (agg-018/019)
+- **Corpus: emission only (+ 1 runtime macro line).** Targets: agg-018 (collect_list/collect_set, schema_only), agg-019 (percentile/median).
+- Root cause (diagnostic returned inline): both are emission-only gaps in render_aggregate's aggregate whitelist — type inference, nullability, and AGGREGATE_NAMES classification already correct for all four; the emitter's catch-all bailed. collect_list/collect_set DuckDB macros were pre-registered at session startup (session.rs) but DEAD (emission bailed first). percentile needed continuous-interpolation mapping.
+- Architecture (architecture-pass-124.md): (1) add `collect_list`/`collect_set` to the verbatim-name pass-through arm (force_distinct=false; macros expand them). (2) add a `percentile` guard emitting `quantile_cont(col, CAST(q AS DOUBLE))` — CONTINUOUS, disjoint from percentile_approx's quantile_disc (agg-019 value 91500 confirms, not disc's 88000). (3) fold in a collect_set macro FILTER fix (LIST(DISTINCT x) FILTER (WHERE x IS NOT NULL)) — drops nulls like Spark; prevents a latent value landmine.
+- Layer(s) touched: transpiler_v2/emission.rs (2 arms), runtime/session.rs (1 macro). No AST/type change.
+- ADR citations: ADR-015/016 (Spark parity: percentile continuous interpolation, collect_set null-drop), ADR-020 (reuse pre-registered DuckDB macros).
+- Corpus signal: 213 → **215** (+2). agg-018/019 GREEN (agg-019 value verified). core_v2 held at 314. No regressions.
+- Files: 2. Tests added: 3 emission (percentile→quantile_cont not disc; collect_list/collect_set verbatim pass-through, no leaked DISTINCT).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED). 2 review Lows (non-blocking): percentile array-of-percentages/3-arg forms mis-emit (mirrors percentile_approx; follow-up); collect_set FILTER value not yet corpus-witnessed (schema_only).
+- **ENVIRONMENT NOTE:** the official v2-sql-progress.sh run was blocked post-implementation by orphaned Spark Connect / validate_fix.py processes from a CONCURRENT claude session (parent PID 281749) in this shared worktree, holding Spark ports → "Failed to start both servers". The 215/47/262 row was recorded from the coder's verified in-implementation corpus run (agg-018/019 green, core_v2 314) + reviewer/perf approval; not re-run by the orchestrator due to the external interference (a foreign claude process not safe to kill).
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS per coder verification (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 594/0, `sql_v2` 215/47/262, `core_v2` 314). Orchestrator corpus re-run blocked by external process interference (see ENVIRONMENT NOTE).
+- Commit SHA: (this commit).

@@ -4426,6 +4426,16 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         let q = render_expr(&f.args[1], schema)?;
         return Ok(format!("quantile_disc({col}, CAST({q} AS DOUBLE))"));
     }
+    // Spark `percentile(col, p)` = exact CONTINUOUS (linear-interpolation)
+    // quantile → DuckDB `quantile_cont` (percentile_approx above uses
+    // `quantile_disc` = discrete sample value). CAST the quantile to DOUBLE
+    // since Spark sends it as Decimal. Corpus witness: `agg-019`
+    // (percentile(salary, 0.5) = 91500 continuous, not 88000 discrete).
+    if lower == "percentile" && f.args.len() >= 2 {
+        let col = render_expr(&f.args[0], schema)?;
+        let q = render_expr(&f.args[1], schema)?;
+        return Ok(format!("quantile_cont({col}, CAST({q} AS DOUBLE))"));
+    }
     let (duck_name, force_distinct) = match lower.as_str() {
         // Direct pass-through — DuckDB accepts the Spark name unchanged.
         "count"
@@ -4463,6 +4473,14 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         | "regr_sxy"
         | "regr_syy"
         | "median"
+        // `collect_list` / `collect_set` are macro-backed (registered at
+        // session startup: collect_list → LIST(x) FILTER (WHERE x IS NOT
+        // NULL), collect_set → LIST(DISTINCT x) FILTER (...)), not
+        // DuckDB-native aggregates. Pass the name through verbatim;
+        // force_distinct stays false — collect_set's DISTINCT lives inside
+        // the macro and Spark never sets distinct=true here.
+        | "collect_list"
+        | "collect_set"
         | "grouping"
         | "grouping_id" => (lower.as_str(), false),
         // Spark's population-formula `skewness` — DuckDB's `skewness` uses
@@ -10404,6 +10422,72 @@ mod tests {
         assert!(
             !sql.contains("approx_quantile"),
             "must not use approx_quantile, got: {sql}"
+        );
+    }
+
+    /// Pass 124 — Spark's `percentile(col, p)` is the exact CONTINUOUS
+    /// (linear-interpolation) quantile → DuckDB `quantile_cont`, distinct
+    /// from `percentile_approx` (discrete `quantile_disc`). Corpus: agg-019.
+    #[test]
+    fn render_percentile_uses_quantile_cont() {
+        let q_lit = Expression::Literal(Literal {
+            value: LiteralValue::Double(0.5),
+            data_type: DataType::Double,
+        });
+        let f = FunctionCall {
+            name: "percentile".to_owned(),
+            args: vec![col_ref_expr("salary"), q_lit],
+            distinct: false,
+        };
+        let sql = render_aggregate(&f, &empty_schema()).expect("render percentile");
+        assert!(
+            sql.contains("quantile_cont"),
+            "expected quantile_cont, got: {sql}"
+        );
+        assert!(
+            sql.contains("CAST(") && sql.contains("AS DOUBLE"),
+            "expected CAST(... AS DOUBLE), got: {sql}"
+        );
+        assert!(
+            !sql.contains("quantile_disc"),
+            "must not use quantile_disc (that is percentile_approx), got: {sql}"
+        );
+    }
+
+    /// Pass 124 — `collect_list` passes through verbatim to the session
+    /// macro (`LIST(x) FILTER (WHERE x IS NOT NULL)`). Corpus: agg-018.
+    #[test]
+    fn render_collect_list_passes_through() {
+        let f = FunctionCall {
+            name: "collect_list".to_owned(),
+            args: vec![col_ref_expr("name")],
+            distinct: false,
+        };
+        let sql = render_aggregate(&f, &empty_schema()).expect("render collect_list");
+        assert!(
+            sql.contains("collect_list("),
+            "expected verbatim collect_list(, got: {sql}"
+        );
+    }
+
+    /// Pass 124 — `collect_set` passes through verbatim; the DISTINCT lives
+    /// inside the session macro, so the emitted SQL carries no DISTINCT
+    /// token itself. Corpus: agg-018.
+    #[test]
+    fn render_collect_set_passes_through() {
+        let f = FunctionCall {
+            name: "collect_set".to_owned(),
+            args: vec![col_ref_expr("name")],
+            distinct: false,
+        };
+        let sql = render_aggregate(&f, &empty_schema()).expect("render collect_set");
+        assert!(
+            sql.contains("collect_set("),
+            "expected verbatim collect_set(, got: {sql}"
+        );
+        assert!(
+            !sql.to_ascii_uppercase().contains("DISTINCT"),
+            "collect_set macro owns the DISTINCT; emission must not add it, got: {sql}"
         );
     }
 

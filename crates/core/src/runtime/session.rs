@@ -400,7 +400,7 @@ CREATE OR REPLACE MACRO monthname(d) AS strftime('%b', d);
 -- forall: not implementable as a DuckDB macro (lambda params not supported); handled in Rust registry
 -- Aggregate-compatible macros: collect_list / collect_set (used in spark.sql() path)
 CREATE OR REPLACE MACRO collect_list(x) AS LIST(x) FILTER (WHERE x IS NOT NULL);
-CREATE OR REPLACE MACRO collect_set(x) AS LIST(DISTINCT x);
+CREATE OR REPLACE MACRO collect_set(x) AS LIST(DISTINCT x) FILTER (WHERE x IS NOT NULL);
 -- substring_index(str, delim, cnt): first/last cnt delim-separated tokens
 CREATE OR REPLACE MACRO substring_index(str, delim, cnt) AS
     CASE WHEN cnt > 0 THEN

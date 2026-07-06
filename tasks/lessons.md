@@ -193,6 +193,38 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   unhandled type surfaces as a loud error. Silent NULL substitution is
   worse than a loud panic in every case.
 
+- **Data-dependent output schemas resolve via a session-injected discovery
+  pre-pass in connect-server, never an inline analyzer query.** Values-less
+  `.pivot(col)` (2026-07-06) punted with `PuntedOperator("Pivot[implicit-values]")`
+  because its output schema (one column per distinct pivot value) is
+  data-dependent — unknowable from `&BaseTypes` alone — and the τ analyzer is a
+  pure, synchronous stage barred by INV10 from importing `crate::runtime`, so it
+  has nowhere to run Spark's eager `select(col).distinct().sort(col)`. The fix
+  mirrors Spark's analyzer *outside* τ: `resolve_implicit_pivots` /
+  `discover_pivot_values` in `crates/connect-server/src/service.rs` (which holds
+  the `DuckDbSession` and may import `crate::runtime`) emit the pivot's `input`
+  subtree, run `SELECT DISTINCT <col> FROM (<input>) ORDER BY 1 ASC NULLS FIRST
+  LIMIT pivotMaxValues+1` via the existing async `session.execute().await`,
+  convert rows to typed literals with the reused `arrow_val_to_literal`, enforce
+  `spark.sql.pivotMaxValues` (10000), and rewrite the `CommonOp::Pivot` node to
+  the explicit-values shape *before* `finalize`/`analyze` — downstream is
+  byte-identical to the passing explicit-values path (grp-004). This keeps the
+  analyzer pure (INV10) and the DuckDB threading model intact (session touched
+  only via its async channel; no `!Send` `Connection` crosses a thread). Two
+  Spark-parity subtleties, both verified against Spark 4.x source (not the Java
+  reference, which null-filters and diverges): (1) `distinct()` does *not*
+  null-filter, so a discovered NULL is a legitimate bucket that sorts first
+  (nulls-first) and is named `"null"` — τ's pre-existing NULL-pivot-value
+  rejection in `analyze_pivot` was therefore a parity *bug* on the explicit path
+  too, not a user-input safeguard, and was removed outright; (2) `ORDER BY … ASC
+  NULLS FIRST` is load-bearing for deterministic output-column order. Rule: any
+  op whose output schema depends on the *values* (not types) of its input —
+  Crosstab is the mirror image, same session-hook blocker — routes through this
+  same eager connect-server pre-pass, not a second mechanism and never a query
+  from inside the analyzer. Model "not yet discovered" distinctly from "empty
+  list" if you extend this (an empty input relation currently re-punts, because
+  a genuinely empty discovered `Vec` is indistinguishable from unresolved).
+
 ## Progress-signal calibration
 
 - **Per-slice progress-signal estimates are lagging indicators; recalibrate after each slice

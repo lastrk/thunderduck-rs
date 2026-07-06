@@ -2752,19 +2752,14 @@ fn analyze_pivot(
     // typing to the emission stage — literals carry their own type already.
     let pivot_values = resolve_expr_list(pivot_values, input_schema)?;
 
-    // Spark-emulated (Pass 60 H2): Catalyst rejects NULL pivot values with
-    // "Literal expressions required for pivot values, found 'null'". Mirror
-    // that behavior so callers cannot smuggle a NULL bucket in.
-    for pv in &pivot_values {
-        if let Expression::Literal(lit) = pv {
-            if matches!(lit.value, super::expression::LiteralValue::Null) {
-                return Err(AnalyzerError::Other {
-                    reason: "literal expressions required for pivot values, found 'null'"
-                        .to_owned(),
-                });
-            }
-        }
-    }
+    // A NULL pivot value is a legitimate bucket, not an error. Spark's
+    // `PivotTransformer` only rejects *non-foldable* pivot value expressions
+    // (`NON_LITERAL_PIVOT_VALUES`); a `Literal(null)` is foldable and yields a
+    // column named `"null"` (its `outputName` casts the value to string and
+    // falls back to `"null"`). Both Spark pivot overloads accept it — the
+    // values-less overload discovers it via `select(col).distinct()` (which
+    // does not null-filter), and the explicit overload takes it verbatim. See
+    // `literal_to_pivot_column_name` for the `"null"` naming.
 
     // Build the output schema. Grouping columns come first, verbatim.
     let mut output_fields: Vec<StructField> = Vec::new();
@@ -2821,11 +2816,11 @@ fn literal_to_pivot_column_name(expr: &Expression) -> String {
     use super::expression::LiteralValue;
     if let Expression::Literal(lit) = expr {
         return match &lit.value {
-            // Pass 60 H2: analyze_pivot rejects NULL pivot values before we
-            // ever reach this arm, so the case is unreachable in practice.
-            LiteralValue::Null => {
-                unreachable!("analyzer rejects Null pivot values (Pass 60 H2)")
-            }
+            // Spark's `PivotTransformer.outputName` casts the pivot value to
+            // StringType and falls back to the literal string `"null"` when the
+            // cast evaluates to null. A discovered NULL bucket (e.g. from an
+            // `explode_outer` pivot column) is therefore named `"null"`.
+            LiteralValue::Null => "null".to_owned(),
             LiteralValue::Boolean(b) => b.to_string(),
             LiteralValue::Byte(v) => v.to_string(),
             LiteralValue::Short(v) => v.to_string(),
@@ -4555,11 +4550,16 @@ mod tests {
         assert_eq!(names, vec!["dept_id", "1.0", "-2.0", "1.5"]);
     }
 
-    /// Pass 60 H2 — Spark's Catalyst rejects NULL pivot values with a
-    /// `Literal expressions required for pivot values` analysis error. τ
-    /// mirrors that as an `AnalyzerError::Other` (Spark-emulated).
+    /// A NULL pivot value is a legitimate bucket. Spark's `PivotTransformer`
+    /// only rejects *non-foldable* pivot value expressions
+    /// (`NON_LITERAL_PIVOT_VALUES`); a `Literal(null)` is foldable and Spark
+    /// names its output column `"null"` (its `outputName` casts to string and
+    /// falls back to `"null"`). The values-less overload feeds a discovered
+    /// NULL straight into this path, so τ must accept it and stamp a `"null"`
+    /// column — verified against `RelationalGroupedDataset.pivot` /
+    /// `PivotTransformer.outputName` in Spark 4.x.
     #[test]
-    fn analyze_pivot_rejects_null_literal_in_pivot_values() {
+    fn analyze_pivot_accepts_null_literal_as_null_bucket() {
         let bt = base_types_with_emp_dept();
         let emp_scan = CommonAst::new(CommonOp::TableScan {
             table: "emp".to_owned(),
@@ -4578,14 +4578,15 @@ mod tests {
                 plan_id: None,
             }),
             pivot_values: vec![
-                Expression::Literal(Literal {
-                    value: LiteralValue::Int(10),
-                    data_type: DataType::Integer,
-                }),
-                // Null in the middle of an otherwise valid list must fail.
+                // A discovered NULL bucket (sorts first per Spark's nulls-first
+                // ordering) followed by a concrete value.
                 Expression::Literal(Literal {
                     value: LiteralValue::Null,
                     data_type: DataType::Null,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::Int(10),
+                    data_type: DataType::Integer,
                 }),
             ],
             aggregates: vec![Expression::FunctionCall(FunctionCall {
@@ -4597,15 +4598,15 @@ mod tests {
                 distinct: false,
             })],
         });
-        match analyze(ast, &bt) {
-            Err(AnalyzerError::Other { reason }) => {
-                assert!(
-                    reason.contains("null"),
-                    "expected null-rejection reason, got: {reason}"
-                );
-            }
-            other => panic!("expected AnalyzerError::Other, got {other:?}"),
-        }
+        let typed = analyze(ast, &bt).expect("NULL pivot value must be accepted");
+        let names: Vec<&str> = typed
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        // grouping column, then the NULL bucket named "null", then "10".
+        assert_eq!(names, vec!["dept_id", "null", "10"]);
     }
 
     // ── Review-fix H1: missing dropField target is Spark-emulated error ──

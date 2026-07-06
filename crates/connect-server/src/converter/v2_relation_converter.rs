@@ -1804,7 +1804,10 @@ fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, EmissionError> {
 /// `Ok(null_literal())` catch-all — silent NULL substitution would turn every
 /// unhandled type into wrong-answer data corruption (see the DECIMAL bug
 /// documented in `local_relation_to_values_sql`).
-fn arrow_val_to_literal(array: &dyn Array, row: usize) -> Result<Expression, EmissionError> {
+pub(crate) fn arrow_val_to_literal(
+    array: &dyn Array,
+    row: usize,
+) -> Result<Expression, EmissionError> {
     if array.is_null(row) {
         return Ok(null_literal());
     }

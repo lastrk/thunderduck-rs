@@ -53,19 +53,31 @@ static SERVER_SESSION_ID: std::sync::LazyLock<String> =
 pub(crate) fn transpile_relation(
     relation: &proto::Relation,
 ) -> Result<(CommonAst, String, StructType), Status> {
+    let common_ast = relation_to_common_ast(relation)?;
+    let (sql, schema) = finalize(&common_ast)?;
+    Ok((common_ast, sql, schema))
+}
+
+/// Convert a Spark Connect [`proto::Relation`] into a [`CommonAst`] **without**
+/// finalizing it to SQL.
+///
+/// Splitting the conversion out of [`transpile_relation`] lets the async
+/// dispatch layer interpose an eager pivot-value-discovery pass
+/// ([`resolve_implicit_pivots`]) between conversion and [`finalize`] — the
+/// discovery needs the live `DuckDbSession`, which the sync `finalize` path
+/// (and τ's analyzer, per INV10) cannot reach.
+pub(crate) fn relation_to_common_ast(relation: &proto::Relation) -> Result<CommonAst, Status> {
     use proto::relation::RelType;
-    let common_ast = match &relation.rel_type {
+    match &relation.rel_type {
         Some(RelType::Sql(sql_relation)) => SparkSqlParserV2::parse(&sql_relation.query)
-            .map_err(|e| Status::from(ConnectError::from(e)))?,
+            .map_err(|e| Status::from(ConnectError::from(e))),
         _ => {
             let mut converter = V2RelationConverter::new();
             converter
                 .convert(relation)
-                .map_err(|e| Status::from(ConnectError::from(e)))?
+                .map_err(|e| Status::from(ConnectError::from(e)))
         }
-    };
-    let (sql, schema) = finalize(&common_ast)?;
-    Ok((common_ast, sql, schema))
+    }
 }
 
 /// Convert a raw SparkSQL string into a [`CommonAst`] and finalize it into
@@ -122,6 +134,151 @@ fn build_base_types(common_ast: &CommonAst) -> BaseTypes {
     }
 }
 
+// ── Eager pivot-value discovery (Spark parity) ───────────────────────────────
+
+/// `spark.sql.pivotMaxValues` default (Spark 4.1.1). A values-less pivot whose
+/// pivot column has more than this many distinct values is a Spark-emulated
+/// compile error (`_LEGACY_ERROR_TEMP_1324`).
+const PIVOT_MAX_VALUES: usize = 10000;
+
+/// Eagerly resolve every values-less [`CommonOp::Pivot`] in `ast` by running
+/// Spark's own discovery query against the live session, mirroring
+/// `RelationalGroupedDataset.pivot(pivotColumn: Column)`:
+/// `df.select(pivotColumn).distinct().limit(maxValues + 1).sort(pivotColumn)`.
+///
+/// τ's analyzer is a pure, synchronous stage (INV10 forbids it importing
+/// `crate::runtime`), so it cannot run the data-dependent DISTINCT itself and
+/// punts an empty-values pivot with `PuntedOperator("Pivot[implicit-values]")`.
+/// This pass runs on the async dispatch layer — which holds the
+/// [`DuckDbSession`] — and rewrites each empty-values pivot into the
+/// explicit-values shape *before* [`finalize`]/[`analyze_schema`], so downstream
+/// is byte-identical to a user-supplied explicit-values pivot.
+///
+/// The walk is post-order (children first) so nested / multiple implicit pivots
+/// are all resolved.
+async fn resolve_implicit_pivots(
+    ast: &mut CommonAst,
+    session: &thunderduck_core::runtime::DuckDbSession,
+) -> Result<(), Status> {
+    use thunderduck_core::transpiler_v2::CommonOp;
+
+    // Resolve children first.
+    match &mut ast.op {
+        CommonOp::Project { input, .. }
+        | CommonOp::Filter { input, .. }
+        | CommonOp::Sort { input, .. }
+        | CommonOp::Limit { input, .. }
+        | CommonOp::Aggregate { input, .. }
+        | CommonOp::WithColumns { input, .. }
+        | CommonOp::DropColumns { input, .. }
+        | CommonOp::AliasedRelation { input, .. }
+        | CommonOp::WithColumnsRenamed { input, .. }
+        | CommonOp::ToDf { input, .. }
+        | CommonOp::Deduplicate { input, .. }
+        | CommonOp::NaFill { input, .. }
+        | CommonOp::NaDrop { input, .. }
+        | CommonOp::NaReplace { input, .. }
+        | CommonOp::Unpivot { input, .. }
+        | CommonOp::Pivot { input, .. }
+        | CommonOp::Describe { input, .. }
+        | CommonOp::Summary { input, .. }
+        | CommonOp::FreqItems { input, .. }
+        | CommonOp::Crosstab { input, .. }
+        | CommonOp::Sample { input, .. }
+        | CommonOp::SampleBy { input, .. } => {
+            Box::pin(resolve_implicit_pivots(input, session)).await?;
+        }
+        CommonOp::Join { left, right, .. } => {
+            Box::pin(resolve_implicit_pivots(left, session)).await?;
+            Box::pin(resolve_implicit_pivots(right, session)).await?;
+        }
+        CommonOp::SetOp { children, .. } => {
+            for child in children.iter_mut() {
+                Box::pin(resolve_implicit_pivots(child, session)).await?;
+            }
+        }
+        // Leaf relations carry no child plan to descend into.
+        CommonOp::SingleRow
+        | CommonOp::TableScan { .. }
+        | CommonOp::Values { .. }
+        | CommonOp::LocalRelation { .. }
+        | CommonOp::FileScan { .. }
+        | CommonOp::TableFunction { .. }
+        | CommonOp::Unnest { .. } => {}
+    }
+
+    // If THIS node is a values-less pivot, discover and stamp its values.
+    if let CommonOp::Pivot {
+        input,
+        pivot_column,
+        pivot_values,
+        ..
+    } = &mut ast.op
+    {
+        if pivot_values.is_empty() {
+            *pivot_values = discover_pivot_values(input, pivot_column, session).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Run Spark's pivot-value discovery query for a single values-less pivot and
+/// return the discovered values as typed literals, sorted ascending with NULLs
+/// first (Spark's default ordering — the NULL bucket, if present, sorts first
+/// and is a legitimate pivot column named `"null"`; Spark's values-less
+/// overload does **not** null-filter, verified against
+/// `RelationalGroupedDataset.pivot` in Spark 4.x).
+async fn discover_pivot_values(
+    input: &CommonAst,
+    pivot_column: &thunderduck_core::transpiler_v2::Expression,
+    session: &thunderduck_core::runtime::DuckDbSession,
+) -> Result<Vec<thunderduck_core::transpiler_v2::Expression>, Status> {
+    use thunderduck_core::transpiler_v2::CommonOp;
+
+    // Emit `SELECT <pivot_column> FROM <input>` via the pure τ path, then wrap
+    // it in the DISTINCT / ORDER BY / LIMIT that Spark's analyzer applies. The
+    // pivot's `input` subtree does not contain the pivot itself, so it emits
+    // independently.
+    let discovery_project = CommonAst::new(CommonOp::Project {
+        input: Box::new(input.clone()),
+        projections: vec![pivot_column.clone()],
+    });
+    let (project_sql, _schema) = finalize(&discovery_project)?;
+    // `.limit(maxValues + 1)` so we can detect (and reject) an over-cap column
+    // count exactly the way Spark does.
+    let discovery_sql = format!(
+        "SELECT DISTINCT * FROM ({project_sql}) AS __td_pivot_discover \
+         ORDER BY 1 ASC NULLS FIRST LIMIT {}",
+        PIVOT_MAX_VALUES + 1
+    );
+    let batches = session
+        .execute(&discovery_sql)
+        .await
+        .map_err(|e| Status::from(ConnectError::from(e)))?;
+
+    let mut values = Vec::new();
+    for batch in &batches {
+        let column = batch.column(0);
+        for row in 0..batch.num_rows() {
+            values.push(
+                crate::converter::v2_relation_converter::arrow_val_to_literal(column.as_ref(), row)
+                    .map_err(|e| Status::from(ConnectError::from(e)))?,
+            );
+        }
+    }
+
+    // Spark-emulated (`_LEGACY_ERROR_TEMP_1324`): reject a pivot column with
+    // more distinct values than `spark.sql.pivotMaxValues`.
+    if values.len() > PIVOT_MAX_VALUES {
+        return Err(Status::invalid_argument(format!(
+            "[_LEGACY_ERROR_TEMP_1324] The pivot column has more than {PIVOT_MAX_VALUES} distinct \
+             values, this could indicate an error. If this was intended, set \
+             spark.sql.pivotMaxValues to at least the number of distinct values of the pivot column."
+        )));
+    }
+    Ok(values)
+}
+
 // ── gRPC service impl ─────────────────────────────────────────────────────────
 
 #[tonic::async_trait]
@@ -158,7 +315,12 @@ impl SparkConnectService for ThunderduckService {
 
         let responses: Vec<proto::ExecutePlanResponse> = match plan.op_type {
             Some(proto::plan::OpType::Root(relation)) => {
-                let (common_ast, sql, resolved_schema) = transpile_relation(&relation)?;
+                // Convert first, then run Spark's eager pivot-value discovery
+                // (needs the live session) BEFORE finalize — see
+                // `resolve_implicit_pivots`.
+                let mut common_ast = relation_to_common_ast(&relation)?;
+                resolve_implicit_pivots(&mut common_ast, &session).await?;
+                let (sql, resolved_schema) = finalize(&common_ast)?;
                 // `finalize()` errors unconditionally, so the
                 // downstream classification / streaming helpers are only
                 // reachable when Slices C/E begin lighting up emission arms.
@@ -217,8 +379,9 @@ impl SparkConnectService for ThunderduckService {
                         ));
                     }
                 };
-                // Warm the session so subsequent slices can reach it.
-                let _session = self
+                // Hold the session so the eager pivot-value discovery pass can
+                // reach it (see `resolve_implicit_pivots`).
+                let session = self
                     .session_manager
                     .get_or_create(&session_id)
                     .await
@@ -236,18 +399,8 @@ impl SparkConnectService for ThunderduckService {
                 // ExecutePlan achieves the same on the response path via
                 // `arrow_schema_stamp::stamp_batch_schemas` in
                 // `execute_streaming_query`. Do not modify this arm.
-                let common_ast = match &relation.rel_type {
-                    Some(proto::relation::RelType::Sql(sql_relation)) => {
-                        SparkSqlParserV2::parse(&sql_relation.query)
-                            .map_err(|e| Status::from(ConnectError::from(e)))?
-                    }
-                    _ => {
-                        let mut converter = V2RelationConverter::new();
-                        converter
-                            .convert(&relation)
-                            .map_err(|e| Status::from(ConnectError::from(e)))?
-                    }
-                };
+                let mut common_ast = relation_to_common_ast(&relation)?;
+                resolve_implicit_pivots(&mut common_ast, &session).await?;
                 let struct_type = analyze_schema(&common_ast)?;
                 // ADR-022 boundary hygiene: `DataType::Unresolved` maps to
                 // `Kind::Unparsed { data_type_string: "unresolved" }` on the
@@ -1113,6 +1266,110 @@ mod tests {
             "guard message must name the offending field; got: {msg}",
             msg = status.message(),
         );
+    }
+
+    // ── Eager pivot-value discovery ─────────────────────────────────────────
+
+    /// The discovery pass rewrites a values-less `Pivot` into the sorted, typed
+    /// literal set discovered from the live session — including a legitimate
+    /// NULL bucket, which Spark's values-less overload does not null-filter and
+    /// which sorts first (nulls-first). Uses an inline `Values` input so the
+    /// test is self-contained (no temp-view registration needed).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_implicit_pivots_discovers_sorted_typed_values_with_null_bucket() {
+        use thunderduck_core::transpiler_v2::ast::CommonOp;
+        use thunderduck_core::transpiler_v2::expression::{
+            Expression, FunctionCall, Literal, LiteralValue, UnresolvedColumn,
+        };
+
+        fn str_lit(s: &str) -> Expression {
+            Expression::Literal(Literal {
+                value: LiteralValue::String(s.to_owned()),
+                data_type: DataType::String,
+            })
+        }
+        fn int_lit(v: i32) -> Expression {
+            Expression::Literal(Literal {
+                value: LiteralValue::Int(v),
+                data_type: DataType::Integer,
+            })
+        }
+        fn null_str_lit() -> Expression {
+            Expression::Literal(Literal {
+                value: LiteralValue::Null,
+                data_type: DataType::Null,
+            })
+        }
+        fn col(name: &str) -> Expression {
+            Expression::UnresolvedColumn(UnresolvedColumn {
+                name: name.to_owned(),
+                qualifier: None,
+                plan_id: None,
+            })
+        }
+
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
+            thunderduck_core::runtime::StreamingConfig::default(),
+        ));
+        let session = session_manager
+            .get_or_create("pivot-discovery-session")
+            .await
+            .expect("session must be created");
+
+        // Inline data: pivot column `p` has distinct values {NULL, "b", "a"}
+        // across the rows — discovery must return them sorted ascending with
+        // NULL first.
+        let values = CommonAst::new(CommonOp::Values {
+            rows: vec![
+                vec![int_lit(1), str_lit("b")],
+                vec![int_lit(1), null_str_lit()],
+                vec![int_lit(2), str_lit("a")],
+                vec![int_lit(2), str_lit("b")],
+            ],
+            column_names: vec!["g".to_owned(), "p".to_owned()],
+        });
+        let mut ast = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(values),
+            grouping: vec![col("g")],
+            pivot_column: col("p"),
+            pivot_values: vec![],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "count".to_owned(),
+                args: vec![int_lit(1)],
+                distinct: false,
+            })],
+        });
+
+        resolve_implicit_pivots(&mut ast, &session)
+            .await
+            .expect("discovery pass must succeed");
+
+        let discovered = match &ast.op {
+            CommonOp::Pivot { pivot_values, .. } => pivot_values,
+            _ => panic!("expected Pivot"),
+        };
+        // NULL bucket sorts first, then "a", then "b".
+        assert_eq!(discovered.len(), 3, "expected NULL + two distinct values");
+        assert!(
+            matches!(
+                &discovered[0],
+                Expression::Literal(Literal {
+                    value: LiteralValue::Null,
+                    ..
+                })
+            ),
+            "NULL bucket must sort first, got {:?}",
+            discovered[0]
+        );
+        let as_str = |e: &Expression| match e {
+            Expression::Literal(Literal {
+                value: LiteralValue::String(s),
+                ..
+            }) => s.clone(),
+            other => panic!("expected string literal, got {other:?}"),
+        };
+        assert_eq!(as_str(&discovered[1]), "a");
+        assert_eq!(as_str(&discovered[2]), "b");
     }
 
     /// Companion test: schemas without unresolved must pass the guard

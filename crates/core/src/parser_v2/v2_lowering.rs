@@ -528,15 +528,34 @@ fn lower_table_factor(
             }
         }
         TableFactor::Derived {
-            subquery, alias: _, ..
+            subquery, alias, ..
         } => {
-            // Subquery-in-FROM is lowered by inlining the inner plan. The
-            // derived-table alias is still dropped here, so a
-            // query that qualifies columns by the derived alias won't bind.
-            // `AliasedRelation` IS live now (pass 101 wraps CTE references in it
-            // with their alias) — preserving the derived alias the same way is a
-            // follow-up (would green e.g. tbl-010).
-            lower_query(*subquery, cte_scope)
+            // Subquery-in-FROM is lowered by inlining the inner plan. When the
+            // derived table carries an alias, wrap the lowered subquery in
+            // `AliasedRelation` so qualified refs (`t.dept_id`) bind to the user
+            // alias in the emitted SQL instead of the synthetic `__td_proj`.
+            // An explicit column list (`AS t(c1, c2)`) positionally renames the
+            // subquery output via `ToDf` first. Mirrors the CTE-definition
+            // branch above. Unaliased derived tables inline unchanged.
+            let inner = lower_query(*subquery, cte_scope)?;
+            match alias {
+                Some(a) => {
+                    let renamed = if a.columns.is_empty() {
+                        inner
+                    } else {
+                        let column_names = a.columns.into_iter().map(|c| c.name.value).collect();
+                        CommonAst::new(CommonOp::ToDf {
+                            input: Box::new(inner),
+                            column_names,
+                        })
+                    };
+                    Ok(CommonAst::new(CommonOp::AliasedRelation {
+                        input: Box::new(renamed),
+                        alias: a.name.value,
+                    }))
+                }
+                None => Ok(inner),
+            }
         }
         TableFactor::TableFunction { expr, alias: _ } => {
             // Only bare identifier / function-call table functions covered.
@@ -2856,6 +2875,73 @@ mod tests {
             }
             other => panic!("expected ToDf under the AliasedRelation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_derived_table_with_alias_wraps_in_aliased_relation() {
+        // `(SELECT ...) AS t` — the derived-table alias is preserved as an
+        // AliasedRelation over the inlined aggregate so `t.dept_id`/`t.n` bind.
+        let plan = parse(
+            "SELECT t.dept_id, t.n \
+             FROM (SELECT dept_id, count(*) n FROM emp GROUP BY dept_id) AS t",
+        )
+        .expect("should parse");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        let CommonOp::AliasedRelation { alias, input } = input.op else {
+            panic!("expected AliasedRelation over the derived table");
+        };
+        assert_eq!(alias, "t");
+        assert!(
+            matches!(input.op, CommonOp::Aggregate { .. }),
+            "expected Aggregate under the AliasedRelation, got {:?}",
+            input.op
+        );
+    }
+
+    #[test]
+    fn parse_derived_table_explicit_columns_wraps_in_todf() {
+        // `(SELECT ...) AS t(c1, c2)` — the explicit column list becomes a
+        // positional ToDf rename beneath the AliasedRelation.
+        let plan = parse(
+            "SELECT t.c1, t.c2 \
+             FROM (SELECT dept_id, count(*) FROM emp GROUP BY dept_id) AS t(c1, c2)",
+        )
+        .expect("should parse");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        let CommonOp::AliasedRelation { alias, input } = input.op else {
+            panic!("expected AliasedRelation over the derived table");
+        };
+        assert_eq!(alias, "t");
+        match input.op {
+            CommonOp::ToDf { column_names, .. } => {
+                assert_eq!(column_names, vec!["c1".to_owned(), "c2".to_owned()]);
+            }
+            other => panic!("expected ToDf under the AliasedRelation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unaliased_derived_table_inlines_bare() {
+        // An unaliased derived table inlines the inner op directly — NO
+        // AliasedRelation wrapper (guards the win-014/pivot inlining path).
+        let plan = parse("SELECT dept_id FROM (SELECT dept_id FROM emp)").expect("should parse");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        assert!(
+            !matches!(input.op, CommonOp::AliasedRelation { .. }),
+            "unaliased derived table must not be wrapped in AliasedRelation, got {:?}",
+            input.op
+        );
+        assert!(
+            matches!(input.op, CommonOp::Project { .. }),
+            "expected the inner Project inlined directly, got {:?}",
+            input.op
+        );
     }
 
     #[test]

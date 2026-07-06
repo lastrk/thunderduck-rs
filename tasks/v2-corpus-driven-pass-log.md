@@ -987,3 +987,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 563/0, `sql_v2` 191/71/262 no regression).
 - Commit SHA: (this commit).
+
+## Pass 118 — 2026-07-06 — SQL corpus: derived-table alias (tbl-010) [sq-011/012/013 unsolvable]
+- **Corpus: SQL front-end (lowering only).** Initial cluster sq-011/012/013 (quantified ALL/ANY/SOME subquery predicates) diagnosed **UNSOLVABLE** — Spark 4.1.1 itself throws `PARSE_SYNTAX_ERROR` on that syntax (reference side), so no differential result exists. Appended to `.agent-output/unsolvable.md`, skipped. sq-014 (derived table, unqualified refs) found ALREADY GREEN. Real target: **tbl-010** `SELECT t.dept_id, t.n FROM (SELECT dept_id, count(*) n FROM emp GROUP BY dept_id) AS t`.
+- Root cause (diagnostic-pass-118.md): `lower_table_factor` `TableFactor::Derived` arm destructured `alias: _`, discarding the derived-table alias → outer `t.dept_id`/`t.n` bound against nothing → DuckDB "Referenced table t not found". τ-side boundary, not a differential mismatch.
+- Architecture (architecture-pass-118.md): lowering-only — wrap an aliased derived table in `CommonOp::AliasedRelation{input, alias}` (nested `ToDf` for `AS t(c1,c2)` column lists), mirroring the CTE-definition branch. Unaliased → bare inner (unchanged). Reuses pass-114 machinery fully; no AST/analyzer/emission change.
+- Layer(s) touched: parser_v2/v2_lowering.rs (one arm).
+- ADR citations: ADR-004 (reuse AliasedRelation/ToDf — one AST, front-end parity/INV7), ADR-022 (was a τ-boundary emit).
+- Corpus signal: 191 → **192** (+1). tbl-010 GREEN; sq-014 stays green; win-014/sq-015/pv-* (unaliased derived) unaffected. No regressions.
+- Files: 1. Tests added: 3 (AS t → AliasedRelation; AS t(c1,c2) → AliasedRelation over ToDf; unaliased → bare inner).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED). 1 informational (pre-existing, out of scope): ToDf HashMap-keyed rename collapses on duplicate output column names under an explicit column list — inherited from the CTE/ToDf path, no witness.
+- Findings queued as follow-up: sq-011/012/013 corpus quarantine (authoring decision); B1 correlated subqueries (biggest lever — analyzer outer-scope + emission; my pass-114 alias fix addressed the stated buries-the-alias blocker, so re-assess).
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 566/0, `sql_v2` 192/70/262 no regression).
+- Commit SHA: (this commit).

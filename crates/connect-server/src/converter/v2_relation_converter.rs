@@ -647,6 +647,10 @@ impl V2RelationConverter {
             grouping,
             aggregates,
             grouping_kind,
+            // DataFrame `groupingSets` path is not implemented in τ — leave the
+            // per-set membership empty so emission surfaces the boundary error
+            // (ADR-022). The SparkSQL front-end populates this instead.
+            grouping_sets: Vec::new(),
             // DataFrame path models post-aggregation filtering as a separate
             // Filter over the Aggregate; HAVING is a SparkSQL-only concept.
             having: None,

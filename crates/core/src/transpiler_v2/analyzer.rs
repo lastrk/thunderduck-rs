@@ -128,6 +128,11 @@ pub enum TypedOp {
         aggregates: Vec<Expression>,
         /// GROUP BY variant.
         grouping_kind: crate::transpiler_v2::ast::GroupingKind,
+        /// Per-set column membership for [`GroupingKind::GroupingSets`] —
+        /// indices into `grouping` (first-appearance order); empty inner vec =
+        /// empty set `()`. EMPTY for all other kinds and on the DataFrame
+        /// `groupingSets` path (which stays a boundary error, ADR-022).
+        grouping_sets: Vec<Vec<usize>>,
         /// Resolved SparkSQL `HAVING <pred>` — see [`CommonOp::Aggregate`].
         /// `None` for the DataFrame path. Resolved against the aggregate
         /// INPUT schema.
@@ -882,6 +887,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             grouping,
             aggregates,
             grouping_kind,
+            grouping_sets,
             having,
         } => {
             let typed_input = analyze_node(*input, base_types)?;
@@ -931,6 +937,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
                     grouping,
                     aggregates,
                     grouping_kind,
+                    grouping_sets,
                     having,
                 },
                 resolved_schema: output_schema,
@@ -5157,6 +5164,7 @@ mod tests {
                 distinct: false,
             })],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
             having: None,
         });
         let typed = analyze(ast, &bt).unwrap();
@@ -5212,6 +5220,7 @@ mod tests {
                 }),
             ],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
             having: None,
         });
         let typed = analyze(ast, &bt).unwrap();
@@ -5268,6 +5277,7 @@ mod tests {
                 avg_salary(),
             ],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
             having: Some(having),
         });
         let typed = analyze(ast, &bt).expect("HAVING over input column should resolve");
@@ -5297,6 +5307,7 @@ mod tests {
                 distinct: false,
             })],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
             // A bare integer literal is not a boolean predicate.
             having: Some(Expression::Literal(Literal {
                 value: LiteralValue::Int(5),

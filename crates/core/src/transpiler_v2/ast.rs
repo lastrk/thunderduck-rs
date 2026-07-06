@@ -116,8 +116,14 @@ pub enum CommonOp {
         /// unfolds them.
         aggregates: Vec<Expression>,
         /// The grouping kind — GroupBy (default), Rollup, Cube, or
-        /// GroupingSets (future τ work — Pivot lives elsewhere).
+        /// GroupingSets (Pivot lives elsewhere).
         grouping_kind: GroupingKind,
+        /// Per-set column membership for [`GroupingKind::GroupingSets`] —
+        /// indices into the flat `grouping` list (first-appearance order). One
+        /// inner vec per set; an empty inner vec is the empty set `()` (grand
+        /// total). EMPTY for all other kinds and on the DataFrame
+        /// `groupingSets` path (which stays a boundary error, ADR-022).
+        grouping_sets: Vec<Vec<usize>>,
         /// SparkSQL `HAVING <pred>` — post-aggregation group filter. `None` for
         /// the DataFrame path (models post-agg filtering as a separate Filter
         /// over the Aggregate). Resolved against the aggregate INPUT schema
@@ -556,10 +562,12 @@ pub enum GroupingKind {
     Rollup,
     /// `GROUP BY CUBE(cols)`.
     Cube,
-    /// `GROUP BY GROUPING SETS((cols), (cols), ...)` — future τ work structured
-    /// form. The `grouping` list carries all distinct cols in first-appear
-    /// order; the set membership is applied at emission time (not yet
-    /// wired; punts as `UnsupportedOp` today).
+    /// `GROUP BY GROUPING SETS((cols), (cols), ...)`. The `grouping` list
+    /// carries all distinct cols in first-appearance order; the per-set
+    /// membership lives in the sibling `grouping_sets` field on
+    /// [`CommonOp::Aggregate`]/`TypedOp::Aggregate` (indices into `grouping`)
+    /// and is applied at emission time. The SparkSQL front-end populates it;
+    /// the DataFrame path leaves it empty and stays a boundary error.
     GroupingSets,
 }
 

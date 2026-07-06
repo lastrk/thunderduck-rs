@@ -523,6 +523,7 @@ mod tests {
             grouping: vec![],
             aggregates: vec![],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
             having: None,
         });
         assert!(plan_has_empty_scan(&with_agg));

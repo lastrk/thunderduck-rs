@@ -23,8 +23,8 @@ use std::collections::HashMap;
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, CastKind, CeilFloorKind, DataType as SqlDataType, DateTimeField,
     Distinct, DuplicateTreatment, ExactNumberInfo, Expr, ExprWithAlias, Function, FunctionArg,
-    FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Interval,
-    JoinConstraint, JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, GroupByWithModifier,
+    Interval, JoinConstraint, JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr,
     NullInclusion, ObjectName, ObjectNamePart, OrderByExpr, OrderByKind, OrderByOptions,
     PivotValueSource, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
     Subscript, TableFactor, TableWithJoins, TrimWhereField, TypedString, UnaryOperator, Value,
@@ -343,23 +343,60 @@ fn lower_aggregate_select(
     having: Option<Expr>,
     cte_scope: &CteScope,
 ) -> Result<CommonAst, EmissionError> {
-    let (grouping, grouping_kind) = match group_by {
+    let (grouping, grouping_kind, grouping_sets) = match group_by {
         GroupByExpr::Expressions(exprs, modifiers) => {
-            if !modifiers.is_empty() {
-                bail_boundary_proto!(
+            // Trailing `GROUP BY <cols> WITH ROLLUP` / `WITH CUBE` (Spark
+            // postfix form). Only a single ROLLUP or CUBE modifier is a Spark
+            // shape; WITH TOTALS (ClickHouse) and stacked modifiers are
+            // Thunderduck-boundary rejects.
+            let with_modifier_kind = match modifiers.as_slice() {
+                [] => None,
+                [GroupByWithModifier::Rollup] => Some(GroupingKind::Rollup),
+                [GroupByWithModifier::Cube] => Some(GroupingKind::Cube),
+                _ => bail_boundary_proto!(
                     "sql::group_by_modifiers",
-                    "GROUP BY modifiers (ROLLUP/CUBE/GROUPING SETS) not supported in τ"
-                );
-            }
-            // Prefix-form `ROLLUP (...)` / `CUBE (...)` parses to a single
-            // `Expr::Rollup`/`Expr::Cube` holding `Vec<Vec<Expr>>` grouping
-            // terms (`ROLLUP (a, b)` → `[[a], [b]]`). Flatten the terms into
-            // τ's flat grouping list and thread the kind — mirroring the
-            // DataFrame path in `v2_relation_converter::convert_aggregate`,
-            // where the grouping list is flat and the direction lives in the
-            // `GroupingKind`. Spark's ROLLUP/CUBE always wraps the whole
-            // grouping list, so a single wrapper element is the expected shape.
-            if exprs.len() == 1 && matches!(exprs[0], Expr::Rollup(_) | Expr::Cube(_)) {
+                    "only a single trailing WITH ROLLUP or WITH CUBE is supported"
+                ),
+            };
+            if let Some(kind) = with_modifier_kind {
+                // Postfix modifier: the grouping list is flat and the direction
+                // lives in the GroupingKind (mirrors the prefix `ROLLUP(...)`
+                // form below and the DataFrame path). A prefix ROLLUP/CUBE/
+                // GROUPING SETS wrapper mixed with a trailing modifier is not a
+                // Spark shape — reject rather than silently mishandle.
+                let mut flat: Vec<Expression> = Vec::with_capacity(exprs.len());
+                for e in exprs {
+                    if matches!(e, Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_)) {
+                        bail_boundary_proto!(
+                            "sql::group_by_modifiers",
+                            "prefix ROLLUP/CUBE/GROUPING SETS combined with a trailing WITH modifier not supported in τ"
+                        );
+                    }
+                    flat.push(lower_expr(e, cte_scope)?);
+                }
+                (flat, kind, Vec::new())
+            } else if exprs.len() == 1 && matches!(exprs[0], Expr::GroupingSets(_)) {
+                // `GROUP BY GROUPING SETS ((a, b), (a), ())` parses to a single
+                // `Expr::GroupingSets(Vec<Vec<Expr>>)` (one inner vec per set;
+                // `()` → empty inner vec). Lower to a flat distinct grouping
+                // list plus per-set index membership consumed at emission.
+                let sets = match exprs.into_iter().next() {
+                    Some(Expr::GroupingSets(sets)) => sets,
+                    // The `len() == 1 && matches!` guard above guarantees the
+                    // first (only) element is `GroupingSets`.
+                    _ => unreachable!("single GROUPING SETS guaranteed by guard"),
+                };
+                let (flat, index_sets) = lower_grouping_sets(sets, cte_scope)?;
+                (flat, GroupingKind::GroupingSets, index_sets)
+            } else if exprs.len() == 1 && matches!(exprs[0], Expr::Rollup(_) | Expr::Cube(_)) {
+                // Prefix-form `ROLLUP (...)` / `CUBE (...)` parses to a single
+                // `Expr::Rollup`/`Expr::Cube` holding `Vec<Vec<Expr>>` grouping
+                // terms (`ROLLUP (a, b)` → `[[a], [b]]`). Flatten the terms into
+                // τ's flat grouping list and thread the kind — mirroring the
+                // DataFrame path in `v2_relation_converter::convert_aggregate`,
+                // where the grouping list is flat and the direction lives in the
+                // `GroupingKind`. Spark's ROLLUP/CUBE always wraps the whole
+                // grouping list, so a single wrapper element is the expected shape.
                 let (sets, kind) = match exprs.into_iter().next() {
                     Some(Expr::Rollup(sets)) => (sets, GroupingKind::Rollup),
                     Some(Expr::Cube(sets)) => (sets, GroupingKind::Cube),
@@ -386,19 +423,18 @@ fn lower_aggregate_select(
                         flat.push(lower_expr(e, cte_scope)?);
                     }
                 }
-                (flat, kind)
+                (flat, kind, Vec::new())
             } else {
-                // Plain GROUP BY, or an unsupported shape: bare GROUPING SETS,
-                // or a ROLLUP/CUBE mixed with other terms / repeated (Spark
-                // wraps the whole list in one wrapper — anything else is a
-                // Thunderduck-boundary reject).
+                // Plain GROUP BY, or an unsupported shape: a ROLLUP/CUBE mixed
+                // with other terms / repeated (Spark wraps the whole list in
+                // one wrapper — anything else is a Thunderduck-boundary reject).
                 let mut plain: Vec<Expression> = Vec::with_capacity(exprs.len());
                 for e in exprs {
                     match e {
                         Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => {
                             bail_boundary_proto!(
                                 "sql::grouping_sets",
-                                "GROUPING SETS / mixed ROLLUP/CUBE not supported in τ"
+                                "mixed ROLLUP/CUBE/GROUPING SETS terms not supported in τ"
                             );
                         }
                         // Spark `spark.sql.groupByOrdinal=true` (ANSI default):
@@ -416,7 +452,7 @@ fn lower_aggregate_select(
                         other => plain.push(lower_expr(other, cte_scope)?),
                     }
                 }
-                (plain, GroupingKind::GroupBy)
+                (plain, GroupingKind::GroupBy, Vec::new())
             }
         }
         GroupByExpr::All(modifiers) => {
@@ -445,7 +481,7 @@ fn lower_aggregate_select(
                     grouping.push(lower_expr(expr.clone(), cte_scope)?);
                 }
             }
-            (grouping, GroupingKind::GroupBy)
+            (grouping, GroupingKind::GroupBy, Vec::new())
         }
     };
 
@@ -470,8 +506,43 @@ fn lower_aggregate_select(
         grouping,
         aggregates: projections,
         grouping_kind,
+        grouping_sets,
         having,
     }))
+}
+
+/// Lower a `GROUP BY GROUPING SETS (...)` clause to a flat distinct grouping
+/// list plus per-set index membership.
+///
+/// Each inner `Vec<Expr>` is one grouping set (`()` → empty). Columns are
+/// deduplicated by structural [`Expression`] equality in first-appearance
+/// order into `flat`; each set becomes a vector of indices into `flat`. The
+/// emission layer renders `flat` once and indexes it per set.
+fn lower_grouping_sets(
+    sets: Vec<Vec<Expr>>,
+    cte_scope: &CteScope,
+) -> Result<(Vec<Expression>, Vec<Vec<usize>>), EmissionError> {
+    let mut flat: Vec<Expression> = Vec::new();
+    let mut index_sets: Vec<Vec<usize>> = Vec::with_capacity(sets.len());
+    for set in sets {
+        let mut idxs: Vec<usize> = Vec::with_capacity(set.len());
+        for e in set {
+            let lowered = lower_expr(e, cte_scope)?;
+            // Bind the search result before pushing so the immutable borrow of
+            // `flat` from `.position()` is released before the mutable push.
+            let existing = flat.iter().position(|g| *g == lowered);
+            let idx = match existing {
+                Some(i) => i,
+                None => {
+                    flat.push(lowered);
+                    flat.len() - 1
+                }
+            };
+            idxs.push(idx);
+        }
+        index_sets.push(idxs);
+    }
+    Ok((flat, index_sets))
 }
 
 fn lower_from(from: Vec<TableWithJoins>, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
@@ -3030,19 +3101,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_group_by_grouping_sets_rejected() {
-        // GROUPING SETS still needs set-membership substrate — reject.
-        let err = parse("SELECT a, b, COUNT(*) FROM t GROUP BY GROUPING SETS ((a), (b))")
-            .expect_err("GROUPING SETS should be rejected");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                name: shape,
+    fn parse_group_by_grouping_sets_lowers_flat_grouping_and_index_sets() {
+        // `GROUPING SETS ((a), (b))` → flat grouping [a, b], per-set membership
+        // [[0], [1]] indexing into the flat list.
+        let plan = parse("SELECT a, b, COUNT(*) FROM t GROUP BY GROUPING SETS ((a), (b))")
+            .expect("GROUPING SETS should parse");
+        match plan.op {
+            CommonOp::Aggregate {
+                grouping,
+                grouping_kind,
+                grouping_sets,
                 ..
             } => {
-                assert_eq!(shape, "sql::grouping_sets");
+                assert_eq!(grouping_kind, GroupingKind::GroupingSets);
+                assert_eq!(grouping.len(), 2, "flat distinct grouping cols a, b");
+                assert_eq!(grouping_sets, vec![vec![0usize], vec![1usize]]);
             }
-            other => panic!("expected UnsupportedProtoShape(sql::grouping_sets), got {other:?}"),
+            other => panic!("expected Aggregate, got {other:?}"),
         }
     }
 
@@ -3124,6 +3199,85 @@ mod tests {
                 if shape == "sql::grouping_sets"),
             "expected UnsupportedProtoShape(sql::grouping_sets), got {err:?}",
         );
+    }
+
+    #[test]
+    fn parse_group_by_with_rollup() {
+        // Postfix `GROUP BY <cols> WITH ROLLUP` → flat grouping, Rollup kind,
+        // empty grouping_sets (membership only applies to GROUPING SETS).
+        // Corpus witness: `gx-010`.
+        let plan = parse("SELECT a, b, COUNT(*) FROM t GROUP BY a, b WITH ROLLUP")
+            .expect("WITH ROLLUP should parse");
+        match plan.op {
+            CommonOp::Aggregate {
+                grouping,
+                grouping_kind,
+                grouping_sets,
+                ..
+            } => {
+                assert_eq!(grouping_kind, GroupingKind::Rollup);
+                assert_eq!(grouping.len(), 2);
+                assert!(grouping_sets.is_empty());
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_group_by_with_cube() {
+        // Postfix `GROUP BY <cols> WITH CUBE` → flat grouping, Cube kind. No
+        // corpus witness yet — this test keeps the Cube modifier arm live.
+        let plan = parse("SELECT a, b, COUNT(*) FROM t GROUP BY a, b WITH CUBE")
+            .expect("WITH CUBE should parse");
+        match plan.op {
+            CommonOp::Aggregate {
+                grouping,
+                grouping_kind,
+                grouping_sets,
+                ..
+            } => {
+                assert_eq!(grouping_kind, GroupingKind::Cube);
+                assert_eq!(grouping.len(), 2);
+                assert!(grouping_sets.is_empty());
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_group_by_with_totals_rejected() {
+        // ClickHouse `WITH TOTALS` is not a Spark shape — boundary reject.
+        let err = parse("SELECT a, COUNT(*) FROM t GROUP BY a WITH TOTALS")
+            .expect_err("WITH TOTALS should be rejected");
+        assert!(
+            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
+                if shape == "sql::group_by_modifiers"),
+            "expected UnsupportedProtoShape(sql::group_by_modifiers), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn parse_group_by_grouping_sets_with_empty_set_and_dedup() {
+        // gx-003 shape: `((a, b), (a), ())`. Flat distinct grouping [a, b];
+        // set membership [[0, 1], [0], []] (empty inner vec = grand-total set).
+        let plan = parse("SELECT a, b, COUNT(*) FROM t GROUP BY GROUPING SETS ((a, b), (a), ())")
+            .expect("GROUPING SETS should parse");
+        match plan.op {
+            CommonOp::Aggregate {
+                grouping,
+                grouping_kind,
+                grouping_sets,
+                ..
+            } => {
+                assert_eq!(grouping_kind, GroupingKind::GroupingSets);
+                assert_eq!(grouping.len(), 2, "flat distinct grouping cols a, b");
+                assert_eq!(
+                    grouping_sets,
+                    vec![vec![0usize, 1usize], vec![0usize], Vec::<usize>::new()]
+                );
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3352,15 +3506,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_grouping_sets_returns_unsupported_proto_shape() {
-        let result = parse("SELECT dept, COUNT(*) FROM t GROUP BY GROUPING SETS ((dept))");
-        assert!(matches!(
-            result,
-            Err(EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
+    fn parse_grouping_sets_single_set_lowers_to_grouping_sets_kind() {
+        let plan = parse("SELECT dept, COUNT(*) FROM t GROUP BY GROUPING SETS ((dept))")
+            .expect("GROUPING SETS should parse");
+        match plan.op {
+            CommonOp::Aggregate {
+                grouping,
+                grouping_kind,
+                grouping_sets,
                 ..
-            })
-        ));
+            } => {
+                assert_eq!(grouping_kind, GroupingKind::GroupingSets);
+                assert_eq!(grouping.len(), 1);
+                assert_eq!(grouping_sets, vec![vec![0usize]]);
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
     }
 
     #[test]

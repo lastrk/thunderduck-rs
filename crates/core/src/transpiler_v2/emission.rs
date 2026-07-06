@@ -172,8 +172,16 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             grouping,
             aggregates,
             grouping_kind,
+            grouping_sets,
             having,
-        } => render_aggregate_op(input, grouping, aggregates, *grouping_kind, having.as_ref()),
+        } => render_aggregate_op(
+            input,
+            grouping,
+            aggregates,
+            *grouping_kind,
+            grouping_sets,
+            having.as_ref(),
+        ),
 
         // ── Join ─────────────────────────────────────────────────────────
         TypedOp::Join {
@@ -4673,13 +4681,17 @@ fn render_aggregate_op(
     grouping: &[Expression],
     aggregates: &[Expression],
     grouping_kind: crate::transpiler_v2::ast::GroupingKind,
+    grouping_sets: &[Vec<usize>],
     having: Option<&Expression>,
 ) -> Result<String, EmissionError> {
     use super::ast::GroupingKind;
-    if matches!(grouping_kind, GroupingKind::GroupingSets) {
+    // The SparkSQL front-end populates `grouping_sets` with per-set membership
+    // (indices into `grouping`). The DataFrame `groupingSets` path leaves it
+    // empty, so it stays a Thunderduck-boundary error (ADR-022).
+    if matches!(grouping_kind, GroupingKind::GroupingSets) && grouping_sets.is_empty() {
         bail_boundary_op!(
             "Aggregate[GroupingSets]",
-            "GROUPING SETS emission requires set-membership metadata; (not implemented in τ)",
+            "GROUPING SETS requires set-membership metadata (DataFrame groupingSets path not implemented in τ)",
         );
     }
     // Aggregate-over-Filter-over-AliasedRelation inlining: correlated scalar
@@ -4741,24 +4753,36 @@ fn render_aggregate_op(
     }
     let mut sql = format!("SELECT {slots} FROM {from_clause}");
     if !grouping.is_empty() {
-        let mut group_sql = String::new();
-        for (i, g) in grouping.iter().enumerate() {
-            if i > 0 {
-                group_sql.push_str(", ");
-            }
-            // GROUP BY doesn't take aliases — strip any wrapping Alias to
-            // avoid `GROUP BY (expr) AS name` parse errors.
+        // Render each flat grouping column once (alias-stripped — GROUP BY
+        // doesn't take aliases, so `GROUP BY (expr) AS name` would be a parse
+        // error). GROUPING SETS indexes into this list per set; the other
+        // kinds join it directly (byte-identical to the prior emission).
+        let mut rendered: Vec<String> = Vec::with_capacity(grouping.len());
+        for g in grouping {
             let bare = match g {
                 Expression::Alias(a) => a.expr.as_ref(),
                 other => other,
             };
-            group_sql.push_str(&render_expr(bare, input_schema)?);
+            rendered.push(render_expr(bare, input_schema)?);
         }
         let group_sql = match grouping_kind {
-            GroupingKind::GroupBy => group_sql,
-            GroupingKind::Rollup => format!("ROLLUP({group_sql})"),
-            GroupingKind::Cube => format!("CUBE({group_sql})"),
-            GroupingKind::GroupingSets => unreachable!(), // returned early above
+            GroupingKind::GroupBy => rendered.join(", "),
+            GroupingKind::Rollup => format!("ROLLUP({})", rendered.join(", ")),
+            GroupingKind::Cube => format!("CUBE({})", rendered.join(", ")),
+            GroupingKind::GroupingSets => {
+                let sets: Vec<String> = grouping_sets
+                    .iter()
+                    .map(|s| {
+                        let cols = s
+                            .iter()
+                            .map(|&i| rendered[i].as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("({cols})")
+                    })
+                    .collect();
+                format!("GROUPING SETS ({})", sets.join(", "))
+            }
         };
         sql.push_str(&format!(" GROUP BY {group_sql}"));
     }
@@ -6371,6 +6395,7 @@ mod tests {
                 distinct: false,
             })],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
             having: None,
         });
         let bt = base_types_emp_dept(&plan);
@@ -6423,6 +6448,7 @@ mod tests {
                 }),
             ],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
             having: Some(count_star_gt_one()),
         });
         let bt = base_types_with_emp();
@@ -6475,6 +6501,7 @@ mod tests {
                 }),
             ],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
             having: None,
         });
         let bt = base_types_with_emp();
@@ -6514,6 +6541,7 @@ mod tests {
                 }),
             ],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::Rollup,
+            grouping_sets: vec![],
             having: Some(count_star_gt_one()),
         });
         let bt = base_types_with_emp();
@@ -6527,6 +6555,75 @@ mod tests {
             having_pos > rollup_pos,
             "HAVING must follow ROLLUP group clause: {sql}"
         );
+    }
+
+    #[test]
+    fn render_aggregate_grouping_sets_emits_per_set_group_clause() {
+        let _g = tap_guard();
+        // GROUPING SETS ((dept_id, name), (dept_id), ()) → flat grouping
+        // [dept_id, name] with per-set membership [[0, 1], [0], []].
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![ucol("dept_id"), ucol("name")],
+            aggregates: vec![
+                ucol("dept_id"),
+                ucol("name"),
+                Expression::FunctionCall(FunctionCall {
+                    name: "count".to_owned(),
+                    args: vec![Expression::Star(StarExpression { qualifier: None })],
+                    distinct: false,
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
+            grouping_sets: vec![vec![0, 1], vec![0], vec![]],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze grouping-sets aggregate");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("GROUPING SETS ((dept_id, name), (dept_id), ())"),
+            "expected per-set GROUP BY clause, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_aggregate_grouping_sets_empty_metadata_preserves_boundary() {
+        let _g = tap_guard();
+        // DataFrame `groupingSets` path leaves `grouping_sets` empty — emission
+        // must surface the preserved Thunderduck-boundary error (ADR-022).
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![ucol("dept_id")],
+            aggregates: vec![
+                ucol("dept_id"),
+                Expression::FunctionCall(FunctionCall {
+                    name: "count".to_owned(),
+                    args: vec![Expression::Star(StarExpression { qualifier: None })],
+                    distinct: false,
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze grouping-sets aggregate");
+        let err = dispatch_op(&typed.op, &typed.resolved_schema).unwrap_err();
+        match err {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Op,
+                name: op,
+                ..
+            } => assert_eq!(op, "Aggregate[GroupingSets]"),
+            other => panic!("expected UnsupportedOp(Aggregate[GroupingSets]), got {other:?}"),
+        }
     }
 
     #[test]

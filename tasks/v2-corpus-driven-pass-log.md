@@ -1170,3 +1170,18 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 (both crates build silent).
 - Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core` 0 warnings, `cargo test -p thunderduck-core --lib` 615/0, `sql_v2` 224/38/262 no regression).
 - Commit SHA: (this commit).
+
+## Pass 131 — 2026-07-06 — SQL corpus: GROUPING SETS + WITH ROLLUP (gx-003/004/010)
+- **Corpus: dialect + lowering + AST + emission.** gx-003 (`GROUPING SETS ((dept_id,active),(dept_id),())`), gx-004 (`((dept_id),(active))`), gx-010 (`GROUP BY dept_id, active WITH ROLLUP`). gx-008 (CUBE over expr) OUT OF SCOPE.
+- Root cause (diagnostic-pass-131.md): NOT one shared fix. gx-010 — PARSE error (SparkDialect didn't set `supports_group_by_with_modifier`) + lowering blanket-bailed on modifiers. gx-003/004 — the flat `grouping:Vec<Expression>` + scalar `grouping_kind` CANNOT encode arbitrary set membership → lowering + emission both bailed.
+- Architecture (architecture-pass-131.md): gx-010 = dialect flag + map WITH ROLLUP/CUBE modifier → EXISTING GroupingKind::Rollup/Cube (reuses gx-007 substrate, no AST/emission change; loud-fail on TOTALS/stacked/mixed-prefix). gx-003/004 = ADDITIVE `grouping_sets: Vec<Vec<usize>>` field (indices into flat grouping list) on CommonOp::Aggregate + TypedOp::Aggregate (GroupingKind stays Copy); `lower_grouping_sets` builds flat first-appearance list + per-set index vecs; emission renders `GROUP BY GROUPING SETS ((set0),(set1),())`; the previously-UNCONDITIONAL GroupingSets bail is now CONDITIONED on `grouping_sets.is_empty()` (SQL always populates → renders; DataFrame leaves empty → preserves boundary).
+- Layer(s) touched: parser_v2/{dialect,v2_lowering}.rs, transpiler_v2/{ast,analyzer,emission,base_types}.rs, connect-server/converter/v2_relation_converter.rs (empty — DataFrame groupingSets stays bailing). AST extension (ADR-003 additive, analogous to pass-121 having).
+- ADR citations: ADR-003 (incremental AST field), ADR-022 (conditioned bail preserves DataFrame boundary; loud-fail on unsupported modifier combos), ADR-015/016 (Spark GROUPING SETS/ROLLUP semantics; empty set = grand total).
+- Corpus signal: 224 → **227** (+3). gx-003/004/010 GREEN; gx-007 (Rollup+HAVING) + gx-001/002/005/006/009 held. core_v2 held at 314. No regressions.
+- Files: 7. Tests: 2 flipped (GROUPING SETS reject→success + index assertions) + 6 added (rollup/cube modifier, WITH TOTALS bail, empty-set/dedup, emission GROUPING SETS clause, empty-metadata boundary).
+- DEFERRED (decided): grouping-column nullability under ROLLUP/CUBE/GROUPING SETS (Spark marks them nullable via super-aggregate NULL rows). No witness — all in-scope + core_v2 grouping cols already nullable (nullable||true==true → forcing is dead code today); a correct fix must cover BOTH the folded SQL path and non-folded DataFrame path, driven later by the ADR-022-deferred test_multidim_aggregations NOT-NULL witness.
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED — index safety airtight, conditioned-bail routing correct, loud-fail complete). Perf 0 HIGH + 0 MEDIUM (OPTIMIZED — cold-path, tiny inputs, field moved not cloned).
+- Findings queued as follow-up (2 review Lows): all-empty-sets `GROUPING SETS ((),())` collapses to 1 grand-total row (gate on !grouping_sets.is_empty() — degenerate, no witness); `rendered[i]` unchecked-invariant doc for a future DataFrame groupingSets populator.
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo build -p thunderduck-core -p thunderduck-connect-server` 0 warnings, `cargo test -p thunderduck-core --lib` 621/0, `sql_v2` 227/35/262, `core_v2` 314 no regression).
+- Commit SHA: (this commit).

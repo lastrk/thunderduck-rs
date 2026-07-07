@@ -2505,18 +2505,17 @@ fn lower_value(vw: ValueWithSpan) -> Result<Expression, EmissionError> {
 /// An odd number of digits or any non-hex character is a malformed literal and
 /// yields a Thunderduck-boundary error rather than a panic.
 fn decode_hex_literal(s: &str) -> Result<Vec<u8>, EmissionError> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         bail_boundary_proto!(
             "sql::value::hex_odd_length",
             format!("hex literal `X'{s}'` has an odd number of digits")
         );
     }
     let mut bytes = Vec::with_capacity(s.len() / 2);
-    let digits = s.as_bytes();
-    let mut i = 0;
-    while i < digits.len() {
-        let hi = (digits[i] as char).to_digit(16);
-        let lo = (digits[i + 1] as char).to_digit(16);
+    // The even-length guard above means `chunks_exact(2)` leaves no remainder.
+    for pair in s.as_bytes().chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16);
+        let lo = (pair[1] as char).to_digit(16);
         match (hi, lo) {
             (Some(h), Some(l)) => bytes.push((h * 16 + l) as u8),
             _ => bail_boundary_proto!(
@@ -2524,7 +2523,6 @@ fn decode_hex_literal(s: &str) -> Result<Vec<u8>, EmissionError> {
                 format!("hex literal `X'{s}'` contains a non-hex character")
             ),
         }
-        i += 2;
     }
     Ok(bytes)
 }
@@ -2669,6 +2667,34 @@ fn value_to_escape_char(v: Value) -> Option<char> {
     }
 }
 
+/// Left-associatively fold a list of boolean `Expression`s with a single
+/// [`BinaryOp`] (`AND`/`OR`). Returns `None` for an empty list so the caller can
+/// emit its own context-specific boundary error. A single-element list returns
+/// that element unwrapped (no `Binary` node). Shared by the `LIKE ANY/ALL` and
+/// row-value `IN` desugars.
+fn reduce_binary(exprs: Vec<Expression>, op: BinaryOp) -> Option<Expression> {
+    exprs.into_iter().reduce(|acc, next| {
+        Expression::Binary(BinaryExpression {
+            op: op.clone(),
+            left: Box::new(acc),
+            right: Box::new(next),
+        })
+    })
+}
+
+/// Wrap `e` in a `NOT` unary iff `negated`, else return it unchanged. Shared tail
+/// of the quantified-predicate desugars (`NOT LIKE ANY/ALL`, `NOT IN`).
+fn wrap_not(e: Expression, negated: bool) -> Expression {
+    if negated {
+        Expression::Unary(UnaryExpression {
+            op: UnaryOp::Not,
+            operand: Box::new(e),
+        })
+    } else {
+        e
+    }
+}
+
 /// Desugar a row-value IN — `(c1,…,ck) IN ((v11,…,v1k), …, (vm1,…,vmk))` — into a
 /// boolean chain that is bit-exact with Spark 4.1.1 `In.eval` over a struct LHS.
 /// Spark builds the LHS/elements as non-null `CreateNamedStruct`s and matches with
@@ -2730,39 +2756,20 @@ fn build_row_in_chain(
                 negated: true,
             }));
         }
-        let Some(and_chain) = eqs.into_iter().reduce(|acc, next| {
-            Expression::Binary(BinaryExpression {
-                op: BinaryOp::And,
-                left: Box::new(acc),
-                right: Box::new(next),
-            })
-        }) else {
+        let Some(and_chain) = reduce_binary(eqs, BinaryOp::And) else {
             // arity ≥ 1 guaranteed above, so this is unreachable; guard anyway.
             bail_boundary_proto!("sql::in_row::empty_tuple", "row IN tuple is empty");
         };
         tuple_preds.push(and_chain);
     }
 
-    let Some(chain) = tuple_preds.into_iter().reduce(|acc, next| {
-        Expression::Binary(BinaryExpression {
-            op: BinaryOp::Or,
-            left: Box::new(acc),
-            right: Box::new(next),
-        })
-    }) else {
+    let Some(chain) = reduce_binary(tuple_preds, BinaryOp::Or) else {
         bail_boundary_proto!(
             "sql::in_row::empty_list",
             "row IN requires at least one right-hand tuple"
         );
     };
-    Ok(if negated {
-        Expression::Unary(UnaryExpression {
-            op: UnaryOp::Not,
-            operand: Box::new(chain),
-        })
-    } else {
-        chain
-    })
+    Ok(wrap_not(chain, negated))
 }
 
 /// Fold a `LIKE ANY`/`LIKE ALL` pattern list into a boolean chain of ordinary
@@ -2807,26 +2814,13 @@ fn build_like_chain(
             case_insensitive: false,
         }));
     }
-    let Some(chain) = likes.into_iter().reduce(|acc, next| {
-        Expression::Binary(BinaryExpression {
-            op: fold_op.clone(),
-            left: Box::new(acc),
-            right: Box::new(next),
-        })
-    }) else {
+    let Some(chain) = reduce_binary(likes, fold_op) else {
         bail_boundary_proto!(
             "sql::like_quantifier_empty",
             "LIKE ANY/ALL requires at least one pattern"
         );
     };
-    Ok(if negated {
-        Expression::Unary(UnaryExpression {
-            op: UnaryOp::Not,
-            operand: Box::new(chain),
-        })
-    } else {
-        chain
-    })
+    Ok(wrap_not(chain, negated))
 }
 
 /// True iff `pattern` is sqlparser 0.61's mis-parse of `LIKE ALL (p1, …, pn)`:

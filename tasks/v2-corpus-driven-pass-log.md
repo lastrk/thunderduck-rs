@@ -1293,3 +1293,15 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo test -p thunderduck-core --lib` 648/0, `sql_v2` 235/27/262, pr-005 GREEN, no regression).
 - Commit SHA: (this commit).
+
+## Pass 140 — 2026-07-07 — TECH-DEBT SWEEP (passes 136-139)
+- **Sweep** (every-5th cadence; prior sweep pass 135). rust-reviewer over the passes 136-139 additions (hex-literal decode+emission, LIKE ANY/ALL + row-value IN desugars, backslash-escape dialect flag) for simplification/refactor/clippy. Verdict: 0 Critical/High/Medium, 2 Low + 1 clippy-on-touched-line.
+- Fixes: (1) clippy `manual_is_multiple_of` at `decode_hex_literal` (`s.len() % 2 != 0` → `!s.len().is_multiple_of(2)`); also modernized its manual index loop to `chunks_exact(2)` (L2). (2) DRY (L1): extracted two shared private helpers `reduce_binary(exprs, op) -> Option<Expression>` (left-assoc Binary fold, None on empty) and `wrap_not(e, negated)` (NOT-wrap tail), collapsing 3 duplicated reduce closures + 2 duplicated NOT-wrap tails across `build_like_chain` (pass 138) and `build_row_in_chain` (pass 139). Each call site keeps its own `let Some(..) else { bail }` so the distinct boundary-error messages are preserved.
+- Layer(s) touched: parser_v2/v2_lowering.rs only. Behavior-preserving (pure extraction + idiom).
+- Corpus signal: 235 → **235** (no change — refactor only). pr-003/004/005 + fn-020 + lit-009 held; core lib 648/0.
+- Files: 1. Tests added: 0 (existing LIKE/row-IN/hex tests cover the refactored paths).
+- Findings addressed: 1 clippy (decode_hex is_multiple_of) + 2 Low (chunks_exact, reduce_binary/wrap_not DRY). Remaining clippy warnings (12) are pre-existing baseline on untouched lines (map/create_map `is_multiple_of`, clamp patterns, etc.) — out of sweep scope.
+- Findings still deferred (no clean fix / no witness): pass-136 `0x1F` bare-hex Medium (sqlparser tokenizes `0x1F` to the same HexStringLiteral as `X'1F'`; needs a tokenizer/dialect guard, no corpus witness); pass-139 projected-row-IN nullability note.
+- Compiler warning delta: 0 (cargo build clean); clippy 13 → 12 (−1, the decode_hex fix).
+- Quality Gate: PASS (rustfmt clean, `cargo test -p thunderduck-core --lib` 648/0, `sql_v2` 235/27/262 no regression).
+- Commit SHA: (this commit).

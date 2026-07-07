@@ -24,11 +24,9 @@
 //! - [`render_cast`] — includes the `try_cast` → `TRY_CAST(...)` branch
 //!   (checklist §4.2 first item).
 //! - [`quote_ident`] — `Cow`-returning fast path (§5.6).
-//! - The six unwired helpers under Decision 13-A (`render_tail`,
+//! - The unwired helpers under Decision 13-A (`render_tail`,
 //!   `render_distinct`, `render_with_columns`, `render_drop_columns`,
-//!   `render_aliased_relation`, `render_range_relation`) — private, marked
-//!   `#[allow(dead_code)]`, become one-line dispatch arms when the matching
-//!   `TypedOp` variants land in a future substrate slice.
+//!   `render_aliased_relation`) — private, marked `#[allow(dead_code)]`.
 //! - [`spark_return_cast`] (§5.1) and `spark_aggregate_return_cast` (§5.1,
 //!   `#[allow(dead_code)]` — wired by C.3) — two distinct `fn` items.
 
@@ -41,11 +39,12 @@ use super::analyzer::{na_fill_compatible, Schema, TypedAst, TypedOp};
 use super::ast::FileFormat;
 use super::error::{EmissionError, UnsupportedKind};
 use super::expression::{
-    AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
-    ColumnReference, Expression, FunctionCall, IntervalExpression, Literal, LiteralValue,
-    NullOrdering, SortDirection, SortOrder, StarExpression, UnaryExpression, UnaryOp,
+    int_literal_value, AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
+    CastExpression, ColumnReference, Expression, FunctionCall, IntervalExpression, Literal,
+    LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan,
+    UnaryExpression, UnaryOp,
 };
-use super::type_inference::AGGREGATE_NAMES;
+use super::type_inference::{TypeInferenceEngine, AGGREGATE_NAMES};
 use crate::types::{DataType, StructField, StructType};
 use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
 
@@ -172,7 +171,16 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             grouping,
             aggregates,
             grouping_kind,
-        } => render_aggregate_op(input, grouping, aggregates, *grouping_kind),
+            grouping_sets,
+            having,
+        } => render_aggregate_op(
+            input,
+            grouping,
+            aggregates,
+            *grouping_kind,
+            grouping_sets,
+            having.as_ref(),
+        ),
 
         // ── Join ─────────────────────────────────────────────────────────
         TypedOp::Join {
@@ -199,12 +207,13 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             widened_schema,
         ),
 
+        TypedOp::TableFunction {
+            name,
+            args,
+            with_ordinality,
+        } => render_table_function(name, args, *with_ordinality, schema),
+
         // ── future τ work owns (analyzer PuntedOperator today; defensive) ──────
-        TypedOp::TableFunction { name, .. } => Err(EmissionError::Unsupported {
-            kind: UnsupportedKind::Op,
-            name: format!("TableFunction[{name}]"),
-            reason: "table-function emission (not implemented in τ)".to_owned(),
-        }),
         TypedOp::Unnest { .. } => Err(EmissionError::Unsupported {
             kind: UnsupportedKind::Op,
             name: "Unnest".to_owned(),
@@ -231,15 +240,23 @@ fn render_single_row() -> Result<String, EmissionError> {
     Ok("SELECT 1".to_owned())
 }
 
-fn render_table_scan(table: &str, alias: Option<&str>) -> Result<String, EmissionError> {
+/// The FROM-body for a table scan: the quoted table name, plus an optional
+/// `AS <alias>`. Shared by [`render_table_scan`] and the Project-over-
+/// TableScan inline branch in [`render_project`] so identifier quoting
+/// (schema-qualified / reserved names) is identical on both paths.
+fn table_scan_from_body(table: &str, alias: Option<&str>) -> String {
     let name = quote_ident(table);
     match alias {
-        Some(a) => {
-            let a = quote_ident(a);
-            Ok(format!("SELECT * FROM {name} AS {a}"))
-        }
-        None => Ok(format!("SELECT * FROM {name}")),
+        Some(a) => format!("{name} AS {}", quote_ident(a)),
+        None => name.into_owned(),
     }
+}
+
+fn render_table_scan(table: &str, alias: Option<&str>) -> Result<String, EmissionError> {
+    Ok(format!(
+        "SELECT * FROM {}",
+        table_scan_from_body(table, alias)
+    ))
 }
 
 fn render_values(
@@ -381,6 +398,40 @@ fn render_file_scan(
     Ok(format!("SELECT * FROM {reader}({paths_sql}{opts_sql})"))
 }
 
+/// Flatten a `Filter` whose child is an `AliasedRelation` into the FROM-body
+/// `(<inner>) AS <alias> WHERE <cond>` shared by the correlated-subquery
+/// inlining in `render_project` and `render_aggregate_op`. Keeps the user
+/// alias as the FROM table name so both slots and the WHERE bind it in one
+/// SELECT. Returns `None` when the shape doesn't match (caller falls back to
+/// its own default wrap).
+///
+/// KNOWN LIMITATION: the correlated outer reference resolves by-NAME against
+/// the inner schema (accidentally correct when the correlation key's name+type
+/// coincide; the analyzer rejects the absent-column case, sq-010). A proper
+/// outer-scope stack is out of scope (ADR-008).
+fn render_filter_over_aliased_from(filter: &TypedAst) -> Result<Option<String>, EmissionError> {
+    let TypedOp::Filter {
+        input: filter_input,
+        condition,
+    } = &filter.op
+    else {
+        return Ok(None);
+    };
+    let TypedOp::AliasedRelation {
+        input: inner,
+        alias,
+    } = &filter_input.op
+    else {
+        return Ok(None);
+    };
+    let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
+    let cond_sql = render_expr(condition, &filter_input.resolved_schema)?;
+    Ok(Some(format!(
+        "({inner_sql}) AS {} WHERE {cond_sql}",
+        quote_ident(alias)
+    )))
+}
+
 fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String, EmissionError> {
     let input_schema = &input.resolved_schema;
     // Project-over-Join inlining: when the child is a Join, emit the
@@ -407,6 +458,51 @@ fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String
             using_columns,
         );
     }
+    // Project-over-Filter-over-Join inlining: a comma-join lowers to
+    // `Project → Filter → Join`, so the aliases sit two subquery levels below
+    // the projection. Collapse all three into one `SELECT ... FROM <join> WHERE
+    // <cond>` so user aliases stay in scope for both the WHERE and the slots.
+    // Filter is schema-passthrough, so `input_schema` (Project input) and the
+    // Join's `resolved_schema` carry identical fields.
+    if let TypedOp::Filter {
+        input: filter_input,
+        condition: filter_cond,
+    } = &input.op
+    {
+        if let TypedOp::Join {
+            left,
+            right,
+            join_type,
+            condition: join_cond,
+            using_columns,
+            ..
+        } = &filter_input.op
+        {
+            let from = render_join_from(
+                left,
+                right,
+                *join_type,
+                join_cond.as_ref(),
+                using_columns,
+                &filter_input.resolved_schema,
+            )?;
+            let slots_sql = render_projection_slots(projections, input_schema)?;
+            let cond_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
+            return Ok(format!("SELECT {slots_sql} FROM {from} WHERE {cond_sql}"));
+        }
+        // Project-over-Filter-over-AliasedRelation inlining: correlated
+        // subqueries (EXISTS / scalar) lower to `Project → Filter →
+        // AliasedRelation`. `render_filter` would re-wrap the child as
+        // `(...) AS __td_filter`, re-burying the user alias so the WHERE's
+        // correlated qualifier (`e.dept_id`) no longer binds. Flatten all
+        // three into one `SELECT <slots> FROM <from_where>` so the alias
+        // becomes the FROM table name and stays in scope for both slots and
+        // WHERE (mirrors the Project-over-Filter-over-Join branch above).
+        if let Some(from_where) = render_filter_over_aliased_from(input)? {
+            let slots_sql = render_projection_slots(projections, input_schema)?;
+            return Ok(format!("SELECT {slots_sql} FROM {from_where}"));
+        }
+    }
     // AliasedRelation is transparent for Project too — inline through it.
     if let TypedOp::AliasedRelation {
         input: inner,
@@ -417,6 +513,15 @@ fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String
         let slots_sql = render_projection_slots(projections, input_schema)?;
         let a = quote_ident(alias);
         return Ok(format!("SELECT {slots_sql} FROM ({inner_sql}) AS {a}"));
+    }
+    // Project over a bare TableScan: inline `FROM t` (optionally `AS alias`)
+    // instead of wrapping the child in `(SELECT * FROM t) AS __td_proj`. This
+    // keeps the table name / alias in scope so qualified refs and qualified
+    // stars (`emp.col` / `emp.*`) bind (Fix A stamps the schema accordingly).
+    if let TypedOp::TableScan { table, alias } = &input.op {
+        let slots_sql = render_projection_slots(projections, input_schema)?;
+        let from = table_scan_from_body(table, alias.as_deref());
+        return Ok(format!("SELECT {slots_sql} FROM {from}"));
     }
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let slots_sql = render_projection_slots(projections, input_schema)?;
@@ -453,6 +558,31 @@ fn render_project_over_join(
     condition: Option<&Expression>,
     using_columns: &[String],
 ) -> Result<String, EmissionError> {
+    let from = render_join_from(
+        left,
+        right,
+        join_type,
+        condition,
+        using_columns,
+        project_input_schema,
+    )?;
+    let slots_sql = render_projection_slots(projections, project_input_schema)?;
+    Ok(format!("SELECT {slots_sql} FROM {from}"))
+}
+
+/// Render the `FROM` body of a join — the two aliased sides and the
+/// `ON`/`USING`/`CROSS` clause — without an enclosing `SELECT`. Hoists user
+/// `AliasedRelation` names into the subquery aliases so alias-qualified refs
+/// in the enclosing clause bind; falls back to synthetic `__td_jl`/`__td_jr`.
+/// `cond_schema` resolves the ON-condition expression.
+fn render_join_from(
+    left: &TypedAst,
+    right: &TypedAst,
+    join_type: crate::transpiler_v2::ast::JoinType,
+    condition: Option<&Expression>,
+    using_columns: &[String],
+    cond_schema: &Schema,
+) -> Result<String, EmissionError> {
     use super::ast::JoinType;
     // Pick subquery aliases: user AliasedRelation names take precedence.
     let (left_ast, left_alias) = match &left.op {
@@ -484,18 +614,17 @@ fn render_project_over_join(
         }
         format!(" USING ({cols})")
     } else if let Some(cond) = condition {
-        let cond_sql = render_expr(cond, project_input_schema)?;
+        let cond_sql = render_expr(cond, cond_schema)?;
         format!(" ON {cond_sql}")
     } else if matches!(join_type, JoinType::Cross) {
         String::new()
     } else {
         bail_boundary_op!("Join", "non-cross join without ON or USING clause");
     };
-    let slots_sql = render_projection_slots(projections, project_input_schema)?;
     let la = quote_ident(&left_alias);
     let ra = quote_ident(&right_alias);
     Ok(format!(
-        "SELECT {slots_sql} FROM ({left_sql}) AS {la} {kind} ({right_sql}) AS {ra}{clause}"
+        "({left_sql}) AS {la} {kind} ({right_sql}) AS {ra}{clause}"
     ))
 }
 
@@ -585,8 +714,7 @@ fn render_limit(
 //
 // These six renderers do not have `TypedOp` sinks in τ's analyzer's substrate. They
 // exist so the §5.4 CTE anchor for `render_tail` (and its sibling helpers)
-// live in code today; when a future substrate slice adds the missing
-// `TypedOp` variants, wiring is a one-line `dispatch_op` arm each.
+// live in code today.
 
 /// **§5.4 CTE rewrite.** DuckDB has no native TAIL operator; we synthesize it
 /// via `ROW_NUMBER() OVER ()` and select rows past `total_rows − n`. The child
@@ -1324,7 +1452,14 @@ fn render_pivot(
 
     let mut out_idx = grouping.len();
     for pv in pivot_values {
-        let pv_sql = render_expr(pv, input_schema)?;
+        // Strip any wrapping Alias so the CASE comparison references the bare
+        // value; the alias only carries the output column name (already read
+        // from the analyzer-stamped output schema below).
+        let bare_pv = match pv {
+            Expression::Alias(a) => a.expr.as_ref(),
+            other => other,
+        };
+        let pv_sql = render_expr(bare_pv, input_schema)?;
         for a in aggregates {
             if !first {
                 slots.push_str(", ");
@@ -1519,20 +1654,69 @@ fn render_aliased_relation(input: &TypedAst, alias: &str) -> Result<String, Emis
     Ok(format!("SELECT * FROM ({child_sql}) AS {a}"))
 }
 
-#[allow(dead_code)] // wired when TypedOp::Range lands (Decision 13-A)
-fn render_range_relation(
-    start: i64,
-    end: i64,
-    step: i64,
-    _num_partitions: Option<i32>,
+/// Emit a table-valued function. Only `range` is implemented; the analyzer has
+/// already rejected everything else (`PuntedOperator`), so a non-`range` name
+/// here is a defensive τ-internal boundary.
+///
+/// Spark `range` arities normalize to `(start, end, step)`; DuckDB `range` is
+/// also end-exclusive (1:1 with Spark — never `generate_series`, which is
+/// inclusive). Synthesized `start`/`step` defaults are TYPED `Long` literals
+/// rendered through [`render_expr`] (ADR-004 — no raw SQL string injection).
+/// The `AS __td_range(id)` column alias renames DuckDB's `range` output column
+/// to Spark's `id`, which the enclosing `SELECT id` then binds. `numPartitions`
+/// is a single-node no-op and is dropped.
+fn render_table_function(
+    name: &str,
+    args: &[Expression],
+    _with_ordinality: bool,
+    schema: &Schema,
 ) -> Result<String, EmissionError> {
-    // `spark.range(start, end, step)` — half-open interval, single column `id`.
+    if !name.eq_ignore_ascii_case("range") {
+        bail_boundary_op!(
+            "TableFunction",
+            format!("table-function `{name}` emission (not implemented in τ)")
+        );
+    }
+    let long_lit = |v: i64| {
+        Expression::Literal(Literal {
+            value: LiteralValue::Long(v),
+            data_type: DataType::Long,
+        })
+    };
+    let (start, end, step): (Expression, Expression, Expression) = match args {
+        [end] => (long_lit(0), end.clone(), long_lit(1)),
+        [start, end] => (start.clone(), end.clone(), long_lit(1)),
+        // A 4th `numPartitions` argument is a single-node no-op — drop it.
+        [start, end, step] | [start, end, step, _] => (start.clone(), end.clone(), step.clone()),
+        _ => bail_boundary_op!(
+            "TableFunction",
+            "range() requires 1..=4 arguments (start, end, step, numPartitions)"
+        ),
+    };
+    let start_sql = render_expr(&start, schema)?;
+    let end_sql = render_expr(&end, schema)?;
+    let step_sql = render_expr(&step, schema)?;
+    // `range` is end-EXCLUSIVE in both Spark and DuckDB; single `id` column.
     Ok(format!(
-        "SELECT id FROM range({start}, {end}, {step}) AS __td_range(id)"
+        "SELECT id FROM range({start_sql}, {end_sql}, {step_sql}) AS __td_range(id)"
     ))
 }
 
 // ── Expression rendering ─────────────────────────────────────────────────────
+
+/// Render a subquery's inner plan to a bare `SELECT …` string. The plan must
+/// be `Analyzed` — a stray `Unanalyzed` means the analyzer pass did not run
+/// (a τ bug, not a user input), surfaced as a defensive boundary error.
+fn render_subquery(plan: &SubqueryPlan) -> Result<String, EmissionError> {
+    match plan {
+        SubqueryPlan::Analyzed(inner) => dispatch_op(&inner.op, &inner.resolved_schema),
+        SubqueryPlan::Unanalyzed(_) => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::Expression,
+            name: "subquery".to_owned(),
+            reason: "inner plan not analyzed — analyzer pass did not run".to_owned(),
+        }),
+    }
+}
 
 /// Exhaustive match over the [`Expression`] enum.
 pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, EmissionError> {
@@ -1633,15 +1817,24 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
         }
         Expression::Alias(a) => render_alias(a, schema),
         Expression::Star(s) => render_star(s),
-        Expression::InSubquery(_) => {
-            bail_boundary_expr!("InSubquery", "correlated subqueries land in future τ work",)
+        // Uncorrelated subqueries render node-local from the analyzed inner
+        // plan carried in the variant (ADR-007 A / INV2). No SQL string
+        // pre/post-processing — the inner SELECT is built from its own typed
+        // AST via `dispatch_op` (SQL-gen principles #1/#2).
+        Expression::ScalarSubquery(s) => {
+            let inner = render_subquery(&s.subquery)?;
+            Ok(format!("({inner})"))
         }
-        Expression::ExistsSubquery(_) => bail_boundary_expr!(
-            "ExistsSubquery",
-            "correlated subqueries land in future τ work",
-        ),
-        Expression::ScalarSubquery(_) => {
-            bail_boundary_expr!("ScalarSubquery", "scalar subqueries land in future τ work",)
+        Expression::InSubquery(i) => {
+            let lhs = render_expr(&i.expr, schema)?;
+            let inner = render_subquery(&i.subquery)?;
+            let not = if i.negated { "NOT " } else { "" };
+            Ok(format!("{lhs} {not}IN ({inner})"))
+        }
+        Expression::ExistsSubquery(e) => {
+            let inner = render_subquery(&e.subquery)?;
+            let not = if e.negated { "NOT " } else { "" };
+            Ok(format!("{not}EXISTS ({inner})"))
         }
         Expression::Lambda(l) => {
             let body = render_expr(&l.body, schema)?;
@@ -1707,29 +1900,47 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
         }
         Expression::ExtractValue(ev) => {
             let child_sql = render_expr(&ev.child, schema)?;
-            // Extraction shape distinguishes struct-field-name (String
-            // literal) vs array-index (Int literal) vs map-key (any
-            // literal). DuckDB uses `.field` for struct, `[expr]` for
-            // both array and map — the latter is a runtime-typed subscript.
-            match ev.extraction.as_ref() {
-                Expression::Literal(l) => match &l.value {
-                    crate::transpiler_v2::expression::LiteralValue::String(name) => {
-                        // Struct field access. DuckDB accepts `child.field`
-                        // when child's static type is struct.
-                        let field = quote_ident(name);
-                        Ok(format!("({child_sql}).{field}"))
-                    }
-                    _ => {
-                        // Numeric index or other literal: emit `[expr]`.
-                        let idx = render_expr(&ev.extraction, schema)?;
-                        Ok(format!("({child_sql})[{idx}]"))
-                    }
-                },
-                _ => {
-                    // Dynamic key/index — same subscript form.
+            // Dispatch on the CHILD's static type, mirroring
+            // `extract_value_data_type` (expression.rs) — Struct→field,
+            // Array→element, Map→value. Keying on the extraction literal shape
+            // alone (the prior behavior) mis-emitted a map string key as struct
+            // dot access. Corpus witnesses: cx-001 (array), cx-002 (map),
+            // struct-003 / json-004 (struct).
+            match ev.child.data_type(schema) {
+                DataType::Struct(_) => extract_struct_field(&child_sql, &ev.extraction, schema),
+                DataType::Array(_, _) => {
+                    // Spark GetArrayItem `arr[i]`: 0-indexed. In ANSI mode
+                    // (ADR-016) `GetArrayItem` sets `failOnError = true` and
+                    // THROWS `[INVALID_ARRAY_INDEX]` when `i < 0` or
+                    // `i >= numElements` — it does NOT return NULL (that is the
+                    // non-ANSI behavior). This is a DISTINCT class from
+                    // `element_at`'s `INVALID_ARRAY_INDEX_IN_ELEMENT_AT`. A NULL
+                    // array short-circuits to NULL (Spark `nullSafeEval`).
+                    // DuckDB `list_extract` is 1-based, so shift the in-bounds
+                    // index by +1. Corpus witness: cx-001 (`[0]`, in-bounds,
+                    // stays green).
                     let idx = render_expr(&ev.extraction, schema)?;
-                    Ok(format!("({child_sql})[{idx}]"))
+                    let err = super::spark_errors::SparkError::InvalidArrayIndexSubscript {
+                        idx_sql: idx.clone(),
+                        arr_sql: child_sql.clone(),
+                    }
+                    .throw_expr();
+                    Ok(format!(
+                        "CASE WHEN ({child_sql}) IS NULL THEN NULL \
+                         WHEN ({idx}) < 0 OR ({idx}) >= len(({child_sql})) THEN {err} \
+                         ELSE list_extract(({child_sql}), ({idx}) + 1) END"
+                    ))
                 }
+                DataType::Map { .. } => {
+                    // Spark GetMapValue `map[k]`: value or NULL on miss, never
+                    // throws. DuckDB `element_at(map, key)` returns a 1-element
+                    // list; `[1]` unwraps it to the scalar value (NULL on miss).
+                    let key = render_expr(&ev.extraction, schema)?;
+                    Ok(format!("element_at(({child_sql}), ({key}))[1]"))
+                }
+                // Unresolved child: reuse the struct-field heuristic
+                // (String literal → `.field`; else → `[expr]`).
+                _ => extract_struct_field(&child_sql, &ev.extraction, schema),
             }
         }
         Expression::RowConstructor(_) => bail_boundary_expr!(
@@ -1737,6 +1948,33 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
             "complex-type emission (not implemented in τ)",
         ),
         Expression::UpdateFields(u) => render_update_fields(u, schema),
+    }
+}
+
+/// Emit a struct field access for an [`Expression::ExtractValue`] whose child
+/// is (statically or heuristically) a struct. A `String`-literal extraction is
+/// a field name → `(child).field`; any other extraction falls back to a
+/// runtime-typed `(child)[expr]` subscript.
+fn extract_struct_field(
+    child_sql: &str,
+    extraction: &Expression,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
+    match extraction {
+        Expression::Literal(l) => match &l.value {
+            crate::transpiler_v2::expression::LiteralValue::String(name) => {
+                let field = quote_ident(name);
+                Ok(format!("({child_sql}).{field}"))
+            }
+            _ => {
+                let idx = render_expr(extraction, schema)?;
+                Ok(format!("({child_sql})[{idx}]"))
+            }
+        },
+        _ => {
+            let idx = render_expr(extraction, schema)?;
+            Ok(format!("({child_sql})[{idx}]"))
+        }
     }
 }
 
@@ -2262,6 +2500,66 @@ fn spark_diff_sql(
     ))
 }
 
+/// Render Spark `ceil`/`floor` to DuckDB SQL. `duck_fn` is the DuckDB substrate
+/// (`"ceil"` / `"floor"`). The CAST target is derived from the SAME
+/// [`TypeInferenceEngine::ceil_floor_type`] the analyzer used, so the physical
+/// type equals `resolved_schema`.
+///
+/// - **Long** (integral / float / double, 1-arg): NaN-guarded `CAST(.. AS
+///   BIGINT)` — byte-identical to the historical emission (math-003 pin).
+/// - **Decimal, 1-arg**: `CAST(fn(a) AS DECIMAL(p, s))` (a DECIMAL can never be
+///   NaN, so no guard).
+/// - **Decimal, 2-arg, t >= 0**: `CAST(fn((a) * 10^t) / 10^t AS DECIMAL(p, s))`.
+/// - **2-arg negative scale**: Thunderduck boundary (no corpus witness).
+fn render_ceil_floor(
+    f: &FunctionCall,
+    schema: &Schema,
+    duck_fn: &str,
+) -> Result<String, EmissionError> {
+    if f.args.is_empty() {
+        bail_boundary_fn!(
+            f.name.clone(),
+            format!("`{}` requires at least 1 argument", f.name)
+        );
+    }
+    let a = render_expr(&f.args[0], schema)?;
+    let input_ty = f.args[0].data_type(schema);
+    let scale_opt = (f.args.len() == 2)
+        .then(|| int_literal_value(&f.args[1]))
+        .flatten();
+    match TypeInferenceEngine::ceil_floor_type(&input_ty, scale_opt) {
+        DataType::Long => Ok(format!(
+            "CASE WHEN ({a}) IS NULL THEN NULL \
+             WHEN isnan(CAST(({a}) AS DOUBLE)) THEN CAST(0 AS BIGINT) \
+             ELSE CAST({duck_fn}({a}) AS BIGINT) END"
+        )),
+        DataType::Decimal { precision, scale } => match scale_opt {
+            None => Ok(format!(
+                "CAST({duck_fn}({a}) AS DECIMAL({precision}, {scale}))"
+            )),
+            Some(t) if t >= 0 => {
+                // `t` is user-controlled; 10^t overflows i128 at t >= 39.
+                // Spark caps DECIMAL scale at 38, so a larger scale has no
+                // valid result — surface an honest boundary rather than panic.
+                let Some(pow) = 10i128.checked_pow(t as u32) else {
+                    bail_boundary_fn!(
+                        f.name.clone(),
+                        "ceil/floor target scale too large (exceeds DECIMAL max scale 38)"
+                    );
+                };
+                Ok(format!(
+                    "CAST({duck_fn}(({a}) * {pow}) / {pow} AS DECIMAL({precision}, {scale}))"
+                ))
+            }
+            Some(_) => bail_boundary_fn!(
+                f.name.clone(),
+                "ceil/floor with negative target scale not implemented in τ"
+            ),
+        },
+        _ => bail_boundary_fn!(f.name.clone(), "ceil/floor: unsupported argument type"),
+    }
+}
+
 fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
     let name_lower = f.name.to_ascii_lowercase();
     // Aggregate-name overlap check — if the analyzer classified a FunctionCall
@@ -2333,9 +2631,8 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `map()` literal — takes flat key/value pairs; DuckDB uses
         // `map { k: v, ... }` or `map_from_entries`. For a variable pair
         // count, emit via `map(list_value(k1,k2,...), list_value(v1,v2,...))`
-        // — but that requires splitting args. Punt for now: use the more
-        // permissive `map_from_entries` shape if args come pre-paired; the
-        // corpus-driven diagnostic will surface any residual case.
+        // — but that requires splitting args, so this uses the more
+        // permissive `map_from_entries` shape if args come pre-paired.
         // Spark's `create_map(k1, v1, k2, v2, ...)` (wire name `map`) builds
         // a MAP from interleaved key/value scalars. DuckDB's `map` expects
         // two lists (keys and values), so split the args and emit
@@ -2687,7 +2984,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let key_lit = sql_string_literal(&format!("$.{key}"));
             return Ok(format!("json_extract_string({json_sql}, {key_lit})"));
         }
-        // Spark → thdck_spark_funcs extension remaps (readiness map §4.1).
+        // Spark → thdck_spark_funcs extension remaps.
         // These functions require the ext6 extension, loaded at session
         // start by `DuckDbSession`.
         "hash" | "murmur3" => "spark_hash",
@@ -2892,28 +3189,8 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // NULL. DuckDB's `CAST(nan AS BIGINT)` raises "Conversion Error",
         // so guard the cast: NULL → NULL, NaN → 0, else CAST. Corpus:
         // `math-003`.
-        "ceil" | "ceiling" => {
-            if f.args.is_empty() {
-                bail_boundary_fn!(f.name.clone(), "`ceil` requires at least 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            return Ok(format!(
-                "CASE WHEN ({a}) IS NULL THEN NULL \
-                 WHEN isnan(CAST(({a}) AS DOUBLE)) THEN CAST(0 AS BIGINT) \
-                 ELSE CAST(ceil({a}) AS BIGINT) END"
-            ));
-        }
-        "floor" => {
-            if f.args.is_empty() {
-                bail_boundary_fn!(f.name.clone(), "`floor` requires at least 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            return Ok(format!(
-                "CASE WHEN ({a}) IS NULL THEN NULL \
-                 WHEN isnan(CAST(({a}) AS DOUBLE)) THEN CAST(0 AS BIGINT) \
-                 ELSE CAST(floor({a}) AS BIGINT) END"
-            ));
-        }
+        "ceil" | "ceiling" => return render_ceil_floor(f, schema, "ceil"),
+        "floor" => return render_ceil_floor(f, schema, "floor"),
         // Spark `signum` returns Double; DuckDB `sign` returns the arg's
         // type. Cast to DOUBLE at emission.
         "sign" | "signum" => {
@@ -3157,9 +3434,12 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `zip_with(a, b, (x, y) -> f)` — DuckDB has no direct
         // equivalent (`list_zip` in DuckDB is `arrays_zip`-style struct
         // packing, not a HOF). Emulate by index iteration:
-        //   list_transform(range(1, least(len(a), len(b)) + 1),
+        //   list_transform(range(0, least(len(a), len(b))),
         //                  i -> f_body[x → a[i], y → b[i]])
-        // DuckDB lists are 1-indexed. Corpus: `hof-006`.
+        // `a[i]` / `b[i]` are built as `ExtractValue` over array children, whose
+        // emission implements Spark's 0-based GetArrayItem (index+1 into DuckDB's
+        // 1-based `list_extract`, guarded). The iteration therefore ranges over
+        // 0-based indices `0..least(len(a), len(b))`. Corpus: `hof-006`.
         "zip_with" if f.args.len() == 3 => {
             let a_sql = render_expr(&f.args[0], schema)?;
             let b_sql = render_expr(&f.args[1], schema)?;
@@ -3195,7 +3475,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let final_body = substitute_lambda_var(&step1, &lam.params[1], &b_at_i);
             let body_sql = render_expr(&final_body, schema)?;
             return Ok(format!(
-                "list_transform(range(1, least(len({a_sql}), len({b_sql})) + 1), {idx_var} -> {body_sql})"
+                "list_transform(range(0, least(len({a_sql}), len({b_sql}))), {idx_var} -> {body_sql})"
             ));
         }
         // Spark's `map_filter(m, (k, v) -> pred)` — DuckDB has no
@@ -4427,6 +4707,16 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         let q = render_expr(&f.args[1], schema)?;
         return Ok(format!("quantile_disc({col}, CAST({q} AS DOUBLE))"));
     }
+    // Spark `percentile(col, p)` = exact CONTINUOUS (linear-interpolation)
+    // quantile → DuckDB `quantile_cont` (percentile_approx above uses
+    // `quantile_disc` = discrete sample value). CAST the quantile to DOUBLE
+    // since Spark sends it as Decimal. Corpus witness: `agg-019`
+    // (percentile(salary, 0.5) = 91500 continuous, not 88000 discrete).
+    if lower == "percentile" && f.args.len() >= 2 {
+        let col = render_expr(&f.args[0], schema)?;
+        let q = render_expr(&f.args[1], schema)?;
+        return Ok(format!("quantile_cont({col}, CAST({q} AS DOUBLE))"));
+    }
     let (duck_name, force_distinct) = match lower.as_str() {
         // Direct pass-through — DuckDB accepts the Spark name unchanged.
         "count"
@@ -4464,6 +4754,14 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         | "regr_sxy"
         | "regr_syy"
         | "median"
+        // `collect_list` / `collect_set` are macro-backed (registered at
+        // session startup: collect_list → LIST(x) FILTER (WHERE x IS NOT
+        // NULL), collect_set → LIST(DISTINCT x) FILTER (...)), not
+        // DuckDB-native aggregates. Pass the name through verbatim;
+        // force_distinct stays false — collect_set's DISTINCT lives inside
+        // the macro and Spark never sets distinct=true here.
+        | "collect_list"
+        | "collect_set"
         | "grouping"
         | "grouping_id" => (lower.as_str(), false),
         // Spark's population-formula `skewness` — DuckDB's `skewness` uses
@@ -4654,15 +4952,40 @@ fn render_aggregate_op(
     grouping: &[Expression],
     aggregates: &[Expression],
     grouping_kind: crate::transpiler_v2::ast::GroupingKind,
+    grouping_sets: &[Vec<usize>],
+    having: Option<&Expression>,
 ) -> Result<String, EmissionError> {
     use super::ast::GroupingKind;
-    if matches!(grouping_kind, GroupingKind::GroupingSets) {
+    // The SparkSQL front-end populates `grouping_sets` with per-set membership
+    // (indices into `grouping`). The DataFrame `groupingSets` path leaves it
+    // empty, so it stays a Thunderduck-boundary error (ADR-022).
+    if matches!(grouping_kind, GroupingKind::GroupingSets) && grouping_sets.is_empty() {
         bail_boundary_op!(
             "Aggregate[GroupingSets]",
-            "GROUPING SETS emission requires set-membership metadata; (not implemented in τ)",
+            "GROUPING SETS requires set-membership metadata (DataFrame groupingSets path not implemented in τ)",
         );
     }
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    // Aggregate-over-Filter-over-AliasedRelation inlining: correlated scalar
+    // subqueries (`SELECT max(e.salary) FROM emp e WHERE e.dept_id =
+    // d.dept_id`) lower to `Aggregate → Filter → AliasedRelation`. The default
+    // `(<child>) AS __td_agg` FROM (plus `render_filter`'s own `__td_filter`
+    // wrap) buries the user alias, so `max(e.salary)` and `WHERE e.dept_id`
+    // reference `e` at two different wrapper levels and neither binds. Collapse
+    // Filter + AliasedRelation into the aggregate's FROM so the alias is the
+    // table name and both slots and WHERE see it in a single SELECT (mirrors
+    // the Project-over-Filter-over-AliasedRelation branch in `render_project`).
+    //
+    // KNOWN LIMITATION: same by-name correlated resolution caveat as
+    // `render_project` — accidentally correct when the correlation key's
+    // name+type coincide; the analyzer rejects the absent-column case (sq-010).
+    // A proper outer-scope stack is out of scope for this pass (ADR-008).
+    let from_clause = match render_filter_over_aliased_from(input)? {
+        Some(fw) => fw,
+        None => {
+            let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+            format!("({child_sql}) AS __td_agg")
+        }
+    };
     let input_schema = &input.resolved_schema;
     // Aggregates may include folded grouping columns at the SparkSQL path
     // (see `CommonOp::Aggregate` doc). For the DataFrame path, aggregates
@@ -4673,26 +4996,7 @@ fn render_aggregate_op(
     // the aggregates list doesn't already start with the grouping cols'
     // output names, prepend them to the SELECT list so the emitted column
     // count matches the resolved schema.
-    let agg_names: Vec<String> = aggregates
-        .iter()
-        .map(|e| match e {
-            Expression::Alias(a) => a.alias.clone(),
-            Expression::ColumnReference(c) => c.name.clone(),
-            _ => String::new(),
-        })
-        .collect();
-    let group_names: Vec<String> = grouping
-        .iter()
-        .map(|e| match e {
-            Expression::Alias(a) => a.alias.clone(),
-            Expression::ColumnReference(c) => c.name.clone(),
-            _ => String::new(),
-        })
-        .collect();
-    let already_folded = grouping.is_empty()
-        || group_names
-            .iter()
-            .all(|gn| !gn.is_empty() && agg_names.iter().any(|an| an.eq_ignore_ascii_case(gn)));
+    let already_folded = super::analyzer::grouping_already_folded(grouping, aggregates);
     // Rewrite any `grouping_id()` (no-arg) calls inside `aggregates` to
     // pass the current grouping columns as explicit args — DuckDB requires
     // them. This is a small tree-walk local to render_aggregate_op scope.
@@ -4718,28 +5022,58 @@ fn render_aggregate_op(
         first = false;
         slots.push_str(&render_projection_slot(agg, input_schema)?);
     }
-    let mut sql = format!("SELECT {slots} FROM ({child_sql}) AS __td_agg");
-    if !grouping.is_empty() {
-        let mut group_sql = String::new();
-        for (i, g) in grouping.iter().enumerate() {
-            if i > 0 {
-                group_sql.push_str(", ");
-            }
-            // GROUP BY doesn't take aliases — strip any wrapping Alias to
-            // avoid `GROUP BY (expr) AS name` parse errors.
+    let mut sql = format!("SELECT {slots} FROM {from_clause}");
+    // Emit a GROUP BY whenever there are flat grouping columns, OR when this is
+    // a GROUPING SETS aggregate with at least one set. The latter covers the
+    // all-empty case `GROUP BY GROUPING SETS ((), ())`: the flat grouping list
+    // is empty (no columns referenced) yet `grouping_sets` holds the empty
+    // sets, and each empty set is a distinct grand-total group (Spark returns
+    // one row per set). Without this the GROUP BY would be dropped and every
+    // set would collapse into a single grand-total row — a silent wrong
+    // row-count. DuckDB accepts `GROUP BY GROUPING SETS ((), ())` and returns
+    // the same per-set rows Spark does.
+    let emit_group_by = !grouping.is_empty()
+        || (matches!(grouping_kind, GroupingKind::GroupingSets) && !grouping_sets.is_empty());
+    if emit_group_by {
+        // Render each flat grouping column once (alias-stripped — GROUP BY
+        // doesn't take aliases, so `GROUP BY (expr) AS name` would be a parse
+        // error). GROUPING SETS indexes into this list per set; the other
+        // kinds join it directly (byte-identical to the prior emission).
+        let mut rendered: Vec<String> = Vec::with_capacity(grouping.len());
+        for g in grouping {
             let bare = match g {
                 Expression::Alias(a) => a.expr.as_ref(),
                 other => other,
             };
-            group_sql.push_str(&render_expr(bare, input_schema)?);
+            rendered.push(render_expr(bare, input_schema)?);
         }
         let group_sql = match grouping_kind {
-            GroupingKind::GroupBy => group_sql,
-            GroupingKind::Rollup => format!("ROLLUP({group_sql})"),
-            GroupingKind::Cube => format!("CUBE({group_sql})"),
-            GroupingKind::GroupingSets => unreachable!(), // returned early above
+            GroupingKind::GroupBy => rendered.join(", "),
+            GroupingKind::Rollup => format!("ROLLUP({})", rendered.join(", ")),
+            GroupingKind::Cube => format!("CUBE({})", rendered.join(", ")),
+            GroupingKind::GroupingSets => {
+                let sets: Vec<String> = grouping_sets
+                    .iter()
+                    .map(|s| {
+                        let cols = s
+                            .iter()
+                            .map(|&i| rendered[i].as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("({cols})")
+                    })
+                    .collect();
+                format!("GROUPING SETS ({})", sets.join(", "))
+            }
         };
         sql.push_str(&format!(" GROUP BY {group_sql}"));
+    }
+    // SparkSQL HAVING — emitted inside the aggregating SELECT (never an outer
+    // WHERE, which DuckDB rejects for aggregate predicates). Rendered against
+    // the aggregate input schema, same scope as the aggregate slots.
+    if let Some(h) = having {
+        let having_sql = render_expr(h, input_schema)?;
+        sql.push_str(&format!(" HAVING {having_sql}"));
     }
     Ok(sql)
 }
@@ -4782,8 +5116,14 @@ fn render_literal(lit: &Literal) -> Result<String, EmissionError> {
             Ok(format!("make_timestamp(CAST({micros} AS BIGINT))"))
         }
         LiteralValue::Binary(bytes) => {
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            Ok(format!("CAST(x'{hex}' AS BLOB)"))
+            // DuckDB does NOT accept `x'..'` as a blob literal — it parses that
+            // as the VARCHAR "x..". The canonical DuckDB blob literal is a
+            // single-quoted string of `\xHH` escapes cast to BLOB, e.g.
+            // `CAST('\x1F\x2A' AS BLOB)`. Every byte becomes exactly `\x` + two
+            // hex digits, so the string never contains a raw quote or backslash
+            // that would need further escaping.
+            let escaped: String = bytes.iter().map(|b| format!("\\x{b:02X}")).collect();
+            Ok(format!("CAST('{escaped}' AS BLOB)"))
         }
     }
 }
@@ -5142,8 +5482,8 @@ fn render_struct_literal(
 ///
 /// Wraps `expr_sql` in `CAST(... AS T)` iff the expression's Spark-typed
 /// result type requires a cast that DuckDB won't apply automatically. At
-/// τ's emission substrate this handles integer-integer division (Spark → Double); Slice
-/// C.2 extends it with the scalar-function Spark-parity table.
+/// τ's emission substrate this handles integer-integer division (Spark → Double)
+/// plus the scalar-function Spark-parity table.
 ///
 /// **§5.1 anchor.** MUST NOT share body with [`spark_aggregate_return_cast`].
 fn spark_return_cast(expr_sql: String, expr: &Expression, schema: &Schema) -> String {
@@ -5901,13 +6241,16 @@ pub(crate) fn extension_targets() -> HashSet<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transpiler_v2::ast::{CommonAst, CommonOp, SetOpKind};
+    use crate::transpiler_v2::ast::{
+        CommonAst, CommonOp, JoinType, PivotGrouping, SetOpKind, UnpivotIds,
+    };
     use crate::transpiler_v2::base_types::BaseTypes;
     use crate::transpiler_v2::expression::{
         AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
-        CastExpression, ColumnReference, FunctionCall, InListExpression, IntervalExpression,
-        LambdaExpression, LambdaVariableExpression, LikeExpression, Literal, LiteralValue,
-        MapLiteralExpression, StarExpression, UnaryExpression, UnaryOp, UpdateFieldsExpression,
+        CastExpression, ColumnReference, ExtractValueExpression, FunctionCall, InListExpression,
+        IntervalExpression, LambdaExpression, LambdaVariableExpression, LikeExpression, Literal,
+        LiteralValue, MapLiteralExpression, StarExpression, UnaryExpression, UnaryOp,
+        UpdateFieldsExpression,
     };
     use crate::transpiler_v2::{analyze, generate};
 
@@ -6001,6 +6344,177 @@ mod tests {
         })
     }
 
+    fn double_lit(v: f64) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Double(v),
+            data_type: DataType::Double,
+        })
+    }
+
+    fn decimal_lit(value: &str, precision: u8, scale: u8) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Decimal {
+                value: value.to_owned(),
+                precision,
+                scale,
+            },
+            data_type: DataType::Decimal { precision, scale },
+        })
+    }
+
+    fn ceil_floor_call(name: &str, args: Vec<Expression>) -> FunctionCall {
+        FunctionCall {
+            name: name.to_owned(),
+            args,
+            distinct: false,
+        }
+    }
+
+    // ── ceil/floor emission (num-001/002/003) ────────────────────────────
+
+    #[test]
+    fn ceil_1arg_long_is_bigint_nan_guard() {
+        let _g = tap_guard();
+        // Integer input → Long → the NaN-guarded BIGINT shape (math-003 pin).
+        let f = ceil_floor_call("ceil", vec![int_lit(5)]);
+        let sql = render_function_call(&f, &empty_schema()).expect("render ceil");
+        assert_eq!(
+            sql,
+            "CASE WHEN (5) IS NULL THEN NULL \
+             WHEN isnan(CAST((5) AS DOUBLE)) THEN CAST(0 AS BIGINT) \
+             ELSE CAST(ceil(5) AS BIGINT) END"
+        );
+    }
+
+    #[test]
+    fn ceil_1arg_decimal_casts_to_scale0_decimal() {
+        let _g = tap_guard();
+        let f = ceil_floor_call("ceil", vec![decimal_lit("1.25", 10, 2)]);
+        let sql = render_function_call(&f, &empty_schema()).expect("render ceil");
+        assert!(sql.ends_with("AS DECIMAL(9, 0))"), "got: {sql}");
+        assert!(sql.starts_with("CAST(ceil("), "got: {sql}");
+    }
+
+    #[test]
+    fn floor_2arg_scaled_decimal() {
+        let _g = tap_guard();
+        // 2-arg over double → decimal(18,2), synthesized as fn((a)*100)/100.
+        let f = ceil_floor_call("ceil", vec![double_lit(1.5), int_lit(2)]);
+        let sql = render_function_call(&f, &empty_schema()).expect("render ceil");
+        assert!(sql.starts_with("CAST(ceil("), "got: {sql}");
+        assert!(sql.contains(") * 100) / 100"), "got: {sql}");
+        assert!(sql.ends_with("AS DECIMAL(18, 2))"), "got: {sql}");
+    }
+
+    #[test]
+    fn ceil_2arg_negative_scale_is_boundary() {
+        let _g = tap_guard();
+        let f = ceil_floor_call("ceil", vec![decimal_lit("1.25", 10, 2), int_lit(-1)]);
+        let err = render_function_call(&f, &empty_schema()).expect_err("negative scale");
+        assert!(matches!(
+            err,
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Function,
+                ..
+            }
+        ));
+    }
+
+    // ── Pass 106 — uncorrelated subquery emission ────────────────────────
+
+    fn analyzed_select_id_from_emp() -> SubqueryPlan {
+        let inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            projections: vec![ColumnReference::untyped("id")],
+        });
+        let typed = analyze(inner, &base_types_with_emp()).expect("analyze inner");
+        SubqueryPlan::Analyzed(Box::new(typed))
+    }
+
+    #[test]
+    fn scalar_subquery_renders_parenthesized_select() {
+        let _g = tap_guard();
+        use super::super::expression::ScalarSubquery;
+        let expr = Expression::ScalarSubquery(ScalarSubquery {
+            subquery: analyzed_select_id_from_emp(),
+        });
+        let sql = render_expr(&expr, &empty_schema()).expect("render scalar");
+        assert!(sql.starts_with("(SELECT"), "got: {sql}");
+        assert!(sql.ends_with(')'), "got: {sql}");
+        assert!(sql.contains("FROM emp"), "got: {sql}");
+    }
+
+    #[test]
+    fn in_subquery_renders_lhs_in_select() {
+        let _g = tap_guard();
+        use super::super::expression::InSubquery;
+        let expr = Expression::InSubquery(InSubquery {
+            expr: Box::new(int_lit(1)),
+            subquery: analyzed_select_id_from_emp(),
+            negated: false,
+        });
+        let sql = render_expr(&expr, &empty_schema()).expect("render IN");
+        assert!(sql.starts_with("1 IN (SELECT"), "got: {sql}");
+        assert!(sql.ends_with(')'), "got: {sql}");
+    }
+
+    #[test]
+    fn not_in_subquery_renders_lhs_not_in_select() {
+        let _g = tap_guard();
+        use super::super::expression::InSubquery;
+        let expr = Expression::InSubquery(InSubquery {
+            expr: Box::new(int_lit(1)),
+            subquery: analyzed_select_id_from_emp(),
+            negated: true,
+        });
+        let sql = render_expr(&expr, &empty_schema()).expect("render NOT IN");
+        assert!(sql.starts_with("1 NOT IN (SELECT"), "got: {sql}");
+    }
+
+    #[test]
+    fn exists_subquery_renders_exists_select() {
+        let _g = tap_guard();
+        use super::super::expression::ExistsSubquery;
+        let expr = Expression::ExistsSubquery(ExistsSubquery {
+            subquery: analyzed_select_id_from_emp(),
+            negated: false,
+        });
+        let sql = render_expr(&expr, &empty_schema()).expect("render EXISTS");
+        assert!(sql.starts_with("EXISTS (SELECT"), "got: {sql}");
+    }
+
+    #[test]
+    fn not_exists_subquery_renders_not_exists_select() {
+        let _g = tap_guard();
+        use super::super::expression::ExistsSubquery;
+        let expr = Expression::ExistsSubquery(ExistsSubquery {
+            subquery: analyzed_select_id_from_emp(),
+            negated: true,
+        });
+        let sql = render_expr(&expr, &empty_schema()).expect("render NOT EXISTS");
+        assert!(sql.starts_with("NOT EXISTS (SELECT"), "got: {sql}");
+    }
+
+    #[test]
+    fn unanalyzed_subquery_is_defensive_boundary_error() {
+        let _g = tap_guard();
+        use super::super::expression::ScalarSubquery;
+        let expr = Expression::ScalarSubquery(ScalarSubquery {
+            subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
+        });
+        let err = render_expr(&expr, &empty_schema()).expect_err("unanalyzed must error");
+        assert!(matches!(
+            err,
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Expression,
+                ..
+            }
+        ));
+    }
+
     // ── 1. dispatch_op — SingleRow ───────────────────────────────────────
 
     #[test]
@@ -6044,7 +6558,100 @@ mod tests {
         assert_eq!(sql, "SELECT * FROM emp AS e");
     }
 
+    // ── TableFunction (range) — pass-141 ─────────────────────────────────
+
+    /// Build `range(<args>)`, analyze, and emit — exercises the whole
+    /// L2-analyzer + L3-emission path for the TVF node.
+    fn emit_range(args: Vec<Expression>) -> String {
+        let ast = CommonAst::new(CommonOp::TableFunction {
+            name: "range".to_owned(),
+            args,
+            with_ordinality: false,
+        });
+        let typed = analyze(ast, &BaseTypes::empty()).expect("analyze range");
+        dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch range")
+    }
+
+    #[test]
+    fn dispatch_range_one_arg_synthesizes_start_zero_step_one() {
+        let _g = tap_guard();
+        // `range(5)` → start=0, step=1 (both synthesized as typed BIGINT).
+        assert_eq!(
+            emit_range(vec![int_lit(5)]),
+            "SELECT id FROM range(CAST(0 AS BIGINT), 5, CAST(1 AS BIGINT)) AS __td_range(id)"
+        );
+    }
+
+    #[test]
+    fn dispatch_range_two_args_synthesizes_step_one() {
+        let _g = tap_guard();
+        assert_eq!(
+            emit_range(vec![int_lit(2), int_lit(5)]),
+            "SELECT id FROM range(2, 5, CAST(1 AS BIGINT)) AS __td_range(id)"
+        );
+    }
+
+    #[test]
+    fn dispatch_range_three_args_uses_explicit_step() {
+        let _g = tap_guard();
+        assert_eq!(
+            emit_range(vec![int_lit(2), int_lit(10), int_lit(2)]),
+            "SELECT id FROM range(2, 10, 2) AS __td_range(id)"
+        );
+    }
+
+    #[test]
+    fn dispatch_range_four_args_drops_num_partitions() {
+        let _g = tap_guard();
+        // The 4th `numPartitions` arg is a single-node no-op — dropped.
+        assert_eq!(
+            emit_range(vec![int_lit(2), int_lit(10), int_lit(2), int_lit(4)]),
+            "SELECT id FROM range(2, 10, 2) AS __td_range(id)"
+        );
+    }
+
+    #[test]
+    fn dispatch_project_over_range_binds_id_column() {
+        let _g = tap_guard();
+        // Full `SELECT id FROM range(5)` — Project wraps the TVF subquery and
+        // binds the synthetic `id` column (tbl-006).
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableFunction {
+                name: "range".to_owned(),
+                args: vec![int_lit(5)],
+                with_ordinality: false,
+            })),
+            projections: vec![Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            )],
+        });
+        let typed = analyze(ast, &BaseTypes::empty()).expect("analyze project-over-range");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT id FROM (SELECT id FROM range(CAST(0 AS BIGINT), 5, CAST(1 AS BIGINT)) \
+             AS __td_range(id)) AS __td_proj"
+        );
+    }
+
     // ── 4-6. render_project ──────────────────────────────────────────────
+
+    #[test]
+    fn render_literal_binary_emits_duckdb_blob_escape() {
+        // Spark `X'1F2A'` lowers to a Binary literal; DuckDB's blob literal is a
+        // `\xHH`-escaped string cast to BLOB (NOT `x'..'`, which DuckDB parses as
+        // the VARCHAR "x.."). Corpus: fn-020.
+        let sql = render_literal(&Literal {
+            value: LiteralValue::Binary(vec![0x1F, 0x2A]),
+            data_type: DataType::Binary,
+        })
+        .expect("render");
+        assert_eq!(sql, r"CAST('\x1F\x2A' AS BLOB)");
+    }
 
     #[test]
     fn render_project_simple_select() {
@@ -6065,8 +6672,454 @@ mod tests {
         });
         let typed = analyze(ast, &bt).expect("analyze");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.starts_with("SELECT id FROM ("), "got: {sql}");
-        assert!(sql.contains("SELECT * FROM emp"), "got: {sql}");
+        // Project over a bare TableScan inlines `FROM emp` (Fix B, pass 126) —
+        // no `__td_proj` wrap.
+        assert_eq!(sql, "SELECT id FROM emp");
+    }
+
+    #[test]
+    fn render_project_qualified_ref_binds_over_table_scan() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            projections: vec![Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: Some("emp".to_owned()),
+                    plan_id: None,
+                },
+            )],
+        });
+        let typed = analyze(ast, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(sql, "SELECT emp.id FROM emp");
+        assert!(!sql.contains("__td_proj"), "got: {sql}");
+    }
+
+    // ── Aliased-join inlining (jn-001/002/003 root fix) ──────────────────
+
+    fn dept_schema() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("dept_id", DataType::Integer),
+            StructField::nullable("dept_name", DataType::String),
+        ])
+    }
+
+    fn base_types_emp_dept(plan: &CommonAst) -> BaseTypes {
+        BaseTypes::build_from_plan(plan, |name| match name {
+            "emp" => Some(emp_schema()),
+            "dept" => Some(dept_schema()),
+            _ => None,
+        })
+    }
+
+    /// `AliasedRelation { TableScan { alias: None }, alias }` — the node both
+    /// front-ends now produce for an aliased table (INV7).
+    fn aliased_scan(table: &str, alias: &str) -> CommonAst {
+        CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: table.to_owned(),
+                alias: None,
+            })),
+            alias: alias.to_owned(),
+        })
+    }
+
+    fn qcol(qualifier: &str, name: &str) -> Expression {
+        Expression::UnresolvedColumn(crate::transpiler_v2::expression::UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: Some(qualifier.to_owned()),
+            plan_id: None,
+        })
+    }
+
+    #[test]
+    fn render_project_over_join_hoists_user_aliases() {
+        let _g = tap_guard();
+        // SELECT e.name, d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(join),
+            projections: vec![qcol("e", "name"), qcol("d", "dept_name")],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze project-over-join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // User aliases hoisted into the subquery aliases; no synthetic alias,
+        // so the ON clause and projection bind against `e` / `d`.
+        assert!(sql.contains(") AS e INNER JOIN ("), "got: {sql}");
+        assert!(sql.contains(") AS d ON "), "got: {sql}");
+        assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
+        assert!(!sql.contains("__td_jl"), "got: {sql}");
+        assert!(!sql.contains("__td_jr"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_project_over_filter_over_join_inlines_to_single_select() {
+        let _g = tap_guard();
+        // SELECT e.name, d.dept_name FROM emp e, dept d WHERE e.dept_id = d.dept_id
+        // lowers to Project → Filter → CrossJoin.
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Cross,
+            condition: None,
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(join),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            }),
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(filter),
+            projections: vec![qcol("e", "name"), qcol("d", "dept_name")],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze project-over-filter-over-join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // Project→Filter→Join collapses into one SELECT: aliases hoisted, the
+        // predicate lands as an outer WHERE (not a buried subquery filter).
+        assert!(sql.contains(") AS e CROSS JOIN ("), "got: {sql}");
+        assert!(sql.contains(") AS d WHERE "), "got: {sql}");
+        assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
+        assert!(!sql.contains("__td_filter"), "got: {sql}");
+        assert!(!sql.contains("__td_proj"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_project_over_filter_over_aliased_relation_inlines() {
+        let _g = tap_guard();
+        // Correlated EXISTS body: `SELECT * FROM emp e WHERE e.dept_id = ...`
+        // lowers to Project → Filter → AliasedRelation. The alias `e` must
+        // become the FROM table name so the WHERE's `e.dept_id` binds.
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(aliased_scan("emp", "e")),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(filter),
+            projections: vec![],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze project-over-filter-over-aliased");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains(") AS e WHERE "), "got: {sql}");
+        assert!(!sql.contains("__td_filter"), "got: {sql}");
+        assert!(!sql.contains("__td_proj"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_aggregate_over_filter_over_aliased_relation_inlines() {
+        let _g = tap_guard();
+        // Correlated scalar subquery body: `SELECT max(e.salary) FROM emp e
+        // WHERE e.dept_id = ...` lowers to Aggregate → Filter →
+        // AliasedRelation. Alias `e` must be the FROM name so both the
+        // aggregate arg and the WHERE bind to it in one SELECT.
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(aliased_scan("emp", "e")),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(filter),
+            grouping: vec![],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "max".to_owned(),
+                args: vec![qcol("e", "salary")],
+                distinct: false,
+            })],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze aggregate-over-filter-over-aliased");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains(") AS e WHERE "), "got: {sql}");
+        assert!(!sql.contains("__td_filter"), "got: {sql}");
+        assert!(!sql.contains("__td_agg"), "got: {sql}");
+    }
+
+    fn ucol(name: &str) -> Expression {
+        Expression::UnresolvedColumn(crate::transpiler_v2::expression::UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: None,
+            plan_id: None,
+        })
+    }
+
+    fn count_star_gt_one() -> Expression {
+        Expression::Binary(BinaryExpression {
+            op: BinaryOp::Gt,
+            left: Box::new(Expression::FunctionCall(FunctionCall {
+                name: "count".to_owned(),
+                args: vec![Expression::Star(StarExpression { qualifier: None })],
+                distinct: false,
+            })),
+            right: Box::new(int_lit(1)),
+        })
+    }
+
+    #[test]
+    fn render_aggregate_having_emits_group_by_having_not_outer_where() {
+        let _g = tap_guard();
+        // `SELECT dept_id, count(*) FROM emp GROUP BY dept_id HAVING count(*) > 1`
+        // — the HAVING predicate must fold into the aggregate SELECT as
+        // `GROUP BY … HAVING`, never an outer `WHERE` wrapper (which DuckDB
+        // rejects for aggregate predicates).
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![ucol("dept_id")],
+            aggregates: vec![
+                ucol("dept_id"),
+                Expression::FunctionCall(FunctionCall {
+                    name: "count".to_owned(),
+                    args: vec![Expression::Star(StarExpression { qualifier: None })],
+                    distinct: false,
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: Some(count_star_gt_one()),
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze aggregate with having");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("GROUP BY"), "expected GROUP BY, got: {sql}");
+        assert!(sql.contains("HAVING"), "expected HAVING, got: {sql}");
+        let group_pos = sql.find("GROUP BY").expect("GROUP BY present");
+        let having_pos = sql.find("HAVING").expect("HAVING present");
+        assert!(having_pos > group_pos, "HAVING must follow GROUP BY: {sql}");
+        assert!(
+            !sql.contains("__td_filter"),
+            "no outer WHERE wrapper: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_aggregate_grouping_expr_also_projected_no_prepended_slot() {
+        let _g = tap_guard();
+        // agg-007 shape: `SELECT dept_id >= 40 AS senior, avg(salary) AS s
+        // FROM emp GROUP BY dept_id >= 40`. The grouping key structurally
+        // equals the alias-stripped first aggregate → already folded → the
+        // SELECT list must have exactly the 2 projected slots, with NO spurious
+        // leading `(dept_id >= 40)` slot.
+        let senior_expr = || {
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::GtEq,
+                left: Box::new(ucol("dept_id")),
+                right: Box::new(int_lit(40)),
+            })
+        };
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![senior_expr()],
+            aggregates: vec![
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(senior_expr()),
+                    alias: "senior".to_owned(),
+                }),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(Expression::FunctionCall(FunctionCall {
+                        name: "avg".to_owned(),
+                        args: vec![ucol("salary")],
+                        distinct: false,
+                    })),
+                    alias: "s".to_owned(),
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze folded aggregate");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // The select list (between SELECT and FROM) must be the 2 projected
+        // slots only: the grouping expr appears once in `senior` and once in
+        // GROUP BY = twice total. A spurious prepended slot would make it 3.
+        assert_eq!(
+            sql.matches("(dept_id) >= (40)").count(),
+            2,
+            "expected the grouping expr exactly twice (senior slot + GROUP BY), got: {sql}"
+        );
+        assert_eq!(
+            sql.matches(" AS senior").count(),
+            1,
+            "senior alias appears exactly once: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_aggregate_all_empty_grouping_sets_emits_group_by() {
+        let _g = tap_guard();
+        // `GROUP BY GROUPING SETS ((), ())`: the flat grouping list is empty
+        // (no columns referenced) but `grouping_sets` holds two empty sets.
+        // Each empty set is a distinct grand-total group, so Spark returns one
+        // row per set. The GROUP BY must NOT be dropped (which would collapse
+        // both sets into a single grand-total row — a silent wrong row-count).
+        // DuckDB accepts `GROUP BY GROUPING SETS ((), ())`.
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "count".to_owned(),
+                args: vec![Expression::Star(StarExpression { qualifier: None })],
+                distinct: false,
+            })],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
+            grouping_sets: vec![vec![], vec![]],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze all-empty grouping sets");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("GROUP BY GROUPING SETS ((), ())"),
+            "expected GROUP BY GROUPING SETS ((), ()), got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_aggregate_having_composes_with_rollup() {
+        let _g = tap_guard();
+        // ROLLUP grouping + HAVING → `GROUP BY ROLLUP(dept_id) HAVING …`.
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![ucol("dept_id")],
+            aggregates: vec![
+                ucol("dept_id"),
+                Expression::FunctionCall(FunctionCall {
+                    name: "count".to_owned(),
+                    args: vec![Expression::Star(StarExpression { qualifier: None })],
+                    distinct: false,
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::Rollup,
+            grouping_sets: vec![],
+            having: Some(count_star_gt_one()),
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze rollup aggregate with having");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("ROLLUP("), "expected ROLLUP, got: {sql}");
+        assert!(sql.contains("HAVING"), "expected HAVING, got: {sql}");
+        let rollup_pos = sql.find("ROLLUP(").expect("ROLLUP present");
+        let having_pos = sql.find("HAVING").expect("HAVING present");
+        assert!(
+            having_pos > rollup_pos,
+            "HAVING must follow ROLLUP group clause: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_aggregate_grouping_sets_emits_per_set_group_clause() {
+        let _g = tap_guard();
+        // GROUPING SETS ((dept_id, name), (dept_id), ()) → flat grouping
+        // [dept_id, name] with per-set membership [[0, 1], [0], []].
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![ucol("dept_id"), ucol("name")],
+            aggregates: vec![
+                ucol("dept_id"),
+                ucol("name"),
+                Expression::FunctionCall(FunctionCall {
+                    name: "count".to_owned(),
+                    args: vec![Expression::Star(StarExpression { qualifier: None })],
+                    distinct: false,
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
+            grouping_sets: vec![vec![0, 1], vec![0], vec![]],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze grouping-sets aggregate");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("GROUPING SETS ((dept_id, name), (dept_id), ())"),
+            "expected per-set GROUP BY clause, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_aggregate_grouping_sets_empty_metadata_preserves_boundary() {
+        let _g = tap_guard();
+        // DataFrame `groupingSets` path leaves `grouping_sets` empty — emission
+        // must surface the preserved Thunderduck-boundary error (ADR-022).
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: vec![ucol("dept_id")],
+            aggregates: vec![
+                ucol("dept_id"),
+                Expression::FunctionCall(FunctionCall {
+                    name: "count".to_owned(),
+                    args: vec![Expression::Star(StarExpression { qualifier: None })],
+                    distinct: false,
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze grouping-sets aggregate");
+        let err = dispatch_op(&typed.op, &typed.resolved_schema).unwrap_err();
+        match err {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::Op,
+                name: op,
+                ..
+            } => assert_eq!(op, "Aggregate[GroupingSets]"),
+            other => panic!("expected UnsupportedOp(Aggregate[GroupingSets]), got {other:?}"),
+        }
     }
 
     #[test]
@@ -6626,6 +7679,105 @@ mod tests {
             }
             other => panic!("expected UnsupportedExpression, got {other:?}"),
         }
+    }
+
+    // ── ExtractValue emission dispatches on child data_type (cx-001/002) ──
+
+    fn col_with_type(name: &str, dt: DataType) -> Expression {
+        Expression::ColumnReference(ColumnReference {
+            name: name.to_owned(),
+            qualifier: None,
+            data_type: Some(dt),
+            nullable: Some(true),
+        })
+    }
+
+    fn string_lit(s: &str) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::String(s.to_owned()),
+            data_type: DataType::String,
+        })
+    }
+
+    fn extract_value(child: Expression, extraction: Expression) -> Expression {
+        Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(child),
+            extraction: Box::new(extraction),
+        })
+    }
+
+    #[test]
+    fn extract_value_over_struct_child_emits_dot_field() {
+        // Regression: struct getField stays on the `.field` path.
+        let child = col_with_type(
+            "address",
+            DataType::Struct(StructType::new(vec![StructField::nullable(
+                "city",
+                DataType::String,
+            )])),
+        );
+        let ev = extract_value(child, string_lit("city"));
+        let sql = render_expr(&ev, &empty_schema()).unwrap();
+        assert_eq!(sql, "(address).city");
+    }
+
+    #[test]
+    fn extract_value_over_array_child_emits_ansi_throwing_list_extract() {
+        // Spark `arr[0]` (0-indexed, ANSI): in-bounds returns the element via
+        // DuckDB list_extract(.., idx+1); OOB/negative THROWS
+        // `[INVALID_ARRAY_INDEX]` (GetArrayItem failOnError=true), NOT NULL.
+        // A NULL array short-circuits to NULL.
+        let child = col_with_type("arr", DataType::Array(Box::new(DataType::Integer), false));
+        let ev = extract_value(child, int_lit(0));
+        let sql = render_expr(&ev, &empty_schema()).unwrap();
+        assert_eq!(
+            sql,
+            "CASE WHEN (arr) IS NULL THEN NULL \
+             WHEN (0) < 0 OR (0) >= len((arr)) THEN \
+             error('[INVALID_ARRAY_INDEX] The index ' || (0)::VARCHAR \
+             || ' is out of bounds. The array has ' || len((arr))::VARCHAR \
+             || ' elements. Use the SQL function `get()` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003') \
+             ELSE list_extract((arr), (0) + 1) END"
+        );
+    }
+
+    #[test]
+    fn extract_value_over_array_child_throws_on_negative_and_oob() {
+        // The OOB/negative branch must THROW `[INVALID_ARRAY_INDEX]` (never
+        // NULL) — distinct from element_at's `_IN_ELEMENT_AT` class — while the
+        // in-bounds ELSE branch still returns the element.
+        let child = col_with_type("arr", DataType::Array(Box::new(DataType::Integer), false));
+        let ev = extract_value(child, int_lit(-1));
+        let sql = render_expr(&ev, &empty_schema()).unwrap();
+        assert!(
+            sql.contains("error('[INVALID_ARRAY_INDEX] The index '"),
+            "missing INVALID_ARRAY_INDEX throw: {sql}"
+        );
+        assert!(
+            !sql.contains("INVALID_ARRAY_INDEX_IN_ELEMENT_AT"),
+            "must NOT use the element_at class: {sql}"
+        );
+        assert!(sql.contains("(-1) < 0"), "missing negative guard: {sql}");
+        assert!(
+            sql.contains("ELSE list_extract((arr), (-1) + 1) END"),
+            "in-bounds branch must still return the element: {sql}"
+        );
+    }
+
+    #[test]
+    fn extract_value_over_map_child_emits_element_at() {
+        // Spark `map[k]` → DuckDB element_at(map, k)[1] (scalar, NULL on miss).
+        let child = col_with_type(
+            "m",
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::Integer),
+                value_nullable: true,
+            },
+        );
+        let ev = extract_value(child, string_lit("a"));
+        let sql = render_expr(&ev, &empty_schema()).unwrap();
+        assert_eq!(sql, "element_at((m), ('a'))[1]");
     }
 
     // ── DUCKDB_RESERVED invariants — required by the binary_search shape
@@ -7421,13 +8573,13 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            grouping: vec![Expression::UnresolvedColumn(
+            grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "dept_id".to_owned(),
                     qualifier: None,
                     plan_id: None,
                 },
-            )],
+            )]),
             pivot_column: Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "id".to_owned(),
@@ -7476,13 +8628,13 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            grouping: vec![Expression::UnresolvedColumn(
+            grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "dept_id".to_owned(),
                     qualifier: None,
                     plan_id: None,
                 },
-            )],
+            )]),
             pivot_column: Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "id".to_owned(),
@@ -7528,6 +8680,49 @@ mod tests {
         assert!(sql.contains(" AS \"1_c\""), "got: {sql}");
     }
 
+    /// G3 (pass 107): an Alias-wrapped pivot value (SQL `IN (1 AS one)`) must
+    /// have its alias stripped inside the CASE comparison — the alias only
+    /// names the output column (`AS "one"`), it must not leak into the CASE.
+    #[test]
+    fn render_pivot_strips_alias_from_pivot_value_in_case() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        let ast = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            })),
+            grouping: PivotGrouping::Implicit,
+            pivot_column: Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            ),
+            pivot_values: vec![Expression::Alias(AliasExpression {
+                alias: "one".to_owned(),
+                expr: Box::new(int_lit(1)),
+            })],
+            aggregates: vec![Expression::Alias(AliasExpression {
+                alias: "n".to_owned(),
+                expr: Box::new(Expression::FunctionCall(FunctionCall {
+                    name: "count".to_owned(),
+                    args: vec![int_lit(1)],
+                    distinct: false,
+                })),
+            })],
+        });
+        let sql = generate(&ast, &bt).expect("generate aliased-value pivot");
+        // The CASE compares against the bare literal, not `1 AS one`.
+        assert!(
+            sql.contains("IS NOT DISTINCT FROM 1") && !sql.contains("IS NOT DISTINCT FROM 1 AS"),
+            "alias must be stripped inside the CASE; got: {sql}"
+        );
+        // The alias names the output column (a bare identifier needs no quotes).
+        assert!(sql.contains(" AS one "), "got: {sql}");
+    }
+
     #[test]
     fn render_unpivot_emits_duckdb_unpivot_shape() {
         // Anchor: piv-004 shape — emits
@@ -7541,7 +8736,7 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             })),
-            ids: vec!["id".to_owned()],
+            ids: UnpivotIds::Explicit(vec!["id".to_owned()]),
             values: vec!["dept_id".to_owned(), "salary".to_owned()],
             variable_column_name: "metric".to_owned(),
             value_column_name: "value".to_owned(),
@@ -8628,7 +9823,8 @@ mod tests {
     }
 
     /// τ `zip_with(a, b, (x, y) -> body)` inlines to
-    /// `list_transform(range(1, least(len(a), len(b)) + 1), i -> body_at_i)`.
+    /// `list_transform(range(0, least(len(a), len(b))), i -> body_at_i)`, where
+    /// `a[i]` / `b[i]` render through the 0-based GetArrayItem ExtractValue arm.
     /// Corpus: `hof-006`.
     #[test]
     fn render_zip_with_emits_index_iteration() {
@@ -8661,12 +9857,20 @@ mod tests {
         };
         let sql = render_function_call(&f, &empty_schema()).expect("render zip_with");
         assert!(
-            sql.contains("list_transform(range(1, least("),
+            sql.contains("list_transform(range(0, least("),
             "range shape: {sql}"
         );
         assert!(sql.contains("__zw_i"), "fresh index var used: {sql}");
-        assert!(sql.contains("(tags)[__zw_i]"), "a[i] substitution: {sql}");
-        assert!(sql.contains("(tags2)[__zw_i]"), "b[i] substitution: {sql}");
+        // a[i] / b[i] render through the 0-based GetArrayItem ExtractValue arm:
+        // guarded `list_extract(child, i + 1)`.
+        assert!(
+            sql.contains("list_extract((tags), (__zw_i) + 1)"),
+            "a[i] substitution: {sql}"
+        );
+        assert!(
+            sql.contains("list_extract((tags2), (__zw_i) + 1)"),
+            "b[i] substitution: {sql}"
+        );
     }
 
     /// τ `map_filter(m, (k, v) -> pred)` emits `map_from_entries(list_filter(
@@ -9837,6 +11041,72 @@ mod tests {
         assert!(
             !sql.contains("approx_quantile"),
             "must not use approx_quantile, got: {sql}"
+        );
+    }
+
+    /// Pass 124 — Spark's `percentile(col, p)` is the exact CONTINUOUS
+    /// (linear-interpolation) quantile → DuckDB `quantile_cont`, distinct
+    /// from `percentile_approx` (discrete `quantile_disc`). Corpus: agg-019.
+    #[test]
+    fn render_percentile_uses_quantile_cont() {
+        let q_lit = Expression::Literal(Literal {
+            value: LiteralValue::Double(0.5),
+            data_type: DataType::Double,
+        });
+        let f = FunctionCall {
+            name: "percentile".to_owned(),
+            args: vec![col_ref_expr("salary"), q_lit],
+            distinct: false,
+        };
+        let sql = render_aggregate(&f, &empty_schema()).expect("render percentile");
+        assert!(
+            sql.contains("quantile_cont"),
+            "expected quantile_cont, got: {sql}"
+        );
+        assert!(
+            sql.contains("CAST(") && sql.contains("AS DOUBLE"),
+            "expected CAST(... AS DOUBLE), got: {sql}"
+        );
+        assert!(
+            !sql.contains("quantile_disc"),
+            "must not use quantile_disc (that is percentile_approx), got: {sql}"
+        );
+    }
+
+    /// Pass 124 — `collect_list` passes through verbatim to the session
+    /// macro (`LIST(x) FILTER (WHERE x IS NOT NULL)`). Corpus: agg-018.
+    #[test]
+    fn render_collect_list_passes_through() {
+        let f = FunctionCall {
+            name: "collect_list".to_owned(),
+            args: vec![col_ref_expr("name")],
+            distinct: false,
+        };
+        let sql = render_aggregate(&f, &empty_schema()).expect("render collect_list");
+        assert!(
+            sql.contains("collect_list("),
+            "expected verbatim collect_list(, got: {sql}"
+        );
+    }
+
+    /// Pass 124 — `collect_set` passes through verbatim; the DISTINCT lives
+    /// inside the session macro, so the emitted SQL carries no DISTINCT
+    /// token itself. Corpus: agg-018.
+    #[test]
+    fn render_collect_set_passes_through() {
+        let f = FunctionCall {
+            name: "collect_set".to_owned(),
+            args: vec![col_ref_expr("name")],
+            distinct: false,
+        };
+        let sql = render_aggregate(&f, &empty_schema()).expect("render collect_set");
+        assert!(
+            sql.contains("collect_set("),
+            "expected verbatim collect_set(, got: {sql}"
+        );
+        assert!(
+            !sql.to_ascii_uppercase().contains("DISTINCT"),
+            "collect_set macro owns the DISTINCT; emission must not add it, got: {sql}"
         );
     }
 

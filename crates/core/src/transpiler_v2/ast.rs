@@ -116,8 +116,21 @@ pub enum CommonOp {
         /// unfolds them.
         aggregates: Vec<Expression>,
         /// The grouping kind — GroupBy (default), Rollup, Cube, or
-        /// GroupingSets (future τ work — Pivot lives elsewhere).
+        /// GroupingSets (Pivot lives elsewhere).
         grouping_kind: GroupingKind,
+        /// Per-set column membership for [`GroupingKind::GroupingSets`] —
+        /// indices into the flat `grouping` list (first-appearance order). One
+        /// inner vec per set; an empty inner vec is the empty set `()` (grand
+        /// total). EMPTY for all other kinds and on the DataFrame
+        /// `groupingSets` path (which stays a boundary error, ADR-022).
+        grouping_sets: Vec<Vec<usize>>,
+        /// SparkSQL `HAVING <pred>` — post-aggregation group filter. `None` for
+        /// the DataFrame path (models post-agg filtering as a separate Filter
+        /// over the Aggregate). Resolved against the aggregate INPUT schema
+        /// (aggregate exprs + grouping keys bind to input columns). Does NOT
+        /// resolve SELECT output-alias refs (`HAVING s > x`) — no corpus
+        /// witness; future merged-scope enhancement.
+        having: Option<Expression>,
     },
 
     // ── Leaves ───────────────────────────────────────────────────────────
@@ -254,8 +267,10 @@ pub enum CommonOp {
     Unpivot {
         /// The input relation.
         input: Box<CommonAst>,
-        /// Id columns — preserved verbatim in the output.
-        ids: Vec<String>,
+        /// Id columns — preserved verbatim in the output. Either supplied
+        /// explicitly (DataFrame path) or derived from the input schema by
+        /// the analyzer (SQL `UNPIVOT`, which lists only value columns).
+        ids: UnpivotIds,
         /// Value columns to unpivot. Empty ⇒ analyzer expands to all
         /// non-id input columns per Spark semantics.
         values: Vec<String>,
@@ -282,8 +297,10 @@ pub enum CommonOp {
     Pivot {
         /// The input relation.
         input: Box<CommonAst>,
-        /// Grouping columns (preserved as rows).
-        grouping: Vec<Expression>,
+        /// Grouping columns (preserved as rows). Either supplied explicitly
+        /// (DataFrame `groupBy(...).pivot(...)`) or derived from the input
+        /// schema by the analyzer (SQL `PIVOT`, which lists no grouping).
+        grouping: PivotGrouping,
         /// The column whose distinct values become new column headers.
         pivot_column: Expression,
         /// Explicit list of pivot values (Literal expressions). Empty ⇒
@@ -483,6 +500,35 @@ pub enum CommonOp {
     },
 }
 
+/// Where a [`CommonOp::Pivot`]'s grouping (preserved-as-rows) columns come from.
+///
+/// `Explicit(vec![])` (a legitimately empty DataFrame grouping) is distinct
+/// from `Implicit` (derive from the input schema), which a bare `Vec` /
+/// `is_empty()` check cannot express.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PivotGrouping {
+    /// Supplied explicitly (DataFrame `groupBy(...).pivot(...)`). May be empty.
+    Explicit(Vec<Expression>),
+    /// SQL `PIVOT` supplies no grouping list; the analyzer derives it as
+    /// `input schema − pivot column − aggregate-referenced columns`.
+    Implicit,
+}
+
+/// Where a [`CommonOp::Unpivot`]'s id (preserved) columns come from.
+///
+/// As with [`PivotGrouping`], an explicitly empty id list (DataFrame
+/// `df.unpivot(ids, None)`) is distinct from an implicit one (SQL `UNPIVOT`,
+/// which lists only value columns).
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnpivotIds {
+    /// Supplied explicitly (DataFrame `df.unpivot(ids, values, ...)`). May be
+    /// empty.
+    Explicit(Vec<String>),
+    /// SQL `UNPIVOT` supplies no id list; the analyzer derives it as
+    /// `input schema − value columns`. Requires `values` non-empty.
+    Implicit,
+}
+
 /// The file formats supported by [`CommonOp::FileScan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileFormat {
@@ -516,10 +562,12 @@ pub enum GroupingKind {
     Rollup,
     /// `GROUP BY CUBE(cols)`.
     Cube,
-    /// `GROUP BY GROUPING SETS((cols), (cols), ...)` — future τ work structured
-    /// form. The `grouping` list carries all distinct cols in first-appear
-    /// order; the set membership is applied at emission time (not yet
-    /// wired; punts as `UnsupportedOp` today).
+    /// `GROUP BY GROUPING SETS((cols), (cols), ...)`. The `grouping` list
+    /// carries all distinct cols in first-appearance order; the per-set
+    /// membership lives in the sibling `grouping_sets` field on
+    /// [`CommonOp::Aggregate`]/`TypedOp::Aggregate` (indices into `grouping`)
+    /// and is applied at emission time. The SparkSQL front-end populates it;
+    /// the DataFrame path leaves it empty and stays a boundary error.
     GroupingSets,
 }
 
@@ -657,7 +705,7 @@ mod tests {
         // columns.
         let plan = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
-            ids: vec!["id".to_owned()],
+            ids: UnpivotIds::Explicit(vec!["id".to_owned()]),
             values: vec!["age".to_owned(), "salary".to_owned()],
             variable_column_name: "metric".to_owned(),
             value_column_name: "value".to_owned(),
@@ -670,7 +718,7 @@ mod tests {
                 value_column_name,
                 ..
             } => {
-                assert_eq!(ids, vec!["id".to_owned()]);
+                assert_eq!(ids, UnpivotIds::Explicit(vec!["id".to_owned()]));
                 assert_eq!(values, vec!["age".to_owned(), "salary".to_owned()]);
                 assert_eq!(variable_column_name, "metric");
                 assert_eq!(value_column_name, "value");
@@ -710,7 +758,7 @@ mod tests {
         });
         let plan = CommonAst::new(CommonOp::Pivot {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
-            grouping: vec![group.clone()],
+            grouping: PivotGrouping::Explicit(vec![group.clone()]),
             pivot_column: pivot_col.clone(),
             pivot_values: vec![v_true.clone(), v_false.clone()],
             aggregates: vec![agg.clone()],
@@ -723,7 +771,7 @@ mod tests {
                 aggregates,
                 ..
             } => {
-                assert_eq!(grouping, vec![group]);
+                assert_eq!(grouping, PivotGrouping::Explicit(vec![group]));
                 assert_eq!(pivot_column, pivot_col);
                 assert_eq!(pivot_values, vec![v_true, v_false]);
                 assert_eq!(aggregates, vec![agg]);
@@ -739,11 +787,13 @@ mod tests {
         use super::super::expression::UnresolvedColumn;
         let plan = CommonAst::new(CommonOp::Pivot {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
-            grouping: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-                name: "active".to_owned(),
-                qualifier: None,
-                plan_id: None,
-            })],
+            grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
+                UnresolvedColumn {
+                    name: "active".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            )]),
             pivot_column: Expression::UnresolvedColumn(UnresolvedColumn {
                 name: "dept_id".to_owned(),
                 qualifier: None,

@@ -4,67 +4,66 @@ Update after any user correction, review finding, or workflow-shape observation 
 generalizing. Terse; one bullet per lesson; cite the concrete instance.
 
 > **Note on vocabulary.** Entries below dated 2026-07-01 through 2026-07-02 reference
-> the retired slice-based methodology (Slice A, Slice B, …) and the retired v1
-> transpiler; keep them as historical evidence but read them for the *lesson*, not
-> the process framing. Slice terminology retired 2026-07-02; the v1 transpiler
-> was deleted 2026-07-05. Current work is corpus-driven — see
+> a retired phase-based methodology and the retired v1 transpiler; keep them as
+> historical evidence but read them for the *lesson*, not the process framing. The
+> v1 transpiler was deleted 2026-07-05. Current work is corpus-driven — see
 > `tasks/v2-corpus-driven-goal-prompt-template.md`.
 
 ---
 
 ## Workflow shape
 
-- **Substrate-only slices are the right shape when the runway to the next unlock is long.**
-  Slice B (v2 analyzer, 2026-07-01) landed as substrate with an honest zero-delta on the
+- **Substrate-only efforts are the right shape when the runway to the next unlock is long.**
+  The v2 analyzer (2026-07-01) landed as substrate with an honest zero-delta on the
   differential progress signal (`v2_progress.md` stayed 12/324). Fighting for a fake `+N`
-  before Slice C's dispatch was wired would have forced adapter shortcuts. The `/new-feature`
+  before the emission-dispatch was wired would have forced adapter shortcuts. The `/new-feature`
   pipeline handled this cleanly — the pipeline's summary just reported "0 corpus cases;
-  substrate for +5..+15 once Slice C lands." Do not force differential movement out of a
-  slice whose ADRs (here ADR-005, ADR-006) explicitly own only typing, not emission.
+  substrate for +5..+15 once emission lands." Do not force differential movement out of an
+  effort whose ADRs (here ADR-005, ADR-006) explicitly own only typing, not emission.
 
-- **Half-declarative is worse than fully-hand-written or fully-interpreted.** In Slice C.1
-  iteration 1 (2026-07-01), the coder built `EmissionRow` / `Template` / `SlotKind` /
+- **Half-declarative is worse than fully-hand-written or fully-interpreted.** In the first
+  emission iteration (2026-07-01), the coder built `EmissionRow` / `Template` / `SlotKind` /
   `EMISSION_TABLE` as declarative data with no interpreter — the actual emission was still
   hand-written `render_*` helpers, and the table was dead code. The reviewer flagged this as
   Critical (C1). Iteration 2 closed it by **deleting the scaffolding** rather than adding an
   interpreter. Rule: don't ship declarative data whose only reader is a `#[test]`. Either
-  hand-write until you have real clients, or write the interpreter in the same pass. Slice
-  C.2 lands the declarative table when it has per-function rows that need it.
+  hand-write until you have real clients, or write the interpreter in the same pass. A later
+  emission pass lands the declarative table when it has per-function rows that need it.
 
-- **The up-front audit is worth the cost.** Slice D Phase 1's architect §0 (2026-07-01)
+- **The up-front audit is worth the cost.** The extension-wiring architect's §0 (2026-07-01)
   audited the actual `emission.rs` state before proposing edits and found that `md5`,
-  `sha1`/`sha2`, and the full stddev/variance family were already wired in Slice C.2 — the
-  readiness map and initial prompt listed them as "wiring to add." The audit collapsed the
+  `sha1`/`sha2`, and the full stddev/variance family were already wired by an earlier emission
+  pass — the initial prompt listed them as "wiring to add." The audit collapsed the
   planned edit surface from ~14 arms to 8 and saved multiple Pass-1 iterations that would
   have discovered the overlap during coder work (each `render_function_call` arm collision
-  is a fresh compile error + re-review cycle). Rule: for any slice that touches a
-  large-surface file already grown by a previous slice, spend a plan §0 pass diff'ing the
+  is a fresh compile error + re-review cycle). Rule: for any effort that touches a
+  large-surface file already grown by a previous effort, spend a plan §0 pass diff'ing the
   actual substrate against the prompt's assumptions before enumerating deliverables.
 
-- **Approach A is the honest choice when the interpreter is trivial.** Slice C.2's architect
+- **Approach A is the honest choice when the interpreter is trivial.** The emission architect
   (2026-07-01) chose Approach A (hand-written per-variant / per-function `match` arms) over
   Approach B (declarative row substrate + interpreter) precisely because the ~50 non-trivial
   function shapes are 3-to-5-line `format!` strings — not enough interpreter substrate to
   justify a table. This is the *inverse* of the Pass-1 dead-data lesson at a different scale:
-  once the substrate is real (Slice D adds `spark_*` extension rows, Slice F adds ~30
-  complex-type functions), the interpreter becomes non-trivial and the declarative form pays
+  once the substrate is real (the extension work adds `spark_*` extension rows, later τ work
+  adds ~30 complex-type functions), the interpreter becomes non-trivial and the declarative form pays
   off. Rule: pick the shape that matches the interpreter's own weight — trivial interpreter
   → hand-written `match`; non-trivial interpreter → declarative rows.
 
 ## ADR-015 discipline (differential oracle > plan document)
 
 - **The legacy `TypeInferenceEngine` is the oracle for Spark-parity coercion, not the plan.**
-  In Slice B, `smoke_type_019` (`type-019`: `Decimal(5,0)` unionByName `Decimal(10,2)`) had a
+  In the analyzer work, `smoke_type_019` (`type-019`: `Decimal(5,0)` unionByName `Decimal(10,2)`) had a
   plan-document expected value of `Decimal(11,2)`. The coder ran the legacy
   `unify_decimal(5,0,10,2)` and got `Decimal(10,2)` — precision =
   `min(max(5-0, 10-2) + max(0,2), 38) = 10`. Fixture updated to match the oracle, not the plan.
   This is the ADR-015 pattern working as designed: LLM-extracted rules stay untrusted until
   the oracle validates. Reuse verbatim; do not re-derive.
 
-## Design tactics learned in Slice C
+## Design tactics learned in the emission work
 
 - **Legacy-verbatim shape hard-copying is the honest cost of a contamination barrier.**
-  Slice C.2 (2026-07-01) needed the shape of ~50 Spark scalar functions inside `emission.rs`
+  The emission work (2026-07-01) needed the shape of ~50 Spark scalar functions inside `emission.rs`
   but INV3 forbids importing `crate::functions::FunctionRegistry`. The architect considered a
   narrow accessor (Approach C in ADR-009's refinement) and rejected it: duplication of a
   bounded, stable surface (~50 function shapes) is honest cost, whereas an accessor becomes a
@@ -74,26 +73,26 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   surface would demonstrably be smaller.
 
 - **The `spark_return_cast` / `spark_aggregate_return_cast` separation prevents double-cast.**
-  In Slice C.2, projection-level and aggregate-level return-type parity live in different
+  In the emission work, projection-level and aggregate-level return-type parity live in different
   renderers (`render_projection_slot` vs. `render_aggregate`). Sharing a single
   `spark_return_cast` helper across both would double-cast aggregate output. Rule: the CAST
   that pins Spark's return type belongs at exactly one call site per emission decision. If a
   helper needs to cover multiple emission contexts, split it by context; do not chain.
 
-- **Silently absorbed performance wins are a real refactoring pattern.** Slice C.2's
-  `SqlGenerator::gen_expr` seam drain (an architectural change) eliminated Slice C.1's
-  per-expression `SqlGenerator::new()` allocation (Pass-1 perf finding OPT-M2 and OPT-L1)
+- **Silently absorbed performance wins are a real refactoring pattern.** The emission work's
+  `SqlGenerator::gen_expr` seam drain (an architectural change) eliminated the earlier emission
+  iteration's per-expression `SqlGenerator::new()` allocation (Pass-1 perf finding OPT-M2 and OPT-L1)
   without a labeled perf change. When a refactor subsumes a perf concern, the perf backlog is
   drained *by* the refactor — no separate perf commit needed. But it should be *named* in the
   Pass N summary so the perf-agent's audit trail stays coherent. Rule: if you're about to
   restructure code the perf backlog references, close the backlog items in your summary as
   "subsumed by <refactor>" rather than letting them go silent.
 
-- **One allowed cross-module edit per slice, flagged and documented.** Slice C.1 needed
+- **One allowed cross-module edit per effort, flagged and documented.** The first emission iteration needed
   `pub fn with_schema_for_v2` in the legacy `generator/mod.rs` to make the analyzer-side schema
   threadable into the emission-time renderer. The plan's §Scope allowed exactly one such
   cross-module edit; the coder's implementation log flagged it as a deviation; the reviewer
-  verified it was minimal and non-behavioral. Rule: cross-module edits outside the slice's
+  verified it was minimal and non-behavioral. Rule: cross-module edits outside the effort's
   designated files are permitted only if (a) the plan sanctions them explicitly, (b) the coder
   discloses them as a named deviation, and (c) the reviewer verifies both scope and
   minimality. Silent cross-module edits are a Critical review finding.
@@ -101,7 +100,7 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
 ## Bug-fix diagnostics
 
 - **Diagnostician-overturned bug reports are a strong signal — trust the
-  falsification.** Slice C.3-4 (2026-07-01) was scoped by the initial prompt as a
+  falsification.** The div-routing bug-fix (2026-07-01) was scoped by the initial prompt as a
   Div-routing bug inside `emission.rs::render_binary` / `render_spark_decimal_div`
   (v2 substrate). The diagnostician's multi-hypothesis pass proved the v2 path
   was byte-correct and traced the failure two crates over to
@@ -116,7 +115,7 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   is roughly right, which is safe only when there's no bug to reproduce yet.
 
 - **Symmetric-omission bug pattern — audit for `count_if` whenever the count family is enumerated.**
-  Slice C.3-3 (2026-07-01) closed `agg-020`/`agg2-006` by adding `count_if` in
+  A 2026-07-01 fix closed `agg-020`/`agg2-006` by adding `count_if` in
   **two** independent files that both enumerated the count family and both
   omitted it: `TypeInferenceEngine::aggregate_return_type` at
   `types/type_inference.rs:326` (arg-type fall-through returned Boolean
@@ -129,7 +128,7 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   `grouping`, `grouping_id`), always audit for `count_if` inclusion; the
   omission travels together across sibling code paths.
 
-- **Corpus-first reading beats prompt speculation.** The C.3-3 initial
+- **Corpus-first reading beats prompt speculation.** The `count_if` fix's initial
   /fix-bug prompt speculated the `salary > 90000` predicate inside
   `count_if` was being routed as Decimal. Reading the corpus fixtures
   verbatim (`agg-020` uses `F.count_if(F.col("active"))` — argument is a
@@ -141,15 +140,15 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   probing the runtime.
 
 - **The diagnostician's "rerun first" preflight can collapse a `/fix-bug` pipeline
-  to a verify-only pass.** Slice C.3-5 (2026-07-01) was scoped as a `sum(decimal)`
+  to a verify-only pass.** A 2026-07-01 fix was scoped as a `sum(decimal)`
   routing fix in `emission.rs::render_aggregate` / `spark_aggregate_rewrite`. The
   diagnostician ran the reproducer (`agg-007` under `THUNDERDUCK_TRANSPILER=v2`)
   twice before staging any hypotheses — both PASSED deterministically. The bug
-  report predated the C.3-4 landing that unmasked `Decimal128` `LocalRelation`
-  payloads; combined with Slice D Phase 1's existing `spark_aggregate_rewrite`
+  report predated the silent-NULL landing that unmasked `Decimal128` `LocalRelation`
+  payloads; combined with the extension work's existing `spark_aggregate_rewrite`
   helper, the case was already GREEN. The pipeline landed as verify-only: two
   regression tests locking in the routing invariant, no production code change.
-  Same shape as C.3-4's scope-overturn (diagnostician-first pipelines catch
+  Same shape as the silent-NULL scope-overturn (diagnostician-first pipelines catch
   stale-scope bugs), but from a different angle: here the bug report itself
   had already been closed by subsequent landings. Rule: when a `/fix-bug`
   prompt was drafted before recent landings, the diagnostician's Phase-1
@@ -158,23 +157,23 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   fabricate a fix for a bug that no longer reproduces.
 
 - **Dormant v2 fixes are legitimate outcomes when the runtime routes through legacy
-  for a corpus case that Slice D/E has not yet wired.** Slice C.3-1 (2026-07-01)
+  for a corpus case that the extension/execution work has not yet wired.** A 2026-07-01 fix
   landed the correct sha arg-strip fix in `crates/core/src/transpiler_v2/emission.rs`
   plus a regression test, but the target case `hash-002` stayed RED because the
   runtime path for `spark.createDataFrame(...)` DataFrames routes through the
   legacy `SqlRelation` fallback (`AnalyzerError::PuntedOperator` — raw-SQL
-  sub-relations are out of the Slice B common-AST surface), and legacy's
+  sub-relations are out of the analyzer's common-AST surface), and legacy's
   `FunctionRegistry` maps `sha2 → SHA256` name-only and has the same bug. Non-goals
   forbid touching legacy `FunctionRegistry`. Two shapes were available: (a)
   silently rewrite legacy to satisfy the corpus, or (b) land the v2 fix + test
-  and halt-and-flag the corpus case as blocked on future Slice D/E `SqlRelation`
-  handling. The coder picked (b). Complements the C.3-4 scope-overturn lesson
+  and halt-and-flag the corpus case as blocked on future extension/execution `SqlRelation`
+  handling. The coder picked (b). Complements the silent-NULL scope-overturn lesson
   from a different angle: there the fix belonged upstream of the v2 substrate;
   here the fix belongs on the v2 substrate but the runtime hasn't yet reached
   it. Rule: when a v2 fix is correct but the corpus case runs through legacy
-  fallback for a plan shape the current slice doesn't own, land the v2 fix +
+  fallback for a plan shape the current effort doesn't own, land the v2 fix +
   regression test as dormant; halt-and-flag the corpus case with an explicit
-  "blocked on future slice X" note. The regression test locks the fix in for
+  "blocked on future τ work" note. The regression test locks the fix in for
   the moment the routing changes, and no non-goal edits sneak in.
 
 - **"Let DuckDB check the type" is an ADR-015 smell — the check belongs on τ.**
@@ -199,7 +198,7 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   do not punt it to the engine.
 
 - **Silent-NULL catch-alls in typed dispatch are data-corruption anti-patterns.**
-  The Slice C.3-4 root cause was a single-line `_ => Ok("NULL".to_string())`
+  The silent-NULL root cause was a single-line `_ => Ok("NULL".to_string())`
   at `relation_converter.rs:2513`. It silently mapped every unhandled Arrow
   type — including `Decimal128`, `Decimal256`, `Interval*`, `Duration*`,
   `Binary`, etc. — to SQL literal `"NULL"`, corrupting every affected column
@@ -328,16 +327,16 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
 
 ## Progress-signal calibration
 
-- **Per-slice progress-signal estimates are lagging indicators; recalibrate after each slice
-  lands.** Slice B predicted `[+5, +15]` on `v2_progress.md`, actual delta was 0 (the analyzer
-  alone can't move differential counts without dispatch). Slice C predicted `12 → 180-200`,
-  actual `12 → 134` (the 46-case gap is the honest DEFER carryover to Slices D/E/F/G). The
-  estimates aren't wrong in principle; they're wrong because the readiness-map case-ID target
-  lists overcounted what the slice alone could unblock without extension functions (Slice D),
-  the full join cluster (Slice E), complex types (Slice F), or verticals (Slice G).
+- **Per-effort progress-signal estimates are lagging indicators; recalibrate after each effort
+  lands.** The analyzer predicted `[+5, +15]` on `v2_progress.md`, actual delta was 0 (the analyzer
+  alone can't move differential counts without dispatch). The emission work predicted `12 → 180-200`,
+  actual `12 → 134` (the 46-case gap is the honest DEFER carryover to the extension, execution, and
+  later τ work). The estimates aren't wrong in principle; they're wrong because the case-ID target
+  lists overcounted what the effort alone could unblock without extension functions,
+  the full join cluster, complex types, or verticals.
   Corollary: `tests/scripts/v2-progress.sh` is a measurement, not a completion gate. Use it to
-  recalibrate the readiness map's per-slice deltas *after* the slice lands, not to score the
-  slice's completion during termination.
+  recalibrate the per-effort deltas *after* the effort lands, not to score the
+  effort's completion during termination.
 
 ## Extension-spec discipline
 
@@ -354,7 +353,7 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   in the sibling C++ project.
 
 - **`extension_targets()` allow-list is not authoritative for what the extension provides.** The
-  first Slice D Phase 2 `/goal` preflight (2026-07-01) halted on a `grep` of `extension_targets()`
+  first extension-Phase-2 `/goal` preflight (2026-07-01) halted on a `grep` of `extension_targets()`
   that returned no Phase-2 `spark_*` names — but the ext6 binary DID register `spark_try_divide`,
   `spark_try_sum`, `spark_try_avg`. The allow-list simply hadn't been extended yet. Rule: for "does
   the extension provide function X" questions, **query `duckdb_functions()` on a live session**,

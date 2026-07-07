@@ -649,6 +649,34 @@ def corpus_inputs_thunderduck(spark_thunderduck):
     return build_inputs(spark_thunderduck)
 
 
+# SQL-corpus input fixtures: register the SQL corpus's temp views (emp, dept,
+# emp2, nums, raw) once per module so `spark.sql("... FROM emp ...")` resolves
+# them. Mirrors the DataFrame corpus_inputs_* fixtures but for the SQL front-end
+# gate (test_sql_corpus_differential.py).
+@pytest.fixture(scope="module")
+def sql_corpus_reference(spark_reference):
+    """Register the SQL corpus's temp views on the Spark reference session."""
+    from differential.sql_corpus import build_inputs
+    return build_inputs(spark_reference)
+
+
+@pytest.fixture(scope="module")
+def sql_corpus_thunderduck(spark_thunderduck):
+    """Register the SQL corpus's temp views on the Thunderduck session.
+
+    Tolerant by design: τ's temp-view registration may fail for some inputs, so
+    `build_inputs` may raise. Swallow it here so setup does NOT abort the whole
+    parametrized module with a fixture ERROR — instead each case fails
+    individually when its `spark.sql(...)` can't resolve the (unregistered) view,
+    which keeps `v2-sql-progress.sh`'s pass/fail parse meaningful.
+    """
+    from differential.sql_corpus import build_inputs
+    try:
+        return build_inputs(spark_thunderduck)
+    except Exception:
+        return {}
+
+
 # Function-scoped sessions (for tests that need per-test isolation)
 @pytest.fixture
 def spark_reference_isolated(orchestrator):

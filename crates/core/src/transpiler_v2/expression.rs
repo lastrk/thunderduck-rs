@@ -5,9 +5,28 @@
 //! `crate::logical`, `crate::generator`, `crate::functions`, or
 //! `crate::types::TypeInferenceEngine`.
 
+use super::analyzer::TypedAst;
 use super::ast::CommonAst;
 use super::type_inference::TypeInferenceEngine;
 use crate::types::{DataType, StructField, StructType};
+
+/// Extract a compile-time integer value from an integral [`Literal`] expression.
+///
+/// Returns `None` for any non-literal or non-integral expression. Used by the
+/// multi-arg type-inference pre-pass and by emission to read a function's
+/// literal scale argument (e.g. `ceil(x, 2)`).
+pub(crate) fn int_literal_value(expr: &Expression) -> Option<i32> {
+    match expr {
+        Expression::Literal(l) => match &l.value {
+            LiteralValue::Int(i) => Some(*i),
+            LiteralValue::Long(i) => i32::try_from(*i).ok(),
+            LiteralValue::Short(i) => Some(*i as i32),
+            LiteralValue::Byte(i) => Some(*i as i32),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 // ── Supporting sub-types ─────────────────────────────────────────────────────
 
@@ -269,25 +288,40 @@ pub struct StarExpression {
     pub qualifier: Option<String>,
 }
 
+/// The two states an embedded subquery's inner plan can be in.
+///
+/// The front-end (lowering / proto-converter) produces the un-analyzed
+/// [`CommonAst`]; the analyzer (layer A) rewrites it into an analyzed
+/// [`TypedAst`] so emission can render it node-local via `dispatch_op`
+/// (ADR-007 A / INV2). Making the two states an enum keeps illegal states
+/// unrepresentable — the field is never both, never neither.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubqueryPlan {
+    /// Front-end output — not yet analyzed.
+    Unanalyzed(Box<CommonAst>),
+    /// Analyzer output — the typed inner plan, carried so emission renders it.
+    Analyzed(Box<TypedAst>),
+}
+
 /// `expr IN (subquery)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InSubquery {
     pub expr: Box<Expression>,
-    pub subquery: Box<CommonAst>,
+    pub subquery: SubqueryPlan,
     pub negated: bool,
 }
 
 /// `EXISTS (subquery)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExistsSubquery {
-    pub subquery: Box<CommonAst>,
+    pub subquery: SubqueryPlan,
     pub negated: bool,
 }
 
 /// `(scalar subquery)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScalarSubquery {
-    pub subquery: Box<CommonAst>,
+    pub subquery: SubqueryPlan,
 }
 
 /// Lambda expression `(x, y) -> body`.
@@ -472,7 +506,18 @@ impl Expression {
             Expression::Alias(a) => a.expr.data_type(schema),
             Expression::Star(_) => DataType::Unresolved,
             Expression::InSubquery(_) | Expression::ExistsSubquery(_) => DataType::Boolean,
-            Expression::ScalarSubquery(_) => DataType::Unresolved,
+            // Post-analysis the inner plan is `Analyzed` and its single output
+            // column's type is the scalar's type; pre-analysis it is still
+            // `Unresolved` (the analyzer must run first).
+            Expression::ScalarSubquery(s) => match &s.subquery {
+                SubqueryPlan::Analyzed(t) => t
+                    .resolved_schema
+                    .fields
+                    .first()
+                    .map(|f| f.data_type.clone())
+                    .unwrap_or(DataType::Unresolved),
+                SubqueryPlan::Unanalyzed(_) => DataType::Unresolved,
+            },
             Expression::Lambda(l) => l.body.data_type(schema),
             Expression::LambdaVariable(lv) => TypeInferenceEngine::column_type(&lv.name, schema),
             Expression::RawSql(r) => r.data_type.clone().unwrap_or(DataType::Unresolved),
@@ -586,7 +631,12 @@ impl Expression {
             Expression::Window(w) => Self::window_nullable(w, schema),
             Expression::Alias(a) => a.expr.nullable(schema),
             Expression::Star(_) => false,
-            Expression::InSubquery(_) | Expression::ExistsSubquery(_) => false,
+            // `x [NOT] IN (subquery)` is 3-valued: a NULL member (or NULL lhs)
+            // yields UNKNOWN, so the predicate result is nullable.
+            Expression::InSubquery(_) => true,
+            // `[NOT] EXISTS (subquery)` is always a non-null boolean.
+            Expression::ExistsSubquery(_) => false,
+            // A scalar subquery returns NULL when the inner plan yields no row.
             Expression::ScalarSubquery(_) => true,
             Expression::Lambda(_) => false,
             Expression::LambdaVariable(lv) => {
@@ -1079,7 +1129,11 @@ impl Expression {
                 let mut acc = f.args[0].data_type(schema);
                 for a in f.args.iter().skip(1) {
                     let dt = a.data_type(schema);
-                    acc = TypeInferenceEngine::promote_numeric(&acc, &dt);
+                    // Spark's CreateArray element type = findWiderCommonType
+                    // over the args (τ's `unify_types`), NOT numeric-only
+                    // promotion — so heterogeneous non-numeric args (e.g.
+                    // `array(1, 'x')` → Array<String>) widen correctly.
+                    acc = TypeInferenceEngine::unify_types(&acc, &dt);
                 }
                 // Spark reports the array as `containsNull` = any element
                 // nullable. Result nullability is handled separately in
@@ -1088,6 +1142,39 @@ impl Expression {
                 // the shared resolver's behavior.
                 let contains_null = f.args.iter().any(|a| a.nullable(schema));
                 return DataType::Array(Box::new(acc), contains_null);
+            }
+            // Spark's `map(k1, v1, k2, v2, ...)` / `create_map(...)` — key type
+            // is the least-common type of the even-index args, value type the
+            // least-common type of the odd-index args, and `valueContainsNull`
+            // is true iff any value arg is nullable. The shared
+            // `function_return_type` resolver only sees the first arg and so
+            // hard-codes `Map<String, String>`; derive the real key/value types
+            // here where the whole arg list is available. Corpus anchor:
+            // cx-002. An empty or odd-length arg list falls through to the
+            // shared resolver.
+            "map" | "create_map" if !f.args.is_empty() && f.args.len() % 2 == 0 => {
+                let mut key_ty = f.args[0].data_type(schema);
+                let mut val_ty = f.args[1].data_type(schema);
+                let mut value_nullable = f.args[1].nullable(schema);
+                let mut i = 2;
+                while i < f.args.len() {
+                    // Spark's CreateMap key/value types = findWiderCommonType
+                    // (τ's `unify_types`), NOT numeric-only promotion — so
+                    // heterogeneous non-numeric args (e.g.
+                    // `map('a', 1, 'b', 'x')` → Map<String, String>) widen
+                    // correctly. The homogeneous cx-002 result is preserved.
+                    key_ty =
+                        TypeInferenceEngine::unify_types(&key_ty, &f.args[i].data_type(schema));
+                    val_ty =
+                        TypeInferenceEngine::unify_types(&val_ty, &f.args[i + 1].data_type(schema));
+                    value_nullable = value_nullable || f.args[i + 1].nullable(schema);
+                    i += 2;
+                }
+                return DataType::Map {
+                    key: Box::new(key_ty),
+                    value: Box::new(val_ty),
+                    value_nullable,
+                };
             }
             // Spark's `aggregate(arr, init, (acc, x) -> f [, finish])` folds
             // the array with `init` as the seed; the result type is the
@@ -1190,6 +1277,73 @@ impl Expression {
             "json_tuple_field" if f.args.len() == 2 => {
                 return DataType::String;
             }
+            // Spark's 2-arg `ceil(x, t)` / `floor(x, t)` (`RoundCeil`/
+            // `RoundFloor`) implicitly cast the child to Decimal and return a
+            // scaled Decimal derived from the child type + literal target
+            // scale. The shared `function_return_type` resolver only sees the
+            // first arg's type and cannot read the scale literal, so derive it
+            // here where the whole `FunctionCall` is available. A non-literal
+            // scale is a Thunderduck boundary → `Unresolved`. 1-arg ceil/floor
+            // falls through to the shared resolver. Corpus: `num-003`.
+            "ceil" | "ceiling" | "floor" if f.args.len() == 2 => {
+                let input = f.args[0].data_type(schema);
+                match int_literal_value(&f.args[1]) {
+                    Some(t) => return TypeInferenceEngine::ceil_floor_type(&input, Some(t)),
+                    None => return DataType::Unresolved,
+                }
+            }
+            // `round(x[, scale])` / `bround(x[, scale])` share Spark's
+            // `RoundBase.dataType`: for a Decimal child the scale (and
+            // precision) decrease per the literal target scale; a non-decimal
+            // child keeps its type unchanged (`case t => t`), independent of the
+            // scale argument. The shared `function_return_type` resolver only
+            // sees the first arg's type and cannot read the scale literal, so
+            // derive the Decimal branch here. A missing 2nd arg ⇒ scale 0; a
+            // non-literal scale on a Decimal child is a Thunderduck boundary →
+            // `Unresolved`. The Decimal branch is byte-identical to
+            // `ceil_floor_type(input, Some(scale))`. Corpus: `num-005`, `num-006`.
+            "round" | "bround" if !f.args.is_empty() => {
+                let input = f.args[0].data_type(schema);
+                if !matches!(input, DataType::Decimal { .. }) {
+                    // Non-decimal child keeps its type regardless of the scale
+                    // form (e.g. `round(sml, -1)` where `-1` is a unary-minus
+                    // expression, not an integer literal).
+                    return input;
+                }
+                let scale = match f.args.get(1) {
+                    Some(a) => int_literal_value(a),
+                    None => Some(0),
+                };
+                return match scale {
+                    Some(t) => TypeInferenceEngine::ceil_floor_type(&input, Some(t)),
+                    None => DataType::Unresolved,
+                };
+            }
+            // `mod(a, b)` / `pmod(a, b)` — when BOTH operands are Decimal,
+            // Spark's `Remainder`/`Pmod` result decimal type widens per
+            // `decimal_mod_type` (scale = max, precision = min(int digits) +
+            // scale). The first-arg-only `function_return_type` resolver
+            // returns the LEFT decimal, which is wrong for two decimals. Handle
+            // only the both-decimal case here; every other operand shape
+            // (int/int, bigint/int, …) falls through to the shared resolver
+            // that already types them correctly. Corpus: `num-012`.
+            "mod" | "pmod" if f.args.len() == 2 => {
+                let l = f.args[0].data_type(schema);
+                let r = f.args[1].data_type(schema);
+                if let (
+                    DataType::Decimal {
+                        precision: p1,
+                        scale: s1,
+                    },
+                    DataType::Decimal {
+                        precision: p2,
+                        scale: s2,
+                    },
+                ) = (&l, &r)
+                {
+                    return TypeInferenceEngine::decimal_mod_type(*p1, *s1, *p2, *s2);
+                }
+            }
             _ => {}
         }
         let first_arg_type = f.args.first().map(|a| a.data_type(schema));
@@ -1239,7 +1393,7 @@ impl Expression {
             return true;
         }
         match lower.as_str() {
-            "coalesce" | "ifnull" | "nvl" | "iif" => f.args.iter().all(|a| a.nullable(schema)),
+            "coalesce" | "ifnull" | "nvl" => f.args.iter().all(|a| a.nullable(schema)),
             "when" => {
                 if f.args.len() % 2 == 0 {
                     true
@@ -1281,6 +1435,13 @@ impl Expression {
             | "to_json" | "to_csv" => true,
             "greatest" | "least" => f.args.iter().all(|a| a.nullable(schema)),
             "nvl2" => {
+                f.args.get(1).is_none_or(|a| a.nullable(schema))
+                    || f.args.get(2).is_none_or(|a| a.nullable(schema))
+            }
+            // Spark's `If.nullable = trueValue.nullable || falseValue.nullable`
+            // — the predicate (args[0]) is excluded. `iif` is a Spark alias for
+            // `If`, so it shares the same nullability rule. Corpus witness: cnd-009.
+            "if" | "iif" => {
                 f.args.get(1).is_none_or(|a| a.nullable(schema))
                     || f.args.get(2).is_none_or(|a| a.nullable(schema))
             }
@@ -1495,7 +1656,70 @@ impl Expression {
                 let field_nullable = st.field_by_name(name).map(|f| f.nullable).unwrap_or(true);
                 base_nullable || field_nullable
             }
+            // Spark `GetArrayItem.nullable` (complexTypeExtractors.scala +
+            // `GetArrayItemUtil.computeNullabilityFromArray`), ANSI
+            // failOnError=true:
+            //   * a foldable, non-null CONSTANT index into a `CreateArray`
+            //     literal child, in-bounds -> that element's nullability
+            //     (e.g. `array(1,2,3)[0]` -> non-null; corpus witness cx-001);
+            //   * a foldable constant index into ANY OTHER child (notably a
+            //     column `col[i]`) -> true;
+            //   * a non-constant index -> the array's `containsNull` flag.
+            // Spark's rule intentionally does NOT OR-in `child.nullable`, so a
+            // nullable array column still yields the above (the array-is-NULL
+            // row is handled by the null-safe eval, not the schema flag).
+            (DataType::Array(_, contains_null), _) => {
+                match Self::const_int_index(ev.extraction.as_ref()) {
+                    Some(i) => match Self::create_array_elements(ev.child.as_ref()) {
+                        Some(elems) if i >= 0 && (i as usize) < elems.len() => {
+                            elems[i as usize].nullable(schema)
+                        }
+                        // OOB constant index into a literal array (ANSI throws
+                        // at runtime) OR a non-literal-array child: Spark
+                        // yields `true`.
+                        _ => true,
+                    },
+                    None => *contains_null,
+                }
+            }
             _ => true,
+        }
+    }
+
+    /// The constant integer index of a foldable, non-null literal subscript
+    /// (Spark's `Literal(_: Int)` case in `computeNullabilityFromArray`), if
+    /// the extraction is one. Non-literal or non-integral extractions — which
+    /// Spark treats as non-foldable — return `None`.
+    fn const_int_index(extraction: &Expression) -> Option<i64> {
+        match extraction {
+            Expression::Literal(Literal { value, .. }) => match value {
+                LiteralValue::Byte(v) => Some(i64::from(*v)),
+                LiteralValue::Short(v) => Some(i64::from(*v)),
+                LiteralValue::Int(v) => Some(i64::from(*v)),
+                LiteralValue::Long(v) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The element expressions of a Spark `CreateArray`-equivalent child, i.e.
+    /// an `array(...)` literal. Both front-ends are covered: the DataFrame
+    /// path lowers to [`Expression::ArrayLiteral`]; the SQL path lowers
+    /// `array(...)` to an array-family [`Expression::FunctionCall`]. Any other
+    /// child (a column, another expression) returns `None`.
+    fn create_array_elements(child: &Expression) -> Option<&[Expression]> {
+        match child {
+            Expression::ArrayLiteral(a) => Some(&a.elements),
+            Expression::FunctionCall(f)
+                if matches!(
+                    f.name.as_str(),
+                    "array" | "list_value" | "make_array" | "list"
+                ) =>
+            {
+                Some(&f.args)
+            }
+            _ => None,
         }
     }
 
@@ -1663,6 +1887,170 @@ mod tests {
             distinct: false,
         });
         assert!(!expr.nullable(&s));
+    }
+
+    /// Spark `If.nullable` excludes the predicate — a nullable predicate with
+    /// two non-null branches is non-nullable. Corpus witness: cnd-009.
+    #[test]
+    fn if_with_nullable_predicate_and_non_null_branches_is_non_nullable() {
+        let s = StructType::new(vec![StructField::nullable("salary", DataType::Long)]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "if".to_owned(),
+            args: vec![
+                // nullable predicate (references a nullable column)
+                Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Gt,
+                    left: Box::new(ColumnReference::untyped("salary")),
+                    right: Box::new(Expression::Literal(Literal {
+                        value: LiteralValue::Long(100_000),
+                        data_type: DataType::Long,
+                    })),
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("high".to_owned()),
+                    data_type: DataType::String,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("low".to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        });
+        assert!(!expr.nullable(&s));
+    }
+
+    /// `iif` is a Spark alias for `If`, so its nullability rule likewise
+    /// excludes the predicate — a nullable predicate with two non-null
+    /// branches is non-nullable.
+    #[test]
+    fn iif_with_nullable_predicate_and_non_null_branches_is_non_nullable() {
+        let s = StructType::new(vec![StructField::nullable("salary", DataType::Long)]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "iif".to_owned(),
+            args: vec![
+                // nullable predicate (references a nullable column)
+                Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Gt,
+                    left: Box::new(ColumnReference::untyped("salary")),
+                    right: Box::new(Expression::Literal(Literal {
+                        value: LiteralValue::Long(100_000),
+                        data_type: DataType::Long,
+                    })),
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("high".to_owned()),
+                    data_type: DataType::String,
+                }),
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("low".to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        });
+        assert!(!expr.nullable(&s));
+    }
+
+    /// `if` with a nullable true-branch is nullable regardless of predicate.
+    #[test]
+    fn if_with_nullable_true_branch_is_nullable() {
+        let s = StructType::new(vec![StructField::nullable("v", DataType::String)]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "if".to_owned(),
+            args: vec![
+                // non-null predicate
+                Expression::Literal(Literal {
+                    value: LiteralValue::Boolean(true),
+                    data_type: DataType::Boolean,
+                }),
+                // nullable true-branch
+                ColumnReference::untyped("v"),
+                // non-null false-branch
+                Expression::Literal(Literal {
+                    value: LiteralValue::String("low".to_owned()),
+                    data_type: DataType::String,
+                }),
+            ],
+            distinct: false,
+        });
+        assert!(expr.nullable(&s));
+    }
+
+    // ── Complex-type constructor inference (cx-001 / cx-002) ───────────────
+
+    fn int_literal(v: i32) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Int(v),
+            data_type: DataType::Integer,
+        })
+    }
+
+    fn str_literal(s: &str) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::String(s.to_owned()),
+            data_type: DataType::String,
+        })
+    }
+
+    #[test]
+    fn map_constructor_infers_key_and_value_types_from_args() {
+        // `map('a', 1, 'b', 2)` → Map<String, Integer> with non-null values,
+        // not the shared resolver's hard-coded Map<String, String>.
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "map".to_owned(),
+            args: vec![
+                str_literal("a"),
+                int_literal(1),
+                str_literal("b"),
+                int_literal(2),
+            ],
+            distinct: false,
+        });
+        match expr.data_type(&StructType::empty()) {
+            DataType::Map {
+                key,
+                value,
+                value_nullable,
+            } => {
+                assert_eq!(*key, DataType::String);
+                assert_eq!(*value, DataType::Integer);
+                assert!(!value_nullable);
+            }
+            other => panic!("expected Map<String, Integer>, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_value_over_map_returns_value_type() {
+        // `map('a', 1)['a']` → Integer (the map's value type).
+        let map = Expression::FunctionCall(FunctionCall {
+            name: "map".to_owned(),
+            args: vec![str_literal("a"), int_literal(1)],
+            distinct: false,
+        });
+        let ev = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(map),
+            extraction: Box::new(str_literal("a")),
+        });
+        assert_eq!(ev.data_type(&StructType::empty()), DataType::Integer);
+    }
+
+    #[test]
+    fn array_index_into_non_null_literal_array_is_non_nullable() {
+        // Spark `array(1, 2, 3)[0]` — the array is non-nullable with no null
+        // elements and the index is a literal, so GetArrayItem is non-nullable.
+        let arr = Expression::FunctionCall(FunctionCall {
+            name: "array".to_owned(),
+            args: vec![int_literal(1), int_literal(2), int_literal(3)],
+            distinct: false,
+        });
+        let ev = Expression::ExtractValue(ExtractValueExpression {
+            child: Box::new(arr),
+            extraction: Box::new(int_literal(0)),
+        });
+        assert_eq!(ev.data_type(&StructType::empty()), DataType::Integer);
+        assert!(!ev.nullable(&StructType::empty()));
     }
 
     // ── Checklist §1.2 — hash family FunctionCall nullability ──────────────
@@ -1891,18 +2279,18 @@ mod tests {
         assert!(u.plan_id.is_none());
     }
 
-    // ── §7 subquery variants carry CommonAst ─────────────────────────────
+    // ── §7 subquery variants carry a SubqueryPlan ────────────────────────
 
     #[test]
-    fn in_subquery_carries_common_ast() {
+    fn in_subquery_carries_unanalyzed_plan() {
         use super::super::ast::{CommonAst, CommonOp};
         let sub = CommonAst::new(CommonOp::SingleRow);
         let expr = Expression::InSubquery(InSubquery {
             expr: Box::new(ColumnReference::untyped("x")),
-            subquery: Box::new(sub),
+            subquery: SubqueryPlan::Unanalyzed(Box::new(sub)),
             negated: false,
         });
-        // Compile-only sanity; ensures the field type is Box<CommonAst>.
+        // Compile-only sanity; ensures the field type is `SubqueryPlan`.
         assert!(matches!(expr, Expression::InSubquery(_)));
     }
 
@@ -1911,7 +2299,7 @@ mod tests {
         use super::super::ast::{CommonAst, CommonOp};
         let s = StructType::empty();
         let expr = Expression::ExistsSubquery(ExistsSubquery {
-            subquery: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
             negated: false,
         });
         assert_eq!(expr.data_type(&s), DataType::Boolean);
@@ -1919,13 +2307,46 @@ mod tests {
     }
 
     #[test]
-    fn scalar_subquery_data_type_unresolved() {
+    fn in_subquery_is_nullable_three_valued() {
+        use super::super::ast::{CommonAst, CommonOp};
+        let s = StructType::empty();
+        let expr = Expression::InSubquery(InSubquery {
+            expr: Box::new(ColumnReference::untyped("x")),
+            subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
+            negated: true,
+        });
+        assert_eq!(expr.data_type(&s), DataType::Boolean);
+        // 3VL: a NULL member yields UNKNOWN → the predicate is nullable.
+        assert!(expr.nullable(&s));
+    }
+
+    #[test]
+    fn scalar_subquery_unanalyzed_data_type_unresolved() {
         use super::super::ast::{CommonAst, CommonOp};
         let s = StructType::empty();
         let expr = Expression::ScalarSubquery(ScalarSubquery {
-            subquery: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
         });
         assert_eq!(expr.data_type(&s), DataType::Unresolved);
+        assert!(expr.nullable(&s));
+    }
+
+    #[test]
+    fn scalar_subquery_analyzed_data_type_from_inner_col() {
+        use super::super::analyzer::{TypedAst, TypedOp};
+        let s = StructType::empty();
+        // A hand-built analyzed inner plan whose single output column is Long.
+        let inner = TypedAst {
+            op: TypedOp::SingleRow,
+            resolved_schema: StructType::new(vec![StructField::nullable(
+                "max_salary",
+                DataType::Long,
+            )]),
+        };
+        let expr = Expression::ScalarSubquery(ScalarSubquery {
+            subquery: SubqueryPlan::Analyzed(Box::new(inner)),
+        });
+        assert_eq!(expr.data_type(&s), DataType::Long);
         assert!(expr.nullable(&s));
     }
 
@@ -2562,5 +2983,149 @@ mod tests {
         let children: Vec<&Expression> = win.children().collect();
         // Exactly three children: func, one partition_by, one order_by.expr.
         assert_eq!(children.len(), 3);
+    }
+
+    // ── round/bround/mod/pmod multi-arg type-inference pre-pass ──────────────
+    // (`function_call_data_type`; corpus num-005 round/bround, num-012 mod/pmod)
+
+    fn dec(precision: u8, scale: u8) -> DataType {
+        DataType::Decimal { precision, scale }
+    }
+
+    fn int_lit(v: i32) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Int(v),
+            data_type: DataType::Integer,
+        })
+    }
+
+    /// Resolve `name(args...)` against a single-column schema of `col_type`,
+    /// where `args[0]` references that column.
+    fn call_type(name: &str, args: Vec<Expression>, col_type: DataType) -> DataType {
+        let schema = StructType::new(vec![StructField::nullable("c", col_type)]);
+        Expression::FunctionCall(FunctionCall {
+            name: name.to_owned(),
+            args,
+            distinct: false,
+        })
+        .data_type(&schema)
+    }
+
+    #[test]
+    fn round_bround_decimal_scale_decreases() {
+        // RoundBase decimal branch: round(Decimal(10,2), 1) → Decimal(10,1).
+        assert_eq!(
+            call_type(
+                "round",
+                vec![ColumnReference::untyped("c"), int_lit(1)],
+                dec(10, 2)
+            ),
+            dec(10, 1)
+        );
+        // bround shares RoundBase: bround(Decimal(6,3), 2) → Decimal(6,2).
+        assert_eq!(
+            call_type(
+                "bround",
+                vec![ColumnReference::untyped("c"), int_lit(2)],
+                dec(6, 3)
+            ),
+            dec(6, 2)
+        );
+        // round(Decimal(38,6), 3): ild=33, ns=3 → min(36,38)=36 → Decimal(36,3).
+        assert_eq!(
+            call_type(
+                "round",
+                vec![ColumnReference::untyped("c"), int_lit(3)],
+                dec(38, 6)
+            ),
+            dec(36, 3)
+        );
+    }
+
+    #[test]
+    fn round_bround_non_decimal_type_unchanged() {
+        // RoundBase `case t => t`: a non-decimal child keeps its type.
+        assert_eq!(
+            call_type(
+                "round",
+                vec![ColumnReference::untyped("c"), int_lit(1)],
+                DataType::Double
+            ),
+            DataType::Double
+        );
+        assert_eq!(
+            call_type(
+                "bround",
+                vec![ColumnReference::untyped("c"), int_lit(2)],
+                DataType::Double
+            ),
+            DataType::Double
+        );
+    }
+
+    #[test]
+    fn round_one_arg_decimal_uses_scale_zero() {
+        // Missing 2nd arg ⇒ scale 0: round(Decimal(10,2)) → Decimal(9,0).
+        assert_eq!(
+            call_type("round", vec![ColumnReference::untyped("c")], dec(10, 2)),
+            dec(9, 0)
+        );
+    }
+
+    #[test]
+    fn round_non_literal_scale_is_unresolved() {
+        // A non-literal scale argument is a Thunderduck boundary → Unresolved.
+        assert_eq!(
+            call_type(
+                "round",
+                vec![ColumnReference::untyped("c"), ColumnReference::untyped("c"),],
+                dec(10, 2)
+            ),
+            DataType::Unresolved
+        );
+    }
+
+    #[test]
+    fn mod_pmod_both_decimal_widens() {
+        // mod(Decimal(10,2), Decimal(6,3)) → Decimal(6,3) per decimal_mod_type.
+        let schema = StructType::new(vec![
+            StructField::nullable("d1", dec(10, 2)),
+            StructField::nullable("d2", dec(6, 3)),
+        ]);
+        let expr = Expression::FunctionCall(FunctionCall {
+            name: "mod".to_owned(),
+            args: vec![
+                ColumnReference::untyped("d1"),
+                ColumnReference::untyped("d2"),
+            ],
+            distinct: false,
+        });
+        assert_eq!(expr.data_type(&schema), dec(6, 3));
+    }
+
+    #[test]
+    fn mod_non_decimal_delegates_to_first_arg_resolver() {
+        // int/int and bigint/int fall through to function_return_type, which
+        // types them via the first (wider) arg — the path that greens today.
+        let schema = StructType::new(vec![
+            StructField::nullable("a", DataType::Integer),
+            StructField::nullable("b", DataType::Integer),
+            StructField::nullable("lng", DataType::Long),
+        ]);
+        let mod_ii = Expression::FunctionCall(FunctionCall {
+            name: "mod".to_owned(),
+            args: vec![ColumnReference::untyped("a"), ColumnReference::untyped("b")],
+            distinct: false,
+        });
+        assert_eq!(mod_ii.data_type(&schema), DataType::Integer);
+        let mod_li = Expression::FunctionCall(FunctionCall {
+            name: "mod".to_owned(),
+            args: vec![
+                ColumnReference::untyped("lng"),
+                ColumnReference::untyped("a"),
+            ],
+            distinct: false,
+        });
+        assert_eq!(mod_li.data_type(&schema), DataType::Long);
     }
 }

@@ -514,6 +514,87 @@ impl TypeInferenceEngine {
 
     // ── Function return types (τ seed) ──────────────────────────────
 
+    /// Spark-parity return type of `ceil`/`floor`.
+    ///
+    /// `target_scale`:
+    /// - `None` → 1-arg `Ceil`/`Floor` (`inputTypes = {Double, Decimal, Long}`).
+    /// - `Some(t)` → 2-arg `RoundCeil`/`RoundFloor`; the child is implicitly cast
+    ///   to `Decimal` first (via Spark's `DecimalType.forType`), so the result is
+    ///   always a `Decimal`.
+    ///
+    /// Rules pinned from `mathExpressions.scala` @ v4.1.1:
+    /// - **1-arg**: `Decimal(p, 0)` → unchanged; `Decimal(p, s>0)` →
+    ///   `Decimal(min(p - s + 1, 38), 0)`; everything else (integral / float /
+    ///   double) → `Long`.
+    /// - **2-arg** with the child's decimal form `(p, s)` and `ild = p - s + 1`:
+    ///   `t < 0` → `Decimal(min(max(ild, -t + 1), 38), 0)`;
+    ///   `t >= 0` → `ns = min(s, t)`, `Decimal(min(ild + ns, 38), ns)`.
+    ///
+    /// Unsupported input types return [`DataType::Unresolved`] (honest — trips the
+    /// ADR-022 boundary guard rather than mis-typing the projection).
+    pub fn ceil_floor_type(input: &DataType, target_scale: Option<i32>) -> DataType {
+        use DataType::*;
+        match target_scale {
+            // ── 1-arg Ceil/Floor ────────────────────────────────────────────
+            None => match input {
+                Decimal { precision, scale } if *scale == 0 => Decimal {
+                    precision: *precision,
+                    scale: 0,
+                },
+                Decimal { precision, scale } => {
+                    let p = (*precision as i32) - (*scale as i32) + 1;
+                    Decimal {
+                        precision: p.clamp(1, 38) as u8,
+                        scale: 0,
+                    }
+                }
+                // Every non-Decimal input → `Long` (Spark implicitly casts
+                // integral / float / double / string to the `Long` result;
+                // byte-identical to the pre-pass-116 unconditional `=> Long`).
+                _ => Long,
+            },
+            // ── 2-arg RoundCeil/RoundFloor (child cast to Decimal first) ─────
+            Some(t) => {
+                let Some((p, s)) = Self::decimal_form_for_ceil_floor(input) else {
+                    return Unresolved;
+                };
+                let ild = p - s + 1;
+                if t < 0 {
+                    let precision = ild.max(-t + 1).clamp(1, 38) as u8;
+                    Decimal {
+                        precision,
+                        scale: 0,
+                    }
+                } else {
+                    let ns = s.min(t);
+                    let precision = (ild + ns).clamp(1, 38) as u8;
+                    Decimal {
+                        precision,
+                        scale: ns as u8,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spark's `DecimalType.forType` mapping used to implicitly cast a 2-arg
+    /// ceil/floor child to `Decimal` before rounding. Returns `(precision,
+    /// scale)` as `i32` for the caller's arithmetic. Non-numeric inputs return
+    /// `None` (→ `Unresolved`).
+    fn decimal_form_for_ceil_floor(input: &DataType) -> Option<(i32, i32)> {
+        use DataType::*;
+        Some(match input {
+            Decimal { precision, scale } => (*precision as i32, *scale as i32),
+            Byte => (3, 0),
+            Short => (5, 0),
+            Integer => (10, 0),
+            Long => (20, 0),
+            Float => (14, 7),
+            Double => (30, 15),
+            _ => return None,
+        })
+    }
+
     /// Infer the return type of a scalar/table function.
     ///
     /// At τ, all seeded arms need at most the first argument's type
@@ -641,13 +722,21 @@ impl TypeInferenceEngine {
             "sqrt" | "cbrt" | "exp" | "expm1" | "ln" | "log" | "log10" | "log2" | "log1p"
             | "pow" | "power" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
             | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians"
-            | "e" | "pi" | "hypot" | "rand" | "randn" | "random" | "bround" => Double,
+            | "e" | "pi" | "hypot" | "rand" | "randn" | "random" => Double,
             // abs preserves arg type; ceil/floor return Long (Spark rule);
-            // signum returns Double; round returns arg type.
-            "abs" | "round" | "greatest" | "least" | "nvl" | "coalesce" | "nullif" | "nvl2"
-            | "if" | "ifnull" => first_arg_type.cloned().unwrap_or(Unresolved),
-            "ceil" | "ceiling" | "floor" => Long,
+            // signum returns Double. (round/bround are resolved earlier by the
+            // `function_call_data_type` pre-pass, which reads the scale literal.)
+            "abs" | "greatest" | "least" | "nvl" | "coalesce" | "nullif" | "ifnull" => {
+                first_arg_type.cloned().unwrap_or(Unresolved)
+            }
+            "ceil" | "ceiling" | "floor" => {
+                Self::ceil_floor_type(first_arg_type.unwrap_or(&Unresolved), None)
+            }
             "sign" | "signum" => Double,
+            // `negative`/`negate` map to Spark's `UnaryMinus`, whose
+            // `dataType` equals the child type (int→int, decimal→decimal).
+            // Corpus: `num-008`.
+            "negative" | "negate" => first_arg_type.cloned().unwrap_or(Unresolved),
             "factorial" => Long,
             "mod" | "pmod" => first_arg_type.cloned().unwrap_or(Integer),
             // `nanvl(a, b)` returns the type of the first argument (Spark:
@@ -771,8 +860,7 @@ impl TypeInferenceEngine {
             // stamped `containsNull=false`. We conservatively stamp
             // `containsNull=false` here (matching the corpus witness);
             // a fully-general answer would inspect both args' containsNull
-            // flags — deferred until a corpus case exercises the
-            // AND-of-both semantics with two nullable inputs.
+            // flags.
             "array_intersect" => match first_arg_type {
                 Some(DataType::Array(elem, _)) => Array(elem.clone(), false),
                 _ => Unresolved,
@@ -1178,6 +1266,117 @@ pub(crate) const HASH_FAMILY_NAMES: &[&str] = &["hash", "murmur3", "xxhash64"];
 mod tests {
     use super::*;
 
+    // ── ceil/floor return type (Spark mathExpressions.scala) ────────────────
+
+    fn dec(p: u8, s: u8) -> DataType {
+        DataType::Decimal {
+            precision: p,
+            scale: s,
+        }
+    }
+
+    #[test]
+    fn ceil_floor_1arg_decimal_scale0() {
+        // Decimal(p, 0) is unchanged.
+        assert_eq!(
+            TypeInferenceEngine::ceil_floor_type(&dec(12, 0), None),
+            dec(12, 0)
+        );
+    }
+
+    #[test]
+    fn ceil_floor_1arg_decimal_positive_scale() {
+        // Decimal(p, s>0) → Decimal(min(p - s + 1, 38), 0).
+        assert_eq!(
+            TypeInferenceEngine::ceil_floor_type(&dec(10, 2), None),
+            dec(9, 0)
+        );
+        assert_eq!(
+            TypeInferenceEngine::ceil_floor_type(&dec(6, 3), None),
+            dec(4, 0)
+        );
+        assert_eq!(
+            TypeInferenceEngine::ceil_floor_type(&dec(38, 6), None),
+            dec(33, 0)
+        );
+    }
+
+    #[test]
+    fn ceil_floor_1arg_non_decimal_is_long() {
+        for input in [
+            DataType::Byte,
+            DataType::Short,
+            DataType::Integer,
+            DataType::Long,
+            DataType::Float,
+            DataType::Double,
+        ] {
+            assert_eq!(
+                TypeInferenceEngine::ceil_floor_type(&input, None),
+                DataType::Long,
+                "ceil/floor({input:?}) must be Long",
+            );
+        }
+    }
+
+    #[test]
+    fn ceil_floor_1arg_non_numeric_still_long() {
+        // Byte-identical to the pre-pass-116 unconditional `=> Long`: any
+        // non-Decimal input (incl. String / Unresolved) resolves to Long.
+        assert_eq!(
+            TypeInferenceEngine::ceil_floor_type(&DataType::String, None),
+            DataType::Long
+        );
+        assert_eq!(
+            TypeInferenceEngine::ceil_floor_type(&DataType::Unresolved, None),
+            DataType::Long
+        );
+    }
+
+    #[test]
+    fn ceil_floor_2arg_decimal_positive_scale() {
+        // floor(decimal(10,2), 1) → decimal(10,1).
+        assert_eq!(
+            TypeInferenceEngine::ceil_floor_type(&dec(10, 2), Some(1)),
+            dec(10, 1)
+        );
+    }
+
+    #[test]
+    fn ceil_floor_2arg_double_scale() {
+        // ceil(double, 2): double→(30,15), ild=16, ns=2 → decimal(18,2).
+        assert_eq!(
+            TypeInferenceEngine::ceil_floor_type(&DataType::Double, Some(2)),
+            dec(18, 2)
+        );
+    }
+
+    #[test]
+    fn ceil_floor_2arg_integral_scale() {
+        // Long→(20,0), ild=21, ns=min(0,2)=0 → decimal(21,0).
+        assert_eq!(
+            TypeInferenceEngine::ceil_floor_type(&DataType::Long, Some(2)),
+            dec(21, 0)
+        );
+    }
+
+    #[test]
+    fn ceil_floor_2arg_negative_scale() {
+        // t<0: decimal(10,2), ild=9, -t+1=4 → decimal(max(9,4),0)=decimal(9,0).
+        assert_eq!(
+            TypeInferenceEngine::ceil_floor_type(&dec(10, 2), Some(-3)),
+            dec(9, 0)
+        );
+    }
+
+    #[test]
+    fn ceil_floor_2arg_unsupported_is_unresolved() {
+        assert_eq!(
+            TypeInferenceEngine::ceil_floor_type(&DataType::String, Some(2)),
+            DataType::Unresolved
+        );
+    }
+
     // ── Checklist §1.1 — `count_if` ─────────────────────────────────────────
 
     #[test]
@@ -1482,6 +1681,23 @@ mod tests {
         assert_eq!(
             TypeInferenceEngine::function_return_type("nanvl", Some(&DataType::Float)),
             DataType::Float
+        );
+    }
+
+    #[test]
+    fn negative_preserves_arg_type() {
+        // `negative`/`negate` map to Spark's UnaryMinus: dataType == child.
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("negative", Some(&DataType::Integer)),
+            DataType::Integer
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("negative", Some(&dec(10, 2))),
+            dec(10, 2)
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("negate", Some(&DataType::Integer)),
+            DataType::Integer
         );
     }
 

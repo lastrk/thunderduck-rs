@@ -440,7 +440,7 @@ fn nested_struct_field_access() -> Fixture {
         input: Box::new(table_scan("emp")),
         projections: vec![lat_expr],
     });
-    let expected = StructType::new(vec![StructField::nullable("expr", DataType::Double)]);
+    let expected = StructType::new(vec![StructField::nullable("lat", DataType::Double)]);
     (
         "nested_struct_field_access",
         ast,

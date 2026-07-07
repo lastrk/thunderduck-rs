@@ -18,6 +18,9 @@
 //! # references it — the τ fitness gate):
 //! cargo test -p thunderduck-connect-server --test differential core_v2 -- --ignored --nocapture
 //!
+//! # Spark SQL conformance corpus (spark.sql) through τ — the SQL front-end gate:
+//! cargo test -p thunderduck-connect-server --test differential sql_v2  -- --ignored --nocapture
+//!
 //! # any single suite (use cargo's test-name filter to pick):
 //! cargo test -p thunderduck-connect-server --test differential tpch    -- --ignored --nocapture
 //!
@@ -81,6 +84,16 @@ fn core() {
 #[ignore]
 fn core_v2() {
     run_suite("core_v2");
+}
+
+/// Spark SQL conformance corpus (`spark.sql`) through τ — the SQL front-end
+/// gate. Today expect nearly all cases to fail (temp-view registration, the
+/// catalog bridge, and most grammar are unimplemented); each commit growing
+/// τ's SQL surface should turn one or more Case IDs green.
+#[test]
+#[ignore]
+fn sql_v2() {
+    run_suite("sql_v2");
 }
 
 #[test]

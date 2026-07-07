@@ -14,7 +14,8 @@
 
 use std::collections::HashMap;
 
-use super::ast::{CommonAst, CommonOp};
+use super::ast::{CommonAst, CommonOp, PivotGrouping};
+use super::expression::{Expression, SubqueryPlan};
 use crate::types::StructType;
 
 /// A per-path overlay recording the resolved schemas of every empty-schema
@@ -92,6 +93,13 @@ impl BaseTypes {
 /// table, and unpopulated tables carry no analyzer info, so a false positive
 /// costs at most one closure invocation per unique table name.
 pub fn plan_has_empty_scan(plan: &CommonAst) -> bool {
+    // Seam D: a table referenced *only* inside a subquery (e.g. `dept` in
+    // `... WHERE EXISTS (SELECT 1 FROM dept)`) must still trigger catalog
+    // pre-fetch. Descend into this node's expressions first so the
+    // short-circuit does not skip a plan whose only scans live in a subquery.
+    if !node_expr_scan_tables(&plan.op).is_empty() {
+        return true;
+    }
     match &plan.op {
         CommonOp::TableScan { .. } => true,
         CommonOp::Project { input, .. }
@@ -131,8 +139,20 @@ pub fn plan_has_empty_scan(plan: &CommonAst) -> bool {
     }
 }
 
+/// Enumerate every empty-scan `TableScan` table name in `plan`, in tree order
+/// (may contain duplicates). Public so the request handler can pre-fetch
+/// session-catalog schemas before building the sync overlay closure.
+pub fn empty_scan_tables(plan: &CommonAst) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_empty_scan_tables(plan, &mut out);
+    out
+}
+
 /// Walk `plan` and push every `TableScan.table` name into `out`.
 fn collect_empty_scan_tables(plan: &CommonAst, out: &mut Vec<String>) {
+    // Seam D: collect tables referenced inside this node's subquery-bearing
+    // expressions (their inner plans are `Unanalyzed` at collection time).
+    out.extend(node_expr_scan_tables(&plan.op));
     match &plan.op {
         CommonOp::TableScan { table, .. } => {
             out.push(table.clone());
@@ -174,6 +194,248 @@ fn collect_empty_scan_tables(plan: &CommonAst, out: &mut Vec<String>) {
         | CommonOp::FileScan { .. }
         | CommonOp::TableFunction { .. }
         | CommonOp::Unnest { .. } => {}
+    }
+}
+
+// ── Seam D: subquery-aware expression descent ────────────────────────────────
+
+/// Collect every empty-scan table referenced inside the subquery-bearing
+/// expressions carried directly by `op` (not its plan inputs — those are
+/// handled by the operator walkers above).
+fn node_expr_scan_tables(op: &CommonOp) -> Vec<String> {
+    let mut out = Vec::new();
+    for_each_node_expr(op, &mut |e| collect_scan_tables_in_expr(e, &mut out));
+    out
+}
+
+/// Invoke `f` on every expression carried *directly* by `op`. Operators whose
+/// only expressions are guaranteed literal (`LocalRelation`) or absent
+/// (schema-only / string-list operators) fall through — none can host a
+/// subquery.
+fn for_each_node_expr(op: &CommonOp, f: &mut dyn FnMut(&Expression)) {
+    match op {
+        CommonOp::Project { projections, .. } => {
+            for e in projections {
+                f(e);
+            }
+        }
+        CommonOp::Filter { condition, .. } => f(condition),
+        CommonOp::Aggregate {
+            grouping,
+            aggregates,
+            having,
+            ..
+        } => {
+            for e in grouping.iter().chain(aggregates).chain(having.iter()) {
+                f(e);
+            }
+        }
+        CommonOp::Sort { order, .. } => {
+            for o in order {
+                f(o.expr.as_ref());
+            }
+        }
+        CommonOp::Join {
+            condition: Some(c), ..
+        } => f(c),
+        CommonOp::Values { rows, .. } => {
+            for e in rows.iter().flatten() {
+                f(e);
+            }
+        }
+        CommonOp::TableFunction { args, .. } => {
+            for e in args {
+                f(e);
+            }
+        }
+        CommonOp::Unnest { expr, .. } => f(expr),
+        CommonOp::NaFill { values, .. } => {
+            for e in values {
+                f(e);
+            }
+        }
+        CommonOp::NaReplace { replacements, .. } => {
+            for (a, b) in replacements {
+                f(a);
+                f(b);
+            }
+        }
+        CommonOp::Pivot {
+            grouping,
+            pivot_column,
+            pivot_values,
+            aggregates,
+            ..
+        } => {
+            // Only explicit grouping carries expressions to walk; an implicit
+            // (SQL PIVOT) grouping is derived from the schema by the analyzer.
+            let grouping_exprs: &[Expression] = match grouping {
+                PivotGrouping::Explicit(g) => g,
+                PivotGrouping::Implicit => &[],
+            };
+            for e in grouping_exprs
+                .iter()
+                .chain(std::iter::once(pivot_column))
+                .chain(pivot_values)
+                .chain(aggregates)
+            {
+                f(e);
+            }
+        }
+        CommonOp::WithColumns { assignments, .. } => {
+            for (_, e) in assignments {
+                f(e);
+            }
+        }
+        CommonOp::SampleBy { col, .. } => f(col),
+        // A join with no `ON` condition carries no direct expression.
+        CommonOp::Join {
+            condition: None, ..
+        } => {}
+        // Remaining variants carry no expression that can host a subquery:
+        // their expressions are absent (schema-only / string-list operators)
+        // or guaranteed literal (`LocalRelation` rows). Listed explicitly —
+        // not `_` — so a future expression-bearing `CommonOp` variant fails
+        // to compile here until its expressions are wired into the walk
+        // (a subquery-only table in such a node would otherwise silently miss
+        // base-type pre-fetch).
+        CommonOp::Limit { .. }
+        | CommonOp::SingleRow
+        | CommonOp::TableScan { .. }
+        | CommonOp::LocalRelation { .. }
+        | CommonOp::FileScan { .. }
+        | CommonOp::SetOp { .. }
+        | CommonOp::NaDrop { .. }
+        | CommonOp::Unpivot { .. }
+        | CommonOp::Describe { .. }
+        | CommonOp::Summary { .. }
+        | CommonOp::FreqItems { .. }
+        | CommonOp::Crosstab { .. }
+        | CommonOp::Deduplicate { .. }
+        | CommonOp::AliasedRelation { .. }
+        | CommonOp::ToDf { .. }
+        | CommonOp::WithColumnsRenamed { .. }
+        | CommonOp::DropColumns { .. }
+        | CommonOp::Sample { .. } => {}
+    }
+}
+
+/// Walk expression `e` and, for every subquery variant (always `Unanalyzed`
+/// at base-types collection time), collect its inner plan's empty-scan tables.
+/// Recurses through every composite expression so a subquery nested inside a
+/// binary op / CASE / function call is still reached.
+///
+/// MAINTENANCE CONTRACT: the match below is exhaustive over `Expression`, so a
+/// new *variant* is a compile error here. It does NOT catch a new sub-expression
+/// *field* added to an existing variant — if you add one, recurse into it here
+/// (and in the sibling walker `analyzer::collect_referenced_columns`).
+fn collect_scan_tables_in_expr(e: &Expression, out: &mut Vec<String>) {
+    match e {
+        Expression::ScalarSubquery(s) => collect_subquery_plan_tables(&s.subquery, out),
+        Expression::InSubquery(i) => {
+            collect_scan_tables_in_expr(&i.expr, out);
+            collect_subquery_plan_tables(&i.subquery, out);
+        }
+        Expression::ExistsSubquery(x) => collect_subquery_plan_tables(&x.subquery, out),
+        Expression::Binary(b) => {
+            collect_scan_tables_in_expr(&b.left, out);
+            collect_scan_tables_in_expr(&b.right, out);
+        }
+        Expression::Unary(u) => collect_scan_tables_in_expr(&u.operand, out),
+        Expression::FunctionCall(fc) => {
+            fc.args
+                .iter()
+                .for_each(|a| collect_scan_tables_in_expr(a, out));
+        }
+        Expression::Cast(c) => collect_scan_tables_in_expr(&c.expr, out),
+        Expression::CaseWhen(cw) => {
+            for (w, t) in &cw.branches {
+                collect_scan_tables_in_expr(w, out);
+                collect_scan_tables_in_expr(t, out);
+            }
+            if let Some(else_expr) = &cw.else_expr {
+                collect_scan_tables_in_expr(else_expr, out);
+            }
+        }
+        Expression::Window(w) => {
+            collect_scan_tables_in_expr(&w.func, out);
+            w.partition_by
+                .iter()
+                .for_each(|e| collect_scan_tables_in_expr(e, out));
+            w.order_by
+                .iter()
+                .for_each(|o| collect_scan_tables_in_expr(o.expr.as_ref(), out));
+        }
+        Expression::Alias(a) => collect_scan_tables_in_expr(&a.expr, out),
+        Expression::Between(b) => {
+            collect_scan_tables_in_expr(&b.expr, out);
+            collect_scan_tables_in_expr(&b.low, out);
+            collect_scan_tables_in_expr(&b.high, out);
+        }
+        Expression::InList(i) => {
+            collect_scan_tables_in_expr(&i.expr, out);
+            i.list
+                .iter()
+                .for_each(|e| collect_scan_tables_in_expr(e, out));
+        }
+        Expression::Like(l) => {
+            collect_scan_tables_in_expr(&l.value, out);
+            collect_scan_tables_in_expr(&l.pattern, out);
+        }
+        Expression::IsDistinctFrom(d) => {
+            collect_scan_tables_in_expr(&d.left, out);
+            collect_scan_tables_in_expr(&d.right, out);
+        }
+        Expression::ExtractValue(ev) => {
+            collect_scan_tables_in_expr(&ev.child, out);
+            collect_scan_tables_in_expr(&ev.extraction, out);
+        }
+        Expression::ArrayLiteral(a) => a
+            .elements
+            .iter()
+            .for_each(|e| collect_scan_tables_in_expr(e, out)),
+        Expression::MapLiteral(m) => {
+            for (k, v) in &m.entries {
+                collect_scan_tables_in_expr(k, out);
+                collect_scan_tables_in_expr(v, out);
+            }
+        }
+        Expression::StructLiteral(s) => s
+            .fields
+            .iter()
+            .for_each(|(_, e)| collect_scan_tables_in_expr(e, out)),
+        Expression::RowConstructor(rc) => rc
+            .elements
+            .iter()
+            .for_each(|e| collect_scan_tables_in_expr(e, out)),
+        Expression::UpdateFields(u) => {
+            collect_scan_tables_in_expr(&u.struct_expr, out);
+            for (_, upd) in &u.updates {
+                if let Some(expr) = upd {
+                    collect_scan_tables_in_expr(expr, out);
+                }
+            }
+        }
+        Expression::Lambda(l) => collect_scan_tables_in_expr(&l.body, out),
+        // Leaves and no-sub-expression variants.
+        Expression::Literal(_)
+        | Expression::ColumnReference(_)
+        | Expression::UnresolvedColumn(_)
+        | Expression::UnresolvedRegex(_)
+        | Expression::Star(_)
+        | Expression::LambdaVariable(_)
+        | Expression::RawSql(_)
+        | Expression::Interval(_) => {}
+    }
+}
+
+/// Collect empty-scan tables from a subquery's inner plan. At base-types
+/// collection time the plan is always `Unanalyzed`; an `Analyzed` plan (would
+/// only appear if collection ran post-analysis) needs no further pre-fetch.
+fn collect_subquery_plan_tables(plan: &SubqueryPlan, out: &mut Vec<String>) {
+    match plan {
+        SubqueryPlan::Unanalyzed(inner) => collect_empty_scan_tables(inner, out),
+        SubqueryPlan::Analyzed(_) => {}
     }
 }
 
@@ -261,6 +523,8 @@ mod tests {
             grouping: vec![],
             aggregates: vec![],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
         });
         assert!(plan_has_empty_scan(&with_agg));
     }
@@ -338,5 +602,43 @@ mod tests {
         });
         assert_eq!(bt.lookup("Orders"), Some(&schema));
         assert!(bt.lookup("orders").is_none());
+    }
+
+    // ── Pass 106 — Seam D: subquery-nested tables are collected ──────────
+
+    #[test]
+    fn collect_descends_into_in_subquery_over_dept() {
+        use super::super::expression::InSubquery;
+        // SELECT * FROM emp WHERE dept_id IN (SELECT dept_id FROM dept)
+        let inner = table_scan("dept");
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(table_scan("emp")),
+            condition: Expression::InSubquery(InSubquery {
+                expr: Box::new(single_int_literal()),
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+                negated: false,
+            }),
+        });
+        let tables = empty_scan_tables(&plan);
+        assert!(tables.contains(&"emp".to_owned()), "outer table collected");
+        assert!(
+            tables.contains(&"dept".to_owned()),
+            "subquery-only table collected (Seam D)"
+        );
+    }
+
+    #[test]
+    fn plan_has_empty_scan_true_when_only_scan_is_in_subquery() {
+        use super::super::expression::ScalarSubquery;
+        // SELECT (SELECT id FROM dept) — outer has no FROM (SingleRow).
+        let inner = table_scan("dept");
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![Expression::ScalarSubquery(ScalarSubquery {
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+            })],
+        });
+        assert!(plan_has_empty_scan(&plan));
+        assert_eq!(empty_scan_tables(&plan), vec!["dept".to_owned()]);
     }
 }

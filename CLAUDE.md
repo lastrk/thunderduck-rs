@@ -20,6 +20,7 @@ Older ADRs under [docs/adrs/legacy-transpiler/](docs/adrs/legacy-transpiler/) ar
 
 **Practical implications:**
 - The DataFrame corpus (`tests/scripts/v2-progress.sh`, 324 cases) is the fitness function; TPC-H is temporarily red until τ covers its query surface.
+- The SQL corpus (`differential/sql_corpus.py`, 262 `spark.sql` cases) is the fitness function for the τ SQL front-end — run it with `./tests/scripts/run-differential-tests.sh sql_v2` (or `tests/scripts/v2-sql-progress.sh` to record a progress row in `tests/integration/v2_sql_progress.md`).
 - The v1 transpiler modules (`crates/core/src/{logical,expression,generator,functions,parser}/`) were deleted on 2026-07-05. INV3/INV10 in `crates/core/src/transpiler_v2/invariants.rs` mechanically enforce that τ does not import from those (now-absent) prefixes.
 
 ## Workflow Orchestration
@@ -349,6 +350,14 @@ cargo test -- --nocapture
 ```
 
 ### Integration / Differential Tests
+
+> **Spark IS INSTALLED** — vendored in the **main checkout** at `/workspace/.spark/spark-4.1.1`
+> (with its venv at `/workspace/.venv`). The runner's default probe (`$HOME/spark/current`)
+> misses it, and worktrees have no in-tree `.spark/`. From a worktree, export the paths first:
+> ```bash
+> export SPARK_HOME=/workspace/.spark/spark-4.1.1 THUNDERDUCK_VENV_DIR=/workspace/.venv
+> ```
+> Do **not** re-run `setup-differential-testing.sh` — Spark is already present.
 
 ```bash
 # Full differential test suite (all 41 test files)

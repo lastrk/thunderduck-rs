@@ -55,6 +55,18 @@ pub(crate) const INVALID_FORMAT_MISMATCH_MSG_HEAD_SUFFIX: &str = ". The input \"
 pub(crate) const INVALID_FORMAT_MISMATCH_MSG_TAIL: &str =
     " does not match the format. SQLSTATE: 42601";
 
+// Spark 4.1's `INVALID_ARRAY_INDEX` message (raised by `GetArrayItem`, i.e. the
+// SQL `arr[i]` subscript, on OOB / negative index in ANSI mode) is likewise
+// runtime-templated. It is a SIBLING of `INVALID_ARRAY_INDEX_IN_ELEMENT_AT`
+// above but a DISTINCT class: different class name and the message references
+// the SQL `get()` function rather than `try_element_at`. Fragment shape mirrors
+// the element_at trio:
+//
+//   HEAD || (idx)::VARCHAR || MID || len(arr)::VARCHAR || TAIL
+pub(crate) const INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_HEAD: &str = "[INVALID_ARRAY_INDEX] The index ";
+pub(crate) const INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_MID: &str = " is out of bounds. The array has ";
+pub(crate) const INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_TAIL: &str = " elements. Use the SQL function `get()` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003";
+
 /// Spark ANSI-mode throw classes τ emits at emission time.
 ///
 /// Each variant carries just enough data to synthesise Spark's
@@ -81,6 +93,14 @@ pub(crate) enum SparkError {
     /// message at emission time; the input value is runtime-interpolated as
     /// a rendered SQL fragment.
     InvalidFormatMismatch { fmt: String, input_sql: String },
+    /// `[INVALID_ARRAY_INDEX]` — Spark ANSI class for the SQL subscript
+    /// `arr[i]` (`GetArrayItem`) when `i < 0` or `i >= len(arr)`. Distinct
+    /// from [`Self::InvalidArrayIndex`] (its `_IN_ELEMENT_AT` sibling): a
+    /// different class name and a message that references the SQL `get()`
+    /// function rather than `try_element_at`. The message body is
+    /// runtime-templated on the index value AND the array length, so both
+    /// are carried as already-rendered SQL fragments.
+    InvalidArrayIndexSubscript { idx_sql: String, arr_sql: String },
 }
 
 impl SparkError {
@@ -93,6 +113,7 @@ impl SparkError {
             Self::RemainderByZero => "REMAINDER_BY_ZERO",
             Self::InvalidArrayIndex { .. } => "INVALID_ARRAY_INDEX_IN_ELEMENT_AT",
             Self::InvalidFormatMismatch { .. } => "INVALID_FORMAT.MISMATCH_INPUT",
+            Self::InvalidArrayIndexSubscript { .. } => "INVALID_ARRAY_INDEX",
         }
     }
 
@@ -136,6 +157,14 @@ impl SparkError {
                     prefix = INVALID_FORMAT_MISMATCH_MSG_HEAD_PREFIX,
                     suffix = INVALID_FORMAT_MISMATCH_MSG_HEAD_SUFFIX,
                     tail = INVALID_FORMAT_MISMATCH_MSG_TAIL,
+                )
+            }
+            Self::InvalidArrayIndexSubscript { idx_sql, arr_sql } => {
+                format!(
+                    "error('{head}' || ({idx_sql})::VARCHAR || '{mid}' || len(({arr_sql}))::VARCHAR || '{tail}')",
+                    head = INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_HEAD,
+                    mid = INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_MID,
+                    tail = INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_TAIL,
                 )
             }
         }
@@ -243,6 +272,24 @@ mod tests {
             err.throw_expr().contains("invalid: a''b."),
             "got: {}",
             err.throw_expr()
+        );
+    }
+
+    /// `InvalidArrayIndexSubscript` (the `GetArrayItem` / `arr[i]` throw)
+    /// carries the distinct `[INVALID_ARRAY_INDEX]` class and the `get()`
+    /// message body — NOT the `_IN_ELEMENT_AT` / `try_element_at` sibling.
+    #[test]
+    fn invalid_array_index_subscript_throw_expr_uses_get_class_and_message() {
+        let err = SparkError::InvalidArrayIndexSubscript {
+            idx_sql: "5".to_owned(),
+            arr_sql: "arr".to_owned(),
+        };
+        assert_eq!(err.class(), "INVALID_ARRAY_INDEX");
+        assert_eq!(
+            err.throw_expr(),
+            "error('[INVALID_ARRAY_INDEX] The index ' || (5)::VARCHAR \
+             || ' is out of bounds. The array has ' || len((arr))::VARCHAR \
+             || ' elements. Use the SQL function `get()` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003')"
         );
     }
 

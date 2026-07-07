@@ -33,7 +33,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType as ArrowDT, IntervalUnit, TimeUnit};
 use arrow_ipc::reader::StreamReader;
 use thunderduck_core::bail_boundary_proto;
-use thunderduck_core::transpiler_v2::ast::{CommonAst, CommonOp, FileFormat, JoinType};
+use thunderduck_core::transpiler_v2::ast::{
+    CommonAst, CommonOp, FileFormat, JoinType, PivotGrouping, UnpivotIds,
+};
 use thunderduck_core::transpiler_v2::error::UnsupportedKind;
 use thunderduck_core::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
@@ -310,7 +312,7 @@ impl V2RelationConverter {
 
         Ok(CommonAst::new(CommonOp::Unpivot {
             input: Box::new(input),
-            ids,
+            ids: UnpivotIds::Explicit(ids),
             values,
             variable_column_name: u.variable_column_name.clone(),
             value_column_name: u.value_column_name.clone(),
@@ -647,6 +649,13 @@ impl V2RelationConverter {
             grouping,
             aggregates,
             grouping_kind,
+            // DataFrame `groupingSets` path is not implemented in τ — leave the
+            // per-set membership empty so emission surfaces the boundary error
+            // (ADR-022). The SparkSQL front-end populates this instead.
+            grouping_sets: Vec::new(),
+            // DataFrame path models post-aggregation filtering as a separate
+            // Filter over the Aggregate; HAVING is a SparkSQL-only concept.
+            having: None,
         }))
     }
 
@@ -685,7 +694,7 @@ impl V2RelationConverter {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(CommonAst::new(CommonOp::Pivot {
             input: Box::new(input),
-            grouping,
+            grouping: PivotGrouping::Explicit(grouping),
             pivot_column,
             pivot_values,
             aggregates,
@@ -2475,7 +2484,10 @@ mod tests {
                 aggregates,
                 ..
             } => {
-                assert_eq!(grouping.len(), 1);
+                match grouping {
+                    PivotGrouping::Explicit(g) => assert_eq!(g.len(), 1),
+                    PivotGrouping::Implicit => panic!("expected explicit grouping"),
+                }
                 assert_eq!(pivot_values.len(), 2);
                 assert_eq!(aggregates.len(), 1);
             }
@@ -2859,7 +2871,7 @@ mod tests {
                 value_column_name,
             } => {
                 assert!(matches!(input.op, CommonOp::TableScan { .. }));
-                assert_eq!(ids, vec!["id".to_owned()]);
+                assert_eq!(ids, UnpivotIds::Explicit(vec!["id".to_owned()]));
                 assert_eq!(values, vec!["age".to_owned(), "salary".to_owned()]);
                 assert_eq!(variable_column_name, "metric");
                 assert_eq!(value_column_name, "value");

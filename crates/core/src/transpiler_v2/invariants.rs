@@ -1,11 +1,11 @@
 //! τ invariant stubs (INV1–INV10, INV7 omitted per ADR-022).
 //!
 //! Marker convention (§CV.5.1 of the rearchitect ADRs):
-//! - active markers name the current slice; deletion is the completion signal.
-//! - deferred markers name the owning slice; not tripped by the current gate.
+//! - active markers name the current phase; deletion is the completion signal.
+//! - deferred markers name the owning phase; not tripped by the current gate.
 //!
 //! At τ only INV10 is active. All other INVs are deferred to their
-//! owning slice per the readiness map. INV7 is intentionally OMITTED (deleted
+//! owning phase. INV7 is intentionally OMITTED (deleted
 //! per ADR-022 §CV.5); do not add an INV7 stub.
 
 // ── INV1 (deferred — differential harness) ────────────────────────────────────

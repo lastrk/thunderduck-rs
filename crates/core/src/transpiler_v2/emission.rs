@@ -24,10 +24,9 @@
 //! - [`render_cast`] — includes the `try_cast` → `TRY_CAST(...)` branch
 //!   (checklist §4.2 first item).
 //! - [`quote_ident`] — `Cow`-returning fast path (§5.6).
-//! - The six unwired helpers under Decision 13-A (`render_tail`,
+//! - The unwired helpers under Decision 13-A (`render_tail`,
 //!   `render_distinct`, `render_with_columns`, `render_drop_columns`,
-//!   `render_aliased_relation`, `render_range_relation`) — private, marked
-//!   `#[allow(dead_code)]`.
+//!   `render_aliased_relation`) — private, marked `#[allow(dead_code)]`.
 //! - [`spark_return_cast`] (§5.1) and `spark_aggregate_return_cast` (§5.1,
 //!   `#[allow(dead_code)]` — wired by C.3) — two distinct `fn` items.
 
@@ -208,12 +207,13 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             widened_schema,
         ),
 
+        TypedOp::TableFunction {
+            name,
+            args,
+            with_ordinality,
+        } => render_table_function(name, args, *with_ordinality, schema),
+
         // ── future τ work owns (analyzer PuntedOperator today; defensive) ──────
-        TypedOp::TableFunction { name, .. } => Err(EmissionError::Unsupported {
-            kind: UnsupportedKind::Op,
-            name: format!("TableFunction[{name}]"),
-            reason: "table-function emission (not implemented in τ)".to_owned(),
-        }),
         TypedOp::Unnest { .. } => Err(EmissionError::Unsupported {
             kind: UnsupportedKind::Op,
             name: "Unnest".to_owned(),
@@ -1646,16 +1646,51 @@ fn render_aliased_relation(input: &TypedAst, alias: &str) -> Result<String, Emis
     Ok(format!("SELECT * FROM ({child_sql}) AS {a}"))
 }
 
-#[allow(dead_code)] // wired when TypedOp::Range lands (Decision 13-A)
-fn render_range_relation(
-    start: i64,
-    end: i64,
-    step: i64,
-    _num_partitions: Option<i32>,
+/// Emit a table-valued function. Only `range` is implemented; the analyzer has
+/// already rejected everything else (`PuntedOperator`), so a non-`range` name
+/// here is a defensive τ-internal boundary.
+///
+/// Spark `range` arities normalize to `(start, end, step)`; DuckDB `range` is
+/// also end-exclusive (1:1 with Spark — never `generate_series`, which is
+/// inclusive). Synthesized `start`/`step` defaults are TYPED `Long` literals
+/// rendered through [`render_expr`] (ADR-004 — no raw SQL string injection).
+/// The `AS __td_range(id)` column alias renames DuckDB's `range` output column
+/// to Spark's `id`, which the enclosing `SELECT id` then binds. `numPartitions`
+/// is a single-node no-op and is dropped.
+fn render_table_function(
+    name: &str,
+    args: &[Expression],
+    _with_ordinality: bool,
+    schema: &Schema,
 ) -> Result<String, EmissionError> {
-    // `spark.range(start, end, step)` — half-open interval, single column `id`.
+    if !name.eq_ignore_ascii_case("range") {
+        bail_boundary_op!(
+            "TableFunction",
+            format!("table-function `{name}` emission (not implemented in τ)")
+        );
+    }
+    let long_lit = |v: i64| {
+        Expression::Literal(Literal {
+            value: LiteralValue::Long(v),
+            data_type: DataType::Long,
+        })
+    };
+    let (start, end, step): (Expression, Expression, Expression) = match args {
+        [end] => (long_lit(0), end.clone(), long_lit(1)),
+        [start, end] => (start.clone(), end.clone(), long_lit(1)),
+        // A 4th `numPartitions` argument is a single-node no-op — drop it.
+        [start, end, step] | [start, end, step, _] => (start.clone(), end.clone(), step.clone()),
+        _ => bail_boundary_op!(
+            "TableFunction",
+            "range() requires 1..=4 arguments (start, end, step, numPartitions)"
+        ),
+    };
+    let start_sql = render_expr(&start, schema)?;
+    let end_sql = render_expr(&end, schema)?;
+    let step_sql = render_expr(&step, schema)?;
+    // `range` is end-EXCLUSIVE in both Spark and DuckDB; single `id` column.
     Ok(format!(
-        "SELECT id FROM range({start}, {end}, {step}) AS __td_range(id)"
+        "SELECT id FROM range({start_sql}, {end_sql}, {step_sql}) AS __td_range(id)"
     ))
 }
 
@@ -6203,6 +6238,86 @@ mod tests {
         let typed = analyze(ast, &bt).expect("analyze TableScan alias");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert_eq!(sql, "SELECT * FROM emp AS e");
+    }
+
+    // ── TableFunction (range) — pass-141 ─────────────────────────────────
+
+    /// Build `range(<args>)`, analyze, and emit — exercises the whole
+    /// L2-analyzer + L3-emission path for the TVF node.
+    fn emit_range(args: Vec<Expression>) -> String {
+        let ast = CommonAst::new(CommonOp::TableFunction {
+            name: "range".to_owned(),
+            args,
+            with_ordinality: false,
+        });
+        let typed = analyze(ast, &BaseTypes::empty()).expect("analyze range");
+        dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch range")
+    }
+
+    #[test]
+    fn dispatch_range_one_arg_synthesizes_start_zero_step_one() {
+        let _g = tap_guard();
+        // `range(5)` → start=0, step=1 (both synthesized as typed BIGINT).
+        assert_eq!(
+            emit_range(vec![int_lit(5)]),
+            "SELECT id FROM range(CAST(0 AS BIGINT), 5, CAST(1 AS BIGINT)) AS __td_range(id)"
+        );
+    }
+
+    #[test]
+    fn dispatch_range_two_args_synthesizes_step_one() {
+        let _g = tap_guard();
+        assert_eq!(
+            emit_range(vec![int_lit(2), int_lit(5)]),
+            "SELECT id FROM range(2, 5, CAST(1 AS BIGINT)) AS __td_range(id)"
+        );
+    }
+
+    #[test]
+    fn dispatch_range_three_args_uses_explicit_step() {
+        let _g = tap_guard();
+        assert_eq!(
+            emit_range(vec![int_lit(2), int_lit(10), int_lit(2)]),
+            "SELECT id FROM range(2, 10, 2) AS __td_range(id)"
+        );
+    }
+
+    #[test]
+    fn dispatch_range_four_args_drops_num_partitions() {
+        let _g = tap_guard();
+        // The 4th `numPartitions` arg is a single-node no-op — dropped.
+        assert_eq!(
+            emit_range(vec![int_lit(2), int_lit(10), int_lit(2), int_lit(4)]),
+            "SELECT id FROM range(2, 10, 2) AS __td_range(id)"
+        );
+    }
+
+    #[test]
+    fn dispatch_project_over_range_binds_id_column() {
+        let _g = tap_guard();
+        // Full `SELECT id FROM range(5)` — Project wraps the TVF subquery and
+        // binds the synthetic `id` column (tbl-006).
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::TableFunction {
+                name: "range".to_owned(),
+                args: vec![int_lit(5)],
+                with_ordinality: false,
+            })),
+            projections: vec![Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            )],
+        });
+        let typed = analyze(ast, &BaseTypes::empty()).expect("analyze project-over-range");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT id FROM (SELECT id FROM range(CAST(0 AS BIGINT), 5, CAST(1 AS BIGINT)) \
+             AS __td_range(id)) AS __td_proj"
+        );
     }
 
     // ── 4-6. render_project ──────────────────────────────────────────────

@@ -27,9 +27,9 @@ use sqlparser::ast::{
     Interval, JoinConstraint, JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr,
     NullInclusion, ObjectName, ObjectNamePart, OrderByExpr, OrderByKind, OrderByOptions,
     PivotValueSource, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
-    Subscript, TableFactor, TableWithJoins, TrimWhereField, TypedString, UnaryOperator, Value,
-    ValueWithSpan, WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec,
-    WindowType,
+    Subscript, TableAlias, TableFactor, TableWithJoins, TrimWhereField, TypedString, UnaryOperator,
+    Value, ValueWithSpan, WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits,
+    WindowSpec, WindowType,
 };
 
 use crate::bail_boundary_proto;
@@ -594,36 +594,72 @@ fn lower_table_factor(
     cte_scope: &CteScope,
 ) -> Result<CommonAst, EmissionError> {
     match factor {
-        TableFactor::Table { name, alias, .. } => {
-            let table = object_name_to_string(&name);
-            // A single-part name matching a CTE in scope inlines the CTE body
-            // (Spark: a CTE shadows a catalog table of the same name). The
-            // reference's own alias wins over the CTE name so qualified refs
-            // bind — `FROM e emp` → alias "emp" (cte-003).
-            if let Some(body) = cte_scope.get(&table.to_lowercase()) {
-                let alias = alias.map(|a| a.name.value).unwrap_or(table);
-                Ok(CommonAst::new(CommonOp::AliasedRelation {
-                    input: Box::new(body.clone()),
-                    alias,
-                }))
-            } else {
-                // Normalize an aliased bare table to
-                // `AliasedRelation { TableScan { alias: None }, alias }`, matching
-                // the DataFrame front-end (`df.alias("e")`) so both front-ends
-                // produce the same CommonAST node for the same meaning (INV7,
-                // ADR-004). Emission's alias-hoisting recognizes `AliasedRelation`;
-                // the old `TableScan { alias: Some(..) }` form buried the user
-                // alias inside a synthetic subquery. Mirrors the CTE branch above.
-                let scan = CommonAst::new(CommonOp::TableScan { table, alias: None });
-                match alias {
-                    Some(a) => Ok(CommonAst::new(CommonOp::AliasedRelation {
-                        input: Box::new(scan),
-                        alias: a.name.value,
-                    })),
-                    None => Ok(scan),
+        // `FROM range(5)` and other table-valued functions parse as
+        // `TableFactor::Table` with `args: Some(..)`; a plain `FROM emp` has
+        // `args: None`. Branch on `args` so the TVF path builds a
+        // `CommonOp::TableFunction` while the bare-table path is preserved
+        // verbatim (no regression for CTE inlining / TableScan / aliases).
+        TableFactor::Table {
+            name,
+            alias,
+            args,
+            with_ordinality,
+            ..
+        } => match args {
+            None => {
+                let table = object_name_to_string(&name);
+                // A single-part name matching a CTE in scope inlines the CTE
+                // body (Spark: a CTE shadows a catalog table of the same name).
+                // The reference's own alias wins over the CTE name so qualified
+                // refs bind — `FROM e emp` → alias "emp" (cte-003).
+                if let Some(body) = cte_scope.get(&table.to_lowercase()) {
+                    let alias = alias.map(|a| a.name.value).unwrap_or(table);
+                    Ok(CommonAst::new(CommonOp::AliasedRelation {
+                        input: Box::new(body.clone()),
+                        alias,
+                    }))
+                } else {
+                    // Normalize an aliased bare table to
+                    // `AliasedRelation { TableScan { alias: None }, alias }`,
+                    // matching the DataFrame front-end (`df.alias("e")`) so both
+                    // front-ends produce the same CommonAST node for the same
+                    // meaning (INV7, ADR-004). Emission's alias-hoisting
+                    // recognizes `AliasedRelation`; the old `TableScan { alias:
+                    // Some(..) }` form buried the user alias inside a synthetic
+                    // subquery. Mirrors the CTE branch above.
+                    let scan = CommonAst::new(CommonOp::TableScan { table, alias: None });
+                    match alias {
+                        Some(a) => Ok(CommonAst::new(CommonOp::AliasedRelation {
+                            input: Box::new(scan),
+                            alias: a.name.value,
+                        })),
+                        None => Ok(scan),
+                    }
                 }
             }
-        }
+            Some(tfa) => {
+                // ClickHouse `SETTINGS` clause has no Spark equivalent.
+                if tfa.settings.is_some() {
+                    bail_boundary_proto!(
+                        "sql::table_function::settings",
+                        "table-function SETTINGS clause (ClickHouse) not supported in τ"
+                    );
+                }
+                let node = CommonAst::new(CommonOp::TableFunction {
+                    name: object_name_to_string(&name),
+                    args: tfa
+                        .args
+                        .into_iter()
+                        .map(|a| function_arg_to_expr(a, cte_scope))
+                        .collect::<Result<_, _>>()?,
+                    with_ordinality,
+                });
+                // A user alias (`range(5) AS t(id2)`) composes on top via
+                // `ToDf` (positional column rename) then `AliasedRelation`
+                // (scope qualifier) — shared with `TableFactor::Derived`.
+                apply_table_alias(node, alias)
+            }
+        },
         TableFactor::Derived {
             subquery, alias, ..
         } => {
@@ -635,24 +671,7 @@ fn lower_table_factor(
             // subquery output via `ToDf` first. Mirrors the CTE-definition
             // branch above. Unaliased derived tables inline unchanged.
             let inner = lower_query(*subquery, cte_scope)?;
-            match alias {
-                Some(a) => {
-                    let renamed = if a.columns.is_empty() {
-                        inner
-                    } else {
-                        let column_names = a.columns.into_iter().map(|c| c.name.value).collect();
-                        CommonAst::new(CommonOp::ToDf {
-                            input: Box::new(inner),
-                            column_names,
-                        })
-                    };
-                    Ok(CommonAst::new(CommonOp::AliasedRelation {
-                        input: Box::new(renamed),
-                        alias: a.name.value,
-                    }))
-                }
-                None => Ok(inner),
-            }
+            apply_table_alias(inner, alias)
         }
         TableFactor::TableFunction { expr, alias: _ } => {
             // Only bare identifier / function-call table functions covered.
@@ -813,6 +832,38 @@ fn lower_table_factor(
             format!("sql::table_factor::{other:?}"),
             "table factor not supported in τ"
         ),
+    }
+}
+
+/// Thread a SQL [`TableAlias`] onto an already-lowered relation. An explicit
+/// column list (`AS t(c1, c2)`) positionally renames the relation's output via
+/// [`CommonOp::ToDf`] first; the alias name is then attached as a scope
+/// qualifier via [`CommonOp::AliasedRelation`] so qualified refs bind. An
+/// absent alias returns the relation unchanged. Shared by the
+/// `TableFactor::Derived` (subquery-in-FROM) and `TableFactor::Table` with
+/// args (table-valued function) branches so both front-end shapes agree
+/// (INV7, ADR-004).
+fn apply_table_alias(
+    inner: CommonAst,
+    alias: Option<TableAlias>,
+) -> Result<CommonAst, EmissionError> {
+    match alias {
+        Some(a) => {
+            let renamed = if a.columns.is_empty() {
+                inner
+            } else {
+                let column_names = a.columns.into_iter().map(|c| c.name.value).collect();
+                CommonAst::new(CommonOp::ToDf {
+                    input: Box::new(inner),
+                    column_names,
+                })
+            };
+            Ok(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(renamed),
+                alias: a.name.value,
+            }))
+        }
+        None => Ok(inner),
     }
 }
 
@@ -2941,6 +2992,81 @@ mod tests {
                 );
             }
             _ => panic!("expected Values"),
+        }
+    }
+
+    #[test]
+    fn parse_range_table_function_lowers_to_table_function_not_scan() {
+        // `FROM range(5)` must lower to `CommonOp::TableFunction`, NOT a bare
+        // `TableScan{"range"}` (pass-141; the `..` used to swallow `args`).
+        let plan = parse("SELECT id FROM range(5)").expect("should parse");
+        match plan.op {
+            CommonOp::Project { input, .. } => match input.op {
+                CommonOp::TableFunction {
+                    name,
+                    args,
+                    with_ordinality,
+                } => {
+                    assert_eq!(name, "range");
+                    assert_eq!(args.len(), 1, "one arg: end=5");
+                    assert!(matches!(args[0], Expression::Literal(_)));
+                    assert!(!with_ordinality);
+                }
+                other => panic!("expected TableFunction, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_range_table_function_with_alias_columns_renames_via_todf() {
+        // `range(5) AS t(id2)` → AliasedRelation{ ToDf{ TableFunction, [id2] }, t }
+        // — a user alias composes on top of the TVF via the shared
+        // `apply_table_alias` helper (pass-141).
+        let plan = parse("SELECT id2 FROM range(5) AS t(id2)").expect("should parse");
+        let aliased = match plan.op {
+            CommonOp::Project { input, .. } => *input,
+            other => panic!("expected Project, got {other:?}"),
+        };
+        let todf = match aliased.op {
+            CommonOp::AliasedRelation { input, alias } => {
+                assert_eq!(alias, "t");
+                *input
+            }
+            other => panic!("expected AliasedRelation, got {other:?}"),
+        };
+        let tf = match todf.op {
+            CommonOp::ToDf {
+                input,
+                column_names,
+            } => {
+                assert_eq!(column_names, vec!["id2".to_owned()]);
+                *input
+            }
+            other => panic!("expected ToDf, got {other:?}"),
+        };
+        match tf.op {
+            CommonOp::TableFunction { name, args, .. } => {
+                assert_eq!(name, "range");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected TableFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bare_table_still_lowers_to_table_scan() {
+        // Regression: `FROM emp` (args None) must keep the bare-table path.
+        let plan = parse("SELECT * FROM emp").expect("should parse");
+        match plan.op {
+            CommonOp::Project { input, .. } => {
+                assert!(
+                    matches!(input.op, CommonOp::TableScan { ref table, .. } if table == "emp"),
+                    "expected TableScan, got {:?}",
+                    input.op
+                );
+            }
+            other => panic!("expected Project, got {other:?}"),
         }
     }
 

@@ -779,12 +779,9 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
 
         CommonOp::TableFunction {
             name,
-            args: _,
-            with_ordinality: _,
-        } => Err(AnalyzerError::PuntedOperator {
-            op: format!("TableFunction[{name}]"),
-            reason: "table-function analysis (not implemented in τ)".to_owned(),
-        }),
+            args,
+            with_ordinality,
+        } => analyze_table_function(name, args, with_ordinality, base_types),
 
         CommonOp::Unnest {
             expr: _,
@@ -2025,6 +2022,38 @@ fn resolve_boolean_predicate(
 
 /// Resolve every `UnresolvedColumn` in `expr` against `schema` and stamp
 /// resolved `ColumnReference`s with `data_type` and `nullable`.
+/// Analyze a table-valued function call. Arguments resolve against an empty
+/// schema — Spark's TVF arguments must be foldable constants, so a bare column
+/// ref correctly fails `UnknownColumn`. `range(end)` / `range(start, end)` /
+/// `range(start, end, step)` / `range(start, end, step, numPartitions)` (arity
+/// 1..=4) resolves to a single non-nullable `id: Long` column, end-exclusive
+/// (ADR-005; Spark 4.1.1 `range`). Any other TVF — or `range` with the wrong
+/// arity — is an honest Thunderduck boundary (`PuntedOperator`, ADR-022);
+/// `explode(...)` and friends land here until τ implements them.
+fn analyze_table_function(
+    name: String,
+    args: Vec<Expression>,
+    with_ordinality: bool,
+    base_types: &BaseTypes,
+) -> Result<TypedAst, AnalyzerError> {
+    let resolved_args = resolve_expr_list(args, &StructType::empty(), base_types)?;
+    if name.eq_ignore_ascii_case("range") && (1..=4).contains(&resolved_args.len()) {
+        Ok(TypedAst {
+            op: TypedOp::TableFunction {
+                name,
+                args: resolved_args,
+                with_ordinality,
+            },
+            resolved_schema: StructType::new(vec![StructField::new("id", DataType::Long, false)]),
+        })
+    } else {
+        Err(AnalyzerError::PuntedOperator {
+            op: format!("TableFunction[{name}]"),
+            reason: "table-function analysis (not implemented in τ)".to_owned(),
+        })
+    }
+}
+
 fn resolve_and_stamp(
     expr: Expression,
     schema: &StructType,
@@ -4595,6 +4624,46 @@ mod tests {
             by_name: true,
             allow_missing_columns: false,
             children: vec![tiny_int_plan(), tiny_int_plan()],
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(matches!(err, AnalyzerError::PuntedOperator { .. }));
+        assert!(err.to_string().starts_with("[TDCK-BOUNDARY]"));
+    }
+
+    /// `range(5)` resolves to a single non-nullable `id: Long` column
+    /// (Spark 4.1.1 `range`; ADR-005). Pass-141.
+    #[test]
+    fn table_function_range_resolves_single_long_id_column() {
+        let bt = BaseTypes::empty();
+        let ast = CommonAst::new(CommonOp::TableFunction {
+            name: "range".to_owned(),
+            args: vec![Expression::Literal(Literal {
+                value: LiteralValue::Int(5),
+                data_type: DataType::Integer,
+            })],
+            with_ordinality: false,
+        });
+        let typed = analyze(ast, &bt).expect("range should analyze");
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        let f = &typed.resolved_schema.fields[0];
+        assert_eq!(f.name, "id");
+        assert_eq!(f.data_type, DataType::Long);
+        assert!(!f.nullable, "range id column is non-nullable");
+    }
+
+    /// An unknown table-valued function (`explode(...)`) is an honest
+    /// Thunderduck boundary — `PuntedOperator`, not a silent wrong answer
+    /// (ADR-022). Pass-141.
+    #[test]
+    fn table_function_unknown_tvf_punts() {
+        let bt = BaseTypes::empty();
+        let ast = CommonAst::new(CommonOp::TableFunction {
+            name: "explode".to_owned(),
+            args: vec![Expression::Literal(Literal {
+                value: LiteralValue::Int(1),
+                data_type: DataType::Integer,
+            })],
+            with_ordinality: false,
         });
         let err = analyze(ast, &bt).unwrap_err();
         assert!(matches!(err, AnalyzerError::PuntedOperator { .. }));

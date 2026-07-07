@@ -612,8 +612,34 @@ case("hash-002", "hashing", "sha2 with bit length", lambda I: I["emp"].select(F.
 case("hash-003", "hashing", "hash / xxhash64 (multi-col)", lambda I: I["emp"].select(F.hash("name", "dept_id").alias("h"), F.xxhash64("name", "salary").alias("xx")))
 
 # ── 24. Interval types & temporal arithmetic ────────────────────────────────
-case("intv-001", "interval", "make_interval -> CalendarInterval", lambda I: I["emp"].select(F.expr("make_interval(1, 2, 0, 5)").alias("iv")))
-case("intv-002", "interval", "make_ym_interval -> YearMonthInterval type", lambda I: I["emp"].select(F.expr("make_ym_interval(2, 3)").alias("ymi")))
+case(
+    "intv-001",
+    "interval",
+    # PySpark's Arrow decoder rejects `Interval(MonthDayNano)` (Spark's Arrow
+    # wire encoding for CalendarIntervalType) with
+    # `PySparkTypeError(UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION)` — same
+    # decoder-gap arm as intv-002. Verified against Spark 4.1.1 reference:
+    # `df.collect()` throws that class. Both engines throw identically, so the
+    # tri-state error-parity comparator PASSes the case.
+    "make_interval -> CalendarInterval (client-side Arrow decode gap)",
+    lambda I: I["emp"].select(F.expr("make_interval(1, 2, 0, 5)").alias("iv")),
+    expected_error="UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION",
+)
+case(
+    "intv-002",
+    "interval",
+    # PySpark's Arrow decoder (`pyspark/sql/pandas/types.py::from_arrow_type`)
+    # has no `is_interval` arm — a YearMonthInterval column on the Arrow wire
+    # is refused with `PySparkTypeError(UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION)`.
+    # Verified against Spark 4.1.1 reference: `.collect()` throws that same
+    # class. Thunderduck passes the column through unchanged; the client raises
+    # the same error, so the tri-state error-parity comparator (see
+    # `utils/dataframe_diff.py::reconcile_error_parity`) PASSes the case.
+    "make_ym_interval -> YearMonthInterval type (client-side Arrow decode gap)",
+    lambda I: I["emp"].select(F.expr("make_ym_interval(2, 3)").alias("ymi")),
+    flags=("spark4",),
+    expected_error="UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION",
+)
 case("intv-003", "interval", "make_dt_interval -> DayTimeInterval type", lambda I: I["emp"].select(F.expr("make_dt_interval(1, 2, 30, 0)").alias("dti")))
 case("intv-004", "interval", "date + INTERVAL literal", lambda I: I["emp"].select((F.col("hire_date") + F.expr("INTERVAL 90 DAYS")).alias("later")))
 case("intv-005", "interval", "timestamp difference -> DayTimeInterval", lambda I: I["emp"].select((F.col("last_login") - F.col("last_login")).alias("zero_iv")))

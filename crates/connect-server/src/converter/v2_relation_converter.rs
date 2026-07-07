@@ -25,19 +25,21 @@
 use std::collections::HashSet;
 
 use arrow::array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, ListArray,
-    MapArray, StringArray, StructArray, TimestampMicrosecondArray,
+    Array, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DurationMicrosecondArray,
+    Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+    IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray, LargeStringArray,
+    ListArray, MapArray, StringArray, StructArray, TimestampMicrosecondArray,
 };
-use arrow::datatypes::DataType as ArrowDT;
+use arrow::datatypes::{DataType as ArrowDT, IntervalUnit, TimeUnit};
 use arrow_ipc::reader::StreamReader;
 use thunderduck_core::bail_boundary_proto;
 use thunderduck_core::transpiler_v2::ast::{CommonAst, CommonOp, FileFormat, JoinType};
 use thunderduck_core::transpiler_v2::error::UnsupportedKind;
 use thunderduck_core::transpiler_v2::expression::{
     AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
-    FunctionCall, InListExpression, Literal, LiteralValue, NullOrdering, SortDirection, SortOrder,
-    StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UnresolvedRegexExpression,
+    FunctionCall, InListExpression, Literal, LiteralValue, NullOrdering, RawSqlExpression,
+    SortDirection, SortOrder, StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn,
+    UnresolvedRegexExpression,
 };
 use thunderduck_core::transpiler_v2::macros::ProtoFieldExt;
 use thunderduck_core::transpiler_v2::EmissionError;
@@ -1743,6 +1745,14 @@ fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, EmissionError> {
             precision: *p,
             scale: *s as u8,
         },
+        // Interval types — round-trip through `createDataFrame(rows, schema)`.
+        // Spark 4.1 sends `DayTimeIntervalType` as Arrow `Duration(Microsecond)`,
+        // `YearMonthIntervalType` as Arrow `Interval(YEAR_MONTH)`, and
+        // `CalendarIntervalType` as Arrow `Interval(MonthDayNano)`. Corpus:
+        // intv-001, intv-003, intv-005.
+        ArrowDT::Duration(TimeUnit::Microsecond) => DataType::DayTimeInterval,
+        ArrowDT::Interval(IntervalUnit::YearMonth) => DataType::YearMonthInterval,
+        ArrowDT::Interval(IntervalUnit::MonthDayNano) => DataType::Interval,
         ArrowDT::List(f) | ArrowDT::LargeList(f) => DataType::Array(
             Box::new(arrow_data_type_to_core(f.data_type())?),
             f.is_nullable(),
@@ -1978,6 +1988,54 @@ pub(crate) fn arrow_val_to_literal(
                     fields: out,
                 },
             ))
+        }
+        // ── Interval Arrow values ────────────────────────────────────────
+        // `createDataFrame(rows_with_intervals, schema)` from PySpark re-sends
+        // interval cells as their Arrow wire form. τ has no `LiteralValue`
+        // variant for intervals; wrap the DuckDB `INTERVAL` literal SQL as
+        // `RawSql` with a data-type hint so the analyzer stamps the correct
+        // shape. Emission of `RawSql` is a verbatim string passthrough
+        // (`emission.rs::render_expr`), which suits DuckDB's native INTERVAL
+        // syntax exactly. Corpus: intv-001 / intv-003 / intv-005.
+        ArrowDT::Duration(TimeUnit::Microsecond) => {
+            let a = downcast::<DurationMicrosecondArray>(array)?;
+            let micros: i64 = a.value(row);
+            // DuckDB has no `make_interval`; use `to_microseconds(BIGINT)` which
+            // returns an INTERVAL representing the given microseconds.
+            let sql = format!("to_microseconds(CAST({micros} AS BIGINT))");
+            Ok(Expression::RawSql(RawSqlExpression {
+                sql,
+                data_type: Some(DataType::DayTimeInterval),
+                nullable: Some(false),
+            }))
+        }
+        ArrowDT::Interval(IntervalUnit::YearMonth) => {
+            let a = downcast::<IntervalYearMonthArray>(array)?;
+            let total_months: i32 = a.value(row);
+            let sql = format!("to_months(CAST({total_months} AS INTEGER))");
+            Ok(Expression::RawSql(RawSqlExpression {
+                sql,
+                data_type: Some(DataType::YearMonthInterval),
+                nullable: Some(false),
+            }))
+        }
+        ArrowDT::Interval(IntervalUnit::MonthDayNano) => {
+            let a = downcast::<IntervalMonthDayNanoArray>(array)?;
+            let v = a.value(row);
+            let micros = v.nanoseconds / 1_000;
+            // Compose the three components — DuckDB INTERVAL arithmetic
+            // preserves the MonthDayNano semantics DuckDB uses internally.
+            let sql = format!(
+                "(to_months(CAST({m} AS INTEGER)) + to_days(CAST({d} AS INTEGER)) + to_microseconds(CAST({us} AS BIGINT)))",
+                m = v.months,
+                d = v.days,
+                us = micros,
+            );
+            Ok(Expression::RawSql(RawSqlExpression {
+                sql,
+                data_type: Some(DataType::Interval),
+                nullable: Some(false),
+            }))
         }
         // §2.1 loud-fail: NO Ok(null_literal()) catch-all here. Every
         // unhandled Arrow type surfaces as `UnsupportedProtoShape`.

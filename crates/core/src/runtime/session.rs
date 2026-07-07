@@ -1318,6 +1318,109 @@ mod tests {
         configure_s3_credential_chain(&conn, None);
     }
 
+    // ── Q3 (interval-transcode plan) — DuckDB's MonthDayNano layout ─────
+    //
+    // The interval-column Arrow transcoder in `crates/connect-server` maps
+    // DuckDB's `Interval(MonthDayNano)` output to Spark's
+    // `Duration(Microsecond)` wire encoding for `DayTimeInterval` columns.
+    // The formula
+    //     total_micros = days * 86_400_000_000 + nanoseconds / 1_000
+    // is correct ONLY if DuckDB folds sub-day components into `nanoseconds`
+    // and does NOT emit non-zero `months` for a pure DayTime result.
+    // This test pins DuckDB's observed layout so a future upstream change
+    // that shifts hours→days (or emits months for pure DayTime) trips loud
+    // in unit tests, not in the corpus.
+
+    /// `INTERVAL 1 DAY + INTERVAL 2 HOUR` → { months: 0, days: 1, nanos: 7.2e12 }.
+    #[test]
+    fn duckdb_month_day_nano_pure_day_time_layout() {
+        use duckdb::arrow::array::IntervalMonthDayNanoArray;
+        use duckdb::arrow::datatypes::{DataType as ArrowDt, IntervalUnit};
+
+        let conn = fresh_conn();
+        let mut stmt = conn
+            .prepare("SELECT INTERVAL 1 DAY + INTERVAL 2 HOUR AS iv")
+            .expect("prepare");
+        let batches: Vec<duckdb::arrow::record_batch::RecordBatch> =
+            stmt.query_arrow([]).expect("query").collect();
+        assert_eq!(batches.len(), 1, "one batch expected");
+        let batch = &batches[0];
+        assert_eq!(
+            batch.schema().field(0).data_type(),
+            &ArrowDt::Interval(IntervalUnit::MonthDayNano),
+            "DuckDB must emit Interval(MonthDayNano) for the INTERVAL type",
+        );
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<IntervalMonthDayNanoArray>()
+            .expect("MonthDayNano array");
+        assert_eq!(arr.len(), 1);
+        let v = arr.value(0);
+        assert_eq!(v.months, 0, "pure DayTime must not accumulate into months");
+        assert_eq!(v.days, 1, "1 day component preserved in `days`");
+        assert_eq!(
+            v.nanoseconds, 7_200_000_000_000,
+            "2 hours = 7.2e12 nanos folded into `nanoseconds` (NOT into days)",
+        );
+    }
+
+    /// `INTERVAL 90 DAYS` (Spark's `make_dt_interval(1, 2, 30, 0)` value —
+    /// well, not exactly; that value is 1 d + 2h + 30 m — but corpus intv-004
+    /// literally uses `INTERVAL 90 DAYS`, and this pins that DuckDB does NOT
+    /// fold days into months at rate 30.
+    #[test]
+    fn duckdb_month_day_nano_ninety_days_stays_as_days() {
+        use duckdb::arrow::array::IntervalMonthDayNanoArray;
+
+        let conn = fresh_conn();
+        let mut stmt = conn
+            .prepare("SELECT INTERVAL 90 DAYS AS iv")
+            .expect("prepare");
+        let batches: Vec<duckdb::arrow::record_batch::RecordBatch> =
+            stmt.query_arrow([]).expect("query").collect();
+        let arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<IntervalMonthDayNanoArray>()
+            .expect("MonthDayNano array");
+        let v = arr.value(0);
+        assert_eq!(
+            v.months, 0,
+            "90 days must NOT be folded into months (30d rate)"
+        );
+        assert_eq!(v.days, 90);
+        assert_eq!(v.nanoseconds, 0);
+    }
+
+    /// `TIMESTAMP - TIMESTAMP` — corpus intv-005. DuckDB emits the difference
+    /// as `Interval(MonthDayNano)` with `months = 0`. The transcoder maps this
+    /// to `Duration(Microsecond)`; days/nanos come through unchanged.
+    #[test]
+    fn duckdb_month_day_nano_timestamp_diff_layout() {
+        use duckdb::arrow::array::IntervalMonthDayNanoArray;
+
+        let conn = fresh_conn();
+        // 1 day, 2 hours, 3 minutes, 4 seconds, .5 seconds -> mixed sub-day.
+        let mut stmt = conn
+            .prepare(
+                "SELECT TIMESTAMP '2024-01-02 02:03:04.5' - TIMESTAMP '2024-01-01 00:00:00' AS d",
+            )
+            .expect("prepare");
+        let batches: Vec<duckdb::arrow::record_batch::RecordBatch> =
+            stmt.query_arrow([]).expect("query").collect();
+        let arr = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<IntervalMonthDayNanoArray>()
+            .expect("MonthDayNano array");
+        let v = arr.value(0);
+        assert_eq!(v.months, 0);
+        assert_eq!(v.days, 1);
+        // 2h 3m 4.5s = (2*3600 + 3*60 + 4)*1e9 + 5e8 = 7_384_500_000_000 ns
+        assert_eq!(v.nanoseconds, 7_384_500_000_000);
+    }
+
     /// Empty string is treated as disabled.
     #[test]
     fn s3_credential_chain_disabled_when_empty() {

@@ -996,6 +996,17 @@ impl TypeInferenceEngine {
             "spark_partition_id" => Integer,
             "monotonically_increasing_id" => Long,
 
+            // ── Interval constructors ────────────────────────────────────
+            // Spark's `make_dt_interval(days[, hours[, mins[, secs]]])`
+            // returns a `DayTimeIntervalType`. Corpus: `intv-003`.
+            "make_dt_interval" | "try_make_dt_interval" => DayTimeInterval,
+            // `make_ym_interval(years[, months])` returns
+            // `YearMonthIntervalType`. Corpus: `intv-002`.
+            "make_ym_interval" | "try_make_ym_interval" => YearMonthInterval,
+            // `make_interval(years, months, weeks, days[, hours, mins, secs])`
+            // returns `CalendarIntervalType` in Spark 4.1. Corpus: `intv-001`.
+            "make_interval" | "try_make_interval" => Interval,
+
             // τ seed: everything else is unresolved.
             _ => Unresolved,
         }
@@ -1898,6 +1909,54 @@ mod tests {
         assert_eq!(
             TypeInferenceEngine::function_return_type("Window", Some(&DataType::Timestamp)),
             expected,
+        );
+    }
+
+    // ── Interval constructors (Spark parity for intv-001, -002, -003) ───────
+
+    #[test]
+    fn make_dt_interval_returns_day_time_interval() {
+        // Corpus: intv-003. Spark: `make_dt_interval(1, 2, 30, 0)` yields
+        // `DayTimeIntervalType`.
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("make_dt_interval", None),
+            DataType::DayTimeInterval,
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("try_make_dt_interval", None),
+            DataType::DayTimeInterval,
+        );
+        // Case-insensitive dispatch.
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("MAKE_DT_INTERVAL", None),
+            DataType::DayTimeInterval,
+        );
+    }
+
+    #[test]
+    fn make_ym_interval_returns_year_month_interval() {
+        // Corpus: intv-002.
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("make_ym_interval", None),
+            DataType::YearMonthInterval,
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("try_make_ym_interval", None),
+            DataType::YearMonthInterval,
+        );
+    }
+
+    #[test]
+    fn make_interval_returns_calendar_interval() {
+        // Corpus: intv-001. Spark 4.1: `make_interval(1, 2, 0, 5)` returns
+        // `CalendarIntervalType` (our `DataType::Interval`).
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("make_interval", None),
+            DataType::Interval,
+        );
+        assert_eq!(
+            TypeInferenceEngine::function_return_type("try_make_interval", None),
+            DataType::Interval,
         );
     }
 }

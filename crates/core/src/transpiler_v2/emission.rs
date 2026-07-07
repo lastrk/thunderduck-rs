@@ -2965,6 +2965,39 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                  + INTERVAL ({s_micros}) MICROSECOND)"
             ));
         }
+        // Spark's `make_interval(years, months, weeks, days[, hours[, mins[, secs]]])`
+        // builds a CalendarInterval. DuckDB has no `make_interval` scalar;
+        // compose from individual `INTERVAL <n> UNIT` summands. Corpus: `intv-001`.
+        "make_interval" | "try_make_interval" => {
+            if f.args.len() > 7 {
+                bail_boundary_fn!(f.name.clone(), "`make_interval` takes at most 7 arguments");
+            }
+            let zero = "0".to_owned();
+            let arg = |i: usize| -> Result<String, EmissionError> {
+                if i >= f.args.len() {
+                    Ok(zero.clone())
+                } else {
+                    render_expr(&f.args[i], schema)
+                }
+            };
+            let y = arg(0)?;
+            let m = arg(1)?;
+            let w = arg(2)?;
+            let d = arg(3)?;
+            let h = arg(4)?;
+            let mi = arg(5)?;
+            let s_micros = if f.args.len() < 7 {
+                zero.clone()
+            } else {
+                let s = render_expr(&f.args[6], schema)?;
+                format!("CAST(({s}) * 1000000 AS BIGINT)")
+            };
+            return Ok(format!(
+                "(INTERVAL ({y}) YEAR + INTERVAL ({m}) MONTH + INTERVAL ({w}) WEEK \
+                 + INTERVAL ({d}) DAY + INTERVAL ({h}) HOUR + INTERVAL ({mi}) MINUTE \
+                 + INTERVAL ({s_micros}) MICROSECOND)"
+            ));
+        }
         // Spark's `make_ym_interval([years[, months]])` builds a year-month
         // INTERVAL. Same principle as `make_dt_interval`.
         "make_ym_interval" => {

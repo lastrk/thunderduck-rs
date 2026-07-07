@@ -287,6 +287,45 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   `schema_only`-flagged case proves nothing about cells. The CaseWhen relabel is
   nullability-neutral (the else branch governs), so the schema stayed correct.
 
+- **A proto-schema frame fixes the server-declared type, but the client's own
+  Arrow row-decoder is a second, independent constraint.** intv-001 / intv-002
+  (2026-07-07): emitting a dedicated `ExecutePlanResponse.schema` frame before
+  the first Arrow batch is *necessary* for interval-typed results (it bypasses
+  PySpark's `from_arrow_schema` fallback, which lacks an `is_interval` arm),
+  but it is *not sufficient* — the per-row Arrow decoder (`from_arrow_type` in
+  `pyspark/sql/pandas/types.py`) has no `is_interval` arm either, so
+  `Interval(MonthDayNano)` (CalendarInterval) and `Interval(YearMonth)`
+  (YearMonthInterval) both throw `UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION`
+  regardless of the schema frame. The corpus fix rides both engines throwing
+  identically (`expected_error=` on the case, `reconcile_error_parity`
+  comparator), not a server-side transcode. Only DayTimeInterval — which Spark
+  emits as `Duration(Microsecond)` — has a client arm to decode into, so only
+  DayTimeInterval gets a real server-side transcode (`arrow_interval_transcode.rs`,
+  `DayTimeToDurationMicros`). Rule: when adding a new Arrow-serialized data
+  type, verify (a) the proto-schema decoder path AND (b) the per-row Arrow
+  decoder path in the client library. If (b) lacks an arm, the honest fix is
+  either upstream PySpark or an `expected_error=` corpus entry (with both
+  engines failing identically) — do not build a server-side transcode into a
+  wire shape the client cannot decode.
+
+- **Data-first / name-second is the durable seam between an Arrow data rewrite
+  and a schema stamp.** `arrow_interval_transcode.rs::apply` returns
+  `Vec<ArrayRef>` (data columns with target Arrow types); `arrow_schema_stamp.rs`
+  owns the `Arc<Schema>` (name rewrite + interval-arm acceptance of both pre-
+  and post-transcode Arrow types). The streaming loop composes them by
+  constructing the wire `RecordBatch` once from `(stamped_schema, cols)` — no
+  intermediate `RecordBatch` is built by either module. The perf pass
+  (`.agent-output/004-perf-findings.md` MED-1, applied 2026-07-07) collapsed a
+  redundant `RecordBatch` + `Vec<Arc<Field>>` + `Arc<Schema>` per non-noop batch
+  by changing `apply()`'s return type from `RecordBatch` to `Vec<ArrayRef>` —
+  a return-type refactor, not a behavior change on either side of the seam.
+  Rule: when two modules cooperatively rewrite Arrow batches (one rewrites
+  data, the other rewrites schema/names), keep them uncoupled by threading
+  `Vec<ArrayRef>` between them and constructing the final `RecordBatch` at
+  exactly one call site. The alternative — each module builds its own
+  intermediate `RecordBatch` — pays two allocation trips per batch and hides
+  the seam under a Vec-of-columns re-derivation on every hop.
+
 ## Progress-signal calibration
 
 - **Per-slice progress-signal estimates are lagging indicators; recalibrate after each slice

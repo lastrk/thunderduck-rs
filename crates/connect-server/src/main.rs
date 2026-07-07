@@ -1,3 +1,4 @@
+mod arrow_interval_transcode;
 mod arrow_ipc;
 mod arrow_schema_stamp;
 mod converter;

@@ -879,6 +879,19 @@ impl Expression {
                 _ => {}
             }
         }
+        // Timestamp − Timestamp → DayTimeInterval (Spark 4.1 parity —
+        // corpus intv-005). NTZ mixes coerce to DayTimeInterval too.
+        if b.op == BinaryOp::Sub {
+            match (&l, &r) {
+                (DataType::Timestamp, DataType::Timestamp)
+                | (DataType::TimestampNtz, DataType::TimestampNtz)
+                | (DataType::Timestamp, DataType::TimestampNtz)
+                | (DataType::TimestampNtz, DataType::Timestamp) => {
+                    return DataType::DayTimeInterval;
+                }
+                _ => {}
+            }
+        }
         // Decimal-aware arithmetic.
         if let (
             DataType::Decimal {

@@ -30,13 +30,21 @@ crates/core/                        # Pure translation engine (no gRPC)
   runtime/                          # DuckDB session, Arrow streaming, extension loading
 
 crates/connect-server/              # gRPC binary (tonic)
-  service.rs                        # SparkConnectService
+  service.rs                        # SparkConnectService; per-batch streaming
+                                    # (execute_streaming_query emits a proto
+                                    # Schema frame first, then transcoded batches)
   session/                          # SessionManager
   converter/
     v2_relation_converter.rs        # Protobuf Relation → CommonAst
+                                    # (LocalRelation Arrow interval-value decoder)
     relation_converter.rs           # parse_json_schema helper
     type_converter.rs               # DataType ↔ proto DataType
   arrow_schema_stamp.rs             # Wire schema = τ's resolved_schema
+                                    # (interval-aware arms accept pre- + post-
+                                    # transcode Arrow types)
+  arrow_interval_transcode.rs       # Per-batch DuckDB Interval(MonthDayNano) →
+                                    # Spark per-semantic Arrow encoding
+                                    # (DayTimeInterval → Duration(us))
 ```
 
 ## Key Types
@@ -69,6 +77,17 @@ session thread → oneshot::Sender<SessionResult> → tokio task → gRPC stream
 ```
 
 Never attempt to move a `Connection` across thread boundaries or hold it across `.await` points.
+
+## Streaming and Arrow interval transcoding
+
+`execute_streaming_query` (`crates/connect-server/src/service.rs`) is a true per-batch stream driven by `futures::stream::unfold`. For every ExecutePlan request it:
+
+1. Yields one `ExecutePlanResponse.schema` frame built from τ's `resolved_schema` (via `build_schema_response`). This bypasses PySpark's `from_arrow_schema` fallback, which lacks `is_interval` arms and would raise `UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION` on any interval column.
+2. Receives Arrow batches from the session thread via a bounded `tokio::sync::mpsc` (buffer 4). The session thread owns `duckdb::Connection` (`!Send`) and never sees the transcoder.
+3. Applies `arrow_interval_transcode::apply(&batch, &plan)` on the tonic async task: DuckDB's uniform `Interval(MonthDayNano)` is rewritten per column to Spark's per-semantic Arrow encoding (currently `DayTimeInterval` → `Duration(Microsecond)`; `CalendarInterval` and `YearMonthInterval` pass through). The wire `RecordBatch` is constructed exactly once per batch from the transcoded columns and a stamped `Arc<Schema>` cached on the first batch (via `arrow_schema_stamp::build_stamped_schema`).
+4. Yields the Arrow batch frame, then loops. On session error the message is reconstructed as `ThunderduckError::DuckDb(msg)`, run through `reclassified_spark_runtime()`, and bridged to `tonic::Status` — the same ANSI error-class parity the synchronous path applies.
+
+INV10 forbids the transcoder (or any wire-shape concern) from living inside `crates/core/transpiler_v2/`. Any future op with a data-driven or otherwise client-unfriendly Arrow schema must route through this same schema-frame + per-batch transcode pattern rather than expecting the client's Arrow-schema fallback to save it.
 
 ## Joins
 

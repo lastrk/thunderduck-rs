@@ -1,7 +1,10 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow::datatypes::{Field, Schema};
 use futures::stream;
+use thunderduck_core::error::ThunderduckError;
 use thunderduck_core::parser_v2::SparkSqlParserV2;
 use thunderduck_core::transpiler_v2::base_types::plan_has_empty_scan;
 use thunderduck_core::transpiler_v2::{self, BaseTypes, CommonAst};
@@ -9,7 +12,9 @@ use thunderduck_core::types::{DataType, StructType};
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
+use crate::arrow_interval_transcode::{self, IntervalPlan};
 use crate::arrow_ipc::record_batches_to_arrow_batches;
+use crate::arrow_schema_stamp;
 use crate::converter::type_converter::data_type_to_proto;
 use crate::converter::v2_relation_converter::V2RelationConverter;
 use crate::error::ConnectError;
@@ -659,6 +664,104 @@ async fn execute_ddl(
 ///      appends a trailing `ResultComplete` frame.
 ///   3. `stream::iter(responses.into_iter().map(Ok))` boxes the responses
 ///      into the `ExecutePlanStream` shape.
+/// Build a schema-only `ExecutePlanResponse` from τ's `resolved_schema`.
+///
+/// PySpark's Connect client short-circuits its `_from_arrow_schema` fallback
+/// (which cannot decode Arrow `Interval(*)` types) when the server has already
+/// sent a `schema` message; instead it uses `proto_schema_to_pyspark_data_type`,
+/// which has arms for all three Spark interval kinds. This frame is what makes
+/// intv-001 (CalendarInterval) and intv-003/intv-005 (DayTimeInterval) decode.
+fn build_schema_response(
+    resolved_schema: &StructType,
+    session_id: &str,
+    operation_id: &str,
+) -> proto::ExecutePlanResponse {
+    proto::ExecutePlanResponse {
+        session_id: session_id.to_owned(),
+        server_side_session_id: SERVER_SESSION_ID.clone(),
+        operation_id: operation_id.to_owned(),
+        response_id: format!("{operation_id}-schema"),
+        schema: Some(data_type_to_proto(&DataType::Struct(
+            resolved_schema.clone(),
+        ))),
+        response_type: None, // schema lives in the top-level field, not in the oneof
+        ..Default::default()
+    }
+}
+
+/// Wrap a single [`arrow::record_batch::RecordBatch`] as one Arrow-IPC
+/// `ExecutePlanResponse` frame.
+fn batch_to_response(
+    batch: &arrow::record_batch::RecordBatch,
+    session_id: &str,
+    operation_id: &str,
+    seq: usize,
+) -> crate::error::Result<proto::ExecutePlanResponse> {
+    let mut abs = record_batches_to_arrow_batches(std::slice::from_ref(batch))?;
+    let ab = abs
+        .pop()
+        .expect("record_batches_to_arrow_batches must emit one per input");
+    Ok(proto::ExecutePlanResponse {
+        session_id: session_id.to_owned(),
+        server_side_session_id: SERVER_SESSION_ID.clone(),
+        operation_id: operation_id.to_owned(),
+        response_id: format!("{operation_id}-{seq}"),
+        response_type: Some(proto::execute_plan_response::ResponseType::ArrowBatch(ab)),
+        ..Default::default()
+    })
+}
+
+/// State machine for the streaming `unfold`. Owns everything the loop needs
+/// per iteration; moved into `unfold` and threaded through each `.await`.
+struct StreamingState {
+    rx: tokio::sync::mpsc::Receiver<thunderduck_core::runtime::StreamBatch>,
+    resolved_schema: StructType,
+    plan: IntervalPlan,
+    /// Cached Arc<Schema> built from the FIRST post-transcode batch — reused
+    /// verbatim for every subsequent batch (Arc::clone is refcount-only).
+    stamped_schema: Option<Arc<Schema>>,
+    session_id: String,
+    operation_id: String,
+    seq: usize,
+    /// One-shot: send the proto `Schema` frame before the first batch.
+    sent_schema_frame: bool,
+    /// Terminal frame — once yielded, unfold returns None on next poll.
+    sent_complete_frame: bool,
+    /// Set when the receiver reports an error; the loop yields the Status
+    /// once and then terminates.
+    pending_error: Option<Status>,
+}
+
+/// Execute a query via τ-emitted SQL and stream Arrow batches back.
+///
+/// Per-batch pipeline:
+///
+/// 1. Emit ONE `ExecutePlanResponse.schema` frame (proto-schema, decoded on
+///    the client via `proto_schema_to_pyspark_data_type` — has arms for all
+///    three Spark interval kinds).
+/// 2. For each `thunderduck_core::runtime::StreamBatch::Batch(rb)`:
+///    a. `arrow_interval_transcode::apply` — returns `Vec<ArrayRef>` with
+///       DayTimeInterval columns rewritten from DuckDB's `Interval(MonthDayNano)`
+///       to Spark's `Duration(Microsecond)`. No intermediate `RecordBatch`.
+///    b. The wire `Arc<Schema>` is built ONCE from the first batch (via
+///       `arrow_schema_stamp::build_stamped_schema`) and reused verbatim on
+///       every subsequent batch (Arc::clone is refcount-only).
+///    c. A single `RecordBatch::try_new_with_options(stamped_schema, cols, ...)`
+///       call constructs the outbound batch in one shot — no
+///       transcode→stamp→wrap chain of temporaries (perf finding MED-1,
+///       `.agent-output/004-perf-findings.md`).
+///    d. Emit an `ArrowBatch` frame.
+/// 3. On `thunderduck_core::runtime::StreamBatch::Complete` — emit `ResultComplete`.
+/// 4. On `thunderduck_core::runtime::StreamBatch::Error(msg)` — reclassify via
+///    `ThunderduckError::DuckDb(msg).reclassified_spark_runtime()` so the
+///    ANSI Spark class token survives to the client, then yield the Status
+///    and terminate the stream (Q5 fix — the previous inline path skipped
+///    reclassification).
+///
+/// Concurrency model: transcode + stamp run on the tonic async task after the
+/// mpsc hop; DuckDB's `!Send` Connection stays on its dedicated session
+/// thread. The mpsc buffer is 4 batches so DuckDB blocks when the client is
+/// slow (backpressure) without wedging the session thread on every batch.
 async fn execute_streaming_query(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     sql: &str,
@@ -666,26 +769,159 @@ async fn execute_streaming_query(
     session_id: &str,
     operation_id: &str,
 ) -> Result<Response<<ThunderduckService as SparkConnectService>::ExecutePlanStream>, Status> {
-    // `resolved_schema` was produced by the SAME `analyze` call that emitted
-    // `sql` (via `transpiler_v2::generate_with_schema`, see `finalize`). Perf
-    // review HIGH #1: the earlier wiring re-ran the analyzer here — dropped.
-    // Its Spark-visible view drives the outbound Arrow-schema stamp; see
-    // `arrow_schema_stamp` for the "why" (arr-012 duplicate-struct-field-name
-    // substrate gap + boundary hygiene).
-    let batches = session
-        .execute(sql)
+    let rx = session
+        .execute_streaming(sql.to_string().as_str(), None, 4)
         .await
         .map_err(|e| Status::from(ConnectError::from(e)))?;
 
-    // Metadata-only rename: buffer identity is preserved (see
-    // `arrow_schema_stamp::stamp_batch_schemas` doc).
-    let stamped = crate::arrow_schema_stamp::stamp_batch_schemas(batches, resolved_schema);
+    let plan = IntervalPlan::build(resolved_schema);
 
-    let responses =
-        batches_to_responses(session_id, operation_id, &stamped).map_err(Status::from)?;
+    let state = StreamingState {
+        rx,
+        resolved_schema: resolved_schema.clone(),
+        plan,
+        stamped_schema: None,
+        session_id: session_id.to_owned(),
+        operation_id: operation_id.to_owned(),
+        seq: 0,
+        sent_schema_frame: false,
+        sent_complete_frame: false,
+        pending_error: None,
+    };
 
-    let stream = stream::iter(responses.into_iter().map(Ok));
+    let stream = stream::unfold(state, streaming_step);
     Ok(Response::new(Box::pin(stream)))
+}
+
+/// Build the post-transcode Arrow `Schema` from the source (pre-transcode)
+/// schema plus the transcoded column array — the source `Field` metadata
+/// (name / nullable / metadata) is preserved verbatim, only the leaf Arrow
+/// `DataType` is taken from each transcoded column. Called ONCE per query on
+/// the first batch; the resulting `Schema` is fed to
+/// `arrow_schema_stamp::build_stamped_schema` and then discarded (or, on
+/// stamp failure, cached as the fallback wire schema).
+fn post_transcode_schema(src: &Schema, cols: &[ArrayRef]) -> Schema {
+    let new_fields: Vec<Field> = src
+        .fields()
+        .iter()
+        .zip(cols.iter())
+        .map(|(f, c)| {
+            Field::new(f.name(), c.data_type().clone(), f.is_nullable())
+                .with_metadata(f.metadata().clone())
+        })
+        .collect();
+    Schema::new(new_fields).with_metadata(src.metadata.clone())
+}
+
+/// One iteration of the streaming state machine. Returns
+/// `Some((frame, next_state))` while there is work to do; `None` terminates
+/// the tonic stream cleanly.
+async fn streaming_step(
+    mut s: StreamingState,
+) -> Option<(Result<proto::ExecutePlanResponse, Status>, StreamingState)> {
+    // 1. Terminal: pending error yields once, then unfold returns None.
+    if let Some(status) = s.pending_error.take() {
+        return Some((
+            Err(status),
+            StreamingState {
+                pending_error: None,
+                ..s
+            },
+        ));
+    }
+    if s.sent_complete_frame {
+        return None;
+    }
+    // 2. Schema frame first (one-shot).
+    if !s.sent_schema_frame {
+        s.sent_schema_frame = true;
+        let frame = build_schema_response(&s.resolved_schema, &s.session_id, &s.operation_id);
+        return Some((Ok(frame), s));
+    }
+    // 3. Pull the next thunderduck_core::runtime::StreamBatch from the session thread.
+    match s.rx.recv().await {
+        Some(thunderduck_core::runtime::StreamBatch::Batch(rb)) => {
+            // 3a. Transcode DayTimeInterval columns → Vec<ArrayRef>. No
+            // intermediate RecordBatch — the wire batch is built once below
+            // from `(stamped_schema, cols)`.
+            let cols: Vec<ArrayRef> = match arrow_interval_transcode::apply(&rb, &s.plan) {
+                Ok(cols) => cols,
+                Err(e) => {
+                    let status = Status::from(ConnectError::from(e));
+                    // Terminate after yielding the error.
+                    s.sent_complete_frame = true;
+                    return Some((Err(status), s));
+                }
+            };
+            // 3b. Build the wire `Arc<Schema>` ONCE per query. On subsequent
+            // batches this branch is skipped and the cached Arc is reused.
+            //
+            // On `build_stamped_schema` failure (structural mismatch — a
+            // debug_assert!/tracing warn path) we cache the un-stamped
+            // post-transcode schema as a fallback so the query still returns
+            // rows. The fallback matches the pre-refactor behavior of
+            // yielding `rb_dt.clone()` at the wire boundary.
+            if s.stamped_schema.is_none() {
+                let post_schema = post_transcode_schema(&rb.schema(), &cols);
+                let cached = match arrow_schema_stamp::build_stamped_schema(
+                    &post_schema,
+                    &s.resolved_schema,
+                ) {
+                    Ok(schema) => schema,
+                    Err(()) => Arc::new(post_schema),
+                };
+                s.stamped_schema = Some(cached);
+            }
+            let schema = Arc::clone(
+                s.stamped_schema
+                    .as_ref()
+                    .expect("stamped_schema seeded above"),
+            );
+            // 3c. One-shot construction of the wire RecordBatch.
+            let opts = RecordBatchOptions::new()
+                .with_match_field_names(false)
+                .with_row_count(Some(rb.num_rows()));
+            let rb_named = match RecordBatch::try_new_with_options(schema, cols, &opts) {
+                Ok(b) => b,
+                Err(e) => {
+                    let status = Status::from(ConnectError::Arrow(e.to_string()));
+                    s.sent_complete_frame = true;
+                    return Some((Err(status), s));
+                }
+            };
+            // 3d. Serialize + wrap.
+            let frame = match batch_to_response(&rb_named, &s.session_id, &s.operation_id, s.seq) {
+                Ok(f) => f,
+                Err(e) => {
+                    let status = Status::from(e);
+                    s.sent_complete_frame = true;
+                    return Some((Err(status), s));
+                }
+            };
+            s.seq += 1;
+            Some((Ok(frame), s))
+        }
+        Some(thunderduck_core::runtime::StreamBatch::Complete) => {
+            let frame = result_complete_response(&s.session_id, &s.operation_id);
+            s.sent_complete_frame = true;
+            Some((Ok(frame), s))
+        }
+        Some(thunderduck_core::runtime::StreamBatch::Error(msg)) => {
+            // Q5 fix — apply ADR-006 reclassification so a τ-emitted
+            // `[CLASS]` token survives to the client via `Status::internal`.
+            let err = ThunderduckError::DuckDb(msg).reclassified_spark_runtime();
+            let status = Status::from(ConnectError::from(err));
+            s.sent_complete_frame = true;
+            Some((Err(status), s))
+        }
+        // Session thread dropped the sender without sending Complete — treat
+        // as an unexpected terminate; surface a Thunderduck-boundary error.
+        None => {
+            let status = Status::internal("session stream closed unexpectedly (no Complete frame)");
+            s.sent_complete_frame = true;
+            Some((Err(status), s))
+        }
+    }
 }
 
 /// Handle `CreateDataframeView` after successful transpile.

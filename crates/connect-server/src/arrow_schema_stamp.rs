@@ -37,9 +37,12 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType as ArrowDt, Field, Fields, Schema};
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatchOptions;
 use thunderduck_core::types::pyspark_parity::dedup_names;
 use thunderduck_core::types::{DataType as TdckDt, StructType as TdckStruct};
+
+use crate::arrow_interval_transcode::{is_arrow_duration_micros, is_arrow_interval_month_day_nano};
 
 /// A structural mismatch between τ's analyzer `resolved_schema` and the
 /// DuckDB-produced Arrow schema at some position in the schema tree.
@@ -67,6 +70,7 @@ struct SchemaShapeMismatch {
 /// in release — no prior-green corpus case may regress. Any regression
 /// surfaces the exact mismatch path in the log so the fix can be traced back
 /// to the τ analyzer.
+#[allow(dead_code)] // Retained for tests + future DDL / non-streaming paths.
 pub fn stamp_batch_schemas(
     batches: Vec<RecordBatch>,
     resolved_schema: &TdckStruct,
@@ -76,8 +80,68 @@ pub fn stamp_batch_schemas(
     }
 
     let arrow_schema = batches[0].schema();
-    let rebuilt = match rewrite_top_schema(&arrow_schema, resolved_schema) {
-        Ok(schema) => Arc::new(schema),
+    let rebuilt = match build_stamped_schema(&arrow_schema, resolved_schema) {
+        Ok(schema) => schema,
+        Err(_) => return batches, // build_stamped_schema already logged.
+    };
+
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        match stamp_one(batch, &rebuilt) {
+            Ok(new_batch) => out.push(new_batch),
+            Err(_) => return batches, // stamp_one already logged.
+        }
+    }
+    out
+}
+
+/// Rewrite one batch's schema against a pre-built `stamped_schema` (from
+/// [`build_stamped_schema`]). Data buffers are unchanged — the rebuilt
+/// [`RecordBatch`] shares the same underlying `ArrayData` as the input.
+///
+/// Callers that stream should build the stamped schema ONCE (from the first
+/// batch's schema) and reuse it for every subsequent batch — the schema
+/// rebuild is O(n_cols) and worth caching.
+pub fn stamp_one(
+    batch: &RecordBatch,
+    stamped_schema: &Arc<Schema>,
+) -> Result<RecordBatch, ArrowError> {
+    let opts = RecordBatchOptions::new()
+        .with_match_field_names(false)
+        .with_row_count(Some(batch.num_rows()));
+    match RecordBatch::try_new_with_options(
+        Arc::clone(stamped_schema),
+        batch.columns().to_vec(),
+        &opts,
+    ) {
+        Ok(new_batch) => Ok(new_batch),
+        Err(err) => {
+            debug_assert!(
+                false,
+                "arrow_schema_stamp: RecordBatch::try_new_with_options failed after \
+                 shape-compatible rewrite: {err}"
+            );
+            tracing::warn!(
+                error = %err,
+                "arrow_schema_stamp: batch reconstruction failed — falling back to \
+                 DuckDB-produced Arrow schema",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Build the stamped Arrow `Schema` once, from a source `arrow_schema` + τ's
+/// `resolved_schema`. On structural mismatch, `debug_assert!`s in debug
+/// builds and returns `Err(())` in release (callers should fall back to the
+/// DuckDB-produced schema). The Err carries no payload — the mismatch is
+/// already surfaced via `tracing::warn!`.
+pub fn build_stamped_schema(
+    arrow_schema: &Schema,
+    resolved_schema: &TdckStruct,
+) -> Result<Arc<Schema>, ()> {
+    match rewrite_top_schema(arrow_schema, resolved_schema) {
+        Ok(schema) => Ok(Arc::new(schema)),
         Err(mm) => {
             debug_assert!(
                 false,
@@ -90,41 +154,9 @@ pub fn stamp_batch_schemas(
                 arrow = %mm.arrow,
                 "arrow_schema_stamp: shape mismatch — falling back to DuckDB-produced Arrow schema"
             );
-            return batches;
-        }
-    };
-
-    // Rebuild each batch with the stamped schema. `match_field_names(false)`
-    // makes `try_new_with_options` compare column and field data types via
-    // `equals_datatype`, which ignores nested field names — required because
-    // the stamp only changes names, not shapes.
-    let mut out = Vec::with_capacity(batches.len());
-    for batch in &batches {
-        let opts = RecordBatchOptions::new()
-            .with_match_field_names(false)
-            .with_row_count(Some(batch.num_rows()));
-        match RecordBatch::try_new_with_options(
-            Arc::clone(&rebuilt),
-            batch.columns().to_vec(),
-            &opts,
-        ) {
-            Ok(new_batch) => out.push(new_batch),
-            Err(err) => {
-                debug_assert!(
-                    false,
-                    "arrow_schema_stamp: RecordBatch::try_new_with_options failed after \
-                     shape-compatible rewrite: {err}"
-                );
-                tracing::warn!(
-                    error = %err,
-                    "arrow_schema_stamp: batch reconstruction failed — falling back to \
-                     DuckDB-produced Arrow schema",
-                );
-                return batches;
-            }
+            Err(())
         }
     }
-    out
 }
 
 /// Rewrite one Arrow `Schema` against τ's row `StructType`.
@@ -206,10 +238,50 @@ fn rewrite_data_type(
         | TdckDt::Date
         | TdckDt::Timestamp
         | TdckDt::TimestampNtz
-        | TdckDt::YearMonthInterval
-        | TdckDt::DayTimeInterval
-        | TdckDt::Interval
         | TdckDt::Null => Ok(arrow.clone()),
+
+        // ── Interval semantics ───────────────────────────────────────────
+        // The `arrow_interval_transcode` module runs BEFORE the stamp; by
+        // the time we get here, `DayTimeInterval` columns have already been
+        // rewritten to `Duration(Microsecond)`. Non-streaming callers (tests,
+        // future DDL paths) may hand us the pre-transcode `Interval(MonthDayNano)`
+        // shape — accept both to keep those paths working.
+        TdckDt::DayTimeInterval => {
+            if is_arrow_duration_micros(arrow) || is_arrow_interval_month_day_nano(arrow) {
+                Ok(arrow.clone())
+            } else {
+                Err(SchemaShapeMismatch {
+                    path: path.to_owned(),
+                    tdck: "DayTimeInterval".to_owned(),
+                    arrow: format!("{arrow:?}"),
+                })
+            }
+        }
+        TdckDt::Interval => {
+            if is_arrow_interval_month_day_nano(arrow) {
+                Ok(arrow.clone())
+            } else {
+                Err(SchemaShapeMismatch {
+                    path: path.to_owned(),
+                    tdck: "Interval (Calendar)".to_owned(),
+                    arrow: format!("{arrow:?}"),
+                })
+            }
+        }
+        // YearMonthInterval passes through as `Interval(MonthDayNano)` from
+        // DuckDB; the client re-raises `UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION`
+        // mirroring Spark's reference behavior (intv-002).
+        TdckDt::YearMonthInterval => {
+            if is_arrow_interval_month_day_nano(arrow) {
+                Ok(arrow.clone())
+            } else {
+                Err(SchemaShapeMismatch {
+                    path: path.to_owned(),
+                    tdck: "YearMonthInterval".to_owned(),
+                    arrow: format!("{arrow:?}"),
+                })
+            }
+        }
 
         // `Unresolved` should never survive to the response path — the
         // AnalyzePlan boundary guard at `service.rs` already rejects it. If
@@ -748,5 +820,96 @@ mod tests {
         let tdck = tdck_struct(vec![("x", TdckDt::Long, true)]);
         let out = stamp_batch_schemas(vec![], &tdck);
         assert!(out.is_empty());
+    }
+
+    // ── Interval semantics (intv-001/003/005 substrate) ─────────────────────
+
+    /// Post-transcode DayTimeInterval column is `Duration(Microsecond)`; the
+    /// stamp must accept it and rename the top-level field only.
+    #[test]
+    fn stamp_daytime_after_transcode_accepts_duration_micros() {
+        use arrow::datatypes::TimeUnit;
+        let arrow_schema = Schema::new(vec![Field::new(
+            "later",
+            ArrowDt::Duration(TimeUnit::Microsecond),
+            true,
+        )]);
+        let tdck = tdck_struct(vec![("later", TdckDt::DayTimeInterval, true)]);
+        let rebuilt = rewrite_top_schema(&arrow_schema, &tdck)
+            .expect("DayTime post-transcode must stamp cleanly");
+        assert_eq!(
+            rebuilt.field(0).data_type(),
+            &ArrowDt::Duration(TimeUnit::Microsecond),
+        );
+        assert_eq!(rebuilt.field(0).name(), "later");
+    }
+
+    /// CalendarInterval — DuckDB's native `Interval(MonthDayNano)` layout is
+    /// bit-identical to Spark's wire encoding; the stamp is a name-only pass.
+    #[test]
+    fn stamp_interval_calendar_passes_month_day_nano_through() {
+        use arrow::datatypes::IntervalUnit;
+        let arrow_schema = Schema::new(vec![Field::new(
+            "iv",
+            ArrowDt::Interval(IntervalUnit::MonthDayNano),
+            true,
+        )]);
+        let tdck = tdck_struct(vec![("iv", TdckDt::Interval, true)]);
+        let rebuilt =
+            rewrite_top_schema(&arrow_schema, &tdck).expect("CalendarInterval stamp must succeed");
+        assert_eq!(
+            rebuilt.field(0).data_type(),
+            &ArrowDt::Interval(IntervalUnit::MonthDayNano),
+        );
+    }
+
+    /// YearMonthInterval — DuckDB emits `Interval(MonthDayNano)`, and τ
+    /// passes it through; the stamp must accept that.
+    #[test]
+    fn stamp_yearmonth_accepts_month_day_nano() {
+        use arrow::datatypes::IntervalUnit;
+        let arrow_schema = Schema::new(vec![Field::new(
+            "ymi",
+            ArrowDt::Interval(IntervalUnit::MonthDayNano),
+            true,
+        )]);
+        let tdck = tdck_struct(vec![("ymi", TdckDt::YearMonthInterval, true)]);
+        let rebuilt = rewrite_top_schema(&arrow_schema, &tdck)
+            .expect("YearMonth stamp must succeed on MonthDayNano");
+        assert_eq!(
+            rebuilt.field(0).data_type(),
+            &ArrowDt::Interval(IntervalUnit::MonthDayNano),
+        );
+    }
+
+    /// Pre-transcode DayTimeInterval — accept `Interval(MonthDayNano)` too so
+    /// non-streaming callers (tests, future DDL) that stamp before the
+    /// transcode still work.
+    #[test]
+    fn stamp_daytime_before_transcode_accepts_month_day_nano() {
+        use arrow::datatypes::IntervalUnit;
+        let arrow_schema = Schema::new(vec![Field::new(
+            "dt",
+            ArrowDt::Interval(IntervalUnit::MonthDayNano),
+            true,
+        )]);
+        let tdck = tdck_struct(vec![("dt", TdckDt::DayTimeInterval, true)]);
+        let rebuilt = rewrite_top_schema(&arrow_schema, &tdck)
+            .expect("DayTime pre-transcode fallback must stamp cleanly");
+        assert_eq!(
+            rebuilt.field(0).data_type(),
+            &ArrowDt::Interval(IntervalUnit::MonthDayNano),
+        );
+    }
+
+    /// A bogus Arrow type paired with an interval τ position is a shape
+    /// mismatch (loud-fail).
+    #[test]
+    fn stamp_interval_rejects_wrong_arrow_shape() {
+        let arrow_schema = Schema::new(vec![Field::new("dt", ArrowDt::Int64, true)]);
+        let tdck = tdck_struct(vec![("dt", TdckDt::DayTimeInterval, true)]);
+        let err = rewrite_top_schema(&arrow_schema, &tdck)
+            .expect_err("Int64 paired with DayTimeInterval must be a shape mismatch");
+        assert_eq!(err.tdck, "DayTimeInterval");
     }
 }

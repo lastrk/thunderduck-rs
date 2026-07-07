@@ -1345,6 +1345,64 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             right: Box::new(bool_literal(false)),
             negated: false,
         })),
+        // `x LIKE ANY (p1, …, pn)` ≡ `(x LIKE p1) OR … OR (x LIKE pn)` (Spark
+        // 4.1.1). sqlparser flags this with `any: true` and parses the pattern
+        // list as an `Expr::Tuple`. Desugar at lowering into an OR-chain of the
+        // ordinary single-pattern `Expression::Like` (so ESCAPE / NULL 3VL are
+        // identical to a plain LIKE). This arm MUST precede the generic
+        // `Expr::Like` arm below (which ignores `any`), or Rust's first-match
+        // ordering would render it unreachable. Corpus witness: `pr-003`.
+        Expr::Like {
+            any: true,
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            let patterns = match *pattern {
+                Expr::Tuple(ps) => ps,
+                // `LIKE ANY (subquery)` and other non-list shapes are not
+                // implemented; do NOT fall through to the single-pattern arm —
+                // that would silently drop the ANY quantifier (wrong answer).
+                _ => bail_boundary_proto!(
+                    "sql::like_any_non_list",
+                    "LIKE ANY requires a parenthesized list of patterns"
+                ),
+            };
+            build_like_chain(
+                *expr,
+                patterns,
+                BinaryOp::Or,
+                negated,
+                escape_char,
+                cte_scope,
+            )
+        }
+        // `x LIKE ALL (p1, …, pn)` ≡ AND-chain of single LIKEs. sqlparser 0.61
+        // has NO native `LIKE ALL`: it leaves `any: false` and mis-parses the
+        // `ALL (…)` right-hand side as a function call `ALL(p1, …, pn)`. Detect
+        // that deterministic parser artifact (see `is_like_all_artifact`) and
+        // fold into an AND-chain. Guarded tightly so a real user function named
+        // `all` cannot misfire; when the guard is false this arm does not match
+        // and an ordinary `x LIKE 'p'` flows to the unchanged generic arm.
+        // Corpus witness: `pr-004`.
+        Expr::Like {
+            any: false,
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } if is_like_all_artifact(&pattern) => {
+            let patterns = like_all_patterns(*pattern);
+            build_like_chain(
+                *expr,
+                patterns,
+                BinaryOp::And,
+                negated,
+                escape_char,
+                cte_scope,
+            )
+        }
         Expr::Like {
             expr,
             pattern,
@@ -1358,6 +1416,15 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             negated,
             case_insensitive: false,
         })),
+        // `x ILIKE ANY (…)` is not implemented. The generic `Expr::ILike` arm
+        // below ignores `any` (via `..`), so without this guard it would
+        // silently drop the quantifier and return a wrong answer. Fail loud
+        // with an honest boundary error instead (no corpus witness for the
+        // desugar, so a full ILIKE-ANY fold would be dead code).
+        Expr::ILike { any: true, .. } => bail_boundary_proto!(
+            "sql::ilike_any_unsupported",
+            "ILIKE ANY is not implemented in Thunderduck"
+        ),
         // `x ILIKE 'p'` — case-insensitive LIKE. Mirrors the `Expr::Like` arm
         // but flags `case_insensitive: true`, which emission renders as
         // `ILIKE`. `NOT ILIKE` rides the same `negated` field as `NOT LIKE`.
@@ -2590,6 +2657,124 @@ fn value_to_escape_char(v: Value) -> Option<char> {
         Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.chars().next(),
         _ => None,
     }
+}
+
+/// Fold a `LIKE ANY`/`LIKE ALL` pattern list into a boolean chain of ordinary
+/// single-pattern `LIKE`s. `connective` is the NON-negated fold: [`BinaryOp::Or`]
+/// for `ANY` (`LikeAny` = ∃ match), [`BinaryOp::And`] for `ALL` (`LikeAll` = ∀
+/// match). Each element reuses τ's ordinary [`Expression::Like`] lowering, so
+/// ESCAPE and NULL (Kleene 3VL) semantics are identical to a plain `LIKE`. A
+/// single-element list yields a bare `Like` (no `Binary` node). An empty list is
+/// a Thunderduck-boundary error rather than a panic.
+///
+/// `negated` (`NOT LIKE ANY/ALL`) FLIPS the quantifier — matching Spark's
+/// `NotLikeAny`/`NotLikeAll` (`regexpExpressions.scala`): `¬∃ = ∀¬` and
+/// `¬∀ = ∃¬`. So `NOT LIKE ANY` = `NOT(AND-chain)` (= `NOT LikeAll`) and
+/// `NOT LIKE ALL` = `NOT(OR-chain)` (= `NOT LikeAny`). Concretely we fold with the
+/// OPPOSITE connective, then wrap the whole chain in `NOT`; this reproduces
+/// Spark exactly, including NULL 3VL. Corpus: `pr-003`, `pr-004`.
+fn build_like_chain(
+    value: Expr,
+    patterns: Vec<Expr>,
+    connective: BinaryOp,
+    negated: bool,
+    escape_char: Option<Value>,
+    cte_scope: &CteScope,
+) -> Result<Expression, EmissionError> {
+    let value = lower_expr(value, cte_scope)?;
+    let escape = escape_char.and_then(value_to_escape_char);
+    // NOT flips the quantifier (¬∃ = ∀¬, ¬∀ = ∃¬): fold with the opposite
+    // connective when negated, then wrap the chain in NOT below.
+    let fold_op = match (&connective, negated) {
+        (BinaryOp::Or, true) => BinaryOp::And,
+        (BinaryOp::And, true) => BinaryOp::Or,
+        (op, _) => op.clone(),
+    };
+    let mut likes = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        likes.push(Expression::Like(LikeExpression {
+            value: Box::new(value.clone()),
+            pattern: Box::new(lower_expr(p, cte_scope)?),
+            escape,
+            // Negation is applied once to the whole chain below, not per element.
+            negated: false,
+            case_insensitive: false,
+        }));
+    }
+    let Some(chain) = likes.into_iter().reduce(|acc, next| {
+        Expression::Binary(BinaryExpression {
+            op: fold_op.clone(),
+            left: Box::new(acc),
+            right: Box::new(next),
+        })
+    }) else {
+        bail_boundary_proto!(
+            "sql::like_quantifier_empty",
+            "LIKE ANY/ALL requires at least one pattern"
+        );
+    };
+    Ok(if negated {
+        Expression::Unary(UnaryExpression {
+            op: UnaryOp::Not,
+            operand: Box::new(chain),
+        })
+    } else {
+        chain
+    })
+}
+
+/// True iff `pattern` is sqlparser 0.61's mis-parse of `LIKE ALL (p1, …, pn)`:
+/// a bare `ALL(p1, …, pn)` function call with positional args only and no other
+/// function features. Because sqlparser has no native `LIKE ALL`, `ALL (…)` on
+/// a LIKE right-hand side is always this artifact — and Spark's grammar has no
+/// competing reading of `x LIKE all(...)` (it parses as `LIKE ALL`), so
+/// recovering it here is Spark-correct, not a guess. The tight guard prevents a
+/// real user function named `all` from misfiring.
+fn is_like_all_artifact(pattern: &Expr) -> bool {
+    let Expr::Function(f) = pattern else {
+        return false;
+    };
+    // Must be a single, UNQUOTED identifier `all` (case-insensitive). A
+    // backtick-quoted `` `all`(...) `` is a genuine user function call, and a
+    // qualified `schema.all(...)` is not the artifact — neither should misfire.
+    let is_bare_all = matches!(
+        f.name.0.as_slice(),
+        [ObjectNamePart::Identifier(id)]
+            if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("all")
+    );
+    is_bare_all
+        && !f.uses_odbc_syntax
+        && matches!(f.parameters, FunctionArguments::None)
+        && f.filter.is_none()
+        && f.null_treatment.is_none()
+        && f.over.is_none()
+        && f.within_group.is_empty()
+        && matches!(&f.args, FunctionArguments::List(l)
+            if l.duplicate_treatment.is_none()
+                && l.clauses.is_empty()
+                && !l.args.is_empty()
+                && l.args.iter().all(|a|
+                    matches!(a, FunctionArg::Unnamed(FunctionArgExpr::Expr(_)))))
+}
+
+/// Extract the pattern expressions from a `LIKE ALL` artifact. Precondition:
+/// [`is_like_all_artifact`] holds for `pattern`; if it does not, this returns an
+/// empty `Vec` (which [`build_like_chain`] turns into a boundary error) rather
+/// than panicking.
+fn like_all_patterns(pattern: Expr) -> Vec<Expr> {
+    let Expr::Function(f) = pattern else {
+        return Vec::new();
+    };
+    let FunctionArguments::List(l) = f.args else {
+        return Vec::new();
+    };
+    l.args
+        .into_iter()
+        .filter_map(|a| match a {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -4343,6 +4528,127 @@ mod tests {
             }
             other => panic!("expected Like, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lower_like_any_folds_to_or_chain() {
+        // pr-003: `name LIKE ANY ('A%', '%e')` → (name LIKE 'A%') OR (name LIKE '%e').
+        let plan =
+            parse("SELECT id FROM t WHERE name LIKE ANY ('A%', '%e')").expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Binary(BinaryExpression { op, left, right }) => {
+                assert_eq!(*op, BinaryOp::Or);
+                for side in [&**left, &**right] {
+                    match side {
+                        Expression::Like(l) => {
+                            assert!(!l.negated && !l.case_insensitive);
+                        }
+                        other => panic!("expected Like leaf, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected Binary(Or), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_like_all_folds_to_and_chain() {
+        // pr-004: sqlparser 0.61 mis-parses `LIKE ALL (…)` as `LIKE ALL(...)`
+        // (function call). We detect that artifact and fold into an AND-chain.
+        // This test also PINS that parser artifact: a future sqlparser that
+        // gains native `LIKE ALL` changes the parse and fails here loudly.
+        let plan = parse("SELECT id FROM t WHERE name LIKE ALL ('%a%', '%e%')")
+            .expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Binary(BinaryExpression { op, left, right }) => {
+                assert_eq!(*op, BinaryOp::And);
+                assert!(matches!(&**left, Expression::Like(_)));
+                assert!(matches!(&**right, Expression::Like(_)));
+            }
+            other => panic!("expected Binary(And), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_not_like_any_negates_flipped_chain() {
+        // No corpus witness, kept Spark-correct: NOT flips the quantifier.
+        // Spark `NotLikeANY` = ∃¬ = NOT(AND-chain) (= NOT LikeAll), NOT NOT(OR).
+        let plan = parse("SELECT id FROM t WHERE name NOT LIKE ANY ('A%', '%e')")
+            .expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Unary(UnaryExpression { op, operand }) => {
+                assert_eq!(*op, UnaryOp::Not);
+                assert!(
+                    matches!(&**operand, Expression::Binary(b) if b.op == BinaryOp::And),
+                    "NOT LIKE ANY must be NOT(AND-chain), got {operand:?}"
+                );
+            }
+            other => panic!("expected Unary(Not), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_not_like_all_negates_flipped_chain() {
+        // Spark `NotLikeAll` = ∀¬ = NOT(OR-chain) (= NOT LikeAny).
+        let plan = parse("SELECT id FROM t WHERE name NOT LIKE ALL ('%a%', '%e%')")
+            .expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Unary(UnaryExpression { op, operand }) => {
+                assert_eq!(*op, UnaryOp::Not);
+                assert!(
+                    matches!(&**operand, Expression::Binary(b) if b.op == BinaryOp::Or),
+                    "NOT LIKE ALL must be NOT(OR-chain), got {operand:?}"
+                );
+            }
+            other => panic!("expected Unary(Not), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_like_all_guard_does_not_misfire_on_over() {
+        // A real function call named `all` with an OVER clause fails the artifact
+        // guard, so it is NOT treated as LIKE ALL — it flows to the generic
+        // single-pattern Like arm (whose pattern lowering then handles the call).
+        // Here we only assert it does NOT become an AND-chain of >1 Like.
+        let plan = parse("SELECT id FROM t WHERE name LIKE all(x) OVER ()");
+        // Either it lowers to a single Like (pattern = window fn) or errors; it
+        // must NOT be a Binary(And) of multiple Likes.
+        if let Ok(plan) = plan {
+            if let Expression::Binary(BinaryExpression { op, .. }) = where_predicate(&plan) {
+                assert_ne!(
+                    *op,
+                    BinaryOp::And,
+                    "windowed all() must not be desugared as LIKE ALL"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lower_plain_like_still_single_pattern() {
+        // Regression guard: ordinary `LIKE 'p'` (any:false, non-ALL pattern) must
+        // still reach the unchanged single-pattern arm.
+        let plan = parse("SELECT id FROM t WHERE a LIKE 'x%'").expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Like(l) => assert!(!l.negated && !l.case_insensitive),
+            other => panic!("expected bare Like, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_ilike_any_is_boundary_error() {
+        // ILIKE ANY is not implemented; must fail loud (not silently drop ANY).
+        let result = parse("SELECT id FROM t WHERE a ILIKE ANY ('x%', 'y%')");
+        assert!(
+            matches!(
+                result,
+                Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    ..
+                })
+            ),
+            "expected boundary error for ILIKE ANY, got {result:?}"
+        );
     }
 
     #[test]

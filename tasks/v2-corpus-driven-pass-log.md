@@ -1266,3 +1266,16 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt --check clean on touched files, `cargo check -p thunderduck-core` clean, `cargo test -p thunderduck-core --lib` 636/0, `sql_v2` 232/30/262, lit-009 GREEN, no regression).
 - Commit SHA: (this commit).
+
+## Pass 138 — 2026-07-07 — SQL corpus: LIKE ANY / LIKE ALL (pr-003, pr-004)
+- **Corpus: SQL front-end (parser_v2 lowering desugar).** pr-003 (`WHERE name LIKE ANY ('A%','%e')`), pr-004 (`WHERE name LIKE ALL ('%a%','%e%')`).
+- Root cause (diagnostic-pass-138.md): both parse, fail at lowering. The generic `Expr::Like` arm ignores `any` and lowers `pattern` directly. pr-003 pattern is `Expr::Tuple` (no arm → boundary). pr-004: sqlparser 0.61 has NO native `LIKE ALL` — it leaves `any:false` and mis-parses `ALL (…)` as a function call `ALL(p1,…)`.
+- Architecture (architecture-pass-138.md): lowering-only desugar, zero analyzer/emission churn (emits only pre-existing `Expression::Like`/`Binary{Or,And}`/`Unary{Not}`). Two new `Expr::Like` arms ABOVE the unchanged generic arm (ordering load-bearing — below the `..` catch-all they'd be unreachable): `any:true` (pattern must be `Tuple`, else `sql::like_any_non_list` boundary) → OR-chain; `any:false if is_like_all_artifact` → AND-chain. Three helpers: `build_like_chain`, `is_like_all_artifact` (tight 8-clause guard + single-unquoted-`all` identity), `like_all_patterns`. Plus a defensive `Expr::ILike { any:true, .. }` boundary-bail closing a silent-drop hole.
+- Layer(s) touched: parser_v2/v2_lowering.rs only.
+- ADR citations: ADR-004 (SQL→CommonAst desugar; INV7 front-end agreement), ADR-015 (Spark parity oracle; justifies ALL-artifact recovery since Spark's grammar has no competing `x LIKE all(...)` reading + drives the 3VL NOT semantics), ADR-022 (τ-only; edge/reject = category-2 boundary errors, no new error variant).
+- Corpus signal: 232 → **234** (+2). pr-003 + pr-004 GREEN (values confirmed). No regressions — single-pattern LIKE/ILIKE/RLIKE (whr-010/011/012/013, cx-014) flow through the byte-identical generic arm. core_v2 unaffected.
+- Files: 1. Tests added: 7 (OR-chain; AND-chain [also parser-artifact pin]; NOT LIKE ANY → NOT(AND-chain); NOT LIKE ALL → NOT(OR-chain); guard non-misfire on OVER; plain LIKE still single-pattern; ILIKE ANY → boundary).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer found **1 CRITICAL** (De Morgan misapplied — NOT must FLIP the quantifier: Spark NotLikeAny=∃¬=NOT(AND-chain), NotLikeAll=∀¬=NOT(OR-chain); my first cut kept the same connective, exactly swapped). FIXED: `build_like_chain` now folds with the opposite connective when negated, then wraps in NOT. Reviewer re-verified all four negated/NULL combinations reproduce Spark exactly → Critical+High = 0 (APPROVED). Also resolved reviewer Low (tightened `is_like_all_artifact` to single unquoted `all` — backtick `` `all`(...) `` / qualified `schema.all(...)` no longer misfire). Perf 0 HIGH + 0 MEDIUM (lowering-time only, O(N) over tiny pattern lists; per-pattern value.clone() informational/pathological).
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo test -p thunderduck-core --lib` 643/0, `sql_v2` 234/28/262, pr-003/pr-004 GREEN, no regression).
+- Commit SHA: (this commit).

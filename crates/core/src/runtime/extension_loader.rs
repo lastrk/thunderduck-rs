@@ -41,5 +41,119 @@ pub fn load(conn: &duckdb::Connection) -> Result<()> {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir(&subdir);
+
+    load_dev_delta_extension(conn)?;
+
     Ok(())
+}
+
+/// Env var pointing at a locally-built `duckdb-delta` extension to `LOAD` after
+/// the mandatory extension. Part of the cross-repo Delta dev loop; see
+/// `docs/context/delta-cross-repo-dev-loop.md`.
+const DELTA_EXT_PATH_ENV: &str = "THUNDERDUCK_DELTA_EXT_PATH";
+
+/// Dev-only: if `THUNDERDUCK_DELTA_EXT_PATH` is set, `LOAD` that extension too.
+///
+/// This lets the cross-repo dev loop swap in a freshly built `duckdb-delta`
+/// (against a custom `delta-kernel-rs`) with only a server restart — no
+/// thunderduck recompile. Unset ⇒ no-op (production is unaffected). Set but
+/// unloadable ⇒ hard error, because a developer who pointed at an extension
+/// expects it to load and must be told when it does not.
+fn load_dev_delta_extension(conn: &duckdb::Connection) -> Result<()> {
+    load_optional_extension(conn, std::env::var_os(DELTA_EXT_PATH_ENV).as_deref())
+}
+
+/// Core of [`load_dev_delta_extension`], split out so it can be unit-tested with
+/// an explicit path instead of a process-global env var (which would race under
+/// the parallel test runner).
+fn load_optional_extension(
+    conn: &duckdb::Connection,
+    path: Option<&std::ffi::OsStr>,
+) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+
+    let path_str = path.to_str().ok_or_else(|| {
+        ThunderduckError::DuckDb(format!("{DELTA_EXT_PATH_ENV} is not valid UTF-8"))
+    })?;
+
+    conn.execute_batch(&format!("LOAD '{path_str}';"))
+        .map_err(|e| {
+            ThunderduckError::DuckDb(format!(
+                "failed to load delta extension from {DELTA_EXT_PATH_ENV}={path_str}: {e}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn() -> duckdb::Connection {
+        let config = duckdb::Config::default()
+            .with("allow_unsigned_extensions", "true")
+            .expect("config");
+        duckdb::Connection::open_in_memory_with_flags(config).expect("open in-memory duckdb")
+    }
+
+    #[test]
+    fn no_path_is_a_noop() {
+        assert!(load_optional_extension(&conn(), None).is_ok());
+    }
+
+    #[test]
+    fn missing_extension_file_is_a_hard_error() {
+        let err = load_optional_extension(
+            &conn(),
+            Some(std::ffi::OsStr::new("/nonexistent/delta.duckdb_extension")),
+        )
+        .expect_err("loading a nonexistent extension must fail");
+        assert!(
+            err.to_string().contains(DELTA_EXT_PATH_ENV),
+            "error should name the env var, got: {err}"
+        );
+    }
+
+    /// End-to-end gate for the cross-repo Delta dev loop: proves a locally-built
+    /// `duckdb-delta` extension loads into thunderduck's *own* linked libduckdb
+    /// (same v1.5.4 ABI) and that `delta_scan` runs. Exercises the real
+    /// [`load`] path, so `THUNDERDUCK_DELTA_EXT_PATH` drives the dev hook.
+    ///
+    /// Ignored by default (needs the built extension + a Delta table). Run it
+    /// from the dev loop, e.g.:
+    /// ```text
+    /// THUNDERDUCK_DELTA_EXT_PATH=.../delta.duckdb_extension \
+    /// THUNDERDUCK_DELTA_TEST_TABLE=.delta-kernel-rs/kernel/tests/data/table-without-dv-small \
+    ///   cargo test -p thunderduck-core -- --ignored delta_extension_loads_and_scans --nocapture
+    /// ```
+    #[test]
+    #[ignore = "cross-repo dev loop: requires THUNDERDUCK_DELTA_EXT_PATH + THUNDERDUCK_DELTA_TEST_TABLE"]
+    fn delta_extension_loads_and_scans() {
+        assert!(
+            std::env::var_os(DELTA_EXT_PATH_ENV).is_some(),
+            "set {DELTA_EXT_PATH_ENV} to the built delta.duckdb_extension"
+        );
+        let table = std::env::var("THUNDERDUCK_DELTA_TEST_TABLE")
+            .expect("set THUNDERDUCK_DELTA_TEST_TABLE to a Delta table directory");
+
+        let conn = conn();
+        // Full mandatory-load path: embeds thdck_spark_funcs AND, via the env
+        // var above, LOADs the local delta extension through load_dev_delta_extension.
+        load(&conn).expect("load thdck_spark_funcs + local delta extension");
+
+        let rows: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM delta_scan('{table}')"),
+                [],
+                |r| r.get(0),
+            )
+            .expect("delta_scan should execute against the fixture table");
+        assert!(
+            rows > 0,
+            "expected a non-empty Delta fixture, got {rows} rows"
+        );
+    }
 }

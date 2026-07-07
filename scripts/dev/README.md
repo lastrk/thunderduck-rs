@@ -63,6 +63,24 @@ build) so that subsequent non-bundled builds — in every worktree — link it.
 - `scripts/dev/duckdb-build-cache.sh dir` — print the prebuilt cache dir.
 - Inspect cache hits: `<repo>/.build-cache/bin/sccache --show-stats`.
 
+## Cross-repo Delta dev loop
+
+- `scripts/dev/delta-dev-setup.sh` — one-time (idempotent): clone our forks of
+  `duckdb-delta` + `delta-kernel-rs` into gitignored `.duckdb-delta/` /
+  `.delta-kernel-rs/`, pin the `duckdb` submodule to the ABI-matching tag, patch
+  the extension's CMakeLists for a local-kernel override, and bootstrap the
+  toolchain (below).
+- `scripts/dev/delta-toolchain-setup.sh` — bootstrap a relocatable conda-forge
+  gcc-13 under gitignored `.delta-toolchain/` via micromamba (no root; the
+  devcontainer's gcc 11 can't compile the extension). Invoked by the setup
+  script; safe to run standalone.
+- `scripts/dev/delta-build.sh [debug|release]` — build the extension against the
+  **local** kernel; prints the `export THUNDERDUCK_DELTA_EXT_PATH=...` line that
+  the server's dev-load hook consumes.
+
+Full design, pinning matrix, and gotchas:
+[`docs/context/delta-cross-repo-dev-loop.md`](../../docs/context/delta-cross-repo-dev-loop.md).
+
 ## Disabling
 
 - Delete the `# >>> thunderduck dev-cache (managed) >>>` block in

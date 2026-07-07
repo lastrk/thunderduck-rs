@@ -32,6 +32,15 @@ tests/integration/.env
 # DuckDB extension binaries (downloaded by build.rs on every fresh build)
 extensions/
 
+# Cross-repo Delta dev loop: local checkouts of our forks of duckdb-delta and
+# delta-kernel-rs, materialized + built by scripts/dev/delta-dev-setup.sh.
+# See docs/context/delta-cross-repo-dev-loop.md.
+/.delta-kernel-rs/
+/.duckdb-delta/
+# Userspace gcc toolchain (micromamba + conda-forge) for building the extension
+# on this gcc-11 devcontainer; bootstrapped by scripts/dev/delta-toolchain-setup.sh.
+/.delta-toolchain/
+
 # Vendored Apache Spark reference install (downloaded by setup-differential-testing.sh)
 .spark/
 

@@ -271,6 +271,7 @@ Source: release [`ext6`](https://github.com/nubank/thunderduck-duckdb-extension/
 4. **Agent context** (`docs/context/`) — condensed reference (architecture, build commands, coding standards, dependencies, gotchas, testing) for τ
 5. **Dev cheatsheets** (`docs/dev-cheatsheets/`) — portable, project-agnostic technique libraries loaded by the language-specialized subagents (see §Agent Cheatsheets below)
 6. **Task tracking** (`tasks/`) — active work items and lessons learned; retired plans under `tasks/archive/`
+7. **Cross-repo Delta dev loop** (`docs/context/delta-cross-repo-dev-loop.md`) — how to develop Delta read/write across thunderduck ⇄ duckdb-delta ⇄ delta-kernel-rs (gitignored `.delta-kernel-rs/`, `.duckdb-delta/` checkouts; `scripts/dev/delta-{dev-setup,build}.sh`; `THUNDERDUCK_DELTA_EXT_PATH` load hook)
 
 ## Agent Cheatsheets
 

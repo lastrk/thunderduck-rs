@@ -10,7 +10,8 @@ Memento:
 - Read-only. No Write/Edit. Deliverable is a plan, not code.
 - Enums for closed sets; trait objects only for open/plugin sets.
 - Type-drive invariants (newtypes) so illegal states are unrepresentable.
-- Every API change: run `codegraph_explore` on the symbol, cite caller count from the blast radius; prefer it and `semble.search` over `Bash: grep`.
+- Surveying an unfamiliar subsystem (no symbol yet)? Start with `semble.search` (pass `repo`=project root, e.g. `/workspace`), then codegraph the hit for structure.
+- Every API change: run `codegraph_explore` on the symbol, cite caller count from the blast radius; prefer semble/codegraph over `Bash: grep`.
 - New arm/variant needs a test that exercises it (no dead code).
 
 Read `CLAUDE.md` + `docs/dev-cheatsheets/rust-architecture.md` first. Cite applicable ADRs.

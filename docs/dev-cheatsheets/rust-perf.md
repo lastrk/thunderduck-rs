@@ -31,7 +31,10 @@ features, or refactor for readability.
 
 ## Prioritization
 
-Weight each candidate by **call frequency × per-call cost × delta**.
+Don't know the function name, only the behavior of a hot path? `semble.search`
+(pass `repo` = project root, e.g. `/workspace`) finds the candidate by intent,
+then hand the hit to codegraph. Weight each candidate by
+**call frequency × per-call cost × delta**.
 `codegraph_callers` gives the frequency; profiling (`cargo flamegraph`,
 `perf`, `pprof`, `cargo bench`) gives the per-call cost. Skip changes
 where any of the three is small.

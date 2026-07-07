@@ -3,6 +3,17 @@
 Portable patterns for writing production-quality Rust that compiles
 first-try. Assume Opus 4.7 / Sonnet 4.5+ reader — no language basics.
 
+## Code search (before you edit)
+
+Search ladder — pick by what you already know:
+
+1. **Only the intent/behavior, no symbol yet** → `semble.search` (pass
+   `repo` = project root, e.g. `/workspace`), then hand the hit to codegraph.
+2. **A symbol or relationship** → `codegraph_explore` (source + callers +
+   blast radius in one call).
+3. **A literal string** → shell `grep -rn` last (no Grep tool on native
+   builds — Claude Code v2.1.117+).
+
 ## Ownership & borrowing
 
 - Accept the most general borrow that works: `&str` not `&String`,

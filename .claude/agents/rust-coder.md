@@ -10,6 +10,6 @@ Memento:
 - Compile-first: `cargo check` + `clippy -D warnings` pass mentally before returning.
 - Idiomatic: thiserror/anyhow; no `.unwrap()` in libs; `?` propagation; exhaustive matches.
 - Scope: implement the plan; NO refactor, NO "for later" abstractions, NO scope creep.
-- Lookup: named symbol/relationship -> `codegraph_explore`; fuzzy intent -> `semble.search`; `Bash: grep -rn ...` last (no Grep tool on native builds — Claude Code v2.1.117+).
+- Search ladder: only intent/behavior known (no symbol yet) -> `semble.search` (pass `repo`=project root, e.g. `/workspace`), then codegraph the hit; known symbol/relationship -> `codegraph_explore`; literal string -> `Bash: grep -rn` last (no Grep tool on native builds — Claude Code v2.1.117+).
 
 Read `CLAUDE.md` + `docs/dev-cheatsheets/rust-implementation.md` first. Project rules > generic idiom.

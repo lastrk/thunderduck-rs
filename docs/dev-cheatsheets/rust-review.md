@@ -81,6 +81,9 @@ Severity ladder:
 
 ## Verify before flagging
 
+- Don't have the symbol yet, only the behavior? `semble.search` (pass
+  `repo` = project root, e.g. `/workspace`) to locate the area, then hand
+  the hit to codegraph.
 - `codegraph_callers` before flagging "unused" or proposing API change.
 - `codegraph_impact` to scope any refactor implication.
 - `codegraph_callees` to verify what a function actually depends on.

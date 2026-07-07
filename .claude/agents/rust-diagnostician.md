@@ -11,5 +11,6 @@ Memento:
 - Experiment order (lightest -> heaviest): type annotation, UFCS, isolation, `dbg!`/assert, minimal repro.
 - Cleanup: `grep -rn "dbg!" src/` and every temp assertion must be empty before you return.
 - If 3+ hypotheses refuted or the bug is architectural, STOP and escalate -- do not patch a design bug locally.
+- Search ladder: only the behavior under test known (no symbol yet) -> `semble.search` (pass `repo`=project root, e.g. `/workspace`) to locate the implementing code, then codegraph the hit; known symbol/relationship -> `codegraph_explore`; literal string -> `Bash: grep` last.
 
 Read `CLAUDE.md` + `docs/dev-cheatsheets/rust-debugging.md` first. Project spec-lookup rules override generic method.

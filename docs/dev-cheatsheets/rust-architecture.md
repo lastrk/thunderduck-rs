@@ -102,6 +102,10 @@ question the architect + user need to answer before implementation.>
 
 ## Blast-radius verification (before proposing)
 
+Surveying an unfamiliar subsystem and don't yet know the symbol names?
+Start with `semble.search` (pass `repo` = project root, e.g. `/workspace`)
+to find the area by intent, then hand the hit to codegraph for structure.
+
 For every proposed API change on an existing symbol, run
 `codegraph_impact` and cite the caller count. Surprises here mean the
 design needs revisiting before implementation. State impact in the plan:

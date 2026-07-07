@@ -1279,3 +1279,17 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new.
 - Quality Gate: PASS (rustfmt clean, `cargo test -p thunderduck-core --lib` 643/0, `sql_v2` 234/28/262, pr-003/pr-004 GREEN, no regression).
 - Commit SHA: (this commit).
+
+## Pass 139 — 2026-07-07 — SQL corpus: multi-column (row-value) IN (pr-005)
+- **Corpus: SQL front-end (parser_v2 lowering desugar).** pr-005 (`WHERE (dept_id, active) IN ((10, true), (20, false))`).
+- Root cause (diagnostic-pass-139.md): parses to `Expr::InList { expr: Tuple([...]), list: [Tuple, Tuple], negated:false }`; the InList arm lowered `*expr` as scalar, Tuple LHS hit the catch-all → `sql::expr::tuple` boundary. Single-column IN (whr-005/006) already green — scope is ONLY the row form.
+- Architecture (architecture-pass-139.md): lowering-only desugar, no new IR/analyzer/emission change. InList arm branches: Tuple LHS → `build_row_in_chain` → OR-of-AND chain; scalar LHS → byte-identical old `InListExpression` path. **Architect CORRECTED the diagnostic on NULL semantics** (verified Spark 4.1.1 `In.eval` + `InterpretedOrdering`): row-IN is NULL-SAFE struct equality (non-null CreateNamedStructs; null==null matches, null-vs-nonnull doesn't) → returns only TRUE/FALSE, never NULL for literal tuples. So each component desugars to `IS NOT DISTINCT FROM` (τ `IsDistinctFrom{negated:true}`, Spark `<=>`), NOT null-unsafe `=` (which diverges on the NOT form with a NULL column: Spark→TRUE, plain-`=`→NULL). Arity mismatch / non-tuple RHS / empty → boundary error.
+- Layer(s) touched: parser_v2/v2_lowering.rs only.
+- ADR citations: ADR-004 (SQL front-end desugar onto shared nodes; INV7), ADR-015 (differential oracle — null-safe desugar passes a STRICT diff incl. NOT/NULL-literal variants), ADR-016 (Spark 4.1.1 pin defines the null-safe In.eval semantics), ADR-022 (reuse supported variants → no new boundary; arity reject = category-2 boundary approximation of Spark's category-1 DATATYPE_MISMATCH.DATA_DIFF_TYPES). CLAUDE.md "match Spark EXACTLY" selects `<=>` over `=`.
+- Corpus signal: 234 → **235** (+1). pr-005 GREEN (values confirmed). No regressions — scalar IN (whr-005/006) only bypassed when LHS is `Expr::Tuple`; single `(x)` parses as `Expr::Nested` not Tuple; IN-subquery is a separate arm. core_v2 unaffected.
+- Files: 1. Tests added: 5 (row IN → OR-of-AND-of-IsDistinctFrom[negated:true] [asserts null-safe, NOT Eq]; NOT form → Unary(Not); arity mismatch → boundary; non-tuple RHS → boundary; scalar IN/NOT IN unchanged).
+- Findings CLOSE_NOW_IN_THIS_PASS: Reviewer 0 Critical + 0 High (APPROVED — truth-table-verified bit-exact with Spark for positive/NOT/NULL-column/NULL-literal cases; IsDistinctFrom nullable=false matches; panic-free; emission fully parenthesizes so precedence-safe). Perf 0 HIGH + 0 MEDIUM (Θ(k·m) = output-tree size, once per query, off hot path; vecs pre-sized).
+- Findings queued as follow-up: projected-row-IN nullability (Spark marks In nullable though it never yields NULL; τ desugar non-null) — observable only via AnalyzePlan projection schema, never in WHERE; gate on a future projected-row-IN witness. Arity-mismatch error category (boundary vs Spark's category-1 type error) — upgrade if a witness appears.
+- Compiler warning delta: 0 new.
+- Quality Gate: PASS (rustfmt clean, `cargo test -p thunderduck-core --lib` 648/0, `sql_v2` 235/27/262, pr-005 GREEN, no regression).
+- Commit SHA: (this commit).

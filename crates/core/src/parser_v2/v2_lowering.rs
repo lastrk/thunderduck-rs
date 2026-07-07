@@ -1273,19 +1273,29 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
                 else_expr,
             }))
         }
+        // Row-value (multi-column) IN: `(c1,…,ck) IN ((v11,…,v1k), …)`. sqlparser
+        // parses the LHS and each RHS element as `Expr::Tuple`. Spark 4.1.1 treats
+        // this as NULL-SAFE struct equality (`In.eval` + `InterpretedOrdering`:
+        // returns only TRUE/FALSE for literal tuples, never NULL), so desugar with
+        // `IS NOT DISTINCT FROM` per component — NOT null-unsafe `=`, which would
+        // diverge on the NOT form with a NULL column. Corpus witness: `pr-005`.
+        // Scalar-LHS IN keeps the byte-identical `InListExpression` path below.
         Expr::InList {
             expr,
             list,
             negated,
-        } => {
-            let converted_list: Result<Vec<Expression>, EmissionError> =
-                list.into_iter().map(|e| lower_expr(e, cte_scope)).collect();
-            Ok(Expression::InList(InListExpression {
-                expr: Box::new(lower_expr(*expr, cte_scope)?),
-                list: converted_list?,
-                negated,
-            }))
-        }
+        } => match *expr {
+            Expr::Tuple(cols) => build_row_in_chain(cols, list, negated, cte_scope),
+            other => {
+                let converted_list: Result<Vec<Expression>, EmissionError> =
+                    list.into_iter().map(|e| lower_expr(e, cte_scope)).collect();
+                Ok(Expression::InList(InListExpression {
+                    expr: Box::new(lower_expr(other, cte_scope)?),
+                    list: converted_list?,
+                    negated,
+                }))
+            }
+        },
         Expr::Between {
             expr,
             negated,
@@ -2657,6 +2667,102 @@ fn value_to_escape_char(v: Value) -> Option<char> {
         Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => s.chars().next(),
         _ => None,
     }
+}
+
+/// Desugar a row-value IN — `(c1,…,ck) IN ((v11,…,v1k), …, (vm1,…,vmk))` — into a
+/// boolean chain that is bit-exact with Spark 4.1.1 `In.eval` over a struct LHS.
+/// Spark builds the LHS/elements as non-null `CreateNamedStruct`s and matches with
+/// `InterpretedOrdering` (NULL-SAFE: `null==null` matches, `null` vs non-null does
+/// not), so row IN yields only TRUE/FALSE — never NULL — for literal tuples. Each
+/// component is therefore `IS NOT DISTINCT FROM` (τ `IsDistinctFrom{negated:true}`,
+/// Spark `<=>`), NOT null-unsafe `=` (which would wrongly yield NULL on the NOT form
+/// with a NULL column). Components are AND-folded per tuple, tuples OR-folded, and
+/// `negated` (`NOT IN`) wraps the whole chain in `NOT` (exact complement, also never
+/// NULL). Mirrors the pass-138 `build_like_chain` reduce-fold + NOT-wrap.
+///
+/// Every RHS element must be an `Expr::Tuple` of arity == `cols.len()`; a non-tuple
+/// element or an arity mismatch is a Thunderduck-boundary error (Spark rejects these
+/// as `DATATYPE_MISMATCH.DATA_DIFF_TYPES` at analysis — lowering's only vocabulary is
+/// the boundary channel). Empty list / empty LHS is likewise a boundary error, not a
+/// panic. Corpus witness: `pr-005`.
+fn build_row_in_chain(
+    cols: Vec<Expr>,
+    rows: Vec<Expr>,
+    negated: bool,
+    cte_scope: &CteScope,
+) -> Result<Expression, EmissionError> {
+    let arity = cols.len();
+    if arity == 0 {
+        bail_boundary_proto!(
+            "sql::in_row::empty_lhs",
+            "row IN requires at least one left-hand column"
+        );
+    }
+    let lowered_cols = cols
+        .into_iter()
+        .map(|c| lower_expr(c, cte_scope))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut tuple_preds = Vec::with_capacity(rows.len());
+    for row in rows {
+        let vs = match row {
+            Expr::Tuple(vs) => vs,
+            other => bail_boundary_proto!(
+                "sql::in_row::non_tuple_element",
+                format!("row IN requires each right-hand element to be a tuple, got {other:?}")
+            ),
+        };
+        if vs.len() != arity {
+            bail_boundary_proto!(
+                "sql::in_row::arity_mismatch",
+                format!(
+                    "row IN element has arity {} but the left-hand side has arity {arity}",
+                    vs.len()
+                )
+            );
+        }
+        // NULL-safe per-component equality: `col IS NOT DISTINCT FROM value`.
+        let mut eqs = Vec::with_capacity(arity);
+        for (col, v) in lowered_cols.iter().zip(vs) {
+            eqs.push(Expression::IsDistinctFrom(IsDistinctFromExpression {
+                left: Box::new(col.clone()),
+                right: Box::new(lower_expr(v, cte_scope)?),
+                negated: true,
+            }));
+        }
+        let Some(and_chain) = eqs.into_iter().reduce(|acc, next| {
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::And,
+                left: Box::new(acc),
+                right: Box::new(next),
+            })
+        }) else {
+            // arity ≥ 1 guaranteed above, so this is unreachable; guard anyway.
+            bail_boundary_proto!("sql::in_row::empty_tuple", "row IN tuple is empty");
+        };
+        tuple_preds.push(and_chain);
+    }
+
+    let Some(chain) = tuple_preds.into_iter().reduce(|acc, next| {
+        Expression::Binary(BinaryExpression {
+            op: BinaryOp::Or,
+            left: Box::new(acc),
+            right: Box::new(next),
+        })
+    }) else {
+        bail_boundary_proto!(
+            "sql::in_row::empty_list",
+            "row IN requires at least one right-hand tuple"
+        );
+    };
+    Ok(if negated {
+        Expression::Unary(UnaryExpression {
+            op: UnaryOp::Not,
+            operand: Box::new(chain),
+        })
+    } else {
+        chain
+    })
 }
 
 /// Fold a `LIKE ANY`/`LIKE ALL` pattern list into a boolean chain of ordinary
@@ -4649,6 +4755,102 @@ mod tests {
             ),
             "expected boundary error for ILIKE ANY, got {result:?}"
         );
+    }
+
+    #[test]
+    fn lower_row_in_folds_to_or_of_and_of_null_safe_eq() {
+        // pr-005: `(a, b) IN ((1, 2), (3, 4))` → NULL-SAFE (Spark row-IN is struct
+        // equality): (a <=> 1 AND b <=> 2) OR (a <=> 3 AND b <=> 4). The leaves
+        // MUST be IsDistinctFrom (negated:true), NOT Binary(Eq).
+        let plan =
+            parse("SELECT id FROM t WHERE (a, b) IN ((1, 2), (3, 4))").expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Binary(BinaryExpression { op, left, right }) => {
+                assert_eq!(*op, BinaryOp::Or);
+                for tuple_pred in [&**left, &**right] {
+                    match tuple_pred {
+                        Expression::Binary(BinaryExpression {
+                            op: inner_op,
+                            left: il,
+                            right: ir,
+                        }) => {
+                            assert_eq!(*inner_op, BinaryOp::And);
+                            for eq in [&**il, &**ir] {
+                                match eq {
+                                    Expression::IsDistinctFrom(d) => assert!(
+                                        d.negated,
+                                        "row-IN component must be IS NOT DISTINCT FROM"
+                                    ),
+                                    other => {
+                                        panic!("expected null-safe IsDistinctFrom, got {other:?}")
+                                    }
+                                }
+                            }
+                        }
+                        other => panic!("expected inner Binary(And), got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected Binary(Or), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_row_not_in_wraps_in_not() {
+        let plan = parse("SELECT id FROM t WHERE (a, b) NOT IN ((1, 2), (3, 4))")
+            .expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::Unary(UnaryExpression { op, operand }) => {
+                assert_eq!(*op, UnaryOp::Not);
+                assert!(matches!(&**operand, Expression::Binary(b) if b.op == BinaryOp::Or));
+            }
+            other => panic!("expected Unary(Not), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_row_in_arity_mismatch_is_boundary_error() {
+        let result = parse("SELECT id FROM t WHERE (a, b) IN ((1, 2), (3))");
+        assert!(
+            matches!(
+                result,
+                Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    ..
+                })
+            ),
+            "expected boundary error for arity mismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn lower_row_in_non_tuple_element_is_boundary_error() {
+        let result = parse("SELECT id FROM t WHERE (a, b) IN (5, (1, 2))");
+        assert!(
+            matches!(
+                result,
+                Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    ..
+                })
+            ),
+            "expected boundary error for non-tuple RHS element, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn lower_scalar_in_still_uses_inlist() {
+        // Regression: single-column IN keeps the scalar InListExpression path.
+        let plan = parse("SELECT id FROM t WHERE a IN (1, 2)").expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::InList(l) => assert!(!l.negated),
+            other => panic!("expected InList, got {other:?}"),
+        }
+        let plan = parse("SELECT id FROM t WHERE a NOT IN (1, 2)").expect("should parse+lower");
+        match where_predicate(&plan) {
+            Expression::InList(l) => assert!(l.negated),
+            other => panic!("expected InList, got {other:?}"),
+        }
     }
 
     #[test]

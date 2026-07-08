@@ -900,20 +900,21 @@ impl V2ExpressionConverter {
             "SortOrder has no child expression",
         )?;
         let expr = self.convert(child)?;
+        // Mirrors Spark's `SparkConnectPlanner.scala::transformSortOrder`,
+        // which decodes the proto with catch-all defaults (not a
+        // derive-from-direction rule — that rule is `SortOrder.scala`'s
+        // `defaultNullOrdering`, which only applies where Spark constructs a
+        // `SortOrder` from SQL text without an explicit ordering; the SQL
+        // front-end's `lower_order_by_expr` already matches that separately).
+        // The proto decoder's unspecified-field defaults are Descending /
+        // NullsLast, not Ascending / NullsFirst.
         let direction = match so.direction() {
-            ProtoSD::Descending => SortDirection::Descending,
-            _ => SortDirection::Ascending,
+            ProtoSD::Ascending => SortDirection::Ascending,
+            _ => SortDirection::Descending,
         };
-        // Divergence from the SQL front-end (deliberate): the SQL parser
-        // derives an unspecified null ordering from the sort direction
-        // (Spark's default — ASC ⇒ NULLS FIRST, DESC ⇒ NULLS LAST), while
-        // this proto arm maps `SortNullsUnspecified` to `NullsFirst`
-        // unconditionally. That is safe here because `Unspecified` is
-        // unreachable from PySpark 4.x — the Connect client always stamps an
-        // explicit null ordering on every `SortOrder` proto it sends.
         let null_ordering = match so.null_ordering() {
-            ProtoNO::SortNullsLast => NullOrdering::NullsLast,
-            _ => NullOrdering::NullsFirst,
+            ProtoNO::SortNullsFirst => NullOrdering::NullsFirst,
+            _ => NullOrdering::NullsLast,
         };
         Ok(SortOrder {
             expr: Box::new(expr),
@@ -2152,6 +2153,55 @@ mod tests {
                 assert!(offset.is_none());
             }
             _ => panic!("expected Sort"),
+        }
+    }
+
+    /// `convert_sort_order`'s `Unspecified`-field defaults must mirror Spark's
+    /// `SparkConnectPlanner.scala::transformSortOrder` proto decoder, not
+    /// `SortOrder.scala`'s direction-derived default (that rule is the SQL
+    /// front-end's `lower_order_by_expr`, a separate code path). Real PySpark
+    /// clients always stamp both fields explicitly, so this is unit-test-only
+    /// (unreachable via the DataFrame corpus).
+    #[test]
+    fn convert_sort_order_unspecified_defaults_match_spark_connect_planner() {
+        use proto::expression::sort_order::{NullOrdering as ProtoNO, SortDirection as ProtoSD};
+
+        let cases = [
+            (
+                ProtoSD::Unspecified,
+                ProtoNO::SortNullsUnspecified,
+                false,
+                false,
+            ),
+            (
+                ProtoSD::Ascending,
+                ProtoNO::SortNullsUnspecified,
+                true,
+                false,
+            ),
+            (ProtoSD::Unspecified, ProtoNO::SortNullsFirst, false, true),
+            (ProtoSD::Descending, ProtoNO::SortNullsLast, false, false),
+        ];
+        for (direction, null_ordering, want_ascending, want_nulls_first) in cases {
+            let so = proto::expression::SortOrder {
+                child: Some(Box::new(unresolved_attr("id"))),
+                direction: direction as i32,
+                null_ordering: null_ordering as i32,
+            };
+            let mut converter = V2ExpressionConverter::new();
+            let out = converter
+                .convert_sort_order(&so)
+                .expect("sort order conversion must succeed");
+            assert_eq!(
+                out.direction == SortDirection::Ascending,
+                want_ascending,
+                "direction mismatch for {direction:?}/{null_ordering:?}"
+            );
+            assert_eq!(
+                out.null_ordering == NullOrdering::NullsFirst,
+                want_nulls_first,
+                "null_ordering mismatch for {direction:?}/{null_ordering:?}"
+            );
         }
     }
 

@@ -684,15 +684,19 @@ fn lower_table_factor(
             let inner = lower_query(*subquery, cte_scope)?;
             apply_table_alias(inner, alias)
         }
-        TableFactor::TableFunction { expr, alias: _ } => {
+        TableFactor::TableFunction { expr, alias } => {
             // Only bare identifier / function-call table functions covered.
-            match expr {
-                Expr::Function(f) => lower_table_function(f, cte_scope),
+            let node = match expr {
+                Expr::Function(f) => lower_table_function(f, cte_scope)?,
                 other => bail_boundary_proto!(
                     format!("sql::table_function::{other:?}"),
                     "table function expr shape not supported in τ"
                 ),
-            }
+            };
+            // A user alias (`TABLE(range(3)) AS r(id)`) composes on top via
+            // `ToDf` + `AliasedRelation`, same as the `Table`-with-args and
+            // `Derived` branches above — previously silently dropped here.
+            apply_table_alias(node, alias)
         }
         TableFactor::UNNEST {
             array_exprs,
@@ -715,17 +719,18 @@ fn lower_table_factor(
             }))
         }
         TableFactor::Function {
-            name,
-            args,
-            alias: _,
-            ..
+            name, args, alias, ..
         } => {
             let func_name = object_name_to_string(&name);
             let arg_exprs: Vec<Expression> = args
                 .into_iter()
                 .map(|a| function_arg_to_expr(a, cte_scope))
                 .collect::<Result<_, _>>()?;
-            Ok(table_function_node(func_name, arg_exprs, false))
+            // A user alias (`LATERAL explode(arr) AS x(v)`) composes the same
+            // way — previously silently dropped here. The `lateral: bool`
+            // flag remains swallowed by `..`; lateral correlation semantics
+            // are a separate, pre-existing gap this fix does not widen into.
+            apply_table_alias(table_function_node(func_name, arg_exprs, false), alias)
         }
         // SQL `PIVOT` (BigQuery/Snowflake/Databricks). Unlike the DataFrame
         // path, SQL supplies no grouping list — the analyzer derives it from
@@ -847,9 +852,10 @@ fn lower_table_factor(
 /// [`CommonOp::ToDf`] first; the alias name is then attached as a scope
 /// qualifier via [`CommonOp::AliasedRelation`] so qualified refs bind. An
 /// absent alias returns the relation unchanged. Shared by the
-/// `TableFactor::Derived` (subquery-in-FROM) and `TableFactor::Table` with
-/// args (table-valued function) branches so both front-end shapes agree
-/// (INV7, ADR-004).
+/// `TableFactor::Derived` (subquery-in-FROM), `TableFactor::Table` with args
+/// (table-valued function), `TableFactor::TableFunction` (`TABLE(f(...))`),
+/// and `TableFactor::Function` (`LATERAL f(...)`) branches so all front-end
+/// shapes agree (INV7, ADR-004).
 fn apply_table_alias(
     inner: CommonAst,
     alias: Option<TableAlias>,
@@ -1152,7 +1158,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
     // shape the projection can contain. A missed shape used to mis-classify
     // e.g. `SELECT count(x) IN (1, 2)` as non-aggregate.
     match expr {
-        Expr::Function(f) => f.over.is_none() && is_aggregate_function_name(&f.name.to_string()),
+        Expr::Function(f) => function_call_has_aggregate(f),
         Expr::BinaryOp { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
         Expr::UnaryOp { expr, .. } => expr_has_aggregate(expr),
         Expr::Nested(e) => expr_has_aggregate(e),
@@ -1214,6 +1220,56 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         // A.2 (identifiers, literals, subqueries, wildcards, GROUPING SETS,
         // interval/map/tuple/JSON access, etc.) contribute no aggregate.
         _ => false,
+    }
+}
+
+/// Spark's aggregate detection is a full-tree `exists` (`GlobalAggregates`,
+/// `ResolveGroupByAll`, and the GROUP BY ordinal check all use
+/// `exists(_.isInstanceOf[AggregateExpression])`), excluding only an
+/// aggregate that IS the window function itself (`sum(x) OVER (...)` alone is
+/// not an aggregate query). So: check the call's own name (non-windowed
+/// only), then descend into its arguments (windowed or not) and into an
+/// inline `OVER` spec's `PARTITION BY` / `ORDER BY` expressions — an
+/// aggregate nested inside another call's arguments, or inside a window
+/// spec's ordering, still makes the whole query an aggregate query
+/// (`abs(count(x))`, `rank() OVER (ORDER BY count(*))`).
+///
+/// Deliberately NOT scanned: `f.filter`, `f.within_group`, `f.parameters`,
+/// the argument-list `clauses`, and window frame bounds — an aggregate in any
+/// of those positions is invalid Spark anyway, so the worst case is an
+/// error-message divergence on an already-invalid query. A `NamedWindow`
+/// reference in `f.over` is inlined into a `WindowSpec` earlier
+/// (`resolve_named_windows_in_select` runs before this classifier in
+/// `lower_select`); a surviving one is an undefined window, not this
+/// function's concern.
+fn function_call_has_aggregate(f: &Function) -> bool {
+    if f.over.is_none() && is_aggregate_function_name(&f.name.to_string()) {
+        return true;
+    }
+    let args_have_aggregate = match &f.args {
+        FunctionArguments::List(list) => list.args.iter().any(function_arg_has_aggregate),
+        // A subquery argument is its own aggregation scope — never counts
+        // (mirrors the `InSubquery` / bare-subquery leaf handling above).
+        FunctionArguments::None | FunctionArguments::Subquery(_) => false,
+    };
+    args_have_aggregate
+        || match &f.over {
+            Some(WindowType::WindowSpec(spec)) => {
+                spec.partition_by.iter().any(expr_has_aggregate)
+                    || spec.order_by.iter().any(|o| expr_has_aggregate(&o.expr))
+            }
+            Some(WindowType::NamedWindow(_)) | None => false,
+        }
+}
+
+fn function_arg_has_aggregate(arg: &FunctionArg) -> bool {
+    match arg {
+        FunctionArg::Unnamed(fae)
+        | FunctionArg::Named { arg: fae, .. }
+        | FunctionArg::ExprNamed { arg: fae, .. } => match fae {
+            FunctionArgExpr::Expr(e) => expr_has_aggregate(e),
+            FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => false,
+        },
     }
 }
 
@@ -2235,7 +2291,13 @@ fn resolve_named_windows_in_select(select: &mut Select) -> Result<(), EmissionEr
 
 /// Rewrite every `Expr::Function` whose `OVER` clause is a `NamedWindow`
 /// reference into an inline `WindowSpec`, descending through the composite
-/// expression shapes a projection can nest a window call inside.
+/// expression shapes a projection can nest a window call inside. Mirrors
+/// `expr_has_aggregate`'s shape list (same "walker missed a composite shape"
+/// bug class, different walker). Deliberately does NOT descend into a
+/// subquery (`Expr::Subquery`, `Expr::Exists`, or the subquery half of
+/// `InSubquery`) — a `WINDOW` clause is scoped to its containing `SELECT`
+/// (Spark), and a nested subquery resolves its own named windows via its own
+/// `lower_select` → `resolve_named_windows_in_select` call.
 fn resolve_named_windows_in_expr(
     expr: &mut Expr,
     defs: &HashMap<String, WindowSpec>,
@@ -2252,6 +2314,18 @@ fn resolve_named_windows_in_expr(
                 )?;
                 f.over = Some(WindowType::WindowSpec(spec.clone()));
             }
+            if let FunctionArguments::List(list) = &mut f.args {
+                for arg in &mut list.args {
+                    let fae = match arg {
+                        FunctionArg::Unnamed(fae)
+                        | FunctionArg::Named { arg: fae, .. }
+                        | FunctionArg::ExprNamed { arg: fae, .. } => fae,
+                    };
+                    if let FunctionArgExpr::Expr(e) = fae {
+                        resolve_named_windows_in_expr(e, defs)?;
+                    }
+                }
+            }
         }
         Expr::Nested(inner)
         | Expr::UnaryOp { expr: inner, .. }
@@ -2261,6 +2335,83 @@ fn resolve_named_windows_in_expr(
         Expr::BinaryOp { left, right, .. } => {
             resolve_named_windows_in_expr(left, defs)?;
             resolve_named_windows_in_expr(right, defs)?;
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(o) = operand.as_deref_mut() {
+                resolve_named_windows_in_expr(o, defs)?;
+            }
+            for c in conditions {
+                resolve_named_windows_in_expr(&mut c.condition, defs)?;
+                resolve_named_windows_in_expr(&mut c.result, defs)?;
+            }
+            if let Some(e) = else_result.as_deref_mut() {
+                resolve_named_windows_in_expr(e, defs)?;
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            resolve_named_windows_in_expr(expr, defs)?;
+            for e in list {
+                resolve_named_windows_in_expr(e, defs)?;
+            }
+        }
+        // The subquery half of `InSubquery` is a separate window scope; only
+        // the LHS expression is walked.
+        Expr::InSubquery { expr, .. } => {
+            resolve_named_windows_in_expr(expr, defs)?;
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            resolve_named_windows_in_expr(expr, defs)?;
+            resolve_named_windows_in_expr(low, defs)?;
+            resolve_named_windows_in_expr(high, defs)?;
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            any: _,
+            ..
+        }
+        | Expr::ILike {
+            expr,
+            pattern,
+            any: _,
+            ..
+        }
+        | Expr::SimilarTo { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. } => {
+            resolve_named_windows_in_expr(expr, defs)?;
+            resolve_named_windows_in_expr(pattern, defs)?;
+        }
+        Expr::IsNull(e)
+        | Expr::IsNotNull(e)
+        | Expr::IsTrue(e)
+        | Expr::IsNotTrue(e)
+        | Expr::IsFalse(e)
+        | Expr::IsNotFalse(e)
+        | Expr::IsUnknown(e)
+        | Expr::IsNotUnknown(e) => {
+            resolve_named_windows_in_expr(e, defs)?;
+        }
+        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
+            resolve_named_windows_in_expr(a, defs)?;
+            resolve_named_windows_in_expr(b, defs)?;
+        }
+        Expr::Tuple(items) | Expr::Array(sqlparser::ast::Array { elem: items, .. }) => {
+            for e in items {
+                resolve_named_windows_in_expr(e, defs)?;
+            }
+        }
+        Expr::Collate { expr, .. }
+        | Expr::AtTimeZone {
+            timestamp: expr, ..
+        } => {
+            resolve_named_windows_in_expr(expr, defs)?;
         }
         _ => {}
     }
@@ -3216,6 +3367,95 @@ mod tests {
         }
     }
 
+    // ── TableFactor::TableFunction / TableFactor::Function alias handling
+    // (finding 3: the alias was silently dropped, unlike the sibling
+    // Table-with-args / Derived branches). Both `TABLE(f(...))` and
+    // `LATERAL f(...)` compose their alias via the shared `apply_table_alias`
+    // helper, mirroring `parse_range_table_function_with_alias_columns_renames_via_todf`. ──
+
+    #[test]
+    fn table_function_table_syntax_with_alias_columns_renames_via_todf() {
+        // `TABLE(range(3)) AS r(id)` → AliasedRelation{ ToDf{ TableFunction, [id] }, r }
+        let plan = parse("SELECT r.id FROM TABLE(range(3)) AS r(id)").expect("should parse");
+        let aliased = match plan.op {
+            CommonOp::Project { input, .. } => *input,
+            other => panic!("expected Project, got {other:?}"),
+        };
+        let todf = match aliased.op {
+            CommonOp::AliasedRelation { input, alias } => {
+                assert_eq!(alias, "r");
+                *input
+            }
+            other => panic!("expected AliasedRelation, got {other:?}"),
+        };
+        let tf = match todf.op {
+            CommonOp::ToDf {
+                input,
+                column_names,
+            } => {
+                assert_eq!(column_names, vec!["id".to_owned()]);
+                *input
+            }
+            other => panic!("expected ToDf, got {other:?}"),
+        };
+        match tf.op {
+            CommonOp::TableFunction { name, .. } => assert_eq!(name, "range"),
+            other => panic!("expected TableFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_function_lateral_syntax_with_alias_columns_renames_via_todf() {
+        // `LATERAL range(3) AS r(id)` → AliasedRelation{ ToDf{ TableFunction, [id] }, r }
+        let plan = parse("SELECT r.id FROM LATERAL range(3) AS r(id)").expect("should parse");
+        let aliased = match plan.op {
+            CommonOp::Project { input, .. } => *input,
+            other => panic!("expected Project, got {other:?}"),
+        };
+        let todf = match aliased.op {
+            CommonOp::AliasedRelation { input, alias } => {
+                assert_eq!(alias, "r");
+                *input
+            }
+            other => panic!("expected AliasedRelation, got {other:?}"),
+        };
+        let tf = match todf.op {
+            CommonOp::ToDf {
+                input,
+                column_names,
+            } => {
+                assert_eq!(column_names, vec!["id".to_owned()]);
+                *input
+            }
+            other => panic!("expected ToDf, got {other:?}"),
+        };
+        match tf.op {
+            CommonOp::TableFunction { name, .. } => assert_eq!(name, "range"),
+            other => panic!("expected TableFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_function_alias_without_column_list_wraps_in_aliased_relation_only() {
+        // `TABLE(range(3)) AS r` (no explicit column list) → AliasedRelation
+        // directly over TableFunction, no ToDf hop.
+        let plan = parse("SELECT * FROM TABLE(range(3)) AS r").expect("should parse");
+        match plan.op {
+            CommonOp::Project { input, .. } => match input.op {
+                CommonOp::AliasedRelation { input, alias } => {
+                    assert_eq!(alias, "r");
+                    assert!(
+                        matches!(input.op, CommonOp::TableFunction { .. }),
+                        "expected bare TableFunction (no ToDf), got {:?}",
+                        input.op
+                    );
+                }
+                other => panic!("expected AliasedRelation, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_bare_table_still_lowers_to_table_scan() {
         // Regression: `FROM emp` (args None) must keep the bare-table path.
@@ -3812,6 +4052,77 @@ mod tests {
             boundary_shape("SELECT dept_id, count(*) FROM emp GROUP BY 2"),
             "sql::group_by_position_aggregate"
         );
+    }
+
+    // ── expr_has_aggregate descends into non-aggregate function args
+    // (finding 1: `abs(count(x))` used to misclassify the whole statement) ──
+
+    #[test]
+    fn aggregate_nested_inside_non_aggregate_function_is_still_aggregate_query() {
+        // `abs(count(x))` — the outer call `abs` is not an aggregate, but its
+        // argument `count(x)` is; the whole SELECT must still lower to a
+        // global Aggregate, not a Project that silently drops the aggregation.
+        let plan = parse("SELECT abs(count(l_quantity)) FROM lineitem").expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate { grouping, .. } => {
+                assert!(grouping.is_empty(), "no GROUP BY ⇒ global aggregate");
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_by_all_excludes_items_with_nested_aggregate_in_function_args() {
+        // `GROUP BY ALL` must exclude `abs(count(*))` from the grouping list
+        // (it contains an aggregate), grouping only by `l_returnflag`.
+        let plan = parse("SELECT l_returnflag, abs(count(*)) FROM lineitem GROUP BY ALL")
+            .expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate { grouping, .. } => {
+                assert_eq!(
+                    grouping.len(),
+                    1,
+                    "GROUP BY ALL groups only by l_returnflag"
+                );
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_by_ordinal_pointing_at_nested_aggregate_in_function_args_rejected() {
+        // `GROUP BY 1` points at `abs(count(*))`, which contains an aggregate
+        // nested inside `abs`'s argument.
+        assert_eq!(
+            boundary_shape("SELECT abs(count(*)) FROM t GROUP BY 1"),
+            "sql::group_by_position_aggregate"
+        );
+    }
+
+    #[test]
+    fn window_function_alone_is_not_an_aggregate_query() {
+        // `sum(x) OVER ()` alone must remain a Project — the aggregate IS the
+        // window function itself (Spark excludes this from aggregate detection).
+        let plan = parse("SELECT sum(x) OVER () FROM t").expect("should parse");
+        assert!(matches!(plan.op, CommonOp::Project { .. }));
+    }
+
+    #[test]
+    fn aggregate_nested_inside_window_function_args_is_aggregate_query() {
+        // `sum(count(x)) OVER ()` — the window function's own argument is an
+        // aggregate, so the query IS an aggregate query (unlike the bare
+        // `sum(x) OVER ()` case above).
+        let plan = parse("SELECT sum(count(x)) OVER () FROM t").expect("should parse");
+        assert!(matches!(plan.op, CommonOp::Aggregate { .. }));
+    }
+
+    #[test]
+    fn aggregate_nested_inside_window_order_by_is_aggregate_query() {
+        // `rank() OVER (ORDER BY count(*))` — the aggregate is in the window
+        // spec's ORDER BY, not the window call's own args; still an aggregate
+        // query.
+        let plan = parse("SELECT rank() OVER (ORDER BY count(*)) FROM t").expect("should parse");
+        assert!(matches!(plan.op, CommonOp::Aggregate { .. }));
     }
 
     #[test]
@@ -4503,6 +4814,79 @@ mod tests {
         assert_eq!(
             boundary_shape("SELECT rank() OVER w FROM t WINDOW v AS (ORDER BY id)"),
             "sql::named_window::unknown"
+        );
+    }
+
+    // ── resolve_named_windows_in_expr descends into composite shapes
+    // (finding 2: a named-window ref nested in CASE/fn-args used to hit a
+    // spurious "not defined in WINDOW clause" error even though it was) ────
+
+    #[test]
+    fn named_window_ref_inside_case_branch_resolves() {
+        let plan = parse(
+            "SELECT CASE WHEN l_quantity > 0 THEN sum(l_extendedprice) OVER w ELSE 0 END \
+             FROM lineitem WINDOW w AS (PARTITION BY l_returnflag)",
+        )
+        .expect("named window inside CASE must resolve");
+        match first_projection(plan) {
+            Expression::CaseWhen(_) => {}
+            other => panic!("expected CaseWhen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_window_ref_inside_function_args_resolves() {
+        let plan = parse(
+            "SELECT abs(sum(l_quantity) OVER w) FROM lineitem WINDOW w AS (ORDER BY l_orderkey)",
+        )
+        .expect("named window inside fn args must resolve");
+        match first_projection(plan) {
+            Expression::FunctionCall(fc) => {
+                assert!(fc.name.eq_ignore_ascii_case("abs"));
+                assert_eq!(fc.args.len(), 1);
+                assert!(
+                    matches!(&fc.args[0], Expression::Window(_)),
+                    "abs's argument must be the inlined Window, got {:?}",
+                    fc.args[0]
+                );
+            }
+            other => panic!("expected FunctionCall(abs), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_window_ref_inside_between_resolves() {
+        let plan = parse("SELECT sum(x) OVER w BETWEEN 0 AND 100 FROM t WINDOW w AS (ORDER BY id)")
+            .expect("named window inside BETWEEN must resolve");
+        match first_projection(plan) {
+            Expression::Between(b) => {
+                assert!(matches!(*b.expr, Expression::Window(_)));
+            }
+            other => panic!("expected Between, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undefined_named_window_nested_in_case_is_rejected() {
+        // The window ref is nested in a CASE branch and genuinely undefined —
+        // must still surface the boundary error, not silently pass through.
+        assert_eq!(
+            boundary_shape(
+                "SELECT CASE WHEN x > 0 THEN sum(y) OVER w ELSE 0 END \
+                 FROM t WINDOW v AS (ORDER BY y)"
+            ),
+            "sql::named_window::unknown"
+        );
+    }
+
+    #[test]
+    fn named_window_scope_does_not_cross_into_subquery() {
+        // A `WINDOW` clause is scoped to its containing SELECT; an outer-only
+        // definition must NOT resolve a named-window ref inside a nested
+        // subquery's own SELECT.
+        assert_eq!(
+            boundary_shape("SELECT (SELECT sum(a) OVER w FROM u) FROM t WINDOW w AS (ORDER BY b)"),
+            "sql::named_window::unresolved"
         );
     }
 

@@ -27,7 +27,8 @@ pub fn proto_to_data_type(dt: &proto::DataType) -> DataType {
         Some(Kind::TimestampNtz(_)) => DataType::TimestampNtz,
         Some(Kind::YearMonthInterval(_)) => DataType::YearMonthInterval,
         Some(Kind::DayTimeInterval(_)) => DataType::DayTimeInterval,
-        Some(Kind::CalendarInterval(_)) => DataType::YearMonthInterval, // best-effort
+        // mirrors data_type_to_proto: Interval <-> CalendarInterval
+        Some(Kind::CalendarInterval(_)) => DataType::Interval,
         Some(Kind::Decimal(d)) => {
             let precision = d.precision.unwrap_or(38) as u8;
             let scale = d.scale.unwrap_or(18) as u8;
@@ -170,4 +171,79 @@ pub fn proto_struct_to_struct_type(s: &proto::data_type::Struct) -> StructType {
         })
         .collect();
     StructType::new(fields)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calendar_interval_round_trips_to_interval() {
+        // Regression guard for the CalendarInterval <-> Interval asymmetry:
+        // data_type_to_proto(Interval) emits Kind::CalendarInterval, so decoding
+        // that proto must yield DataType::Interval back, not YearMonthInterval.
+        let proto = data_type_to_proto(&DataType::Interval);
+        assert_eq!(proto_to_data_type(&proto), DataType::Interval);
+    }
+
+    #[test]
+    fn interval_kinds_decode_to_distinct_types() {
+        use proto::data_type::Kind;
+
+        let calendar = proto::DataType {
+            kind: Some(Kind::CalendarInterval(
+                proto::data_type::CalendarInterval::default(),
+            )),
+        };
+        assert_eq!(proto_to_data_type(&calendar), DataType::Interval);
+
+        let year_month = proto::DataType {
+            kind: Some(Kind::YearMonthInterval(
+                proto::data_type::YearMonthInterval::default(),
+            )),
+        };
+        assert_eq!(proto_to_data_type(&year_month), DataType::YearMonthInterval);
+
+        let day_time = proto::DataType {
+            kind: Some(Kind::DayTimeInterval(
+                proto::data_type::DayTimeInterval::default(),
+            )),
+        };
+        assert_eq!(proto_to_data_type(&day_time), DataType::DayTimeInterval);
+    }
+
+    #[test]
+    fn nested_calendar_interval_decodes_via_struct_and_array() {
+        use proto::data_type::Kind;
+
+        let calendar_proto = proto::DataType {
+            kind: Some(Kind::CalendarInterval(
+                proto::data_type::CalendarInterval::default(),
+            )),
+        };
+
+        let struct_proto = proto::data_type::Struct {
+            fields: vec![proto::data_type::StructField {
+                name: "ci".to_string(),
+                data_type: Some(calendar_proto.clone()),
+                nullable: true,
+                metadata: None,
+            }],
+            type_variation_reference: 0,
+        };
+        let struct_type = proto_struct_to_struct_type(&struct_proto);
+        assert_eq!(struct_type.fields[0].data_type, DataType::Interval);
+
+        let array_proto = proto::DataType {
+            kind: Some(Kind::Array(Box::new(proto::data_type::Array {
+                element_type: Some(Box::new(calendar_proto)),
+                contains_null: true,
+                type_variation_reference: 0,
+            }))),
+        };
+        assert_eq!(
+            proto_to_data_type(&array_proto),
+            DataType::Array(Box::new(DataType::Interval), true)
+        );
+    }
 }

@@ -295,6 +295,15 @@ case("agg-017", "aggregate", "aggregate FILTER (WHERE) clause (spark4)", "SELECT
 case("agg-018", "aggregate", "collect_list / collect_set", "SELECT dept_id, collect_list(name) names FROM emp GROUP BY dept_id", flags=("schema_only",))
 case("agg-019", "aggregate", "percentile / median", "SELECT percentile(salary, 0.5) AS p50, median(salary) AS med FROM emp")
 case("agg-020", "aggregate", "any / every boolean aggregates", "SELECT dept_id, any(active) any_a, every(active) all_a FROM emp GROUP BY dept_id")
+# agg-021: pass-3 fix — `expr_has_aggregate` (v2_lowering.rs) used to check only
+# whether a projection item's OWN top-level call name was an aggregate, so
+# `abs(count(*))` (aggregate nested inside a non-aggregate call's args) was
+# misclassified as non-aggregate. That misclassification fed `GROUP BY ALL`'s
+# non-aggregate-column inference, which would incorrectly try to group by
+# `abs(count(*))` itself. `function_call_has_aggregate` now descends into call
+# args (and window PARTITION BY / ORDER BY), so GROUP BY ALL correctly groups
+# only by `dept_id`.
+case("agg-021", "aggregate", "GROUP BY ALL excludes aggregate nested in fn args (spark4)", "SELECT dept_id, abs(count(*)) n FROM emp GROUP BY ALL", flags=("spark4",))
 
 # ── 5. ORDER BY / LIMIT ──────────────────────────────────────────────────────
 case("ord-001", "ordering", "ORDER BY asc (default)", "SELECT * FROM emp ORDER BY salary")
@@ -399,6 +408,13 @@ case("win-013", "window", "RANGE BETWEEN INTERVAL (time frame)", "SELECT id, las
 case("win-014", "window", "top-per-group via window + outer filter", "SELECT * FROM (SELECT name, dept_id, salary, row_number() OVER (PARTITION BY dept_id ORDER BY salary DESC) rn FROM emp) WHERE rn = 1")
 case("win-015", "window", "multiple windows different partitions", "SELECT name, rank() OVER (PARTITION BY dept_id ORDER BY salary) r1, rank() OVER (PARTITION BY active ORDER BY age) r2 FROM emp")
 case("win-016", "window", "window over expression", "SELECT name, sum(salary + coalesce(cast(bonus AS double),0)) OVER (PARTITION BY dept_id) AS comp_sum FROM emp")
+# win-017: pass-3 fix — `resolve_named_windows_in_expr` (v2_lowering.rs) only
+# descended through Function/Nested/UnaryOp/Cast/BinaryOp, so a named-window
+# reference nested inside a CASE branch fell to the `_ => {}` no-op arm and
+# stayed an unresolved `WindowType::NamedWindow`, surfacing a spurious "not
+# defined in WINDOW clause" boundary error even though `w` IS defined. The
+# widened walk now descends into CASE (and BETWEEN, InList, IS NULL, etc.).
+case("win-017", "window", "named WINDOW clause referenced inside CASE branch", "SELECT name, CASE WHEN active THEN rank() OVER w ELSE NULL END AS rk FROM emp WINDOW w AS (PARTITION BY dept_id ORDER BY salary)")
 
 # ── 11. Set operations ───────────────────────────────────────────────────────
 case("set-001", "setop", "UNION (distinct)", "SELECT id, name FROM emp UNION SELECT id, name FROM emp2")
@@ -423,6 +439,14 @@ case("gx-007", "group_ext", "ROLLUP with HAVING", "SELECT dept_id, count(*) n FR
 case("gx-008", "group_ext", "CUBE 3 columns", "SELECT dept_id, active, year(hire_date) y, count(*) n FROM emp GROUP BY CUBE (dept_id, active, year(hire_date))")
 case("gx-009", "group_ext", "ROLLUP + order by grouping_id", "SELECT dept_id, active, grouping_id() gid, count(*) n FROM emp GROUP BY ROLLUP (dept_id, active) ORDER BY gid")
 case("gx-010", "group_ext", "GROUP BY ... WITH ROLLUP (Hive syntax)", "SELECT dept_id, active, count(*) n FROM emp GROUP BY dept_id, active WITH ROLLUP")
+# gx-011: pass-3 fix — `rewrite_grouping_id` (emission.rs) previously walked
+# only a hand-enumerated set of containers (FunctionCall args / Alias / Cast /
+# CaseWhen); a no-arg `grouping_id()` nested inside a `Binary` expression (here,
+# `+ 1`) fell through untouched and reached DuckDB as a literal zero-arg
+# `grouping_id()` -> parser error (DuckDB requires explicit grouping-column
+# args). The generic `children_mut` walk now splices the ROLLUP grouping
+# columns regardless of the surrounding container shape.
+case("gx-011", "group_ext", "grouping_id() nested in arithmetic expr (ROLLUP)", "SELECT dept_id, active, grouping_id() + 1 AS gid1, count(*) n FROM emp GROUP BY ROLLUP (dept_id, active)")
 
 # ── 13. Complex types & LATERAL VIEW ─────────────────────────────────────────
 case("cx-001", "complex_type", "array literal + element access", "SELECT array(1, 2, 3) AS arr, array(1,2,3)[0] AS first")
@@ -451,6 +475,28 @@ case("tbl-007", "table_expr", "explode() as table function", "SELECT * FROM expl
 case("tbl-008", "table_expr", "broadcast hint", "SELECT /*+ BROADCAST(d) */ e.name, d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id", flags=("cosmetic",))
 case("tbl-009", "table_expr", "coalesce/repartition hint", "SELECT /*+ COALESCE(1) */ * FROM emp", flags=("cosmetic",))
 case("tbl-010", "table_expr", "subquery alias required", "SELECT t.dept_id, t.n FROM (SELECT dept_id, count(*) n FROM emp GROUP BY dept_id) AS t")
+# tbl-011: pass-3 fix — `lower_table_factor`'s `TableFactor::Function` arm
+# (`LATERAL f(...)`) built the table-function node but silently dropped the
+# user alias (`alias: _`), unlike the sibling `Derived` / `Table`-with-args
+# branches. Now composed through the shared `apply_table_alias` helper, so
+# `AS r(id)` renames the single output column via `ToDf`. Uses `range` rather
+# than `explode` as the underlying table function — `explode` hits an
+# unrelated, pre-existing τ boundary gap ("table-function analysis" not yet
+# implemented for `TableFunction[explode]`, see `tbl-007`), which would mask
+# the alias-plumbing fix under test here.
+#
+# NOTE: the sibling fix in the same finding — `TableFactor::TableFunction`
+# (ANSI `TABLE(<expr>) AS alias` syntax) — is unit-test-only. Real Spark's
+# grammar treats a bare `TABLE(...)` in FROM position as invoking a
+# table-valued function literally NAMED `TABLE` (used for passing a TABLE
+# argument to a Python UDTF/PTF), not as "call the function inside the
+# parens" — `TABLE(explode(...))` throws Spark's own
+# `UNRESOLVABLE_TABLE_VALUED_FUNCTION`/`UNRESOLVED_ROUTINE`, verified against
+# the vendored Spark 4.1.1 reference. That branch is therefore unreachable via
+# real PySpark SQL traffic and is covered only by
+# `table_function_table_syntax_with_alias_columns_renames_via_todf` in
+# `crates/core/src/parser_v2/v2_lowering.rs`.
+case("tbl-011", "table_expr", "LATERAL table function with column alias list", "SELECT r.id FROM LATERAL range(3) AS r(id)")
 
 # ── 15. Advanced predicates / SQL-specific operators ─────────────────────────
 case("pr-001", "predicate_adv", "IS DISTINCT FROM", "SELECT * FROM emp WHERE dept_id IS DISTINCT FROM 10")

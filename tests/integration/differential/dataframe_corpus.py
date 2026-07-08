@@ -68,8 +68,9 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window as W
 from pyspark.sql.types import (
-    ArrayType, BooleanType, DateType, DecimalType, DoubleType, IntegerType,
-    LongType, MapType, StringType, StructField, StructType, TimestampType,
+    ArrayType, BooleanType, CalendarIntervalType, DateType, DecimalType,
+    DoubleType, IntegerType, LongType, MapType, StringType, StructField,
+    StructType, TimestampType,
 )
 
 NAN = float("nan")
@@ -374,6 +375,12 @@ case("grp-003", "grouping", "rollup with grouping_id", lambda I: I["emp"].rollup
 case("grp-004", "grouping", "pivot with explicit values", lambda I: I["emp"].groupBy("dept_id").pivot("active", [True, False]).agg(F.count(F.lit(1)).alias("n")))
 case("grp-005", "grouping", "pivot without values (eager)", lambda I: I["emp"].groupBy("active").pivot("dept_id").agg(F.avg("salary")))
 case("grp-006", "grouping", "grouping() flag column", lambda I: I["emp"].cube("dept_id").agg(F.grouping("dept_id").alias("g"), F.count(F.lit(1)).alias("n")))
+# grp-007: pass-3 fix — `rewrite_grouping_id` (crates/core/src/transpiler_v2/emission.rs)
+# used to only walk FunctionCall/Alias/Cast/CaseWhen containers, so a no-arg
+# grouping_id() nested inside a Binary expr fell through untouched and reached
+# DuckDB as a literal zero-arg `grouping_id()` — a parse error. Now a generic
+# `children_mut` walk splices the grouping columns regardless of container shape.
+case("grp-007", "grouping", "rollup with grouping_id() nested in arithmetic", lambda I: I["emp"].rollup("dept_id", "active").agg((F.grouping_id() + 1).alias("gid1"), F.count(F.lit(1)).alias("n")))
 
 # ── 10. Window functions ───────────────────────────────────────────────────
 case("win-001", "window", "row_number over partition+order", lambda I: I["emp"].withColumn("rn", F.row_number().over(W.partitionBy("dept_id").orderBy(F.col("salary").desc()))))
@@ -644,6 +651,23 @@ case("intv-003", "interval", "make_dt_interval -> DayTimeInterval type", lambda 
 case("intv-004", "interval", "date + INTERVAL literal", lambda I: I["emp"].select((F.col("hire_date") + F.expr("INTERVAL 90 DAYS")).alias("later")))
 case("intv-005", "interval", "timestamp difference -> DayTimeInterval", lambda I: I["emp"].select((F.col("last_login") - F.col("last_login")).alias("zero_iv")))
 case("intv-006", "interval", "timestampadd / timestampdiff (spark4)", lambda I: I["emp"].select(F.expr("timestampadd(MONTH, 3, last_login)").alias("ta"), F.expr("timestampdiff(DAY, hire_date, current_date())").alias("td")), flags=("spark4", "nondeterministic"))
+case(
+    "intv-007",
+    "interval",
+    # pass-3 fix — `proto_to_data_type` (type_converter.rs) used to decode a
+    # `Kind::CalendarInterval` proto DataType as `DataType::YearMonthInterval`
+    # ("best-effort"); `.cast(CalendarIntervalType())` sends exactly this proto
+    # kind for the CAST target type (`convert_cast` -> `CastToType::Type`), so
+    # the mis-decode meant τ resolved the wrong interval subtype for the cast.
+    # Now it decodes to `DataType::Interval`, matching Spark's actual
+    # CalendarIntervalType. Same client-side Arrow decode gap as intv-001
+    # (`from_arrow_type` has no `is_interval` arm) fires on `.collect()`
+    # regardless of source (CAST vs make_interval), so both engines throw the
+    # same error class -> tri-state PASS, same shape as intv-001/002.
+    "cast to CalendarIntervalType (proto DataType Cast target decode)",
+    lambda I: I["emp"].select(F.lit("1 day").cast(CalendarIntervalType()).alias("iv")),
+    expected_error="UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION",
+)
 
 # ── 25. Newer array / map functions ─────────────────────────────────────────
 case("arr2-001", "array_new", "array_append / array_prepend", lambda I: I["emp"].select(F.array_append("tags", "new").alias("ap"), F.array_prepend("tags", "first").alias("pp")))

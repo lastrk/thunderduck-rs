@@ -4215,68 +4215,32 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
 /// through unchanged — aggregate-return casts are the responsibility of the
 /// aggregate function arm itself (via [`spark_aggregate_return_cast`], wired
 /// per checklist §5.7 when needed).
-/// Rewrite `grouping_id()` (no-arg) inside an expression tree to
-/// `grouping_id(<grouping cols>)`. Recurses into common expression
-/// containers used by the aggregate slot. The recursion is deliberately
-/// narrow (FunctionCall / Alias / Cast / CaseWhen only) — intentional; do
-/// not widen to a generic `map_children` walk.
-fn rewrite_grouping_id(expr: &Expression, grouping: &[Expression]) -> Expression {
-    use super::expression::{AliasExpression, CaseWhenExpression, CastExpression, FunctionCall};
-    match expr {
-        Expression::FunctionCall(f) => {
-            let name_lower = f.name.to_lowercase();
-            if (name_lower == "grouping_id" || name_lower == "grouping")
-                && f.args.is_empty()
-                && !grouping.is_empty()
-            {
-                // Take bare column references from `grouping` (strip alias
-                // wrappers for the GROUP BY reference).
-                let new_args: Vec<Expression> =
-                    grouping.iter().map(|g| g.unaliased().clone()).collect();
-                Expression::FunctionCall(FunctionCall {
-                    name: f.name.clone(),
-                    args: new_args,
-                    distinct: f.distinct,
-                })
-            } else {
-                let args = f
-                    .args
-                    .iter()
-                    .map(|a| rewrite_grouping_id(a, grouping))
-                    .collect();
-                Expression::FunctionCall(FunctionCall {
-                    name: f.name.clone(),
-                    args,
-                    distinct: f.distinct,
-                })
-            }
+/// Rewrite no-arg `grouping_id()` / `grouping()` anywhere in an aggregate
+/// slot to `grouping_id(<grouping cols>)` — DuckDB has no zero-arg form
+/// (it is a parse error). Generic `children_mut` walk (pass-3 kept this
+/// narrow pending a corpus witness; `grouping_id() + 1` via `Binary` is
+/// that witness — see tasks/v2-simplification-pass-log.md flag #6).
+/// Widening is safe: an unrewritten zero-arg call is a guaranteed
+/// whole-query DuckDB parse error, so the walk only converts errors into
+/// the Spark-intended emission — it cannot change working output.
+/// Subquery bodies stay opaque per the `children`/`children_mut` walker
+/// convention, which is the correct scoping here: an inner aggregate's
+/// `grouping_id()` binds to the inner GROUP BY via its own
+/// `render_aggregate_op` call, not the outer one.
+fn rewrite_grouping_id(expr: &mut Expression, grouping: &[Expression]) {
+    if let Expression::FunctionCall(f) = expr {
+        let name_lower = f.name.to_lowercase();
+        if (name_lower == "grouping_id" || name_lower == "grouping")
+            && f.args.is_empty()
+            && !grouping.is_empty()
+        {
+            // Splice bare (alias-stripped) grouping exprs as explicit args.
+            f.args = grouping.iter().map(|g| g.unaliased().clone()).collect();
+            return; // do not walk the newly spliced args
         }
-        Expression::Alias(a) => Expression::Alias(AliasExpression {
-            alias: a.alias.clone(),
-            expr: Box::new(rewrite_grouping_id(&a.expr, grouping)),
-        }),
-        Expression::Cast(c) => Expression::Cast(CastExpression {
-            expr: Box::new(rewrite_grouping_id(&c.expr, grouping)),
-            to_type: c.to_type.clone(),
-            try_cast: c.try_cast,
-        }),
-        Expression::CaseWhen(cw) => Expression::CaseWhen(CaseWhenExpression {
-            branches: cw
-                .branches
-                .iter()
-                .map(|(cond, then)| {
-                    (
-                        rewrite_grouping_id(cond, grouping),
-                        rewrite_grouping_id(then, grouping),
-                    )
-                })
-                .collect(),
-            else_expr: cw
-                .else_expr
-                .as_ref()
-                .map(|e| Box::new(rewrite_grouping_id(e, grouping))),
-        }),
-        other => other.clone(),
+    }
+    for child in expr.children_mut() {
+        rewrite_grouping_id(child, grouping);
     }
 }
 
@@ -4332,10 +4296,15 @@ fn render_aggregate_op(
     let already_folded = super::analyzer::grouping_already_folded(grouping, aggregates);
     // Rewrite any `grouping_id()` (no-arg) calls inside `aggregates` to
     // pass the current grouping columns as explicit args — DuckDB requires
-    // them. This is a small tree-walk local to render_aggregate_op scope.
+    // them. Generic `children_mut` walk in `rewrite_grouping_id` (see its
+    // doc comment); mutates a per-slot clone in place.
     let rewritten_aggregates: Vec<Expression> = aggregates
         .iter()
-        .map(|a| rewrite_grouping_id(a, grouping))
+        .map(|a| {
+            let mut e = a.clone();
+            rewrite_grouping_id(&mut e, grouping);
+            e
+        })
         .collect();
     let keys: &[Expression] = if already_folded { &[] } else { grouping };
     let slots = sql_join(keys.iter().chain(rewritten_aggregates.iter()), ", ", |e| {
@@ -6369,6 +6338,180 @@ mod tests {
         let typed = analyze(plan, &bt).expect("analyze grouping-sets aggregate");
         let err = dispatch_op(&typed.op, &typed.resolved_schema).unwrap_err();
         expect_unsupported(err, UnsupportedKind::Op, "Aggregate[GroupingSets]", &[]);
+    }
+
+    // ── rewrite_grouping_id widening (finding 6) ────────────────────────────
+    // `rewrite_grouping_id` splices no-arg `grouping_id()`/`grouping()` calls
+    // with the ambient grouping columns anywhere in an aggregate slot — not
+    // just the 4 originally-hand-enumerated containers (FunctionCall args /
+    // Alias / Cast / CaseWhen). These pin the widened `children_mut` walk
+    // directly against the pure function (no analyze/dispatch needed).
+
+    fn grouping_id_call() -> Expression {
+        fexpr("grouping_id", vec![])
+    }
+
+    #[test]
+    fn rewrite_grouping_id_bare_call_spliced() {
+        let mut e = grouping_id_call();
+        rewrite_grouping_id(&mut e, &[ucol("dept_id")]);
+        assert_eq!(e, fexpr("grouping_id", vec![ucol("dept_id")]));
+    }
+
+    #[test]
+    fn rewrite_grouping_id_binary_witness_spliced() {
+        // `grouping_id() + 1` — the corpus-witness shape (Finding 6): pre-fix
+        // this fell through `other => other.clone()` and reached DuckDB as a
+        // literal zero-arg `grouping_id()`, a parse error.
+        let mut e = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(grouping_id_call()),
+            right: Box::new(int_lit(1)),
+        });
+        rewrite_grouping_id(&mut e, &[ucol("dept_id")]);
+        assert_eq!(
+            e,
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::Add,
+                left: Box::new(fexpr("grouping_id", vec![ucol("dept_id")])),
+                right: Box::new(int_lit(1)),
+            })
+        );
+    }
+
+    #[test]
+    fn rewrite_grouping_id_unary_and_nested_binary_spliced() {
+        // `NOT (grouping_id() = 0)` — covers a `Unary` hop wrapping a
+        // `Binary` hop wrapping the call, in one tree.
+        let mut e = Expression::Unary(UnaryExpression {
+            op: UnaryOp::Not,
+            operand: Box::new(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(grouping_id_call()),
+                right: Box::new(int_lit(0)),
+            })),
+        });
+        rewrite_grouping_id(&mut e, &[ucol("dept_id")]);
+        assert_eq!(
+            e,
+            Expression::Unary(UnaryExpression {
+                op: UnaryOp::Not,
+                operand: Box::new(Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Eq,
+                    left: Box::new(fexpr("grouping_id", vec![ucol("dept_id")])),
+                    right: Box::new(int_lit(0)),
+                })),
+            })
+        );
+    }
+
+    #[test]
+    fn rewrite_grouping_id_in_list_container_spliced() {
+        // `grouping_id() IN (0, 3)` — a container beyond the 4 originally
+        // hand-enumerated arms (FunctionCall/Alias/Cast/CaseWhen), pinning
+        // that the widened walk now reaches siblings, not just the witness.
+        let mut e = Expression::InList(InListExpression {
+            expr: Box::new(grouping_id_call()),
+            list: vec![int_lit(0), int_lit(3)],
+            negated: false,
+        });
+        rewrite_grouping_id(&mut e, &[ucol("dept_id")]);
+        assert_eq!(
+            e,
+            Expression::InList(InListExpression {
+                expr: Box::new(fexpr("grouping_id", vec![ucol("dept_id")])),
+                list: vec![int_lit(0), int_lit(3)],
+                negated: false,
+            })
+        );
+    }
+
+    #[test]
+    fn rewrite_grouping_id_alias_cast_previously_covered_arms_unchanged() {
+        // Pin the 2 originally hand-enumerated arms still work identically
+        // post-widening: `CAST(grouping_id() AS BIGINT) AS gid`.
+        let mut e = Expression::Alias(AliasExpression {
+            expr: Box::new(Expression::Cast(CastExpression {
+                expr: Box::new(grouping_id_call()),
+                to_type: DataType::Long,
+                try_cast: false,
+            })),
+            alias: "gid".to_owned(),
+        });
+        rewrite_grouping_id(&mut e, &[ucol("dept_id")]);
+        assert_eq!(
+            e,
+            Expression::Alias(AliasExpression {
+                expr: Box::new(Expression::Cast(CastExpression {
+                    expr: Box::new(fexpr("grouping_id", vec![ucol("dept_id")])),
+                    to_type: DataType::Long,
+                    try_cast: false,
+                })),
+                alias: "gid".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn rewrite_grouping_id_call_with_args_unchanged() {
+        // `grouping_id(dept_id)` (already has args) must not be touched.
+        let mut e = fexpr("grouping_id", vec![ucol("dept_id")]);
+        let before = e.clone();
+        rewrite_grouping_id(&mut e, &[ucol("dept_id")]);
+        assert_eq!(e, before);
+    }
+
+    #[test]
+    fn rewrite_grouping_id_empty_grouping_is_noop() {
+        // No GROUP BY columns to splice → leave the bare call as-is (still a
+        // pre-existing, separate, un-witnessed DuckDB error path; out of
+        // this finding's scope — see design doc §5).
+        let mut e = grouping_id_call();
+        let before = e.clone();
+        rewrite_grouping_id(&mut e, &[]);
+        assert_eq!(e, before);
+    }
+
+    #[test]
+    fn render_aggregate_op_binary_witness_grouping_id_plus_one() {
+        let _g = tap_guard();
+        // Regression example 1 (SQL front-end shape): `grouping_id() + 1` in
+        // a ROLLUP aggregate. Pre-fix this reached DuckDB as a literal
+        // zero-arg `grouping_id()` → `Parser Error: syntax error at or near
+        // ")"`. Post-fix it must render `grouping_id(dept_id) + 1`.
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(scan("emp")),
+            grouping: vec![ucol("dept_id")],
+            aggregates: vec![
+                ucol("dept_id"),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(Expression::Binary(BinaryExpression {
+                        op: BinaryOp::Add,
+                        left: Box::new(grouping_id_call()),
+                        right: Box::new(int_lit(1)),
+                    })),
+                    alias: "gid1".to_owned(),
+                }),
+                fexpr(
+                    "count",
+                    vec![Expression::Star(StarExpression { qualifier: None })],
+                ),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::Rollup,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze rollup aggregate with grouping_id() + 1");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("grouping_id(dept_id)"),
+            "expected the splice to carry the grouping column, got: {sql}"
+        );
+        assert!(
+            !sql.contains("grouping_id()"),
+            "must not leave a zero-arg grouping_id() call, got: {sql}"
+        );
     }
 
     #[test]

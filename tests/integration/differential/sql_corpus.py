@@ -459,16 +459,16 @@ case("gx-010", "group_ext", "GROUP BY ... WITH ROLLUP (Hive syntax)", "SELECT de
 # args). The generic `children_mut` walk now splices the ROLLUP grouping
 # columns regardless of the surrounding container shape.
 case("gx-011", "group_ext", "grouping_id() nested in arithmetic expr (ROLLUP)", "SELECT dept_id, active, grouping_id() + 1 AS gid1, count(*) n FROM emp GROUP BY ROLLUP (dept_id, active)")
-# gx-012: KNOWN-RED witness (NOT a pass-3 fix — out of findings 1-6). The gx-011
-# fix widened `rewrite_grouping_id` (emission.rs) so a no-arg `grouping_id()`
-# gets the grouping columns spliced in anywhere in the aggregate SELECT list —
-# but `render_aggregate_op` still emits the HAVING predicate through plain
-# `render_expr`, WITHOUT the rewrite. So a no-arg `grouping_id()` in HAVING
-# reaches DuckDB as a zero-arg call -> parser error (DuckDB requires explicit
-# grouping-column args). Spark accepts grouping functions in HAVING over
-# ROLLUP/CUBE/GROUPING SETS. Flips green once the HAVING render path also
-# splices the grouping columns (the render-side companion to the gx-011 fix).
-case("gx-012", "group_ext", "grouping_id() in HAVING over ROLLUP (known gap)", "SELECT dept_id, count(*) n FROM emp GROUP BY ROLLUP (dept_id) HAVING grouping_id() = 0")
+# gx-012: fixed (corpus-driven pass 1). The gx-011 fix widened
+# `rewrite_grouping_id` (emission.rs) so a no-arg `grouping_id()` gets the
+# grouping columns spliced in anywhere in the aggregate SELECT list — but
+# `render_aggregate_op` still emitted the HAVING predicate through plain
+# `render_expr`, WITHOUT the rewrite, so a no-arg `grouping_id()` in HAVING
+# reached DuckDB as a zero-arg call -> parser error. The HAVING branch of
+# `render_aggregate_op` now applies `rewrite_grouping_id` before rendering, so
+# grouping functions in HAVING over ROLLUP/CUBE/GROUPING SETS splice the
+# grouping columns exactly as the SELECT list does.
+case("gx-012", "group_ext", "grouping_id() in HAVING over ROLLUP", "SELECT dept_id, count(*) n FROM emp GROUP BY ROLLUP (dept_id) HAVING grouping_id() = 0")
 
 # ── 13. Complex types & LATERAL VIEW ─────────────────────────────────────────
 case("cx-001", "complex_type", "array literal + element access", "SELECT array(1, 2, 3) AS arr, array(1,2,3)[0] AS first")

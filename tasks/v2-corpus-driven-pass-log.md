@@ -1319,3 +1319,29 @@ the summary below records the corpus deltas by pass number.
 - Compiler warning delta: 0 new (clippy 12, all pre-existing baseline).
 - Quality Gate: PASS (rustfmt clean on 3 touched files, `cargo test -p thunderduck-core --lib` 658/0, `sql_v2` 236/26/262, tbl-006 GREEN, no regression).
 - Commit SHA: (this commit).
+
+## Pass 1 — gx-012 (241→242)
+
+- **Case:** gx-012 — `SELECT dept_id, count(*) n FROM emp GROUP BY ROLLUP (dept_id) HAVING grouping_id() = 0`
+- **Owning layer:** emission (`crates/core/src/transpiler_v2/emission.rs`)
+- **Root cause:** `render_aggregate_op` applied `rewrite_grouping_id` (the no-arg
+  `grouping_id()`/`grouping()` → `grouping_id(<grouping cols>)` splice) only to the
+  SELECT-list slots; the HAVING predicate was rendered via plain `render_expr`, so a
+  no-arg `grouping_id()` in HAVING reached DuckDB as a zero-arg call → `Parser Error`.
+- **Fix:** HAVING branch of `render_aggregate_op` now clones the predicate, applies
+  `rewrite_grouping_id(&mut h, grouping)`, then renders — mirroring the SELECT-slot
+  loop. Inline clone-then-mutate, no new helper. Pure emission change; no AST/analyzer
+  extension.
+- **ADRs:** ADR-015 (Spark-parity over DuckDB ergonomics), ADR-016 (never surface a raw
+  DuckDB error on Spark-legal input), ADR-022 (failure fit neither error category — no
+  new variant), CLAUDE.md SQL-gen principles 1-2 (typed-AST transform, no string ops).
+- **Findings closed:** reviewer Critical=0 High=0; perf High=0 Medium=0.
+- **Before→after:** 241 → 242 passed (270 total); one case flipped, no regression.
+- **Tests:** unit `render_aggregate_having_grouping_id_spliced_with_rollup` (emission.rs);
+  corpus gx-012 green E2E.
+- **Diagnostic:** `.agent-output/diagnostic-pass-1.md` · **Architecture:** `.agent-output/architecture-pass-1.md`
+- **SHA-to-be:** feat(v2-corpus): pass 1 — gx-012 (241→242)
+- **PROCESS NOTE:** `run-differential-tests.sh` only builds the release binary when it is
+  *absent* — it does NOT rebuild on source change. Every acceptance run MUST be preceded
+  by `cargo build --release` or the suite silently tests a stale binary. (This masked
+  pass 1 on the first attempt.)

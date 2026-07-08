@@ -4217,7 +4217,9 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
 /// per checklist §5.7 when needed).
 /// Rewrite no-arg `grouping_id()` / `grouping()` anywhere in an aggregate
 /// slot to `grouping_id(<grouping cols>)` — DuckDB has no zero-arg form
-/// (it is a parse error). Generic `children_mut` walk (pass-3 kept this
+/// (it is a parse error). Also applied to the HAVING predicate, which can
+/// legally carry these grouping functions over ROLLUP/CUBE/GROUPING SETS.
+/// Generic `children_mut` walk (pass-3 kept this
 /// narrow pending a corpus witness; `grouping_id() + 1` via `Binary` is
 /// that witness — see tasks/v2-simplification-pass-log.md flag #6).
 /// Widening is safe: an unrewritten zero-arg call is a guaranteed
@@ -4353,7 +4355,13 @@ fn render_aggregate_op(
     // WHERE, which DuckDB rejects for aggregate predicates). Rendered against
     // the aggregate input schema, same scope as the aggregate slots.
     if let Some(h) = having {
-        let having_sql = render_expr(h, input_schema)?;
+        // Mirror the SELECT-slot loop above: HAVING may carry no-arg
+        // `grouping_id()`/`grouping()` (Spark-legal over ROLLUP/CUBE/GROUPING
+        // SETS) which DuckDB has no surface form for. Splice the ambient
+        // grouping columns into a clone before rendering.
+        let mut h = h.clone();
+        rewrite_grouping_id(&mut h, grouping);
+        let having_sql = render_expr(&h, input_schema)?;
         sql.push_str(&format!(" HAVING {having_sql}"));
     }
     Ok(sql)
@@ -6283,6 +6291,44 @@ mod tests {
         assert!(
             having_pos > rollup_pos,
             "HAVING must follow ROLLUP group clause: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_aggregate_having_grouping_id_spliced_with_rollup() {
+        let _g = tap_guard();
+        // gx-012: `... GROUP BY ROLLUP(dept_id) HAVING grouping_id() = 0`.
+        // The HAVING predicate carries a no-arg `grouping_id()` which DuckDB
+        // cannot parse; emission must splice the ambient grouping column into
+        // the call, mirroring the SELECT-slot rewrite.
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(scan("emp")),
+            grouping: vec![ucol("dept_id")],
+            aggregates: vec![
+                ucol("dept_id"),
+                fexpr(
+                    "count",
+                    vec![Expression::Star(StarExpression { qualifier: None })],
+                ),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::Rollup,
+            grouping_sets: vec![],
+            having: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(grouping_id_call()),
+                right: Box::new(int_lit(0)),
+            })),
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze rollup aggregate with grouping_id having");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("grouping_id(dept_id)"),
+            "expected spliced grouping_id(dept_id) in HAVING, got: {sql}"
+        );
+        assert!(
+            !sql.contains("grouping_id()"),
+            "bare zero-arg grouping_id() must not reach DuckDB, got: {sql}"
         );
     }
 

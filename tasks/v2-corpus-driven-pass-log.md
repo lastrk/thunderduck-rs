@@ -1374,3 +1374,40 @@ the summary below records the corpus deltas by pass number.
   corpus agg-022/agg-023 green E2E.
 - **Diagnostic:** `.agent-output/diagnostic-pass-2.md` · **Architecture:** `.agent-output/architecture-pass-2.md`
 - **SHA-to-be:** feat(v2-corpus): pass 2 — agg-022/agg-023 (242→244)
+
+## Pass 3 — lit-004, lit-005 (244→246)
+
+- **Cases:** lit-004 `SELECT INTERVAL '1-2' YEAR TO MONTH AS ym` (→ YearMonthInterval);
+  lit-005 `SELECT INTERVAL '1 02:30:00' DAY TO SECOND AS dts` (→ DayTimeInterval)
+- **Owning layers:** parser_v2 lowering + transpiler_v2/expression (AST field). Emission,
+  type_inference, connect-server unchanged.
+- **Root cause:** `lower_interval` bailed on all compound (`X TO Y`) literals; `extract_interval_int`
+  parsed only plain i32; `Expression::Interval` hardcoded generic `DataType::Interval` and could not
+  surface the strict Spark type.
+- **Fix:** added closed `IntervalKind { YearMonth, DayTime, Calendar }` enum + `kind` field on
+  `IntervalExpression` (minimal ADR-003 IR extension); `data_type()` maps kind → DataType. New
+  `lower_compound_interval` parses the two Spark-ANSI pairs (`YEAR TO MONTH` = `[+|-]y-m`,
+  `DAY TO SECOND` = `[+|-]d h:m:s[.f]`, Spark-exact value semantics + checked arithmetic +
+  i64-representability guard for the connect-server Duration transcode). All other pairs / precision
+  forms keep the `sql::expr::interval::compound` boundary bail; malformed values → new
+  `sql::expr::interval::{year_month,day_time}_format` boundaries. Single-field literals stay
+  kind=Calendar (scope guard). `render_interval` stays kind-blind.
+- **ADRs:** ADR-003 (bounded IR extension, justified sub-node-level), ADR-004/005, ADR-009,
+  ADR-015 (lit-004 schema_only = AnalyzePlan oracle), ADR-016 (strict interval types; documented
+  malformed-value boundary deviation), ADR-022; gotchas 13/14.
+- **Solvability note:** lit-005 full E2E (DayTime → Duration(µs) transcode + schema frame). lit-004
+  `schema_only` ONLY — per gotcha 14 the PySpark Connect client cannot row-decode YearMonthInterval
+  on EITHER engine (no is_interval arm; fromInternal raises); schema is still fully diffed via
+  AnalyzePlan. Mirrors intv-002.
+- **Findings closed:** reviewer Critical=0 High=0 (3 non-blocking Lows: extreme-sentinel parity edge
+  w/ no witness — deferred; stale doc comment — FIXED in-pass; minor untested boundary arms —
+  deferred, correct by inspection); perf High=0 Medium=0.
+- **Before→after:** 244 → 246 passed (270 total); +2, no regression.
+- **Tests:** compound value/fraction/sign/malformed/out-of-scope + single-field kind=Calendar
+  regression in v2_lowering.rs; kind→DataType + nullable in expression.rs; kind-invisibility in
+  emission.rs; bare-projection analyze→emit. Corpus lit-004 (schema_only) + lit-005 green E2E.
+- **Diagnostic:** `.agent-output/diagnostic-pass-3.md` · **Architecture:** `.agent-output/architecture-pass-3.md`
+- **Process note:** the rust-coder was interrupted by an opus (claude-opus-4-8) 429 rate-limit
+  mid-run but had completed the edits; the driver re-ran the gate. Perf reviewer run on sonnet to
+  dodge the opus limit. Consider sonnet overrides for the read-write/perf agents if 429s recur.
+- **SHA-to-be:** feat(v2-corpus): pass 3 — lit-004/lit-005 (244→246)

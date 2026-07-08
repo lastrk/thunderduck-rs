@@ -553,7 +553,9 @@ case("pv-006", "pivot", "stack() unpivot form", "SELECT id, stack(2, 'age', age,
 case("lit-001", "typed_literal", "DATE literal", "SELECT DATE '2026-01-15' AS d")
 case("lit-002", "typed_literal", "TIMESTAMP literal", "SELECT TIMESTAMP '2026-01-15 10:30:00' AS ts")
 case("lit-003", "typed_literal", "INTERVAL day literal", "SELECT hire_date + INTERVAL '90' DAY AS later FROM emp")
-case("lit-004", "typed_literal", "INTERVAL year-to-month", "SELECT INTERVAL '1-2' YEAR TO MONTH AS ym")
+# schema_only: gotcha 14 — YearMonthInterval rows cannot be row-decoded by the PySpark
+# client on EITHER engine (from_arrow_type has no is_interval arm); schema is validated via AnalyzePlan.
+case("lit-004", "typed_literal", "INTERVAL year-to-month", "SELECT INTERVAL '1-2' YEAR TO MONTH AS ym", flags=("schema_only",))
 case("lit-005", "typed_literal", "INTERVAL day-to-second", "SELECT INTERVAL '1 02:30:00' DAY TO SECOND AS dts")
 case("lit-006", "typed_literal", "make_interval / make_dt_interval", "SELECT make_interval(1, 2, 0, 5) iv, make_dt_interval(1, 2, 30, 0) dti FROM emp LIMIT 1")
 case("lit-007", "typed_literal", "DECIMAL literal arithmetic", "SELECT 100.25 * 3.142 AS prod")

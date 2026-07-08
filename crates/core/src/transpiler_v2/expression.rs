@@ -423,12 +423,29 @@ pub struct LikeExpression {
     pub case_insensitive: bool,
 }
 
+/// Semantic kind of an interval literal. The `(months, days, microseconds)`
+/// triple cannot disambiguate Spark's ANSI interval types (a bare month count
+/// is ambiguous between `YearMonthInterval` and generic `CalendarInterval`), so
+/// the kind is carried explicitly. This is emission-invisible (DuckDB has one
+/// `INTERVAL` type); it only steers [`Expression::data_type`] so the wire
+/// schema surfaces the correct Spark type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntervalKind {
+    /// Spark `YearMonthIntervalType` — compound `YEAR TO MONTH` literals.
+    YearMonth,
+    /// Spark `DayTimeIntervalType` — compound `DAY TO SECOND` literals.
+    DayTime,
+    /// Spark `CalendarIntervalType` — single-field / generic interval literals.
+    Calendar,
+}
+
 /// Interval literal (year-month or day-time, or generic Interval).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IntervalExpression {
     pub months: i32,
     pub days: i32,
     pub microseconds: i64,
+    pub kind: IntervalKind,
 }
 
 /// `a IS [NOT] DISTINCT FROM b`.
@@ -662,7 +679,11 @@ impl Expression {
             | Expression::InList(_)
             | Expression::Like(_)
             | Expression::IsDistinctFrom(_) => DataType::Boolean,
-            Expression::Interval(_) => DataType::Interval,
+            Expression::Interval(i) => match i.kind {
+                IntervalKind::YearMonth => DataType::YearMonthInterval,
+                IntervalKind::DayTime => DataType::DayTimeInterval,
+                IntervalKind::Calendar => DataType::Interval,
+            },
             Expression::ExtractValue(ev) => Self::extract_value_data_type(ev, schema),
             Expression::RowConstructor(rc) => {
                 let fields: Vec<StructField> = rc
@@ -2777,5 +2798,48 @@ mod tests {
             ],
         );
         assert_eq!(mod_li.data_type(&schema), DataType::Long);
+    }
+
+    #[test]
+    fn interval_kind_maps_to_spark_data_type() {
+        let schema = StructType::empty();
+        let with_kind = |kind| {
+            Expression::Interval(IntervalExpression {
+                months: 0,
+                days: 0,
+                microseconds: 0,
+                kind,
+            })
+        };
+        assert_eq!(
+            with_kind(IntervalKind::YearMonth).data_type(&schema),
+            DataType::YearMonthInterval
+        );
+        assert_eq!(
+            with_kind(IntervalKind::DayTime).data_type(&schema),
+            DataType::DayTimeInterval
+        );
+        assert_eq!(
+            with_kind(IntervalKind::Calendar).data_type(&schema),
+            DataType::Interval
+        );
+    }
+
+    #[test]
+    fn interval_literal_is_non_nullable_for_all_kinds() {
+        let schema = StructType::empty();
+        for kind in [
+            IntervalKind::YearMonth,
+            IntervalKind::DayTime,
+            IntervalKind::Calendar,
+        ] {
+            let expr = Expression::Interval(IntervalExpression {
+                months: 0,
+                days: 0,
+                microseconds: 0,
+                kind,
+            });
+            assert!(!expr.nullable(&schema));
+        }
     }
 }

@@ -5459,9 +5459,9 @@ mod tests {
     use crate::transpiler_v2::expression::{
         AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
         CastExpression, ColumnReference, ExtractValueExpression, FunctionCall, InListExpression,
-        IntervalExpression, LambdaExpression, LambdaVariableExpression, LikeExpression, Literal,
-        LiteralValue, MapLiteralExpression, StarExpression, UnaryExpression, UnaryOp,
-        UpdateFieldsExpression,
+        IntervalExpression, IntervalKind, LambdaExpression, LambdaVariableExpression,
+        LikeExpression, Literal, LiteralValue, MapLiteralExpression, StarExpression,
+        UnaryExpression, UnaryOp, UpdateFieldsExpression,
     };
     use crate::transpiler_v2::{analyze, generate};
     use crate::types::StructField;
@@ -7378,10 +7378,34 @@ mod tests {
             months: 1,
             days: 2,
             microseconds: 3,
+            kind: IntervalKind::Calendar,
         };
         let sql = render_interval(&i).expect("render");
         assert!(sql.starts_with("INTERVAL '"), "got: {sql}");
         assert!(sql.contains("1 months 2 days 3 microseconds"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_interval_is_kind_invisible() {
+        // The semantic kind steers only `data_type()`; emission is kind-blind
+        // (DuckDB has a single INTERVAL type). A YearMonth-kind carrier renders
+        // the identical INTERVAL string as a Calendar-kind carrier.
+        let ym = IntervalExpression {
+            months: 14,
+            days: 0,
+            microseconds: 0,
+            kind: IntervalKind::YearMonth,
+        };
+        let cal = IntervalExpression {
+            months: 14,
+            days: 0,
+            microseconds: 0,
+            kind: IntervalKind::Calendar,
+        };
+        assert_eq!(
+            render_interval(&ym).expect("render"),
+            render_interval(&cal).expect("render"),
+        );
     }
 
     #[test]

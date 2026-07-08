@@ -42,9 +42,10 @@ use crate::transpiler_v2::expression::{
     decimal_value_precision_scale, AliasExpression, BetweenExpression, BinaryExpression, BinaryOp,
     CaseWhenExpression, CastExpression, ExistsSubquery, Expression, ExtractValueExpression,
     FrameBoundary, FrameUnit, FunctionCall, InListExpression, InSubquery, IntervalExpression,
-    IsDistinctFromExpression, LambdaExpression, LambdaVariableExpression, LikeExpression, Literal,
-    LiteralValue, NullOrdering, ScalarSubquery, SortDirection, SortOrder, StarExpression,
-    SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn, WindowFrame, WindowFunction,
+    IntervalKind, IsDistinctFromExpression, LambdaExpression, LambdaVariableExpression,
+    LikeExpression, Literal, LiteralValue, NullOrdering, ScalarSubquery, SortDirection, SortOrder,
+    StarExpression, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn, WindowFrame,
+    WindowFunction,
 };
 use crate::transpiler_v2::macros::ProtoFieldExt;
 use crate::transpiler_v2::type_inference::is_aggregate_classifier_name;
@@ -2536,15 +2537,15 @@ fn resolve_named_windows_in_expr(
 
 /// Lower a sqlparser [`Interval`] literal into τ's [`IntervalExpression`].
 ///
-/// Single-field intervals only (`INTERVAL '90' DAY`, `INTERVAL 3 YEAR`, …).
-/// Compound (`X TO Y`), non-literal, or unrepresentable-field shapes are
-/// Thunderduck-boundary errors (ADR-022), never a RawSql fallback.
+/// Single-field intervals (`INTERVAL '90' DAY`, `INTERVAL 3 YEAR`, …) lower
+/// here directly; compound (`X TO Y`) literals route to
+/// [`lower_compound_interval`], which supports the `YEAR TO MONTH` and
+/// `DAY TO SECOND` pairs. Every other compound pair, any precision-annotated
+/// form, non-literal, or unrepresentable-field shape is a Thunderduck-boundary
+/// error (ADR-022), never a RawSql fallback.
 fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
     if iv.last_field.is_some() {
-        bail_boundary_proto!(
-            "sql::expr::interval::compound",
-            "compound `INTERVAL X TO Y` literals are not supported"
-        );
+        return lower_compound_interval(iv);
     }
     let n = extract_interval_int(&iv.value).require_proto(
         "sql::expr::interval::non_literal",
@@ -2599,11 +2600,13 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
             months: n.checked_mul(factor).ok_or_else(|| overflow(unit))?,
             days: 0,
             microseconds: 0,
+            kind: IntervalKind::Calendar,
         },
         Slot::Days => IntervalExpression {
             months: 0,
             days: n,
             microseconds: 0,
+            kind: IntervalKind::Calendar,
         },
         Slot::Micros(per_unit) => IntervalExpression {
             months: 0,
@@ -2611,6 +2614,7 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
             microseconds: i64::from(n)
                 .checked_mul(per_unit)
                 .ok_or_else(|| overflow(unit))?,
+            kind: IntervalKind::Calendar,
         },
     };
     Ok(Expression::Interval(ie))
@@ -2627,6 +2631,181 @@ fn extract_interval_int(expr: &Expr) -> Option<i32> {
         },
         _ => None,
     }
+}
+
+/// Extract the string value of a compound interval literal (`'1-2'`,
+/// `'1 02:30:00'`). Compound ANSI interval values are always single-quoted
+/// strings; a non-string value is a Thunderduck boundary.
+fn extract_interval_string(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Lower a compound (`X TO Y`) interval literal. Supports ONLY the singular
+/// field pairs `YEAR TO MONTH` → [`IntervalKind::YearMonth`] and `DAY TO
+/// SECOND` → [`IntervalKind::DayTime`], the only two pairs that τ's field-less
+/// interval `DataType`s encode wire-exactly (per architecture-pass-3). Every
+/// other pair, or any field precision, is the existing
+/// `sql::expr::interval::compound` Thunderduck boundary (ADR-022).
+fn lower_compound_interval(iv: Interval) -> Result<Expression, EmissionError> {
+    if iv.leading_precision.is_some() || iv.fractional_seconds_precision.is_some() {
+        bail_boundary_proto!(
+            "sql::expr::interval::compound",
+            "compound `INTERVAL X TO Y` literals with field precision are not supported"
+        );
+    }
+    let leading = iv.leading_field.as_ref().require_proto(
+        "sql::expr::interval::no_field",
+        "compound interval literal has no leading time field",
+    )?;
+    let last = iv.last_field.as_ref().require_proto(
+        "sql::expr::interval::compound",
+        "compound interval literal has no trailing time field",
+    )?;
+    let value = extract_interval_string(&iv.value).require_proto(
+        "sql::expr::interval::non_literal",
+        "compound interval value must be a string literal",
+    )?;
+
+    match (leading, last) {
+        (DateTimeField::Year, DateTimeField::Month) => {
+            let months = parse_year_month_value(&value)?;
+            Ok(Expression::Interval(IntervalExpression {
+                months,
+                days: 0,
+                microseconds: 0,
+                kind: IntervalKind::YearMonth,
+            }))
+        }
+        (DateTimeField::Day, DateTimeField::Second) => {
+            let (days, microseconds) = parse_day_second_value(&value)?;
+            Ok(Expression::Interval(IntervalExpression {
+                months: 0,
+                days,
+                microseconds,
+                kind: IntervalKind::DayTime,
+            }))
+        }
+        (l, r) => {
+            bail_boundary_proto!(
+                "sql::expr::interval::compound",
+                format!("compound `INTERVAL {l} TO {r}` literals are not supported")
+            );
+        }
+    }
+}
+
+/// Parse a Spark `YEAR TO MONTH` interval value `[+|-]y-m` into a total month
+/// count (`sign*(12*y + m)`), matching Spark `IntervalUtils.fromYearMonthString`
+/// (`m` in `0..=11`). Malformed / out-of-range strings surface the
+/// `sql::expr::interval::year_month_format` Thunderduck boundary.
+fn parse_year_month_value(value: &str) -> Result<i32, EmissionError> {
+    let fmt_err = || EmissionError::Unsupported {
+        kind: UnsupportedKind::ProtoShape,
+        name: "sql::expr::interval::year_month_format".to_owned(),
+        reason: format!("cannot parse YEAR TO MONTH interval value `{value}`"),
+    };
+    let trimmed = value.trim();
+    let (sign, rest) = match trimmed.strip_prefix('-') {
+        Some(r) => (-1i32, r),
+        None => (1i32, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let (y_str, m_str) = rest.split_once('-').ok_or_else(fmt_err)?;
+    let years = parse_ascii_digits_i64(y_str).ok_or_else(fmt_err)?;
+    let months = parse_ascii_digits_i64(m_str).ok_or_else(fmt_err)?;
+    if !(0..=11).contains(&months) {
+        return Err(fmt_err());
+    }
+    let total = years
+        .checked_mul(12)
+        .and_then(|v| v.checked_add(months))
+        .and_then(|v| i32::try_from(v).ok())
+        .and_then(|v| v.checked_mul(sign))
+        .ok_or_else(fmt_err)?;
+    Ok(total)
+}
+
+/// Parse a Spark `DAY TO SECOND` interval value `[+|-]d h:m:s[.f]` into
+/// `(days, microseconds)`, matching Spark `IntervalUtils.fromDayTimeString`
+/// (`h<=23`, `m<=59`, `s<=59`; fraction 1-9 digits, right-padded to 6 and
+/// TRUNCATED beyond microseconds). The sign applies to the whole value. The
+/// total is enforced i64-representable as microseconds
+/// (`|d|*86_400_000_000 + time_µs <= i64::MAX`) so the connect-server
+/// `Duration(µs)` transcode cannot overflow. Malformed / out-of-range strings
+/// surface the `sql::expr::interval::day_time_format` Thunderduck boundary.
+fn parse_day_second_value(value: &str) -> Result<(i32, i64), EmissionError> {
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    let fmt_err = || EmissionError::Unsupported {
+        kind: UnsupportedKind::ProtoShape,
+        name: "sql::expr::interval::day_time_format".to_owned(),
+        reason: format!("cannot parse DAY TO SECOND interval value `{value}`"),
+    };
+    let trimmed = value.trim();
+    let (sign, rest) = match trimmed.strip_prefix('-') {
+        Some(r) => (-1i64, r),
+        None => (1i64, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let (day_str, time_str) = rest.split_once(' ').ok_or_else(fmt_err)?;
+    let days = parse_ascii_digits_i64(day_str).ok_or_else(fmt_err)?;
+
+    let (hms, frac_str) = match time_str.split_once('.') {
+        Some((hms, frac)) => (hms, Some(frac)),
+        None => (time_str, None),
+    };
+    let mut parts = hms.split(':');
+    let h = parts.next().and_then(parse_ascii_digits_i64);
+    let m = parts.next().and_then(parse_ascii_digits_i64);
+    let s = parts.next().and_then(parse_ascii_digits_i64);
+    let (h, m, s) = match (h, m, s) {
+        (Some(h), Some(m), Some(s)) if parts.next().is_none() => (h, m, s),
+        _ => return Err(fmt_err()),
+    };
+    if h > 23 || m > 59 || s > 59 {
+        return Err(fmt_err());
+    }
+    let frac_us = match frac_str {
+        Some(f) => {
+            if f.is_empty() || f.len() > 9 || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(fmt_err());
+            }
+            // Right-pad to 6 digits; truncate digits 7-9 toward zero.
+            let mut buf: String = f.chars().take(6).collect();
+            while buf.len() < 6 {
+                buf.push('0');
+            }
+            buf.parse::<i64>().map_err(|_| fmt_err())?
+        }
+        None => 0,
+    };
+
+    let time_us = (h * 3600 + m * 60 + s)
+        .checked_mul(1_000_000)
+        .and_then(|v| v.checked_add(frac_us))
+        .ok_or_else(fmt_err)?;
+    // Total-i64-representability guard (microseconds), on the unsigned magnitude.
+    days.checked_mul(MICROS_PER_DAY)
+        .and_then(|v| v.checked_add(time_us))
+        .ok_or_else(fmt_err)?;
+
+    let days_signed = days.checked_mul(sign).ok_or_else(fmt_err)?;
+    let micros_signed = time_us.checked_mul(sign).ok_or_else(fmt_err)?;
+    let days_i32 = i32::try_from(days_signed).map_err(|_| fmt_err())?;
+    Ok((days_i32, micros_signed))
+}
+
+/// Parse a non-empty ASCII-digit run into a non-negative `i64`. Rejects empty
+/// strings and any non-digit byte (so `+`/`-`/whitespace fail), matching
+/// Spark's `\d+` interval-component grammar.
+fn parse_ascii_digits_i64(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<i64>().ok()
 }
 
 /// Lower a `DATE '...'` / `TIMESTAMP '...'` typed-string literal to a NON-NULL
@@ -5131,9 +5310,121 @@ mod tests {
                 assert_eq!(ie.days, 90);
                 assert_eq!(ie.months, 0);
                 assert_eq!(ie.microseconds, 0);
+                // Scope guard: single-field literals stay generic Calendar
+                // (retyping would regress the green date-arithmetic cases).
+                assert_eq!(ie.kind, IntervalKind::Calendar);
             }
             other => panic!("expected Interval, got {other:?}"),
         }
+    }
+
+    /// Extract the top-level projection as an `IntervalExpression`, panicking
+    /// otherwise.
+    fn first_interval(sql: &str) -> IntervalExpression {
+        let plan = parse(sql).expect("should parse");
+        match first_projection(plan) {
+            Expression::Interval(ie) => ie,
+            other => panic!("expected Interval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interval_year_to_month_lowers_to_year_month_interval() {
+        let ie = first_interval("SELECT INTERVAL '1-2' YEAR TO MONTH AS ym");
+        assert_eq!(ie.months, 14);
+        assert_eq!(ie.days, 0);
+        assert_eq!(ie.microseconds, 0);
+        assert_eq!(ie.kind, IntervalKind::YearMonth);
+    }
+
+    #[test]
+    fn interval_day_to_second_lowers_to_day_time_interval() {
+        let ie = first_interval("SELECT INTERVAL '1 02:30:00' DAY TO SECOND AS dts");
+        assert_eq!(ie.days, 1);
+        assert_eq!(ie.months, 0);
+        assert_eq!(ie.microseconds, 9_000_000_000);
+        assert_eq!(ie.kind, IntervalKind::DayTime);
+    }
+
+    #[test]
+    fn interval_day_to_second_parses_fractional_seconds() {
+        let ie = first_interval("SELECT INTERVAL '1 02:30:00.123456' DAY TO SECOND AS dts");
+        assert_eq!(ie.days, 1);
+        assert_eq!(ie.microseconds, 9_000_123_456);
+        assert_eq!(ie.kind, IntervalKind::DayTime);
+    }
+
+    #[test]
+    fn interval_day_to_second_truncates_fraction_beyond_micros() {
+        // 7-digit fraction: digits 7-9 are truncated toward zero to microseconds.
+        let ie = first_interval("SELECT INTERVAL '1 02:30:00.1234567' DAY TO SECOND AS dts");
+        assert_eq!(ie.microseconds, 9_000_123_456);
+    }
+
+    #[test]
+    fn interval_year_to_month_negative_sign() {
+        let ie = first_interval("SELECT INTERVAL '-1-2' YEAR TO MONTH AS ym");
+        assert_eq!(ie.months, -14);
+        assert_eq!(ie.kind, IntervalKind::YearMonth);
+    }
+
+    #[test]
+    fn interval_day_to_second_negative_sign() {
+        let ie = first_interval("SELECT INTERVAL '-1 02:30:00' DAY TO SECOND AS dts");
+        assert_eq!(ie.days, -1);
+        assert_eq!(ie.microseconds, -9_000_000_000);
+        assert_eq!(ie.kind, IntervalKind::DayTime);
+    }
+
+    #[test]
+    fn interval_year_to_month_malformed_months_is_boundary() {
+        // Month component out of `0..=11` → year_month_format boundary.
+        assert_eq!(
+            boundary_shape("SELECT INTERVAL '1-13' YEAR TO MONTH AS ym"),
+            "sql::expr::interval::year_month_format"
+        );
+    }
+
+    #[test]
+    fn interval_day_to_second_malformed_hours_is_boundary() {
+        // Hour component > 23 → day_time_format boundary.
+        assert_eq!(
+            boundary_shape("SELECT INTERVAL '1 25:00:00' DAY TO SECOND AS dts"),
+            "sql::expr::interval::day_time_format"
+        );
+    }
+
+    #[test]
+    fn interval_out_of_scope_pair_is_compound_boundary() {
+        // Only YEAR TO MONTH and DAY TO SECOND are supported; every other pair
+        // keeps the existing compound Thunderduck boundary.
+        assert_eq!(
+            boundary_shape("SELECT INTERVAL '1 02' DAY TO HOUR AS dh"),
+            "sql::expr::interval::compound"
+        );
+    }
+
+    #[test]
+    fn interval_year_to_month_bare_projection_analyzes_and_emits() {
+        use crate::transpiler_v2::analyzer::analyze;
+        use crate::transpiler_v2::base_types::BaseTypes;
+        use crate::transpiler_v2::emission::dispatch_op;
+
+        let plan = parse("SELECT INTERVAL '1-2' YEAR TO MONTH AS ym").expect("parse");
+        // No FROM clause → SingleRow input, no TableScan → empty overlay.
+        let bt = BaseTypes::empty();
+        let typed = analyze(plan, &bt).expect("analyze");
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        let field = &typed.resolved_schema.fields[0];
+        assert_eq!(field.name, "ym");
+        assert_eq!(field.data_type, DataType::YearMonthInterval);
+        assert!(!field.nullable);
+
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("emit");
+        assert!(
+            sql.contains("INTERVAL '14 months 0 days 0 microseconds'"),
+            "got: {sql}"
+        );
     }
 
     /// Extract the top-level projection as a `FunctionCall`, panicking otherwise.

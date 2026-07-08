@@ -1153,6 +1153,15 @@ fn select_item_has_aggregate(item: &SelectItem) -> bool {
     select_item_expr(item).is_some_and(expr_has_aggregate)
 }
 
+/// Full-tree `exists` for a nested aggregate call (Spark's
+/// `GlobalAggregates` / `ResolveGroupByAll` / GROUP BY ordinal checks).
+///
+/// The special-form arms (`Extract`/`Ceil`/`Floor`/`Substring`/`Position`/
+/// `Trim`/`Overlay`/`CompoundFieldAccess`) MUST stay in lockstep with
+/// [`resolve_named_windows_in_expr`]'s `&mut` mirror — the two walkers share
+/// the "missed a composite shape" bug class, one classifying aggregates, the
+/// other rewriting named windows. The parse-from-SQL parity test
+/// `expr_has_aggregate_classifier_table` guards against drift.
 fn expr_has_aggregate(expr: &Expr) -> bool {
     // Fix pass (review M4): extend the walker to every composite
     // shape the projection can contain. A missed shape used to mis-classify
@@ -1216,6 +1225,49 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         | Expr::AtTimeZone {
             timestamp: expr, ..
         } => expr_has_aggregate(expr),
+        // ── SQL special forms ────────────────────────────────────────────
+        // sqlparser parses `EXTRACT`/`CEIL`/`FLOOR`/`SUBSTRING`/`POSITION`/
+        // `TRIM`/`OVERLAY` and bracket field access to dedicated `Expr`
+        // variants (NOT `Expr::Function`). These arms MUST stay in lockstep
+        // with `resolve_named_windows_in_expr`'s mirror set; the parse-from-
+        // SQL parity test `expr_has_aggregate_classifier_table` guards drift.
+        Expr::Extract { expr, .. } | Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => {
+            expr_has_aggregate(expr)
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            expr_has_aggregate(expr)
+                || substring_from.as_deref().is_some_and(expr_has_aggregate)
+                || substring_for.as_deref().is_some_and(expr_has_aggregate)
+        }
+        Expr::Position { expr, r#in } => expr_has_aggregate(expr) || expr_has_aggregate(r#in),
+        // `trim_characters` is elided via `..` — never produced under τ's
+        // SparkDialect (always `None`), so recursing it would be a dead arm.
+        Expr::Trim {
+            expr, trim_what, ..
+        } => expr_has_aggregate(expr) || trim_what.as_deref().is_some_and(expr_has_aggregate),
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            expr_has_aggregate(expr)
+                || expr_has_aggregate(overlay_what)
+                || expr_has_aggregate(overlay_from)
+                || overlay_for.as_deref().is_some_and(expr_has_aggregate)
+        }
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            expr_has_aggregate(root)
+                || access_chain.iter().any(|a| match a {
+                    AccessExpr::Subscript(Subscript::Index { index }) => expr_has_aggregate(index),
+                    AccessExpr::Dot(_) | AccessExpr::Subscript(Subscript::Slice { .. }) => false,
+                })
+        }
         // Leaves and shapes that can't syntactically host an aggregate at
         // A.2 (identifiers, literals, subqueries, wildcards, GROUPING SETS,
         // interval/map/tuple/JSON access, etc.) contribute no aggregate.
@@ -2292,8 +2344,12 @@ fn resolve_named_windows_in_select(select: &mut Select) -> Result<(), EmissionEr
 /// Rewrite every `Expr::Function` whose `OVER` clause is a `NamedWindow`
 /// reference into an inline `WindowSpec`, descending through the composite
 /// expression shapes a projection can nest a window call inside. Mirrors
-/// `expr_has_aggregate`'s shape list (same "walker missed a composite shape"
-/// bug class, different walker). Deliberately does NOT descend into a
+/// [`expr_has_aggregate`]'s shape list — including the SQL special forms
+/// (`Extract`/`Ceil`/`Floor`/`Substring`/`Position`/`Trim`/`Overlay`/
+/// `CompoundFieldAccess`) — kept in lockstep to defeat the same "walker
+/// missed a composite shape" bug class (different walker); the parity test
+/// `expr_has_aggregate_classifier_table` guards the bool half against drift.
+/// Deliberately does NOT descend into a
 /// subquery (`Expr::Subquery`, `Expr::Exists`, or the subquery half of
 /// `InSubquery`) — a `WINDOW` clause is scoped to its containing `SELECT`
 /// (Spark), and a nested subquery resolves its own named windows via its own
@@ -2412,6 +2468,66 @@ fn resolve_named_windows_in_expr(
             timestamp: expr, ..
         } => {
             resolve_named_windows_in_expr(expr, defs)?;
+        }
+        // ── SQL special forms ────────────────────────────────────────────
+        // `&mut` mirror of `expr_has_aggregate`'s special-form arms — a
+        // named-window ref can legally nest inside any of these (e.g.
+        // `extract(YEAR FROM lag(ts) OVER w)`). Keep in lockstep; the parity
+        // test `expr_has_aggregate_classifier_table` guards the bool walker.
+        Expr::Extract { expr, .. } | Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => {
+            resolve_named_windows_in_expr(expr, defs)?;
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            resolve_named_windows_in_expr(expr, defs)?;
+            if let Some(e) = substring_from.as_deref_mut() {
+                resolve_named_windows_in_expr(e, defs)?;
+            }
+            if let Some(e) = substring_for.as_deref_mut() {
+                resolve_named_windows_in_expr(e, defs)?;
+            }
+        }
+        Expr::Position { expr, r#in } => {
+            resolve_named_windows_in_expr(expr, defs)?;
+            resolve_named_windows_in_expr(r#in, defs)?;
+        }
+        // `trim_characters` is elided via `..` — never produced under τ's
+        // SparkDialect (always `None`), so recursing it would be a dead arm.
+        Expr::Trim {
+            expr, trim_what, ..
+        } => {
+            resolve_named_windows_in_expr(expr, defs)?;
+            if let Some(e) = trim_what.as_deref_mut() {
+                resolve_named_windows_in_expr(e, defs)?;
+            }
+        }
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            resolve_named_windows_in_expr(expr, defs)?;
+            resolve_named_windows_in_expr(overlay_what, defs)?;
+            resolve_named_windows_in_expr(overlay_from, defs)?;
+            if let Some(e) = overlay_for.as_deref_mut() {
+                resolve_named_windows_in_expr(e, defs)?;
+            }
+        }
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            resolve_named_windows_in_expr(root, defs)?;
+            for a in access_chain {
+                match a {
+                    AccessExpr::Subscript(Subscript::Index { index }) => {
+                        resolve_named_windows_in_expr(index, defs)?;
+                    }
+                    AccessExpr::Dot(_) | AccessExpr::Subscript(Subscript::Slice { .. }) => {}
+                }
+            }
         }
         _ => {}
     }
@@ -3125,6 +3241,17 @@ mod tests {
             })?;
         assert_eq!(stmts.len(), 1);
         lower_statement(stmts.remove(0))
+    }
+
+    /// Parse a single SparkDialect scalar expression into a sqlparser `Expr`,
+    /// for the `expr_has_aggregate` classifier parity table.
+    fn parse_expr(sql: &str) -> Expr {
+        let dialect = SparkDialect::default();
+        Parser::new(&dialect)
+            .try_with_sql(sql)
+            .expect("tokenize")
+            .parse_expr()
+            .expect("parse expr")
     }
 
     /// Parse `sql`, require a Thunderduck-boundary error
@@ -4096,6 +4223,112 @@ mod tests {
         assert_eq!(
             boundary_shape("SELECT abs(count(*)) FROM t GROUP BY 1"),
             "sql::group_by_position_aggregate"
+        );
+    }
+
+    // ── SQL special-form aggregate classification (agg-022 / agg-023) ──────
+    //
+    // sqlparser parses EXTRACT / SUBSTRING / POSITION / TRIM / OVERLAY /
+    // CEIL / FLOOR / bracket-access to dedicated `Expr` variants (NOT
+    // `Expr::Function`); `expr_has_aggregate` must descend into them so an
+    // aggregate nested inside is not mis-classified as a grouping key under
+    // GROUP BY ALL. This table parses real SparkDialect SQL exprs (catching
+    // both a missed arm AND a wrong-field-shape assumption).
+
+    #[test]
+    fn expr_has_aggregate_classifier_table() {
+        let positive = [
+            "extract(year from max(ts))",
+            "substring(max(name) from 1 for 2)",
+            "substring(name from 1 for max(n))",
+            "overlay(name placing 'x' from 1 for max(n))",
+            "position('x' in max(name))",
+            "trim(both max(t) from name)",
+            "ceil(max(salary))",
+            "arr[max(i)]",
+            "collect_list(name)[0]",
+        ];
+        for sql in positive {
+            assert!(
+                expr_has_aggregate(&parse_expr(sql)),
+                "`{sql}` should classify as containing an aggregate"
+            );
+        }
+
+        let negative = ["ceil(salary, 2)", "extract(year from hire_date)"];
+        for sql in negative {
+            assert!(
+                !expr_has_aggregate(&parse_expr(sql)),
+                "`{sql}` should NOT classify as containing an aggregate"
+            );
+        }
+    }
+
+    #[test]
+    fn group_by_all_excludes_special_form_wrapped_aggregate() {
+        // agg-022: `extract(YEAR FROM max(last_login))` contains an aggregate,
+        // so GROUP BY ALL must group by `dept_id` only.
+        let plan =
+            parse("SELECT dept_id, extract(YEAR FROM max(last_login)) y FROM emp GROUP BY ALL")
+                .expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate { grouping, .. } => {
+                assert_eq!(grouping.len(), 1, "GROUP BY ALL groups only by dept_id");
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_by_all_excludes_substring_wrapped_aggregate() {
+        // agg-023: `substring(max(name) FROM 1 FOR 2)` contains an aggregate,
+        // so GROUP BY ALL must group by `dept_id` only.
+        let plan =
+            parse("SELECT dept_id, substring(max(name) FROM 1 FOR 2) s FROM emp GROUP BY ALL")
+                .expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate { grouping, .. } => {
+                assert_eq!(grouping.len(), 1, "GROUP BY ALL groups only by dept_id");
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn special_form_wrapped_aggregate_no_group_by_is_global_aggregate() {
+        // The secondary blast radius: with no GROUP BY, an aggregate nested
+        // inside EXTRACT must promote the query to a global Aggregate, not a
+        // plain Project.
+        let plan =
+            parse("SELECT extract(YEAR FROM max(last_login)) FROM emp").expect("should parse");
+        match plan.op {
+            CommonOp::Aggregate { grouping, .. } => {
+                assert!(grouping.is_empty(), "no GROUP BY ⇒ global aggregate");
+            }
+            other => panic!("expected global Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_window_ref_inside_extract_is_inlined() {
+        // The `&mut` mirror walker must descend into EXTRACT to inline the
+        // named window `w`; without the arm this raised a spurious
+        // `sql::named_window::unknown` boundary error.
+        parse(
+            "SELECT extract(YEAR FROM lag(last_login) OVER w) FROM emp WINDOW w AS (ORDER BY id)",
+        )
+        .expect("named window inside EXTRACT should inline and lower Ok");
+    }
+
+    #[test]
+    fn unknown_named_window_inside_extract_rejected() {
+        // Negative: the arm reaches the defs lookup, so an undefined window
+        // still yields the honest boundary shape.
+        assert_eq!(
+            boundary_shape(
+                "SELECT extract(YEAR FROM lag(last_login) OVER wrong) FROM emp WINDOW w AS (ORDER BY id)"
+            ),
+            "sql::named_window::unknown"
         );
     }
 

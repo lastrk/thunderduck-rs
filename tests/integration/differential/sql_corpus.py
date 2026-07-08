@@ -304,18 +304,18 @@ case("agg-020", "aggregate", "any / every boolean aggregates", "SELECT dept_id, 
 # args (and window PARTITION BY / ORDER BY), so GROUP BY ALL correctly groups
 # only by `dept_id`.
 case("agg-021", "aggregate", "GROUP BY ALL excludes aggregate nested in fn args (spark4)", "SELECT dept_id, abs(count(*)) n FROM emp GROUP BY ALL", flags=("spark4",))
-# agg-022 / agg-023: KNOWN-RED witnesses (NOT a pass-3 fix — out of findings
-# 1-6). `function_call_has_aggregate` (v2_lowering.rs, added by the agg-021 fix)
-# walks sqlparser's `Expr` tree, but SQL *special-form* syntax parses to
-# dedicated `Expr` variants — `EXTRACT(f FROM x)` -> `Expr::Extract`,
-# `SUBSTRING(s FROM p FOR n)` -> `Expr::Substring` — for which the aggregate
-# walker has no arms. An aggregate nested inside such a special form is missed,
-# so under `GROUP BY ALL` it is not excluded from the grouping keys and τ tries
-# to GROUP BY an expression that contains an aggregate -> DuckDB error. Spark
-# groups only by `dept_id`. Fails until the walker covers the special-form
-# `Expr` shapes (same bug class as agg-021, different syntax).
-case("agg-022", "aggregate", "aggregate nested in EXTRACT special form under GROUP BY ALL (known gap)", "SELECT dept_id, extract(YEAR FROM max(last_login)) y FROM emp GROUP BY ALL", flags=("spark4",))
-case("agg-023", "aggregate", "aggregate nested in SUBSTRING special form under GROUP BY ALL (known gap)", "SELECT dept_id, substring(max(name) FROM 1 FOR 2) s FROM emp GROUP BY ALL", flags=("spark4",))
+# agg-022 / agg-023: fixed (corpus-driven pass 2). SQL *special-form* syntax
+# parses to dedicated sqlparser `Expr` variants — `EXTRACT(f FROM x)` ->
+# `Expr::Extract`, `SUBSTRING(s FROM p FOR n)` -> `Expr::Substring` — NOT
+# `Expr::Function`. `expr_has_aggregate` (v2_lowering.rs) previously had no arms
+# for these, so an aggregate nested inside a special form was missed: under
+# `GROUP BY ALL` it was not excluded from the grouping keys and τ tried to GROUP
+# BY an expression containing an aggregate -> DuckDB error. Spark groups only by
+# `dept_id`. The walker (and its `&mut` named-window mirror) now descend into the
+# special-form variants (Extract/Ceil/Floor/Substring/Position/Trim/Overlay/
+# CompoundFieldAccess), so both cases group only by `dept_id` — matching Spark.
+case("agg-022", "aggregate", "aggregate nested in EXTRACT special form under GROUP BY ALL", "SELECT dept_id, extract(YEAR FROM max(last_login)) y FROM emp GROUP BY ALL", flags=("spark4",))
+case("agg-023", "aggregate", "aggregate nested in SUBSTRING special form under GROUP BY ALL", "SELECT dept_id, substring(max(name) FROM 1 FOR 2) s FROM emp GROUP BY ALL", flags=("spark4",))
 
 # ── 5. ORDER BY / LIMIT ──────────────────────────────────────────────────────
 case("ord-001", "ordering", "ORDER BY asc (default)", "SELECT * FROM emp ORDER BY salary")

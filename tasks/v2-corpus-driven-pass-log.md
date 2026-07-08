@@ -1345,3 +1345,32 @@ the summary below records the corpus deltas by pass number.
   *absent* — it does NOT rebuild on source change. Every acceptance run MUST be preceded
   by `cargo build --release` or the suite silently tests a stale binary. (This masked
   pass 1 on the first attempt.)
+
+## Pass 2 — agg-022, agg-023 (242→244)
+
+- **Cases:** agg-022 `SELECT dept_id, extract(YEAR FROM max(last_login)) y FROM emp GROUP BY ALL`;
+  agg-023 `SELECT dept_id, substring(max(name) FROM 1 FOR 2) s FROM emp GROUP BY ALL`
+- **Owning layer:** parser_v2 lowering (`crates/core/src/parser_v2/v2_lowering.rs`)
+- **Root cause:** the two sqlparser-`Expr` walkers `expr_has_aggregate` (bool) and
+  `resolve_named_windows_in_expr` (`&mut` mirror) had no arms for SQL special-form variants
+  (`Extract`/`Substring`/`Position`/`Trim`/`Overlay`/`Ceil`/`Floor`/`CompoundFieldAccess`), so an
+  aggregate nested inside one was missed; `GROUP BY ALL` then pushed the special-form item into
+  the grouping keys → DuckDB `Binder Error: GROUP BY clause cannot contain aggregates!`. Same bug
+  class as agg-021 (pass-3 flag 1), different syntax surface. The window-walker shared the
+  identical gap (had silently drifted from the bool walker despite a doc comment claiming mirror).
+- **Fix:** added identical special-form arms to BOTH walkers in lockstep, before each catch-all;
+  `CompoundFieldAccess` recurses `root` + `Subscript::Index.index` only (Dot/Slice non-recursed —
+  lower_expr boundary-rejects them; matched exhaustively so a future sqlparser variant is a compile
+  error); `trim_characters` elided (unreachable under SparkDialect). Anti-drift: a parse-from-SQL
+  classifier parity table + cross-referencing doc comments. Parser-local; no AST/analyzer/emission
+  change.
+- **ADRs:** ADR-004 (SQL-front-end-local desugaring; CommonAst unchanged), ADR-015 (full-tree
+  `exists` mirrors Spark ResolveGroupByAll/GlobalAggregates), ADR-016, ADR-022 (removes an opaque
+  DuckDB binder error + a false named-window boundary error; no new variants).
+- **Findings closed:** reviewer Critical=0 High=0 (1 non-blocking Low: optional extra mirror test);
+  perf High=0 Medium=0.
+- **Before→after:** 242 → 244 passed (270 total); +2, no regression.
+- **Tests:** classifier parity table `expr_has_aggregate_classifier_table` + 5 more in v2_lowering.rs;
+  corpus agg-022/agg-023 green E2E.
+- **Diagnostic:** `.agent-output/diagnostic-pass-2.md` · **Architecture:** `.agent-output/architecture-pass-2.md`
+- **SHA-to-be:** feat(v2-corpus): pass 2 — agg-022/agg-023 (242→244)

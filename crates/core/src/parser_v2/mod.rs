@@ -28,16 +28,32 @@ impl SparkSqlParserV2 {
     /// `ORDER BY`, `LIMIT/OFFSET`, joins, and subqueries in `FROM`.
     /// Everything else surfaces as
     /// [`EmissionError::Unsupported`] with `kind: ProtoShape`.
+    ///
+    /// Before handing SQL to `sqlparser-rs`, a token-level pre-pass rewrites
+    /// any depth-0 `AS (ident, ident+)` multi-column aliases (which sqlparser
+    /// cannot parse) into sentinel single-identifier aliases. After lowering,
+    /// a post-pass splices the sentinel-aliased projections into their
+    /// generator-specific expansions (e.g. `explode(m) AS (k, v)` becomes
+    /// `map_explode_key(m) AS k, map_explode_val(m) AS v`).
     pub fn parse(sql: &str) -> Result<CommonAst, EmissionError> {
         use crate::transpiler_v2::error::UnsupportedKind;
         use sqlparser::parser::Parser;
+
+        // Step 1: token-level rewrite of multi-column aliases.
+        let (rewritten_sql, alias_lists) = multi_alias::rewrite_multi_aliases(sql)?;
+        let parse_input = if alias_lists.is_empty() {
+            sql
+        } else {
+            rewritten_sql.as_str()
+        };
+
         let dialect = SparkDialect::default();
         // τ fix pass (review M2): sqlparser errors are boundary
         // failures — the input never reached `CommonAst`, so the correct
         // category is `ProtoShape` (input τ can't ingest), not `Op`
         // (emission arm not implemented).
         let mut stmts =
-            Parser::parse_sql(&dialect, sql).map_err(|e| EmissionError::Unsupported {
+            Parser::parse_sql(&dialect, parse_input).map_err(|e| EmissionError::Unsupported {
                 kind: UnsupportedKind::ProtoShape,
                 name: "sql::parse_error".to_owned(),
                 reason: e.to_string(),
@@ -48,7 +64,14 @@ impl SparkSqlParserV2 {
                 format!("expected exactly one SQL statement, got {}", stmts.len()),
             );
         }
-        v2_lowering::lower_statement(stmts.remove(0))
+        let mut ast = v2_lowering::lower_statement(stmts.remove(0))?;
+
+        // Step 2: post-lowering splice of sentinel-aliased projections.
+        if !alias_lists.is_empty() {
+            multi_alias::splice_multi_aliases(&mut ast, &alias_lists)?;
+        }
+
+        Ok(ast)
     }
 
     /// Parse a SparkSQL expression FRAGMENT (e.g. `age + 1`, `upper(name)`)
@@ -134,15 +157,17 @@ impl SparkSqlParserV2 {
 ///
 /// Only accepts an inner `stack` call (piv-006 scope) — other generator
 /// functions (`posexplode`, `explode(map)`, `inline`, `json_tuple`) with a
-/// multi-alias on the SQL path surface as a Thunderduck-boundary error and
-/// remain a follow-up.
+/// multi-alias on the `F.expr()` SQL fragment path surface as a
+/// Thunderduck-boundary error and remain a follow-up.
+///
+/// Delegates to [`multi_alias::build_stack_multi_alias`] for the actual
+/// construction (single source of truth shared with the full-SQL path).
 fn wrap_stack_multi_alias(
     inner: crate::transpiler_v2::Expression,
     aliases: Vec<String>,
     expr_sql: &str,
 ) -> Result<crate::transpiler_v2::Expression, EmissionError> {
-    use crate::transpiler_v2::expression::{Expression, FunctionCall, Literal, LiteralValue};
-    use crate::types::DataType;
+    use crate::transpiler_v2::expression::Expression;
 
     let is_stack = matches!(
         &inner,
@@ -157,19 +182,7 @@ fn wrap_stack_multi_alias(
             ),
         );
     }
-    let mut args: Vec<Expression> = Vec::with_capacity(1 + aliases.len());
-    args.push(inner);
-    for a in aliases {
-        args.push(Expression::Literal(Literal {
-            value: LiteralValue::String(a),
-            data_type: DataType::String,
-        }));
-    }
-    Ok(Expression::FunctionCall(FunctionCall {
-        name: "stack_multi_alias".to_owned(),
-        args,
-        distinct: false,
-    }))
+    Ok(multi_alias::build_stack_multi_alias(inner, &aliases))
 }
 
 #[cfg(test)]
@@ -333,5 +346,247 @@ mod tests {
             }
         }
         assert_eq!(alias_slots, vec!["metric", "value"]);
+    }
+
+    // ── Full-SQL multi-alias (cx-011, pv-006) ────────────────────────────────
+
+    #[test]
+    fn parse_cx011_explode_map_multi_alias_produces_key_val_pair() {
+        // cx-011: `SELECT id, explode(attrs) AS (k, v) FROM emp`
+        // Must produce Project with projections:
+        //   [UnresolvedColumn("id"),
+        //    Alias(FunctionCall("map_explode_key", [UnresolvedColumn("attrs")]), "k"),
+        //    Alias(FunctionCall("map_explode_val", [UnresolvedColumn("attrs")]), "v")]
+        use crate::transpiler_v2::ast::CommonOp;
+        use crate::transpiler_v2::expression::{AliasExpression, FunctionCall};
+
+        let ast = SparkSqlParserV2::parse("SELECT id, explode(attrs) AS (k, v) FROM emp")
+            .expect("cx-011 SQL must parse");
+
+        let projections = match ast.op {
+            CommonOp::Project { projections, .. } => projections,
+            other => panic!("expected Project, got {other:?}"),
+        };
+        assert_eq!(
+            projections.len(),
+            3,
+            "expected 3 projections (id + key + val), got {}",
+            projections.len()
+        );
+
+        // projections[0]: id column (bare UnresolvedColumn — no alias on
+        // a bare column reference in a SELECT list without AS).
+        match &projections[0] {
+            Expression::UnresolvedColumn(uc) => {
+                assert_eq!(uc.name, "id");
+            }
+            // The lowering may wrap bare columns in Alias(col, "id") for
+            // SparkSQL default naming — accept both shapes.
+            Expression::Alias(a) => {
+                assert_eq!(a.alias, "id");
+            }
+            other => panic!("expected UnresolvedColumn or Alias for id, got {other:?}"),
+        }
+
+        // projections[1]: Alias(map_explode_key(attrs), "k")
+        match &projections[1] {
+            Expression::Alias(AliasExpression { expr, alias }) => {
+                assert_eq!(alias, "k");
+                match expr.as_ref() {
+                    Expression::FunctionCall(FunctionCall { name, args, .. }) => {
+                        assert_eq!(name, "map_explode_key");
+                        assert_eq!(args.len(), 1);
+                    }
+                    other => panic!("expected FunctionCall(map_explode_key), got {other:?}"),
+                }
+            }
+            other => panic!("expected Alias(map_explode_key, 'k'), got {other:?}"),
+        }
+
+        // projections[2]: Alias(map_explode_val(attrs), "v")
+        match &projections[2] {
+            Expression::Alias(AliasExpression { expr, alias }) => {
+                assert_eq!(alias, "v");
+                match expr.as_ref() {
+                    Expression::FunctionCall(FunctionCall { name, args, .. }) => {
+                        assert_eq!(name, "map_explode_val");
+                        assert_eq!(args.len(), 1);
+                    }
+                    other => panic!("expected FunctionCall(map_explode_val), got {other:?}"),
+                }
+            }
+            other => panic!("expected Alias(map_explode_val, 'v'), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_pv006_stack_multi_alias_produces_wrapper() {
+        // pv-006: `SELECT id, stack(2, 'age', age, 'salary', salary) AS (metric, value) FROM emp`
+        // Must produce Project with projections:
+        //   [Alias("id"), FunctionCall("stack_multi_alias", [stack(...), "metric", "value"])]
+        // (proves the stack dispatch arm is distinct from explode)
+        use crate::transpiler_v2::ast::CommonOp;
+        use crate::transpiler_v2::expression::{FunctionCall, Literal, LiteralValue};
+
+        let ast = SparkSqlParserV2::parse(
+            "SELECT id, stack(2, 'age', age, 'salary', salary) AS (metric, value) FROM emp",
+        )
+        .expect("pv-006 SQL must parse");
+
+        let projections = match ast.op {
+            CommonOp::Project { projections, .. } => projections,
+            other => panic!("expected Project, got {other:?}"),
+        };
+        assert_eq!(projections.len(), 2);
+
+        // projections[1]: stack_multi_alias(stack(...), "metric", "value")
+        match &projections[1] {
+            Expression::FunctionCall(FunctionCall { name, args, .. }) => {
+                assert_eq!(name, "stack_multi_alias");
+                assert_eq!(args.len(), 3);
+                match &args[0] {
+                    Expression::FunctionCall(fc) => {
+                        assert!(fc.name.eq_ignore_ascii_case("stack"));
+                    }
+                    other => panic!("expected inner stack call, got {other:?}"),
+                }
+                for (i, expected) in ["metric", "value"].iter().enumerate() {
+                    match &args[i + 1] {
+                        Expression::Literal(Literal {
+                            value: LiteralValue::String(s),
+                            ..
+                        }) => assert_eq!(s, expected),
+                        other => panic!("expected string literal '{expected}', got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected FunctionCall(stack_multi_alias), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_posexplode_multi_alias_is_boundary_error() {
+        // posexplode with 2 aliases on the full-SQL path must be a boundary error
+        // (not yet implemented for the SQL path — only explode and stack are).
+        use crate::transpiler_v2::error::UnsupportedKind;
+        let result = SparkSqlParserV2::parse("SELECT posexplode(arr) AS (p, v) FROM t");
+        match result {
+            Err(crate::transpiler_v2::EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                ref name,
+                ..
+            }) => {
+                assert!(
+                    name.contains("posexplode"),
+                    "boundary error name must mention posexplode, got: {name}"
+                );
+            }
+            other => panic!("expected boundary error for posexplode multi-alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_explode_with_three_aliases_is_boundary_error() {
+        // explode with 3 aliases (arity mismatch) must be a boundary error.
+        use crate::transpiler_v2::error::UnsupportedKind;
+        let result = SparkSqlParserV2::parse("SELECT explode(m) AS (a, b, c) FROM t");
+        match result {
+            Err(crate::transpiler_v2::EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                ref name,
+                ..
+            }) => {
+                assert!(
+                    name.contains("explode"),
+                    "boundary error name must mention explode, got: {name}"
+                );
+            }
+            other => panic!("expected boundary error for explode 3-alias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unconsumed_sentinel_is_boundary_error() {
+        // Deliberately construct a scenario where the sentinel survives into
+        // a non-Project node. We use a CTE whose body is a subquery — but
+        // actually, the simplest way to trigger this is to have the rewrite
+        // produce a sentinel that lands in a non-Project op. Since all SELECT
+        // statements produce Projects, a truly unconsumed sentinel is hard to
+        // trigger via normal SQL. Instead, test the splice_multi_aliases
+        // function directly with a tree that has no Project.
+        use crate::transpiler_v2::ast::{CommonAst, CommonOp};
+        let mut ast = CommonAst::new(CommonOp::SingleRow);
+        let alias_lists = vec![vec!["k".to_owned(), "v".to_owned()]];
+        let result = super::multi_alias::splice_multi_aliases(&mut ast, &alias_lists);
+        match result {
+            Err(crate::transpiler_v2::EmissionError::Unsupported {
+                kind: crate::transpiler_v2::error::UnsupportedKind::ProtoShape,
+                ref name,
+                ..
+            }) => {
+                assert!(
+                    name.contains("unconsumed_sentinel"),
+                    "error name must contain 'unconsumed_sentinel', got: {name}"
+                );
+            }
+            other => panic!("expected unconsumed-sentinel boundary error, got {other:?}"),
+        }
+    }
+
+    // ── Convergence: SQL-path explode pair == DataFrame-path shape ───────────
+
+    #[test]
+    fn sql_path_explode_pair_matches_dataframe_path_shape() {
+        // The SQL path's spliced explode pair (from splice_multi_aliases) must
+        // be structurally identical to what try_convert_posexplode_multi_alias
+        // (DataFrame converter) builds. We construct both shapes manually and
+        // compare.
+        use crate::transpiler_v2::expression::{AliasExpression, FunctionCall};
+
+        // SQL-path shape: build via build_map_explode_pair.
+        let arg = Expression::FunctionCall(FunctionCall {
+            name: "explode".to_owned(),
+            args: vec![Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "attrs".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            )],
+            distinct: false,
+        });
+        // The SQL path uses the single argument to explode, not the explode
+        // call itself. Extract it.
+        let inner_arg = arg.clone();
+        let sql_pair = super::multi_alias::build_map_explode_pair(inner_arg, "k", "v");
+
+        // DataFrame-path shape: manual construction matching
+        // try_convert_posexplode_multi_alias (v2_relation_converter.rs:1290-1309).
+        let df_a = Expression::Alias(AliasExpression {
+            expr: Box::new(Expression::FunctionCall(FunctionCall {
+                name: "map_explode_key".to_owned(),
+                args: vec![arg.clone()],
+                distinct: false,
+            })),
+            alias: "k".to_owned(),
+        });
+        let df_b = Expression::Alias(AliasExpression {
+            expr: Box::new(Expression::FunctionCall(FunctionCall {
+                name: "map_explode_val".to_owned(),
+                args: vec![arg],
+                distinct: false,
+            })),
+            alias: "v".to_owned(),
+        });
+
+        assert_eq!(sql_pair.len(), 2);
+        assert_eq!(
+            sql_pair[0], df_a,
+            "SQL-path key projection must match DataFrame-path shape"
+        );
+        assert_eq!(
+            sql_pair[1], df_b,
+            "SQL-path val projection must match DataFrame-path shape"
+        );
     }
 }

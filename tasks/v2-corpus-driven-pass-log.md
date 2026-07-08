@@ -1670,3 +1670,41 @@ Gate green (core 778, connect-server 97 unit tests). Corpora unchanged: SQL 254/
   effort:auto on all 6 subagents; confirmed definitions reload fresh on every Agent call, no special
   reload command needed).
 - **SHA-to-be:** feat(v2-corpus): pass 11 — cx-007/cx-008/cx-009 (254→257)
+
+## Pass 12 — cx-011 (257→258)
+
+- **Case:** cx-011 `SELECT id, explode(attrs) AS (k, v) FROM emp` (attrs is a MAP) — SELECT-list
+  generator with a parenthesized multi-column alias.
+- **Owning layer:** parser_v2 (`multi_alias.rs` + `mod.rs`) only. No AST/analyzer/emission change.
+- **Root cause:** genuine sqlparser-rs 0.61 gap — `SelectItem::ExprWithAlias` carries only a single
+  `Ident`; `AS (` after a SELECT-list function call hard-fails at parse. The existing
+  `strip_trailing_multi_alias`/`wrap_stack_multi_alias` machinery only covers the `F.expr()` fragment
+  path, not full SQL statements — discovered (correcting the initial task premise) that `pv-006`
+  (stack multi-alias) was ALSO red on the full-SQL path for this exact reason.
+- **Fix:** new token-level pre-pass `rewrite_multi_aliases` (Tokenizer-based, NOT string manipulation —
+  scans the whole token stream for depth-0 `AS (ident, ident+)`, rewrites to a sentinel
+  `__td_multi_alias_<N>` before sqlparser runs) plus post-lowering `splice_multi_aliases` (walks the
+  CommonAst, dispatches sentinel-aliased Project items: `stack(...)` → existing `stack_multi_alias`
+  wrapper; `explode`/`explode_outer(map)` + 2 aliases → direct split into
+  `map_explode_key`/`map_explode_val` Alias pair, converging byte-for-byte with the DataFrame
+  converter's `try_convert_posexplode_multi_alias`; anything else → boundary error). Added a cheap
+  byte-level pre-check (`might_contain_as_paren`) before tokenizing, avoiding a redundant full
+  tokenization pass on the ~99% of queries with no multi-alias (perf finding, fixed in-pass). Zero
+  analyzer/emission changes — map_explode_key/val and stack_multi_alias/expand_stack_projections were
+  already fully implemented and tested.
+- **ADRs:** ADR-003 (not an AST extension — no new CommonOp/Expression variants, no new synthetic
+  function names), ADR-004 (DataFrame side needs zero changes — full front-end convergence at the
+  CommonAst), ADR-006 (analyzer pass list unchanged), ADR-015 (cx-011 the oracle), ADR-022 (boundary
+  errors for posexplode/inline/json_tuple multi-alias, wrong arity).
+- **Findings closed:** reviewer Critical=0 High=0 (scanned every `AS (` in the corpus for false
+  positives — zero found; 2 non-blocking Lows, neither fixed); perf High=0 Medium=0 (1 Low — redundant
+  tokenization on every parse — FIXED in-pass via a cheap byte-level pre-check).
+- **Before→after:** SQL 257 → 258 passed (270 total), +1, no regression. DataFrame 329/329 (verified).
+- **Bonus finding, NOT a regression:** the fix also made `pv-006` parse successfully (confirming
+  correctness), but pv-006 then fails at the REFERENCE Spark session itself
+  (`DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES` — the corpus SQL mixes INT `age` and DOUBLE `salary` in
+  one stack() value column, which Spark 4.1.1 itself rejects). Documented in `.agent-output/
+  unsolvable.md` as a 4th invalid corpus case (same class as sq-011/012/013) — caps the achievable
+  ceiling at 266/270, not 267/270.
+- **Diagnostic:** `.agent-output/diagnostic-pass-12.md` · **Architecture:** `.agent-output/architecture-pass-12.md`
+- **SHA-to-be:** feat(v2-corpus): pass 12 — cx-011 (257→258)

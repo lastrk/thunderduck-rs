@@ -214,6 +214,12 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             with_ordinality,
         } => render_table_function(name, args, *with_ordinality, schema),
 
+        TypedOp::LateralView {
+            input,
+            table_alias,
+            columns,
+        } => render_lateral_view(input, table_alias, columns),
+
         // ── future τ work owns (analyzer PuntedOperator today; defensive) ──────
         TypedOp::Unnest { .. } => Err(EmissionError::Unsupported {
             kind: UnsupportedKind::Op,
@@ -493,6 +499,20 @@ fn render_alias_transparent_from(
         let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
         return Ok(Some(AliasTransparentFrom {
             from_sql: quoted_derived(&inner_sql, alias),
+            where_sql: None,
+        }));
+    }
+    // LateralView already carries the user's table alias (`t`) — Project over
+    // LateralView must inline the LATERAL(SELECT...) FROM body so `e` and `t`
+    // stay in scope (the default `__td_proj` wrap would occlude both).
+    if let TypedOp::LateralView {
+        input,
+        table_alias,
+        columns,
+    } = &input.op
+    {
+        return Ok(Some(AliasTransparentFrom {
+            from_sql: render_lateral_view_from(input, table_alias, columns)?,
             where_sql: None,
         }));
     }
@@ -845,6 +865,57 @@ fn render_projection_slot(
     }
     let inner_sql = render_expr(expr, input_schema)?;
     Ok(spark_return_cast(inner_sql, expr, input_schema))
+}
+
+/// Render the FROM-body of a `LATERAL VIEW` operator:
+/// `<input-from-body>, LATERAL (SELECT <expr1> AS <alias1>[, ...]) AS <table_alias>`.
+///
+/// The input FROM resolution follows the same priority as `render_project`:
+/// - TableScan → inline `table_scan_from_body`
+/// - alias-transparent shapes → inline their `from_sql`
+/// - anything else → wrap in a `quoted_derived(dispatch_op(input), "__td_lv")`
+fn render_lateral_view_from(
+    input: &TypedAst,
+    table_alias: &str,
+    columns: &[(String, Expression)],
+) -> Result<String, EmissionError> {
+    let input_schema = &input.resolved_schema;
+    let input_from = if let TypedOp::TableScan { table, alias } = &input.op {
+        table_scan_from_body(table, alias.as_deref())
+    } else if let Some(atf) = render_alias_transparent_from(input)? {
+        // alias-transparent shapes already expose user aliases.
+        // A WHERE from a Filter-over-X is not expected here (LateralView
+        // does not nest with Filter in its immediate input in the current
+        // corpus), but handle it defensively.
+        match atf.where_sql {
+            Some(w) => format!("(SELECT * FROM {} WHERE {w}) AS __td_lv", atf.from_sql),
+            None => atf.from_sql,
+        }
+    } else {
+        let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+        quoted_derived(&inner_sql, "__td_lv")
+    };
+
+    let inner_select = sql_join(columns.iter(), ", ", |(alias, expr)| {
+        let expr_sql = render_expr(expr, input_schema)?;
+        Ok(format!("{expr_sql} AS {}", quote_ident(alias)))
+    })?;
+
+    Ok(format!(
+        "{input_from}, LATERAL (SELECT {inner_select}) AS {}",
+        quote_ident(table_alias)
+    ))
+}
+
+/// Top-level dispatch for `TypedOp::LateralView` —
+/// `SELECT * FROM <render_lateral_view_from(...)>`.
+fn render_lateral_view(
+    input: &TypedAst,
+    table_alias: &str,
+    columns: &[(String, Expression)],
+) -> Result<String, EmissionError> {
+    let from_body = render_lateral_view_from(input, table_alias, columns)?;
+    Ok(format!("SELECT * FROM {from_body}"))
 }
 
 fn render_filter(input: &TypedAst, condition: &Expression) -> Result<String, EmissionError> {
@@ -11210,5 +11281,199 @@ mod tests {
         // The bare column names still appear in the projection.
         assert!(sql.contains("SELECT s,"), "got: {sql}");
         assert!(sql.contains(", b FROM"), "got: {sql}");
+    }
+
+    // ── LATERAL VIEW emission tests (cx-007/cx-008/cx-009) ──────────────
+
+    /// Build a `TypedOp::LateralView` with a TableScan("emp") aliased "e"
+    /// and an `ARRAY<STRING>` tags column. Returns the TypedAst for the
+    /// LateralView operator ready for dispatch_op / render tests.
+    fn emp_tags_schema() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("tags", DataType::Array(Box::new(DataType::String), true)),
+        ])
+    }
+
+    fn typed_table_scan(table: &str, alias: Option<&str>, schema: StructType) -> TypedAst {
+        TypedAst {
+            resolved_schema: schema,
+            op: TypedOp::TableScan {
+                table: table.to_owned(),
+                alias: alias.map(|s| s.to_owned()),
+            },
+        }
+    }
+
+    fn tags_col_ref() -> Expression {
+        Expression::ColumnReference(ColumnReference {
+            name: "tags".to_owned(),
+            qualifier: Some("e".to_owned()),
+            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
+            nullable: Some(true),
+        })
+    }
+
+    fn lateral_view_typed(columns: Vec<(String, Expression)>, input: TypedAst) -> TypedAst {
+        let gen_fields: Vec<StructField> = columns
+            .iter()
+            .map(|(alias, expr)| {
+                StructField::new(
+                    alias.clone(),
+                    expr.data_type(&input.resolved_schema),
+                    expr.nullable(&input.resolved_schema),
+                )
+            })
+            .collect();
+        let resolved_schema =
+            StructType::merge(&input.resolved_schema, &StructType::new(gen_fields));
+        TypedAst {
+            op: TypedOp::LateralView {
+                input: Box::new(input),
+                table_alias: "t".to_owned(),
+                columns,
+            },
+            resolved_schema,
+        }
+    }
+
+    #[test]
+    fn render_lateral_view_plain_explode() {
+        let _g = tap_guard();
+        let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
+        let lv = lateral_view_typed(
+            vec![("tag".to_owned(), fexpr("explode", vec![tags_col_ref()]))],
+            input,
+        );
+        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
+        // cx-007 shape: SELECT * FROM emp AS e, LATERAL (SELECT UNNEST(e.tags) AS tag) AS t
+        assert!(
+            sql.contains("LATERAL (SELECT"),
+            "must contain LATERAL(SELECT), got: {sql}"
+        );
+        assert!(
+            sql.contains("UNNEST(e.tags)"),
+            "must contain UNNEST(e.tags), got: {sql}"
+        );
+        assert!(sql.contains("AS tag"), "must alias as tag, got: {sql}");
+        assert!(
+            sql.contains("AS t"),
+            "must alias lateral table as t, got: {sql}"
+        );
+        assert!(
+            !sql.contains("__td_proj"),
+            "must not contain __td_proj, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_lateral_view_outer_explode() {
+        let _g = tap_guard();
+        let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
+        let lv = lateral_view_typed(
+            vec![(
+                "tag".to_owned(),
+                fexpr("explode_outer", vec![tags_col_ref()]),
+            )],
+            input,
+        );
+        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
+        // cx-008 shape: the CASE-wrapped UNNEST should appear inside the
+        // LATERAL(SELECT...) wrapper.
+        assert!(
+            sql.contains("LATERAL (SELECT"),
+            "must contain LATERAL(SELECT), got: {sql}"
+        );
+        assert!(
+            sql.contains("CASE WHEN"),
+            "OUTER must use CASE rewrite, got: {sql}"
+        );
+        assert!(
+            sql.contains("UNNEST(CASE WHEN e.tags"),
+            "must contain UNNEST(CASE WHEN e.tags...), got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_lateral_view_posexplode_single_inner_select() {
+        let _g = tap_guard();
+        let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
+        let lv = lateral_view_typed(
+            vec![
+                (
+                    "pos".to_owned(),
+                    fexpr("posexplode_pos", vec![tags_col_ref()]),
+                ),
+                (
+                    "tag".to_owned(),
+                    fexpr("posexplode_val", vec![tags_col_ref()]),
+                ),
+            ],
+            input,
+        );
+        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
+        // cx-009 shape: both columns in ONE inner SELECT.
+        let lateral_count = sql.matches("LATERAL (SELECT").count();
+        assert_eq!(
+            lateral_count, 1,
+            "posexplode must produce exactly one LATERAL(SELECT), got {lateral_count} in: {sql}"
+        );
+        assert!(
+            sql.contains("generate_subscripts"),
+            "pos column must use generate_subscripts, got: {sql}"
+        );
+        assert!(sql.contains("AS pos"), "must alias pos, got: {sql}");
+        assert!(sql.contains("AS tag"), "must alias tag, got: {sql}");
+        assert!(
+            !sql.contains("__td_proj"),
+            "must not contain __td_proj, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_project_over_lateral_view_no_td_proj() {
+        let _g = tap_guard();
+        let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
+        let lv = lateral_view_typed(
+            vec![("tag".to_owned(), fexpr("explode", vec![tags_col_ref()]))],
+            input,
+        );
+        // Project[e.id, t.tag] over LateralView
+        let id_ref = Expression::ColumnReference(ColumnReference {
+            name: "id".to_owned(),
+            qualifier: Some("e".to_owned()),
+            data_type: Some(DataType::Long),
+            nullable: Some(false),
+        });
+        let tag_ref = Expression::ColumnReference(ColumnReference {
+            name: "tag".to_owned(),
+            qualifier: Some("t".to_owned()),
+            data_type: Some(DataType::String),
+            nullable: Some(true),
+        });
+        let proj = TypedAst {
+            resolved_schema: StructType::new(vec![
+                StructField::not_null("id", DataType::Long),
+                StructField::nullable("tag", DataType::String),
+            ]),
+            op: TypedOp::Project {
+                input: Box::new(lv),
+                projections: vec![id_ref, tag_ref],
+            },
+        };
+        let sql = dispatch_op(&proj.op, &proj.resolved_schema).expect("render");
+        // The output must NOT wrap in __td_proj — the alias-transparent-from
+        // arm must inline the LATERAL FROM body.
+        assert!(
+            !sql.contains("__td_proj"),
+            "Project-over-LateralView must not contain __td_proj, got: {sql}"
+        );
+        assert!(sql.contains("e.id"), "must reference e.id, got: {sql}");
+        assert!(sql.contains("t.tag"), "must reference t.tag, got: {sql}");
+        assert!(
+            sql.contains("LATERAL (SELECT"),
+            "must contain LATERAL(SELECT), got: {sql}"
+        );
     }
 }

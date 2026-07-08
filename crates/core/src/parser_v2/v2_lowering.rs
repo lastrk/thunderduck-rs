@@ -25,12 +25,12 @@ use sqlparser::ast::{
     AccessExpr, BinaryOperator, CastKind, CeilFloorKind, DataType as SqlDataType, DateTimeField,
     Distinct, DuplicateTreatment, ExactNumberInfo, Expr, ExprWithAlias, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, GroupByWithModifier,
-    Interval, JoinConstraint, JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr,
-    NullInclusion, ObjectName, ObjectNamePart, OrderByExpr, OrderByKind, OrderByOptions,
-    PivotValueSource, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
-    Subscript, TableAlias, TableFactor, TableWithJoins, TrimWhereField, TypedString, UnaryOperator,
-    Value, ValueWithSpan, WindowFrame as SqlWindowFrame, WindowFrameBound, WindowFrameUnits,
-    WindowSpec, WindowType,
+    Interval, JoinConstraint, JoinOperator, LateralView, LimitClause, NamedWindowDefinition,
+    NamedWindowExpr, NullInclusion, ObjectName, ObjectNamePart, OrderByExpr, OrderByKind,
+    OrderByOptions, PivotValueSource, Query, Select, SelectItem, SetExpr, SetOperator,
+    SetQuantifier, Statement, Subscript, TableAlias, TableFactor, TableWithJoins, TrimWhereField,
+    TypedString, UnaryOperator, Value, ValueWithSpan, WindowFrame as SqlWindowFrame,
+    WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 
 use crate::bail_boundary_proto;
@@ -261,6 +261,159 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
     }
 }
 
+/// Fold `lateral_views` into the plan tree — each `LATERAL VIEW [OUTER]
+/// generator(arg) table_alias AS col1[, col2]` becomes a
+/// [`CommonOp::LateralView`] wrapping `base`.
+///
+/// Dispatch table (generator name lowercased, alias count):
+/// - `explode` / `explode_outer`, 1 alias → single-column LateralView
+/// - `posexplode`, 2 aliases → split into `posexplode_pos` + `posexplode_val`
+/// - Chained (2+) LATERAL VIEWs → boundary error
+/// - OUTER posexplode → boundary error (no CASE-wrapped pos/val renderer)
+/// - Everything else (wrong alias count, unknown generator, non-1-arg) → boundary error
+fn lower_lateral_views(
+    base: CommonAst,
+    lateral_views: Vec<LateralView>,
+    cte_scope: &CteScope,
+) -> Result<CommonAst, EmissionError> {
+    if lateral_views.is_empty() {
+        return Ok(base);
+    }
+    if lateral_views.len() > 1 {
+        bail_boundary_proto!(
+            "sql::lateral_view::chained",
+            "multiple LATERAL VIEW clauses not implemented in τ"
+        );
+    }
+    let lv = lateral_views.into_iter().next().expect("len checked == 1");
+    // Extract the generator function name and arguments from the parsed Expr.
+    let (gen_name, gen_args) = match &lv.lateral_view {
+        Expr::Function(func) => {
+            let name = object_name_to_string(&func.name).to_lowercase();
+            let args: Vec<Expression> = match &func.args {
+                FunctionArguments::List(list) => list
+                    .args
+                    .iter()
+                    .map(|a| function_arg_to_expr(a.clone(), cte_scope))
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => {
+                    bail_boundary_proto!(
+                        "sql::lateral_view::generator_args",
+                        "LATERAL VIEW generator with non-list arguments not supported in τ"
+                    );
+                }
+            };
+            (name, args)
+        }
+        _ => {
+            bail_boundary_proto!(
+                "sql::lateral_view::generator",
+                "LATERAL VIEW with non-function generator not supported in τ"
+            );
+        }
+    };
+    // Require exactly one generator argument.
+    if gen_args.len() != 1 {
+        bail_boundary_proto!(
+            "sql::lateral_view::generator_arity",
+            "LATERAL VIEW generator must have exactly 1 argument"
+        );
+    }
+    let arg = gen_args.into_iter().next().expect("len checked == 1");
+    let table_alias = object_name_to_string(&lv.lateral_view_name);
+    let aliases: Vec<String> = lv
+        .lateral_col_alias
+        .iter()
+        .map(|id| id.value.clone())
+        .collect();
+    if aliases.is_empty() {
+        bail_boundary_proto!(
+            "sql::lateral_view::empty_aliases",
+            "LATERAL VIEW with no column aliases not supported in τ"
+        );
+    }
+
+    let columns = match gen_name.as_str() {
+        "explode" if !lv.outer && aliases.len() == 1 => {
+            vec![(
+                aliases.into_iter().next().expect("len checked == 1"),
+                Expression::FunctionCall(FunctionCall {
+                    name: "explode".to_owned(),
+                    args: vec![arg],
+                    distinct: false,
+                }),
+            )]
+        }
+        "explode" if lv.outer && aliases.len() == 1 => {
+            vec![(
+                aliases.into_iter().next().expect("len checked == 1"),
+                Expression::FunctionCall(FunctionCall {
+                    name: "explode_outer".to_owned(),
+                    args: vec![arg],
+                    distinct: false,
+                }),
+            )]
+        }
+        "explode_outer" if aliases.len() == 1 => {
+            vec![(
+                aliases.into_iter().next().expect("len checked == 1"),
+                Expression::FunctionCall(FunctionCall {
+                    name: "explode_outer".to_owned(),
+                    args: vec![arg],
+                    distinct: false,
+                }),
+            )]
+        }
+        "posexplode" if !lv.outer && aliases.len() == 2 => {
+            let mut it = aliases.into_iter();
+            let pos_alias = it.next().expect("len checked == 2");
+            let val_alias = it.next().expect("len checked == 2");
+            vec![
+                (
+                    pos_alias,
+                    Expression::FunctionCall(FunctionCall {
+                        name: "posexplode_pos".to_owned(),
+                        args: vec![arg.clone()],
+                        distinct: false,
+                    }),
+                ),
+                (
+                    val_alias,
+                    Expression::FunctionCall(FunctionCall {
+                        name: "posexplode_val".to_owned(),
+                        args: vec![arg],
+                        distinct: false,
+                    }),
+                ),
+            ]
+        }
+        "posexplode" if lv.outer => {
+            bail_boundary_proto!(
+                "sql::lateral_view::outer_posexplode",
+                "OUTER posexplode in LATERAL VIEW not implemented in τ"
+            );
+        }
+        "posexplode" => {
+            bail_boundary_proto!(
+                "sql::lateral_view::posexplode_alias_count",
+                "posexplode in LATERAL VIEW requires exactly 2 aliases"
+            );
+        }
+        _ => {
+            bail_boundary_proto!(
+                format!("sql::lateral_view::generator::{gen_name}"),
+                format!("LATERAL VIEW generator `{gen_name}` not supported in τ")
+            );
+        }
+    };
+
+    Ok(CommonAst::new(CommonOp::LateralView {
+        input: Box::new(base),
+        table_alias,
+        columns,
+    }))
+}
+
 fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
     // Capture DISTINCT before building the projection plan; the plain
     // `SELECT DISTINCT` lowers to a `Deduplicate` wrapping the final Project
@@ -281,6 +434,7 @@ fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, E
     // lowering — τ's Window substrate has no named-window concept (win-012).
     resolve_named_windows_in_select(&mut select)?;
     let base = lower_from(select.from, cte_scope)?;
+    let base = lower_lateral_views(base, select.lateral_views, cte_scope)?;
 
     let filtered = if let Some(cond) = select.selection {
         CommonAst::new(CommonOp::Filter {
@@ -6401,6 +6555,113 @@ mod tests {
         assert_eq!(
             boundary_shape_of(decode_hex_literal("1G")),
             "sql::value::hex_invalid_digit"
+        );
+    }
+
+    // ── LATERAL VIEW lowering (cx-007/cx-008/cx-009) ────────────────────
+
+    /// Helper: extract a `CommonOp::LateralView` from a lowered SQL that
+    /// produces `Project { input: LateralView { .. }, .. }`.
+    fn lateral_view_of(plan: CommonAst) -> (String, Vec<(String, Expression)>) {
+        match plan.op {
+            CommonOp::Project { input, .. } => match input.op {
+                CommonOp::LateralView {
+                    table_alias,
+                    columns,
+                    ..
+                } => (table_alias, columns),
+                other => panic!("expected LateralView under Project, got {other:?}"),
+            },
+            other => panic!("expected Project at top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lateral_view_explode_fires_with_correct_alias_and_column() {
+        let plan = parse("SELECT e.id, t.tag FROM emp e LATERAL VIEW explode(e.tags) t AS tag")
+            .expect("should parse");
+        let (alias, cols) = lateral_view_of(plan);
+        assert_eq!(alias, "t");
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].0, "tag");
+        match &cols[0].1 {
+            Expression::FunctionCall(f) => {
+                assert_eq!(f.name, "explode");
+                assert_eq!(f.args.len(), 1);
+            }
+            other => panic!("expected explode FunctionCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lateral_view_outer_folds_to_explode_outer() {
+        let plan =
+            parse("SELECT e.id, t.tag FROM emp e LATERAL VIEW OUTER explode(e.tags) t AS tag")
+                .expect("should parse");
+        let (_, cols) = lateral_view_of(plan);
+        match &cols[0].1 {
+            Expression::FunctionCall(f) => assert_eq!(f.name, "explode_outer"),
+            other => panic!("expected explode_outer FunctionCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lateral_view_posexplode_splits_into_pos_and_val() {
+        let plan = parse(
+            "SELECT e.id, t.pos, t.tag FROM emp e LATERAL VIEW posexplode(e.tags) t AS pos, tag",
+        )
+        .expect("should parse");
+        let (alias, cols) = lateral_view_of(plan);
+        assert_eq!(alias, "t");
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].0, "pos");
+        assert_eq!(cols[1].0, "tag");
+        match &cols[0].1 {
+            Expression::FunctionCall(f) => assert_eq!(f.name, "posexplode_pos"),
+            other => panic!("expected posexplode_pos, got {other:?}"),
+        }
+        match &cols[1].1 {
+            Expression::FunctionCall(f) => assert_eq!(f.name, "posexplode_val"),
+            other => panic!("expected posexplode_val, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lateral_view_chained_is_boundary_error() {
+        assert_eq!(
+            boundary_shape(
+                "SELECT * FROM emp e \
+                 LATERAL VIEW explode(e.tags) t AS tag \
+                 LATERAL VIEW explode(e.tags) t2 AS tag2"
+            ),
+            "sql::lateral_view::chained"
+        );
+    }
+
+    #[test]
+    fn lateral_view_posexplode_one_alias_is_boundary_error() {
+        assert_eq!(
+            boundary_shape("SELECT * FROM emp e LATERAL VIEW posexplode(e.tags) t AS tag"),
+            "sql::lateral_view::posexplode_alias_count"
+        );
+    }
+
+    #[test]
+    fn lateral_view_outer_posexplode_is_boundary_error() {
+        assert_eq!(
+            boundary_shape(
+                "SELECT * FROM emp e LATERAL VIEW OUTER posexplode(e.tags) t AS pos, tag"
+            ),
+            "sql::lateral_view::outer_posexplode"
+        );
+    }
+
+    #[test]
+    fn lateral_view_unknown_generator_is_boundary_error() {
+        let shape = boundary_shape("SELECT * FROM emp e LATERAL VIEW inline(e.structs) t AS v");
+        assert!(
+            shape.starts_with("sql::lateral_view::generator::"),
+            "expected generator boundary shape, got `{shape}`"
         );
     }
 }

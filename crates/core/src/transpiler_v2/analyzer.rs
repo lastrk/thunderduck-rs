@@ -385,6 +385,17 @@ pub enum TypedOp {
         /// Optional RNG seed.
         seed: Option<i64>,
     },
+    /// `LATERAL VIEW [OUTER] generator(arg) table_alias AS col1[, col2]`.
+    /// Analyzer resolves each column expression against the input schema,
+    /// then appends the generated fields to produce the output schema.
+    LateralView {
+        /// The input relation.
+        input: Box<TypedAst>,
+        /// The table alias.
+        table_alias: String,
+        /// Per-output-column `(alias, generator FunctionCall)` pairs.
+        columns: Vec<(String, Expression)>,
+    },
     /// `df.groupBy(...).pivot(col, [values]).agg(...)`. See
     /// [`CommonOp::Pivot`] for the semantic contract. The analyzer resolves
     /// grouping / pivot column / aggregates against the input schema and
@@ -600,6 +611,10 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
         // never reaches this arm — `analyze_pivot` punts with a
         // Thunderduck-boundary error before constructing the `TypedOp::Pivot`.
         TypedOp::Pivot { input, .. } => has_resolved_schema(input),
+        TypedOp::LateralView { input, columns, .. } => {
+            has_resolved_schema(input)
+                && columns.iter().all(|(_, e)| expression_is_fully_resolved(e))
+        }
         TypedOp::SingleRow | TypedOp::TableScan { .. } | TypedOp::FileScan { .. } => true,
     }
 }
@@ -1089,6 +1104,13 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             })
         }
 
+        // ── LateralView (Hive LATERAL VIEW explode/posexplode) ──────────
+        CommonOp::LateralView {
+            input,
+            table_alias,
+            columns,
+        } => analyze_lateral_view(*input, table_alias, columns, base_types),
+
         // ── Binary: Join ──────────────────────────────────────────────────
         CommonOp::Join {
             left,
@@ -1130,6 +1152,56 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
 }
 
 // ── Extracted arm bodies (Pass 13 — OPP-V uniform arm shape) ────────────────
+
+/// Analyze a `LATERAL VIEW` node: resolve each generator column expression
+/// against the input schema, compute generated-field types/nullability, and
+/// produce a merged output schema `input fields ++ generated fields`.
+fn analyze_lateral_view(
+    input: CommonAst,
+    table_alias: String,
+    columns: Vec<(String, Expression)>,
+    base_types: &BaseTypes,
+) -> Result<TypedAst, AnalyzerError> {
+    let typed_input = analyze_node(input, base_types)?;
+    let ctx = ResolveContext::of_input(&typed_input, base_types);
+    let input_schema = &typed_input.resolved_schema;
+    let resolved_columns: Vec<(String, Expression)> = columns
+        .into_iter()
+        .map(|(alias, expr)| {
+            let resolved = resolve_and_stamp(expr, &ctx)?;
+            // Loud-fail if the generated type resolves Unresolved.
+            let dt = resolved.data_type(input_schema);
+            if dt == DataType::Unresolved {
+                return Err(AnalyzerError::PuntedOperator {
+                    op: "LateralView".to_owned(),
+                    reason: format!("generated column `{alias}` resolved to Unresolved type"),
+                });
+            }
+            Ok((alias, resolved))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let generated_schema = StructType::new(
+        resolved_columns
+            .iter()
+            .map(|(alias, expr)| {
+                StructField::new(
+                    alias.clone(),
+                    expr.data_type(input_schema),
+                    expr.nullable(input_schema),
+                )
+            })
+            .collect(),
+    );
+    let resolved_schema = StructType::merge(&typed_input.resolved_schema, &generated_schema);
+    Ok(TypedAst {
+        op: TypedOp::LateralView {
+            input: Box::new(typed_input),
+            table_alias,
+            columns: resolved_columns,
+        },
+        resolved_schema,
+    })
+}
 
 fn analyze_with_columns(
     input: CommonAst,
@@ -2779,6 +2851,21 @@ fn collect_qualifier_bindings(
         | TypedOp::NaDrop { input, .. }
         | TypedOp::NaReplace { input, .. } => {
             collect_qualifier_bindings(input, base, out);
+        }
+        // LateralView appends generated columns after the input. Recurse the
+        // input at the same base, then bind the table_alias to the generated
+        // columns' contiguous range. This makes `t.tag` resolve via the
+        // qualifier-scoped path while `e.tag` correctly does NOT resolve
+        // (e.tag is not in the input's range). Without this arm, resolution
+        // would fall through to the legacy name-only fallback.
+        TypedOp::LateralView {
+            input,
+            table_alias,
+            columns,
+        } => {
+            collect_qualifier_bindings(input, base, out);
+            let start = base + input.resolved_schema.len();
+            out.push((table_alias.clone(), start..start + columns.len()));
         }
         _ => {}
     }
@@ -7869,5 +7956,226 @@ mod tests {
             },
             other => panic!("expected Lambda untouched, got {other:?}"),
         }
+    }
+
+    // ── LATERAL VIEW analyzer tests (cx-007/cx-008/cx-009) ──────────────
+
+    /// Build an emp schema with a `tags` column of type `ARRAY<STRING>` for
+    /// LATERAL VIEW tests.
+    fn emp_tags_schema() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("tags", DataType::Array(Box::new(DataType::String), true)),
+        ])
+    }
+
+    /// Build a `CommonOp::LateralView` wrapping a TableScan("emp") with the
+    /// given generator columns under table alias `t`.
+    fn lateral_view_plan(columns: Vec<(String, Expression)>) -> CommonAst {
+        CommonAst::new(CommonOp::LateralView {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: Some("e".to_owned()),
+            })),
+            table_alias: "t".to_owned(),
+            columns,
+        })
+    }
+
+    fn explode_call(arg: Expression) -> Expression {
+        Expression::FunctionCall(FunctionCall {
+            name: "explode".to_owned(),
+            args: vec![arg],
+            distinct: false,
+        })
+    }
+
+    fn explode_outer_call(arg: Expression) -> Expression {
+        Expression::FunctionCall(FunctionCall {
+            name: "explode_outer".to_owned(),
+            args: vec![arg],
+            distinct: false,
+        })
+    }
+
+    #[test]
+    fn lateral_view_schema_union_is_input_then_generated() {
+        let plan = lateral_view_plan(vec![("tag".to_owned(), explode_call(qcol("e", "tags")))]);
+        let bt = BaseTypes::from_entries(
+            [("emp".to_owned(), emp_tags_schema())]
+                .into_iter()
+                .collect(),
+        );
+        let typed = analyze(plan, &bt).expect("analyze");
+        // Output schema = input fields (id, name, tags) + generated (tag).
+        assert_eq!(typed.resolved_schema.len(), 4);
+        assert_eq!(typed.resolved_schema.fields[0].name, "id");
+        assert_eq!(typed.resolved_schema.fields[1].name, "name");
+        assert_eq!(typed.resolved_schema.fields[2].name, "tags");
+        assert_eq!(typed.resolved_schema.fields[3].name, "tag");
+        assert_eq!(typed.resolved_schema.fields[3].data_type, DataType::String);
+    }
+
+    #[test]
+    fn lateral_view_qualifier_binding_t_tag_resolves() {
+        // Project[t.tag] over LateralView — `t.tag` must resolve.
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(lateral_view_plan(vec![(
+                "tag".to_owned(),
+                explode_call(qcol("e", "tags")),
+            )])),
+            projections: vec![qcol("t", "tag")],
+        });
+        let bt = BaseTypes::from_entries(
+            [("emp".to_owned(), emp_tags_schema())]
+                .into_iter()
+                .collect(),
+        );
+        let typed = analyze(plan, &bt).expect("analyze must succeed for t.tag");
+        assert_eq!(typed.resolved_schema.fields[0].name, "tag");
+    }
+
+    #[test]
+    fn lateral_view_qualifier_binding_e_id_resolves() {
+        // Project[e.id] over LateralView — input-side qualifier must resolve.
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(lateral_view_plan(vec![(
+                "tag".to_owned(),
+                explode_call(qcol("e", "tags")),
+            )])),
+            projections: vec![qcol("e", "id")],
+        });
+        let bt = BaseTypes::from_entries(
+            [("emp".to_owned(), emp_tags_schema())]
+                .into_iter()
+                .collect(),
+        );
+        let typed = analyze(plan, &bt).expect("analyze must succeed for e.id");
+        assert_eq!(typed.resolved_schema.fields[0].name, "id");
+    }
+
+    #[test]
+    fn lateral_view_qualifier_t_nope_is_unknown_column() {
+        // `t.nope` — column not in the generated range → UnknownColumn.
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(lateral_view_plan(vec![(
+                "tag".to_owned(),
+                explode_call(qcol("e", "tags")),
+            )])),
+            projections: vec![qcol("t", "nope")],
+        });
+        let bt = BaseTypes::from_entries(
+            [("emp".to_owned(), emp_tags_schema())]
+                .into_iter()
+                .collect(),
+        );
+        let err = analyze(plan, &bt).expect_err("t.nope must fail");
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "nope");
+                assert_eq!(qualifier, Some("t".to_owned()));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lateral_view_qualifier_e_tag_is_unknown_column() {
+        // `e.tag` — `tag` is NOT in the input (emp) range → UnknownColumn.
+        // This proves the bespoke qualifier binding arm is active (the legacy
+        // name-only fallback would wrongly resolve `tag` by name).
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(lateral_view_plan(vec![(
+                "tag".to_owned(),
+                explode_call(qcol("e", "tags")),
+            )])),
+            projections: vec![qcol("e", "tag")],
+        });
+        let bt = BaseTypes::from_entries(
+            [("emp".to_owned(), emp_tags_schema())]
+                .into_iter()
+                .collect(),
+        );
+        let err = analyze(plan, &bt).expect_err("e.tag must fail");
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "tag");
+                assert_eq!(qualifier, Some("e".to_owned()));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lateral_view_outer_always_nullable() {
+        // explode_outer always produces nullable output regardless of
+        // the array's containsNull flag.
+        let non_null_array_schema = StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::not_null("tags", DataType::Array(Box::new(DataType::String), false)),
+        ]);
+        let plan = CommonAst::new(CommonOp::LateralView {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: Some("e".to_owned()),
+            })),
+            table_alias: "t".to_owned(),
+            columns: vec![("tag".to_owned(), explode_outer_call(qcol("e", "tags")))],
+        });
+        let bt = BaseTypes::from_entries(
+            [("emp".to_owned(), non_null_array_schema)]
+                .into_iter()
+                .collect(),
+        );
+        let typed = analyze(plan, &bt).expect("analyze");
+        // explode_outer always produces nullable output.
+        assert!(typed.resolved_schema.fields[2].nullable);
+    }
+
+    #[test]
+    fn lateral_view_posexplode_pos_not_nullable() {
+        let plan = CommonAst::new(CommonOp::LateralView {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+                alias: Some("e".to_owned()),
+            })),
+            table_alias: "t".to_owned(),
+            columns: vec![
+                (
+                    "pos".to_owned(),
+                    Expression::FunctionCall(FunctionCall {
+                        name: "posexplode_pos".to_owned(),
+                        args: vec![qcol("e", "tags")],
+                        distinct: false,
+                    }),
+                ),
+                (
+                    "tag".to_owned(),
+                    Expression::FunctionCall(FunctionCall {
+                        name: "posexplode_val".to_owned(),
+                        args: vec![qcol("e", "tags")],
+                        distinct: false,
+                    }),
+                ),
+            ],
+        });
+        let bt = BaseTypes::from_entries(
+            [("emp".to_owned(), emp_tags_schema())]
+                .into_iter()
+                .collect(),
+        );
+        let typed = analyze(plan, &bt).expect("analyze");
+        // pos is the 4th field (index 3), val is the 5th (index 4).
+        assert_eq!(typed.resolved_schema.fields[3].name, "pos");
+        assert!(
+            !typed.resolved_schema.fields[3].nullable,
+            "posexplode_pos is non-nullable"
+        );
+        assert_eq!(typed.resolved_schema.fields[3].data_type, DataType::Integer);
+        assert_eq!(typed.resolved_schema.fields[4].name, "tag");
+        // posexplode_val nullable depends on containsNull of the array.
+        assert!(typed.resolved_schema.fields[4].nullable);
+        assert_eq!(typed.resolved_schema.fields[4].data_type, DataType::String);
     }
 }

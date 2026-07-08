@@ -485,6 +485,28 @@ pub enum CommonOp {
         seed: Option<i64>,
     },
 
+    /// `LATERAL VIEW [OUTER] generator(arg) table_alias AS col1[, col2, ...]`.
+    ///
+    /// Spark models this as a correlated unary operator: the generator
+    /// expression references columns from the input relation (`e.tags`), and
+    /// its output columns are appended (not replaced) to the input schema
+    /// under the specified `table_alias`. Lowering folds the `OUTER` flag
+    /// into the canonical generator name (`explode_outer`) and splits
+    /// `posexplode` into `posexplode_pos`/`posexplode_val` — so `columns`
+    /// always carries fully-canonical `FunctionCall` expressions.
+    ///
+    /// ADR-003 pre-authorizes this variant; composition of existing nodes
+    /// fails concretely (see architecture-pass-11 justification).
+    LateralView {
+        /// The correlated input relation.
+        input: Box<CommonAst>,
+        /// The table alias (e.g. `t` in `LATERAL VIEW explode(e.tags) t AS tag`).
+        table_alias: String,
+        /// Per-output-column `(alias, generator FunctionCall)` pairs. Non-empty
+        /// invariant; all co-project in a single inner SELECT at emission.
+        columns: Vec<(String, Expression)>,
+    },
+
     // ── Join with first-class plan_ids (§2.3) ────────────────────────────
     /// A binary join.
     ///
@@ -544,7 +566,8 @@ macro_rules! common_op_children {
             | CommonOp::FreqItems { input, .. }
             | CommonOp::Crosstab { input, .. }
             | CommonOp::Sample { input, .. }
-            | CommonOp::SampleBy { input, .. } => vec![input.$as_child()],
+            | CommonOp::SampleBy { input, .. }
+            | CommonOp::LateralView { input, .. } => vec![input.$as_child()],
             CommonOp::Join { left, right, .. } => vec![left.$as_child(), right.$as_child()],
             CommonOp::SetOp { children, .. } => children.$iter().collect(),
             // Leaves: no child *plan* to descend into. `TableFunction` /

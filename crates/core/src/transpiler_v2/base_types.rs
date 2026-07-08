@@ -199,6 +199,11 @@ fn for_each_node_expr(op: &CommonOp, f: &mut dyn FnMut(&Expression)) {
             }
         }
         CommonOp::SampleBy { col, .. } => f(col),
+        CommonOp::LateralView { columns, .. } => {
+            for (_, e) in columns {
+                f(e);
+            }
+        }
         // A join with no `ON` condition carries no direct expression.
         CommonOp::Join {
             condition: None, ..

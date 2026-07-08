@@ -1625,3 +1625,48 @@ pass, not fixed); the debug_assert-only NATURAL invariant (unreachable today, no
 pass only amplified by one field, a builder refactor is out of scope for a sweep).
 Gate green (core 778, connect-server 97 unit tests). Corpora unchanged: SQL 254/16/270, DataFrame
 329/329 (verified — the emission.rs dedup touches the join/aggregate rendering path).
+
+## Pass 11 — cx-007, cx-008, cx-009 (254→257)
+
+- **Cluster:** cx-007 `... LATERAL VIEW explode(e.tags) t AS tag`, cx-008 (OUTER explode), cx-009
+  (posexplode, two aliases `pos, tag`).
+- **Owning layer:** genuine AST extension — first new top-level `CommonOp`/`TypedOp` variant added in
+  this pipeline (all prior passes fixed bugs within the existing structure).
+- **Root cause:** sqlparser 0.61 already parses Hive `LATERAL VIEW [OUTER] expr name [AS alias,...]`
+  into `Select.lateral_views` unconditionally — NOT a parser gap. `lower_select` never read that field,
+  silently dropping the clause; the alias `t`/columns `tag`/`pos` never entered the CommonAst.
+- **Fix:** new sui generis unary `CommonOp::LateralView { input, table_alias, columns:
+  Vec<(String,Expression)> }` (ADR-003 explicitly pre-authorizes "LATERAL VIEW/explode shape" as a
+  sanctioned new node — composing existing Project/Join fails concretely: Project schema-replaces
+  rather than appends and introduces no qualifier; Join can't express the correlated generator side).
+  No `outer: bool` field — OUTER folds into the canonical synthetic name `explode_outer`; posexplode
+  splits into `posexplode_pos`/`posexplode_val` — the SAME names the DataFrame converter already uses,
+  so all Spark-parity math (types, nullability) is REUSED verbatim from the existing cx-010-tested
+  expression machinery, not reimplemented. New lowering dispatch (`lower_lateral_views`), analyzer arm
+  (`analyze_lateral_view`, schema = `StructType::merge(input, generated)`) PLUS a required new
+  `collect_qualifier_bindings` arm (binds `table_alias` to the generated-column range — without it,
+  `t.tag` only accidentally resolves via the legacy fallback and `e.tag` would wrongly also resolve).
+  New emission (`render_lateral_view_from`/`render_lateral_view`, emitting the empirically-verified
+  DuckDB shape `<from>, LATERAL (SELECT <gen-exprs>) <alias>`, reusing existing explode/posexplode
+  expression renderers) PLUS a required new `render_alias_transparent_from` arm (else Project-over-
+  LateralView occludes both `e` and `t` behind `__td_proj`).
+- **ADRs:** ADR-003 (explicitly pre-authorized new node), ADR-004/INV7 (SQL-only; proto has no LATERAL
+  VIEW equivalent; zero connect-server changes — verified zero diff), ADR-009 (match-arm dispatch,
+  reused expression arms), ADR-015 (cx-007/008/009 the oracle), ADR-022 (chained/OUTER-posexplode/
+  unknown-generator all honest boundary errors). No deeper escalation.
+- **Findings closed:** reviewer Critical=0 High=0 (thorough — independently verified all 3 emitted SQL
+  shapes against live DuckDB, confirmed qualifier-binding off-by-one-free and genuinely distinguished
+  from the legacy fallback, confirmed zero connect-server diff; 2 non-blocking Lows deferred: a
+  documented latent hazard for LATERAL VIEW over non-single-table FROM with no witness, and 4 untested-
+  but-simple boundary arms); perf High=0 Medium=0.
+- **Before→after:** SQL 254 → 257 passed (270 total), +3, no regression. DataFrame 329/329 (verified).
+- **Tests:** 18 new tests (7 lowering incl. 4 distinct boundary-error arms, 7 analyzer incl. the
+  qualifier-binding proof, 4 emission shape assertions).
+- **Out of scope (documented):** cx-011 (distinct `AS (k,v)` parse grammar), tbl-007/tbl-012 (bare
+  table-function explode, separate consumption path), `CommonOp::Unnest` stub (untouched, different
+  sqlparser production), chained LATERAL VIEW, OUTER posexplode, map-explode via LATERAL VIEW.
+- **Diagnostic:** `.agent-output/diagnostic-pass-11.md` · **Architecture:** `.agent-output/architecture-pass-11.md`
+- **Process note:** agent-model config finalized mid-pass (rust-architect→fable, rust-reviewer→opus,
+  effort:auto on all 6 subagents; confirmed definitions reload fresh on every Agent call, no special
+  reload command needed).
+- **SHA-to-be:** feat(v2-corpus): pass 11 — cx-007/cx-008/cx-009 (254→257)

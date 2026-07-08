@@ -451,6 +451,18 @@ pub enum AnalyzerError {
         candidates: Vec<String>,
     },
 
+    /// A later SELECT-list item references an earlier item's alias (Spark's
+    /// Lateral Column Alias feature, pr-007) but 2+ earlier items in the same
+    /// projection list share that alias name — Spark's own
+    /// `AMBIGUOUS_LATERAL_COLUMN_ALIAS` error class.
+    #[error("[SPARK-EMULATED] lateral column alias `{name}` is ambiguous and has {count} matches")]
+    AmbiguousLateralColumnAlias {
+        /// The ambiguous lateral column alias name.
+        name: String,
+        /// The number of earlier same-SELECT aliases sharing this name.
+        count: usize,
+    },
+
     /// A type mismatch — an operand's actual type does not match the expected
     /// type (e.g. Filter condition must be Boolean).
     #[error(
@@ -600,6 +612,7 @@ pub(super) fn analyzer_error_to_emission_error(e: AnalyzerError) -> EmissionErro
         AnalyzerError::UnknownTable { .. }
         | AnalyzerError::UnknownColumn { .. }
         | AnalyzerError::AmbiguousColumn { .. }
+        | AnalyzerError::AmbiguousLateralColumnAlias { .. }
         | AnalyzerError::TypeMismatch { .. }
         | AnalyzerError::Other { .. } => EmissionError::Unsupported {
             kind: UnsupportedKind::Expression,
@@ -756,6 +769,14 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             // per-column projections `Alias(stack_col(v1i, v2i, ..., vNi),
             // "ai")`. Emission maps `stack_col(...)` to `UNNEST([...])`.
             let projections = expand_stack_projections(projections)?;
+            // Pass 9 (pr-007) — Spark's Lateral Column Alias (LCA): a later
+            // SELECT-list item may reference an earlier item's alias, e.g.
+            // `SELECT salary * 1.1 AS raised, raised - salary AS delta`.
+            // Left-to-right fold; substitutes fully-inlined earlier aliases
+            // into later items BEFORE `resolve_and_stamp` ever sees them, so
+            // the rest of resolution/typing is completely unaware of LCA.
+            let projections =
+                expand_lateral_column_aliases(projections, &typed_input.resolved_schema)?;
             let ctx = ResolveContext::of_input(&typed_input, base_types);
             let projections = projections
                 .into_iter()
@@ -2201,6 +2222,149 @@ fn expand_stack_projections(
         }
         Ok(Some(expanded))
     })
+}
+
+// ── Lateral Column Alias (LCA) — pr-007 ─────────────────────────────────────
+//
+// `SELECT salary * 1.1 AS raised, raised - salary AS delta FROM emp`: Spark
+// lets a later SELECT-list item reference an earlier item's alias. τ's
+// resolver (`resolve_and_stamp` / `ResolveContext`) is schema/scope-shaped —
+// it has no notion of "aliases introduced earlier in this same projection
+// list" — so this is a dedicated pre-pass, not a `ResolveContext` extension.
+//
+// Semantics (confirmed against Spark 4.1.1's `ResolveLateralColumnAliasReference`
+// catalyst rule, whose `AliasEntry(alias, index)` map is itself left-to-right,
+// map-then-substitute):
+// * Substitution, not scoped lookup — a later reference is replaced with the
+//   earlier item's (already-inlined) expression, so a 3-item chain resolves
+//   in one left-to-right pass with no fixed-point iteration.
+// * Input-column-wins — a name that is BOTH a real input column and a
+//   would-be lateral alias is never recorded as a lateral source; the real
+//   column always wins at the reference site (falls through to ordinary
+//   resolution).
+// * Ambiguity is lazy — two same-named aliases with no later reference is
+//   ordinary, legal SQL (duplicate output names). It only errors
+//   (`AnalyzerError::AmbiguousLateralColumnAlias`) if a LATER item actually
+//   references the shared name.
+
+/// Left-to-right accumulator of LCA definitions built while folding one
+/// `Project`'s projection list. Append-only MULTIMAP — mirrors
+/// `QualifierScopes`'s "exactly one match or bail" shape, but (unlike
+/// `QualifierScopes::lookup`, which collapses both to `None`) distinguishes
+/// 0 matches (fall through to ordinary resolution) from 2+ (a hard
+/// ambiguity error) — see [`Self::lookup`].
+#[derive(Debug, Default)]
+struct LateralAliasTable {
+    entries: Vec<(String, Expression)>,
+}
+
+impl LateralAliasTable {
+    /// Record a newly-eligible lateral alias definition. Callers push in
+    /// list order; a reused name appends a second entry rather than
+    /// overwriting, mirroring Spark's own `AliasEntry` map.
+    fn record(&mut self, name: String, expr: Expression) {
+        self.entries.push((name, expr));
+    }
+
+    /// Case-insensitive lookup against every entry recorded so far.
+    ///
+    /// * 0 matches -> `Ok(None)` — the caller leaves the reference as a
+    ///   plain `UnresolvedColumn`, which falls through to ordinary
+    ///   `resolve_and_stamp`/`resolve_column` resolution, so a genuinely
+    ///   nonexistent name still gets the correct `UnknownColumn`.
+    /// * Exactly 1 match -> `Ok(Some(&expr))` — substitute.
+    /// * 2+ matches -> `Err(AmbiguousLateralColumnAlias)` — Spark's own
+    ///   `AMBIGUOUS_LATERAL_COLUMN_ALIAS` error class.
+    fn lookup(&self, name: &str) -> Result<Option<&Expression>, AnalyzerError> {
+        let mut found: Option<&Expression> = None;
+        let mut count = 0usize;
+        for (entry_name, expr) in &self.entries {
+            if entry_name.eq_ignore_ascii_case(name) {
+                count += 1;
+                found = Some(expr);
+            }
+        }
+        match count {
+            0 => Ok(None),
+            1 => Ok(found),
+            _ => Err(AnalyzerError::AmbiguousLateralColumnAlias {
+                name: name.to_owned(),
+                count,
+            }),
+        }
+    }
+}
+
+/// Left-to-right fold over `projections`: for each item, substitute any
+/// eligible earlier-sibling lateral alias reference (via
+/// [`substitute_lateral_aliases`]), then — if the (already-substituted) item
+/// is itself an `Alias` whose name does not collide with a real input
+/// column — record it as a new lateral alias definition for subsequent
+/// items. Recording the POST-substitution expression (not the raw one) is
+/// what makes a multi-hop chain (`a` -> `b` referencing `a` -> `c`
+/// referencing `b`) resolve fully-inlined in a single pass.
+///
+/// Called by `analyze_node`'s `CommonOp::Project` arm AFTER
+/// [`expand_stack_projections`] (last among the pre-passes — Spark's own LCA
+/// rule runs over the fully-expanded project list too) and BEFORE
+/// `ResolveContext::of_input` / `resolve_and_stamp`, so downstream resolution
+/// never has to know LCA exists — every item it sees is already a plain,
+/// fully-inlined tree.
+fn expand_lateral_column_aliases(
+    projections: Vec<Expression>,
+    input_schema: &StructType,
+) -> Result<Vec<Expression>, AnalyzerError> {
+    let mut table = LateralAliasTable::default();
+    let mut out = Vec::with_capacity(projections.len());
+    for proj in projections {
+        let proj = substitute_lateral_aliases(proj, &table)?;
+        if let Expression::Alias(ref a) = proj {
+            if input_schema.field_by_name(&a.alias).is_none() {
+                table.record(a.alias.clone(), (*a.expr).clone());
+            }
+        }
+        out.push(proj);
+    }
+    Ok(out)
+}
+
+/// Recursively rewrite every unqualified `UnresolvedColumn` in `expr` that
+/// case-insensitively matches exactly one entry in `table` to that entry's
+/// (already-inlined) expression, cloned. Zero matches leave the column
+/// reference unchanged (ordinary resolution handles it — typo or genuine
+/// forward-reference alike). Recurses via `Expression::map_children`, the
+/// SAME fallible-fold primitive `resolve_and_stamp` itself uses, walking
+/// into `FunctionCall` args, `CaseWhen` branches, etc.
+///
+/// Mirrors `resolve_and_stamp`'s own opaque-arm list: `Lambda`,
+/// `LambdaVariable`, `RawSql`, `Interval`, and `UnresolvedRegex` all pass
+/// through unchanged. A lambda's own bound parameter must never be mistaken
+/// for an outer lateral alias reference (e.g. `SELECT 1 AS x, transform(arr,
+/// x -> x + 1) FROM t` — the lambda's `x` is its own bound variable, not the
+/// outer alias). `InSubquery`/`ExistsSubquery`/`ScalarSubquery` are not
+/// custom-cased here; `expression_children!` already yields no children for
+/// the two Exists/Scalar forms and only the outer probe expression for
+/// `InSubquery`, so the default `map_children` arm below reproduces the same
+/// opacity `resolve_and_stamp` gets from its explicit arm.
+fn substitute_lateral_aliases(
+    expr: Expression,
+    table: &LateralAliasTable,
+) -> Result<Expression, AnalyzerError> {
+    match expr {
+        Expression::UnresolvedColumn(ref u) if u.qualifier.is_none() => {
+            let name = u.name.clone();
+            match table.lookup(&name)? {
+                Some(replacement) => Ok(replacement.clone()),
+                None => Ok(expr),
+            }
+        }
+        Expression::Lambda(_)
+        | Expression::LambdaVariable(_)
+        | Expression::RawSql(_)
+        | Expression::Interval(_)
+        | Expression::UnresolvedRegex(_) => Ok(expr),
+        _ => expr.map_children(|e| substitute_lateral_aliases(e, table)),
+    }
 }
 
 /// Resolve `expr` against `ctx` and enforce Spark's boolean-predicate guard
@@ -3996,7 +4160,8 @@ mod tests {
     use super::super::ast::CommonAst;
     use super::super::expression::{
         BetweenExpression, BinaryExpression, BinaryOp, ExistsSubquery, FunctionCall, InSubquery,
-        Literal, LiteralValue, ScalarSubquery, StarExpression, UnresolvedRegexExpression,
+        LambdaExpression, LambdaVariableExpression, Literal, LiteralValue, ScalarSubquery,
+        StarExpression, UnresolvedRegexExpression,
     };
     use super::*;
 
@@ -7452,5 +7617,256 @@ mod tests {
         });
         let typed = analyze(ast, &bt).expect("USING join qualifier resolution must not panic");
         assert_eq!(typed.resolved_schema.fields.len(), 1);
+    }
+
+    // ── Pass 9 (pr-007) — Lateral Column Alias (LCA) ───────────────────────
+
+    /// Whether `expr` (or any descendant) contains an `UnresolvedColumn`
+    /// case-insensitively named `name`. Shared by the chain/nested tests to
+    /// assert an earlier alias name has been fully inlined away.
+    fn contains_unresolved_ref(expr: &Expression, name: &str) -> bool {
+        match expr {
+            Expression::UnresolvedColumn(u) => u.name.eq_ignore_ascii_case(name),
+            other => other.children().any(|c| contains_unresolved_ref(c, name)),
+        }
+    }
+
+    #[test]
+    fn lateral_column_alias_single_ref_resolves_and_types() {
+        // pr-007: SELECT salary * 1.1 AS raised, raised - salary AS delta FROM emp
+        let bt = base_types_for(&[("emp", emp_schema())]);
+        let raised = alias_expr(
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::Mul,
+                left: Box::new(unresolved_col("salary")),
+                right: Box::new(lit_double(1.1)),
+            }),
+            "raised",
+        );
+        let delta = alias_expr(
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::Sub,
+                left: Box::new(unresolved_col("raised")),
+                right: Box::new(unresolved_col("salary")),
+            }),
+            "delta",
+        );
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![raised, delta],
+        });
+        let typed = analyze(ast, &bt).expect("lateral column alias must resolve");
+        assert_eq!(field_names(&typed), vec!["raised", "delta"]);
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Double);
+        assert_eq!(typed.resolved_schema.fields[1].data_type, DataType::Double);
+    }
+
+    #[test]
+    fn lateral_column_alias_chain_inlines_in_one_pass() {
+        // a = salary + 1; b = a + 1 (refs `a`); c = b + 1 (refs `b`) — a
+        // three-item chain must fully inline in a single left-to-right pass.
+        let schema = emp_schema();
+        let a = alias_expr(
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::Add,
+                left: Box::new(unresolved_col("salary")),
+                right: Box::new(lit_double(1.0)),
+            }),
+            "a",
+        );
+        let b = alias_expr(
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::Add,
+                left: Box::new(unresolved_col("a")),
+                right: Box::new(lit_double(1.0)),
+            }),
+            "b",
+        );
+        let c = alias_expr(
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::Add,
+                left: Box::new(unresolved_col("b")),
+                right: Box::new(lit_double(1.0)),
+            }),
+            "c",
+        );
+        let expanded = expand_lateral_column_aliases(vec![a, b, c], &schema)
+            .expect("chained lateral aliases must inline in one pass");
+        let c_expr = match &expanded[2] {
+            Expression::Alias(alias) => &*alias.expr,
+            other => panic!("expected Alias, got {other:?}"),
+        };
+        assert!(
+            !contains_unresolved_ref(c_expr, "a"),
+            "chain must fully inline away the `a` reference"
+        );
+        assert!(
+            !contains_unresolved_ref(c_expr, "b"),
+            "chain must fully inline away the `b` reference"
+        );
+        assert!(contains_unresolved_ref(c_expr, "salary"));
+    }
+
+    #[test]
+    fn lateral_column_alias_input_column_wins_over_alias() {
+        // `emp_schema` has a real `dept_id` input column. An item aliased AS
+        // `dept_id` collides with it, so it must NOT be recorded as a
+        // lateral source; a later bare `dept_id` ref must stay untouched
+        // (falls through to ordinary resolution against the INPUT column,
+        // not the alias expression).
+        let schema = emp_schema();
+        let shadow = alias_expr(unresolved_col("id"), "dept_id");
+        let later = unresolved_col("dept_id");
+        let expanded = expand_lateral_column_aliases(vec![shadow, later], &schema)
+            .expect("input-column collision must not error");
+        match &expanded[1] {
+            Expression::UnresolvedColumn(u) => assert_eq!(u.name, "dept_id"),
+            other => panic!("expected untouched UnresolvedColumn(\"dept_id\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lateral_column_alias_ambiguous_when_referenced() {
+        // Two earlier items both alias to `x`; a third item references `x`
+        // — Spark's AMBIGUOUS_LATERAL_COLUMN_ALIAS (count = 2).
+        let schema = emp_schema();
+        let x1 = alias_expr(unresolved_col("salary"), "x");
+        let x2 = alias_expr(unresolved_col("id"), "x");
+        let referencer = alias_expr(unresolved_col("x"), "y");
+        let err = expand_lateral_column_aliases(vec![x1, x2, referencer], &schema).unwrap_err();
+        match err {
+            AnalyzerError::AmbiguousLateralColumnAlias { name, count } => {
+                assert_eq!(name, "x");
+                assert_eq!(count, 2);
+            }
+            other => panic!("expected AmbiguousLateralColumnAlias, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lateral_column_alias_duplicate_name_without_reference_is_not_an_error() {
+        // Two same-named aliases with NO later reference is ordinary, legal
+        // SQL (duplicate output column names) — must not error.
+        let schema = emp_schema();
+        let x1 = alias_expr(unresolved_col("salary"), "x");
+        let x2 = alias_expr(unresolved_col("id"), "x");
+        let expanded = expand_lateral_column_aliases(vec![x1, x2], &schema)
+            .expect("duplicate alias names with no later reference must not error");
+        assert_eq!(expanded.len(), 2);
+    }
+
+    #[test]
+    fn lateral_column_alias_substitutes_inside_function_call_and_case_when() {
+        let schema = emp_schema();
+        let raised = alias_expr(
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::Mul,
+                left: Box::new(unresolved_col("salary")),
+                right: Box::new(lit_double(1.1)),
+            }),
+            "raised",
+        );
+        // Lateral ref inside a FunctionCall arg: `abs(raised)`.
+        let via_call = alias_expr(func("abs", vec![unresolved_col("raised")]), "abs_raised");
+        // Lateral ref inside a CASE branch: `CASE WHEN raised > 0 THEN raised
+        // ELSE salary END`.
+        let case_expr = Expression::CaseWhen(CaseWhenExpression {
+            branches: vec![(
+                Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Gt,
+                    left: Box::new(unresolved_col("raised")),
+                    right: Box::new(int_lit(0)),
+                }),
+                unresolved_col("raised"),
+            )],
+            else_expr: Some(Box::new(unresolved_col("salary"))),
+        });
+        let via_case = alias_expr(case_expr, "case_raised");
+
+        let expanded = expand_lateral_column_aliases(vec![raised, via_call, via_case], &schema)
+            .expect("nested lateral refs must substitute");
+
+        let call_expr = match &expanded[1] {
+            Expression::Alias(alias) => &*alias.expr,
+            other => panic!("expected Alias, got {other:?}"),
+        };
+        assert!(!contains_unresolved_ref(call_expr, "raised"));
+        assert!(contains_unresolved_ref(call_expr, "salary"));
+
+        let case_expr = match &expanded[2] {
+            Expression::Alias(alias) => &*alias.expr,
+            other => panic!("expected Alias, got {other:?}"),
+        };
+        assert!(!contains_unresolved_ref(case_expr, "raised"));
+    }
+
+    #[test]
+    fn lateral_column_alias_forward_reference_still_unknown_column() {
+        // Item 1 references `delta`, which is only DEFINED by item 2 — no
+        // look-ahead: item 1's `delta` ref is left untouched (table is empty
+        // when item 1 is processed), falls through to ordinary resolution,
+        // and surfaces the correct `UnknownColumn` (proven end-to-end via
+        // `analyze()`, not merely the pre-pass in isolation).
+        let bt = base_types_for(&[("emp", emp_schema())]);
+        let first = alias_expr(unresolved_col("delta"), "early");
+        let second = alias_expr(unresolved_col("salary"), "delta");
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![first, second],
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "delta");
+                assert_eq!(qualifier, None);
+            }
+            other => panic!("expected UnknownColumn(\"delta\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lateral_column_alias_does_not_reach_into_lambda_body() {
+        // `SELECT 1 AS x, transform(arr, x -> x + 1) AS transformed FROM t`
+        // — the lambda's OWN bound parameter `x` must NOT be substituted by
+        // the outer lateral alias `x`.
+        let schema = StructType::new(vec![StructField::nullable(
+            "arr",
+            DataType::Array(Box::new(DataType::Integer), true),
+        )]);
+        let outer_x = alias_expr(int_lit(1), "x");
+        let lambda_body = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(Expression::LambdaVariable(LambdaVariableExpression {
+                name: "x".to_owned(),
+            })),
+            right: Box::new(int_lit(1)),
+        });
+        let lambda = Expression::Lambda(LambdaExpression {
+            params: vec!["x".to_owned()],
+            body: Box::new(lambda_body),
+        });
+        let transform_call = alias_expr(
+            func("transform", vec![unresolved_col("arr"), lambda]),
+            "transformed",
+        );
+        let expanded = expand_lateral_column_aliases(vec![outer_x, transform_call], &schema)
+            .expect("lambda-shadowed name must not error");
+        let lambda_arg = match &expanded[1] {
+            Expression::Alias(alias) => match &*alias.expr {
+                Expression::FunctionCall(f) => &f.args[1],
+                other => panic!("expected FunctionCall, got {other:?}"),
+            },
+            other => panic!("expected Alias, got {other:?}"),
+        };
+        match lambda_arg {
+            Expression::Lambda(l) => match &*l.body {
+                Expression::Binary(b) => match &*b.left {
+                    Expression::LambdaVariable(lv) => assert_eq!(lv.name, "x"),
+                    other => panic!("expected LambdaVariable untouched, got {other:?}"),
+                },
+                other => panic!("expected Binary, got {other:?}"),
+            },
+            other => panic!("expected Lambda untouched, got {other:?}"),
+        }
     }
 }

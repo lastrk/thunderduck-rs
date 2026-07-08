@@ -1564,3 +1564,46 @@ findings 6/7 touch the shared resolve_column path). Sweep report source: rust-re
   `> ALL/ANY/= ANY (subquery)`). These are mis-authored corpus cases that cap the achievable at 267/270
   unless a human corrects/removes them.
 - **SHA-to-be:** feat(v2-corpus): pass 8 — fn-018/lit-006 + SQL-harness error-parity (251→253)
+
+## Pass 9 — pr-007 (253→254)
+
+- **Case:** pr-007 `SELECT salary * 1.1 AS raised, raised - salary AS delta FROM emp` — Spark's
+  Lateral Column Alias (LCA) feature.
+- **Owning layer:** analyzer (`crates/core/src/transpiler_v2/analyzer.rs`) only. No AST/emission/
+  connect-server change.
+- **Root cause:** `CommonOp::Project`'s arm resolves every projection item against ONE `ResolveContext`
+  built solely from the input schema, so no item can see an earlier sibling's alias. Spark's own
+  resolver (confirmed via Spark 4.1.1 jar decompile: `ResolveLateralColumnAliasReference`,
+  `AliasEntry(alias, index)`) is itself a left-to-right, index-keyed map-then-substitute — empirically
+  matched by a lateral-form-vs-manually-inlined-form byte-identical test.
+- **Fix:** new pre-pass `expand_lateral_column_aliases` (mirrors the existing `expand_regex_/inline_/
+  json_tuple_/stack_` projections family), inserted just before `ResolveContext::of_input`. Builds an
+  append-only `LateralAliasTable` (case-insensitive multimap) left-to-right: each item is substituted
+  against entries recorded so far via `substitute_lateral_aliases` (recursive `map_children` rewrite,
+  opaque on the exact 5-variant list `resolve_and_stamp` already uses: Lambda/LambdaVariable/RawSql/
+  Interval/UnresolvedRegex), then — if the (substituted) item is an Alias whose name does NOT collide
+  with a real input column — recorded for later items. Ambiguity (2+ same-named aliases) is a LAZY,
+  reference-time error (`AnalyzerError::AmbiguousLateralColumnAlias`, Spark-emulated ADR-022 cat-1) —
+  matching Spark's own dedicated error class; merely defining duplicates with no later reference is
+  legal. Input-column-wins precedence and no-forward-reference are both structural consequences of the
+  algorithm (never overridden name; empty table when an earlier item is processed).
+- **ADRs:** ADR-003 (no AST extension — composes existing nodes), ADR-004 (confirmed reachable from
+  BOTH front-ends structurally — DataFrame `.select()` routes through the same Project/Aggregate split
+  as SQL's `has_aggregates`), ADR-005/INV5 (analyzer owns this resolution semantic; rejected delegating
+  to DuckDB's native forward-alias support as unvalidated per LB3), ADR-006 (new named instance of the
+  "sideways sibling-dependency" pass family, a single bounded extra pass), INV2 (fact made node-local
+  pre-type-inference). No escalation.
+- **Findings closed:** reviewer Critical=0 High=0 (2 non-blocking Lows: a new clippy `doc_lazy_
+  continuation` warning — FIXED by the driver via doc reflow; missing explicit subquery-opacity arm —
+  hardened via a doc-comment explaining why the default `map_children` arm already reproduces the
+  correct opacity, no behavior change needed); perf High=0 Medium=0.
+- **Before→after:** SQL 253 → 254 passed (270 total), +1, no regression. DataFrame 329/329 (verified).
+- **Tests:** 8 new analyzer unit tests (single ref, multi-hop chain, input-wins, ambiguity-on-reference,
+  duplicate-no-reference-is-fine, nested function/CASE, forward-ref rejection, lambda isolation);
+  corpus pr-007 green.
+- **Process note:** BOTH opus and fable subagent tiers hit repeated org-wide 429 rate-limits this pass
+  (diagnostician failed twice). Retried all agent calls with `model: sonnet` override, which succeeded
+  cleanly for diagnostician, architect, coder, reviewer, and perf. Sonnet override is now the fallback
+  when opus/fable are saturated.
+- **Diagnostic:** `.agent-output/diagnostic-pass-9.md` · **Architecture:** `.agent-output/architecture-pass-9.md`
+- **SHA-to-be:** feat(v2-corpus): pass 9 — pr-007 (253→254)

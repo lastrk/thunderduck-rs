@@ -8,9 +8,9 @@
 //! bridges `DuckDbSession` into this overlay.
 //!
 //! **Short-circuit invariant (checklist §5.5):** `build_from_plan()` walks
-//! the plan once via [`plan_has_empty_scan()`] and returns [`BaseTypes::empty()`]
-//! without invoking the catalog closure when no empty-schema `TableScan`
-//! exists. See the `build_from_plan_short_circuits_when_no_empty_scan` test.
+//! the plan once via [`empty_scan_tables()`] and never invokes the catalog
+//! closure when no empty-schema `TableScan` exists. See the
+//! `build_from_plan_short_circuits_when_no_empty_scan` test.
 
 use std::collections::HashMap;
 
@@ -40,10 +40,10 @@ impl BaseTypes {
     /// Build an overlay by walking `plan` and resolving every empty-schema
     /// `TableScan` via `catalog_lookup`.
     ///
-    /// **Short-circuit (checklist §5.5):** if `plan_has_empty_scan(plan)` is
-    /// `false`, returns [`Self::empty()`] without invoking `catalog_lookup`
-    /// even once — verified by the
-    /// `build_from_plan_short_circuits_when_no_empty_scan` test.
+    /// **Short-circuit (checklist §5.5):** `catalog_lookup` is invoked at
+    /// most once per unique table name collected by [`empty_scan_tables`] —
+    /// a plan with no empty-schema `TableScan` never invokes it, verified by
+    /// the `build_from_plan_short_circuits_when_no_empty_scan` test.
     ///
     /// `catalog_lookup` is an injected closure — this keeps INV10 discipline
     /// (no `crate::runtime` import inside `transpiler_v2/`). The dispatch
@@ -52,13 +52,8 @@ impl BaseTypes {
     where
         F: FnMut(&str) -> Option<StructType>,
     {
-        if !plan_has_empty_scan(plan) {
-            return Self::empty();
-        }
-        let mut tables: Vec<String> = Vec::new();
-        collect_empty_scan_tables(plan, &mut tables);
         let mut entries = HashMap::new();
-        for table in tables {
+        for table in empty_scan_tables(plan) {
             if entries.contains_key(&table) {
                 continue;
             }
@@ -66,6 +61,15 @@ impl BaseTypes {
                 entries.insert(table, schema);
             }
         }
+        Self { entries }
+    }
+
+    /// Construct an overlay directly from pre-resolved `table → schema`
+    /// entries. For callers (e.g. the connect-server request handler) that
+    /// have already collected the plan's empty-scan tables via
+    /// [`empty_scan_tables`] and resolved each schema through an async
+    /// catalog — avoids [`Self::build_from_plan`]'s second plan walk.
+    pub fn from_entries(entries: HashMap<String, StructType>) -> Self {
         Self { entries }
     }
 
@@ -82,66 +86,15 @@ impl BaseTypes {
     }
 }
 
-/// Walk `plan` and return `true` iff any `TableScan` has an empty implicit
-/// schema requirement — the substrate distinguishes populated schemas from
-/// empty ones; A.2 treats every `TableScan` as "empty" (i.e. the
-/// analyzer will need a catalog lookup) because the substrate does not yet
-/// attach resolved schema to plan nodes.
-///
-/// τ semantic: every `TableScan` is empty (the analyzer resolves
-/// schemas). This is intentional — the overlay populates once per unique
-/// table, and unpopulated tables carry no analyzer info, so a false positive
-/// costs at most one closure invocation per unique table name.
-pub fn plan_has_empty_scan(plan: &CommonAst) -> bool {
-    // Seam D: a table referenced *only* inside a subquery (e.g. `dept` in
-    // `... WHERE EXISTS (SELECT 1 FROM dept)`) must still trigger catalog
-    // pre-fetch. Descend into this node's expressions first so the
-    // short-circuit does not skip a plan whose only scans live in a subquery.
-    if !node_expr_scan_tables(&plan.op).is_empty() {
-        return true;
-    }
-    match &plan.op {
-        CommonOp::TableScan { .. } => true,
-        CommonOp::Project { input, .. }
-        | CommonOp::Filter { input, .. }
-        | CommonOp::Sort { input, .. }
-        | CommonOp::Limit { input, .. }
-        | CommonOp::Aggregate { input, .. }
-        | CommonOp::WithColumns { input, .. }
-        | CommonOp::DropColumns { input, .. }
-        | CommonOp::AliasedRelation { input, .. }
-        | CommonOp::WithColumnsRenamed { input, .. }
-        | CommonOp::ToDf { input, .. }
-        | CommonOp::Deduplicate { input, .. }
-        | CommonOp::NaFill { input, .. }
-        | CommonOp::NaDrop { input, .. }
-        | CommonOp::NaReplace { input, .. }
-        | CommonOp::Unpivot { input, .. }
-        | CommonOp::Pivot { input, .. }
-        | CommonOp::Describe { input, .. }
-        | CommonOp::Summary { input, .. }
-        | CommonOp::FreqItems { input, .. }
-        | CommonOp::Crosstab { input, .. }
-        | CommonOp::Sample { input, .. }
-        | CommonOp::SampleBy { input, .. } => plan_has_empty_scan(input),
-        CommonOp::Join { left, right, .. } => {
-            plan_has_empty_scan(left) || plan_has_empty_scan(right)
-        }
-        CommonOp::SetOp { children, .. } => children.iter().any(plan_has_empty_scan),
-        // Leaves other than TableScan carry their schema inline or resolve
-        // via other channels — never empty for the purposes of this overlay.
-        CommonOp::SingleRow
-        | CommonOp::Values { .. }
-        | CommonOp::LocalRelation { .. }
-        | CommonOp::FileScan { .. }
-        | CommonOp::TableFunction { .. }
-        | CommonOp::Unnest { .. } => false,
-    }
-}
-
 /// Enumerate every empty-scan `TableScan` table name in `plan`, in tree order
 /// (may contain duplicates). Public so the request handler can pre-fetch
-/// session-catalog schemas before building the sync overlay closure.
+/// session-catalog schemas and hand them to [`BaseTypes::from_entries`].
+///
+/// τ semantic: every `TableScan` is "empty" (the analyzer resolves schemas)
+/// because the substrate does not yet attach resolved schema to plan nodes.
+/// This is intentional — the overlay populates once per unique table, and
+/// unpopulated tables carry no analyzer info, so a false positive costs at
+/// most one closure invocation per unique table name.
 pub fn empty_scan_tables(plan: &CommonAst) -> Vec<String> {
     let mut out = Vec::new();
     collect_empty_scan_tables(plan, &mut out);
@@ -151,62 +104,20 @@ pub fn empty_scan_tables(plan: &CommonAst) -> Vec<String> {
 /// Walk `plan` and push every `TableScan.table` name into `out`.
 fn collect_empty_scan_tables(plan: &CommonAst, out: &mut Vec<String>) {
     // Seam D: collect tables referenced inside this node's subquery-bearing
-    // expressions (their inner plans are `Unanalyzed` at collection time).
-    out.extend(node_expr_scan_tables(&plan.op));
-    match &plan.op {
-        CommonOp::TableScan { table, .. } => {
-            out.push(table.clone());
-        }
-        CommonOp::Project { input, .. }
-        | CommonOp::Filter { input, .. }
-        | CommonOp::Sort { input, .. }
-        | CommonOp::Limit { input, .. }
-        | CommonOp::Aggregate { input, .. }
-        | CommonOp::WithColumns { input, .. }
-        | CommonOp::DropColumns { input, .. }
-        | CommonOp::AliasedRelation { input, .. }
-        | CommonOp::WithColumnsRenamed { input, .. }
-        | CommonOp::ToDf { input, .. }
-        | CommonOp::Deduplicate { input, .. }
-        | CommonOp::NaFill { input, .. }
-        | CommonOp::NaDrop { input, .. }
-        | CommonOp::NaReplace { input, .. }
-        | CommonOp::Unpivot { input, .. }
-        | CommonOp::Pivot { input, .. }
-        | CommonOp::Describe { input, .. }
-        | CommonOp::Summary { input, .. }
-        | CommonOp::FreqItems { input, .. }
-        | CommonOp::Crosstab { input, .. }
-        | CommonOp::Sample { input, .. }
-        | CommonOp::SampleBy { input, .. } => collect_empty_scan_tables(input, out),
-        CommonOp::Join { left, right, .. } => {
-            collect_empty_scan_tables(left, out);
-            collect_empty_scan_tables(right, out);
-        }
-        CommonOp::SetOp { children, .. } => {
-            for child in children {
-                collect_empty_scan_tables(child, out);
-            }
-        }
-        CommonOp::SingleRow
-        | CommonOp::Values { .. }
-        | CommonOp::LocalRelation { .. }
-        | CommonOp::FileScan { .. }
-        | CommonOp::TableFunction { .. }
-        | CommonOp::Unnest { .. } => {}
+    // expressions (their inner plans are `Unanalyzed` at collection time) —
+    // a table referenced *only* inside a subquery (e.g. `dept` in
+    // `... WHERE EXISTS (SELECT 1 FROM dept)`) must still trigger catalog
+    // pre-fetch.
+    for_each_node_expr(&plan.op, &mut |e| collect_scan_tables_in_expr(e, out));
+    if let CommonOp::TableScan { table, .. } = &plan.op {
+        out.push(table.clone());
+    }
+    for child in plan.op.children() {
+        collect_empty_scan_tables(child, out);
     }
 }
 
 // ── Seam D: subquery-aware expression descent ────────────────────────────────
-
-/// Collect every empty-scan table referenced inside the subquery-bearing
-/// expressions carried directly by `op` (not its plan inputs — those are
-/// handled by the operator walkers above).
-fn node_expr_scan_tables(op: &CommonOp) -> Vec<String> {
-    let mut out = Vec::new();
-    for_each_node_expr(op, &mut |e| collect_scan_tables_in_expr(e, &mut out));
-    out
-}
 
 /// Invoke `f` on every expression carried *directly* by `op`. Operators whose
 /// only expressions are guaranteed literal (`LocalRelation`) or absent
@@ -322,13 +233,15 @@ fn for_each_node_expr(op: &CommonOp, f: &mut dyn FnMut(&Expression)) {
 
 /// Walk expression `e` and, for every subquery variant (always `Unanalyzed`
 /// at base-types collection time), collect its inner plan's empty-scan tables.
-/// Recurses through every composite expression so a subquery nested inside a
-/// binary op / CASE / function call is still reached.
+/// Recurses through every composite expression via [`Expression::children`]
+/// so a subquery nested inside a binary op / CASE / function call is still
+/// reached.
 ///
-/// MAINTENANCE CONTRACT: the match below is exhaustive over `Expression`, so a
-/// new *variant* is a compile error here. It does NOT catch a new sub-expression
-/// *field* added to an existing variant — if you add one, recurse into it here
-/// (and in the sibling walker `analyzer::collect_referenced_columns`).
+/// MAINTENANCE CONTRACT: the subquery plans are opaque to
+/// [`Expression::children`] (τ walker convention), so they need the custom
+/// arms below. A future subquery-bearing variant added to `children()` as
+/// opaque must be added here too — its subquery-only tables would otherwise
+/// silently miss base-type pre-fetch.
 fn collect_scan_tables_in_expr(e: &Expression, out: &mut Vec<String>) {
     match e {
         Expression::ScalarSubquery(s) => collect_subquery_plan_tables(&s.subquery, out),
@@ -337,95 +250,9 @@ fn collect_scan_tables_in_expr(e: &Expression, out: &mut Vec<String>) {
             collect_subquery_plan_tables(&i.subquery, out);
         }
         Expression::ExistsSubquery(x) => collect_subquery_plan_tables(&x.subquery, out),
-        Expression::Binary(b) => {
-            collect_scan_tables_in_expr(&b.left, out);
-            collect_scan_tables_in_expr(&b.right, out);
-        }
-        Expression::Unary(u) => collect_scan_tables_in_expr(&u.operand, out),
-        Expression::FunctionCall(fc) => {
-            fc.args
-                .iter()
-                .for_each(|a| collect_scan_tables_in_expr(a, out));
-        }
-        Expression::Cast(c) => collect_scan_tables_in_expr(&c.expr, out),
-        Expression::CaseWhen(cw) => {
-            for (w, t) in &cw.branches {
-                collect_scan_tables_in_expr(w, out);
-                collect_scan_tables_in_expr(t, out);
-            }
-            if let Some(else_expr) = &cw.else_expr {
-                collect_scan_tables_in_expr(else_expr, out);
-            }
-        }
-        Expression::Window(w) => {
-            collect_scan_tables_in_expr(&w.func, out);
-            w.partition_by
-                .iter()
-                .for_each(|e| collect_scan_tables_in_expr(e, out));
-            w.order_by
-                .iter()
-                .for_each(|o| collect_scan_tables_in_expr(o.expr.as_ref(), out));
-        }
-        Expression::Alias(a) => collect_scan_tables_in_expr(&a.expr, out),
-        Expression::Between(b) => {
-            collect_scan_tables_in_expr(&b.expr, out);
-            collect_scan_tables_in_expr(&b.low, out);
-            collect_scan_tables_in_expr(&b.high, out);
-        }
-        Expression::InList(i) => {
-            collect_scan_tables_in_expr(&i.expr, out);
-            i.list
-                .iter()
-                .for_each(|e| collect_scan_tables_in_expr(e, out));
-        }
-        Expression::Like(l) => {
-            collect_scan_tables_in_expr(&l.value, out);
-            collect_scan_tables_in_expr(&l.pattern, out);
-        }
-        Expression::IsDistinctFrom(d) => {
-            collect_scan_tables_in_expr(&d.left, out);
-            collect_scan_tables_in_expr(&d.right, out);
-        }
-        Expression::ExtractValue(ev) => {
-            collect_scan_tables_in_expr(&ev.child, out);
-            collect_scan_tables_in_expr(&ev.extraction, out);
-        }
-        Expression::ArrayLiteral(a) => a
-            .elements
-            .iter()
-            .for_each(|e| collect_scan_tables_in_expr(e, out)),
-        Expression::MapLiteral(m) => {
-            for (k, v) in &m.entries {
-                collect_scan_tables_in_expr(k, out);
-                collect_scan_tables_in_expr(v, out);
-            }
-        }
-        Expression::StructLiteral(s) => s
-            .fields
-            .iter()
-            .for_each(|(_, e)| collect_scan_tables_in_expr(e, out)),
-        Expression::RowConstructor(rc) => rc
-            .elements
-            .iter()
-            .for_each(|e| collect_scan_tables_in_expr(e, out)),
-        Expression::UpdateFields(u) => {
-            collect_scan_tables_in_expr(&u.struct_expr, out);
-            for (_, upd) in &u.updates {
-                if let Some(expr) = upd {
-                    collect_scan_tables_in_expr(expr, out);
-                }
-            }
-        }
-        Expression::Lambda(l) => collect_scan_tables_in_expr(&l.body, out),
-        // Leaves and no-sub-expression variants.
-        Expression::Literal(_)
-        | Expression::ColumnReference(_)
-        | Expression::UnresolvedColumn(_)
-        | Expression::UnresolvedRegex(_)
-        | Expression::Star(_)
-        | Expression::LambdaVariable(_)
-        | Expression::RawSql(_)
-        | Expression::Interval(_) => {}
+        _ => e
+            .children()
+            .for_each(|c| collect_scan_tables_in_expr(c, out)),
     }
 }
 
@@ -473,35 +300,38 @@ mod tests {
     }
 
     #[test]
-    fn plan_has_empty_scan_true_for_bare_table_scan_with_empty_schema() {
-        assert!(plan_has_empty_scan(&table_scan("orders")));
+    fn empty_scan_tables_collects_bare_table_scan() {
+        assert_eq!(
+            empty_scan_tables(&table_scan("orders")),
+            vec!["orders".to_owned()]
+        );
     }
 
     #[test]
-    fn plan_has_empty_scan_false_for_project_over_populated_scan() {
+    fn empty_scan_tables_empty_for_project_over_populated_scan() {
         // §5.5 short-circuit anchor: a plan whose leaves are non-TableScan
-        // (here: SingleRow) reports `false`.
+        // (here: SingleRow) collects nothing.
         let plan = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::SingleRow)),
             projections: vec![single_int_literal()],
         });
-        assert!(!plan_has_empty_scan(&plan));
+        assert!(empty_scan_tables(&plan).is_empty());
     }
 
     #[test]
-    fn plan_has_empty_scan_true_recursively_through_project_filter_sort_limit_aggregate() {
+    fn empty_scan_tables_recurses_through_project_filter_sort_limit_aggregate() {
         let leaf = table_scan("orders");
         let with_project = CommonAst::new(CommonOp::Project {
             input: Box::new(leaf.clone()),
             projections: vec![single_int_literal()],
         });
-        assert!(plan_has_empty_scan(&with_project));
+        assert!(!empty_scan_tables(&with_project).is_empty());
 
         let with_filter = CommonAst::new(CommonOp::Filter {
             input: Box::new(leaf.clone()),
             condition: single_int_literal(),
         });
-        assert!(plan_has_empty_scan(&with_filter));
+        assert!(!empty_scan_tables(&with_filter).is_empty());
 
         let with_sort = CommonAst::new(CommonOp::Sort {
             input: Box::new(leaf.clone()),
@@ -509,14 +339,14 @@ mod tests {
             limit: None,
             offset: None,
         });
-        assert!(plan_has_empty_scan(&with_sort));
+        assert!(!empty_scan_tables(&with_sort).is_empty());
 
         let with_limit = CommonAst::new(CommonOp::Limit {
             input: Box::new(leaf.clone()),
             limit: 10,
             offset: None,
         });
-        assert!(plan_has_empty_scan(&with_limit));
+        assert!(!empty_scan_tables(&with_limit).is_empty());
 
         let with_agg = CommonAst::new(CommonOp::Aggregate {
             input: Box::new(leaf),
@@ -526,12 +356,12 @@ mod tests {
             grouping_sets: vec![],
             having: None,
         });
-        assert!(plan_has_empty_scan(&with_agg));
+        assert!(!empty_scan_tables(&with_agg).is_empty());
     }
 
     #[test]
-    fn plan_has_empty_scan_true_across_join_sides() {
-        // Right side has a table scan, left does not — still true.
+    fn empty_scan_tables_collects_across_join_sides() {
+        // Right side has a table scan, left does not — still collected.
         let plan = CommonAst::new(CommonOp::Join {
             left: Box::new(CommonAst::new(CommonOp::SingleRow)),
             right: Box::new(table_scan("orders")),
@@ -541,7 +371,7 @@ mod tests {
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
-        assert!(plan_has_empty_scan(&plan));
+        assert_eq!(empty_scan_tables(&plan), vec!["orders".to_owned()]);
     }
 
     #[test]
@@ -628,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_has_empty_scan_true_when_only_scan_is_in_subquery() {
+    fn empty_scan_tables_collects_when_only_scan_is_in_subquery() {
         use super::super::expression::ScalarSubquery;
         // SELECT (SELECT id FROM dept) — outer has no FROM (SingleRow).
         let inner = table_scan("dept");
@@ -638,7 +468,6 @@ mod tests {
                 subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
             })],
         });
-        assert!(plan_has_empty_scan(&plan));
         assert_eq!(empty_scan_tables(&plan), vec!["dept".to_owned()]);
     }
 }

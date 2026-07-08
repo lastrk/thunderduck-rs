@@ -27,6 +27,27 @@
 //!   `thunderduck_core`. Downstream crates (e.g. `thunderduck-connect-server`)
 //!   invoke them as `thunderduck_core::bail_boundary_*!(...)`.
 
+/// Shared expansion behind the four `bail_boundary_{op,expr,fn,proto}!`
+/// macros — a `return Err(...)` of [`EmissionError::Unsupported`] tagged with
+/// the given [`UnsupportedKind`] variant. Internal plumbing: call the kinded
+/// wrappers instead. `#[macro_export]` (with `#[doc(hidden)]`) only so the
+/// wrappers' `$crate::bail_boundary_kind!` forwarding paths resolve from
+/// downstream crates.
+///
+/// [`EmissionError::Unsupported`]: crate::transpiler_v2::error::EmissionError::Unsupported
+/// [`UnsupportedKind`]: crate::transpiler_v2::error::UnsupportedKind
+#[doc(hidden)]
+#[macro_export]
+macro_rules! bail_boundary_kind {
+    ($kind:ident, $name:expr, $reason:expr $(,)?) => {
+        return Err($crate::transpiler_v2::error::EmissionError::Unsupported {
+            kind: $crate::transpiler_v2::error::UnsupportedKind::$kind,
+            name: ($name).to_owned(),
+            reason: ($reason).to_owned(),
+        })
+    };
+}
+
 /// Bail with an `Op`-kinded [`EmissionError::Unsupported`]: the top-level
 /// operator has no τ emission arm yet.
 ///
@@ -34,11 +55,7 @@
 #[macro_export]
 macro_rules! bail_boundary_op {
     ($op:expr, $reason:expr $(,)?) => {
-        return Err($crate::transpiler_v2::error::EmissionError::Unsupported {
-            kind: $crate::transpiler_v2::error::UnsupportedKind::Op,
-            name: ($op).to_owned(),
-            reason: ($reason).to_owned(),
-        })
+        $crate::bail_boundary_kind!(Op, $op, $reason)
     };
 }
 
@@ -49,11 +66,7 @@ macro_rules! bail_boundary_op {
 #[macro_export]
 macro_rules! bail_boundary_expr {
     ($shape:expr, $reason:expr $(,)?) => {
-        return Err($crate::transpiler_v2::error::EmissionError::Unsupported {
-            kind: $crate::transpiler_v2::error::UnsupportedKind::Expression,
-            name: ($shape).to_owned(),
-            reason: ($reason).to_owned(),
-        })
+        $crate::bail_boundary_kind!(Expression, $shape, $reason)
     };
 }
 
@@ -64,11 +77,7 @@ macro_rules! bail_boundary_expr {
 #[macro_export]
 macro_rules! bail_boundary_fn {
     ($name:expr, $reason:expr $(,)?) => {
-        return Err($crate::transpiler_v2::error::EmissionError::Unsupported {
-            kind: $crate::transpiler_v2::error::UnsupportedKind::Function,
-            name: ($name).to_owned(),
-            reason: ($reason).to_owned(),
-        })
+        $crate::bail_boundary_kind!(Function, $name, $reason)
     };
 }
 
@@ -81,11 +90,7 @@ macro_rules! bail_boundary_fn {
 #[macro_export]
 macro_rules! bail_boundary_proto {
     ($shape:expr, $reason:expr $(,)?) => {
-        return Err($crate::transpiler_v2::error::EmissionError::Unsupported {
-            kind: $crate::transpiler_v2::error::UnsupportedKind::ProtoShape,
-            name: ($shape).to_owned(),
-            reason: ($reason).to_owned(),
-        })
+        $crate::bail_boundary_kind!(ProtoShape, $shape, $reason)
     };
 }
 

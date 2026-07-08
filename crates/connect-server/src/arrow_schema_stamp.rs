@@ -35,10 +35,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType as ArrowDt, Field, Fields, Schema};
-use arrow::error::ArrowError;
-use arrow::record_batch::RecordBatchOptions;
 use thunderduck_core::types::pyspark_parity::dedup_names;
 use thunderduck_core::types::{DataType as TdckDt, StructType as TdckStruct};
 
@@ -47,7 +44,7 @@ use crate::arrow_interval_transcode::{is_arrow_duration_micros, is_arrow_interva
 /// A structural mismatch between τ's analyzer `resolved_schema` and the
 /// DuckDB-produced Arrow schema at some position in the schema tree.
 ///
-/// Populated by [`rewrite_top_schema`] and consumed by [`stamp_batch_schemas`]
+/// Populated by [`rewrite_top_schema`] and consumed by [`build_stamped_schema`]
 /// (which converts it into a `debug_assert!` in debug builds and a
 /// `tracing::warn!` + soft-fallback in release).
 #[derive(Debug, Clone)]
@@ -58,77 +55,6 @@ struct SchemaShapeMismatch {
     tdck: String,
     /// Textual dump of Arrow's `DataType` (or shape descriptor) at `path`.
     arrow: String,
-}
-
-/// Rewrite each batch's Arrow schema so field names at every nested position
-/// match τ's `resolved_schema`. Data buffers are unchanged — the rebuilt
-/// [`RecordBatch`] shares the same underlying `ArrayData` as the input.
-///
-/// On structural mismatch (length disagreement, or a compound where τ expects
-/// e.g. `Struct` but Arrow has a primitive) the stamp `debug_assert!`s in
-/// debug builds and soft-falls back to the original batches + `tracing::warn!`
-/// in release — no prior-green corpus case may regress. Any regression
-/// surfaces the exact mismatch path in the log so the fix can be traced back
-/// to the τ analyzer.
-#[allow(dead_code)] // Retained for tests + future DDL / non-streaming paths.
-pub fn stamp_batch_schemas(
-    batches: Vec<RecordBatch>,
-    resolved_schema: &TdckStruct,
-) -> Vec<RecordBatch> {
-    if batches.is_empty() {
-        return batches;
-    }
-
-    let arrow_schema = batches[0].schema();
-    let rebuilt = match build_stamped_schema(&arrow_schema, resolved_schema) {
-        Ok(schema) => schema,
-        Err(_) => return batches, // build_stamped_schema already logged.
-    };
-
-    let mut out = Vec::with_capacity(batches.len());
-    for batch in &batches {
-        match stamp_one(batch, &rebuilt) {
-            Ok(new_batch) => out.push(new_batch),
-            Err(_) => return batches, // stamp_one already logged.
-        }
-    }
-    out
-}
-
-/// Rewrite one batch's schema against a pre-built `stamped_schema` (from
-/// [`build_stamped_schema`]). Data buffers are unchanged — the rebuilt
-/// [`RecordBatch`] shares the same underlying `ArrayData` as the input.
-///
-/// Callers that stream should build the stamped schema ONCE (from the first
-/// batch's schema) and reuse it for every subsequent batch — the schema
-/// rebuild is O(n_cols) and worth caching.
-pub fn stamp_one(
-    batch: &RecordBatch,
-    stamped_schema: &Arc<Schema>,
-) -> Result<RecordBatch, ArrowError> {
-    let opts = RecordBatchOptions::new()
-        .with_match_field_names(false)
-        .with_row_count(Some(batch.num_rows()));
-    match RecordBatch::try_new_with_options(
-        Arc::clone(stamped_schema),
-        batch.columns().to_vec(),
-        &opts,
-    ) {
-        Ok(new_batch) => Ok(new_batch),
-        Err(err) => {
-            debug_assert!(
-                false,
-                "arrow_schema_stamp: RecordBatch::try_new_with_options failed after \
-                 shape-compatible rewrite: {err}"
-            );
-            tracing::warn!(
-                error = %err,
-                "arrow_schema_stamp: batch reconstruction failed — falling back to \
-                 DuckDB-produced Arrow schema",
-            );
-            Err(err)
-        }
-    }
 }
 
 /// Build the stamped Arrow `Schema` once, from a source `arrow_schema` + τ's
@@ -423,7 +349,43 @@ mod tests {
     use super::*;
     use arrow::array::{ArrayRef, Int64Array, ListArray, StringArray, StructArray};
     use arrow::buffer::OffsetBuffer;
+    use arrow::record_batch::{RecordBatch, RecordBatchOptions};
     use thunderduck_core::types::StructField as TdckField;
+
+    /// Test-local stand-in for the retired production batch-stamping wrapper:
+    /// build the stamped schema once from the first batch (via the live
+    /// [`build_stamped_schema`]), then rebuild every batch against it with
+    /// `RecordBatch::try_new_with_options` — exactly the shape the streaming
+    /// path in `service.rs` uses inline. On any failure, fall back to the
+    /// input batches unchanged (the soft-fallback contract the tests pin).
+    fn stamp_batch_schemas(
+        batches: Vec<RecordBatch>,
+        resolved_schema: &TdckStruct,
+    ) -> Vec<RecordBatch> {
+        if batches.is_empty() {
+            return batches;
+        }
+        let arrow_schema = batches[0].schema();
+        let rebuilt = match build_stamped_schema(&arrow_schema, resolved_schema) {
+            Ok(schema) => schema,
+            Err(()) => return batches, // build_stamped_schema already logged.
+        };
+        let mut out = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            let opts = RecordBatchOptions::new()
+                .with_match_field_names(false)
+                .with_row_count(Some(batch.num_rows()));
+            match RecordBatch::try_new_with_options(
+                Arc::clone(&rebuilt),
+                batch.columns().to_vec(),
+                &opts,
+            ) {
+                Ok(new_batch) => out.push(new_batch),
+                Err(_) => return batches,
+            }
+        }
+        out
+    }
 
     /// Convenience: build a τ `StructType` from a list of `(name, dt, nullable)`.
     fn tdck_struct(fields: Vec<(&str, TdckDt, bool)>) -> TdckStruct {

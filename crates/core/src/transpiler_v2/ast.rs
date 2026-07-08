@@ -32,14 +32,14 @@ impl CommonAst {
 
 /// The canonical plan operator set shared by every τ front-end.
 ///
-/// τ covers the structured shapes needed by the round-trip tests
-/// (Project / Filter / Sort / Limit / Aggregate primitive / TableScan /
-/// FileScan / Values / LocalRelation / Join / TableFunction / Unnest /
-/// SingleRow). Deferred plan shapes (SetOp, SubqueryAlias, WithColumns,
-/// Distinct, Sample, ShowString, Tail, DropColumns, ToDataFrame, NA family,
-/// Pivot, Stat family, Repartition/Hint passthrough) surface as
-/// [`super::EmissionError::Unsupported`] (`kind: ProtoShape`) until later slices grow
-/// their variants. There is **no** opaque `Sql` variant — parser_v2 owns SQL
+/// Every variant below is analyzed and emitted end-to-end (relational core,
+/// Aggregate incl. Rollup/Cube/GroupingSets, Join, SetOp, WithColumns, NA
+/// family, Unpivot, Pivot / Crosstab, Stat family, TableFunction, ...) with
+/// one exception: `Unnest`, whose emission arm is still a
+/// Thunderduck-boundary [`super::EmissionError::Unsupported`] per ADR-022.
+/// Plan shapes with no variant here surface as
+/// [`super::EmissionError::Unsupported`] (`kind: ProtoShape`) from the
+/// front-ends. There is **no** opaque `Sql` variant — parser_v2 owns SQL
 /// text (Open Decision 1 Option 1b).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommonOp {
@@ -89,9 +89,9 @@ pub enum CommonOp {
 
     /// `SELECT aggregates FROM input GROUP BY grouping`.
     ///
-    /// **Primitive Aggregate only.** Rollup / Cube / GroupingSets / Pivot
-    /// surface as [`super::EmissionError::Unsupported`] (`kind: ProtoShape`) and land
-    ///
+    /// Covers plain GROUP BY plus Rollup / Cube / GroupingSets via
+    /// `grouping_kind` / `grouping_sets`. Pivot is a separate variant
+    /// ([`CommonOp::Pivot`]).
     ///
     /// # τ invariant on `aggregates`
     ///
@@ -201,8 +201,10 @@ pub enum CommonOp {
     /// **τ's analyzer adds this variant.** Set-op widening (analyzer's downward
     /// sub-sweep, per rearchitect ADR-006) runs across `children` to compute
     /// the widened schema; the resolved schema is stamped by the analyzer.
-    /// `UNION BY NAME` (`by_name = true`) is deferred to future τ work and surfaces
-    /// as `AnalyzerError::PuntedOperator` today.
+    /// `UNION BY NAME` (`by_name = true`) is implemented (name-matched
+    /// widening, optional `allow_missing_columns`); by-name INTERSECT /
+    /// EXCEPT are unsupported by DuckDB itself and still surface as
+    /// `AnalyzerError::PuntedOperator`.
     SetOp {
         /// The kind of set operation.
         kind: SetOpKind,
@@ -290,10 +292,13 @@ pub enum CommonOp {
     /// When multiple aggregates are supplied, output column names follow
     /// Spark's `<pivot_value>_<agg_alias>` convention; when a single aggregate
     /// is supplied, output columns are named after the pivot values verbatim.
-    /// Empty `pivot_values` (implicit / "eager discovery" per Spark) is a
-    /// Thunderduck-boundary case per ADR-022 — the τ analyzer rejects with
-    /// `PuntedOperator("Pivot[implicit-values]")` because implementing it
-    /// needs a session-injected DISTINCT-query hook.
+    /// Empty `pivot_values` (implicit / "eager discovery" per Spark) is
+    /// resolved by the connect-server pre-pass (`resolve_implicit_pivots` in
+    /// `service.rs` runs the eager `SELECT DISTINCT` against the live session
+    /// and rewrites this node to the explicit-values shape *before*
+    /// `analyze`); the analyzer itself — a pure stage with no session hook
+    /// (INV10) — still rejects a residual empty list with
+    /// `PuntedOperator("Pivot[implicit-values]")`.
     Pivot {
         /// The input relation.
         input: Box<CommonAst>,
@@ -352,9 +357,14 @@ pub enum CommonOp {
 
     /// `df.stat.crosstab(col1, col2)` — Spark's `StatFunctions.crossTabulate`.
     /// The output column list is `DISTINCT(col2)` — unknowable at plan time —
-    /// so the τ analyzer rejects with `PuntedOperator("Crosstab[dynamic-values]")`
-    /// mirroring `Pivot[implicit-values]` per ADR-022. The variant exists so
-    /// future τ work can lift the punt with a session-injected DISTINCT hook.
+    /// so this rides the same connect-server pre-pass as implicit Pivot:
+    /// `resolve_implicit_pivots` (`service.rs`) discovers `col2`'s distinct
+    /// buckets from the live session and
+    /// `analyzer::crosstab_to_aggregate` desugars this node into a
+    /// conditional-count `Aggregate` *before* `analyze`. The analyzer itself
+    /// — a pure stage with no session hook (INV10) — still rejects a
+    /// residual `Crosstab` node with
+    /// `PuntedOperator("Crosstab[dynamic-values]")`.
     Crosstab {
         /// The input relation.
         input: Box<CommonAst>,
@@ -498,6 +508,64 @@ pub enum CommonOp {
         /// Plan-ids appearing anywhere under the right side.
         right_plan_ids: Vec<i64>,
     },
+}
+
+/// Child-plan classification shared by [`CommonOp::children`] and
+/// [`CommonOp::children_mut`] — ONE exhaustive match (no `_` arm), so adding a
+/// `CommonOp` variant fails to compile here until it is classified as a
+/// unary-input, Join, SetOp, or leaf operator.
+macro_rules! common_op_children {
+    ($op:expr, $as_child:ident, $iter:ident) => {
+        match $op {
+            CommonOp::Project { input, .. }
+            | CommonOp::Filter { input, .. }
+            | CommonOp::Sort { input, .. }
+            | CommonOp::Limit { input, .. }
+            | CommonOp::Aggregate { input, .. }
+            | CommonOp::WithColumns { input, .. }
+            | CommonOp::DropColumns { input, .. }
+            | CommonOp::AliasedRelation { input, .. }
+            | CommonOp::WithColumnsRenamed { input, .. }
+            | CommonOp::ToDf { input, .. }
+            | CommonOp::Deduplicate { input, .. }
+            | CommonOp::NaFill { input, .. }
+            | CommonOp::NaDrop { input, .. }
+            | CommonOp::NaReplace { input, .. }
+            | CommonOp::Unpivot { input, .. }
+            | CommonOp::Pivot { input, .. }
+            | CommonOp::Describe { input, .. }
+            | CommonOp::Summary { input, .. }
+            | CommonOp::FreqItems { input, .. }
+            | CommonOp::Crosstab { input, .. }
+            | CommonOp::Sample { input, .. }
+            | CommonOp::SampleBy { input, .. } => vec![input.$as_child()],
+            CommonOp::Join { left, right, .. } => vec![left.$as_child(), right.$as_child()],
+            CommonOp::SetOp { children, .. } => children.$iter().collect(),
+            // Leaves: no child *plan* to descend into. `TableFunction` /
+            // `Unnest` payloads are expressions, not plans.
+            CommonOp::SingleRow
+            | CommonOp::TableScan { .. }
+            | CommonOp::Values { .. }
+            | CommonOp::LocalRelation { .. }
+            | CommonOp::FileScan { .. }
+            | CommonOp::TableFunction { .. }
+            | CommonOp::Unnest { .. } => Vec::new(),
+        }
+    };
+}
+
+impl CommonOp {
+    /// The direct child plan nodes of this operator, in tree order: the unary
+    /// `input` first, `Join` left then right, `SetOp` children in declared
+    /// order. Leaves return an empty vec.
+    pub fn children(&self) -> Vec<&CommonAst> {
+        common_op_children!(self, as_ref, iter)
+    }
+
+    /// Mutable variant of [`Self::children`] — same order, same coverage.
+    pub fn children_mut(&mut self) -> Vec<&mut CommonAst> {
+        common_op_children!(self, as_mut, iter_mut)
+    }
 }
 
 /// Where a [`CommonOp::Pivot`]'s grouping (preserved-as-rows) columns come from.

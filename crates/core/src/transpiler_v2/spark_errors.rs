@@ -15,6 +15,8 @@
 //! assertions (`sql.contains(INVALID_ARRAY_INDEX_MSG_HEAD)` etc.) import
 //! them via `use super::spark_errors::{...}`.
 
+use super::emission::escape_sql_string;
+
 /// Spark ANSI-mode `[DIVIDE_BY_ZERO]` runtime message text. Interpolated
 /// into the DuckDB `error('[<CLASS>] <message>')` throw at emission time.
 pub(crate) const DIVIDE_BY_ZERO_MSG: &str = "Division by zero. Use `try_divide` to tolerate divisor being 0 and return NULL instead. If necessary set \"spark.sql.ansi.enabled\" to \"false\" to bypass this error. SQLSTATE: 22012";
@@ -130,20 +132,32 @@ impl SparkError {
     /// `ansi_zero_guard` / `array_index_error_expr` helpers.
     pub(crate) fn throw_expr(&self) -> String {
         match self {
-            Self::DivideByZero => {
-                let escaped = DIVIDE_BY_ZERO_MSG.replace('\'', "''");
+            Self::DivideByZero | Self::RemainderByZero => {
+                let msg = if matches!(self, Self::DivideByZero) {
+                    DIVIDE_BY_ZERO_MSG
+                } else {
+                    REMAINDER_BY_ZERO_MSG
+                };
+                let escaped = escape_sql_string(msg);
                 format!("error('[{class}] {escaped}')", class = self.class())
             }
-            Self::RemainderByZero => {
-                let escaped = REMAINDER_BY_ZERO_MSG.replace('\'', "''");
-                format!("error('[{class}] {escaped}')", class = self.class())
-            }
-            Self::InvalidArrayIndex { idx_sql, arr_sql } => {
+            Self::InvalidArrayIndex { idx_sql, arr_sql }
+            | Self::InvalidArrayIndexSubscript { idx_sql, arr_sql } => {
+                let (head, mid, tail) = if matches!(self, Self::InvalidArrayIndex { .. }) {
+                    (
+                        INVALID_ARRAY_INDEX_MSG_HEAD,
+                        INVALID_ARRAY_INDEX_MSG_MID,
+                        INVALID_ARRAY_INDEX_MSG_TAIL,
+                    )
+                } else {
+                    (
+                        INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_HEAD,
+                        INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_MID,
+                        INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_TAIL,
+                    )
+                };
                 format!(
-                    "error('{head}' || ({idx_sql})::VARCHAR || '{mid}' || len(({arr_sql}))::VARCHAR || '{tail}')",
-                    head = INVALID_ARRAY_INDEX_MSG_HEAD,
-                    mid = INVALID_ARRAY_INDEX_MSG_MID,
-                    tail = INVALID_ARRAY_INDEX_MSG_TAIL,
+                    "error('{head}' || ({idx_sql})::VARCHAR || '{mid}' || len(({arr_sql}))::VARCHAR || '{tail}')"
                 )
             }
             Self::InvalidFormatMismatch { fmt, input_sql } => {
@@ -151,20 +165,12 @@ impl SparkError {
                 // embedded apostrophes for the enclosing single-quoted
                 // string literal). The input value is interpolated at
                 // eval time via `(input_sql)::VARCHAR`.
-                let fmt_escaped = fmt.replace('\'', "''");
+                let fmt_escaped = escape_sql_string(fmt);
                 format!(
                     "error('{prefix}{fmt_escaped}{suffix}' || ({input_sql})::VARCHAR || '{tail}')",
                     prefix = INVALID_FORMAT_MISMATCH_MSG_HEAD_PREFIX,
                     suffix = INVALID_FORMAT_MISMATCH_MSG_HEAD_SUFFIX,
                     tail = INVALID_FORMAT_MISMATCH_MSG_TAIL,
-                )
-            }
-            Self::InvalidArrayIndexSubscript { idx_sql, arr_sql } => {
-                format!(
-                    "error('{head}' || ({idx_sql})::VARCHAR || '{mid}' || len(({arr_sql}))::VARCHAR || '{tail}')",
-                    head = INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_HEAD,
-                    mid = INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_MID,
-                    tail = INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_TAIL,
                 )
             }
         }

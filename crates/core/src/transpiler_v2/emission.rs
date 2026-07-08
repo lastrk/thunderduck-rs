@@ -24,9 +24,8 @@
 //! - [`render_cast`] — includes the `try_cast` → `TRY_CAST(...)` branch
 //!   (checklist §4.2 first item).
 //! - [`quote_ident`] — `Cow`-returning fast path (§5.6).
-//! - The unwired helpers under Decision 13-A (`render_tail`,
-//!   `render_distinct`, `render_with_columns`, `render_drop_columns`,
-//!   `render_aliased_relation`) — private, marked `#[allow(dead_code)]`.
+//! - The one still-unwired helper under Decision 13-A (`render_tail`) —
+//!   private, marked `#[allow(dead_code)]`, kept for its §5.4 CTE anchor test.
 //! - [`spark_return_cast`] (§5.1) and `spark_aggregate_return_cast` (§5.1,
 //!   `#[allow(dead_code)]` — wired by C.3) — two distinct `fn` items.
 
@@ -35,7 +34,9 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use super::analyzer::{na_fill_compatible, Schema, TypedAst, TypedOp};
+use super::analyzer::{
+    na_fill_value_for, with_columns_plan, Schema, TypedAst, TypedOp, TD_JOIN_LEFT, TD_JOIN_RIGHT,
+};
 use super::ast::FileFormat;
 use super::error::{EmissionError, UnsupportedKind};
 use super::expression::{
@@ -44,8 +45,8 @@ use super::expression::{
     LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan,
     UnaryExpression, UnaryOp,
 };
-use super::type_inference::{TypeInferenceEngine, AGGREGATE_NAMES};
-use crate::types::{DataType, StructField, StructType};
+use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
+use crate::types::{DataType, StructType};
 use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
 
 // ── INV2 companion (§5.3) ────────────────────────────────────────────────────
@@ -229,6 +230,23 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
 
 // ── Operator renderers ───────────────────────────────────────────────────────
 
+/// Render each item with `f` and join the results with `sep`. Fallible
+/// equivalent of `Itertools::join` — replaces the hand-rolled
+/// `if i > 0 { push_str(sep) }` loops throughout this file. Output is
+/// byte-identical to those loops (`Vec::join` inserts `sep` between elements
+/// only).
+fn sql_join<T>(
+    items: impl IntoIterator<Item = T>,
+    sep: &str,
+    f: impl FnMut(T) -> Result<String, EmissionError>,
+) -> Result<String, EmissionError> {
+    let parts = items
+        .into_iter()
+        .map(f)
+        .collect::<Result<Vec<String>, EmissionError>>()?;
+    Ok(parts.join(sep))
+}
+
 fn render_single_row() -> Result<String, EmissionError> {
     // DuckDB requires a subquery to have a projection list — bare `SELECT`
     // parses at top-level but fails inside `FROM (...)`. Emit `SELECT 1` so
@@ -267,27 +285,13 @@ fn render_values(
     if rows.is_empty() {
         bail_boundary_op!("Values", "empty VALUES relations are not supported");
     }
-    let mut rendered_rows = String::new();
-    for (i, row) in rows.iter().enumerate() {
-        if i > 0 {
-            rendered_rows.push_str(", ");
-        }
-        rendered_rows.push('(');
-        for (j, cell) in row.iter().enumerate() {
-            if j > 0 {
-                rendered_rows.push_str(", ");
-            }
-            rendered_rows.push_str(&render_expr(cell, schema)?);
-        }
-        rendered_rows.push(')');
-    }
-    let mut cols = String::new();
-    for (i, c) in column_names.iter().enumerate() {
-        if i > 0 {
-            cols.push_str(", ");
-        }
-        cols.push_str(&quote_ident(c));
-    }
+    let rendered_rows = sql_join(rows.iter(), ", ", |row| {
+        let cells = sql_join(row.iter(), ", ", |cell| render_expr(cell, schema))?;
+        Ok(format!("({cells})"))
+    })?;
+    let cols = sql_join(column_names.iter(), ", ", |c| {
+        Ok(quote_ident(c).into_owned())
+    })?;
     Ok(format!(
         "SELECT * FROM (VALUES {rendered_rows}) AS __td_values({cols})"
     ))
@@ -306,43 +310,27 @@ fn render_local_relation(
     // Special case: no rows → emit an empty relation with the correct schema.
     if rows.is_empty() {
         // `SELECT CAST(NULL AS T) AS c, ... WHERE 1=0` — zero rows, right shape.
-        let mut cols = String::new();
-        for (i, f) in schema_decl.fields.iter().enumerate() {
-            if i > 0 {
-                cols.push_str(", ");
-            }
+        let cols = sql_join(schema_decl.fields.iter(), ", ", |f| {
             let ty = render_data_type(&f.data_type);
             let name = quote_ident(&f.name);
-            cols.push_str(&format!("CAST(NULL AS {ty}) AS {name}"));
-        }
+            Ok(format!("CAST(NULL AS {ty}) AS {name}"))
+        })?;
         return Ok(format!("SELECT {cols} WHERE 1=0"));
     }
-    let mut rendered_rows = String::new();
-    for (i, row) in rows.iter().enumerate() {
-        if i > 0 {
-            rendered_rows.push_str(", ");
-        }
-        rendered_rows.push('(');
-        for (idx, cell) in row.iter().enumerate() {
-            if idx > 0 {
-                rendered_rows.push_str(", ");
-            }
+    let rendered_rows = sql_join(rows.iter(), ", ", |row| {
+        let cells = sql_join(row.iter().enumerate(), ", ", |(idx, cell)| {
             let inner = render_expr(cell, schema_decl)?;
             // Ensure each cell carries the declared type — a naked NULL literal
             // would otherwise adopt DuckDB's inferred column type across rows.
             let field = &schema_decl.fields[idx];
             let ty = render_data_type(&field.data_type);
-            rendered_rows.push_str(&format!("CAST({inner} AS {ty})"));
-        }
-        rendered_rows.push(')');
-    }
-    let mut cols = String::new();
-    for (i, f) in schema_decl.fields.iter().enumerate() {
-        if i > 0 {
-            cols.push_str(", ");
-        }
-        cols.push_str(&quote_ident(&f.name));
-    }
+            Ok(format!("CAST({inner} AS {ty})"))
+        })?;
+        Ok(format!("({cells})"))
+    })?;
+    let cols = sql_join(schema_decl.fields.iter(), ", ", |f| {
+        Ok(quote_ident(&f.name).into_owned())
+    })?;
     Ok(format!(
         "SELECT * FROM (VALUES {rendered_rows}) AS __td_local({cols})"
     ))
@@ -360,17 +348,10 @@ fn render_file_scan(
     let paths_sql = if paths.len() == 1 {
         format!("'{}'", escape_sql_string(&paths[0]))
     } else {
-        let mut buf = String::from("[");
-        for (i, p) in paths.iter().enumerate() {
-            if i > 0 {
-                buf.push_str(", ");
-            }
-            buf.push('\'');
-            buf.push_str(&escape_sql_string(p));
-            buf.push('\'');
-        }
-        buf.push(']');
-        buf
+        let items = sql_join(paths.iter(), ", ", |p| {
+            Ok(format!("'{}'", escape_sql_string(p)))
+        })?;
+        format!("[{items}]")
     };
     let reader = match format {
         FileFormat::Parquet => "read_parquet",
@@ -386,14 +367,10 @@ fn render_file_scan(
     let opts_sql = if options.is_empty() {
         String::new()
     } else {
-        let mut opts = String::from(", ");
-        for (i, (k, v)) in options.iter().enumerate() {
-            if i > 0 {
-                opts.push_str(", ");
-            }
-            opts.push_str(&format!("{k}='{}'", escape_sql_string(v)));
-        }
-        opts
+        let opts = sql_join(options.iter(), ", ", |(k, v)| {
+            Ok(format!("{k}='{}'", escape_sql_string(v)))
+        })?;
+        format!(", {opts}")
     };
     Ok(format!("SELECT * FROM {reader}({paths_sql}{opts_sql})"))
 }
@@ -537,14 +514,9 @@ fn render_projection_slots(
     if projections.is_empty() {
         return Ok("*".to_owned());
     }
-    let mut buf = String::new();
-    for (i, p) in projections.iter().enumerate() {
-        if i > 0 {
-            buf.push_str(", ");
-        }
-        buf.push_str(&render_projection_slot(p, input_schema)?);
-    }
-    Ok(buf)
+    sql_join(projections.iter(), ", ", |p| {
+        render_projection_slot(p, input_schema)
+    })
 }
 
 /// Render a Project whose child is a Join. Inline the Join's FROM/ON so
@@ -570,6 +542,47 @@ fn render_project_over_join(
     Ok(format!("SELECT {slots_sql} FROM {from}"))
 }
 
+/// Map a [`JoinType`] to its DuckDB join keyword. DuckDB requires `SEMI JOIN`
+/// / `ANTI JOIN` WITHOUT the `LEFT` prefix (checklist §5 / CLAUDE.md Known
+/// Gotcha #5) — this is the single site for that mapping.
+fn join_kind_sql(join_type: crate::transpiler_v2::ast::JoinType) -> &'static str {
+    use super::ast::JoinType;
+    match join_type {
+        JoinType::Inner => "INNER JOIN",
+        JoinType::Left => "LEFT OUTER JOIN",
+        JoinType::Right => "RIGHT OUTER JOIN",
+        JoinType::Full => "FULL OUTER JOIN",
+        JoinType::Cross => "CROSS JOIN",
+        JoinType::LeftSemi => "SEMI JOIN",
+        JoinType::LeftAnti => "ANTI JOIN",
+    }
+}
+
+/// Build the join clause (leading space included). USING wins over ON when
+/// both are present per Spark semantics (Spark's `on="col"` maps to USING);
+/// a CROSS join takes no clause; any other join without ON/USING is a
+/// Thunderduck-boundary error. `cond_schema` resolves the ON-condition
+/// expression — the one axis on which the two join renderers differ.
+fn render_join_clause(
+    join_type: crate::transpiler_v2::ast::JoinType,
+    condition: Option<&Expression>,
+    using_columns: &[String],
+    cond_schema: &Schema,
+) -> Result<String, EmissionError> {
+    use super::ast::JoinType;
+    if !using_columns.is_empty() {
+        let cols = sql_join(using_columns, ", ", |c| Ok(quote_ident(c).into_owned()))?;
+        Ok(format!(" USING ({cols})"))
+    } else if let Some(cond) = condition {
+        let cond_sql = render_expr(cond, cond_schema)?;
+        Ok(format!(" ON {cond_sql}"))
+    } else if matches!(join_type, JoinType::Cross) {
+        Ok(String::new())
+    } else {
+        bail_boundary_op!("Join", "non-cross join without ON or USING clause");
+    }
+}
+
 /// Render the `FROM` body of a join — the two aliased sides and the
 /// `ON`/`USING`/`CROSS` clause — without an enclosing `SELECT`. Hoists user
 /// `AliasedRelation` names into the subquery aliases so alias-qualified refs
@@ -583,44 +596,19 @@ fn render_join_from(
     using_columns: &[String],
     cond_schema: &Schema,
 ) -> Result<String, EmissionError> {
-    use super::ast::JoinType;
     // Pick subquery aliases: user AliasedRelation names take precedence.
     let (left_ast, left_alias) = match &left.op {
         TypedOp::AliasedRelation { input, alias } => (input.as_ref(), alias.clone()),
-        _ => (left, "__td_jl".to_owned()),
+        _ => (left, TD_JOIN_LEFT.to_owned()),
     };
     let (right_ast, right_alias) = match &right.op {
         TypedOp::AliasedRelation { input, alias } => (input.as_ref(), alias.clone()),
-        _ => (right, "__td_jr".to_owned()),
+        _ => (right, TD_JOIN_RIGHT.to_owned()),
     };
     let left_sql = dispatch_op(&left_ast.op, &left_ast.resolved_schema)?;
     let right_sql = dispatch_op(&right_ast.op, &right_ast.resolved_schema)?;
-    let kind = match join_type {
-        JoinType::Inner => "INNER JOIN",
-        JoinType::Left => "LEFT OUTER JOIN",
-        JoinType::Right => "RIGHT OUTER JOIN",
-        JoinType::Full => "FULL OUTER JOIN",
-        JoinType::Cross => "CROSS JOIN",
-        JoinType::LeftSemi => "SEMI JOIN",
-        JoinType::LeftAnti => "ANTI JOIN",
-    };
-    let clause = if !using_columns.is_empty() {
-        let mut cols = String::new();
-        for (i, c) in using_columns.iter().enumerate() {
-            if i > 0 {
-                cols.push_str(", ");
-            }
-            cols.push_str(&quote_ident(c));
-        }
-        format!(" USING ({cols})")
-    } else if let Some(cond) = condition {
-        let cond_sql = render_expr(cond, cond_schema)?;
-        format!(" ON {cond_sql}")
-    } else if matches!(join_type, JoinType::Cross) {
-        String::new()
-    } else {
-        bail_boundary_op!("Join", "non-cross join without ON or USING clause");
-    };
+    let kind = join_kind_sql(join_type);
+    let clause = render_join_clause(join_type, condition, using_columns, cond_schema)?;
     let la = quote_ident(&left_alias);
     let ra = quote_ident(&right_alias);
     Ok(format!(
@@ -668,12 +656,9 @@ fn render_sort(
     let mut sql = format!("SELECT * FROM ({child_sql}) AS __td_sort");
     if !order.is_empty() {
         sql.push_str(" ORDER BY ");
-        for (i, so) in order.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&render_sort_key(so, &input.resolved_schema)?);
-        }
+        sql.push_str(&sql_join(order.iter(), ", ", |so| {
+            render_sort_key(so, &input.resolved_schema)
+        })?);
     }
     if let Some(l) = limit {
         sql.push_str(&format!(" LIMIT {l}"));
@@ -710,11 +695,11 @@ fn render_limit(
     Ok(sql)
 }
 
-// ── Unwired renderers (Decision 13-A) ────────────────────────────────────────
+// ── Unwired renderer (Decision 13-A) ─────────────────────────────────────────
 //
-// These six renderers do not have `TypedOp` sinks in τ's analyzer's substrate. They
-// exist so the §5.4 CTE anchor for `render_tail` (and its sibling helpers)
-// live in code today.
+// `render_tail` is the one remaining renderer without a `TypedOp` sink in τ's
+// analyzer substrate. It exists so the §5.4 CTE anchor test lives in code
+// today; its former Decision 13-A siblings are all wired via `dispatch_op`.
 
 /// **§5.4 CTE rewrite.** DuckDB has no native TAIL operator; we synthesize it
 /// via `ROW_NUMBER() OVER ()` and select rows past `total_rows − n`. The child
@@ -727,14 +712,6 @@ fn render_tail(input: &TypedAst, n: i64) -> Result<String, EmissionError> {
          SELECT * EXCLUDE (__td_row_num__) \
          FROM (SELECT *, ROW_NUMBER() OVER () AS __td_row_num__ FROM __td_child) \
          WHERE __td_row_num__ > (SELECT COUNT(*) FROM __td_child) - {n}"
-    ))
-}
-
-#[allow(dead_code)] // wired when TypedOp::Distinct lands (Decision 13-A)
-fn render_distinct(input: &TypedAst) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    Ok(format!(
-        "SELECT DISTINCT * FROM ({child_sql}) AS __td_distinct"
     ))
 }
 
@@ -796,55 +773,42 @@ fn render_set_op(
         //     emit `CAST(child_col AS widened_ty) AS widened_name` if the
         //     child has it, or `CAST(NULL AS widened_ty) AS widened_name`
         //     for the padded slot.
-        let mut slots = String::new();
-        if by_name && allow_missing_columns {
-            for (i, widened_field) in widened_schema.fields.iter().enumerate() {
-                if i > 0 {
-                    slots.push_str(", ");
-                }
-                let ty = render_data_type(&widened_field.data_type);
-                let widened_name = quote_ident(&widened_field.name);
-                if let Some(child_field) = child.resolved_schema.field_by_name(&widened_field.name)
-                {
-                    let col = quote_ident(&child_field.name);
-                    slots.push_str(&format!("CAST({col} AS {ty}) AS {widened_name}"));
+        let slots = sql_join(
+            widened_schema.fields.iter().enumerate(),
+            ", ",
+            |(i, widened_field)| {
+                // Resolve this child's source column for the widened slot:
+                //   - by-name + allow_missing_columns: optional (missing
+                //     names pad with NULL);
+                //   - by-name (strict): required — children have identical
+                //     name SETS (analyzer verified);
+                //   - by-position: positional index — children have
+                //     identical arity (analyzer verified).
+                let child_field = if by_name && allow_missing_columns {
+                    child.resolved_schema.field_by_name(&widened_field.name)
+                } else if by_name {
+                    Some(
+                        child
+                            .resolved_schema
+                            .fields
+                            .iter()
+                            .find(|f| f.name.eq_ignore_ascii_case(&widened_field.name))
+                            .expect("analyzer guaranteed name match"),
+                    )
                 } else {
-                    slots.push_str(&format!("CAST(NULL AS {ty}) AS {widened_name}"));
-                }
-            }
-        } else if by_name {
-            for (i, widened_field) in widened_schema.fields.iter().enumerate() {
-                if i > 0 {
-                    slots.push_str(", ");
-                }
-                let child_field = child
-                    .resolved_schema
-                    .fields
-                    .iter()
-                    .find(|f| f.name.eq_ignore_ascii_case(&widened_field.name))
-                    .expect("analyzer guaranteed name match");
+                    child.resolved_schema.fields.get(i)
+                };
                 let ty = render_data_type(&widened_field.data_type);
-                let col = quote_ident(&child_field.name);
                 let widened_name = quote_ident(&widened_field.name);
-                slots.push_str(&format!("CAST({col} AS {ty}) AS {widened_name}"));
-            }
-        } else {
-            for (i, (child_field, widened_field)) in child
-                .resolved_schema
-                .fields
-                .iter()
-                .zip(widened_schema.fields.iter())
-                .enumerate()
-            {
-                if i > 0 {
-                    slots.push_str(", ");
-                }
-                let ty = render_data_type(&widened_field.data_type);
-                let col = quote_ident(&child_field.name);
-                let widened_name = quote_ident(&widened_field.name);
-                slots.push_str(&format!("CAST({col} AS {ty}) AS {widened_name}"));
-            }
-        }
+                Ok(match child_field {
+                    Some(cf) => {
+                        let col = quote_ident(&cf.name);
+                        format!("CAST({col} AS {ty}) AS {widened_name}")
+                    }
+                    None => format!("CAST(NULL AS {ty}) AS {widened_name}"),
+                })
+            },
+        )?;
         parts.push(format!("SELECT {slots} FROM ({child_sql}) AS __td_setop"));
     }
     // Wrap the union expression in an outer SELECT so downstream operators
@@ -871,38 +835,8 @@ fn render_join(
     use super::ast::JoinType;
     let left_sql = dispatch_op(&left.op, &left.resolved_schema)?;
     let right_sql = dispatch_op(&right.op, &right.resolved_schema)?;
-    let left_alias = "__td_jl".to_owned();
-    let right_alias = "__td_jr".to_owned();
-    let kind = match join_type {
-        JoinType::Inner => "INNER JOIN",
-        JoinType::Left => "LEFT OUTER JOIN",
-        JoinType::Right => "RIGHT OUTER JOIN",
-        JoinType::Full => "FULL OUTER JOIN",
-        JoinType::Cross => "CROSS JOIN",
-        // DuckDB requires SEMI JOIN / ANTI JOIN WITHOUT the `LEFT` prefix
-        // (CLAUDE.md Known Gotcha #5).
-        JoinType::LeftSemi => "SEMI JOIN",
-        JoinType::LeftAnti => "ANTI JOIN",
-    };
-    // Build the join clause. USING wins over ON when both are present per
-    // Spark semantics (Spark's `on="col"` maps to USING).
-    let clause = if !using_columns.is_empty() {
-        let mut cols = String::new();
-        for (i, c) in using_columns.iter().enumerate() {
-            if i > 0 {
-                cols.push_str(", ");
-            }
-            cols.push_str(&quote_ident(c));
-        }
-        format!(" USING ({cols})")
-    } else if let Some(cond) = condition {
-        let cond_sql = render_expr(cond, &left.resolved_schema)?;
-        format!(" ON {cond_sql}")
-    } else if matches!(join_type, JoinType::Cross) {
-        String::new()
-    } else {
-        bail_boundary_op!("Join", "non-cross join without ON or USING clause");
-    };
+    let kind = join_kind_sql(join_type);
+    let clause = render_join_clause(join_type, condition, using_columns, &left.resolved_schema)?;
     // Emit an EXPLICIT column list mirroring the analyzer's output schema
     // (see `analyzer.rs::CommonOp::Join` output-schema block for the
     // canonical order). Without this, `SELECT *` on a USING-joined
@@ -911,26 +845,17 @@ fn render_join(
     let is_semi_or_anti = matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
     let using_lower: std::collections::HashSet<String> =
         using_columns.iter().map(|s| s.to_lowercase()).collect();
-    let mut slots = String::new();
-    let mut first = true;
-    let push = |slots: &mut String, first: &mut bool, s: String| {
-        if !*first {
-            slots.push_str(", ");
-        }
-        *first = false;
-        slots.push_str(&s);
-    };
-    let left_alias_q = quote_ident(&left_alias);
-    let right_alias_q = quote_ident(&right_alias);
+    let left_alias_q = quote_ident(TD_JOIN_LEFT);
+    let right_alias_q = quote_ident(TD_JOIN_RIGHT);
+    let mut slots: Vec<String> = Vec::new();
     // USING columns first (Spark hoists them).
     for c in using_columns {
-        push(&mut slots, &mut first, quote_ident(c).into_owned());
+        slots.push(quote_ident(c).into_owned());
     }
     // Left's non-USING columns in declared order.
     for f in &left.resolved_schema.fields {
         if !using_lower.contains(&f.name.to_lowercase()) {
-            let qualified = format!("{}.{}", left_alias_q, quote_ident(&f.name));
-            push(&mut slots, &mut first, qualified);
+            slots.push(format!("{}.{}", left_alias_q, quote_ident(&f.name)));
         }
     }
     // Right's non-USING columns — only when NOT semi/anti (which suppresses
@@ -938,15 +863,16 @@ fn render_join(
     if !is_semi_or_anti {
         for f in &right.resolved_schema.fields {
             if !using_lower.contains(&f.name.to_lowercase()) {
-                let qualified = format!("{}.{}", right_alias_q, quote_ident(&f.name));
-                push(&mut slots, &mut first, qualified);
+                slots.push(format!("{}.{}", right_alias_q, quote_ident(&f.name)));
             }
         }
     }
-    if slots.is_empty() {
+    let slots = if slots.is_empty() {
         // Fallback for SEMI/ANTI on identical USING columns only.
-        slots.push('*');
-    }
+        "*".to_owned()
+    } else {
+        slots.join(", ")
+    };
     Ok(format!(
         "SELECT {slots} FROM ({left_sql}) AS {left_alias_q} {kind} ({right_sql}) AS {right_alias_q}{clause}"
     ))
@@ -958,60 +884,37 @@ fn render_with_columns(
 ) -> Result<String, EmissionError> {
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let input_schema = &input.resolved_schema;
-    // Column-order contract with the analyzer: input columns emit in their
+    // Column-order contract with the analyzer is single-homed in
+    // [`with_columns_plan`] (see its doc): input columns emit in their
     // original positions (replaced in place if named by an assignment), and
-    // net-new assignments append at the end in assignment order. `analyzer.rs`
-    // `CommonOp::WithColumns` arm produces the resolved schema by the same
-    // walk — any deviation here would misalign Arrow columns with the schema
-    // Spark Connect advertises via `analyze_plan`, corrupting downstream
-    // decoding.
-    let assigned_lower: std::collections::HashMap<String, usize> = assignments
-        .iter()
-        .enumerate()
-        .map(|(i, (n, _))| (n.to_lowercase(), i))
-        .collect();
-    let mut consumed = vec![false; assignments.len()];
-    let mut slots = String::new();
-    let mut first = true;
-    for f in &input_schema.fields {
-        if !first {
-            slots.push_str(", ");
-        }
-        first = false;
-        if let Some(&idx) = assigned_lower.get(&f.name.to_lowercase()) {
-            let (_, expr) = &assignments[idx];
+    // net-new assignments append at the end in assignment order — the
+    // analyzer builds the resolved schema from the same plan, so the SELECT
+    // slots and the advertised schema stay aligned by construction.
+    let plan = with_columns_plan(input_schema, assignments);
+    let mut slots: Vec<String> = Vec::new();
+    for (f, replaced_by) in input_schema.fields.iter().zip(&plan.replaced) {
+        if let Some(idx) = replaced_by {
+            let (_, expr) = &assignments[*idx];
             let expr_sql = render_expr(expr, input_schema)?;
             let name_q = quote_ident(&f.name);
-            slots.push_str(&format!("{expr_sql} AS {name_q}"));
-            consumed[idx] = true;
+            slots.push(format!("{expr_sql} AS {name_q}"));
         } else {
-            slots.push_str(&quote_ident(&f.name));
+            slots.push(quote_ident(&f.name).into_owned());
         }
     }
-    for (i, (name, expr)) in assignments.iter().enumerate() {
-        if consumed[i] {
-            continue;
-        }
-        if !first {
-            slots.push_str(", ");
-        }
-        first = false;
+    for &i in &plan.appended {
+        let (name, expr) = &assignments[i];
         let expr_sql = render_expr(expr, input_schema)?;
         let name_q = quote_ident(name);
-        slots.push_str(&format!("{expr_sql} AS {name_q}"));
+        slots.push(format!("{expr_sql} AS {name_q}"));
     }
+    let slots = slots.join(", ");
     Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_with"))
 }
 
 fn render_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<String, EmissionError> {
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let mut dropped = String::new();
-    for (i, n) in drop_names.iter().enumerate() {
-        if i > 0 {
-            dropped.push_str(", ");
-        }
-        dropped.push_str(&quote_ident(n));
-    }
+    let dropped = sql_join(drop_names.iter(), ", ", |n| Ok(quote_ident(n).into_owned()))?;
     Ok(format!(
         "SELECT * EXCLUDE ({dropped}) FROM ({child_sql}) AS __td_drop"
     ))
@@ -1033,48 +936,23 @@ fn render_na_fill(
     if values.is_empty() {
         bail_boundary_op!("NaFill", "NaFill requires at least one fill value");
     }
-    // Build a per-column value map. Per Spark's `fillValue` contract, the
-    // empty-`cols` and single-value subset branches skip type-incompatible
-    // columns silently (see [`na_fill_compatible`]) — a mixed-type COALESCE
-    // (e.g. `COALESCE(varchar_col, 0)`) would otherwise be a DuckDB binder
-    // error, whereas Spark silently passes such columns through unchanged.
+    // Per-column fill selection — shared with `analyze_na_fill` via
+    // [`na_fill_value_for`] so the stamped schema and the emitted SQL apply
+    // the identical Spark `fillValue` contract (type-incompatible columns
+    // pass through untouched; a mixed-type COALESCE would be a DuckDB
+    // binder error, whereas Spark silently skips such columns).
     let value_for = |col_name: &str, col_type: &DataType| -> Option<&Expression> {
-        if cols.is_empty() {
-            if na_fill_compatible(col_type, &values[0].data_type(input_schema)) {
-                Some(&values[0])
-            } else {
-                None
-            }
-        } else if values.len() == 1 {
-            if cols.iter().any(|c| c.eq_ignore_ascii_case(col_name))
-                && na_fill_compatible(col_type, &values[0].data_type(input_schema))
-            {
-                Some(&values[0])
-            } else {
-                None
-            }
-        } else {
-            for (c, v) in cols.iter().zip(values.iter()) {
-                if c.eq_ignore_ascii_case(col_name) {
-                    return Some(v);
-                }
-            }
-            None
-        }
+        na_fill_value_for(cols, values, input_schema, col_name, col_type)
     };
-    let mut slots = String::new();
-    for (i, f) in input_schema.fields.iter().enumerate() {
-        if i > 0 {
-            slots.push_str(", ");
-        }
+    let slots = sql_join(input_schema.fields.iter(), ", ", |f| {
         let name_q = quote_ident(&f.name);
         if let Some(v) = value_for(&f.name, &f.data_type) {
             let v_sql = render_expr(v, input_schema)?;
-            slots.push_str(&format!("COALESCE({name_q}, {v_sql}) AS {name_q}"));
+            Ok(format!("COALESCE({name_q}, {v_sql}) AS {name_q}"))
         } else {
-            slots.push_str(&name_q);
+            Ok(name_q.into_owned())
         }
-    }
+    })?;
     Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_nafill"))
 }
 
@@ -1105,26 +983,17 @@ fn render_na_drop(
     let condition = if let Some(thresh) = min_non_nulls {
         // Row kept iff at least `thresh` of subset cols are non-null.
         // Emit: (CAST(col1 IS NOT NULL AS INT) + ... ) >= thresh.
-        let mut sum = String::new();
-        for (i, c) in subset.iter().enumerate() {
-            if i > 0 {
-                sum.push_str(" + ");
-            }
+        let sum = sql_join(subset.iter(), " + ", |c| {
             let q = quote_ident(c);
-            sum.push_str(&format!("CAST({q} IS NOT NULL AS INTEGER)"));
-        }
+            Ok(format!("CAST({q} IS NOT NULL AS INTEGER)"))
+        })?;
         format!("({sum}) >= {thresh}")
     } else {
         // how="any": all subset cols must be non-null.
-        let mut cond = String::new();
-        for (i, c) in subset.iter().enumerate() {
-            if i > 0 {
-                cond.push_str(" AND ");
-            }
+        sql_join(subset.iter(), " AND ", |c| {
             let q = quote_ident(c);
-            cond.push_str(&format!("{q} IS NOT NULL"));
-        }
-        cond
+            Ok(format!("{q} IS NOT NULL"))
+        })?
     };
     Ok(format!(
         "SELECT * FROM ({child_sql}) AS __td_nadrop WHERE {condition}"
@@ -1144,11 +1013,7 @@ fn render_na_replace(
     let in_subset = |name: &str| -> bool {
         cols.is_empty() || cols.iter().any(|c| c.eq_ignore_ascii_case(name))
     };
-    let mut slots = String::new();
-    for (i, f) in input_schema.fields.iter().enumerate() {
-        if i > 0 {
-            slots.push_str(", ");
-        }
+    let slots = sql_join(input_schema.fields.iter(), ", ", |f| {
         let name_q = quote_ident(&f.name);
         if in_subset(&f.name) && !replacements.is_empty() {
             let mut case = String::from("CASE ");
@@ -1158,11 +1023,11 @@ fn render_na_replace(
                 case.push_str(&format!("WHEN {name_q} = {old_sql} THEN {new_sql} "));
             }
             case.push_str(&format!("ELSE {name_q} END AS {name_q}"));
-            slots.push_str(&case);
+            Ok(case)
         } else {
-            slots.push_str(&name_q);
+            Ok(name_q.into_owned())
         }
-    }
+    })?;
     Ok(format!(
         "SELECT {slots} FROM ({child_sql}) AS __td_nareplace"
     ))
@@ -1195,30 +1060,10 @@ fn render_unpivot(
 
     // Pre-select only `ids + values` so DuckDB doesn't fold extra input
     // columns into the id set.
-    //
-    // OPT-3: preallocate builders. Estimate ~16 chars per identifier (quoted
-    // name + ", " separator) — cheap upper bound that avoids the geometric
-    // reallocations `String::push_str` would otherwise incur on wide unpivots.
-    const AVG_IDENT_BYTES: usize = 16;
-    let select_cap = (ids.len() + values.len()) * AVG_IDENT_BYTES;
-    let mut select_list = String::with_capacity(select_cap);
-    let mut first = true;
-    for c in ids.iter().chain(values.iter()) {
-        if !first {
-            select_list.push_str(", ");
-        }
-        select_list.push_str(&quote_ident(c));
-        first = false;
-    }
-
-    let value_cap = values.len() * AVG_IDENT_BYTES;
-    let mut value_cols = String::with_capacity(value_cap);
-    for (i, c) in values.iter().enumerate() {
-        if i > 0 {
-            value_cols.push_str(", ");
-        }
-        value_cols.push_str(&quote_ident(c));
-    }
+    let select_list = sql_join(ids.iter().chain(values.iter()), ", ", |c| {
+        Ok(quote_ident(c).into_owned())
+    })?;
+    let value_cols = sql_join(values.iter(), ", ", |c| Ok(quote_ident(c).into_owned()))?;
 
     Ok(format!(
         "UNPIVOT (SELECT {select_list} FROM ({child_sql}) AS __td_unpivot_src) ON {value_cols} INTO NAME {var_col} VALUE {val_col}"
@@ -1317,7 +1162,7 @@ fn render_stats_union(
                     format!("{} AS {q}", stat_to_agg_expr(stat, &q))
                 })
                 .collect();
-            let summary_lit = format!("'{}'", stat.replace('\'', "''"));
+            let summary_lit = sql_string_literal(stat);
             let cols_sql = if col_exprs.is_empty() {
                 String::new()
             } else {
@@ -1430,24 +1275,15 @@ fn render_pivot(
     let input_schema = &input.resolved_schema;
 
     // Pivot column — strip any wrapping Alias so the CASE reference is bare.
-    let pivot_col_expr = match pivot_column {
-        Expression::Alias(a) => a.expr.as_ref(),
-        other => other,
-    };
-    let pivot_col_sql = render_expr(pivot_col_expr, input_schema)?;
+    let pivot_col_sql = render_expr(pivot_column.unaliased(), input_schema)?;
 
     // Assemble the SELECT slots: grouping columns first, then one
     // conditional-aggregate slot per (pivot_value, aggregate) pair.
-    let mut slots = String::new();
-    let mut first = true;
+    let mut slots: Vec<String> = Vec::new();
     for g in grouping {
-        if !first {
-            slots.push_str(", ");
-        }
-        first = false;
         // Grouping expressions keep any alias; render_projection_slot
         // handles Spark-return casts + alias suffix.
-        slots.push_str(&render_projection_slot(g, input_schema)?);
+        slots.push(render_projection_slot(g, input_schema)?);
     }
 
     let mut out_idx = grouping.len();
@@ -1455,45 +1291,24 @@ fn render_pivot(
         // Strip any wrapping Alias so the CASE comparison references the bare
         // value; the alias only carries the output column name (already read
         // from the analyzer-stamped output schema below).
-        let bare_pv = match pv {
-            Expression::Alias(a) => a.expr.as_ref(),
-            other => other,
-        };
-        let pv_sql = render_expr(bare_pv, input_schema)?;
+        let pv_sql = render_expr(pv.unaliased(), input_schema)?;
         for a in aggregates {
-            if !first {
-                slots.push_str(", ");
-            }
-            first = false;
-            let bare_agg = match a {
-                Expression::Alias(al) => al.expr.as_ref(),
-                other => other,
-            };
+            let bare_agg = a.unaliased();
             // Read the stamped output name from the analyzer's schema.
             let out_name = &output_schema.fields[out_idx].name;
             out_idx += 1;
             let agg_sql =
                 build_conditional_aggregate(bare_agg, &pivot_col_sql, &pv_sql, input_schema)?;
-            slots.push_str(&agg_sql);
-            slots.push_str(" AS ");
-            slots.push_str(&quote_ident(out_name));
+            slots.push(format!("{agg_sql} AS {}", quote_ident(out_name)));
         }
     }
+    let slots = slots.join(", ");
 
     // GROUP BY clause — grouping columns, aliases stripped.
     let mut sql = format!("SELECT {slots} FROM ({child_sql}) AS __td_pivot_src");
     if !grouping.is_empty() {
         sql.push_str(" GROUP BY ");
-        for (i, g) in grouping.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            let bare = match g {
-                Expression::Alias(al) => al.expr.as_ref(),
-                other => other,
-            };
-            sql.push_str(&render_expr(bare, input_schema)?);
-        }
+        sql.push_str(&render_group_exprs(grouping, input_schema)?.join(", "));
     }
     Ok(sql)
 }
@@ -1610,13 +1425,7 @@ fn render_deduplicate(input: &TypedAst, on_columns: &[String]) -> Result<String,
             "SELECT DISTINCT * FROM ({child_sql}) AS __td_dedup"
         ))
     } else {
-        let mut cols = String::new();
-        for (i, c) in on_columns.iter().enumerate() {
-            if i > 0 {
-                cols.push_str(", ");
-            }
-            cols.push_str(&quote_ident(c));
-        }
+        let cols = sql_join(on_columns.iter(), ", ", |c| Ok(quote_ident(c).into_owned()))?;
         Ok(format!(
             "SELECT DISTINCT ON ({cols}) * FROM ({child_sql}) AS __td_dedup"
         ))
@@ -1632,19 +1441,15 @@ fn render_with_columns_renamed(
         .iter()
         .map(|(old, new)| (old.to_lowercase(), new.clone()))
         .collect();
-    let mut slots = String::new();
-    for (i, f) in input.resolved_schema.fields.iter().enumerate() {
-        if i > 0 {
-            slots.push_str(", ");
-        }
+    let slots = sql_join(input.resolved_schema.fields.iter(), ", ", |f| {
         let src = quote_ident(&f.name);
         let dst_name = rename_map
             .get(&f.name.to_lowercase())
             .cloned()
             .unwrap_or_else(|| f.name.clone());
         let dst = quote_ident(&dst_name);
-        slots.push_str(&format!("{src} AS {dst}"));
-    }
+        Ok(format!("{src} AS {dst}"))
+    })?;
     Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_rename"))
 }
 
@@ -1742,79 +1547,7 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
         }
         Expression::Cast(c) => render_cast(c, schema),
         Expression::CaseWhen(cw) => render_case_when(cw, schema),
-        Expression::Window(w) => {
-            let func_sql = render_expr(&w.func, schema)?;
-            let mut over = String::from("OVER (");
-            let mut had_content = false;
-            if !w.partition_by.is_empty() {
-                over.push_str("PARTITION BY ");
-                for (i, p) in w.partition_by.iter().enumerate() {
-                    if i > 0 {
-                        over.push_str(", ");
-                    }
-                    over.push_str(&render_expr(p, schema)?);
-                }
-                had_content = true;
-            }
-            if !w.order_by.is_empty() {
-                if had_content {
-                    over.push(' ');
-                }
-                over.push_str("ORDER BY ");
-                for (i, s) in w.order_by.iter().enumerate() {
-                    if i > 0 {
-                        over.push_str(", ");
-                    }
-                    let e = render_expr(&s.expr, schema)?;
-                    let dir = match s.direction {
-                        crate::transpiler_v2::expression::SortDirection::Ascending => "ASC",
-                        crate::transpiler_v2::expression::SortDirection::Descending => "DESC",
-                    };
-                    let nulls = match s.null_ordering {
-                        crate::transpiler_v2::expression::NullOrdering::NullsFirst => "NULLS FIRST",
-                        crate::transpiler_v2::expression::NullOrdering::NullsLast => "NULLS LAST",
-                    };
-                    over.push_str(&format!("{e} {dir} {nulls}"));
-                }
-                had_content = true;
-            }
-            // Frame clause emission.
-            if let Some(frame) = &w.frame {
-                use super::expression::{FrameBoundary, FrameUnit};
-                if had_content {
-                    over.push(' ');
-                }
-                let unit_kw = match frame.unit {
-                    FrameUnit::Rows => "ROWS",
-                    FrameUnit::Range => "RANGE",
-                };
-                let render_bound = |b: &FrameBoundary,
-                                    is_lower: bool|
-                 -> Result<String, EmissionError> {
-                    match b {
-                        FrameBoundary::UnboundedPreceding => Ok("UNBOUNDED PRECEDING".to_owned()),
-                        FrameBoundary::UnboundedFollowing => Ok("UNBOUNDED FOLLOWING".to_owned()),
-                        FrameBoundary::CurrentRow => Ok("CURRENT ROW".to_owned()),
-                        FrameBoundary::Preceding(e) => {
-                            let n = render_expr(e, schema)?;
-                            let _ = is_lower;
-                            Ok(format!("{n} PRECEDING"))
-                        }
-                        FrameBoundary::Following(e) => {
-                            let n = render_expr(e, schema)?;
-                            let _ = is_lower;
-                            Ok(format!("{n} FOLLOWING"))
-                        }
-                    }
-                };
-                let lo = render_bound(&frame.lower, true)?;
-                let up = render_bound(&frame.upper, false)?;
-                over.push_str(&format!("{unit_kw} BETWEEN {lo} AND {up}"));
-            }
-            let _ = had_content;
-            over.push(')');
-            Ok(format!("{func_sql} {over}"))
-        }
+        Expression::Window(w) => render_window(w, schema),
         Expression::Alias(a) => render_alias(a, schema),
         Expression::Star(s) => render_star(s),
         // Uncorrelated subqueries render node-local from the analyzed inner
@@ -1847,15 +1580,8 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
                 let p = quote_ident(&l.params[0]);
                 Ok(format!("{p} -> {body}"))
             } else {
-                let mut buf = String::from("(");
-                for (i, p) in l.params.iter().enumerate() {
-                    if i > 0 {
-                        buf.push_str(", ");
-                    }
-                    buf.push_str(&quote_ident(p));
-                }
-                buf.push(')');
-                Ok(format!("{buf} -> {body}"))
+                let params = sql_join(l.params.iter(), ", ", |p| Ok(quote_ident(p).into_owned()))?;
+                Ok(format!("({params}) -> {body}"))
             }
         }
         Expression::LambdaVariable(lv) => Ok(quote_ident(&lv.name).into_owned()),
@@ -1951,6 +1677,67 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
     }
 }
 
+/// Render a window function application:
+/// `<func> OVER (PARTITION BY ... ORDER BY ... [frame])`. ORDER BY items
+/// share [`render_sort_key`] with the `Sort` operator (byte-identical
+/// `{expr} {ASC|DESC} {NULLS FIRST|NULLS LAST}` shape).
+fn render_window(
+    w: &crate::transpiler_v2::expression::WindowFunction,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
+    let func_sql = render_expr(&w.func, schema)?;
+    let mut over = String::from("OVER (");
+    let mut had_content = false;
+    if !w.partition_by.is_empty() {
+        over.push_str("PARTITION BY ");
+        over.push_str(&sql_join(w.partition_by.iter(), ", ", |p| {
+            render_expr(p, schema)
+        })?);
+        had_content = true;
+    }
+    if !w.order_by.is_empty() {
+        if had_content {
+            over.push(' ');
+        }
+        over.push_str("ORDER BY ");
+        over.push_str(&sql_join(w.order_by.iter(), ", ", |s| {
+            render_sort_key(s, schema)
+        })?);
+        had_content = true;
+    }
+    // Frame clause emission.
+    if let Some(frame) = &w.frame {
+        use super::expression::{FrameBoundary, FrameUnit};
+        if had_content {
+            over.push(' ');
+        }
+        let unit_kw = match frame.unit {
+            FrameUnit::Rows => "ROWS",
+            FrameUnit::Range => "RANGE",
+        };
+        let render_bound = |b: &FrameBoundary| -> Result<String, EmissionError> {
+            match b {
+                FrameBoundary::UnboundedPreceding => Ok("UNBOUNDED PRECEDING".to_owned()),
+                FrameBoundary::UnboundedFollowing => Ok("UNBOUNDED FOLLOWING".to_owned()),
+                FrameBoundary::CurrentRow => Ok("CURRENT ROW".to_owned()),
+                FrameBoundary::Preceding(e) => {
+                    let n = render_expr(e, schema)?;
+                    Ok(format!("{n} PRECEDING"))
+                }
+                FrameBoundary::Following(e) => {
+                    let n = render_expr(e, schema)?;
+                    Ok(format!("{n} FOLLOWING"))
+                }
+            }
+        };
+        let lo = render_bound(&frame.lower)?;
+        let up = render_bound(&frame.upper)?;
+        over.push_str(&format!("{unit_kw} BETWEEN {lo} AND {up}"));
+    }
+    over.push(')');
+    Ok(format!("{func_sql} {over}"))
+}
+
 /// Emit a struct field access for an [`Expression::ExtractValue`] whose child
 /// is (statically or heuristically) a struct. A `String`-literal extraction is
 /// a field name → `(child).field`; any other extraction falls back to a
@@ -1978,11 +1765,24 @@ fn extract_struct_field(
     }
 }
 
+/// Render each grouping expression bare (alias-stripped — GROUP BY doesn't
+/// take aliases, so `GROUP BY (expr) AS name` would be a parse error).
+/// Shared by [`render_pivot`] and [`render_aggregate_op`] (whose GROUPING
+/// SETS arm indexes into the returned Vec per set).
+fn render_group_exprs(
+    grouping: &[Expression],
+    schema: &Schema,
+) -> Result<Vec<String>, EmissionError> {
+    grouping
+        .iter()
+        .map(|g| render_expr(g.unaliased(), schema))
+        .collect()
+}
+
 fn is_aggregate_name(name: &str) -> bool {
-    // `AGGREGATE_NAMES` (in `type_inference.rs`) is all-lowercase ASCII per
-    // τ's analyzer; case-insensitive byte comparison matches without allocating the
-    // per-call lowercased `String` this function used to build.
-    AGGREGATE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(name))
+    // Classifier roster lives in the `AGG_SPECS` table (`type_inference.rs`);
+    // the lookup is case-insensitive without allocating a lowercased `String`.
+    is_aggregate_classifier_name(name)
 }
 
 /// Wrap a rendered format-string expression (typically a string literal, but
@@ -2066,134 +1866,24 @@ fn render_expr_with_lambda_adjust(
 /// Nested `Lambda` expressions with a parameter named `index_var` shadow the
 /// outer name — descent stops for that subtree so we don't rewrite an
 /// unrelated inner binding.
+///
+/// Exact special case of [`substitute_lambda_var`] — the replacement is the
+/// fixed `(index_var - 1)` expression instead of an arbitrary caller-supplied
+/// sub-expression.
 fn substitute_index_var(body: &Expression, index_var: &str) -> Expression {
-    match body {
-        Expression::LambdaVariable(lv) if lv.name == index_var => {
-            Expression::Binary(BinaryExpression {
-                op: BinaryOp::Sub,
-                left: Box::new(Expression::LambdaVariable(lv.clone())),
-                right: Box::new(Expression::Literal(Literal {
-                    value: LiteralValue::Long(1),
-                    data_type: DataType::Long,
-                })),
-            })
-        }
-        Expression::LambdaVariable(_)
-        | Expression::Literal(_)
-        | Expression::ColumnReference(_)
-        | Expression::UnresolvedColumn(_)
-        | Expression::Star(_)
-        | Expression::RawSql(_) => body.clone(),
-        Expression::Binary(b) => Expression::Binary(BinaryExpression {
-            op: b.op.clone(),
-            left: Box::new(substitute_index_var(&b.left, index_var)),
-            right: Box::new(substitute_index_var(&b.right, index_var)),
-        }),
-        Expression::Unary(u) => Expression::Unary(UnaryExpression {
-            op: u.op.clone(),
-            operand: Box::new(substitute_index_var(&u.operand, index_var)),
-        }),
-        Expression::FunctionCall(fc) => Expression::FunctionCall(FunctionCall {
-            name: fc.name.clone(),
-            args: fc
-                .args
-                .iter()
-                .map(|a| substitute_index_var(a, index_var))
-                .collect(),
-            distinct: fc.distinct,
-        }),
-        Expression::Cast(c) => Expression::Cast(CastExpression {
-            expr: Box::new(substitute_index_var(&c.expr, index_var)),
-            to_type: c.to_type.clone(),
-            try_cast: c.try_cast,
-        }),
-        Expression::CaseWhen(cw) => Expression::CaseWhen(CaseWhenExpression {
-            branches: cw
-                .branches
-                .iter()
-                .map(|(w, t)| {
-                    (
-                        substitute_index_var(w, index_var),
-                        substitute_index_var(t, index_var),
-                    )
-                })
-                .collect(),
-            else_expr: cw
-                .else_expr
-                .as_ref()
-                .map(|e| Box::new(substitute_index_var(e, index_var))),
-        }),
-        Expression::Alias(a) => Expression::Alias(AliasExpression {
-            expr: Box::new(substitute_index_var(&a.expr, index_var)),
-            alias: a.alias.clone(),
-        }),
-        Expression::Lambda(inner) => {
-            // Shadowing: if the inner lambda re-binds our index name, its
-            // body must not be rewritten.
-            if inner.params.iter().any(|p| p == index_var) {
-                Expression::Lambda(super::expression::LambdaExpression {
-                    params: inner.params.clone(),
-                    body: inner.body.clone(),
-                })
-            } else {
-                Expression::Lambda(super::expression::LambdaExpression {
-                    params: inner.params.clone(),
-                    body: Box::new(substitute_index_var(&inner.body, index_var)),
-                })
-            }
-        }
-        // Composite / less-common shapes — walk children generically. Any
-        // shape not enumerated here falls back to a clone (safe: it means the
-        // subtree contains no `LambdaVariable` we care about, or an exotic
-        // shape corpus HOF cases don't exercise).
-        Expression::ArrayLiteral(a) => {
-            Expression::ArrayLiteral(super::expression::ArrayLiteralExpression {
-                element_type: a.element_type.clone(),
-                elements: a
-                    .elements
-                    .iter()
-                    .map(|e| substitute_index_var(e, index_var))
-                    .collect(),
-            })
-        }
-        Expression::Between(b) => Expression::Between(super::expression::BetweenExpression {
-            expr: Box::new(substitute_index_var(&b.expr, index_var)),
-            low: Box::new(substitute_index_var(&b.low, index_var)),
-            high: Box::new(substitute_index_var(&b.high, index_var)),
-            negated: b.negated,
-        }),
-        Expression::InList(i) => Expression::InList(super::expression::InListExpression {
-            expr: Box::new(substitute_index_var(&i.expr, index_var)),
-            list: i
-                .list
-                .iter()
-                .map(|e| substitute_index_var(e, index_var))
-                .collect(),
-            negated: i.negated,
-        }),
-        Expression::Like(l) => Expression::Like(super::expression::LikeExpression {
-            value: Box::new(substitute_index_var(&l.value, index_var)),
-            pattern: Box::new(substitute_index_var(&l.pattern, index_var)),
-            escape: l.escape,
-            case_insensitive: l.case_insensitive,
-            negated: l.negated,
-        }),
-        Expression::IsDistinctFrom(d) => {
-            Expression::IsDistinctFrom(super::expression::IsDistinctFromExpression {
-                left: Box::new(substitute_index_var(&d.left, index_var)),
-                right: Box::new(substitute_index_var(&d.right, index_var)),
-                negated: d.negated,
-            })
-        }
-        Expression::ExtractValue(ev) => {
-            Expression::ExtractValue(super::expression::ExtractValueExpression {
-                child: Box::new(substitute_index_var(&ev.child, index_var)),
-                extraction: Box::new(substitute_index_var(&ev.extraction, index_var)),
-            })
-        }
-        // Shapes with no `LambdaVariable` children in normal usage — clone.
-        _ => body.clone(),
-    }
+    let replacement = Expression::Binary(BinaryExpression {
+        op: BinaryOp::Sub,
+        left: Box::new(Expression::LambdaVariable(
+            super::expression::LambdaVariableExpression {
+                name: index_var.to_owned(),
+            },
+        )),
+        right: Box::new(Expression::Literal(Literal {
+            value: LiteralValue::Long(1),
+            data_type: DataType::Long,
+        })),
+    });
+    substitute_lambda_var(body, index_var, &replacement)
 }
 
 /// Rewrite `body` so every `LambdaVariable(var_name)` reference is replaced by
@@ -2206,123 +1896,48 @@ fn substitute_index_var(body: &Expression, index_var: &str) -> Expression {
 ///
 /// Nested `Lambda` expressions that re-bind `var_name` shadow the outer
 /// binding — descent stops for the shadowed subtree.
+///
+/// Traversal is structural via [`Expression::map_children`], so every
+/// composite variant recurses (the previous hand walker's catch-all silently
+/// skipped `MapLiteral`, `StructLiteral`, `RowConstructor`, `UpdateFields` —
+/// leaving lambda variables unsubstituted there). Subqueries and `Window`
+/// stay opaque; see the explicit arms.
 fn substitute_lambda_var(
     body: &Expression,
     var_name: &str,
     replacement: &Expression,
 ) -> Expression {
     match body {
+        // Hit: exact (case-sensitive) name match on the bound variable.
         Expression::LambdaVariable(lv) if lv.name == var_name => replacement.clone(),
-        Expression::LambdaVariable(_)
-        | Expression::Literal(_)
-        | Expression::ColumnReference(_)
-        | Expression::UnresolvedColumn(_)
-        | Expression::Star(_)
-        | Expression::RawSql(_) => body.clone(),
-        Expression::Binary(b) => Expression::Binary(BinaryExpression {
-            op: b.op.clone(),
-            left: Box::new(substitute_lambda_var(&b.left, var_name, replacement)),
-            right: Box::new(substitute_lambda_var(&b.right, var_name, replacement)),
-        }),
-        Expression::Unary(u) => Expression::Unary(UnaryExpression {
-            op: u.op.clone(),
-            operand: Box::new(substitute_lambda_var(&u.operand, var_name, replacement)),
-        }),
-        Expression::FunctionCall(fc) => Expression::FunctionCall(FunctionCall {
-            name: fc.name.clone(),
-            args: fc
-                .args
-                .iter()
-                .map(|a| substitute_lambda_var(a, var_name, replacement))
-                .collect(),
-            distinct: fc.distinct,
-        }),
-        Expression::Cast(c) => Expression::Cast(CastExpression {
-            expr: Box::new(substitute_lambda_var(&c.expr, var_name, replacement)),
-            to_type: c.to_type.clone(),
-            try_cast: c.try_cast,
-        }),
-        Expression::CaseWhen(cw) => Expression::CaseWhen(CaseWhenExpression {
-            branches: cw
-                .branches
-                .iter()
-                .map(|(w, t)| {
-                    (
-                        substitute_lambda_var(w, var_name, replacement),
-                        substitute_lambda_var(t, var_name, replacement),
-                    )
-                })
-                .collect(),
-            else_expr: cw
-                .else_expr
-                .as_ref()
-                .map(|e| Box::new(substitute_lambda_var(e, var_name, replacement))),
-        }),
-        Expression::Alias(a) => Expression::Alias(AliasExpression {
-            expr: Box::new(substitute_lambda_var(&a.expr, var_name, replacement)),
-            alias: a.alias.clone(),
-        }),
-        Expression::Lambda(inner) => {
-            // Shadowing: if the inner lambda re-binds our var name, its
-            // body must not be rewritten.
-            if inner.params.iter().any(|p| p == var_name) {
-                Expression::Lambda(super::expression::LambdaExpression {
-                    params: inner.params.clone(),
-                    body: inner.body.clone(),
-                })
-            } else {
-                Expression::Lambda(super::expression::LambdaExpression {
-                    params: inner.params.clone(),
-                    body: Box::new(substitute_lambda_var(&inner.body, var_name, replacement)),
-                })
+        // Shadowing: an inner lambda that re-binds `var_name` makes its body
+        // opaque — the inner binding wins, so descent stops here.
+        Expression::Lambda(inner) if inner.params.iter().any(|p| p == var_name) => body.clone(),
+        // Opacity: the hand walker never descended into subqueries or window
+        // expressions (they fell to its catch-all). A subquery or window
+        // inside a HOF lambda body is pathological — DuckDB cannot evaluate
+        // either per-element — so preserve the historical skip exactly rather
+        // than adopt `map_children`'s child set there (it would visit
+        // `InSubquery`'s LHS and `Window`'s func/partition/order children).
+        Expression::InSubquery(_)
+        | Expression::ExistsSubquery(_)
+        | Expression::ScalarSubquery(_)
+        | Expression::Window(_) => body.clone(),
+        // Everything else (including non-shadowing lambdas, whose only child
+        // is their body): recurse structurally over the immediate children.
+        other => {
+            let mapped = other.clone().map_children(|child| {
+                Ok::<_, std::convert::Infallible>(substitute_lambda_var(
+                    &child,
+                    var_name,
+                    replacement,
+                ))
+            });
+            match mapped {
+                Ok(e) => e,
+                Err(never) => match never {},
             }
         }
-        Expression::ArrayLiteral(a) => {
-            Expression::ArrayLiteral(super::expression::ArrayLiteralExpression {
-                element_type: a.element_type.clone(),
-                elements: a
-                    .elements
-                    .iter()
-                    .map(|e| substitute_lambda_var(e, var_name, replacement))
-                    .collect(),
-            })
-        }
-        Expression::Between(b) => Expression::Between(super::expression::BetweenExpression {
-            expr: Box::new(substitute_lambda_var(&b.expr, var_name, replacement)),
-            low: Box::new(substitute_lambda_var(&b.low, var_name, replacement)),
-            high: Box::new(substitute_lambda_var(&b.high, var_name, replacement)),
-            negated: b.negated,
-        }),
-        Expression::InList(i) => Expression::InList(super::expression::InListExpression {
-            expr: Box::new(substitute_lambda_var(&i.expr, var_name, replacement)),
-            list: i
-                .list
-                .iter()
-                .map(|e| substitute_lambda_var(e, var_name, replacement))
-                .collect(),
-            negated: i.negated,
-        }),
-        Expression::Like(l) => Expression::Like(super::expression::LikeExpression {
-            value: Box::new(substitute_lambda_var(&l.value, var_name, replacement)),
-            pattern: Box::new(substitute_lambda_var(&l.pattern, var_name, replacement)),
-            escape: l.escape,
-            case_insensitive: l.case_insensitive,
-            negated: l.negated,
-        }),
-        Expression::IsDistinctFrom(d) => {
-            Expression::IsDistinctFrom(super::expression::IsDistinctFromExpression {
-                left: Box::new(substitute_lambda_var(&d.left, var_name, replacement)),
-                right: Box::new(substitute_lambda_var(&d.right, var_name, replacement)),
-                negated: d.negated,
-            })
-        }
-        Expression::ExtractValue(ev) => {
-            Expression::ExtractValue(super::expression::ExtractValueExpression {
-                child: Box::new(substitute_lambda_var(&ev.child, var_name, replacement)),
-                extraction: Box::new(substitute_lambda_var(&ev.extraction, var_name, replacement)),
-            })
-        }
-        _ => body.clone(),
     }
 }
 
@@ -2426,6 +2041,107 @@ fn string_literal_arg(f: &FunctionCall, idx: usize, what: &str) -> Result<String
             reason: format!("{what} must be a string literal"),
         }),
     }
+}
+
+/// If `e` is a boolean literal expression, return its value. Otherwise return
+/// `None`. Used by the arms that recognise (or drop) Spark's trailing
+/// boolean-literal flags (`ignoreNulls`, `sort_array` asc, `mode`).
+fn bool_literal(e: &Expression) -> Option<bool> {
+    match e {
+        Expression::Literal(Literal {
+            value: LiteralValue::Boolean(b),
+            ..
+        }) => Some(*b),
+        _ => None,
+    }
+}
+
+/// Render the first `N` arguments of `f` positionally via [`render_expr`].
+/// The caller must have already established (match guard or explicit arity
+/// check) that at least `N` arguments are present.
+fn rendered_args<const N: usize>(
+    f: &FunctionCall,
+    schema: &Schema,
+) -> Result<[String; N], EmissionError> {
+    let rendered = f.args[..N]
+        .iter()
+        .map(|a| render_expr(a, schema))
+        .collect::<Result<Vec<String>, EmissionError>>()?;
+    Ok(<[String; N]>::try_from(rendered).expect("sliced to exactly N elements above"))
+}
+
+/// Bail with `msg` (verbatim, same `bail_boundary_fn!` error shape, `f.name`
+/// as the function name) unless the call has exactly `N` arguments; then
+/// render each argument positionally via [`render_expr`].
+fn exact_args<const N: usize>(
+    f: &FunctionCall,
+    schema: &Schema,
+    msg: &str,
+) -> Result<[String; N], EmissionError> {
+    if f.args.len() != N {
+        bail_boundary_fn!(f.name.clone(), msg);
+    }
+    rendered_args(f, schema)
+}
+
+/// [`exact_args`] variant for "at least `N`" arities: bails with `msg` unless
+/// the call has `N` or more arguments, then renders the FIRST `N` arguments
+/// (any extras are intentionally handled — or dropped — by the calling arm).
+fn min_args<const N: usize>(
+    f: &FunctionCall,
+    schema: &Schema,
+    msg: &str,
+) -> Result<[String; N], EmissionError> {
+    if f.args.len() < N {
+        bail_boundary_fn!(f.name.clone(), msg);
+    }
+    rendered_args(f, schema)
+}
+
+/// Compose Spark's `make_dt_interval` / `make_interval` / `make_ym_interval`
+/// as a sum of `INTERVAL (expr) UNIT` summands — DuckDB has none of the three
+/// scalars. One summand per entry of `units` (missing arguments default to 0,
+/// Spark's documented behavior); when `with_seconds` is set, a trailing
+/// fractional-seconds argument is preserved via `MICROSECOND` with
+/// `* 1_000_000` (DuckDB `INTERVAL (expr) SECOND` truncates to integer
+/// seconds). Argument counts beyond `units.len() + with_seconds` bail with
+/// `max_msg` verbatim.
+fn render_make_interval(
+    f: &FunctionCall,
+    schema: &Schema,
+    units: &[&str],
+    with_seconds: bool,
+    max_msg: &str,
+) -> Result<String, EmissionError> {
+    let max_args = units.len() + usize::from(with_seconds);
+    if f.args.len() > max_args {
+        bail_boundary_fn!(f.name.clone(), max_msg);
+    }
+    let zero = "0".to_owned();
+    let arg = |i: usize| -> Result<String, EmissionError> {
+        if i >= f.args.len() {
+            Ok(zero.clone())
+        } else {
+            render_expr(&f.args[i], schema)
+        }
+    };
+    let mut parts: Vec<String> = Vec::with_capacity(max_args);
+    for (i, unit) in units.iter().enumerate() {
+        parts.push(format!("INTERVAL ({}) {unit}", arg(i)?));
+    }
+    if with_seconds {
+        // Seconds are DECIMAL(8,6) in Spark. DuckDB `INTERVAL (expr) SECOND`
+        // truncates to integer seconds; use MICROSECOND with `* 1_000_000`
+        // to preserve fractional seconds.
+        let s_micros = if f.args.len() < max_args {
+            zero.clone()
+        } else {
+            let s = render_expr(&f.args[max_args - 1], schema)?;
+            format!("CAST(({s}) * 1000000 AS BIGINT)")
+        };
+        parts.push(format!("INTERVAL ({s_micros}) MICROSECOND"));
+    }
+    Ok(format!("({})", parts.join(" + ")))
 }
 
 /// Build the DuckDB interval expression for Spark's `timestampadd(unit, n, ts)`.
@@ -2560,69 +2276,69 @@ fn render_ceil_floor(
     }
 }
 
+/// Number of leading arguments to KEEP when trimming Spark's trailing
+/// `ignoreNulls` boolean from a first/last/nth_value/lag/lead call — DuckDB's
+/// equivalents do not accept the flag. Single source for the per-function
+/// keep-arity, shared by the two trim sites. The sites' trim GUARDS are
+/// deliberately divergent — do NOT unify them without a corpus witness:
+///
+/// * [`render_function_call`] (reached by `nth_value`/`lag`/`lead`, whose
+///   aggregate-classifier bit is false) trims ONLY when every extra trailing
+///   arg is a boolean literal — it never drops a real value. Anchor: corpus
+///   win-006.
+/// * [`render_aggregate`] (reached by `first`/`last`/`first_value`/
+///   `last_value`, which the classifier routes there) trims UNCONDITIONALLY
+///   whenever extra args are present (corpus uses ignorenulls=True, which
+///   matches DuckDB's default).
+fn trailing_ignore_nulls_keep_arity(name_lower: &str) -> Option<usize> {
+    match name_lower {
+        "first" | "last" | "first_value" | "last_value" => Some(1),
+        "nth_value" => Some(2),
+        "lag" | "lead" => Some(3), // (col, offset, default)
+        _ => None,
+    }
+}
+
 fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
     let name_lower = f.name.to_ascii_lowercase();
     // Aggregate-name overlap check — if the analyzer classified a FunctionCall
     // as aggregate, `render_expr` routes to `render_aggregate` before this
     // function; anything reaching here is scalar by construction. Defense in
-    // depth: any name matching AGGREGATE_NAMES should never be seen here.
+    // depth: any name in the classifier roster should never be seen here.
     //
     // Window-only functions with a trailing `ignoreNulls` argument that PySpark
     // serializes verbatim — DuckDB's `nth_value(col, n)` / `lag`/`lead`/
     // `first_value`/`last_value` do not accept the boolean flag. Drop the
-    // trailing bool. Anchor: corpus win-006.
+    // trailing bool; keep-arity is single-homed in
+    // [`trailing_ignore_nulls_keep_arity`]. Anchor: corpus win-006.
     if matches!(
         name_lower.as_str(),
         "nth_value" | "first_value" | "last_value" | "lag" | "lead"
     ) {
-        let arity_keep = match name_lower.as_str() {
-            "nth_value" => 2,
-            "first_value" | "last_value" => 1,
-            "lag" | "lead" => 3, // (col, offset, default)
-            _ => unreachable!(),
-        };
-        // Only apply the trim if the extra trailing arg is a boolean literal
-        // (Spark's ignoreNulls flag). Never silently drop a real value.
-        if f.args.len() > arity_keep {
-            let extras = &f.args[arity_keep..];
-            let all_bool_literals = extras.iter().all(|e| {
-                matches!(
-                    e,
-                    Expression::Literal(super::expression::Literal {
-                        value: super::expression::LiteralValue::Boolean(_),
-                        ..
-                    })
-                )
-            });
-            if all_bool_literals {
-                let mut parts = String::new();
-                for (i, arg) in f.args.iter().take(arity_keep).enumerate() {
-                    if i > 0 {
-                        parts.push_str(", ");
-                    }
-                    parts.push_str(&render_expr(arg, schema)?);
+        if let Some(arity_keep) = trailing_ignore_nulls_keep_arity(&name_lower) {
+            // Only apply the trim if the extra trailing arg is a boolean literal
+            // (Spark's ignoreNulls flag). Never silently drop a real value.
+            if f.args.len() > arity_keep {
+                let extras = &f.args[arity_keep..];
+                let all_bool_literals = extras.iter().all(|e| bool_literal(e).is_some());
+                if all_bool_literals {
+                    let parts = sql_join(f.args.iter().take(arity_keep), ", ", |arg| {
+                        render_expr(arg, schema)
+                    })?;
+                    return Ok(format!("{name_lower}({parts})"));
                 }
-                return Ok(format!("{name_lower}({parts})"));
             }
         }
     }
-    let mut args_sql = String::new();
-    for (i, arg) in f.args.iter().enumerate() {
-        if i > 0 {
-            args_sql.push_str(", ");
-        }
-        args_sql.push_str(&render_expr(arg, schema)?);
-    }
+    let args_sql = sql_join(f.args.iter(), ", ", |arg| render_expr(arg, schema))?;
     // Handful of Spark-name → DuckDB-name remappings where the direct
     // pass-through wouldn't work. Everything else passes through unchanged.
     let duck_name: &str = match name_lower.as_str() {
         // DuckDB parses `not` as a keyword; Spark sends unary NOT as a
         // function. Emit as a keyword expression.
         "not" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`not` requires exactly one argument");
-            }
-            return Ok(format!("(NOT {args_sql})"));
+            let [a] = exact_args(f, schema, "`not` requires exactly one argument")?;
+            return Ok(format!("(NOT {a})"));
         }
         // Spark's `array()` literal — DuckDB uses `[a, b, c]` or
         // `list_value(a, b, c)`. Emit the list_value form since it accepts
@@ -2649,21 +2365,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             if f.args.len() % 2 != 0 {
                 bail_boundary_fn!(f.name.clone(), "`create_map` requires an even arg count");
             }
-            let mut keys = String::from("list_value(");
-            let mut vals = String::from("list_value(");
-            let mut i = 0;
-            while i < f.args.len() {
-                if i > 0 {
-                    keys.push_str(", ");
-                    vals.push_str(", ");
-                }
-                keys.push_str(&render_expr(&f.args[i], schema)?);
-                vals.push_str(&render_expr(&f.args[i + 1], schema)?);
-                i += 2;
-            }
-            keys.push(')');
-            vals.push(')');
-            return Ok(format!("map({keys}, {vals})"));
+            let keys = sql_join(f.args.iter().step_by(2), ", ", |k| render_expr(k, schema))?;
+            let vals = sql_join(f.args.iter().skip(1).step_by(2), ", ", |v| {
+                render_expr(v, schema)
+            })?;
+            return Ok(format!("map(list_value({keys}), list_value({vals}))"));
         }
         // Spark's `struct(a, b, ...)` — Catalyst `CreateStruct`. Field
         // names derive per-argument from `derive_struct_field_name` (Alias
@@ -2680,39 +2386,24 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // inside function calls. Strip the outer Alias when rendering the
         // value expression.
         "struct" => {
-            let mut parts = String::new();
-            for (i, arg) in f.args.iter().enumerate() {
-                if i > 0 {
-                    parts.push_str(", ");
-                }
+            let parts = sql_join(f.args.iter().enumerate(), ", ", |(i, arg)| {
                 let name = super::struct_names::derive_struct_field_name(arg, i);
-                let value_expr: &Expression = match arg {
-                    Expression::Alias(a) => a.expr.as_ref(),
-                    other => other,
-                };
-                let val = render_expr(value_expr, schema)?;
+                let val = render_expr(arg.unaliased(), schema)?;
                 let name_q = quote_ident(&name);
-                parts.push_str(&format!("{name_q} := {val}"));
-            }
+                Ok(format!("{name_q} := {val}"))
+            })?;
             return Ok(format!("struct_pack({parts})"));
         }
         // Spark's `locate(needle, haystack[, start])` → DuckDB's
         // `strpos(haystack, needle)` (no start-position support).
         "locate" => {
-            if f.args.len() < 2 {
-                bail_boundary_fn!(f.name.clone(), "`locate` requires at least 2 arguments");
-            }
-            let needle = render_expr(&f.args[0], schema)?;
-            let haystack = render_expr(&f.args[1], schema)?;
+            let [needle, haystack] = min_args(f, schema, "`locate` requires at least 2 arguments")?;
             return Ok(format!("strpos({haystack}, {needle})"));
         }
         // Spark's `dayofweek(x)` returns 1..7 (Sunday=1); DuckDB's returns
         // 0..6 (Sunday=0). Add 1 to align with Spark.
         "dayofweek" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`dayofweek` requires exactly 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = exact_args(f, schema, "`dayofweek` requires exactly 1 argument")?;
             return Ok(format!("(dayofweek({a}) + 1)"));
         }
         // Spark's `date_format(date, fmt)` → DuckDB `strftime(date, fmt)`.
@@ -2721,8 +2412,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // token translation for the most common patterns; complex format
         // strings will diverge and require per-case follow-ups.
         "date_format" if f.args.len() == 2 => {
-            let d = render_expr(&f.args[0], schema)?;
-            let fmt = render_expr(&f.args[1], schema)?;
+            let [d, fmt] = rendered_args(f, schema)?;
             // Translate Spark tokens to strftime tokens at emission time
             // — supports yyyy/MM/dd/HH/mm/ss and common variants.
             let duck_fmt = spark_fmt_to_duckdb(&fmt);
@@ -2731,8 +2421,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `trunc(date, format)` → DuckDB `date_trunc(format, date)`.
         // Spark's arg order is (date, fmt); DuckDB's is (fmt, date).
         "trunc" if f.args.len() == 2 => {
-            let d = render_expr(&f.args[0], schema)?;
-            let fmt = render_expr(&f.args[1], schema)?;
+            let [d, fmt] = rendered_args(f, schema)?;
             return Ok(format!("date_trunc({fmt}, {d})"));
         }
         // Spark generator functions — row-multiplying `explode` / `explode_outer`
@@ -2744,20 +2433,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `posexplode_val(arr)` (element value). Corpus: arr-015, arr-016,
         // arr-017.
         "explode" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`explode` requires exactly 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = exact_args(f, schema, "`explode` requires exactly 1 argument")?;
             return Ok(format!("UNNEST({a})"));
         }
         "explode_outer" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`explode_outer` requires exactly 1 argument"
-                );
-            }
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = exact_args(f, schema, "`explode_outer` requires exactly 1 argument")?;
             // Spark semantics: NULL arrays and empty arrays each produce one
             // row with a NULL element. DuckDB's raw UNNEST drops both; we
             // rewrite to `UNNEST(CASE WHEN a IS NULL OR len(a) = 0 THEN
@@ -2771,25 +2451,13 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // See `V2ExpressionConverter::convert_alias` and
         // `V2RelationConverter::convert_project`. Never emitted by user code.
         "posexplode_pos" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`posexplode_pos` requires exactly 1 argument"
-                );
-            }
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = exact_args(f, schema, "`posexplode_pos` requires exactly 1 argument")?;
             // DuckDB's `generate_subscripts(list, 1)` is 1-indexed; Spark's
             // `posexplode` is 0-indexed. Subtract 1 to align.
             return Ok(format!("(generate_subscripts({a}, 1) - 1)"));
         }
         "posexplode_val" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`posexplode_val` requires exactly 1 argument"
-                );
-            }
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = exact_args(f, schema, "`posexplode_val` requires exactly 1 argument")?;
             return Ok(format!("UNNEST({a})"));
         }
         // Synthetic FunctionCall names produced by the v2 converter when it
@@ -2798,23 +2466,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `UNNEST(map_values(m))` — DuckDB's MAP is a list-pair internally,
         // so co-UNNESTed sibling projections stay row-aligned. Corpus: map-007.
         "map_explode_key" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`map_explode_key` requires exactly 1 argument"
-                );
-            }
-            let m = render_expr(&f.args[0], schema)?;
+            let [m] = exact_args(f, schema, "`map_explode_key` requires exactly 1 argument")?;
             return Ok(format!("UNNEST(map_keys({m}))"));
         }
         "map_explode_val" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`map_explode_val` requires exactly 1 argument"
-                );
-            }
-            let m = render_expr(&f.args[0], schema)?;
+            let [m] = exact_args(f, schema, "`map_explode_val` requires exactly 1 argument")?;
             return Ok(format!("UNNEST(map_values({m}))"));
         }
         // piv-006 — synthetic per-column call produced by the analyzer's
@@ -2838,11 +2494,8 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     "`stack_col` requires at least 1 argument (one per stack row)"
                 );
             }
-            let mut rendered = Vec::with_capacity(f.args.len());
-            for a in &f.args {
-                rendered.push(render_expr(a, schema)?);
-            }
-            return Ok(format!("UNNEST([{}])", rendered.join(", ")));
+            let items = sql_join(f.args.iter(), ", ", |a| render_expr(a, schema))?;
+            return Ok(format!("UNNEST([{items}])"));
         }
         // Pass 90 — synthetic FunctionCall names produced by the analyzer's
         // Project pre-pass (`expand_inline_projections`) when it fans
@@ -2859,19 +2512,8 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 );
             }
             let arr_sql = render_expr(&f.args[0], schema)?;
-            let field_name = match &f.args[1] {
-                Expression::Literal(Literal {
-                    value: LiteralValue::String(s),
-                    ..
-                }) => s,
-                _ => {
-                    bail_boundary_fn!(
-                        f.name.clone(),
-                        "`inline_field` second argument must be a string literal",
-                    );
-                }
-            };
-            let field_q = quote_ident(field_name);
+            let field_name = string_literal_arg(f, 1, "`inline_field` second argument")?;
+            let field_q = quote_ident(&field_name);
             return Ok(format!("UNNEST({arr_sql}).{field_q}"));
         }
         "inline_outer_field" => {
@@ -2882,18 +2524,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 );
             }
             let arr_sql = render_expr(&f.args[0], schema)?;
-            let field_name = match &f.args[1] {
-                Expression::Literal(Literal {
-                    value: LiteralValue::String(s),
-                    ..
-                }) => s,
-                _ => {
-                    bail_boundary_fn!(
-                        f.name.clone(),
-                        "`inline_outer_field` second argument must be a string literal",
-                    );
-                }
-            };
+            let field_name = string_literal_arg(f, 1, "`inline_outer_field` second argument")?;
             // Build the struct-typed NULL sentinel from the resolved
             // `Array<Struct<...>>` schema so a NULL / empty array yields
             // exactly one all-NULL row (mirrors `explode_outer`'s
@@ -2920,17 +2551,13 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     );
                 }
             };
-            let mut sentinel = String::from("struct_pack(");
-            for (i, f0) in struct_fields.iter().enumerate() {
-                if i > 0 {
-                    sentinel.push_str(", ");
-                }
+            let sentinel_fields = sql_join(struct_fields.iter(), ", ", |f0| {
                 let name_q = quote_ident(&f0.name);
                 let ty = render_data_type(&f0.data_type);
-                sentinel.push_str(&format!("{name_q} := CAST(NULL AS {ty})"));
-            }
-            sentinel.push(')');
-            let field_q = quote_ident(field_name);
+                Ok(format!("{name_q} := CAST(NULL AS {ty})"))
+            })?;
+            let sentinel = format!("struct_pack({sentinel_fields})");
+            let field_q = quote_ident(&field_name);
             return Ok(format!(
                 "UNNEST(CASE WHEN {arr_sql} IS NULL OR len({arr_sql}) = 0 THEN [{sentinel}] ELSE {arr_sql} END).{field_q}"
             ));
@@ -2952,18 +2579,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 );
             }
             let json_sql = render_expr(&f.args[0], schema)?;
-            let key = match &f.args[1] {
-                Expression::Literal(Literal {
-                    value: LiteralValue::String(s),
-                    ..
-                }) => s,
-                _ => {
-                    bail_boundary_fn!(
-                        f.name.clone(),
-                        "`json_tuple_field` second argument must be a string literal",
-                    );
-                }
-            };
+            let key = string_literal_arg(f, 1, "`json_tuple_field` second argument")?;
             // Defense in depth: the analyzer pre-pass has already rejected
             // any key containing single-quote or path-walk metachars, so the
             // `escape_sql_string` call below is defensive rather than
@@ -3092,18 +2708,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     );
                 }
             };
-            let mut parts = String::new();
-            for (i, arg) in struct_args.iter().enumerate() {
-                if i > 0 {
-                    parts.push_str(", ");
-                }
-                let value_expr: &Expression = match arg {
-                    Expression::Alias(a) => a.expr.as_ref(),
-                    other => other,
-                };
-                let val = render_expr(value_expr, schema)?;
-                parts.push_str(&format!("CAST({val} AS VARCHAR)"));
-            }
+            let parts = sql_join(struct_args.iter(), ", ", |arg| {
+                let val = render_expr(arg.unaliased(), schema)?;
+                Ok(format!("CAST({val} AS VARCHAR)"))
+            })?;
             return Ok(format!("concat_ws(',', {parts})"));
         }
         // Spark's `regexp_replace(str, pat, repl)` replaces ALL matches.
@@ -3113,21 +2721,14 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             if !(3..=4).contains(&f.args.len()) {
                 bail_boundary_fn!(f.name.clone(), "`regexp_replace` requires 3 or 4 arguments");
             }
-            let s = render_expr(&f.args[0], schema)?;
-            let p = render_expr(&f.args[1], schema)?;
-            let r = render_expr(&f.args[2], schema)?;
+            let [s, p, r] = rendered_args(f, schema)?;
             return Ok(format!("regexp_replace({s}, {p}, {r}, 'g')"));
         }
         // Spark null-handling remaps (DuckDB uses coalesce).
         "nvl" => "coalesce",
         "nvl2" => {
             // Spark's `nvl2(a, b, c)` = if a is not null then b else c.
-            if f.args.len() != 3 {
-                bail_boundary_fn!(f.name.clone(), "`nvl2` requires exactly 3 arguments");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
-            let c = render_expr(&f.args[2], schema)?;
+            let [a, b, c] = exact_args(f, schema, "`nvl2` requires exactly 3 arguments")?;
             return Ok(format!("CASE WHEN {a} IS NOT NULL THEN {b} ELSE {c} END"));
         }
         "ifnull" => "coalesce",
@@ -3153,19 +2754,15 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             // General case: emit `concat_ws(sep, args...)`. Any array args
             // beyond that would surface as `[...]` string; the corpus
             // primary witness is the one-array case above.
-            let mut parts = String::new();
-            for (i, arg) in f.args.iter().enumerate().skip(1) {
-                if i > 1 {
-                    parts.push_str(", ");
-                }
+            let parts = sql_join(f.args[1..].iter(), ", ", |arg| {
                 let dt = arg.data_type(schema);
                 let arg_sql = render_expr(arg, schema)?;
                 if matches!(dt, DataType::Array(_, _)) {
-                    parts.push_str(&format!("array_to_string({arg_sql}, {sep})"));
+                    Ok(format!("array_to_string({arg_sql}, {sep})"))
                 } else {
-                    parts.push_str(&arg_sql);
+                    Ok(arg_sql)
                 }
-            }
+            })?;
             return Ok(format!("concat_ws({sep}, {parts})"));
         }
         // Spark's `unix_timestamp` has an explicit arm below (`return Ok(..)`)
@@ -3194,10 +2791,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark `signum` returns Double; DuckDB `sign` returns the arg's
         // type. Cast to DOUBLE at emission.
         "sign" | "signum" => {
-            if f.args.is_empty() {
-                bail_boundary_fn!(f.name.clone(), "`signum` requires at least 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = min_args(f, schema, "`signum` requires at least 1 argument")?;
             return Ok(format!("CAST(sign({a}) AS DOUBLE)"));
         }
         // Spark's `make_dt_interval([days[, hours[, mins[, secs]]]])` builds a
@@ -3206,96 +2800,36 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // summing each present component (missing components default to 0,
         // Spark's documented behavior). Corpus anchor: `intv-003`.
         "make_dt_interval" => {
-            if f.args.len() > 4 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`make_dt_interval` takes at most 4 arguments"
-                );
-            }
-            let zero = "0".to_owned();
-            let d = if f.args.is_empty() {
-                zero.clone()
-            } else {
-                render_expr(&f.args[0], schema)?
-            };
-            let h = if f.args.len() < 2 {
-                zero.clone()
-            } else {
-                render_expr(&f.args[1], schema)?
-            };
-            let m = if f.args.len() < 3 {
-                zero.clone()
-            } else {
-                render_expr(&f.args[2], schema)?
-            };
-            // Seconds are DECIMAL(8,6) in Spark. DuckDB `INTERVAL (expr) SECOND`
-            // truncates to integer seconds; use MICROSECOND with `* 1_000_000`
-            // to preserve fractional seconds.
-            let s_micros = if f.args.len() < 4 {
-                zero
-            } else {
-                let s = render_expr(&f.args[3], schema)?;
-                format!("CAST(({s}) * 1000000 AS BIGINT)")
-            };
-            return Ok(format!(
-                "(INTERVAL ({d}) DAY + INTERVAL ({h}) HOUR + INTERVAL ({m}) MINUTE \
-                 + INTERVAL ({s_micros}) MICROSECOND)"
-            ));
+            return render_make_interval(
+                f,
+                schema,
+                &["DAY", "HOUR", "MINUTE"],
+                true,
+                "`make_dt_interval` takes at most 4 arguments",
+            );
         }
         // Spark's `make_interval(years, months, weeks, days[, hours[, mins[, secs]]])`
         // builds a CalendarInterval. DuckDB has no `make_interval` scalar;
         // compose from individual `INTERVAL <n> UNIT` summands. Corpus: `intv-001`.
         "make_interval" | "try_make_interval" => {
-            if f.args.len() > 7 {
-                bail_boundary_fn!(f.name.clone(), "`make_interval` takes at most 7 arguments");
-            }
-            let zero = "0".to_owned();
-            let arg = |i: usize| -> Result<String, EmissionError> {
-                if i >= f.args.len() {
-                    Ok(zero.clone())
-                } else {
-                    render_expr(&f.args[i], schema)
-                }
-            };
-            let y = arg(0)?;
-            let m = arg(1)?;
-            let w = arg(2)?;
-            let d = arg(3)?;
-            let h = arg(4)?;
-            let mi = arg(5)?;
-            let s_micros = if f.args.len() < 7 {
-                zero.clone()
-            } else {
-                let s = render_expr(&f.args[6], schema)?;
-                format!("CAST(({s}) * 1000000 AS BIGINT)")
-            };
-            return Ok(format!(
-                "(INTERVAL ({y}) YEAR + INTERVAL ({m}) MONTH + INTERVAL ({w}) WEEK \
-                 + INTERVAL ({d}) DAY + INTERVAL ({h}) HOUR + INTERVAL ({mi}) MINUTE \
-                 + INTERVAL ({s_micros}) MICROSECOND)"
-            ));
+            return render_make_interval(
+                f,
+                schema,
+                &["YEAR", "MONTH", "WEEK", "DAY", "HOUR", "MINUTE"],
+                true,
+                "`make_interval` takes at most 7 arguments",
+            );
         }
         // Spark's `make_ym_interval([years[, months]])` builds a year-month
         // INTERVAL. Same principle as `make_dt_interval`.
         "make_ym_interval" => {
-            if f.args.len() > 2 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`make_ym_interval` takes at most 2 arguments"
-                );
-            }
-            let zero = "0".to_owned();
-            let y = if f.args.is_empty() {
-                zero.clone()
-            } else {
-                render_expr(&f.args[0], schema)?
-            };
-            let m = if f.args.len() < 2 {
-                zero
-            } else {
-                render_expr(&f.args[1], schema)?
-            };
-            return Ok(format!("(INTERVAL ({y}) YEAR + INTERVAL ({m}) MONTH)"));
+            return render_make_interval(
+                f,
+                schema,
+                &["YEAR", "MONTH"],
+                false,
+                "`make_ym_interval` takes at most 2 arguments",
+            );
         }
         // Spark's `F.window(ts, "N unit")` — tumbling time-window over a
         // Timestamp column. Returns a `Struct{start: Timestamp, end: Timestamp}`
@@ -3373,8 +2907,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         //     UTC — this is the Spark return value, a naive TIMESTAMP.
         // Corpus anchor: `dt-017`.
         "to_utc_timestamp" if f.args.len() == 2 => {
-            let ts = render_expr(&f.args[0], schema)?;
-            let tz = render_expr(&f.args[1], schema)?;
+            let [ts, tz] = rendered_args(f, schema)?;
             return Ok(format!(
                 "timezone('UTC', timezone({tz}, timezone('UTC', CAST({ts} AS TIMESTAMPTZ))))"
             ));
@@ -3382,8 +2915,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `from_utc_timestamp(ts, tz)` is the inverse — interpret
         // `ts` as UTC and convert to local wall-clock time in `tz`.
         "from_utc_timestamp" if f.args.len() == 2 => {
-            let ts = render_expr(&f.args[0], schema)?;
-            let tz = render_expr(&f.args[1], schema)?;
+            let [ts, tz] = rendered_args(f, schema)?;
             return Ok(format!(
                 "timezone({tz}, timezone('UTC', timezone('UTC', CAST({ts} AS TIMESTAMPTZ))))"
             ));
@@ -3397,8 +2929,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         //   else       → OR of `pred(x)` across elements (NULL if all-NULL preds).
         // Anchors: corpus hof-004.
         "exists" if f.args.len() == 2 => {
-            let arr = render_expr(&f.args[0], schema)?;
-            let lambda = render_expr_with_lambda_adjust(&f.args[1], schema, false)?;
+            let [arr, lambda] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({arr}) IS NULL THEN NULL WHEN len({arr}) = 0 THEN false ELSE list_bool_or(list_transform({arr}, {lambda})) END"
             ));
@@ -3408,8 +2939,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark-parity empty/NULL guard: NULL list → NULL, empty list → true.
         // Anchors: corpus hof-005.
         "forall" if f.args.len() == 2 => {
-            let arr = render_expr(&f.args[0], schema)?;
-            let lambda = render_expr_with_lambda_adjust(&f.args[1], schema, false)?;
+            let [arr, lambda] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({arr}) IS NULL THEN NULL WHEN len({arr}) = 0 THEN true ELSE list_bool_and(list_transform({arr}, {lambda})) END"
             ));
@@ -3441,8 +2971,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // 1-based `list_extract`, guarded). The iteration therefore ranges over
         // 0-based indices `0..least(len(a), len(b))`. Corpus: `hof-006`.
         "zip_with" if f.args.len() == 3 => {
-            let a_sql = render_expr(&f.args[0], schema)?;
-            let b_sql = render_expr(&f.args[1], schema)?;
+            let [a_sql, b_sql] = rendered_args(f, schema)?;
             let Expression::Lambda(lam) = &f.args[2] else {
                 bail_boundary_fn!(
                     f.name.clone(),
@@ -3508,9 +3037,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // folds to `init` — masking the NULL. Guard with a CASE that
         // preserves Spark's NULL-in / NULL-out semantics. Corpus: `hof-003`.
         "aggregate" | "reduce" if f.args.len() >= 3 => {
-            let arr = render_expr(&f.args[0], schema)?;
-            let init = render_expr(&f.args[1], schema)?;
-            let lambda = render_expr(&f.args[2], schema)?;
+            let [arr, init, lambda] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({arr}) IS NULL THEN NULL \
                  ELSE list_reduce(list_prepend({init}, {arr}), {lambda}) END"
@@ -3523,20 +3050,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let arr = render_expr(&f.args[0], schema)?;
             // Second arg: Spark boolean literal (True=ASC, False=DESC).
             // Try to extract literal; otherwise use CASE.
-            let order = match &f.args[1] {
-                Expression::Literal(l) => match &l.value {
-                    crate::transpiler_v2::expression::LiteralValue::Boolean(true) => {
-                        "'ASC'".to_owned()
-                    }
-                    crate::transpiler_v2::expression::LiteralValue::Boolean(false) => {
-                        "'DESC'".to_owned()
-                    }
-                    _ => {
-                        let b = render_expr(&f.args[1], schema)?;
-                        format!("CASE WHEN {b} THEN 'ASC' ELSE 'DESC' END")
-                    }
-                },
-                _ => {
+            let order = match bool_literal(&f.args[1]) {
+                Some(true) => "'ASC'".to_owned(),
+                Some(false) => "'DESC'".to_owned(),
+                None => {
                     let b = render_expr(&f.args[1], schema)?;
                     format!("CASE WHEN {b} THEN 'ASC' ELSE 'DESC' END")
                 }
@@ -3552,17 +3069,14 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         //     string via `list_transform + coalesce`, then join.
         // Corpus: `arr-010`.
         "array_join" if f.args.len() == 2 => {
-            let arr = render_expr(&f.args[0], schema)?;
-            let sep = render_expr(&f.args[1], schema)?;
+            let [arr, sep] = rendered_args(f, schema)?;
             // Skip NULL elements to match Spark's default behavior.
             return Ok(format!(
                 "array_to_string(list_filter({arr}, x -> x IS NOT NULL), {sep})"
             ));
         }
         "array_join" if f.args.len() == 3 => {
-            let arr = render_expr(&f.args[0], schema)?;
-            let sep = render_expr(&f.args[1], schema)?;
-            let null_repl = render_expr(&f.args[2], schema)?;
+            let [arr, sep, null_repl] = rendered_args(f, schema)?;
             return Ok(format!(
                 "array_to_string(list_transform({arr}, x -> coalesce(CAST(x AS VARCHAR), {null_repl})), {sep})"
             ));
@@ -3584,8 +3098,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // witnesses have de-duplicated inputs, so no inner-dedup is needed.
         // Corpus: `arr-011`.
         "array_union" if f.args.len() == 2 => {
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({a}) IS NULL OR ({b}) IS NULL THEN NULL ELSE list_concat({a}, list_filter({b}, x -> NOT list_contains({a}, x))) END"
             ));
@@ -3597,8 +3110,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Coalesce with 0, but propagate NULL for a NULL array. Corpus:
         // `arr-007`.
         "array_position" if f.args.len() == 2 => {
-            let arr = render_expr(&f.args[0], schema)?;
-            let item = render_expr(&f.args[1], schema)?;
+            let [arr, item] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN {arr} IS NULL THEN NULL ELSE CAST(coalesce(list_position({arr}, {item}), 0) AS BIGINT) END"
             ));
@@ -3622,28 +3134,25 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // non-NULL result — mismatch. Wrap with a null-propagation check.
         // Corpus: `arr-013`.
         "flatten" if f.args.len() == 1 => {
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({a}) IS NULL OR list_bool_or(list_transform({a}, x -> x IS NULL)) THEN NULL ELSE flatten({a}) END"
             ));
         }
         "arrays_zip" if !f.args.is_empty() => {
-            let mut arg_sqls: Vec<String> = Vec::with_capacity(f.args.len());
-            for a in &f.args {
-                arg_sqls.push(render_expr(a, schema)?);
-            }
+            let arg_sqls: Vec<String> = f
+                .args
+                .iter()
+                .map(|a| render_expr(a, schema))
+                .collect::<Result<_, _>>()?;
             // Derive per-arg field names. Alias / column ref wins;
             // everything else uses the positional integer string.
-            let mut names: Vec<String> = Vec::with_capacity(f.args.len());
-            for (i, arg) in f.args.iter().enumerate() {
-                let name = match arg {
-                    Expression::Alias(a) => a.alias.clone(),
-                    Expression::ColumnReference(c) => c.name.clone(),
-                    Expression::UnresolvedColumn(u) => u.name.clone(),
-                    _ => i.to_string(),
-                };
-                names.push(name);
-            }
+            let mut names: Vec<String> = f
+                .args
+                .iter()
+                .enumerate()
+                .map(|(i, arg)| super::struct_names::derive_zip_field_name(arg, i))
+                .collect();
             // Dedup: if any name repeats, fall back to positional integer
             // strings for the whole tuple so `struct_pack` accepts it.
             let mut seen = std::collections::HashSet::new();
@@ -3656,22 +3165,22 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let len_expr = if arg_sqls.len() == 1 {
                 format!("len({})", arg_sqls[0])
             } else {
-                let mut buf = format!("least(len({})", arg_sqls[0]);
-                for s in &arg_sqls[1..] {
-                    buf.push_str(&format!(", len({s})"));
-                }
-                buf.push(')');
-                buf
+                let lens = arg_sqls
+                    .iter()
+                    .map(|s| format!("len({s})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("least({lens})")
             };
-            let mut struct_body = String::from("struct_pack(");
-            for (i, (name, arg_sql)) in names.iter().zip(arg_sqls.iter()).enumerate() {
-                if i > 0 {
-                    struct_body.push_str(", ");
-                }
-                let name_q = quote_ident(name);
-                struct_body.push_str(&format!("{name_q} := ({arg_sql})[{idx_var}]"));
-            }
-            struct_body.push(')');
+            let struct_fields = sql_join(
+                names.iter().zip(arg_sqls.iter()),
+                ", ",
+                |(name, arg_sql)| {
+                    let name_q = quote_ident(name);
+                    Ok(format!("{name_q} := ({arg_sql})[{idx_var}]"))
+                },
+            )?;
+            let struct_body = format!("struct_pack({struct_fields})");
             return Ok(format!(
                 "list_transform(range(1, {len_expr} + 1), {idx_var} -> {struct_body})"
             ));
@@ -3689,8 +3198,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // wrapped list's `[1]` yields NULL on empty. Corpus: `map-004`,
         // `arr-008`.
         "element_at" if f.args.len() == 2 => {
-            let coll = render_expr(&f.args[0], schema)?;
-            let key = render_expr(&f.args[1], schema)?;
+            let [coll, key] = rendered_args(f, schema)?;
             let coll_ty = f.args[0].data_type(schema);
             if let DataType::Map { .. } = coll_ty {
                 // Unwrap the 1-element list DuckDB returns from
@@ -3726,8 +3234,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `try_element_at` — colocated here so future adds work
         // end-to-end.
         "try_element_at" if f.args.len() == 2 => {
-            let coll = render_expr(&f.args[0], schema)?;
-            let key = render_expr(&f.args[1], schema)?;
+            let [coll, key] = rendered_args(f, schema)?;
             let coll_ty = f.args[0].data_type(schema);
             if let DataType::Map { .. } = coll_ty {
                 return Ok(format!("element_at({coll}, {key})[1]"));
@@ -3739,10 +3246,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // uppercase (`DOUBLE`, `DECIMAL(9,2)`). Wrap with `lower()` for
         // Spark parity. Corpus: `meta-003`.
         "typeof" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`typeof` requires exactly 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = exact_args(f, schema, "`typeof` requires exactly 1 argument")?;
             return Ok(format!("lower(typeof({a}))"));
         }
         // Spark's `array_append(arr, elem)` / `array_prepend(elem, arr)`
@@ -3751,8 +3255,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // array, silently coercing NULL to an empty list. Wrap with a NULL
         // guard on the array side to match Spark. Corpus: `arr2-001`.
         "array_append" if f.args.len() == 2 => {
-            let arr = render_expr(&f.args[0], schema)?;
-            let elem = render_expr(&f.args[1], schema)?;
+            let [arr, elem] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({arr}) IS NULL THEN NULL ELSE array_append({arr}, {elem}) END"
             ));
@@ -3761,8 +3264,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             // Spark signature is `array_prepend(arr, elem)`; the session
             // macro (see `session.rs`) rewrites this to DuckDB's
             // `list_prepend(elem, arr)`. Preserve NULL on the array arg.
-            let arr = render_expr(&f.args[0], schema)?;
-            let elem = render_expr(&f.args[1], schema)?;
+            let [arr, elem] = rendered_args(f, schema)?;
             return Ok(format!(
                 "CASE WHEN ({arr}) IS NULL THEN NULL ELSE array_prepend({arr}, {elem}) END"
             ));
@@ -3852,11 +3354,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // versions expect INTERVAL args. Rewrite to arithmetic form.
         // Spark's `nanvl(a, b)` — if a is NaN, return b; else a.
         "nanvl" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`nanvl` requires exactly 2 arguments");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = exact_args(f, schema, "`nanvl` requires exactly 2 arguments")?;
             return Ok(format!("CASE WHEN isnan({a}) THEN {b} ELSE {a} END"));
         }
         // Spark's `log(x)` / `ln(x)` / `log10(x)` / `log2(x)` return NULL for
@@ -3906,11 +3404,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // already types the FunctionCall, so the projection-slot cast in
         // `spark_return_cast` handles the outer type match.
         "shiftleft" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`shiftleft` requires exactly 2 arguments");
-            }
-            let x = render_expr(&f.args[0], schema)?;
-            let n = render_expr(&f.args[1], schema)?;
+            let [x, n] = exact_args(f, schema, "`shiftleft` requires exactly 2 arguments")?;
             return Ok(format!("({x} * (1::BIGINT << ({n})))"));
         }
         // Spark's `shiftright(x, n)` — arithmetic (sign-preserving) right
@@ -3920,11 +3414,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // division form for parity across widths: `x >> n` in DuckDB is
         // legal for negative x (unlike `<<`), so we can pass through.
         "shiftright" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`shiftright` requires exactly 2 arguments");
-            }
-            let x = render_expr(&f.args[0], schema)?;
-            let n = render_expr(&f.args[1], schema)?;
+            let [x, n] = exact_args(f, schema, "`shiftright` requires exactly 2 arguments")?;
             return Ok(format!("({x} >> ({n}))"));
         }
         // Spark's `bround(x[, n])` — banker's rounding (ROUND_HALF_EVEN).
@@ -3970,11 +3460,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `hypot(a, b)` = sqrt(a*a + b*b). DuckDB has no `hypot`;
         // emit the inline form. Corpus witness: `math-006`.
         "hypot" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`hypot` requires exactly 2 arguments");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = exact_args(f, schema, "`hypot` requires exactly 2 arguments")?;
             return Ok(format!(
                 "sqrt((CAST({a} AS DOUBLE) * CAST({a} AS DOUBLE)) + (CAST({b} AS DOUBLE) * CAST({b} AS DOUBLE)))"
             ));
@@ -3993,24 +3479,21 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 bail_boundary_fn!(f.name.clone(), "`conv` requires exactly 3 arguments");
             }
             let s = render_expr(&f.args[0], schema)?;
+            // Rendered only for its error path: an unrenderable from_base
+            // expression must still surface its boundary error (the rendered
+            // value itself is unused).
             let _from_base = render_expr(&f.args[1], schema)?;
-            let to_base_expr = &f.args[2];
             // Spark's `conv(str, from_base, to_base)` renders the value as
             // UNSIGNED 64-bit. DuckDB's `to_base(bigint, base)` produces
             // signed output. For base 2 and base 16, DuckDB's `bin` and
             // `hex` on BIGINT emit the two's-complement (unsigned) bytes,
             // matching Spark. For other to_base values, boundary-error.
             // Corpus witness: `math-013` uses to_base ∈ {2}.
-            let to_base_lit = match to_base_expr {
-                Expression::Literal(l) => match &l.value {
-                    crate::transpiler_v2::expression::LiteralValue::Int(i) => Some(*i),
-                    crate::transpiler_v2::expression::LiteralValue::Long(i) => Some(*i as i32),
-                    crate::transpiler_v2::expression::LiteralValue::Short(i) => Some(*i as i32),
-                    crate::transpiler_v2::expression::LiteralValue::Byte(i) => Some(*i as i32),
-                    _ => None,
-                },
-                _ => None,
-            };
+            //
+            // DEVIATION: `int_literal_value` maps an i32-overflowing Long
+            // to `None` (boundary error) where the old inline match wrapped
+            // with `as i32` — a pathological, corpus-unwitnessed input.
+            let to_base_lit = int_literal_value(&f.args[2]);
             match to_base_lit {
                 Some(2) => {
                     // DuckDB's `bin(bigint)` renders two's-complement bits
@@ -4038,10 +3521,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // returns the signed hex. Adjust with a CASE. Corpus witness:
         // `math-013`.
         "hex" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`hex` requires exactly 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = exact_args(f, schema, "`hex` requires exactly 1 argument")?;
             // Only remap for integer types; DuckDB's hex(VARCHAR) already
             // matches Spark's hex(String) which encodes bytes. Detect by
             // arg type at analyzer time — but we don't have that here;
@@ -4063,34 +3543,17 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     "`named_struct` requires an even, non-zero arg count",
                 );
             }
-            let mut parts = String::new();
-            let mut i = 0;
-            while i < f.args.len() {
-                if i > 0 {
-                    parts.push_str(", ");
-                }
-                let key = match &f.args[i] {
-                    Expression::Literal(l) => match &l.value {
-                        crate::transpiler_v2::expression::LiteralValue::String(s) => s.clone(),
-                        _ => {
-                            bail_boundary_fn!(
-                                f.name.clone(),
-                                "`named_struct` keys must be string literals",
-                            );
-                        }
-                    },
-                    _ => {
-                        bail_boundary_fn!(
-                            f.name.clone(),
-                            "`named_struct` keys must be string literals",
-                        );
-                    }
+            let parts = sql_join(f.args.chunks(2), ", ", |pair| {
+                let Some(key) = literal_string_arg(&pair[0]) else {
+                    bail_boundary_fn!(
+                        f.name.clone(),
+                        "`named_struct` keys must be string literals",
+                    );
                 };
-                let val = render_expr(&f.args[i + 1], schema)?;
+                let val = render_expr(&pair[1], schema)?;
                 let key_q = quote_ident(&key);
-                parts.push_str(&format!("{key_q} := {val}"));
-                i += 2;
-            }
+                Ok(format!("{key_q} := {val}"))
+            })?;
             return Ok(format!("struct_pack({parts})"));
         }
         // Spark's `map_contains_key(m, k)` → DuckDB
@@ -4101,10 +3564,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // treats NULL as an empty map. Wrap with a NULL guard on every
         // argument. Corpus: `map-006`.
         "map_concat" if !f.args.is_empty() => {
-            let mut arg_sqls: Vec<String> = Vec::with_capacity(f.args.len());
-            for a in &f.args {
-                arg_sqls.push(render_expr(a, schema)?);
-            }
+            let arg_sqls: Vec<String> = f
+                .args
+                .iter()
+                .map(|a| render_expr(a, schema))
+                .collect::<Result<_, _>>()?;
             let null_guard = arg_sqls
                 .iter()
                 .map(|s| format!("({s}) IS NULL"))
@@ -4117,90 +3581,52 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         // Spark's `isnull`/`isnotnull` — DuckDB uses `IS NULL`/`IS NOT NULL`.
         "isnull" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`isnull` requires exactly 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = exact_args(f, schema, "`isnull` requires exactly 1 argument")?;
             return Ok(format!("({a} IS NULL)"));
         }
         "isnotnull" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`isnotnull` requires exactly 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = exact_args(f, schema, "`isnotnull` requires exactly 1 argument")?;
             return Ok(format!("({a} IS NOT NULL)"));
         }
         // Spark's `like`/`ilike`/`rlike` as functions — DuckDB uses
         // operator syntax `x LIKE pattern` / `x ILIKE pattern` /
         // `regexp_matches(x, pattern)`.
         "like" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`like` requires exactly 2 arguments");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = exact_args(f, schema, "`like` requires exactly 2 arguments")?;
             return Ok(format!("({a} LIKE {b})"));
         }
         "ilike" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`ilike` requires exactly 2 arguments");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = exact_args(f, schema, "`ilike` requires exactly 2 arguments")?;
             return Ok(format!("({a} ILIKE {b})"));
         }
         "rlike" | "regexp_like" | "regexp" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`rlike` requires exactly 2 arguments");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = exact_args(f, schema, "`rlike` requires exactly 2 arguments")?;
             return Ok(format!("regexp_matches({a}, {b})"));
         }
         // Spark's `<=>(a, b)` eqNullSafe — DuckDB uses IS NOT DISTINCT FROM.
         "eqnullsafe" | "<=>" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`eqNullSafe` requires exactly 2 arguments");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = exact_args(f, schema, "`eqNullSafe` requires exactly 2 arguments")?;
             return Ok(format!("({a} IS NOT DISTINCT FROM {b})"));
         }
         // Spark's `split(str, pattern, limit)` — DuckDB's `split(str, pat)`
         // has no limit. Drop the limit arg (Spark's default is -1 = no
         // limit; corpus cases pass -1 so this is safe).
         "split" => {
-            if f.args.len() < 2 {
-                bail_boundary_fn!(f.name.clone(), "`split` requires at least 2 arguments");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = min_args(f, schema, "`split` requires at least 2 arguments")?;
             return Ok(format!("split({a}, {b})"));
         }
         // Spark bitwise ops arriving as function calls (name is symbolic).
         // DuckDB uses operator form.
         "&" | "bitwise_and" | "bitwiseand" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`bitwiseAND` requires exactly 2 arguments");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = exact_args(f, schema, "`bitwiseAND` requires exactly 2 arguments")?;
             return Ok(format!("({a} & {b})"));
         }
         "|" | "bitwise_or" | "bitwiseor" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`bitwiseOR` requires exactly 2 arguments");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = exact_args(f, schema, "`bitwiseOR` requires exactly 2 arguments")?;
             return Ok(format!("({a} | {b})"));
         }
         "^" | "bitwise_xor" | "bitwisexor" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`bitwiseXOR` requires exactly 2 arguments");
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = exact_args(f, schema, "`bitwiseXOR` requires exactly 2 arguments")?;
             return Ok(format!("xor({a}, {b})"));
         }
         // (signum handled above with explicit DOUBLE cast.)
@@ -4208,31 +3634,20 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // bits=256; we ignore the bits arg — non-256 surfaces later as
         // per-case follow-up if it fires).
         "sha2" => {
-            if f.args.is_empty() {
-                bail_boundary_fn!(f.name.clone(), "`sha2` requires at least 1 argument");
-            }
-            let s = render_expr(&f.args[0], schema)?;
+            let [s] = min_args(f, schema, "`sha2` requires at least 1 argument")?;
             return Ok(format!("sha256({s})"));
         }
         // Spark `sha`/`sha1` → DuckDB `sha1`.
         "sha" => "sha1",
         // Spark's `add_months(date, n)` — DuckDB uses `date + INTERVAL n MONTH`.
         "add_months" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`add_months` requires exactly 2 arguments");
-            }
-            let d = render_expr(&f.args[0], schema)?;
-            let n = render_expr(&f.args[1], schema)?;
+            let [d, n] = exact_args(f, schema, "`add_months` requires exactly 2 arguments")?;
             return Ok(format!("({d} + INTERVAL ({n}) MONTH)"));
         }
         // Spark's `datediff(end, start)` (2 args, days-diff) → DuckDB's
         // `datediff('day', start, end)` (3 args, unit-prefixed).
         "datediff" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`datediff` requires exactly 2 arguments");
-            }
-            let end = render_expr(&f.args[0], schema)?;
-            let start = render_expr(&f.args[1], schema)?;
+            let [end, start] = exact_args(f, schema, "`datediff` requires exactly 2 arguments")?;
             return Ok(format!("datediff('day', {start}, {end})"));
         }
         // Spark's `timestampadd(unit, quantity, ts)` → `ts + n * INTERVAL 1 unit`.
@@ -4274,14 +3689,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             return spark_diff_sql(&f.name, &unit, &start, &end);
         }
         "months_between" => {
-            if f.args.len() < 2 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`months_between` requires at least 2 arguments"
-                );
-            }
-            let a = render_expr(&f.args[0], schema)?;
-            let b = render_expr(&f.args[1], schema)?;
+            let [a, b] = min_args(f, schema, "`months_between` requires at least 2 arguments")?;
             // Spark's `months_between(a, b)` returns a DOUBLE where the
             // integer part is the whole-month diff and the fractional part
             // is `(day-of-month diff) / 31.0` (Spark uses 31 as the
@@ -4294,19 +3702,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             ));
         }
         "date_add" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`date_add` requires exactly 2 arguments");
-            }
-            let d = render_expr(&f.args[0], schema)?;
-            let n = render_expr(&f.args[1], schema)?;
+            let [d, n] = exact_args(f, schema, "`date_add` requires exactly 2 arguments")?;
             return Ok(format!("({d} + INTERVAL ({n}) DAY)"));
         }
         "date_sub" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`date_sub` requires exactly 2 arguments");
-            }
-            let d = render_expr(&f.args[0], schema)?;
-            let n = render_expr(&f.args[1], schema)?;
+            let [d, n] = exact_args(f, schema, "`date_sub` requires exactly 2 arguments")?;
             return Ok(format!("({d} - INTERVAL ({n}) DAY)"));
         }
         // Spark's `concat(s1, s2, ...)` on strings PROPAGATES NULL:
@@ -4322,40 +3722,34 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                     .all(|a| matches!(a.data_type(schema), DataType::String))
                 && f.args.iter().any(|a| a.nullable(schema)) =>
         {
-            let mut null_guard = String::new();
-            let mut rendered_args = String::new();
-            for (i, arg) in f.args.iter().enumerate() {
-                let sql = render_expr(arg, schema)?;
-                if i > 0 {
-                    rendered_args.push_str(", ");
-                    null_guard.push_str(" OR ");
-                }
-                null_guard.push_str(&format!("({sql}) IS NULL"));
-                rendered_args.push_str(&sql);
-            }
+            let arg_sqls: Vec<String> = f
+                .args
+                .iter()
+                .map(|a| render_expr(a, schema))
+                .collect::<Result<_, _>>()?;
+            let null_guard = arg_sqls
+                .iter()
+                .map(|s| format!("({s}) IS NULL"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let inner = arg_sqls.join(", ");
             return Ok(format!(
-                "(CASE WHEN {null_guard} THEN NULL ELSE concat({rendered_args}) END)"
+                "(CASE WHEN {null_guard} THEN NULL ELSE concat({inner}) END)"
             ));
         }
         // Spark's `isnan(x)` — schema is BOOLEAN non-nullable. DuckDB's
         // `isnan(NULL)` returns NULL; wrap in `COALESCE(..., FALSE)` to
         // match Spark's non-null semantics. Corpus witness: `cond-010`.
         "isnan" | "is_nan" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`isnan` requires exactly 1 argument");
-            }
-            let a = render_expr(&f.args[0], schema)?;
+            let [a] = exact_args(f, schema, "`isnan` requires exactly 1 argument")?;
             return Ok(format!("COALESCE(isnan({a}), FALSE)"));
         }
         // Spark's `find_in_set(needle, csv)` — 1-based position of `needle`
         // in comma-separated `csv`, or 0 if not found. DuckDB has no
         // `find_in_set`; emit `COALESCE(list_position(string_split(csv, ','), needle), 0)`.
         "find_in_set" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`find_in_set` requires exactly 2 arguments");
-            }
-            let needle = render_expr(&f.args[0], schema)?;
-            let csv = render_expr(&f.args[1], schema)?;
+            let [needle, csv] =
+                exact_args(f, schema, "`find_in_set` requires exactly 2 arguments")?;
             // `list_position` is 1-based in DuckDB (returns NULL if missing);
             // Spark returns 0 if missing. Wrap with COALESCE to 0.
             return Ok(format!(
@@ -4369,13 +3763,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 bail_boundary_fn!(f.name.clone(), "`elt` requires at least 2 arguments");
             }
             let idx = render_expr(&f.args[0], schema)?;
-            let mut items = String::new();
-            for (i, arg) in f.args.iter().enumerate().skip(1) {
-                if i > 1 {
-                    items.push_str(", ");
-                }
-                items.push_str(&render_expr(arg, schema)?);
-            }
+            let items = sql_join(f.args[1..].iter(), ", ", |arg| render_expr(arg, schema))?;
             return Ok(format!("([{items}])[{idx}]"));
         }
         // Spark's `from_json(json_str, schema_ddl[, options])` parses a
@@ -4443,11 +3831,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let csv_str = render_expr(&f.args[0], schema)?;
             if let Some(ddl) = literal_string_arg(&f.args[1]) {
                 if let Some(st) = from_csv_ddl_to_struct(&ddl) {
-                    let mut parts = String::new();
-                    for (i, field) in st.fields.iter().enumerate() {
-                        if i > 0 {
-                            parts.push_str(", ");
-                        }
+                    let parts = sql_join(st.fields.iter().enumerate(), ", ", |(i, field)| {
                         let idx = i + 1;
                         let split = format!("split_part({csv_str}, ',', {idx})");
                         let name_q = quote_ident(&field.name);
@@ -4458,8 +3842,8 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                                 format!("try_cast(nullif({split}, '') AS {ty})")
                             }
                         };
-                        parts.push_str(&format!("{name_q} := {field_expr}"));
-                    }
+                        Ok(format!("{name_q} := {field_expr}"))
+                    })?;
                     return Ok(format!(
                         "CASE WHEN ({csv_str}) IS NULL THEN NULL ELSE struct_pack({parts}) END"
                     ));
@@ -4482,29 +3866,22 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's exact format-error semantics for those. Corpus witness:
         // `parse-004`.
         "try_to_number" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(
-                    f.name.clone(),
-                    "`try_to_number` requires exactly 2 arguments"
-                );
-            }
-            let fmt = literal_string_arg(&f.args[1]).ok_or_else(|| EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name: f.name.clone(),
-                reason: "`try_to_number` requires a string literal for the format argument"
-                    .to_owned(),
-            })?;
-            let (precision, scale) =
-                parse_number_format(&fmt).ok_or_else(|| EmissionError::Unsupported {
-                    kind: UnsupportedKind::Function,
-                    name: f.name.clone(),
-                    reason: format!(
-                        "`try_to_number`: unsupported format string `{fmt}` (τ only \
-                         handles `9`/`0`/`.` digit templates)"
-                    ),
-                })?;
-            let s = render_expr(&f.args[0], schema)?;
-            return Ok(render_to_number_cast(&s, precision, scale, &fmt));
+            let (_, cast, _) = to_number_parts(
+                f,
+                schema,
+                &ToNumberMsgs {
+                    arity: "`try_to_number` requires exactly 2 arguments",
+                    fmt_literal:
+                        "`try_to_number` requires a string literal for the format argument",
+                    fmt_unsupported: |fmt| {
+                        format!(
+                            "`try_to_number`: unsupported format string `{fmt}` (τ only \
+                             handles `9`/`0`/`.` digit templates)"
+                        )
+                    },
+                },
+            )?;
+            return Ok(cast);
         }
         // Spark's `to_number(str, fmt)` mirrors `try_to_number` when parsing
         // succeeds but ANSI-throws `[INVALID_FORMAT.MISMATCH_INPUT]` on
@@ -4514,31 +3891,26 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // non-NULL input that fails `try_cast` raises the ANSI class.
         // Corpus witness: `parse-003`.
         "to_number" => {
-            if f.args.len() != 2 {
-                bail_boundary_fn!(f.name.clone(), "`to_number` requires exactly 2 arguments");
-            }
-            let fmt = literal_string_arg(&f.args[1]).ok_or_else(|| EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name: f.name.clone(),
-                reason: "`to_number` requires a string literal for the format argument".to_owned(),
-            })?;
-            let (precision, scale) =
-                parse_number_format(&fmt).ok_or_else(|| EmissionError::Unsupported {
-                    kind: UnsupportedKind::Function,
-                    name: f.name.clone(),
-                    reason: format!(
-                        "`to_number`: unsupported format string `{fmt}` (τ only \
-                         handles `9`/`0`/`.`/`,` digit templates)"
-                    ),
-                })?;
-            let s = render_expr(&f.args[0], schema)?;
-            let cast = render_to_number_cast(&s, precision, scale, &fmt);
+            let (s, cast, fmt) = to_number_parts(
+                f,
+                schema,
+                &ToNumberMsgs {
+                    arity: "`to_number` requires exactly 2 arguments",
+                    fmt_literal: "`to_number` requires a string literal for the format argument",
+                    fmt_unsupported: |fmt| {
+                        format!(
+                            "`to_number`: unsupported format string `{fmt}` (τ only \
+                             handles `9`/`0`/`.`/`,` digit templates)"
+                        )
+                    },
+                },
+            )?;
             // IS NOT NULL guard AND error message reference the RAW input `s`
             // (what the user passed), NOT the grouping-stripped form — so the
             // reported input matches user-visible text and the guard doesn't
             // trip on empty-string-after-strip artefacts.
             let throw = super::spark_errors::SparkError::InvalidFormatMismatch {
-                fmt: fmt.clone(),
+                fmt,
                 input_sql: s.clone(),
             }
             .throw_expr();
@@ -4551,20 +3923,14 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `url_encode(s)` uses RFC 3986 percent-encoding (spaces → `%20`).
         // Bridge by post-substituting `%20 → +`. Corpus witness: `parse-002`.
         "url_encode" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`url_encode` requires exactly 1 argument");
-            }
-            let s = render_expr(&f.args[0], schema)?;
+            let [s] = exact_args(f, schema, "`url_encode` requires exactly 1 argument")?;
             return Ok(format!("replace(url_encode({s}), '%20', '+')"));
         }
         // Spark's `url_decode(s)` mirrors form-urlencoded (accepts `+` as
         // space). DuckDB's `url_decode(s)` leaves `+` literal. Bridge by
         // pre-substituting `+` → `%20` before decoding.
         "url_decode" => {
-            if f.args.len() != 1 {
-                bail_boundary_fn!(f.name.clone(), "`url_decode` requires exactly 1 argument");
-            }
-            let s = render_expr(&f.args[0], schema)?;
+            let [s] = exact_args(f, schema, "`url_decode` requires exactly 1 argument")?;
             return Ok(format!("url_decode(replace({s}, '+', '%20'))"));
         }
         // Spark's `parse_url(url, part[, key])` — DuckDB has no native
@@ -4581,13 +3947,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 bail_boundary_fn!(f.name.clone(), "`parse_url` requires 2 or 3 arguments");
             }
             let url = render_expr(&f.args[0], schema)?;
-            let part =
-                literal_string_arg(&f.args[1]).ok_or_else(|| EmissionError::Unsupported {
-                    kind: UnsupportedKind::Function,
-                    name: f.name.clone(),
-                    reason: "`parse_url` requires a string literal for the part argument"
-                        .to_owned(),
-                })?;
+            let part = string_literal_arg_or(
+                &f.args[1],
+                &f.name,
+                "`parse_url` requires a string literal for the part argument",
+            )?;
             let part_upper = part.to_ascii_uppercase();
             let pattern: String = match part_upper.as_str() {
                 "HOST" => "^[^:]+://(?:[^@/]+@)?([^:/?#]+)".to_owned(),
@@ -4595,15 +3959,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 "PATH" => "^[^:]+://[^/?#]*([^?#]*)".to_owned(),
                 "QUERY" => {
                     if f.args.len() == 3 {
-                        let key = literal_string_arg(&f.args[2]).ok_or_else(|| {
-                            EmissionError::Unsupported {
-                                kind: UnsupportedKind::Function,
-                                name: f.name.clone(),
-                                reason:
-                                    "`parse_url` with 3 arguments requires a string literal key"
-                                        .to_owned(),
-                            }
-                        })?;
+                        let key = string_literal_arg_or(
+                            &f.args[2],
+                            &f.name,
+                            "`parse_url` with 3 arguments requires a string literal key",
+                        )?;
                         format!("[?&]{}=([^&#]*)", regex_escape(&key))
                     } else {
                         r"\?([^#]*)".to_owned()
@@ -4634,9 +3994,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             if !(3..=4).contains(&f.args.len()) {
                 bail_boundary_fn!(f.name.clone(), "`overlay` requires 3 or 4 arguments");
             }
-            let s = render_expr(&f.args[0], schema)?;
-            let r = render_expr(&f.args[1], schema)?;
-            let p = render_expr(&f.args[2], schema)?;
+            let [s, r, p] = rendered_args(f, schema)?;
             let length_expr = if f.args.len() == 4 {
                 render_expr(&f.args[3], schema)?
             } else {
@@ -4674,8 +4032,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
 fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
     let lower = f.name.to_ascii_lowercase();
     // Guard-based arms MUST come before the pass-through arm (else the
-    // pass-through catches `first`/`last`/`nth_value` first and the guard
-    // never fires).
+    // pass-through catches `first`/`last` first and the guard never fires).
     if matches!(
         lower.as_str(),
         "first" | "last" | "first_value" | "last_value"
@@ -4683,15 +4040,17 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
     {
         // Spark's `first(col, ignorenulls)` / `last(col, ignorenulls)` —
         // DuckDB's first/last are single-arg. Drop the ignorenulls flag
-        // (corpus uses ignorenulls=True which matches DuckDB's default).
-        let a = render_expr(&f.args[0], schema)?;
-        let distinct = if f.distinct { "DISTINCT " } else { "" };
-        return Ok(format!("{lower}({distinct}{a})"));
-    }
-    if lower == "nth_value" && f.args.len() >= 2 {
-        let col = render_expr(&f.args[0], schema)?;
-        let n = render_expr(&f.args[1], schema)?;
-        return Ok(format!("nth_value({col}, {n})"));
+        // UNCONDITIONALLY (corpus uses ignorenulls=True which matches
+        // DuckDB's default); keep-arity is single-homed in
+        // [`trailing_ignore_nulls_keep_arity`] — see its doc for the
+        // deliberate guard divergence from `render_function_call`.
+        if let Some(keep) = trailing_ignore_nulls_keep_arity(&lower) {
+            let distinct = if f.distinct { "DISTINCT " } else { "" };
+            let parts = sql_join(f.args.iter().take(keep), ", ", |arg| {
+                render_expr(arg, schema)
+            })?;
+            return Ok(format!("{lower}({distinct}{parts})"));
+        }
     }
     // Spark's `percentile_approx(col, quantile [, accuracy])` returns the
     // discrete value at the requested percentile — for a small dataset,
@@ -4782,34 +4141,17 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         "mode" => {
             // Extract the first arg; drop any trailing boolean-literal flags.
             let first = f.args.first().cloned();
-            let trailing_bool_only = f.args.iter().skip(1).all(|e| {
-                matches!(
-                    e,
-                    Expression::Literal(super::expression::Literal {
-                        value: super::expression::LiteralValue::Boolean(_),
-                        ..
-                    })
-                )
-            });
+            let trailing_bool_only = f.args.iter().skip(1).all(|e| bool_literal(e).is_some());
             if let Some(arg) = first {
                 if trailing_bool_only {
                     let distinct = if f.distinct { "DISTINCT " } else { "" };
                     // Peek through any wrapping Alias for the type check.
-                    let inner = match &arg {
-                        Expression::Alias(a) => a.expr.as_ref(),
-                        other => other,
-                    };
+                    let inner = arg.unaliased();
                     let a = render_expr(inner, schema)?;
                     // Boolean sniff: either the analyzer-resolved type is
                     // Boolean, OR the argument is a boolean literal.
                     let is_bool = matches!(inner.data_type(schema), DataType::Boolean)
-                        || matches!(
-                            inner,
-                            Expression::Literal(super::expression::Literal {
-                                value: super::expression::LiteralValue::Boolean(_),
-                                ..
-                            })
-                        );
+                        || bool_literal(inner).is_some();
                     if is_bool {
                         return Ok(format!(
                             "CAST(mode({distinct}CAST({a} AS INTEGER)) AS BOOLEAN)"
@@ -4849,7 +4191,6 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
             );
         }
     };
-    let mut args_sql = String::new();
     // Zero-arg aggregate calls are legal for a handful of Spark functions
     // (grouping_id() picks up the ambient GROUP BY). Handle by emitting
     // the empty arg list.
@@ -4857,12 +4198,7 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
     if f.args.is_empty() && !zero_arg_ok {
         bail_boundary_fn!(f.name.clone(), "aggregate function call has no arguments");
     }
-    for (i, arg) in f.args.iter().enumerate() {
-        if i > 0 {
-            args_sql.push_str(", ");
-        }
-        args_sql.push_str(&render_expr(arg, schema)?);
-    }
+    let args_sql = sql_join(f.args.iter(), ", ", |arg| render_expr(arg, schema))?;
     let distinct = if f.distinct || force_distinct {
         "DISTINCT "
     } else {
@@ -4881,7 +4217,9 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
 /// per checklist §5.7 when needed).
 /// Rewrite `grouping_id()` (no-arg) inside an expression tree to
 /// `grouping_id(<grouping cols>)`. Recurses into common expression
-/// containers used by the aggregate slot.
+/// containers used by the aggregate slot. The recursion is deliberately
+/// narrow (FunctionCall / Alias / Cast / CaseWhen only) — intentional; do
+/// not widen to a generic `map_children` walk.
 fn rewrite_grouping_id(expr: &Expression, grouping: &[Expression]) -> Expression {
     use super::expression::{AliasExpression, CaseWhenExpression, CastExpression, FunctionCall};
     match expr {
@@ -4893,13 +4231,8 @@ fn rewrite_grouping_id(expr: &Expression, grouping: &[Expression]) -> Expression
             {
                 // Take bare column references from `grouping` (strip alias
                 // wrappers for the GROUP BY reference).
-                let new_args: Vec<Expression> = grouping
-                    .iter()
-                    .map(|g| match g {
-                        Expression::Alias(a) => a.expr.as_ref().clone(),
-                        other => other.clone(),
-                    })
-                    .collect();
+                let new_args: Vec<Expression> =
+                    grouping.iter().map(|g| g.unaliased().clone()).collect();
                 Expression::FunctionCall(FunctionCall {
                     name: f.name.clone(),
                     args: new_args,
@@ -5004,24 +4337,10 @@ fn render_aggregate_op(
         .iter()
         .map(|a| rewrite_grouping_id(a, grouping))
         .collect();
-    let mut slots = String::new();
-    let mut first = true;
-    if !already_folded {
-        for g in grouping {
-            if !first {
-                slots.push_str(", ");
-            }
-            first = false;
-            slots.push_str(&render_projection_slot(g, input_schema)?);
-        }
-    }
-    for agg in &rewritten_aggregates {
-        if !first {
-            slots.push_str(", ");
-        }
-        first = false;
-        slots.push_str(&render_projection_slot(agg, input_schema)?);
-    }
+    let keys: &[Expression] = if already_folded { &[] } else { grouping };
+    let slots = sql_join(keys.iter().chain(rewritten_aggregates.iter()), ", ", |e| {
+        render_projection_slot(e, input_schema)
+    })?;
     let mut sql = format!("SELECT {slots} FROM {from_clause}");
     // Emit a GROUP BY whenever there are flat grouping columns, OR when this is
     // a GROUPING SETS aggregate with at least one set. The latter covers the
@@ -5039,14 +4358,7 @@ fn render_aggregate_op(
         // doesn't take aliases, so `GROUP BY (expr) AS name` would be a parse
         // error). GROUPING SETS indexes into this list per set; the other
         // kinds join it directly (byte-identical to the prior emission).
-        let mut rendered: Vec<String> = Vec::with_capacity(grouping.len());
-        for g in grouping {
-            let bare = match g {
-                Expression::Alias(a) => a.expr.as_ref(),
-                other => other,
-            };
-            rendered.push(render_expr(bare, input_schema)?);
-        }
+        let rendered = render_group_exprs(grouping, input_schema)?;
         let group_sql = match grouping_kind {
             GroupingKind::GroupBy => rendered.join(", "),
             GroupingKind::Rollup => format!("ROLLUP({})", rendered.join(", ")),
@@ -5350,15 +4662,8 @@ fn render_array_literal(
         let ty = render_data_type(&a.element_type);
         return Ok(format!("CAST([] AS {ty}[])"));
     }
-    let mut buf = String::from("[");
-    for (i, e) in a.elements.iter().enumerate() {
-        if i > 0 {
-            buf.push_str(", ");
-        }
-        buf.push_str(&render_expr(e, schema)?);
-    }
-    buf.push(']');
-    Ok(buf)
+    let elems = sql_join(a.elements.iter(), ", ", |e| render_expr(e, schema))?;
+    Ok(format!("[{elems}]"))
 }
 
 fn render_map_literal(
@@ -5368,17 +4673,12 @@ fn render_map_literal(
     if m.entries.is_empty() {
         return Ok("MAP()".to_owned());
     }
-    let mut buf = String::from("MAP {");
-    for (i, (k, v)) in m.entries.iter().enumerate() {
-        if i > 0 {
-            buf.push_str(", ");
-        }
-        buf.push_str(&render_expr(k, schema)?);
-        buf.push_str(": ");
-        buf.push_str(&render_expr(v, schema)?);
-    }
-    buf.push('}');
-    Ok(buf)
+    let entries = sql_join(m.entries.iter(), ", ", |(k, v)| {
+        let k_sql = render_expr(k, schema)?;
+        let v_sql = render_expr(v, schema)?;
+        Ok(format!("{k_sql}: {v_sql}"))
+    })?;
+    Ok(format!("MAP {{{entries}}}"))
 }
 
 /// Render Spark `withField` / `dropFields` on a struct.
@@ -5429,23 +4729,16 @@ fn render_update_fields(
     );
 
     // Emit `struct_pack(f1 := <expr>, f2 := <expr>, ...)`.
-    let mut parts = String::new();
-    for (i, (name, src)) in fields.iter().enumerate() {
-        if i > 0 {
-            parts.push_str(", ");
-        }
-        parts.push_str(&quote_ident(name));
-        parts.push_str(" := ");
-        match src {
+    let parts = sql_join(fields.iter(), ", ", |(name, src)| {
+        let value = match src {
             FieldSource::FromBase => {
                 let key = sql_string_literal(name);
-                parts.push_str(&format!("struct_extract({base_sql}, {key})"));
+                format!("struct_extract({base_sql}, {key})")
             }
-            FieldSource::Value(expr) => {
-                parts.push_str(&render_expr(expr, schema)?);
-            }
-        }
-    }
+            FieldSource::Value(expr) => render_expr(expr, schema)?,
+        };
+        Ok(format!("{} := {value}", quote_ident(name)))
+    })?;
     Ok(format!("struct_pack({parts})"))
 }
 
@@ -5462,18 +4755,15 @@ fn render_struct_literal(
     s: &crate::transpiler_v2::expression::StructLiteralExpression,
     schema: &Schema,
 ) -> Result<String, EmissionError> {
-    let mut buf = String::from("{");
-    for (i, (name, expr)) in s.fields.iter().enumerate() {
-        if i > 0 {
-            buf.push_str(", ");
-        }
-        // DuckDB struct literal keys are single-quoted string literals.
-        buf.push_str(&sql_string_literal(name));
-        buf.push_str(": ");
-        buf.push_str(&render_expr(expr, schema)?);
-    }
-    buf.push('}');
-    Ok(buf)
+    // DuckDB struct literal keys are single-quoted string literals.
+    let fields = sql_join(s.fields.iter(), ", ", |(name, expr)| {
+        Ok(format!(
+            "{}: {}",
+            sql_string_literal(name),
+            render_expr(expr, schema)?
+        ))
+    })?;
+    Ok(format!("{{{fields}}}"))
 }
 
 // ── Return-type CAST helpers (§5.1 — SEPARATE `fn` items) ────────────────────
@@ -5731,7 +5021,11 @@ fn ascii_ci_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 
 // ── SQL string escaping helpers ──────────────────────────────────────────────
 
-fn escape_sql_string(s: &str) -> String {
+/// Escape embedded single quotes (`'` → `''`) for interpolation into a
+/// DuckDB single-quoted string literal. The canonical escape helper for τ —
+/// `pub(super)` so sibling modules (`spark_errors`) reuse it instead of
+/// hand-rolling the replace.
+pub(super) fn escape_sql_string(s: &str) -> String {
     s.replace('\'', "''")
 }
 
@@ -5754,13 +5048,22 @@ fn sql_string_literal(s: &str) -> String {
 /// return `None`. Used by scalars like `parse_url` that require literal
 /// STRING parts / keys.
 fn literal_string_arg(e: &Expression) -> Option<String> {
-    match e {
-        Expression::Literal(super::expression::Literal {
-            value: super::expression::LiteralValue::String(s),
-            ..
-        }) => Some(s.clone()),
-        _ => None,
-    }
+    super::expression::as_string_literal(e).map(str::to_owned)
+}
+
+/// [`literal_string_arg`] variant that fails loudly: returns the string
+/// literal's value, or a `Function`-kinded [`EmissionError::Unsupported`]
+/// carrying `fn_name` and the caller's verbatim `reason`.
+fn string_literal_arg_or(
+    e: &Expression,
+    fn_name: &str,
+    reason: &str,
+) -> Result<String, EmissionError> {
+    literal_string_arg(e).ok_or_else(|| EmissionError::Unsupported {
+        kind: UnsupportedKind::Function,
+        name: fn_name.to_owned(),
+        reason: reason.to_owned(),
+    })
 }
 
 /// Recognise the one Spark option τ supports on `to_json`: a `MapLiteral`
@@ -5847,84 +5150,42 @@ pub(crate) fn parse_window_duration_literal(s: &str) -> Option<(u64, &'static st
     Some((n, canonical))
 }
 
-/// Parse a Spark DDL field-list schema string (e.g.
-/// `"a INT, b ARRAY<STRING>"`) into a [`StructType`] using the same
-/// tolerant subset as [`spark_ddl_schema_to_duckdb_json`]. Returns
+/// Parse a Spark DDL schema string (field list, e.g. `"a INT, b
+/// ARRAY<STRING>"`, or `struct<...>` wrapper) into a [`StructType`] using the
+/// shared strict Spark-DDL parser ([`crate::types::spark_ddl`] — pass-2
+/// simplification consolidated the two legacy grammars there). Returns
 /// `None` when τ cannot translate the DDL — the caller then falls back
 /// to the shared type-inference default. Pass 76 witnesses: `json-003`,
 /// `json-004`.
+///
+/// Acceptance is strictly-additively wider than the legacy emission-local
+/// parser (union grammar: decimal, intervals, null/void, extra primitive
+/// aliases, NOT NULL qualifiers, `struct<...>` wrapper form); everything the
+/// legacy parser accepted parses identically, and unknown types still yield
+/// `None` → the same boundary error.
 pub(crate) fn from_json_ddl_to_struct_for_type_inference(ddl: &str) -> Option<StructType> {
-    let fields = split_top_level_fields(ddl)?;
-    let mut out: Vec<StructField> = Vec::with_capacity(fields.len());
-    for field in &fields {
-        let (name, ty) = split_field_name_type(field)?;
-        let dt = spark_ddl_type_to_core_data_type(ty.trim())?;
-        out.push(StructField::new(name.trim().to_owned(), dt, true));
-    }
-    Some(StructType::new(out))
+    crate::types::spark_ddl::parse_spark_schema(ddl)
 }
 
-/// Parse a Spark DDL field-list schema string for `from_csv`. Spark's
+/// Parse a Spark DDL schema string for `from_csv`. Spark's
 /// `from_csv` accepts only flat primitive schemas (no nested STRUCT / ARRAY
 /// / MAP) — this helper enforces that narrower surface so we fail loud on
 /// shapes Spark itself would reject. Returns `None` when τ cannot translate
 /// the DDL. Pass 87 witness: `json-007`.
 pub(crate) fn from_csv_ddl_to_struct(ddl: &str) -> Option<StructType> {
-    let fields = split_top_level_fields(ddl)?;
-    let mut out: Vec<StructField> = Vec::with_capacity(fields.len());
-    for field in &fields {
-        let (name, ty) = split_field_name_type(field)?;
-        let dt = spark_ddl_type_to_core_data_type(ty.trim())?;
-        // from_csv is flat-only: reject nested/composite types (Spark
-        // itself would reject these too — from_csv operates row-per-row on
-        // a single delimited line).
-        if matches!(
-            dt,
+    let st = crate::types::spark_ddl::parse_spark_schema(ddl)?;
+    // from_csv is flat-only: reject nested/composite types (Spark
+    // itself would reject these too — from_csv operates row-per-row on
+    // a single delimited line).
+    if st.fields.iter().any(|f| {
+        matches!(
+            f.data_type,
             DataType::Struct(_) | DataType::Array(_, _) | DataType::Map { .. }
-        ) {
-            return None;
-        }
-        out.push(StructField::new(name.trim().to_owned(), dt, true));
+        )
+    }) {
+        return None;
     }
-    Some(StructType::new(out))
-}
-
-fn spark_ddl_type_to_core_data_type(ty: &str) -> Option<DataType> {
-    let trimmed = ty.trim();
-    let upper = trimmed.to_ascii_uppercase();
-    if let Some(inner) = upper
-        .strip_prefix("STRUCT<")
-        .and_then(|r| r.strip_suffix('>'))
-    {
-        // Recurse using the original (case-preserved) inner slice so struct
-        // field names keep their casing.
-        let _ = inner;
-        let orig_inner = &trimmed[trimmed.find('<')? + 1..trimmed.rfind('>')?];
-        let st = from_json_ddl_to_struct_for_type_inference(orig_inner)?;
-        return Some(DataType::Struct(st));
-    }
-    if let Some(inner) = upper
-        .strip_prefix("ARRAY<")
-        .and_then(|r| r.strip_suffix('>'))
-    {
-        let elem = spark_ddl_type_to_core_data_type(inner)?;
-        return Some(DataType::Array(Box::new(elem), true));
-    }
-    Some(match upper.as_str() {
-        "INT" | "INTEGER" => DataType::Integer,
-        "LONG" | "BIGINT" => DataType::Long,
-        "SHORT" | "SMALLINT" => DataType::Short,
-        "TINYINT" | "BYTE" => DataType::Byte,
-        "FLOAT" | "REAL" => DataType::Float,
-        "DOUBLE" => DataType::Double,
-        "BOOLEAN" | "BOOL" => DataType::Boolean,
-        "STRING" | "VARCHAR" => DataType::String,
-        "BINARY" | "BLOB" => DataType::Binary,
-        "DATE" => DataType::Date,
-        "TIMESTAMP" | "TIMESTAMP_LTZ" => DataType::Timestamp,
-        "TIMESTAMP_NTZ" => DataType::TimestampNtz,
-        _ => return None,
-    })
+    Some(st)
 }
 
 /// Translate a Spark DDL field-list schema (as used by `from_json`,
@@ -5944,137 +5205,71 @@ fn spark_ddl_type_to_core_data_type(ty: &str) -> Option<DataType> {
 ///   - `STRUCT<f1:T1, f2:T2, ...>` → nested JSON object.
 ///
 /// Pass 76 witnesses: `json-003`, `json-004`.
+///
+/// Parses ONCE via the typed DDL parser
+/// ([`from_json_ddl_to_struct_for_type_inference`], the same grammar the
+/// type-inference side uses) and renders the JSON schema from the resulting
+/// [`StructType`] — the old parallel string-walking grammar is gone.
 fn spark_ddl_schema_to_duckdb_json(ddl: &str) -> Option<String> {
-    let fields = split_top_level_fields(ddl)?;
+    let st = from_json_ddl_to_struct_for_type_inference(ddl)?;
+    struct_type_to_duckdb_json(&st)
+}
+
+/// Render a parsed [`StructType`] as DuckDB's JSON-schema object literal.
+/// An empty field list renders as `{}` (matching the historical walker).
+fn struct_type_to_duckdb_json(st: &StructType) -> Option<String> {
     let mut out = String::from("{");
-    for (i, field) in fields.iter().enumerate() {
-        let (name, ty) = split_field_name_type(field)?;
+    for (i, field) in st.fields.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
         out.push('"');
-        out.push_str(name.trim());
+        out.push_str(&field.name);
         out.push_str("\":");
-        out.push_str(&spark_ddl_type_to_duckdb_json_value(ty.trim())?);
+        out.push_str(&data_type_to_duckdb_json_value(&field.data_type)?);
     }
     out.push('}');
     Some(out)
 }
 
-/// Split a comma-separated field list, honoring nested `<...>` and `(...)`
-/// so `STRUCT<a:INT, b:DOUBLE>` is treated as one field.
-fn split_top_level_fields(s: &str) -> Option<Vec<String>> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut depth = 0i32;
-    let mut cur = String::new();
-    for ch in s.chars() {
-        match ch {
-            '<' | '(' => {
-                depth += 1;
-                cur.push(ch);
-            }
-            '>' | ')' => {
-                depth -= 1;
-                if depth < 0 {
-                    return None;
-                }
-                cur.push(ch);
-            }
-            ',' if depth == 0 => {
-                if !cur.trim().is_empty() {
-                    parts.push(std::mem::take(&mut cur));
-                }
-            }
-            _ => cur.push(ch),
+/// Render one field's [`DataType`] as its DuckDB JSON-schema value.
+fn data_type_to_duckdb_json_value(dt: &DataType) -> Option<String> {
+    match dt {
+        // STRUCT<...> → nested object.
+        DataType::Struct(st) => struct_type_to_duckdb_json(st),
+        // ARRAY<T> → "<duckdb_T>[]". The typed parser accepts
+        // `ARRAY<STRUCT<...>>` / nested arrays, but DuckDB's JSON-schema
+        // shape has no spelling for those — keep rejecting non-primitive
+        // element types (matches the historical walker).
+        DataType::Array(elem, _) => {
+            let name = duckdb_primitive_name(elem)?;
+            Some(format!("\"{name}[]\""))
         }
+        // Primitive.
+        other => Some(format!("\"{}\"", duckdb_primitive_name(other)?)),
     }
-    if depth != 0 {
-        return None;
-    }
-    if !cur.trim().is_empty() {
-        parts.push(cur);
-    }
-    Some(parts)
 }
 
-/// Split `name TYPE` (space-separated, top-level DDL) or `name:TYPE`
-/// (colon-separated, used inside `STRUCT<...>`) into `(name, type_str)`.
-/// Honors nested `<...>` and `(...)` so a `:` inside `STRUCT<f:INT>` is
-/// not mistaken for the outer separator.
-fn split_field_name_type(field: &str) -> Option<(&str, &str)> {
-    let trimmed = field.trim();
-    let mut depth = 0i32;
-    let mut sep_idx: Option<usize> = None;
-    let mut sep_len = 1usize;
-    for (i, ch) in trimmed.char_indices() {
-        match ch {
-            '<' | '(' => depth += 1,
-            '>' | ')' => depth -= 1,
-            ':' if depth == 0 => {
-                sep_idx = Some(i);
-                sep_len = 1;
-                break;
-            }
-            c if depth == 0 && c.is_whitespace() => {
-                if sep_idx.is_none() {
-                    sep_idx = Some(i);
-                    sep_len = c.len_utf8();
-                    // Don't `break` on whitespace — we still prefer a
-                    // colon if one appears later at depth 0.
-                }
-            }
-            _ => {}
-        }
-    }
-    let idx = sep_idx?;
-    let (n, t) = trimmed.split_at(idx);
-    Some((n, &t[sep_len..]))
-}
-
-fn spark_ddl_type_to_duckdb_json_value(ty: &str) -> Option<String> {
-    let trimmed = ty.trim();
-    let upper = trimmed.to_ascii_uppercase();
-    // STRUCT<...> → nested object.
-    if let Some(inner) = upper
-        .strip_prefix("STRUCT<")
-        .and_then(|r| r.strip_suffix('>'))
-    {
-        // Re-slice the original (case-preserved) DDL to keep field names
-        // as-written; the uppercase prefix/suffix match is only for the
-        // `STRUCT<...>` envelope.
-        let orig_inner = &trimmed[trimmed.find('<')? + 1..trimmed.rfind('>')?];
-        let _ = inner; // consumed only for the envelope match
-        return spark_ddl_schema_to_duckdb_json(orig_inner);
-    }
-    // ARRAY<T> → "<duckdb_T>[]".
-    if let Some(inner) = upper
-        .strip_prefix("ARRAY<")
-        .and_then(|r| r.strip_suffix('>'))
-    {
-        let elem = spark_ddl_primitive_to_duckdb(inner.trim())?;
-        return Some(format!("\"{elem}[]\""));
-    }
-    // Primitive.
-    let duck = spark_ddl_primitive_to_duckdb(&upper)?;
-    Some(format!("\"{duck}\""))
-}
-
-fn spark_ddl_primitive_to_duckdb(ty: &str) -> Option<&'static str> {
-    // Return DuckDB's canonical type-name spelling. `INT` / `INTEGER`
-    // both accept in DuckDB; use `INTEGER` for clarity.
-    match ty.trim() {
-        "INT" | "INTEGER" => Some("INTEGER"),
-        "LONG" | "BIGINT" => Some("BIGINT"),
-        "SHORT" | "SMALLINT" => Some("SMALLINT"),
-        "TINYINT" | "BYTE" => Some("TINYINT"),
-        "FLOAT" | "REAL" => Some("FLOAT"),
-        "DOUBLE" => Some("DOUBLE"),
-        "BOOLEAN" | "BOOL" => Some("BOOLEAN"),
-        "STRING" | "VARCHAR" => Some("VARCHAR"),
-        "BINARY" | "BLOB" => Some("BLOB"),
-        "DATE" => Some("DATE"),
-        "TIMESTAMP" | "TIMESTAMP_LTZ" => Some("TIMESTAMP"),
-        "TIMESTAMP_NTZ" => Some("TIMESTAMP"),
+/// DuckDB's canonical type-name spelling for the primitive [`DataType`]s the
+/// `from_json` DDL path supports. `INT` / `INTEGER` both accept in DuckDB;
+/// use `INTEGER` for clarity.
+///
+/// NOTE: this path emits `TIMESTAMP` for BOTH timestamp flavors — NOT
+/// [`render_data_type`]'s `TIMESTAMP WITH TIME ZONE`. Keep the mappings
+/// separate.
+fn duckdb_primitive_name(dt: &DataType) -> Option<&'static str> {
+    match dt {
+        DataType::Integer => Some("INTEGER"),
+        DataType::Long => Some("BIGINT"),
+        DataType::Short => Some("SMALLINT"),
+        DataType::Byte => Some("TINYINT"),
+        DataType::Float => Some("FLOAT"),
+        DataType::Double => Some("DOUBLE"),
+        DataType::Boolean => Some("BOOLEAN"),
+        DataType::String => Some("VARCHAR"),
+        DataType::Binary => Some("BLOB"),
+        DataType::Date => Some("DATE"),
+        DataType::Timestamp | DataType::TimestampNtz => Some("TIMESTAMP"),
         _ => None,
     }
 }
@@ -6132,6 +5327,45 @@ fn render_to_number_cast(input_sql: &str, precision: u8, scale: u8, fmt: &str) -
         input_sql.to_owned()
     };
     format!("try_cast({cast_input} AS DECIMAL({precision}, {scale}))")
+}
+
+/// The per-arm reason strings for [`to_number_parts`]. Each arm passes its
+/// three EXACT strings verbatim — the `to_number` / `try_to_number` texts
+/// differ (name prefix AND supported-template list); never derive one arm's
+/// string from the other's.
+struct ToNumberMsgs {
+    /// Reason when the call does not have exactly 2 arguments.
+    arity: &'static str,
+    /// Reason when the format argument is not a string literal.
+    fmt_literal: &'static str,
+    /// Reason when [`parse_number_format`] rejects the format string;
+    /// rendered with the offending format string.
+    fmt_unsupported: fn(&str) -> String,
+}
+
+/// Shared body of the `to_number` / `try_to_number` emission arms: arity
+/// check, literal format extraction, format → `DECIMAL(p, s)` parse, and the
+/// `try_cast` emission. Returns `(raw_input_sql, cast_sql, fmt)` — the raw
+/// input and format feed `to_number`'s ANSI throw guard; `try_to_number`
+/// returns the cast alone.
+fn to_number_parts(
+    f: &FunctionCall,
+    schema: &Schema,
+    msgs: &ToNumberMsgs,
+) -> Result<(String, String, String), EmissionError> {
+    if f.args.len() != 2 {
+        bail_boundary_fn!(f.name.clone(), msgs.arity);
+    }
+    let fmt = string_literal_arg_or(&f.args[1], &f.name, msgs.fmt_literal)?;
+    let (precision, scale) =
+        parse_number_format(&fmt).ok_or_else(|| EmissionError::Unsupported {
+            kind: UnsupportedKind::Function,
+            name: f.name.clone(),
+            reason: (msgs.fmt_unsupported)(&fmt),
+        })?;
+    let s = render_expr(&f.args[0], schema)?;
+    let cast = render_to_number_cast(&s, precision, scale, &fmt);
+    Ok((s, cast, fmt))
 }
 
 /// Escape the characters that carry regex meaning in a DuckDB regex pattern.
@@ -6253,6 +5487,7 @@ mod tests {
         UpdateFieldsExpression,
     };
     use crate::transpiler_v2::{analyze, generate};
+    use crate::types::StructField;
 
     fn tap_guard() -> std::sync::MutexGuard<'static, ()> {
         EMIT_TAP_MUTEX.lock().expect("EMIT_TAP_MUTEX poisoned")
@@ -6327,10 +5562,7 @@ mod tests {
     }
 
     fn base_types_with_emp() -> BaseTypes {
-        let plan = CommonAst::new(CommonOp::TableScan {
-            table: "emp".to_owned(),
-            alias: None,
-        });
+        let plan = scan("emp");
         BaseTypes::build_from_plan(&plan, |name| match name {
             "emp" => Some(emp_schema()),
             _ => None,
@@ -6362,11 +5594,85 @@ mod tests {
         })
     }
 
-    fn ceil_floor_call(name: &str, args: Vec<Expression>) -> FunctionCall {
+    fn str_lit(s: &str) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::String(s.to_owned()),
+            data_type: DataType::String,
+        })
+    }
+
+    fn col_with_type(name: &str, dt: DataType) -> Expression {
+        Expression::ColumnReference(ColumnReference {
+            name: name.to_owned(),
+            qualifier: None,
+            data_type: Some(dt),
+            nullable: Some(true),
+        })
+    }
+
+    fn col_ref_expr(name: &str) -> Expression {
+        col_with_type(name, DataType::String)
+    }
+
+    fn ts_col_ref(name: &str) -> Expression {
+        col_with_type(name, DataType::Timestamp)
+    }
+
+    fn scan(table: &str) -> CommonAst {
+        CommonAst::new(CommonOp::TableScan {
+            table: table.to_owned(),
+            alias: None,
+        })
+    }
+
+    fn fcall(name: &str, args: Vec<Expression>) -> FunctionCall {
         FunctionCall {
             name: name.to_owned(),
             args,
             distinct: false,
+        }
+    }
+
+    fn fexpr(name: &str, args: Vec<Expression>) -> Expression {
+        Expression::FunctionCall(fcall(name, args))
+    }
+
+    fn render_fn(name: &str, args: Vec<Expression>) -> String {
+        render_function_call(&fcall(name, args), &empty_schema()).expect("render")
+    }
+
+    fn render_fn_on(schema: &Schema, name: &str, args: Vec<Expression>) -> String {
+        render_function_call(&fcall(name, args), schema).expect("render")
+    }
+
+    /// Asserts `err` is [`EmissionError::Unsupported`] with the given `kind`
+    /// and `name`, and that `reason` contains every fragment in
+    /// `reason_frags`.
+    #[track_caller]
+    fn expect_unsupported(
+        err: EmissionError,
+        kind: UnsupportedKind,
+        name: &str,
+        reason_frags: &[&str],
+    ) {
+        match err {
+            EmissionError::Unsupported {
+                kind: got_kind,
+                name: got_name,
+                reason,
+            } => {
+                assert_eq!(
+                    got_kind, kind,
+                    "unexpected UnsupportedKind; reason: {reason}"
+                );
+                assert_eq!(got_name, name, "unexpected boundary name; reason: {reason}");
+                for frag in reason_frags {
+                    assert!(
+                        reason.contains(frag),
+                        "reason must contain {frag:?}; got: {reason}"
+                    );
+                }
+            }
         }
     }
 
@@ -6376,8 +5682,7 @@ mod tests {
     fn ceil_1arg_long_is_bigint_nan_guard() {
         let _g = tap_guard();
         // Integer input → Long → the NaN-guarded BIGINT shape (math-003 pin).
-        let f = ceil_floor_call("ceil", vec![int_lit(5)]);
-        let sql = render_function_call(&f, &empty_schema()).expect("render ceil");
+        let sql = render_fn("ceil", vec![int_lit(5)]);
         assert_eq!(
             sql,
             "CASE WHEN (5) IS NULL THEN NULL \
@@ -6389,8 +5694,7 @@ mod tests {
     #[test]
     fn ceil_1arg_decimal_casts_to_scale0_decimal() {
         let _g = tap_guard();
-        let f = ceil_floor_call("ceil", vec![decimal_lit("1.25", 10, 2)]);
-        let sql = render_function_call(&f, &empty_schema()).expect("render ceil");
+        let sql = render_fn("ceil", vec![decimal_lit("1.25", 10, 2)]);
         assert!(sql.ends_with("AS DECIMAL(9, 0))"), "got: {sql}");
         assert!(sql.starts_with("CAST(ceil("), "got: {sql}");
     }
@@ -6399,8 +5703,7 @@ mod tests {
     fn floor_2arg_scaled_decimal() {
         let _g = tap_guard();
         // 2-arg over double → decimal(18,2), synthesized as fn((a)*100)/100.
-        let f = ceil_floor_call("ceil", vec![double_lit(1.5), int_lit(2)]);
-        let sql = render_function_call(&f, &empty_schema()).expect("render ceil");
+        let sql = render_fn("ceil", vec![double_lit(1.5), int_lit(2)]);
         assert!(sql.starts_with("CAST(ceil("), "got: {sql}");
         assert!(sql.contains(") * 100) / 100"), "got: {sql}");
         assert!(sql.ends_with("AS DECIMAL(18, 2))"), "got: {sql}");
@@ -6409,7 +5712,7 @@ mod tests {
     #[test]
     fn ceil_2arg_negative_scale_is_boundary() {
         let _g = tap_guard();
-        let f = ceil_floor_call("ceil", vec![decimal_lit("1.25", 10, 2), int_lit(-1)]);
+        let f = fcall("ceil", vec![decimal_lit("1.25", 10, 2), int_lit(-1)]);
         let err = render_function_call(&f, &empty_schema()).expect_err("negative scale");
         assert!(matches!(
             err,
@@ -6424,10 +5727,7 @@ mod tests {
 
     fn analyzed_select_id_from_emp() -> SubqueryPlan {
         let inner = CommonAst::new(CommonOp::Project {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             projections: vec![ColumnReference::untyped("id")],
         });
         let typed = analyze(inner, &base_types_with_emp()).expect("analyze inner");
@@ -6536,10 +5836,7 @@ mod tests {
     fn dispatch_op_table_scan_emits_select_star_from_table() {
         let _g = tap_guard();
         let bt = base_types_with_emp();
-        let ast = CommonAst::new(CommonOp::TableScan {
-            table: "emp".to_owned(),
-            alias: None,
-        });
+        let ast = scan("emp");
         let typed = analyze(ast, &bt).expect("analyze TableScan");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert_eq!(sql, "SELECT * FROM emp");
@@ -6658,10 +5955,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Project {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             projections: vec![Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "id".to_owned(),
@@ -6682,10 +5976,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Project {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             projections: vec![Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "id".to_owned(),
@@ -6721,10 +6012,7 @@ mod tests {
     /// front-ends now produce for an aliased table (INV7).
     fn aliased_scan(table: &str, alias: &str) -> CommonAst {
         CommonAst::new(CommonOp::AliasedRelation {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: table.to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan(table)),
             alias: alias.to_owned(),
         })
     }
@@ -6852,11 +6140,7 @@ mod tests {
         let plan = CommonAst::new(CommonOp::Aggregate {
             input: Box::new(filter),
             grouping: vec![],
-            aggregates: vec![Expression::FunctionCall(FunctionCall {
-                name: "max".to_owned(),
-                args: vec![qcol("e", "salary")],
-                distinct: false,
-            })],
+            aggregates: vec![fexpr("max", vec![qcol("e", "salary")])],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -6880,11 +6164,10 @@ mod tests {
     fn count_star_gt_one() -> Expression {
         Expression::Binary(BinaryExpression {
             op: BinaryOp::Gt,
-            left: Box::new(Expression::FunctionCall(FunctionCall {
-                name: "count".to_owned(),
-                args: vec![Expression::Star(StarExpression { qualifier: None })],
-                distinct: false,
-            })),
+            left: Box::new(fexpr(
+                "count",
+                vec![Expression::Star(StarExpression { qualifier: None })],
+            )),
             right: Box::new(int_lit(1)),
         })
     }
@@ -6897,18 +6180,14 @@ mod tests {
         // `GROUP BY … HAVING`, never an outer `WHERE` wrapper (which DuckDB
         // rejects for aggregate predicates).
         let plan = CommonAst::new(CommonOp::Aggregate {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             grouping: vec![ucol("dept_id")],
             aggregates: vec![
                 ucol("dept_id"),
-                Expression::FunctionCall(FunctionCall {
-                    name: "count".to_owned(),
-                    args: vec![Expression::Star(StarExpression { qualifier: None })],
-                    distinct: false,
-                }),
+                fexpr(
+                    "count",
+                    vec![Expression::Star(StarExpression { qualifier: None })],
+                ),
             ],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
@@ -6944,10 +6223,7 @@ mod tests {
             })
         };
         let plan = CommonAst::new(CommonOp::Aggregate {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             grouping: vec![senior_expr()],
             aggregates: vec![
                 Expression::Alias(AliasExpression {
@@ -6955,11 +6231,7 @@ mod tests {
                     alias: "senior".to_owned(),
                 }),
                 Expression::Alias(AliasExpression {
-                    expr: Box::new(Expression::FunctionCall(FunctionCall {
-                        name: "avg".to_owned(),
-                        args: vec![ucol("salary")],
-                        distinct: false,
-                    })),
+                    expr: Box::new(fexpr("avg", vec![ucol("salary")])),
                     alias: "s".to_owned(),
                 }),
             ],
@@ -6995,16 +6267,12 @@ mod tests {
         // both sets into a single grand-total row — a silent wrong row-count).
         // DuckDB accepts `GROUP BY GROUPING SETS ((), ())`.
         let plan = CommonAst::new(CommonOp::Aggregate {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             grouping: vec![],
-            aggregates: vec![Expression::FunctionCall(FunctionCall {
-                name: "count".to_owned(),
-                args: vec![Expression::Star(StarExpression { qualifier: None })],
-                distinct: false,
-            })],
+            aggregates: vec![fexpr(
+                "count",
+                vec![Expression::Star(StarExpression { qualifier: None })],
+            )],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
             grouping_sets: vec![vec![], vec![]],
             having: None,
@@ -7023,18 +6291,14 @@ mod tests {
         let _g = tap_guard();
         // ROLLUP grouping + HAVING → `GROUP BY ROLLUP(dept_id) HAVING …`.
         let plan = CommonAst::new(CommonOp::Aggregate {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             grouping: vec![ucol("dept_id")],
             aggregates: vec![
                 ucol("dept_id"),
-                Expression::FunctionCall(FunctionCall {
-                    name: "count".to_owned(),
-                    args: vec![Expression::Star(StarExpression { qualifier: None })],
-                    distinct: false,
-                }),
+                fexpr(
+                    "count",
+                    vec![Expression::Star(StarExpression { qualifier: None })],
+                ),
             ],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::Rollup,
             grouping_sets: vec![],
@@ -7059,19 +6323,15 @@ mod tests {
         // GROUPING SETS ((dept_id, name), (dept_id), ()) → flat grouping
         // [dept_id, name] with per-set membership [[0, 1], [0], []].
         let plan = CommonAst::new(CommonOp::Aggregate {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             grouping: vec![ucol("dept_id"), ucol("name")],
             aggregates: vec![
                 ucol("dept_id"),
                 ucol("name"),
-                Expression::FunctionCall(FunctionCall {
-                    name: "count".to_owned(),
-                    args: vec![Expression::Star(StarExpression { qualifier: None })],
-                    distinct: false,
-                }),
+                fexpr(
+                    "count",
+                    vec![Expression::Star(StarExpression { qualifier: None })],
+                ),
             ],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
             grouping_sets: vec![vec![0, 1], vec![0], vec![]],
@@ -7092,18 +6352,14 @@ mod tests {
         // DataFrame `groupingSets` path leaves `grouping_sets` empty — emission
         // must surface the preserved Thunderduck-boundary error (ADR-022).
         let plan = CommonAst::new(CommonOp::Aggregate {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             grouping: vec![ucol("dept_id")],
             aggregates: vec![
                 ucol("dept_id"),
-                Expression::FunctionCall(FunctionCall {
-                    name: "count".to_owned(),
-                    args: vec![Expression::Star(StarExpression { qualifier: None })],
-                    distinct: false,
-                }),
+                fexpr(
+                    "count",
+                    vec![Expression::Star(StarExpression { qualifier: None })],
+                ),
             ],
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
             grouping_sets: vec![],
@@ -7112,14 +6368,7 @@ mod tests {
         let bt = base_types_with_emp();
         let typed = analyze(plan, &bt).expect("analyze grouping-sets aggregate");
         let err = dispatch_op(&typed.op, &typed.resolved_schema).unwrap_err();
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Op,
-                name: op,
-                ..
-            } => assert_eq!(op, "Aggregate[GroupingSets]"),
-            other => panic!("expected UnsupportedOp(Aggregate[GroupingSets]), got {other:?}"),
-        }
+        expect_unsupported(err, UnsupportedKind::Op, "Aggregate[GroupingSets]", &[]);
     }
 
     #[test]
@@ -7144,10 +6393,7 @@ mod tests {
             alias: "ratio".to_owned(),
         });
         let ast = CommonAst::new(CommonOp::Project {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             projections: vec![aliased],
         });
         let typed = analyze(ast, &bt).expect("analyze");
@@ -7168,10 +6414,7 @@ mod tests {
             right: Box::new(int_lit(2)),
         });
         let ast = CommonAst::new(CommonOp::Project {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             projections: vec![div],
         });
         let typed = analyze(ast, &bt).expect("analyze");
@@ -7205,10 +6448,7 @@ mod tests {
         // BUT: analyzer requires cond to be Boolean; the shape above IS
         // Boolean (Gt). We turn it into a Cast for safety.
         let ast = CommonAst::new(CommonOp::Filter {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             condition: cond,
         });
         let typed = analyze(ast, &bt).expect("analyze");
@@ -7251,10 +6491,7 @@ mod tests {
             },
         ];
         let ast = CommonAst::new(CommonOp::Sort {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             order,
             limit: None,
             offset: None,
@@ -7270,10 +6507,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Sort {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             order: vec![SortOrder {
                 expr: Box::new(Expression::UnresolvedColumn(
                     crate::transpiler_v2::expression::UnresolvedColumn {
@@ -7301,10 +6535,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Limit {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             limit: 20,
             offset: Some(3),
         });
@@ -7538,12 +6769,7 @@ mod tests {
 
     #[test]
     fn render_pmod_column_divisor_guards_remainder_by_zero() {
-        let f = FunctionCall {
-            name: "pmod".to_owned(),
-            args: vec![col_ref_expr("a"), col_ref_expr("b")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render");
+        let sql = render_fn("pmod", vec![col_ref_expr("a"), col_ref_expr("b")]);
         assert!(
             sql.starts_with("CASE WHEN (b) = 0 THEN error('[REMAINDER_BY_ZERO]"),
             "got: {sql}"
@@ -7669,35 +6895,10 @@ mod tests {
             plan_id: None,
         });
         let err = render_expr(&expr, &empty_schema()).unwrap_err();
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Expression,
-                name: shape,
-                ..
-            } => {
-                assert_eq!(shape, "UnresolvedRegex");
-            }
-            other => panic!("expected UnsupportedExpression, got {other:?}"),
-        }
+        expect_unsupported(err, UnsupportedKind::Expression, "UnresolvedRegex", &[]);
     }
 
     // ── ExtractValue emission dispatches on child data_type (cx-001/002) ──
-
-    fn col_with_type(name: &str, dt: DataType) -> Expression {
-        Expression::ColumnReference(ColumnReference {
-            name: name.to_owned(),
-            qualifier: None,
-            data_type: Some(dt),
-            nullable: Some(true),
-        })
-    }
-
-    fn string_lit(s: &str) -> Expression {
-        Expression::Literal(Literal {
-            value: LiteralValue::String(s.to_owned()),
-            data_type: DataType::String,
-        })
-    }
 
     fn extract_value(child: Expression, extraction: Expression) -> Expression {
         Expression::ExtractValue(ExtractValueExpression {
@@ -7716,7 +6917,7 @@ mod tests {
                 DataType::String,
             )])),
         );
-        let ev = extract_value(child, string_lit("city"));
+        let ev = extract_value(child, str_lit("city"));
         let sql = render_expr(&ev, &empty_schema()).unwrap();
         assert_eq!(sql, "(address).city");
     }
@@ -7775,7 +6976,7 @@ mod tests {
                 value_nullable: true,
             },
         );
-        let ev = extract_value(child, string_lit("a"));
+        let ev = extract_value(child, str_lit("a"));
         let sql = render_expr(&ev, &empty_schema()).unwrap();
         assert_eq!(sql, "element_at((m), ('a'))[1]");
     }
@@ -7907,10 +7108,7 @@ mod tests {
         // §5.4 anchor. render_tail is unwired under Decision 13-A; we invoke
         // the helper directly with a synthesized child TypedAst.
         let bt = base_types_with_emp();
-        let ast = CommonAst::new(CommonOp::TableScan {
-            table: "emp".to_owned(),
-            alias: None,
-        });
+        let ast = scan("emp");
         let typed = analyze(ast, &bt).expect("analyze");
         let sql = render_tail(&typed, 3).expect("render_tail");
         assert!(sql.contains("WITH __td_child AS"), "got: {sql}");
@@ -7967,10 +7165,7 @@ mod tests {
         // is a stable erroring dispatch that won't bit-rot as coverage grows.
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Sample {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             lower_bound: 0.0,
             upper_bound: 0.5,
             with_replacement: true,
@@ -8019,25 +7214,11 @@ mod tests {
     // PySpark Arrow decoding (empty string keys collide). The current arm
     // derives Spark-parity field names per argument.
 
-    fn col_ref_expr(name: &str) -> Expression {
-        Expression::ColumnReference(ColumnReference {
-            name: name.to_owned(),
-            qualifier: None,
-            data_type: Some(DataType::String),
-            nullable: Some(true),
-        })
-    }
-
     /// §9 test 1 — struct-001 regression: `struct("name","age")` →
     /// `struct_pack(name := name, age := age)`.
     #[test]
     fn render_struct_two_column_refs() {
-        let f = FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![col_ref_expr("name"), col_ref_expr("age")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render struct");
+        let sql = render_fn("struct", vec![col_ref_expr("name"), col_ref_expr("age")]);
         assert_eq!(sql, "struct_pack(name := name, age := age)");
     }
 
@@ -8049,12 +7230,7 @@ mod tests {
             expr: Box::new(inner),
             alias: "who".to_owned(),
         });
-        let f = FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![aliased],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render struct");
+        let sql = render_fn("struct", vec![aliased]);
         assert_eq!(sql, "struct_pack(who := name)");
     }
 
@@ -8071,12 +7247,7 @@ mod tests {
             value: LiteralValue::String("colA".to_owned()),
             data_type: DataType::String,
         });
-        let f = FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![lit],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render struct");
+        let sql = render_fn("struct", vec![lit]);
         assert_eq!(sql, "struct_pack(col1 := 'colA')");
     }
 
@@ -8091,24 +7262,14 @@ mod tests {
                 data_type: DataType::Integer,
             })),
         });
-        let f = FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![computed, col_ref_expr("b")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render struct");
+        let sql = render_fn("struct", vec![computed, col_ref_expr("b")]);
         assert_eq!(sql, "struct_pack(col1 := (a) + (1), b := b)");
     }
 
     /// §9 test 5 — zero-arg `struct()` emits `struct_pack()`.
     #[test]
     fn render_struct_empty() {
-        let f = FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render struct");
+        let sql = render_fn("struct", vec![]);
         assert_eq!(sql, "struct_pack()");
     }
 
@@ -8121,17 +7282,8 @@ mod tests {
     /// preserved). Corpus: `json-005`.
     #[test]
     fn render_to_json_wraps_with_json_strip_nulls() {
-        let struct_arg = Expression::FunctionCall(FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![col_ref_expr("name"), col_ref_expr("age")],
-            distinct: false,
-        });
-        let f = FunctionCall {
-            name: "to_json".to_owned(),
-            args: vec![struct_arg],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render to_json");
+        let struct_arg = fexpr("struct", vec![col_ref_expr("name"), col_ref_expr("age")]);
+        let sql = render_fn("to_json", vec![struct_arg]);
         assert_eq!(
             sql, "json_strip_nulls(to_json(struct_pack(name := name, age := age)))",
             "1-arg to_json wraps DuckDB's to_json with json_strip_nulls",
@@ -8144,22 +7296,9 @@ mod tests {
     /// accidentally re-wrapping inside `render_expr` recursion.
     #[test]
     fn render_to_json_of_nested_struct_still_wraps_once() {
-        let inner_struct = Expression::FunctionCall(FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![col_ref_expr("city"), col_ref_expr("zip")],
-            distinct: false,
-        });
-        let outer_struct = Expression::FunctionCall(FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![col_ref_expr("name"), inner_struct],
-            distinct: false,
-        });
-        let f = FunctionCall {
-            name: "to_json".to_owned(),
-            args: vec![outer_struct],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render to_json");
+        let inner_struct = fexpr("struct", vec![col_ref_expr("city"), col_ref_expr("zip")]);
+        let outer_struct = fexpr("struct", vec![col_ref_expr("name"), inner_struct]);
+        let sql = render_fn("to_json", vec![outer_struct]);
         assert_eq!(
             sql.matches("json_strip_nulls(").count(),
             1,
@@ -8176,11 +7315,7 @@ mod tests {
     /// (no wrapper), letting DuckDB retain null-valued keys verbatim.
     #[test]
     fn render_to_json_with_ignore_null_fields_false_option_omits_wrapper() {
-        let struct_arg = Expression::FunctionCall(FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![col_ref_expr("name"), col_ref_expr("age")],
-            distinct: false,
-        });
+        let struct_arg = fexpr("struct", vec![col_ref_expr("name"), col_ref_expr("age")]);
         let options = Expression::MapLiteral(MapLiteralExpression {
             entries: vec![(
                 Expression::Literal(Literal {
@@ -8195,12 +7330,7 @@ mod tests {
             key_type: DataType::String,
             value_type: DataType::String,
         });
-        let f = FunctionCall {
-            name: "to_json".to_owned(),
-            args: vec![struct_arg, options],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render to_json");
+        let sql = render_fn("to_json", vec![struct_arg, options]);
         assert_eq!(
             sql, "to_json(struct_pack(name := name, age := age))",
             "explicit ignoreNullFields=false must emit bare to_json (no wrapper)",
@@ -8213,11 +7343,7 @@ mod tests {
     /// match.
     #[test]
     fn render_to_json_with_unsupported_option_is_boundary_error() {
-        let struct_arg = Expression::FunctionCall(FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![col_ref_expr("ts")],
-            distinct: false,
-        });
+        let struct_arg = fexpr("struct", vec![col_ref_expr("ts")]);
         let options = Expression::MapLiteral(MapLiteralExpression {
             entries: vec![(
                 Expression::Literal(Literal {
@@ -8232,27 +7358,15 @@ mod tests {
             key_type: DataType::String,
             value_type: DataType::String,
         });
-        let f = FunctionCall {
-            name: "to_json".to_owned(),
-            args: vec![struct_arg, options],
-            distinct: false,
-        };
+        let f = fcall("to_json", vec![struct_arg, options]);
         let err = render_function_call(&f, &empty_schema())
             .expect_err("unsupported to_json option must be a boundary error");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name,
-                reason,
-            } => {
-                assert_eq!(name, "to_json");
-                assert!(
-                    reason.contains("ignoreNullFields"),
-                    "reason must cite the supported option; got: {reason}",
-                );
-            }
-            other => panic!("expected UnsupportedFunction, got: {other:?}"),
-        }
+        expect_unsupported(
+            err,
+            UnsupportedKind::Function,
+            "to_json",
+            &["ignoreNullFields"],
+        );
     }
 
     /// hash-001 anchor: `crc32(col)` is remapped to `spark_crc32(col)`
@@ -8260,12 +7374,7 @@ mod tests {
     /// `thdck_spark_funcs` extension). Defends the dispatch-arm shape.
     #[test]
     fn render_crc32_remaps_to_spark_crc32() {
-        let f = FunctionCall {
-            name: "crc32".to_owned(),
-            args: vec![col_ref_expr("name")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render crc32");
+        let sql = render_fn("crc32", vec![col_ref_expr("name")]);
         assert_eq!(sql, "spark_crc32(name)");
     }
 
@@ -8277,12 +7386,7 @@ mod tests {
             value: LiteralValue::String(r#"{"a":1,"b":"x"}"#.to_owned()),
             data_type: DataType::String,
         });
-        let f = FunctionCall {
-            name: "schema_of_json".to_owned(),
-            args: vec![lit],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render schema_of_json");
+        let sql = render_fn("schema_of_json", vec![lit]);
         assert_eq!(sql, "spark_schema_of_json('{\"a\":1,\"b\":\"x\"}')");
     }
 
@@ -8291,21 +7395,15 @@ mod tests {
     /// `concat_ws(',', CAST(a AS VARCHAR), CAST(b AS VARCHAR), CAST(c AS VARCHAR))`.
     #[test]
     fn render_to_csv_of_struct_emits_concat_ws() {
-        let struct_arg = Expression::FunctionCall(FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![
+        let struct_arg = fexpr(
+            "struct",
+            vec![
                 col_ref_expr("id"),
                 col_ref_expr("name"),
                 col_ref_expr("age"),
             ],
-            distinct: false,
-        });
-        let f = FunctionCall {
-            name: "to_csv".to_owned(),
-            args: vec![struct_arg],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render to_csv");
+        );
+        let sql = render_fn("to_csv", vec![struct_arg]);
         assert_eq!(
             sql,
             "concat_ws(',', CAST(id AS VARCHAR), CAST(name AS VARCHAR), CAST(age AS VARCHAR))",
@@ -8325,17 +7423,11 @@ mod tests {
             value: LiteralValue::String("k2".to_owned()),
             data_type: DataType::String,
         });
-        let named_struct = Expression::FunctionCall(FunctionCall {
-            name: "named_struct".to_owned(),
-            args: vec![key1, col_ref_expr("id"), key2, col_ref_expr("name")],
-            distinct: false,
-        });
-        let f = FunctionCall {
-            name: "to_csv".to_owned(),
-            args: vec![named_struct],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render to_csv");
+        let named_struct = fexpr(
+            "named_struct",
+            vec![key1, col_ref_expr("id"), key2, col_ref_expr("name")],
+        );
+        let sql = render_fn("to_csv", vec![named_struct]);
         assert_eq!(
             sql,
             "concat_ws(',', CAST(id AS VARCHAR), CAST(name AS VARCHAR))",
@@ -8347,24 +7439,10 @@ mod tests {
     /// Thunderduck-boundary error instead of silently emitting bad SQL.
     #[test]
     fn render_to_csv_of_non_struct_arg_is_boundary_error() {
-        let f = FunctionCall {
-            name: "to_csv".to_owned(),
-            args: vec![col_ref_expr("some_struct_col")],
-            distinct: false,
-        };
+        let f = fcall("to_csv", vec![col_ref_expr("some_struct_col")]);
         let err = render_function_call(&f, &empty_schema())
             .expect_err("to_csv on non-struct arg must boundary-error");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name,
-                reason,
-            } => {
-                assert_eq!(name, "to_csv");
-                assert!(reason.contains("struct"), "reason: {reason}");
-            }
-            other => panic!("expected UnsupportedFunction, got {other:?}"),
-        }
+        expect_unsupported(err, UnsupportedKind::Function, "to_csv", &["struct"]);
     }
 
     // ── Math domain-guard wrappers (Pass 63) ────────────────────────────
@@ -8374,48 +7452,28 @@ mod tests {
     /// τ wraps the call in a CASE that guards `> 0`.
     #[test]
     fn render_log_wraps_in_null_safe_domain_guard() {
-        let f = FunctionCall {
-            name: "log".to_owned(),
-            args: vec![col_ref_expr("y")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render log");
+        let sql = render_fn("log", vec![col_ref_expr("y")]);
         assert_eq!(sql, "CASE WHEN (y) > 0 THEN ln(y) ELSE NULL END");
     }
 
     /// Explicit `ln(y)` — identical guard, direct DuckDB name.
     #[test]
     fn render_ln_wraps_in_null_safe_domain_guard() {
-        let f = FunctionCall {
-            name: "ln".to_owned(),
-            args: vec![col_ref_expr("y")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render ln");
+        let sql = render_fn("ln", vec![col_ref_expr("y")]);
         assert_eq!(sql, "CASE WHEN (y) > 0 THEN ln(y) ELSE NULL END");
     }
 
     /// `log10(y)` — same guard, DuckDB has native `log10`.
     #[test]
     fn render_log10_wraps_in_null_safe_domain_guard() {
-        let f = FunctionCall {
-            name: "log10".to_owned(),
-            args: vec![col_ref_expr("y")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render log10");
+        let sql = render_fn("log10", vec![col_ref_expr("y")]);
         assert_eq!(sql, "CASE WHEN (y) > 0 THEN log10(y) ELSE NULL END");
     }
 
     /// `log2(y)` — same guard, DuckDB has native `log2`.
     #[test]
     fn render_log2_wraps_in_null_safe_domain_guard() {
-        let f = FunctionCall {
-            name: "log2".to_owned(),
-            args: vec![col_ref_expr("y")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render log2");
+        let sql = render_fn("log2", vec![col_ref_expr("y")]);
         assert_eq!(sql, "CASE WHEN (y) > 0 THEN log2(y) ELSE NULL END");
     }
 
@@ -8423,12 +7481,7 @@ mod tests {
     /// passed through as DuckDB's `log(base, x)` positional form.
     #[test]
     fn render_log_two_arg_guards_value_only() {
-        let f = FunctionCall {
-            name: "log".to_owned(),
-            args: vec![int_lit(10), col_ref_expr("y")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render log(base, x)");
+        let sql = render_fn("log", vec![int_lit(10), col_ref_expr("y")]);
         assert_eq!(sql, "CASE WHEN (y) > 0 THEN log(10, y) ELSE NULL END");
     }
 
@@ -8438,12 +7491,7 @@ mod tests {
     /// negative operands and preserves 2's-complement shift semantics.
     #[test]
     fn render_shiftleft_uses_arithmetic_form() {
-        let f = FunctionCall {
-            name: "shiftleft".to_owned(),
-            args: vec![col_ref_expr("a"), int_lit(2)],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render shiftleft");
+        let sql = render_fn("shiftleft", vec![col_ref_expr("a"), int_lit(2)]);
         assert_eq!(sql, "(a * (1::BIGINT << (2)))");
     }
 
@@ -8451,12 +7499,7 @@ mod tests {
     /// inline form `sqrt(a*a + b*b)` with explicit DOUBLE casts.
     #[test]
     fn render_hypot_emits_inline_sqrt_form() {
-        let f = FunctionCall {
-            name: "hypot".to_owned(),
-            args: vec![col_ref_expr("x"), col_ref_expr("y")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render hypot");
+        let sql = render_fn("hypot", vec![col_ref_expr("x"), col_ref_expr("y")]);
         assert!(sql.starts_with("sqrt("));
         assert!(sql.contains("CAST(x AS DOUBLE)"));
         assert!(sql.contains("CAST(y AS DOUBLE)"));
@@ -8465,9 +7508,9 @@ mod tests {
     /// Pass 73: `format_string(fmt, args...)` remaps to DuckDB's `printf`.
     #[test]
     fn render_format_string_remaps_to_printf() {
-        let f = FunctionCall {
-            name: "format_string".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "format_string",
+            vec![
                 Expression::Literal(Literal {
                     value: LiteralValue::String("%s=%d".to_owned()),
                     data_type: DataType::String,
@@ -8475,9 +7518,7 @@ mod tests {
                 col_ref_expr("name"),
                 col_ref_expr("age"),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render format_string");
+        );
         assert!(sql.starts_with("printf("));
     }
 
@@ -8485,12 +7526,7 @@ mod tests {
     /// half-even CASE around `round(x * 10^n)`.
     #[test]
     fn render_bround_emits_half_even_case() {
-        let f = FunctionCall {
-            name: "bround".to_owned(),
-            args: vec![col_ref_expr("x"), int_lit(1)],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render bround");
+        let sql = render_fn("bround", vec![col_ref_expr("x"), int_lit(1)]);
         assert!(sql.contains("floor(") || sql.contains("round("));
         // The half-even branch must reference the even-parity check.
         assert!(sql.contains("% 2 = 0"));
@@ -8500,12 +7536,7 @@ mod tests {
     /// and accepts negative operands, so τ passes it through directly.
     #[test]
     fn render_shiftright_uses_operator_form() {
-        let f = FunctionCall {
-            name: "shiftright".to_owned(),
-            args: vec![col_ref_expr("a"), int_lit(2)],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render shiftright");
+        let sql = render_fn("shiftright", vec![col_ref_expr("a"), int_lit(2)]);
         assert_eq!(sql, "(a >> (2))");
     }
 
@@ -8520,24 +7551,17 @@ mod tests {
             value: LiteralValue::Boolean(false),
             data_type: DataType::Boolean,
         });
-        let f = FunctionCall {
-            name: "nth_value".to_owned(),
-            args: vec![col_ref_expr("salary"), int_lit(2), bool_lit],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render nth_value");
+        let sql = render_fn(
+            "nth_value",
+            vec![col_ref_expr("salary"), int_lit(2), bool_lit],
+        );
         assert_eq!(sql, "nth_value(salary, 2)");
     }
 
     /// Two-arg `nth_value` (no trailing bool) passes through unchanged.
     #[test]
     fn render_nth_value_two_args_passes_through() {
-        let f = FunctionCall {
-            name: "nth_value".to_owned(),
-            args: vec![col_ref_expr("salary"), int_lit(2)],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render nth_value");
+        let sql = render_fn("nth_value", vec![col_ref_expr("salary"), int_lit(2)]);
         assert_eq!(sql, "nth_value(salary, 2)");
     }
 
@@ -8546,15 +7570,13 @@ mod tests {
     /// Verifies the safety-net check on the trim behavior.
     #[test]
     fn render_nth_value_with_non_bool_extra_arg_passes_through() {
-        let f = FunctionCall {
-            name: "nth_value".to_owned(),
-            args: vec![col_ref_expr("salary"), int_lit(2), int_lit(99)],
-            distinct: false,
-        };
         // Falls through to pass-through emission — DuckDB will still reject
         // the extra arg, but τ preserves it faithfully rather than silently
         // dropping a real value.
-        let sql = render_function_call(&f, &empty_schema()).expect("render nth_value passthrough");
+        let sql = render_fn(
+            "nth_value",
+            vec![col_ref_expr("salary"), int_lit(2), int_lit(99)],
+        );
         assert_eq!(sql, "nth_value(salary, 2, 99)");
     }
 
@@ -8569,10 +7591,7 @@ mod tests {
         // Build: emp.groupBy("dept_id").pivot("id", [1, 2]).agg(count(*) AS n)
         // Using existing emp cols to satisfy the analyzer.
         let ast = CommonAst::new(CommonOp::Pivot {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "dept_id".to_owned(),
@@ -8590,11 +7609,7 @@ mod tests {
             pivot_values: vec![int_lit(1), int_lit(2)],
             aggregates: vec![Expression::Alias(AliasExpression {
                 alias: "n".to_owned(),
-                expr: Box::new(Expression::FunctionCall(FunctionCall {
-                    name: "count".to_owned(),
-                    args: vec![int_lit(1)],
-                    distinct: false,
-                })),
+                expr: Box::new(fexpr("count", vec![int_lit(1)])),
             })],
         });
         let sql = generate(&ast, &bt).expect("generate pivot");
@@ -8624,10 +7639,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Pivot {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
                     name: "dept_id".to_owned(),
@@ -8646,25 +7658,20 @@ mod tests {
             aggregates: vec![
                 Expression::Alias(AliasExpression {
                     alias: "s".to_owned(),
-                    expr: Box::new(Expression::FunctionCall(FunctionCall {
-                        name: "sum".to_owned(),
-                        args: vec![Expression::UnresolvedColumn(
+                    expr: Box::new(fexpr(
+                        "sum",
+                        vec![Expression::UnresolvedColumn(
                             crate::transpiler_v2::expression::UnresolvedColumn {
                                 name: "salary".to_owned(),
                                 qualifier: None,
                                 plan_id: None,
                             },
                         )],
-                        distinct: false,
-                    })),
+                    )),
                 }),
                 Expression::Alias(AliasExpression {
                     alias: "c".to_owned(),
-                    expr: Box::new(Expression::FunctionCall(FunctionCall {
-                        name: "count".to_owned(),
-                        args: vec![int_lit(1)],
-                        distinct: false,
-                    })),
+                    expr: Box::new(fexpr("count", vec![int_lit(1)])),
                 }),
             ],
         });
@@ -8688,10 +7695,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Pivot {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             grouping: PivotGrouping::Implicit,
             pivot_column: Expression::UnresolvedColumn(
                 crate::transpiler_v2::expression::UnresolvedColumn {
@@ -8706,11 +7710,7 @@ mod tests {
             })],
             aggregates: vec![Expression::Alias(AliasExpression {
                 alias: "n".to_owned(),
-                expr: Box::new(Expression::FunctionCall(FunctionCall {
-                    name: "count".to_owned(),
-                    args: vec![int_lit(1)],
-                    distinct: false,
-                })),
+                expr: Box::new(fexpr("count", vec![int_lit(1)])),
             })],
         });
         let sql = generate(&ast, &bt).expect("generate aliased-value pivot");
@@ -8732,10 +7732,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Unpivot {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             ids: UnpivotIds::Explicit(vec!["id".to_owned()]),
             values: vec!["dept_id".to_owned(), "salary".to_owned()],
             variable_column_name: "metric".to_owned(),
@@ -8757,10 +7754,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Describe {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             cols: vec!["dept_id".to_owned(), "salary".to_owned()],
         });
         let sql = generate(&ast, &bt).expect("generate describe");
@@ -8788,10 +7782,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Summary {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             statistics: vec![
                 "count".to_owned(),
                 "min".to_owned(),
@@ -8822,10 +7813,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::FreqItems {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             cols: vec!["dept_id".to_owned()],
             support: 0.3,
         });
@@ -8860,10 +7848,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::FreqItems {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             cols: vec!["dept_id".to_owned(), "salary".to_owned()],
             support: 0.01,
         });
@@ -8890,14 +7875,7 @@ mod tests {
             resolved_schema: StructType::empty(),
         };
         let err = super::render_freq_items(&typed_input, &[], 0.01).unwrap_err();
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Op,
-                name: op,
-                ..
-            } => assert_eq!(op, "FreqItems"),
-            other => panic!("expected UnsupportedOp, got {other:?}"),
-        }
+        expect_unsupported(err, UnsupportedKind::Op, "FreqItems", &[]);
     }
 
     // ── Sample / SampleBy emission (Pass 83) ─────────────────────────────
@@ -8907,10 +7885,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Sample {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             lower_bound: 0.0,
             upper_bound: 0.5,
             with_replacement: false,
@@ -8932,10 +7907,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::Sample {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             lower_bound: 0.0,
             upper_bound: 0.5,
             with_replacement: false,
@@ -8961,16 +7933,7 @@ mod tests {
             resolved_schema: StructType::empty(),
         };
         let err = super::render_sample(&typed_input, 0.0, 0.5, true, Some(11)).unwrap_err();
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Op,
-                name: op,
-                ..
-            } => {
-                assert_eq!(op, "Sample[with_replacement]");
-            }
-            other => panic!("expected UnsupportedOp, got {other:?}"),
-        }
+        expect_unsupported(err, UnsupportedKind::Op, "Sample[with_replacement]", &[]);
     }
 
     #[test]
@@ -8978,10 +7941,7 @@ mod tests {
         let _g = tap_guard();
         let bt = base_types_with_emp();
         let ast = CommonAst::new(CommonOp::SampleBy {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: None,
-            })),
+            input: Box::new(scan("emp")),
             col: Expression::UnresolvedColumn(crate::transpiler_v2::expression::UnresolvedColumn {
                 name: "dept_id".to_owned(),
                 qualifier: None,
@@ -9065,12 +8025,7 @@ mod tests {
     }
 
     fn address_col() -> Expression {
-        Expression::ColumnReference(ColumnReference {
-            name: "address".to_owned(),
-            qualifier: None,
-            data_type: Some(address_struct_dt()),
-            nullable: Some(true),
-        })
+        col_with_type("address", address_struct_dt())
     }
 
     fn addr_schema() -> Schema {
@@ -9216,13 +8171,6 @@ mod tests {
     // `unix_timestamp(col[, fmt])`, `from_unixtime(secs[, fmt])`. All rely
     // on the shared `spark_fmt_to_duckdb` helper.
 
-    fn str_lit(s: &str) -> Expression {
-        Expression::Literal(Literal {
-            value: LiteralValue::String(s.to_owned()),
-            data_type: DataType::String,
-        })
-    }
-
     fn long_lit(v: i64) -> Expression {
         Expression::Literal(Literal {
             value: LiteralValue::Long(v),
@@ -9247,12 +8195,10 @@ mod tests {
         // dt-009 regression: `F.to_date(F.lit("15/01/2026"), "dd/MM/yyyy")`
         // must emit `CAST(strptime(..., translated_fmt) AS DATE)` — NOT the
         // pre-Pass-66 UnsupportedFunction error.
-        let f = FunctionCall {
-            name: "to_date".to_owned(),
-            args: vec![str_lit("15/01/2026"), str_lit("dd/MM/yyyy")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render to_date");
+        let sql = render_fn(
+            "to_date",
+            vec![str_lit("15/01/2026"), str_lit("dd/MM/yyyy")],
+        );
         assert!(sql.starts_with("CAST(strptime('15/01/2026', replace("));
         assert!(sql.contains("'dd/MM/yyyy'"));
         assert!(sql.ends_with(") AS DATE)"));
@@ -9260,12 +8206,7 @@ mod tests {
 
     #[test]
     fn render_to_date_one_arg_stays_a_cast() {
-        let f = FunctionCall {
-            name: "to_date".to_owned(),
-            args: vec![str_lit("2026-01-15")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render to_date");
+        let sql = render_fn("to_date", vec![str_lit("2026-01-15")]);
         assert_eq!(sql, "CAST('2026-01-15' AS DATE)");
     }
 
@@ -9274,24 +8215,17 @@ mod tests {
         // dt-010 regression: `F.to_timestamp(F.lit("2026-01-15 10:00"),
         // "yyyy-MM-dd HH:mm")` must emit `strptime(..., translated_fmt)` —
         // NOT `to_timestamp(STRING, STRING)` which DuckDB rejects.
-        let f = FunctionCall {
-            name: "to_timestamp".to_owned(),
-            args: vec![str_lit("2026-01-15 10:00"), str_lit("yyyy-MM-dd HH:mm")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render to_timestamp");
+        let sql = render_fn(
+            "to_timestamp",
+            vec![str_lit("2026-01-15 10:00"), str_lit("yyyy-MM-dd HH:mm")],
+        );
         assert!(sql.starts_with("strptime('2026-01-15 10:00', replace("));
         assert!(sql.contains("'yyyy-MM-dd HH:mm'"));
     }
 
     #[test]
     fn render_to_timestamp_one_arg_stays_a_cast() {
-        let f = FunctionCall {
-            name: "to_timestamp".to_owned(),
-            args: vec![str_lit("2026-01-15 10:00:00")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render to_timestamp");
+        let sql = render_fn("to_timestamp", vec![str_lit("2026-01-15 10:00:00")]);
         assert_eq!(sql, "CAST('2026-01-15 10:00:00' AS TIMESTAMP)");
     }
 
@@ -9301,23 +8235,16 @@ mod tests {
         // `CAST(epoch(last_login) AS BIGINT)`. Pre-Pass-66 emission was just
         // `epoch(last_login)` which DuckDB accepts but with wrong Spark-parity
         // return type (Double vs Long) and TZ column shape mismatch.
-        let f = FunctionCall {
-            name: "unix_timestamp".to_owned(),
-            args: vec![col_ref_expr("last_login")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render unix_timestamp");
+        let sql = render_fn("unix_timestamp", vec![col_ref_expr("last_login")]);
         assert_eq!(sql, "CAST(epoch(last_login) AS BIGINT)");
     }
 
     #[test]
     fn render_unix_timestamp_two_arg_wraps_strptime() {
-        let f = FunctionCall {
-            name: "unix_timestamp".to_owned(),
-            args: vec![col_ref_expr("ts_str"), str_lit("yyyy-MM-dd HH:mm:ss")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render unix_timestamp");
+        let sql = render_fn(
+            "unix_timestamp",
+            vec![col_ref_expr("ts_str"), str_lit("yyyy-MM-dd HH:mm:ss")],
+        );
         assert!(sql.starts_with("CAST(epoch(strptime(ts_str, replace("));
         assert!(sql.ends_with(")) AS BIGINT)"));
     }
@@ -9330,9 +8257,9 @@ mod tests {
     /// such overload exists.
     #[test]
     fn render_unix_timestamp_two_arg_temporal_input_skips_strptime() {
-        let f = FunctionCall {
-            name: "unix_timestamp".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "unix_timestamp",
+            vec![
                 Expression::ColumnReference(ColumnReference {
                     name: "last_login".to_owned(),
                     qualifier: None,
@@ -9341,9 +8268,7 @@ mod tests {
                 }),
                 str_lit("yyyy-MM-dd HH:mm:ss"),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render unix_timestamp");
+        );
         assert_eq!(sql, "CAST(epoch(last_login) AS BIGINT)");
     }
 
@@ -9354,12 +8279,7 @@ mod tests {
         // '%Y-%m-%d %H:%M:%S')`. Spark returns String, not Timestamp.
         // Note: Long literal renders as `CAST(1700000000 AS BIGINT)` — the
         // outer `CAST(.. AS DOUBLE)` wraps it, which DuckDB folds fine.
-        let f = FunctionCall {
-            name: "from_unixtime".to_owned(),
-            args: vec![long_lit(1_700_000_000)],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render from_unixtime");
+        let sql = render_fn("from_unixtime", vec![long_lit(1_700_000_000)]);
         assert!(sql.starts_with("strftime(to_timestamp(CAST("));
         assert!(sql.contains("1700000000"));
         assert!(sql.ends_with(" AS DOUBLE)), '%Y-%m-%d %H:%M:%S')"));
@@ -9367,12 +8287,10 @@ mod tests {
 
     #[test]
     fn render_from_unixtime_two_arg_translates_format() {
-        let f = FunctionCall {
-            name: "from_unixtime".to_owned(),
-            args: vec![long_lit(1_700_000_000), str_lit("yyyy/MM/dd")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render from_unixtime");
+        let sql = render_fn(
+            "from_unixtime",
+            vec![long_lit(1_700_000_000), str_lit("yyyy/MM/dd")],
+        );
         assert!(sql.starts_with("strftime(to_timestamp(CAST("));
         assert!(sql.contains("1700000000"));
         assert!(sql.contains(" AS DOUBLE)), replace("));
@@ -9394,16 +8312,7 @@ mod tests {
             updates: vec![("x".to_owned(), None)],
         });
         let err = render_expr(&expr, &schema).expect_err("must error on non-struct base");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Expression,
-                name: shape,
-                ..
-            } => {
-                assert_eq!(shape, "UpdateFields");
-            }
-            other => panic!("expected UnsupportedExpression, got: {other:?}"),
-        }
+        expect_unsupported(err, UnsupportedKind::Expression, "UpdateFields", &[]);
     }
 
     // ── Pass 67: HOF fixes — exists / forall / transform-with-index ─────
@@ -9433,12 +8342,7 @@ mod tests {
                 })),
             })),
         });
-        let f = FunctionCall {
-            name: "exists".to_owned(),
-            args: vec![arr, lambda],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render exists");
+        let sql = render_fn("exists", vec![arr, lambda]);
         assert!(sql.contains("list_bool_or"), "must use list_bool_or: {sql}");
         assert!(sql.contains("list_transform"), "must wrap transform: {sql}");
         assert!(!sql.contains("list_any"), "must not use list_any: {sql}");
@@ -9461,25 +8365,19 @@ mod tests {
             params: vec!["x_7".to_owned()],
             body: Box::new(Expression::Binary(BinaryExpression {
                 op: BinaryOp::Gt,
-                left: Box::new(Expression::FunctionCall(FunctionCall {
-                    name: "length".to_owned(),
-                    args: vec![Expression::LambdaVariable(LambdaVariableExpression {
+                left: Box::new(fexpr(
+                    "length",
+                    vec![Expression::LambdaVariable(LambdaVariableExpression {
                         name: "x_7".to_owned(),
                     })],
-                    distinct: false,
-                })),
+                )),
                 right: Box::new(Expression::Literal(Literal {
                     value: LiteralValue::Long(0),
                     data_type: DataType::Long,
                 })),
             })),
         });
-        let f = FunctionCall {
-            name: "forall".to_owned(),
-            args: vec![arr, lambda],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render forall");
+        let sql = render_fn("forall", vec![arr, lambda]);
         assert!(
             sql.contains("list_bool_and"),
             "must use list_bool_and: {sql}"
@@ -9504,9 +8402,9 @@ mod tests {
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x".to_owned(), "i".to_owned()],
-            body: Box::new(Expression::FunctionCall(FunctionCall {
-                name: "concat".to_owned(),
-                args: vec![
+            body: Box::new(fexpr(
+                "concat",
+                vec![
                     Expression::Cast(CastExpression {
                         expr: Box::new(Expression::LambdaVariable(LambdaVariableExpression {
                             name: "i".to_owned(),
@@ -9522,15 +8420,9 @@ mod tests {
                         name: "x".to_owned(),
                     }),
                 ],
-                distinct: false,
-            })),
+            )),
         });
-        let f = FunctionCall {
-            name: "transform".to_owned(),
-            args: vec![arr, lambda],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render transform");
+        let sql = render_fn("transform", vec![arr, lambda]);
         assert!(
             sql.starts_with("list_transform("),
             "must remap to list_transform: {sql}"
@@ -9561,20 +8453,14 @@ mod tests {
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x".to_owned()],
-            body: Box::new(Expression::FunctionCall(FunctionCall {
-                name: "upper".to_owned(),
-                args: vec![Expression::LambdaVariable(LambdaVariableExpression {
+            body: Box::new(fexpr(
+                "upper",
+                vec![Expression::LambdaVariable(LambdaVariableExpression {
                     name: "x".to_owned(),
                 })],
-                distinct: false,
-            })),
+            )),
         });
-        let f = FunctionCall {
-            name: "transform".to_owned(),
-            args: vec![arr, lambda],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render transform");
+        let sql = render_fn("transform", vec![arr, lambda]);
         assert!(sql.starts_with("list_transform("), "plain remap: {sql}");
         assert!(!sql.contains(" - 1"), "no index adjustment: {sql}");
     }
@@ -9593,9 +8479,9 @@ mod tests {
             left: Box::new(Expression::LambdaVariable(LambdaVariableExpression {
                 name: "i".to_owned(),
             })),
-            right: Box::new(Expression::FunctionCall(FunctionCall {
-                name: "list_transform".to_owned(),
-                args: vec![
+            right: Box::new(fexpr(
+                "list_transform",
+                vec![
                     Expression::ColumnReference(ColumnReference {
                         name: "arr".to_owned(),
                         qualifier: None,
@@ -9609,8 +8495,7 @@ mod tests {
                         })),
                     }),
                 ],
-                distinct: false,
-            })),
+            )),
         });
         let out = substitute_index_var(&body, "i");
         // Outer `i` (left of Add) must be rewritten to Binary(-, i, 1).
@@ -9646,52 +8531,26 @@ mod tests {
     // arr-017.
 
     fn tags_col() -> Expression {
-        Expression::ColumnReference(ColumnReference {
-            name: "tags".to_owned(),
-            qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
-        })
+        col_with_type("tags", DataType::Array(Box::new(DataType::String), true))
     }
 
     #[test]
     fn render_explode_emits_unnest() {
-        let f = FunctionCall {
-            name: "explode".to_owned(),
-            args: vec![tags_col()],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render explode");
+        let sql = render_fn("explode", vec![tags_col()]);
         assert_eq!(sql, "UNNEST(tags)");
     }
 
     #[test]
     fn render_explode_arity_error() {
-        let f = FunctionCall {
-            name: "explode".to_owned(),
-            args: vec![tags_col(), tags_col()],
-            distinct: false,
-        };
+        let f = fcall("explode", vec![tags_col(), tags_col()]);
         let err =
             render_function_call(&f, &empty_schema()).expect_err("explode with 2 args must error");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name,
-                ..
-            } => assert_eq!(name, "explode"),
-            other => panic!("expected UnsupportedFunction, got {other:?}"),
-        }
+        expect_unsupported(err, UnsupportedKind::Function, "explode", &[]);
     }
 
     #[test]
     fn render_explode_outer_wraps_empty_and_null_arrays() {
-        let f = FunctionCall {
-            name: "explode_outer".to_owned(),
-            args: vec![tags_col()],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render explode_outer");
+        let sql = render_fn("explode_outer", vec![tags_col()]);
         // Explode_outer must emit a one-NULL-row fallback for both NULL and
         // empty arrays so the outer semantics hold.
         assert_eq!(
@@ -9702,12 +8561,7 @@ mod tests {
 
     #[test]
     fn render_posexplode_pos_emits_zero_indexed_subscripts() {
-        let f = FunctionCall {
-            name: "posexplode_pos".to_owned(),
-            args: vec![tags_col()],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render posexplode_pos");
+        let sql = render_fn("posexplode_pos", vec![tags_col()]);
         // DuckDB `generate_subscripts` is 1-indexed; subtract 1 to align
         // with Spark's 0-indexed posexplode.
         assert_eq!(sql, "(generate_subscripts(tags, 1) - 1)");
@@ -9715,12 +8569,7 @@ mod tests {
 
     #[test]
     fn render_posexplode_val_emits_unnest() {
-        let f = FunctionCall {
-            name: "posexplode_val".to_owned(),
-            args: vec![tags_col()],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render posexplode_val");
+        let sql = render_fn("posexplode_val", vec![tags_col()]);
         assert_eq!(sql, "UNNEST(tags)");
     }
 
@@ -9732,18 +8581,8 @@ mod tests {
     #[test]
     fn render_map_explode_key_and_val_emit_unnested_map_accessors() {
         let m = col_ref_expr("attrs");
-        let k = FunctionCall {
-            name: "map_explode_key".to_owned(),
-            args: vec![m.clone()],
-            distinct: false,
-        };
-        let v = FunctionCall {
-            name: "map_explode_val".to_owned(),
-            args: vec![m],
-            distinct: false,
-        };
-        let k_sql = render_function_call(&k, &empty_schema()).expect("render map_explode_key");
-        let v_sql = render_function_call(&v, &empty_schema()).expect("render map_explode_val");
+        let k_sql = render_fn("map_explode_key", vec![m.clone()]);
+        let v_sql = render_fn("map_explode_val", vec![m]);
         assert_eq!(k_sql, "UNNEST(map_keys(attrs))");
         assert_eq!(v_sql, "UNNEST(map_values(attrs))");
     }
@@ -9752,9 +8591,9 @@ mod tests {
     /// DuckDB has no `arrays_overlap` function. Corpus: `arr-011`.
     #[test]
     fn render_arrays_overlap_emits_list_has_any() {
-        let f = FunctionCall {
-            name: "arrays_overlap".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "arrays_overlap",
+            vec![
                 tags_col(),
                 Expression::ColumnReference(ColumnReference {
                     name: "tags2".to_owned(),
@@ -9763,9 +8602,7 @@ mod tests {
                     nullable: Some(true),
                 }),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render arrays_overlap");
+        );
         assert_eq!(sql, "list_has_any(tags, tags2)");
     }
 
@@ -9773,18 +8610,16 @@ mod tests {
     /// Spark's default null-skip semantics. Corpus: `arr-010`.
     #[test]
     fn render_array_join_two_arg_filters_nulls() {
-        let f = FunctionCall {
-            name: "array_join".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "array_join",
+            vec![
                 tags_col(),
                 Expression::Literal(Literal {
                     value: LiteralValue::String(",".to_owned()),
                     data_type: DataType::String,
                 }),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render array_join 2-arg");
+        );
         assert_eq!(
             sql,
             "array_to_string(list_filter(tags, x -> x IS NOT NULL), ',')"
@@ -9795,9 +8630,9 @@ mod tests {
     /// replacement string per Spark's semantics. Corpus: `arr-010`.
     #[test]
     fn render_array_join_three_arg_uses_coalesce() {
-        let f = FunctionCall {
-            name: "array_join".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "array_join",
+            vec![
                 tags_col(),
                 Expression::Literal(Literal {
                     value: LiteralValue::String(",".to_owned()),
@@ -9808,9 +8643,7 @@ mod tests {
                     data_type: DataType::String,
                 }),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render array_join 3-arg");
+        );
         assert!(
             sql.contains("list_transform(tags,"),
             "list_transform present: {sql}"
@@ -9837,9 +8670,9 @@ mod tests {
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_1".to_owned(), "y_2".to_owned()],
-            body: Box::new(Expression::FunctionCall(FunctionCall {
-                name: "concat".to_owned(),
-                args: vec![
+            body: Box::new(fexpr(
+                "concat",
+                vec![
                     Expression::LambdaVariable(LambdaVariableExpression {
                         name: "x_1".to_owned(),
                     }),
@@ -9847,15 +8680,9 @@ mod tests {
                         name: "y_2".to_owned(),
                     }),
                 ],
-                distinct: false,
-            })),
+            )),
         });
-        let f = FunctionCall {
-            name: "zip_with".to_owned(),
-            args: vec![a, b, lambda],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render zip_with");
+        let sql = render_fn("zip_with", vec![a, b, lambda]);
         assert!(
             sql.contains("list_transform(range(0, least("),
             "range shape: {sql}"
@@ -9901,12 +8728,7 @@ mod tests {
                 })),
             })),
         });
-        let f = FunctionCall {
-            name: "map_filter".to_owned(),
-            args: vec![m, lambda],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render map_filter");
+        let sql = render_fn("map_filter", vec![m, lambda]);
         assert!(
             sql.starts_with("map_from_entries(list_filter(map_entries(attrs),"),
             "pipeline shape: {sql}"
@@ -9932,20 +8754,14 @@ mod tests {
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
-            body: Box::new(Expression::FunctionCall(FunctionCall {
-                name: "upper".to_owned(),
-                args: vec![Expression::LambdaVariable(LambdaVariableExpression {
+            body: Box::new(fexpr(
+                "upper",
+                vec![Expression::LambdaVariable(LambdaVariableExpression {
                     name: "v".to_owned(),
                 })],
-                distinct: false,
-            })),
+            )),
         });
-        let f = FunctionCall {
-            name: "transform_values".to_owned(),
-            args: vec![m, lambda],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render transform_values");
+        let sql = render_fn("transform_values", vec![m, lambda]);
         assert!(
             sql.contains("struct_pack(key := (__mh_kv).key, value :="),
             "value transformed: {sql}"
@@ -9970,9 +8786,9 @@ mod tests {
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
-            body: Box::new(Expression::FunctionCall(FunctionCall {
-                name: "concat".to_owned(),
-                args: vec![
+            body: Box::new(fexpr(
+                "concat",
+                vec![
                     Expression::Literal(Literal {
                         value: LiteralValue::String("attr_".to_owned()),
                         data_type: DataType::String,
@@ -9981,15 +8797,9 @@ mod tests {
                         name: "k".to_owned(),
                     }),
                 ],
-                distinct: false,
-            })),
+            )),
         });
-        let f = FunctionCall {
-            name: "transform_keys".to_owned(),
-            args: vec![m, lambda],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render transform_keys");
+        let sql = render_fn("transform_keys", vec![m, lambda]);
         assert!(
             sql.contains("struct_pack(key := concat('attr_', (__mh_kv).key)"),
             "key transformed: {sql}"
@@ -10003,12 +8813,7 @@ mod tests {
     /// Corpus: `arr-012`.
     #[test]
     fn render_arrays_zip_duplicate_column_names_fall_back_to_positional() {
-        let f = FunctionCall {
-            name: "arrays_zip".to_owned(),
-            args: vec![tags_col(), tags_col()],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render arrays_zip");
+        let sql = render_fn("arrays_zip", vec![tags_col(), tags_col()]);
         assert!(
             sql.contains("list_transform(range(1, least("),
             "range: {sql}"
@@ -10031,12 +8836,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
         });
-        let f = FunctionCall {
-            name: "array_union".to_owned(),
-            args: vec![a, b],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render array_union");
+        let sql = render_fn("array_union", vec![a, b]);
         assert!(
             sql.contains("CASE WHEN (tags) IS NULL OR (tags2) IS NULL THEN NULL"),
             "null propagation: {sql}"
@@ -10062,12 +8862,7 @@ mod tests {
             )),
             nullable: Some(true),
         });
-        let f = FunctionCall {
-            name: "flatten".to_owned(),
-            args: vec![outer],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render flatten");
+        let sql = render_fn("flatten", vec![outer]);
         assert!(
             sql.contains("CASE WHEN (nested) IS NULL"),
             "null propagation: {sql}"
@@ -10084,18 +8879,16 @@ mod tests {
     /// preserves NULL when the input array is NULL. Corpus: `arr-007`.
     #[test]
     fn render_array_position_coalesces_to_zero_and_preserves_null_array() {
-        let f = FunctionCall {
-            name: "array_position".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "array_position",
+            vec![
                 tags_col(),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("rust".to_owned()),
                     data_type: DataType::String,
                 }),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render array_position");
+        );
         assert!(
             sql.contains("CASE WHEN tags IS NULL THEN NULL"),
             "null propagation: {sql}"
@@ -10120,9 +8913,9 @@ mod tests {
             left: Box::new(Expression::LambdaVariable(LambdaVariableExpression {
                 name: "k".to_owned(),
             })),
-            right: Box::new(Expression::FunctionCall(FunctionCall {
-                name: "list_transform".to_owned(),
-                args: vec![
+            right: Box::new(fexpr(
+                "list_transform",
+                vec![
                     Expression::ColumnReference(ColumnReference {
                         name: "arr".to_owned(),
                         qualifier: None,
@@ -10136,8 +8929,7 @@ mod tests {
                         })),
                     }),
                 ],
-                distinct: false,
-            })),
+            )),
         });
         let replacement = Expression::Literal(Literal {
             value: LiteralValue::Long(42),
@@ -10178,12 +8970,7 @@ mod tests {
     /// τ emits a three-way CASE: NULL → NULL, NaN → 0, else CAST.
     #[test]
     fn render_ceil_uses_case_for_nan_safety() {
-        let f = FunctionCall {
-            name: "ceil".to_owned(),
-            args: vec![col_ref_expr("x")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render ceil");
+        let sql = render_fn("ceil", vec![col_ref_expr("x")]);
         assert_eq!(
             sql,
             "CASE WHEN (x) IS NULL THEN NULL \
@@ -10194,12 +8981,7 @@ mod tests {
 
     #[test]
     fn render_floor_uses_case_for_nan_safety() {
-        let f = FunctionCall {
-            name: "floor".to_owned(),
-            args: vec![col_ref_expr("x")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render floor");
+        let sql = render_fn("floor", vec![col_ref_expr("x")]);
         assert_eq!(
             sql,
             "CASE WHEN (x) IS NULL THEN NULL \
@@ -10210,12 +8992,7 @@ mod tests {
 
     #[test]
     fn render_ceiling_alias_uses_case_for_nan_safety() {
-        let f = FunctionCall {
-            name: "ceiling".to_owned(),
-            args: vec![col_ref_expr("x")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render ceiling");
+        let sql = render_fn("ceiling", vec![col_ref_expr("x")]);
         assert_eq!(
             sql,
             "CASE WHEN (x) IS NULL THEN NULL \
@@ -10228,12 +9005,10 @@ mod tests {
     /// `make_dt_interval` scalar. τ emits a sum of INTERVAL fragments.
     #[test]
     fn render_make_dt_interval_four_args() {
-        let f = FunctionCall {
-            name: "make_dt_interval".to_owned(),
-            args: vec![int_lit(1), int_lit(2), int_lit(30), int_lit(0)],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render make_dt_interval");
+        let sql = render_fn(
+            "make_dt_interval",
+            vec![int_lit(1), int_lit(2), int_lit(30), int_lit(0)],
+        );
         assert_eq!(
             sql,
             "(INTERVAL (1) DAY + INTERVAL (2) HOUR + INTERVAL (30) MINUTE \
@@ -10243,12 +9018,7 @@ mod tests {
 
     #[test]
     fn render_make_dt_interval_zero_args_defaults_all_zero() {
-        let f = FunctionCall {
-            name: "make_dt_interval".to_owned(),
-            args: vec![],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render make_dt_interval");
+        let sql = render_fn("make_dt_interval", vec![]);
         assert_eq!(
             sql,
             "(INTERVAL (0) DAY + INTERVAL (0) HOUR + INTERVAL (0) MINUTE \
@@ -10258,12 +9028,7 @@ mod tests {
 
     #[test]
     fn render_make_dt_interval_one_arg_days_only() {
-        let f = FunctionCall {
-            name: "make_dt_interval".to_owned(),
-            args: vec![int_lit(7)],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render make_dt_interval");
+        let sql = render_fn("make_dt_interval", vec![int_lit(7)]);
         assert_eq!(
             sql,
             "(INTERVAL (7) DAY + INTERVAL (0) HOUR + INTERVAL (0) MINUTE \
@@ -10273,45 +9038,18 @@ mod tests {
 
     #[test]
     fn render_make_dt_interval_too_many_args_is_boundary_error() {
-        let f = FunctionCall {
-            name: "make_dt_interval".to_owned(),
-            args: vec![int_lit(1); 5],
-            distinct: false,
-        };
+        let f = fcall("make_dt_interval", vec![int_lit(1); 5]);
         let err = render_function_call(&f, &empty_schema()).expect_err("too many args");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name,
-                ..
-            } => {
-                assert_eq!(name, "make_dt_interval");
-            }
-            other => panic!("expected UnsupportedFunction, got {other:?}"),
-        }
+        expect_unsupported(err, UnsupportedKind::Function, "make_dt_interval", &[]);
     }
 
     #[test]
     fn render_make_ym_interval_two_args() {
-        let f = FunctionCall {
-            name: "make_ym_interval".to_owned(),
-            args: vec![int_lit(1), int_lit(6)],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render make_ym_interval");
+        let sql = render_fn("make_ym_interval", vec![int_lit(1), int_lit(6)]);
         assert_eq!(sql, "(INTERVAL (1) YEAR + INTERVAL (6) MONTH)");
     }
 
     // ── `F.window(ts, "N unit")` — tumbling time-window (win2-002) ──────
-
-    fn ts_col_ref(name: &str) -> Expression {
-        Expression::ColumnReference(ColumnReference {
-            name: name.to_owned(),
-            qualifier: None,
-            data_type: Some(DataType::Timestamp),
-            nullable: Some(true),
-        })
-    }
 
     /// Duration parser — accepts every {second,minute,hour,day,week} form.
     #[test]
@@ -10379,12 +9117,7 @@ mod tests {
     /// `time_bucket` with a quoted `"end"` field name (reserved keyword).
     #[test]
     fn render_window_emits_struct_pack_time_bucket_1_day() {
-        let f = FunctionCall {
-            name: "window".to_owned(),
-            args: vec![ts_col_ref("last_login"), str_lit("1 day")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render window");
+        let sql = render_fn("window", vec![ts_col_ref("last_login"), str_lit("1 day")]);
         assert_eq!(
             sql,
             "struct_pack(start := time_bucket(INTERVAL '1 day', last_login), \
@@ -10401,12 +9134,7 @@ mod tests {
             ("2 hours", 2, "hour"),
             ("3 weeks", 3, "week"),
         ] {
-            let f = FunctionCall {
-                name: "window".to_owned(),
-                args: vec![ts_col_ref("ts"), str_lit(dur)],
-                distinct: false,
-            };
-            let sql = render_function_call(&f, &empty_schema()).expect("render window");
+            let sql = render_fn("window", vec![ts_col_ref("ts"), str_lit(dur)]);
             let expected = format!(
                 "struct_pack(start := time_bucket(INTERVAL '{n} {unit}', ts), \
                  \"end\" := time_bucket(INTERVAL '{n} {unit}', ts) + INTERVAL '{n} {unit}')"
@@ -10418,51 +9146,35 @@ mod tests {
     /// 3-arg (sliding) form → boundary reject per ADR-022.
     #[test]
     fn render_window_boundary_rejects_three_arg_form() {
-        let f = FunctionCall {
-            name: "window".to_owned(),
-            args: vec![
+        let f = fcall(
+            "window",
+            vec![
                 ts_col_ref("last_login"),
                 str_lit("1 day"),
                 str_lit("30 minutes"),
             ],
-            distinct: false,
-        };
+        );
         let err = render_function_call(&f, &empty_schema()).expect_err("three-arg reject");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name,
-                reason,
-            } => {
-                assert_eq!(name, "window");
-                assert!(reason.contains("[TDCK-BOUNDARY]"), "reason: {reason}");
-                assert!(reason.contains("tumbling"), "reason: {reason}");
-            }
-            other => panic!("expected UnsupportedFunction, got {other:?}"),
-        }
+        expect_unsupported(
+            err,
+            UnsupportedKind::Function,
+            "window",
+            &["[TDCK-BOUNDARY]", "tumbling"],
+        );
     }
 
     /// Compound / month duration → boundary reject.
     #[test]
     fn render_window_boundary_rejects_compound_duration() {
         for dur in &["1 day 3 hours", "1 month"] {
-            let f = FunctionCall {
-                name: "window".to_owned(),
-                args: vec![ts_col_ref("ts"), str_lit(dur)],
-                distinct: false,
-            };
+            let f = fcall("window", vec![ts_col_ref("ts"), str_lit(dur)]);
             let err = render_function_call(&f, &empty_schema()).expect_err("compound reject");
-            match err {
-                EmissionError::Unsupported {
-                    kind: UnsupportedKind::Function,
-                    name,
-                    reason,
-                } => {
-                    assert_eq!(name, "window");
-                    assert!(reason.contains("[TDCK-BOUNDARY]"), "reason: {reason}");
-                }
-                other => panic!("expected UnsupportedFunction, got {other:?}"),
-            }
+            expect_unsupported(
+                err,
+                UnsupportedKind::Function,
+                "window",
+                &["[TDCK-BOUNDARY]"],
+            );
         }
     }
 
@@ -10471,24 +9183,17 @@ mod tests {
     /// expression, and τ can only translate literals.
     #[test]
     fn render_window_boundary_rejects_non_literal_duration() {
-        let f = FunctionCall {
-            name: "window".to_owned(),
-            args: vec![ts_col_ref("last_login"), col_ref_expr("dur_col")],
-            distinct: false,
-        };
+        let f = fcall(
+            "window",
+            vec![ts_col_ref("last_login"), col_ref_expr("dur_col")],
+        );
         let err = render_function_call(&f, &empty_schema()).expect_err("non-literal reject");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name,
-                reason,
-            } => {
-                assert_eq!(name, "window");
-                assert!(reason.contains("[TDCK-BOUNDARY]"), "reason: {reason}");
-                assert!(reason.contains("string literal"), "reason: {reason}");
-            }
-            other => panic!("expected UnsupportedFunction, got {other:?}"),
-        }
+        expect_unsupported(
+            err,
+            UnsupportedKind::Function,
+            "window",
+            &["[TDCK-BOUNDARY]", "string literal"],
+        );
     }
 
     /// Empirical smoke: the emitted SQL must actually parse and execute
@@ -10536,12 +9241,10 @@ mod tests {
     /// TIMESTAMP-vs-TIMESTAMPTZ inputs uniformly.
     #[test]
     fn render_to_utc_timestamp_uses_timezone_composition() {
-        let f = FunctionCall {
-            name: "to_utc_timestamp".to_owned(),
-            args: vec![col_ref_expr("last_login"), str_lit("CET")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render to_utc_timestamp");
+        let sql = render_fn(
+            "to_utc_timestamp",
+            vec![col_ref_expr("last_login"), str_lit("CET")],
+        );
         assert_eq!(
             sql,
             "timezone('UTC', timezone('CET', timezone('UTC', CAST(last_login AS TIMESTAMPTZ))))"
@@ -10550,12 +9253,10 @@ mod tests {
 
     #[test]
     fn render_from_utc_timestamp_uses_timezone_composition() {
-        let f = FunctionCall {
-            name: "from_utc_timestamp".to_owned(),
-            args: vec![col_ref_expr("last_login"), str_lit("CET")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render from_utc_timestamp");
+        let sql = render_fn(
+            "from_utc_timestamp",
+            vec![col_ref_expr("last_login"), str_lit("CET")],
+        );
         assert_eq!(
             sql,
             "timezone('CET', timezone('UTC', timezone('UTC', CAST(last_login AS TIMESTAMPTZ))))"
@@ -10583,12 +9284,7 @@ mod tests {
             }),
             nullable: Some(true),
         });
-        let f = FunctionCall {
-            name: "element_at".to_owned(),
-            args: vec![map_col, str_lit("team")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render element_at map");
+        let sql = render_fn("element_at", vec![map_col, str_lit("team")]);
         assert_eq!(sql, "element_at(attrs, 'team')[1]");
     }
 
@@ -10605,18 +9301,16 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
         });
-        let f = FunctionCall {
-            name: "element_at".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "element_at",
+            vec![
                 arr_col,
                 Expression::Literal(super::super::expression::Literal {
                     value: super::super::expression::LiteralValue::Int(1),
                     data_type: DataType::Integer,
                 }),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render element_at array");
+        );
         // Spark class token — the runtime classifier keys on this.
         assert!(
             sql.contains("[INVALID_ARRAY_INDEX_IN_ELEMENT_AT]"),
@@ -10666,18 +9360,16 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
         });
-        let f = FunctionCall {
-            name: "element_at".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "element_at",
+            vec![
                 arr_col,
                 Expression::Literal(super::super::expression::Literal {
                     value: super::super::expression::LiteralValue::Int(1),
                     data_type: DataType::Integer,
                 }),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render element_at array");
+        );
         assert!(
             sql.starts_with("CASE WHEN"),
             "expected CASE guard even for positive literal, got: {sql}"
@@ -10699,18 +9391,16 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
         });
-        let f = FunctionCall {
-            name: "try_element_at".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "try_element_at",
+            vec![
                 arr_col,
                 Expression::Literal(super::super::expression::Literal {
                     value: super::super::expression::LiteralValue::Int(1),
                     data_type: DataType::Integer,
                 }),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render try_element_at");
+        );
         assert_eq!(sql, "list_extract(tags, 1)");
         assert!(
             !sql.contains("error("),
@@ -10734,12 +9424,7 @@ mod tests {
             }),
             nullable: Some(true),
         });
-        let f = FunctionCall {
-            name: "element_at".to_owned(),
-            args: vec![map_col, str_lit("missing")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render element_at map");
+        let sql = render_fn("element_at", vec![map_col, str_lit("missing")]);
         assert_eq!(sql, "element_at(attrs, 'missing')[1]");
         assert!(
             !sql.contains("INVALID_ARRAY_INDEX_IN_ELEMENT_AT"),
@@ -10751,12 +9436,7 @@ mod tests {
     /// Spark-lowercase parity.
     #[test]
     fn render_typeof_wraps_in_lower_for_spark_case() {
-        let f = FunctionCall {
-            name: "typeof".to_owned(),
-            args: vec![col_ref_expr("salary")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render typeof");
+        let sql = render_fn("typeof", vec![col_ref_expr("salary")]);
         assert_eq!(sql, "lower(typeof(salary))");
     }
 
@@ -10764,12 +9444,7 @@ mod tests {
     /// NULL input propagates to a NULL result (Spark semantics).
     #[test]
     fn render_map_concat_propagates_null_across_all_args() {
-        let f = FunctionCall {
-            name: "map_concat".to_owned(),
-            args: vec![col_ref_expr("m1"), col_ref_expr("m2")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render map_concat");
+        let sql = render_fn("map_concat", vec![col_ref_expr("m1"), col_ref_expr("m2")]);
         assert!(
             sql.contains("(m1) IS NULL OR (m2) IS NULL"),
             "expected NULL guard on both args, got: {sql}"
@@ -10785,12 +9460,7 @@ mod tests {
     /// leak.
     #[test]
     fn render_array_append_guards_null_array_argument() {
-        let f = FunctionCall {
-            name: "array_append".to_owned(),
-            args: vec![col_ref_expr("tags"), str_lit("new")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render array_append");
+        let sql = render_fn("array_append", vec![col_ref_expr("tags"), str_lit("new")]);
         assert_eq!(
             sql,
             "CASE WHEN (tags) IS NULL THEN NULL ELSE array_append(tags, 'new') END"
@@ -10801,12 +9471,10 @@ mod tests {
     /// `map(list_value(keys...), list_value(values...))`.
     #[test]
     fn render_create_map_splits_pairs_into_two_lists() {
-        let f = FunctionCall {
-            name: "map".to_owned(),
-            args: vec![str_lit("a"), str_lit("1"), str_lit("b"), str_lit("2")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render create_map");
+        let sql = render_fn(
+            "map",
+            vec![str_lit("a"), str_lit("1"), str_lit("b"), str_lit("2")],
+        );
         assert_eq!(sql, "map(list_value('a', 'b'), list_value('1', '2'))");
     }
 
@@ -10816,12 +9484,7 @@ mod tests {
     /// `COALESCE(list_position(string_split(csv, ','), needle), 0)`.
     #[test]
     fn render_find_in_set_uses_list_position_over_split() {
-        let f = FunctionCall {
-            name: "find_in_set".to_owned(),
-            args: vec![str_lit("rust"), col_ref_expr("tags")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render find_in_set");
+        let sql = render_fn("find_in_set", vec![str_lit("rust"), col_ref_expr("tags")]);
         assert_eq!(
             sql,
             "COALESCE(list_position(string_split(tags, ','), 'rust'), 0)"
@@ -10833,12 +9496,10 @@ mod tests {
     /// 1-based list-literal indexing.
     #[test]
     fn render_elt_uses_1_based_list_indexing() {
-        let f = FunctionCall {
-            name: "elt".to_owned(),
-            args: vec![int_lit(2), str_lit("a"), str_lit("b"), str_lit("c")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render elt");
+        let sql = render_fn(
+            "elt",
+            vec![int_lit(2), str_lit("a"), str_lit("b"), str_lit("c")],
+        );
         assert_eq!(sql, "(['a', 'b', 'c'])[2]");
     }
 
@@ -10847,12 +9508,7 @@ mod tests {
     /// `COALESCE(..., FALSE)` to preserve the non-null semantics.
     #[test]
     fn render_isnan_wraps_in_coalesce_false() {
-        let f = FunctionCall {
-            name: "isnan".to_owned(),
-            args: vec![col_ref_expr("score")],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render isnan");
+        let sql = render_fn("isnan", vec![col_ref_expr("score")]);
         assert_eq!(sql, "COALESCE(isnan(score), FALSE)");
     }
 
@@ -10867,12 +9523,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
         });
-        let f = FunctionCall {
-            name: "concat_ws".to_owned(),
-            args: vec![str_lit(","), arr_col],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render concat_ws");
+        let sql = render_fn("concat_ws", vec![str_lit(","), arr_col]);
         assert_eq!(sql, "COALESCE(array_to_string(tags, ','), '')");
     }
 
@@ -10885,12 +9536,7 @@ mod tests {
             value: LiteralValue::Null,
             data_type: DataType::String,
         });
-        let f = FunctionCall {
-            name: "concat".to_owned(),
-            args: vec![col_ref_expr("name"), null_lit],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render concat");
+        let sql = render_fn("concat", vec![col_ref_expr("name"), null_lit]);
         assert!(
             sql.starts_with("(CASE WHEN "),
             "expected CASE null-guard, got: {sql}"
@@ -10915,12 +9561,7 @@ mod tests {
             value: LiteralValue::String("HOST".to_owned()),
             data_type: DataType::String,
         });
-        let f = FunctionCall {
-            name: "parse_url".to_owned(),
-            args: vec![url, part],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render parse_url HOST");
+        let sql = render_fn("parse_url", vec![url, part]);
         assert!(sql.contains("regexp_extract"), "got: {sql}");
         assert!(sql.contains("NULLIF"), "got: {sql}");
         assert!(
@@ -10943,12 +9584,7 @@ mod tests {
             value: LiteralValue::String("q.k".to_owned()),
             data_type: DataType::String,
         });
-        let f = FunctionCall {
-            name: "parse_url".to_owned(),
-            args: vec![url, part, key],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render parse_url QUERY key");
+        let sql = render_fn("parse_url", vec![url, part, key]);
         assert!(sql.contains("regexp_extract"), "got: {sql}");
         // The `.` in the key must be regex-escaped.
         assert!(sql.contains(r"q\.k="), "expected escaped key, got: {sql}");
@@ -11028,11 +9664,7 @@ mod tests {
             value: LiteralValue::Double(0.5),
             data_type: DataType::Double,
         });
-        let f = FunctionCall {
-            name: "percentile_approx".to_owned(),
-            args: vec![col_ref_expr("salary"), q_lit],
-            distinct: false,
-        };
+        let f = fcall("percentile_approx", vec![col_ref_expr("salary"), q_lit]);
         let sql = render_aggregate(&f, &empty_schema()).expect("render percentile_approx");
         assert!(
             sql.contains("quantile_disc"),
@@ -11053,11 +9685,7 @@ mod tests {
             value: LiteralValue::Double(0.5),
             data_type: DataType::Double,
         });
-        let f = FunctionCall {
-            name: "percentile".to_owned(),
-            args: vec![col_ref_expr("salary"), q_lit],
-            distinct: false,
-        };
+        let f = fcall("percentile", vec![col_ref_expr("salary"), q_lit]);
         let sql = render_aggregate(&f, &empty_schema()).expect("render percentile");
         assert!(
             sql.contains("quantile_cont"),
@@ -11077,11 +9705,7 @@ mod tests {
     /// macro (`LIST(x) FILTER (WHERE x IS NOT NULL)`). Corpus: agg-018.
     #[test]
     fn render_collect_list_passes_through() {
-        let f = FunctionCall {
-            name: "collect_list".to_owned(),
-            args: vec![col_ref_expr("name")],
-            distinct: false,
-        };
+        let f = fcall("collect_list", vec![col_ref_expr("name")]);
         let sql = render_aggregate(&f, &empty_schema()).expect("render collect_list");
         assert!(
             sql.contains("collect_list("),
@@ -11094,11 +9718,7 @@ mod tests {
     /// token itself. Corpus: agg-018.
     #[test]
     fn render_collect_set_passes_through() {
-        let f = FunctionCall {
-            name: "collect_set".to_owned(),
-            args: vec![col_ref_expr("name")],
-            distinct: false,
-        };
+        let f = fcall("collect_set", vec![col_ref_expr("name")]);
         let sql = render_aggregate(&f, &empty_schema()).expect("render collect_set");
         assert!(
             sql.contains("collect_set("),
@@ -11115,15 +9735,13 @@ mod tests {
     /// bytes match Spark. Corpus witness: `parse-002`.
     #[test]
     fn render_url_encode_form_urlencoded_substitutes_space() {
-        let f = FunctionCall {
-            name: "url_encode".to_owned(),
-            args: vec![Expression::Literal(Literal {
+        let sql = render_fn(
+            "url_encode",
+            vec![Expression::Literal(Literal {
                 value: LiteralValue::String("a b&c".to_owned()),
                 data_type: DataType::String,
             })],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render url_encode");
+        );
         assert!(sql.contains("url_encode"), "got: {sql}");
         assert!(
             sql.contains("replace(") && sql.contains("'%20'") && sql.contains("'+'"),
@@ -11135,15 +9753,13 @@ mod tests {
     /// Spark's form-urlencoded decoding.
     #[test]
     fn render_url_decode_pre_substitutes_plus() {
-        let f = FunctionCall {
-            name: "url_decode".to_owned(),
-            args: vec![Expression::Literal(Literal {
+        let sql = render_fn(
+            "url_decode",
+            vec![Expression::Literal(Literal {
                 value: LiteralValue::String("a+b%26c".to_owned()),
                 data_type: DataType::String,
             })],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render url_decode");
+        );
         assert!(sql.contains("url_decode(replace("), "got: {sql}");
         assert!(sql.contains("'+'") && sql.contains("'%20'"), "got: {sql}");
     }
@@ -11153,18 +9769,16 @@ mod tests {
     /// Corpus witness: `parse-004`.
     #[test]
     fn render_try_to_number_emits_try_cast_decimal() {
-        let f = FunctionCall {
-            name: "try_to_number".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "try_to_number",
+            vec![
                 col_ref_expr("num_str"),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("999.99".to_owned()),
                     data_type: DataType::String,
                 }),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render try_to_number");
+        );
         assert!(sql.contains("try_cast("), "got: {sql}");
         assert!(sql.contains("DECIMAL(5, 2)"), "got: {sql}");
     }
@@ -11207,9 +9821,9 @@ mod tests {
     /// Corpus witness: `json-007`.
     #[test]
     fn render_from_csv_emits_split_part_struct_pack_with_null_guard() {
-        let f = FunctionCall {
-            name: "from_csv".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "from_csv",
+            vec![
                 Expression::ColumnReference(ColumnReference {
                     name: "csv_str".to_owned(),
                     qualifier: None,
@@ -11221,9 +9835,7 @@ mod tests {
                     data_type: DataType::String,
                 }),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render from_csv");
+        );
         // NULL guard on the entire input.
         assert!(
             sql.starts_with("CASE WHEN (csv_str) IS NULL THEN NULL ELSE struct_pack("),
@@ -11270,9 +9882,9 @@ mod tests {
     /// `UnsupportedFunction` upfront.
     #[test]
     fn render_from_csv_three_arg_is_boundary_error() {
-        let f = FunctionCall {
-            name: "from_csv".to_owned(),
-            args: vec![
+        let f = fcall(
+            "from_csv",
+            vec![
                 Expression::ColumnReference(ColumnReference {
                     name: "csv_str".to_owned(),
                     qualifier: None,
@@ -11288,20 +9900,9 @@ mod tests {
                     data_type: DataType::String,
                 }),
             ],
-            distinct: false,
-        };
+        );
         let err = render_function_call(&f, &empty_schema()).expect_err("expected boundary error");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name,
-                reason,
-            } => {
-                assert_eq!(name, "from_csv");
-                assert!(reason.contains("options-map"), "got: {reason}");
-            }
-            other => panic!("expected UnsupportedFunction, got {other:?}"),
-        }
+        expect_unsupported(err, UnsupportedKind::Function, "from_csv", &["options-map"]);
     }
 
     /// Pass 87 review M2 — Spark's `from_json(json_str, schema_ddl, options_map)`
@@ -11310,9 +9911,9 @@ mod tests {
     /// literal `from_json(...)` with an unrecognized options arg.
     #[test]
     fn render_from_json_three_arg_is_boundary_error() {
-        let f = FunctionCall {
-            name: "from_json".to_owned(),
-            args: vec![
+        let f = fcall(
+            "from_json",
+            vec![
                 Expression::ColumnReference(ColumnReference {
                     name: "json_str".to_owned(),
                     qualifier: None,
@@ -11328,29 +9929,23 @@ mod tests {
                     data_type: DataType::String,
                 }),
             ],
-            distinct: false,
-        };
+        );
         let err = render_function_call(&f, &empty_schema()).expect_err("expected boundary error");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name,
-                reason,
-            } => {
-                assert_eq!(name, "from_json");
-                assert!(reason.contains("options-map"), "got: {reason}");
-            }
-            other => panic!("expected UnsupportedFunction, got {other:?}"),
-        }
+        expect_unsupported(
+            err,
+            UnsupportedKind::Function,
+            "from_json",
+            &["options-map"],
+        );
     }
 
     /// Pass 87 — a non-literal schema argument is a Thunderduck-boundary
     /// error, mirroring `from_json`'s behavior.
     #[test]
     fn render_from_csv_non_literal_schema_is_boundary_error() {
-        let f = FunctionCall {
-            name: "from_csv".to_owned(),
-            args: vec![
+        let f = fcall(
+            "from_csv",
+            vec![
                 Expression::ColumnReference(ColumnReference {
                     name: "csv_str".to_owned(),
                     qualifier: None,
@@ -11364,17 +9959,9 @@ mod tests {
                     nullable: Some(true),
                 }),
             ],
-            distinct: false,
-        };
+        );
         let err = render_function_call(&f, &empty_schema()).expect_err("expected boundary error");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name,
-                ..
-            } => assert_eq!(name, "from_csv"),
-            other => panic!("expected UnsupportedFunction, got {other:?}"),
-        }
+        expect_unsupported(err, UnsupportedKind::Function, "from_csv", &[]);
     }
 
     /// Pass 77 — `unionByName(allowMissingColumns=True)` emits padded
@@ -11460,35 +10047,26 @@ mod tests {
         ])
     }
 
-    fn inline_field_call_render(field: &str, outer: bool) -> FunctionCall {
-        FunctionCall {
-            name: if outer {
-                "inline_outer_field".to_owned()
-            } else {
-                "inline_field".to_owned()
-            },
-            args: vec![
-                Expression::ColumnReference(ColumnReference {
-                    name: "arr".to_owned(),
-                    qualifier: None,
-                    data_type: None,
-                    nullable: None,
-                }),
-                Expression::Literal(Literal {
-                    value: LiteralValue::String(field.to_owned()),
-                    data_type: DataType::String,
-                }),
-            ],
-            distinct: false,
-        }
+    fn inline_field_args(field: &str) -> Vec<Expression> {
+        vec![
+            Expression::ColumnReference(ColumnReference {
+                name: "arr".to_owned(),
+                qualifier: None,
+                data_type: None,
+                nullable: None,
+            }),
+            str_lit(field),
+        ]
     }
 
     /// Plain `inline_field(arr, "name")` renders as `UNNEST(arr).name`.
     #[test]
     fn render_inline_field_emits_unnest_dot_field() {
-        let schema = arr_of_struct_schema();
-        let f = inline_field_call_render("name", false);
-        let sql = render_function_call(&f, &schema).expect("render inline_field");
+        let sql = render_fn_on(
+            &arr_of_struct_schema(),
+            "inline_field",
+            inline_field_args("name"),
+        );
         assert_eq!(sql, "UNNEST(arr).name");
     }
 
@@ -11497,9 +10075,11 @@ mod tests {
     /// Snapshot pins the exact sentinel shape.
     #[test]
     fn render_inline_outer_field_emits_case_guard_with_typed_null() {
-        let schema = arr_of_struct_schema();
-        let f = inline_field_call_render("dept_id", true);
-        let sql = render_function_call(&f, &schema).expect("render inline_outer_field");
+        let sql = render_fn_on(
+            &arr_of_struct_schema(),
+            "inline_outer_field",
+            inline_field_args("dept_id"),
+        );
         assert_eq!(
             sql,
             "UNNEST(CASE WHEN arr IS NULL OR len(arr) = 0 \
@@ -11516,28 +10096,22 @@ mod tests {
     #[test]
     fn render_inline_field_rejects_wrong_arity() {
         let schema = arr_of_struct_schema();
-        let f = FunctionCall {
-            name: "inline_field".to_owned(),
-            args: vec![Expression::ColumnReference(ColumnReference {
+        let f = fcall(
+            "inline_field",
+            vec![Expression::ColumnReference(ColumnReference {
                 name: "arr".to_owned(),
                 qualifier: None,
                 data_type: None,
                 nullable: None,
             })],
-            distinct: false,
-        };
+        );
         let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name,
-                reason,
-            } => {
-                assert_eq!(name, "inline_field");
-                assert!(reason.contains("2 arguments"), "reason: {reason}");
-            }
-            other => panic!("expected UnsupportedFunction, got {other:?}"),
-        }
+        expect_unsupported(
+            err,
+            UnsupportedKind::Function,
+            "inline_field",
+            &["2 arguments"],
+        );
     }
 
     // ── Pass 91 — json_tuple_field emission ─────────────────────────────
@@ -11549,33 +10123,24 @@ mod tests {
         ])
     }
 
-    fn json_tuple_field_call_render(key: &str) -> FunctionCall {
-        FunctionCall {
-            name: "json_tuple_field".to_owned(),
-            args: vec![
+    /// `json_tuple_field(json_str, "a")` renders as
+    /// `json_extract_string(json_str, '$.a')` — same substrate as the
+    /// `get_json_object` session macro (session.rs:344).
+    #[test]
+    fn render_json_tuple_field_emits_json_extract_string() {
+        let sql = render_fn_on(
+            &json_str_schema(),
+            "json_tuple_field",
+            vec![
                 Expression::ColumnReference(ColumnReference {
                     name: "json_str".to_owned(),
                     qualifier: None,
                     data_type: None,
                     nullable: None,
                 }),
-                Expression::Literal(Literal {
-                    value: LiteralValue::String(key.to_owned()),
-                    data_type: DataType::String,
-                }),
+                str_lit("a"),
             ],
-            distinct: false,
-        }
-    }
-
-    /// `json_tuple_field(json_str, "a")` renders as
-    /// `json_extract_string(json_str, '$.a')` — same substrate as the
-    /// `get_json_object` session macro (session.rs:344).
-    #[test]
-    fn render_json_tuple_field_emits_json_extract_string() {
-        let schema = json_str_schema();
-        let f = json_tuple_field_call_render("a");
-        let sql = render_function_call(&f, &schema).expect("render json_tuple_field");
+        );
         assert_eq!(sql, "json_extract_string(json_str, '$.a')");
     }
 
@@ -11584,28 +10149,22 @@ mod tests {
     #[test]
     fn render_json_tuple_field_rejects_wrong_arity() {
         let schema = json_str_schema();
-        let f = FunctionCall {
-            name: "json_tuple_field".to_owned(),
-            args: vec![Expression::ColumnReference(ColumnReference {
+        let f = fcall(
+            "json_tuple_field",
+            vec![Expression::ColumnReference(ColumnReference {
                 name: "json_str".to_owned(),
                 qualifier: None,
                 data_type: None,
                 nullable: None,
             })],
-            distinct: false,
-        };
+        );
         let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::Function,
-                name,
-                reason,
-            } => {
-                assert_eq!(name, "json_tuple_field");
-                assert!(reason.contains("2 arguments"), "reason: {reason}");
-            }
-            other => panic!("expected UnsupportedFunction, got {other:?}"),
-        }
+        expect_unsupported(
+            err,
+            UnsupportedKind::Function,
+            "json_tuple_field",
+            &["2 arguments"],
+        );
     }
 
     /// Pass 76 — `parse_number_format` recognizes digit templates.
@@ -11629,18 +10188,16 @@ mod tests {
     /// token and the format literal `9,999.99`. Corpus witness: `parse-003`.
     #[test]
     fn render_to_number_emits_ansi_throw_on_mismatch() {
-        let f = FunctionCall {
-            name: "to_number".to_owned(),
-            args: vec![
+        let sql = render_fn(
+            "to_number",
+            vec![
                 col_ref_expr("num_str"),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("9,999.99".to_owned()),
                     data_type: DataType::String,
                 }),
             ],
-            distinct: false,
-        };
-        let sql = render_function_call(&f, &empty_schema()).expect("render to_number");
+        );
         // The DECIMAL(6, 2) precision/scale derives from the format
         // `'9,999.99'` (comma is grouping, no digit slot; four `9`s pre-dot
         // → precision 6, scale 2).
@@ -11677,10 +10234,7 @@ mod tests {
             StructField::nullable("d", DataType::Double),
             StructField::nullable("b", DataType::Boolean),
         ]);
-        let plan = CommonAst::new(CommonOp::TableScan {
-            table: "t".to_owned(),
-            alias: None,
-        });
+        let plan = scan("t");
         let bt = BaseTypes::build_from_plan(&plan, |n| {
             if n == "t" {
                 Some(mixed_schema.clone())

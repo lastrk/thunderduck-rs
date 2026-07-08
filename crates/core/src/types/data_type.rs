@@ -66,22 +66,12 @@ impl DataType {
         )
     }
 
-    /// Returns true if this is a floating-point type (Float or Double).
-    pub fn is_floating_point(&self) -> bool {
-        matches!(self, DataType::Float | DataType::Double)
-    }
-
     /// Returns true if this is any interval type (generic, year-month, or day-time).
     pub fn is_interval(&self) -> bool {
         matches!(
             self,
             DataType::Interval | DataType::YearMonthInterval | DataType::DayTimeInterval
         )
-    }
-
-    /// Returns true if this is Decimal.
-    pub fn is_decimal(&self) -> bool {
-        matches!(self, DataType::Decimal { .. })
     }
 
     /// Returns true if this type or any nested type is `Unresolved`.

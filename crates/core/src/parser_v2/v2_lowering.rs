@@ -19,6 +19,7 @@
 //! by this module has `plan_id = None`.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, CastKind, CeilFloorKind, DataType as SqlDataType, DateTimeField,
@@ -38,15 +39,15 @@ use crate::transpiler_v2::ast::{
 };
 use crate::transpiler_v2::error::UnsupportedKind;
 use crate::transpiler_v2::expression::{
-    AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
-    CastExpression, ExistsSubquery, Expression, ExtractValueExpression, FrameBoundary, FrameUnit,
-    FunctionCall, InListExpression, InSubquery, IntervalExpression, IsDistinctFromExpression,
-    LambdaExpression, LambdaVariableExpression, LikeExpression, Literal, LiteralValue,
-    NullOrdering, ScalarSubquery, SortDirection, SortOrder, StarExpression, SubqueryPlan,
-    UnaryExpression, UnaryOp, UnresolvedColumn, WindowFrame, WindowFunction,
+    decimal_value_precision_scale, AliasExpression, BetweenExpression, BinaryExpression, BinaryOp,
+    CaseWhenExpression, CastExpression, ExistsSubquery, Expression, ExtractValueExpression,
+    FrameBoundary, FrameUnit, FunctionCall, InListExpression, InSubquery, IntervalExpression,
+    IsDistinctFromExpression, LambdaExpression, LambdaVariableExpression, LikeExpression, Literal,
+    LiteralValue, NullOrdering, ScalarSubquery, SortDirection, SortOrder, StarExpression,
+    SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn, WindowFrame, WindowFunction,
 };
 use crate::transpiler_v2::macros::ProtoFieldExt;
-use crate::transpiler_v2::type_inference::AGGREGATE_NAMES;
+use crate::transpiler_v2::type_inference::is_aggregate_classifier_name;
 use crate::transpiler_v2::EmissionError;
 use crate::types::DataType;
 
@@ -163,16 +164,12 @@ fn order_by_all_exprs(
     };
     let mut out: Vec<OrderByExpr> = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
-        let expr = match item {
-            SelectItem::UnnamedExpr(e) => e.clone(),
-            SelectItem::ExprWithAlias { expr, .. } => expr.clone(),
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
-                bail_boundary_proto!(
-                    "sql::order_by_all_wildcard",
-                    "ORDER BY ALL over `*` projection not supported"
-                );
-            }
-        };
+        let expr = select_item_expr(item)
+            .require_proto(
+                "sql::order_by_all_wildcard",
+                "ORDER BY ALL over `*` projection not supported",
+            )?
+            .clone();
         out.push(OrderByExpr {
             expr,
             options: options.clone(),
@@ -375,84 +372,39 @@ fn lower_aggregate_select(
                     flat.push(lower_expr(e, cte_scope)?);
                 }
                 (flat, kind, Vec::new())
-            } else if exprs.len() == 1 && matches!(exprs[0], Expr::GroupingSets(_)) {
-                // `GROUP BY GROUPING SETS ((a, b), (a), ())` parses to a single
-                // `Expr::GroupingSets(Vec<Vec<Expr>>)` (one inner vec per set;
-                // `()` → empty inner vec). Lower to a flat distinct grouping
-                // list plus per-set index membership consumed at emission.
-                let sets = match exprs.into_iter().next() {
-                    Some(Expr::GroupingSets(sets)) => sets,
-                    // The `len() == 1 && matches!` guard above guarantees the
-                    // first (only) element is `GroupingSets`.
-                    _ => unreachable!("single GROUPING SETS guaranteed by guard"),
-                };
-                let (flat, index_sets) = lower_grouping_sets(sets, cte_scope)?;
-                (flat, GroupingKind::GroupingSets, index_sets)
-            } else if exprs.len() == 1 && matches!(exprs[0], Expr::Rollup(_) | Expr::Cube(_)) {
-                // Prefix-form `ROLLUP (...)` / `CUBE (...)` parses to a single
-                // `Expr::Rollup`/`Expr::Cube` holding `Vec<Vec<Expr>>` grouping
-                // terms (`ROLLUP (a, b)` → `[[a], [b]]`). Flatten the terms into
-                // τ's flat grouping list and thread the kind — mirroring the
-                // DataFrame path in `v2_relation_converter::convert_aggregate`,
-                // where the grouping list is flat and the direction lives in the
-                // `GroupingKind`. Spark's ROLLUP/CUBE always wraps the whole
-                // grouping list, so a single wrapper element is the expected shape.
-                let (sets, kind) = match exprs.into_iter().next() {
-                    Some(Expr::Rollup(sets)) => (sets, GroupingKind::Rollup),
-                    Some(Expr::Cube(sets)) => (sets, GroupingKind::Cube),
-                    // The `len() == 1 && matches!` guard above guarantees the
-                    // first (only) element is `Rollup` or `Cube`.
-                    _ => unreachable!("single ROLLUP/CUBE guaranteed by guard"),
-                };
-                // sqlparser preserves parenthesized grouping terms: `ROLLUP
-                // ((a, b), c)` → `[[a, b], [c]]`, which Spark treats as a
-                // distinct set of levels that a flat `ROLLUP(a, b, c)` does NOT
-                // reproduce. τ's grouping list is flat (one column per level),
-                // so a multi-column term can't be represented — reject rather
-                // than silently flatten to the wrong grouping sets (ADR-022,
-                // loud-fail). Simple `ROLLUP (a, b)` = `[[a],[b]]` is unaffected.
-                if sets.iter().any(|term| term.len() != 1) {
-                    bail_boundary_proto!(
-                        "sql::grouping_sets",
-                        "nested ROLLUP/CUBE grouping terms not supported in τ"
-                    );
-                }
-                let mut flat: Vec<Expression> = Vec::new();
-                for term in sets {
-                    for e in term {
-                        flat.push(lower_expr(e, cte_scope)?);
-                    }
-                }
-                (flat, kind, Vec::new())
             } else {
-                // Plain GROUP BY, or an unsupported shape: a ROLLUP/CUBE mixed
-                // with other terms / repeated (Spark wraps the whole list in
-                // one wrapper — anything else is a Thunderduck-boundary reject).
-                let mut plain: Vec<Expression> = Vec::with_capacity(exprs.len());
-                for e in exprs {
-                    match e {
-                        Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => {
-                            bail_boundary_proto!(
-                                "sql::grouping_sets",
-                                "mixed ROLLUP/CUBE/GROUPING SETS terms not supported in τ"
-                            );
-                        }
-                        // Spark `spark.sql.groupByOrdinal=true` (ANSI default):
-                        // a bare integer literal `N` is an ordinal referencing
-                        // the Nth (1-based) SELECT item, NOT a constant grouping
-                        // key. Resolve it to that item's underlying expression so
-                        // `GROUP BY 1` groups by `dept_id`, not the literal `1`.
-                        // Composite forms (`1 + 1`, `1.5`, `'x'`) are not bare
-                        // integer literals and fall through to `lower_expr`.
-                        Expr::Value(ref vw) if int_from_number_value(&vw.value).is_some() => {
-                            let n = int_from_number_value(&vw.value)
-                                .expect("guarded by matches arm above");
-                            plain.push(resolve_group_by_ordinal(n, &projection, cte_scope)?);
-                        }
-                        other => plain.push(lower_expr(other, cte_scope)?),
+                // Single-element grouping lists carry the prefix wrappers:
+                // `GROUP BY GROUPING SETS ((a, b), (a), ())` parses to one
+                // `Expr::GroupingSets(Vec<Vec<Expr>>)` (one inner vec per set;
+                // `()` → empty inner vec), and prefix `ROLLUP (...)` /
+                // `CUBE (...)` to one `Expr::Rollup`/`Expr::Cube` (Spark's
+                // ROLLUP/CUBE always wraps the whole grouping list, so a
+                // single wrapper element is the expected shape). Anything else
+                // — including a ROLLUP/CUBE mixed with other terms / repeated
+                // — flows to the plain GROUP BY path, which rejects the mixed
+                // shapes (Thunderduck-boundary, ADR-022).
+                match <[Expr; 1]>::try_from(exprs) {
+                    Ok([Expr::GroupingSets(sets)]) => {
+                        let (flat, index_sets) = lower_grouping_sets(sets, cte_scope)?;
+                        (flat, GroupingKind::GroupingSets, index_sets)
                     }
+                    Ok([Expr::Rollup(sets)]) => {
+                        lower_prefix_rollup_cube(sets, GroupingKind::Rollup, cte_scope)?
+                    }
+                    Ok([Expr::Cube(sets)]) => {
+                        lower_prefix_rollup_cube(sets, GroupingKind::Cube, cte_scope)?
+                    }
+                    Ok([other]) => (
+                        lower_plain_group_by(vec![other], &projection, cte_scope)?,
+                        GroupingKind::GroupBy,
+                        Vec::new(),
+                    ),
+                    Err(exprs) => (
+                        lower_plain_group_by(exprs, &projection, cte_scope)?,
+                        GroupingKind::GroupBy,
+                        Vec::new(),
+                    ),
                 }
-                (plain, GroupingKind::GroupBy, Vec::new())
             }
         }
         GroupByExpr::All(modifiers) => {
@@ -467,16 +419,10 @@ fn lower_aggregate_select(
             // as usual). Compute the grouping from the projection here.
             let mut grouping: Vec<Expression> = Vec::new();
             for item in &projection {
-                let expr = match item {
-                    SelectItem::UnnamedExpr(e) => e,
-                    SelectItem::ExprWithAlias { expr, .. } => expr,
-                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
-                        bail_boundary_proto!(
-                            "sql::group_by_all_wildcard",
-                            "GROUP BY ALL over `*` projection not supported"
-                        );
-                    }
-                };
+                let expr = select_item_expr(item).require_proto(
+                    "sql::group_by_all_wildcard",
+                    "GROUP BY ALL over `*` projection not supported",
+                )?;
                 if !expr_has_aggregate(expr) {
                     grouping.push(lower_expr(expr.clone(), cte_scope)?);
                 }
@@ -509,6 +455,74 @@ fn lower_aggregate_select(
         grouping_sets,
         having,
     }))
+}
+
+/// Flat grouping list + grouping direction + per-set index membership — the
+/// tuple `lower_aggregate_select` derives from its GROUP BY clause.
+type GroupingSpec = (Vec<Expression>, GroupingKind, Vec<Vec<usize>>);
+
+/// Lower a prefix-form `ROLLUP (...)` / `CUBE (...)` grouping wrapper into τ's
+/// flat grouping list, threading the direction as the [`GroupingKind`] —
+/// mirroring the DataFrame path in `v2_relation_converter::convert_aggregate`.
+///
+/// sqlparser preserves parenthesized grouping terms: `ROLLUP ((a, b), c)` →
+/// `[[a, b], [c]]`, which Spark treats as a distinct set of levels that a flat
+/// `ROLLUP(a, b, c)` does NOT reproduce. τ's grouping list is flat (one column
+/// per level), so a multi-column term can't be represented — reject rather
+/// than silently flatten to the wrong grouping sets (ADR-022, loud-fail).
+/// Simple `ROLLUP (a, b)` = `[[a],[b]]` is unaffected.
+fn lower_prefix_rollup_cube(
+    sets: Vec<Vec<Expr>>,
+    kind: GroupingKind,
+    cte_scope: &CteScope,
+) -> Result<GroupingSpec, EmissionError> {
+    if sets.iter().any(|term| term.len() != 1) {
+        bail_boundary_proto!(
+            "sql::grouping_sets",
+            "nested ROLLUP/CUBE grouping terms not supported in τ"
+        );
+    }
+    let mut flat: Vec<Expression> = Vec::new();
+    for term in sets {
+        for e in term {
+            flat.push(lower_expr(e, cte_scope)?);
+        }
+    }
+    Ok((flat, kind, Vec::new()))
+}
+
+/// Lower a plain `GROUP BY` expression list.
+///
+/// Spark `spark.sql.groupByOrdinal=true` (ANSI default): a bare integer
+/// literal `N` is an ordinal referencing the Nth (1-based) SELECT item, NOT a
+/// constant grouping key — it resolves to that item's underlying expression so
+/// `GROUP BY 1` groups by `dept_id`, not the literal `1`. Composite forms
+/// (`1 + 1`, `1.5`, `'x'`) are not bare integer literals and fall through to
+/// `lower_expr`. A ROLLUP/CUBE/GROUPING SETS mixed with other terms / repeated
+/// is not a Spark shape (Spark wraps the whole list in one wrapper) — a
+/// Thunderduck-boundary reject.
+fn lower_plain_group_by(
+    exprs: Vec<Expr>,
+    projection: &[SelectItem],
+    cte_scope: &CteScope,
+) -> Result<Vec<Expression>, EmissionError> {
+    let mut plain: Vec<Expression> = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        match e {
+            Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_) => {
+                bail_boundary_proto!(
+                    "sql::grouping_sets",
+                    "mixed ROLLUP/CUBE/GROUPING SETS terms not supported in τ"
+                );
+            }
+            Expr::Value(ref vw) if int_from_number_value(&vw.value).is_some() => {
+                let n = int_from_number_value(&vw.value).expect("guarded by matches arm above");
+                plain.push(resolve_group_by_ordinal(n, projection, cte_scope)?);
+            }
+            other => plain.push(lower_expr(other, cte_scope)?),
+        }
+    }
+    Ok(plain)
 }
 
 /// Lower a `GROUP BY GROUPING SETS (...)` clause to a flat distinct grouping
@@ -645,15 +659,12 @@ fn lower_table_factor(
                         "table-function SETTINGS clause (ClickHouse) not supported in τ"
                     );
                 }
-                let node = CommonAst::new(CommonOp::TableFunction {
-                    name: object_name_to_string(&name),
-                    args: tfa
-                        .args
-                        .into_iter()
-                        .map(|a| function_arg_to_expr(a, cte_scope))
-                        .collect::<Result<_, _>>()?,
-                    with_ordinality,
-                });
+                let args: Vec<Expression> = tfa
+                    .args
+                    .into_iter()
+                    .map(|a| function_arg_to_expr(a, cte_scope))
+                    .collect::<Result<_, _>>()?;
+                let node = table_function_node(object_name_to_string(&name), args, with_ordinality);
                 // A user alias (`range(5) AS t(id2)`) composes on top via
                 // `ToDf` (positional column rename) then `AliasedRelation`
                 // (scope qualifier) — shared with `TableFactor::Derived`.
@@ -714,11 +725,7 @@ fn lower_table_factor(
                 .into_iter()
                 .map(|a| function_arg_to_expr(a, cte_scope))
                 .collect::<Result<_, _>>()?;
-            Ok(CommonAst::new(CommonOp::TableFunction {
-                name: func_name,
-                args: arg_exprs,
-                with_ordinality: false,
-            }))
+            Ok(table_function_node(func_name, arg_exprs, false))
         }
         // SQL `PIVOT` (BigQuery/Snowflake/Databricks). Unlike the DataFrame
         // path, SQL supplies no grouping list — the analyzer derives it from
@@ -895,31 +902,71 @@ fn expr_to_ident_string(expr: &Expr) -> Option<String> {
     }
 }
 
-fn lower_table_function(f: Function, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
-    let name = object_name_to_string(&f.name);
-    let args = lower_function_args(f.args, cte_scope)?;
-    Ok(CommonAst::new(CommonOp::TableFunction {
+/// Build a [`CommonOp::TableFunction`] node. Shared by the three
+/// table-valued-function construction sites (`TableFactor::Table` with args,
+/// `TableFactor::TableFunction`, `TableFactor::Function`) so all parse shapes
+/// produce the identical node.
+fn table_function_node(name: String, args: Vec<Expression>, with_ordinality: bool) -> CommonAst {
+    CommonAst::new(CommonOp::TableFunction {
         name,
         args,
-        with_ordinality: false,
-    }))
+        with_ordinality,
+    })
 }
 
+fn lower_table_function(f: Function, cte_scope: &CteScope) -> Result<CommonAst, EmissionError> {
+    let name = object_name_to_string(&f.name);
+    // DISTINCT cannot arrive in these TVF parse shapes (`FROM TABLE(f(...))`
+    // takes no duplicate-treatment clause), so the flag is ignored here.
+    let (_distinct, args) = lower_function_args(f.args, cte_scope)?;
+    Ok(table_function_node(name, args, false))
+}
+
+/// Triage sqlparser [`FunctionArguments`] into `(distinct, args)`: the
+/// `DISTINCT` duplicate-treatment flag plus the lowered argument expressions.
+/// Subquery-shaped argument lists are a Thunderduck-boundary reject. Shared
+/// by the scalar path ([`lower_function`], which consumes `distinct`) and the
+/// table-function path ([`lower_table_function`], which ignores it).
 fn lower_function_args(
     args: FunctionArguments,
     cte_scope: &CteScope,
-) -> Result<Vec<Expression>, EmissionError> {
+) -> Result<(bool, Vec<Expression>), EmissionError> {
     match args {
-        FunctionArguments::None => Ok(vec![]),
+        FunctionArguments::None => Ok((false, vec![])),
         FunctionArguments::Subquery(_) => bail_boundary_proto!(
             "sql::function_args_subquery",
             "subquery function arguments not supported in τ"
         ),
-        FunctionArguments::List(list) => list
-            .args
-            .into_iter()
-            .map(|a| function_arg_to_expr(a, cte_scope))
-            .collect::<Result<_, _>>(),
+        FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment,
+            args,
+            ..
+        }) => {
+            let distinct = matches!(duplicate_treatment, Some(DuplicateTreatment::Distinct));
+            let converted = args
+                .into_iter()
+                .map(|a| function_arg_to_expr(a, cte_scope))
+                .collect::<Result<_, _>>()?;
+            Ok((distinct, converted))
+        }
+    }
+}
+
+/// Unwrap the [`Expr`] carried by a positional (`Unnamed`) or named
+/// [`FunctionArg`]. Wildcard and other shapes hand the argument back
+/// unchanged so each caller can build its own shape-specific boundary error
+/// (or handle wildcards, as [`function_arg_to_expr`] does).
+// `Err` here is the give-the-argument-back channel, not an error type —
+// boxing it would buy nothing but an allocation on the reject path.
+#[allow(clippy::result_large_err)]
+fn unnamed_or_named_expr(arg: FunctionArg) -> Result<Expr, FunctionArg> {
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+        | FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(e),
+            ..
+        } => Ok(e),
+        other => Err(other),
     }
 }
 
@@ -927,21 +974,17 @@ fn function_arg_to_expr(
     arg: FunctionArg,
     cte_scope: &CteScope,
 ) -> Result<Expression, EmissionError> {
-    match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => lower_expr(e, cte_scope),
-        FunctionArg::Named {
-            arg: FunctionArgExpr::Expr(e),
-            ..
-        } => lower_expr(e, cte_scope),
-        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+    match unnamed_or_named_expr(arg) {
+        Ok(e) => lower_expr(e, cte_scope),
+        Err(FunctionArg::Unnamed(FunctionArgExpr::Wildcard)) => {
             Ok(Expression::Star(StarExpression { qualifier: None }))
         }
-        FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(name)) => {
+        Err(FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(name))) => {
             Ok(Expression::Star(StarExpression {
                 qualifier: Some(object_name_to_string(&name)),
             }))
         }
-        other => bail_boundary_proto!(
+        Err(other) => bail_boundary_proto!(
             format!("sql::function_arg::{other:?}"),
             "function argument shape not supported in τ"
         ),
@@ -1084,23 +1127,24 @@ fn resolve_group_by_ordinal(
             format!("GROUP BY position {n} is an aggregate function; not allowed in GROUP BY")
         );
     }
+    let expr = select_item_expr(item).require_proto(
+        "sql::group_by_position",
+        &format!("GROUP BY position {n} references a wildcard select item"),
+    )?;
+    lower_expr(expr.clone(), cte_scope)
+}
+
+/// The projection expression carried by a [`SelectItem`], if any: both the
+/// unnamed and aliased forms carry one; wildcard items (`*`, `t.*`) do not.
+fn select_item_expr(item: &SelectItem) -> Option<&Expr> {
     match item {
-        SelectItem::UnnamedExpr(e) => lower_expr(e.clone(), cte_scope),
-        SelectItem::ExprWithAlias { expr, .. } => lower_expr(expr.clone(), cte_scope),
-        _ => bail_boundary_proto!(
-            "sql::group_by_position",
-            format!("GROUP BY position {n} references a wildcard select item")
-        ),
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => None,
     }
 }
 
 fn select_item_has_aggregate(item: &SelectItem) -> bool {
-    match item {
-        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-            expr_has_aggregate(e)
-        }
-        _ => false,
-    }
+    select_item_expr(item).is_some_and(expr_has_aggregate)
 }
 
 fn expr_has_aggregate(expr: &Expr) -> bool {
@@ -1175,10 +1219,11 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
 
 fn is_aggregate_function_name(name: &str) -> bool {
     // Fix pass (review M3 + perf OPT-5): defer to τ's canonical
-    // aggregate roster (`transpiler_v2::type_inference::AGGREGATE_NAMES`)
-    // instead of a locally-drifted 32-name subset. `eq_ignore_ascii_case`
-    // avoids the per-call `String` allocation from `to_ascii_uppercase()`.
-    AGGREGATE_NAMES.iter().any(|a| name.eq_ignore_ascii_case(a))
+    // aggregate roster (the classifier column of the `AGG_SPECS` table in
+    // `transpiler_v2::type_inference`) instead of a locally-drifted 32-name
+    // subset. The lookup is case-insensitive without a per-call `String`
+    // allocation.
+    is_aggregate_classifier_name(name)
 }
 
 /// Build a non-null boolean literal expression — used to lower `IS [NOT] TRUE`
@@ -1187,6 +1232,33 @@ fn bool_literal(b: bool) -> Expression {
     Expression::Literal(Literal {
         value: LiteralValue::Boolean(b),
         data_type: DataType::Boolean,
+    })
+}
+
+/// Build a non-null string literal expression.
+fn str_lit(s: String) -> Expression {
+    Expression::Literal(Literal {
+        value: LiteralValue::String(s),
+        data_type: DataType::String,
+    })
+}
+
+/// Build a non-DISTINCT [`Expression::FunctionCall`] — the common shape every
+/// special-syntax lowering (EXTRACT, SUBSTRING, TRIM, POSITION, …) produces.
+fn fn_call(name: impl Into<String>, args: Vec<Expression>) -> Expression {
+    Expression::FunctionCall(FunctionCall {
+        name: name.into(),
+        args,
+        distinct: false,
+    })
+}
+
+/// Build an `IS [NOT] DISTINCT FROM` node on τ's `IsDistinctFrom` substrate.
+fn is_distinct(left: Expression, right: Expression, negated: bool) -> Expression {
+    Expression::IsDistinctFrom(IsDistinctFromExpression {
+        left: Box::new(left),
+        right: Box::new(right),
+        negated,
     })
 }
 
@@ -1245,11 +1317,11 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             // (which yields a `BinaryOp` enum and can't produce this shape).
             // Corpus witness: `whr-015`.
             if matches!(op, BinaryOperator::Spaceship) {
-                return Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
-                    left: Box::new(lower_expr(*left, cte_scope)?),
-                    right: Box::new(lower_expr(*right, cte_scope)?),
-                    negated: true,
-                }));
+                return Ok(is_distinct(
+                    lower_expr(*left, cte_scope)?,
+                    lower_expr(*right, cte_scope)?,
+                    true,
+                ));
             }
             Ok(Expression::Binary(BinaryExpression {
                 op: lower_binary_op(op)?,
@@ -1370,42 +1442,42 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
         // non-null boolean. Lower onto τ's `IsDistinctFrom` substrate; the
         // `IS NOT` form sets `negated: true`. Corpus witnesses: `pr-001`,
         // `pr-002`.
-        Expr::IsDistinctFrom(a, b) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
-            left: Box::new(lower_expr(*a, cte_scope)?),
-            right: Box::new(lower_expr(*b, cte_scope)?),
-            negated: false,
-        })),
-        Expr::IsNotDistinctFrom(a, b) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
-            left: Box::new(lower_expr(*a, cte_scope)?),
-            right: Box::new(lower_expr(*b, cte_scope)?),
-            negated: true,
-        })),
+        Expr::IsDistinctFrom(a, b) => Ok(is_distinct(
+            lower_expr(*a, cte_scope)?,
+            lower_expr(*b, cte_scope)?,
+            false,
+        )),
+        Expr::IsNotDistinctFrom(a, b) => Ok(is_distinct(
+            lower_expr(*a, cte_scope)?,
+            lower_expr(*b, cte_scope)?,
+            true,
+        )),
         // `x IS [NOT] TRUE` / `x IS [NOT] FALSE` — 3VL boolean tests yielding a
         // non-null boolean. Lower onto τ's `IsDistinctFrom` substrate:
         //   `x IS TRUE`      ⟺ `x IS NOT DISTINCT FROM TRUE`  (negated: true)
         //   `x IS NOT TRUE`  ⟺ `x IS DISTINCT FROM TRUE`      (negated: false)
         // and likewise for FALSE. NULL IS TRUE = false, NULL IS NOT TRUE = true.
         // Corpus witness: `pr-006`.
-        Expr::IsTrue(e) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
-            left: Box::new(lower_expr(*e, cte_scope)?),
-            right: Box::new(bool_literal(true)),
-            negated: true,
-        })),
-        Expr::IsNotTrue(e) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
-            left: Box::new(lower_expr(*e, cte_scope)?),
-            right: Box::new(bool_literal(true)),
-            negated: false,
-        })),
-        Expr::IsFalse(e) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
-            left: Box::new(lower_expr(*e, cte_scope)?),
-            right: Box::new(bool_literal(false)),
-            negated: true,
-        })),
-        Expr::IsNotFalse(e) => Ok(Expression::IsDistinctFrom(IsDistinctFromExpression {
-            left: Box::new(lower_expr(*e, cte_scope)?),
-            right: Box::new(bool_literal(false)),
-            negated: false,
-        })),
+        Expr::IsTrue(e) => Ok(is_distinct(
+            lower_expr(*e, cte_scope)?,
+            bool_literal(true),
+            true,
+        )),
+        Expr::IsNotTrue(e) => Ok(is_distinct(
+            lower_expr(*e, cte_scope)?,
+            bool_literal(true),
+            false,
+        )),
+        Expr::IsFalse(e) => Ok(is_distinct(
+            lower_expr(*e, cte_scope)?,
+            bool_literal(false),
+            true,
+        )),
+        Expr::IsNotFalse(e) => Ok(is_distinct(
+            lower_expr(*e, cte_scope)?,
+            bool_literal(false),
+            false,
+        )),
         // `x LIKE ANY (p1, …, pn)` ≡ `(x LIKE p1) OR … OR (x LIKE pn)` (Spark
         // 4.1.1). sqlparser flags this with `any: true` and parses the pattern
         // list as an `Expr::Tuple`. Desugar at lowering into an OR-chain of the
@@ -1515,22 +1587,14 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             negated,
             ..
         } => {
-            let call = Expression::FunctionCall(FunctionCall {
-                name: "rlike".to_owned(),
-                args: vec![
+            let call = fn_call(
+                "rlike",
+                vec![
                     lower_expr(*expr, cte_scope)?,
                     lower_expr(*pattern, cte_scope)?,
                 ],
-                distinct: false,
-            });
-            if negated {
-                Ok(Expression::Unary(UnaryExpression {
-                    op: UnaryOp::Not,
-                    operand: Box::new(call),
-                }))
-            } else {
-                Ok(call)
-            }
+            );
+            Ok(wrap_not(call, negated))
         }
         // `x SIMILAR TO 'p'` — SQL-standard regex is WHOLE-STRING (anchored) and
         // Spark has no `SIMILAR TO` operator at all. Borrowing `rlike`
@@ -1557,35 +1621,23 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             // Corpus witness: `dt-016` (`extract(YEAR FROM hire_date)`).
             let field_str = format!("{field}").to_lowercase();
             let inner = lower_expr(*expr, cte_scope)?;
-            let (fn_name, use_date_part) = match field_str.as_str() {
-                "year" => ("year", false),
-                "month" => ("month", false),
-                "day" | "dayofmonth" => ("day", false),
-                "hour" => ("hour", false),
-                "minute" => ("minute", false),
-                "second" => ("second", false),
-                "quarter" => ("quarter", false),
-                "week" | "weekofyear" => ("weekofyear", false),
-                "dayofweek" => ("dayofweek", false),
-                "dayofyear" => ("dayofyear", false),
-                _ => ("date_part", true),
+            let direct_fn = match field_str.as_str() {
+                "year" => Some("year"),
+                "month" => Some("month"),
+                "day" | "dayofmonth" => Some("day"),
+                "hour" => Some("hour"),
+                "minute" => Some("minute"),
+                "second" => Some("second"),
+                "quarter" => Some("quarter"),
+                "week" | "weekofyear" => Some("weekofyear"),
+                "dayofweek" => Some("dayofweek"),
+                "dayofyear" => Some("dayofyear"),
+                _ => None,
             };
-            let args = if use_date_part {
-                vec![
-                    Expression::Literal(Literal {
-                        value: LiteralValue::String(field_str),
-                        data_type: DataType::String,
-                    }),
-                    inner,
-                ]
-            } else {
-                vec![inner]
-            };
-            Ok(Expression::FunctionCall(FunctionCall {
-                name: fn_name.to_owned(),
-                args,
-                distinct: false,
-            }))
+            Ok(match direct_fn {
+                Some(name) => fn_call(name, vec![inner]),
+                None => fn_call("date_part", vec![str_lit(field_str), inner]),
+            })
         }
         // Spark's `SUBSTRING(<expr> FROM <from> [FOR <for>])` special syntax and
         // the `SUBSTR(<expr>, <from>, <for>)` shorthand both parse to
@@ -1605,11 +1657,7 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             if let Some(for_) = substring_for {
                 args.push(lower_expr(*for_, cte_scope)?);
             }
-            Ok(Expression::FunctionCall(FunctionCall {
-                name: "substring".to_owned(),
-                args,
-                distinct: false,
-            }))
+            Ok(fn_call("substring", args))
         }
         // Spark's `TRIM([BOTH | LEADING | TRAILING] [<what> FROM] <expr>)`
         // special syntax. Map the trim side to the DuckDB function name
@@ -1632,20 +1680,15 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             if let Some(what) = trim_what {
                 args.push(lower_expr(*what, cte_scope)?);
             }
-            Ok(Expression::FunctionCall(FunctionCall {
-                name: name.to_owned(),
-                args,
-                distinct: false,
-            }))
+            Ok(fn_call(name, args))
         }
         // Spark's `POSITION(<substr> IN <str>)` special syntax. Lower to
         // `locate(substr, str)` (NOT `position` — DuckDB has no `position`
         // scalar; `locate` emits 1-based `strpos`). Corpus witness: `fn-006`.
-        Expr::Position { expr, r#in } => Ok(Expression::FunctionCall(FunctionCall {
-            name: "locate".to_owned(),
-            args: vec![lower_expr(*expr, cte_scope)?, lower_expr(*r#in, cte_scope)?],
-            distinct: false,
-        })),
+        Expr::Position { expr, r#in } => Ok(fn_call(
+            "locate",
+            vec![lower_expr(*expr, cte_scope)?, lower_expr(*r#in, cte_scope)?],
+        )),
         // Spark's `OVERLAY(<expr> PLACING <what> FROM <from> [FOR <for>])`
         // special syntax. Lower to `overlay(expr, what, from[, for])` — the
         // existing `overlay` emission arm rewrites it via substring/concat.
@@ -1664,11 +1707,7 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             if let Some(for_) = overlay_for {
                 args.push(lower_expr(*for_, cte_scope)?);
             }
-            Ok(Expression::FunctionCall(FunctionCall {
-                name: "overlay".to_owned(),
-                args,
-                distinct: false,
-            }))
+            Ok(fn_call("overlay", args))
         }
         Expr::Lambda(lambda) => {
             let params: Vec<String> = lambda.params.iter().map(|p| p.value.clone()).collect();
@@ -1801,11 +1840,7 @@ fn lower_ceil_floor(
             "ceil/floor TO <datetime-field> not supported in τ"
         ),
     };
-    Ok(Expression::FunctionCall(FunctionCall {
-        name: name.to_owned(),
-        args,
-        distinct: false,
-    }))
+    Ok(fn_call(name, args))
 }
 
 /// Parse a sqlparser numeric [`Value`] into an `i32` scale (accepts negatives).
@@ -1833,48 +1868,6 @@ fn rewrite_lambda_params_to_vars(body: Expression, params: &[String]) -> Express
         {
             Expression::LambdaVariable(LambdaVariableExpression { name: u.name })
         }
-        Expression::Binary(b) => Expression::Binary(BinaryExpression {
-            op: b.op,
-            left: Box::new(rewrite_lambda_params_to_vars(*b.left, params)),
-            right: Box::new(rewrite_lambda_params_to_vars(*b.right, params)),
-        }),
-        Expression::Unary(u) => Expression::Unary(UnaryExpression {
-            op: u.op,
-            operand: Box::new(rewrite_lambda_params_to_vars(*u.operand, params)),
-        }),
-        Expression::FunctionCall(fc) => Expression::FunctionCall(FunctionCall {
-            name: fc.name,
-            args: fc
-                .args
-                .into_iter()
-                .map(|a| rewrite_lambda_params_to_vars(a, params))
-                .collect(),
-            distinct: fc.distinct,
-        }),
-        Expression::Cast(c) => Expression::Cast(CastExpression {
-            expr: Box::new(rewrite_lambda_params_to_vars(*c.expr, params)),
-            to_type: c.to_type,
-            try_cast: c.try_cast,
-        }),
-        Expression::CaseWhen(cw) => Expression::CaseWhen(CaseWhenExpression {
-            branches: cw
-                .branches
-                .into_iter()
-                .map(|(w, t)| {
-                    (
-                        rewrite_lambda_params_to_vars(w, params),
-                        rewrite_lambda_params_to_vars(t, params),
-                    )
-                })
-                .collect(),
-            else_expr: cw
-                .else_expr
-                .map(|e| Box::new(rewrite_lambda_params_to_vars(*e, params))),
-        }),
-        Expression::Alias(a) => Expression::Alias(AliasExpression {
-            expr: Box::new(rewrite_lambda_params_to_vars(*a.expr, params)),
-            alias: a.alias,
-        }),
         Expression::Lambda(inner) => {
             // Inner lambda's params shadow ours: drop them from the active set
             // before descending into the inner body.
@@ -1889,58 +1882,23 @@ fn rewrite_lambda_params_to_vars(body: Expression, params: &[String]) -> Express
                 body: Box::new(new_body),
             })
         }
-        Expression::Between(b) => {
-            Expression::Between(crate::transpiler_v2::expression::BetweenExpression {
-                expr: Box::new(rewrite_lambda_params_to_vars(*b.expr, params)),
-                low: Box::new(rewrite_lambda_params_to_vars(*b.low, params)),
-                high: Box::new(rewrite_lambda_params_to_vars(*b.high, params)),
-                negated: b.negated,
-            })
+        // The historical hand-rolled walker left `InSubquery` and `Window`
+        // untouched (subqueries/windows inside a Spark lambda body would
+        // themselves be `UnsupportedProtoShape` from upstream lower_expr —
+        // never reaching this rewrite). `map_children` DOES descend into
+        // them, so pass them through explicitly to keep the rewrite
+        // byte-identical.
+        e @ (Expression::InSubquery(_) | Expression::Window(_)) => e,
+        // Every other variant recurses structurally via `map_children`
+        // (leaves come back unchanged).
+        other => {
+            let rewritten: Result<Expression, Infallible> =
+                other.map_children(|c| Ok(rewrite_lambda_params_to_vars(c, params)));
+            match rewritten {
+                Ok(e) => e,
+                Err(never) => match never {},
+            }
         }
-        Expression::InList(i) => Expression::InList(InListExpression {
-            expr: Box::new(rewrite_lambda_params_to_vars(*i.expr, params)),
-            list: i
-                .list
-                .into_iter()
-                .map(|e| rewrite_lambda_params_to_vars(e, params))
-                .collect(),
-            negated: i.negated,
-        }),
-        Expression::Like(l) => Expression::Like(LikeExpression {
-            value: Box::new(rewrite_lambda_params_to_vars(*l.value, params)),
-            pattern: Box::new(rewrite_lambda_params_to_vars(*l.pattern, params)),
-            escape: l.escape,
-            case_insensitive: l.case_insensitive,
-            negated: l.negated,
-        }),
-        Expression::IsDistinctFrom(d) => {
-            Expression::IsDistinctFrom(crate::transpiler_v2::expression::IsDistinctFromExpression {
-                left: Box::new(rewrite_lambda_params_to_vars(*d.left, params)),
-                right: Box::new(rewrite_lambda_params_to_vars(*d.right, params)),
-                negated: d.negated,
-            })
-        }
-        Expression::ExtractValue(ev) => {
-            Expression::ExtractValue(crate::transpiler_v2::expression::ExtractValueExpression {
-                child: Box::new(rewrite_lambda_params_to_vars(*ev.child, params)),
-                extraction: Box::new(rewrite_lambda_params_to_vars(*ev.extraction, params)),
-            })
-        }
-        Expression::ArrayLiteral(a) => {
-            Expression::ArrayLiteral(crate::transpiler_v2::expression::ArrayLiteralExpression {
-                element_type: a.element_type,
-                elements: a
-                    .elements
-                    .into_iter()
-                    .map(|e| rewrite_lambda_params_to_vars(e, params))
-                    .collect(),
-            })
-        }
-        // Leaf variants + shapes that don't carry column refs in typical
-        // lambda bodies: return unchanged. Subqueries/windows/etc. inside a
-        // Spark lambda body would themselves be `UnsupportedProtoShape` from
-        // upstream lower_expr — never reaching this rewrite.
-        other => other,
     }
 }
 
@@ -2015,54 +1973,55 @@ fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, Emiss
     }
     let over = f.over;
     let filter = f.filter;
-    let (distinct, mut args) = match f.args {
-        FunctionArguments::None => (false, vec![]),
-        FunctionArguments::List(FunctionArgumentList {
-            duplicate_treatment,
-            args,
-            ..
-        }) => {
-            let distinct = matches!(duplicate_treatment, Some(DuplicateTreatment::Distinct));
-            let converted: Result<Vec<Expression>, EmissionError> = args
-                .into_iter()
-                .map(|a| function_arg_to_expr(a, cte_scope))
-                .collect();
-            (distinct, converted?)
-        }
-        FunctionArguments::Subquery(_) => {
-            bail_boundary_proto!(
-                "sql::function_args_subquery",
-                "subquery function arguments not supported in τ"
-            );
-        }
-    };
-    // Desugar an aggregate `FILTER (WHERE <pred>)` clause into a CASE inside
-    // each aggregate argument. `agg(a) FILTER (WHERE p)` aggregates only rows
-    // where `p` is TRUE, which is exactly `agg(CASE WHEN p THEN a END)` for
-    // every NULL-skipping aggregate (count/sum/avg/min/max/…): non-matching
-    // rows become NULL and are skipped. `count(*)`/`count()` has no argument
-    // to wrap, so synthesize a single `CASE WHEN p THEN 1 END` (the matching
-    // rows contribute a non-NULL `1`). `distinct` is preserved so
-    // `count(DISTINCT x) FILTER (WHERE p)` → `count(DISTINCT CASE WHEN p THEN x END)`.
-    // Corpus witness: `agg-017`. Precedent: `count_if` desugars the same way.
+    let (distinct, mut args) = lower_function_args(f.args, cte_scope)?;
     if let Some(pred) = filter {
-        // Spark only accepts `FILTER (WHERE …)` on aggregate functions; a
-        // scalar like `abs(x) FILTER (WHERE p)` is rejected. Guard the desugar
-        // so it never silently converts a non-aggregate into valid SQL.
-        if !is_aggregate_function_name(&name) {
-            bail_boundary_proto!(
-                "sql::filter_on_non_aggregate",
-                format!("FILTER (WHERE …) is only supported on aggregate functions, not `{name}`")
-            );
-        }
-        let p = lower_expr(*pred, cte_scope)?;
-        let wrap = |arg: Expression, cond: Expression| {
-            Expression::CaseWhen(CaseWhenExpression {
-                branches: vec![(cond, arg)],
-                else_expr: None,
-            })
-        };
-        args = if args.is_empty() || matches!(args.as_slice(), [Expression::Star(_)]) {
+        args = desugar_aggregate_filter(&name, args, *pred, cte_scope)?;
+    }
+    let call = Expression::FunctionCall(FunctionCall {
+        name,
+        args,
+        distinct,
+    });
+    match over {
+        None => Ok(call),
+        Some(window) => wrap_window(call, window, cte_scope),
+    }
+}
+
+/// Desugar an aggregate `FILTER (WHERE <pred>)` clause into a CASE inside
+/// each aggregate argument. `agg(a) FILTER (WHERE p)` aggregates only rows
+/// where `p` is TRUE, which is exactly `agg(CASE WHEN p THEN a END)` for
+/// every NULL-skipping aggregate (count/sum/avg/min/max/…): non-matching
+/// rows become NULL and are skipped. `count(*)`/`count()` has no argument
+/// to wrap, so synthesize a single `CASE WHEN p THEN 1 END` (the matching
+/// rows contribute a non-NULL `1`). `distinct` is preserved by the caller so
+/// `count(DISTINCT x) FILTER (WHERE p)` →
+/// `count(DISTINCT CASE WHEN p THEN x END)`.
+/// Corpus witness: `agg-017`. Precedent: `count_if` desugars the same way.
+fn desugar_aggregate_filter(
+    name: &str,
+    args: Vec<Expression>,
+    pred: Expr,
+    cte_scope: &CteScope,
+) -> Result<Vec<Expression>, EmissionError> {
+    // Spark only accepts `FILTER (WHERE …)` on aggregate functions; a
+    // scalar like `abs(x) FILTER (WHERE p)` is rejected. Guard the desugar
+    // so it never silently converts a non-aggregate into valid SQL.
+    if !is_aggregate_function_name(name) {
+        bail_boundary_proto!(
+            "sql::filter_on_non_aggregate",
+            format!("FILTER (WHERE …) is only supported on aggregate functions, not `{name}`")
+        );
+    }
+    let p = lower_expr(pred, cte_scope)?;
+    let wrap = |arg: Expression, cond: Expression| {
+        Expression::CaseWhen(CaseWhenExpression {
+            branches: vec![(cond, arg)],
+            else_expr: None,
+        })
+    };
+    Ok(
+        if args.is_empty() || matches!(args.as_slice(), [Expression::Star(_)]) {
             vec![wrap(
                 Expression::Literal(Literal {
                     value: LiteralValue::Int(1),
@@ -2072,16 +2031,23 @@ fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, Emiss
             )]
         } else {
             args.into_iter().map(|a| wrap(a, p.clone())).collect()
-        };
-    }
-    let call = Expression::FunctionCall(FunctionCall {
-        name,
-        args,
-        distinct,
-    });
-    match over {
-        None => Ok(call),
-        Some(WindowType::WindowSpec(spec)) => {
+        },
+    )
+}
+
+/// Wrap a lowered function call in its `OVER (...)` window.
+///
+/// Safety net: named-window references are normally rewritten into a
+/// `WindowSpec` by `resolve_named_windows_in_select` before lowering.
+/// Reaching the `NamedWindow` arm means the reference was never defined
+/// (e.g. no WINDOW clause at all) — a Thunderduck-boundary error (ADR-022).
+fn wrap_window(
+    call: Expression,
+    window: WindowType,
+    cte_scope: &CteScope,
+) -> Result<Expression, EmissionError> {
+    match window {
+        WindowType::WindowSpec(spec) => {
             let partition_by: Vec<Expression> = spec
                 .partition_by
                 .into_iter()
@@ -2100,11 +2066,7 @@ fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, Emiss
                 frame,
             }))
         }
-        // Safety net: named-window references are normally rewritten into a
-        // `WindowSpec` by `resolve_named_windows_in_select` before lowering.
-        // Reaching here means the reference was never defined (e.g. no WINDOW
-        // clause at all) — a Thunderduck-boundary error (ADR-022).
-        Some(WindowType::NamedWindow(ident)) => bail_boundary_proto!(
+        WindowType::NamedWindow(ident) => bail_boundary_proto!(
             "sql::named_window::unresolved",
             format!("window `{}` is not defined in a WINDOW clause", ident.value)
         ),
@@ -2140,11 +2102,7 @@ fn lower_timestamp_unit_fn(
     for a in arg_iter {
         lowered.push(function_arg_to_expr(a, cte_scope)?);
     }
-    Ok(Expression::FunctionCall(FunctionCall {
-        name: fn_name,
-        args: lowered,
-        distinct: false,
-    }))
+    Ok(fn_call(fn_name, lowered))
 }
 
 /// Lower the leading UNIT argument of `timestampadd` / `timestampdiff` into a
@@ -2155,22 +2113,15 @@ fn lower_timestamp_unit_arg(
     arg: FunctionArg,
     cte_scope: &CteScope,
 ) -> Result<Expression, EmissionError> {
-    let expr = match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
-        FunctionArg::Named {
-            arg: FunctionArgExpr::Expr(e),
-            ..
-        } => e,
-        other => bail_boundary_proto!(
+    let expr = match unnamed_or_named_expr(arg) {
+        Ok(e) => e,
+        Err(other) => bail_boundary_proto!(
             format!("sql::{fn_name}::unit::{other:?}"),
             "datetime unit must be a bare field name or string literal",
         ),
     };
     match expr {
-        Expr::Identifier(ident) => Ok(Expression::Literal(Literal {
-            value: LiteralValue::String(ident.value),
-            data_type: DataType::String,
-        })),
+        Expr::Identifier(ident) => Ok(str_lit(ident.value)),
         // A quoted string unit (`timestampadd('MONTH', …)`) lowers via the
         // normal value path; accept it only if it yields a string literal.
         other => {
@@ -2347,49 +2298,53 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
         reason: format!("interval {unit} value overflows"),
     };
 
-    let ie = match field {
-        DateTimeField::Year | DateTimeField::Years => IntervalExpression {
-            months: n.checked_mul(12).ok_or_else(|| overflow("year"))?,
-            days: 0,
-            microseconds: 0,
-        },
-        DateTimeField::Month | DateTimeField::Months => IntervalExpression {
-            months: n,
-            days: 0,
-            microseconds: 0,
-        },
-        DateTimeField::Day | DateTimeField::Days => IntervalExpression {
-            months: 0,
-            days: n,
-            microseconds: 0,
-        },
-        DateTimeField::Hour | DateTimeField::Hours => IntervalExpression {
-            months: 0,
-            days: 0,
-            microseconds: i64::from(n)
-                .checked_mul(MICROS_PER_HOUR)
-                .ok_or_else(|| overflow("hour"))?,
-        },
-        DateTimeField::Minute | DateTimeField::Minutes => IntervalExpression {
-            months: 0,
-            days: 0,
-            microseconds: i64::from(n)
-                .checked_mul(MICROS_PER_MINUTE)
-                .ok_or_else(|| overflow("minute"))?,
-        },
-        DateTimeField::Second | DateTimeField::Seconds => IntervalExpression {
-            months: 0,
-            days: 0,
-            microseconds: i64::from(n)
-                .checked_mul(MICROS_PER_SECOND)
-                .ok_or_else(|| overflow("second"))?,
-        },
+    // Map the field to its Spark unit name (used in the overflow error name)
+    // plus the IntervalExpression slot it fills: `Months(factor)` multiplies
+    // `n` into months (×12 for YEAR), `Days` carries `n` verbatim, and
+    // `Micros(per_unit)` scales `n` into microseconds.
+    enum Slot {
+        Months(i32),
+        Days,
+        Micros(i64),
+    }
+    let (unit, slot) = match field {
+        DateTimeField::Year | DateTimeField::Years => ("year", Slot::Months(12)),
+        DateTimeField::Month | DateTimeField::Months => ("month", Slot::Months(1)),
+        DateTimeField::Day | DateTimeField::Days => ("day", Slot::Days),
+        DateTimeField::Hour | DateTimeField::Hours => ("hour", Slot::Micros(MICROS_PER_HOUR)),
+        DateTimeField::Minute | DateTimeField::Minutes => {
+            ("minute", Slot::Micros(MICROS_PER_MINUTE))
+        }
+        DateTimeField::Second | DateTimeField::Seconds => {
+            ("second", Slot::Micros(MICROS_PER_SECOND))
+        }
         other => {
             bail_boundary_proto!(
                 "sql::expr::interval::unsupported_field",
                 format!("interval field `{other}` is not representable")
             );
         }
+    };
+    let ie = match slot {
+        // The ×1 MONTH multiply can't overflow, but keep the checked path
+        // for uniformity with YEAR.
+        Slot::Months(factor) => IntervalExpression {
+            months: n.checked_mul(factor).ok_or_else(|| overflow(unit))?,
+            days: 0,
+            microseconds: 0,
+        },
+        Slot::Days => IntervalExpression {
+            months: 0,
+            days: n,
+            microseconds: 0,
+        },
+        Slot::Micros(per_unit) => IntervalExpression {
+            months: 0,
+            days: 0,
+            microseconds: i64::from(n)
+                .checked_mul(per_unit)
+                .ok_or_else(|| overflow(unit))?,
+        },
     };
     Ok(Expression::Interval(ie))
 }
@@ -2544,33 +2499,17 @@ fn parse_timestamp_to_epoch_micros(s: &str) -> Option<i64> {
     Some(days * 86_400_000_000 + (hh * 3600 + mm * 60 + ss) * 1_000_000 + frac_micros)
 }
 
-/// Derive `(precision, scale)` for a bare SQL decimal literal, mirroring the
-/// value-derived branch of the connect-server `normalize_decimal_literal`
-/// (Apache Spark `Decimal.set()`): `scale` = fractional digits; `precision` =
-/// significant integer digits + scale, floored at `max(scale, 1)`. Sign and
-/// leading integer zeros are not significant. `100.25`→(5,2); `3.142`→(4,3);
-/// `0.00`→(2,2).
+/// Derive `(precision, scale)` for a bare SQL decimal literal: the shared
+/// value-derived computation
+/// (`transpiler_v2::expression::decimal_value_precision_scale`, Apache Spark
+/// `Decimal.set()`) plus this front-end's clamp. `100.25`→(5,2);
+/// `3.142`→(4,3); `0.00`→(2,2).
 fn decimal_literal_precision_scale(s: &str) -> (u8, u8) {
-    let trimmed = s.trim_start_matches(['+', '-']);
-    let (int_part, frac_part) = match trimmed.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (trimmed, ""),
-    };
-    let raw_int_digits = int_part
-        .trim_start_matches('0')
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .count() as u8;
-    let scale = frac_part.chars().filter(|c| c.is_ascii_digit()).count() as u8;
-    // Clamp precision to DECIMAL's MAX_PRECISION = 38 (M2), matching the mirrored
-    // `normalize_decimal_literal` in v2_relation_converter.rs. A literal with more
+    let (raw_precision, scale) = decimal_value_precision_scale(s);
+    // Clamp precision to DECIMAL's MAX_PRECISION = 38 (M2). A literal with more
     // than 38 significant digits must not yield `Decimal(precision > 38)`, which is
     // invalid in both Spark and DuckDB.
-    let mut precision = raw_int_digits
-        .saturating_add(scale)
-        .max(scale)
-        .max(1)
-        .min(38);
+    let mut precision = raw_precision.min(38);
     if scale > precision {
         precision = scale.min(38);
     }
@@ -2619,12 +2558,7 @@ fn lower_value(vw: ValueWithSpan) -> Result<Expression, EmissionError> {
                 })
             }
         }
-        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::String(s),
-                data_type: DataType::String,
-            }))
-        }
+        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Ok(str_lit(s)),
         Value::Boolean(b) => Ok(Expression::Literal(Literal {
             value: LiteralValue::Boolean(b),
             data_type: DataType::Boolean,
@@ -2901,11 +2835,7 @@ fn build_row_in_chain(
         // NULL-safe per-component equality: `col IS NOT DISTINCT FROM value`.
         let mut eqs = Vec::with_capacity(arity);
         for (col, v) in lowered_cols.iter().zip(vs) {
-            eqs.push(Expression::IsDistinctFrom(IsDistinctFromExpression {
-                left: Box::new(col.clone()),
-                right: Box::new(lower_expr(v, cte_scope)?),
-                negated: true,
-            }));
+            eqs.push(is_distinct(col.clone(), lower_expr(v, cte_scope)?, true));
         }
         let Some(and_chain) = reduce_binary(eqs, BinaryOp::And) else {
             // arity ≥ 1 guaranteed above, so this is unreachable; guard anyway.
@@ -3044,6 +2974,36 @@ mod tests {
             })?;
         assert_eq!(stmts.len(), 1);
         lower_statement(stmts.remove(0))
+    }
+
+    /// Parse `sql`, require a Thunderduck-boundary error
+    /// (`EmissionError::Unsupported` with [`UnsupportedKind::ProtoShape`]),
+    /// and return the shape name for the caller's `assert_eq!`.
+    fn boundary_shape(sql: &str) -> String {
+        boundary_shape_of(parse(sql))
+    }
+
+    /// [`boundary_shape`] over a pre-built lowering result, for helpers called
+    /// directly (e.g. `decode_hex_literal`) instead of through [`parse`].
+    fn boundary_shape_of<T: std::fmt::Debug>(result: Result<T, EmissionError>) -> String {
+        match result {
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name,
+                ..
+            }) => name,
+            other => panic!("expected a ProtoShape boundary error, got {other:?}"),
+        }
+    }
+
+    /// [`boundary_shape`] variant asserting only a stable shape-name prefix,
+    /// for shapes that embed a debug-formatted payload after the prefix.
+    fn assert_boundary_shape_prefix(sql: &str, prefix: &str) {
+        let shape = boundary_shape(sql);
+        assert!(
+            shape.starts_with(prefix),
+            "expected boundary shape starting with `{prefix}`, got `{shape}`"
+        );
     }
 
     #[test]
@@ -3354,13 +3314,9 @@ mod tests {
 
     #[test]
     fn parse_select_distinct_on_rejected() {
-        let err = parse("SELECT DISTINCT ON (a) a, b FROM t").expect_err("DISTINCT ON is invalid");
-        assert!(
-            matches!(
-                err,
-                EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. } if shape == "sql::distinct_on"
-            ),
-            "expected sql::distinct_on boundary error, got {err:?}"
+        assert_eq!(
+            boundary_shape("SELECT DISTINCT ON (a) a, b FROM t"),
+            "sql::distinct_on"
         );
     }
 
@@ -3400,15 +3356,7 @@ mod tests {
 
     #[test]
     fn ceil_to_datetime_field_is_boundary() {
-        let err = parse("SELECT ceil(ts TO DAY) FROM t").expect_err("TO <field> unsupported");
-        assert!(
-            matches!(
-                err,
-                EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
-                    if shape.starts_with("sql::ceil::datetime_field")
-            ),
-            "expected sql::ceil::datetime_field boundary, got {err:?}"
-        );
+        assert_boundary_shape_prefix("SELECT ceil(ts TO DAY) FROM t", "sql::ceil::datetime_field");
     }
 
     /// Extract the single projection expression under a top-level `Project`.
@@ -3458,17 +3406,10 @@ mod tests {
 
     #[test]
     fn typed_string_malformed_date_is_boundary_error() {
-        let err = parse("SELECT DATE 'nope' AS d").expect_err("should reject");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                name: shape,
-                ..
-            } => {
-                assert_eq!(shape, "sql::typed_string::malformed");
-            }
-            other => panic!("expected boundary error, got {other:?}"),
-        }
+        assert_eq!(
+            boundary_shape("SELECT DATE 'nope' AS d"),
+            "sql::typed_string::malformed"
+        );
     }
 
     #[test]
@@ -3510,26 +3451,15 @@ mod tests {
 
     #[test]
     fn typed_string_invalid_calendar_date_is_boundary_error() {
-        let err = parse("SELECT DATE '2026-02-30' AS d").expect_err("should reject");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                name: shape,
-                ..
-            } => {
-                assert_eq!(shape, "sql::typed_string::malformed");
-            }
-            other => panic!("expected boundary error, got {other:?}"),
-        }
+        assert_eq!(
+            boundary_shape("SELECT DATE '2026-02-30' AS d"),
+            "sql::typed_string::malformed"
+        );
         // Year out of range must also be a boundary error, not a panic.
-        let err = parse("SELECT DATE '99999-01-01' AS d").expect_err("should reject");
-        assert!(matches!(
-            err,
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                ..
-            }
-        ));
+        assert_eq!(
+            boundary_shape("SELECT DATE '99999-01-01' AS d"),
+            "sql::typed_string::malformed"
+        );
     }
 
     #[test]
@@ -3869,24 +3799,18 @@ mod tests {
     #[test]
     fn parse_group_by_ordinal_out_of_range_rejected() {
         // `GROUP BY 5` with only 2 SELECT items is out of range.
-        let err = parse("SELECT dept_id, count(*) FROM emp GROUP BY 5")
-            .expect_err("out-of-range ordinal should be rejected");
-        assert!(
-            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
-                if shape == "sql::group_by_position"),
-            "expected UnsupportedProtoShape(sql::group_by_position), got {err:?}",
+        assert_eq!(
+            boundary_shape("SELECT dept_id, count(*) FROM emp GROUP BY 5"),
+            "sql::group_by_position"
         );
     }
 
     #[test]
     fn parse_group_by_ordinal_pointing_at_aggregate_rejected() {
         // `GROUP BY 2` references `count(*)`, an aggregate select item.
-        let err = parse("SELECT dept_id, count(*) FROM emp GROUP BY 2")
-            .expect_err("ordinal at aggregate item should be rejected");
-        assert!(
-            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
-                if shape == "sql::group_by_position_aggregate"),
-            "expected UnsupportedProtoShape(sql::group_by_position_aggregate), got {err:?}",
+        assert_eq!(
+            boundary_shape("SELECT dept_id, count(*) FROM emp GROUP BY 2"),
+            "sql::group_by_position_aggregate"
         );
     }
 
@@ -3895,12 +3819,9 @@ mod tests {
         // `ROLLUP ((a, b), c)` has a multi-column grouping term Spark treats as
         // a distinct level; τ's flat grouping can't represent it — reject rather
         // than silently flatten to `ROLLUP(a, b, c)` (ADR-022 loud-fail).
-        let err = parse("SELECT a, b, COUNT(*) FROM t GROUP BY ROLLUP ((a, b), c)")
-            .expect_err("nested ROLLUP term should be rejected");
-        assert!(
-            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
-                if shape == "sql::grouping_sets"),
-            "expected UnsupportedProtoShape(sql::grouping_sets), got {err:?}",
+        assert_eq!(
+            boundary_shape("SELECT a, b, COUNT(*) FROM t GROUP BY ROLLUP ((a, b), c)"),
+            "sql::grouping_sets"
         );
     }
 
@@ -3950,12 +3871,9 @@ mod tests {
     #[test]
     fn parse_group_by_with_totals_rejected() {
         // ClickHouse `WITH TOTALS` is not a Spark shape — boundary reject.
-        let err = parse("SELECT a, COUNT(*) FROM t GROUP BY a WITH TOTALS")
-            .expect_err("WITH TOTALS should be rejected");
-        assert!(
-            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
-                if shape == "sql::group_by_modifiers"),
-            "expected UnsupportedProtoShape(sql::group_by_modifiers), got {err:?}",
+        assert_eq!(
+            boundary_shape("SELECT a, COUNT(*) FROM t GROUP BY a WITH TOTALS"),
+            "sql::group_by_modifiers"
         );
     }
 
@@ -3996,26 +3914,35 @@ mod tests {
         }
     }
 
+    /// Unwrap the input relation beneath a top-level `Project`.
+    fn project_input(plan: CommonAst) -> CommonAst {
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project as top-level, got {:?}", plan.op);
+        };
+        *input
+    }
+
+    /// Require an `AliasedRelation` carrying `alias` and return its input.
+    fn expect_aliased(input: CommonAst, alias: &str) -> CommonAst {
+        let CommonOp::AliasedRelation { alias: got, input } = input.op else {
+            panic!("expected AliasedRelation `{alias}`, got {:?}", input.op);
+        };
+        assert_eq!(got, alias);
+        *input
+    }
+
     #[test]
     fn parse_cte_single_reference_inlines_as_aliased_relation() {
         // A `FROM <cte>` reference lowers to an AliasedRelation over the CTE
         // body — NOT a TableScan named x (the CTE shadows any catalog table).
         let plan = parse("WITH x AS (SELECT id FROM t) SELECT * FROM x").expect("should parse");
-        let CommonOp::Project { input, .. } = plan.op else {
-            panic!("expected Project");
-        };
-        match input.op {
-            CommonOp::AliasedRelation { alias, input } => {
-                assert_eq!(alias, "x");
-                // The inlined body is the CTE's own Project, not a scan of `x`.
-                assert!(
-                    matches!(input.op, CommonOp::Project { .. }),
-                    "expected the inlined CTE body, got {:?}",
-                    input.op
-                );
-            }
-            other => panic!("expected AliasedRelation over the CTE body, got {other:?}"),
-        }
+        let body = expect_aliased(project_input(plan), "x");
+        // The inlined body is the CTE's own Project, not a scan of `x`.
+        assert!(
+            matches!(body.op, CommonOp::Project { .. }),
+            "expected the inlined CTE body, got {:?}",
+            body.op
+        );
     }
 
     #[test]
@@ -4025,14 +3952,8 @@ mod tests {
         let plan =
             parse("WITH t(k, v) AS (SELECT a, COUNT(*) FROM u GROUP BY a) SELECT k, v FROM t")
                 .expect("should parse");
-        let CommonOp::Project { input, .. } = plan.op else {
-            panic!("expected Project");
-        };
-        let CommonOp::AliasedRelation { alias, input } = input.op else {
-            panic!("expected AliasedRelation over the CTE body");
-        };
-        assert_eq!(alias, "t");
-        match input.op {
+        let body = expect_aliased(project_input(plan), "t");
+        match body.op {
             CommonOp::ToDf { column_names, .. } => {
                 assert_eq!(column_names, vec!["k".to_owned(), "v".to_owned()]);
             }
@@ -4049,17 +3970,11 @@ mod tests {
              FROM (SELECT dept_id, count(*) n FROM emp GROUP BY dept_id) AS t",
         )
         .expect("should parse");
-        let CommonOp::Project { input, .. } = plan.op else {
-            panic!("expected Project");
-        };
-        let CommonOp::AliasedRelation { alias, input } = input.op else {
-            panic!("expected AliasedRelation over the derived table");
-        };
-        assert_eq!(alias, "t");
+        let body = expect_aliased(project_input(plan), "t");
         assert!(
-            matches!(input.op, CommonOp::Aggregate { .. }),
+            matches!(body.op, CommonOp::Aggregate { .. }),
             "expected Aggregate under the AliasedRelation, got {:?}",
-            input.op
+            body.op
         );
     }
 
@@ -4072,14 +3987,8 @@ mod tests {
              FROM (SELECT dept_id, count(*) FROM emp GROUP BY dept_id) AS t(c1, c2)",
         )
         .expect("should parse");
-        let CommonOp::Project { input, .. } = plan.op else {
-            panic!("expected Project");
-        };
-        let CommonOp::AliasedRelation { alias, input } = input.op else {
-            panic!("expected AliasedRelation over the derived table");
-        };
-        assert_eq!(alias, "t");
-        match input.op {
+        let body = expect_aliased(project_input(plan), "t");
+        match body.op {
             CommonOp::ToDf { column_names, .. } => {
                 assert_eq!(column_names, vec!["c1".to_owned(), "c2".to_owned()]);
             }
@@ -4092,9 +4001,7 @@ mod tests {
         // An unaliased derived table inlines the inner op directly — NO
         // AliasedRelation wrapper (guards the win-014/pivot inlining path).
         let plan = parse("SELECT dept_id FROM (SELECT dept_id FROM emp)").expect("should parse");
-        let CommonOp::Project { input, .. } = plan.op else {
-            panic!("expected Project");
-        };
+        let input = project_input(plan);
         assert!(
             !matches!(input.op, CommonOp::AliasedRelation { .. }),
             "unaliased derived table must not be wrapped in AliasedRelation, got {:?}",
@@ -4116,22 +4023,11 @@ mod tests {
              SELECT emp.id FROM e emp LEFT JOIN e mgr ON emp.manager_id = mgr.id",
         )
         .expect("should parse");
-        let CommonOp::Project { input, .. } = plan.op else {
-            panic!("expected Project");
-        };
-        let CommonOp::Join { left, right, .. } = input.op else {
+        let CommonOp::Join { left, right, .. } = project_input(plan).op else {
             panic!("expected Join");
         };
-        assert!(
-            matches!(left.op, CommonOp::AliasedRelation { ref alias, .. } if alias == "emp"),
-            "left side should be AliasedRelation aliased emp, got {:?}",
-            left.op
-        );
-        assert!(
-            matches!(right.op, CommonOp::AliasedRelation { ref alias, .. } if alias == "mgr"),
-            "right side should be AliasedRelation aliased mgr, got {:?}",
-            right.op
-        );
+        expect_aliased(*left, "emp");
+        expect_aliased(*right, "mgr");
     }
 
     #[test]
@@ -4141,21 +4037,15 @@ mod tests {
         // `AliasedRelation { input: TableScan { alias: None }, alias: "e" }` —
         // not the old `TableScan { alias: Some("e") }`.
         let plan = parse("SELECT e.id FROM emp e").expect("should parse");
-        let CommonOp::Project { input, .. } = plan.op else {
-            panic!("expected Project");
-        };
-        let CommonOp::AliasedRelation { alias, input } = input.op else {
-            panic!("expected AliasedRelation over the scan, got {:?}", input.op);
-        };
-        assert_eq!(alias, "e");
+        let scan = expect_aliased(project_input(plan), "e");
         assert!(
             matches!(
-                input.op,
+                scan.op,
                 CommonOp::TableScan { ref table, alias: None } if table == "emp"
             ),
             "expected TableScan {{ table: emp, alias: None }} under the \
              AliasedRelation, got {:?}",
-            input.op
+            scan.op
         );
     }
 
@@ -4164,9 +4054,7 @@ mod tests {
         // Without an alias, a bare table stays a plain `TableScan` (no
         // AliasedRelation wrapping) — the normalization only triggers on alias.
         let plan = parse("SELECT * FROM emp").expect("should parse");
-        let CommonOp::Project { input, .. } = plan.op else {
-            panic!("expected Project");
-        };
+        let input = project_input(plan);
         assert!(
             matches!(
                 input.op,
@@ -4180,18 +4068,10 @@ mod tests {
     #[test]
     fn parse_recursive_cte_rejected() {
         // WITH RECURSIVE is not inlinable (self-reference) — honest boundary.
-        let err = parse("WITH RECURSIVE r(n) AS (SELECT 1) SELECT * FROM r")
-            .expect_err("WITH RECURSIVE should be rejected");
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                name: shape,
-                ..
-            } => {
-                assert_eq!(shape, "sql::recursive_cte");
-            }
-            other => panic!("expected UnsupportedProtoShape(sql::recursive_cte), got {other:?}"),
-        }
+        assert_eq!(
+            boundary_shape("WITH RECURSIVE r(n) AS (SELECT 1) SELECT * FROM r"),
+            "sql::recursive_cte"
+        );
     }
 
     #[test]
@@ -4334,12 +4214,9 @@ mod tests {
         // `UNION BY NAME` parses in SparkDialect but has no positional
         // lowering — must be a Thunderduck-boundary error, not a silent
         // by-position union (ADR-022; loud-fail).
-        let err = parse("SELECT a, b FROM t UNION BY NAME SELECT b, a FROM u")
-            .expect_err("UNION BY NAME must be rejected");
-        assert!(
-            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
-                if shape == "sql::set_operation::by_name"),
-            "expected UnsupportedProtoShape(sql::set_operation::by_name), got {err:?}",
+        assert_eq!(
+            boundary_shape("SELECT a, b FROM t UNION BY NAME SELECT b, a FROM u"),
+            "sql::set_operation::by_name"
         );
     }
 
@@ -4524,7 +4401,8 @@ mod tests {
     }
 
     /// Return the first projection expression of a `Project` plan, unwrapping a
-    /// top-level `Alias` if present.
+    /// top-level `Alias` if present (owned counterpart of
+    /// [`Expression::unaliased`]).
     fn first_projection(plan: CommonAst) -> Expression {
         let CommonOp::Project {
             mut projections, ..
@@ -4533,10 +4411,7 @@ mod tests {
             panic!("expected Project as top-level");
         };
         assert!(!projections.is_empty());
-        match projections.remove(0) {
-            Expression::Alias(a) => *a.expr,
-            other => other,
-        }
+        projections.remove(0).unaliased().clone()
     }
 
     #[test]
@@ -4614,25 +4489,20 @@ mod tests {
 
     #[test]
     fn window_groups_frame_is_rejected() {
-        let err = parse(
-            "SELECT sum(x) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
-        )
-        .expect_err("GROUPS frame must be rejected");
-        assert!(
-            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
-                if shape == "sql::window_frame::groups"),
-            "expected UnsupportedProtoShape(sql::window_frame::groups), got {err:?}",
+        assert_eq!(
+            boundary_shape(
+                "SELECT sum(x) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                 FROM t"
+            ),
+            "sql::window_frame::groups"
         );
     }
 
     #[test]
     fn unknown_named_window_is_rejected() {
-        let err = parse("SELECT rank() OVER w FROM t WINDOW v AS (ORDER BY id)")
-            .expect_err("unknown named window must be rejected");
-        assert!(
-            matches!(err, EmissionError::Unsupported { kind: UnsupportedKind::ProtoShape, name: ref shape, .. }
-                if shape == "sql::named_window::unknown"),
-            "expected UnsupportedProtoShape(sql::named_window::unknown), got {err:?}",
+        assert_eq!(
+            boundary_shape("SELECT rank() OVER w FROM t WINDOW v AS (ORDER BY id)"),
+            "sql::named_window::unknown"
         );
     }
 
@@ -5066,16 +4936,9 @@ mod tests {
     #[test]
     fn lower_ilike_any_is_boundary_error() {
         // ILIKE ANY is not implemented; must fail loud (not silently drop ANY).
-        let result = parse("SELECT id FROM t WHERE a ILIKE ANY ('x%', 'y%')");
-        assert!(
-            matches!(
-                result,
-                Err(EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
-                    ..
-                })
-            ),
-            "expected boundary error for ILIKE ANY, got {result:?}"
+        assert_eq!(
+            boundary_shape("SELECT id FROM t WHERE a ILIKE ANY ('x%', 'y%')"),
+            "sql::ilike_any_unsupported"
         );
     }
 
@@ -5132,31 +4995,20 @@ mod tests {
 
     #[test]
     fn lower_row_in_arity_mismatch_is_boundary_error() {
-        let result = parse("SELECT id FROM t WHERE (a, b) IN ((1, 2), (3))");
-        assert!(
-            matches!(
-                result,
-                Err(EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
-                    ..
-                })
-            ),
-            "expected boundary error for arity mismatch, got {result:?}"
+        // NB: sqlparser reads `(3)` as a parenthesized scalar, not a 1-tuple,
+        // so the mismatch surfaces through the row-IN non-tuple arm — pin the
+        // `sql::in_row::` family rather than the specific arm.
+        assert_boundary_shape_prefix(
+            "SELECT id FROM t WHERE (a, b) IN ((1, 2), (3))",
+            "sql::in_row::",
         );
     }
 
     #[test]
     fn lower_row_in_non_tuple_element_is_boundary_error() {
-        let result = parse("SELECT id FROM t WHERE (a, b) IN (5, (1, 2))");
-        assert!(
-            matches!(
-                result,
-                Err(EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
-                    ..
-                })
-            ),
-            "expected boundary error for non-tuple RHS element, got {result:?}"
+        assert_eq!(
+            boundary_shape("SELECT id FROM t WHERE (a, b) IN (5, (1, 2))"),
+            "sql::in_row::non_tuple_element"
         );
     }
 
@@ -5447,16 +5299,9 @@ mod tests {
         // Spark rejects `FILTER (WHERE …)` on a non-aggregate function; the
         // desugar must not silently turn `abs(x) FILTER (WHERE p)` into valid
         // SQL. τ surfaces an honest Thunderduck-boundary error instead.
-        let result = parse("SELECT abs(x) FILTER (WHERE x > 0) FROM emp");
-        assert!(
-            matches!(
-                result,
-                Err(EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
-                    ..
-                })
-            ),
-            "expected boundary error for FILTER on non-aggregate, got {result:?}"
+        assert_eq!(
+            boundary_shape("SELECT abs(x) FILTER (WHERE x > 0) FROM emp"),
+            "sql::filter_on_non_aggregate"
         );
     }
 
@@ -5519,31 +5364,17 @@ mod tests {
 
     #[test]
     fn decode_hex_literal_odd_length_is_boundary_error() {
-        let result = decode_hex_literal("1");
-        assert!(
-            matches!(
-                result,
-                Err(EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
-                    ..
-                })
-            ),
-            "expected boundary error for odd-length hex, got {result:?}"
+        assert_eq!(
+            boundary_shape_of(decode_hex_literal("1")),
+            "sql::value::hex_odd_length"
         );
     }
 
     #[test]
     fn decode_hex_literal_invalid_digit_is_boundary_error() {
-        let result = decode_hex_literal("1G");
-        assert!(
-            matches!(
-                result,
-                Err(EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
-                    ..
-                })
-            ),
-            "expected boundary error for non-hex digit, got {result:?}"
+        assert_eq!(
+            boundary_shape_of(decode_hex_literal("1G")),
+            "sql::value::hex_invalid_digit"
         );
     }
 }

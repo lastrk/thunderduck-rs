@@ -2,15 +2,16 @@
 //!
 //! ADR-021 (τ owns substrate) + ADR-022 (τ is the only path).
 //!
-//! At τ's emission substrate this module tree carries the type substrate, the stable
-//! [`CommonAst`] + [`BaseTypes`] surface, the analyzer that turns a
-//! `CommonAst` into a [`TypedAst`] with resolved schemas and stamped column
-//! types / nullabilities, AND the emission substrate — [`emission::dispatch_op`]
-//! turns a [`TypedAst`] into a DuckDB SQL string for the wired operator arms
-//! (`SingleRow`, `TableScan`, `Values`, `LocalRelation`, `FileScan`, `Project`,
-//! `Filter`, `Sort`, `Limit`). Unwired arms (`Aggregate`, `Join`, `SetOp`,
-//! `TableFunction`, `Unnest`) return Thunderduck-boundary `EmissionError`s per
-//! ADR-022.
+//! This module tree carries the type substrate, the stable [`CommonAst`] +
+//! [`BaseTypes`] surface, the analyzer that turns a `CommonAst` into a
+//! [`TypedAst`] with resolved schemas and stamped column types /
+//! nullabilities, AND the emission substrate — [`emission::dispatch_op`]
+//! turns a [`TypedAst`] into a DuckDB SQL string. Every [`CommonOp`] variant
+//! is wired end-to-end (leaves, Project/Filter/Sort/Limit, Aggregate incl.
+//! Rollup/Cube/GroupingSets, Join, SetOp, WithColumns, NA family, Pivot /
+//! Crosstab, Stat family, TableFunction, ...) except `Unnest`, whose emission
+//! arm still returns a Thunderduck-boundary `EmissionError` per ADR-022;
+//! shapes τ has not implemented surface the same way.
 
 pub mod analyzer;
 #[cfg(test)]
@@ -28,8 +29,7 @@ mod struct_names;
 pub mod type_inference;
 
 pub use analyzer::{
-    analyze, has_resolved_schema, AnalyzerError, HasSchema, Schema, SetOpKind, TypedAst, TypedAttr,
-    TypedOp,
+    analyze, has_resolved_schema, AnalyzerError, Schema, SetOpKind, TypedAst, TypedOp,
 };
 pub use ast::{CommonAst, CommonOp};
 pub use base_types::BaseTypes;

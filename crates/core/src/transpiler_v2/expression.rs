@@ -28,6 +28,21 @@ pub(crate) fn int_literal_value(expr: &Expression) -> Option<i32> {
     }
 }
 
+/// Extract a borrowed string value from a string [`Literal`] expression.
+///
+/// Returns `None` for any non-literal or non-string expression. Used by the
+/// literal-keyed inference arms (`named_struct`, `to_number`, `from_json`,
+/// `from_csv`, `inline_field`) and the `ExtractValue` field-name lookups.
+pub(super) fn as_string_literal(e: &Expression) -> Option<&str> {
+    match e {
+        Expression::Literal(Literal {
+            value: LiteralValue::String(s),
+            ..
+        }) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
 // ── Supporting sub-types ─────────────────────────────────────────────────────
 
 /// Binary arithmetic / comparison / logical / string / bitwise operators.
@@ -71,19 +86,6 @@ impl BinaryOp {
                 | BinaryOp::GtEq
                 | BinaryOp::And
                 | BinaryOp::Or
-        )
-    }
-
-    /// Whether this operator is arithmetic (subject to numeric promotion).
-    pub fn is_arithmetic(&self) -> bool {
-        matches!(
-            self,
-            BinaryOp::Add
-                | BinaryOp::Sub
-                | BinaryOp::Mul
-                | BinaryOp::Div
-                | BinaryOp::Mod
-                | BinaryOp::IntDiv
         )
     }
 
@@ -186,6 +188,33 @@ pub enum LiteralValue {
 pub struct Literal {
     pub value: LiteralValue,
     pub data_type: DataType,
+}
+
+/// Value-derived `(precision, scale)` of a decimal literal string, mirroring
+/// Apache Spark's `Decimal.set(BigDecimal)`: `scale` is the fractional-digit
+/// count; `precision` is significant integer digits (sign and leading zeros
+/// excluded) plus `scale`, floored at `max(scale, 1)` — Spark bumps
+/// `_precision` up to `max(bigDecimal.precision, bigDecimal.scale)` and never
+/// below 1. `100.25`→(5,2); `3.142`→(4,3); `0.00`→(2,2).
+///
+/// **Unclamped** — no `MAX_PRECISION = 38` cap. Callers own their remaining
+/// steps: `parser_v2::v2_lowering::decimal_literal_precision_scale` clamps to
+/// 38; the connect-server's `normalize_decimal_literal` reconciles against
+/// the wire-supplied shape before clamping.
+pub fn decimal_value_precision_scale(s: &str) -> (u8, u8) {
+    let trimmed = s.trim_start_matches(['+', '-']);
+    let (int_part, frac_part) = match trimmed.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (trimmed, ""),
+    };
+    let raw_int_digits = int_part
+        .trim_start_matches('0')
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .count() as u8;
+    let scale = frac_part.chars().filter(|c| c.is_ascii_digit()).count() as u8;
+    let precision = raw_int_digits.saturating_add(scale).max(scale).max(1);
+    (precision, scale)
 }
 
 /// A resolved column reference with schema-recorded type/nullability info.
@@ -474,7 +503,89 @@ pub enum Expression {
     UpdateFields(UpdateFieldsExpression),
 }
 
+/// Immediate-child classification shared by [`Expression::children`] and
+/// [`Expression::children_mut`] — ONE exhaustive match (no `_` arm), so adding
+/// an `Expression` variant fails to compile here until it is classified.
+/// Parameterized on the borrow flavor: `as_ref`/`iter`/`as_deref` for the
+/// shared walker, `as_mut`/`iter_mut`/`as_deref_mut` for the mutable one (the
+/// deref pair exists for `CaseWhen.else_expr`'s `Option<Box<Expression>>`).
+macro_rules! expression_children {
+    ($expr:expr, $as_child:ident, $iter:ident, $as_deref:ident) => {
+        match $expr {
+            Expression::Literal(_)
+            | Expression::ColumnReference(_)
+            | Expression::UnresolvedColumn(_)
+            | Expression::UnresolvedRegex(_)
+            | Expression::Star(_)
+            | Expression::LambdaVariable(_)
+            | Expression::RawSql(_)
+            | Expression::Interval(_)
+            | Expression::ExistsSubquery(_)
+            | Expression::ScalarSubquery(_) => Box::new(std::iter::empty()),
+
+            Expression::Unary(u) => Box::new(std::iter::once(u.operand.$as_child())),
+            Expression::Cast(c) => Box::new(std::iter::once(c.expr.$as_child())),
+            Expression::Alias(a) => Box::new(std::iter::once(a.expr.$as_child())),
+            Expression::Lambda(l) => Box::new(std::iter::once(l.body.$as_child())),
+            Expression::InSubquery(i) => Box::new(std::iter::once(i.expr.$as_child())),
+
+            Expression::Binary(b) => {
+                Box::new([b.left.$as_child(), b.right.$as_child()].into_iter())
+            }
+            Expression::Like(l) => {
+                Box::new([l.value.$as_child(), l.pattern.$as_child()].into_iter())
+            }
+            Expression::IsDistinctFrom(d) => {
+                Box::new([d.left.$as_child(), d.right.$as_child()].into_iter())
+            }
+            Expression::ExtractValue(ev) => {
+                Box::new([ev.child.$as_child(), ev.extraction.$as_child()].into_iter())
+            }
+            Expression::Between(b) => {
+                Box::new([b.expr.$as_child(), b.low.$as_child(), b.high.$as_child()].into_iter())
+            }
+
+            Expression::FunctionCall(f) => Box::new(f.args.$iter()),
+            Expression::ArrayLiteral(a) => Box::new(a.elements.$iter()),
+            Expression::RowConstructor(rc) => Box::new(rc.elements.$iter()),
+
+            Expression::CaseWhen(cw) => Box::new(
+                cw.branches
+                    .$iter()
+                    .flat_map(|(w, t)| [w, t])
+                    .chain(cw.else_expr.$as_deref()),
+            ),
+            Expression::InList(i) => {
+                Box::new(std::iter::once(i.expr.$as_child()).chain(i.list.$iter()))
+            }
+            Expression::MapLiteral(m) => Box::new(m.entries.$iter().flat_map(|(k, v)| [k, v])),
+            Expression::StructLiteral(s) => Box::new(s.fields.$iter().map(|(_, e)| e)),
+
+            Expression::Window(w) => Box::new(
+                std::iter::once(w.func.$as_child())
+                    .chain(w.partition_by.$iter())
+                    .chain(w.order_by.$iter().map(|so| so.expr.$as_child())),
+            ),
+            Expression::UpdateFields(u) => Box::new(
+                std::iter::once(u.struct_expr.$as_child())
+                    .chain(u.updates.$iter().filter_map(|(_, e)| e.$as_child())),
+            ),
+        }
+    };
+}
+
 impl Expression {
+    /// Strip a single outer `Alias` wrapper, returning the inner expression
+    /// (`self` for every non-alias variant). Used where an expression must
+    /// act bare (GROUP BY keys, structural comparisons, function-argument
+    /// values) while its alias only contributes an output name elsewhere.
+    pub fn unaliased(&self) -> &Expression {
+        match self {
+            Expression::Alias(a) => &a.expr,
+            other => other,
+        }
+    }
+
     /// The Spark-compatible data type of this expression given the input schema.
     pub fn data_type(&self, schema: &StructType) -> DataType {
         match self {
@@ -605,19 +716,13 @@ impl Expression {
                 // even if the source expression is non-nullable.
                 let src = c.expr.data_type(schema);
                 let src_is_string = matches!(src, DataType::String);
-                let dst_may_fail = matches!(
-                    c.to_type,
-                    DataType::Date
-                        | DataType::Timestamp
-                        | DataType::TimestampNtz
-                        | DataType::Integer
-                        | DataType::Long
-                        | DataType::Short
-                        | DataType::Byte
-                        | DataType::Float
-                        | DataType::Double
-                        | DataType::Decimal { .. }
-                );
+                // Intended coupling: string → numeric/temporal casts may
+                // fail in ANSI mode — every numeric type plus Date/Timestamp.
+                let dst_may_fail = c.to_type.is_numeric()
+                    || matches!(
+                        c.to_type,
+                        DataType::Date | DataType::Timestamp | DataType::TimestampNtz
+                    );
                 if src_is_string && dst_may_fail {
                     return true;
                 }
@@ -687,55 +792,22 @@ impl Expression {
     /// default, since `children()` still enumerates the structural
     /// expression children.
     pub fn children(&self) -> Box<dyn Iterator<Item = &Expression> + '_> {
-        use Expression::*;
-        match self {
-            Literal(_) | ColumnReference(_) | UnresolvedColumn(_) | UnresolvedRegex(_)
-            | Star(_) | LambdaVariable(_) | RawSql(_) | Interval(_) | ExistsSubquery(_)
-            | ScalarSubquery(_) => Box::new(std::iter::empty()),
+        expression_children!(self, as_ref, iter, as_deref)
+    }
 
-            Unary(u) => Box::new(std::iter::once(u.operand.as_ref())),
-            Cast(c) => Box::new(std::iter::once(c.expr.as_ref())),
-            Alias(a) => Box::new(std::iter::once(a.expr.as_ref())),
-            Lambda(l) => Box::new(std::iter::once(l.body.as_ref())),
-            InSubquery(i) => Box::new(std::iter::once(i.expr.as_ref())),
-
-            Binary(b) => Box::new([b.left.as_ref(), b.right.as_ref()].into_iter()),
-            Like(l) => Box::new([l.value.as_ref(), l.pattern.as_ref()].into_iter()),
-            IsDistinctFrom(d) => Box::new([d.left.as_ref(), d.right.as_ref()].into_iter()),
-            ExtractValue(ev) => Box::new([ev.child.as_ref(), ev.extraction.as_ref()].into_iter()),
-            Between(b) => Box::new([b.expr.as_ref(), b.low.as_ref(), b.high.as_ref()].into_iter()),
-
-            FunctionCall(f) => Box::new(f.args.iter()),
-            ArrayLiteral(a) => Box::new(a.elements.iter()),
-            RowConstructor(rc) => Box::new(rc.elements.iter()),
-
-            CaseWhen(cw) => Box::new(
-                cw.branches
-                    .iter()
-                    .flat_map(|(w, t)| [w, t])
-                    .chain(cw.else_expr.as_deref()),
-            ),
-            InList(i) => Box::new(std::iter::once(i.expr.as_ref()).chain(i.list.iter())),
-            MapLiteral(m) => Box::new(m.entries.iter().flat_map(|(k, v)| [k, v])),
-            StructLiteral(s) => Box::new(s.fields.iter().map(|(_, e)| e)),
-
-            Window(w) => Box::new(
-                std::iter::once(w.func.as_ref())
-                    .chain(w.partition_by.iter())
-                    .chain(w.order_by.iter().map(|so| so.expr.as_ref())),
-            ),
-            UpdateFields(u) => Box::new(
-                std::iter::once(u.struct_expr.as_ref())
-                    .chain(u.updates.iter().filter_map(|(_, e)| e.as_ref())),
-            ),
-        }
+    /// Mutable counterpart of [`Self::children`] — iterates over the SAME
+    /// immediate child expressions in the SAME order (arm-for-arm parity;
+    /// window-frame boundaries and subquery bodies excluded per the τ
+    /// walker convention documented on `children`).
+    pub fn children_mut(&mut self) -> Box<dyn Iterator<Item = &mut Expression> + '_> {
+        expression_children!(self, as_mut, iter_mut, as_deref_mut)
     }
 
     /// Structural map: apply `f` to each immediate child expression,
     /// preserving the node's structure.
     ///
-    /// **Same child set as [`Self::children`]** (see its docstring for the
-    /// window-frame + subquery-body conventions).
+    /// **Same child set and visit order as [`Self::children`]** (see its
+    /// docstring for the window-frame + subquery-body conventions).
     ///
     /// Transform walkers built on `map_children` should custom-case
     /// variants that must be opaque to the transform (τ's
@@ -744,160 +816,17 @@ impl Expression {
     /// `RawSql`, and `Interval` as passthrough — matching semantics
     /// preserved when `map_children` is called as the default arm).
     pub fn map_children<E>(
-        self,
+        mut self,
         mut f: impl FnMut(Expression) -> Result<Expression, E>,
     ) -> Result<Expression, E> {
-        use Expression::*;
-        match self {
-            Literal(_) | ColumnReference(_) | UnresolvedColumn(_) | UnresolvedRegex(_)
-            | Star(_) | LambdaVariable(_) | RawSql(_) | Interval(_) | ExistsSubquery(_)
-            | ScalarSubquery(_) => Ok(self),
-
-            Unary(mut u) => {
-                u.operand = Box::new(f(*u.operand)?);
-                Ok(Unary(u))
-            }
-            Cast(mut c) => {
-                c.expr = Box::new(f(*c.expr)?);
-                Ok(Cast(c))
-            }
-            Alias(mut a) => {
-                a.expr = Box::new(f(*a.expr)?);
-                Ok(Alias(a))
-            }
-            Lambda(mut l) => {
-                l.body = Box::new(f(*l.body)?);
-                Ok(Lambda(l))
-            }
-            InSubquery(mut i) => {
-                i.expr = Box::new(f(*i.expr)?);
-                Ok(InSubquery(i))
-            }
-
-            Binary(mut b) => {
-                b.left = Box::new(f(*b.left)?);
-                b.right = Box::new(f(*b.right)?);
-                Ok(Binary(b))
-            }
-            Like(mut l) => {
-                l.value = Box::new(f(*l.value)?);
-                l.pattern = Box::new(f(*l.pattern)?);
-                Ok(Like(l))
-            }
-            IsDistinctFrom(mut d) => {
-                d.left = Box::new(f(*d.left)?);
-                d.right = Box::new(f(*d.right)?);
-                Ok(IsDistinctFrom(d))
-            }
-            ExtractValue(mut ev) => {
-                ev.child = Box::new(f(*ev.child)?);
-                ev.extraction = Box::new(f(*ev.extraction)?);
-                Ok(ExtractValue(ev))
-            }
-            Between(mut b) => {
-                b.expr = Box::new(f(*b.expr)?);
-                b.low = Box::new(f(*b.low)?);
-                b.high = Box::new(f(*b.high)?);
-                Ok(Between(b))
-            }
-
-            FunctionCall(mut fc) => {
-                fc.args = fc
-                    .args
-                    .into_iter()
-                    .map(&mut f)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(FunctionCall(fc))
-            }
-            ArrayLiteral(mut a) => {
-                a.elements = a
-                    .elements
-                    .into_iter()
-                    .map(&mut f)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(ArrayLiteral(a))
-            }
-            RowConstructor(mut rc) => {
-                rc.elements = rc
-                    .elements
-                    .into_iter()
-                    .map(&mut f)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(RowConstructor(rc))
-            }
-
-            CaseWhen(mut cw) => {
-                cw.branches = cw
-                    .branches
-                    .into_iter()
-                    .map(|(w, t)| Ok::<_, E>((f(w)?, f(t)?)))
-                    .collect::<Result<Vec<_>, E>>()?;
-                if let Some(e) = cw.else_expr {
-                    cw.else_expr = Some(Box::new(f(*e)?));
-                }
-                Ok(CaseWhen(cw))
-            }
-            InList(mut i) => {
-                i.expr = Box::new(f(*i.expr)?);
-                i.list = i
-                    .list
-                    .into_iter()
-                    .map(&mut f)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(InList(i))
-            }
-            MapLiteral(mut m) => {
-                m.entries = m
-                    .entries
-                    .into_iter()
-                    .map(|(k, v)| Ok::<_, E>((f(k)?, f(v)?)))
-                    .collect::<Result<Vec<_>, E>>()?;
-                Ok(MapLiteral(m))
-            }
-            StructLiteral(mut s) => {
-                s.fields = s
-                    .fields
-                    .into_iter()
-                    .map(|(n, e)| Ok::<_, E>((n, f(e)?)))
-                    .collect::<Result<Vec<_>, E>>()?;
-                Ok(StructLiteral(s))
-            }
-
-            Window(mut w) => {
-                w.func = Box::new(f(*w.func)?);
-                w.partition_by = w
-                    .partition_by
-                    .into_iter()
-                    .map(&mut f)
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut new_order = Vec::with_capacity(w.order_by.len());
-                for so in w.order_by {
-                    let e = f(*so.expr)?;
-                    new_order.push(SortOrder {
-                        expr: Box::new(e),
-                        direction: so.direction,
-                        null_ordering: so.null_ordering,
-                    });
-                }
-                w.order_by = new_order;
-                Ok(Window(w))
-            }
-            UpdateFields(mut u) => {
-                u.struct_expr = Box::new(f(*u.struct_expr)?);
-                u.updates = u
-                    .updates
-                    .into_iter()
-                    .map(|(n, opt_e)| {
-                        let mapped = match opt_e {
-                            Some(e) => Some(f(e)?),
-                            None => None,
-                        };
-                        Ok::<_, E>((n, mapped))
-                    })
-                    .collect::<Result<Vec<_>, E>>()?;
-                Ok(UpdateFields(u))
-            }
+        for slot in self.children_mut() {
+            // Cheap placeholder to take ownership of the child; overwritten
+            // immediately (or the whole node is dropped on error).
+            let child =
+                std::mem::replace(slot, Expression::Star(StarExpression { qualifier: None }));
+            *slot = f(child)?;
         }
+        Ok(self)
     }
 
     // ── Binary data-type derivation ──────────────────────────────────────────
@@ -979,11 +908,16 @@ impl Expression {
     // ── FunctionCall data-type derivation ────────────────────────────────────
 
     fn function_call_data_type(f: &FunctionCall, schema: &StructType) -> DataType {
+        // Pre-pass for return types that need the argument EXPRESSIONS —
+        // literal schemas, literal scales, struct field naming, per-arg
+        // nullability. `TypeInferenceEngine::function_return_type` sees only
+        // the argument TYPES, so it cannot express these; derive here where
+        // the full `&FunctionCall` is available. Rules that depend on
+        // argument types alone live in `function_return_type` (single home).
+        //
         // Struct-constructor fast-paths — Spark's `struct` / `named_struct`
         // return a `DataType::Struct` whose field names depend on the shape
-        // of the argument tree. `TypeInferenceEngine::function_return_type`
-        // takes only the function name + first-arg type, so it cannot express
-        // this; derive here where the full `&FunctionCall` is available.
+        // of the argument tree.
         // Symmetric with emission's `struct` / `named_struct` arms.
         match f.name.to_lowercase().as_str() {
             "struct" => {
@@ -1006,32 +940,20 @@ impl Expression {
                 // returns `DataType::Unresolved` rather than fabricating a
                 // fake schema.
                 if !f.args.is_empty() && f.args.len() % 2 == 0 {
-                    let mut fields: Vec<StructField> = Vec::with_capacity(f.args.len() / 2);
-                    let mut i = 0;
-                    let mut ok = true;
-                    while i < f.args.len() {
-                        let key = match &f.args[i] {
-                            Expression::Literal(l) => match &l.value {
-                                LiteralValue::String(s) => s.clone(),
-                                _ => {
-                                    ok = false;
-                                    break;
-                                }
-                            },
-                            _ => {
-                                ok = false;
-                                break;
-                            }
-                        };
-                        let val = &f.args[i + 1];
-                        fields.push(StructField::new(
-                            key,
-                            val.data_type(schema),
-                            val.nullable(schema),
-                        ));
-                        i += 2;
-                    }
-                    if ok {
+                    let fields: Option<Vec<StructField>> = f
+                        .args
+                        .chunks_exact(2)
+                        .map(|kv| {
+                            as_string_literal(&kv[0]).map(|key| {
+                                StructField::new(
+                                    key,
+                                    kv[1].data_type(schema),
+                                    kv[1].nullable(schema),
+                                )
+                            })
+                        })
+                        .collect();
+                    if let Some(fields) = fields {
                         return DataType::Struct(StructType::new(fields));
                     }
                 }
@@ -1046,16 +968,12 @@ impl Expression {
             // `emission.rs`, `"arrays_zip"` arm). Corpus anchor: `arr-012`.
             "arrays_zip" if !f.args.is_empty() => {
                 // Derive per-arg field names — same rules as emission.
-                let mut names: Vec<String> = Vec::with_capacity(f.args.len());
-                for (i, arg) in f.args.iter().enumerate() {
-                    let name = match arg {
-                        Expression::Alias(a) => a.alias.clone(),
-                        Expression::ColumnReference(c) => c.name.clone(),
-                        Expression::UnresolvedColumn(u) => u.name.clone(),
-                        _ => i.to_string(),
-                    };
-                    names.push(name);
-                }
+                let names: Vec<String> = f
+                    .args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, arg)| super::struct_names::derive_zip_field_name(arg, i))
+                    .collect();
                 // Note: Spark tolerates duplicate field names in the returned
                 // struct schema (unlike DuckDB `struct_pack` which requires
                 // unique names). Preserve Spark's schema (duplicates and all);
@@ -1074,52 +992,6 @@ impl Expression {
                 // (containsNull=false) — the struct itself is always present
                 // per input row.
                 return DataType::Array(Box::new(DataType::Struct(StructType::new(fields))), false);
-            }
-            // Spark's `coalesce(a, b, c, ...)` returns the least-common
-            // (widening) type across all args. First-arg-only inference
-            // misses e.g. `coalesce(decimal(9,2), decimal(2,2)) → decimal(10,2)`.
-            // Corpus anchor: `cond-004`.
-            "coalesce" | "nvl" | "ifnull" if !f.args.is_empty() => {
-                let mut acc = f.args[0].data_type(schema);
-                for a in f.args.iter().skip(1) {
-                    let dt = a.data_type(schema);
-                    acc = TypeInferenceEngine::promote_numeric(&acc, &dt);
-                }
-                return acc;
-            }
-            // Spark's `greatest` / `least` — same widening rule as coalesce.
-            "greatest" | "least" if !f.args.is_empty() => {
-                let mut acc = f.args[0].data_type(schema);
-                for a in f.args.iter().skip(1) {
-                    let dt = a.data_type(schema);
-                    acc = TypeInferenceEngine::promote_numeric(&acc, &dt);
-                }
-                return acc;
-            }
-            // Spark's `nvl2(cond, ifNotNull, ifNull)` — returns `ifNotNull` if
-            // `cond IS NOT NULL`, otherwise `ifNull`. Result type is the least
-            // common type of args[1] and args[2] (both branches are
-            // evaluated). The shared resolver only sees `args[0]`; use args[1]
-            // as the anchor (matches Spark's promotion when args[1]/args[2]
-            // agree). Corpus anchor: `cond-007`.
-            "nvl2" if f.args.len() == 3 => {
-                return f.args[1].data_type(schema);
-            }
-            // Spark's `if(cond, then, else)` / `ifnull(a, b)` / `iif(...)` —
-            // return-type derives from the branch args (not the condition).
-            "if" if f.args.len() == 3 => {
-                return f.args[1].data_type(schema);
-            }
-            "iif" if f.args.len() == 3 => {
-                return f.args[1].data_type(schema);
-            }
-            "ifnull" if f.args.len() == 2 => {
-                // Both branches meaningful; use the first (Spark spec).
-                let first = f.args[0].data_type(schema);
-                if matches!(first, DataType::Unresolved) {
-                    return f.args[1].data_type(schema);
-                }
-                return first;
             }
             // Spark's `array(a, b, ...)` — element type is the least-common
             // (widening) type of the args. First-arg-only inference misses
@@ -1176,31 +1048,17 @@ impl Expression {
                     value_nullable,
                 };
             }
-            // Spark's `aggregate(arr, init, (acc, x) -> f [, finish])` folds
-            // the array with `init` as the seed; the result type is the
-            // finish-lambda's return type (or, if `finish` is absent, the
-            // seed / accumulator type). The shared `function_return_type`
-            // resolver only receives the first arg's type, so it cannot
-            // express this. Derive here where the whole `FunctionCall` is
-            // available. Corpus anchor: `hof-003`.
-            "aggregate" | "reduce" | "list_reduce" if f.args.len() >= 2 => {
-                // Prefer the init's type (arg[1]) — Spark accepts init as
-                // any expression and the accumulator inherits its type.
-                return f.args[1].data_type(schema);
-            }
             // Spark's `to_number(str, fmt)` / `try_to_number(str, fmt)` return
             // DECIMAL(p, s) derived from the format string. Emission parses
             // the same format literal to build the CAST; mirror the
             // precision/scale derivation here so the projection schema
-            // matches Spark. Falls through to the shared resolver (returns
-            // String, matching arg[0]) when the format is not a literal or
-            // not a recognized digit template. Corpus anchor: `parse-004`.
+            // matches Spark. When the format is not a literal or not a
+            // recognized digit template, this falls through to the shared
+            // resolver, which has no `to_number` arm — the result is
+            // `Unresolved` (an honest ADR-022 boundary, not a String).
+            // Corpus anchor: `parse-004`.
             "to_number" | "try_to_number" if f.args.len() == 2 => {
-                if let Expression::Literal(Literal {
-                    value: LiteralValue::String(fmt),
-                    ..
-                }) = &f.args[1]
-                {
+                if let Some(fmt) = as_string_literal(&f.args[1]) {
                     if let Some((precision, scale)) =
                         super::emission::parse_number_format_for_type_inference(fmt)
                     {
@@ -1208,34 +1066,21 @@ impl Expression {
                     }
                 }
             }
-            // Spark's `from_json(json_str, ddl_schema)` returns a Struct
-            // typed per the DDL literal. Mirror emission's DDL translation
-            // for type inference so the projection schema matches Spark.
-            // Corpus anchors: `json-003`, `json-004`.
-            "from_json" if f.args.len() == 2 => {
-                if let Expression::Literal(Literal {
-                    value: LiteralValue::String(ddl),
-                    ..
-                }) = &f.args[1]
-                {
-                    if let Some(st) =
+            // Spark's `from_json(json_str, ddl_schema)` and
+            // `from_csv(csv_str, ddl_schema)` return a Struct typed per the
+            // DDL literal (from_csv: flat primitives only — Spark's own
+            // surface). Mirror emission's DDL translation for type inference
+            // so the projection schema matches Spark; only the DDL helper
+            // differs between the two. Corpus anchors: `json-003`,
+            // `json-004` (from_json); `json-007` (from_csv).
+            name @ ("from_json" | "from_csv") if f.args.len() == 2 => {
+                if let Some(ddl) = as_string_literal(&f.args[1]) {
+                    let st = if name == "from_json" {
                         super::emission::from_json_ddl_to_struct_for_type_inference(ddl)
-                    {
-                        return DataType::Struct(st);
-                    }
-                }
-            }
-            // Spark's `from_csv(csv_str, ddl_schema)` returns a Struct typed
-            // per the DDL literal (flat primitives only — Spark's own
-            // surface). Mirror emission's DDL translation so the projection
-            // schema matches Spark. Corpus anchor: `json-007`.
-            "from_csv" if f.args.len() == 2 => {
-                if let Expression::Literal(Literal {
-                    value: LiteralValue::String(ddl),
-                    ..
-                }) = &f.args[1]
-                {
-                    if let Some(st) = super::emission::from_csv_ddl_to_struct(ddl) {
+                    } else {
+                        super::emission::from_csv_ddl_to_struct(ddl)
+                    };
+                    if let Some(st) = st {
                         return DataType::Struct(st);
                     }
                 }
@@ -1248,15 +1093,8 @@ impl Expression {
             // type (case-insensitive lookup, matching Spark). Corpus: inl-001,
             // inl-002.
             "inline_field" | "inline_outer_field" if f.args.len() == 2 => {
-                if let (
-                    arr,
-                    Expression::Literal(Literal {
-                        value: LiteralValue::String(field_name),
-                        ..
-                    }),
-                ) = (&f.args[0], &f.args[1])
-                {
-                    if let DataType::Array(inner, _) = arr.data_type(schema) {
+                if let Some(field_name) = as_string_literal(&f.args[1]) {
+                    if let DataType::Array(inner, _) = f.args[0].data_type(schema) {
                         if let DataType::Struct(st) = *inner {
                             for field in &st.fields {
                                 if field.name.eq_ignore_ascii_case(field_name) {
@@ -1319,35 +1157,14 @@ impl Expression {
                     None => DataType::Unresolved,
                 };
             }
-            // `mod(a, b)` / `pmod(a, b)` — when BOTH operands are Decimal,
-            // Spark's `Remainder`/`Pmod` result decimal type widens per
-            // `decimal_mod_type` (scale = max, precision = min(int digits) +
-            // scale). The first-arg-only `function_return_type` resolver
-            // returns the LEFT decimal, which is wrong for two decimals. Handle
-            // only the both-decimal case here; every other operand shape
-            // (int/int, bigint/int, …) falls through to the shared resolver
-            // that already types them correctly. Corpus: `num-012`.
-            "mod" | "pmod" if f.args.len() == 2 => {
-                let l = f.args[0].data_type(schema);
-                let r = f.args[1].data_type(schema);
-                if let (
-                    DataType::Decimal {
-                        precision: p1,
-                        scale: s1,
-                    },
-                    DataType::Decimal {
-                        precision: p2,
-                        scale: s2,
-                    },
-                ) = (&l, &r)
-                {
-                    return TypeInferenceEngine::decimal_mod_type(*p1, *s1, *p2, *s2);
-                }
-            }
             _ => {}
         }
-        let first_arg_type = f.args.first().map(|a| a.data_type(schema));
-        TypeInferenceEngine::function_return_type(&f.name, first_arg_type.as_ref())
+        // All remaining return-type rules depend on argument TYPES alone
+        // (widening folds, arity-branch selection, decimal widening) — the
+        // single home is `TypeInferenceEngine::function_return_type`, which now
+        // receives the full argument-type list.
+        let arg_types: Vec<DataType> = f.args.iter().map(|a| a.data_type(schema)).collect();
+        TypeInferenceEngine::function_return_type(&f.name, &arg_types)
     }
 
     // ── FunctionCall nullability ─────────────────────────────────────────────
@@ -1361,27 +1178,15 @@ impl Expression {
     /// Contains the count family (checklist §1.1) and the hash family
     /// (checklist §1.2). Extending this list requires adding to the
     /// symmetric-omission tests (§8) as well.
-    pub(crate) fn is_non_nullable_function_name_lower(name_lower: &str) -> bool {
+    fn is_non_nullable_function_name_lower(name_lower: &str) -> bool {
         debug_assert!(
             name_lower.chars().all(|c| !c.is_ascii_uppercase()),
             "is_non_nullable_function_name_lower requires pre-lowercased input; got `{name_lower}`",
         );
-        matches!(
-            name_lower,
-            "count"
-                | "count_distinct"
-                | "count_if"
-                | "grouping"
-                | "grouping_id"
-                | "hash"
-                | "murmur3"
-                | "xxhash64"
-                | "collect_list"
-                | "collect_set"
-                | "array_agg"
-                | "approx_count_distinct"
-                | "count_approx_distinct"
-        )
+        // Non-nullable aggregates come from the AGG_SPECS table; the hash
+        // family (checklist §1.2) is the only non-aggregate addition.
+        TypeInferenceEngine::aggregate_is_non_nullable_lower(name_lower)
+            || matches!(name_lower, "hash" | "murmur3" | "xxhash64")
     }
 
     fn function_call_nullable(f: &FunctionCall, schema: &StructType) -> bool {
@@ -1393,7 +1198,9 @@ impl Expression {
             return true;
         }
         match lower.as_str() {
-            "coalesce" | "ifnull" | "nvl" => f.args.iter().all(|a| a.nullable(schema)),
+            "coalesce" | "ifnull" | "nvl" | "greatest" | "least" => {
+                f.args.iter().all(|a| a.nullable(schema))
+            }
             "when" => {
                 if f.args.len() % 2 == 0 {
                     true
@@ -1404,13 +1211,43 @@ impl Expression {
                     then_nullable || else_nullable
                 }
             }
-            "isnull" | "isnan" | "isnotnull" | "isnotnan" | "is_nan" | "isinf" => false,
-            "concat_ws" => false,
-            // Spark's `format_string(fmt, args...)` returns non-nullable —
-            // NULL args render as the literal string "null" rather than
-            // propagating NULL. Corpus witness: `str-015`.
-            "format_string" | "printf" => false,
-            "typeof" | "spark_partition_id" | "monotonically_increasing_id" => false,
+            // ── Always non-nullable scalars — constant `false` regardless of
+            // arg nullability ────────────────────────────────────────────────
+            // * `isnull` / `isnan` / `isnotnull` / `isnotnan` / `is_nan` /
+            //   `isinf`, `concat_ws`, `typeof` / `spark_partition_id` /
+            //   `monotonically_increasing_id`.
+            // * `format_string` / `printf` — Spark returns non-nullable; NULL
+            //   args render as the literal string "null" rather than
+            //   propagating NULL. Corpus witness: `str-015`.
+            // * `array` / `make_array` / `create_map` / `map` /
+            //   `named_struct` / `struct` — constructors are never NULL
+            //   themselves (only elements / fields carry nullability).
+            // * `window` — `F.window(ts, dur)`: Spark's `TimeWindow` is
+            //   rewritten by the analyzer into
+            //   `CreateNamedStruct(start := ..., end := ...)` whose
+            //   `nullable = false` (Spark's struct-construction is never
+            //   null; only the fields inside carry per-field nullability).
+            //   τ's default `any(arg.nullable)` fallback would incorrectly
+            //   propagate the timestamp arg's nullable into the struct
+            //   itself; pin `false` here to match Spark's observable schema.
+            //   Corpus: `win2-002`.
+            // * `posexplode_pos` — the position column is a synthetic
+            //   0-indexed integer, never NULL. Non-nullable regardless of the
+            //   input array's nullability. Corpus: arr-017.
+            // * `map_explode_key` — synthetic per-column call (map-007; see
+            //   the v2 relation converter's alias-splitter). Spark's
+            //   `explode(map)` produces `(key, value)` rows where keys are
+            //   ALWAYS non-nullable (Spark's MAP invariant); a NULL map arg
+            //   emits zero rows, so a nullable outer map does not propagate
+            //   to the key column. (Values inherit the map's
+            //   `valueContainsNull` flag — see the data-dependent
+            //   `map_explode_val` arm below.)
+            "isnull" | "isnan" | "isnotnull" | "isnotnan" | "is_nan" | "isinf" | "concat_ws"
+            | "format_string" | "printf" | "typeof" | "spark_partition_id"
+            | "monotonically_increasing_id" | "array" | "make_array" | "create_map" | "map"
+            | "named_struct" | "struct" | "window" | "posexplode_pos" | "map_explode_key" => false,
+            // ── Always nullable scalars — constant `true` regardless of arg
+            // nullability ────────────────────────────────────────────────────
             // Spark scalars declared nullable regardless of arg nullability
             // (overflow / parse-fail / undefined-domain producers).
             "factorial" | "url_encode" | "url_decode" | "parse_url"
@@ -1432,29 +1269,37 @@ impl Expression {
             // Reference=False), so it falls through to the default
             // `any(arg.nullable)` path which correctly yields false for
             // literal arguments.
-            | "to_json" | "to_csv" => true,
-            "greatest" | "least" => f.args.iter().all(|a| a.nullable(schema)),
-            "nvl2" => {
-                f.args.get(1).is_none_or(|a| a.nullable(schema))
-                    || f.args.get(2).is_none_or(|a| a.nullable(schema))
-            }
+            | "to_json" | "to_csv"
+            // `explode_outer(arr)` — always nullable: empty / NULL arrays
+            // emit exactly one row with a NULL value. Corpus: arr-016.
+            | "explode_outer"
+            // `inline_outer_field` — always nullable: the empty / NULL array
+            // sentinel row is all-NULL by construction. Mirrors
+            // `explode_outer` in this same list. Corpus: inl-002.
+            | "inline_outer_field"
+            // Pass 91 — synthetic `json_tuple_field(json, "<key>")` produced
+            // by the analyzer's Project pre-pass (`expand_json_tuple_projections`).
+            // Always nullable — Spark returns NULL for missing key OR JSON
+            // null value OR NULL `json_str`. Corpus: json-002.
+            | "json_tuple_field"
+            // Spark's `flatten(Array<Array<T>>)` returns NULL if the outer
+            // array contains any NULL inner array. Even a non-nullable
+            // literal outer array (`F.array(...)`) produces a nullable
+            // result per Spark's schema semantics. Corpus: `arr-013`.
+            | "flatten" | "list_flatten"
+            // piv-006 — synthetic per-column call from
+            // `expand_stack_projections`. Spark's `Stack.elementSchema`
+            // pins every output column to `nullable = true` regardless
+            // of whether the individual row-values are non-null literals.
+            | "stack_col" => true,
             // Spark's `If.nullable = trueValue.nullable || falseValue.nullable`
             // — the predicate (args[0]) is excluded. `iif` is a Spark alias for
-            // `If`, so it shares the same nullability rule. Corpus witness: cnd-009.
-            "if" | "iif" => {
+            // `If`, and `nvl2(cond, ifNotNull, ifNull)` shares the same
+            // branch-only nullability rule. Corpus witness: cnd-009.
+            "nvl2" | "if" | "iif" => {
                 f.args.get(1).is_none_or(|a| a.nullable(schema))
                     || f.args.get(2).is_none_or(|a| a.nullable(schema))
             }
-            "array" | "make_array" | "create_map" | "map" | "named_struct" | "struct" => false,
-            // `F.window(ts, dur)` — Spark's `TimeWindow` is rewritten by the
-            // analyzer into `CreateNamedStruct(start := ..., end := ...)`
-            // whose `nullable = false` (Spark's struct-construction is never
-            // null; only the fields inside carry per-field nullability).
-            // τ's default `any(arg.nullable)` fallback would incorrectly
-            // propagate the timestamp arg's nullable into the struct itself;
-            // pin `false` here to match Spark's observable schema. Corpus:
-            // `win2-002`.
-            "window" => false,
             // Generator functions (row-multiplying via UNNEST at emission).
             // `explode(arr)` / `posexplode_val(arr)` — element nullability
             // follows the array's `containsNull` flag AND the array arg's own
@@ -1470,13 +1315,6 @@ impl Expression {
                 }
                 None => true,
             },
-            // `explode_outer(arr)` — always nullable: empty / NULL arrays
-            // emit exactly one row with a NULL value. Corpus: arr-016.
-            "explode_outer" => true,
-            // `posexplode_pos(arr)` — the position column is a synthetic
-            // 0-indexed integer, never NULL. Non-nullable regardless of the
-            // input array's nullability. Corpus: arr-017.
-            "posexplode_pos" => false,
             // Pass 90 — synthetic per-field FunctionCalls for
             // `F.inline` / `F.inline_outer` (analyzer's Project pre-pass —
             // `expand_inline_projections`). Args: (arr, field_name_literal).
@@ -1490,14 +1328,8 @@ impl Expression {
             //     conservative disjunction — matches `explode`'s posexplode_val
             //     arm above for parity).
             // Corpus: inl-001.
-            "inline_field" => match (f.args.first(), f.args.get(1)) {
-                (
-                    Some(arr),
-                    Some(Expression::Literal(Literal {
-                        value: LiteralValue::String(field_name),
-                        ..
-                    })),
-                ) => {
+            "inline_field" => match (f.args.first(), f.args.get(1).and_then(as_string_literal)) {
+                (Some(arr), Some(field_name)) => {
                     let arr_ty = arr.data_type(schema);
                     let (contains_null, field_nullable) = match &arr_ty {
                         DataType::Array(inner, cn) => match inner.as_ref() {
@@ -1518,22 +1350,9 @@ impl Expression {
                 }
                 _ => true,
             },
-            // `inline_outer_field` — always nullable: the empty / NULL array
-            // sentinel row is all-NULL by construction. Mirrors
-            // `explode_outer`'s arm above. Corpus: inl-002.
-            "inline_outer_field" => true,
-            // Pass 91 — synthetic `json_tuple_field(json, "<key>")` produced
-            // by the analyzer's Project pre-pass (`expand_json_tuple_projections`).
-            // Always nullable — Spark returns NULL for missing key OR JSON
-            // null value OR NULL `json_str`. Corpus: json-002.
-            "json_tuple_field" => true,
-            // Synthetic `map_explode_key(m)` / `map_explode_val(m)` (map-007).
-            // Spark's `explode(map)` produces `(key, value)` rows where keys
-            // are ALWAYS non-nullable (Spark's MAP invariant); a NULL map
-            // arg emits zero rows, so a nullable outer map does not
-            // propagate to the key column. Values inherit the map's
-            // `valueContainsNull` flag.
-            "map_explode_key" => false,
+            // Synthetic `map_explode_val(m)` (map-007) — values inherit the
+            // map's `valueContainsNull` flag. (Its `map_explode_key` sibling
+            // is pinned non-nullable in the constant-`false` list above.)
             "map_explode_val" => match f.args.first() {
                 Some(arg) => matches!(
                     arg.data_type(schema),
@@ -1544,16 +1363,6 @@ impl Expression {
                 ),
                 None => true,
             },
-            // Spark's `flatten(Array<Array<T>>)` returns NULL if the outer
-            // array contains any NULL inner array. Even a non-nullable
-            // literal outer array (`F.array(...)`) produces a nullable
-            // result per Spark's schema semantics. Corpus: `arr-013`.
-            "flatten" | "list_flatten" => true,
-            // piv-006 — synthetic per-column call from
-            // `expand_stack_projections`. Spark's `Stack.elementSchema`
-            // pins every output column to `nullable = true` regardless
-            // of whether the individual row-values are non-null literals.
-            "stack_col" => true,
             _ => f.args.iter().any(|a| a.nullable(schema)),
         }
     }
@@ -1623,13 +1432,7 @@ impl Expression {
 
     fn extract_value_data_type(ev: &ExtractValueExpression, schema: &StructType) -> DataType {
         let base_type = ev.child.data_type(schema);
-        let field_name = match ev.extraction.as_ref() {
-            Expression::Literal(Literal {
-                value: LiteralValue::String(s),
-                ..
-            }) => Some(s.as_str()),
-            _ => None,
-        };
+        let field_name = as_string_literal(ev.extraction.as_ref());
         match (&base_type, field_name) {
             (DataType::Struct(st), Some(name)) => st
                 .field_by_name(name)
@@ -1644,13 +1447,7 @@ impl Expression {
     fn extract_value_nullable(ev: &ExtractValueExpression, schema: &StructType) -> bool {
         let base_nullable = ev.child.nullable(schema);
         let base_type = ev.child.data_type(schema);
-        let field_name = match ev.extraction.as_ref() {
-            Expression::Literal(Literal {
-                value: LiteralValue::String(s),
-                ..
-            }) => Some(s.as_str()),
-            _ => None,
-        };
+        let field_name = as_string_literal(ev.extraction.as_ref());
         match (&base_type, field_name) {
             (DataType::Struct(st), Some(name)) => {
                 let field_nullable = st.field_by_name(name).map(|f| f.nullable).unwrap_or(true);
@@ -1861,19 +1658,56 @@ impl ColumnReference {
 
 #[cfg(test)]
 mod tests {
-    use super::super::type_inference::{AGGREGATE_NAMES, CORR_FAMILY_NAMES, HASH_FAMILY_NAMES};
+    use super::super::type_inference::{
+        aggregate_classifier_names, CORR_FAMILY_NAMES, HASH_FAMILY_NAMES,
+    };
     use super::*;
+
+    // ── Shared expression constructors ──────────────────────────────────────
+
+    fn int_lit(v: i32) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Int(v),
+            data_type: DataType::Integer,
+        })
+    }
+
+    fn long_lit(v: i64) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Long(v),
+            data_type: DataType::Long,
+        })
+    }
+
+    fn str_lit(s: &str) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::String(s.to_owned()),
+            data_type: DataType::String,
+        })
+    }
+
+    fn bool_lit(v: bool) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Boolean(v),
+            data_type: DataType::Boolean,
+        })
+    }
+
+    /// `name(args...)` — every test-constructed call is non-DISTINCT.
+    fn fcall(name: &str, args: Vec<Expression>) -> Expression {
+        Expression::FunctionCall(FunctionCall {
+            name: name.to_owned(),
+            args,
+            distinct: false,
+        })
+    }
 
     // ── Checklist §1.1 — `count_if` FunctionCall nullability ────────────────
 
     #[test]
     fn count_if_function_call_is_non_nullable() {
         let s = StructType::new(vec![StructField::nullable("active", DataType::Boolean)]);
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "count_if".to_owned(),
-            args: vec![ColumnReference::untyped("active")],
-            distinct: false,
-        });
+        let expr = fcall("count_if", vec![ColumnReference::untyped("active")]);
         assert!(!expr.nullable(&s));
     }
 
@@ -1881,11 +1715,7 @@ mod tests {
     #[test]
     fn count_of_nullable_column_is_non_nullable() {
         let s = StructType::new(vec![StructField::nullable("id", DataType::Long)]);
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "count".to_owned(),
-            args: vec![ColumnReference::untyped("id")],
-            distinct: false,
-        });
+        let expr = fcall("count", vec![ColumnReference::untyped("id")]);
         assert!(!expr.nullable(&s));
     }
 
@@ -1894,29 +1724,19 @@ mod tests {
     #[test]
     fn if_with_nullable_predicate_and_non_null_branches_is_non_nullable() {
         let s = StructType::new(vec![StructField::nullable("salary", DataType::Long)]);
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "if".to_owned(),
-            args: vec![
+        let expr = fcall(
+            "if",
+            vec![
                 // nullable predicate (references a nullable column)
                 Expression::Binary(BinaryExpression {
                     op: BinaryOp::Gt,
                     left: Box::new(ColumnReference::untyped("salary")),
-                    right: Box::new(Expression::Literal(Literal {
-                        value: LiteralValue::Long(100_000),
-                        data_type: DataType::Long,
-                    })),
+                    right: Box::new(long_lit(100_000)),
                 }),
-                Expression::Literal(Literal {
-                    value: LiteralValue::String("high".to_owned()),
-                    data_type: DataType::String,
-                }),
-                Expression::Literal(Literal {
-                    value: LiteralValue::String("low".to_owned()),
-                    data_type: DataType::String,
-                }),
+                str_lit("high"),
+                str_lit("low"),
             ],
-            distinct: false,
-        });
+        );
         assert!(!expr.nullable(&s));
     }
 
@@ -1926,29 +1746,19 @@ mod tests {
     #[test]
     fn iif_with_nullable_predicate_and_non_null_branches_is_non_nullable() {
         let s = StructType::new(vec![StructField::nullable("salary", DataType::Long)]);
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "iif".to_owned(),
-            args: vec![
+        let expr = fcall(
+            "iif",
+            vec![
                 // nullable predicate (references a nullable column)
                 Expression::Binary(BinaryExpression {
                     op: BinaryOp::Gt,
                     left: Box::new(ColumnReference::untyped("salary")),
-                    right: Box::new(Expression::Literal(Literal {
-                        value: LiteralValue::Long(100_000),
-                        data_type: DataType::Long,
-                    })),
+                    right: Box::new(long_lit(100_000)),
                 }),
-                Expression::Literal(Literal {
-                    value: LiteralValue::String("high".to_owned()),
-                    data_type: DataType::String,
-                }),
-                Expression::Literal(Literal {
-                    value: LiteralValue::String("low".to_owned()),
-                    data_type: DataType::String,
-                }),
+                str_lit("high"),
+                str_lit("low"),
             ],
-            distinct: false,
-        });
+        );
         assert!(!expr.nullable(&s));
     }
 
@@ -1956,57 +1766,30 @@ mod tests {
     #[test]
     fn if_with_nullable_true_branch_is_nullable() {
         let s = StructType::new(vec![StructField::nullable("v", DataType::String)]);
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "if".to_owned(),
-            args: vec![
+        let expr = fcall(
+            "if",
+            vec![
                 // non-null predicate
-                Expression::Literal(Literal {
-                    value: LiteralValue::Boolean(true),
-                    data_type: DataType::Boolean,
-                }),
+                bool_lit(true),
                 // nullable true-branch
                 ColumnReference::untyped("v"),
                 // non-null false-branch
-                Expression::Literal(Literal {
-                    value: LiteralValue::String("low".to_owned()),
-                    data_type: DataType::String,
-                }),
+                str_lit("low"),
             ],
-            distinct: false,
-        });
+        );
         assert!(expr.nullable(&s));
     }
 
     // ── Complex-type constructor inference (cx-001 / cx-002) ───────────────
 
-    fn int_literal(v: i32) -> Expression {
-        Expression::Literal(Literal {
-            value: LiteralValue::Int(v),
-            data_type: DataType::Integer,
-        })
-    }
-
-    fn str_literal(s: &str) -> Expression {
-        Expression::Literal(Literal {
-            value: LiteralValue::String(s.to_owned()),
-            data_type: DataType::String,
-        })
-    }
-
     #[test]
     fn map_constructor_infers_key_and_value_types_from_args() {
         // `map('a', 1, 'b', 2)` → Map<String, Integer> with non-null values,
         // not the shared resolver's hard-coded Map<String, String>.
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "map".to_owned(),
-            args: vec![
-                str_literal("a"),
-                int_literal(1),
-                str_literal("b"),
-                int_literal(2),
-            ],
-            distinct: false,
-        });
+        let expr = fcall(
+            "map",
+            vec![str_lit("a"), int_lit(1), str_lit("b"), int_lit(2)],
+        );
         match expr.data_type(&StructType::empty()) {
             DataType::Map {
                 key,
@@ -2024,14 +1807,10 @@ mod tests {
     #[test]
     fn extract_value_over_map_returns_value_type() {
         // `map('a', 1)['a']` → Integer (the map's value type).
-        let map = Expression::FunctionCall(FunctionCall {
-            name: "map".to_owned(),
-            args: vec![str_literal("a"), int_literal(1)],
-            distinct: false,
-        });
+        let map = fcall("map", vec![str_lit("a"), int_lit(1)]);
         let ev = Expression::ExtractValue(ExtractValueExpression {
             child: Box::new(map),
-            extraction: Box::new(str_literal("a")),
+            extraction: Box::new(str_lit("a")),
         });
         assert_eq!(ev.data_type(&StructType::empty()), DataType::Integer);
     }
@@ -2040,14 +1819,10 @@ mod tests {
     fn array_index_into_non_null_literal_array_is_non_nullable() {
         // Spark `array(1, 2, 3)[0]` — the array is non-nullable with no null
         // elements and the index is a literal, so GetArrayItem is non-nullable.
-        let arr = Expression::FunctionCall(FunctionCall {
-            name: "array".to_owned(),
-            args: vec![int_literal(1), int_literal(2), int_literal(3)],
-            distinct: false,
-        });
+        let arr = fcall("array", vec![int_lit(1), int_lit(2), int_lit(3)]);
         let ev = Expression::ExtractValue(ExtractValueExpression {
             child: Box::new(arr),
-            extraction: Box::new(int_literal(0)),
+            extraction: Box::new(int_lit(0)),
         });
         assert_eq!(ev.data_type(&StructType::empty()), DataType::Integer);
         assert!(!ev.nullable(&StructType::empty()));
@@ -2068,24 +1843,19 @@ mod tests {
         assert!(ColumnReference::untyped("salary").nullable(&s));
 
         for name in HASH_FAMILY_NAMES {
-            let single = Expression::FunctionCall(FunctionCall {
-                name: (*name).to_owned(),
-                args: vec![ColumnReference::untyped("name")],
-                distinct: false,
-            });
+            let single = fcall(name, vec![ColumnReference::untyped("name")]);
             assert!(
                 !single.nullable(&s),
                 "{name}(nullable_col) must report nullable=false",
             );
 
-            let multi = Expression::FunctionCall(FunctionCall {
-                name: (*name).to_owned(),
-                args: vec![
+            let multi = fcall(
+                name,
+                vec![
                     ColumnReference::untyped("name"),
                     ColumnReference::untyped("salary"),
                 ],
-                distinct: false,
-            });
+            );
             assert!(
                 !multi.nullable(&s),
                 "{name}(nullable_col, nullable_col) must report nullable=false",
@@ -2097,18 +1867,16 @@ mod tests {
 
     /// §8.2 — every name where `aggregate_is_non_nullable` is `true` must
     /// produce a `FunctionCall` that reports `nullable == false`.
+    /// (Rewritten for the AGG_SPECS table: iterates the classifier column in
+    /// place of the retired `AGGREGATE_NAMES` const — same membership.)
     #[test]
     fn function_call_nullable_lists_are_symmetric_with_aggregate_is_non_nullable() {
         let schema = StructType::new(vec![StructField::nullable("x", DataType::Long)]);
-        for name in AGGREGATE_NAMES {
+        for name in aggregate_classifier_names() {
             if !TypeInferenceEngine::aggregate_is_non_nullable(name) {
                 continue;
             }
-            let expr = Expression::FunctionCall(FunctionCall {
-                name: (*name).to_owned(),
-                args: vec![ColumnReference::untyped("x")],
-                distinct: false,
-            });
+            let expr = fcall(name, vec![ColumnReference::untyped("x")]);
             assert!(
                 !expr.nullable(&schema),
                 "aggregate `{name}` is aggregate_is_non_nullable but \
@@ -2126,17 +1894,10 @@ mod tests {
     fn window_function_call_is_never_nullable() {
         // Nullable timestamp arg — struct itself must still be non-null.
         let schema = StructType::new(vec![StructField::nullable("ts", DataType::Timestamp)]);
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "window".to_owned(),
-            args: vec![
-                ColumnReference::untyped("ts"),
-                Expression::Literal(Literal {
-                    value: LiteralValue::String("1 day".to_owned()),
-                    data_type: DataType::String,
-                }),
-            ],
-            distinct: false,
-        });
+        let expr = fcall(
+            "window",
+            vec![ColumnReference::untyped("ts"), str_lit("1 day")],
+        );
         assert!(!expr.nullable(&schema));
         // Also non-nullable when the timestamp arg is non-null.
         let schema_nn = StructType::new(vec![StructField::not_null("ts", DataType::Timestamp)]);
@@ -2148,11 +1909,7 @@ mod tests {
     fn hash_family_is_in_function_call_nullable_literal_list() {
         let schema = StructType::new(vec![StructField::nullable("x", DataType::String)]);
         for name in HASH_FAMILY_NAMES {
-            let expr = Expression::FunctionCall(FunctionCall {
-                name: (*name).to_owned(),
-                args: vec![ColumnReference::untyped("x")],
-                distinct: false,
-            });
+            let expr = fcall(name, vec![ColumnReference::untyped("x")]);
             assert!(
                 !expr.nullable(&schema),
                 "hash family `{name}` must report nullable=false",
@@ -2165,10 +1922,7 @@ mod tests {
     #[test]
     fn literal_data_type_and_nullability() {
         let s = StructType::empty();
-        let lit_int = Expression::Literal(Literal {
-            value: LiteralValue::Int(42),
-            data_type: DataType::Integer,
-        });
+        let lit_int = int_lit(42);
         assert_eq!(lit_int.data_type(&s), DataType::Integer);
         assert!(!lit_int.nullable(&s));
 
@@ -2360,14 +2114,13 @@ mod tests {
             StructField::nullable("name", DataType::String),
             StructField::not_null("age", DataType::Integer),
         ]);
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![
+        let expr = fcall(
+            "struct",
+            vec![
                 ColumnReference::untyped("name"),
                 ColumnReference::untyped("age"),
             ],
-            distinct: false,
-        });
+        );
         match expr.data_type(&schema) {
             DataType::Struct(st) => {
                 assert_eq!(st.fields.len(), 2);
@@ -2392,11 +2145,7 @@ mod tests {
             expr: Box::new(ColumnReference::untyped("name")),
             alias: "who".to_owned(),
         });
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "struct".to_owned(),
-            args: vec![aliased],
-            distinct: false,
-        });
+        let expr = fcall("struct", vec![aliased]);
         match expr.data_type(&schema) {
             DataType::Struct(st) => {
                 assert_eq!(st.fields.len(), 1);
@@ -2414,24 +2163,15 @@ mod tests {
             StructField::nullable("a", DataType::Integer),
             StructField::nullable("b", DataType::String),
         ]);
-        let key_x = Expression::Literal(Literal {
-            value: LiteralValue::String("x".to_owned()),
-            data_type: DataType::String,
-        });
-        let key_y = Expression::Literal(Literal {
-            value: LiteralValue::String("y".to_owned()),
-            data_type: DataType::String,
-        });
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "named_struct".to_owned(),
-            args: vec![
-                key_x,
+        let expr = fcall(
+            "named_struct",
+            vec![
+                str_lit("x"),
                 ColumnReference::untyped("a"),
-                key_y,
+                str_lit("y"),
                 ColumnReference::untyped("b"),
             ],
-            distinct: false,
-        });
+        );
         match expr.data_type(&schema) {
             DataType::Struct(st) => {
                 assert_eq!(st.fields.len(), 2);
@@ -2473,13 +2213,7 @@ mod tests {
         )]);
         let expr = Expression::UpdateFields(UpdateFieldsExpression {
             struct_expr: Box::new(address_column()),
-            updates: vec![(
-                "country".to_owned(),
-                Some(Expression::Literal(Literal {
-                    value: LiteralValue::String("AT".to_owned()),
-                    data_type: DataType::String,
-                })),
-            )],
+            updates: vec![("country".to_owned(), Some(str_lit("AT")))],
         });
         match expr.data_type(&schema) {
             DataType::Struct(st) => {
@@ -2503,13 +2237,7 @@ mod tests {
         )]);
         let expr = Expression::UpdateFields(UpdateFieldsExpression {
             struct_expr: Box::new(address_column()),
-            updates: vec![(
-                "city".to_owned(),
-                Some(Expression::Literal(Literal {
-                    value: LiteralValue::String("Vienna".to_owned()),
-                    data_type: DataType::String,
-                })),
-            )],
+            updates: vec![("city".to_owned(), Some(str_lit("Vienna")))],
         });
         match expr.data_type(&schema) {
             DataType::Struct(st) => {
@@ -2573,13 +2301,7 @@ mod tests {
         )]);
         let expr = Expression::UpdateFields(UpdateFieldsExpression {
             struct_expr: Box::new(address_column()),
-            updates: vec![(
-                "CITY".to_owned(),
-                Some(Expression::Literal(Literal {
-                    value: LiteralValue::String("Vienna".to_owned()),
-                    data_type: DataType::String,
-                })),
-            )],
+            updates: vec![("CITY".to_owned(), Some(str_lit("Vienna")))],
         });
         match expr.data_type(&schema) {
             DataType::Struct(st) => {
@@ -2607,21 +2329,9 @@ mod tests {
         let expr = Expression::UpdateFields(UpdateFieldsExpression {
             struct_expr: Box::new(address_column()),
             updates: vec![
-                (
-                    "CITY".to_owned(),
-                    Some(Expression::Literal(Literal {
-                        value: LiteralValue::String("Vienna".to_owned()),
-                        data_type: DataType::String,
-                    })),
-                ),
+                ("CITY".to_owned(), Some(str_lit("Vienna"))),
                 ("GEO".to_owned(), None),
-                (
-                    "country".to_owned(),
-                    Some(Expression::Literal(Literal {
-                        value: LiteralValue::String("AT".to_owned()),
-                        data_type: DataType::String,
-                    })),
-                ),
+                ("country".to_owned(), Some(str_lit("AT"))),
             ],
         });
         match expr.data_type(&schema) {
@@ -2641,11 +2351,10 @@ mod tests {
             StructField::nullable("b", DataType::Integer),
         ]);
         for name in CORR_FAMILY_NAMES {
-            let expr = Expression::FunctionCall(FunctionCall {
-                name: (*name).to_owned(),
-                args: vec![ColumnReference::untyped("a"), ColumnReference::untyped("b")],
-                distinct: false,
-            });
+            let expr = fcall(
+                name,
+                vec![ColumnReference::untyped("a"), ColumnReference::untyped("b")],
+            );
             assert_eq!(
                 expr.data_type(&s),
                 DataType::Double,
@@ -2664,21 +2373,17 @@ mod tests {
             "tags",
             DataType::Array(Box::new(DataType::String), true),
         )]);
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "aggregate".to_owned(),
-            args: vec![
+        let expr = fcall(
+            "aggregate",
+            vec![
                 ColumnReference::untyped("tags"),
-                Expression::Literal(Literal {
-                    value: LiteralValue::String(String::new()),
-                    data_type: DataType::String,
-                }),
+                str_lit(""),
                 // Real emissions place a Lambda here; the type inference
                 // fast-path reads only args[0..2], so a placeholder col
                 // is sufficient for this test.
                 ColumnReference::untyped("__lambda_placeholder"),
             ],
-            distinct: false,
-        });
+        );
         assert_eq!(
             expr.data_type(&s),
             DataType::String,
@@ -2693,18 +2398,14 @@ mod tests {
             "nums",
             DataType::Array(Box::new(DataType::Long), true),
         )]);
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "reduce".to_owned(),
-            args: vec![
+        let expr = fcall(
+            "reduce",
+            vec![
                 ColumnReference::untyped("nums"),
-                Expression::Literal(Literal {
-                    value: LiteralValue::Long(0),
-                    data_type: DataType::Long,
-                }),
+                long_lit(0),
                 ColumnReference::untyped("__lambda_placeholder"),
             ],
-            distinct: false,
-        });
+        );
         assert_eq!(expr.data_type(&s), DataType::Long);
     }
 
@@ -2724,21 +2425,15 @@ mod tests {
     }
 
     fn inline_field_call(arr_col: &str, field: &str, outer: bool) -> Expression {
-        Expression::FunctionCall(FunctionCall {
-            name: if outer {
-                "inline_outer_field".to_owned()
-            } else {
-                "inline_field".to_owned()
-            },
-            args: vec![
-                ColumnReference::untyped(arr_col),
-                Expression::Literal(Literal {
-                    value: LiteralValue::String(field.to_owned()),
-                    data_type: DataType::String,
-                }),
-            ],
-            distinct: false,
-        })
+        let name = if outer {
+            "inline_outer_field"
+        } else {
+            "inline_field"
+        };
+        fcall(
+            name,
+            vec![ColumnReference::untyped(arr_col), str_lit(field)],
+        )
     }
 
     /// `inline_field(arr, "name")` returns the struct field's own type.
@@ -2833,17 +2528,10 @@ mod tests {
     // ── Pass 91 — json_tuple_field type + nullability ────────────────────
 
     fn json_tuple_field_call(json_col: &str, key: &str) -> Expression {
-        Expression::FunctionCall(FunctionCall {
-            name: "json_tuple_field".to_owned(),
-            args: vec![
-                ColumnReference::untyped(json_col),
-                Expression::Literal(Literal {
-                    value: LiteralValue::String(key.to_owned()),
-                    data_type: DataType::String,
-                }),
-            ],
-            distinct: false,
-        })
+        fcall(
+            "json_tuple_field",
+            vec![ColumnReference::untyped(json_col), str_lit(key)],
+        )
     }
 
     /// `json_tuple_field(json_str, "<key>")` is always STRING per Spark's
@@ -2878,38 +2566,18 @@ mod tests {
     #[test]
     fn map_children_visits_each_immediate_child_exactly_once() {
         // Alias(FunctionCall("f", [Binary(Add, CaseWhen(when=Lit(1), then=Lit(2)) else=Lit(3), Lit(4))]))
-        let leaf_lit_1 = Expression::Literal(Literal {
-            value: LiteralValue::Int(1),
-            data_type: DataType::Integer,
-        });
-        let leaf_lit_2 = Expression::Literal(Literal {
-            value: LiteralValue::Int(2),
-            data_type: DataType::Integer,
-        });
-        let leaf_lit_3 = Expression::Literal(Literal {
-            value: LiteralValue::Int(3),
-            data_type: DataType::Integer,
-        });
-        let leaf_lit_4 = Expression::Literal(Literal {
-            value: LiteralValue::Int(4),
-            data_type: DataType::Integer,
-        });
         let case_when = Expression::CaseWhen(CaseWhenExpression {
-            branches: vec![(leaf_lit_1, leaf_lit_2)],
-            else_expr: Some(Box::new(leaf_lit_3)),
+            branches: vec![(int_lit(1), int_lit(2))],
+            else_expr: Some(Box::new(int_lit(3))),
         });
         let binary = Expression::Binary(BinaryExpression {
             op: BinaryOp::Add,
             left: Box::new(case_when),
-            right: Box::new(leaf_lit_4),
+            right: Box::new(int_lit(4)),
         });
-        let fcall = Expression::FunctionCall(FunctionCall {
-            name: "f".to_owned(),
-            args: vec![binary],
-            distinct: false,
-        });
+        let func = fcall("f", vec![binary]);
         let alias = Expression::Alias(AliasExpression {
-            expr: Box::new(fcall),
+            expr: Box::new(func),
             alias: "x".to_owned(),
         });
 
@@ -2973,10 +2641,7 @@ mod tests {
             }],
             frame: Some(WindowFrame {
                 unit: FrameUnit::Rows,
-                lower: FrameBoundary::Preceding(Box::new(Expression::Literal(Literal {
-                    value: LiteralValue::Int(1),
-                    data_type: DataType::Integer,
-                }))),
+                lower: FrameBoundary::Preceding(Box::new(int_lit(1))),
                 upper: FrameBoundary::CurrentRow,
             }),
         });
@@ -2992,23 +2657,11 @@ mod tests {
         DataType::Decimal { precision, scale }
     }
 
-    fn int_lit(v: i32) -> Expression {
-        Expression::Literal(Literal {
-            value: LiteralValue::Int(v),
-            data_type: DataType::Integer,
-        })
-    }
-
     /// Resolve `name(args...)` against a single-column schema of `col_type`,
     /// where `args[0]` references that column.
     fn call_type(name: &str, args: Vec<Expression>, col_type: DataType) -> DataType {
         let schema = StructType::new(vec![StructField::nullable("c", col_type)]);
-        Expression::FunctionCall(FunctionCall {
-            name: name.to_owned(),
-            args,
-            distinct: false,
-        })
-        .data_type(&schema)
+        fcall(name, args).data_type(&schema)
     }
 
     #[test]
@@ -3092,14 +2745,13 @@ mod tests {
             StructField::nullable("d1", dec(10, 2)),
             StructField::nullable("d2", dec(6, 3)),
         ]);
-        let expr = Expression::FunctionCall(FunctionCall {
-            name: "mod".to_owned(),
-            args: vec![
+        let expr = fcall(
+            "mod",
+            vec![
                 ColumnReference::untyped("d1"),
                 ColumnReference::untyped("d2"),
             ],
-            distinct: false,
-        });
+        );
         assert_eq!(expr.data_type(&schema), dec(6, 3));
     }
 
@@ -3112,20 +2764,18 @@ mod tests {
             StructField::nullable("b", DataType::Integer),
             StructField::nullable("lng", DataType::Long),
         ]);
-        let mod_ii = Expression::FunctionCall(FunctionCall {
-            name: "mod".to_owned(),
-            args: vec![ColumnReference::untyped("a"), ColumnReference::untyped("b")],
-            distinct: false,
-        });
+        let mod_ii = fcall(
+            "mod",
+            vec![ColumnReference::untyped("a"), ColumnReference::untyped("b")],
+        );
         assert_eq!(mod_ii.data_type(&schema), DataType::Integer);
-        let mod_li = Expression::FunctionCall(FunctionCall {
-            name: "mod".to_owned(),
-            args: vec![
+        let mod_li = fcall(
+            "mod",
+            vec![
                 ColumnReference::untyped("lng"),
                 ColumnReference::untyped("a"),
             ],
-            distinct: false,
-        });
+        );
         assert_eq!(mod_li.data_type(&schema), DataType::Long);
     }
 }

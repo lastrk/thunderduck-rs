@@ -12,6 +12,7 @@
 //! `invariants::inv5_schema_everywhere`. Error-path fixtures (e.g. ambiguous
 //! column) are exercised directly inside `analyzer.rs::tests`.
 
+use super::analyzer::flip_all_nullable;
 use super::ast::{CommonAst, CommonOp, JoinType, SetOpKind};
 use super::base_types::BaseTypes;
 use super::expression::{
@@ -399,15 +400,6 @@ fn full_outer_join_flips_both_sides() -> Fixture {
         base_types_all_inputs(),
         expected,
     )
-}
-
-fn flip_all_nullable(schema: &StructType) -> StructType {
-    let fields = schema
-        .fields
-        .iter()
-        .map(|f| StructField::new(f.name.clone(), f.data_type.clone(), true))
-        .collect();
-    StructType::new(fields)
 }
 
 // ── Nested-struct field access ──────────────────────────────────────────────

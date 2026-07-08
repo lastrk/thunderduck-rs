@@ -30,7 +30,7 @@ use arrow::array::{
     IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray, LargeStringArray,
     ListArray, MapArray, StringArray, StructArray, TimestampMicrosecondArray,
 };
-use arrow::datatypes::{DataType as ArrowDT, IntervalUnit, TimeUnit};
+use arrow::datatypes::{DataType as ArrowDT, Field, IntervalUnit, TimeUnit};
 use arrow_ipc::reader::StreamReader;
 use thunderduck_core::bail_boundary_proto;
 use thunderduck_core::transpiler_v2::ast::{
@@ -38,10 +38,12 @@ use thunderduck_core::transpiler_v2::ast::{
 };
 use thunderduck_core::transpiler_v2::error::UnsupportedKind;
 use thunderduck_core::transpiler_v2::expression::{
-    AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression, Expression,
-    FunctionCall, InListExpression, Literal, LiteralValue, NullOrdering, RawSqlExpression,
-    SortDirection, SortOrder, StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn,
-    UnresolvedRegexExpression,
+    decimal_value_precision_scale, AliasExpression, ArrayLiteralExpression, BinaryExpression,
+    BinaryOp, CaseWhenExpression, CastExpression, Expression, ExtractValueExpression, FunctionCall,
+    InListExpression, LambdaExpression, LambdaVariableExpression, Literal, LiteralValue,
+    MapLiteralExpression, NullOrdering, RawSqlExpression, SortDirection, SortOrder, StarExpression,
+    StructLiteralExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UnresolvedRegexExpression,
+    UpdateFieldsExpression, WindowFunction,
 };
 use thunderduck_core::transpiler_v2::macros::ProtoFieldExt;
 use thunderduck_core::transpiler_v2::EmissionError;
@@ -83,21 +85,9 @@ fn normalize_decimal_literal(
     server_precision: Option<u8>,
     server_scale: Option<u8>,
 ) -> (u8, u8) {
-    // Step 1: parse `value` into (vp, vs). Strip sign, split on '.'.
-    let trimmed = value.trim_start_matches(['+', '-']);
-    let (int_part, frac_part) = match trimmed.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (trimmed, ""),
-    };
-    let raw_int_digits = int_part
-        .trim_start_matches('0')
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .count() as u8;
-    let vs = frac_part.chars().filter(|c| c.is_ascii_digit()).count() as u8;
-    // Spark's Decimal.set() bumps precision up to max(precision, scale) and
-    // never below 1 (the smallest legal DecimalType precision).
-    let vp = raw_int_digits.saturating_add(vs).max(vs).max(1);
+    // Step 1: value-derived (vp, vs) — shared, unclamped computation in
+    // `transpiler_v2::expression::decimal_value_precision_scale`.
+    let (vp, vs) = decimal_value_precision_scale(value);
 
     // Steps 2-3: wire fields default to the value-derived shape.
     let p_wire = server_precision.unwrap_or(vp);
@@ -214,17 +204,11 @@ impl V2RelationConverter {
 
     fn convert_fill_na(&mut self, f: &proto::NaFill) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(f.input.as_deref(), "NaFill")?;
-        let mut values: Vec<thunderduck_core::transpiler_v2::Expression> =
-            Vec::with_capacity(f.values.len());
-        for lit in &f.values {
-            // Wrap each Literal into a proto::Expression for the shared
-            // literal-converter path.
-            let expr = proto::Expression {
-                expr_type: Some(proto::expression::ExprType::Literal(lit.clone())),
-                ..Default::default()
-            };
-            values.push(self.expr.convert(&expr)?);
-        }
+        let values = f
+            .values
+            .iter()
+            .map(|l| self.expr.convert_literal(l))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(CommonAst::new(CommonOp::NaFill {
             input: Box::new(input),
             cols: f.cols.clone(),
@@ -243,10 +227,8 @@ impl V2RelationConverter {
 
     fn convert_replace(&mut self, r: &proto::NaReplace) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(r.input.as_deref(), "NaReplace")?;
-        let mut replacements: Vec<(
-            thunderduck_core::transpiler_v2::Expression,
-            thunderduck_core::transpiler_v2::Expression,
-        )> = Vec::with_capacity(r.replacements.len());
+        let mut replacements: Vec<(Expression, Expression)> =
+            Vec::with_capacity(r.replacements.len());
         for rep in &r.replacements {
             let old_lit = rep.old_value.as_ref().require_proto(
                 "NaReplace::old_value::None",
@@ -256,15 +238,10 @@ impl V2RelationConverter {
                 "NaReplace::new_value::None",
                 "NaReplace replacement missing new_value",
             )?;
-            let old_expr = proto::Expression {
-                expr_type: Some(proto::expression::ExprType::Literal(old_lit.clone())),
-                ..Default::default()
-            };
-            let new_expr = proto::Expression {
-                expr_type: Some(proto::expression::ExprType::Literal(new_lit.clone())),
-                ..Default::default()
-            };
-            replacements.push((self.expr.convert(&old_expr)?, self.expr.convert(&new_expr)?));
+            replacements.push((
+                self.expr.convert_literal(old_lit)?,
+                self.expr.convert_literal(new_lit)?,
+            ));
         }
         Ok(CommonAst::new(CommonOp::NaReplace {
             input: Box::new(input),
@@ -281,13 +258,10 @@ impl V2RelationConverter {
         // shape.
         let mut ids: Vec<String> = Vec::with_capacity(u.ids.len());
         for e in &u.ids {
-            ids.push(
-                extract_column_name(e).ok_or_else(|| EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
-                    name: "Unpivot::id::non_attribute".to_owned(),
-                    reason: "Unpivot id columns must be bare column references".to_owned(),
-                })?,
-            );
+            ids.push(extract_column_name(e).require_proto(
+                "Unpivot::id::non_attribute",
+                "Unpivot id columns must be bare column references",
+            )?);
         }
 
         // Extract value column names; None ⇒ analyzer expands to all non-id
@@ -296,14 +270,10 @@ impl V2RelationConverter {
             Some(v) => {
                 let mut out = Vec::with_capacity(v.values.len());
                 for e in &v.values {
-                    out.push(
-                        extract_column_name(e).ok_or_else(|| EmissionError::Unsupported {
-                            kind: UnsupportedKind::ProtoShape,
-                            name: "Unpivot::value::non_attribute".to_owned(),
-                            reason: "Unpivot value columns must be bare column references"
-                                .to_owned(),
-                        })?,
-                    );
+                    out.push(extract_column_name(e).require_proto(
+                        "Unpivot::value::non_attribute",
+                        "Unpivot value columns must be bare column references",
+                    )?);
                 }
                 out
             }
@@ -483,15 +453,10 @@ impl V2RelationConverter {
         let mut drop_names: Vec<String> = d.column_names.clone();
         for col_expr in &d.columns {
             use proto::expression::ExprType;
-            let expr_type =
-                col_expr
-                    .expr_type
-                    .as_ref()
-                    .ok_or_else(|| EmissionError::Unsupported {
-                        kind: UnsupportedKind::ProtoShape,
-                        name: "Drop::column::None".to_owned(),
-                        reason: "Drop.columns entry has no expr_type".to_owned(),
-                    })?;
+            let expr_type = col_expr
+                .expr_type
+                .as_ref()
+                .require_proto("Drop::column::None", "Drop.columns entry has no expr_type")?;
             match expr_type {
                 ExprType::UnresolvedAttribute(a) => {
                     drop_names.push(a.unparsed_identifier.clone());
@@ -519,15 +484,11 @@ impl V2RelationConverter {
             Vec::with_capacity(wc.aliases.len());
         for alias in &wc.aliases {
             // Proto contract: exactly one name part for a scalar column.
-            let name = match alias.name.as_slice() {
-                [n] => n.clone(),
-                _ => {
-                    bail_boundary_proto!(
-                        "WithColumns::Alias::multi_name",
-                        "WithColumns aliases must carry exactly one name part",
-                    );
-                }
-            };
+            let name = single_name_part(
+                &alias.name,
+                "WithColumns::Alias::multi_name",
+                "WithColumns aliases must carry exactly one name part",
+            )?;
             let expr_proto = alias.expr.as_deref().require_proto(
                 "WithColumns::Alias::missing_expr",
                 "WithColumns alias has no expression",
@@ -571,12 +532,11 @@ impl V2RelationConverter {
 
     fn convert_filter(&mut self, f: &proto::Filter) -> Result<CommonAst, EmissionError> {
         let input = self.convert_input(f.input.as_deref(), "Filter")?;
-        let condition = match &f.condition {
-            Some(c) => self.expr.convert(c)?,
-            None => {
-                bail_boundary_proto!("Filter::missing_condition", "Filter has no condition");
-            }
-        };
+        let condition_proto = f
+            .condition
+            .as_ref()
+            .require_proto("Filter::missing_condition", "Filter has no condition")?;
+        let condition = self.expr.convert(condition_proto)?;
         Ok(CommonAst::new(CommonOp::Filter {
             input: Box::new(input),
             condition,
@@ -634,16 +594,8 @@ impl V2RelationConverter {
             GroupType::Pivot => unreachable!("handled by convert_pivot above"),
         };
         let input = self.convert_input(a.input.as_deref(), "Aggregate")?;
-        let grouping = a
-            .grouping_expressions
-            .iter()
-            .map(|e| self.expr.convert(e))
-            .collect::<Result<Vec<_>, _>>()?;
-        let aggregates = a
-            .aggregate_expressions
-            .iter()
-            .map(|e| self.expr.convert(e))
-            .collect::<Result<Vec<_>, _>>()?;
+        let grouping = self.expr.convert_all(&a.grouping_expressions)?;
+        let aggregates = self.expr.convert_all(&a.aggregate_expressions)?;
         Ok(CommonAst::new(CommonOp::Aggregate {
             input: Box::new(input),
             grouping,
@@ -677,21 +629,13 @@ impl V2RelationConverter {
         )?;
         let input = self.convert_input(a.input.as_deref(), "Aggregate[Pivot]")?;
         let pivot_column = self.expr.convert(pivot_col_proto)?;
-        let grouping = a
-            .grouping_expressions
-            .iter()
-            .map(|e| self.expr.convert(e))
-            .collect::<Result<Vec<_>, _>>()?;
+        let grouping = self.expr.convert_all(&a.grouping_expressions)?;
         let pivot_values = pivot_proto
             .values
             .iter()
             .map(|lit| self.expr.convert_literal(lit))
             .collect::<Result<Vec<_>, _>>()?;
-        let aggregates = a
-            .aggregate_expressions
-            .iter()
-            .map(|e| self.expr.convert(e))
-            .collect::<Result<Vec<_>, _>>()?;
+        let aggregates = self.expr.convert_all(&a.aggregate_expressions)?;
         Ok(CommonAst::new(CommonOp::Pivot {
             input: Box::new(input),
             grouping: PivotGrouping::Explicit(grouping),
@@ -819,6 +763,15 @@ impl V2ExpressionConverter {
         Self
     }
 
+    /// Convert a slice of proto expressions, short-circuiting on the first
+    /// conversion error.
+    fn convert_all(
+        &mut self,
+        exprs: &[proto::Expression],
+    ) -> Result<Vec<Expression>, EmissionError> {
+        exprs.iter().map(|e| self.convert(e)).collect()
+    }
+
     fn convert(&mut self, expr: &proto::Expression) -> Result<Expression, EmissionError> {
         use proto::expression::ExprType;
         let expr_type = expr
@@ -851,152 +804,33 @@ impl V2ExpressionConverter {
                     "LambdaFunction missing body",
                 )?;
                 let body = self.convert(func_proto)?;
-                let mut params: Vec<String> = Vec::with_capacity(lf.arguments.len());
-                for arg in &lf.arguments {
-                    let name = match arg.name_parts.as_slice() {
-                        [n] => n.clone(),
-                        _ => {
-                            bail_boundary_proto!(
-                                "LambdaFunction::arg::multi_part",
-                                "lambda argument name must be a single part",
-                            );
-                        }
-                    };
-                    params.push(name);
-                }
-                Ok(Expression::Lambda(
-                    thunderduck_core::transpiler_v2::expression::LambdaExpression {
-                        params,
-                        body: Box::new(body),
-                    },
-                ))
+                let params = lf
+                    .arguments
+                    .iter()
+                    .map(|arg| {
+                        single_name_part(
+                            &arg.name_parts,
+                            "LambdaFunction::arg::multi_part",
+                            "lambda argument name must be a single part",
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Expression::Lambda(LambdaExpression {
+                    params,
+                    body: Box::new(body),
+                }))
             }
             ExprType::UnresolvedNamedLambdaVariable(v) => {
-                let name = match v.name_parts.as_slice() {
-                    [n] => n.clone(),
-                    _ => {
-                        bail_boundary_proto!(
-                            "UnresolvedNamedLambdaVariable::multi_part",
-                            "lambda variable name must be a single part",
-                        );
-                    }
-                };
-                Ok(Expression::LambdaVariable(
-                    thunderduck_core::transpiler_v2::expression::LambdaVariableExpression { name },
-                ))
+                let name = single_name_part(
+                    &v.name_parts,
+                    "UnresolvedNamedLambdaVariable::multi_part",
+                    "lambda variable name must be a single part",
+                )?;
+                Ok(Expression::LambdaVariable(LambdaVariableExpression {
+                    name,
+                }))
             }
-            ExprType::Window(w) => {
-                let func_proto =
-                    w.window_function
-                        .as_deref()
-                        .ok_or_else(|| EmissionError::Unsupported {
-                            kind: UnsupportedKind::ProtoShape,
-                            name: "Window::window_function::None".to_owned(),
-                            reason: "Window missing window_function".to_owned(),
-                        })?;
-                let func = self.convert(func_proto)?;
-                let mut partition_by: Vec<Expression> = Vec::with_capacity(w.partition_spec.len());
-                for p in &w.partition_spec {
-                    partition_by.push(self.convert(p)?);
-                }
-                let mut order_by: Vec<thunderduck_core::transpiler_v2::expression::SortOrder> =
-                    Vec::with_capacity(w.order_spec.len());
-                for so in &w.order_spec {
-                    order_by.push(self.convert_sort_order(so)?);
-                }
-                // Parse the frame spec if present.
-                use proto::expression::window::window_frame as pwf;
-                use thunderduck_core::transpiler_v2::expression::{
-                    FrameBoundary as VFB, FrameUnit as VFU, WindowFrame as VWF,
-                };
-                let frame = match w.frame_spec.as_deref() {
-                    Some(fs) => {
-                        let unit = match pwf::FrameType::try_from(fs.frame_type)
-                            .unwrap_or(pwf::FrameType::Undefined)
-                        {
-                            pwf::FrameType::Row => VFU::Rows,
-                            pwf::FrameType::Range => VFU::Range,
-                            pwf::FrameType::Undefined => {
-                                // No frame semantics — omit the frame.
-                                return Ok(Expression::Window(
-                                    thunderduck_core::transpiler_v2::expression::WindowFunction {
-                                        func: Box::new(func),
-                                        partition_by,
-                                        order_by,
-                                        frame: None,
-                                    },
-                                ));
-                            }
-                        };
-                        let mut convert_boundary =
-                            |b_opt: Option<&pwf::FrameBoundary>,
-                             is_lower: bool|
-                             -> Result<VFB, EmissionError> {
-                                let b = b_opt.require_proto(
-                                    "Window::frame_spec::missing_boundary",
-                                    "frame boundary missing",
-                                )?;
-                                use pwf::frame_boundary::Boundary as PB;
-                                match b.boundary.as_ref() {
-                                    Some(PB::CurrentRow(_)) => Ok(VFB::CurrentRow),
-                                    Some(PB::Unbounded(_)) => Ok(if is_lower {
-                                        VFB::UnboundedPreceding
-                                    } else {
-                                        VFB::UnboundedFollowing
-                                    }),
-                                    Some(PB::Value(v)) => {
-                                        let expr = self.convert(v)?;
-                                        // Spark encodes offsets as signed
-                                        // numeric literals: negative = PRECEDING,
-                                        // positive = FOLLOWING. Match here.
-                                        if let Expression::Literal(l) = &expr {
-                                            use thunderduck_core::transpiler_v2::expression::LiteralValue as LV;
-                                            let sign: Option<i64> = match &l.value {
-                                                LV::Int(i) => Some(*i as i64),
-                                                LV::Long(i) => Some(*i),
-                                                _ => None,
-                                            };
-                                            if let Some(n) = sign {
-                                                let abs_expr = Expression::Literal(
-                                                    thunderduck_core::transpiler_v2::expression::Literal {
-                                                        value: LV::Long(n.abs()),
-                                                        data_type: thunderduck_core::types::DataType::Long,
-                                                    },
-                                                );
-                                                return Ok(if n < 0 {
-                                                    VFB::Preceding(Box::new(abs_expr))
-                                                } else {
-                                                    VFB::Following(Box::new(abs_expr))
-                                                });
-                                            }
-                                        }
-                                        Ok(if is_lower {
-                                            VFB::Preceding(Box::new(expr))
-                                        } else {
-                                            VFB::Following(Box::new(expr))
-                                        })
-                                    }
-                                    None => bail_boundary_proto!(
-                                        "Window::frame_boundary::None",
-                                        "frame boundary carries no shape",
-                                    ),
-                                }
-                            };
-                        let lower = convert_boundary(fs.lower.as_deref(), true)?;
-                        let upper = convert_boundary(fs.upper.as_deref(), false)?;
-                        Some(VWF { unit, lower, upper })
-                    }
-                    None => None,
-                };
-                Ok(Expression::Window(
-                    thunderduck_core::transpiler_v2::expression::WindowFunction {
-                        func: Box::new(func),
-                        partition_by,
-                        order_by,
-                        frame,
-                    },
-                ))
-            }
+            ExprType::Window(w) => self.convert_window(w),
             ExprType::UnresolvedExtractValue(uev) => {
                 let child = uev.child.as_deref().require_proto(
                     "UnresolvedExtractValue::child::None",
@@ -1008,12 +842,10 @@ impl V2ExpressionConverter {
                 )?;
                 let child = self.convert(child)?;
                 let extraction = self.convert(extraction)?;
-                Ok(Expression::ExtractValue(
-                    thunderduck_core::transpiler_v2::expression::ExtractValueExpression {
-                        child: Box::new(child),
-                        extraction: Box::new(extraction),
-                    },
-                ))
+                Ok(Expression::ExtractValue(ExtractValueExpression {
+                    child: Box::new(child),
+                    extraction: Box::new(extraction),
+                }))
             }
             ExprType::ExpressionString(es) => {
                 // Spark's `F.expr("<sql>")` / `df.selectExpr("<sql>")` — a
@@ -1045,12 +877,10 @@ impl V2ExpressionConverter {
                     };
                     updates.push((field_name, converted_value));
                 }
-                Ok(Expression::UpdateFields(
-                    thunderduck_core::transpiler_v2::expression::UpdateFieldsExpression {
-                        struct_expr: Box::new(struct_expr),
-                        updates,
-                    },
-                ))
+                Ok(Expression::UpdateFields(UpdateFieldsExpression {
+                    struct_expr: Box::new(struct_expr),
+                    updates,
+                }))
             }
             ExprType::UnresolvedRegex(ur) => Ok(convert_unresolved_regex(ur)),
             other => bail_boundary_proto!(
@@ -1074,6 +904,13 @@ impl V2ExpressionConverter {
             ProtoSD::Descending => SortDirection::Descending,
             _ => SortDirection::Ascending,
         };
+        // Divergence from the SQL front-end (deliberate): the SQL parser
+        // derives an unspecified null ordering from the sort direction
+        // (Spark's default — ASC ⇒ NULLS FIRST, DESC ⇒ NULLS LAST), while
+        // this proto arm maps `SortNullsUnspecified` to `NullsFirst`
+        // unconditionally. That is safe here because `Unspecified` is
+        // unreachable from PySpark 4.x — the Connect client always stamps an
+        // explicit null ordering on every `SortOrder` proto it sends.
         let null_ordering = match so.null_ordering() {
             ProtoNO::SortNullsLast => NullOrdering::NullsLast,
             _ => NullOrdering::NullsFirst,
@@ -1085,78 +922,142 @@ impl V2ExpressionConverter {
         })
     }
 
+    /// Convert a proto `Window` expression: window function + PARTITION BY /
+    /// ORDER BY specs + optional frame.
+    fn convert_window(
+        &mut self,
+        w: &proto::expression::Window,
+    ) -> Result<Expression, EmissionError> {
+        let func_proto = w.window_function.as_deref().require_proto(
+            "Window::window_function::None",
+            "Window missing window_function",
+        )?;
+        let func = self.convert(func_proto)?;
+        let partition_by = self.convert_all(&w.partition_spec)?;
+        let order_by = w
+            .order_spec
+            .iter()
+            .map(|so| self.convert_sort_order(so))
+            .collect::<Result<Vec<_>, _>>()?;
+        let frame = match w.frame_spec.as_deref() {
+            Some(fs) => self.convert_window_frame(fs)?,
+            None => None,
+        };
+        Ok(Expression::Window(WindowFunction {
+            func: Box::new(func),
+            partition_by,
+            order_by,
+            frame,
+        }))
+    }
+
+    /// Parse a proto window frame spec. `FrameType::Undefined` carries no
+    /// frame semantics — returns `Ok(None)` so the caller omits the frame.
+    fn convert_window_frame(
+        &mut self,
+        fs: &proto::expression::window::WindowFrame,
+    ) -> Result<Option<thunderduck_core::transpiler_v2::expression::WindowFrame>, EmissionError>
+    {
+        use proto::expression::window::window_frame as pwf;
+        use thunderduck_core::transpiler_v2::expression::{
+            FrameBoundary as VFB, FrameUnit as VFU, WindowFrame as VWF,
+        };
+        let unit =
+            match pwf::FrameType::try_from(fs.frame_type).unwrap_or(pwf::FrameType::Undefined) {
+                pwf::FrameType::Row => VFU::Rows,
+                pwf::FrameType::Range => VFU::Range,
+                pwf::FrameType::Undefined => return Ok(None),
+            };
+        let mut convert_boundary =
+            |b_opt: Option<&pwf::FrameBoundary>, is_lower: bool| -> Result<VFB, EmissionError> {
+                let b = b_opt.require_proto(
+                    "Window::frame_spec::missing_boundary",
+                    "frame boundary missing",
+                )?;
+                use pwf::frame_boundary::Boundary as PB;
+                match b.boundary.as_ref() {
+                    Some(PB::CurrentRow(_)) => Ok(VFB::CurrentRow),
+                    Some(PB::Unbounded(_)) => Ok(if is_lower {
+                        VFB::UnboundedPreceding
+                    } else {
+                        VFB::UnboundedFollowing
+                    }),
+                    Some(PB::Value(v)) => {
+                        let expr = self.convert(v)?;
+                        // Spark encodes offsets as signed
+                        // numeric literals: negative = PRECEDING,
+                        // positive = FOLLOWING. Match here.
+                        if let Expression::Literal(l) = &expr {
+                            use thunderduck_core::transpiler_v2::expression::LiteralValue as LV;
+                            let sign: Option<i64> = match &l.value {
+                                LV::Int(i) => Some(*i as i64),
+                                LV::Long(i) => Some(*i),
+                                _ => None,
+                            };
+                            if let Some(n) = sign {
+                                let abs_expr = lit(LV::Long(n.abs()), DataType::Long);
+                                return Ok(if n < 0 {
+                                    VFB::Preceding(Box::new(abs_expr))
+                                } else {
+                                    VFB::Following(Box::new(abs_expr))
+                                });
+                            }
+                        }
+                        Ok(if is_lower {
+                            VFB::Preceding(Box::new(expr))
+                        } else {
+                            VFB::Following(Box::new(expr))
+                        })
+                    }
+                    None => bail_boundary_proto!(
+                        "Window::frame_boundary::None",
+                        "frame boundary carries no shape",
+                    ),
+                }
+            };
+        let lower = convert_boundary(fs.lower.as_deref(), true)?;
+        let upper = convert_boundary(fs.upper.as_deref(), false)?;
+        Ok(Some(VWF { unit, lower, upper }))
+    }
+
     fn convert_literal(
         &self,
-        lit: &proto::expression::Literal,
+        proto_lit: &proto::expression::Literal,
     ) -> Result<Expression, EmissionError> {
         use proto::expression::literal::LiteralType;
-        let lt = match &lit.literal_type {
+        let lt = match &proto_lit.literal_type {
             Some(l) => l,
             None => return Ok(null_literal()),
         };
         Ok(match lt {
             LiteralType::Null(_) => null_literal(),
-            LiteralType::Boolean(b) => Expression::Literal(Literal {
-                value: LiteralValue::Boolean(*b),
-                data_type: DataType::Boolean,
-            }),
-            LiteralType::Byte(v) => Expression::Literal(Literal {
-                value: LiteralValue::Byte(*v as i8),
-                data_type: DataType::Byte,
-            }),
-            LiteralType::Short(v) => Expression::Literal(Literal {
-                value: LiteralValue::Short(*v as i16),
-                data_type: DataType::Short,
-            }),
-            LiteralType::Integer(v) => Expression::Literal(Literal {
-                value: LiteralValue::Int(*v),
-                data_type: DataType::Integer,
-            }),
-            LiteralType::Long(v) => Expression::Literal(Literal {
-                value: LiteralValue::Long(*v),
-                data_type: DataType::Long,
-            }),
-            LiteralType::Float(v) => Expression::Literal(Literal {
-                value: LiteralValue::Float(*v),
-                data_type: DataType::Float,
-            }),
-            LiteralType::Double(v) => Expression::Literal(Literal {
-                value: LiteralValue::Double(*v),
-                data_type: DataType::Double,
-            }),
-            LiteralType::String(s) => Expression::Literal(Literal {
-                value: LiteralValue::String(s.clone()),
-                data_type: DataType::String,
-            }),
-            LiteralType::Binary(b) => Expression::Literal(Literal {
-                value: LiteralValue::Binary(b.clone()),
-                data_type: DataType::Binary,
-            }),
-            LiteralType::Date(d) => Expression::Literal(Literal {
-                value: LiteralValue::Date(*d),
-                data_type: DataType::Date,
-            }),
-            LiteralType::Timestamp(ts) => Expression::Literal(Literal {
-                value: LiteralValue::Timestamp(*ts),
-                data_type: DataType::Timestamp,
-            }),
-            LiteralType::TimestampNtz(ts) => Expression::Literal(Literal {
-                value: LiteralValue::TimestampNtz(*ts),
-                data_type: DataType::TimestampNtz,
-            }),
+            LiteralType::Boolean(b) => lit(LiteralValue::Boolean(*b), DataType::Boolean),
+            LiteralType::Byte(v) => lit(LiteralValue::Byte(*v as i8), DataType::Byte),
+            LiteralType::Short(v) => lit(LiteralValue::Short(*v as i16), DataType::Short),
+            LiteralType::Integer(v) => lit(LiteralValue::Int(*v), DataType::Integer),
+            LiteralType::Long(v) => lit(LiteralValue::Long(*v), DataType::Long),
+            LiteralType::Float(v) => lit(LiteralValue::Float(*v), DataType::Float),
+            LiteralType::Double(v) => lit(LiteralValue::Double(*v), DataType::Double),
+            LiteralType::String(s) => lit(LiteralValue::String(s.clone()), DataType::String),
+            LiteralType::Binary(b) => lit(LiteralValue::Binary(b.clone()), DataType::Binary),
+            LiteralType::Date(d) => lit(LiteralValue::Date(*d), DataType::Date),
+            LiteralType::Timestamp(ts) => lit(LiteralValue::Timestamp(*ts), DataType::Timestamp),
+            LiteralType::TimestampNtz(ts) => {
+                lit(LiteralValue::TimestampNtz(*ts), DataType::TimestampNtz)
+            }
             LiteralType::Decimal(d) => {
                 let server_precision = d.precision.map(|p| p as u8);
                 let server_scale = d.scale.map(|s| s as u8);
                 let (precision, scale) =
                     normalize_decimal_literal(&d.value, server_precision, server_scale);
-                Expression::Literal(Literal {
-                    value: LiteralValue::Decimal {
+                lit(
+                    LiteralValue::Decimal {
                         value: d.value.clone(),
                         precision,
                         scale,
                     },
-                    data_type: DataType::Decimal { precision, scale },
-                })
+                    DataType::Decimal { precision, scale },
+                )
             }
             other => {
                 bail_boundary_proto!(
@@ -1204,11 +1105,7 @@ impl V2ExpressionConverter {
         &mut self,
         func: &proto::expression::UnresolvedFunction,
     ) -> Result<Expression, EmissionError> {
-        let args = func
-            .arguments
-            .iter()
-            .map(|a| self.convert(a))
-            .collect::<Result<Vec<_>, _>>()?;
+        let args = self.convert_all(&func.arguments)?;
         if args.len() == 2 {
             let op = match func.function_name.as_str() {
                 ">" => Some(BinaryOp::Gt),
@@ -1417,13 +1314,7 @@ impl V2ExpressionConverter {
             .as_deref()
             .require_proto("Cast::missing_expr", "Cast has no inner expression")?;
         let to_type = match &cast.cast_to_type {
-            Some(CastToType::Type(dt)) => {
-                proto_to_data_type(dt).map_err(|e| EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
-                    name: "Cast::type".to_owned(),
-                    reason: format!("failed to convert cast type: {e}"),
-                })?
-            }
+            Some(CastToType::Type(dt)) => proto_to_data_type(dt),
             Some(CastToType::TypeStr(s)) => parse_type_str(s),
             None => {
                 bail_boundary_proto!("Cast::missing_to_type", "Cast has no target type");
@@ -1456,6 +1347,38 @@ fn null_literal() -> Expression {
     Expression::Literal(Literal {
         value: LiteralValue::Null,
         data_type: DataType::Null,
+    })
+}
+
+/// Construct an [`Expression::Literal`] from a value / data-type pair —
+/// collapses the `Expression::Literal(Literal { value, data_type })`
+/// constructor boilerplate at every typed literal dispatch arm.
+fn lit(value: LiteralValue, data_type: DataType) -> Expression {
+    Expression::Literal(Literal { value, data_type })
+}
+
+/// Require `parts` to carry exactly one name part, returning it owned.
+/// Anything else is a `ProtoShape`-kinded [`EmissionError::Unsupported`]
+/// with the caller's `name` / `reason` strings.
+fn single_name_part(parts: &[String], name: &str, reason: &str) -> Result<String, EmissionError> {
+    match parts {
+        [n] => Ok(n.clone()),
+        _ => Err(EmissionError::Unsupported {
+            kind: UnsupportedKind::ProtoShape,
+            name: name.to_owned(),
+            reason: reason.to_owned(),
+        }),
+    }
+}
+
+/// Convert an Arrow schema [`Field`] into a τ [`StructField`], preserving
+/// name and nullability.
+fn arrow_field_to_struct_field(f: &Field) -> Result<StructField, EmissionError> {
+    let dt = arrow_data_type_to_core(f.data_type())?;
+    Ok(if f.is_nullable() {
+        StructField::nullable(f.name().clone(), dt)
+    } else {
+        StructField::not_null(f.name().clone(), dt)
     })
 }
 
@@ -1674,17 +1597,21 @@ fn parse_type_str_to_struct(s: &str) -> StructType {
     // PySpark's client dedups struct field names before wire serialization.
     let trimmed = s.trim();
     if trimmed.starts_with('{') {
-        if let Ok(st) = super::relation_converter::parse_json_schema(trimmed) {
-            return st;
-        }
+        // A `{`-leading schema is ALWAYS decoded as JSON — `parse_json_schema`
+        // is total (invalid JSON or a missing `"fields"` array yields the
+        // empty struct), so a JSON-shaped string never falls through to the
+        // DDL parser below. Returning the (possibly empty) result verbatim
+        // preserves that long-standing behavior.
+        return super::relation_converter::parse_json_schema(trimmed);
     }
-    // Fallback: simple-string DDL parser (e.g. `STRUCT<id: BIGINT>` or scalar
-    // type names).
-    let dt = parse_type_str(s);
-    match dt {
-        DataType::Struct(st) => st,
-        _ => StructType::empty(),
-    }
+    // Fallback: Spark DDL schema parser — accepts both the `struct<...>`
+    // wrapper form (`struct<id:bigint,name:string>`) and the bare field-list
+    // form PySpark sends for `DataFrameReader.schema("id INT, name STRING")`.
+    // Pass-2 widening: the legacy fallback routed through `parse_type_str`,
+    // which had no struct arm — its `DataType::Struct` match was unreachable
+    // and every DDL-string schema silently became `StructType::empty()`.
+    // Untranslatable DDL still degrades to the empty struct (legacy shape).
+    thunderduck_core::types::spark_ddl::parse_spark_schema(s).unwrap_or_else(StructType::empty)
 }
 
 /// Parse an Arrow IPC stream once, returning both the schema and the row
@@ -1703,15 +1630,7 @@ fn arrow_ipc_to_schema_and_rows(
     let fields = arrow_schema
         .fields()
         .iter()
-        .map(|f| {
-            let dt = arrow_data_type_to_core(f.data_type())?;
-            let name = f.name().clone();
-            Ok(if f.is_nullable() {
-                StructField::nullable(name, dt)
-            } else {
-                StructField::not_null(name, dt)
-            })
-        })
+        .map(|f| arrow_field_to_struct_field(f))
         .collect::<Result<Vec<_>, EmissionError>>()?;
     let schema = StructType::new(fields);
     let batches: Vec<arrow::record_batch::RecordBatch> = reader
@@ -1773,20 +1692,14 @@ fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, EmissionError> {
                     "Arrow Map entries must be Struct",
                 );
             };
-            let key_field = fields.iter().find(|f| f.name() == "key").ok_or_else(|| {
-                EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
-                    name: "arrow_schema::map_missing_key".to_owned(),
-                    reason: "Arrow Map entries missing `key`".to_owned(),
-                }
-            })?;
-            let val_field = fields.iter().find(|f| f.name() == "value").ok_or_else(|| {
-                EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
-                    name: "arrow_schema::map_missing_value".to_owned(),
-                    reason: "Arrow Map entries missing `value`".to_owned(),
-                }
-            })?;
+            let key_field = fields.iter().find(|f| f.name() == "key").require_proto(
+                "arrow_schema::map_missing_key",
+                "Arrow Map entries missing `key`",
+            )?;
+            let val_field = fields.iter().find(|f| f.name() == "value").require_proto(
+                "arrow_schema::map_missing_value",
+                "Arrow Map entries missing `value`",
+            )?;
             DataType::Map {
                 key: Box::new(arrow_data_type_to_core(key_field.data_type())?),
                 value: Box::new(arrow_data_type_to_core(val_field.data_type())?),
@@ -1796,14 +1709,7 @@ fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, EmissionError> {
         ArrowDT::Struct(fields) => {
             let inner = fields
                 .iter()
-                .map(|f| {
-                    let dt = arrow_data_type_to_core(f.data_type())?;
-                    Ok(if f.is_nullable() {
-                        StructField::nullable(f.name().clone(), dt)
-                    } else {
-                        StructField::not_null(f.name().clone(), dt)
-                    })
-                })
+                .map(|f| arrow_field_to_struct_field(f))
                 .collect::<Result<Vec<_>, EmissionError>>()?;
             DataType::Struct(StructType::new(inner))
         }
@@ -1834,87 +1740,63 @@ pub(crate) fn arrow_val_to_literal(
         ArrowDT::Null => Ok(null_literal()),
         ArrowDT::Boolean => {
             let a = downcast::<BooleanArray>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::Boolean(a.value(row)),
-                data_type: DataType::Boolean,
-            }))
+            Ok(lit(LiteralValue::Boolean(a.value(row)), DataType::Boolean))
         }
         ArrowDT::Int8 => {
             let a = downcast::<Int8Array>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::Byte(a.value(row)),
-                data_type: DataType::Byte,
-            }))
+            Ok(lit(LiteralValue::Byte(a.value(row)), DataType::Byte))
         }
         ArrowDT::Int16 => {
             let a = downcast::<Int16Array>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::Short(a.value(row)),
-                data_type: DataType::Short,
-            }))
+            Ok(lit(LiteralValue::Short(a.value(row)), DataType::Short))
         }
         ArrowDT::Int32 => {
             let a = downcast::<Int32Array>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::Int(a.value(row)),
-                data_type: DataType::Integer,
-            }))
+            Ok(lit(LiteralValue::Int(a.value(row)), DataType::Integer))
         }
         ArrowDT::Int64 => {
             let a = downcast::<Int64Array>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::Long(a.value(row)),
-                data_type: DataType::Long,
-            }))
+            Ok(lit(LiteralValue::Long(a.value(row)), DataType::Long))
         }
         ArrowDT::Float32 => {
             let a = downcast::<Float32Array>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::Float(a.value(row)),
-                data_type: DataType::Float,
-            }))
+            Ok(lit(LiteralValue::Float(a.value(row)), DataType::Float))
         }
         ArrowDT::Float64 => {
             let a = downcast::<Float64Array>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::Double(a.value(row)),
-                data_type: DataType::Double,
-            }))
+            Ok(lit(LiteralValue::Double(a.value(row)), DataType::Double))
         }
         ArrowDT::Utf8 => {
             let a = downcast::<StringArray>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::String(a.value(row).to_owned()),
-                data_type: DataType::String,
-            }))
+            Ok(lit(
+                LiteralValue::String(a.value(row).to_owned()),
+                DataType::String,
+            ))
         }
         ArrowDT::LargeUtf8 => {
             let a = downcast::<LargeStringArray>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::String(a.value(row).to_owned()),
-                data_type: DataType::String,
-            }))
+            Ok(lit(
+                LiteralValue::String(a.value(row).to_owned()),
+                DataType::String,
+            ))
         }
         ArrowDT::Binary => {
             let a = downcast::<BinaryArray>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::Binary(a.value(row).to_vec()),
-                data_type: DataType::Binary,
-            }))
+            Ok(lit(
+                LiteralValue::Binary(a.value(row).to_vec()),
+                DataType::Binary,
+            ))
         }
         ArrowDT::LargeBinary => {
             let a = downcast::<LargeBinaryArray>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::Binary(a.value(row).to_vec()),
-                data_type: DataType::Binary,
-            }))
+            Ok(lit(
+                LiteralValue::Binary(a.value(row).to_vec()),
+                DataType::Binary,
+            ))
         }
         ArrowDT::Date32 => {
             let a = downcast::<Date32Array>(array)?;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::Date(a.value(row)),
-                data_type: DataType::Date,
-            }))
+            Ok(lit(LiteralValue::Date(a.value(row)), DataType::Date))
         }
         ArrowDT::Timestamp(_, tz) => {
             let a = downcast::<TimestampMicrosecondArray>(array)?;
@@ -1924,7 +1806,7 @@ pub(crate) fn arrow_val_to_literal(
             } else {
                 (LiteralValue::TimestampNtz(micros), DataType::TimestampNtz)
             };
-            Ok(Expression::Literal(Literal { value, data_type }))
+            Ok(lit(value, data_type))
         }
         ArrowDT::Decimal128(p, s) => {
             let a = downcast::<Decimal128Array>(array)?;
@@ -1932,14 +1814,14 @@ pub(crate) fn arrow_val_to_literal(
             let value = format_decimal128(unscaled, *s);
             let precision = *p;
             let scale = *s as u8;
-            Ok(Expression::Literal(Literal {
-                value: LiteralValue::Decimal {
+            Ok(lit(
+                LiteralValue::Decimal {
                     value,
                     precision,
                     scale,
                 },
-                data_type: DataType::Decimal { precision, scale },
-            }))
+                DataType::Decimal { precision, scale },
+            ))
         }
         ArrowDT::List(_) | ArrowDT::LargeList(_) => {
             let a = downcast::<ListArray>(array)?;
@@ -1949,12 +1831,10 @@ pub(crate) fn arrow_val_to_literal(
                 elements.push(arrow_val_to_literal(inner.as_ref(), i)?);
             }
             let element_type = arrow_data_type_to_core(inner.data_type())?;
-            Ok(Expression::ArrayLiteral(
-                thunderduck_core::transpiler_v2::expression::ArrayLiteralExpression {
-                    elements,
-                    element_type,
-                },
-            ))
+            Ok(Expression::ArrayLiteral(ArrayLiteralExpression {
+                elements,
+                element_type,
+            }))
         }
         ArrowDT::Map(_, _) => {
             let a = downcast::<MapArray>(array)?;
@@ -1977,13 +1857,11 @@ pub(crate) fn arrow_val_to_literal(
             }
             let key_type = arrow_data_type_to_core(keys.data_type())?;
             let value_type = arrow_data_type_to_core(vals.data_type())?;
-            Ok(Expression::MapLiteral(
-                thunderduck_core::transpiler_v2::expression::MapLiteralExpression {
-                    entries: entries_out,
-                    key_type,
-                    value_type,
-                },
-            ))
+            Ok(Expression::MapLiteral(MapLiteralExpression {
+                entries: entries_out,
+                key_type,
+                value_type,
+            }))
         }
         ArrowDT::Struct(fields) => {
             let a = downcast::<StructArray>(array)?;
@@ -1992,11 +1870,9 @@ pub(crate) fn arrow_val_to_literal(
                 let col = a.column(i);
                 out.push((f.name().clone(), arrow_val_to_literal(col.as_ref(), row)?));
             }
-            Ok(Expression::StructLiteral(
-                thunderduck_core::transpiler_v2::expression::StructLiteralExpression {
-                    fields: out,
-                },
-            ))
+            Ok(Expression::StructLiteral(StructLiteralExpression {
+                fields: out,
+            }))
         }
         // ── Interval Arrow values ────────────────────────────────────────
         // `createDataFrame(rows_with_intervals, schema)` from PySpark re-sends
@@ -2094,46 +1970,19 @@ fn collect_relation_plan_ids(rel: &proto::Relation, ids: &mut HashSet<i64>) {
         }
     }
     use proto::relation::RelType;
-    match &rel.rel_type {
-        Some(RelType::Filter(f)) => {
-            if let Some(i) = &f.input {
-                collect_relation_plan_ids(i, ids);
-            }
-        }
-        Some(RelType::Project(p)) => {
-            if let Some(i) = &p.input {
-                collect_relation_plan_ids(i, ids);
-            }
-        }
-        Some(RelType::Aggregate(a)) => {
-            if let Some(i) = &a.input {
-                collect_relation_plan_ids(i, ids);
-            }
-        }
-        Some(RelType::Sort(s)) => {
-            if let Some(i) = &s.input {
-                collect_relation_plan_ids(i, ids);
-            }
-        }
-        Some(RelType::Limit(l)) => {
-            if let Some(i) = &l.input {
-                collect_relation_plan_ids(i, ids);
-            }
-        }
-        Some(RelType::Offset(o)) => {
-            if let Some(i) = &o.input {
-                collect_relation_plan_ids(i, ids);
-            }
-        }
-        Some(RelType::Join(j)) => {
-            if let Some(l) = &j.left {
-                collect_relation_plan_ids(l, ids);
-            }
-            if let Some(r) = &j.right {
-                collect_relation_plan_ids(r, ids);
-            }
-        }
-        _ => {}
+    // Deliberately partial traversal — only these operator shapes are walked.
+    let children: [Option<&proto::Relation>; 2] = match &rel.rel_type {
+        Some(RelType::Filter(f)) => [f.input.as_deref(), None],
+        Some(RelType::Project(p)) => [p.input.as_deref(), None],
+        Some(RelType::Aggregate(a)) => [a.input.as_deref(), None],
+        Some(RelType::Sort(s)) => [s.input.as_deref(), None],
+        Some(RelType::Limit(l)) => [l.input.as_deref(), None],
+        Some(RelType::Offset(o)) => [o.input.as_deref(), None],
+        Some(RelType::Join(j)) => [j.left.as_deref(), j.right.as_deref()],
+        _ => [None, None],
+    };
+    for child in children.into_iter().flatten() {
+        collect_relation_plan_ids(child, ids);
     }
 }
 
@@ -2221,6 +2070,29 @@ mod tests {
         }
     }
 
+    // ── Invoke helpers ─────────────────────────────────────────────────────
+
+    /// Convert a relation whose conversion must succeed.
+    fn convert_ok(relation: &proto::Relation) -> CommonAst {
+        V2RelationConverter::new()
+            .convert(relation)
+            .expect("conversion must succeed")
+    }
+
+    /// Convert a relation whose conversion must fail with
+    /// `EmissionError::Unsupported { kind: ProtoShape }`; asserts the error
+    /// kind and returns the shape name for further assertions.
+    fn convert_proto_shape_err(relation: &proto::Relation) -> String {
+        match V2RelationConverter::new().convert(relation).unwrap_err() {
+            EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name,
+                ..
+            } => name,
+            other => panic!("expected UnsupportedProtoShape, got {other:?}"),
+        }
+    }
+
     // ── Round-trip tests ───────────────────────────────────────────────────
 
     #[test]
@@ -2232,8 +2104,7 @@ mod tests {
                 expressions: vec![int_literal(1)],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&proj).expect("convert Project");
+        let out = convert_ok(&proj);
         match out.op {
             CommonOp::Project {
                 input, projections, ..
@@ -2252,8 +2123,7 @@ mod tests {
             input: Some(Box::new(input)),
             condition: Some(int_literal(1)),
         })));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&f).expect("convert Filter");
+        let out = convert_ok(&f);
         assert!(matches!(out.op, CommonOp::Filter { .. }));
     }
 
@@ -2269,8 +2139,7 @@ mod tests {
             }],
             is_global: None,
         })));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&s).expect("convert Sort");
+        let out = convert_ok(&s);
         match out.op {
             CommonOp::Sort {
                 order,
@@ -2293,8 +2162,7 @@ mod tests {
             input: Some(Box::new(input)),
             limit: 10,
         })));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&l).expect("convert Limit");
+        let out = convert_ok(&l);
         match out.op {
             CommonOp::Limit { limit, .. } => assert_eq!(limit, 10),
             _ => panic!("expected Limit"),
@@ -2308,8 +2176,7 @@ mod tests {
             input: Some(Box::new(input)),
             offset: 5,
         })));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&o).expect("convert Offset");
+        let out = convert_ok(&o);
         match out.op {
             CommonOp::Sort {
                 order,
@@ -2338,8 +2205,7 @@ mod tests {
                 grouping_sets: vec![],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&a).expect("convert Aggregate");
+        let out = convert_ok(&a);
         match out.op {
             CommonOp::Aggregate { grouping, .. } => assert_eq!(grouping.len(), 1),
             _ => panic!("expected Aggregate"),
@@ -2359,8 +2225,7 @@ mod tests {
                 grouping_sets: vec![],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&a).expect("convert Aggregate::Rollup");
+        let out = convert_ok(&a);
         match out.op {
             CommonOp::Aggregate { grouping_kind, .. } => assert_eq!(
                 grouping_kind,
@@ -2383,8 +2248,7 @@ mod tests {
                 grouping_sets: vec![],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&a).expect("convert Aggregate::Cube");
+        let out = convert_ok(&a);
         match out.op {
             CommonOp::Aggregate { grouping_kind, .. } => assert_eq!(
                 grouping_kind,
@@ -2407,8 +2271,7 @@ mod tests {
                 grouping_sets: vec![],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&a).expect("convert Aggregate::GroupingSets");
+        let out = convert_ok(&a);
         match out.op {
             CommonOp::Aggregate { grouping_kind, .. } => assert_eq!(
                 grouping_kind,
@@ -2434,17 +2297,10 @@ mod tests {
                 grouping_sets: vec![],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        match c.convert(&a).unwrap_err() {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                name: shape,
-                ..
-            } => {
-                assert_eq!(shape, "Aggregate::Pivot::missing_pivot");
-            }
-            other => panic!("expected UnsupportedProtoShape(missing_pivot), got {other:?}"),
-        }
+        assert_eq!(
+            convert_proto_shape_err(&a),
+            "Aggregate::Pivot::missing_pivot"
+        );
     }
 
     #[test]
@@ -2475,8 +2331,7 @@ mod tests {
                 grouping_sets: vec![],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&a).expect("convert Pivot");
+        let out = convert_ok(&a);
         match out.op {
             CommonOp::Pivot {
                 grouping,
@@ -2514,8 +2369,7 @@ mod tests {
                 grouping_sets: vec![],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&a).expect("convert implicit Pivot");
+        let out = convert_ok(&a);
         match out.op {
             CommonOp::Pivot { pivot_values, .. } => assert!(pivot_values.is_empty()),
             _ => panic!("expected CommonOp::Pivot"),
@@ -2524,8 +2378,7 @@ mod tests {
 
     #[test]
     fn convert_read_named_table_round_trip() {
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&table_scan_rel("orders")).expect("convert Read");
+        let out = convert_ok(&table_scan_rel("orders"));
         match out.op {
             CommonOp::TableScan { table, .. } => assert_eq!(table, "orders"),
             _ => panic!("expected TableScan"),
@@ -2544,8 +2397,7 @@ mod tests {
                 predicates: vec![],
             })),
         }));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&read).expect("convert Read::DataSource");
+        let out = convert_ok(&read);
         match out.op {
             CommonOp::FileScan { format, paths, .. } => {
                 assert_eq!(format, FileFormat::Parquet);
@@ -2563,12 +2415,48 @@ mod tests {
                 schema: Some("STRUCT<id: BIGINT>".into()),
             },
         ));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&lr).expect("convert LocalRelation (schema-only)");
+        let out = convert_ok(&lr);
         match out.op {
             CommonOp::LocalRelation { rows, .. } => assert!(rows.is_empty()),
             _ => panic!("expected LocalRelation"),
         }
+    }
+
+    // ── parse_type_str_to_struct — DDL fallback (pass-2 fix) ────────────────
+    // The legacy fallback routed through `parse_type_str`, which had no
+    // struct arm — DDL-string schemas silently became `StructType::empty()`.
+
+    #[test]
+    fn parse_type_str_to_struct_parses_struct_wrapper_ddl() {
+        let st = super::parse_type_str_to_struct("struct<id:bigint,name:string>");
+        assert_eq!(st.fields.len(), 2);
+        assert_eq!(st.fields[0].name, "id");
+        assert_eq!(st.fields[0].data_type, DataType::Long);
+        assert_eq!(st.fields[1].name, "name");
+        assert_eq!(st.fields[1].data_type, DataType::String);
+    }
+
+    #[test]
+    fn parse_type_str_to_struct_parses_bare_field_list_ddl() {
+        // The shape `DataFrameReader.schema("id INT, name STRING")` sends for
+        // a Read::DataSource schema string.
+        let st = super::parse_type_str_to_struct("id bigint, name string");
+        assert_eq!(st.fields.len(), 2);
+        assert_eq!(st.fields[0].name, "id");
+        assert_eq!(st.fields[0].data_type, DataType::Long);
+        assert_eq!(st.fields[1].name, "name");
+        assert_eq!(st.fields[1].data_type, DataType::String);
+    }
+
+    #[test]
+    fn parse_type_str_to_struct_untranslatable_input_degrades_to_empty() {
+        // Legacy shape preserved: scalar type strings and garbage are not
+        // schemas — they yield the empty struct, not a panic/error.
+        assert_eq!(super::parse_type_str_to_struct("int"), StructType::empty());
+        assert_eq!(
+            super::parse_type_str_to_struct("not a schema at all!"),
+            StructType::empty()
+        );
     }
 
     #[test]
@@ -2583,8 +2471,7 @@ mod tests {
             using_columns: vec![],
             join_data_type: None,
         })));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&j).expect("convert Join");
+        let out = convert_ok(&j);
         assert!(matches!(out.op, CommonOp::Join { .. }));
     }
 
@@ -2601,8 +2488,7 @@ mod tests {
             using_columns: vec![],
             join_data_type: None,
         })));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&j).expect("convert Join with plan_ids");
+        let out = convert_ok(&j);
         match out.op {
             CommonOp::Join {
                 left_plan_ids,
@@ -2630,8 +2516,7 @@ mod tests {
             using_columns: vec![],
             join_data_type: None,
         })));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&j).expect("convert Join with cond plan_id");
+        let out = convert_ok(&j);
         let CommonOp::Join { condition, .. } = out.op else {
             panic!("expected Join");
         };
@@ -2656,18 +2541,7 @@ mod tests {
             query: "SELECT 1".to_owned(),
             ..Default::default()
         }));
-        let mut c = V2RelationConverter::new();
-        let err = c.convert(&s).unwrap_err();
-        match err {
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                name: shape,
-                ..
-            } => {
-                assert_eq!(shape, "RelType::Sql");
-            }
-            other => panic!("expected UnsupportedProtoShape, got {other:?}"),
-        }
+        assert_eq!(convert_proto_shape_err(&s), "RelType::Sql");
     }
 
     #[test]
@@ -2675,14 +2549,7 @@ mod tests {
         let c_rel = rel(proto::relation::RelType::Catalog(proto::Catalog {
             cat_type: None,
         }));
-        let mut c = V2RelationConverter::new();
-        assert!(matches!(
-            c.convert(&c_rel).unwrap_err(),
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                ..
-            }
-        ));
+        convert_proto_shape_err(&c_rel);
     }
 
     // ── Arrow value dispatch tests ─────────────────────────────────────────
@@ -2860,8 +2727,7 @@ mod tests {
                 value_column_name: "value".to_owned(),
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&unpivot).expect("convert Unpivot");
+        let out = convert_ok(&unpivot);
         match out.op {
             CommonOp::Unpivot {
                 input,
@@ -2895,8 +2761,7 @@ mod tests {
                 value_column_name: "value".to_owned(),
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&unpivot).expect("convert Unpivot");
+        let out = convert_ok(&unpivot);
         match out.op {
             CommonOp::Unpivot { values, .. } => assert!(values.is_empty()),
             _ => panic!("expected Unpivot"),
@@ -2914,8 +2779,7 @@ mod tests {
                 cols: vec!["age".to_owned(), "salary".to_owned()],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&describe).expect("convert Describe");
+        let out = convert_ok(&describe);
         match out.op {
             CommonOp::Describe { input, cols } => {
                 assert!(matches!(input.op, CommonOp::TableScan { .. }));
@@ -2933,15 +2797,7 @@ mod tests {
                 cols: vec![],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let err = c.convert(&describe).unwrap_err();
-        assert!(matches!(
-            err,
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                ..
-            }
-        ));
+        convert_proto_shape_err(&describe);
     }
 
     #[test]
@@ -2959,8 +2815,7 @@ mod tests {
                 ],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&summary).expect("convert Summary");
+        let out = convert_ok(&summary);
         match out.op {
             CommonOp::Summary { input, statistics } => {
                 assert!(matches!(input.op, CommonOp::TableScan { .. }));
@@ -2979,15 +2834,7 @@ mod tests {
                 statistics: vec![],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let err = c.convert(&summary).unwrap_err();
-        assert!(matches!(
-            err,
-            EmissionError::Unsupported {
-                kind: UnsupportedKind::ProtoShape,
-                ..
-            }
-        ));
+        convert_proto_shape_err(&summary);
     }
 
     // ── FreqItems / Crosstab (Pass 82) ────────────────────────────────────
@@ -3002,8 +2849,7 @@ mod tests {
                 support: None,
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&fi).expect("convert FreqItems");
+        let out = convert_ok(&fi);
         match out.op {
             CommonOp::FreqItems {
                 input: _,
@@ -3027,8 +2873,7 @@ mod tests {
                 support: Some(0.42),
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&fi).expect("convert FreqItems");
+        let out = convert_ok(&fi);
         match out.op {
             CommonOp::FreqItems { cols, support, .. } => {
                 assert_eq!(cols, vec!["a".to_owned(), "b".to_owned()]);
@@ -3048,8 +2893,7 @@ mod tests {
                 col2: "active".to_owned(),
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&ct).expect("convert Crosstab");
+        let out = convert_ok(&ct);
         match out.op {
             CommonOp::Crosstab {
                 input: _,
@@ -3079,8 +2923,7 @@ mod tests {
             seed: Some(11),
             deterministic_order: false,
         })));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&s).expect("convert Sample");
+        let out = convert_ok(&s);
         match out.op {
             CommonOp::Sample {
                 input,
@@ -3142,8 +2985,7 @@ mod tests {
                 seed: Some(11),
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&s).expect("convert SampleBy");
+        let out = convert_ok(&s);
         match out.op {
             CommonOp::SampleBy {
                 input,
@@ -3170,8 +3012,7 @@ mod tests {
                 statistics: vec![],
             },
         )));
-        let mut c = V2RelationConverter::new();
-        let out = c.convert(&summary).expect("convert Summary");
+        let out = convert_ok(&summary);
         match out.op {
             CommonOp::Summary { statistics, .. } => {
                 assert!(statistics.is_empty());

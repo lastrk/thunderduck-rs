@@ -239,7 +239,6 @@ pub(crate) fn is_arrow_duration_micros(dt: &ArrowDt) -> bool {
 mod tests {
     use super::*;
     use arrow::array::{ArrayRef, DurationMicrosecondArray, Int64Array};
-    use arrow::buffer::NullBuffer;
     use arrow::datatypes::{Field, IntervalMonthDayNano, Schema};
     use thunderduck_core::types::{DataType as TdckDt, StructField as TdckField};
 
@@ -413,23 +412,15 @@ mod tests {
         );
     }
 
-    /// Silence unused-import warnings for the null-buffer helper — used only
-    /// as a doc-example / cross-check that `NullBuffer` is Arc-shared, which
-    /// is why nulls are refcount-only.
-    #[test]
-    fn null_buffer_is_arc_shared() {
-        let nb = NullBuffer::new_valid(3);
-        assert_eq!(nb.len(), 3);
-    }
-
     /// Pins the streaming pipeline shape (perf finding MED-1). `apply` returns
     /// only `Vec<ArrayRef>`; the caller feeds those columns + a wire schema
     /// (built once per query, distinct from the source Arrow schema in both
     /// type — post-transcode — and name — post-stamp) directly to a single
     /// `RecordBatch::try_new_with_options`. Regressing the seam back to
-    /// "apply builds a RecordBatch, stamp_one rebuilds it" would fail this
-    /// assertion by producing a batch whose schema comes from `apply` rather
-    /// than the caller-supplied schema.
+    /// "apply builds a RecordBatch, then it is rebuilt against the
+    /// `build_stamped_schema` result" would fail this assertion by producing
+    /// a batch whose schema comes from `apply` rather than the
+    /// caller-supplied schema.
     #[test]
     fn one_shot_batch_construction_from_cols_and_wire_schema() {
         use arrow::array::RecordBatchOptions;

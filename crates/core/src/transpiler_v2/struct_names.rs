@@ -39,6 +39,26 @@ pub(super) fn derive_struct_field_name(arg: &Expression, i: usize) -> String {
     }
 }
 
+/// Derive the Spark-parity field name for the i-th argument of
+/// `arrays_zip(*args)`.
+///
+/// Same alias > column-ref > unresolved-column precedence as
+/// [`derive_struct_field_name`], but the fallback for anything else is the
+/// positional integer string `"0"`, `"1"`, ... (0-indexed) — Spark uses
+/// integer strings, not `col{i+1}`, for `arrays_zip` specifically. Shared by
+/// `expression::function_call_data_type` (schema side) and
+/// `emission::render_function_call` (SQL side); the two MUST agree or the
+/// wire schema desyncs from the emitted struct fields. Corpus anchor:
+/// `arr-012`.
+pub(super) fn derive_zip_field_name(arg: &Expression, i: usize) -> String {
+    match arg {
+        Expression::Alias(a) => a.alias.clone(),
+        Expression::ColumnReference(c) => c.name.clone(),
+        Expression::UnresolvedColumn(u) => u.name.clone(),
+        _ => i.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::expression::{

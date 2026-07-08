@@ -1,633 +1,420 @@
-# v2 Simplification Pass Log
+# τ Simplification Pass Log (fresh start 2026-07-07)
 
-Companion to `tasks/v2-simplification-driven-goal-plan.md`. One row per
-executed pass, in queue order. Records the corpus baseline delta (must be
-monotone), files touched, and any deviations from the plan.
+Goal: iterative simplification of the τ transpiler (type inference, analyzer/lowering,
+emission, both front-end converters): fewer special-case branches, more general and
+compact code, no obscure abstractions, behavior preserved exactly (Spark parity).
+Prior simplification work was deleted/ignored per step 0; this log is the new record.
 
-**Corpus fitness gate:** `tests/scripts/v2-progress.sh` PASSED count.
-**Pre-plan baseline (2026-07-05, commit `6b421b1`):** **314 PASSED / 10 failed / 324 total.**
-This is the floor — subsequent passes must remain ≥ 314.
+Method per pass: parallel Fable 5 analysis agents → triage → parallel implementation on
+disjoint files → quality gate (fmt scoped to changed files, cargo check, crate unit
+tests) → DataFrame corpus (`tests/scripts/v2-progress.sh`) as the fitness gate.
+Max 20 passes; stop when a pass yields no meaningful improvement. No commits without
+user review (per CLAUDE.md); per-pass diffs snapshotted to /tmp/simplify-passN.patch.
+
+Baseline (pass 0, working tree at fb274d1 + deleted old log):
+- `cargo fmt --check` clean
+- `cargo test -p thunderduck-core --lib --tests` green
+- `cargo test -p thunderduck-connect-server --tests` green (91 passed)
 
 ---
 
-## Pre-flight — orphaned v1 test removal (2026-07-05, pre-Pass 1)
-
-**Not an OPP.** The v1 module cleanup (`e8bc04a chore(cleanup): delete
-dead legacy v1 transpiler modules`) left one orphaned test behind:
-`crates/core/tests/runtime_integration.rs::generator_to_duckdb` (lines
-78-115) still imported from the deleted `thunderduck_core::{expression,
-generator, logical}` modules. `cargo test -p thunderduck-core --lib
---tests` fails at HEAD with `E0432 unresolved imports` because of this
-one test. Removing the test file's stale `#[ignore]`d function unblocks
-the Quality Gate for the entire simplification plan.
-
-- **Files touched.** `crates/core/tests/runtime_integration.rs`
-  (−38 LOC: one dead `#[tokio::test] #[ignore] async fn
-  generator_to_duckdb`).
-- **Corpus.** Unchanged (test was `#[ignore]`; not part of corpus).
-- **Warnings.** No delta.
-
-## Pass 1 — OPP-JJJ (2026-07-05)
-
-Delete legacy `crates/core/src/types/type_inference.rs` (v1 leftover
-that survived the 2026-07-05 cleanup). No production callers.
-
-- **Files touched.**
-  - `crates/core/src/types/type_inference.rs` — deleted (−1313 LOC).
-  - `crates/core/src/types/mod.rs` — drop `mod type_inference;` and
-    `pub use type_inference::TypeInferenceEngine;` (−2 lines).
-- **LOC delta.** −1315.
-- **Corpus.** Baseline 314 → 314 (unchanged — dead-code deletion is
-  behavior-preserving by construction).
-- **Warnings.** No delta on touched files. `PipeIfUnresolved`
-  never-used warning remains (Pass 4's target — expected).
-- **INV10 grep barrier.** `git grep -E 'use
-  crate::types::TypeInferenceEngine|use
-  thunderduck_core::types::TypeInferenceEngine' crates/` returns only
-  the mechanical mentions inside `crates/core/src/transpiler_v2/invariants.rs`
-  (the disallowed-imports list). Barrier satisfied.
-- **Gate.** `cargo check -p thunderduck-core` clean. Scoped
-  `rustfmt --edition 2021 --check` on touched files clean. `cargo test
-  -p thunderduck-core --lib --tests` → 448 pass / 0 fail / 4 ignored
-  (lib) + 1 pass / 0 fail / 4 ignored (runtime_integration).
-
-## Pass 2 — OPP-LLL (2026-07-05)
-
-Delete unused `crates/core/src/types/type_mapper.rs`. `TypeMapper`
-(Spark → DuckDB type-string helper for CAST/DDL) has zero non-self
-callers; τ's emission uses `render_data_type` in
-`transpiler_v2/emission.rs`.
-
-- **Files touched.**
-  - `crates/core/src/types/type_mapper.rs` — deleted (−72 LOC,
-    including its two unit tests).
-  - `crates/core/src/types/mod.rs` — drop `mod type_mapper;` +
-    `pub use type_mapper::TypeMapper;` (−2 lines).
-- **LOC delta.** −74.
-- **Corpus.** 314 → 314 (unchanged — dead-code deletion).
-- **Warnings.** No delta on touched files. `PipeIfUnresolved` warning
-  persists (Pass 4's target).
-- **Verify grep.** `git grep 'TypeMapper' crates/` returns zero hits
-  (only dev-journal historical references remain, which are docs).
-- **Gate.** `cargo check -p thunderduck-core` clean. Scoped
-  `rustfmt --edition 2021 --check` clean. `cargo test -p
-  thunderduck-core --lib --tests` → 446 pass / 0 fail / 4 ignored
-  (lib, −2 vs Pass 1 = removed TypeMapper unit tests) + 1 pass / 0
-  fail / 4 ignored (runtime_integration).
-
-## Pass 3 — OPP-MMM (2026-07-05)
-
-Delete `crates/core/src/runtime/schema_inferrer.rs` and its single
-consumer test `crates/core/tests/runtime_integration.rs::struct_field_
-name_case_is_preserved`. The load-bearing property (STRUCT field-name
-round-trip through DuckDB's Arrow schema) is already covered by the
-differential DataFrame corpus (arr-*, struc-*, map-* cases).
-
-- **Files touched.**
-  - `crates/core/src/runtime/schema_inferrer.rs` — deleted (−117 LOC).
-  - `crates/core/src/runtime/mod.rs` — drop `pub mod schema_inferrer;`
-    + `pub use schema_inferrer::SchemaInferrer;` (−2 lines).
-  - `crates/core/tests/runtime_integration.rs` — drop
-    `struct_field_name_case_is_preserved` (−83 LOC).
-- **LOC delta.** −202.
-- **Corpus.** 314 → 314 (unchanged — dead-code deletion; the removed
-  test was `runtime_integration`, not part of the DataFrame corpus).
-- **Warnings.** No delta on touched files. `PipeIfUnresolved` warning
-  persists (Pass 4's target).
-- **Verify grep.** `git grep 'SchemaInferrer\|schema_inferrer' crates/`
-  returns zero hits.
-- **Gate.** `cargo check -p thunderduck-core` clean. Scoped
-  `rustfmt --edition 2021 --check` clean. `cargo test -p
-  thunderduck-core --lib --tests` → 446 pass / 0 fail / 4 ignored
-  (lib, unchanged) + 0 pass / 0 fail / 4 ignored
-  (runtime_integration, −1 = removed test).
-
-## Pass 4 — OPP-NNN (2026-07-05)
-
-Delete unused `PipeIfUnresolved` trait +
-`impl PipeIfUnresolved for DataType` in
-`crates/core/src/types/data_type.rs`. Zero callers; the compiler
-already surfaced this as a `dead_code` warning.
-
-- **Files touched.**
-  - `crates/core/src/types/data_type.rs:102-116` — remove the
-    trait declaration + impl (−16 LOC).
-- **LOC delta.** −16.
-- **Corpus.** 314 → 314 (unchanged — dead-code deletion).
-- **Warnings.** `cargo check -p thunderduck-core` now emits **zero
-  warnings** (previously 1: "trait `PipeIfUnresolved` is never
-  used"). Delta: −1.
-- **Verify grep.** `git grep 'PipeIfUnresolved\|pipe_if_unresolved'
-  crates/` returns zero hits.
-- **Gate.** `cargo check -p thunderduck-core` clean, zero warnings.
-  Scoped `rustfmt --edition 2021 --check` clean. `cargo test -p
-  thunderduck-core --lib --tests` → 446 pass / 0 fail / 4 ignored
-  (lib, unchanged).
-
-## Pass 5 — OPP-OOO (2026-07-05)
-
-Audit the ~11 `#[allow(dead_code)]` sites in `crates/core` and
-`crates/connect-server`. Per the plan disposition rule: sites with no
-scheduled landing (no ADR / no open decision) are dead-forever and get
-deleted; sites with scheduled landings receive an ADR / invariant
-citation on the annotation.
-
-Site-by-site disposition:
-
-| File:line | Symbol | Disposition |
-|-----------|--------|-------------|
-| `emission.rs:63` | `EMIT_TAP_MUTEX` | ANNOTATE — INV2 companion (rearchitect ADR-009 test tap) |
-| `emission.rs:598` | `render_tail` | KEEP — Decision 13-A (dev journal 2026-07-02) |
-| `emission.rs:609` | `render_distinct` | KEEP — Decision 13-A |
-| `emission.rs:1537` | `render_range_relation` | KEEP — Decision 13-A |
-| `emission.rs:5181` | `spark_aggregate_return_cast` | ANNOTATE — §5.1 anchor test requires the item; extension-delegated aggregates (ADR-020) make it unwired |
-| `emission.rs:5855` | `extension_targets` | ANNOTATE — INV6 activator (currently DEFER) |
-| `expression.rs:965` | `is_non_nullable_function_name` | **DELETE** — pub(crate) wrapper of already-used `_lower`; zero callers; no scheduled landing |
-| `analyzer.rs:3119` | `_STAR` | KEEP — module doc anchor (comment above already documents) |
-| `service.rs:425` | `PlanKind::Ddl` | KEEP — "reintroduced when DDL classification lands" (see `classify_plan` docstring) |
-| `service.rs:584` | `bool_batch_responses` | ANNOTATE — DDL classification helper |
-| `service.rs:620` | `sql_command_result_response` | ANNOTATE — DDL classification helper |
-
-- **Files touched.**
-  - `crates/core/src/transpiler_v2/expression.rs` — delete
-    `is_non_nullable_function_name` (−13 LOC) and fold its docstring
-    (§1.1/§1.2 anchor) onto the `_lower` sibling.
-  - `crates/core/src/transpiler_v2/emission.rs` — three annotation
-    updates (`EMIT_TAP_MUTEX`, `spark_aggregate_return_cast`,
-    `extension_targets`).
-  - `crates/connect-server/src/service.rs` — two annotation updates
-    (`bool_batch_responses`, `sql_command_result_response`).
-- **LOC delta.** −13 (delete) + neutral annotation updates.
-- **Corpus.** 314 → 314 (unchanged — audit is annotation-and-delete of
-  dead code).
-- **Warnings.** No delta (all sites remain properly-annotated dead
-  code or become deleted code; no new warnings).
-- **Gate.** `cargo check -p thunderduck-core -p thunderduck-connect-server`
-  clean. `cargo test -p thunderduck-core --lib --tests` → 446 pass / 0
-  fail (unchanged) + 0 pass / 4 ignored (runtime_integration).
-  `cargo test -p thunderduck-connect-server --tests` → 14 ignored
-  (differential harness — expected).
-- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` on
-  touched files reports 3 pre-existing drift blocks (emission.rs:4602,
-  service.rs:530/545). Baseline-drift comparison: block counts are
-  identical between HEAD and working tree, so Pass 5 introduces zero
-  new drift and does not own any drift per CLAUDE.md § Quality Gate.
-
-## Pass 6 — OPP-L (2026-07-05)
-
-Extract the `Expression::children()` iterator and the
-`Expression::map_children()` structural map into `transpiler_v2/
-expression.rs`, then rewrite `resolve_and_stamp` and
-`expression_is_fully_resolved` in `transpiler_v2/analyzer.rs` to
-consume the walker via a wildcard default arm. Unlocks Phase 3.
-
-**Scope deviation from the plan (documented, not silent):**
-The plan lists 5 walkers for the rewrite: `resolve_and_stamp`,
-`expression_is_fully_resolved`, `Expression::data_type`,
-`Expression::nullable`, `stamp_column_reference`. Only the first two
-are natural fits — the last three are not walker rewrites:
-- `Expression::data_type` and `Expression::nullable` have variant-
-  specific type-derivation logic for almost every arm (Binary type
-  promotion, FunctionCall type inference, Cast fixed type, Window
-  type from the underlying agg, etc.). There is no natural "default
-  recursion" they can fall through to — the arms are not duplicated
-  recursion, they are per-variant type-derivation logic.
-- `stamp_column_reference` operates on `ColumnReference` alone; it is
-  not a full-tree walker.
-
-The plan's stated LOC target ("analyzer.rs LOC drops ≥ 100") is met
-by the two-walker rewrite: analyzer.rs drops **182 LOC** (5907 →
-5725). The maintenance-cost reduction ("every new variant needs 5
-updates") lands proportionally — 2 of the 5 walkers now delegate to
-`map_children`, so new variants require updating only 3 of the
-original 5.
-
-- **Files touched.**
-  - `crates/core/src/transpiler_v2/expression.rs` — add
-    `Expression::children()` and `Expression::map_children()` (walker
-    substrate; +226 LOC including 2 new unit tests exercising the
-    Alias > FunctionCall > Binary > CaseWhen > Literal shape and the
-    Window frame-boundary-skip invariant).
-  - `crates/core/src/transpiler_v2/analyzer.rs` — rewrite
-    `resolve_and_stamp` (~180 LOC → ~50 LOC with UpdateFields
-    validation preserved) and `expression_is_fully_resolved` (~70 LOC
-    → ~20 LOC via `expr.children().all(...)`).
-- **LOC delta.** analyzer.rs −182; expression.rs +226 (walker +
-  tests). Net +44 LOC across the two files. The walker substrate is
-  the point — future walkers (Phase 3 analyzer normalization,
-  Passes 13-15) reuse it instead of duplicating recursion.
-- **Corpus.** Baseline verified at 314 pre-commit (running
-  `v2-progress.sh` in the pass session). Behavior-preserving:
-  `map_children`'s per-variant recursion matches the deleted walker
-  arms 1-for-1, and both walkers explicitly custom-case the same
-  punt set (`InSubquery`, `ExistsSubquery`, `ScalarSubquery`,
-  `Lambda`, `LambdaVariable`, `RawSql`, `Interval`,
-  `UnresolvedRegex`).
-- **Warnings.** `cargo check -p thunderduck-core` clean, zero
-  warnings. No delta.
-- **Gate.** `cargo test -p thunderduck-core --lib --tests` → 448
-  pass / 0 fail / 4 ignored (+2 vs Pass 5 = new walker tests) + 0
-  pass / 4 ignored (runtime_integration).
-- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` reports
-  1 pre-existing drift block (`analyzer.rs:710` FileScan error
-  branch). HEAD-vs-WT block counts identical (analyzer.rs = 1 / 1,
-  expression.rs = 0 / 0), so Pass 6 introduces zero new drift.
-
-## Pass 7 — OPP-D (2026-07-05)
-
-Introduce five `bail_boundary_*!` macros in a new
-`crates/core/src/transpiler_v2/macros.rs`, then rewrite ~160
-hand-written `return Err(EmissionError::Unsupported*)` (and
-tail-`Err(...)` match arm) sites in `emission.rs`,
-`parser_v2/v2_lowering.rs`, `parser_v2/mod.rs`,
-`converter/v2_relation_converter.rs`, plus the three
-`AnalyzerError::UnsupportedRule` sites in `analyzer.rs`. Wire error
-`Display` output is byte-identical: each macro `$field.to_owned()`s
-its arguments and expands to the same struct literal the callers
-wrote by hand. The macros expand to `return Err(...)` **without**
-trailing semicolon so they compose both at statement position and as
-a match-arm tail expression (`Foo => bail_boundary_op!(...)` —
-`return` is `!` and coerces).
-
-**`bail_boundary_rule!` decision.** Added. `analyzer.rs` has exactly
-3 clean `return Err(AnalyzerError::UnsupportedRule { rule, reason })`
-sites — meets the ≥ 3-clean-site threshold. `PuntedOperator` (2
-sites) uses a different field shape (`op/reason` not `rule/reason`)
-and 2 < 3, so no dedicated `bail_boundary_punt!` was added.
-
-- **Files touched.**
-  - `crates/core/src/transpiler_v2/macros.rs` — **new**, +98 LOC.
-    Five `#[macro_export]` macros: `bail_boundary_op!`,
-    `bail_boundary_expr!`, `bail_boundary_fn!`,
-    `bail_boundary_proto!`, `bail_boundary_rule!`. Each accepts a
-    trailing comma (`$(,)?`) so `rustfmt`-multi-line invocations
-    parse.
-  - `crates/core/src/transpiler_v2/mod.rs` — +1 line: `mod macros;`.
-  - `crates/core/src/transpiler_v2/emission.rs` — 108 rewrites (102
-    return sites + 6 tail-`Err` match arms). INV10 positive test
-    `inv10_emission_imports_are_typed` widened to accept
-    `use crate::bail_boundary_*` alongside the existing
-    `use crate::types::*` allow-list.
-  - `crates/core/src/parser_v2/v2_lowering.rs` — 28 rewrites (16
-    return + 12 tail-`Err`).
-  - `crates/core/src/parser_v2/mod.rs` — 2 rewrites (1 return + 1
-    tail-`Err`).
-  - `crates/connect-server/src/converter/v2_relation_converter.rs` —
-    22 rewrites (14 return + 8 tail-`Err`). Imports as
-    `use thunderduck_core::bail_boundary_proto;`.
-  - `crates/core/src/transpiler_v2/analyzer.rs` — 3 rewrites (all
-    `AnalyzerError::UnsupportedRule` sites).
-- **LOC delta.** macros.rs +98; six touched files −190 net (495 ins
-  / 685 del). Net **−92 LOC** across the pass. 166 macro invocations
-  landed (111 emission + 28 v2_lowering + 2 parser_v2 + 22 converter
-  + 3 analyzer).
-- **Verify grep.** `git grep 'return Err(EmissionError::Unsupported'
-  crates/`: 133 → 0 (delta −133; plan target ≥ 40). Remaining
-  `EmissionError::Unsupported*` references (`.ok_or_else(|| …)` /
-  `.map_err(|e| …)` closure sites, doc comments, test-side
-  `matches!` patterns) are OPP-HHH's target (Pass 8).
-- **Sites left for OPP-H (Pass 9).** After Pass 9 merges the four
-  `EmissionError::Unsupported*` variants into a single
-  `Unsupported { kind, name, reason }`, the entire migration reduces
-  to a **one-line change per macro body** — the ~160 call sites do
-  not need to be touched again. That's the ordering benefit OPP-D
-  before OPP-H cites.
-- **Corpus.** 314 → 314 (unchanged — wire error strings are
-  byte-identical).
-- **Warnings.** No delta. `cargo check -p thunderduck-core -p
-  thunderduck-connect-server` clean.
-- **Gate.** `cargo test -p thunderduck-core --lib --tests` → 448
-  pass / 0 fail / 4 ignored. `cargo test -p
-  thunderduck-connect-server --tests` → 69 pass / 0 fail + 14
-  ignored differential — status matches HEAD.
-- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` on
-  touched files: **zero** drift blocks. Pass 7's rustfmt run
-  incidentally cleaned up 8 pre-existing drift blocks (2 in
-  converter, 4 in v2_lowering, 1 in analyzer, 1 in emission) — those
-  drifts landed in files this pass edited, so re-formatting them is
-  a natural side effect.
-
-## Pass 8 — OPP-HHH (2026-07-05)
-
-Introduce `ProtoFieldExt` extension trait on `Option<T>` in
-`crates/core/src/transpiler_v2/macros.rs` (co-located with Pass 7's
-`bail_boundary_*!` macros — the file's docstring already frames
-itself as τ's boundary-error surface, and this trait is the
-missing-field companion). Trait exposes
-`.require_proto(shape, reason)?` — the closure form of
-`bail_boundary_proto!` that Pass 7 could not cover because its
-`return` would leave the enclosing closure, not the function.
-
-**Trait shape.** Generic over `T`; `.as_ref()` (`Option<&T>`) and
-`.as_deref()` unify at the call site — one impl covers all 24
-sites.
-
-```rust
-pub trait ProtoFieldExt<T> {
-    fn require_proto(self, shape: &str, reason: &str) -> Result<T, EmissionError>;
-}
-impl<T> ProtoFieldExt<T> for Option<T> { … }
-```
-
-**Module visibility.** `mod macros;` → `pub mod macros;` in
-`transpiler_v2/mod.rs` so the trait is importable via
-`use crate::transpiler_v2::macros::ProtoFieldExt;` (core) and
-`use thunderduck_core::transpiler_v2::macros::ProtoFieldExt;`
-(connect-server).
-
-- **Files touched.**
-  - `crates/core/src/transpiler_v2/macros.rs` — add `ProtoFieldExt`
-    trait + impl (+48 LOC including docstring with `# Example`).
-  - `crates/core/src/transpiler_v2/mod.rs` — `pub mod macros;`.
-  - `crates/core/src/parser_v2/v2_lowering.rs` — 3 rewrites.
-  - `crates/connect-server/src/converter/v2_relation_converter.rs` —
-    21 rewrites (20 inline-closure + 1 bracket-block sibling for
-    `UnresolvedExtractValue::extraction`).
-- **LOC delta.** macros.rs +48; v2_lowering.rs −6; converter −56.
-  Net **−14 LOC** across the pass. 24 sites migrated.
-- **Verify grep.** `git grep 'ok_or_else(|| EmissionError::UnsupportedProtoShape'
-  crates/`: **23 → 0** (all inline-closure sites migrated).
-- **Corpus.** 314 → 314 (unchanged — wire error strings
-  byte-identical).
-- **Warnings.** No delta. `cargo check -p thunderduck-core -p
-  thunderduck-connect-server` clean, zero warnings.
-- **Gate.** `cargo test -p thunderduck-core --lib --tests` → 448
-  pass / 0 fail / 4 ignored. `cargo test -p thunderduck-connect-server
-  --tests` → 69 pass / 0 fail + 14 ignored — matches HEAD.
-- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` clean.
-  All 4 touched files had 0 pre-existing drift blocks at HEAD.
-
-## Pass 9 — OPP-H (2026-07-05)
-
-Merge the four
-`EmissionError::Unsupported{Op,Expression,Function,ProtoShape}`
-variants — which shared the same `(name, reason)` shape and differed
-only in the Display prefix — into a single
-`EmissionError::Unsupported { kind: UnsupportedKind, name: String,
-reason: String }` variant. Prefix routing moves to
-`impl UnsupportedKind { fn display_prefix() -> &'static str }`, so
-the `#[error(...)]` attribute inlines the kind's prefix and the four
-legacy Display strings emit byte-identical output.
-
-**Ordering benefit realized.** Pass 7's `bail_boundary_*!` macros
-hide the enum name from ~160 call sites, so the migration reduces
-(as OPP-H's dependency note predicted) to a one-line change per
-macro body plus mechanical rewrites of the remaining struct-literal
-and `matches!`-pattern sites.
-
-- **Files touched.**
-  - `crates/core/src/transpiler_v2/error.rs` — replace the 4-variant
-    enum with `Unsupported { kind, name, reason }` + `UnsupportedKind`
-    sibling enum. Migrate 4 Display tests + 2 `From`-composition
-    tests to the new shape; assertions on Display strings unchanged.
-  - `crates/core/src/transpiler_v2/macros.rs` — 4 macro bodies
-    rewritten (`bail_boundary_op!`, `bail_boundary_expr!`,
-    `bail_boundary_fn!`, `bail_boundary_proto!`) plus
-    `ProtoFieldExt::require_proto`. `bail_boundary_rule!`
-    (`AnalyzerError`) untouched.
-  - `crates/core/src/transpiler_v2/analyzer.rs` —
-    `analyzer_error_to_emission_error` bridge migrated (3 arms) plus
-    2 unit tests updated to new pattern.
-  - `crates/core/src/transpiler_v2/emission.rs` — 6 constructor-form
-    closure sites + 16 test-side `matches!` pattern sites migrated;
-    2 doc-comment refs rewritten.
-  - `crates/core/src/parser_v2/v2_lowering.rs` — 8 constructor sites
-    + 7 `matches!` arms + 1 doc-comment ref.
-  - `crates/core/src/parser_v2/mod.rs` — 1 constructor + 2
-    doc-comments.
-  - `crates/connect-server/src/converter/v2_relation_converter.rs` —
-    10 constructor closures + 6 pattern sites + 3 doc-comments.
-    `UnsupportedKind` added to imports.
-  - `crates/core/src/transpiler_v2/mod.rs` — 1 test pattern.
-  - `crates/core/src/transpiler_v2/ast.rs` — 3 doc-comments.
-  - `crates/connect-server/src/service.rs` — 2 doc-comment
-    variant→kind rewrites.
-- **Site counts (old variant names in `crates/`).** 93 → 0 (emission
-  25→0; converter 20→0; v2_lowering 16→0; macros 14→0; error 6→0;
-  analyzer 5→0; ast + parser_v2/mod 3→0 each; service 2→0;
-  transpiler_v2/mod 1→0).
-- **Verify grep.** `git grep 'EmissionError::UnsupportedOp\|
-  EmissionError::UnsupportedExpression\|
-  EmissionError::UnsupportedFunction\|
-  EmissionError::UnsupportedProtoShape' crates/`: **93 → 0**.
-- **Corpus.** 314 → 314 (wire error strings byte-identical).
-- **Warnings.** No delta. `cargo check -p thunderduck-core -p
-  thunderduck-connect-server` clean, zero warnings.
-- **Gate.** `cargo test -p thunderduck-core --lib --tests` → 448
-  pass / 0 fail / 4 ignored. `cargo test -p thunderduck-connect-server
-  --tests` → 69 pass / 0 fail + 14 ignored — matches HEAD.
-- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` on
-  touched files: **zero** drift blocks.
-
-## Pass 10 — OPP-C (2026-07-05)
-
-**Refactor.** Introduced `crates/core/src/transpiler_v2/spark_errors.rs`
-(170 LOC) housing the `SparkError` enum (`DivideByZero`,
-`RemainderByZero`, `InvalidArrayIndex { idx_sql, arr_sql }`) and two
-synthesis helpers: `SparkError::throw_expr()` renders the DuckDB
-`error('[CLASS] <message>')` fragment; `ansi_throw_if(cond, err,
-inner)` wraps it in the `CASE WHEN cond THEN throw ELSE inner END`
-shape. Byte-identity with the retired `ansi_zero_guard` /
-`array_index_error_expr` helpers is pinned by 4 unit tests inside
-the new module.
-
-**Call sites migrated:**
-- `emission::render_binary` Div/IntDiv/Mod arm →
-  `ansi_throw_if(.., SparkError::{DivideByZero, RemainderByZero}, ..)`.
-- `emission::render_scalar_function_call` `pmod`/`mod` arm →
-  `ansi_throw_if(.., SparkError::RemainderByZero, ..)`.
-- `emission::render_element_at` array arm →
-  `SparkError::InvalidArrayIndex { .. }.throw_expr()` (caller still
-  wraps in the 2-branch NULL-short-circuit CASE — `ansi_throw_if`
-  does not fit the two-WHEN shape, so `throw_expr()` is called
-  directly).
-
-**Legacy helpers.** `ansi_zero_guard` and `array_index_error_expr`
-deleted outright (no remaining callers).
-
-**Consts.** Pass 10 scope explicitly excludes moving
-`DIVIDE_BY_ZERO_MSG`, `REMAINDER_BY_ZERO_MSG`, and
-`INVALID_ARRAY_INDEX_MSG_{HEAD,MID,TAIL}` — they stay in `emission.rs`
-widened from private to `pub(crate)`, referenced from
-`spark_errors.rs` via `use super::emission::{...}`. Pass 11 (OPP-J)
-is the pure move.
-
-- **Files touched.**
-  - `crates/core/src/transpiler_v2/spark_errors.rs` — new, +170 LOC.
-  - `crates/core/src/transpiler_v2/mod.rs` — +1 line.
-  - `crates/core/src/transpiler_v2/emission.rs` — net roughly flat
-    (−22 retired helper LOC, +16 migrated call-site LOC, +6
-    doc/visibility comments).
-- **Corpus.** 314 → 314. math-010, math-011, arr-008 remain GREEN.
-- **Warnings.** No delta.
-- **Gate.** `cargo test -p thunderduck-core --lib --tests` → 452
-  pass / 0 fail / 4 ignored (baseline 448 + 4 new
-  `spark_errors::tests`). `cargo test -p thunderduck-connect-server
-  --tests` → 69 pass / 0 fail + 14 ignored (matches HEAD).
-- **Fmt drift note.** Scoped `rustfmt --edition 2021 --check` on
-  touched files clean.
-
-## Pass 11 — OPP-J (2026-07-05)
-
-Move the Spark ANSI error-text constants (`DIVIDE_BY_ZERO_MSG`,
-`REMAINDER_BY_ZERO_MSG`, `INVALID_ARRAY_INDEX_MSG_{HEAD,MID,TAIL}`)
-from `emission.rs` (where Pass 10 left them as `pub(crate)` bridges)
-into `spark_errors.rs` proper. The consts now live next to the
-`SparkError` enum + `throw_expr()` / `ansi_throw_if` synthesis
-helpers that consume them.
-
-- **Files touched.**
-  - `crates/core/src/transpiler_v2/spark_errors.rs` — drop the
-    `use super::emission::{...}` bridge; consts now defined locally
-    with docstrings.
-  - `crates/core/src/transpiler_v2/emission.rs` — remove the 5 const
-    declarations (+ their comment blocks); test-side `sql.contains(...)`
-    assertions in `render_element_at_array_wraps_with_ansi_oob_guard`
-    now import the fragments via
-    `use super::super::spark_errors::{...}`.
-- **LOC delta.** −7 net (const bodies move; two comment blocks
-  slimmed).
-- **Corpus.** 314 → 314 (pure relocation; wire strings byte-identical).
-- **Warnings.** No delta.
-- **Gate.** `cargo test -p thunderduck-core --lib` → 452 pass / 0
-  fail. Scoped `rustfmt --edition 2021 --check` clean.
-
-## Pass 12 — OPP-O (2026-07-05)
-
-Extract the duplicated `dedup_names` PySpark-parity helper into a
-shared, INV10-safe module `crates/core/src/types/pyspark_parity.rs`.
-Two copies existed: `crates/connect-server/src/arrow_schema_stamp.rs`
-(private) and `crates/core/src/transpiler_v2/emission.rs`
-(`dedup_struct_field_names`). Both are rule-of-two duplication with a
-documented sync invariant (τ substrate names + outbound Arrow stamp
-target names must match bit-for-bit for `arrays_zip` / duplicate
-STRUCT field cases). Extraction eliminates the sync tax.
-
-- **Files touched.**
-  - `crates/core/src/types/pyspark_parity.rs` — new, +91 LOC (fn +
-    5-case unit test suite pinning the PySpark rule).
-  - `crates/core/src/types/mod.rs` — `pub mod pyspark_parity;`.
-  - `crates/core/src/transpiler_v2/emission.rs` — replace 21-LOC
-    body of `dedup_struct_field_names` with a one-line delegation
-    to `crate::types::pyspark_parity::dedup_names(names)`. `Docstring
-    updated to name the shared helper.
-  - `crates/connect-server/src/arrow_schema_stamp.rs` — delete the
-    duplicate `dedup_names` fn (−26 LOC) + its local
-    `use std::collections::HashMap;` (no longer needed here). Import
-    via `use thunderduck_core::types::pyspark_parity::dedup_names;`.
-    Callers stay identical.
-- **LOC delta.** +91 new file; net −45 across the two consumer files
-  (both duplicate bodies collapse to a single import line each).
-  Total: +46 LOC across the pass, but the sync tax is now zero.
-- **INV10.** Safe. `dedup_names(&[&str]) -> Vec<String>` is
-  value-level in/out. No τ types cross the boundary.
-- **Corpus.** 314 → 314 (behavior-preserving; both call sites now
-  invoke the identical fn body).
-- **Warnings.** No delta.
-- **Gate.** `cargo test -p thunderduck-core --lib`: 453 pass / 0
-  fail (baseline 452 + 1 new `pyspark_parity::tests`). Scoped
-  `rustfmt --edition 2021 --check` clean.
-
-## Pass 13 — OPP-V (2026-07-05)
-
-Extract the 5 fattest `analyze_node` arms (SetOp, Join, NaFill,
-WithColumns, ToDf) into dedicated free functions matching
-`dispatch_op`'s uniform delegation shape.
-
-New free functions in `crates/core/src/transpiler_v2/analyzer.rs`:
-- `analyze_with_columns` — 56 LOC.
-- `analyze_na_fill` — 56 LOC.
-- `analyze_to_df` — 41 LOC.
-- `analyze_join` — 136 LOC (`#[allow(clippy::too_many_arguments)]`).
-- `analyze_set_op` — 217 LOC (biggest offender).
-
-Each corresponding `analyze_node` arm becomes a 3-8 line delegating
-call. Arm bodies moved verbatim; only the recursive `analyze_node
-(*input, base_types)` inside the arms adjusted to `analyze_node
-(input, base_types)` because the helpers accept unboxed
-`CommonAst` (matches the pre-existing `analyze_unpivot` /
-`analyze_describe` style).
-
-- **`analyze_node` LOC.** 940 → 500 (Δ −440).
-- **`analyzer.rs` total LOC.** 5741 → 5795 (Δ +54 — verbatim-extraction
-  floor: helper signatures + separator comment exceed savings from
-  the removed arm-scope braces). The plan's optimistic "~40 LOC
-  final `analyze_node`" projection assumed every arm collapse into a
-  single delegating line, but ~27 non-extracted arms retain their
-  destructure boilerplate. `dispatch_op`-uniform shape landed for
-  the 5 fat arms as intended.
-- **Corpus.** 314 → 314 (behavior-preserving; arm bodies moved
-  verbatim).
-- **Warnings.** No delta.
-- **Gate.** `cargo test -p thunderduck-core --lib --tests`: 453
-  pass / 0 fail. Scoped `rustfmt --edition 2021 --check` clean.
-
-## Pass 14 — OPP-WW (2026-07-05)
-
-Extract a shared `passthrough_schema_arm(input, base_types, |ti|
-build_op) -> Result<TypedAst, AnalyzerError>` helper in
-`crates/core/src/transpiler_v2/analyzer.rs`. Signature accepts a
-failable `build_op` closure so callers can `?`-propagate inside it.
-
-**7 arms migrated** to the helper (in file order): `Limit`, `NaDrop`,
-`NaReplace`, `Deduplicate`, `Sample`, `SampleBy`, `AliasedRelation`.
-Each arm shrunk from ~15 LOC to ~7-9 LOC (closure overhead + `Ok(...)`
-wrap eats some of the raw win, but every arm now follows one shape).
-
-Deviations from the plan's target list (10 arms):
-- `NaFill` uses schema-mutating `analyze_na_fill` (Pass 13); does not
-  fit passthrough — excluded.
-- `Filter` and `Sort` are deferred to Pass 15 (OPP-II bounded resolver)
-  since they need per-op `T` resolution beyond bare passthrough.
-
-- **LOC delta.** analyzer.rs net roughly flat (+22 helper vs −20
-  across 7 migrated arms). The point is the shared shape, not raw
-  LOC reduction.
-- **Corpus.** 314 → 314 (behavior-preserving).
-- **Warnings.** No delta.
-- **Gate.** `cargo test -p thunderduck-core --lib`: 453 pass / 0
-  fail. Scoped fmt clean.
-
-## Pass 15 — OPP-II (2026-07-05)
-
-Introduce the bounded schema-passthrough resolver
-`analyze_input_with_schema_passthrough<T>` in
-`crates/core/src/transpiler_v2/analyzer.rs`. Signature:
-
-```rust
-fn analyze_input_with_schema_passthrough<T>(
-    input: CommonAst,
-    base_types: &BaseTypes,
-    resolve_t: impl FnOnce(&StructType) -> Result<T, AnalyzerError>,
-    build_op: impl FnOnce(TypedAst, T) -> TypedOp,
-) -> Result<TypedAst, AnalyzerError>
-```
-
-`resolve_t` runs against the analyzed input schema; `build_op`
-receives the typed input and the resolved `T`, and yields the
-concrete `TypedOp` variant. Complements Pass 14's
-`passthrough_schema_arm` (which requires no `T`) by covering the
-"resolve, then passthrough" pattern.
-
-**2 arms migrated:**
-- `Filter` — `T = Expression` (condition, includes the Boolean
-  type-check inline in `resolve_t`; wire error preserved).
-- `Sort` — `T = Vec<SortOrder>`.
-
-Interaction with Pass 14's helper: SEPARATE, not layered. Pass 15's
-arms never touch `passthrough_schema_arm`; they jump straight to the
-layered helper. Both helpers coexist.
-
-Deviation from plan's 3-arm target: `Limit` stayed on Pass 14's
-`passthrough_schema_arm` because it has no `T` to resolve — forcing
-it through Pass 15 with `T = ()` + a `|ti, ()|` build closure adds
-1 LOC and 2 lines of noise for zero benefit. The plan constraint
-"reconsider the helper shape if signature is longer than the arm it
-replaced" favors Pass 14 for `Limit`.
-
-- **LOC delta.** analyzer.rs +24 helper + ~−6 across Filter/Sort
-  migration. Structural DRYness gained; raw LOC near-flat.
-- **Corpus.** 314 → 314 (behavior-preserving).
-- **Warnings.** No delta.
-- **Gate.** `cargo test -p thunderduck-core --lib`: 453 pass / 0
-  fail. Scoped `rustfmt --edition 2021 --check` clean.
+## Pass 1 — analysis summary (9 agents)
+
+Verified headroom by area (production code unless noted):
+- **type_inference.rs**: agg metadata in 5 parallel in-file rosters (real drift found);
+  paired type/nullability resolvers walking the same structure twice; duplicated
+  integral→decimal table + dead else; near-identical array-rewrap arms; dead pub fns.
+- **analyzer.rs** (production ends ~3858): two pre-`children()` hand walkers
+  (`collect_referenced_columns`, `qualify_plan_id_refs`); set-op strict-by-name branch
+  proved a special case of allow-missing; small exact dedups (pretty_literal,
+  field_by_name, na_fill closure, unpivot double-validation, expr_field, projection
+  expanders); dead pivot guard + stale docs.
+- **emission.rs first half**: ~50 `render_function_call` arms share an
+  arity-check/render/format skeleton (const-generic `exact_args::<N>` helper); 40+
+  hand-rolled comma-join loops; `substitute_index_var` provably = `substitute_lambda_var`
+  wrapper; join keyword/clause duplicated across `render_join_from`/`render_join`
+  (SEMI/ANTI gotcha lives twice); set-op triple loop; make_interval trio; misc.
+- **emission.rs second half**: production is only ~240 lines; duplicate DDL-grammar
+  walker (typed vs DuckDB-JSON) collapsible to parse-once/render-from-DataType; rest is
+  a 5,478-line test module with ~850–1,000 lines of pure builder boilerplate.
+- **expression.rs**: verbose `map_children` (156 lines) → `children_mut` + generic loop;
+  dead `ifnull` arm (differing body!); dead `is_arithmetic`; `as_string_literal` helper
+  (8 in-file sites, ~64 more elsewhere); mergeable identical arms; arrays_zip name
+  ladder duplicated with emission (comment-enforced parity).
+- **v2_relation_converter.rs**: `lit()` ctor helper (~110 LOC); hand-rolled ~270-line
+  JSON schema scanner → serde_json (~220 LOC, kills a bug class); require_proto sweep;
+  convert_window extraction; small dedups. Confirmed NO function-name table duplication
+  with the SQL front-end (different input domains).
+- **v2_lowering.rs**: hand-rolled 120-line lambda rewriter → `map_children`;
+  ctor micro-helpers; guard-then-`unreachable!` double matches; select_item_expr;
+  interval slot table; lower_function split. Decimal precision/scale computation
+  duplicated verbatim with connect-server (comment-enforced mirror).
+- **cross-cutting**: 6 hand-rolled Expression walkers in 4 files (~650 lines total);
+  `CommonOp` child-walk written 3× (base_types ×2 + service.rs) with plan walked 3× per
+  request; Spark type-string parsing implemented 2×+1 mapping table (incl. a dead
+  struct branch in `parse_type_str_to_struct` — DDL-string schema silently becomes
+  empty); function return-type knowledge shadowed between expression.rs and
+  type_inference.rs; bail_boundary macro quadruplication; alias-strip idiom ×9.
+
+Reconciliation notes:
+- Cross-cutting's "aggregate roster single-sourced" refers to external consumers of
+  `AGGREGATE_NAMES`; the 5-roster problem is *within* type_inference.rs — both true.
+- Cross-cutting proposed "add map_children" — it already exists; the actual work is
+  rebuilding each hand walker on it.
+
+### Pass 1 implementation slate
+
+Wave 1 (parallel, disjoint files, byte-identical behavior only):
+1. type_inference.rs: resolver pairs → (DataType,bool); decimal_form dedup + dead else;
+   array-rewrap helper + arm merges; delete dead pub fns + no-op window branch.
+2. expression.rs: children_mut + generic map_children; delete dead ifnull arm +
+   is_arithmetic; as_string_literal (pub(super)); merge identical arms; dst_may_fail
+   via is_numeric.
+3. emission.rs: substitute_index_var wrapper; join kind/clause dedup; exact_args/
+   min_args helpers; sql_join; string_literal_arg reuse; render_window extraction +
+   render_sort_key reuse; strip_alias local; set-op single loop; make_interval helper;
+   group-exprs builder; DDL walker parse-once dedup.
+4. v2_lowering.rs: lambda rewriter on map_children; fn_call/str_lit/is_distinct
+   helpers + wrap_not reuse; try_from single-elem matches; select_item_expr; interval
+   slot; lower_function split.
+5. v2_relation_converter.rs + relation_converter.rs: lit(); require_proto sweep;
+   convert_window; NaFill direct convert_literal; plan-ids children table;
+   arrow_field_to_struct_field; single_name_part; serde_json schema decode.
+6. analyzer.rs: collect_referenced_columns via children(); widen_by_name extraction;
+   pretty_literal merge; field_by_name sweep; dead pivot guard; na_fill closure merge;
+   unpivot implicit-path dedup; expr_field; expand_projections driver; minor items.
+
+Deferred to later passes (behavior-superset or cross-file, need dedicated gating):
+- qualify_plan_id_refs recursion widening (corpus-gated behavior superset).
+- Aggregate spec table (T1) + expression.rs roster delegation (touches 3 files).
+- CommonOp::children (ast.rs + base_types.rs + service.rs).
+- Expression::unaliased shared helper; arrays_zip name into struct_names.rs.
+- Shared decimal precision/scale fn (core + connect-server).
+- Spark DDL type parser unification (acceptance-widening; corpus-gated).
+- bail_boundary macro + spark_errors fragments consolidation.
+- Test-module boilerplate consolidation (analyzer ~600 LOC, emission ~900 LOC).
+
+### Pass 1 implementation results
+
+Wave 1 (6 parallel coders, disjoint files) + Wave 2 (2 coders, cross-file):
+
+| File | Δ |
+|---|---|
+| type_inference.rs | −107 then ≈+30 (agg spec table replaces 5 rosters) |
+| expression.rs | −171 then ≈+35 (shared decimal fn, unaliased) |
+| emission.rs | −469 then ≈−10 |
+| analyzer.rs (+fixtures) | −114 then −12 |
+| v2_lowering.rs | −50 then −15 |
+| converter (2 files + Cargo.toml) | −303 then −12 |
+| ast.rs / base_types.rs / service.rs | −53 (CommonOp::children; plan walked 1× not 3×) |
+
+Net: **−1,800 lines** (2,511 insertions / 4,311 deletions incl. this log).
+
+Landed: all Wave-1 items from the slate; CommonOp::children()/children_mut
+(exhaustive, no `_` arm — new variants fail to compile in one place);
+BaseTypes::from_entries; aggregate spec table (drift transcribed verbatim and
+commented: std, array_agg, approx_count_distinct, count_approx_distinct,
+regr_count, nth_value, mode); arrays_zip name ladder → struct_names;
+Expression::unaliased; shared decimal_value_precision_scale;
+bail_boundary_kind! consolidation; spark_errors template dedup + canonical
+escaping; flip_all_nullable dedup.
+
+Documented equivalence caveats (reviewed, accepted):
+- analyze_set_op strict-by-name: old code was internally inconsistent for
+  non-ASCII-cased duplicate names (to_lowercase vs eq_ignore_ascii_case);
+  new code marks such a field nullable. ASCII behavior identical.
+- render_function_call converted arms now check arity BEFORE rendering args;
+  only observable when a call is both wrong-arity AND has an unrenderable arg
+  (error precedence between two errors). No test/corpus case observes it.
+- Test rewrites confined to: type_inference/expression drift-police tests
+  (now police the single table), base_types plan_has_empty_scan tests
+  (rewritten to empty_scan_tables equivalents, intent preserved).
+- ast.rs uses one local macro (common_op_children!) to generate the &/&mut
+  accessor pair from a single exhaustive match — accepted as the standard
+  Rust idiom for mut/immut accessor pairs (logic visible in one place).
+
+Verification: `cargo fmt --check` clean; core 686 passed / cs 91 passed;
+invariants 10/10; DataFrame corpus **327/327 (= baseline)**; SQL corpus
+**237 passed / 25 failed (= baseline exactly)**. Diff snapshot:
+/tmp/simplify-pass1-full.patch. Not committed (awaiting user review).
+
+---
+
+## Pass 2 — deferred behavior-superset + larger structural items
+
+Slate (from pass-1 analysis, deferred for dedicated gating):
+- A1 analyzer.rs: qualify_plan_id_refs rebuilt on map_children — recursion-set
+  superset (plan_id refs inside Between/InList/Like/etc. now qualified);
+  corpus-gated. Also: delete dead TypedAttr (zero constructors workspace-wide;
+  flagged for user review here).
+- A2 emission.rs: substitute_lambda_var rebuilt on children_mut/map_children —
+  same superset class (lambda vars inside Between/InList currently silently
+  unsubstituted = latent wrong-SQL bug); corpus-gated.
+- A3 expression.rs + type_inference.rs: function_return_type takes the
+  argument types; move the whole-arg-list widening arms out of
+  expression.rs's pre-empt block; delete the shadowed weaker duplicates.
+- B1 Spark type-string parsing unification: one DDL/type-string parser in
+  core (types/spark_ddl.rs) shared by type_converter.parse_type_str and
+  emission's DDL parser; fixes the dead Struct branch in
+  parse_type_str_to_struct (DDL-string schema currently silently → empty);
+  acceptance-widening, corpus-gated.
+- B2 analyzer.rs test-module builder consolidation (~500–700 LOC, zero risk).
+- C1 emission.rs test-module builder consolidation (~850–1,000 LOC, zero risk).
+
+### Pass 2 implementation results
+
+All six slate items landed (one agent needed two relaunches due to transient
+API errors/rate limits; the finisher verified byte-identical end state):
+- A1 qualify_plan_id_refs → map_children (61→29 lines) + dead TypedAttr
+  deleted (−54 total). No test pinned the old narrower recursion.
+- A2 substitute_lambda_var → map_children (−75); MapLiteral/StructLiteral/
+  RowConstructor/UpdateFields now recursed (latent wrong-SQL bug fixed);
+  subquery/Window opacity explicitly preserved with rationale comment.
+- A3 function_return_type(name, &[DataType]) is the single home for
+  per-function return typing; widening arms moved from expression.rs
+  (coalesce family, nvl2/if/iif, aggregate/reduce); shadowed weak arm reduced
+  to abs|nullif; zero-args edges documented in comments.
+- B1 types/spark_ddl.rs: ONE Spark DDL/type-string parser (strict + lenient
+  entries), union grammar documented; emission −155, type_converter −49;
+  latent bug fixed: parse_type_str_to_struct's DDL fallback was dead and
+  DDL-string schemas silently became empty — now live, +17 tests. Acceptance
+  changes strictly additive (verified; corpus unchanged).
+- B2 analyzer test module: 4,038 → 3,059 lines (−979) via shared builders;
+  115/115 module tests, name list byte-identical.
+- C1 emission test module: 5,481 → 4,801 (−680); fcall/render_fn/
+  expect_unsupported/scan helpers; 217/217 tests, name list byte-identical;
+  tap_guard placements untouched.
+
+Cumulative (passes 1+2, vs HEAD fb274d1): **−3,580 lines** across 25 code
+files (3,942 insertions / 7,522 deletions incl. logs). Diff snapshot:
+/tmp/simplify-pass2-full.patch.
+
+Verification: fmt clean; core 700 passed / cs 94 passed (both grew by new
+tests); DataFrame corpus **327/327**; SQL corpus **237/25** — both identical
+to baseline; the two walker behavior-supersets and the DDL widening caused
+zero corpus movement.
+
+Process note: .claude/agents/*.md all pinned `model: opus`; per user
+instruction all six now pin `model: fable` (explicit per-launch overrides
+were already Fable; resume-after-crash fell back to frontmatter — now safe).
+
+---
+
+## Pass 3 — fresh analysis on the post-pass-2 code
+
+Four analysis agents re-read the updated tree. Consensus: production code is
+approaching its natural minimum everywhere; remaining verified headroom is
+~430–490 production lines (mostly mechanical: sweep-missed separator loops,
+one to_number/try_to_number dup, bool-literal matcher ×4, dead code
+incl. service.rs's retired collect-then-stream path (~55), the
+collect_scan_tables_in_expr walker (~85, feasibility verified arm-by-arm),
+the na.fill selection rule duplicated analyzer↔emission (the exact gotcha-12
+desync hazard), dead HasSchema trait, children/children_mut macro per the
+ast.rs precedent) plus ~800–1,000 test-module lines (type_inference,
+expression, v2_lowering, converter, service test modules — never
+consolidated).
+
+Explicitly REJECTED after evaluation: splitting render_function_call into
+domain modules (moves branches, breaks the O(1) grep-the-name navigation,
+and the INV3 barrier is enforced by two file-hardcoded scans); sqlparser
+visitor for expr_has_aggregate (descends into subqueries = behavior change);
+Display↔spark_ddl name-table unification (format vs parse direction,
+deliberately different vocabularies); CommonAst wrapper flattening
+(high churn, low value).
+
+### Correctness flags recorded during pass 3 (NOT fixed — need corpus
+witnesses first; candidates for regular /fix-bug or corpus passes)
+1. v2_lowering `expr_has_aggregate` does not descend into function args:
+   `SELECT abs(count(x)) FROM t` classifies non-aggregate and mis-lowers to
+   a plain Project (should be aggregate or an honest boundary error).
+2. v2_lowering `resolve_named_windows_in_expr` descends only through
+   Nested/UnaryOp/Cast/BinaryOp — a named-window ref inside CASE/IN/BETWEEN
+   hits the "not defined in WINDOW clause" error despite being defined.
+3. v2_lowering TableFactor::Function / TableFactor::TableFunction arms
+   silently drop a user alias (`alias: _`), unlike the Table arm which
+   routes through apply_table_alias — same silent-drop class gotcha 9 bans.
+4. type_converter proto Kind::CalendarInterval → DataType::YearMonthInterval
+   ("best-effort" written before DataType::Interval existed) — lossy
+   round-trip vs data_type_to_proto's Interval → CalendarInterval.
+5. Sort null-ordering divergence between front-ends (proto Unspecified →
+   NullsFirst unconditionally vs SQL deriving from direction) — currently
+   unobservable (PySpark always stamps explicit ordering); documented via
+   comment in pass 3, alignment deferred until a wire shape witnesses it.
+6. emission `rewrite_grouping_id` deliberately recurses only into
+   FunctionCall/Alias/Cast/CaseWhen — `grouping_id() + 1` passes through
+   un-rewritten (latent; conversion to map_children would be a behavior
+   change, deferred).
+
+### Pass 3 implementation results
+
+Five parallel coders (disjoint files) + a 2-item sequential mini-wave:
+
+| Area | Δ | Highlights |
+|---|---|---|
+| emission.rs | −85 | 7 sweep-missed loops → sql_join; to_number/try_to_number merged; bool_literal; render_distinct deleted; stale Decision-13-A docs fixed; TD_JOIN_* consts imported from analyzer (coupling fix); rendered_args adoption |
+| analyzer.rs + base_types.rs | −134 | collect_scan_tables_in_expr → children() (last big hand walker); na_fill_value_for extracted (pub(super)); passthrough helpers merged; dead HasSchema deleted; qualify_plan_id_refs → in-place &mut |
+| expression.rs + type_inference.rs + types/ | −359 | expression_children! macro (ast.rs precedent); dead API deleted (is_floating_point, is_decimal, field_index); constant-arm folds in function_call_nullable; from_json/from_csv merged; decimal_bounds; stale to_number comment fixed; both test modules consolidated |
+| v2_lowering.rs | −104 | table_function_node; lower_function_args returns (distinct, args); boundary_shape test helper — assertions strengthened to kind+name; one masked misclassification pinned (in_row family) |
+| connect-server (3 files) | −206 | dead collect-then-stream path deleted (~55); convert_all + import hoist; sort-divergence comment; test helpers; make-work test deleted |
+| mini-wave (emission) | −28 | render_na_fill's value_for → shared na_fill_value_for (gotcha-12 hazard closed); literal_string_arg delegates to as_string_literal |
+
+Pass 3 net: ≈ −915 lines. Documented deviations: conv() overflowing-Long
+to_base now errors instead of silently wrapping (pathological,
+corpus-unwitnessed, noted in code); v2_lowering boundary tests strengthened
+(kind-only → kind+name); field_index test deleted with its function.
+
+Verification: fmt clean; core 699 passed (−1 = deleted field_index test) /
+cs 93 passed (−1 = deleted make-work test); DataFrame corpus **327/327**;
+SQL corpus **237/25** — both identical to baseline. Diff snapshot:
+/tmp/simplify-pass3-full.patch.
+
+---
+
+## Pass 4 — adversarial convergence check + residue implementation
+
+Two adversarial agents tried to disprove the passes' "natural minimum" claims.
+
+**Split verdict.** The transpiler proper (transpiler_v2/ + parser_v2/ + types/)
+is converged: parser_v2 audit found nothing above bar (helper adoption
+complete, no drift, no dead code); expression/type_inference audit likewise.
+Only two in-scope core items remained (WithColumns slot-matching maintained
+in analyzer AND emission — a documented wire-schema drift hazard; and
+render_aggregate's dead nth_value arm + the first/last ignoreNulls trim rule
+implemented twice with already-divergent guards).
+
+**The claims failed in the never-analyzed adjacencies:**
+- core runtime/session.rs: ~180 lines of zero-caller v1-era code (dead
+  SessionCommand variants ExecDdl/ViewExists/CacheViewSchema + the LIMIT-0
+  schema-probe path SchemaOf/schema_of/find_trailing_limit).
+- core error.rs: five never-constructed ThunderduckError variants.
+- runtime/config.rs: StreamingConfig threaded end-to-end but inert
+  (from_env has zero callers; spawn takes `_config`).
+- connect-server: stamp_batch_schemas/stamp_one production-dead + stale doc
+  refs; classify_plan constant-returns Query (fake DDL dispatch, ADR-checked
+  during implementation); StreamingState.pending_error never written;
+  record_batches_to_arrow_batches serves one single-batch caller (with a
+  production .expect); infallible-but-Result-typed converters incl. a
+  misleading `if let Ok` fallback that can never fall through; dead dashmap
+  dependency.
+
+Rejected candidates recorded: toDF/WithColumnsRenamed merge (positional vs
+name-map — diverges on duplicate names); ADR-anchored #[allow(dead_code)]
+retention (render_tail, spark_aggregate_return_cast, extension_targets —
+policy, not cleanup); StreamingConfig full de-threading (cross-crate churn,
+deferred; minimal from_env deletion only).
+
+Doc drift flagged (not auto-fixed, for user review): CLAUDE.md's crate map
+lists `crates/connect-server/src/session/` — that module no longer exists
+(SessionManager lives in thunderduck_core::runtime).
+
+### Pass 4 implementation results
+
+Core (−228 exact in runtime/error/config + transpiler items):
+- session.rs +3/−201: dead SessionCommand surface (ExecDdl/ViewExists/
+  CacheViewSchema) and the LIMIT-0 schema-probe path deleted; the one
+  #[ignore]d integration test repointed, not deleted.
+- error.rs −15: five never-constructed v1-era variants deleted.
+- config.rs −7: from_env deleted; StreamingConfig documented as inert
+  (full de-threading deferred — cross-crate churn).
+- WithColumns slot-matching single-homed: WithColumnsPlan/with_columns_plan
+  in analyzer.rs (na_fill_value_for style), consumed by both
+  analyze_with_columns and render_with_columns — wire-schema drift hazard
+  closed, byte-identical by construction.
+- render_aggregate's dead nth_value arm deleted (classifier=false makes it
+  unreachable); trailing-ignoreNulls trim arity table single-homed with the
+  two paths' divergent guards PRESERVED and documented ("do NOT unify
+  without a corpus witness").
+- Stale docs fixed in transpiler_v2/mod.rs and ast.rs (ops described as
+  unwired/punted that are implemented).
+
+Connect-server (−109):
+- classify_plan/execute_ddl/PlanKind fake dispatch deleted — ADR evidence:
+  zero mentions in the rearchitect ADRs; ADR-011/ADR-004 route command
+  discrimination at the parse root (the live handle_command), not by
+  post-conversion classification.
+- stamp_batch_schemas/stamp_one deleted (test-local helper keeps the 7
+  rewrite-path tests' coverage); stale service.rs doc refs fixed.
+- StreamingState.pending_error (never written) deleted with its dead branch.
+- record_batch_to_arrow_batch single-batch API (removes a production
+  .expect()).
+- proto_to_data_type/proto_struct_to_struct_type/parse_json_schema made
+  infallible; convert_cast's never-run map_err gone; the misleading
+  `if let Ok` JSON-fallback expressed honestly (behavior re-derived and
+  preserved exactly: a `{`-leading schema never reaches the DDL parser).
+- dashmap dead dependency removed.
+
+Verification: fmt clean; core 699 / cs 93; DataFrame corpus **327/327**;
+SQL corpus **237/25** — baseline preserved through all four passes. Diff
+snapshot: /tmp/simplify-pass4-full.patch.
+
+---
+
+## Pass 5 — final dry-check + last removals
+
+The dry-check verified pass 4 left no orphans (compiler-verified, plus
+caller-graph greps for every deleted symbol), read the last never-audited
+corners (session_manager.rs, extension_loader.rs, runtime/mod.rs, lib.rs,
+main.rs, connect-server error.rs), and found exactly two remaining items
+above the bar — both implemented:
+- F1 session.rs: the `spark_names` rename machinery in the streaming path
+  was provably dead (sole caller passes None; column naming moved to
+  connect-server's build_stamped_schema in the streaming rewrite). −49.
+- F2 connect-server error.rs: three zero-constructor ConnectError variants
+  (PlanConversion, Unsupported, Session) — the unfinished mirror of pass 4's
+  core ThunderduckError purge. −12.
+Plus an 8-item polish batch (stale comments referencing deleted v1 symbols
+and pre-rewrite architecture; a misattached doc block; all verified against
+the live emission arms).
+
+Verification: fmt clean; zero cargo warnings workspace-wide; core 699 /
+cs 93; DataFrame corpus **327/327**; SQL corpus **237/25** — baseline
+preserved. Snapshot: /tmp/simplify-final.patch.
+
+---
+
+## CONVERGENCE DECLARATION (effort complete after 5 passes of 20 allowed)
+
+**Stopping determination:** pass 4's adversarial audits declared the
+transpiler proper converged (parser_v2: nothing above bar; expression/
+type_inference: nothing above bar; transpiler_v2 core: two items, fixed);
+pass 5 verified pass 4's own changes left no residue, audited the last
+corners, found only F1/F2 (fixed above), and concluded "a pass 6 would not
+pay for itself." No new meaningful improvements remain — remaining
+compression would trade per-arm Spark-parity legibility (corpus-witnessed
+rules with load-bearing comments) for line count, which the constraints
+forbid.
+
+**Totals (working tree vs HEAD fb274d1):** 37 files, 5,436 insertions /
+10,074 deletions — net **≈ −4,600 lines** (code-only ≈ −4,300 excluding
+this log and progress-row files), with every gate identical to baseline:
+- `cargo fmt --check` clean; `cargo check --workspace --all-targets` zero
+  warnings; no NEW clippy findings on any touched file (workspace clippy
+  has pre-existing baseline issues excluded from the gate per CLAUDE.md).
+- Unit tests: core 699 passed (was 685 — net +14 from new spark_ddl/
+  converter tests minus 2 deliberately deleted with their dead subjects),
+  connect-server 93 (was 91: +3 new, −1 make-work).
+- DataFrame corpus 327/327 and SQL corpus 237 passed / 25 failed —
+  **identical to baseline after every single pass**.
+
+**What structurally changed:** traversal machinery single-homed
+(Expression::children/children_mut/map_children + CommonOp::children — six
+hand walkers and both MAINTENANCE CONTRACT hazards eliminated); aggregate
+metadata in ONE spec table (was 5 rosters + cross-file copy); function
+return typing single-homed in type_inference; ONE Spark DDL type parser
+(was 2 grammars + a mapping table, with a dead fallback made live); emission
+arity/join/separator/interval/set-op boilerplate collapsed into shared
+helpers with byte-identical output; analyzer↔emission shared rules
+(na.fill selection, WithColumns slot plan, grouping-fold, join-alias
+consts) made structural instead of comment-enforced; ~600 lines of v1-era
+dead code purged from runtime/session, error enums, and service.rs; four
+test modules consolidated (~2,900 lines) with byte-identical test-name
+lists.
+
+**Left deliberately (recorded above, needs decisions/witnesses):** the six
+correctness flags; ADR-anchored dead-code trio; StreamingConfig full
+de-threading; CLAUDE.md crate-map drift (connect-server session/ no longer
+exists); `parse_spark_type_strict` kept as documented strict entry point.
+
+**Nothing committed** — the entire effort awaits user review per the git
+workflow rule. Per-pass diff snapshots: /tmp/simplify-pass{1,2,3,4}-full.patch,
+/tmp/simplify-final.patch (cumulative).

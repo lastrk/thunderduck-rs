@@ -56,13 +56,6 @@ impl StructType {
             .find(|f| f.name.eq_ignore_ascii_case(name))
     }
 
-    /// Lookup index by name (case-insensitive).
-    pub fn field_index(&self, name: &str) -> Option<usize> {
-        self.fields
-            .iter()
-            .position(|f| f.name.eq_ignore_ascii_case(name))
-    }
-
     /// All field names in order.
     pub fn field_names(&self) -> Vec<&str> {
         self.fields.iter().map(|f| f.name.as_str()).collect()
@@ -110,14 +103,6 @@ mod tests {
         assert!(s.field_by_name("ID").is_some());
         assert!(s.field_by_name("name").is_some()); // "Name" → found
         assert!(s.field_by_name("missing").is_none());
-    }
-
-    #[test]
-    fn field_index() {
-        let s = schema();
-        assert_eq!(s.field_index("id"), Some(0));
-        assert_eq!(s.field_index("AMOUNT"), Some(2));
-        assert_eq!(s.field_index("x"), None);
     }
 
     #[test]

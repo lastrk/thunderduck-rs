@@ -192,12 +192,4 @@ async fn check_parquet_types() {
             println!("  {}: {:?}", field.name(), field.data_type());
         }
     }
-
-    // Check schema_of (the LIMIT 0 path used by analyze_plan)
-    let q1_sql = "SELECT \"l_returnflag\", \"l_linestatus\", SUM(\"l_extendedprice\" * (1 - \"l_discount\")) AS \"sum_disc_price\" FROM (SELECT * FROM \"lineitem\") GROUP BY \"l_returnflag\", \"l_linestatus\"";
-    let schema = session.schema_of(q1_sql).await.expect("schema_of failed");
-    println!("schema_of (LIMIT 0) result:");
-    for field in schema.fields() {
-        println!("  {}: {:?}", field.name(), field.data_type());
-    }
 }

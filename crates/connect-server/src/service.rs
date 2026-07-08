@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::arrow_interval_transcode::{self, IntervalPlan};
-use crate::arrow_ipc::record_batches_to_arrow_batches;
+use crate::arrow_ipc::record_batch_to_arrow_batch;
 use crate::arrow_schema_stamp;
 use crate::converter::type_converter::data_type_to_proto;
 use crate::converter::v2_relation_converter::V2RelationConverter;
@@ -35,6 +35,19 @@ pub struct ThunderduckService {
 impl ThunderduckService {
     pub fn new(session_manager: Arc<thunderduck_core::runtime::SessionManager>) -> Self {
         Self { session_manager }
+    }
+
+    /// Fetch (or create) the session for `session_id`, mapping failures to
+    /// `Status::internal` — the identical error mapping both gRPC entry
+    /// points (`execute_plan`, `analyze_plan`) require.
+    async fn session(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<thunderduck_core::runtime::DuckDbSession>, Status> {
+        self.session_manager
+            .get_or_create(session_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))
     }
 }
 
@@ -92,7 +105,7 @@ pub(crate) async fn transpile_relation(
 ///
 /// Returns both the emitted DuckDB SQL and the analyzer's root
 /// `resolved_schema` — the schema drives the outbound Arrow-schema stamp in
-/// `execute_streaming_query` (see `arrow_schema_stamp::stamp_batch_schemas`).
+/// `execute_streaming_query` (see `arrow_schema_stamp::build_stamped_schema`).
 /// Fusing avoids the second `analyze()` call that pass 88's initial wiring
 /// incurred (perf review HIGH #1).
 ///
@@ -124,13 +137,13 @@ pub(crate) async fn analyze_schema(
 
 /// Build the per-path `BaseTypes` overlay for a `CommonAst`.
 ///
-/// The catalog closure resolves each empty-scan `TableScan` from the
-/// session's temp-view schema cache. `get_view_schema` is async and
-/// `build_from_plan`'s closure is sync, so we pre-fetch every table's schema
-/// into a map first, then feed `build_from_plan` a synchronous
-/// `|name| map.get(name).cloned()`. The closure stays the sole runtime→analyzer
-/// bridge (INV10). Short-circuits to `BaseTypes::empty()` when the plan carries
-/// no empty scan (ADR-012 request-handler seeding short-circuit).
+/// Walks the plan ONCE via `empty_scan_tables`, resolves each collected
+/// empty-scan `TableScan` from the session's async temp-view schema cache
+/// (`get_view_schema`), then constructs the overlay directly from the
+/// resolved entries (`BaseTypes::from_entries`) — no second plan walk. The
+/// pre-fetched map stays the sole runtime→analyzer bridge (INV10).
+/// Short-circuits to `BaseTypes::empty()` when the plan carries no empty scan
+/// (ADR-012 request-handler seeding short-circuit).
 async fn build_base_types(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     common_ast: &CommonAst,
@@ -148,7 +161,7 @@ async fn build_base_types(
             map.insert(table, schema);
         }
     }
-    BaseTypes::build_from_plan(common_ast, |name| map.get(name).cloned())
+    BaseTypes::from_entries(map)
 }
 
 // ── Eager pivot-value discovery (Spark parity) ───────────────────────────────
@@ -179,49 +192,10 @@ async fn resolve_implicit_pivots(
 ) -> Result<(), Status> {
     use thunderduck_core::transpiler_v2::CommonOp;
 
-    // Resolve children first.
-    match &mut ast.op {
-        CommonOp::Project { input, .. }
-        | CommonOp::Filter { input, .. }
-        | CommonOp::Sort { input, .. }
-        | CommonOp::Limit { input, .. }
-        | CommonOp::Aggregate { input, .. }
-        | CommonOp::WithColumns { input, .. }
-        | CommonOp::DropColumns { input, .. }
-        | CommonOp::AliasedRelation { input, .. }
-        | CommonOp::WithColumnsRenamed { input, .. }
-        | CommonOp::ToDf { input, .. }
-        | CommonOp::Deduplicate { input, .. }
-        | CommonOp::NaFill { input, .. }
-        | CommonOp::NaDrop { input, .. }
-        | CommonOp::NaReplace { input, .. }
-        | CommonOp::Unpivot { input, .. }
-        | CommonOp::Pivot { input, .. }
-        | CommonOp::Describe { input, .. }
-        | CommonOp::Summary { input, .. }
-        | CommonOp::FreqItems { input, .. }
-        | CommonOp::Crosstab { input, .. }
-        | CommonOp::Sample { input, .. }
-        | CommonOp::SampleBy { input, .. } => {
-            Box::pin(resolve_implicit_pivots(input, session)).await?;
-        }
-        CommonOp::Join { left, right, .. } => {
-            Box::pin(resolve_implicit_pivots(left, session)).await?;
-            Box::pin(resolve_implicit_pivots(right, session)).await?;
-        }
-        CommonOp::SetOp { children, .. } => {
-            for child in children.iter_mut() {
-                Box::pin(resolve_implicit_pivots(child, session)).await?;
-            }
-        }
-        // Leaf relations carry no child plan to descend into.
-        CommonOp::SingleRow
-        | CommonOp::TableScan { .. }
-        | CommonOp::Values { .. }
-        | CommonOp::LocalRelation { .. }
-        | CommonOp::FileScan { .. }
-        | CommonOp::TableFunction { .. }
-        | CommonOp::Unnest { .. } => {}
+    // Resolve children first — `CommonOp::children_mut` covers every variant
+    // exhaustively (leaf relations yield no child plan to descend into).
+    for child in ast.op.children_mut() {
+        Box::pin(resolve_implicit_pivots(child, session)).await?;
     }
 
     // If THIS node is a values-less pivot, discover and stamp its values.
@@ -348,11 +322,7 @@ impl SparkConnectService for ThunderduckService {
             "execute_plan",
         );
 
-        let session = self
-            .session_manager
-            .get_or_create(&session_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let session = self.session(&session_id).await?;
 
         let plan = req
             .plan
@@ -363,27 +333,18 @@ impl SparkConnectService for ThunderduckService {
                 // Convert first, then run Spark's eager pivot-value discovery
                 // (needs the live session) BEFORE finalize — see
                 // `resolve_implicit_pivots`. `finalize` succeeds for every
-                // plan τ covers, so `execute_streaming_query` is live. DDL
-                // classification is still a placeholder — `classify_plan`
-                // always returns `Query` (see `execute_ddl`).
+                // plan τ covers, so `execute_streaming_query` is live.
                 let mut common_ast = relation_to_common_ast(&relation)?;
                 resolve_implicit_pivots(&mut common_ast, &session).await?;
                 let (sql, resolved_schema) = finalize(&session, &common_ast).await?;
-                match classify_plan(&common_ast) {
-                    PlanKind::Ddl => {
-                        execute_ddl(&session, &common_ast, &sql, &session_id, &operation_id).await?
-                    }
-                    PlanKind::Query => {
-                        return execute_streaming_query(
-                            &session,
-                            &sql,
-                            &resolved_schema,
-                            &session_id,
-                            &operation_id,
-                        )
-                        .await;
-                    }
-                }
+                return execute_streaming_query(
+                    &session,
+                    &sql,
+                    &resolved_schema,
+                    &session_id,
+                    &operation_id,
+                )
+                .await;
             }
             Some(proto::plan::OpType::Command(cmd)) => {
                 handle_command(&session, &session_id, &operation_id, cmd).await?
@@ -427,11 +388,7 @@ impl SparkConnectService for ThunderduckService {
                 // reach it (see `resolve_implicit_pivots`); the session also
                 // carries the temp-view catalog the analyzer resolves
                 // `TableScan` schemas from (catalog bridge).
-                let session = self
-                    .session_manager
-                    .get_or_create(&session_id)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                let session = self.session(&session_id).await?;
                 // E.0 addendum: route analyze_plan(Schema) through τ's
                 // analyzer. Parse the relation to CommonAst, then invoke
                 // `analyze_schema` — which runs the analyzer without
@@ -443,7 +400,7 @@ impl SparkConnectService for ThunderduckService {
                 // `resolved_schema` verbatim (via `data_type_to_proto`), so
                 // AnalyzePlan already surfaces the Spark-visible view.
                 // ExecutePlan achieves the same on the response path via
-                // `arrow_schema_stamp::stamp_batch_schemas` in
+                // `arrow_schema_stamp::build_stamped_schema` in
                 // `execute_streaming_query`. Do not modify this arm.
                 let mut common_ast = relation_to_common_ast(&relation)?;
                 resolve_implicit_pivots(&mut common_ast, &session).await?;
@@ -635,72 +592,8 @@ async fn handle_command(
     }
 }
 
-// ── Plan-classification + DDL helpers ────────────────────────────────────────
-//
-// These helpers consume `&CommonAst`. `execute_streaming_query` (the Query arm)
-// is live; `classify_plan` still collapses to `Query` and `execute_ddl` remains
-// an `unimplemented` placeholder.
+// ── Response builders + streaming ────────────────────────────────────────────
 
-/// Classification of a τ plan for execution routing.
-///
-/// Currently a two-arm placeholder (DDL vs. Query) pending τ-side DDL
-/// classification over `CommonAst`.
-#[allow(dead_code)] // `Ddl` reintroduced when DDL classification lands.
-enum PlanKind {
-    /// A DDL/DML statement — execute without result streaming.
-    Ddl,
-    /// A query — stream results back to the client.
-    Query,
-}
-
-/// Classify a τ plan as DDL or query.
-///
-/// always returns [`PlanKind::Query`]. The DDL classification is a
-/// τ's emission substrate deliverable — `CommonAst` does not yet carry a DDL discriminant.
-fn classify_plan(_common_ast: &CommonAst) -> PlanKind {
-    PlanKind::Query
-}
-
-/// Execute a DDL statement and return appropriate responses.
-///
-/// **τ's emission substrate (owner):** DDL classification and execution over `CommonAst`.
-/// the τ dispatch site body errors with `Status::unimplemented` because τ's
-/// `finalize()` never reaches this point.
-async fn execute_ddl(
-    _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    _common_ast: &CommonAst,
-    _sql: &str,
-    _session_id: &str,
-    _operation_id: &str,
-) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
-    Err(Status::unimplemented(
-        "DDL classification and execution over CommonAst",
-    ))
-}
-
-/// Execute a query plan and stream results back to the client.
-///
-/// **future τ work.0 (owner):** streaming query execution over `CommonAst`.
-///
-/// The `_common_ast` parameter is reserved for future use (per plan §8:
-/// `spark_names` / column-rename metadata) and is intentionally unused at
-/// future τ work.0. The τ pipeline has already produced fully-aliased DuckDB SQL by
-/// this point (via `finalize()` at the dispatch seam), so E.0 only needs to
-/// submit that SQL to the session and wrap the resulting Arrow batches into
-/// `ExecutePlanResponse` frames.
-///
-/// Execution shape (collect-then-stream, symmetric with the DDL arm at the
-/// call site in `execute_plan`):
-///   1. `session.execute(sql).await` submits the SQL through the intact
-///      `SessionCommand::Execute` → oneshot transport (no new variants
-///      introduced at E.0). Failures map `ThunderduckError → ConnectError
-///      → Status::internal` — DuckDB errors on τ-emitted SQL are Thunderduck
-///      runtime bugs, not client faults.
-///   2. `batches_to_responses` serializes each `RecordBatch` as an
-///      independent Arrow IPC stream (schema-only frame for 0 rows) and
-///      appends a trailing `ResultComplete` frame.
-///   3. `stream::iter(responses.into_iter().map(Ok))` boxes the responses
-///      into the `ExecutePlanStream` shape.
 /// Build a schema-only `ExecutePlanResponse` from τ's `resolved_schema`.
 ///
 /// PySpark's Connect client short-circuits its `_from_arrow_schema` fallback
@@ -734,10 +627,7 @@ fn batch_to_response(
     operation_id: &str,
     seq: usize,
 ) -> crate::error::Result<proto::ExecutePlanResponse> {
-    let mut abs = record_batches_to_arrow_batches(std::slice::from_ref(batch))?;
-    let ab = abs
-        .pop()
-        .expect("record_batches_to_arrow_batches must emit one per input");
+    let ab = record_batch_to_arrow_batch(batch)?;
     Ok(proto::ExecutePlanResponse {
         session_id: session_id.to_owned(),
         server_side_session_id: SERVER_SESSION_ID.clone(),
@@ -764,9 +654,6 @@ struct StreamingState {
     sent_schema_frame: bool,
     /// Terminal frame — once yielded, unfold returns None on next poll.
     sent_complete_frame: bool,
-    /// Set when the receiver reports an error; the loop yields the Status
-    /// once and then terminates.
-    pending_error: Option<Status>,
 }
 
 /// Execute a query via τ-emitted SQL and stream Arrow batches back.
@@ -807,7 +694,7 @@ async fn execute_streaming_query(
     operation_id: &str,
 ) -> Result<Response<<ThunderduckService as SparkConnectService>::ExecutePlanStream>, Status> {
     let rx = session
-        .execute_streaming(sql.to_string().as_str(), None, 4)
+        .execute_streaming(sql.to_string().as_str(), 4)
         .await
         .map_err(|e| Status::from(ConnectError::from(e)))?;
 
@@ -823,7 +710,6 @@ async fn execute_streaming_query(
         seq: 0,
         sent_schema_frame: false,
         sent_complete_frame: false,
-        pending_error: None,
     };
 
     let stream = stream::unfold(state, streaming_step);
@@ -856,16 +742,8 @@ fn post_transcode_schema(src: &Schema, cols: &[ArrayRef]) -> Schema {
 async fn streaming_step(
     mut s: StreamingState,
 ) -> Option<(Result<proto::ExecutePlanResponse, Status>, StreamingState)> {
-    // 1. Terminal: pending error yields once, then unfold returns None.
-    if let Some(status) = s.pending_error.take() {
-        return Some((
-            Err(status),
-            StreamingState {
-                pending_error: None,
-                ..s
-            },
-        ));
-    }
+    // 1. Terminal: once the complete frame (or a terminal error) has been
+    //    yielded, unfold returns None.
     if s.sent_complete_frame {
         return None;
     }
@@ -1025,59 +903,7 @@ async fn handle_write_operation(
     Err(Status::unimplemented("WriteOperation over CommonAst"))
 }
 
-// ── Response builders (preserved) ────────────────────────────────────────────
-
-/// Convert DuckDB record batches to a complete `ExecutePlanResponse` sequence,
-/// including the mandatory trailing `ResultComplete` frame.
-fn batches_to_responses(
-    session_id: &str,
-    operation_id: &str,
-    batches: &[arrow::record_batch::RecordBatch],
-) -> crate::error::Result<Vec<proto::ExecutePlanResponse>> {
-    let arrow_batches = record_batches_to_arrow_batches(batches)?;
-    let mut responses: Vec<proto::ExecutePlanResponse> =
-        Vec::with_capacity(arrow_batches.len() + 1);
-    for (i, ab) in arrow_batches.into_iter().enumerate() {
-        responses.push(proto::ExecutePlanResponse {
-            session_id: session_id.to_string(),
-            server_side_session_id: SERVER_SESSION_ID.clone(),
-            operation_id: operation_id.to_string(),
-            response_id: format!("{operation_id}-{i}"),
-            response_type: Some(proto::execute_plan_response::ResponseType::ArrowBatch(ab)),
-            ..Default::default()
-        });
-    }
-    // Send ResultComplete even when there are no batches (0 rows).
-    // Do NOT push an empty ArrowBatch (data: vec![]) — empty bytes are invalid Arrow IPC
-    // and PySpark raises ArrowInvalid when it tries to deserialize them.
-    responses.push(result_complete_response(session_id, operation_id));
-    Ok(responses)
-}
-
-/// Create an ArrowBatch response with a single boolean `value` column = `val`.
-/// Used for DDL operations (DropTempView etc.) that must return a non-null table.
-#[allow(dead_code)] // DDL classification helper; wired when τ's DDL classification lands (see `classify_plan`).
-fn bool_batch_responses(
-    session_id: &str,
-    operation_id: &str,
-    val: bool,
-) -> crate::error::Result<Vec<proto::ExecutePlanResponse>> {
-    use arrow::array::BooleanArray;
-    use arrow::datatypes::{Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use std::sync::Arc;
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        arrow::datatypes::DataType::Boolean,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(BooleanArray::from(vec![val]))],
-    )
-    .map_err(|e| crate::error::ConnectError::Arrow(e.to_string()))?;
-    batches_to_responses(session_id, operation_id, &[batch])
-}
+// ── Response builders ────────────────────────────────────────────────────────
 
 fn result_complete_response(session_id: &str, operation_id: &str) -> proto::ExecutePlanResponse {
     proto::ExecutePlanResponse {
@@ -1222,6 +1048,84 @@ mod tests {
             .get_or_create(session_id)
             .await
             .expect("session must be creatable")
+    }
+
+    /// Drain an `ExecutePlanStream` into a flat `Vec` of response frames.
+    async fn drain(
+        resp: Response<<ThunderduckService as SparkConnectService>::ExecutePlanStream>,
+    ) -> Vec<proto::ExecutePlanResponse> {
+        use futures::StreamExt;
+        let mut stream = resp.into_inner();
+        let mut frames = Vec::new();
+        while let Some(item) = stream.next().await {
+            frames.push(item.expect("stream frame must be Ok"));
+        }
+        frames
+    }
+
+    /// Assert the final response frame is `ResultComplete`.
+    fn assert_trailing_result_complete(frames: &[proto::ExecutePlanResponse]) {
+        assert!(
+            frames.last().is_some_and(|f| matches!(
+                f.response_type,
+                Some(proto::execute_plan_response::ResponseType::ResultComplete(
+                    _
+                ))
+            )),
+            "final frame must be ResultComplete",
+        );
+    }
+
+    /// Find the first `ArrowBatch` frame in a response sequence.
+    fn find_arrow_batch(
+        frames: &[proto::ExecutePlanResponse],
+    ) -> Option<&proto::execute_plan_response::ArrowBatch> {
+        frames.iter().find_map(|f| match &f.response_type {
+            Some(proto::execute_plan_response::ResponseType::ArrowBatch(ab)) => Some(ab),
+            _ => None,
+        })
+    }
+
+    // ── Shared τ literal/column builders (pivot-discovery + crosstab tests) ──
+
+    use thunderduck_core::transpiler_v2::expression::{
+        Expression, Literal, LiteralValue, UnresolvedColumn,
+    };
+
+    fn int_lit(v: i32) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Int(v),
+            data_type: DataType::Integer,
+        })
+    }
+
+    fn str_lit(s: &str) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::String(s.to_owned()),
+            data_type: DataType::String,
+        })
+    }
+
+    fn bool_lit(b: bool) -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Boolean(b),
+            data_type: DataType::Boolean,
+        })
+    }
+
+    fn null_str_lit() -> Expression {
+        Expression::Literal(Literal {
+            value: LiteralValue::Null,
+            data_type: DataType::Null,
+        })
+    }
+
+    fn col(name: &str) -> Expression {
+        Expression::UnresolvedColumn(UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: None,
+            plan_id: None,
+        })
     }
 
     /// Regression for nubank/thunderduck#33: GetOption must emit one KeyValue per
@@ -1450,8 +1354,8 @@ mod tests {
     async fn finalize_short_circuits_on_plans_without_empty_scan() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
         let session = test_session("test-finalize-short-circuit").await;
-        // A `SingleRow` plan carries no `TableScan` → `plan_has_empty_scan`
-        // is false → `BaseTypes::empty()` (no closure invocation) → τ emits.
+        // A `SingleRow` plan carries no `TableScan` → `empty_scan_tables` is
+        // empty → `BaseTypes::empty()` (no catalog lookup) → τ emits.
         let plan = CommonAst::new(CommonOp::SingleRow);
         let (sql, _schema) = finalize(&session, &plan)
             .await
@@ -1464,7 +1368,7 @@ mod tests {
     //
     // Round-trips `SELECT 1` through the full gRPC path:
     // `execute_plan` → `transpile_relation` (parser_v2 → τ finalize) →
-    // `execute_streaming_query` (session.execute + batches_to_responses) →
+    // `execute_streaming_query` (session.execute_streaming + per-batch frames) →
     // Arrow IPC stream. Verifies the E.0 wiring end-to-end at the service
     // layer without spinning up a network gRPC server.
 
@@ -1484,7 +1388,6 @@ mod tests {
     async fn execute_plan_single_row_round_trips_through_duckdb() {
         use arrow::array::Int32Array;
         use arrow_ipc::reader::StreamReader;
-        use futures::StreamExt;
         use std::io::Cursor;
 
         // Arrange: build a service with a real SessionManager (same pattern
@@ -1517,37 +1420,19 @@ mod tests {
             .execute_plan(Request::new(req))
             .await
             .expect("execute_plan must succeed");
-        let mut stream = resp.into_inner();
-        let mut frames: Vec<proto::ExecutePlanResponse> = Vec::new();
-        while let Some(item) = stream.next().await {
-            frames.push(item.expect("stream frame must be Ok"));
-        }
+        let frames = drain(resp).await;
 
         // Assert: at least one ArrowBatch frame with non-empty data, and a
         // trailing ResultComplete frame.
         assert!(!frames.is_empty(), "expected at least one response frame");
 
-        let arrow_frame = frames
-            .iter()
-            .find_map(|f| match &f.response_type {
-                Some(proto::execute_plan_response::ResponseType::ArrowBatch(ab)) => Some(ab),
-                _ => None,
-            })
-            .expect("expected an ArrowBatch frame");
+        let arrow_frame = find_arrow_batch(&frames).expect("expected an ArrowBatch frame");
         assert!(
             !arrow_frame.data.is_empty(),
             "ArrowBatch data must be non-empty (schema+row IPC bytes)",
         );
 
-        let has_complete = frames.last().is_some_and(|f| {
-            matches!(
-                f.response_type,
-                Some(proto::execute_plan_response::ResponseType::ResultComplete(
-                    _
-                ))
-            )
-        });
-        assert!(has_complete, "final frame must be ResultComplete");
+        assert_trailing_result_complete(&frames);
 
         // Decode the IPC stream — expect exactly one RecordBatch with one row
         // and one Int32 column carrying `1`.
@@ -1579,8 +1464,6 @@ mod tests {
     /// The command arm echoes the input relation verbatim.
     #[tokio::test(flavor = "multi_thread")]
     async fn sql_command_select_literals_returns_echoed_relation() {
-        use futures::StreamExt;
-
         let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
             thunderduck_core::runtime::StreamingConfig::default(),
         ));
@@ -1612,18 +1495,11 @@ mod tests {
             .execute_plan(Request::new(req))
             .await
             .expect("execute_plan must succeed");
-        let mut stream = resp.into_inner();
-        let mut frames: Vec<proto::ExecutePlanResponse> = Vec::new();
-        while let Some(item) = stream.next().await {
-            frames.push(item.expect("stream frame must be Ok"));
-        }
+        let frames = drain(resp).await;
 
         // No ArrowBatch frame — the command arm does not stream data.
         assert!(
-            !frames.iter().any(|f| matches!(
-                f.response_type,
-                Some(proto::execute_plan_response::ResponseType::ArrowBatch(_))
-            )),
+            find_arrow_batch(&frames).is_none(),
             "command arm must not emit an ArrowBatch frame",
         );
 
@@ -1647,23 +1523,13 @@ mod tests {
         }
 
         // Final frame is ResultComplete.
-        let has_complete = frames.last().is_some_and(|f| {
-            matches!(
-                f.response_type,
-                Some(proto::execute_plan_response::ResponseType::ResultComplete(
-                    _
-                ))
-            )
-        });
-        assert!(has_complete, "final frame must be ResultComplete");
+        assert_trailing_result_complete(&frames);
     }
 
     /// Deprecated text path: `SqlCommand { sql: "SELECT 1", input: None }`
     /// synthesizes a `RelType::Sql` relation and echoes it.
     #[tokio::test(flavor = "multi_thread")]
     async fn sql_command_deprecated_text_synthesizes_sql_relation() {
-        use futures::StreamExt;
-
         let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
             thunderduck_core::runtime::StreamingConfig::default(),
         ));
@@ -1691,11 +1557,7 @@ mod tests {
             .execute_plan(Request::new(req))
             .await
             .expect("execute_plan must succeed");
-        let mut stream = resp.into_inner();
-        let mut frames: Vec<proto::ExecutePlanResponse> = Vec::new();
-        while let Some(item) = stream.next().await {
-            frames.push(item.expect("stream frame must be Ok"));
-        }
+        let frames = drain(resp).await;
 
         let cmd_result = frames
             .iter()
@@ -1718,15 +1580,7 @@ mod tests {
             other => panic!("expected synthesized RelType::Sql, got {other:?}"),
         }
 
-        let has_complete = frames.last().is_some_and(|f| {
-            matches!(
-                f.response_type,
-                Some(proto::execute_plan_response::ResponseType::ResultComplete(
-                    _
-                ))
-            )
-        });
-        assert!(has_complete, "final frame must be ResultComplete");
+        assert_trailing_result_complete(&frames);
     }
 
     // ── Pass 58 — ADR-022 boundary guard for unresolved schema ──────────────
@@ -1797,35 +1651,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_implicit_pivots_discovers_sorted_typed_values_with_null_bucket() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
-        use thunderduck_core::transpiler_v2::expression::{
-            Expression, FunctionCall, Literal, LiteralValue, UnresolvedColumn,
-        };
-
-        fn str_lit(s: &str) -> Expression {
-            Expression::Literal(Literal {
-                value: LiteralValue::String(s.to_owned()),
-                data_type: DataType::String,
-            })
-        }
-        fn int_lit(v: i32) -> Expression {
-            Expression::Literal(Literal {
-                value: LiteralValue::Int(v),
-                data_type: DataType::Integer,
-            })
-        }
-        fn null_str_lit() -> Expression {
-            Expression::Literal(Literal {
-                value: LiteralValue::Null,
-                data_type: DataType::Null,
-            })
-        }
-        fn col(name: &str) -> Expression {
-            Expression::UnresolvedColumn(UnresolvedColumn {
-                name: name.to_owned(),
-                qualifier: None,
-                plan_id: None,
-            })
-        }
+        use thunderduck_core::transpiler_v2::expression::FunctionCall;
 
         let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
             thunderduck_core::runtime::StreamingConfig::default(),
@@ -1902,20 +1728,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_implicit_pivots_desugars_crosstab_end_to_end() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
-        use thunderduck_core::transpiler_v2::expression::{Expression, Literal, LiteralValue};
-
-        fn int_lit(v: i32) -> Expression {
-            Expression::Literal(Literal {
-                value: LiteralValue::Int(v),
-                data_type: DataType::Integer,
-            })
-        }
-        fn bool_lit(b: bool) -> Expression {
-            Expression::Literal(Literal {
-                value: LiteralValue::Boolean(b),
-                data_type: DataType::Boolean,
-            })
-        }
 
         let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
             thunderduck_core::runtime::StreamingConfig::default(),
@@ -2003,19 +1815,6 @@ mod tests {
     // resolves an empty-scan `TableScan` from the session's temp-view schema
     // cache, and (2) `handle_create_dataframe_view` registers the view.
 
-    /// Drain an `ExecutePlanStream` into a flat `Vec` of response frames.
-    async fn drain(
-        resp: Response<<ThunderduckService as SparkConnectService>::ExecutePlanStream>,
-    ) -> Vec<proto::ExecutePlanResponse> {
-        use futures::StreamExt;
-        let mut stream = resp.into_inner();
-        let mut frames = Vec::new();
-        while let Some(item) = stream.next().await {
-            frames.push(item.expect("stream frame must be Ok"));
-        }
-        frames
-    }
-
     fn sql_plan(query: &str) -> proto::Plan {
         proto::Plan {
             op_type: Some(proto::plan::OpType::Root(proto::Relation {
@@ -2072,22 +1871,8 @@ mod tests {
             .expect("SELECT * FROM emp must resolve the registered view");
         let frames = drain(resp).await;
 
-        let arrow_frame = frames
-            .iter()
-            .find_map(|f| match &f.response_type {
-                Some(proto::execute_plan_response::ResponseType::ArrowBatch(ab)) => Some(ab),
-                _ => None,
-            })
-            .expect("expected an ArrowBatch frame");
-        let has_complete = frames.last().is_some_and(|f| {
-            matches!(
-                f.response_type,
-                Some(proto::execute_plan_response::ResponseType::ResultComplete(
-                    _
-                ))
-            )
-        });
-        assert!(has_complete, "final frame must be ResultComplete");
+        let arrow_frame = find_arrow_batch(&frames).expect("expected an ArrowBatch frame");
+        assert_trailing_result_complete(&frames);
 
         let reader = StreamReader::try_new(Cursor::new(arrow_frame.data.as_slice()), None)
             .expect("StreamReader::try_new must succeed on valid IPC bytes");
@@ -2150,15 +1935,8 @@ mod tests {
         )
         .await;
         assert_eq!(frames.len(), 1, "command arm returns a lone frame");
-        assert!(
-            matches!(
-                frames[0].response_type,
-                Some(proto::execute_plan_response::ResponseType::ResultComplete(
-                    _
-                ))
-            ),
-            "the lone frame must be ResultComplete",
-        );
+        // With exactly one frame, "trailing" == "lone".
+        assert_trailing_result_complete(&frames);
 
         // The view now resolves on the same session.
         let sel = proto::ExecutePlanRequest {
@@ -2174,16 +1952,13 @@ mod tests {
         )
         .await;
         assert!(
-            frames.iter().any(|f| matches!(
-                f.response_type,
-                Some(proto::execute_plan_response::ResponseType::ArrowBatch(_))
-            )),
+            find_arrow_batch(&frames).is_some(),
             "SELECT over the view must stream an ArrowBatch",
         );
     }
 
     /// Regression guard: a catalog-free plan (`SELECT 1`) still round-trips —
-    /// `plan_has_empty_scan == false` short-circuits `build_base_types` to
+    /// an empty `empty_scan_tables` result short-circuits `build_base_types` to
     /// `BaseTypes::empty()` with zero session round-trips.
     #[tokio::test(flavor = "multi_thread")]
     async fn select_literal_makes_no_catalog_call_short_circuit() {
@@ -2204,20 +1979,9 @@ mod tests {
         )
         .await;
         assert!(
-            frames.iter().any(|f| matches!(
-                f.response_type,
-                Some(proto::execute_plan_response::ResponseType::ArrowBatch(_))
-            )),
+            find_arrow_batch(&frames).is_some(),
             "SELECT 1 must stream an ArrowBatch",
         );
-        assert!(
-            frames.last().is_some_and(|f| matches!(
-                f.response_type,
-                Some(proto::execute_plan_response::ResponseType::ResultComplete(
-                    _
-                ))
-            )),
-            "final frame must be ResultComplete",
-        );
+        assert_trailing_result_complete(&frames);
     }
 }

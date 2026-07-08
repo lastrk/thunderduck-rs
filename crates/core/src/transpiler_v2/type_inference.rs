@@ -19,44 +19,13 @@ impl TypeInferenceEngine {
     /// Supports dot-notation for struct fields: `"person.name"` resolves
     /// to the `name` field within the `person` struct column.
     pub fn column_type(name: &str, schema: &StructType) -> DataType {
-        if let Some(f) = schema.field_by_name(name) {
-            return f.data_type.clone();
-        }
-        if let Some(dot_pos) = name.find('.') {
-            let struct_name = &name[..dot_pos];
-            let field_name = &name[dot_pos + 1..];
-            if let Some(f) = schema.field_by_name(struct_name) {
-                if let DataType::Struct(st) = &f.data_type {
-                    return st
-                        .field_by_name(field_name)
-                        .map(|ff| ff.data_type.clone())
-                        .unwrap_or(DataType::Unresolved);
-                }
-            }
-        }
-        DataType::Unresolved
+        Self::column_info(name, schema).0
     }
 
     /// Look up the nullability of `name` in `schema` (case-insensitive).
     /// Returns `true` (nullable) if not found — safe default.
     pub fn column_nullable(name: &str, schema: &StructType) -> bool {
-        if let Some(f) = schema.field_by_name(name) {
-            return f.nullable;
-        }
-        if let Some(dot_pos) = name.find('.') {
-            let struct_name = &name[..dot_pos];
-            let field_name = &name[dot_pos + 1..];
-            if let Some(f) = schema.field_by_name(struct_name) {
-                if let DataType::Struct(st) = &f.data_type {
-                    let field_nullable = st
-                        .field_by_name(field_name)
-                        .map(|ff| ff.nullable)
-                        .unwrap_or(true);
-                    return f.nullable || field_nullable;
-                }
-            }
-        }
-        true
+        Self::column_info(name, schema).1
     }
 
     /// Look up the type of a qualified column reference in `schema`.
@@ -65,19 +34,7 @@ impl TypeInferenceEngine {
         qualifier: Option<&str>,
         schema: &StructType,
     ) -> DataType {
-        if let Some(q) = qualifier {
-            if let Some(f) = schema.field_by_name(q) {
-                if let DataType::Struct(st) = &f.data_type {
-                    if let Some(ff) = st.field_by_name(name) {
-                        return ff.data_type.clone();
-                    }
-                    if let Some(dt) = Self::resolve_nested_field_type(name, st) {
-                        return dt;
-                    }
-                }
-            }
-        }
-        Self::column_type(name, schema)
+        Self::qualified_column_info(name, qualifier, schema).0
     }
 
     /// Look up the nullability of a qualified column reference in `schema`.
@@ -86,84 +43,78 @@ impl TypeInferenceEngine {
         qualifier: Option<&str>,
         schema: &StructType,
     ) -> bool {
+        Self::qualified_column_info(name, qualifier, schema).1
+    }
+
+    /// Shared resolver behind [`Self::column_type`] / [`Self::column_nullable`]:
+    /// `(data_type, nullable)` of `name` in `schema`. Not found →
+    /// `(Unresolved, true)`. The dot-notation branch supports exactly ONE
+    /// level of struct-field nesting (no recursion) — the qualified path
+    /// ([`Self::qualified_column_info`]) is the one that recurses. Struct-field
+    /// nullability ORs in the parent column's nullability (a NULL struct makes
+    /// every field read NULL).
+    fn column_info(name: &str, schema: &StructType) -> (DataType, bool) {
+        if let Some(f) = schema.field_by_name(name) {
+            return (f.data_type.clone(), f.nullable);
+        }
+        if let Some(dot_pos) = name.find('.') {
+            let struct_name = &name[..dot_pos];
+            let field_name = &name[dot_pos + 1..];
+            if let Some(f) = schema.field_by_name(struct_name) {
+                if let DataType::Struct(st) = &f.data_type {
+                    let (dt, field_nullable) = st
+                        .field_by_name(field_name)
+                        .map(|ff| (ff.data_type.clone(), ff.nullable))
+                        .unwrap_or((DataType::Unresolved, true));
+                    return (dt, f.nullable || field_nullable);
+                }
+            }
+        }
+        (DataType::Unresolved, true)
+    }
+
+    /// Shared resolver behind [`Self::qualified_column_type`] /
+    /// [`Self::qualified_column_nullable`]. Tries `qualifier` as a struct
+    /// column first (with recursive nested-field resolution), then falls back
+    /// to the unqualified lookup.
+    fn qualified_column_info(
+        name: &str,
+        qualifier: Option<&str>,
+        schema: &StructType,
+    ) -> (DataType, bool) {
         if let Some(q) = qualifier {
             if let Some(f) = schema.field_by_name(q) {
                 if let DataType::Struct(st) = &f.data_type {
                     if let Some(ff) = st.field_by_name(name) {
-                        return f.nullable || ff.nullable;
+                        return (ff.data_type.clone(), f.nullable || ff.nullable);
                     }
-                    if let Some(nullable) = Self::resolve_nested_field_nullable(name, st) {
-                        return f.nullable || nullable;
+                    if let Some((dt, nullable)) = Self::resolve_nested_field(name, st) {
+                        return (dt, f.nullable || nullable);
                     }
                 }
             }
         }
-        Self::column_nullable(name, schema)
+        Self::column_info(name, schema)
     }
 
-    fn resolve_nested_field_type(path: &str, st: &StructType) -> Option<DataType> {
+    /// Recursively resolve a dotted `path` inside a struct, returning
+    /// `(data_type, nullable)`. Nullability ORs in every ancestor field's
+    /// nullability along the path.
+    fn resolve_nested_field(path: &str, st: &StructType) -> Option<(DataType, bool)> {
         let dot_pos = path.find('.')?;
         let head = &path[..dot_pos];
         let tail = &path[dot_pos + 1..];
         let field = st.field_by_name(head)?;
         if let DataType::Struct(inner_st) = &field.data_type {
             if let Some(ff) = inner_st.field_by_name(tail) {
-                Some(ff.data_type.clone())
+                Some((ff.data_type.clone(), field.nullable || ff.nullable))
             } else {
-                Self::resolve_nested_field_type(tail, inner_st)
+                let (dt, inner_nullable) = Self::resolve_nested_field(tail, inner_st)?;
+                Some((dt, field.nullable || inner_nullable))
             }
         } else {
             None
         }
-    }
-
-    fn resolve_nested_field_nullable(path: &str, st: &StructType) -> Option<bool> {
-        let dot_pos = path.find('.')?;
-        let head = &path[..dot_pos];
-        let tail = &path[dot_pos + 1..];
-        let field = st.field_by_name(head)?;
-        if let DataType::Struct(inner_st) = &field.data_type {
-            if let Some(ff) = inner_st.field_by_name(tail) {
-                Some(field.nullable || ff.nullable)
-            } else {
-                let inner_nullable = Self::resolve_nested_field_nullable(tail, inner_st)?;
-                Some(field.nullable || inner_nullable)
-            }
-        } else {
-            None
-        }
-    }
-
-    // ── Lambda schema augmentation ───────────────────────────────────────────
-
-    /// Creates a schema augmented with lambda parameter bindings.
-    pub fn augment_schema_with_lambda_params(
-        schema: &StructType,
-        param_names: &[String],
-        element_type: &DataType,
-        element_nullable: bool,
-    ) -> StructType {
-        let mut fields: Vec<StructField> = schema
-            .fields
-            .iter()
-            .filter(|f| !param_names.iter().any(|p| f.name.eq_ignore_ascii_case(p)))
-            .cloned()
-            .collect();
-        if let Some(name) = param_names.first() {
-            fields.push(StructField::new(
-                name.clone(),
-                element_type.clone(),
-                element_nullable,
-            ));
-        }
-        if param_names.len() > 1 {
-            fields.push(StructField::new(
-                param_names[1].clone(),
-                DataType::Integer,
-                false,
-            ));
-        }
-        StructType::new(fields)
     }
 
     // ── Numeric promotion ────────────────────────────────────────────────────
@@ -190,19 +141,10 @@ impl TypeInferenceEngine {
             (Decimal { precision, scale }, b) | (b, Decimal { precision, scale })
                 if b.is_integral() =>
             {
-                let other_dec = Self::integral_to_decimal(b);
-                if let Decimal {
-                    precision: p2,
-                    scale: s2,
-                } = other_dec
-                {
-                    Self::unify_decimal(*precision, *scale, p2, s2)
-                } else {
-                    Decimal {
-                        precision: *precision,
-                        scale: *scale,
-                    }
-                }
+                // `is_integral()` guarantees `decimal_form` is `Some`; the
+                // fallback (identity unification) is unreachable.
+                let (p2, s2) = Self::decimal_form(b).unwrap_or((*precision, *scale));
+                Self::unify_decimal(*precision, *scale, p2, s2)
             }
             (Long, _) | (_, Long) => Long,
             (Integer, _) | (_, Integer) => Integer,
@@ -232,12 +174,10 @@ impl TypeInferenceEngine {
 
     // ── Decimal arithmetic formulas ──────────────────────────────────────────
 
-    /// Spark's decimal addition/subtraction result type.
+    /// Spark's decimal addition/subtraction result type — the shared bounds
+    /// with a `+1` carry digit for the potential extra leading digit.
     pub fn decimal_add_type(p1: u8, s1: u8, p2: u8, s2: u8) -> DataType {
-        let scale = s1.max(s2);
-        let int_digits = (p1 as i16 - s1 as i16).max(p2 as i16 - s2 as i16);
-        let precision = ((int_digits + scale as i16 + 1).min(38)) as u8;
-        DataType::Decimal { precision, scale }
+        Self::decimal_bounds(p1, s1, p2, s2, 1)
     }
 
     /// Spark's decimal multiplication result type.
@@ -277,13 +217,23 @@ impl TypeInferenceEngine {
     /// enforced here — see the corresponding matches below.
     pub fn aggregate_return_type(name: &str, arg_type: &DataType) -> DataType {
         use DataType::*;
-        match name.to_lowercase().as_str() {
-            // COUNT family — checklist §1.1 pins `count_if` alongside `count`.
-            "count" | "count_distinct" | "count_if" => Long,
+        // Names without a spec row echo the argument's type — byte-identical
+        // to the old default match arm.
+        let Some(spec) = agg_spec_lower(&name.to_lowercase()) else {
+            return arg_type.clone();
+        };
+        match spec.ret {
+            AggRet::Long => Long,
+            AggRet::Double => Double,
+            AggRet::Integer => Integer,
+            AggRet::Byte => Byte,
+            AggRet::Boolean => Boolean,
+            AggRet::ArgType => arg_type.clone(),
+            AggRet::ArrayOfArg => Array(Box::new(arg_type.clone()), false),
 
             // SUM family: integer types → Long, float → Double, decimal → wider.
             // `try_sum` mirrors `sum` — τ's analyzer checklist §1.4 adds it here.
-            "sum" | "sum_distinct" | "try_sum" => match arg_type {
+            AggRet::SumLike => match arg_type {
                 Byte | Short | Integer | Long => Long,
                 Float => Double,
                 Double => Double,
@@ -299,7 +249,7 @@ impl TypeInferenceEngine {
 
             // AVG family: integer types → Double, decimal → wider.
             // `try_avg` mirrors `avg` — τ's analyzer checklist §1.4 adds it here.
-            "avg" | "mean" | "try_avg" => match arg_type {
+            AggRet::AvgLike => match arg_type {
                 Byte | Short | Integer | Long => Double,
                 Float | Double => Double,
                 Decimal { precision, scale } => {
@@ -312,67 +262,23 @@ impl TypeInferenceEngine {
                 }
                 _ => arg_type.clone(),
             },
-
-            // MIN / MAX / first / last / any_value — same type as argument.
-            "min" | "max" | "first" | "last" | "first_value" | "last_value" | "any_value" => {
-                arg_type.clone()
-            }
-
-            // STDDEV / VARIANCE / SKEWNESS / KURTOSIS / CORR / COVAR / REGR → Double.
-            //
-            // Checklist §1.3 pins the full 11-name correlation / covariance /
-            // regression family here. All members also appear in
-            // `aggregate_is_always_nullable`.
-            "stddev" | "stddev_samp" | "std" | "stddev_pop" | "variance" | "var_samp"
-            | "var_pop" | "skewness" | "kurtosis" | "corr" | "covar_samp" | "covar_pop"
-            | "regr_slope" | "regr_r2" | "regr_intercept" | "regr_avgx" | "regr_avgy"
-            | "regr_sxx" | "regr_sxy" | "regr_syy" => Double,
-
-            // Percentile / median → Double.
-            "percentile" | "percentile_approx" | "approx_percentile" | "median" => Double,
-
-            // collect_list / collect_set / array_agg → Array.
-            // Pass 58: `array_agg` is a Spark 4.x alias of `collect_list`;
-            // wire it into the aggregate table so the `agg2-002` corpus
-            // case gets a resolved schema.
-            "collect_list" | "collect_set" | "array_agg" => {
-                Array(Box::new(arg_type.clone()), false)
-            }
-
-            // approx_count_distinct → Long.
-            "approx_count_distinct" | "count_approx_distinct" => Long,
-
-            // Bit aggregates → same type as arg.
-            "bit_and" | "bit_or" | "bit_xor" => arg_type.clone(),
-
-            // Bool aggregates → Boolean.
-            // Pass 71: `any` / `some` / `all` are Spark aliases of
-            // `bool_or` / `bool_or` / `bool_and` — same Boolean return type.
-            "bool_and" | "every" | "bool_or" | "any" | "some" | "all" => Boolean,
-
-            // Scalar-wrapper size functions when they appear as aggregates.
-            "size" | "cardinality" | "map_size" | "array_size" => Integer,
-
-            // GROUPING / GROUPING_ID.
-            "grouping" => Byte,
-            "grouping_id" => Long,
-
-            _ => arg_type.clone(),
         }
     }
 
     /// Is this aggregate function always non-nullable?
     ///
-    /// Case-insensitive wrapper. Prefer
-    /// [`Self::aggregate_is_non_nullable_lower`] on hot paths where the caller
-    /// has already lowercased the name.
+    /// Case-insensitive wrapper — test-only convenience; production callers
+    /// all use [`Self::aggregate_is_non_nullable_lower`] with a
+    /// pre-lowercased name.
     ///
     /// Checklist §1.1 pins `count_if` here alongside `count`.
+    #[cfg(test)]
     pub fn aggregate_is_non_nullable(name: &str) -> bool {
         Self::aggregate_is_non_nullable_lower(&name.to_lowercase())
     }
 
-    /// Fast-path sibling of [`Self::aggregate_is_non_nullable`].
+    /// Fast-path form of the aggregate non-nullability predicate (the
+    /// case-insensitive wrapper `aggregate_is_non_nullable` is test-only).
     ///
     /// **Precondition:** `name_lower` MUST already be lowercase. Debug builds
     /// `debug_assert!` this; release builds trust the contract to avoid an
@@ -382,34 +288,24 @@ impl TypeInferenceEngine {
             name_lower.chars().all(|c| !c.is_ascii_uppercase()),
             "aggregate_is_non_nullable_lower requires pre-lowercased input; got `{name_lower}`",
         );
-        matches!(
-            name_lower,
-            "count"
-                | "count_distinct"
-                | "count_if"
-                | "grouping"
-                | "grouping_id"
-                | "collect_list"
-                | "collect_set"
-                | "array_agg"
-                | "approx_count_distinct"
-                | "count_approx_distinct"
-        )
+        agg_spec_lower(name_lower).is_some_and(|s| s.null == AggNull::NonNullable)
     }
 
     /// Aggregate functions that always return NULL for an empty group.
     ///
-    /// Case-insensitive wrapper. Prefer
-    /// [`Self::aggregate_is_always_nullable_lower`] on hot paths where the
-    /// caller has already lowercased the name.
+    /// Case-insensitive wrapper — test-only convenience; production callers
+    /// all use [`Self::aggregate_is_always_nullable_lower`] with a
+    /// pre-lowercased name.
     ///
     /// Checklist §1.3 pins the full 11-name correlation / covariance /
     /// regression family here.
+    #[cfg(test)]
     pub fn aggregate_is_always_nullable(name: &str) -> bool {
         Self::aggregate_is_always_nullable_lower(&name.to_lowercase())
     }
 
-    /// Fast-path sibling of [`Self::aggregate_is_always_nullable`].
+    /// Fast-path form of the aggregate always-nullable predicate (the
+    /// case-insensitive wrapper `aggregate_is_always_nullable` is test-only).
     ///
     /// **Precondition:** `name_lower` MUST already be lowercase. Debug builds
     /// `debug_assert!` this; release builds trust the contract to avoid an
@@ -419,60 +315,7 @@ impl TypeInferenceEngine {
             name_lower.chars().all(|c| !c.is_ascii_uppercase()),
             "aggregate_is_always_nullable_lower requires pre-lowercased input; got `{name_lower}`",
         );
-        matches!(
-            name_lower,
-            "sum"
-                | "sum_distinct"
-                | "try_sum"
-                | "avg"
-                | "mean"
-                | "try_avg"
-                | "min"
-                | "max"
-                | "first"
-                | "last"
-                | "first_value"
-                | "last_value"
-                | "any_value"
-                | "stddev"
-                | "stddev_samp"
-                | "std"
-                | "stddev_pop"
-                | "variance"
-                | "var_samp"
-                | "var_pop"
-                | "skewness"
-                | "kurtosis"
-                | "percentile"
-                | "percentile_approx"
-                | "approx_percentile"
-                | "median"
-                | "mode"
-                | "corr"
-                | "covar_pop"
-                | "covar_samp"
-                | "regr_avgx"
-                | "regr_avgy"
-                | "regr_count"
-                | "regr_r2"
-                | "regr_slope"
-                | "regr_intercept"
-                | "regr_sxx"
-                | "regr_sxy"
-                | "regr_syy"
-                | "bit_and"
-                | "bit_or"
-                | "bit_xor"
-                | "bool_and"
-                | "bool_or"
-                | "every"
-                // Pass 71: Spark aliases of bool_or / bool_and — same
-                // nullability semantics (NULL for empty input).
-                | "any"
-                | "some"
-                | "all"
-                | "nth_value"
-        )
+        agg_spec_lower(name_lower).is_some_and(|s| s.null == AggNull::AlwaysNullable)
     }
 
     // ── Window function return types ─────────────────────────────────────────
@@ -485,15 +328,7 @@ impl TypeInferenceEngine {
             "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
                 arg_type.cloned().unwrap_or(DataType::Long)
             }
-            agg => {
-                let resolved = arg_type.unwrap_or(&DataType::Unresolved);
-                let dt = Self::aggregate_return_type(agg, resolved);
-                if dt == *resolved && matches!(resolved, DataType::Unresolved) {
-                    DataType::Unresolved
-                } else {
-                    dt
-                }
-            }
+            agg => Self::aggregate_return_type(agg, arg_type.unwrap_or(&DataType::Unresolved)),
         }
     }
 
@@ -555,7 +390,8 @@ impl TypeInferenceEngine {
             },
             // ── 2-arg RoundCeil/RoundFloor (child cast to Decimal first) ─────
             Some(t) => {
-                let Some((p, s)) = Self::decimal_form_for_ceil_floor(input) else {
+                let Some((p, s)) = Self::decimal_form(input).map(|(p, s)| (p as i32, s as i32))
+                else {
                     return Unresolved;
                 };
                 let ild = p - s + 1;
@@ -577,14 +413,15 @@ impl TypeInferenceEngine {
         }
     }
 
-    /// Spark's `DecimalType.forType` mapping used to implicitly cast a 2-arg
-    /// ceil/floor child to `Decimal` before rounding. Returns `(precision,
-    /// scale)` as `i32` for the caller's arithmetic. Non-numeric inputs return
-    /// `None` (→ `Unresolved`).
-    fn decimal_form_for_ceil_floor(input: &DataType) -> Option<(i32, i32)> {
+    /// Spark's `DecimalType.forType` mapping: the exact-decimal form
+    /// `(precision, scale)` of a numeric type — used to implicitly cast a
+    /// 2-arg ceil/floor child to `Decimal` before rounding, and to widen an
+    /// integral operand against a `Decimal` in [`Self::promote_numeric`].
+    /// Non-numeric inputs return `None` (→ `Unresolved`).
+    fn decimal_form(dt: &DataType) -> Option<(u8, u8)> {
         use DataType::*;
-        Some(match input {
-            Decimal { precision, scale } => (*precision as i32, *scale as i32),
+        Some(match dt {
+            Decimal { precision, scale } => (*precision, *scale),
             Byte => (3, 0),
             Short => (5, 0),
             Integer => (10, 0),
@@ -597,19 +434,28 @@ impl TypeInferenceEngine {
 
     /// Infer the return type of a scalar/table function.
     ///
-    /// At τ, all seeded arms need at most the first argument's type
-    /// (aggregate delegation) or nothing at all (hash/grouping). The signature
-    /// takes `first_arg_type: Option<&DataType>` to avoid materializing an
-    /// intermediate `Vec<DataType>` for arg types the current arms never read.
-    /// future τ work may grow additional signatures if scalar arms need multi-arg
-    /// awareness.
+    /// Receives the FULL list of argument types (`arg_types`), so this is the
+    /// single home for every return-type rule that depends on argument types
+    /// alone — including the multi-arg widening folds (`coalesce` / `greatest`
+    /// / `least`), arity-branch selection (`nvl2` / `if` / `iif`,
+    /// `aggregate` / `reduce`), and decimal widening (`mod` / `pmod`). Arms
+    /// that need the argument *expressions* (literal schemas, literal scales,
+    /// struct field naming, per-arg nullability) stay in
+    /// `Expression::function_call_data_type`, which pre-empts this resolver.
+    ///
+    /// Arms that only need the first argument read `arg_types.first()`; arms
+    /// that need nothing at all (hash / grouping) ignore `arg_types`.
     ///
     /// **τ seed:** returns `DataType::Unresolved` for anything the
     /// aggregate roster does not handle. future τ work grows the scalar arms.
     /// The count / hash / grouping arms that τ's checklist tests
     /// exercise are wired here.
-    pub fn function_return_type(name: &str, first_arg_type: Option<&DataType>) -> DataType {
+    pub fn function_return_type(name: &str, arg_types: &[DataType]) -> DataType {
         use DataType::*;
+        let first_arg_type = arg_types.first();
+        // The most common per-arm reduction: the first argument's type, or
+        // the arm-specific `default` when the call has no arguments.
+        let first_arg_or = |default: DataType| first_arg_type.cloned().unwrap_or(default);
         let name_lower = name.to_lowercase();
         match name_lower.as_str() {
             // Checklist §1.2 — hash family pins return-types deterministically.
@@ -620,65 +466,45 @@ impl TypeInferenceEngine {
             "grouping" => Byte,
             "grouping_id" => Long,
 
-            // Delegate to aggregate_return_type for known aggregates.
-            "count"
-            | "count_distinct"
-            | "count_if"
-            | "sum"
-            | "sum_distinct"
-            | "try_sum"
-            | "avg"
-            | "mean"
-            | "try_avg"
-            | "min"
-            | "max"
-            | "first"
-            | "last"
-            | "first_value"
-            | "last_value"
-            | "any_value"
-            | "stddev"
-            | "stddev_samp"
-            | "std"
-            | "stddev_pop"
-            | "variance"
-            | "var_samp"
-            | "var_pop"
-            | "skewness"
-            | "kurtosis"
-            | "corr"
-            | "covar_samp"
-            | "covar_pop"
-            | "regr_slope"
-            | "regr_r2"
-            | "regr_intercept"
-            | "regr_avgx"
-            | "regr_avgy"
-            | "regr_sxx"
-            | "regr_sxy"
-            | "regr_syy"
-            | "percentile"
-            | "percentile_approx"
-            | "approx_percentile"
-            | "median"
-            | "mode"
-            | "any"
-            | "some"
-            | "all"
-            | "every"
-            | "approx_count_distinct"
-            | "count_approx_distinct"
-            | "bit_and"
-            | "bit_or"
-            | "bit_xor"
-            | "bool_and"
-            | "bool_or"
-            | "collect_list"
-            | "collect_set"
-            | "array_agg" => Self::aggregate_return_type(
-                name_lower.as_str(),
-                first_arg_type.unwrap_or(&Unresolved),
-            ),
+            // ── Multi-arg type-only widening (moved from
+            // `function_call_data_type`; type-only, so this is their single
+            // home) ──────────────────────────────────────────────────────
+            // Spark's `coalesce(a, b, c, ...)` (and aliases `nvl` / `ifnull`)
+            // plus `greatest` / `least` return the least-common (widening)
+            // type across all args (e.g.
+            // `coalesce(decimal(9,2), decimal(2,2)) → decimal(10,2)`). An
+            // empty arg list yields `Unresolved` — byte-identical to the old
+            // path, where `function_call_data_type`'s `!is_empty()` guard fell
+            // through to this resolver's weaker first-arg arm with a `None`
+            // first arg (`first_arg_type.cloned().unwrap_or(Unresolved)`).
+            // Corpus anchor: `cond-004`.
+            "coalesce" | "nvl" | "ifnull" | "greatest" | "least" => match arg_types.split_first() {
+                Some((first, rest)) => rest
+                    .iter()
+                    .fold(first.clone(), |acc, dt| Self::promote_numeric(&acc, dt)),
+                None => Unresolved,
+            },
+            // Spark's `nvl2(cond, ifNotNull, ifNull)` and `if(cond, then,
+            // else)` / `iif(...)` derive their return type from the branch
+            // args (not the condition): the type of `args[1]`. Guarded on
+            // arity 3 to stay byte-identical — any other arity fell through
+            // the old `f.args.len() == 3` guard to this resolver's default
+            // (`Unresolved`, since these names had no first-arg arm).
+            // Corpus anchor: `cond-007`.
+            "nvl2" | "if" | "iif" if arg_types.len() == 3 => arg_types[1].clone(),
+            // Spark's `aggregate(arr, init, (acc, x) -> f [, finish])` /
+            // `reduce` / `list_reduce` fold the array with `init` as the seed;
+            // the result type is the seed/accumulator type (`args[1]`).
+            // Guarded on arity ≥ 2 to stay byte-identical — a shorter arg list
+            // fell through the old `f.args.len() >= 2` guard to this resolver's
+            // default (`Unresolved`). Corpus anchor: `hof-003`.
+            "aggregate" | "reduce" | "list_reduce" if arg_types.len() >= 2 => arg_types[1].clone(),
+
+            // Delegate to aggregate_return_type for known aggregates (the
+            // `delegate` column of `AGG_SPECS`).
+            n if agg_spec_lower(n).is_some_and(|s| s.delegate) => {
+                Self::aggregate_return_type(n, first_arg_type.unwrap_or(&Unresolved))
+            }
 
             // ── String functions ─────────────────────────────────────────
             // Most string functions return String; length family returns
@@ -723,12 +549,13 @@ impl TypeInferenceEngine {
             | "pow" | "power" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
             | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians"
             | "e" | "pi" | "hypot" | "rand" | "randn" | "random" => Double,
-            // abs preserves arg type; ceil/floor return Long (Spark rule);
-            // signum returns Double. (round/bround are resolved earlier by the
-            // `function_call_data_type` pre-pass, which reads the scale literal.)
-            "abs" | "greatest" | "least" | "nvl" | "coalesce" | "nullif" | "ifnull" => {
-                first_arg_type.cloned().unwrap_or(Unresolved)
-            }
+            // abs / nullif preserve the first-arg type; ceil/floor return
+            // Long (Spark rule); signum returns Double. (round/bround are
+            // resolved earlier by the `function_call_data_type` pre-pass,
+            // which reads the scale literal; coalesce / nvl / ifnull /
+            // greatest / least are typed once by the widening arm above —
+            // never here.)
+            "abs" | "nullif" => first_arg_or(Unresolved),
             "ceil" | "ceiling" | "floor" => {
                 Self::ceil_floor_type(first_arg_type.unwrap_or(&Unresolved), None)
             }
@@ -736,13 +563,30 @@ impl TypeInferenceEngine {
             // `negative`/`negate` map to Spark's `UnaryMinus`, whose
             // `dataType` equals the child type (int→int, decimal→decimal).
             // Corpus: `num-008`.
-            "negative" | "negate" => first_arg_type.cloned().unwrap_or(Unresolved),
+            "negative" | "negate" => first_arg_or(Unresolved),
             "factorial" => Long,
-            "mod" | "pmod" => first_arg_type.cloned().unwrap_or(Integer),
+            // `mod(a, b)` / `pmod(a, b)` — when BOTH operands are Decimal,
+            // Spark's `Remainder`/`Pmod` result decimal type widens per
+            // `decimal_mod_type` (scale = max, precision = min(int digits) +
+            // scale). Every other operand shape (int/int, bigint/int,
+            // wrong arity — including zero args, which yield `Integer`)
+            // keeps the first-arg type, byte-identical to the old
+            // `function_call_data_type` pre-empt + first-arg fall-through.
+            // Corpus: `num-012`.
+            "mod" | "pmod" => match arg_types {
+                [Decimal {
+                    precision: p1,
+                    scale: s1,
+                }, Decimal {
+                    precision: p2,
+                    scale: s2,
+                }] => Self::decimal_mod_type(*p1, *s1, *p2, *s2),
+                _ => first_arg_or(Integer),
+            },
             // `nanvl(a, b)` returns the type of the first argument (Spark:
             // both args must be Float/Double; return matches). Corpus:
             // `cond-011`.
-            "nanvl" => first_arg_type.cloned().unwrap_or(Double),
+            "nanvl" => first_arg_or(Double),
             // `try_divide(a, b)` — Spark returns Double for integral / Float
             // inputs, Decimal for Decimal inputs (widened per
             // `decimal_div_type(p1,s1,p2,s2)`). This resolver only sees the
@@ -762,9 +606,7 @@ impl TypeInferenceEngine {
             "conv" => String,
             "shiftleft" | "shiftright" | "shiftrightunsigned" | "bitwise_and" | "bitwise_or"
             | "bitwise_xor" | "bitwise_not" | "bit_count" | "bit_length_arg" | "bitwise_or_agg"
-            | "&" | "|" | "^" | "bitwiseand" | "bitwiseor" | "bitwisexor" => {
-                first_arg_type.cloned().unwrap_or(Integer)
-            }
+            | "&" | "|" | "^" | "bitwiseand" | "bitwiseor" | "bitwisexor" => first_arg_or(Integer),
 
             // ── Date/time functions ──────────────────────────────────────
             "current_date" => Date,
@@ -801,31 +643,31 @@ impl TypeInferenceEngine {
             "timestampdiff" => Long,
 
             // ── Array/List constructors and simple operations ───────────
-            "array" | "list_value" | "make_array" | "list" => match first_arg_type {
-                Some(dt) => DataType::Array(Box::new(dt.clone()), true),
-                None => DataType::Array(Box::new(Unresolved), true),
-            },
-            "map" | "map_from_arrays" | "create_map" | "map_from_entries" => DataType::Map {
-                key: Box::new(String),
-                value: Box::new(String),
-                value_nullable: true,
-            },
-            // `str_to_map(str, pair_delim, kv_delim)` returns
+            // NOTE: the `Some` (non-empty args) path is unreachable from
+            // `Expression::function_call_data_type`, which pre-empts these
+            // names whenever the arg list is non-empty (the widening
+            // `unify_types` fold). Kept defensively — this fn is `pub`.
+            "array" | "list_value" | "make_array" | "list" => {
+                Array(Box::new(first_arg_or(Unresolved)), true)
+            }
+            // `str_to_map(str, pair_delim, kv_delim)` returns the same
             // `Map<VARCHAR, VARCHAR>`. Session macro `str_to_map` (see
             // `runtime/session.rs`) provides the DuckDB translation. Corpus:
             // `map2-002`.
-            "str_to_map" => DataType::Map {
-                key: Box::new(String),
-                value: Box::new(String),
-                value_nullable: true,
-            },
+            "map" | "map_from_arrays" | "create_map" | "map_from_entries" | "str_to_map" => {
+                DataType::Map {
+                    key: Box::new(String),
+                    value: Box::new(String),
+                    value_nullable: true,
+                }
+            }
             // `map_concat(m1, m2, ...)` merges maps left-to-right; result
             // type is the (unified) map type of the arguments. τ takes the
             // first-arg type as an approximation — Spark rejects
             // mixed-key/value-type inputs earlier, so the first-arg type
             // matches the result type on any well-typed input. Corpus:
             // `map-006`.
-            "map_concat" => first_arg_type.cloned().unwrap_or(Unresolved),
+            "map_concat" => first_arg_or(Unresolved),
 
             // ── Higher-order array/map functions ─────────────────────────
             // Return type = first-arg type (the collection) for filters;
@@ -849,9 +691,7 @@ impl TypeInferenceEngine {
             // Spark map higher-order functions preserve the outer Map type
             // (element-nullability details are approximated). Corpus:
             // `hof-008`, `hof-009`, `hof-010`.
-            | "transform_values" | "transform_keys" => {
-                first_arg_type.cloned().unwrap_or(Unresolved)
-            }
+            | "transform_values" | "transform_keys" => first_arg_or(Unresolved),
             // Spark's `array_intersect(a, b)` returns `Array<T>` with
             // `containsNull = leftContainsNull AND rightContainsNull` per
             // Catalyst's `ArrayIntersect` — a NULL in the output requires
@@ -861,10 +701,7 @@ impl TypeInferenceEngine {
             // `containsNull=false` here (matching the corpus witness);
             // a fully-general answer would inspect both args' containsNull
             // flags.
-            "array_intersect" => match first_arg_type {
-                Some(DataType::Array(elem, _)) => Array(elem.clone(), false),
-                _ => Unresolved,
-            },
+            "array_intersect" => Self::rewrap_array(first_arg_type, Some(false)),
             // `array_position(arr, item)` returns the 1-based index of the
             // first match, or 0 if not found. Spark returns `Long` (BIGINT)
             // regardless of the array element type. Corpus: `arr-007`.
@@ -903,10 +740,7 @@ impl TypeInferenceEngine {
             // ── Sequence generator ──────────────────────────────────────
             // `sequence(start, stop[, step])` returns Array<T> where T is
             // the first arg's type (Long by default). Corpus: `arr-014`.
-            "sequence" => {
-                let elem = first_arg_type.cloned().unwrap_or(Long);
-                Array(Box::new(elem), false)
-            }
+            "sequence" => Array(Box::new(first_arg_or(Long)), false),
 
             // ── Generator functions (unnest) ────────────────────────────
             // Spark's `explode(arr)` / `explode_outer(arr)` emit one row
@@ -918,7 +752,11 @@ impl TypeInferenceEngine {
             // shapes synthesized by the converter when it splits a
             // multi-name `Alias(names=[pos, val], inner=posexplode(arr))`
             // into two projections. Corpus: `arr-017`.
-            "explode" | "explode_outer" | "posexplode_val" => match first_arg_type {
+            //
+            // `element_at(coll, k)` shares the exact same reduction: Array →
+            // element type; Map → value type (always nullable — missing key
+            // returns NULL). Corpus: `map-004`, `type-018`.
+            "explode" | "explode_outer" | "posexplode_val" | "element_at" => match first_arg_type {
                 Some(DataType::Array(elem, _)) => (**elem).clone(),
                 Some(DataType::Map { value, .. }) => (**value).clone(),
                 _ => Unresolved,
@@ -944,46 +782,26 @@ impl TypeInferenceEngine {
             // rows); take the first arg's type as the column type.
             // Emission maps `stack_col(v1, ..., vN)` to `UNNEST([v1, ..., vN])`.
             // Corpus: piv-006.
-            "stack_col" => first_arg_type.cloned().unwrap_or(Unresolved),
+            "stack_col" => first_arg_or(Unresolved),
 
             // ── Array mutation (Spark-conservative element nullability) ─
             // `array_append` / `array_prepend`: Spark stamps containsNull
             // = true (a NULL element may be appended). Corpus: `arr2-001`.
-            "array_append" | "array_prepend" | "append_element" | "prepend_element" => {
-                match first_arg_type {
-                    Some(DataType::Array(elem, _)) => Array(elem.clone(), true),
-                    _ => Unresolved,
-                }
-            }
-            // `array_compact` removes NULL elements → containsNull=false.
-            // Corpus: `arr2-003`.
-            "array_compact" => match first_arg_type {
-                Some(DataType::Array(elem, _)) => Array(elem.clone(), false),
-                _ => Unresolved,
-            },
-            // `array_remove` preserves the input's containsNull flag.
-            // Corpus: `arr2-005`.
-            "array_remove" => match first_arg_type {
-                Some(DataType::Array(elem, contains_null)) => Array(elem.clone(), *contains_null),
-                _ => Unresolved,
-            },
             // `array_insert(arr, pos, val)` — Spark stamps `containsNull=true`
             // (out-of-range positive `pos` pads the gap with NULLs). Return
             // the same element type as the input array. Corpus: `arr2-002`.
-            "array_insert" => match first_arg_type {
-                Some(DataType::Array(elem, _)) => Array(elem.clone(), true),
-                _ => Unresolved,
-            },
+            "array_append" | "array_prepend" | "append_element" | "prepend_element"
+            | "array_insert" => Self::rewrap_array(first_arg_type, Some(true)),
+            // `array_compact` removes NULL elements → containsNull=false.
+            // Corpus: `arr2-003`.
+            "array_compact" => Self::rewrap_array(first_arg_type, Some(false)),
+            // `array_remove` preserves the input's containsNull flag.
+            // Corpus: `arr2-005`.
+            "array_remove" => Self::rewrap_array(first_arg_type, None),
 
             // ── Map accessors ───────────────────────────────────────────
-            // `element_at(coll, k)` on Array → element type; on Map →
-            // value type (always nullable — missing key returns NULL).
-            // Corpus: `map-004`, `type-018`.
-            "element_at" => match first_arg_type {
-                Some(DataType::Array(elem, _)) => (**elem).clone(),
-                Some(DataType::Map { value, .. }) => (**value).clone(),
-                _ => Unresolved,
-            },
+            // (`element_at` rides the explode arm above — same Array/Map
+            // reduction.)
             // `map_keys(Map<K, V>) → Array<K>`. Spark stamps
             // containsNull=true on the returned array (matches the
             // reference `ArrayType(StringType(), True)` — the map-keys
@@ -1102,44 +920,34 @@ impl TypeInferenceEngine {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    /// Rewrap an `Array<T>` argument type with the same element type and a
+    /// per-function `containsNull` stamp: `Some(b)` forces the flag to `b`,
+    /// `None` preserves the input array's flag. Non-array (or absent) inputs
+    /// return `Unresolved`.
+    fn rewrap_array(arg: Option<&DataType>, contains_null: Option<bool>) -> DataType {
+        match arg {
+            Some(DataType::Array(elem, arg_contains_null)) => {
+                DataType::Array(elem.clone(), contains_null.unwrap_or(*arg_contains_null))
+            }
+            _ => DataType::Unresolved,
+        }
+    }
+
+    /// Widest-operand decimal unification — the shared bounds with no carry
+    /// digit (plain type unification cannot gain a leading digit).
     fn unify_decimal(p1: u8, s1: u8, p2: u8, s2: u8) -> DataType {
+        Self::decimal_bounds(p1, s1, p2, s2, 0)
+    }
+
+    /// Shared decimal-bounds math behind [`Self::unify_decimal`] (`carry = 0`)
+    /// and [`Self::decimal_add_type`] (`carry = 1`):
+    /// `scale = max(s1, s2)`, `int_digits = max(p1 - s1, p2 - s2)`,
+    /// `precision = min(int_digits + scale + carry, 38)`.
+    fn decimal_bounds(p1: u8, s1: u8, p2: u8, s2: u8, carry: i16) -> DataType {
         let scale = s1.max(s2);
         let int_digits = (p1 as i16 - s1 as i16).max(p2 as i16 - s2 as i16);
-        let precision = ((int_digits + scale as i16).min(38)) as u8;
+        let precision = ((int_digits + scale as i16 + carry).min(38)) as u8;
         DataType::Decimal { precision, scale }
-    }
-
-    /// Convert an integral type to its equivalent DECIMAL type.
-    pub fn integral_to_decimal(dt: &DataType) -> DataType {
-        match dt {
-            DataType::Byte => DataType::Decimal {
-                precision: 3,
-                scale: 0,
-            },
-            DataType::Short => DataType::Decimal {
-                precision: 5,
-                scale: 0,
-            },
-            DataType::Integer => DataType::Decimal {
-                precision: 10,
-                scale: 0,
-            },
-            DataType::Long => DataType::Decimal {
-                precision: 20,
-                scale: 0,
-            },
-            other => other.clone(),
-        }
-    }
-
-    /// Compute the minimum number of decimal digits needed to represent a value.
-    pub fn decimal_digits_for_value(v: i64) -> u8 {
-        if v == 0 {
-            return 1;
-        }
-        let abs = v.unsigned_abs();
-        let digits = (abs as f64).log10().floor() as u8 + 1;
-        digits.max(1)
     }
 
     fn adjust_precision_scale(raw_precision: i16, raw_scale: i16) -> (u8, u8) {
@@ -1155,92 +963,222 @@ impl TypeInferenceEngine {
     }
 }
 
-// ── Canonical name lists used by symmetric-omission tests ────────────────────
+// ── Aggregate spec table ─────────────────────────────────────────────────────
 
-/// Canonical aggregate names for the symmetric-omission mechanical checks
-/// (§8 of the plan). Every entry must appear in exactly one of
-/// `aggregate_is_non_nullable` XOR `aggregate_is_always_nullable`.
+/// Return-type rule of an aggregate function (the `ret` column of
+/// [`AGG_SPECS`]). Fixed-type variants map directly to a `DataType`;
+/// `SumLike` / `AvgLike` carry Spark's integer-widening / decimal-widening
+/// bodies in [`TypeInferenceEngine::aggregate_return_type`]; `ArgType`
+/// echoes the argument's type — which is also the behavior of any name
+/// absent from the table, so `ArgType` rows are byte-identical to the old
+/// default match arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggRet {
+    /// Fixed `Long` (COUNT family, `grouping_id`, approx-distinct family).
+    Long,
+    /// Fixed `Double` (stddev/variance, corr/covar/regr, percentile family).
+    Double,
+    /// Fixed `Integer` (scalar-wrapper size functions seen as aggregates).
+    Integer,
+    /// Fixed `Byte` (`grouping`).
+    Byte,
+    /// Fixed `Boolean` (bool_and/bool_or + Spark aliases).
+    Boolean,
+    /// Same type as the argument (min/max/first/last, bit aggregates, ...).
+    ArgType,
+    /// SUM family: integer types → Long, float → Double, decimal → wider.
+    SumLike,
+    /// AVG family: integer types → Double, decimal → wider.
+    AvgLike,
+    /// `Array(arg_type, containsNull = false)` (collect_list/collect_set).
+    ArrayOfArg,
+}
+
+/// Nullability class of an aggregate function (the `null` column of
+/// [`AGG_SPECS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggNull {
+    /// Always non-nullable (COUNT family, grouping, collect family).
+    NonNullable,
+    /// Returns NULL for an empty group (SUM/AVG/MIN/MAX, statistics, ...).
+    AlwaysNullable,
+    /// In neither nullability predicate (scalar-wrapper size functions).
+    Neither,
+}
+
+/// One row of the aggregate spec table — the single source of truth that
+/// replaced five parallel hand-maintained lists (`aggregate_return_type`
+/// match arms, the two nullability predicates, `function_return_type`'s
+/// aggregate-delegation arm, and the `AGGREGATE_NAMES` classifier const).
 ///
-/// Promoted from `#[cfg(test)]`.2's fix pass (review M3): the
-/// SparkSQL front-end (`parser_v2::v2_lowering::is_aggregate_function_name`)
-/// needs the canonical list at compile time to decide whether a projection
-/// requires an `Aggregate` plan node. INV10-compliant — the constant lives
-/// under the `transpiler_v2` tree that τ's front-ends are allowed to consume.
-pub(crate) const AGGREGATE_NAMES: &[&str] = &[
-    // COUNT family (non-nullable).
-    "count",
-    "count_distinct",
-    "count_if",
-    "grouping",
-    "grouping_id",
-    // SUM family (always-nullable).
-    "sum",
-    "sum_distinct",
-    "try_sum",
-    // AVG family.
-    "avg",
-    "mean",
-    "try_avg",
-    // MIN / MAX.
-    "min",
-    "max",
-    "first",
-    "last",
-    "first_value",
-    "last_value",
-    "any_value",
-    // STDDEV / VARIANCE.
-    "stddev",
-    "stddev_samp",
-    "stddev_pop",
-    "variance",
-    "var_samp",
-    "var_pop",
-    "skewness",
-    "kurtosis",
-    // Correlation / covariance / regression family (checklist §1.3).
-    "corr",
-    "covar_samp",
-    "covar_pop",
-    "regr_slope",
-    "regr_r2",
-    "regr_intercept",
-    "regr_avgx",
-    "regr_avgy",
-    "regr_sxx",
-    "regr_sxy",
-    "regr_syy",
-    // Percentile.
-    "percentile",
-    "percentile_approx",
-    "approx_percentile",
-    // Collect.
-    "collect_list",
-    "collect_set",
-    // Bit.
-    "bit_and",
-    "bit_or",
-    "bit_xor",
-    // Bool.
-    "bool_and",
-    "bool_or",
-    "every",
-    // Pass 71: Spark's `any` / `some` / `all` are canonical aliases of
-    // `bool_or` / `bool_or` / `bool_and`. Registering them here lets the
-    // SparkSQL parser classify bare-aggregate fragments (`F.expr("any(x)")`,
-    // `F.expr("all(x)")`) as aggregates so they route to
-    // `lower_aggregate_select`, and lets emission's `is_aggregate_name` route
-    // them to `render_aggregate` where the name-remap already lives.
-    "any",
-    "some",
-    "all",
-    // Pass 73: Spark's `mode` and `median` are aggregate builtins. Register
-    // here so the SparkSQL parser classifies bare `mode(col)` fragments as
-    // aggregates and emission's `is_aggregate_name` routes them to
-    // `render_aggregate` where the name-remap already lives.
-    "mode",
-    "median",
+/// Membership is transcribed verbatim from those lists, historical drift
+/// included (e.g. `std` was never in the classifier roster; `nth_value` and
+/// `regr_count` appear only in the always-nullable predicate). Roster
+/// membership is observable behavior — do NOT "fix" drift here without a
+/// corpus witness.
+struct AggSpec {
+    /// Lowercase canonical function name.
+    name: &'static str,
+    /// Return-type rule (see [`AggRet`]).
+    ret: AggRet,
+    /// Nullability class (see [`AggNull`]).
+    null: AggNull,
+    /// In the SparkSQL classifier roster (formerly `AGGREGATE_NAMES`):
+    /// `parser_v2::v2_lowering::is_aggregate_function_name` and emission's
+    /// `is_aggregate_name` treat this name as an aggregate.
+    classifier: bool,
+    /// `function_return_type` delegates this name to
+    /// [`TypeInferenceEngine::aggregate_return_type`].
+    delegate: bool,
+}
+
+/// Shorthand row constructor keeping [`AGG_SPECS`] readable.
+const fn agg(
+    name: &'static str,
+    ret: AggRet,
+    null: AggNull,
+    classifier: bool,
+    delegate: bool,
+) -> AggSpec {
+    AggSpec {
+        name,
+        ret,
+        null,
+        classifier,
+        delegate,
+    }
+}
+
+/// The flat aggregate spec table. INV10-compliant — lives under the
+/// `transpiler_v2` tree that τ's front-ends are allowed to consume.
+///
+/// Column order: `(name, ret, null, classifier, delegate)`.
+/// `rustfmt::skip` keeps the one-row-per-line tabular layout readable.
+#[rustfmt::skip]
+const AGG_SPECS: &[AggSpec] = &[
+    // COUNT family (non-nullable). Checklist §1.1 pins `count_if`.
+    agg("count", AggRet::Long, AggNull::NonNullable, true, true),
+    agg("count_distinct", AggRet::Long, AggNull::NonNullable, true, true),
+    agg("count_if", AggRet::Long, AggNull::NonNullable, true, true),
+    // GROUPING / GROUPING_ID (non-nullable; `function_return_type` resolves
+    // them via dedicated arms rather than aggregate delegation).
+    agg("grouping", AggRet::Byte, AggNull::NonNullable, true, false),
+    agg("grouping_id", AggRet::Long, AggNull::NonNullable, true, false),
+    // SUM family (always-nullable). `try_sum` mirrors `sum` — τ's analyzer
+    // checklist §1.4.
+    agg("sum", AggRet::SumLike, AggNull::AlwaysNullable, true, true),
+    agg("sum_distinct", AggRet::SumLike, AggNull::AlwaysNullable, true, true),
+    agg("try_sum", AggRet::SumLike, AggNull::AlwaysNullable, true, true),
+    // AVG family. `try_avg` mirrors `avg` — τ's analyzer checklist §1.4.
+    agg("avg", AggRet::AvgLike, AggNull::AlwaysNullable, true, true),
+    agg("mean", AggRet::AvgLike, AggNull::AlwaysNullable, true, true),
+    agg("try_avg", AggRet::AvgLike, AggNull::AlwaysNullable, true, true),
+    // MIN / MAX / first / last / any_value — same type as argument.
+    agg("min", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    agg("max", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    agg("first", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    agg("last", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    agg("first_value", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    agg("last_value", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    agg("any_value", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    // STDDEV / VARIANCE / SKEWNESS / KURTOSIS → Double.
+    // Drift (verbatim): `std` is NOT in the classifier roster.
+    agg("stddev", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("stddev_samp", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("std", AggRet::Double, AggNull::AlwaysNullable, false, true),
+    agg("stddev_pop", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("variance", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("var_samp", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("var_pop", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("skewness", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("kurtosis", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    // Correlation / covariance / regression family (checklist §1.3) → Double.
+    agg("corr", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("covar_samp", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("covar_pop", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("regr_slope", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("regr_r2", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("regr_intercept", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("regr_avgx", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("regr_avgy", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("regr_sxx", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("regr_sxy", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("regr_syy", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    // Drift (verbatim): `regr_count` appears ONLY in the always-nullable
+    // predicate — no dedicated return-type arm (falls to arg-type), not in
+    // the classifier roster, not aggregate-delegated.
+    agg("regr_count", AggRet::ArgType, AggNull::AlwaysNullable, false, false),
+    // Percentile / median → Double.
+    agg("percentile", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("percentile_approx", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("approx_percentile", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    agg("median", AggRet::Double, AggNull::AlwaysNullable, true, true),
+    // Pass 73: `mode` is an aggregate builtin (classifier + delegation) but
+    // never had a return-type arm — falls to arg-type (verbatim).
+    agg("mode", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    // Drift (verbatim): `nth_value` appears ONLY in the always-nullable
+    // predicate (its return type resolves via `window_return_type`).
+    agg("nth_value", AggRet::ArgType, AggNull::AlwaysNullable, false, false),
+    // collect_list / collect_set / array_agg → Array (non-nullable).
+    // Pass 58: `array_agg` is a Spark 4.x alias of `collect_list` — wired
+    // into return-type / nullability / delegation but (drift, verbatim) NOT
+    // into the classifier roster.
+    agg("collect_list", AggRet::ArrayOfArg, AggNull::NonNullable, true, true),
+    agg("collect_set", AggRet::ArrayOfArg, AggNull::NonNullable, true, true),
+    agg("array_agg", AggRet::ArrayOfArg, AggNull::NonNullable, false, true),
+    // approx_count_distinct → Long. Drift (verbatim): neither name is in the
+    // classifier roster.
+    agg("approx_count_distinct", AggRet::Long, AggNull::NonNullable, false, true),
+    agg("count_approx_distinct", AggRet::Long, AggNull::NonNullable, false, true),
+    // Bit aggregates → same type as arg.
+    agg("bit_and", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    agg("bit_or", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    agg("bit_xor", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    // Bool aggregates → Boolean.
+    // Pass 71: `any` / `some` / `all` are Spark aliases of `bool_or` /
+    // `bool_or` / `bool_and` — registering them in the classifier roster lets
+    // the SparkSQL parser classify bare-aggregate fragments (`F.expr("any(x)")`)
+    // as aggregates so they route to `lower_aggregate_select`, and lets
+    // emission's `is_aggregate_name` route them to `render_aggregate` where
+    // the name-remap already lives.
+    agg("bool_and", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
+    agg("every", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
+    agg("bool_or", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
+    agg("any", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
+    agg("some", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
+    agg("all", AggRet::Boolean, AggNull::AlwaysNullable, true, true),
+    // Scalar-wrapper size functions when they appear as aggregates — a
+    // return-type arm only (no nullability class, no classifier/delegation).
+    agg("size", AggRet::Integer, AggNull::Neither, false, false),
+    agg("cardinality", AggRet::Integer, AggNull::Neither, false, false),
+    agg("map_size", AggRet::Integer, AggNull::Neither, false, false),
+    agg("array_size", AggRet::Integer, AggNull::Neither, false, false),
 ];
+
+/// Look up the spec row for an already-lowercased aggregate name.
+fn agg_spec_lower(name_lower: &str) -> Option<&'static AggSpec> {
+    AGG_SPECS.iter().find(|s| s.name == name_lower)
+}
+
+/// Case-insensitive membership test against the classifier roster (the
+/// `classifier` column of [`AGG_SPECS`]; formerly the `AGGREGATE_NAMES`
+/// const). Used by the SparkSQL front-end
+/// (`parser_v2::v2_lowering::is_aggregate_function_name`) and by emission's
+/// `is_aggregate_name` to decide whether a bare function name is an
+/// aggregate. Table names are all-lowercase ASCII, so case-insensitive byte
+/// comparison matches without allocating a lowercased `String`.
+pub(crate) fn is_aggregate_classifier_name(name: &str) -> bool {
+    AGG_SPECS
+        .iter()
+        .any(|s| s.classifier && s.name.eq_ignore_ascii_case(name))
+}
+
+/// Classifier-roster names (test-only iterator for the symmetric-omission
+/// mechanical checks in this module and `expression.rs`).
+#[cfg(test)]
+pub(crate) fn aggregate_classifier_names() -> impl Iterator<Item = &'static str> {
+    AGG_SPECS.iter().filter(|s| s.classifier).map(|s| s.name)
+}
 
 /// The 11-name correlation / covariance / regression family (checklist §1.3).
 #[cfg(test)]
@@ -1273,6 +1211,16 @@ mod tests {
             precision: p,
             scale: s,
         }
+    }
+
+    /// One-line wrapper for [`TypeInferenceEngine::function_return_type`].
+    fn frt(name: &str, args: &[DataType]) -> DataType {
+        TypeInferenceEngine::function_return_type(name, args)
+    }
+
+    /// One-line wrapper for [`TypeInferenceEngine::aggregate_return_type`].
+    fn agg_rt(name: &str, arg: &DataType) -> DataType {
+        TypeInferenceEngine::aggregate_return_type(name, arg)
     }
 
     #[test]
@@ -1388,7 +1336,7 @@ mod tests {
             DataType::Null,
         ] {
             assert_eq!(
-                TypeInferenceEngine::aggregate_return_type("count_if", &arg),
+                agg_rt("count_if", &arg),
                 DataType::Long,
                 "count_if({arg:?}) must return Long",
             );
@@ -1402,10 +1350,7 @@ mod tests {
 
     #[test]
     fn count_if_case_insensitive() {
-        assert_eq!(
-            TypeInferenceEngine::aggregate_return_type("COUNT_IF", &DataType::Boolean),
-            DataType::Long
-        );
+        assert_eq!(agg_rt("COUNT_IF", &DataType::Boolean), DataType::Long);
         assert!(TypeInferenceEngine::aggregate_is_non_nullable("Count_If"));
     }
 
@@ -1415,7 +1360,7 @@ mod tests {
     fn corr_family_returns_double() {
         for name in CORR_FAMILY_NAMES {
             assert_eq!(
-                TypeInferenceEngine::aggregate_return_type(name, &DataType::Integer),
+                agg_rt(name, &DataType::Integer),
                 DataType::Double,
                 "{name}(Integer) must return Double",
             );
@@ -1446,7 +1391,7 @@ mod tests {
             "kurtosis",
         ] {
             assert_eq!(
-                TypeInferenceEngine::aggregate_return_type(name, &DataType::Integer),
+                agg_rt(name, &DataType::Integer),
                 DataType::Double,
                 "{name}(Integer) must return Double",
             );
@@ -1461,44 +1406,28 @@ mod tests {
 
     #[test]
     fn sum_integer_returns_long() {
-        assert_eq!(
-            TypeInferenceEngine::aggregate_return_type("sum", &DataType::Integer),
-            DataType::Long
-        );
+        assert_eq!(agg_rt("sum", &DataType::Integer), DataType::Long);
     }
 
     #[test]
     fn sum_decimal_widens_precision() {
-        assert_eq!(
-            TypeInferenceEngine::aggregate_return_type(
-                "sum",
-                &DataType::Decimal {
-                    precision: 10,
-                    scale: 2
-                }
-            ),
-            DataType::Decimal {
-                precision: 20,
-                scale: 2
-            }
-        );
+        assert_eq!(agg_rt("sum", &dec(10, 2)), dec(20, 2));
     }
 
     #[test]
     fn avg_integer_returns_double() {
-        assert_eq!(
-            TypeInferenceEngine::aggregate_return_type("avg", &DataType::Long),
-            DataType::Double
-        );
+        assert_eq!(agg_rt("avg", &DataType::Long), DataType::Double);
     }
 
     // ── Symmetric-omission mechanical checks (§8) ───────────────────────────
 
-    /// §8.1 — every aggregate name in AGGREGATE_NAMES must appear in exactly
+    /// §8.1 — every classifier-roster aggregate name must appear in exactly
     /// one of `aggregate_is_non_nullable` XOR `aggregate_is_always_nullable`.
+    /// (Rewritten for the AGG_SPECS table: iterates the classifier column in
+    /// place of the retired `AGGREGATE_NAMES` const — same membership.)
     #[test]
     fn every_aggregate_return_type_name_appears_in_a_nullability_predicate() {
-        for name in AGGREGATE_NAMES {
+        for name in aggregate_classifier_names() {
             let non_null = TypeInferenceEngine::aggregate_is_non_nullable(name);
             let always_null = TypeInferenceEngine::aggregate_is_always_nullable(name);
             assert!(
@@ -1510,13 +1439,35 @@ mod tests {
         }
     }
 
+    /// AGG_SPECS single-table invariants: every row name is unique (no
+    /// shadowed lookups) and all-lowercase ASCII (the `_lower` predicates
+    /// and `eq_ignore_ascii_case` classifier lookups rely on it).
+    #[test]
+    fn agg_specs_names_are_unique_and_lowercase() {
+        let mut seen = std::collections::HashSet::new();
+        for spec in AGG_SPECS {
+            assert!(
+                seen.insert(spec.name),
+                "duplicate AGG_SPECS row for `{}`",
+                spec.name,
+            );
+            assert!(
+                spec.name
+                    .chars()
+                    .all(|c| !c.is_ascii_uppercase() && !c.is_whitespace()),
+                "AGG_SPECS name `{}` must be lowercase ASCII with no whitespace",
+                spec.name,
+            );
+        }
+    }
+
     /// §8.4 — corr/covar/regr family must be `→ Double` AND
     /// `aggregate_is_always_nullable` AND NOT `aggregate_is_non_nullable`.
     #[test]
     fn corr_family_is_symmetric_across_return_type_and_nullability_predicates() {
         for name in CORR_FAMILY_NAMES {
             assert_eq!(
-                TypeInferenceEngine::aggregate_return_type(name, &DataType::Integer),
+                agg_rt(name, &DataType::Integer),
                 DataType::Double,
                 "{name} return-type must be Double",
             );
@@ -1556,26 +1507,29 @@ mod tests {
 
     // ── τ's analyzer checklist §1.4 — try_sum / try_avg (aggregate) ──────────────
 
-    /// `try_sum` and `try_avg` must be present in `AGGREGATE_NAMES` so the
+    /// `try_sum` and `try_avg` must be in the classifier roster so the
     /// SparkSQL classifier (`is_aggregate_function_name`) picks them up.
+    /// (Rewritten for the AGG_SPECS table: checks the classifier column in
+    /// place of the retired `AGGREGATE_NAMES` const — same membership.)
     #[test]
     fn aggregate_names_contains_try_sum_and_try_avg() {
         assert!(
-            AGGREGATE_NAMES.contains(&"try_sum"),
-            "AGGREGATE_NAMES must contain try_sum (checklist §1.4)",
+            is_aggregate_classifier_name("try_sum"),
+            "classifier roster must contain try_sum (checklist §1.4)",
         );
         assert!(
-            AGGREGATE_NAMES.contains(&"try_avg"),
-            "AGGREGATE_NAMES must contain try_avg (checklist §1.4)",
+            is_aggregate_classifier_name("try_avg"),
+            "classifier roster must contain try_avg (checklist §1.4)",
         );
     }
 
-    /// `try_divide` is a scalar function — it must NOT be in `AGGREGATE_NAMES`.
+    /// `try_divide` is a scalar function — it must NOT be in the classifier
+    /// roster.
     #[test]
     fn aggregate_names_does_not_contain_try_divide() {
         assert!(
-            !AGGREGATE_NAMES.contains(&"try_divide"),
-            "AGGREGATE_NAMES must NOT contain try_divide (scalar per checklist §4.1)",
+            !is_aggregate_classifier_name("try_divide"),
+            "classifier roster must NOT contain try_divide (scalar per checklist §4.1)",
         );
     }
 
@@ -1590,14 +1544,11 @@ mod tests {
             DataType::Long,
             DataType::Float,
             DataType::Double,
-            DataType::Decimal {
-                precision: 10,
-                scale: 2,
-            },
+            dec(10, 2),
         ] {
             assert_eq!(
-                TypeInferenceEngine::aggregate_return_type("try_sum", &arg),
-                TypeInferenceEngine::aggregate_return_type("sum", &arg),
+                agg_rt("try_sum", &arg),
+                agg_rt("sum", &arg),
                 "try_sum({arg:?}) must return the same type as sum({arg:?})",
             );
         }
@@ -1613,14 +1564,11 @@ mod tests {
             DataType::Long,
             DataType::Float,
             DataType::Double,
-            DataType::Decimal {
-                precision: 10,
-                scale: 2,
-            },
+            dec(10, 2),
         ] {
             assert_eq!(
-                TypeInferenceEngine::aggregate_return_type("try_avg", &arg),
-                TypeInferenceEngine::aggregate_return_type("avg", &arg),
+                agg_rt("try_avg", &arg),
+                agg_rt("avg", &arg),
                 "try_avg({arg:?}) must return the same type as avg({arg:?})",
             );
         }
@@ -1641,26 +1589,17 @@ mod tests {
 
     #[test]
     fn hash_return_type_is_integer() {
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("hash", Some(&DataType::Integer)),
-            DataType::Integer
-        );
+        assert_eq!(frt("hash", &[DataType::Integer]), DataType::Integer);
     }
 
     #[test]
     fn xxhash64_return_type_is_long() {
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("xxhash64", Some(&DataType::Integer)),
-            DataType::Long
-        );
+        assert_eq!(frt("xxhash64", &[DataType::Integer]), DataType::Long);
     }
 
     #[test]
     fn murmur3_return_type_is_integer() {
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("murmur3", Some(&DataType::String)),
-            DataType::Integer
-        );
+        assert_eq!(frt("murmur3", &[DataType::String]), DataType::Integer);
     }
 
     // ── Pass 58 — scalar function-return-type coverage ──────────────────────
@@ -1674,43 +1613,22 @@ mod tests {
 
     #[test]
     fn nanvl_returns_first_arg_type() {
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("nanvl", Some(&DataType::Double)),
-            DataType::Double
-        );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("nanvl", Some(&DataType::Float)),
-            DataType::Float
-        );
+        assert_eq!(frt("nanvl", &[DataType::Double]), DataType::Double);
+        assert_eq!(frt("nanvl", &[DataType::Float]), DataType::Float);
     }
 
     #[test]
     fn negative_preserves_arg_type() {
         // `negative`/`negate` map to Spark's UnaryMinus: dataType == child.
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("negative", Some(&DataType::Integer)),
-            DataType::Integer
-        );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("negative", Some(&dec(10, 2))),
-            dec(10, 2)
-        );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("negate", Some(&DataType::Integer)),
-            DataType::Integer
-        );
+        assert_eq!(frt("negative", &[DataType::Integer]), DataType::Integer);
+        assert_eq!(frt("negative", &[dec(10, 2)]), dec(10, 2));
+        assert_eq!(frt("negate", &[DataType::Integer]), DataType::Integer);
     }
 
     #[test]
     fn try_divide_returns_double_for_integers() {
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("try_divide", Some(&DataType::Integer)),
-            DataType::Double
-        );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("try_divide", Some(&DataType::Long)),
-            DataType::Double
-        );
+        assert_eq!(frt("try_divide", &[DataType::Integer]), DataType::Double);
+        assert_eq!(frt("try_divide", &[DataType::Long]), DataType::Double);
     }
 
     #[test]
@@ -1719,29 +1637,19 @@ mod tests {
         // this resolver only sees the first arg's type. Until multi-arg
         // dispatch lands, the Decimal branch must return `Unresolved` so the
         // ADR-022 boundary guard trips instead of silently mis-typing.
-        let dec = DataType::Decimal {
-            precision: 10,
-            scale: 2,
-        };
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("try_divide", Some(&dec)),
-            DataType::Unresolved
-        );
+        assert_eq!(frt("try_divide", &[dec(10, 2)]), DataType::Unresolved);
     }
 
     #[test]
     fn size_scalar_returns_integer() {
         assert_eq!(
-            TypeInferenceEngine::function_return_type(
-                "size",
-                Some(&DataType::Array(Box::new(DataType::String), true))
-            ),
+            frt("size", &[DataType::Array(Box::new(DataType::String), true)]),
             DataType::Integer
         );
         assert_eq!(
-            TypeInferenceEngine::function_return_type(
+            frt(
                 "cardinality",
-                Some(&DataType::Array(Box::new(DataType::Integer), true))
+                &[DataType::Array(Box::new(DataType::Integer), true)]
             ),
             DataType::Integer
         );
@@ -1753,18 +1661,12 @@ mod tests {
     #[test]
     fn explode_returns_array_element_type() {
         let arr = DataType::Array(Box::new(DataType::String), true);
+        assert_eq!(frt("explode", std::slice::from_ref(&arr)), DataType::String);
         assert_eq!(
-            TypeInferenceEngine::function_return_type("explode", Some(&arr)),
+            frt("explode_outer", std::slice::from_ref(&arr)),
             DataType::String
         );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("explode_outer", Some(&arr)),
-            DataType::String
-        );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("posexplode_val", Some(&arr)),
-            DataType::String
-        );
+        assert_eq!(frt("posexplode_val", &[arr]), DataType::String);
     }
 
     /// Pass 68 — `posexplode_pos(arr)` always returns Integer (the
@@ -1772,21 +1674,18 @@ mod tests {
     #[test]
     fn posexplode_pos_returns_integer() {
         let arr = DataType::Array(Box::new(DataType::String), true);
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("posexplode_pos", Some(&arr)),
-            DataType::Integer
-        );
+        assert_eq!(frt("posexplode_pos", &[arr]), DataType::Integer);
     }
 
     #[test]
     fn sequence_returns_array_of_first_arg() {
         assert_eq!(
-            TypeInferenceEngine::function_return_type("sequence", Some(&DataType::Integer)),
+            frt("sequence", &[DataType::Integer]),
             DataType::Array(Box::new(DataType::Integer), false)
         );
         // No arg → default element type is Long (start/stop unknown).
         assert_eq!(
-            TypeInferenceEngine::function_return_type("sequence", None),
+            frt("sequence", &[]),
             DataType::Array(Box::new(DataType::Long), false)
         );
     }
@@ -1794,7 +1693,7 @@ mod tests {
     #[test]
     fn get_json_object_returns_string() {
         assert_eq!(
-            TypeInferenceEngine::function_return_type("get_json_object", Some(&DataType::String)),
+            frt("get_json_object", &[DataType::String]),
             DataType::String
         );
     }
@@ -1805,29 +1704,20 @@ mod tests {
         // Argument here is a StructType (from `struct(...)`) — the resolver
         // only takes the first-arg type; the return is always String.
         let s = DataType::Struct(StructType::new(vec![]));
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("to_json", Some(&s)),
-            DataType::String
-        );
+        assert_eq!(frt("to_json", &[s]), DataType::String);
     }
 
     /// Pass 62 — `schema_of_json(json_str)` returns String. Corpus: `json-006`.
     #[test]
     fn schema_of_json_returns_string() {
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("schema_of_json", Some(&DataType::String)),
-            DataType::String
-        );
+        assert_eq!(frt("schema_of_json", &[DataType::String]), DataType::String);
     }
 
     /// Pass 62 — `to_csv(struct)` returns String. Corpus: `json-008`.
     #[test]
     fn to_csv_returns_string() {
         let s = DataType::Struct(StructType::new(vec![]));
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("to_csv", Some(&s)),
-            DataType::String
-        );
+        assert_eq!(frt("to_csv", &[s]), DataType::String);
     }
 
     #[test]
@@ -1837,19 +1727,13 @@ mod tests {
             value: Box::new(DataType::Long),
             value_nullable: true,
         };
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("element_at", Some(&m)),
-            DataType::Long
-        );
+        assert_eq!(frt("element_at", &[m]), DataType::Long);
     }
 
     #[test]
     fn element_at_on_array_returns_element_type() {
         let a = DataType::Array(Box::new(DataType::String), true);
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("element_at", Some(&a)),
-            DataType::String
-        );
+        assert_eq!(frt("element_at", &[a]), DataType::String);
     }
 
     #[test]
@@ -1861,7 +1745,7 @@ mod tests {
             value_nullable: true,
         };
         assert_eq!(
-            TypeInferenceEngine::function_return_type("map_keys", Some(&m)),
+            frt("map_keys", &[m]),
             DataType::Array(Box::new(DataType::String), true)
         );
     }
@@ -1874,7 +1758,7 @@ mod tests {
             value_nullable: true,
         };
         assert_eq!(
-            TypeInferenceEngine::function_return_type("map_values", Some(&m)),
+            frt("map_values", &[m]),
             DataType::Array(Box::new(DataType::Long), true)
         );
     }
@@ -1893,10 +1777,7 @@ mod tests {
             ]))),
             false,
         );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("map_entries", Some(&m)),
-            expected
-        );
+        assert_eq!(frt("map_entries", &[m]), expected);
     }
 
     #[test]
@@ -1906,21 +1787,18 @@ mod tests {
             value: Box::new(DataType::Long),
             value_nullable: true,
         };
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("map_contains_key", Some(&m)),
-            DataType::Boolean
-        );
+        assert_eq!(frt("map_contains_key", &[m]), DataType::Boolean);
     }
 
     #[test]
     fn array_append_preserves_element_but_forces_containsnull_true() {
         let a = DataType::Array(Box::new(DataType::String), false);
         assert_eq!(
-            TypeInferenceEngine::function_return_type("array_append", Some(&a)),
+            frt("array_append", std::slice::from_ref(&a)),
             DataType::Array(Box::new(DataType::String), true)
         );
         assert_eq!(
-            TypeInferenceEngine::function_return_type("array_prepend", Some(&a)),
+            frt("array_prepend", &[a]),
             DataType::Array(Box::new(DataType::String), true)
         );
     }
@@ -1929,7 +1807,7 @@ mod tests {
     fn array_compact_forces_containsnull_false() {
         let a = DataType::Array(Box::new(DataType::String), true);
         assert_eq!(
-            TypeInferenceEngine::function_return_type("array_compact", Some(&a)),
+            frt("array_compact", &[a]),
             DataType::Array(Box::new(DataType::String), false)
         );
     }
@@ -1937,10 +1815,7 @@ mod tests {
     #[test]
     fn array_remove_returns_first_arg_type() {
         let a = DataType::Array(Box::new(DataType::String), true);
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("array_remove", Some(&a)),
-            a
-        );
+        assert_eq!(frt("array_remove", std::slice::from_ref(&a)), a);
     }
 
     #[test]
@@ -1951,7 +1826,7 @@ mod tests {
         // non-nullable array literal, so the AND collapses to false).
         let a = DataType::Array(Box::new(DataType::String), true);
         assert_eq!(
-            TypeInferenceEngine::function_return_type("array_intersect", Some(&a)),
+            frt("array_intersect", &[a]),
             DataType::Array(Box::new(DataType::String), false)
         );
     }
@@ -1962,7 +1837,7 @@ mod tests {
         // `containsNull=true` (out-of-range positive pos pads with NULLs).
         let a = DataType::Array(Box::new(DataType::String), false);
         assert_eq!(
-            TypeInferenceEngine::function_return_type("array_insert", Some(&a)),
+            frt("array_insert", &[a]),
             DataType::Array(Box::new(DataType::String), true)
         );
     }
@@ -1972,7 +1847,7 @@ mod tests {
         // Pass 72: `str_to_map` returns Map<VARCHAR, VARCHAR> with
         // nullable values (missing tokens produce NULL values).
         assert_eq!(
-            TypeInferenceEngine::function_return_type("str_to_map", Some(&DataType::String)),
+            frt("str_to_map", &[DataType::String]),
             DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),
@@ -1989,10 +1864,7 @@ mod tests {
             value: Box::new(DataType::String),
             value_nullable: true,
         };
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("map_concat", Some(&m)),
-            m
-        );
+        assert_eq!(frt("map_concat", std::slice::from_ref(&m)), m);
     }
 
     #[test]
@@ -2006,35 +1878,23 @@ mod tests {
             ]))),
             true,
         );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("histogram_numeric", Some(&DataType::Double)),
-            expected
-        );
+        assert_eq!(frt("histogram_numeric", &[DataType::Double]), expected);
     }
 
     #[test]
     fn input_file_name_returns_string() {
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("input_file_name", None),
-            DataType::String
-        );
+        assert_eq!(frt("input_file_name", &[]), DataType::String);
     }
 
     #[test]
     fn split_part_returns_string() {
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("split_part", Some(&DataType::String)),
-            DataType::String
-        );
+        assert_eq!(frt("split_part", &[DataType::String]), DataType::String);
     }
 
     #[test]
     fn regexp_extract_all_returns_array_of_string() {
         assert_eq!(
-            TypeInferenceEngine::function_return_type(
-                "regexp_extract_all",
-                Some(&DataType::String)
-            ),
+            frt("regexp_extract_all", &[DataType::String]),
             DataType::Array(Box::new(DataType::String), true)
         );
     }
@@ -2046,7 +1906,7 @@ mod tests {
         // the divergent case where `array_agg(Array<T>)` incorrectly
         // stayed at `Array<T>` instead of widening to `Array<Array<T>>`.
         assert_eq!(
-            TypeInferenceEngine::function_return_type("array_agg", Some(&DataType::String)),
+            frt("array_agg", &[DataType::String]),
             DataType::Array(Box::new(DataType::String), false)
         );
     }
@@ -2057,7 +1917,7 @@ mod tests {
         // Regression lock for the OPT-2 unification (pass 58 fix iter 1).
         let inner = DataType::Array(Box::new(DataType::String), true);
         assert_eq!(
-            TypeInferenceEngine::function_return_type("array_agg", Some(&inner)),
+            frt("array_agg", std::slice::from_ref(&inner)),
             DataType::Array(Box::new(inner), false)
         );
     }
@@ -2069,13 +1929,10 @@ mod tests {
     fn array_position_returns_long() {
         let arr = DataType::Array(Box::new(DataType::String), true);
         assert_eq!(
-            TypeInferenceEngine::function_return_type("array_position", Some(&arr)),
+            frt("array_position", std::slice::from_ref(&arr)),
             DataType::Long
         );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("list_position", Some(&arr)),
-            DataType::Long
-        );
+        assert_eq!(frt("list_position", &[arr]), DataType::Long);
     }
 
     /// `arrays_overlap(a, b)` returns Boolean regardless of the array
@@ -2083,10 +1940,7 @@ mod tests {
     #[test]
     fn arrays_overlap_returns_boolean() {
         let arr = DataType::Array(Box::new(DataType::String), true);
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("arrays_overlap", Some(&arr)),
-            DataType::Boolean
-        );
+        assert_eq!(frt("arrays_overlap", &[arr]), DataType::Boolean);
     }
 
     /// `flatten(Array<Array<T>>)` unwraps one level of nesting → `Array<T>`,
@@ -2095,10 +1949,7 @@ mod tests {
     fn flatten_reduces_one_array_level() {
         let inner = DataType::Array(Box::new(DataType::String), true);
         let outer = DataType::Array(Box::new(inner.clone()), false);
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("flatten", Some(&outer)),
-            inner
-        );
+        assert_eq!(frt("flatten", &[outer]), inner);
     }
 
     /// `F.window(ts, duration)` → `Struct{start: Timestamp, end: Timestamp}`
@@ -2112,20 +1963,11 @@ mod tests {
             StructField::nullable("start", DataType::Timestamp),
             StructField::nullable("end", DataType::Timestamp),
         ]));
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("window", Some(&DataType::Timestamp)),
-            expected,
-        );
+        assert_eq!(frt("window", &[DataType::Timestamp]), expected);
         // Arg-independent — no arg-type context should give the same schema.
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("window", None),
-            expected,
-        );
+        assert_eq!(frt("window", &[]), expected);
         // Case-insensitive dispatch.
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("Window", Some(&DataType::Timestamp)),
-            expected,
-        );
+        assert_eq!(frt("Window", &[DataType::Timestamp]), expected);
     }
 
     // ── Interval constructors (Spark parity for intv-001, -002, -003) ───────
@@ -2134,31 +1976,19 @@ mod tests {
     fn make_dt_interval_returns_day_time_interval() {
         // Corpus: intv-003. Spark: `make_dt_interval(1, 2, 30, 0)` yields
         // `DayTimeIntervalType`.
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("make_dt_interval", None),
-            DataType::DayTimeInterval,
-        );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("try_make_dt_interval", None),
-            DataType::DayTimeInterval,
-        );
+        assert_eq!(frt("make_dt_interval", &[]), DataType::DayTimeInterval);
+        assert_eq!(frt("try_make_dt_interval", &[]), DataType::DayTimeInterval);
         // Case-insensitive dispatch.
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("MAKE_DT_INTERVAL", None),
-            DataType::DayTimeInterval,
-        );
+        assert_eq!(frt("MAKE_DT_INTERVAL", &[]), DataType::DayTimeInterval);
     }
 
     #[test]
     fn make_ym_interval_returns_year_month_interval() {
         // Corpus: intv-002.
+        assert_eq!(frt("make_ym_interval", &[]), DataType::YearMonthInterval);
         assert_eq!(
-            TypeInferenceEngine::function_return_type("make_ym_interval", None),
-            DataType::YearMonthInterval,
-        );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("try_make_ym_interval", None),
-            DataType::YearMonthInterval,
+            frt("try_make_ym_interval", &[]),
+            DataType::YearMonthInterval
         );
     }
 
@@ -2166,13 +1996,7 @@ mod tests {
     fn make_interval_returns_calendar_interval() {
         // Corpus: intv-001. Spark 4.1: `make_interval(1, 2, 0, 5)` returns
         // `CalendarIntervalType` (our `DataType::Interval`).
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("make_interval", None),
-            DataType::Interval,
-        );
-        assert_eq!(
-            TypeInferenceEngine::function_return_type("try_make_interval", None),
-            DataType::Interval,
-        );
+        assert_eq!(frt("make_interval", &[]), DataType::Interval);
+        assert_eq!(frt("try_make_interval", &[]), DataType::Interval);
     }
 }

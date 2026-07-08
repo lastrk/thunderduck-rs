@@ -1462,3 +1462,47 @@ touched: the expr_has_aggregate / resolve_named_windows_in_expr symmetric duplic
 choice); pre-existing baseline clippy drift.
 Gate green (747 unit tests). Corpora unchanged: SQL 247/23/270, DataFrame 329/329 (verified —
 findings 6/7 touch the shared resolve_column path). Sweep report source: rust-reviewer pass-5 sweep.
+
+## Pass 6 — jn-013, jn-015, sq-015 (247→250)
+
+- **Cluster (one root cause):** jn-013 (three-way join), jn-015 (join then aggregate), sq-015
+  (correlated aggregate in HAVING over an aliased scan).
+- **Owning layer:** emission (`crates/core/src/transpiler_v2/emission.rs`).
+- **Root cause:** τ wrapped operator inputs carrying a USER alias (e, d) inside a synthetic
+  derived-table alias (__td_agg in render_aggregate_op; __td_jl/__td_jr in generic render_join via
+  render_join_from's non-AliasedRelation fallback). SQL scoping makes the wrapper the only visible
+  name, so ON / GROUP BY / HAVING / projection referencing the user alias fail with DuckDB
+  "Referenced table \"e\" not found! Candidate: __td_jl/__td_agg". Single two-way joins passed
+  (Project routed through the alias-transparent render_join_from); a third join, an aggregate over a
+  join, or an aggregate over an aliased scan triggered the wrap.
+- **Fix (direction a — alias-transparent FROM inlining):** new shared helper
+  `render_alias_transparent_from` (arms Join / Filter{Join} / Filter{AliasedRelation} /
+  AliasedRelation) reused by render_project (byte-identical for green cases) AND render_aggregate_op
+  (replaces the __td_agg wrap; __td_agg kept as fallback on None). New `render_join_side` 4-step
+  ladder: (1) if the join condition references the synthetic alias (DataFrame plan_id contract via
+  qualify_plan_id_refs) → keep the __td_jl/__td_jr wrapper; (2) AliasedRelation → hoist user alias;
+  (3) flattenable nested Join → `emit_flat_chain` (single-walk left-deep chain, no wrapper); (4) else
+  wrap. `flattenable_chain_aliases` gates flattening (break at USING and SEMI/ANTI per gotcha 4;
+  synthetic-free conditions; user-aliased leaves) AND collects spine aliases to refuse a flatten that
+  would duplicate a user alias in one FROM scope (reviewer Medium). `expr_uses_qualifier` shares the
+  expression_children! walk with qualify_plan_id_refs, so the plan_id-contract scan is complete by
+  construction. Generic render_join unchanged. NO AST/analyzer change.
+- **ADRs:** ADR-001 (flattened chain = user's original left-deep FROM, transliteration), ADR-004/INV7
+  (AliasedRelation = front-end-neutral alias signal), ADR-008 (correlated carve-out preserved),
+  ADR-009 (per-op dispatch + shared render helpers), ADR-015 (both corpora oracle), ADR-022. Gotchas
+  4/5 honored.
+- **Findings closed:** reviewer Critical=0 High=0 (1 Medium duplicate-user-alias collision — FIXED via
+  flattenable_chain_aliases spine+sibling dup guard + regression test; 2 Lows: test discrimination +
+  redundant matches! — addressed); perf High=0 Medium=1 (O(N^2) spine re-walk — FIXED via emit_flat_chain
+  single-walk, O(N)). NOTE: the coder fix-loop was interrupted by an opus 429 mid-edit; the driver
+  (opus main loop) finished wiring the sibling-alias arg, added the duplicate-alias regression test,
+  and implemented emit_flat_chain.
+- **Before→after:** SQL 247 → 250 passed (270 total), +3, no regression. DataFrame 329/329 (verified).
+- **Out of scope (documented):** __td_sort/__td_limit/__td_filter qualified-ref class (different
+  mechanism above Project boundaries, no witness); TableScan arm in helper + unaliased-chain flatten.
+- **Tests:** 9 new emission unit tests (aggregate-over-join, aggregate-over-aliased-scan+HAVING,
+  aggregate-over-filter-over-join, three-way flatten, duplicate-alias-refuses-flatten, DataFrame
+  plan_id contract, plan_id-overrides-hoist, USING-under-aggregate, SEMI-break); 4 pre-existing inline
+  tests unmodified/green. Corpus jn-013/jn-015/sq-015 green E2E.
+- **Diagnostic:** `.agent-output/diagnostic-pass-6.md` · **Architecture:** `.agent-output/architecture-pass-6.md`
+- **SHA-to-be:** feat(v2-corpus): pass 6 — jn-013/jn-015/sq-015 (247→250)

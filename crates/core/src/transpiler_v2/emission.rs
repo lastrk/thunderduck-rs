@@ -375,47 +375,45 @@ fn render_file_scan(
     Ok(format!("SELECT * FROM {reader}({paths_sql}{opts_sql})"))
 }
 
-/// Flatten a `Filter` whose child is an `AliasedRelation` into the FROM-body
-/// `(<inner>) AS <alias> WHERE <cond>` shared by the correlated-subquery
-/// inlining in `render_project` and `render_aggregate_op`. Keeps the user
-/// alias as the FROM table name so both slots and the WHERE bind it in one
-/// SELECT. Returns `None` when the shape doesn't match (caller falls back to
-/// its own default wrap).
-///
-/// KNOWN LIMITATION: the correlated outer reference resolves by-NAME against
-/// the inner schema (accidentally correct when the correlation key's name+type
-/// coincide; the analyzer rejects the absent-column case, sq-010). A proper
-/// outer-scope stack is out of scope (ADR-008).
-fn render_filter_over_aliased_from(filter: &TypedAst) -> Result<Option<String>, EmissionError> {
-    let TypedOp::Filter {
-        input: filter_input,
-        condition,
-    } = &filter.op
-    else {
-        return Ok(None);
-    };
-    let TypedOp::AliasedRelation {
-        input: inner,
-        alias,
-    } = &filter_input.op
-    else {
-        return Ok(None);
-    };
-    let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
-    let cond_sql = render_expr(condition, &filter_input.resolved_schema)?;
-    Ok(Some(format!(
-        "({inner_sql}) AS {} WHERE {cond_sql}",
-        quote_ident(alias)
-    )))
+/// The FROM-body (and, when the shape carries a correlated/comma-join
+/// predicate, the WHERE) of a child subtree that already exposes the user
+/// aliases the enclosing `Project`/`Aggregate` clause references — so the
+/// caller can inline directly instead of wrapping the child in its own
+/// occluding synthetic alias (`__td_proj` / `__td_agg`).
+struct AliasTransparentFrom {
+    from_sql: String,
+    where_sql: Option<String>,
 }
 
-fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String, EmissionError> {
-    let input_schema = &input.resolved_schema;
-    // Project-over-Join inlining: when the child is a Join, emit the
-    // projections directly against the Join's FROM/ON clauses rather than
-    // wrapping the join output as a subquery. This preserves outer-level
-    // access to user aliases (`df.alias("e").join(...).select(e.name)`)
-    // and matches Spark's plan-tree shape.
+/// Whether `input`'s shape already exposes the aliases an enclosing
+/// `Project`/`Aggregate` clause needs, and if so, its alias-transparent
+/// `FROM`/`WHERE` fragments. Mirrors, on the emission side, the question the
+/// analyzer's `collect_qualifier_bindings` asks of the same shapes. Arms, in
+/// order:
+///
+/// - `Join` → inline the join's FROM/ON via [`render_join_from`], hoisting
+///   user aliases (`df.alias("e").join(...).select(e.name)`).
+/// - `Filter { Join }` → a comma-join lowers to `... → Filter → Join`;
+///   collapse into one FROM + WHERE so aliases stay in scope for both.
+///   Filter is schema-passthrough, so the Filter's own `resolved_schema` and
+///   the Join's carry identical fields.
+/// - `Filter { AliasedRelation }` → correlated subqueries (EXISTS / scalar /
+///   scalar-aggregate) lower to `... → Filter → AliasedRelation`. The
+///   default `__td_filter`/`__td_agg`/`__td_proj` wrap would re-bury the
+///   user alias the WHERE's correlated qualifier needs, so flatten into one
+///   FROM + WHERE, keeping the alias as the FROM table name.
+///
+///   KNOWN LIMITATION: the correlated outer reference resolves by-NAME
+///   against the inner schema (accidentally correct when the correlation
+///   key's name+type coincide; the analyzer rejects the absent-column case,
+///   sq-010). A proper outer-scope stack is out of scope (ADR-008).
+/// - `AliasedRelation` → transparent on its own too: `(inner) AS alias`.
+///
+/// Returns `Ok(None)` for any other shape — the caller keeps its own default
+/// synthetic wrap.
+fn render_alias_transparent_from(
+    input: &TypedAst,
+) -> Result<Option<AliasTransparentFrom>, EmissionError> {
     if let TypedOp::Join {
         left,
         right,
@@ -425,22 +423,19 @@ fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String
         ..
     } = &input.op
     {
-        return render_project_over_join(
-            projections,
-            input_schema,
+        let from_sql = render_join_from(
             left,
             right,
             *join_type,
             condition.as_ref(),
             using_columns,
-        );
+            &input.resolved_schema,
+        )?;
+        return Ok(Some(AliasTransparentFrom {
+            from_sql,
+            where_sql: None,
+        }));
     }
-    // Project-over-Filter-over-Join inlining: a comma-join lowers to
-    // `Project → Filter → Join`, so the aliases sit two subquery levels below
-    // the projection. Collapse all three into one `SELECT ... FROM <join> WHERE
-    // <cond>` so user aliases stay in scope for both the WHERE and the slots.
-    // Filter is schema-passthrough, so `input_schema` (Project input) and the
-    // Join's `resolved_schema` carry identical fields.
     if let TypedOp::Filter {
         input: filter_input,
         condition: filter_cond,
@@ -455,7 +450,7 @@ fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String
             ..
         } = &filter_input.op
         {
-            let from = render_join_from(
+            let from_sql = render_join_from(
                 left,
                 right,
                 *join_type,
@@ -463,33 +458,53 @@ fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String
                 using_columns,
                 &filter_input.resolved_schema,
             )?;
-            let slots_sql = render_projection_slots(projections, input_schema)?;
-            let cond_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
-            return Ok(format!("SELECT {slots_sql} FROM {from} WHERE {cond_sql}"));
+            let where_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
+            return Ok(Some(AliasTransparentFrom {
+                from_sql,
+                where_sql: Some(where_sql),
+            }));
         }
-        // Project-over-Filter-over-AliasedRelation inlining: correlated
-        // subqueries (EXISTS / scalar) lower to `Project → Filter →
-        // AliasedRelation`. `render_filter` would re-wrap the child as
-        // `(...) AS __td_filter`, re-burying the user alias so the WHERE's
-        // correlated qualifier (`e.dept_id`) no longer binds. Flatten all
-        // three into one `SELECT <slots> FROM <from_where>` so the alias
-        // becomes the FROM table name and stays in scope for both slots and
-        // WHERE (mirrors the Project-over-Filter-over-Join branch above).
-        if let Some(from_where) = render_filter_over_aliased_from(input)? {
-            let slots_sql = render_projection_slots(projections, input_schema)?;
-            return Ok(format!("SELECT {slots_sql} FROM {from_where}"));
+        if let TypedOp::AliasedRelation {
+            input: inner,
+            alias,
+        } = &filter_input.op
+        {
+            let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
+            let where_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
+            let a = quote_ident(alias);
+            return Ok(Some(AliasTransparentFrom {
+                from_sql: format!("({inner_sql}) AS {a}"),
+                where_sql: Some(where_sql),
+            }));
         }
+        return Ok(None);
     }
-    // AliasedRelation is transparent for Project too — inline through it.
     if let TypedOp::AliasedRelation {
         input: inner,
         alias,
     } = &input.op
     {
         let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
-        let slots_sql = render_projection_slots(projections, input_schema)?;
         let a = quote_ident(alias);
-        return Ok(format!("SELECT {slots_sql} FROM ({inner_sql}) AS {a}"));
+        return Ok(Some(AliasTransparentFrom {
+            from_sql: format!("({inner_sql}) AS {a}"),
+            where_sql: None,
+        }));
+    }
+    Ok(None)
+}
+
+fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String, EmissionError> {
+    let input_schema = &input.resolved_schema;
+    // Join / Filter-over-Join / Filter-over-AliasedRelation / AliasedRelation
+    // children already expose the aliases the projection list references —
+    // inline through them instead of wrapping in a synthetic `__td_proj`.
+    if let Some(atf) = render_alias_transparent_from(input)? {
+        let slots_sql = render_projection_slots(projections, input_schema)?;
+        return Ok(match atf.where_sql {
+            Some(w) => format!("SELECT {slots_sql} FROM {} WHERE {w}", atf.from_sql),
+            None => format!("SELECT {slots_sql} FROM {}", atf.from_sql),
+        });
     }
     // Project over a bare TableScan: inline `FROM t` (optionally `AS alias`)
     // instead of wrapping the child in `(SELECT * FROM t) AS __td_proj`. This
@@ -517,29 +532,6 @@ fn render_projection_slots(
     sql_join(projections.iter(), ", ", |p| {
         render_projection_slot(p, input_schema)
     })
-}
-
-/// Render a Project whose child is a Join. Inline the Join's FROM/ON so
-/// user aliases (`df.alias("e")`) remain in scope for the projection list.
-fn render_project_over_join(
-    projections: &[Expression],
-    project_input_schema: &Schema,
-    left: &TypedAst,
-    right: &TypedAst,
-    join_type: crate::transpiler_v2::ast::JoinType,
-    condition: Option<&Expression>,
-    using_columns: &[String],
-) -> Result<String, EmissionError> {
-    let from = render_join_from(
-        left,
-        right,
-        join_type,
-        condition,
-        using_columns,
-        project_input_schema,
-    )?;
-    let slots_sql = render_projection_slots(projections, project_input_schema)?;
-    Ok(format!("SELECT {slots_sql} FROM {from}"))
 }
 
 /// Map a [`JoinType`] to its DuckDB join keyword. DuckDB requires `SEMI JOIN`
@@ -583,10 +575,201 @@ fn render_join_clause(
     }
 }
 
+/// Whether `expr` contains any `ColumnReference`/`UnresolvedColumn` whose
+/// qualifier matches `q` (ASCII case-insensitive). The join-side decision
+/// ladder's own version of the qualifier scan `qualify_plan_id_refs` (§2.3,
+/// analyzer.rs) uses to stamp `__td_jl`/`__td_jr` in the first place.
+fn expr_uses_qualifier(expr: &Expression, q: &str) -> bool {
+    match expr {
+        Expression::ColumnReference(c) => c
+            .qualifier
+            .as_deref()
+            .is_some_and(|cq| cq.eq_ignore_ascii_case(q)),
+        Expression::UnresolvedColumn(u) => u
+            .qualifier
+            .as_deref()
+            .is_some_and(|cq| cq.eq_ignore_ascii_case(q)),
+        other => other.children().any(|c| expr_uses_qualifier(c, q)),
+    }
+}
+
+/// Whether `side`'s left spine can be folded into one chained `FROM` instead
+/// of wrapping it in a synthetic derived-table alias. Requires, at this
+/// level and recursively down the left spine:
+///
+/// - `using_columns` empty (USING has its own column-order/dedup semantics —
+///   generic [`render_join`]'s explicit slot list exists precisely to fix
+///   USING order; flattening across it would change `SELECT *` order).
+/// - `join_type` is not `LeftSemi`/`LeftAnti` (CLAUDE.md gotcha 4 — the
+///   flat-chain rendering must break at semi/anti boundaries).
+/// - the join condition carries no `__td_jl`/`__td_jr` references (those are
+///   per-level synthetic names; a match means this level was itself produced
+///   under the plan_id contract and must stay wrapped).
+/// - the left side is a user `AliasedRelation` or another flattenable `Join`.
+/// - the right side is a user `AliasedRelation` (user-aliased leaves only —
+///   avoids colliding with the fallback synthetic alias).
+/// - no user alias repeats across the whole flattened scope. DuckDB rejects
+///   `Duplicate alias X in query!` when two `AS X` land in one FROM scope,
+///   whereas the isolating synthetic wrapper (the step-4 fallback) does not —
+///   so a chain that would emit a duplicate stays wrapped. Spark permits
+///   duplicate FROM aliases (it errors only on ambiguous *references*), so
+///   this keeps such queries green rather than flipping them red.
+///
+/// Returns the ordered list of user aliases the flattened chain would emit
+/// into a single FROM scope, or `None` when `side` is not flattenable (by any
+/// of the above rules, including the duplicate-alias guard).
+fn flattenable_chain_aliases(side: &TypedAst) -> Option<Vec<String>> {
+    use super::ast::JoinType;
+    let TypedOp::Join {
+        left,
+        right,
+        join_type,
+        condition,
+        using_columns,
+        ..
+    } = &side.op
+    else {
+        return None;
+    };
+    if !using_columns.is_empty() {
+        return None;
+    }
+    if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+        return None;
+    }
+    if let Some(cond) = condition {
+        if expr_uses_qualifier(cond, TD_JOIN_LEFT) || expr_uses_qualifier(cond, TD_JOIN_RIGHT) {
+            return None;
+        }
+    }
+    let mut aliases = match &left.op {
+        TypedOp::AliasedRelation { alias, .. } => vec![alias.clone()],
+        TypedOp::Join { .. } => flattenable_chain_aliases(left)?,
+        _ => return None,
+    };
+    let TypedOp::AliasedRelation {
+        alias: right_alias, ..
+    } = &right.op
+    else {
+        return None;
+    };
+    if aliases.iter().any(|a| a.eq_ignore_ascii_case(right_alias)) {
+        return None;
+    }
+    aliases.push(right_alias.clone());
+    Some(aliases)
+}
+
+/// Render one side of a join's `FROM` clause. Decision ladder, in order:
+///
+/// 1. `condition` references `synthetic_alias` (via [`expr_uses_qualifier`])
+///    → `(dispatch_op(side)) AS synthetic_alias`. This is the DataFrame
+///    plan_id-qualified-condition contract (`qualify_plan_id_refs`,
+///    analyzer.rs) — it must win even when `side` is itself a user
+///    `AliasedRelation` (closes the latent `df.alias("e")` + plan_id hazard:
+///    hoisting to the user alias there would leave the plan_id-stamped
+///    condition referencing a qualifier nothing binds).
+/// 2. `side` is a user `AliasedRelation` → hoist `(inner) AS user_alias`.
+/// 3. `allow_flatten` and `side` is a [`flattenable_chain_aliases`] nested
+///    `Join` whose flattened aliases do not collide with `sibling_alias` (the
+///    outer join's other side) → recurse into [`render_join_from`] for a
+///    chained FROM with no wrapper (left-deep join chains parse to the same
+///    tree shape either way — ADR-001 transliteration). The sibling-collision
+///    guard is the spine-vs-outer-right half of the duplicate-alias check:
+///    without it a flattened left spine could reuse the outer right's alias in
+///    the same FROM scope, which DuckDB rejects. On collision we fall through
+///    to the isolating wrapper (step 4).
+/// 4. else → `(dispatch_op(side)) AS synthetic_alias` (existing fallback).
+fn render_join_side(
+    side: &TypedAst,
+    synthetic_alias: &str,
+    condition: Option<&Expression>,
+    allow_flatten: bool,
+    sibling_alias: Option<&str>,
+) -> Result<String, EmissionError> {
+    let condition_uses_synthetic = condition
+        .map(|c| expr_uses_qualifier(c, synthetic_alias))
+        .unwrap_or(false);
+    if condition_uses_synthetic {
+        let side_sql = dispatch_op(&side.op, &side.resolved_schema)?;
+        return Ok(format!("({side_sql}) AS {}", quote_ident(synthetic_alias)));
+    }
+    if let TypedOp::AliasedRelation { input, alias } = &side.op {
+        let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+        return Ok(format!("({inner_sql}) AS {}", quote_ident(alias)));
+    }
+    if allow_flatten {
+        if let Some(chain_aliases) = flattenable_chain_aliases(side) {
+            let collides_with_sibling = sibling_alias
+                .is_some_and(|s| chain_aliases.iter().any(|a| a.eq_ignore_ascii_case(s)));
+            if !collides_with_sibling {
+                // `flattenable_chain_aliases` has already validated the whole
+                // left spine, so emit it in a single walk via `emit_flat_chain`
+                // rather than recursing through `render_join_from` (which would
+                // re-run the O(spine) validation at every level → O(N^2)).
+                return emit_flat_chain(side);
+            }
+        }
+    }
+    let side_sql = dispatch_op(&side.op, &side.resolved_schema)?;
+    Ok(format!("({side_sql}) AS {}", quote_ident(synthetic_alias)))
+}
+
+/// Emit a validated-flattenable left-deep join chain as one chained `FROM`
+/// body (`(a) AS x K (b) AS y ON .. K (c) AS z ON ..`), walking the spine
+/// exactly once. Precondition: `side` passed [`flattenable_chain_aliases`], so
+/// every leaf is a user `AliasedRelation` and no re-validation is needed. Kept
+/// separate from [`render_join_from`] so the flatten path does not re-invoke
+/// the O(spine) flattenability check at each recursion level.
+fn emit_flat_chain(side: &TypedAst) -> Result<String, EmissionError> {
+    let TypedOp::Join {
+        left,
+        right,
+        join_type,
+        condition,
+        using_columns,
+        ..
+    } = &side.op
+    else {
+        // Precondition guarantees a Join; fall back defensively rather than panic.
+        return dispatch_op(&side.op, &side.resolved_schema);
+    };
+    let left_frag = match &left.op {
+        TypedOp::Join { .. } => emit_flat_chain(left)?,
+        TypedOp::AliasedRelation { input, alias } => {
+            let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+            format!("({inner_sql}) AS {}", quote_ident(alias))
+        }
+        _ => {
+            let inner_sql = dispatch_op(&left.op, &left.resolved_schema)?;
+            format!("({inner_sql}) AS {}", quote_ident(TD_JOIN_LEFT))
+        }
+    };
+    let right_frag = match &right.op {
+        TypedOp::AliasedRelation { input, alias } => {
+            let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+            format!("({inner_sql}) AS {}", quote_ident(alias))
+        }
+        _ => {
+            let inner_sql = dispatch_op(&right.op, &right.resolved_schema)?;
+            format!("({inner_sql}) AS {}", quote_ident(TD_JOIN_RIGHT))
+        }
+    };
+    let kind = join_kind_sql(*join_type);
+    let clause = render_join_clause(
+        *join_type,
+        condition.as_ref(),
+        using_columns,
+        &side.resolved_schema,
+    )?;
+    Ok(format!("{left_frag} {kind} {right_frag}{clause}"))
+}
+
 /// Render the `FROM` body of a join — the two aliased sides and the
-/// `ON`/`USING`/`CROSS` clause — without an enclosing `SELECT`. Hoists user
-/// `AliasedRelation` names into the subquery aliases so alias-qualified refs
-/// in the enclosing clause bind; falls back to synthetic `__td_jl`/`__td_jr`.
+/// `ON`/`USING`/`CROSS` clause — without an enclosing `SELECT`. Delegates
+/// each side to [`render_join_side`] (left may flatten a nested,
+/// user-aliased join chain; right never does — only the left spine of a
+/// left-deep join chain matches the original SQL FROM-list shape).
 /// `cond_schema` resolves the ON-condition expression.
 fn render_join_from(
     left: &TypedAst,
@@ -596,24 +779,19 @@ fn render_join_from(
     using_columns: &[String],
     cond_schema: &Schema,
 ) -> Result<String, EmissionError> {
-    // Pick subquery aliases: user AliasedRelation names take precedence.
-    let (left_ast, left_alias) = match &left.op {
-        TypedOp::AliasedRelation { input, alias } => (input.as_ref(), alias.clone()),
-        _ => (left, TD_JOIN_LEFT.to_owned()),
+    // The left spine may flatten into this FROM scope; guard it against reusing
+    // the outer right side's user alias (spine-vs-sibling half of the
+    // duplicate-alias check). The right side never flattens, so it needs no
+    // sibling guard.
+    let right_alias = match &right.op {
+        TypedOp::AliasedRelation { alias, .. } => Some(alias.as_str()),
+        _ => None,
     };
-    let (right_ast, right_alias) = match &right.op {
-        TypedOp::AliasedRelation { input, alias } => (input.as_ref(), alias.clone()),
-        _ => (right, TD_JOIN_RIGHT.to_owned()),
-    };
-    let left_sql = dispatch_op(&left_ast.op, &left_ast.resolved_schema)?;
-    let right_sql = dispatch_op(&right_ast.op, &right_ast.resolved_schema)?;
+    let left_from = render_join_side(left, TD_JOIN_LEFT, condition, true, right_alias)?;
+    let right_from = render_join_side(right, TD_JOIN_RIGHT, condition, false, None)?;
     let kind = join_kind_sql(join_type);
     let clause = render_join_clause(join_type, condition, using_columns, cond_schema)?;
-    let la = quote_ident(&left_alias);
-    let ra = quote_ident(&right_alias);
-    Ok(format!(
-        "({left_sql}) AS {la} {kind} ({right_sql}) AS {ra}{clause}"
-    ))
+    Ok(format!("{left_from} {kind} {right_from}{clause}"))
 }
 
 /// Render a projection slot, applying `spark_return_cast` at the top level
@@ -825,6 +1003,14 @@ fn render_set_op(
 /// produces right-side columns (semantically absent); the analyzer already
 /// computes the output schema accordingly (LeftSemi/LeftAnti → left schema
 /// only).
+///
+/// This is the `__td_jl`/`__td_jr` contract renderer `qualify_plan_id_refs`
+/// (analyzer.rs) and [`render_join_side`]'s condition-qualifier check both
+/// key off of — it stays unchanged by the alias-transparent-FROM work above.
+/// A user-qualified ref sitting directly above one of the OTHER synthetic
+/// wrappers (`__td_sort`/`__td_limit`/`__td_filter`) is a known-latent class
+/// of the same root cause with no corpus witness today — out of scope for
+/// this pass (see diagnostic-pass-6.md).
 fn render_join(
     left: &TypedAst,
     right: &TypedAst,
@@ -4273,22 +4459,26 @@ fn render_aggregate_op(
             "GROUPING SETS requires set-membership metadata (DataFrame groupingSets path not implemented in τ)",
         );
     }
-    // Aggregate-over-Filter-over-AliasedRelation inlining: correlated scalar
-    // subqueries (`SELECT max(e.salary) FROM emp e WHERE e.dept_id =
-    // d.dept_id`) lower to `Aggregate → Filter → AliasedRelation`. The default
-    // `(<child>) AS __td_agg` FROM (plus `render_filter`'s own `__td_filter`
-    // wrap) buries the user alias, so `max(e.salary)` and `WHERE e.dept_id`
-    // reference `e` at two different wrapper levels and neither binds. Collapse
-    // Filter + AliasedRelation into the aggregate's FROM so the alias is the
-    // table name and both slots and WHERE see it in a single SELECT (mirrors
-    // the Project-over-Filter-over-AliasedRelation branch in `render_project`).
+    // Aggregate-over-Join / Aggregate-over-Filter-over-Join / Aggregate-over-
+    // Filter-over-AliasedRelation / Aggregate-over-AliasedRelation inlining:
+    // any of these children already expose the aliases the aggregate slots,
+    // GROUP BY, and HAVING reference (`SELECT max(e.salary) FROM emp e WHERE
+    // e.dept_id = d.dept_id`, `SELECT d.dept_name, avg(e.salary) FROM emp e
+    // JOIN dept d ON ... GROUP BY d.dept_name`, etc.). The default `(<child>)
+    // AS __td_agg` FROM buries the user alias, so the aggregate slots /
+    // GROUP BY / HAVING and any correlated WHERE reference `e`/`d` at a
+    // wrapper level nothing binds. Reuse the same alias-transparent-FROM
+    // helper `render_project` inlines through (mirrors the Project branches);
+    // fall back to the `__td_agg` wrap for any other child shape.
     //
-    // KNOWN LIMITATION: same by-name correlated resolution caveat as
-    // `render_project` — accidentally correct when the correlation key's
-    // name+type coincide; the analyzer rejects the absent-column case (sq-010).
-    // A proper outer-scope stack is out of scope for this pass (ADR-008).
-    let from_clause = match render_filter_over_aliased_from(input)? {
-        Some(fw) => fw,
+    // KNOWN LIMITATION (Filter-over-AliasedRelation carve-out only): the
+    // correlated outer reference resolves by-NAME against the inner schema
+    // (accidentally correct when the correlation key's name+type coincide;
+    // the analyzer rejects the absent-column case, sq-010). A proper
+    // outer-scope stack is out of scope for this pass (ADR-008).
+    let atf = render_alias_transparent_from(input)?;
+    let from_clause = match &atf {
+        Some(a) => a.from_sql.clone(),
         None => {
             let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
             format!("({child_sql}) AS __td_agg")
@@ -4318,6 +4508,12 @@ fn render_aggregate_op(
         render_projection_slot(e, input_schema)
     })?;
     let mut sql = format!("SELECT {slots} FROM {from_clause}");
+    // Emitted before GROUP BY: the Filter-over-{Join,AliasedRelation} arms of
+    // `render_alias_transparent_from` carry a WHERE fragment (the comma-join
+    // predicate or the correlated-subquery predicate) alongside their FROM.
+    if let Some(w) = atf.as_ref().and_then(|a| a.where_sql.as_ref()) {
+        sql.push_str(&format!(" WHERE {w}"));
+    }
     // Emit a GROUP BY whenever there are flat grouping columns, OR when this is
     // a GROUPING SETS aggregate with at least one set. The latter covers the
     // all-empty case `GROUP BY GROUPING SETS ((), ())`: the flat grouping list
@@ -6132,6 +6328,450 @@ mod tests {
         assert!(sql.contains(") AS e WHERE "), "got: {sql}");
         assert!(!sql.contains("__td_filter"), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
+    }
+
+    // ── Pass 6: alias-transparent FROM for aggregate inputs & nested join
+    // sides (jn-013/jn-015/sq-015) ────────────────────────────────────────
+
+    /// Third table for three-way-join / nested-join-side tests — `emp2` in
+    /// the diagnostic's jn-013 shape.
+    fn emp2_schema() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("country", DataType::String),
+        ])
+    }
+
+    fn base_types_emp_dept_emp2(plan: &CommonAst) -> BaseTypes {
+        BaseTypes::build_from_plan(plan, |name| match name {
+            "emp" => Some(emp_schema()),
+            "dept" => Some(dept_schema()),
+            "emp2" => Some(emp2_schema()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn render_aggregate_over_join_hoists_user_aliases_no_td_agg_or_td_jl() {
+        let _g = tap_guard();
+        // jn-015: SELECT d.dept_name, avg(e.salary) AS avg_sal FROM emp e
+        //   JOIN dept d ON e.dept_id = d.dept_id GROUP BY d.dept_name
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(join),
+            grouping: vec![qcol("d", "dept_name")],
+            aggregates: vec![
+                qcol("d", "dept_name"),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(fexpr("avg", vec![qcol("e", "salary")])),
+                    alias: "avg_sal".to_owned(),
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze aggregate-over-join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains(") AS e INNER JOIN ("), "got: {sql}");
+        assert!(sql.contains(") AS d ON "), "got: {sql}");
+        assert!(sql.contains("GROUP BY d.dept_name"), "got: {sql}");
+        assert!(!sql.contains("__td_agg"), "got: {sql}");
+        assert!(!sql.contains("__td_jl"), "got: {sql}");
+        assert!(!sql.contains("__td_jr"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_aggregate_over_aliased_relation_with_having_no_td_agg() {
+        let _g = tap_guard();
+        // sq-015: SELECT e.dept_id, count(*) AS n FROM emp e GROUP BY
+        //   e.dept_id HAVING count(*) > 1
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(aliased_scan("emp", "e")),
+            grouping: vec![qcol("e", "dept_id")],
+            aggregates: vec![
+                qcol("e", "dept_id"),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(fexpr(
+                        "count",
+                        vec![Expression::Star(StarExpression { qualifier: None })],
+                    )),
+                    alias: "n".to_owned(),
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: Some(count_star_gt_one()),
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze aggregate-over-aliased-relation+having");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains(") AS e"), "got: {sql}");
+        assert!(sql.contains("GROUP BY e.dept_id"), "got: {sql}");
+        assert!(sql.contains("HAVING "), "got: {sql}");
+        assert!(!sql.contains("__td_agg"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_aggregate_over_filter_over_join_chains_from_and_where_before_group_by() {
+        let _g = tap_guard();
+        // SELECT d.dept_name, avg(e.salary) FROM emp e, dept d
+        //   WHERE e.dept_id = d.dept_id GROUP BY d.dept_name
+        // (comma-join lowers to Aggregate → Filter → Join.)
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Cross,
+            condition: None,
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(join),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            }),
+        });
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(filter),
+            grouping: vec![qcol("d", "dept_name")],
+            aggregates: vec![
+                qcol("d", "dept_name"),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(fexpr("avg", vec![qcol("e", "salary")])),
+                    alias: "avg_sal".to_owned(),
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze aggregate-over-filter-over-join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains(") AS e CROSS JOIN ("), "got: {sql}");
+        assert!(sql.contains(") AS d WHERE "), "got: {sql}");
+        assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
+        assert!(sql.contains("GROUP BY d.dept_name"), "got: {sql}");
+        assert!(!sql.contains("__td_agg"), "got: {sql}");
+        assert!(!sql.contains("__td_filter"), "got: {sql}");
+        let where_pos = sql.find(" WHERE ").expect("where clause present");
+        let group_pos = sql.find(" GROUP BY ").expect("group by clause present");
+        assert!(where_pos < group_pos, "WHERE must precede GROUP BY: {sql}");
+    }
+
+    #[test]
+    fn render_project_over_nested_join_flattens_three_way_chain() {
+        let _g = tap_guard();
+        // jn-013: SELECT e.name, d.dept_name FROM emp e JOIN dept d
+        //   ON e.dept_id = d.dept_id JOIN emp2 m ON d.dept_id = m.dept_id
+        let inner_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let outer_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(inner_join),
+            right: Box::new(aliased_scan("emp2", "m")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("d", "dept_id")),
+                right: Box::new(qcol("m", "dept_id")),
+            })),
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(outer_join),
+            projections: vec![qcol("e", "name"), qcol("d", "dept_name")],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze three-way join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains(") AS e INNER JOIN ("), "got: {sql}");
+        assert!(sql.contains(") AS d ON "), "got: {sql}");
+        assert!(sql.contains(") AS m ON "), "got: {sql}");
+        assert!(!sql.contains("__td_jl"), "got: {sql}");
+        assert!(!sql.contains("__td_jr"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_project_over_nested_join_duplicate_alias_refuses_flatten() {
+        let _g = tap_guard();
+        // Reviewer pass-6 Medium: a nested join whose flattened chain would
+        // reuse a user alias must NOT flatten, or DuckDB rejects the FROM with
+        // "Duplicate alias". Here the inner join's left is `emp m` and the
+        // OUTER right is `emp2 m` — flattening would put two `AS m` in one FROM
+        // scope. The sibling-collision guard must keep the inner join wrapped
+        // in `__td_jl` instead.
+        let inner_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "m")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("m", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let outer_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(inner_join),
+            right: Box::new(aliased_scan("emp2", "m")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("d", "dept_id")),
+                right: Box::new(qcol("m", "dept_id")),
+            })),
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(outer_join),
+            projections: vec![qcol("d", "dept_name")],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze duplicate-alias join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // Guard fired: inner join stays wrapped (not flattened into the chain).
+        assert!(
+            sql.contains("__td_jl"),
+            "duplicate-alias chain must not flatten; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_join_from_dataframe_plan_id_contract_keeps_td_jl_no_flatten() {
+        let _g = tap_guard();
+        // DataFrame join-of-join, plan_id-tagged outer condition:
+        // `df.join(df2).join(df3, ...)` — `qualify_plan_id_refs` stamps the
+        // outer condition's refs to `__td_jl`/`__td_jr` from `left_plan_ids`/
+        // `right_plan_ids`. `render_join_side` must honor that (ladder case
+        // 1) rather than flattening the nested join into a chained FROM.
+        let inner_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Cross,
+            condition: None,
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        // `id` (unique to `emp` within the inner join's merged schema) and
+        // `country` (unique to `emp2`) avoid an unrelated `AmbiguousColumn`
+        // from the `dept_id` name that both `dept` and `emp2` share.
+        let outer_condition = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: Some(1),
+                },
+            )),
+            right: Box::new(Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "country".to_owned(),
+                    qualifier: None,
+                    plan_id: Some(2),
+                },
+            )),
+        });
+        let outer_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(inner_join),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: Some(outer_condition),
+            using_columns: vec![],
+            left_plan_ids: vec![1],
+            right_plan_ids: vec![2],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(outer_join),
+            projections: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze DataFrame join-of-join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // Both outer sides carry a plan_id-stamped reference in the outer
+        // condition, so both stay wrapped in their synthetic alias — no
+        // flatten, no hoisted user alias at the outer level.
+        assert!(
+            sql.contains("AS __td_jl INNER JOIN (SELECT * FROM emp2) AS __td_jr"),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_join_side_plan_id_condition_overrides_aliased_relation_hoist() {
+        let _g = tap_guard();
+        // Latent-hazard guard: `df.alias("e").join(df2.alias("d"), ...)` with
+        // a plan_id-tagged (not user-qualified) condition. Even though both
+        // sides are user `AliasedRelation`s, the plan_id contract (ladder
+        // case 1) must win over the alias hoist (ladder case 2) — otherwise
+        // the analyzer-stamped `__td_jl`/`__td_jr` condition would reference
+        // a qualifier the emitted FROM never binds.
+        let condition = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: Some(1),
+                },
+            )),
+            right: Box::new(Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: Some(2),
+                },
+            )),
+        });
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: Some(condition),
+            using_columns: vec![],
+            left_plan_ids: vec![1],
+            right_plan_ids: vec![2],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(join),
+            projections: vec![],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze plan_id-tagged aliased join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("(SELECT * FROM (SELECT * FROM emp) AS e) AS __td_jl"),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains("(SELECT * FROM (SELECT * FROM dept) AS d) AS __td_jr"),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_aggregate_over_join_using_inlines_from_no_td_agg() {
+        let _g = tap_guard();
+        // USING-under-aggregate regression pin: a direct (non-nested) USING
+        // join under Aggregate still inlines through
+        // `render_alias_transparent_from` (no `__td_agg`); USING's own
+        // column-order semantics are unaffected (join_chain_flattenable only
+        // governs whether a NESTED join side flattens).
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(join),
+            grouping: vec![ucol("dept_id")],
+            aggregates: vec![
+                ucol("dept_id"),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(fexpr(
+                        "count",
+                        vec![Expression::Star(StarExpression { qualifier: None })],
+                    )),
+                    alias: "n".to_owned(),
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze aggregate-over-using-join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("USING (dept_id)"), "got: {sql}");
+        assert!(sql.contains("GROUP BY dept_id"), "got: {sql}");
+        assert!(!sql.contains("__td_agg"), "got: {sql}");
+    }
+
+    #[test]
+    fn render_project_over_nested_semi_join_side_breaks_chain_flatten() {
+        let _g = tap_guard();
+        // SEMI/ANTI-break regression pin: an inner SEMI JOIN, as the left
+        // side of an outer join, must not flatten into the outer join's
+        // chained FROM (CLAUDE.md gotcha 4) — `join_chain_flattenable`
+        // rejects LeftSemi/LeftAnti, so it keeps its own generic
+        // `render_join` wrap (correct `SEMI JOIN`, never `LEFT SEMI JOIN`).
+        let inner_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::LeftSemi,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let outer_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(inner_join),
+            right: Box::new(aliased_scan("emp2", "m")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("m", "dept_id")),
+            })),
+            using_columns: vec![],
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(outer_join),
+            projections: vec![qcol("e", "name")],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze semi-join-chain");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("SEMI JOIN"), "got: {sql}");
+        assert!(!sql.contains("LEFT SEMI JOIN"), "got: {sql}");
+        assert!(sql.contains("__td_jl"), "got: {sql}");
+        assert!(sql.contains(") AS m ON "), "got: {sql}");
     }
 
     fn ucol(name: &str) -> Expression {

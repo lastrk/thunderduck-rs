@@ -304,6 +304,18 @@ case("agg-020", "aggregate", "any / every boolean aggregates", "SELECT dept_id, 
 # args (and window PARTITION BY / ORDER BY), so GROUP BY ALL correctly groups
 # only by `dept_id`.
 case("agg-021", "aggregate", "GROUP BY ALL excludes aggregate nested in fn args (spark4)", "SELECT dept_id, abs(count(*)) n FROM emp GROUP BY ALL", flags=("spark4",))
+# agg-022 / agg-023: KNOWN-RED witnesses (NOT a pass-3 fix — out of findings
+# 1-6). `function_call_has_aggregate` (v2_lowering.rs, added by the agg-021 fix)
+# walks sqlparser's `Expr` tree, but SQL *special-form* syntax parses to
+# dedicated `Expr` variants — `EXTRACT(f FROM x)` -> `Expr::Extract`,
+# `SUBSTRING(s FROM p FOR n)` -> `Expr::Substring` — for which the aggregate
+# walker has no arms. An aggregate nested inside such a special form is missed,
+# so under `GROUP BY ALL` it is not excluded from the grouping keys and τ tries
+# to GROUP BY an expression that contains an aggregate -> DuckDB error. Spark
+# groups only by `dept_id`. Fails until the walker covers the special-form
+# `Expr` shapes (same bug class as agg-021, different syntax).
+case("agg-022", "aggregate", "aggregate nested in EXTRACT special form under GROUP BY ALL (known gap)", "SELECT dept_id, extract(YEAR FROM max(last_login)) y FROM emp GROUP BY ALL", flags=("spark4",))
+case("agg-023", "aggregate", "aggregate nested in SUBSTRING special form under GROUP BY ALL (known gap)", "SELECT dept_id, substring(max(name) FROM 1 FOR 2) s FROM emp GROUP BY ALL", flags=("spark4",))
 
 # ── 5. ORDER BY / LIMIT ──────────────────────────────────────────────────────
 case("ord-001", "ordering", "ORDER BY asc (default)", "SELECT * FROM emp ORDER BY salary")
@@ -447,6 +459,16 @@ case("gx-010", "group_ext", "GROUP BY ... WITH ROLLUP (Hive syntax)", "SELECT de
 # args). The generic `children_mut` walk now splices the ROLLUP grouping
 # columns regardless of the surrounding container shape.
 case("gx-011", "group_ext", "grouping_id() nested in arithmetic expr (ROLLUP)", "SELECT dept_id, active, grouping_id() + 1 AS gid1, count(*) n FROM emp GROUP BY ROLLUP (dept_id, active)")
+# gx-012: KNOWN-RED witness (NOT a pass-3 fix — out of findings 1-6). The gx-011
+# fix widened `rewrite_grouping_id` (emission.rs) so a no-arg `grouping_id()`
+# gets the grouping columns spliced in anywhere in the aggregate SELECT list —
+# but `render_aggregate_op` still emits the HAVING predicate through plain
+# `render_expr`, WITHOUT the rewrite. So a no-arg `grouping_id()` in HAVING
+# reaches DuckDB as a zero-arg call -> parser error (DuckDB requires explicit
+# grouping-column args). Spark accepts grouping functions in HAVING over
+# ROLLUP/CUBE/GROUPING SETS. Flips green once the HAVING render path also
+# splices the grouping columns (the render-side companion to the gx-011 fix).
+case("gx-012", "group_ext", "grouping_id() in HAVING over ROLLUP (known gap)", "SELECT dept_id, count(*) n FROM emp GROUP BY ROLLUP (dept_id) HAVING grouping_id() = 0")
 
 # ── 13. Complex types & LATERAL VIEW ─────────────────────────────────────────
 case("cx-001", "complex_type", "array literal + element access", "SELECT array(1, 2, 3) AS arr, array(1,2,3)[0] AS first")
@@ -497,6 +519,15 @@ case("tbl-010", "table_expr", "subquery alias required", "SELECT t.dept_id, t.n 
 # `table_function_table_syntax_with_alias_columns_renames_via_todf` in
 # `crates/core/src/parser_v2/v2_lowering.rs`.
 case("tbl-011", "table_expr", "LATERAL table function with column alias list", "SELECT r.id FROM LATERAL range(3) AS r(id)")
+# tbl-012: KNOWN-RED witness (NOT a pass-3 fix — out of findings 1-6). The
+# tbl-011 fix restored the *alias* on `TableFactor::Function` (`LATERAL
+# f(...)`), but the arm still swallows the `lateral: true` flag (`..`), so
+# correlation to outer columns is lost; and the underlying generator TVF
+# (`explode`) has no τ table-function analysis yet (see tbl-007). A correlated
+# lateral generator — `LATERAL explode(e.tags)` referencing the outer row — is
+# valid Spark 4.x (SPARK-41961) but fails end-to-end in τ today. Flips green
+# once both the swallowed `lateral` flag and generator-TVF analysis land.
+case("tbl-012", "table_expr", "correlated LATERAL table function over outer column (known gap)", "SELECT e.id, r.v FROM emp e, LATERAL explode(e.tags) AS r(v)")
 
 # ── 15. Advanced predicates / SQL-specific operators ─────────────────────────
 case("pr-001", "predicate_adv", "IS DISTINCT FROM", "SELECT * FROM emp WHERE dept_id IS DISTINCT FROM 10")

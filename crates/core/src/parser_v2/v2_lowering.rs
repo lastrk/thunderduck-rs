@@ -2636,10 +2636,10 @@ fn extract_interval_int(expr: &Expr) -> Option<i32> {
 /// Extract the string value of a compound interval literal (`'1-2'`,
 /// `'1 02:30:00'`). Compound ANSI interval values are always single-quoted
 /// strings; a non-string value is a Thunderduck boundary.
-fn extract_interval_string(expr: &Expr) -> Option<String> {
+fn extract_interval_string(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Value(v) => match &v.value {
-            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Some(s.clone()),
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Some(s.as_str()),
             _ => None,
         },
         _ => None,
@@ -2674,7 +2674,7 @@ fn lower_compound_interval(iv: Interval) -> Result<Expression, EmissionError> {
 
     match (leading, last) {
         (DateTimeField::Year, DateTimeField::Month) => {
-            let months = parse_year_month_value(&value)?;
+            let months = parse_year_month_value(value)?;
             Ok(Expression::Interval(IntervalExpression {
                 months,
                 days: 0,
@@ -2683,7 +2683,7 @@ fn lower_compound_interval(iv: Interval) -> Result<Expression, EmissionError> {
             }))
         }
         (DateTimeField::Day, DateTimeField::Second) => {
-            let (days, microseconds) = parse_day_second_value(&value)?;
+            let (days, microseconds) = parse_day_second_value(value)?;
             Ok(Expression::Interval(IntervalExpression {
                 months: 0,
                 days,
@@ -3411,7 +3411,7 @@ mod tests {
     use sqlparser::parser::Parser;
 
     fn parse(sql: &str) -> Result<CommonAst, EmissionError> {
-        let dialect = SparkDialect::default();
+        let dialect = SparkDialect;
         let mut stmts =
             Parser::parse_sql(&dialect, sql).map_err(|e| EmissionError::Unsupported {
                 kind: UnsupportedKind::Op,
@@ -3425,7 +3425,7 @@ mod tests {
     /// Parse a single SparkDialect scalar expression into a sqlparser `Expr`,
     /// for the `expr_has_aggregate` classifier parity table.
     fn parse_expr(sql: &str) -> Expr {
-        let dialect = SparkDialect::default();
+        let dialect = SparkDialect;
         Parser::new(&dialect)
             .try_with_sql(sql)
             .expect("tokenize")

@@ -92,8 +92,11 @@ impl TypeInferenceEngine {
     /// Shared resolver behind [`Self::qualified_column_type`] /
     /// [`Self::qualified_column_nullable`]. Tries `qualifier` as a struct
     /// column first (with recursive nested-field resolution), then falls back
-    /// to the unqualified lookup.
-    fn qualified_column_info(
+    /// to the unqualified lookup. `pub(super)` so [`super::analyzer`]'s
+    /// `resolve_column` can call it once per fallback site instead of the
+    /// `qualified_column_type` + `qualified_column_nullable` pair (each of
+    /// which re-runs this same resolution end-to-end).
+    pub(super) fn qualified_column_info(
         name: &str,
         qualifier: Option<&str>,
         schema: &StructType,

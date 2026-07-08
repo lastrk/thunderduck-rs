@@ -4207,22 +4207,14 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
     Ok(format!("{duck_name}({distinct}{args_sql})"))
 }
 
-/// Render the `Aggregate` operator. Emits
-/// `SELECT <aggregates> FROM (<child>) AS __td_agg [GROUP BY <groupings>]`.
-/// The analyzer already resolves each `aggregate` expression's type; this
-/// renderer relies on `render_projection_slot` (which applies
-/// [`spark_return_cast`] on non-aggregate slots) and passes aggregate slots
-/// through unchanged — aggregate-return casts are the responsibility of the
-/// aggregate function arm itself (via [`spark_aggregate_return_cast`], wired
-/// per checklist §5.7 when needed).
 /// Rewrite no-arg `grouping_id()` / `grouping()` anywhere in an aggregate
 /// slot to `grouping_id(<grouping cols>)` — DuckDB has no zero-arg form
 /// (it is a parse error). Also applied to the HAVING predicate, which can
 /// legally carry these grouping functions over ROLLUP/CUBE/GROUPING SETS.
-/// Generic `children_mut` walk (pass-3 kept this
-/// narrow pending a corpus witness; `grouping_id() + 1` via `Binary` is
-/// that witness — see tasks/v2-simplification-pass-log.md flag #6).
-/// Widening is safe: an unrewritten zero-arg call is a guaranteed
+/// Uses a generic `children_mut` walk to reach nested occurrences (pass-3
+/// kept this narrow pending a corpus witness; `grouping_id() + 1` via
+/// `Binary` is that witness — see tasks/v2-simplification-pass-log.md flag
+/// #6). Widening is safe: an unrewritten zero-arg call is a guaranteed
 /// whole-query DuckDB parse error, so the walk only converts errors into
 /// the Spark-intended emission — it cannot change working output.
 /// Subquery bodies stay opaque per the `children`/`children_mut` walker
@@ -4246,6 +4238,23 @@ fn rewrite_grouping_id(expr: &mut Expression, grouping: &[Expression]) {
     }
 }
 
+/// Clone `expr` and splice in any no-arg `grouping_id()`/`grouping()` calls
+/// via [`rewrite_grouping_id`]. Shared by the aggregate-slot and HAVING
+/// rendering paths in `render_aggregate_op`.
+fn with_grouping_id_spliced(expr: &Expression, grouping: &[Expression]) -> Expression {
+    let mut e = expr.clone();
+    rewrite_grouping_id(&mut e, grouping);
+    e
+}
+
+/// Render the `Aggregate` operator. Emits
+/// `SELECT <aggregates> FROM (<child>) AS __td_agg [GROUP BY <groupings>]`.
+/// The analyzer already resolves each `aggregate` expression's type; this
+/// renderer relies on `render_projection_slot` (which applies
+/// [`spark_return_cast`] on non-aggregate slots) and passes aggregate slots
+/// through unchanged — aggregate-return casts are the responsibility of the
+/// aggregate function arm itself (via [`spark_aggregate_return_cast`], wired
+/// per checklist §5.7 when needed).
 fn render_aggregate_op(
     input: &TypedAst,
     grouping: &[Expression],
@@ -4302,11 +4311,7 @@ fn render_aggregate_op(
     // doc comment); mutates a per-slot clone in place.
     let rewritten_aggregates: Vec<Expression> = aggregates
         .iter()
-        .map(|a| {
-            let mut e = a.clone();
-            rewrite_grouping_id(&mut e, grouping);
-            e
-        })
+        .map(|a| with_grouping_id_spliced(a, grouping))
         .collect();
     let keys: &[Expression] = if already_folded { &[] } else { grouping };
     let slots = sql_join(keys.iter().chain(rewritten_aggregates.iter()), ", ", |e| {
@@ -4359,8 +4364,7 @@ fn render_aggregate_op(
         // `grouping_id()`/`grouping()` (Spark-legal over ROLLUP/CUBE/GROUPING
         // SETS) which DuckDB has no surface form for. Splice the ambient
         // grouping columns into a clone before rendering.
-        let mut h = h.clone();
-        rewrite_grouping_id(&mut h, grouping);
+        let h = with_grouping_id_spliced(h, grouping);
         let having_sql = render_expr(&h, input_schema)?;
         sql.push_str(&format!(" HAVING {having_sql}"));
     }

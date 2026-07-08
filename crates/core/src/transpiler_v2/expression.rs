@@ -445,6 +445,8 @@ pub struct IntervalExpression {
     pub months: i32,
     pub days: i32,
     pub microseconds: i64,
+    /// Semantic kind — emission-invisible; steers `data_type()`. See
+    /// [`IntervalKind`].
     pub kind: IntervalKind,
 }
 

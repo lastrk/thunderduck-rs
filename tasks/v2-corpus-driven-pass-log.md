@@ -1445,3 +1445,20 @@ the summary below records the corpus deltas by pass number.
   duplicate→legacy-no-panic, struct-precedence, join-condition stamp; corpus jn-006 green.
 - **Diagnostic:** `.agent-output/diagnostic-pass-4.md` · **Architecture:** `.agent-output/architecture-pass-4.md`
 - **SHA-to-be:** feat(v2-corpus): pass 4 — jn-006 (246→247)
+
+## Pass 5 — tech-debt sweep (247→247, behavior-preserving)
+
+rust-reviewer swept the code touched by passes 1-4; 9 trivial/low behavior-preserving findings
+applied (no Critical/High). Highlights: removed the one NEW clippy warning
+(`SparkDialect::default()` in test helpers); split a misattached doc block between
+`render_aggregate_op` and `rewrite_grouping_id`; documented `IntervalExpression.kind`; derived
+`Debug` on `ResolveContext` and dropped an unused `Clone` on `QualifierScopes`; collapsed
+`resolve_column`'s duplicate legacy-fallback arms behind a `ResolveContext::scoped_range` helper
+(bounds-guard + debug_assert now shared by tier (e) AND the synthetic-qualifier arm); made
+`qualified_column_info` `pub(super)` and call it once per fallback site (was `qualified_column_type`
++ `qualified_column_nullable`, double work); extracted `with_grouping_id_spliced` (dedup of the
+clone-then-splice pattern); `extract_interval_string` now returns `Option<&str>`. Deliberately NOT
+touched: the expr_has_aggregate / resolve_named_windows_in_expr symmetric duplication (design
+choice); pre-existing baseline clippy drift.
+Gate green (747 unit tests). Corpora unchanged: SQL 247/23/270, DataFrame 329/329 (verified —
+findings 6/7 touch the shared resolve_column path). Sweep report source: rust-reviewer pass-5 sweep.

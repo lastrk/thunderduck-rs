@@ -2372,7 +2372,7 @@ fn qualify_plan_id_refs(expr: &mut Expression, left_ids: &[i64], right_ids: &[i6
 
 /// Alias/table-name → contiguous field-range bindings for a resolution
 /// schema. Built once per [`ResolveContext`] by [`collect_qualifier_bindings`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct QualifierScopes {
     bindings: Vec<(String, std::ops::Range<usize>)>,
 }
@@ -2405,6 +2405,7 @@ impl QualifierScopes {
 /// Threaded through `resolve_and_stamp` / `resolve_column` / `resolve_expr_list`
 /// / `resolve_boolean_predicate` in place of the bare `&StructType` they
 /// previously took.
+#[derive(Debug)]
 struct ResolveContext<'a> {
     /// The current operator's resolution schema (already outer-join-flipped
     /// and positionally merged, per [`apply_join_nullability`] /
@@ -2463,6 +2464,26 @@ impl<'a> ResolveContext<'a> {
             scopes: QualifierScopes::empty(),
             base_types,
         }
+    }
+
+    /// Look up `q`'s alias-scope range, guarding it against the current
+    /// schema's length. `QualifierScopes::lookup` only ever binds ranges
+    /// within the schema they were built from, so an out-of-bounds range is
+    /// an analyzer invariant violation — surface it loudly in debug builds,
+    /// but degrade to `None` (the caller's legacy fallback) in release
+    /// rather than panicking on the index. Shared by the synthetic
+    /// `__td_jl`/`__td_jr` join-qualifier arm and tier (e) in
+    /// `resolve_column`, so both get the identical guard.
+    fn scoped_range(&self, q: &str) -> Option<std::ops::Range<usize>> {
+        self.scopes.lookup(q).filter(|range| {
+            let in_bounds = range.end <= self.schema.len();
+            debug_assert!(
+                in_bounds,
+                "qualifier `{q}` scope range {range:?} exceeds schema of {} fields",
+                self.schema.len()
+            );
+            in_bounds
+        })
     }
 }
 
@@ -2657,18 +2678,14 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     }
     let (dt, nullable) = if is_synthetic_join_qualifier {
         let q = u.qualifier.as_deref().unwrap_or_default();
-        // Guard the slice exactly as tier (e) below: an out-of-bounds range
-        // would be an analyzer invariant violation (`for_join_condition` only
-        // ever binds ranges within the schema it built). Filter it out so a
-        // violation degrades to the legacy field-by-name fallback rather than
-        // panicking on the index.
-        match ctx
-            .scopes
-            .lookup(q)
-            .filter(|range| range.end <= ctx.schema.len())
-            .and_then(|range| {
-                TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range])
-            }) {
+        // `scoped_range` guards the slice exactly as tier (e) below: an
+        // out-of-bounds range would be an analyzer invariant violation
+        // (`for_join_condition` only ever binds ranges within the schema it
+        // built). Filter it out so a violation degrades to the legacy
+        // field-by-name fallback rather than panicking on the index.
+        match ctx.scoped_range(q).and_then(|range| {
+            TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range])
+        }) {
             Some(info) => info,
             None => ctx
                 .schema
@@ -2683,13 +2700,14 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         if let Some(info) = TypeInferenceEngine::struct_qualifier_info(&u.name, q, ctx.schema) {
             info
         } else {
-            match ctx.scopes.lookup(q) {
-                // (e) qualifier binds exactly one relation scope — restrict
-                // the name-only lookup to that relation's own fields. A miss
-                // here means `q` is a real, unambiguous relation but `name`
-                // does not exist on it: a Spark-emulated `UnknownColumn`
-                // (ADR-022 cat-1), not an opaque DuckDB bind error.
-                Some(range) if range.end <= ctx.schema.len() => {
+            match ctx.scoped_range(q) {
+                // (e) qualifier binds exactly one in-bounds relation scope —
+                // restrict the name-only lookup to that relation's own
+                // fields. A miss here means `q` is a real, unambiguous
+                // relation but `name` does not exist on it: a Spark-emulated
+                // `UnknownColumn` (ADR-022 cat-1), not an opaque DuckDB bind
+                // error.
+                Some(range) => {
                     match TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range]) {
                         Some(info) => info,
                         None => {
@@ -2700,40 +2718,17 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                         }
                     }
                 }
-                // Defensive: an out-of-bounds range would be an analyzer
-                // invariant violation (never expected — `collect_qualifier_bindings`
-                // only ever binds ranges within the schema it was built from).
-                // Surface loudly in debug builds, degrade to the legacy
-                // fallback in release rather than panicking on a production path.
-                Some(range) => {
-                    debug_assert!(
-                        false,
-                        "qualifier `{q}` scope range {range:?} exceeds schema of {} fields",
-                        ctx.schema.len()
-                    );
-                    (
-                        TypeInferenceEngine::qualified_column_type(&u.name, Some(q), ctx.schema),
-                        TypeInferenceEngine::qualified_column_nullable(
-                            &u.name,
-                            Some(q),
-                            ctx.schema,
-                        ),
-                    )
-                }
-                // (f) qualifier binds no scope (e.g. USING joins stay on the
-                // legacy path — `collect_qualifier_bindings` STOPs there) —
-                // unchanged legacy fallback.
-                None => (
-                    TypeInferenceEngine::qualified_column_type(&u.name, Some(q), ctx.schema),
-                    TypeInferenceEngine::qualified_column_nullable(&u.name, Some(q), ctx.schema),
-                ),
+                // (f) qualifier binds no in-bounds scope — either no scope at
+                // all (e.g. USING joins stay on the legacy path —
+                // `collect_qualifier_bindings` STOPs there), or `scoped_range`
+                // caught an out-of-bounds invariant violation (defensive,
+                // never expected in practice) and degraded here. Both cases
+                // share the identical legacy fallback.
+                None => TypeInferenceEngine::qualified_column_info(&u.name, Some(q), ctx.schema),
             }
         }
     } else {
-        (
-            TypeInferenceEngine::qualified_column_type(&u.name, None, ctx.schema),
-            TypeInferenceEngine::qualified_column_nullable(&u.name, None, ctx.schema),
-        )
+        TypeInferenceEngine::qualified_column_info(&u.name, None, ctx.schema)
     };
     if matches!(dt, DataType::Unresolved) {
         return Err(AnalyzerError::UnknownColumn {

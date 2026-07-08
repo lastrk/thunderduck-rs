@@ -2,7 +2,7 @@
 name: rust-architect
 description: Rust architect. Designs module boundaries, types, ownership. Read-only; plans, not code.
 tools: [Read, Bash, mcp__codegraph__*, mcp__semble__*]
-model: fable
+model: opus
 effort: max
 ---
 

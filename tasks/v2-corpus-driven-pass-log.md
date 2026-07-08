@@ -1411,3 +1411,37 @@ the summary below records the corpus deltas by pass number.
   mid-run but had completed the edits; the driver re-ran the gate. Perf reviewer run on sonnet to
   dodge the opus limit. Consider sonnet overrides for the read-write/perf agents if 429s recur.
 - **SHA-to-be:** feat(v2-corpus): pass 3 — lit-004/lit-005 (244→246)
+
+## Pass 4 — jn-006 (246→247)
+
+- **Case:** jn-006 `SELECT e.id, d.dept_id FROM emp e CROSS JOIN dept d`
+- **Owning layer:** analyzer (`crates/core/src/transpiler_v2/analyzer.rs` + `type_inference.rs`)
+- **Root cause:** NOT a join-nullability-rule bug (`apply_join_nullability` is correct). Qualified
+  column resolution over the flat merged join schema used name-only first-match; a RELATION ALIAS
+  (`d`) was not understood (only struct-column qualifiers were), so `d.dept_id` resolved to emp's
+  first `dept_id` (nullable) instead of dept's (non-nullable) — and could stamp the wrong TYPE.
+  Latent for INNER/RIGHT joins too; jn-006 is the first witness (jn-001..005 project unique names).
+- **Fix:** alias-aware resolution — map each relation alias to a CONTIGUOUS field Range in the current
+  (already-flipped) resolution schema via a new `collect_qualifier_bindings` walk, wrapped in a
+  `ResolveContext { schema, scopes, base_types }`; `resolve_column` restricts the name lookup to the
+  bound side's field range. Ranges over the flip-applied ancestor schema are correct under nested
+  joins (unlike the retained pre-flip per-side schemas). resolve precedence: struct-path → synthetic
+  __td_jl/jr (scoped) → unqualified-ambiguity → struct-qualifier-wins → NEW range-scoped alias lookup
+  (miss → Spark-emulated UnknownColumn) → legacy fallback. USING joins bail to legacy (output
+  reordering breaks contiguity). type_inference extraction (`struct_qualifier_info`, `column_info_in`),
+  behavior-preserving. NO AST/schema representational change (deferral dissolved) — the info is
+  derivable from merge()'s positional invariant + retained typed children.
+- **ADRs:** ADR-005 (analyzer owns type/nullability), ADR-004 (front-end-agnostic; INV7 deleted per
+  ADR-022 §CV.5), ADR-006 (one bottom-up pass), ADR-015 (AnalyzePlan schema oracle), ADR-022
+  (range-miss UnknownColumn = Spark-emulated).
+- **Findings closed:** reviewer Critical=0 High=0 (1 Medium semi/anti test gap + 2 Lows: unguarded
+  synthetic slice, overclaiming comment — ALL fixed in a coder fix-loop, incl. extending the walk's
+  passthrough set to Deduplicate/NaFill/NaDrop/NaReplace); perf High=0 Medium=0.
+- **Before→after:** SQL 246 → 247 passed (270 total), +1, no regression. DataFrame corpus 329/329
+  (verified — shared analyzer path).
+- **Tests:** pin table (Cross/Inner/Left/Right/Full qualified-ref type+nullability, wrong-type dup,
+  nested-join flip-through-range, Project(Filter(Join)) + Project(Deduplicate(Join)) passthrough,
+  semi/anti left-only + sibling-offset), unqualified→AmbiguousColumn, absent→UnknownColumn, self-join
+  duplicate→legacy-no-panic, struct-precedence, join-condition stamp; corpus jn-006 green.
+- **Diagnostic:** `.agent-output/diagnostic-pass-4.md` · **Architecture:** `.agent-output/architecture-pass-4.md`
+- **SHA-to-be:** feat(v2-corpus): pass 4 — jn-006 (246→247)

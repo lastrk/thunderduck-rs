@@ -48,29 +48,45 @@ impl TypeInferenceEngine {
 
     /// Shared resolver behind [`Self::column_type`] / [`Self::column_nullable`]:
     /// `(data_type, nullable)` of `name` in `schema`. Not found →
-    /// `(Unresolved, true)`. The dot-notation branch supports exactly ONE
-    /// level of struct-field nesting (no recursion) — the qualified path
-    /// ([`Self::qualified_column_info`]) is the one that recurses. Struct-field
+    /// `(Unresolved, true)`. Thin wrapper over [`Self::column_info_in`] scoped
+    /// to the whole schema.
+    fn column_info(name: &str, schema: &StructType) -> (DataType, bool) {
+        Self::column_info_in(name, &schema.fields).unwrap_or((DataType::Unresolved, true))
+    }
+
+    /// Slice-scoped sibling of [`Self::column_info`]: look up `name`
+    /// case-insensitively within `fields` (rather than a whole [`StructType`]),
+    /// returning `None` when not found instead of the `(Unresolved, true)`
+    /// sentinel. Lets callers restrict a name-only lookup to a contiguous
+    /// sub-range of a merged join schema (the alias→field-range map built by
+    /// [`super::analyzer`]'s `QualifierScopes`) while sharing the exact
+    /// dot-notation / nullability-OR semantics `column_info` relies on. The
+    /// dot-notation branch supports exactly ONE level of struct-field nesting
+    /// (no recursion) — the qualified path ([`Self::qualified_column_info`] /
+    /// [`Self::struct_qualifier_info`]) is the one that recurses. Struct-field
     /// nullability ORs in the parent column's nullability (a NULL struct makes
     /// every field read NULL).
-    fn column_info(name: &str, schema: &StructType) -> (DataType, bool) {
-        if let Some(f) = schema.field_by_name(name) {
-            return (f.data_type.clone(), f.nullable);
+    pub(super) fn column_info_in(name: &str, fields: &[StructField]) -> Option<(DataType, bool)> {
+        if let Some(f) = fields.iter().find(|f| f.name.eq_ignore_ascii_case(name)) {
+            return Some((f.data_type.clone(), f.nullable));
         }
         if let Some(dot_pos) = name.find('.') {
             let struct_name = &name[..dot_pos];
             let field_name = &name[dot_pos + 1..];
-            if let Some(f) = schema.field_by_name(struct_name) {
+            if let Some(f) = fields
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(struct_name))
+            {
                 if let DataType::Struct(st) = &f.data_type {
                     let (dt, field_nullable) = st
                         .field_by_name(field_name)
                         .map(|ff| (ff.data_type.clone(), ff.nullable))
                         .unwrap_or((DataType::Unresolved, true));
-                    return (dt, f.nullable || field_nullable);
+                    return Some((dt, f.nullable || field_nullable));
                 }
             }
         }
-        (DataType::Unresolved, true)
+        None
     }
 
     /// Shared resolver behind [`Self::qualified_column_type`] /
@@ -83,18 +99,34 @@ impl TypeInferenceEngine {
         schema: &StructType,
     ) -> (DataType, bool) {
         if let Some(q) = qualifier {
-            if let Some(f) = schema.field_by_name(q) {
-                if let DataType::Struct(st) = &f.data_type {
-                    if let Some(ff) = st.field_by_name(name) {
-                        return (ff.data_type.clone(), f.nullable || ff.nullable);
-                    }
-                    if let Some((dt, nullable)) = Self::resolve_nested_field(name, st) {
-                        return (dt, f.nullable || nullable);
-                    }
-                }
+            if let Some(info) = Self::struct_qualifier_info(name, q, schema) {
+                return info;
             }
         }
         Self::column_info(name, schema)
+    }
+
+    /// The struct-qualifier arm of [`Self::qualified_column_info`], extracted
+    /// so [`super::analyzer`]'s `resolve_column` can run it standalone: struct
+    /// precedence (a qualifier naming a top-level STRUCT column) must win over
+    /// relation-alias scope resolution. `None` means `qualifier` does not name
+    /// a struct column with a matching field — callers fall through to
+    /// alias-scope or legacy name-only resolution.
+    pub(super) fn struct_qualifier_info(
+        name: &str,
+        qualifier: &str,
+        schema: &StructType,
+    ) -> Option<(DataType, bool)> {
+        let f = schema.field_by_name(qualifier)?;
+        if let DataType::Struct(st) = &f.data_type {
+            if let Some(ff) = st.field_by_name(name) {
+                return Some((ff.data_type.clone(), f.nullable || ff.nullable));
+            }
+            if let Some((dt, nullable)) = Self::resolve_nested_field(name, st) {
+                return Some((dt, f.nullable || nullable));
+            }
+        }
+        None
     }
 
     /// Recursively resolve a dotted `path` inside a struct, returning

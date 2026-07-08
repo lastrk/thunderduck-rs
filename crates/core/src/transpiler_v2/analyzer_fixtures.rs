@@ -198,6 +198,18 @@ pub(crate) fn all_fixtures() -> impl Iterator<Item = Fixture> {
         plan_id_disambiguates_self_join(),
         star_expansion_in_project(),
         sparksql_no_plan_id_resolves_by_qualifier(),
+        cross_join_dept_dept_id_binds_right_not_first_match(),
+        cross_join_emp_dept_id_left_twin_unharmed(),
+        inner_join_dept_dept_id_binds_right_not_cross_specific(),
+        left_join_dept_dept_id_flips_through_range(),
+        right_join_emp_id_flips_left_through_range(),
+        full_join_dept_dept_id_flips_through_range(),
+        duplicate_name_wrong_type_binds_by_range(),
+        project_over_filter_over_join_binds_alias_through_passthrough(),
+        nested_left_join_inner_join_ranges_beat_side_schemas(),
+        semi_join_left_qualifier_resolves_from_left_side(),
+        semi_join_child_sibling_offset_alignment(),
+        project_over_deduplicate_over_join_binds_alias_through_passthrough(),
     ]
     .into_iter()
 }
@@ -520,6 +532,281 @@ fn sparksql_no_plan_id_resolves_by_qualifier() -> Fixture {
     let expected = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
     (
         "sparksql_no_plan_id_resolves_by_qualifier",
+        ast,
+        base_types_all_inputs(),
+        expected,
+    )
+}
+
+// ── Alias-aware qualified column resolution over joins (jn-006) ────────────
+//
+// `emp.dept_id` is nullable, `dept.dept_id` is non-null (see the schemas
+// above) — the SAME name on both sides of a join with DIFFERING
+// nullability/type is exactly the shape that defeats a name-only
+// first-match lookup over the flat merged schema. These fixtures pin
+// `QualifierScopes`/`collect_qualifier_bindings` resolving a relation-alias
+// qualifier to the CORRECT side's field, across every join kind and through
+// schema-verbatim passthroughs and join nesting.
+
+fn aliased_scan(table: &str, alias: &str) -> CommonAst {
+    CommonAst::new(CommonOp::TableScan {
+        table: table.to_owned(),
+        alias: Some(alias.to_owned()),
+    })
+}
+
+fn emp_e_dept_d_join(join_type: JoinType) -> CommonAst {
+    CommonAst::new(CommonOp::Join {
+        left: Box::new(aliased_scan("emp", "e")),
+        right: Box::new(aliased_scan("dept", "d")),
+        join_type,
+        condition: None,
+        using_columns: vec![],
+        left_plan_ids: vec![],
+        right_plan_ids: vec![],
+    })
+}
+
+fn project_qualified_ref(input: CommonAst, qualifier: &str, name: &str) -> CommonAst {
+    CommonAst::new(CommonOp::Project {
+        input: Box::new(input),
+        projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: Some(qualifier.to_owned()),
+            plan_id: None,
+        })],
+    })
+}
+
+/// jn-006 witness: `SELECT d.dept_id FROM emp e CROSS JOIN dept d` — must
+/// bind to dept's non-null `dept_id`, not emp's nullable copy (the first
+/// match by name in the merged schema).
+fn cross_join_dept_dept_id_binds_right_not_first_match() -> Fixture {
+    let ast = project_qualified_ref(emp_e_dept_d_join(JoinType::Cross), "d", "dept_id");
+    let expected = StructType::new(vec![StructField::not_null("dept_id", DataType::Integer)]);
+    (
+        "cross_join_dept_dept_id_binds_right_not_first_match",
+        ast,
+        base_types_all_inputs(),
+        expected,
+    )
+}
+
+/// Left twin of the jn-006 witness: `e.dept_id` over the same CROSS JOIN
+/// must still resolve to emp's (nullable) copy — the fix must not disturb
+/// the correct, already-working side.
+fn cross_join_emp_dept_id_left_twin_unharmed() -> Fixture {
+    let ast = project_qualified_ref(emp_e_dept_d_join(JoinType::Cross), "e", "dept_id");
+    let expected = StructType::new(vec![StructField::nullable("dept_id", DataType::Integer)]);
+    (
+        "cross_join_emp_dept_id_left_twin_unharmed",
+        ast,
+        base_types_all_inputs(),
+        expected,
+    )
+}
+
+/// The bug is not CROSS-specific: INNER over the same duplicated-name shape
+/// mis-stamps identically without the fix.
+fn inner_join_dept_dept_id_binds_right_not_cross_specific() -> Fixture {
+    let ast = project_qualified_ref(emp_e_dept_d_join(JoinType::Inner), "d", "dept_id");
+    let expected = StructType::new(vec![StructField::not_null("dept_id", DataType::Integer)]);
+    (
+        "inner_join_dept_dept_id_binds_right_not_cross_specific",
+        ast,
+        base_types_all_inputs(),
+        expected,
+    )
+}
+
+/// LEFT JOIN flips the right side nullable — `d.dept_id` (non-null at rest)
+/// must come out nullable via the SAME range-based lookup, i.e. the flip
+/// must be visible through the alias binding, not just the flat schema.
+fn left_join_dept_dept_id_flips_through_range() -> Fixture {
+    let ast = project_qualified_ref(emp_e_dept_d_join(JoinType::Left), "d", "dept_id");
+    let expected = StructType::new(vec![StructField::nullable("dept_id", DataType::Integer)]);
+    (
+        "left_join_dept_dept_id_flips_through_range",
+        ast,
+        base_types_all_inputs(),
+        expected,
+    )
+}
+
+/// RIGHT JOIN flips the left side nullable — `e.id` (non-null at rest) must
+/// come out nullable.
+fn right_join_emp_id_flips_left_through_range() -> Fixture {
+    let ast = project_qualified_ref(emp_e_dept_d_join(JoinType::Right), "e", "id");
+    let expected = StructType::new(vec![StructField::nullable("id", DataType::Long)]);
+    (
+        "right_join_emp_id_flips_left_through_range",
+        ast,
+        base_types_all_inputs(),
+        expected,
+    )
+}
+
+/// FULL JOIN flips both sides nullable.
+fn full_join_dept_dept_id_flips_through_range() -> Fixture {
+    let ast = project_qualified_ref(emp_e_dept_d_join(JoinType::Full), "d", "dept_id");
+    let expected = StructType::new(vec![StructField::nullable("dept_id", DataType::Integer)]);
+    (
+        "full_join_dept_dept_id_flips_through_range",
+        ast,
+        base_types_all_inputs(),
+        expected,
+    )
+}
+
+/// Duplicated-name adjacency with DIFFERING TYPES (not just nullability):
+/// `l.k` is `Integer`, `r.k` is `Long`. A name-only first match would stamp
+/// `r.k` as `Integer` (wrong TYPE, not just wrong nullability).
+fn duplicate_name_wrong_type_binds_by_range() -> Fixture {
+    let l_schema = StructType::new(vec![StructField::not_null("k", DataType::Integer)]);
+    let r_schema = StructType::new(vec![StructField::not_null("k", DataType::Long)]);
+    let bt = BaseTypes::from_entries(
+        [("l".to_owned(), l_schema), ("r".to_owned(), r_schema)]
+            .into_iter()
+            .collect(),
+    );
+    let join = CommonAst::new(CommonOp::Join {
+        left: Box::new(aliased_scan("l", "lft")),
+        right: Box::new(aliased_scan("r", "rgt")),
+        join_type: JoinType::Inner,
+        condition: None,
+        using_columns: vec![],
+        left_plan_ids: vec![],
+        right_plan_ids: vec![],
+    });
+    let ast = project_qualified_ref(join, "rgt", "k");
+    let expected = StructType::new(vec![StructField::not_null("k", DataType::Long)]);
+    (
+        "duplicate_name_wrong_type_binds_by_range",
+        ast,
+        bt,
+        expected,
+    )
+}
+
+/// Passthrough descent: `Project(Filter(Join Cross))` — the qualifier
+/// binding must be visible through the schema-verbatim `Filter` node so
+/// `d.dept_id` still resolves correctly one level up.
+fn project_over_filter_over_join_binds_alias_through_passthrough() -> Fixture {
+    let filter_ast = CommonAst::new(CommonOp::Filter {
+        input: Box::new(emp_e_dept_d_join(JoinType::Cross)),
+        condition: Expression::Literal(Literal {
+            value: LiteralValue::Boolean(true),
+            data_type: DataType::Boolean,
+        }),
+    });
+    let ast = project_qualified_ref(filter_ast, "d", "dept_id");
+    let expected = StructType::new(vec![StructField::not_null("dept_id", DataType::Integer)]);
+    (
+        "project_over_filter_over_join_binds_alias_through_passthrough",
+        ast,
+        base_types_all_inputs(),
+        expected,
+    )
+}
+
+/// Nesting: `a LEFT JOIN (b INNER JOIN c)`. `c.id` (emp2's non-null `id`) is
+/// untouched by the INNER join, but the OUTER LEFT join flips the entire
+/// right subtree (including `c`) nullable. Ranges are read off the
+/// fully-flipped outer schema, so this comes out nullable — a retained
+/// pre-flip side-schema for the inner join would wrongly report non-null.
+fn nested_left_join_inner_join_ranges_beat_side_schemas() -> Fixture {
+    let inner = CommonAst::new(CommonOp::Join {
+        left: Box::new(aliased_scan("dept", "b")),
+        right: Box::new(aliased_scan("emp2", "c")),
+        join_type: JoinType::Inner,
+        condition: None,
+        using_columns: vec![],
+        left_plan_ids: vec![],
+        right_plan_ids: vec![],
+    });
+    let outer = CommonAst::new(CommonOp::Join {
+        left: Box::new(aliased_scan("emp", "a")),
+        right: Box::new(inner),
+        join_type: JoinType::Left,
+        condition: None,
+        using_columns: vec![],
+        left_plan_ids: vec![],
+        right_plan_ids: vec![],
+    });
+    let ast = project_qualified_ref(outer, "c", "id");
+    let expected = StructType::new(vec![StructField::nullable("id", DataType::Long)]);
+    (
+        "nested_left_join_inner_join_ranges_beat_side_schemas",
+        ast,
+        base_types_all_inputs(),
+        expected,
+    )
+}
+
+/// Semi-join left-only recursion: `SELECT e.dept_id FROM emp e SEMI JOIN
+/// dept d`. A SEMI join's output schema is the LEFT side only, so `e`
+/// binds to the full range and `d` (the right side) contributes no
+/// columns / no binding. `e.dept_id` must resolve to emp's nullable copy.
+fn semi_join_left_qualifier_resolves_from_left_side() -> Fixture {
+    let ast = project_qualified_ref(emp_e_dept_d_join(JoinType::LeftSemi), "e", "dept_id");
+    let expected = StructType::new(vec![StructField::nullable("dept_id", DataType::Integer)]);
+    (
+        "semi_join_left_qualifier_resolves_from_left_side",
+        ast,
+        base_types_all_inputs(),
+        expected,
+    )
+}
+
+/// Sibling-offset alignment after a left-only semi recursion:
+/// `(emp e SEMI JOIN dept d) INNER JOIN dept d2`. The semi join emits only
+/// emp's 16 columns, so `collect_qualifier_bindings` must offset the outer
+/// join's RIGHT child (`d2`) by 16 — the semi join's resolved-schema length
+/// — not by 21 (emp+dept, as if it had recursed the semi's right side).
+/// `d2.dept_id` (a name that ALSO exists, nullable, in emp's left range)
+/// must resolve to dept's non-null copy at the correct offset.
+fn semi_join_child_sibling_offset_alignment() -> Fixture {
+    let semi = CommonAst::new(CommonOp::Join {
+        left: Box::new(aliased_scan("emp", "e")),
+        right: Box::new(aliased_scan("dept", "d")),
+        join_type: JoinType::LeftSemi,
+        condition: None,
+        using_columns: vec![],
+        left_plan_ids: vec![],
+        right_plan_ids: vec![],
+    });
+    let outer = CommonAst::new(CommonOp::Join {
+        left: Box::new(semi),
+        right: Box::new(aliased_scan("dept", "d2")),
+        join_type: JoinType::Inner,
+        condition: None,
+        using_columns: vec![],
+        left_plan_ids: vec![],
+        right_plan_ids: vec![],
+    });
+    let ast = project_qualified_ref(outer, "d2", "dept_id");
+    let expected = StructType::new(vec![StructField::not_null("dept_id", DataType::Integer)]);
+    (
+        "semi_join_child_sibling_offset_alignment",
+        ast,
+        base_types_all_inputs(),
+        expected,
+    )
+}
+
+/// Passthrough descent through `Deduplicate`: `Project(Deduplicate(Join
+/// Cross))`. `Deduplicate` clones the input schema verbatim, so the
+/// qualifier binding must be visible through it — `d.dept_id` still
+/// resolves to dept's non-null copy one level up.
+fn project_over_deduplicate_over_join_binds_alias_through_passthrough() -> Fixture {
+    let dedup = CommonAst::new(CommonOp::Deduplicate {
+        input: Box::new(emp_e_dept_d_join(JoinType::Cross)),
+        on_columns: vec![],
+    });
+    let ast = project_qualified_ref(dedup, "d", "dept_id");
+    let expected = StructType::new(vec![StructField::not_null("dept_id", DataType::Integer)]);
+    (
+        "project_over_deduplicate_over_join_binds_alias_through_passthrough",
         ast,
         base_types_all_inputs(),
         expected,

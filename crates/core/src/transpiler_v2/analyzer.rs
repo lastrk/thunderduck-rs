@@ -2115,8 +2115,9 @@ fn expand_json_tuple_projections(
 ///   wrap-site guards this, but the analyzer double-checks).
 ///
 /// Called by `analyze_node`'s `CommonOp::Project` arm AFTER
-/// [`expand_json_tuple_projections`] and BEFORE [`resolve_and_stamp`], so
-/// downstream analysis only ever sees the fanned-out `stack_col` calls.
+/// [`expand_json_tuple_projections`] and BEFORE [`expand_lateral_column_aliases`]
+/// / [`resolve_and_stamp`], so downstream analysis only ever sees the
+/// fanned-out `stack_col` calls.
 ///
 /// Corpus witness: `piv-006`.
 fn expand_stack_projections(

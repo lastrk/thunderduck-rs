@@ -375,6 +375,13 @@ fn render_file_scan(
     Ok(format!("SELECT * FROM {reader}({paths_sql}{opts_sql})"))
 }
 
+/// `(sql) AS alias`, quoting `alias` — the derived-table wrapper shape shared
+/// by every alias-transparent FROM / join-side renderer below (hoisted user
+/// aliases and synthetic `__td_*` fallbacks alike).
+fn quoted_derived(sql: &str, alias: &str) -> String {
+    format!("({sql}) AS {}", quote_ident(alias))
+}
+
 /// The FROM-body (and, when the shape carries a correlated/comma-join
 /// predicate, the WHERE) of a child subtree that already exposes the user
 /// aliases the enclosing `Project`/`Aggregate` clause references — so the
@@ -471,9 +478,8 @@ fn render_alias_transparent_from(
         {
             let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
             let where_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
-            let a = quote_ident(alias);
             return Ok(Some(AliasTransparentFrom {
-                from_sql: format!("({inner_sql}) AS {a}"),
+                from_sql: quoted_derived(&inner_sql, alias),
                 where_sql: Some(where_sql),
             }));
         }
@@ -485,9 +491,8 @@ fn render_alias_transparent_from(
     } = &input.op
     {
         let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
-        let a = quote_ident(alias);
         return Ok(Some(AliasTransparentFrom {
-            from_sql: format!("({inner_sql}) AS {a}"),
+            from_sql: quoted_derived(&inner_sql, alias),
             where_sql: None,
         }));
     }
@@ -718,11 +723,11 @@ fn render_join_side(
         .unwrap_or(false);
     if condition_uses_synthetic {
         let side_sql = dispatch_op(&side.op, &side.resolved_schema)?;
-        return Ok(format!("({side_sql}) AS {}", quote_ident(synthetic_alias)));
+        return Ok(quoted_derived(&side_sql, synthetic_alias));
     }
     if let TypedOp::AliasedRelation { input, alias } = &side.op {
         let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-        return Ok(format!("({inner_sql}) AS {}", quote_ident(alias)));
+        return Ok(quoted_derived(&inner_sql, alias));
     }
     if allow_flatten {
         if let Some(chain_aliases) = flattenable_chain_aliases(side) {
@@ -738,7 +743,7 @@ fn render_join_side(
         }
     }
     let side_sql = dispatch_op(&side.op, &side.resolved_schema)?;
-    Ok(format!("({side_sql}) AS {}", quote_ident(synthetic_alias)))
+    Ok(quoted_derived(&side_sql, synthetic_alias))
 }
 
 /// Emit a validated-flattenable left-deep join chain as one chained `FROM`
@@ -764,21 +769,21 @@ fn emit_flat_chain(side: &TypedAst) -> Result<String, EmissionError> {
         TypedOp::Join { .. } => emit_flat_chain(left)?,
         TypedOp::AliasedRelation { input, alias } => {
             let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-            format!("({inner_sql}) AS {}", quote_ident(alias))
+            quoted_derived(&inner_sql, alias)
         }
         _ => {
             let inner_sql = dispatch_op(&left.op, &left.resolved_schema)?;
-            format!("({inner_sql}) AS {}", quote_ident(TD_JOIN_LEFT))
+            quoted_derived(&inner_sql, TD_JOIN_LEFT)
         }
     };
     let right_frag = match &right.op {
         TypedOp::AliasedRelation { input, alias } => {
             let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-            format!("({inner_sql}) AS {}", quote_ident(alias))
+            quoted_derived(&inner_sql, alias)
         }
         _ => {
             let inner_sql = dispatch_op(&right.op, &right.resolved_schema)?;
-            format!("({inner_sql}) AS {}", quote_ident(TD_JOIN_RIGHT))
+            quoted_derived(&inner_sql, TD_JOIN_RIGHT)
         }
     };
     let kind = join_kind_sql(*join_type);

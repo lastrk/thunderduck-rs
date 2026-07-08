@@ -1607,3 +1607,21 @@ findings 6/7 touch the shared resolve_column path). Sweep report source: rust-re
   when opus/fable are saturated.
 - **Diagnostic:** `.agent-output/diagnostic-pass-9.md` · **Architecture:** `.agent-output/architecture-pass-9.md`
 - **SHA-to-be:** feat(v2-corpus): pass 9 — pr-007 (253→254)
+
+## Pass 10 — tech-debt sweep (254→254, behavior-preserving)
+
+rust-reviewer swept the code touched by passes 6-9 (`git diff 58d724b..HEAD -- '*.rs'`); zero new
+clippy warnings, no unwrap/expect/as-cast issues, no missing docs on new public items. 2 trivial/low
+findings applied: (1) deduplicated the repeated `format!("({sql}) AS {}", quote_ident(alias))` pattern
+(9 call sites across render_alias_transparent_from/render_join_side/emit_flat_chain in emission.rs)
+into a shared `quoted_derived(sql, alias)` helper — behavior-identical output, verified byte-for-byte
+by the existing render_project_over_*/render_join_from/render_aggregate_* test suite; (2) fixed a
+stale doc-comment cross-reference on `expand_stack_projections` (said "BEFORE resolve_and_stamp",
+now correctly says "BEFORE expand_lateral_column_aliases / resolve_and_stamp" per pass 9's insertion).
+Deliberately NOT touched (informational only, no witness/no action): the NATURAL-desugar-inline-in-
+analyze_join vs named-expand_*-function structural inconsistency (flagged for a future architecture
+pass, not fixed); the debug_assert-only NATURAL invariant (unreachable today, no violation); the
+~15-site CommonOp::Join literal-construction churn from adding `natural` (pre-existing tech debt this
+pass only amplified by one field, a builder refactor is out of scope for a sweep).
+Gate green (core 778, connect-server 97 unit tests). Corpora unchanged: SQL 254/16/270, DataFrame
+329/329 (verified — the emission.rs dedup touches the join/aggregate rendering path).

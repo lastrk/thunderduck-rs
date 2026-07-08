@@ -1746,3 +1746,26 @@ Gate green (core 778, connect-server 97 unit tests). Corpora unchanged: SQL 254/
   tree-identity analysis empirically). DataFrame 329/329 (verified).
 - **Diagnostic:** `.agent-output/diagnostic-pass-13.md` · **Architecture:** `.agent-output/architecture-pass-13.md`
 - **SHA-to-be:** feat(v2-corpus): pass 13 — tbl-007/tbl-012 (258→260)
+
+## Pass 14 — pv-002 (260→261)
+
+- **Case:** pv-002 `SELECT * FROM (SELECT dept_id, active FROM emp) PIVOT (count(*) FOR active IN
+  (true AS t, false AS f))`.
+- **Owning layer:** emission only (`build_conditional_aggregate`).
+- **Root cause:** count(*)'s Star argument rendered to literal `*`, embedded inside a CASE expression
+  body (`count(CASE WHEN pv_col IS NOT DISTINCT FROM pv THEN * END)`) — DuckDB rejects `*` in any
+  non-root-of-expression position. count(*)-specific, not pivot-general (other pivot aggregates use
+  column refs, which render fine inside CASE).
+- **Fix:** 3-line guard — when the aggregate is `count` with an UNQUALIFIED `Star` arg, render the
+  CASE-then value as literal `"1"` instead of `render_expr`-ing the Star. Mirrors Spark's own internal
+  count(*)→count(1) rewrite (precedent already in this codebase, v2_lowering.rs's FILTER desugar).
+  Scoped narrowly: sum/avg/max/min with any arg, and count with a QUALIFIED star (`tbl.*`, different
+  multi-column NULL-skip semantics in Spark), both fall through unchanged. NULLIF empty-bucket wrap
+  untouched.
+- **ADRs:** ADR-015 (Spark parity — mirrors Spark's own rewrite), ADR-022 (removes an opaque DuckDB
+  binder error, no fallback). Pure emission-level, no AST/analyzer/error-taxonomy change.
+- **Findings closed:** reviewer Critical=0 High=0 (confirmed scoping precision, semantic equivalence,
+  test genuinely exercises count(*) not count(1)); perf High=0 Medium=0.
+- **Before→after:** SQL 260 → 261 passed (270 total), +1, no regression. DataFrame 329/329.
+- **Diagnostic:** `.agent-output/diagnostic-pass-14.md` · **Architecture:** `.agent-output/architecture-pass-14.md`
+- **SHA-to-be:** feat(v2-corpus): pass 14 — pv-002 (260→261)

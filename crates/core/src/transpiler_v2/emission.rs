@@ -1619,8 +1619,19 @@ fn build_conditional_aggregate(
     if f.args.is_empty() {
         return render_expr(agg, input_schema);
     }
-    // Render remaining args verbatim; wrap the first arg in a CASE.
-    let first_arg_sql = render_expr(&f.args[0], input_schema)?;
+    // count(*) → count(1) inside CASE: DuckDB rejects bare `*` anywhere
+    // except as an expression root.  Mirrors Spark's own count(*)→count(1)
+    // rewrite (cf. v2_lowering.rs FILTER desugar).  Scoped to unqualified
+    // Star only — qualified `tbl.*` has different NULL-skip semantics.
+    let first_arg_sql = if f.name.eq_ignore_ascii_case("count")
+        && matches!(
+            &f.args[0],
+            Expression::Star(StarExpression { qualifier: None })
+        ) {
+        "1".to_owned()
+    } else {
+        render_expr(&f.args[0], input_schema)?
+    };
     let case_sql = format!(
         "CASE WHEN {pivot_col_sql} IS NOT DISTINCT FROM {pivot_value_sql} THEN {first_arg_sql} END"
     );
@@ -8808,6 +8819,59 @@ mod tests {
         );
         // The alias names the output column (a bare identifier needs no quotes).
         assert!(sql.contains(" AS one "), "got: {sql}");
+    }
+
+    /// pv-002: `count(*)` inside a PIVOT conditional-aggregate must render
+    /// as `THEN 1 END` (not `THEN * END`) — DuckDB rejects a bare `*`
+    /// anywhere except as an expression root.
+    #[test]
+    fn render_pivot_count_star_rewrites_to_count_one() {
+        let _g = tap_guard();
+        let bt = base_types_with_emp();
+        // Build: emp.groupBy("dept_id").pivot("id", [1, 2]).agg(count(*) AS n)
+        // Mirrors the existing explicit-values test but uses Star instead of
+        // int_lit(1) for the count arg — exercises the rewrite path.
+        let ast = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(scan("emp")),
+            grouping: PivotGrouping::Explicit(vec![Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            )]),
+            pivot_column: Expression::UnresolvedColumn(
+                crate::transpiler_v2::expression::UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                },
+            ),
+            pivot_values: vec![int_lit(1), int_lit(2)],
+            aggregates: vec![Expression::Alias(AliasExpression {
+                alias: "n".to_owned(),
+                expr: Box::new(Expression::FunctionCall(FunctionCall {
+                    name: "count".to_owned(),
+                    args: vec![Expression::Star(StarExpression { qualifier: None })],
+                    distinct: false,
+                })),
+            })],
+        });
+        let sql = generate(&ast, &bt).expect("generate pivot with count(*)");
+        // Star must be rewritten to literal 1 inside the CASE body.
+        assert!(
+            sql.contains("THEN 1 END"),
+            "count(*) should rewrite Star to 1 inside CASE; got: {sql}"
+        );
+        assert!(
+            !sql.contains("THEN * END"),
+            "bare * must not appear inside CASE; got: {sql}"
+        );
+        // NULLIF empty-bucket wrap must still be present.
+        assert!(
+            sql.contains("NULLIF(count("),
+            "COUNT should be NULLIF-wrapped; got: {sql}"
+        );
     }
 
     #[test]

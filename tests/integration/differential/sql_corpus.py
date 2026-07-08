@@ -67,7 +67,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import (
@@ -207,13 +207,20 @@ class Case:
     description: str
     sql: str
     flags: Tuple[str, ...] = ()
+    # When set, BOTH engines are expected to raise this Spark error class; the
+    # differential passes iff they throw the same class (ADR-006 tri-state /
+    # ADR-016 ANSI errors). Mirrors the DataFrame corpus's expected_error. Use
+    # for inputs Spark itself rejects/throws on (e.g. ANSI DIVIDE_BY_ZERO).
+    expected_error: Optional[str] = None
 
 
 CASES: List[Case] = []
 
 
-def case(id, category, description, sql, flags=()):
-    CASES.append(Case(id, category, description, sql.strip(), tuple(flags)))
+def case(id, category, description, sql, flags=(), expected_error=None):
+    CASES.append(
+        Case(id, category, description, sql.strip(), tuple(flags), expected_error)
+    )
 
 
 # ===========================================================================
@@ -363,7 +370,11 @@ case("fn-014", "scalar_fn", "date_add / datediff", "SELECT date_add(hire_date, 3
 case("fn-015", "scalar_fn", "year / month / dayofmonth", "SELECT year(hire_date) y, month(hire_date) m, dayofmonth(hire_date) d FROM emp")
 case("fn-016", "scalar_fn", "to_date / date_format", "SELECT to_date('15/01/2026', 'dd/MM/yyyy') td, date_format(hire_date, 'yyyy/MM') df FROM emp")
 case("fn-017", "scalar_fn", "round / abs / ceil / floor", "SELECT round(x, 1) r, abs(a) ab, ceil(x) c, floor(x) f FROM nums")
-case("fn-018", "scalar_fn", "int/int division -> double", "SELECT a / b AS dv FROM nums")
+# fn-018: `nums` has a zero divisor, so ANSI mode makes `a / b` throw
+# DIVIDE_BY_ZERO on BOTH engines (Spark reference throws on collect; τ emits the
+# ANSI-throwing division). Tri-state PASS via expected_error — mirrors the
+# DataFrame corpus's math-011.
+case("fn-018", "scalar_fn", "int/int division -> double (ANSI divide-by-zero)", "SELECT a / b AS dv FROM nums", expected_error="DIVIDE_BY_ZERO")
 case("fn-019", "scalar_fn", "current_date / current_timestamp", "SELECT current_date() cd, current_timestamp() ct FROM emp", flags=("nondeterministic",))
 case("fn-020", "scalar_fn", "binary literal X'..' + hex", "SELECT hex(X'1F2A') AS h, cast(X'41' AS string) AS s FROM emp")
 
@@ -557,7 +568,12 @@ case("lit-003", "typed_literal", "INTERVAL day literal", "SELECT hire_date + INT
 # client on EITHER engine (from_arrow_type has no is_interval arm); schema is validated via AnalyzePlan.
 case("lit-004", "typed_literal", "INTERVAL year-to-month", "SELECT INTERVAL '1-2' YEAR TO MONTH AS ym", flags=("schema_only",))
 case("lit-005", "typed_literal", "INTERVAL day-to-second", "SELECT INTERVAL '1 02:30:00' DAY TO SECOND AS dts")
-case("lit-006", "typed_literal", "make_interval / make_dt_interval", "SELECT make_interval(1, 2, 0, 5) iv, make_dt_interval(1, 2, 30, 0) dti FROM emp LIMIT 1")
+# lit-006: make_interval -> CalendarInterval, make_dt_interval -> DayTimeInterval.
+# The PySpark Connect client cannot row-decode these interval types on EITHER
+# engine (CLAUDE.md gotcha 14: from_arrow_type has no is_interval arm), so the
+# result set is uncollectable for both; the schema is still validated via
+# AnalyzePlan. schema_only, mirroring lit-004 / intv-002.
+case("lit-006", "typed_literal", "make_interval / make_dt_interval (schema)", "SELECT make_interval(1, 2, 0, 5) iv, make_dt_interval(1, 2, 30, 0) dti FROM emp LIMIT 1", flags=("schema_only",))
 case("lit-007", "typed_literal", "DECIMAL literal arithmetic", "SELECT 100.25 * 3.142 AS prod")
 case("lit-008", "typed_literal", "timestamp - timestamp -> interval", "SELECT (TIMESTAMP '2026-06-30 00:00:00' - TIMESTAMP '2026-06-01 00:00:00') AS diff_iv")
 case("lit-009", "typed_literal", "string escape literal", "SELECT 'line1\\nline2' AS s, 'tab\\there' AS t")

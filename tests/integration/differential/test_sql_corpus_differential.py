@@ -33,7 +33,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 
-from utils.dataframe_diff import DataFrameDiff, assert_dataframes_equal
+from utils.dataframe_diff import (
+    DataFrameDiff,
+    assert_dataframes_equal,
+    capture_outcome,
+    reconcile_error_parity,
+)
 from differential.sql_corpus import CASES, Case
 
 
@@ -86,6 +91,26 @@ def test_case(
     """
     ref_df = spark_reference.sql(case.sql)
     td_df = spark_thunderduck.sql(case.sql)
+
+    # Error-parity cases: BOTH engines are expected to raise the same Spark error
+    # class (ADR-006 tri-state / ADR-016 ANSI). Evaluate each side independently
+    # and reconcile — mirrors the DataFrame corpus harness.
+    if case.expected_error is not None:
+        timeout = int(os.environ.get("DIFFERENTIAL_TIMEOUT", "60"))
+        ref = capture_outcome(ref_df, timeout, "Spark Reference")
+        td = capture_outcome(td_df, timeout, "Thunderduck")
+        outcome = reconcile_error_parity(
+            ref, td, case.id, expected_class=case.expected_error
+        )
+        if outcome is None:
+            return  # both threw the matching class → PASS
+        ref_rows, td_rows = outcome  # both returned values → normal row diff
+        assert_dataframes_equal(
+            ref_df.sparkSession.createDataFrame(sorted(ref_rows, key=repr), ref_df.schema),
+            td_df.sparkSession.createDataFrame(sorted(td_rows, key=repr), td_df.schema),
+            query_name=case.id,
+        )
+        return
 
     schema_only = "schema_only" in case.flags or "nondeterministic" in case.flags
     if schema_only:

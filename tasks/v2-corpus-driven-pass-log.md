@@ -1541,3 +1541,26 @@ findings 6/7 touch the shared resolve_column path). Sweep report source: rust-re
 - **Diagnostic:** `.agent-output/diagnostic-pass-7.md` + `diagnostic-pass-7b.md` (partial, 429) ·
   **Architecture:** `.agent-output/architecture-pass-7.md`
 - **SHA-to-be:** feat(v2-corpus): pass 7 — jn-008 (250→251)
+
+## Pass 8 — fn-018, lit-006 + SQL-harness error-parity (251→253)
+
+- **Cases:** fn-018 (`SELECT a / b FROM nums`, ANSI divide-by-zero), lit-006 (make_interval /
+  make_dt_interval).
+- **Owning layer:** test harness + corpus (Python) — NOT a τ Rust change. Handled directly by the
+  driver (like the earlier witness work); the Rust agent pipeline does not apply to Python test-infra.
+- **Root cause:** the SQL corpus harness had no error-parity mechanism (unlike the DataFrame corpus),
+  so any case where Spark itself throws (or the client can't row-decode) was an unavoidable red.
+- **Fix:** (1) Added `expected_error: Optional[str]` to the SQL corpus `Case`/`case()` and an
+  error-parity branch to `test_sql_corpus_differential.py` mirroring the DataFrame harness
+  (capture_outcome + reconcile_error_parity, ADR-006 tri-state). Defaults None → zero impact on the
+  253 non-error cases. (2) fn-018 → expected_error="DIVIDE_BY_ZERO" (both engines throw the same ANSI
+  class; τ's ANSI-throwing division proven green by DataFrame math-011). (3) lit-006 → schema_only
+  (client can't row-decode the interval result on either engine per gotcha 14; schema validated via
+  AnalyzePlan; mirrors lit-004 / intv-002).
+- **Before→after:** SQL 251 → 253 passed (270 total), +2, no regression. No Rust change → binary
+  unchanged, DataFrame corpus unaffected (not re-run).
+- **Triage output:** wrote `.agent-output/unsolvable.md` — sq-011/012/013 documented as INVALID on the
+  Spark 4.1.1 pin (reference throws PARSE_SYNTAX_ERROR; Spark SQL lacks quantified subquery comparisons
+  `> ALL/ANY/= ANY (subquery)`). These are mis-authored corpus cases that cap the achievable at 267/270
+  unless a human corrects/removes them.
+- **SHA-to-be:** feat(v2-corpus): pass 8 — fn-018/lit-006 + SQL-harness error-parity (251→253)

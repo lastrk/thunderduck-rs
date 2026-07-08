@@ -1075,6 +1075,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             join_type,
             condition,
             using_columns,
+            natural,
             left_plan_ids,
             right_plan_ids,
         } => analyze_join(
@@ -1083,6 +1084,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             join_type,
             condition,
             using_columns,
+            natural,
             left_plan_ids,
             right_plan_ids,
             base_types,
@@ -1354,12 +1356,66 @@ fn analyze_join(
     join_type: JoinType,
     condition: Option<Expression>,
     using_columns: Vec<String>,
+    natural: bool,
     left_plan_ids: Vec<i64>,
     right_plan_ids: Vec<i64>,
     base_types: &BaseTypes,
 ) -> Result<TypedAst, AnalyzerError> {
     let typed_left = analyze_node(left, base_types)?;
     let typed_right = analyze_node(right, base_types)?;
+
+    // NATURAL-join desugar (Spark's `ResolveNaturalAndUsingJoin`): rewrite
+    // NATURAL into the equivalent USING(...) shape now that both sides'
+    // resolved schemas are known, so every downstream step (condition
+    // resolution, outer-join nullability flip, USING donor rules, output
+    // schema) rides the existing, proven USING/Cross machinery unchanged.
+    let mut join_type = join_type;
+    let mut condition = condition;
+    let mut using_columns = using_columns;
+    if natural {
+        // Spark rejects NATURAL combined with SEMI/ANTI outright.
+        if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+            return Err(AnalyzerError::Other {
+                reason: format!("requirement failed: Unsupported natural join type {join_type:?}"),
+            });
+        }
+        debug_assert!(
+            condition.is_none() && using_columns.is_empty(),
+            "CommonOp::Join invariant: natural implies no condition/using_columns"
+        );
+        // Case-SENSITIVE exact-name intersection (Spark's `Seq.intersect`,
+        // not τ's usual case-insensitive `field_by_name`), in LEFT schema
+        // order, keep-first dedup.
+        let right_names: HashSet<&str> = typed_right
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        let mut common: Vec<String> = Vec::new();
+        for f in &typed_left.resolved_schema.fields {
+            if right_names.contains(f.name.as_str()) && !common.contains(&f.name) {
+                common.push(f.name.clone());
+            }
+        }
+        if common.is_empty() {
+            // No shared column names: Spark yields a condition-less cartesian
+            // product (INNER → CROSS; other join kinds have no "outer
+            // cross" so a TRUE condition stands in). NEVER both — Cross +
+            // condition would emit an invalid `CROSS JOIN ... ON TRUE`.
+            match join_type {
+                JoinType::Inner => join_type = JoinType::Cross,
+                _ => {
+                    condition = Some(Expression::Literal(Literal {
+                        value: LiteralValue::Boolean(true),
+                        data_type: DataType::Boolean,
+                    }));
+                }
+            }
+        } else {
+            using_columns = common;
+        }
+    }
 
     // resolve+assign_types: resolve condition against merged schema.
     let combined_input_schema =
@@ -4072,6 +4128,7 @@ mod tests {
             join_type,
             condition,
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         })
@@ -4475,6 +4532,237 @@ mod tests {
         assert!(right.is_empty());
         // Output schema is left-only.
         assert_eq!(resolved, emp_schema());
+    }
+
+    // ── NATURAL JOIN analyzer desugar (jn-008) ───────────────────────────
+
+    /// `Join` with `natural: true` and no explicit condition/using —
+    /// the shape both front-ends produce for a SQL `NATURAL JOIN`.
+    fn natural_join(left: CommonAst, right: CommonAst, join_type: JoinType) -> CommonAst {
+        CommonAst::new(CommonOp::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type,
+            condition: None,
+            using_columns: vec![],
+            natural: true,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        })
+    }
+
+    /// `dept`-shaped table with NO column names in common with `emp_schema`
+    /// — exercises the empty-intersection NATURAL rewrite.
+    fn dept_no_overlap_schema() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("division", DataType::Integer),
+            StructField::nullable("location", DataType::String),
+        ])
+    }
+
+    /// `emp`-shaped table whose join key is spelled `DEPT_ID` (uppercase) —
+    /// the E3 case-sensitivity witness: NATURAL's name intersection is exact
+    /// `==`, so this does NOT match `dept_schema`'s lowercase `dept_id`.
+    fn emp_uppercase_dept_id_schema() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("DEPT_ID", DataType::Integer),
+            StructField::nullable("salary", DataType::Double),
+        ])
+    }
+
+    /// LOAD-BEARING: NATURAL inner join over `emp`/`dept` (common column
+    /// `dept_id`) must analyze to a TypedAst byte-identical (full
+    /// `PartialEq`) to the same join expressed explicitly as
+    /// `USING (dept_id)` — proving the desugar rides the existing,
+    /// proven-green USING machinery unchanged.
+    #[test]
+    fn natural_inner_join_converges_with_equivalent_using_join() {
+        let bt = base_types_with_emp_dept();
+        let natural_ast = natural_join(scan("emp"), scan("dept"), JoinType::Inner);
+        let using_ast = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let natural_typed = analyze(natural_ast, &bt).expect("natural analyze");
+        let using_typed = analyze(using_ast, &bt).expect("using analyze");
+        assert_eq!(natural_typed, using_typed);
+
+        // Output schema: dept_id (INT, nullable — left/emp donor) once and
+        // first, then emp's remaining columns, then dept's remaining columns.
+        assert_eq!(
+            field_names(&natural_typed),
+            vec!["dept_id", "id", "name", "salary", "dept_name"]
+        );
+        let dept_id_field = natural_typed
+            .resolved_schema
+            .field_by_name("dept_id")
+            .expect("dept_id present");
+        assert_eq!(dept_id_field.data_type, DataType::Integer);
+        assert!(
+            dept_id_field.nullable,
+            "dept_id is nullable in emp (left donor)"
+        );
+    }
+
+    #[test]
+    fn natural_left_join_left_donor_nullability() {
+        let bt = base_types_with_emp_dept();
+        let ast = natural_join(scan("emp"), scan("dept"), JoinType::Left);
+        let typed = analyze(ast, &bt).expect("natural left analyze");
+        assert_eq!(
+            field_names(&typed),
+            vec!["dept_id", "id", "name", "salary", "dept_name"]
+        );
+        let dept_id_field = typed
+            .resolved_schema
+            .field_by_name("dept_id")
+            .expect("dept_id present");
+        assert!(dept_id_field.nullable, "LEFT donor nullability preserved");
+    }
+
+    #[test]
+    fn natural_full_join_nullability_is_post_flip_and_of_both_sides() {
+        let bt = base_types_with_emp_dept();
+        let ast = natural_join(scan("emp"), scan("dept"), JoinType::Full);
+        let typed = analyze(ast, &bt).expect("natural full analyze");
+        // FULL flips both sides fully nullable; every output field is
+        // nullable, including the USING-hoisted `dept_id` (coalesced
+        // `left.nullable && right.nullable`, both true post-flip).
+        for f in &typed.resolved_schema.fields {
+            assert!(f.nullable, "field {} must be nullable under FULL", f.name);
+        }
+    }
+
+    #[test]
+    fn natural_inner_join_no_common_columns_rewrites_to_cross() {
+        let bt = base_types_for(&[("emp", emp_schema()), ("dept2", dept_no_overlap_schema())]);
+        let ast = natural_join(scan("emp"), scan("dept2"), JoinType::Inner);
+        let typed = analyze(ast, &bt).expect("natural inner no-common analyze");
+        match &typed.op {
+            TypedOp::Join {
+                join_type,
+                condition,
+                using_columns,
+                ..
+            } => {
+                assert_eq!(*join_type, JoinType::Cross);
+                assert!(condition.is_none());
+                assert!(using_columns.is_empty());
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+        // Plain concatenation: emp's 4 fields + dept2's 2 fields.
+        assert_eq!(typed.resolved_schema.fields.len(), 6);
+    }
+
+    #[test]
+    fn natural_left_join_no_common_columns_rewrites_to_true_condition() {
+        let bt = base_types_for(&[("emp", emp_schema()), ("dept2", dept_no_overlap_schema())]);
+        let ast = natural_join(scan("emp"), scan("dept2"), JoinType::Left);
+        let typed = analyze(ast, &bt).expect("natural left no-common analyze");
+        match &typed.op {
+            TypedOp::Join {
+                join_type,
+                condition,
+                using_columns,
+                ..
+            } => {
+                assert_eq!(*join_type, JoinType::Left);
+                assert!(using_columns.is_empty());
+                match condition {
+                    Some(Expression::Literal(Literal {
+                        value: LiteralValue::Boolean(true),
+                        data_type: DataType::Boolean,
+                    })) => {}
+                    other => panic!("expected TRUE literal condition, got {other:?}"),
+                }
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+        // LEFT flips the right side fully nullable — `division` was not-null.
+        let division_field = typed
+            .resolved_schema
+            .field_by_name("division")
+            .expect("division present");
+        assert!(
+            division_field.nullable,
+            "right side flipped nullable under LEFT"
+        );
+    }
+
+    #[test]
+    fn natural_semi_join_is_rejected_as_spark_emulated_error() {
+        let bt = base_types_with_emp_dept();
+        let ast = natural_join(scan("emp"), scan("dept"), JoinType::LeftSemi);
+        let err = analyze(ast, &bt).unwrap_err();
+        match err {
+            AnalyzerError::Other { ref reason } => {
+                assert!(
+                    reason.contains("Unsupported natural join type LeftSemi"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected AnalyzerError::Other, got {other:?}"),
+        }
+        assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
+    }
+
+    #[test]
+    fn natural_anti_join_is_rejected_as_spark_emulated_error() {
+        let bt = base_types_with_emp_dept();
+        let ast = natural_join(scan("emp"), scan("dept"), JoinType::LeftAnti);
+        let err = analyze(ast, &bt).unwrap_err();
+        match err {
+            AnalyzerError::Other { ref reason } => {
+                assert!(
+                    reason.contains("Unsupported natural join type LeftAnti"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected AnalyzerError::Other, got {other:?}"),
+        }
+        assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
+    }
+
+    /// E3 case-sensitivity witness: `DEPT_ID` (left) vs `dept_id` (right)
+    /// do NOT intersect under NATURAL's exact `==` match (Spark's
+    /// `Seq.intersect`, not τ's usual case-insensitive `field_by_name`) —
+    /// the empty intersection rewrites to a cartesian product carrying BOTH
+    /// columns.
+    #[test]
+    fn natural_join_case_sensitive_witness_both_columns_survive() {
+        let bt = base_types_for(&[
+            ("emp_uc", emp_uppercase_dept_id_schema()),
+            ("dept", dept_schema()),
+        ]);
+        let ast = natural_join(scan("emp_uc"), scan("dept"), JoinType::Inner);
+        let typed = analyze(ast, &bt).expect("natural case-witness analyze");
+        match &typed.op {
+            TypedOp::Join { join_type, .. } => assert_eq!(*join_type, JoinType::Cross),
+            other => panic!("expected Join, got {other:?}"),
+        }
+        assert_eq!(typed.resolved_schema.fields.len(), 6);
+        // Exact (case-sensitive) presence check — `field_by_name` is
+        // case-insensitive and would conflate the two distinctly-cased
+        // fields, defeating the point of this witness.
+        assert!(typed
+            .resolved_schema
+            .fields
+            .iter()
+            .any(|f| f.name == "DEPT_ID"));
+        assert!(typed
+            .resolved_schema
+            .fields
+            .iter()
+            .any(|f| f.name == "dept_id"));
     }
 
     #[test]
@@ -7156,6 +7444,7 @@ mod tests {
                 join_type: JoinType::Inner,
                 condition: None,
                 using_columns: vec!["dept_id".to_owned()],
+                natural: false,
                 left_plan_ids: vec![],
                 right_plan_ids: vec![],
             })),

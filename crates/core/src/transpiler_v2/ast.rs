@@ -503,6 +503,12 @@ pub enum CommonOp {
         condition: Option<Expression>,
         /// USING column names (empty when `ON` is used).
         using_columns: Vec<String>,
+        /// Whether this is a SQL `NATURAL JOIN`. Invariant: `natural` implies
+        /// `condition.is_none() && using_columns.is_empty()` — NATURAL carries
+        /// no explicit constraint of its own; the analyzer desugars it into
+        /// `using_columns` (or a `Cross`/`TRUE`-condition rewrite when the two
+        /// sides share no column names) before it reaches `TypedOp::Join`.
+        natural: bool,
         /// Plan-ids appearing anywhere under the left side.
         left_plan_ids: Vec<i64>,
         /// Plan-ids appearing anywhere under the right side.
@@ -697,6 +703,7 @@ mod tests {
             join_type: JoinType::Inner,
             condition: None,
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![1, 2],
             right_plan_ids: vec![3],
         });

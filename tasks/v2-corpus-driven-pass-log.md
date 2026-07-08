@@ -1506,3 +1506,38 @@ findings 6/7 touch the shared resolve_column path). Sweep report source: rust-re
   tests unmodified/green. Corpus jn-013/jn-015/sq-015 green E2E.
 - **Diagnostic:** `.agent-output/diagnostic-pass-6.md` · **Architecture:** `.agent-output/architecture-pass-6.md`
 - **SHA-to-be:** feat(v2-corpus): pass 6 — jn-013/jn-015/sq-015 (247→250)
+
+## Pass 7 — jn-008 (250→251)
+
+- **Case:** jn-008 `SELECT * FROM emp NATURAL JOIN dept`
+- **Owning layers:** analyzer (NATURAL desugar) + emission (Star-over-USING order) + ast/lowering
+  (natural flag).
+- **Two fixes (jn-008 needed both):**
+  1. **NATURAL JOIN** (planned): `CommonOp::Join` gains `natural: bool`; the analyzer desugars NATURAL
+     to USING(case-SENSITIVE left-order name intersection) = Spark's ResolveNaturalAndUsingJoin. Empty
+     intersection → Cross (inner) / ON TRUE (outer). NATURAL semi/anti → Spark-emulated error
+     ("Unsupported natural join type LeftSemi/LeftAnti"). Desugared node rides the existing USING path.
+  2. **Star-over-USING column order** (latent bug NATURAL witnessed, found during acceptance):
+     `SELECT *` over a USING/NATURAL join delegated column order to DuckDB's `*`, which keeps the join
+     key in its natural (left) position, but resolved_schema HOISTS the coalesced key to the front
+     (Spark). Verified against DuckDB directly. Fix: render_project, for a lone unqualified `*` over a
+     Join with using_columns, delegates to the generic render_join (which emits the explicit hoisted
+     slot list matching resolved_schema) instead of `SELECT * FROM (...USING...)`. Plain ON/CROSS joins
+     unaffected (`*` = left-then-right = matches). New helper `is_unqualified_star_only`.
+- **Process note:** the coder finished the NATURAL work, then BOTH opus and fable subagent tiers hit
+  429 rate-limits; the driver (Opus 4.8 1M main loop) re-diagnosed the Star-over-USING failure
+  directly (empirical DuckDB check), implemented + unit-tested the emission fix, and self-reviewed
+  (minimal delegation to the well-tested generic render_join, gated + both corpora verified).
+- **ADRs:** ADR-003 (minimal IR bool field), ADR-004 (SQL-only NATURAL; converges post-desugar),
+  ADR-005 (analyzer owns schema; desugar needs resolved child schemas), ADR-009 (emission dispatch),
+  ADR-015 (both corpora oracle), ADR-022 (one new Spark-emulated error). Gotchas 4/5.
+- **Findings closed:** reviewer (NATURAL) Critical=0 High=0 (2 non-blocking Lows: dup-name multiset,
+  unreachable natural+Cross); perf (NATURAL) High=0 Medium=0.
+- **Before→after:** SQL 250 → 251 passed (270 total), +1, no regression. DataFrame 329/329 (verified —
+  shared analyzer+emission).
+- **Tests:** lowering (natural flag set/unset), analyzer (convergence NATURAL==USING, LEFT/FULL
+  nullability, no-common Cross/TRUE, semi/anti rejection, E3 case-witness), emission
+  (render_project_star_over_using_join_emits_hoisted_slot_list); corpus jn-008 green.
+- **Diagnostic:** `.agent-output/diagnostic-pass-7.md` + `diagnostic-pass-7b.md` (partial, 429) ·
+  **Architecture:** `.agent-output/architecture-pass-7.md`
+- **SHA-to-be:** feat(v2-corpus): pass 7 — jn-008 (250→251)

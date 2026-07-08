@@ -576,6 +576,7 @@ fn lower_from(from: Vec<TableWithJoins>, cte_scope: &CteScope) -> Result<CommonA
             join_type: JoinType::Cross,
             condition: None,
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         }))
@@ -589,7 +590,7 @@ fn lower_table_with_joins(
     let mut plan = lower_table_factor(twj.relation, cte_scope)?;
     for join in twj.joins {
         let right = lower_table_factor(join.relation, cte_scope)?;
-        let (join_type, condition, using_columns) =
+        let (join_type, condition, using_columns, natural) =
             lower_join_operator(join.join_operator, cte_scope)?;
         plan = CommonAst::new(CommonOp::Join {
             left: Box::new(plan),
@@ -597,6 +598,7 @@ fn lower_table_with_joins(
             join_type,
             condition,
             using_columns,
+            natural,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -1001,7 +1003,7 @@ fn function_arg_to_expr(
 fn lower_join_operator(
     op: JoinOperator,
     cte_scope: &CteScope,
-) -> Result<(JoinType, Option<Expression>, Vec<String>), EmissionError> {
+) -> Result<(JoinType, Option<Expression>, Vec<String>, bool), EmissionError> {
     let (join_type, constraint) = match op {
         JoinOperator::Join(c) | JoinOperator::Inner(c) => (JoinType::Inner, c),
         JoinOperator::Left(c) | JoinOperator::LeftOuter(c) => (JoinType::Left, c),
@@ -1017,21 +1019,25 @@ fn lower_join_operator(
             );
         }
     };
-    let (cond, using) = lower_join_constraint(constraint, cte_scope)?;
-    Ok((join_type, cond, using))
+    let (cond, using, natural) = lower_join_constraint(constraint, cte_scope)?;
+    Ok((join_type, cond, using, natural))
 }
 
 fn lower_join_constraint(
     constraint: JoinConstraint,
     cte_scope: &CteScope,
-) -> Result<(Option<Expression>, Vec<String>), EmissionError> {
+) -> Result<(Option<Expression>, Vec<String>, bool), EmissionError> {
     match constraint {
-        JoinConstraint::On(expr) => Ok((Some(lower_expr(expr, cte_scope)?), vec![])),
+        JoinConstraint::On(expr) => Ok((Some(lower_expr(expr, cte_scope)?), vec![], false)),
         JoinConstraint::Using(cols) => {
             let names: Vec<String> = cols.iter().map(object_name_to_string).collect();
-            Ok((None, names))
+            Ok((None, names, false))
         }
-        JoinConstraint::Natural | JoinConstraint::None => Ok((None, vec![])),
+        // NATURAL carries no explicit condition/using of its own; the
+        // analyzer desugars it into `using_columns` (name intersection) once
+        // resolved child schemas are available (lowering has no schemas).
+        JoinConstraint::Natural => Ok((None, vec![], true)),
+        JoinConstraint::None => Ok((None, vec![], false)),
     }
 }
 
@@ -4754,6 +4760,72 @@ mod tests {
     }
 
     #[test]
+    fn parse_natural_join_lowers_to_join_with_natural_flag_no_condition_no_using() {
+        let plan = parse("SELECT * FROM emp NATURAL JOIN dept").expect("should parse");
+        match project_input(plan).op {
+            CommonOp::Join {
+                join_type,
+                condition,
+                using_columns,
+                natural,
+                ..
+            } => {
+                assert_eq!(join_type, JoinType::Inner);
+                assert!(condition.is_none());
+                assert!(using_columns.is_empty());
+                assert!(natural, "NATURAL JOIN must set natural: true");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_natural_left_join_lowers_to_left_join_with_natural_flag() {
+        let plan = parse("SELECT * FROM emp NATURAL LEFT JOIN dept").expect("should parse");
+        match project_input(plan).op {
+            CommonOp::Join {
+                join_type,
+                condition,
+                using_columns,
+                natural,
+                ..
+            } => {
+                assert_eq!(join_type, JoinType::Left);
+                assert!(condition.is_none());
+                assert!(using_columns.is_empty());
+                assert!(natural, "NATURAL LEFT JOIN must set natural: true");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_plain_on_join_lowers_with_natural_false() {
+        let plan = parse("SELECT * FROM emp JOIN dept ON emp.dept_id = dept.dept_id")
+            .expect("should parse");
+        match project_input(plan).op {
+            CommonOp::Join { natural, .. } => {
+                assert!(!natural, "plain ON join must not set natural");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_comma_join_lowers_with_natural_false() {
+        let plan = parse("SELECT * FROM emp, dept").expect("should parse");
+        match project_input(plan).op {
+            CommonOp::Join {
+                natural, join_type, ..
+            } => {
+                assert_eq!(join_type, JoinType::Cross);
+                assert!(!natural, "comma-join must not set natural");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_aliased_bare_table_yields_aliased_relation() {
         // INV7 (ADR-004): an aliased bare table (`emp e`) lowers to the same
         // node the DataFrame front-end produces for `df.alias("e")` —
@@ -5425,6 +5497,52 @@ mod tests {
             sql.contains("INTERVAL '14 months 0 days 0 microseconds'"),
             "got: {sql}"
         );
+    }
+
+    #[test]
+    fn natural_join_emits_identical_sql_to_explicit_using() {
+        // End-to-end parse → analyze → emit: NATURAL JOIN's analyzer desugar
+        // must land on the exact same SQL as the equivalent explicit
+        // `USING (dept_id)` join — proving the two are indistinguishable
+        // past the analyzer (jn-008).
+        use crate::transpiler_v2::analyzer::analyze;
+        use crate::transpiler_v2::base_types::BaseTypes;
+        use crate::transpiler_v2::emission::dispatch_op;
+        use crate::types::{StructField, StructType};
+
+        fn emp() -> StructType {
+            StructType::new(vec![
+                StructField::not_null("id", DataType::Long),
+                StructField::nullable("name", DataType::String),
+                StructField::nullable("dept_id", DataType::Integer),
+                StructField::nullable("salary", DataType::Double),
+            ])
+        }
+
+        fn dept() -> StructType {
+            StructType::new(vec![
+                StructField::not_null("dept_id", DataType::Integer),
+                StructField::nullable("dept_name", DataType::String),
+            ])
+        }
+
+        let bt = BaseTypes::from_entries(
+            [("emp".to_owned(), emp()), ("dept".to_owned(), dept())]
+                .into_iter()
+                .collect(),
+        );
+
+        let natural_plan = parse("SELECT * FROM emp NATURAL JOIN dept").expect("parse natural");
+        let using_plan = parse("SELECT * FROM emp JOIN dept USING (dept_id)").expect("parse using");
+
+        let natural_typed = analyze(natural_plan, &bt).expect("analyze natural");
+        let using_typed = analyze(using_plan, &bt).expect("analyze using");
+
+        let natural_sql =
+            dispatch_op(&natural_typed.op, &natural_typed.resolved_schema).expect("emit natural");
+        let using_sql =
+            dispatch_op(&using_typed.op, &using_typed.resolved_schema).expect("emit using");
+        assert_eq!(natural_sql, using_sql);
     }
 
     /// Extract the top-level projection as a `FunctionCall`, panicking otherwise.

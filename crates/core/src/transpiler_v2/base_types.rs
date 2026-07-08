@@ -368,6 +368,7 @@ mod tests {
             join_type: JoinType::Inner,
             condition: None,
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -402,6 +403,7 @@ mod tests {
             join_type: JoinType::Inner,
             condition: None,
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });

@@ -496,6 +496,22 @@ fn render_alias_transparent_from(
 
 fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String, EmissionError> {
     let input_schema = &input.resolved_schema;
+    // `SELECT *` over a USING/NATURAL join: DuckDB's `*` keeps the join key in
+    // its natural (left-table) position, but the analyzer's resolved_schema
+    // HOISTS the coalesced key(s) to the front (Spark semantics). If we emitted
+    // `SELECT * FROM (... USING (k))` the wire column order would diverge from
+    // the declared schema. Delegate to the generic join renderer, which emits
+    // an explicit hoisted slot list mirroring resolved_schema. Only fires for a
+    // lone unqualified `*` over a Join carrying USING columns; plain ON/CROSS
+    // joins expand `*` in left-then-right order, which already matches the
+    // declared schema.
+    if is_unqualified_star_only(projections) {
+        if let TypedOp::Join { using_columns, .. } = &input.op {
+            if !using_columns.is_empty() {
+                return dispatch_op(&input.op, &input.resolved_schema);
+            }
+        }
+    }
     // Join / Filter-over-Join / Filter-over-AliasedRelation / AliasedRelation
     // children already expose the aliases the projection list references —
     // inline through them instead of wrapping in a synthetic `__td_proj`.
@@ -520,6 +536,16 @@ fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String
     Ok(format!(
         "SELECT {slots_sql} FROM ({child_sql}) AS __td_proj"
     ))
+}
+
+/// True iff `projections` is exactly one unqualified `*` (i.e. `SELECT *`),
+/// whose emitted column order is delegated to the FROM clause rather than an
+/// explicit slot list.
+fn is_unqualified_star_only(projections: &[Expression]) -> bool {
+    matches!(
+        projections,
+        [Expression::Star(StarExpression { qualifier: None })]
+    )
 }
 
 fn render_projection_slots(
@@ -6203,6 +6229,44 @@ mod tests {
     }
 
     #[test]
+    fn render_project_star_over_using_join_emits_hoisted_slot_list() {
+        let _g = tap_guard();
+        // jn-008 downstream: `SELECT * FROM emp NATURAL JOIN dept` desugars to a
+        // USING(dept_id) join. resolved_schema hoists dept_id to the front, but
+        // DuckDB's `*` over USING keeps it in its natural (left) position. The
+        // lone-`*`-over-USING-join path must delegate to the generic join
+        // renderer's explicit hoisted slot list so wire order == declared order.
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(join),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze star-over-using");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // Hoisted explicit slot list: dept_id first, no bare `SELECT *`.
+        assert!(
+            sql.starts_with("SELECT dept_id,"),
+            "USING key must be hoisted first; got: {sql}"
+        );
+        assert!(
+            !sql.starts_with("SELECT *"),
+            "outer projection must not delegate `*` order to DuckDB for a USING join; got: {sql}"
+        );
+        // The declared schema's first column is the hoisted key.
+        assert_eq!(typed.resolved_schema.fields[0].name, "dept_id");
+    }
+
+    #[test]
     fn render_project_over_join_hoists_user_aliases() {
         let _g = tap_guard();
         // SELECT e.name, d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id
@@ -6216,6 +6280,7 @@ mod tests {
                 right: Box::new(qcol("d", "dept_id")),
             })),
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6246,6 +6311,7 @@ mod tests {
             join_type: JoinType::Cross,
             condition: None,
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6367,6 +6433,7 @@ mod tests {
                 right: Box::new(qcol("d", "dept_id")),
             })),
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6438,6 +6505,7 @@ mod tests {
             join_type: JoinType::Cross,
             condition: None,
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6492,6 +6560,7 @@ mod tests {
                 right: Box::new(qcol("d", "dept_id")),
             })),
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6505,6 +6574,7 @@ mod tests {
                 right: Box::new(qcol("m", "dept_id")),
             })),
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6541,6 +6611,7 @@ mod tests {
                 right: Box::new(qcol("d", "dept_id")),
             })),
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6554,6 +6625,7 @@ mod tests {
                 right: Box::new(qcol("m", "dept_id")),
             })),
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6585,6 +6657,7 @@ mod tests {
             join_type: JoinType::Cross,
             condition: None,
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6614,6 +6687,7 @@ mod tests {
             join_type: JoinType::Inner,
             condition: Some(outer_condition),
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![1],
             right_plan_ids: vec![2],
         });
@@ -6665,6 +6739,7 @@ mod tests {
             join_type: JoinType::Inner,
             condition: Some(condition),
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![1],
             right_plan_ids: vec![2],
         });
@@ -6699,6 +6774,7 @@ mod tests {
             join_type: JoinType::Inner,
             condition: None,
             using_columns: vec!["dept_id".to_owned()],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6745,6 +6821,7 @@ mod tests {
                 right: Box::new(qcol("d", "dept_id")),
             })),
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6758,6 +6835,7 @@ mod tests {
                 right: Box::new(qcol("m", "dept_id")),
             })),
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });

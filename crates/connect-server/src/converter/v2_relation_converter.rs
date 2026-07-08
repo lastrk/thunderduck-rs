@@ -748,6 +748,10 @@ impl V2RelationConverter {
             join_type,
             condition,
             using_columns: j.using_columns.clone(),
+            // Spark Connect's `Join.JoinType` proto has no NATURAL variant —
+            // the DataFrame front-end can never produce a NATURAL join; only
+            // the SparkSQL front-end (`v2_lowering.rs`) can set this true.
+            natural: false,
             left_plan_ids,
             right_plan_ids,
         }))

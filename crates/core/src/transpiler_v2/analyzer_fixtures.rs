@@ -166,6 +166,7 @@ fn table_scan_chain(names: &[&str]) -> CommonAst {
             join_type: JoinType::Cross,
             condition: None,
             using_columns: vec![],
+            natural: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         })
@@ -360,6 +361,7 @@ fn left_outer_join_flips_right_nullability() -> Fixture {
         join_type: JoinType::Left,
         condition: None,
         using_columns: vec![],
+        natural: false,
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     });
@@ -380,6 +382,7 @@ fn right_outer_join_flips_left_nullability() -> Fixture {
         join_type: JoinType::Right,
         condition: None,
         using_columns: vec![],
+        natural: false,
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     });
@@ -399,6 +402,7 @@ fn full_outer_join_flips_both_sides() -> Fixture {
         join_type: JoinType::Full,
         condition: None,
         using_columns: vec![],
+        natural: false,
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     });
@@ -484,6 +488,7 @@ fn plan_id_disambiguates_self_join() -> Fixture {
         join_type: JoinType::Inner,
         condition: Some(cond),
         using_columns: vec![],
+        natural: false,
         left_plan_ids: vec![1],
         right_plan_ids: vec![2],
     });
@@ -562,6 +567,7 @@ fn emp_e_dept_d_join(join_type: JoinType) -> CommonAst {
         join_type,
         condition: None,
         using_columns: vec![],
+        natural: false,
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     })
@@ -675,6 +681,7 @@ fn duplicate_name_wrong_type_binds_by_range() -> Fixture {
         join_type: JoinType::Inner,
         condition: None,
         using_columns: vec![],
+        natural: false,
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     });
@@ -721,6 +728,7 @@ fn nested_left_join_inner_join_ranges_beat_side_schemas() -> Fixture {
         join_type: JoinType::Inner,
         condition: None,
         using_columns: vec![],
+        natural: false,
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     });
@@ -730,6 +738,7 @@ fn nested_left_join_inner_join_ranges_beat_side_schemas() -> Fixture {
         join_type: JoinType::Left,
         condition: None,
         using_columns: vec![],
+        natural: false,
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     });
@@ -772,6 +781,7 @@ fn semi_join_child_sibling_offset_alignment() -> Fixture {
         join_type: JoinType::LeftSemi,
         condition: None,
         using_columns: vec![],
+        natural: false,
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     });
@@ -781,6 +791,7 @@ fn semi_join_child_sibling_offset_alignment() -> Fixture {
         join_type: JoinType::Inner,
         condition: None,
         using_columns: vec![],
+        natural: false,
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     });

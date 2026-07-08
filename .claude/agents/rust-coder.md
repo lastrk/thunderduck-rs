@@ -2,7 +2,7 @@
 name: rust-coder
 description: Rust implementer. Executes a plan into production code. Not architecture/review.
 tools: [Read, Write, Edit, Bash, LSP, mcp__codegraph__*, mcp__semble__*]
-model: opus
+model: fable
 effort: high
 ---
 

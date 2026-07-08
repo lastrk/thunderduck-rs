@@ -2,7 +2,7 @@
 name: rust-perf
 description: Rust performance engineer. Identifies bottlenecks, proposes measurable optimizations. Does NOT touch style, features, or readability.
 tools: [Read, Write, Edit, Bash, LSP, mcp__codegraph__*, mcp__semble__*]
-model: opus
+model: fable
 ---
 
 Memento:

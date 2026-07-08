@@ -1708,3 +1708,41 @@ Gate green (core 778, connect-server 97 unit tests). Corpora unchanged: SQL 254/
   ceiling at 266/270, not 267/270.
 - **Diagnostic:** `.agent-output/diagnostic-pass-12.md` · **Architecture:** `.agent-output/architecture-pass-12.md`
 - **SHA-to-be:** feat(v2-corpus): pass 12 — cx-011 (257→258)
+
+## Pass 13 — tbl-007, tbl-012 (258→260)
+
+- **Cluster:** tbl-007 `SELECT * FROM explode(array(1,2,3))` (bare/uncorrelated table function),
+  tbl-012 `SELECT e.id, r.v FROM emp e, LATERAL explode(e.tags) AS r(v)` (correlated LATERAL table
+  function). Same surface error ("TableFunction[explode] not implemented"), TWO different fixes.
+- **Owning layers:** analyzer + emission (tbl-007, extends the existing `range`-style dispatch);
+  parser_v2 lowering ONLY (tbl-012, a lowering-time redirect — zero analyzer/emission touch).
+- **Root cause:** `analyze_table_function`/`render_table_function` only had a `range` arm. tbl-012's
+  leaf `TableFunction` model is structurally wrong for the correlated case — args resolve against an
+  EMPTY schema, so `e.tags` can never resolve there regardless of how much analyzer work is added.
+- **Fix 1 (tbl-007):** extend `analyze_table_function`/`render_table_function` with an
+  `explode`/`explode_outer` arm, gated on the resolved arg being `DataType::Array`. Type/nullability
+  REUSE the existing single-homed `FunctionCall.data_type()/.nullable()` (no duplicated logic). Output
+  column literally named `"col"` — verified empirically against live Spark 4.1.1 ANSI (also confirmed
+  posexplode's `pos`/`col` naming for future reference). Deferred (honest boundary, no witness):
+  posexplode-as-bare-TVF, map-arg explode.
+- **Fix 2 (tbl-012):** restructured `lower_from`'s comma-join fold from eager-lower-then-fold to a
+  per-item fold that inspects each RAW `TableWithJoins` for a redirect condition (`lateral:true` +
+  known generator name + 1 arg + alias present, no trailing joins) before lowering it normally. A
+  matching item builds `CommonOp::LateralView { input: <already-folded-left>, .. }` instead of a
+  cross-joined `TableFunction` — reusing pass-11's `LateralView`/`analyze_lateral_view`/
+  `render_lateral_view` with ZERO changes, proven by a convergence test asserting the comma-LATERAL
+  syntax and Hive `LATERAL VIEW` syntax produce structurally IDENTICAL CommonAst. Extracted the shared
+  generator-dispatch table (`generator_view_columns`) out of `lower_lateral_views` as the single source
+  of truth for both syntaxes (ADR-004/INV7 convergence by construction).
+- **ADRs:** ADR-003 (fix 1 extends an existing dispatch; fix 2 reuses an existing variant via a 2nd
+  lowering site — zero new variants either way), ADR-004/INV7 (redirect increases convergence — two SQL
+  syntaxes → one node), ADR-009 (both fixes follow the range-arm precedent), ADR-015/016 (col/pos
+  naming verified against live Spark), ADR-022 (deferred shapes stay honest boundaries).
+- **Findings closed:** reviewer Critical=0 High=0 — HIGHEST-RISK review this pipeline: `lower_from`'s
+  restructuring touches every multi-table-FROM query in both corpora; reviewer traced a 3-way comma
+  join under old vs new fold structure and confirmed byte-identical trees (2 non-blocking Lows:
+  a discriminator-inner-guard test gap, an imprecise boundary message — deferred); perf High=0 Medium=0.
+- **Before→after:** SQL 258 → 260 passed (270 total), +2, no regression (confirming the reviewer's
+  tree-identity analysis empirically). DataFrame 329/329 (verified).
+- **Diagnostic:** `.agent-output/diagnostic-pass-13.md` · **Architecture:** `.agent-output/architecture-pass-13.md`
+- **SHA-to-be:** feat(v2-corpus): pass 13 — tbl-007/tbl-012 (258→260)

@@ -1764,35 +1764,64 @@ fn render_table_function(
     _with_ordinality: bool,
     schema: &Schema,
 ) -> Result<String, EmissionError> {
-    if !name.eq_ignore_ascii_case("range") {
-        bail_boundary_op!(
-            "TableFunction",
-            format!("table-function `{name}` emission (not implemented in τ)")
-        );
-    }
-    let long_lit = |v: i64| {
-        Expression::Literal(Literal {
-            value: LiteralValue::Long(v),
-            data_type: DataType::Long,
-        })
-    };
-    let (start, end, step): (Expression, Expression, Expression) = match args {
-        [end] => (long_lit(0), end.clone(), long_lit(1)),
-        [start, end] => (start.clone(), end.clone(), long_lit(1)),
-        // A 4th `numPartitions` argument is a single-node no-op — drop it.
-        [start, end, step] | [start, end, step, _] => (start.clone(), end.clone(), step.clone()),
+    let name_lower = name.to_ascii_lowercase();
+    match name_lower.as_str() {
+        "range" => {
+            let long_lit = |v: i64| {
+                Expression::Literal(Literal {
+                    value: LiteralValue::Long(v),
+                    data_type: DataType::Long,
+                })
+            };
+            let (start, end, step): (Expression, Expression, Expression) = match args {
+                [end] => (long_lit(0), end.clone(), long_lit(1)),
+                [start, end] => (start.clone(), end.clone(), long_lit(1)),
+                // A 4th `numPartitions` argument is a single-node no-op — drop it.
+                [start, end, step] | [start, end, step, _] => {
+                    (start.clone(), end.clone(), step.clone())
+                }
+                _ => bail_boundary_op!(
+                    "TableFunction",
+                    "range() requires 1..=4 arguments (start, end, step, numPartitions)"
+                ),
+            };
+            let start_sql = render_expr(&start, schema)?;
+            let end_sql = render_expr(&end, schema)?;
+            let step_sql = render_expr(&step, schema)?;
+            // `range` is end-EXCLUSIVE in both Spark and DuckDB; single `id` column.
+            Ok(format!(
+                "SELECT id FROM range({start_sql}, {end_sql}, {step_sql}) AS __td_range(id)"
+            ))
+        }
+        // Bare `FROM explode(array(1,2,3))` — uncorrelated generator as a TVF.
+        // Build the canonical FunctionCall and render via the existing render_expr
+        // path, which already handles UNNEST emission for explode/explode_outer
+        // (single-homed — no duplication of the CASE wrapper logic).
+        "explode" | "explode_outer" => {
+            // Defensive: the analyzer guarantees exactly 1 output column.
+            if schema.fields.len() != 1 {
+                bail_boundary_op!(
+                    "TableFunction",
+                    format!(
+                        "explode TVF schema must have exactly 1 field, got {}",
+                        schema.fields.len()
+                    )
+                );
+            }
+            let fc = FunctionCall {
+                name: name_lower,
+                args: args.to_vec(),
+                distinct: false,
+            };
+            let unnest_sql = render_function_call(&fc, schema)?;
+            let col_name = quote_ident(&schema.fields[0].name);
+            Ok(format!("SELECT {unnest_sql} AS {col_name}"))
+        }
         _ => bail_boundary_op!(
             "TableFunction",
-            "range() requires 1..=4 arguments (start, end, step, numPartitions)"
+            format!("table-function `{name}` emission (not implemented in τ)")
         ),
-    };
-    let start_sql = render_expr(&start, schema)?;
-    let end_sql = render_expr(&end, schema)?;
-    let step_sql = render_expr(&step, schema)?;
-    // `range` is end-EXCLUSIVE in both Spark and DuckDB; single `id` column.
-    Ok(format!(
-        "SELECT id FROM range({start_sql}, {end_sql}, {step_sql}) AS __td_range(id)"
-    ))
+    }
 }
 
 // ── Expression rendering ─────────────────────────────────────────────────────
@@ -6211,6 +6240,53 @@ mod tests {
             sql,
             "SELECT id FROM (SELECT id FROM range(CAST(0 AS BIGINT), 5, CAST(1 AS BIGINT)) \
              AS __td_range(id)) AS __td_proj"
+        );
+    }
+
+    // ── TableFunction (explode) — pass-13 ──────────────────────────────
+
+    /// Build `explode(<args>)` or `explode_outer(<args>)`, analyze, and emit.
+    fn emit_explode_tvf(name: &str, args: Vec<Expression>) -> String {
+        let ast = CommonAst::new(CommonOp::TableFunction {
+            name: name.to_owned(),
+            args,
+            with_ordinality: false,
+        });
+        let typed = analyze(ast, &BaseTypes::empty()).expect("analyze explode TVF");
+        dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch explode TVF")
+    }
+
+    /// Pass 13 — tbl-007: `SELECT * FROM explode(array(1,2,3))` → SQL
+    /// contains `UNNEST` and emits the column as `col`.
+    #[test]
+    fn dispatch_explode_tvf_emits_unnest_as_col() {
+        let _g = tap_guard();
+        let arr = Expression::FunctionCall(FunctionCall {
+            name: "array".to_owned(),
+            args: vec![int_lit(1), int_lit(2), int_lit(3)],
+            distinct: false,
+        });
+        let sql = emit_explode_tvf("explode", vec![arr]);
+        assert_eq!(sql, "SELECT UNNEST(list_value(1, 2, 3)) AS col");
+    }
+
+    /// Pass 13 — explode_outer as TVF wraps with the CASE/NULL sentinel.
+    #[test]
+    fn dispatch_explode_outer_tvf_emits_case_wrapper() {
+        let _g = tap_guard();
+        let arr = Expression::FunctionCall(FunctionCall {
+            name: "array".to_owned(),
+            args: vec![int_lit(1), int_lit(2)],
+            distinct: false,
+        });
+        let sql = emit_explode_tvf("explode_outer", vec![arr]);
+        assert!(
+            sql.contains("UNNEST(CASE WHEN"),
+            "explode_outer must emit the CASE wrapper; got: {sql}"
+        );
+        assert!(
+            sql.contains("AS col"),
+            "output column must be named 'col'; got: {sql}"
         );
     }
 

@@ -2482,20 +2482,59 @@ fn analyze_table_function(
 ) -> Result<TypedAst, AnalyzerError> {
     let empty_schema = StructType::empty();
     let resolved_args = resolve_expr_list(args, &ResolveContext::bare(&empty_schema, base_types))?;
-    if name.eq_ignore_ascii_case("range") && (1..=4).contains(&resolved_args.len()) {
-        Ok(TypedAst {
+    let name_lower = name.to_ascii_lowercase();
+    match name_lower.as_str() {
+        "range" if (1..=4).contains(&resolved_args.len()) => Ok(TypedAst {
             op: TypedOp::TableFunction {
                 name,
                 args: resolved_args,
                 with_ordinality,
             },
             resolved_schema: StructType::new(vec![StructField::new("id", DataType::Long, false)]),
-        })
-    } else {
-        Err(AnalyzerError::PuntedOperator {
+        }),
+        // Bare `FROM explode(array(1,2,3))` — uncorrelated generator as a TVF.
+        // Derive the output schema from the resolved arg's element type via the
+        // existing single-homed `.data_type()` / `.nullable()` arms (type_inference
+        // + expression.rs). Spark's default output column is named `"col"`.
+        "explode" | "explode_outer" if resolved_args.len() == 1 => {
+            // Gate: the argument must resolve to Array — Map args and non-collection
+            // types fall through to PuntedOperator (no witness, ADR-022).
+            let arg = &resolved_args[0];
+            let arg_type = arg.data_type(&empty_schema);
+            if !matches!(arg_type, DataType::Array(..)) {
+                return Err(AnalyzerError::PuntedOperator {
+                    op: format!("TableFunction[{name}]"),
+                    reason: format!(
+                        "bare {name_lower} with non-Array argument type ({arg_type:?}) \
+                         not implemented in τ"
+                    ),
+                });
+            }
+            // Build the canonical FunctionCall shape to derive element type and
+            // nullability via the existing single-homed arms in type_inference.rs
+            // and expression.rs (no duplication).
+            let fc_expr = Expression::FunctionCall(FunctionCall {
+                name: name_lower.clone(),
+                args: resolved_args.clone(),
+                distinct: false,
+            });
+            let elem_type = fc_expr.data_type(&empty_schema);
+            let nullable = fc_expr.nullable(&empty_schema);
+            Ok(TypedAst {
+                op: TypedOp::TableFunction {
+                    name: name_lower,
+                    args: resolved_args,
+                    with_ordinality,
+                },
+                resolved_schema: StructType::new(vec![StructField::new(
+                    "col", elem_type, nullable,
+                )]),
+            })
+        }
+        _ => Err(AnalyzerError::PuntedOperator {
             op: format!("TableFunction[{name}]"),
             reason: "table-function analysis (not implemented in τ)".to_owned(),
-        })
+        }),
     }
 }
 
@@ -5414,11 +5453,45 @@ mod tests {
         assert!(!f.nullable, "range id column is non-nullable");
     }
 
-    /// An unknown table-valued function (`explode(...)`) is an honest
-    /// Thunderduck boundary — `PuntedOperator`, not a silent wrong answer
-    /// (ADR-022). Pass-141.
+    /// An unknown table-valued function is an honest Thunderduck boundary —
+    /// `PuntedOperator`, not a silent wrong answer (ADR-022). Pass-141.
     #[test]
     fn table_function_unknown_tvf_punts() {
+        let bt = BaseTypes::empty();
+        let ast = CommonAst::new(CommonOp::TableFunction {
+            name: "some_unknown_tvf".to_owned(),
+            args: vec![int_lit(1)],
+            with_ordinality: false,
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(matches!(err, AnalyzerError::PuntedOperator { .. }));
+        assert!(err.to_string().starts_with("[TDCK-BOUNDARY]"));
+    }
+
+    /// Pass 13 — `explode(array(1,2,3))` as a bare TVF resolves to a
+    /// single-column schema `[col: Integer, non-nullable]` (Spark 4.1.1 default
+    /// output column name is `"col"`). Corpus: tbl-007.
+    #[test]
+    fn table_function_explode_array_resolves_single_col_column() {
+        let bt = BaseTypes::empty();
+        let arr = func("array", vec![int_lit(1), int_lit(2), int_lit(3)]);
+        let ast = CommonAst::new(CommonOp::TableFunction {
+            name: "explode".to_owned(),
+            args: vec![arr],
+            with_ordinality: false,
+        });
+        let typed = analyze(ast, &bt).expect("explode(array(1,2,3)) should analyze");
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        let f = &typed.resolved_schema.fields[0];
+        assert_eq!(f.name, "col");
+        assert_eq!(f.data_type, DataType::Integer);
+        assert!(!f.nullable, "explode of non-null array is non-nullable");
+    }
+
+    /// Pass 13 — `explode` with a non-Array argument (bare integer) still
+    /// punts as PuntedOperator — the gate rejects non-Array args.
+    #[test]
+    fn table_function_explode_non_array_arg_punts() {
         let bt = BaseTypes::empty();
         let ast = CommonAst::new(CommonOp::TableFunction {
             name: "explode".to_owned(),
@@ -5427,7 +5500,48 @@ mod tests {
         });
         let err = analyze(ast, &bt).unwrap_err();
         assert!(matches!(err, AnalyzerError::PuntedOperator { .. }));
-        assert!(err.to_string().starts_with("[TDCK-BOUNDARY]"));
+        assert!(
+            err.to_string().contains("non-Array"),
+            "error should mention non-Array: {err}"
+        );
+    }
+
+    /// Pass 13 — `explode(unresolved_col)` with no relation in scope yields
+    /// `AnalyzerError::UnknownColumn` (args resolve against empty schema).
+    #[test]
+    fn table_function_explode_unresolvable_arg_is_unknown_column() {
+        let bt = BaseTypes::empty();
+        let col = Expression::UnresolvedColumn(UnresolvedColumn {
+            name: "some_col".to_owned(),
+            qualifier: None,
+            plan_id: None,
+        });
+        let ast = CommonAst::new(CommonOp::TableFunction {
+            name: "explode".to_owned(),
+            args: vec![col],
+            with_ordinality: false,
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(
+            matches!(err, AnalyzerError::UnknownColumn { .. }),
+            "expected UnknownColumn, got: {err}"
+        );
+    }
+
+    /// Pass 13 — `posexplode` as bare TVF is not implemented (no witness) —
+    /// still punts. The `posexplode` name hits the default `_` arm since it
+    /// is not in the `"explode"|"explode_outer"` match set.
+    #[test]
+    fn table_function_posexplode_still_punts() {
+        let bt = BaseTypes::empty();
+        let arr = func("array", vec![int_lit(1), int_lit(2)]);
+        let ast = CommonAst::new(CommonOp::TableFunction {
+            name: "posexplode".to_owned(),
+            args: vec![arr],
+            with_ordinality: false,
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(matches!(err, AnalyzerError::PuntedOperator { .. }));
     }
 
     /// Pass 76 — `UNION BY NAME` used to trip the positional-cast pushdown

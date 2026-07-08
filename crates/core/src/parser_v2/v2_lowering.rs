@@ -271,6 +271,87 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
 /// - Chained (2+) LATERAL VIEWs → boundary error
 /// - OUTER posexplode → boundary error (no CASE-wrapped pos/val renderer)
 /// - Everything else (wrong alias count, unknown generator, non-1-arg) → boundary error
+/// Dispatch table mapping a generator function name + outer flag + column aliases
+/// to the `(alias, FunctionCall)` column pairs consumed by `CommonOp::LateralView`.
+///
+/// Single source of truth for BOTH `LATERAL VIEW explode(...) t AS tag` syntax
+/// (via `lower_lateral_views`) and `LATERAL explode(...) AS r(v)` comma-syntax
+/// (via `lower_lateral_generator_item`). ADR-004/INV7 convergence by construction.
+fn generator_view_columns(
+    gen_name: &str,
+    outer: bool,
+    arg: Expression,
+    aliases: Vec<String>,
+) -> Result<Vec<(String, Expression)>, EmissionError> {
+    match gen_name {
+        "explode" if !outer && aliases.len() == 1 => Ok(vec![(
+            aliases.into_iter().next().expect("len checked == 1"),
+            Expression::FunctionCall(FunctionCall {
+                name: "explode".to_owned(),
+                args: vec![arg],
+                distinct: false,
+            }),
+        )]),
+        "explode" if outer && aliases.len() == 1 => Ok(vec![(
+            aliases.into_iter().next().expect("len checked == 1"),
+            Expression::FunctionCall(FunctionCall {
+                name: "explode_outer".to_owned(),
+                args: vec![arg],
+                distinct: false,
+            }),
+        )]),
+        "explode_outer" if aliases.len() == 1 => Ok(vec![(
+            aliases.into_iter().next().expect("len checked == 1"),
+            Expression::FunctionCall(FunctionCall {
+                name: "explode_outer".to_owned(),
+                args: vec![arg],
+                distinct: false,
+            }),
+        )]),
+        "posexplode" if !outer && aliases.len() == 2 => {
+            let mut it = aliases.into_iter();
+            let pos_alias = it.next().expect("len checked == 2");
+            let val_alias = it.next().expect("len checked == 2");
+            Ok(vec![
+                (
+                    pos_alias,
+                    Expression::FunctionCall(FunctionCall {
+                        name: "posexplode_pos".to_owned(),
+                        args: vec![arg.clone()],
+                        distinct: false,
+                    }),
+                ),
+                (
+                    val_alias,
+                    Expression::FunctionCall(FunctionCall {
+                        name: "posexplode_val".to_owned(),
+                        args: vec![arg],
+                        distinct: false,
+                    }),
+                ),
+            ])
+        }
+        "posexplode" if outer => {
+            bail_boundary_proto!(
+                "sql::lateral_view::outer_posexplode",
+                "OUTER posexplode in LATERAL VIEW not implemented in τ"
+            );
+        }
+        "posexplode" => {
+            bail_boundary_proto!(
+                "sql::lateral_view::posexplode_alias_count",
+                "posexplode in LATERAL VIEW requires exactly 2 aliases"
+            );
+        }
+        _ => {
+            bail_boundary_proto!(
+                format!("sql::lateral_view::generator::{gen_name}"),
+                format!("LATERAL VIEW generator `{gen_name}` not supported in τ")
+            );
+        }
+    }
+}
+
 fn lower_lateral_views(
     base: CommonAst,
     lateral_views: Vec<LateralView>,
@@ -333,79 +414,7 @@ fn lower_lateral_views(
         );
     }
 
-    let columns = match gen_name.as_str() {
-        "explode" if !lv.outer && aliases.len() == 1 => {
-            vec![(
-                aliases.into_iter().next().expect("len checked == 1"),
-                Expression::FunctionCall(FunctionCall {
-                    name: "explode".to_owned(),
-                    args: vec![arg],
-                    distinct: false,
-                }),
-            )]
-        }
-        "explode" if lv.outer && aliases.len() == 1 => {
-            vec![(
-                aliases.into_iter().next().expect("len checked == 1"),
-                Expression::FunctionCall(FunctionCall {
-                    name: "explode_outer".to_owned(),
-                    args: vec![arg],
-                    distinct: false,
-                }),
-            )]
-        }
-        "explode_outer" if aliases.len() == 1 => {
-            vec![(
-                aliases.into_iter().next().expect("len checked == 1"),
-                Expression::FunctionCall(FunctionCall {
-                    name: "explode_outer".to_owned(),
-                    args: vec![arg],
-                    distinct: false,
-                }),
-            )]
-        }
-        "posexplode" if !lv.outer && aliases.len() == 2 => {
-            let mut it = aliases.into_iter();
-            let pos_alias = it.next().expect("len checked == 2");
-            let val_alias = it.next().expect("len checked == 2");
-            vec![
-                (
-                    pos_alias,
-                    Expression::FunctionCall(FunctionCall {
-                        name: "posexplode_pos".to_owned(),
-                        args: vec![arg.clone()],
-                        distinct: false,
-                    }),
-                ),
-                (
-                    val_alias,
-                    Expression::FunctionCall(FunctionCall {
-                        name: "posexplode_val".to_owned(),
-                        args: vec![arg],
-                        distinct: false,
-                    }),
-                ),
-            ]
-        }
-        "posexplode" if lv.outer => {
-            bail_boundary_proto!(
-                "sql::lateral_view::outer_posexplode",
-                "OUTER posexplode in LATERAL VIEW not implemented in τ"
-            );
-        }
-        "posexplode" => {
-            bail_boundary_proto!(
-                "sql::lateral_view::posexplode_alias_count",
-                "posexplode in LATERAL VIEW requires exactly 2 aliases"
-            );
-        }
-        _ => {
-            bail_boundary_proto!(
-                format!("sql::lateral_view::generator::{gen_name}"),
-                format!("LATERAL VIEW generator `{gen_name}` not supported in τ")
-            );
-        }
-    };
+    let columns = generator_view_columns(&gen_name, lv.outer, arg, aliases)?;
 
     Ok(CommonAst::new(CommonOp::LateralView {
         input: Box::new(base),
@@ -718,23 +727,105 @@ fn lower_from(from: Vec<TableWithJoins>, cte_scope: &CteScope) -> Result<CommonA
     if from.is_empty() {
         return Ok(CommonAst::new(CommonOp::SingleRow));
     }
-    let mut plans: Vec<CommonAst> = from
+    let mut items = from.into_iter();
+    let first = items.next().expect("from is non-empty");
+    let mut acc = lower_table_with_joins(first, cte_scope)?;
+    for twj in items {
+        acc = if is_lateral_generator_item(&twj) {
+            // Correlated LATERAL generator (e.g. `LATERAL explode(e.tags) AS r(v)`)
+            // — redirect to CommonOp::LateralView so the existing analyzer/emission
+            // machinery resolves the correlated arg against the left plan's schema.
+            lower_lateral_generator_item(acc, twj.relation, cte_scope)?
+        } else {
+            let right = lower_table_with_joins(twj, cte_scope)?;
+            CommonAst::new(CommonOp::Join {
+                left: Box::new(acc),
+                right: Box::new(right),
+                join_type: JoinType::Cross,
+                condition: None,
+                using_columns: vec![],
+                natural: false,
+                left_plan_ids: vec![],
+                right_plan_ids: vec![],
+            })
+        };
+    }
+    Ok(acc)
+}
+
+/// True iff the raw comma-item is a `LATERAL <generator>(arg) AS alias(cols)` shape
+/// that should redirect to `CommonOp::LateralView` instead of the normal
+/// CrossJoin fold. Predicate is narrow by design (ADR-022 — no false positives):
+/// trailing joins, non-generator functions, no-alias, and non-LATERAL items
+/// all fall through to the existing CrossJoin path.
+fn is_lateral_generator_item(twj: &TableWithJoins) -> bool {
+    if !twj.joins.is_empty() {
+        return false;
+    }
+    match &twj.relation {
+        TableFactor::Function {
+            lateral,
+            name,
+            args,
+            alias,
+        } => {
+            if !lateral || alias.is_none() || args.len() != 1 {
+                return false;
+            }
+            let func_name = object_name_to_string(name).to_lowercase();
+            matches!(
+                func_name.as_str(),
+                "explode" | "explode_outer" | "posexplode"
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Lower a correlated `LATERAL <generator>(arg) AS alias(cols)` comma-item
+/// into `CommonOp::LateralView { input: acc, ... }`. The generator arg
+/// references columns from the left plan (e.g. `e.tags`), which the
+/// existing `analyze_lateral_view` resolves against the input's schema.
+fn lower_lateral_generator_item(
+    acc: CommonAst,
+    relation: TableFactor,
+    cte_scope: &CteScope,
+) -> Result<CommonAst, EmissionError> {
+    // The caller guarantees this is a matched Function variant via
+    // `is_lateral_generator_item`, so this destructure is safe.
+    let (name, raw_args, alias) = match relation {
+        TableFactor::Function {
+            name, args, alias, ..
+        } => (name, args, alias),
+        _ => unreachable!("is_lateral_generator_item verified Function variant"),
+    };
+    let gen_name = object_name_to_string(&name).to_lowercase();
+    // Lower the single generator argument.
+    let arg_exprs: Vec<Expression> = raw_args
         .into_iter()
-        .map(|twj| lower_table_with_joins(twj, cte_scope))
+        .map(|a| function_arg_to_expr(a, cte_scope))
         .collect::<Result<_, _>>()?;
-    let first = plans.remove(0);
-    plans.into_iter().try_fold(first, |acc, next| {
-        Ok(CommonAst::new(CommonOp::Join {
-            left: Box::new(acc),
-            right: Box::new(next),
-            join_type: JoinType::Cross,
-            condition: None,
-            using_columns: vec![],
-            natural: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
-        }))
-    })
+    let arg = arg_exprs
+        .into_iter()
+        .next()
+        .expect("is_lateral_generator_item checked args.len() == 1");
+    // Extract alias name and column list from the `AS r(v)` alias.
+    let table_alias_obj = alias.expect("is_lateral_generator_item checked alias.is_some()");
+    let table_alias = table_alias_obj.name.value;
+    let column_aliases: Vec<String> = table_alias_obj
+        .columns
+        .iter()
+        .map(|c| c.name.value.clone())
+        .collect();
+    // For the comma-LATERAL syntax, `OUTER` is not expressible — always non-outer.
+    let outer = gen_name == "explode_outer";
+    // Use the shared generator dispatch table.
+    let columns = generator_view_columns(&gen_name, outer, arg, column_aliases)?;
+    Ok(CommonAst::new(CommonOp::LateralView {
+        input: Box::new(acc),
+        table_alias,
+        columns,
+    }))
 }
 
 fn lower_table_with_joins(
@@ -6662,6 +6753,69 @@ mod tests {
         assert!(
             shape.starts_with("sql::lateral_view::generator::"),
             "expected generator boundary shape, got `{shape}`"
+        );
+    }
+
+    // ── Pass 13 — LATERAL generator comma-syntax redirect to LateralView ──
+
+    /// CONVERGENCE: `FROM emp e, LATERAL explode(e.tags) AS r(v)` produces a
+    /// CommonAst structurally EQUAL to `FROM emp e LATERAL VIEW explode(e.tags) r
+    /// AS v`. Both syntaxes must converge to the same LateralView node shape.
+    #[test]
+    fn comma_lateral_explode_converges_with_lateral_view_syntax() {
+        let comma_plan = parse("SELECT e.id, r.v FROM emp e, LATERAL explode(e.tags) AS r(v)")
+            .expect("comma LATERAL should parse");
+        let lv_plan = parse("SELECT e.id, r.v FROM emp e LATERAL VIEW explode(e.tags) r AS v")
+            .expect("LATERAL VIEW should parse");
+        assert_eq!(
+            comma_plan, lv_plan,
+            "comma-LATERAL and LATERAL VIEW must produce identical CommonAst"
+        );
+    }
+
+    /// DISCRIMINATOR regression guard: non-LATERAL `FROM emp, explode(array(1,2))`
+    /// still lowers to a CrossJoin with right=TableFunction, NOT a LateralView.
+    /// sqlparser parses this as `TableFactor::Table { args: Some(...) }` (not
+    /// `TableFactor::Function`), so the redirect predicate never fires.
+    #[test]
+    fn non_lateral_comma_explode_lowers_to_cross_join_not_lateral_view() {
+        let plan =
+            parse("SELECT * FROM emp, explode(array(1, 2))").expect("non-LATERAL should parse");
+        match plan.op {
+            CommonOp::Project { input, .. } => match input.op {
+                CommonOp::Join {
+                    join_type,
+                    ref right,
+                    ..
+                } => {
+                    assert_eq!(join_type, JoinType::Cross, "must be a CrossJoin");
+                    assert!(
+                        matches!(right.op, CommonOp::TableFunction { .. }),
+                        "right side must be TableFunction, got: {:?}",
+                        right.op
+                    );
+                }
+                other => panic!("expected Join under Project, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    /// The comma-LATERAL redirect handles `posexplode` with 2-alias correctly,
+    /// producing the same split as LATERAL VIEW syntax.
+    #[test]
+    fn comma_lateral_posexplode_two_alias_matches_lateral_view() {
+        let comma_plan = parse(
+            "SELECT e.id, r.pos, r.val FROM emp e, LATERAL posexplode(e.tags) AS r(pos, val)",
+        )
+        .expect("comma LATERAL posexplode should parse");
+        let lv_plan = parse(
+            "SELECT e.id, r.pos, r.val FROM emp e LATERAL VIEW posexplode(e.tags) r AS pos, val",
+        )
+        .expect("LATERAL VIEW posexplode should parse");
+        assert_eq!(
+            comma_plan, lv_plan,
+            "comma-LATERAL and LATERAL VIEW posexplode must produce identical CommonAst"
         );
     }
 }

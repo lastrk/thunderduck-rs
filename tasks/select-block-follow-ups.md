@@ -101,6 +101,13 @@ last of the three original scope re-derivations.
 
 ## 3. Wrap-boundary qualifier rewriting (retire the strand class)
 
+**Witnesses added 2026-07-09**: `filt-016` (alias-qualified filter above
+LIMIT) and `filt-017` (alias-qualified filter above DISTINCT) in the
+DataFrame corpus — both red on τ with the exact strand signature
+(`Binder Error: Referenced table "e" not found! Candidate tables:
+"__td_sub"`) and green on reference Spark. The evidence gate is satisfied;
+this item is now actionable.
+
 **What.** The one residual alias-occlusion class: a qualified reference above
 a slot-conflict wrap. Example: `df.orderBy(x).limit(5).filter(e.y > 1)` — the
 analyzer resolves `e.y` (Limit/Sort are scope-passthrough), but emission

@@ -256,6 +256,14 @@ case("filt-012", "filter", "startswith / endswith / contains", lambda I: I["emp"
 case("filt-013", "filter", "eqNullSafe (<=>)", lambda I: I["emp"].filter(F.col("dept_id").eqNullSafe(F.lit(None))))
 case("filt-014", "filter", "two chained filters", lambda I: I["emp"].filter(F.col("age") > 25).filter(F.col("salary") < 130000))
 case("filt-015", "filter", "filter on computed column", lambda I: I["emp"].withColumn("tenure_pos", F.col("age") - 18).filter(F.col("tenure_pos") > 10))
+# Wrap-boundary strand witnesses (tasks/select-block-follow-ups.md item 3):
+# an alias-qualified reference above a clause-ordinal wrap (Filter cannot
+# merge past an occupied LIMIT/DISTINCT slot, so emission wraps under
+# __td_sub and the analyzer-stamped qualifier strands). Spark accepts both;
+# red on the τ side until wrap-boundary qualifier rewriting lands — the
+# fitness signal item 3 is gated on (ADR-022).
+case("filt-016", "filter", "alias-qualified filter above limit (strand witness)", lambda I: I["emp"].alias("e").orderBy("id").limit(5).filter(F.col("e.salary") > 60000))
+case("filt-017", "filter", "alias-qualified filter above distinct (strand witness)", lambda I: I["emp"].alias("e").select("e.dept_id", "e.active").distinct().filter(F.col("e.dept_id") == 101))
 
 # ── 3. Literals, typed columns & casts (type-source stress) ─────────────────
 case("cast-001", "cast", "lit int / string / bool / double", lambda I: I["emp"].select(F.lit(1).alias("i"), F.lit("x").alias("s"), F.lit(True).alias("b"), F.lit(3.14).alias("d")))

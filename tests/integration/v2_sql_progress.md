@@ -79,3 +79,8 @@ tbl-013, sq-023) demonstrating latent τ bugs uncovered when the FileScan fix
 made TPC-H runnable — each passes on the Spark reference and fails on τ. They
 are the fitness signal for the next implementation passes; see
 `.agent-output/unsolvable.md` §"Latent bugs" for minimized root causes.
+
+Note (2026-07-09): totals jump from 273 to 396 — the corpus absorbed the
+TPC-H (22) and TPC-DS (100) SQL clusters from the retired standalone TPC
+test files, plus jn-018 (the migrated q90 at-alias check). Red TPC cases
+are expected fitness signal (ADR-022).

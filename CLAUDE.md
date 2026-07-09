@@ -19,8 +19,9 @@ Older ADRs under [docs/adrs/legacy-transpiler/](docs/adrs/legacy-transpiler/) ar
 **Two error categories** (ADR-022): (1) **Spark-emulated errors** — inputs Spark itself would reject; τ matches Spark's error semantics. (2) **Thunderduck-boundary errors** — inputs Spark accepts but τ has not implemented; honest "not implemented in Thunderduck."
 
 **Practical implications:**
-- The DataFrame corpus (`tests/scripts/v2-progress.sh`, 324 cases) is the fitness function; TPC-H is temporarily red until τ covers its query surface.
-- The SQL corpus (`differential/sql_corpus.py`, 262 `spark.sql` cases) is the fitness function for the τ SQL front-end — run it with `./tests/scripts/run-differential-tests.sh sql_v2` (or `tests/scripts/v2-sql-progress.sh` to record a progress row in `tests/integration/v2_sql_progress.md`).
+- The DataFrame corpus (`tests/scripts/v2-progress.sh`, 384 cases incl. the migrated `tpch`/`tpcds` clusters) is the fitness function; red TPC cases within it are the signal until τ covers their query surface.
+- The SQL corpus (`differential/sql_corpus.py`, 396 `spark.sql` cases incl. the migrated `tpch`/`tpcds` clusters) is the fitness function for the τ SQL front-end — run it with `./tests/scripts/run-differential-tests.sh sql_v2` (or `tests/scripts/v2-sql-progress.sh` to record a progress row in `tests/integration/v2_sql_progress.md`).
+- TPC-H/TPC-DS live INSIDE the corpora as `tpch-*`/`tpcds-*` cases (the legacy standalone TPC test files were deleted 2026-07-09); `./tests/scripts/run-differential-tests.sh tpch` (or `tpcds`) selects just that cluster across both corpora. `tests/scripts/check-tpc-migration.sh` verifies the migration invariants.
 - The v1 transpiler modules (`crates/core/src/{logical,expression,generator,functions,parser}/`) were deleted on 2026-07-05. INV3/INV10 in `crates/core/src/transpiler_v2/invariants.rs` mechanically enforce that τ does not import from those (now-absent) prefixes.
 
 ## Workflow Orchestration
@@ -42,8 +43,8 @@ Never mark a task complete without proving it works. For any non-trivial change,
 1. **Format** — `cargo fmt --check` must be clean.
 2. **Lint** — `cargo clippy -- -D warnings` must be clean (zero warnings).
 3. **Unit tests** — `cargo test` must pass across all crates.
-4. **TPC-H differential (DEFERRED during the τ reimplementation per ADR-022)** — `./tests/scripts/run-differential-tests.sh tpch` is *not* a required gate right now. The DataFrame corpus (`tests/scripts/v2-progress.sh`, 324 cases) is the fitness function; TPC-H is temporarily red until τ covers its query surface. TPC-H rejoins this step as mandatory once τ covers its query surface.
-5. **Full differential (when SQL-relevant)** — DEFERRED for the same reason as step 4. The `all` suite exercises TPC-H + TPC-DS through the non-τ path, which is not maintained. Use `./tests/scripts/v2-progress.sh` to measure τ progress on the DataFrame corpus.
+4. **Corpus differential** — `./tests/scripts/v2-progress.sh` (DataFrame corpus, 384 cases) and `./tests/scripts/run-differential-tests.sh sql_v2` (SQL corpus, 396 cases) are the fitness gates. Both corpora now CONTAIN the TPC-H/TPC-DS clusters (`tpch-*`/`tpcds-*` case ids); red TPC cases are expected fitness signal (ADR-022), not gate failures — the gate requirement is "no previously-green case regresses."
+5. **TPC cluster check (when touching TPC-relevant surface)** — `./tests/scripts/run-differential-tests.sh tpch` / `tpcds` runs just those clusters across both corpora (~30s / ~1min). The former standalone TPC suites were migrated into the corpora on 2026-07-09; there is no separate TPC path anymore.
 
 A task is **not** done if any step is red. Do not commit, do not declare success, do not move on. If a step is intentionally skipped (e.g., docs-only change skips clippy, or TPC-H is deferred per ADR-022 above), state which step and why.
 
@@ -360,19 +361,36 @@ cargo test -- --nocapture
 > ```
 > Do **not** re-run `setup-differential-testing.sh` — Spark is already present.
 
+`run-differential-tests.sh` is the SINGLE entry point — it runs everything
+(`all`) or a subgroup, and forwards any extra pytest args verbatim (quoting
+preserved). TPC-H/TPC-DS are corpus clusters (`tpch-*`/`tpcds-*` case ids in
+both corpora), not separate test files.
+
 ```bash
-# Full differential test suite (all 41 test files)
+# Everything (the comprehensive gate)
 ./tests/scripts/run-differential-tests.sh all
 
-# Quick check: TPC-H only
-./tests/scripts/run-differential-tests.sh tpch
+# The two corpus fitness gates
+./tests/scripts/run-differential-tests.sh core     # DataFrame corpus (384 cases)
+./tests/scripts/run-differential-tests.sh sql_v2   # SQL corpus (396 cases)
+
+# TPC clusters only (selected by case-id prefix across BOTH corpora)
+./tests/scripts/run-differential-tests.sh tpch     # 44 cases: 22 SQL + 22 DataFrame
+./tests/scripts/run-differential-tests.sh tpcds    # 133 cases: 100 SQL + 33 DataFrame
+
+# Arbitrary case selection via forwarded pytest args
+./tests/scripts/run-differential-tests.sh sql_v2 -k "tpch-q01 or sel-001" --tb=long
+
+# Verify the TPC-migration invariants (structure + zero baseline regressions)
+./tests/scripts/check-tpc-migration.sh              # full (~2 min, runs both clusters)
+./tests/scripts/check-tpc-migration.sh --collect-only   # structural checks only
 
 # Direct pytest (activate venv first)
 cd tests/integration && python3 -m pytest differential/ -v --tb=short
 
-# Single test
+# Single corpus case
 cd tests/integration && python3 -m pytest \
-  "differential/test_differential_v2.py::TestTPCH_AllQueries_Differential[7]" -v --tb=long
+  "differential/test_sql_corpus_differential.py::test_case[tpch-q07]" -v --tb=long
 ```
 
 ### Server
@@ -423,7 +441,7 @@ runs never clash and cleanup never kills another worktree's servers:
 | Test conftest | `tests/integration/conftest.py` |
 | DataFrame diff util | `tests/integration/utils/dataframe_diff.py` |
 
-**Last Updated**: 2026-05-24
+**Last Updated**: 2026-07-09
 
 # Project Guidelines
 

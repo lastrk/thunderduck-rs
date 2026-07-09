@@ -236,3 +236,7 @@ corpus total).
 | 2026-07-08T11:56:13Z | 1aec6e9 |    329 |      0 |   329 |       n/a |
 | 2026-07-09T02:31:52Z | 63855f0 |    329 |      0 |   329 |       n/a |
 | 2026-07-09T06:42:23Z | c8a9b12 |    329 |      0 |   329 |       n/a |
+
+Note (2026-07-09): totals jump from 329 to 384 — the corpus absorbed the
+TPC-H (22) and TPC-DS (33) DataFrame clusters from the retired standalone
+TPC test files. Red TPC cases are expected fitness signal (ADR-022).

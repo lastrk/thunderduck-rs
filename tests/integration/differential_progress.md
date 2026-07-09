@@ -33,3 +33,4 @@ Supersedes the per-corpus ledgers `v2_progress.md` and `v2_sql_progress.md`
 > always rebuilds; the `da6c0d8` row is the first honest measurement of the
 > SELECT-block emission refactor: +32 vs the same-day baseline with zero
 > per-case regressions (verified by full per-case log diff).
+| 2026-07-09T20:10:44Z | 0b944bd |   378/389 |    341/400 | 574/625 |   1293 |    121 |       0 |  1414 |       +8 |

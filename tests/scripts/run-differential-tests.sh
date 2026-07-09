@@ -219,7 +219,10 @@ if [ -z "${THUNDERDUCK_BINARY:-}" ]; then
         echo -e "${YELLOW}  DUCKDB_LIB_DIR unset — compiling DuckDB from source (--features bundled)${NC}"
         BUILD_FEATURES="--features bundled"
     fi
-    if ! cargo build --release $BUILD_FEATURES 2>&1 | tail -20; then
+    # Subshell pipefail so the guard tests CARGO's exit status, not tail's
+    # (plain `cmd | tail` under set -e without pipefail always sees tail's 0,
+    # silently gating against a stale binary when the build breaks).
+    if ! (set -o pipefail; cargo build --release $BUILD_FEATURES 2>&1 | tail -20); then
         echo -e "${RED}ERROR: Failed to build Thunderduck server${NC}"
         exit 1
     fi

@@ -60,11 +60,14 @@ Repro: `df1.alias('e').join(df2.alias('d'), e.x==d.y).join(df3, on='k')
 "__td_jl"`. The pre-branch flatten path (`emit_flat_chain`) kept `e`
 visible — genuine green→red.
 
-### 6. Runner build-failure guard is inert — infra (CONFIRMED)
+### 6. Runner build-failure guard is inert — infra (CONFIRMED) — **FIXED 2026-07-09**
 `tests/scripts/run-differential-tests.sh:222` — `if ! cargo build … 2>&1 |
 tail -20` tests **tail's** exit status (`set -e`, no `pipefail`). A failed
 rebuild with a stale binary present silently gates against the old build —
 the exact false-green class the 6bd9f07 fix claimed to close.
+**Fix:** subshell `(set -o pipefail; cargo build … | tail -20)` so the
+guard sees cargo's status; both branches verified (failing command → guard
+fires; success → passes; old pattern reproduces the miss).
 
 ### 7. Duplicate `__td_jr` when an inlined stamped child join collides with a parent wrap (CONFIRMED, empirical)
 `emission.rs:352` — the duplicate-alias guard re-wraps the colliding right

@@ -69,7 +69,7 @@ the exact false-green class the 6bd9f07 fix claimed to close.
 guard sees cargo's status; both branches verified (failing command → guard
 fires; success → passes; old pattern reproduces the miss).
 
-### 7. Duplicate `__td_jr` when an inlined stamped child join collides with a parent wrap (CONFIRMED, empirical)
+### 7. Duplicate `__td_jr` when an inlined stamped child join collides with a parent wrap (CONFIRMED, empirical) — **FIXED 2026-07-09** (round 2: non-USING joins never build default slots; USING-over-dup-name-side → boundary error; dup-alias guard renames the right wrap when free, else rebuilds the left with inlining disabled to confine the contract-demanded `__td_jr` — witness join-022 green with correct data, tpch-q08 not regressed, gate 8/8 · 0 regressions. Round-1 refusal abandoned — see `tasks/archive/select-block-emission-agent-output/009-*`.)
 `emission.rs:352` — the duplicate-alias guard re-wraps the colliding right
 side under the **same** `TD_JOIN_RIGHT` name, so a collision against an
 inlined child join that itself exposes `__td_jr` is never fixed. DuckDB

@@ -295,6 +295,27 @@ fn side_slot_quals(side: &TypedAst, item: &FromItem) -> Option<Vec<String>> {
         .collect()
 }
 
+/// Whether `fields` (a `(name, qualifier)` sequence — one entry per hoisted
+/// slot a join side would contribute) contains two entries that resolve to
+/// the SAME qualified reference (`qualifier.name`, case-insensitive) — e.g.
+/// a single-alias synthetic wrap over `emp JOIN emp2`, where both sides' `id`
+/// end up qualified by the same `__td_jl` and the hoisted list would emit
+/// `__td_jl.id` twice, silently dropping the second column's data (join-022
+/// round-1). A multi-alias inlined side (F5) never collides this way even
+/// when the raw schema repeats a name: each same-named field carries its OWN
+/// covering alias (`e.dept_id` vs `d.dept_id`), so the qualified references
+/// stay distinct. [`build_join`]'s Change 3 guard uses this — keyed on the
+/// qualified pair, not the raw name alone, and over only the NON-USING-key
+/// fields (the ones a side actually contributes a qualified slot for) — to
+/// decide whether a USING join over a duplicate-name side is genuinely
+/// unsafe to hoist.
+fn has_unsafe_qualified_duplicate<'a>(
+    mut fields: impl Iterator<Item = (&'a str, &'a str)>,
+) -> bool {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    fields.any(|(name, qual)| !seen.insert((qual.to_lowercase(), name.to_lowercase())))
+}
+
 /// Lower one join side to a [`FromItem`]. Ladder:
 ///
 /// 1. `requires_synthetic` (analyzer-stamped — the plan_id contract) →
@@ -400,7 +421,8 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
     let has_using = !using_columns.is_empty();
     let is_semi_or_anti = matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
 
-    let left_item = build_join_side(left, TD_JOIN_LEFT, left_requires_synthetic, true, has_using)?;
+    let mut left_item =
+        build_join_side(left, TD_JOIN_LEFT, left_requires_synthetic, true, has_using)?;
     let mut right_item = build_join_side(
         right,
         TD_JOIN_RIGHT,
@@ -409,20 +431,72 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
         has_using,
     )?;
     // Duplicate-alias guard: DuckDB rejects two `AS x` in one FROM scope
-    // (Spark errors only on ambiguous references). On collision, re-wrap the
-    // RIGHT side under its synthetic alias (isolating scope), matching the
-    // old chain-vs-sibling guard's fallback.
+    // (Spark errors only on ambiguous references). Two independent collision
+    // shapes reach here (F7 round 2):
+    //
+    // 1. An ordinary user-alias collision (rare — both sides literally
+    //    expose the same name) — the right side's synthetic wrap, if any,
+    //    is NOT analyzer-demanded (`right_requires_synthetic == false`), so
+    //    it is free to move: rewrap under the first name in the sequence
+    //    `__td_jr`, `__td_jr_2`, `__td_jr_3`, … that the LEFT does not
+    //    expose. For ordinary collisions this degenerates to today's
+    //    `__td_jr`.
+    // 2. The `__td_jr` synthetic collides with ITSELF (join-022): the LEFT
+    //    is an inlined nested join whose OWN inner right sub-side was
+    //    itself synthetic-wrapped `__td_jr` (now visible, once inlined,
+    //    at THIS FROM scope), while THIS join's right side is separately
+    //    contract-demanded `__td_jr` by an ancestor plan_id reference
+    //    (`right_requires_synthetic == true`). The right name is fixed (the
+    //    contract) — retry by rebuilding the LEFT with
+    //    `may_inline_nested_join = false`: it collapses to a single derived
+    //    `AS __td_jl` wrap, confining its inner `__td_jr` to that sub-scope
+    //    instead. Outermost-first plan_id stamping (review 008) guarantees
+    //    no ancestor expression demands the now-buried inner alias.
+    //    Residual (documented, not fixed): if the rebuilt left ALSO happens
+    //    to expose a user alias an ancestor expression references, that
+    //    reference would strand loudly — this triple-rare shape is
+    //    un-witnessed and out of scope here. The mirror case (LEFT
+    //    flag-demanded, right exposing `__td_jl`) is reachable only via a
+    //    user alias literally spelled `__td_jl` (F13 class) — also out of
+    //    scope; no code handles it.
     {
-        let left_names = left_item.exposed();
-        let collides = right_item
-            .exposed()
-            .iter()
-            .any(|r| left_names.iter().any(|l| l.eq_ignore_ascii_case(r)));
-        if collides {
-            right_item = FromItem::Derived {
-                unit: Box::new(SqlUnit::from(SelectBlock::from_item(right_item))),
-                alias: TD_JOIN_RIGHT.to_owned(),
-            };
+        let collides = |left: &FromItem, right: &FromItem| -> bool {
+            let left_names = left.exposed();
+            right
+                .exposed()
+                .iter()
+                .any(|r| left_names.iter().any(|l| l.eq_ignore_ascii_case(r)))
+        };
+        if collides(&left_item, &right_item) {
+            if !right_requires_synthetic {
+                let left_names = left_item.exposed();
+                let alias = std::iter::once(TD_JOIN_RIGHT.to_owned())
+                    .chain((2..=64).map(|n| format!("{TD_JOIN_RIGHT}_{n}")))
+                    .find(|cand| !left_names.iter().any(|l| l.eq_ignore_ascii_case(cand)))
+                    // Defensive fallback — never observed; avoids an
+                    // unbounded loop / `unwrap` if all 64 candidates collide.
+                    .unwrap_or_else(|| format!("{TD_JOIN_RIGHT}_64"));
+                right_item = FromItem::Derived {
+                    unit: Box::new(SqlUnit::from(SelectBlock::from_item(right_item))),
+                    alias,
+                };
+            } else if left_item
+                .exposed()
+                .iter()
+                .any(|l| l.eq_ignore_ascii_case(TD_JOIN_RIGHT))
+            {
+                left_item = build_join_side(
+                    left,
+                    TD_JOIN_LEFT,
+                    left_requires_synthetic,
+                    false,
+                    has_using,
+                )?;
+                debug_assert!(
+                    !collides(&left_item, &right_item),
+                    "retry-left rebuild must eliminate the __td_jr collision"
+                );
+            }
         }
     }
 
@@ -436,45 +510,19 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
     // suppressed for semi/anti).
     let need_right = !is_semi_or_anti;
     let default_slots = if using_columns.is_empty() {
-        // Non-USING joins: unchanged from before F5 — a default slot list is
-        // built only when each participating side exposes exactly one
-        // alias; a multi-alias (inlined-chain) side renders `SELECT *`,
-        // whose natural left-then-right order already matches the declared
-        // schema for the plain ON/CROSS joins that allow chain inlining. Do
-        // not churn those shapes with the per-field machinery below.
-        let single_alias = |item: &FromItem| -> Option<String> {
-            match item.exposed().as_slice() {
-                [only] => Some(only.clone()),
-                _ => None,
-            }
-        };
-        let left_alias = single_alias(&left_item);
-        let right_alias = single_alias(&right_item);
-        match (left_alias, right_alias) {
-            (Some(la), ra) if !need_right || ra.is_some() => {
-                let la_q = quote_ident(&la);
-                let mut slots: Vec<DefaultSlot> = left
-                    .resolved_schema
-                    .fields
-                    .iter()
-                    .map(|f| DefaultSlot {
-                        name: f.name.clone(),
-                        sql: format!("{la_q}.{}", quote_ident(&f.name)),
-                    })
-                    .collect();
-                if need_right {
-                    if let Some(ra) = &ra {
-                        let ra_q = quote_ident(ra);
-                        slots.extend(right.resolved_schema.fields.iter().map(|f| DefaultSlot {
-                            name: f.name.clone(),
-                            sql: format!("{ra_q}.{}", quote_ident(&f.name)),
-                        }));
-                    }
-                }
-                Some(slots)
-            }
-            _ => None,
-        }
+        // Non-USING joins NEVER build a default slot list (F7 round 2,
+        // Change 2). DuckDB expands bare `SELECT *` over a plain
+        // ON/CROSS/semi/anti join left-then-right in natural order — exactly
+        // the analyzer's resolved-schema order — so a hoisted list adds
+        // nothing here. Worse, a single-alias side over a DUPLICATE-name
+        // schema (e.g. an inlined `emp JOIN emp2` wrapped as one `__td_jl` /
+        // `__td_jr`, per [`build_join_side`]'s ladder) made the OLD
+        // name-based slot list emit e.g. `__td_jl.id` twice, double-binding
+        // the first `id` — silent corruption (join-022 round-1 residual).
+        // `*` is positional and never double-binds. The hoisted list stays a
+        // USING-only device below: it alone enforces Spark's key-first
+        // output order, which DuckDB's `*` breaks for USING joins.
+        None
     } else {
         // USING joins (F5): per-field qualifiers from the RelScope stamp,
         // rather than a single alias per side — this is what lets a
@@ -505,10 +553,40 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
         } else {
             None
         };
+        let using_lower: HashSet<String> = using_columns.iter().map(|s| s.to_lowercase()).collect();
+        // Change 3 (F7 round 2): a USING join over a side whose non-USING-key
+        // fields would collide under the SAME qualified reference (see
+        // [`has_unsafe_qualified_duplicate`]) can build neither a safe
+        // per-field-qualified slot list (double-binds the duplicate) NOR
+        // bare `*` (breaks USING's key-first output order) — an honest
+        // Thunderduck-boundary error (ADR-022) is the correct interim. No
+        // baseline-green corpus case exercises this shape.
+        let side_unsafe = |schema: &Schema, quals: &[String]| {
+            has_unsafe_qualified_duplicate(
+                schema
+                    .fields
+                    .iter()
+                    .zip(quals.iter())
+                    .filter(|(f, _)| !using_lower.contains(&f.name.to_lowercase()))
+                    .map(|(f, q)| (f.name.as_str(), q.as_str())),
+            )
+        };
+        if left_quals
+            .as_ref()
+            .is_some_and(|lq| side_unsafe(&left.resolved_schema, lq))
+            || right_quals
+                .as_ref()
+                .is_some_and(|rq| need_right && side_unsafe(&right.resolved_schema, rq))
+        {
+            bail_boundary_op!(
+                "Join",
+                "USING join over an input with duplicate column names is not supported \
+                 (per-field qualified slots would double-bind the duplicate and `*` \
+                 breaks USING key order — both silently corrupt data)"
+            );
+        }
         match (left_quals, right_quals) {
             (Some(lq), rq) if !need_right || rq.is_some() => {
-                let using_lower: HashSet<String> =
-                    using_columns.iter().map(|s| s.to_lowercase()).collect();
                 let mut slots: Vec<DefaultSlot> = using_columns
                     .iter()
                     .map(|c| DefaultSlot {
@@ -8058,6 +8136,287 @@ mod tests {
         assert!(!sql.contains("LEFT SEMI JOIN"), "got: {sql}");
         assert!(sql.contains("__td_jl"), "got: {sql}");
         assert!(sql.contains("emp2 AS m ON "), "got: {sql}");
+    }
+
+    // ── F7 round 2: duplicate `__td_jr` join-side alias collision ───────────
+
+    #[test]
+    fn contract_collision_wraps_left_keeps_right_name() {
+        let _g = tap_guard();
+        // join-022 unit mirror. `inner = emp.join(emp2, emp.dept_id ==
+        // emp2.dept_id)`: the plan_id-tagged condition self-demands BOTH of
+        // the inner join's own sides, wrapping them `__td_jl`/`__td_jr`; the
+        // inner join is a plain-ON join, so it inlines as the OUTER left,
+        // exposing `__td_jl` AND `__td_jr` at the outer FROM scope. `d3 =
+        // dept.select("dept_id", "dept_name")` is the outer RIGHT; an
+        // ancestor `Filter` references `d3`'s plan_id (3), so the OUTER's
+        // `right_requires_synthetic` is true and `d3` wraps `AS __td_jr` too
+        // — colliding with the inner's OWN (buried) `__td_jr`, which is
+        // contract-demanded and cannot move. The guard must rebuild the
+        // LEFT into a single derived `AS __td_jl` wrap instead.
+        let inner_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(Expression::UnresolvedColumn(
+                    crate::transpiler_v2::expression::UnresolvedColumn {
+                        name: "dept_id".to_owned(),
+                        qualifier: None,
+                        plan_id: Some(1),
+                    },
+                )),
+                right: Box::new(Expression::UnresolvedColumn(
+                    crate::transpiler_v2::expression::UnresolvedColumn {
+                        name: "dept_id".to_owned(),
+                        qualifier: None,
+                        plan_id: Some(2),
+                    },
+                )),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![1],
+            right_plan_ids: vec![2],
+        });
+        let d3 = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("dept")),
+            projections: vec![ucol("dept_id"), ucol("dept_name")],
+        });
+        let outer_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(inner_join),
+            right: Box::new(d3),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(ucol("dept_name")),
+                right: Box::new(str_lit("Data")),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![3],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(outer_join),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(Expression::UnresolvedColumn(
+                    crate::transpiler_v2::expression::UnresolvedColumn {
+                        name: "dept_id".to_owned(),
+                        qualifier: None,
+                        plan_id: Some(3),
+                    },
+                )),
+                right: Box::new(int_lit(20)),
+            }),
+        });
+        let bt = base_types_emp_dept_emp2(&filter);
+        let typed = analyze(filter, &bt).expect("analyze join-022 shape");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // Derived empirically (see .agent-output/009-implementation-f7-round2.md):
+        // "SELECT * FROM (SELECT * FROM (SELECT * FROM emp) AS __td_jl INNER
+        //  JOIN (SELECT * FROM emp2) AS __td_jr ON (__td_jl.dept_id) =
+        //  (__td_jr.dept_id)) AS __td_jl INNER JOIN (SELECT dept_id,
+        //  dept_name FROM dept) AS __td_jr ON (dept_name) = ('Data') WHERE
+        //  (__td_jr.dept_id) = (20)"
+        // The inner join's OWN `__td_jl`/`__td_jr` pair is now buried inside
+        // the outer LEFT's parenthesized derived wrap — a DIFFERENT FROM
+        // scope than the outer's own `__td_jl`/`__td_jr` — so the text
+        // legitimately contains two `AS __td_jr` (one per scope); the guard
+        // pins the STRUCTURE (single collapsed left wrap), not a raw count.
+        assert!(
+            sql.starts_with(
+                "SELECT * FROM (SELECT * FROM (SELECT * FROM emp) AS __td_jl \
+                 INNER JOIN (SELECT * FROM emp2) AS __td_jr ON (__td_jl.dept_id) = \
+                 (__td_jr.dept_id)) AS __td_jl INNER JOIN "
+            ),
+            "left must collapse to a single derived `AS __td_jl` wrap over the \
+             WHOLE inner join; got: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "(SELECT dept_id, dept_name FROM dept) AS __td_jr ON (dept_name) = ('Data')"
+            ),
+            "outer right must keep its contract-demanded __td_jr wrap; got: {sql}"
+        );
+        assert!(
+            sql.ends_with("WHERE (__td_jr.dept_id) = (20)"),
+            "outer filter must bind against the contract-demanded __td_jr; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn free_collision_renames_right_wrap() {
+        let _g = tap_guard();
+        // Same shape as `contract_collision_wraps_left_keeps_right_name` but
+        // WITHOUT the ancestor filter: `d3`'s wrap is NOT contract-demanded
+        // (`right_requires_synthetic == false`), so it is free to move — the
+        // guard renames it to `__td_jr_2` instead of touching the left.
+        let inner_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(Expression::UnresolvedColumn(
+                    crate::transpiler_v2::expression::UnresolvedColumn {
+                        name: "dept_id".to_owned(),
+                        qualifier: None,
+                        plan_id: Some(1),
+                    },
+                )),
+                right: Box::new(Expression::UnresolvedColumn(
+                    crate::transpiler_v2::expression::UnresolvedColumn {
+                        name: "dept_id".to_owned(),
+                        qualifier: None,
+                        plan_id: Some(2),
+                    },
+                )),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![1],
+            right_plan_ids: vec![2],
+        });
+        let d3 = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("dept")),
+            projections: vec![ucol("dept_id"), ucol("dept_name")],
+        });
+        let outer_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(inner_join),
+            right: Box::new(d3),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(ucol("dept_name")),
+                right: Box::new(str_lit("Data")),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&outer_join);
+        let typed = analyze(outer_join, &bt).expect("analyze free-collision shape");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS __td_jr_2"),
+            "free collision must rename the right wrap; got: {sql}"
+        );
+        assert_eq!(
+            sql.matches("AS __td_jr ").count(),
+            1,
+            "the inner join's OWN __td_jr must survive unrenamed; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn plain_join_over_dup_name_side_renders_star() {
+        let _g = tap_guard();
+        // join-022 round-1 corruption pin: a single-alias side whose OWN
+        // resolved_schema has duplicate names (`id`, `dept_id` both appear
+        // twice in `emp JOIN emp2`) sits as the RIGHT side of a plain-ON
+        // outer join — the right side never inlines, so it always wraps as
+        // ONE alias, `__td_jr`, over the duplicate-name schema. Change 2
+        // (non-USING joins never build a default slot list) must render bare
+        // `*` here, never a name-qualified list that would double-bind
+        // `__td_jr.id` / `__td_jr.dept_id`.
+        let inner_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("emp2", "e2")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("e2", "dept_id")),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let outer_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("dept")),
+            right: Box::new(inner_join),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("dept", "dept_id")),
+                right: Box::new(qcol("e", "dept_id")),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&outer_join);
+        let typed = analyze(outer_join, &bt).expect("analyze plain-join-over-dup-name-side");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.starts_with("SELECT * FROM"),
+            "non-USING join must render bare `*`, never a hoisted slot list; got: {sql}"
+        );
+        assert!(
+            !sql.contains("__td_jr.id") && !sql.contains("__td_jr.dept_id"),
+            "must not double-bind the duplicate-name side's fields; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn using_join_over_dup_name_side_is_boundary_error() {
+        let _g = tap_guard();
+        // Change 3: a USING(dept_id) parent's RIGHT side is NEVER inlined
+        // (`may_inline_nested_join` is hardcoded `false` for the right in
+        // `build_join_side`), so a nested `emp JOIN emp2` there always wraps
+        // as ONE alias (`__td_jr`) regardless of any analyzer contract —
+        // `side_slot_quals`'s single-alias fast path then qualifies EVERY
+        // field (including both `id`s) with that same alias. Neither a
+        // per-field-qualified slot list (double-binds `__td_jr.id`) nor bare
+        // `*` (breaks USING's key-first output order) is safe here — an
+        // honest Thunderduck-boundary error is the correct interim.
+        let inner_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("emp2", "e2")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("e2", "dept_id")),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let outer_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("dept")),
+            right: Box::new(inner_join),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&outer_join);
+        let typed = analyze(outer_join, &bt).expect("analyze USING-over-dup-name-side");
+        let err = dispatch_op(&typed.op, &typed.resolved_schema).expect_err("must bail");
+        expect_unsupported(
+            err,
+            UnsupportedKind::Op,
+            "Join",
+            &["duplicate column names"],
+        );
     }
 
     fn ucol(name: &str) -> Expression {

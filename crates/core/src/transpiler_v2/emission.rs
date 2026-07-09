@@ -240,6 +240,61 @@ struct JoinParts<'a> {
     right_requires_synthetic: bool,
 }
 
+/// Alias that qualifies field `i` of `side.resolved_schema` in the
+/// enclosing FROM scope: the FIRST alias in `side`'s stamped
+/// [`RelScope`](super::analyzer::RelScope) whose range covers `i`
+/// (`TableScan` binds table and alias to the SAME range; first-match is
+/// canonical, matching `RelScope::lookup`) — but ONLY if `item`, the
+/// [`FromItem`] actually emitted for this side, exposes that alias too
+/// (case-insensitive membership in [`FromItem::exposed`]). A RelScope alias
+/// the emitted item does NOT expose cannot qualify anything: a nested-join
+/// side whose OWN sub-sides are synthetic-wrapped
+/// (`left/right_requires_synthetic`) renders those sub-sides under
+/// `__td_jl`/`__td_jr`, not the analyzer-scoped logical alias RelScope
+/// still reports — this predicate is what stops that mismatch from
+/// producing an unbindable qualified reference. Returns `None` when no
+/// covering, exposed alias exists for field `i`.
+fn covering_alias(side: &TypedAst, item: &FromItem, i: usize) -> Option<String> {
+    let (name, _) = side
+        .scope
+        .aliases
+        .iter()
+        .find(|(_, range)| range.contains(&i))?;
+    let exposed = item.exposed();
+    exposed
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(name))
+        .then(|| name.clone())
+}
+
+/// Whether every field index of `side.resolved_schema` is coverable by an
+/// alias that `item` (the [`FromItem`] actually emitted for this side)
+/// exposes — the shared coverage predicate, built on [`covering_alias`] so
+/// it can never drift from [`side_slot_quals`]'s per-field lookup.
+/// [`build_join_side`]'s `inline_ok` uses it to decide whether a
+/// multi-alias nested-`Join` side may inline under a USING parent (F5).
+fn scope_covers_fields(side: &TypedAst, item: &FromItem) -> bool {
+    (0..side.resolved_schema.len()).all(|i| covering_alias(side, item, i).is_some())
+}
+
+/// Per-field qualifier list for one join side: which alias qualifies each
+/// column of `side.resolved_schema` in the enclosing FROM scope. A
+/// single-alias `item` (a bare relation, derived table, or synthetic wrap)
+/// qualifies every field with that one alias; a multi-alias item (an
+/// inlined nested-join chain, F5) derives each field's alias via
+/// [`covering_alias`]. Returns `None` if any field index has no covering,
+/// exposed alias — un-hoistable; the caller must fall back to `*` (no
+/// default slot list) for this join instead of building one from an
+/// incomplete qualifier map.
+fn side_slot_quals(side: &TypedAst, item: &FromItem) -> Option<Vec<String>> {
+    if let [only] = item.exposed().as_slice() {
+        return Some(vec![only.clone(); side.resolved_schema.len()]);
+    }
+    (0..side.resolved_schema.len())
+        .map(|i| covering_alias(side, item, i))
+        .collect()
+}
+
 /// Lower one join side to a [`FromItem`]. Ladder:
 ///
 /// 1. `requires_synthetic` (analyzer-stamped — the plan_id contract) →
@@ -247,11 +302,16 @@ struct JoinParts<'a> {
 /// 2. The side's unit is a pure-FROM block → inline its `FromItem` directly,
 ///    keeping user aliases / table names visible (subsumes the old
 ///    user-alias hoist, bare-TableScan hoist, and left-spine chain flatten).
-///    Guarded: a nested `Join` item inlines only on the left side of a
-///    non-USING parent, and only when the nested join itself is a plain
-///    ON/CROSS join (CLAUDE.md gotcha 4 — never fold across semi/anti; USING
-///    has its own column-order semantics; lateral correlation must stay
-///    isolated). `Raw` FROM bodies (lateral-view chains) never inline.
+///    Guarded: a nested `Join` item inlines only on the left side, and only
+///    when the nested join itself is a plain ON/CROSS join (CLAUDE.md
+///    gotcha 4 — never fold across semi/anti; lateral correlation must stay
+///    isolated). Under a non-USING parent this is unconditional; under a
+///    USING parent (F5) it additionally requires [`scope_covers_fields`] to
+///    hold for the nested side — the USING parent's own hoisted-slot
+///    qualifiers must be derivable per field from an alias the nested join's
+///    emitted `FromItem` actually exposes, or the side stays wrapped under
+///    its synthetic alias instead (see [`side_slot_quals`]). `Raw` FROM
+///    bodies (lateral-view chains) never inline.
 /// 3. Otherwise → `(side) AS __td_jl/__td_jr`.
 ///
 /// The duplicate-alias guard runs in [`build_join`] across BOTH lowered
@@ -287,9 +347,9 @@ fn build_join_side(
     let inline_ok = block.pure_from()
         && match block.from_ref() {
             FromItem::Relation { .. } | FromItem::Derived { .. } => true,
-            FromItem::Join { .. } => {
+            item @ FromItem::Join { .. } => {
                 may_inline_nested_join
-                    && !parent_has_using
+                    && (!parent_has_using || scope_covers_fields(side, item))
                     && matches!(
                         &side.op,
                         TypedOp::Join {
@@ -373,26 +433,82 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
 
     // Hoisted slot list mirroring the analyzer's output-schema order (USING
     // cols first, then left non-USING, then right non-USING; right side
-    // suppressed for semi/anti). Constructible only when each participating
-    // side exposes exactly one alias; a multi-alias (inlined-chain) side
-    // renders `SELECT *`, whose natural left-then-right order already
-    // matches the declared schema for the plain ON/CROSS joins that allow
-    // chain inlining.
-    let single_alias = |item: &FromItem| -> Option<String> {
-        match item.exposed().as_slice() {
-            [only] => Some(only.clone()),
-            _ => None,
-        }
-    };
-    let default_slots = {
+    // suppressed for semi/anti).
+    let need_right = !is_semi_or_anti;
+    let default_slots = if using_columns.is_empty() {
+        // Non-USING joins: unchanged from before F5 — a default slot list is
+        // built only when each participating side exposes exactly one
+        // alias; a multi-alias (inlined-chain) side renders `SELECT *`,
+        // whose natural left-then-right order already matches the declared
+        // schema for the plain ON/CROSS joins that allow chain inlining. Do
+        // not churn those shapes with the per-field machinery below.
+        let single_alias = |item: &FromItem| -> Option<String> {
+            match item.exposed().as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            }
+        };
         let left_alias = single_alias(&left_item);
         let right_alias = single_alias(&right_item);
-        let need_right = !is_semi_or_anti;
         match (left_alias, right_alias) {
             (Some(la), ra) if !need_right || ra.is_some() => {
+                let la_q = quote_ident(&la);
+                let mut slots: Vec<DefaultSlot> = left
+                    .resolved_schema
+                    .fields
+                    .iter()
+                    .map(|f| DefaultSlot {
+                        name: f.name.clone(),
+                        sql: format!("{la_q}.{}", quote_ident(&f.name)),
+                    })
+                    .collect();
+                if need_right {
+                    if let Some(ra) = &ra {
+                        let ra_q = quote_ident(ra);
+                        slots.extend(right.resolved_schema.fields.iter().map(|f| DefaultSlot {
+                            name: f.name.clone(),
+                            sql: format!("{ra_q}.{}", quote_ident(&f.name)),
+                        }));
+                    }
+                }
+                Some(slots)
+            }
+            _ => None,
+        }
+    } else {
+        // USING joins (F5): per-field qualifiers from the RelScope stamp,
+        // rather than a single alias per side — this is what lets a
+        // multi-alias inlined nested-join side (change 2's
+        // `scope_covers_fields` gate) hoist its slots under a USING parent
+        // instead of staying buried under a synthetic wrap alias. Honestly
+        // stated (fix round 1): `side_slot_quals` requires every covering
+        // RelScope alias to ALSO be one `left_item`/`right_item` actually
+        // exposes — a covering alias RelScope reports but the emitted item
+        // does not expose (e.g. a nested-join side whose own children are
+        // synthetic-wrapped, rendering under `__td_jl`/`__td_jr` instead of
+        // their logical aliases) does not count. `build_join_side`'s
+        // `inline_ok` gates on that SAME exposure-aware
+        // `scope_covers_fields(side, &item)` predicate, against the SAME
+        // item, before ever inlining a multi-alias side under a USING
+        // parent — so `side_slot_quals(left, &left_item)` is guaranteed
+        // `Some` for every inlined multi-alias left side by construction.
+        // The right side is never inlined under USING
+        // (`may_inline_nested_join` is always `false` for it in
+        // `build_join_side`), so it stays single-alias and hits the
+        // `item.exposed()` fast path in `side_slot_quals` unconditionally.
+        // If either is ever `None` here regardless, fall back to bare `*`
+        // rather than panic — this function only consumes that guarantee,
+        // it does not reprove it locally.
+        let left_quals = side_slot_quals(left, &left_item);
+        let right_quals = if need_right {
+            side_slot_quals(right, &right_item)
+        } else {
+            None
+        };
+        match (left_quals, right_quals) {
+            (Some(lq), rq) if !need_right || rq.is_some() => {
                 let using_lower: HashSet<String> =
                     using_columns.iter().map(|s| s.to_lowercase()).collect();
-                let la_q = quote_ident(&la);
                 let mut slots: Vec<DefaultSlot> = using_columns
                     .iter()
                     .map(|c| DefaultSlot {
@@ -400,36 +516,32 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
                         sql: quote_ident(c).into_owned(),
                     })
                     .collect();
-                for f in &left.resolved_schema.fields {
+                for (f, qual) in left.resolved_schema.fields.iter().zip(lq.iter()) {
                     if !using_lower.contains(&f.name.to_lowercase()) {
                         slots.push(DefaultSlot {
                             name: f.name.clone(),
-                            sql: format!("{la_q}.{}", quote_ident(&f.name)),
+                            sql: format!("{}.{}", quote_ident(qual), quote_ident(&f.name)),
                         });
                     }
                 }
                 if need_right {
-                    if let Some(ra) = &ra {
-                        let ra_q = quote_ident(ra);
-                        for f in &right.resolved_schema.fields {
+                    if let Some(rq) = &rq {
+                        for (f, qual) in right.resolved_schema.fields.iter().zip(rq.iter()) {
                             if !using_lower.contains(&f.name.to_lowercase()) {
                                 slots.push(DefaultSlot {
                                     name: f.name.clone(),
-                                    sql: format!("{ra_q}.{}", quote_ident(&f.name)),
+                                    sql: format!("{}.{}", quote_ident(qual), quote_ident(&f.name)),
                                 });
                             }
                         }
                     }
                 }
-                if slots.is_empty() {
-                    None // SEMI/ANTI on identical USING columns only → `*`.
-                } else {
-                    Some(slots)
-                }
+                Some(slots)
             }
             _ => None,
         }
-    };
+    }
+    .filter(|slots: &Vec<DefaultSlot>| !slots.is_empty());
 
     let mut block = SelectBlock::from_item(FromItem::Join {
         left: Box::new(left_item),
@@ -7065,6 +7177,277 @@ mod tests {
         assert!(
             !sql.contains("(SELECT * FROM dept INNER JOIN emp2 USING (dept_id)) AS __td_jr"),
             "must not discard hoisted slots for a bare `SELECT *`; got: {sql}"
+        );
+    }
+
+    // ── Plan 007 F5: inline under USING parents; RelScope-qualified
+    // hoisted slots ───────────────────────────────────────────────────────
+
+    #[test]
+    fn alias_ref_above_using_parent_inlines_and_binds() {
+        let _g = tap_guard();
+        // join-021 (F5 regression pin): a plain-ON nested join (`emp e JOIN
+        // dept d ON e.dept_id = d.dept_id`) is the LEFT side of an outer
+        // USING(dept_id) join against `emp2`. Before F5, the USING parent's
+        // `parent_has_using` guard unconditionally refused to inline the
+        // nested join, burying `e` under `AS __td_jl` — and the outer USING
+        // join's EMPTY `RelScope` made the qualifier vis-exempt in
+        // `exprs_visible_in`, so the merge went ahead anyway and emitted an
+        // unbindable `e.name`. F5 widens the guard to inline whenever the
+        // nested join's own `RelScope` covers every field (it does here:
+        // `e` covers 0..4, `d` covers 4..6), so `e` stays visible in the
+        // outer FROM scope and `e.name` binds.
+        let nested_on_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let outer_using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(nested_on_join),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(outer_using_join),
+            projections: vec![qcol("e", "name")],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze alias-ref-above-using-parent");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS e"),
+            "left alias must not be buried; got: {sql}"
+        );
+        assert!(
+            sql.contains("e.name"),
+            "projection must bind against the now-visible alias; got: {sql}"
+        );
+        assert!(
+            !sql.contains("__td_jl"),
+            "the nested join must inline, not wrap under the synthetic alias; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn using_parent_hoisted_slots_qualify_by_covering_alias() {
+        let _g = tap_guard();
+        // Same shape as `alias_ref_above_using_parent_inlines_and_binds`,
+        // dispatched with no enclosing Project: the join builder's own
+        // hoisted default-slot list must qualify each left-side field by
+        // whichever alias's `RelScope` range covers it (`e` for emp's
+        // fields, `d` for dept's), not a single side-wide alias.
+        let nested_on_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Join {
+            left: Box::new(nested_on_join),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze bare using-parent join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.starts_with("SELECT dept_id, e.id, e.name, e.salary, d.dept_name"),
+            "hoisted slots must lead with the bare USING key, then e.-qualified, \
+             then d.-qualified fields in schema order; got: {sql}"
+        );
+        assert!(
+            !sql.contains("__td_jl"),
+            "left side must inline; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn using_parent_with_uncoverable_side_still_wraps() {
+        let _g = tap_guard();
+        // Residual gap (plan 007, tracked not fixed here): when the nested
+        // join's OWN children re-scope (each a `Project` over a scan, whose
+        // `RelScope` is empty per `RelScope::of`), the nested join's own
+        // `RelScope` has zero coverage — `scope_covers_fields` fails, so the
+        // left side must still wrap under `AS __td_jl` exactly as before
+        // F5. F5 only WIDENS inlining to coverable multi-alias sides; it
+        // never removes the wrap fallback for an uncoverable one.
+        let left_child = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![
+                ColumnReference::untyped("id"),
+                ColumnReference::untyped("dept_id"),
+            ],
+        });
+        let right_child = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("dept")),
+            projections: vec![
+                ColumnReference::untyped("dept_id"),
+                ColumnReference::untyped("dept_name"),
+            ],
+        });
+        let nested_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(left_child),
+            right: Box::new(right_child),
+            join_type: JoinType::Cross,
+            condition: None,
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let outer_using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(nested_join),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(outer_using_join),
+            projections: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze uncoverable-side USING wrap");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS __td_jl"),
+            "an uncoverable multi-alias side must still wrap; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn using_parent_with_synthetic_scoped_side_stays_wrapped() {
+        let _g = tap_guard();
+        // Fix round 1 (Medium finding on plan 007/F5): the nested join's OWN
+        // sides are synthetic-stamped — its condition carries plan_id-tagged
+        // `dept_id` refs ambiguous across `emp`/`dept` (mirrors
+        // `analyzer::tests::join_flags_set_when_condition_carries_plan_id_ambiguity`'s
+        // `plan_id_join` construction), so the analyzer sets the nested
+        // join's OWN `left_requires_synthetic`/`right_requires_synthetic` to
+        // true. That makes the nested join render its children under `(emp)
+        // AS __td_jl` / `(dept) AS __td_jr` — but the nested join's stamped
+        // `RelScope` (`RelScope::of` for a plain, non-USING `Join`) still
+        // reports the LOGICAL `emp`/`dept` aliases over those same field
+        // ranges, because scope derivation is independent of the
+        // synthetic-wrap emission decision. Before fix round 1,
+        // `scope_covers_fields`/`side_slot_quals` trusted `RelScope` alone,
+        // inlined this side under the outer USING(dept_id) parent, and
+        // qualified its hoisted default slots with the now-invisible
+        // `emp`/`dept` names — an unbindable reference (`emp.id` when the
+        // FROM only exposes `__td_jl`). The exposure-aware predicate must
+        // instead treat this side as uncoverable and keep it wrapped under
+        // its OWN synthetic alias at the outer level, exactly as an
+        // ordinary uncoverable side would.
+        let nested_on_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(Expression::UnresolvedColumn(
+                    crate::transpiler_v2::expression::UnresolvedColumn {
+                        name: "dept_id".to_owned(),
+                        qualifier: None,
+                        plan_id: Some(10),
+                    },
+                )),
+                right: Box::new(Expression::UnresolvedColumn(
+                    crate::transpiler_v2::expression::UnresolvedColumn {
+                        name: "dept_id".to_owned(),
+                        qualifier: None,
+                        plan_id: Some(20),
+                    },
+                )),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![10],
+            right_plan_ids: vec![20],
+        });
+        let outer_using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(nested_on_join),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&outer_using_join);
+        let typed = analyze(outer_using_join, &bt).expect("analyze synthetic-scoped side");
+        // Sanity: confirm the nested join really did get its own synthetic
+        // flags stamped (the premise this test pins), not just that the
+        // outer wrap happens to look right for an unrelated reason.
+        let TypedOp::Join { left, .. } = &typed.op else {
+            panic!("expected outer Join, got {:?}", typed.op);
+        };
+        let TypedOp::Join {
+            left_requires_synthetic,
+            right_requires_synthetic,
+            ..
+        } = &left.op
+        else {
+            panic!("expected nested Join, got {:?}", left.op);
+        };
+        assert!(
+            *left_requires_synthetic && *right_requires_synthetic,
+            "premise: the nested join's own sides must be synthetic-stamped"
+        );
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS __td_jl"),
+            "a nested-join side whose OWN children are synthetic-wrapped must \
+             stay wrapped at the outer level (Derived under its synthetic \
+             alias), not inline with a stranded logical-alias qualifier; \
+             got: {sql}"
+        );
+        assert!(
+            !sql.contains("emp."),
+            "no logical-name-qualified slot may appear once the covering \
+             alias is not exposed by the emitted FromItem; got: {sql}"
+        );
+        assert!(
+            !sql.contains("dept."),
+            "same requirement for the nested join's right side; got: {sql}"
         );
     }
 

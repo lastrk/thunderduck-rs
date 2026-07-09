@@ -50,7 +50,7 @@ Repro: `l(a,k).join(r, on='k').select('*', lit(1).alias('one'))` → live
 `Row(k=10, a=1, …)` vs Spark `Row(k=1, a=10, …)`. The 5b2edb3 renderer had
 the identical flaw (lone-star-only delegate) — live defect, not a regression.
 
-### 5. USING-join scope exemption strands buried user aliases on the merge path — regression (CONFIRMED, empirical)
+### 5. USING-join scope exemption strands buried user aliases on the merge path — regression (CONFIRMED, empirical) — **FIXED 2026-07-09** (nested plain-ON joins inline under USING parents when every side field's RelScope-covering alias is actually exposed by the item; hoisted slots qualify per-field via the covering alias — witness join-021 green. Narrowed residual, un-witnessed: a side with an uncoverable/synthetic-re-scoped scope still wraps and a qualified ref above it still strands loudly.)
 `emission.rs:606` — a USING join's `RelScope` is deliberately empty, so
 `exprs_visible_in`'s `scope_binds` filter exempts a user alias that
 `build_join_side` (parent_has_using) just buried under `AS __td_jl`; the

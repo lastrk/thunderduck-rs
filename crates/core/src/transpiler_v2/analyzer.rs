@@ -3749,13 +3749,11 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                     // Only stamp the join-side qualifier when the column
                     // name is AMBIGUOUS in the full schema (appears on
                     // both sides of the join). Unambiguous names must NOT
-                    // be qualified: `__td_jl`/`__td_jr` are only in scope
-                    // when emission uses alias-transparent rendering
-                    // (Project-over-Join). In other render shapes
-                    // (Filter-over-Join → `__td_filter`, Sort-over-Join →
-                    // `__td_sort`, aggregate-over-join, etc.) the join's
-                    // synthetic aliases are buried inside a subquery and
-                    // the qualifier would cause a "table not found" error.
+                    // be qualified — they resolve by name in any FROM
+                    // scope, and every stamped synthetic qualifier obliges
+                    // emission (via the `mark_join_alias_requirements`
+                    // flags) to pin that join side under its `__td_jl` /
+                    // `__td_jr` alias instead of hoisting the user's.
                     let is_ambiguous = ctx
                         .schema
                         .fields

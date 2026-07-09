@@ -14,12 +14,17 @@
 //!
 //! # What lives here
 //!
-//! - [`dispatch_op`] — the single top-level operator dispatcher. One
-//!   hand-written match arm per [`TypedOp`] variant. Every `Ok` return path
-//!   increments the [`EMIT_TAP`] counter (§5.3).
-//! - Per-operator renderers (`render_project`, `render_filter`, `render_sort`,
-//!   `render_limit`, `render_single_row`, `render_table_scan`, `render_values`,
-//!   `render_local_relation`, `render_file_scan`).
+//! - [`dispatch_op`] — the single top-level operator dispatcher: it renders
+//!   [`build_unit`]'s [`SqlUnit`] and increments the [`EMIT_TAP`] counter
+//!   once per `Ok` (§5.3).
+//! - [`build_unit`] — one hand-written match arm per [`TypedOp`] variant.
+//!   Block-composable operators build/merge a `sql_block::SelectBlock`
+//!   (merge when the clause ordinal and alias-visibility preconditions
+//!   hold, wrap under `__td_sub` on slot conflict — see `sql_block.rs`);
+//!   the analyzer's per-node `RelScope` stamp and the Join
+//!   `*_requires_synthetic` flags are the scope authority. Self-contained
+//!   generators (Values, FileScan, Pivot, Sample, RecursiveCte, …) render
+//!   via [`legacy_render`] into opaque `Raw` units.
 //! - [`render_expr`] — exhaustive match over the [`Expression`] enum.
 //! - [`render_cast`] — includes the `try_cast` → `TRY_CAST(...)` branch
 //!   (checklist §4.2 first item).
@@ -579,6 +584,29 @@ fn exprs_visible_in<'e>(
     quals.iter().all(|q| block.exposes(q))
 }
 
+/// R7 latent-occlusion witness: when a slot-conflict wrap is about to strand
+/// a qualifier the child block's FROM scope DID expose (the reference will
+/// not resolve through the `__td_sub` boundary), leave a trace. This is not
+/// an error path — it reproduces the pre-block-builder behavior exactly —
+/// but each hit is a corpus witness for a case class the merge rules could
+/// be widened to cover.
+fn trace_stranded_qualifiers<'e>(
+    block: &SelectBlock,
+    exprs: impl IntoIterator<Item = &'e Expression>,
+) {
+    let mut quals = Vec::new();
+    for e in exprs {
+        expr_qualifiers(e, &mut quals);
+    }
+    let stranded: Vec<&str> = quals.into_iter().filter(|q| block.exposes(q)).collect();
+    if !stranded.is_empty() {
+        tracing::debug!(
+            ?stranded,
+            "SELECT-block wrap strands qualifiers the child scope exposed"
+        );
+    }
+}
+
 fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit, EmissionError> {
     // A lone unqualified `*` is a pure identity projection: return the child
     // unit verbatim (ADR-001 cosmetic "SELECT * over SELECT *" collapse).
@@ -592,6 +620,7 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
     let slots = render_projection_slots(projections, &input.resolved_schema)?;
     let mut block = open_block(input)?;
     if !(block.can_accept(Clause::Select) && exprs_visible_in(projections, &block)) {
+        trace_stranded_qualifiers(&block, projections);
         block = SelectBlock::wrap(block.into());
     }
     block.set_projections(slots);
@@ -605,6 +634,7 @@ fn build_filter(input: &TypedAst, condition: &Expression) -> Result<SqlUnit, Emi
         block.push_where(cond_sql);
         return Ok(block.into());
     }
+    trace_stranded_qualifiers(&block, [condition]);
     let mut wrapped = SelectBlock::wrap(block.into());
     wrapped.push_where(cond_sql);
     Ok(wrapped.into())
@@ -820,8 +850,8 @@ fn sql_join<T>(
 fn render_single_row() -> Result<String, EmissionError> {
     // DuckDB requires a subquery to have a projection list — bare `SELECT`
     // parses at top-level but fails inside `FROM (...)`. Emit `SELECT 1` so
-    // `SingleRow` is subquery-safe under `Project` (which wraps as
-    // `SELECT expr FROM (<child>) AS __td_proj` — the placeholder column is
+    // `SingleRow` is subquery-safe under `Project` (which wraps the Raw unit
+    // as `SELECT expr FROM (<child>) AS __td_sub` — the placeholder column is
     // unused because Project provides its own SELECT list). The analyzer
     // stamps SingleRow with an empty schema; no legitimate operator resolves
     // the placeholder column from downstream code, so its presence is inert.

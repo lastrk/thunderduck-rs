@@ -148,8 +148,60 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
             table_alias,
             columns,
         } => build_lateral_view(input, table_alias, columns),
+        TypedOp::SetOp {
+            kind,
+            all,
+            by_name,
+            allow_missing_columns,
+            children,
+            widened_schema,
+        } => build_set_op(
+            *kind,
+            *all,
+            *by_name,
+            *allow_missing_columns,
+            children,
+            widened_schema,
+        ),
+        TypedOp::WithColumns { input, assignments } => build_with_columns(input, assignments),
+        TypedOp::DropColumns { input, drop_names } => build_drop_columns(input, drop_names),
+        TypedOp::WithColumnsRenamed { input, renames } => {
+            build_with_columns_renamed(input, renames)
+        }
+        TypedOp::NaFill {
+            input,
+            cols,
+            values,
+        } => build_na_fill(input, cols, values),
+        TypedOp::NaDrop {
+            input,
+            cols,
+            min_non_nulls,
+        } => build_na_drop(input, cols, *min_non_nulls),
+        TypedOp::NaReplace {
+            input,
+            cols,
+            replacements,
+        } => build_na_replace(input, cols, replacements),
         other => legacy_render(other, schema).map(SqlUnit::Raw),
     }
+}
+
+/// Fill a SELECT slot list over `input`'s open block: merge when the Select
+/// ordinal is free and `vis` holds, else wrap. Shared by every
+/// projection-shaped operator (Project, WithColumns[Renamed], DropColumns,
+/// NaFill, NaReplace).
+fn block_with_projections(
+    input: &TypedAst,
+    slots: String,
+    vis: impl FnOnce(&SelectBlock) -> bool,
+) -> Result<SqlUnit, EmissionError> {
+    let mut block = open_block(input)?;
+    if !(block.can_accept(Clause::Select) && vis(&block)) {
+        block = SelectBlock::wrap(block.into());
+    }
+    block.set_projections(slots);
+    Ok(block.into())
 }
 
 /// The `TypedOp::Join` fields [`build_join`] consumes (destructured into a
@@ -656,26 +708,6 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
             schema: s,
             options,
         } => render_file_scan(*format, paths, s, options),
-        TypedOp::WithColumns { input, assignments } => render_with_columns(input, assignments),
-        TypedOp::DropColumns { input, drop_names } => render_drop_columns(input, drop_names),
-        TypedOp::WithColumnsRenamed { input, renames } => {
-            render_with_columns_renamed(input, renames)
-        }
-        TypedOp::NaFill {
-            input,
-            cols,
-            values,
-        } => render_na_fill(input, cols, values),
-        TypedOp::NaDrop {
-            input,
-            cols,
-            min_non_nulls,
-        } => render_na_drop(input, cols, *min_non_nulls),
-        TypedOp::NaReplace {
-            input,
-            cols,
-            replacements,
-        } => render_na_replace(input, cols, replacements),
         TypedOp::Unpivot {
             input,
             ids,
@@ -722,22 +754,6 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
             seed,
         } => render_sample_by(input, col, fractions, *seed),
 
-        TypedOp::SetOp {
-            kind,
-            all,
-            by_name,
-            allow_missing_columns,
-            children,
-            widened_schema,
-        } => render_set_op(
-            *kind,
-            *all,
-            *by_name,
-            *allow_missing_columns,
-            children,
-            widened_schema,
-        ),
-
         TypedOp::TableFunction {
             name,
             args,
@@ -768,7 +784,14 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
         | TypedOp::AliasedRelation { .. }
         | TypedOp::Join { .. }
         | TypedOp::Aggregate { .. }
-        | TypedOp::LateralView { .. } => {
+        | TypedOp::LateralView { .. }
+        | TypedOp::SetOp { .. }
+        | TypedOp::WithColumns { .. }
+        | TypedOp::DropColumns { .. }
+        | TypedOp::WithColumnsRenamed { .. }
+        | TypedOp::NaFill { .. }
+        | TypedOp::NaDrop { .. }
+        | TypedOp::NaReplace { .. } => {
             unreachable!("block-composable operator routed to legacy_render: {op:?}")
         }
     };
@@ -1067,14 +1090,14 @@ fn render_recursive_cte(
 /// column types match the analyzer's widened schema (per ADR-006 refinement +
 /// Open Decision 5). `UNION BY NAME` is deferred (analyzer surfaces it as
 /// `PuntedOperator`); it never reaches this renderer.
-fn render_set_op(
+fn build_set_op(
     kind: crate::transpiler_v2::ast::SetOpKind,
     all: bool,
     by_name: bool,
     allow_missing_columns: bool,
     children: &[TypedAst],
     widened_schema: &StructType,
-) -> Result<String, EmissionError> {
+) -> Result<SqlUnit, EmissionError> {
     use super::ast::SetOpKind;
     if children.is_empty() {
         bail_boundary_op!("SetOp", "set-op with no children");
@@ -1106,7 +1129,6 @@ fn render_set_op(
     };
     let mut parts: Vec<String> = Vec::with_capacity(children.len());
     for child in children {
-        let child_sql = dispatch_op(&child.op, &child.resolved_schema)?;
         // Per-column CAST to widened parent schema.
         //   - by-position: children have identical arity (analyzer verified);
         //     zip position-wise, CAST each column to widened_schema[i] and
@@ -1156,19 +1178,24 @@ fn render_set_op(
                 })
             },
         )?;
-        parts.push(format!("SELECT {slots} FROM ({child_sql}) AS __td_setop"));
+        // Every child is a block barrier: the cast list references the
+        // child's OUTPUT names, which are unambiguous only across a
+        // derived-table boundary (a join child's FROM scope could bind the
+        // same unqualified name on both sides).
+        let child_unit = build_unit(&child.op, &child.resolved_schema)?;
+        let mut cast_block = SelectBlock::wrap(child_unit);
+        cast_block.set_projections(slots);
+        parts.push(cast_block.to_sql());
     }
-    // Wrap the union expression in an outer SELECT so downstream operators
-    // can wrap it as `FROM (...)` without DuckDB parse errors on the
-    // UNION-composed subquery.
-    Ok(parts.join(&format!(" {op_kw} ")))
+    // The chain stays a bare `a UNION b …` Raw unit; a parent embedding it
+    // as a FROM item adds the parentheses via its Derived wrap.
+    Ok(SqlUnit::Raw(parts.join(&format!(" {op_kw} "))))
 }
 
-fn render_with_columns(
+fn build_with_columns(
     input: &TypedAst,
     assignments: &[(String, Expression)],
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+) -> Result<SqlUnit, EmissionError> {
     let input_schema = &input.resolved_schema;
     // Column-order contract with the analyzer is single-homed in
     // [`with_columns_plan`] (see its doc): input columns emit in their
@@ -1195,15 +1222,14 @@ fn render_with_columns(
         slots.push(format!("{expr_sql} AS {name_q}"));
     }
     let slots = slots.join(", ");
-    Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_with"))
+    block_with_projections(input, slots, |block| {
+        exprs_visible_in(assignments.iter().map(|(_, e)| e), block)
+    })
 }
 
-fn render_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+fn build_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<SqlUnit, EmissionError> {
     let dropped = sql_join(drop_names.iter(), ", ", |n| Ok(quote_ident(n).into_owned()))?;
-    Ok(format!(
-        "SELECT * EXCLUDE ({dropped}) FROM ({child_sql}) AS __td_drop"
-    ))
+    block_with_projections(input, format!("* EXCLUDE ({dropped})"), |_| true)
 }
 
 /// Render `df.na.fill(values, subset=cols)`. For each column in the input
@@ -1212,12 +1238,11 @@ fn render_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<String
 /// Single-value form (`values.len()==1`) applies that value to all cols in
 /// the subset. Per-column form (`values.len()==cols.len()`) pairs
 /// position-wise.
-fn render_na_fill(
+fn build_na_fill(
     input: &TypedAst,
     cols: &[String],
     values: &[Expression],
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+) -> Result<SqlUnit, EmissionError> {
     let input_schema = &input.resolved_schema;
     if values.is_empty() {
         bail_boundary_op!("NaFill", "NaFill requires at least one fill value");
@@ -1239,19 +1264,18 @@ fn render_na_fill(
             Ok(name_q.into_owned())
         }
     })?;
-    Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_nafill"))
+    block_with_projections(input, slots, |_| true)
 }
 
 /// Render `df.na.drop(how, subset, thresh)`. `min_non_nulls=None` means
 /// how="any" (drop if ANY subset col is null); `Some(1)` means how="all"
 /// (drop only if ALL subset cols are null); other values are Spark's
 /// `thresh` semantic.
-fn render_na_drop(
+fn build_na_drop(
     input: &TypedAst,
     cols: &[String],
     min_non_nulls: Option<i32>,
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+) -> Result<SqlUnit, EmissionError> {
     let input_schema = &input.resolved_schema;
     // Resolve subset — empty means all columns.
     let subset: Vec<&str> = if cols.is_empty() {
@@ -1264,7 +1288,8 @@ fn render_na_drop(
         cols.iter().map(|s| s.as_str()).collect()
     };
     if subset.is_empty() {
-        return Ok(format!("SELECT * FROM ({child_sql}) AS __td_nadrop"));
+        // Nothing to test — the operator is an identity.
+        return build_unit(&input.op, input_schema);
     }
     let condition = if let Some(thresh) = min_non_nulls {
         // Row kept iff at least `thresh` of subset cols are non-null.
@@ -1281,20 +1306,22 @@ fn render_na_drop(
             Ok(format!("{q} IS NOT NULL"))
         })?
     };
-    Ok(format!(
-        "SELECT * FROM ({child_sql}) AS __td_nadrop WHERE {condition}"
-    ))
+    let mut block = open_block(input)?;
+    if !block.can_accept(Clause::Where) {
+        block = SelectBlock::wrap(block.into());
+    }
+    block.push_where(condition);
+    Ok(block.into())
 }
 
 /// Render `df.na.replace([old_vals], [new_vals], subset=cols)`. Emit
 /// `SELECT CASE WHEN col = old1 THEN new1 ... ELSE col END AS col` for each
 /// column in subset (or all cols if empty).
-fn render_na_replace(
+fn build_na_replace(
     input: &TypedAst,
     cols: &[String],
     replacements: &[(Expression, Expression)],
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+) -> Result<SqlUnit, EmissionError> {
     let input_schema = &input.resolved_schema;
     let in_subset = |name: &str| -> bool {
         cols.is_empty() || cols.iter().any(|c| c.eq_ignore_ascii_case(name))
@@ -1314,9 +1341,7 @@ fn render_na_replace(
             Ok(name_q.into_owned())
         }
     })?;
-    Ok(format!(
-        "SELECT {slots} FROM ({child_sql}) AS __td_nareplace"
-    ))
+    block_with_projections(input, slots, |_| true)
 }
 
 /// Render `df.unpivot(ids, values, var_col, val_col)`.
@@ -1715,11 +1740,10 @@ fn render_sample_by(
     ))
 }
 
-fn render_with_columns_renamed(
+fn build_with_columns_renamed(
     input: &TypedAst,
     renames: &[(String, String)],
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+) -> Result<SqlUnit, EmissionError> {
     let rename_map: std::collections::HashMap<String, String> = renames
         .iter()
         .map(|(old, new)| (old.to_lowercase(), new.clone()))
@@ -1733,7 +1757,7 @@ fn render_with_columns_renamed(
         let dst = quote_ident(&dst_name);
         Ok(format!("{src} AS {dst}"))
     })?;
-    Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_rename"))
+    block_with_projections(input, slots, |_| true)
 }
 
 /// Emit a table-valued function. Only `range` is implemented; the analyzer has

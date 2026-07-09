@@ -13,3 +13,4 @@ Supersedes the per-corpus ledgers `v2_progress.md` and `v2_sql_progress.md`
 | Timestamp UTC        | Commit  | DF corpus | SQL corpus |   Other | Passed | Failed | Skipped | Total | Δ passed |
 | -------------------- | ------- | --------: | ---------: | ------: | -----: | -----: | ------: | ----: | -------: |
 | 2026-07-09T09:16:56Z | bf17f49 |   369/384 |    308/396 | 408/625 |   1085 |    320 |       0 |  1405 |      n/a |
+| 2026-07-09T09:26:37Z | 50ac9c4 |   369/384 |    308/396 | 408/625 |   1085 |    320 |       0 |  1405 |       +0 |

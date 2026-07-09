@@ -16,6 +16,8 @@
 #     - Runs `tests/scripts/run-differential-tests.sh all -v --tb=no` (~10 min).
 #     - Appends one row to tests/integration/differential_progress.md
 #       (tracked in git).
+#     - If DIFFERENTIAL_PROGRESS_LOG is set, copies the raw pytest -v output
+#       there (for per-case failure diffs against a baseline).
 #
 # The goal is for the overall PASSED count to climb monotonically toward the
 # suite total. Red cases are expected fitness signal (ADR-022); the gate
@@ -34,6 +36,11 @@ echo "running the full differential suite (run-differential-tests.sh all) ..."
 # Tolerate non-zero exit — the suite is expected to be partially red while
 # τ grows coverage.
 "$SCRIPT_DIR/run-differential-tests.sh" all -v --tb=no > "$TMP" 2>&1 || true
+
+# Optionally preserve the raw per-test output for per-case regression diffs.
+if [ -n "${DIFFERENTIAL_PROGRESS_LOG:-}" ]; then
+    cp "$TMP" "$DIFFERENTIAL_PROGRESS_LOG"
+fi
 
 # Parse pytest -v per-test lines, e.g.
 #   differential/test_sql_corpus_differential.py::test_case[agg-001] PASSED [  3%]

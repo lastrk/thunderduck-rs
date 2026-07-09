@@ -1314,7 +1314,16 @@ impl Expression {
             // `expand_stack_projections`. Spark's `Stack.elementSchema`
             // pins every output column to `nullable = true` regardless
             // of whether the individual row-values are non-null literals.
-            | "stack_col" => true,
+            | "stack_col"
+            // Spark's `ArrayAggregate.nullable` = `argument.nullable ||
+            // finish.nullable`. In `bindInternal` the accumulator variable
+            // is bound with `nullable = true` (hardcoded), so
+            // `finish.nullable()` is always `true` — making the overall
+            // result always nullable. Applies to `aggregate`, `reduce`,
+            // and `list_reduce` HOFs.
+            // Corpus: lambda aggregate_sum / aggregate_product /
+            // aggregate_with_init / sql_aggregate / sql_aggregate_product.
+            | "aggregate" | "reduce" | "list_reduce" => true,
             // Spark's `If.nullable = trueValue.nullable || falseValue.nullable`
             // — the predicate (args[0]) is excluded. `iif` is a Spark alias for
             // `If`, and `nvl2(cond, ifNotNull, ifNull)` shares the same
@@ -2430,6 +2439,54 @@ mod tests {
             ],
         );
         assert_eq!(expr.data_type(&s), DataType::Long);
+    }
+
+    /// Spark's `ArrayAggregate.nullable` is always `true` — the accumulator
+    /// variable is bound with `nullable = true` in `bindInternal`, so
+    /// `finish.nullable()` is always `true`. Verify this holds even when the
+    /// array column AND the seed literal are both non-nullable.
+    #[test]
+    fn aggregate_hof_nullable_with_non_null_array_and_seed() {
+        // Non-nullable array column + non-nullable seed → still nullable.
+        let s = StructType::new(vec![StructField::not_null(
+            "nums",
+            DataType::Array(Box::new(DataType::Integer), false),
+        )]);
+        for name in ["aggregate", "reduce", "list_reduce"] {
+            let expr = fcall(
+                name,
+                vec![
+                    ColumnReference::untyped("nums"),
+                    long_lit(0),
+                    ColumnReference::untyped("__lambda_placeholder"),
+                ],
+            );
+            assert!(
+                expr.nullable(&s),
+                "{name} HOF must be nullable (Spark ArrayAggregate rule)",
+            );
+        }
+    }
+
+    /// Same as above but with a nullable array column — still always nullable.
+    #[test]
+    fn aggregate_hof_nullable_with_nullable_array() {
+        let s = StructType::new(vec![StructField::nullable(
+            "nums",
+            DataType::Array(Box::new(DataType::Long), true),
+        )]);
+        let expr = fcall(
+            "aggregate",
+            vec![
+                ColumnReference::untyped("nums"),
+                long_lit(0),
+                ColumnReference::untyped("__lambda_placeholder"),
+            ],
+        );
+        assert!(
+            expr.nullable(&s),
+            "aggregate HOF must be nullable even with nullable array input",
+        );
     }
 
     // ── Pass 90 — inline_field / inline_outer_field type + nullability ──────

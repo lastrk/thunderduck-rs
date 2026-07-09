@@ -494,3 +494,18 @@ red in any later pass.
 - **Review:** APPROVE, 0 Critical/High; nested-aggregate-in-array emission
   risk discharged by the 16/16 statistics run.
 - **Gate:** 1230→1237 (Δ +7, zero regressions); statistics file 16/16.
+
+## Pass 8 — 2026-07-09 — aggregate() HOF nullability
+
+- **Root cause (source-verified from spark-catalyst 4.1.1 bytecode):**
+  ArrayAggregate.nullable = argument.nullable || finish.nullable, and
+  bindInternal hardcodes the accumulator LambdaVariable nullable=true — so
+  the rule is effectively ALWAYS true. τ's fallback (any-arg-nullable) gave
+  false for non-null arrays + literal seeds.
+- **Fix:** `aggregate | reduce | list_reduce` added to the always-nullable
+  arm of function_call_nullable (expression.rs) — covers both front-ends via
+  the shared Expression type. Two unit tests lock the rule.
+- **Review:** SKIPPED deliberately (stated per verification policy): 3-name
+  match-arm addition with the Spark rule cited from bytecode, unit-locked,
+  full gate arbitrates.
+- **Gate:** 1237→1242 (Δ +5, zero regressions); lambda file 27/27.

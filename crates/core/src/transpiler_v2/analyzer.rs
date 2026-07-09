@@ -1291,8 +1291,7 @@ fn analyze_node(
                 .map(|e| resolve_and_stamp(e, &ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             // Compute output schema — expand Star; take alias name if present.
-            let output_schema =
-                project_output_schema(&projections, &typed_input.resolved_schema, &typed_input.op)?;
+            let output_schema = project_output_schema(&projections, &typed_input)?;
             Ok(TypedAst::new(
                 TypedOp::Project {
                     input: Box::new(typed_input),
@@ -3956,45 +3955,11 @@ fn expr_field(e: &Expression, schema: &StructType) -> StructField {
     )
 }
 
-/// True iff the Project input exposes a SINGLE relation `q` binds to AND
-/// emission keeps that qualifier in scope: a bare `TableScan` (Fix B inlines
-/// `FROM t`), an `AliasedRelation` (render_project inline → `FROM (..) AS
-/// alias`), or the LEFT of a semi/anti `Join` (render_project_over_join).
-/// Multi-relation joins (other than semi/anti) → false: this is an EMISSION
-/// scoping question, not a resolvability one — `resolve_column`'s per-column
-/// qualifier resolution is alias-aware over ALL join shapes (`RelScope`
-/// / `collect_qualifier_bindings`; USING joins are the only qualifier-
-/// resolution gap remaining, since USING's output reorder/dedup breaks the
-/// contiguous-range invariant those bindings rely on). `q.*` star-expansion
-/// additionally needs `render_project`/`render_project_over_join` to keep
-/// `q`'s alias alive in the emitted SQL, which they do not for a plain
-/// multi-relation join — out of scope for this pass; no corpus case exercises
-/// it. We deliberately do NOT descend Filter/Sort/Limit: schema passthrough
-/// there does not imply the emitter keeps the qualifier in scope (it
-/// re-buries the relation under a synthetic `__td_proj` alias), so a
-/// qualified star over them would emit an opaque DuckDB error — worse than the
-/// clean UnknownColumn we return today.
-fn input_relation_binds_qualifier(op: &TypedOp, q: &str) -> bool {
-    match op {
-        TypedOp::TableScan { table, alias } => {
-            table.eq_ignore_ascii_case(q)
-                || alias.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(q))
-        }
-        TypedOp::AliasedRelation { alias, .. } => alias.eq_ignore_ascii_case(q),
-        TypedOp::Join {
-            join_type: JoinType::LeftSemi | JoinType::LeftAnti,
-            left,
-            ..
-        } => input_relation_binds_qualifier(&left.op, q),
-        _ => false,
-    }
-}
-
 fn project_output_schema(
     projections: &[Expression],
-    input_schema: &StructType,
-    input_op: &TypedOp,
+    input: &TypedAst,
 ) -> Result<StructType, AnalyzerError> {
+    let input_schema = &input.resolved_schema;
     let mut fields: Vec<StructField> = Vec::with_capacity(projections.len());
     for expr in projections {
         match expr {
@@ -4022,13 +3987,26 @@ fn project_output_schema(
                                 continue;
                             }
                         }
-                        // Table-qualified star (`emp.*` / `e.*`) where `q`
-                        // binds the SINGLE input relation that emission keeps
-                        // in scope: expand to the full input schema, exactly
-                        // like the unqualified `*` branch above.
-                        if input_relation_binds_qualifier(input_op, q) {
-                            fields.extend(input_schema.fields.iter().cloned());
-                            continue;
+                        // Table-qualified star (`emp.*` / `e.*`): expand to
+                        // the qualifier's bound field RANGE from the input's
+                        // stamped RelScope — the same contiguous-range
+                        // authority `resolve_column`'s qualifier arm trusts.
+                        // This covers every shape whose scope exposes `q`
+                        // (aliased relations, bare scans, either side of a
+                        // plain multi-relation join, through the
+                        // scope-passthrough operator class); emission keeps
+                        // the alias visible in exactly those shapes, and its
+                        // `q.*` slot returns that relation's columns in the
+                        // same range order. USING joins stay excluded
+                        // automatically (their RelScope is empty), as are
+                        // ambiguous duplicates (`lookup` bails on 2+
+                        // matches).
+                        if let Some(range) = input.scope.lookup(q) {
+                            debug_assert!(range.end <= input_schema.len());
+                            if range.end <= input_schema.len() {
+                                fields.extend(input_schema.fields[range].iter().cloned());
+                                continue;
+                            }
                         }
                         // Unknown qualifier — do NOT silently expand as `*`.
                         // Surface as an UnknownColumn error so `SELECT
@@ -5793,6 +5771,126 @@ mod tests {
             })],
         });
         let err = analyze(ast, &bt).unwrap_err();
+        assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
+    }
+
+    /// `q.*` projection under the given alias, over `input`.
+    fn qstar_project(input: CommonAst, q: &str) -> CommonAst {
+        CommonAst::new(CommonOp::Project {
+            input: Box::new(input),
+            projections: vec![Expression::Star(StarExpression {
+                qualifier: Some(q.to_owned()),
+            })],
+        })
+    }
+
+    /// `emp e INNER JOIN dept d ON e.dept_id = d.dept_id`.
+    fn emp_dept_aliased_join() -> CommonAst {
+        join(
+            aliased_scan("emp", "e"),
+            aliased_scan("dept", "d"),
+            JoinType::Inner,
+            Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+        )
+    }
+
+    #[test]
+    fn qualified_star_over_plain_join_expands_left_range() {
+        let bt = base_types_with_emp_dept();
+        // SELECT e.* FROM emp e JOIN dept d ON … — left side's columns only.
+        let typed = analyze(qstar_project(emp_dept_aliased_join(), "e"), &bt)
+            .expect("analyze e.* over join");
+        assert_eq!(typed.resolved_schema, emp_schema());
+    }
+
+    #[test]
+    fn qualified_star_over_plain_join_expands_right_range() {
+        let bt = base_types_with_emp_dept();
+        // SELECT d.* — right side's columns, at the offset range.
+        let typed = analyze(qstar_project(emp_dept_aliased_join(), "d"), &bt)
+            .expect("analyze d.* over join");
+        assert_eq!(typed.resolved_schema, dept_schema());
+    }
+
+    #[test]
+    fn qualified_star_resolves_through_scope_passthrough() {
+        let bt = base_types_with_emp_dept();
+        // SELECT e.* FROM (emp e JOIN dept d ON …) WHERE d.dept_id > 0 —
+        // Filter is scope-passthrough, so the join's bindings survive.
+        let filtered = CommonAst::new(CommonOp::Filter {
+            input: Box::new(emp_dept_aliased_join()),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Gt,
+                left: Box::new(qcol("d", "dept_id")),
+                right: Box::new(int_lit(0)),
+            }),
+        });
+        let typed = analyze(qstar_project(filtered, "e"), &bt).expect("analyze e.* through filter");
+        assert_eq!(typed.resolved_schema, emp_schema());
+    }
+
+    #[test]
+    fn qualified_star_nullability_reflects_outer_join_flip() {
+        let bt = base_types_with_emp_dept();
+        // SELECT d.* FROM emp e LEFT OUTER JOIN dept d ON … — the right
+        // side's fields are null-extended; `d.*` must carry the flip.
+        let outer_join = join(
+            aliased_scan("emp", "e"),
+            aliased_scan("dept", "d"),
+            JoinType::Left,
+            Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+        );
+        let typed =
+            analyze(qstar_project(outer_join, "d"), &bt).expect("analyze d.* over left join");
+        assert!(
+            typed
+                .resolved_schema
+                .field_by_name("dept_id")
+                .unwrap()
+                .nullable,
+            "left-join null extension must survive d.* expansion"
+        );
+    }
+
+    #[test]
+    fn qualified_star_over_using_join_still_rejects() {
+        let bt = base_types_with_emp_dept();
+        // USING joins have an empty RelScope (reorder/dedup breaks the
+        // contiguous-range invariant) — q.* stays a clean UnknownColumn.
+        let using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let err = analyze(qstar_project(using_join, "e"), &bt).unwrap_err();
+        assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
+    }
+
+    #[test]
+    fn qualified_star_ambiguous_duplicate_alias_rejects() {
+        let bt = base_types_with_emp_dept();
+        // Both sides aliased `x` — `x.*` is ambiguous by construction.
+        let dup_join = join(
+            aliased_scan("emp", "x"),
+            aliased_scan("dept", "x"),
+            JoinType::Cross,
+            None,
+        );
+        let err = analyze(qstar_project(dup_join, "x"), &bt).unwrap_err();
         assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
     }
 

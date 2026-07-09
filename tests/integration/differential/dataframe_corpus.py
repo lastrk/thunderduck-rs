@@ -418,6 +418,9 @@ case("join-012", "join", "three-way join chain", lambda I: (I["emp"].join(I["dep
     .join(I["emp2"].select(F.col("id").alias("e2id"), F.col("country").alias("c2")), I["dept"].country == F.col("c2"), "left")))
 case("join-013", "join", "join then groupBy+agg", lambda I: I["emp"].join(I["dept"], on="dept_id").groupBy("dept_name").agg(F.avg("salary").alias("avg_sal")))
 case("join-014", "join", "broadcast hint join (cosmetic)", lambda I: I["emp"].join(F.broadcast(I["dept"]), on="dept_id", how="inner"), flags=("cosmetic",))
+case("join-015", "join", "qualified star over join (left side + extra col)", lambda I: I["emp"].alias("e").join(I["dept"].alias("d"), F.col("e.dept_id") == F.col("d.dept_id"), "inner").select("e.*", "d.dept_name"))
+case("join-016", "join", "qualified star over outer join (right side, null-extended)", lambda I: I["emp"].alias("e").join(I["dept"].alias("d"), F.col("e.dept_id") == F.col("d.dept_id"), "left").select("d.*"))
+case("join-017", "join", "qualified star through post-join filter", lambda I: I["emp"].alias("e").join(I["dept"].alias("d"), F.col("e.dept_id") == F.col("d.dept_id"), "inner").filter(F.col("d.budget") > 0).select("e.*"))
 
 # ── 12. Set operations (type widening) ──────────────────────────────────────
 def _emp_proj(I):

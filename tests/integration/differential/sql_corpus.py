@@ -301,6 +301,10 @@ case("jn-017", "join", "bare first table + aliased tables in comma join", "SELEC
 # (Parser Error at `AS at`). The fix is τ quoting keyword-like aliases on
 # emission — this case is the fitness witness for that gap.
 case("jn-018", "join", "keyword-like alias `at` before CROSS JOIN (TPC-DS Q90 parse shape)", "SELECT name, dept_name FROM (SELECT id, name FROM emp) at CROSS JOIN (SELECT dept_name FROM dept) d")
+case("jn-019", "join", "qualified star over join (left side + extra col)", "SELECT e.*, d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id")
+case("jn-020", "join", "qualified star over outer join (right side, null-extended)", "SELECT d.* FROM emp e LEFT JOIN dept d ON e.dept_id = d.dept_id")
+case("jn-021", "join", "qualified star through post-join WHERE", "SELECT e.* FROM emp e JOIN dept d ON e.dept_id = d.dept_id WHERE d.budget > 0")
+case("jn-022", "join", "both sides qualified star", "SELECT e.*, d.* FROM emp e JOIN dept d ON e.dept_id = d.dept_id")
 
 # ── 4. GROUP BY / aggregates ─────────────────────────────────────────────────
 case("agg-001", "aggregate", "COUNT(*)", "SELECT count(*) AS n FROM emp")

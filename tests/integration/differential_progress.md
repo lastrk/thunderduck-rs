@@ -25,3 +25,11 @@ Supersedes the per-corpus ledgers `v2_progress.md` and `v2_sql_progress.md`
 | 2026-07-09T13:30:45Z | eb3909a |   364/384 |    311/396 | 573/625 |   1248 |    157 |       0 |  1405 |       +6 |
 | 2026-07-09T13:40:50Z | eb3909a |   369/384 |    311/396 | 573/625 |   1253 |    152 |       0 |  1405 |       +5 |
 | 2026-07-09T15:46:29Z | 74f8aa8 |   369/384 |    311/396 | 573/625 |   1253 |    152 |       0 |  1405 |       +0 |
+| 2026-07-09T18:06:29Z | da6c0d8 |   376/387 |    336/400 | 573/625 |   1285 |    127 |       0 |  1412 |      +32 |
+
+> **Note (2026-07-09):** the `74f8aa8` row above was recorded against a STALE
+> binary — the runner then only built when the binary was missing, so that
+> run exercised the pre-refactor build (its Δ +0 is vacuous). The runner now
+> always rebuilds; the `da6c0d8` row is the first honest measurement of the
+> SELECT-block emission refactor: +32 vs the same-day baseline with zero
+> per-case regressions (verified by full per-case log diff).

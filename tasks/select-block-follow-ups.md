@@ -46,9 +46,25 @@ genuinely self-contained generators (Pivot family, Sample, RecursiveCte).
   __td_range(id)` merges rather than wraps.
 - Gate: corpus per-case diff, zero green→red.
 
-## 2. Qualified-star expansion via the RelScope stamp (`input_relation_binds_qualifier`)
+## 2. Qualified-star expansion via the RelScope stamp — DONE
 
-**What.** `input_relation_binds_qualifier` (analyzer.rs) gates qualified-star
+Implemented 2026-07-09 (this branch). `project_output_schema` expands `q.*`
+to the qualifier's stamped range; `input_relation_binds_qualifier` deleted.
+7 new corpus cases (join-015..017, jn-019..022) all PASS against real Spark.
+Implementation surfaced two systemic findings: (a) the differential runner
+only built the server when the binary was MISSING — every prior per-phase
+corpus gate had silently tested the pre-refactor binary (runner fixed:
+always builds; see tasks/lessons.md); (b) the first honest full-suite run
+exposed a correlated-subquery regression cluster (sq-*, tbl-005,
+tpcds-q006): merge visibility wrongly required correlated OUTER qualifiers
+to be bound by the inner FROM scope. Fixed by exempting qualifiers the
+input's own RelScope does not bind (they are outer refs / struct quals /
+flag-guaranteed synthetics); pinned by
+`correlated_scalar_subquery_inner_filter_merges_into_one_block`. Net result
+vs pre-refactor baseline: 0 regressions, 25 improvements (incl. tpch-q07/
+q08 and 16 TPC-DS queries).
+
+**Original plan:** `input_relation_binds_qualifier` (analyzer.rs) gates qualified-star
 (`q.*`) expansion in `project_output_schema`, allowing only three shapes:
 bare `TableScan`, `AliasedRelation`, and the LEFT of a semi/anti join.
 Everything else — notably `e.*` over a plain multi-relation join — is an

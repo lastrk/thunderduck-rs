@@ -501,6 +501,7 @@ fn build_aggregate(
             .chain(rewritten_aggregates.iter())
             .chain(having),
         &block,
+        &input.scope,
     );
     if !(block.can_accept(Clause::GroupBy) && vis) {
         block = SelectBlock::wrap(block.into());
@@ -528,7 +529,7 @@ fn build_lateral_view(
     let mut block = open_block(input)?;
     // The generator expressions reference the input's FROM scope; extending
     // is sound only on a pure-FROM block whose scope satisfies them.
-    let vis = exprs_visible_in(columns.iter().map(|(_, e)| e), &block);
+    let vis = exprs_visible_in(columns.iter().map(|(_, e)| e), &block, &input.scope);
     if !(block.pure_from() && vis) {
         block = SelectBlock::wrap(block.into());
     }
@@ -582,19 +583,37 @@ fn expr_qualifiers<'e>(expr: &'e Expression, out: &mut Vec<&'e str>) {
     }
 }
 
-/// Merge visibility: every qualifier stamped on `exprs` must be an alias the
-/// block's FROM scope actually emits. A failed check falls back to the wrap
-/// path, which reproduces today's occlusion behavior exactly (merging only
-/// ever WIDENS what a clause can see).
+/// Merge visibility: every qualifier stamped on `exprs` that the input's own
+/// [`RelScope`] binds must be an alias the block's FROM scope actually
+/// emits. Qualifiers the input scope does NOT know are exempt: they are
+/// correlated outer references (DuckDB's correlated-subquery binder resolves
+/// them OUTWARD, so no inner FROM shape can bind them), struct-column
+/// qualifiers (rendered as struct access, scope-independent), or the
+/// synthetic `__td_jl`/`__td_jr` names (whose exposure the analyzer's
+/// `*_requires_synthetic` flags already guarantee). A failed check falls
+/// back to the wrap path (merging only ever WIDENS what a clause can see).
 fn exprs_visible_in<'e>(
     exprs: impl IntoIterator<Item = &'e Expression>,
     block: &SelectBlock,
+    input_scope: &super::analyzer::RelScope,
 ) -> bool {
     let mut quals = Vec::new();
     for e in exprs {
         expr_qualifiers(e, &mut quals);
     }
-    quals.iter().all(|q| block.exposes(q))
+    quals
+        .iter()
+        .filter(|q| scope_binds(input_scope, q))
+        .all(|q| block.exposes(q))
+}
+
+/// Whether the analyzer's stamped scope binds `q` (case-insensitive, any
+/// number of matches — ambiguity is the resolver's concern, not vis's).
+fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
+    scope
+        .aliases
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(q))
 }
 
 /// R7 latent-occlusion witness: when a slot-conflict wrap is about to strand
@@ -606,12 +625,16 @@ fn exprs_visible_in<'e>(
 fn trace_stranded_qualifiers<'e>(
     block: &SelectBlock,
     exprs: impl IntoIterator<Item = &'e Expression>,
+    input_scope: &super::analyzer::RelScope,
 ) {
     let mut quals = Vec::new();
     for e in exprs {
         expr_qualifiers(e, &mut quals);
     }
-    let stranded: Vec<&str> = quals.into_iter().filter(|q| block.exposes(q)).collect();
+    let stranded: Vec<&str> = quals
+        .into_iter()
+        .filter(|q| scope_binds(input_scope, q) && block.exposes(q))
+        .collect();
     if !stranded.is_empty() {
         tracing::debug!(
             ?stranded,
@@ -632,8 +655,8 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
     }
     let slots = render_projection_slots(projections, &input.resolved_schema)?;
     let mut block = open_block(input)?;
-    if !(block.can_accept(Clause::Select) && exprs_visible_in(projections, &block)) {
-        trace_stranded_qualifiers(&block, projections);
+    if !(block.can_accept(Clause::Select) && exprs_visible_in(projections, &block, &input.scope)) {
+        trace_stranded_qualifiers(&block, projections, &input.scope);
         block = SelectBlock::wrap(block.into());
     }
     block.set_projections(slots);
@@ -643,11 +666,11 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
 fn build_filter(input: &TypedAst, condition: &Expression) -> Result<SqlUnit, EmissionError> {
     let cond_sql = render_expr(condition, &input.resolved_schema)?;
     let mut block = open_block(input)?;
-    if block.can_accept(Clause::Where) && exprs_visible_in([condition], &block) {
+    if block.can_accept(Clause::Where) && exprs_visible_in([condition], &block, &input.scope) {
         block.push_where(cond_sql);
         return Ok(block.into());
     }
-    trace_stranded_qualifiers(&block, [condition]);
+    trace_stranded_qualifiers(&block, [condition], &input.scope);
     let mut wrapped = SelectBlock::wrap(block.into());
     wrapped.push_where(cond_sql);
     Ok(wrapped.into())
@@ -668,7 +691,11 @@ fn build_sort(
     // ORDER BY resolves them against the select list's aliases; expression
     // keys would re-bind against FROM columns and could diverge.
     let keys_bind = if block.select_free() {
-        exprs_visible_in(order.iter().map(|so| so.expr.as_ref()), &block)
+        exprs_visible_in(
+            order.iter().map(|so| so.expr.as_ref()),
+            &block,
+            &input.scope,
+        )
     } else {
         order.iter().all(|so| {
             matches!(so.expr.as_ref(), Expression::ColumnReference(c) if c.qualifier.is_none())
@@ -1272,7 +1299,7 @@ fn build_with_columns(
     }
     let slots = slots.join(", ");
     block_with_projections(input, slots, |block| {
-        exprs_visible_in(assignments.iter().map(|(_, e)| e), block)
+        exprs_visible_in(assignments.iter().map(|(_, e)| e), block, &input.scope)
     })
 }
 
@@ -6004,6 +6031,62 @@ mod tests {
         let sql = render_expr(&expr, &empty_schema()).expect("render IN");
         assert!(sql.starts_with("1 IN (SELECT"), "got: {sql}");
         assert!(sql.ends_with(')'), "got: {sql}");
+    }
+
+    /// Regression pin (sq-003/sq-004 corpus cluster): a correlated scalar
+    /// subquery's inner plan — Aggregate over Filter over
+    /// `AliasedRelation(e2)` with the filter referencing the OUTER alias `e`
+    /// — must merge into ONE inner block. The correlated qualifier `e` is
+    /// not bound by the inner scope, so merge visibility must EXEMPT it
+    /// (DuckDB's correlated binder resolves it outward); treating it as a
+    /// visibility failure wraps the inner FROM under `__td_sub`, burying
+    /// `e2` and breaking `e2.dept_id`.
+    #[test]
+    fn correlated_scalar_subquery_inner_filter_merges_into_one_block() {
+        let _g = tap_guard();
+        use super::super::expression::ScalarSubquery;
+        // Inner: SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id = e.dept_id
+        let inner = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(aliased_scan("emp", "e2")),
+                condition: Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Eq,
+                    left: Box::new(qcol("e2", "dept_id")),
+                    right: Box::new(qcol("e", "dept_id")),
+                }),
+            })),
+            grouping: vec![],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "avg".to_owned(),
+                args: vec![qcol("e2", "salary")],
+                distinct: false,
+            })],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        // Outer: SELECT name, (<inner>) AS dept_avg FROM emp e
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased_scan("emp", "e")),
+            projections: vec![Expression::Alias(AliasExpression {
+                expr: Box::new(Expression::ScalarSubquery(ScalarSubquery {
+                    subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+                })),
+                alias: "dept_avg".to_owned(),
+            })],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze correlated scalar");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("FROM emp AS e2 WHERE"),
+            "inner filter must merge into the aliased block (correlated \
+             qualifier exempt from visibility), got: {sql}"
+        );
+        assert!(
+            !sql.contains("__td_sub"),
+            "no wrap may bury the inner alias, got: {sql}"
+        );
     }
 
     #[test]

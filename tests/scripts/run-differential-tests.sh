@@ -202,10 +202,14 @@ if [ ! -d "$WORKSPACE_DIR/tests/integration/tpch_sf001" ]; then
 fi
 echo -e "${GREEN}  TPC-H data found${NC}"
 
-# Find Thunderduck Rust binary
+# Find Thunderduck Rust binary. ALWAYS build unless the caller supplied an
+# explicit THUNDERDUCK_BINARY: cargo is a fast no-op when the tree is
+# unchanged, and silently running the suite against a stale binary is a
+# false-green machine — the differential gate must test the sources as they
+# stand, not whatever binary happened to exist.
 BINARY_PATH="${THUNDERDUCK_BINARY:-$WORKSPACE_DIR/target/release/thunderduck-connect-server}"
-if [ ! -f "$BINARY_PATH" ]; then
-    echo -e "${YELLOW}  Thunderduck binary not found at $BINARY_PATH. Building...${NC}"
+if [ -z "${THUNDERDUCK_BINARY:-}" ]; then
+    echo -e "${YELLOW}  Building Thunderduck server (no-op when up to date)...${NC}"
     cd "$WORKSPACE_DIR"
     # DuckDB is non-bundled by default. If no external libduckdb is configured
     # (DUCKDB_LIB_DIR — set by local dev via scripts/dev/), compile it from
@@ -215,11 +219,14 @@ if [ ! -f "$BINARY_PATH" ]; then
         echo -e "${YELLOW}  DUCKDB_LIB_DIR unset — compiling DuckDB from source (--features bundled)${NC}"
         BUILD_FEATURES="--features bundled"
     fi
-    cargo build --release $BUILD_FEATURES 2>&1 | tail -20
-    if [ ! -f "$BINARY_PATH" ]; then
+    if ! cargo build --release $BUILD_FEATURES 2>&1 | tail -20; then
         echo -e "${RED}ERROR: Failed to build Thunderduck server${NC}"
         exit 1
     fi
+fi
+if [ ! -f "$BINARY_PATH" ]; then
+    echo -e "${RED}ERROR: Thunderduck binary not found at $BINARY_PATH${NC}"
+    exit 1
 fi
 echo -e "${GREEN}  Thunderduck binary found: $BINARY_PATH${NC}"
 

@@ -22,6 +22,14 @@ cargo test -- --nocapture
 
 The differential suite validates Thunderduck against Apache Spark 4.1.1 by running the same query through both engines and diffing the result.
 
+> **Spark IS INSTALLED** — vendored in the **main checkout** at `/workspace/.spark/spark-4.1.1`
+> (with its venv at `/workspace/.venv`). The runner's default probe (`$HOME/spark/current`)
+> misses it, and worktrees have no in-tree `.spark/`. From a worktree, export the paths first:
+> ```bash
+> export SPARK_HOME=/workspace/.spark/spark-4.1.1 THUNDERDUCK_VENV_DIR=/workspace/.venv
+> ```
+> Do **not** re-run `setup-differential-testing.sh` — Spark is already present.
+
 ### Via run script (preferred — the single entry point)
 
 `run-differential-tests.sh` runs everything (`all`) or a subgroup, and forwards
@@ -84,6 +92,31 @@ cd tests/integration && python3 -m pytest \
 - DataFrame cluster implementations live in `differential/tpch_dataframe_queries.py` and `differential/tpcds_dataframe_queries.py`; cases adapt them via the session that built the corpus inputs.
 - Parquet-backed temp views are registered by the corpus fixtures (`conftest._register_tpc_views`). `customer` exists in BOTH benchmarks with different schemas — the `tpc_view_switcher` fixture re-points it per case category.
 - The pre-migration per-query baseline (regression oracle) is `.agent-output/tpc-baseline.md`; `check-tpc-migration.sh` compares against it.
+
+## Per-worktree test isolation
+
+Multiple git worktrees run tests on one machine. Each worktree gets its own
+remembered server ports, isolated Spark daemon state, and scoped cleanup, so
+runs never clash and cleanup never kills another worktree's servers:
+
+- **Ports** are picked once (random free ports) and persisted to
+  `<worktree_root>/.thunderduck-test-env.json` by
+  `tests/integration/utils/test_env.py`; runs reuse them, so a manual PySpark
+  client connects to the right instance (`sc://localhost:<thunderduck_port>`)
+  and cleanup can locate dangling servers. Explicit `THUNDERDUCK_PORT` /
+  `SPARK_PORT` env vars still override.
+- **Spark reference** runs with per-worktree `SPARK_PID_DIR` / `SPARK_LOG_DIR` /
+  `SPARK_IDENT_STRING` and a `-Dthunderduck.worktree=<id>` JVM marker, so Spark's
+  (port-agnostic) class+instance daemon bookkeeping doesn't collide.
+- **Cleanup**: `./tests/scripts/kill-test-servers.sh` kills only *this*
+  worktree's servers after proving ownership (Thunderduck binary under this
+  worktree's `target/`, or the Spark JVM marker). `--all` sweeps every worktree
+  (still ownership-verified); `--stale` reaps only orphaned (ppid==1) servers;
+  `--list` / `--list-all` show status. **Never** use
+  `pkill -f thunderduck-connect-server` — it crosses worktrees.
+- **Unit tests** are already isolated (in-memory DuckDB, per-process extension
+  temp dir); `THUNDERDUCK_DUCKDB_EXTENSION_DIR` optionally points DuckDB's
+  `INSTALL` cache at a per-worktree dir to avoid a shared-`~/.duckdb` race.
 
 ## Key Data & SQL Paths
 

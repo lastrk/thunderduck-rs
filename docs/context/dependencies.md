@@ -30,6 +30,7 @@ The extension implements Spark-precise numerical semantics:
 | `spark_decimal_div(a, b)` | Decimal `/` | `ROUND_HALF_UP` |
 | `spark_sum(col)` | `SUM` | Spark-compatible return types |
 | `spark_avg(col)` | `AVG` | Spark-compatible return types |
+| `spark_skewness(col)` | `skewness()` | Population skewness (Spark semantics) |
 
 Full details: [extension-loading.md](../adrs/runtime/extension-loading.md) (see [`docs/adrs/README.md`](../adrs/README.md) for the ADR index).
 

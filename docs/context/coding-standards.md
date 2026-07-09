@@ -18,19 +18,34 @@ cargo test
 - **`.expect()` only for proven invariants** — the expect message must state the invariant.
 - **All public items must have `///` doc comments.**
 - **Error types**: `thiserror` in library crates, `anyhow` in application/binary crates.
-- **No hardcoded secrets.** Use environment variables via `dotenvy`.
+- **No hardcoded secrets.** Use environment variables.
 
-## Preferred Crates
+## Quality Gate
+
+The checks a coder subagent must clear after every implementation and after every review-fix pass. Run in order; each must pass before the next is meaningful:
+
+1. **`cargo check -p <touched-crate>`** — succeeds (no compile errors, no missing imports). Run once per crate touched.
+2. **`cargo fmt --check`** on created/modified files — clean. Scope to changed files: `git diff --name-only HEAD -- '*.rs' | xargs -r rustfmt --check --edition 2021`. (The workspace baseline has pre-existing formatting drift this work does not own; plain `rustfmt --check` without `--edition 2021` also fails spuriously here.)
+3. **`cargo test -p <touched-crate> --lib --tests`** — all unit/lib tests for the touched crate pass (e.g. `cargo test -p thunderduck-core` for `crates/core/` work, `cargo test -p thunderduck-connect-server` for `crates/connect-server/`). When a crate has multiple test binaries, the summary prints one `test result:` line per binary — read the sum, not just the last block.
+
+Clippy is **not** in this gate: the workspace baseline has pre-existing clippy errors in unrelated modules. Do not introduce *new* clippy warnings on touched files (verify ad-hoc); a workspace `cargo clippy` run is not required here. The broader human verification (full clippy, full differential suite) lives in CLAUDE.md → Verification Before Done.
+
+## Core Stack
+
+The crates this project is actually built on — reach for these rather than
+alternatives:
 
 | Concern | Crate |
 |---------|-------|
-| Async runtime | `tokio` |
-| HTTP server | `axum` + `tower` |
-| HTTP client | `reqwest` |
+| gRPC / protobuf | `tonic` + `prost` |
+| Async runtime | `tokio` (multi-thread scheduler) |
+| Embedded engine | `duckdb` |
+| Columnar data / IPC | `arrow` (shared dep tree with `duckdb-rs`) |
+| SQL parsing | `sqlparser` (+ SparkDialect) |
 | Serialization | `serde` + `serde_json` |
 | CLI | `clap` (derive) |
 | Logging | `tracing` |
-| Database | `sqlx` |
+| Errors | `thiserror` (library crates), `anyhow` (binary crates) |
 
 ## Code Style
 

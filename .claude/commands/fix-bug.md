@@ -63,9 +63,9 @@ Before invoking any subagent, verify that the project has declared its
 post-implementation quality checks. A guessed quality gate is worse than
 no quality gate.
 
-1. Confirm a top-level `CLAUDE.md` exists at `$PROJECT_ROOT`. If it does
-   not, halt with the message below and do NOT proceed to Stage 1.
-2. Read `CLAUDE.md` and scan for a level-2 heading `## Quality Gate`
+1. Confirm `docs/context/coding-standards.md` exists at `$PROJECT_ROOT`.
+   If it does not, halt with the message below and do NOT proceed to Stage 1.
+2. Read `docs/context/coding-standards.md` and scan for a level-2 heading `## Quality Gate`
    (exact match, case-sensitive). The section runs from that heading
    up to the next heading of equal-or-higher level (or end of file).
 3. The section body must contain at least one non-blank line of
@@ -76,20 +76,20 @@ no quality gate.
 5. Otherwise, capture the literal text of the `## Quality Gate`
    section into a variable named `QUALITY_GATE_INSTRUCTIONS`. Every
    coder-subagent prompt in later stages will reference this section
-   by name; the coder reads `CLAUDE.md` itself, so you do not need to
+   by name; the coder reads `docs/context/coding-standards.md` itself, so you do not need to
    inline the text into the prompt.
 
 **Halt message** (output verbatim to the user; do not paraphrase):
 
 ```
 Cannot proceed: the project has no `## Quality Gate` section in
-CLAUDE.md.
+docs/context/coding-standards.md.
 
 The pipeline refuses to run post-implementation checks without
 explicit instructions, because a guessed quality gate is worse than
 no quality gate.
 
-Please add a `## Quality Gate` section to the top-level CLAUDE.md
+Please add a `## Quality Gate` section to docs/context/coding-standards.md
 describing the commands the coder should run after implementation
 and after addressing review findings. Cover at minimum:
   - the build / compile command
@@ -109,7 +109,7 @@ Example (for a Maven project):
     4. (If integration behavior changed)
        `cd tests/integration && ./.venv/bin/python3 -m pytest …`
 
-Re-run /fix-bug once CLAUDE.md is updated.
+Re-run /fix-bug once docs/context/coding-standards.md is updated.
 ```
 
 After printing the halt message, stop the pipeline. No pipeline-side
@@ -168,11 +168,11 @@ Use the `${LANG}-coder` subagent with this task:
 > prescribed fix. Do not add unrelated improvements or refactors.
 >
 > After implementation, run the quality gate exactly as defined in the
-> `## Quality Gate` section of the top-level `CLAUDE.md`. Read that
+> `## Quality Gate` section of `docs/context/coding-standards.md`. Read that
 > section first; execute the commands it lists in order; fix any
 > failures before continuing. Do not substitute or augment those
 > commands — if a step you think is missing is genuinely required,
-> that is a CLAUDE.md bug to flag in your log, not something for you
+> that is a coding-standards.md bug to flag in your log, not something for you
 > to paper over. (The orchestrator already verified the section exists;
 > if it has somehow gone missing, stop and tell the user rather than
 > guessing.)
@@ -249,7 +249,7 @@ Use the `${LANG}-coder` subagent with this task:
 > Fix ONLY the Critical and High issues listed.
 >
 > After fixing, run the quality gate exactly as defined in the
-> `## Quality Gate` section of the top-level `CLAUDE.md`. Read that
+> `## Quality Gate` section of `docs/context/coding-standards.md`. Read that
 > section first; execute the commands it lists in order; fix any
 > failures before continuing.
 >
@@ -278,12 +278,12 @@ Use the `${LANG}-coder` subagent with this task:
 > Steps:
 > 1. Re-run the specific reproducer named in the bug report (or the
 >    failing test the diagnostic report identifies). Use whichever
->    test-invocation command from the `## Quality Gate` section of the
->    top-level `CLAUDE.md` runs a single targeted test; if the gate
+>    test-invocation command from the `## Quality Gate` section of
+>    `docs/context/coding-standards.md` runs a single targeted test; if the gate
 >    section does not document a single-test invocation, document that
 >    gap in the verification log and run the gate's standard test
 >    command instead.
-> 2. Run the full quality gate from `CLAUDE.md` (every command in the
+> 2. Run the full quality gate from `docs/context/coding-standards.md` (every command in the
 >    `## Quality Gate` section, in order) to check for regressions in
 >    unrelated areas.
 > 3. Write `.agent-output/004-verification-log.md` containing:

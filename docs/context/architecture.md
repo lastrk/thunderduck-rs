@@ -24,16 +24,20 @@ crates/core/                        # Pure translation engine (no gRPC)
     emission.rs                     # TypedAst → DuckDB SQL
     expression.rs                   # τ Expression enum
     type_inference.rs               # Spark-parity type inference
+    statement.rs                    # SqlStatement / DdlStatement (CREATE/DROP/INSERT) + render_ddl
+    function_catalog.rs             # Static roster of τ-supported Spark functions
     invariants.rs                   # INV1-10 mechanical enforcement
   parser_v2/                        # SparkSQL parser (sqlparser-rs + SparkDialect) → CommonAst
   types/                            # DataType, StructField, StructType
   runtime/                          # DuckDB session, Arrow streaming, extension loading
 
 crates/connect-server/              # gRPC binary (tonic)
-  service.rs                        # SparkConnectService; per-batch streaming
-                                    # (execute_streaming_query emits a proto
-                                    # Schema frame first, then transcoded batches)
-  session/                          # SessionManager
+  service.rs                        # SparkConnectService + SessionManager;
+                                    # per-batch streaming (execute_streaming_query
+                                    # emits a proto Schema frame first, then
+                                    # transcoded batches)
+  catalog_ops.rs                    # Root Catalog-op pre-pass (currentCatalog,
+                                    # tableExists, dropTempView, …) → CommonOp::Values
   converter/
     v2_relation_converter.rs        # Protobuf Relation → CommonAst
                                     # (LocalRelation Arrow interval-value decoder)
@@ -45,7 +49,13 @@ crates/connect-server/              # gRPC binary (tonic)
   arrow_interval_transcode.rs       # Per-batch DuckDB Interval(MonthDayNano) →
                                     # Spark per-semantic Arrow encoding
                                     # (DayTimeInterval → Duration(us))
+  arrow_ipc.rs                      # Arrow IPC stream helpers
+  error.rs                          # ConnectError ↔ tonic::Status bridge
 ```
+
+`SessionManager` (session lifecycle; each session owns a DuckDB `Connection` on a
+dedicated OS thread) lives inside `service.rs` — there is no separate `session/`
+module.
 
 ## Key Types
 

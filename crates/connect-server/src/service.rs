@@ -631,37 +631,12 @@ async fn handle_command(
             // `RelType::Sql` relation in `sql_cmd.input`; older clients use the
             // proto-deprecated `sql` text field. Synthesize a `RelType::Sql`
             // relation for the latter so both paths echo a typed relation.
-            let input_rel = match sql_cmd.input {
-                Some(input_rel) => input_rel,
-                None => {
-                    #[allow(deprecated)]
-                    let text = sql_cmd.sql;
-                    if text.is_empty() {
-                        return Err(Status::invalid_argument(
-                            "SqlCommand missing both input relation and sql text",
-                        ));
-                    }
-                    proto::Relation {
-                        common: None,
-                        rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
-                            query: text,
-                            ..Default::default()
-                        })),
-                    }
-                }
-            };
-            // Eager-validate (parse + analyze) at `sql()` time so Spark-emulated
-            // errors surface eagerly, matching Spark's `AnalysisException`. The
-            // emitted SQL / resolved schema are discarded — the client
-            // re-transpiles the echoed relation on `.collect()` via the Root
-            // path.
-            //
-            // TODO: eager DDL/DML side effects
-            // (`spark.sql("CREATE VIEW ...")`) and non-deterministic
-            // re-evaluation (`rand()`, `current_timestamp()`) require eager
-            // execution to a `LocalRelation` — out of scope for this pass.
-            let _ = transpile_relation(session, &input_rel).await?;
-            handle_sql_command(session, session_id, operation_id, input_rel).await
+            let (sql_text, input_rel) = extract_sql_command_text_and_rel(sql_cmd)?;
+
+            // Try statement-level parse: DDL statements (CREATE TEMP VIEW)
+            // must be eagerly executed; pure queries echo a CachedRelation.
+            handle_sql_command_dispatch(session, session_id, operation_id, &sql_text, input_rel)
+                .await
         }
         Some(CommandType::WriteOperation(mut write_cmd)) => {
             let input_rel = write_cmd
@@ -951,18 +926,91 @@ async fn handle_create_dataframe_view(
     Ok(vec![result_complete_response(session_id, operation_id)])
 }
 
-/// Handle `SqlCommand` (both `input`-bearing and deprecated text paths).
-///
-/// SQL command execution over `CommonAst`.
-///
-/// Lazy-echo design (ADR-011 command-arm response shape): return a
-/// `SqlCommandResult` carrying the re-executable input relation verbatim,
-/// followed by `ResultComplete`. PySpark wraps that relation in a
-/// `CachedRelation` and re-sends it as a `Root` plan on `.collect()`, flowing
-/// through the already-proven `transpile_relation → execute_streaming_query`
-/// path. The command arm never streams an `ArrowBatch`.
-async fn handle_sql_command(
-    _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+/// Extract the SQL text and synthesise the echoed relation from a
+/// `SqlCommand` proto. Handles both modern (`input` field) and
+/// proto-deprecated (`sql` text field) shapes.
+#[allow(clippy::result_large_err)]
+fn extract_sql_command_text_and_rel(
+    sql_cmd: proto::SqlCommand,
+) -> Result<(String, proto::Relation), Status> {
+    match sql_cmd.input {
+        Some(input_rel) => {
+            // Modern: extract the text from the inner Sql relation.
+            let text = match &input_rel.rel_type {
+                Some(proto::relation::RelType::Sql(sql)) => sql.query.clone(),
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "SqlCommand input is not a Sql relation",
+                    ));
+                }
+            };
+            Ok((text, input_rel))
+        }
+        None => {
+            #[allow(deprecated)]
+            let text = sql_cmd.sql;
+            if text.is_empty() {
+                return Err(Status::invalid_argument(
+                    "SqlCommand missing both input relation and sql text",
+                ));
+            }
+            let rel = proto::Relation {
+                common: None,
+                rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
+                    query: text.clone(),
+                    ..Default::default()
+                })),
+            };
+            Ok((text, rel))
+        }
+    }
+}
+
+/// Dispatch a `SqlCommand` — eagerly execute DDL side-effects, or echo
+/// the relation for lazy queries.
+async fn handle_sql_command_dispatch(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    session_id: &str,
+    operation_id: &str,
+    sql_text: &str,
+    input_rel: proto::Relation,
+) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
+    use thunderduck_core::transpiler_v2::{DdlStatement, SqlStatement};
+
+    let stmt = SparkSqlParserV2::parse_statement(sql_text)
+        .map_err(|e| Status::from(ConnectError::from(e)))?;
+
+    match stmt {
+        SqlStatement::Query(_) => {
+            // Eager-validate (parse + analyze) at `sql()` time so
+            // Spark-emulated errors surface eagerly, matching Spark's
+            // `AnalysisException`. The emitted SQL / resolved schema are
+            // discarded — the client re-transpiles the echoed relation on
+            // `.collect()` via the Root path.
+            let _ = transpile_relation(session, &input_rel).await?;
+            handle_sql_command_echo(session_id, operation_id, input_rel)
+        }
+        SqlStatement::Ddl(DdlStatement::CreateTempView {
+            name,
+            or_replace,
+            query,
+        }) => {
+            handle_sql_create_temp_view(
+                session,
+                session_id,
+                operation_id,
+                &name,
+                or_replace,
+                &query,
+            )
+            .await
+        }
+    }
+}
+
+/// Handle a pure-query `SqlCommand` — echo the relation as a
+/// `SqlCommandResult` so the client can re-send it as a `Root` plan.
+fn handle_sql_command_echo(
     session_id: &str,
     operation_id: &str,
     result_rel: proto::Relation,
@@ -971,6 +1019,51 @@ async fn handle_sql_command(
         sql_command_result_response(session_id, operation_id, result_rel),
         result_complete_response(session_id, operation_id),
     ])
+}
+
+/// Handle `CREATE [OR REPLACE] TEMP VIEW` from a SQL command.
+///
+/// Finalize/analyze the body `CommonAst` to get (sql, schema), then
+/// register the view using the same machinery as
+/// `handle_create_dataframe_view`. Returns a lone `ResultComplete`.
+async fn handle_sql_create_temp_view(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    session_id: &str,
+    operation_id: &str,
+    name: &str,
+    or_replace: bool,
+    body: &CommonAst,
+) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
+    // If `OR REPLACE` is false and the view exists, match Spark's error.
+    // (IF NOT EXISTS is unreachable for temp views — Spark rejects it at
+    // parse time and τ mirrors that rejection in lower_statement_or_ddl.)
+    if !or_replace {
+        if session.get_view_schema(name).await.is_some() {
+            return Err(Status::already_exists(format!(
+                "[TEMP_TABLE_OR_VIEW_ALREADY_EXISTS] Cannot create the temporary \
+                 view `{name}` because it already exists. Choose a different name, \
+                 drop or replace the existing view, or add the IF NOT EXISTS clause \
+                 to tolerate a pre-existing view.",
+            )));
+        }
+    }
+
+    // Finalize the body to get DuckDB SQL + resolved schema.
+    let mut body_ast = body.clone();
+    resolve_implicit_pivots(&mut body_ast, session).await?;
+    let (sql, schema) = finalize(session, &body_ast).await?;
+
+    // Register using the existing machinery.
+    handle_create_dataframe_view(
+        session,
+        session_id,
+        operation_id,
+        name,
+        false, // is_global — SQL CREATE TEMP VIEW is session-scoped
+        sql,
+        schema,
+    )
+    .await
 }
 
 /// Handle `WriteOperation` after successful transpile.
@@ -2066,5 +2159,110 @@ mod tests {
             "SELECT 1 must stream an ArrowBatch",
         );
         assert_trailing_result_complete(&frames);
+    }
+
+    // ── SQL CREATE TEMP VIEW via SqlCommand ─────────────────────────────
+
+    /// Helper: build an `ExecutePlanRequest` wrapping a `SqlCommand`
+    /// with the given SQL text.
+    fn sql_command_plan(session_id: &str, sql: &str) -> proto::ExecutePlanRequest {
+        proto::ExecutePlanRequest {
+            session_id: session_id.to_owned(),
+            operation_id: Some("test-op".to_owned()),
+            plan: Some(proto::Plan {
+                op_type: Some(proto::plan::OpType::Command(proto::Command {
+                    command_type: Some(proto::command::CommandType::SqlCommand(
+                        proto::SqlCommand {
+                            #[allow(deprecated)]
+                            sql: String::new(),
+                            input: Some(proto::Relation {
+                                common: None,
+                                rel_type: Some(proto::relation::RelType::Sql(proto::Sql {
+                                    query: sql.to_owned(),
+                                    ..Default::default()
+                                })),
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                })),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// `spark.sql("CREATE TEMP VIEW v AS SELECT 1 AS id")` followed by
+    /// `spark.sql("SELECT * FROM v")` — the SQL DDL path registers the view
+    /// and the subsequent SELECT resolves it. End-to-end through `SqlCommand`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sql_create_temp_view_then_select() {
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
+            thunderduck_core::runtime::StreamingConfig::default(),
+        ));
+        let svc = ThunderduckService::new(Arc::clone(&session_manager));
+        let session_id = "sql-create-temp-view-session";
+
+        // Step 1: CREATE TEMP VIEW via SqlCommand.
+        let create_req = sql_command_plan(session_id, "CREATE TEMP VIEW v AS SELECT 1 AS id");
+        let frames = drain(
+            svc.execute_plan(Request::new(create_req))
+                .await
+                .expect("CREATE TEMP VIEW via SqlCommand must succeed"),
+        )
+        .await;
+        // DDL returns a lone ResultComplete (same shape as
+        // CreateDataframeView).
+        assert_eq!(frames.len(), 1, "DDL returns exactly one frame");
+        assert_trailing_result_complete(&frames);
+
+        // Step 2: SELECT from the view on the same session.
+        let select_req = proto::ExecutePlanRequest {
+            session_id: session_id.to_owned(),
+            operation_id: Some("test-op-2".to_owned()),
+            plan: Some(sql_plan("SELECT * FROM v")),
+            ..Default::default()
+        };
+        let frames = drain(
+            svc.execute_plan(Request::new(select_req))
+                .await
+                .expect("SELECT * FROM v must resolve the SQL-created temp view"),
+        )
+        .await;
+        assert!(
+            find_arrow_batch(&frames).is_some(),
+            "SELECT over the SQL-created view must stream an ArrowBatch",
+        );
+        assert_trailing_result_complete(&frames);
+    }
+
+    /// `CREATE OR REPLACE TEMP VIEW` via SqlCommand overwrites an existing
+    /// view without error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sql_create_or_replace_temp_view_overwrites() {
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
+            thunderduck_core::runtime::StreamingConfig::default(),
+        ));
+        let svc = ThunderduckService::new(Arc::clone(&session_manager));
+        let session_id = "sql-replace-view-session";
+
+        // First creation.
+        let req1 = sql_command_plan(session_id, "CREATE OR REPLACE TEMP VIEW w AS SELECT 1 AS a");
+        let frames = drain(
+            svc.execute_plan(Request::new(req1))
+                .await
+                .expect("first CREATE OR REPLACE must succeed"),
+        )
+        .await;
+        assert_eq!(frames.len(), 1);
+
+        // Replace with different body.
+        let req2 = sql_command_plan(session_id, "CREATE OR REPLACE TEMP VIEW w AS SELECT 2 AS b");
+        let frames = drain(
+            svc.execute_plan(Request::new(req2))
+                .await
+                .expect("second CREATE OR REPLACE must succeed"),
+        )
+        .await;
+        assert_eq!(frames.len(), 1);
     }
 }

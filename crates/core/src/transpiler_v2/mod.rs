@@ -25,6 +25,7 @@ pub mod invariants;
 pub mod macros;
 pub mod rewrites;
 pub(crate) mod spark_errors;
+pub mod statement;
 mod struct_names;
 pub mod type_inference;
 
@@ -35,6 +36,7 @@ pub use ast::{CommonAst, CommonOp};
 pub use base_types::BaseTypes;
 pub use error::EmissionError;
 pub use expression::Expression;
+pub use statement::{DdlStatement, SqlStatement};
 pub use type_inference::TypeInferenceEngine;
 
 /// τ's top-level entry point.

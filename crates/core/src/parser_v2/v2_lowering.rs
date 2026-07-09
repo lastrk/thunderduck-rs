@@ -71,6 +71,190 @@ pub fn lower_statement(stmt: Statement) -> Result<CommonAst, EmissionError> {
     }
 }
 
+/// Lower a parsed sqlparser [`Statement`] into a [`SqlStatement`].
+///
+/// Queries lower exactly as [`lower_statement`]. `CREATE [OR REPLACE]
+/// TEMP[ORARY] VIEW` lowers to [`DdlStatement::CreateTempView`]. Every
+/// other statement kind surfaces as a Thunderduck-boundary error.
+pub fn lower_statement_or_ddl(
+    stmt: Statement,
+) -> Result<crate::transpiler_v2::SqlStatement, EmissionError> {
+    use crate::transpiler_v2::statement::{DdlStatement, SqlStatement};
+    use sqlparser::ast::CreateView;
+
+    match stmt {
+        Statement::Query(q) => {
+            let ast = lower_query(*q, &CteScope::new())?;
+            Ok(SqlStatement::Query(ast))
+        }
+        Statement::CreateView(CreateView {
+            temporary: true,
+            name,
+            query,
+            or_replace,
+            if_not_exists,
+            // Reject unsupported clauses loudly.
+            columns,
+            comment,
+            options,
+            cluster_by,
+            with_no_schema_binding,
+            materialized,
+            to,
+            params,
+            or_alter,
+            secure,
+            name_before_not_exists: _,
+        }) => {
+            // Spark-emulated parse errors (match Spark 4.1.1 ParseException
+            // wording exactly). These fire before unsupported-clause guards
+            // because Spark itself rejects these at parse time.
+            //
+            // Rule 1: OR REPLACE + IF NOT EXISTS on ANY view (including
+            // temp). Spark: "CREATE VIEW with both IF NOT EXISTS and REPLACE
+            // is not allowed."
+            if or_replace && if_not_exists {
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::parse_error".to_owned(),
+                    reason: "CREATE VIEW with both IF NOT EXISTS and REPLACE \
+                             is not allowed."
+                        .to_owned(),
+                });
+            }
+            // Rule 2: IF NOT EXISTS on any temporary view. Spark: "It is
+            // not allowed to define a TEMPORARY view with IF NOT EXISTS."
+            if if_not_exists {
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "sql::parse_error".to_owned(),
+                    reason: "It is not allowed to define a TEMPORARY view \
+                             with IF NOT EXISTS."
+                        .to_owned(),
+                });
+            }
+
+            // Reject unsupported clauses loudly — no silent drops.
+            if !columns.is_empty() {
+                bail_boundary_proto!(
+                    "sql::create_view::column_list",
+                    "column alias list on CREATE TEMP VIEW is not implemented in τ"
+                );
+            }
+            if comment.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_view::comment",
+                    "COMMENT on CREATE TEMP VIEW is not implemented in τ"
+                );
+            }
+            if !matches!(options, sqlparser::ast::CreateTableOptions::None) {
+                bail_boundary_proto!(
+                    "sql::create_view::options",
+                    "OPTIONS / WITH on CREATE TEMP VIEW is not implemented in τ"
+                );
+            }
+            if !cluster_by.is_empty() {
+                bail_boundary_proto!(
+                    "sql::create_view::cluster_by",
+                    "CLUSTER BY on CREATE TEMP VIEW is not implemented in τ"
+                );
+            }
+            if with_no_schema_binding {
+                bail_boundary_proto!(
+                    "sql::create_view::no_schema_binding",
+                    "WITH NO SCHEMA BINDING on CREATE TEMP VIEW is not implemented in τ"
+                );
+            }
+            if materialized {
+                bail_boundary_proto!(
+                    "sql::create_view::materialized",
+                    "CREATE MATERIALIZED TEMP VIEW is not implemented in τ"
+                );
+            }
+            if to.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_view::to",
+                    "TO clause on CREATE TEMP VIEW is not implemented in τ"
+                );
+            }
+            if params.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_view::params",
+                    "algorithm/security params on CREATE TEMP VIEW is not implemented in τ"
+                );
+            }
+            if or_alter {
+                bail_boundary_proto!(
+                    "sql::create_view::or_alter",
+                    "CREATE OR ALTER TEMP VIEW is not implemented in τ"
+                );
+            }
+            if secure {
+                bail_boundary_proto!(
+                    "sql::create_view::secure",
+                    "CREATE SECURE TEMP VIEW is not implemented in τ"
+                );
+            }
+
+            // Extract unqualified view name.
+            let view_name = extract_simple_name(&name, "sql::create_view::name")?;
+
+            // Lower the body query.
+            let body_ast = lower_query(*query, &CteScope::new())?;
+
+            Ok(SqlStatement::Ddl(DdlStatement::CreateTempView {
+                name: view_name,
+                or_replace,
+                query: body_ast,
+            }))
+        }
+        // Non-temporary CREATE VIEW → Spark-emulated parse error if
+        // OR REPLACE + IF NOT EXISTS combo (Spark rejects on ALL views),
+        // else Thunderduck boundary error.
+        Statement::CreateView(ref cv) if cv.or_replace && cv.if_not_exists => {
+            return Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: "sql::parse_error".to_owned(),
+                reason: "CREATE VIEW with both IF NOT EXISTS and REPLACE \
+                         is not allowed."
+                    .to_owned(),
+            });
+        }
+        Statement::CreateView(_) => {
+            bail_boundary_proto!(
+                "sql::create_view",
+                "non-temporary CREATE VIEW is not implemented in τ"
+            )
+        }
+        other => bail_boundary_proto!(
+            format!("sql::{}", statement_kind(&other)),
+            "parser_v2 only supports SELECT queries in τ"
+        ),
+    }
+}
+
+/// Extract a simple (unqualified, single-part) identifier from an
+/// [`ObjectName`], returning a boundary error for multi-part or
+/// function-based names.
+fn extract_simple_name(name: &ObjectName, shape: &str) -> Result<String, EmissionError> {
+    let parts = &name.0;
+    if parts.len() != 1 {
+        bail_boundary_proto!(
+            shape,
+            format!("multi-part name `{name}` is not supported — expected a simple identifier")
+        );
+    }
+    match &parts[0] {
+        ObjectNamePart::Identifier(ident) => Ok(ident.value.clone()),
+        ObjectNamePart::Function(_) => {
+            bail_boundary_proto!(
+                shape,
+                format!("function-derived name `{name}` is not supported")
+            )
+        }
+    }
+}
+
 fn statement_kind(stmt: &Statement) -> &'static str {
     match stmt {
         Statement::Query(_) => "query",

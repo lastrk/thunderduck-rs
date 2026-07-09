@@ -356,3 +356,28 @@ red in any later pass.
 - **Reflect:** subagents clean this pass; no attributable skill gaps. Lesson
   reinforced: check for an existing CommonOp before assuming a new node
   (TableFunction already carried `range` for SQL).
+
+## Pass 2 — 2026-07-09 — SQL `CREATE [OR REPLACE] TEMP VIEW ... AS SELECT`
+
+- **Hypothesis:** the `sql::create_view` boundary error is one root cause
+  spanning lambda (21), complex_types (14), sql_expressions, ddl files —
+  DDL fixtures issued via `spark.sql(...)`.
+- **Architecture (rust-architect):** statement-level `SqlStatement { Query,
+  Ddl }` enum BESIDE CommonAst (DDL is not a relation — no new CommonOp);
+  parser_v2 `parse_statement` lowers `Statement::CreateView{temporary}`;
+  service.rs SqlCommand arm branches and reuses the EXISTING
+  createOrReplaceTempView machinery. INV10 intact (side effects only in
+  connect-server). Staged plan: stage 2 (CREATE TABLE/DROP/INSERT) = pass 3.
+- **Review:** APPROVE, 0 Critical/High. Medium fixed same pass: Spark
+  rejects `IF NOT EXISTS` on temp views at parse time (verified empirically
+  against Spark 4.1.1) — field made unrepresentable in the enum, two
+  Spark-emulated parse errors added with Spark's exact wording.
+- **Gate:** 1116→1147 (Δ +31, zero regressions): lambda +16, complex_types
+  +14, ddl_parser +1. Remaining lambda 5 = HOF aggregate() nullable
+  mismatch (separate root cause); sql_expressions 10 = `sql::drop` (pass 3).
+- **Reflect (orchestrator, not subagent):** the review Medium originated in
+  MY coder brief — I embellished the architect's skeleton with a speculative
+  `if_not_exists` field without checking Spark's rule. Lesson: pass architect
+  skeletons through verbatim; any added surface needs a Spark-source check
+  first. Coder did well: verified Spark's actual rule empirically and made
+  the invalid state unrepresentable.

@@ -74,6 +74,56 @@ impl SparkSqlParserV2 {
         Ok(ast)
     }
 
+    /// Parse a raw Spark SQL string into a [`SqlStatement`].
+    ///
+    /// Unlike [`parse`] (which only accepts `SELECT` queries), this entry
+    /// point also recognises DDL statements (`CREATE TEMP VIEW …`).
+    /// Non-temporary `CREATE VIEW`, `CREATE TABLE`, and every other
+    /// statement kind surface as Thunderduck-boundary errors.
+    ///
+    /// Used by the `SqlCommand` dispatch path in `connect-server::service`
+    /// so that `spark.sql("CREATE TEMP VIEW v AS SELECT …")` can be
+    /// eagerly executed.
+    pub fn parse_statement(sql: &str) -> Result<crate::transpiler_v2::SqlStatement, EmissionError> {
+        use crate::transpiler_v2::error::UnsupportedKind;
+        use crate::transpiler_v2::SqlStatement;
+        use sqlparser::parser::Parser;
+
+        // Step 1: token-level rewrite of multi-column aliases (shared
+        // with the SELECT-only path).
+        let (rewritten_sql, alias_lists) = multi_alias::rewrite_multi_aliases(sql)?;
+        let parse_input = if alias_lists.is_empty() {
+            sql
+        } else {
+            rewritten_sql.as_str()
+        };
+
+        let dialect = SparkDialect;
+        let mut stmts =
+            Parser::parse_sql(&dialect, parse_input).map_err(|e| EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: "sql::parse_error".to_owned(),
+                reason: e.to_string(),
+            })?;
+        if stmts.len() != 1 {
+            bail_boundary_proto!(
+                "sql::multi_statement",
+                format!("expected exactly one SQL statement, got {}", stmts.len()),
+            );
+        }
+        let mut result = v2_lowering::lower_statement_or_ddl(stmts.remove(0))?;
+
+        // Step 2: post-lowering splice of sentinel-aliased projections
+        // (only applicable to Query variants).
+        if !alias_lists.is_empty() {
+            if let SqlStatement::Query(ref mut ast) = result {
+                multi_alias::splice_multi_aliases(ast, &alias_lists)?;
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Parse a SparkSQL expression FRAGMENT (e.g. `age + 1`, `upper(name)`)
     /// into a single [`crate::transpiler_v2::Expression`]. Used by the
     /// protobuf front-end for `Expression::ExpressionString` — Spark's
@@ -588,5 +638,200 @@ mod tests {
             sql_pair[1], df_b,
             "SQL-path val projection must match DataFrame-path shape"
         );
+    }
+
+    // ── parse_statement tests ───────────────────────────────────────────
+
+    mod parse_statement_tests {
+        use super::*;
+        use crate::transpiler_v2::error::UnsupportedKind;
+        use crate::transpiler_v2::statement::{DdlStatement, SqlStatement};
+        use crate::transpiler_v2::EmissionError;
+
+        #[test]
+        fn plain_select_returns_query() {
+            let result = SparkSqlParserV2::parse_statement("SELECT 1 AS x")
+                .expect("plain SELECT must parse");
+            assert!(
+                matches!(result, SqlStatement::Query(_)),
+                "expected SqlStatement::Query, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn create_temporary_view_returns_ddl() {
+            let result =
+                SparkSqlParserV2::parse_statement("CREATE TEMPORARY VIEW v AS SELECT 1 AS x")
+                    .expect("CREATE TEMPORARY VIEW must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::CreateTempView {
+                    name, or_replace, ..
+                }) => {
+                    assert_eq!(name, "v");
+                    assert!(!or_replace);
+                }
+                other => panic!("expected CreateTempView, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn create_temp_view_shorthand() {
+            let result = SparkSqlParserV2::parse_statement("CREATE TEMP VIEW v AS SELECT 1 AS x")
+                .expect("CREATE TEMP VIEW must parse");
+            assert!(
+                matches!(
+                    result,
+                    SqlStatement::Ddl(DdlStatement::CreateTempView { .. })
+                ),
+                "expected CreateTempView, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn create_or_replace_temporary_view_returns_ddl() {
+            let result = SparkSqlParserV2::parse_statement(
+                "CREATE OR REPLACE TEMPORARY VIEW v AS SELECT 1 AS x",
+            )
+            .expect("CREATE OR REPLACE TEMPORARY VIEW must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::CreateTempView {
+                    name, or_replace, ..
+                }) => {
+                    assert_eq!(name, "v");
+                    assert!(or_replace);
+                }
+                other => panic!("expected CreateTempView with or_replace, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn temp_view_if_not_exists_rejected_as_spark_parse_error() {
+            // Spark 4.1.1 raises ParseException:
+            // "It is not allowed to define a TEMPORARY view with IF NOT EXISTS."
+            let err = SparkSqlParserV2::parse_statement(
+                "CREATE TEMPORARY VIEW IF NOT EXISTS v AS SELECT 1 AS x",
+            )
+            .expect_err("IF NOT EXISTS on temp view must be rejected");
+            match err {
+                EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name,
+                    reason,
+                } => {
+                    assert_eq!(name, "sql::parse_error");
+                    assert!(
+                        reason.contains("TEMPORARY view with IF NOT EXISTS"),
+                        "expected Spark-parity message, got: {reason}"
+                    );
+                }
+                other => panic!("expected sql::parse_error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn or_replace_with_if_not_exists_rejected_as_spark_parse_error() {
+            // Spark 4.1.1 raises ParseException:
+            // "CREATE VIEW with both IF NOT EXISTS and REPLACE is not allowed."
+            let err = SparkSqlParserV2::parse_statement(
+                "CREATE OR REPLACE TEMPORARY VIEW IF NOT EXISTS v AS SELECT 1 AS x",
+            )
+            .expect_err("OR REPLACE + IF NOT EXISTS must be rejected");
+            match err {
+                EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name,
+                    reason,
+                } => {
+                    assert_eq!(name, "sql::parse_error");
+                    assert!(
+                        reason.contains("IF NOT EXISTS and REPLACE"),
+                        "expected Spark-parity message, got: {reason}"
+                    );
+                }
+                other => panic!("expected sql::parse_error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn or_replace_with_if_not_exists_on_persistent_view_also_rejected() {
+            // Spark rejects OR REPLACE + IF NOT EXISTS on ALL views (not
+            // just temporary). τ mirrors this before the boundary error.
+            let err = SparkSqlParserV2::parse_statement(
+                "CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT 1 AS x",
+            )
+            .expect_err("OR REPLACE + IF NOT EXISTS on persistent view must be rejected");
+            match err {
+                EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name,
+                    reason,
+                } => {
+                    assert_eq!(name, "sql::parse_error");
+                    assert!(
+                        reason.contains("IF NOT EXISTS and REPLACE"),
+                        "expected Spark-parity message, got: {reason}"
+                    );
+                }
+                other => panic!("expected sql::parse_error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn persistent_create_view_bails_with_create_view() {
+            let err = SparkSqlParserV2::parse_statement("CREATE VIEW v AS SELECT 1 AS x")
+                .expect_err("persistent CREATE VIEW must bail");
+            match err {
+                EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name,
+                    ..
+                } => {
+                    assert_eq!(name, "sql::create_view");
+                }
+                other => panic!("expected sql::create_view boundary, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn unsupported_column_list_bails_loudly() {
+            let err = SparkSqlParserV2::parse_statement("CREATE TEMP VIEW v (a, b) AS SELECT 1, 2")
+                .expect_err("column list must bail");
+            match err {
+                EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name,
+                    ..
+                } => {
+                    assert_eq!(name, "sql::create_view::column_list");
+                }
+                other => panic!("expected column_list boundary, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn create_table_bails_with_create_table() {
+            let err = SparkSqlParserV2::parse_statement("CREATE TABLE t (id INT)")
+                .expect_err("CREATE TABLE must bail");
+            match err {
+                EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name,
+                    ..
+                } => {
+                    assert_eq!(name, "sql::create_table");
+                }
+                other => panic!("expected sql::create_table boundary, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn existing_parse_unchanged_for_select() {
+            // The SELECT-only `parse()` still works and rejects DDL.
+            let ok = SparkSqlParserV2::parse("SELECT 1 AS x");
+            assert!(ok.is_ok(), "parse() must still accept SELECT");
+
+            let err = SparkSqlParserV2::parse("CREATE TEMP VIEW v AS SELECT 1");
+            assert!(err.is_err(), "parse() must still reject DDL");
+        }
     }
 }

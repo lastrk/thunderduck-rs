@@ -361,3 +361,12 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   does not check the reverse — extensions can register functions the allow-list hasn't caught up
   with. A preflight that checks the allow-list is testing "did *this repo* wire the arm," not
   "does the extension provide the function." Design preflights for what they actually measure.
+
+## 2026-07-09 — Don't embellish architect skeletons in coder briefs
+Pass 2 of the corpus goal: the architect's DdlStatement skeleton was
+`CreateTempView { name, or_replace, query }`; the orchestrator's coder brief
+added `if_not_exists` speculatively. Spark rejects IF NOT EXISTS on temp
+views at parse time, so the field was unrepresentable-by-design — the
+reviewer caught it as a Medium and a fix iteration was spent removing it.
+Rule: relay type skeletons verbatim; any field the plan doesn't have needs a
+Spark-source/empirical check BEFORE it enters a brief.

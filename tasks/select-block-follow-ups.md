@@ -7,9 +7,16 @@ identified during that work and deliberately deferred; neither blocks the
 merge. Evidence gate for both: the corpus (no previously-green case regresses)
 plus the `tracing::debug` "wrap strands qualifiers" witness added in Phase E.
 
-## 1. FromItem leaf generators (Values / LocalRelation / FileScan / Range)
+## 1. FromItem leaf generators (Values / LocalRelation / FileScan / Range) — DONE
 
-**What.** These ops render as `Raw` units today, so every parent wraps them:
+Implemented 2026-07-09 (this branch). `build_values` / `build_local_relation`
+/ `build_file_scan` / `build_table_function` produce leaf blocks over
+`FromItem::Raw`; the empty-`LocalRelation` and bare-`explode` forms stay Raw
+units (genuine FROM-less SELECTs); `range` keeps its `id` bind via
+`default_projections` (pinned by `dispatch_project_over_range_binds_id_column`
++ `bare_range_dispatch_keeps_id_default_projection`). Corpora: zero movement.
+
+**Original plan:** These ops render as `Raw` units today, so every parent wraps them:
 `SELECT cols FROM (SELECT * FROM read_parquet(...)) AS __td_sub`. But their
 SQL essence is a FROM-item generator, not a SELECT statement. Convert each to
 a leaf `SelectBlock` over `FromItem::Raw { sql, exposed }`:

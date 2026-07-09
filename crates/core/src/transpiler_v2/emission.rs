@@ -98,6 +98,19 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
                 alias: alias.clone(),
             })))
         }
+        TypedOp::Values { rows, column_names } => build_values(rows, column_names, schema),
+        TypedOp::LocalRelation { schema: s, rows } => build_local_relation(s, rows),
+        TypedOp::FileScan {
+            format,
+            paths,
+            options,
+            ..
+        } => build_file_scan(*format, paths, options),
+        TypedOp::TableFunction {
+            name,
+            args,
+            with_ordinality,
+        } => build_table_function(name, args, *with_ordinality, schema),
         TypedOp::Project { input, projections } => build_project(input, projections),
         TypedOp::Filter { input, condition } => build_filter(input, condition),
         TypedOp::Sort {
@@ -730,14 +743,6 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
     let result: Result<String, EmissionError> = match op {
         // ── C.1 wired ────────────────────────────────────────────────────
         TypedOp::SingleRow => render_single_row(),
-        TypedOp::Values { rows, column_names } => render_values(rows, column_names, schema),
-        TypedOp::LocalRelation { schema: s, rows } => render_local_relation(s, rows),
-        TypedOp::FileScan {
-            format,
-            paths,
-            schema: s,
-            options,
-        } => render_file_scan(*format, paths, s, options),
         TypedOp::Unpivot {
             input,
             ids,
@@ -784,12 +789,6 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
             seed,
         } => render_sample_by(input, col, fractions, *seed),
 
-        TypedOp::TableFunction {
-            name,
-            args,
-            with_ordinality,
-        } => render_table_function(name, args, *with_ordinality, schema),
-
         TypedOp::RecursiveCte {
             name,
             anchor,
@@ -805,7 +804,11 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
 
         // Converted to the SELECT-block builder — reaching a legacy arm for
         // these is a `build_unit` dispatch bug.
-        TypedOp::TableScan { .. }
+        TypedOp::Values { .. }
+        | TypedOp::LocalRelation { .. }
+        | TypedOp::FileScan { .. }
+        | TypedOp::TableFunction { .. }
+        | TypedOp::TableScan { .. }
         | TypedOp::Project { .. }
         | TypedOp::Filter { .. }
         | TypedOp::Sort { .. }
@@ -858,11 +861,23 @@ fn render_single_row() -> Result<String, EmissionError> {
     Ok("SELECT 1".to_owned())
 }
 
-fn render_values(
+/// A leaf block over a `(VALUES …) AS <alias>(cols)` derived table — the
+/// shared shape of `Values` and non-empty `LocalRelation`. The alias is
+/// exposed truthfully in the block scope; nothing qualifies through it
+/// today (both ops have an empty `RelScope`).
+fn values_leaf_block(rendered_rows: &str, alias: &str, cols: &str) -> SqlUnit {
+    SelectBlock::from_item(FromItem::Raw {
+        sql: format!("(VALUES {rendered_rows}) AS {alias}({cols})"),
+        exposed: vec![alias.to_owned()],
+    })
+    .into()
+}
+
+fn build_values(
     rows: &[Vec<Expression>],
     column_names: &[String],
     schema: &Schema,
-) -> Result<String, EmissionError> {
+) -> Result<SqlUnit, EmissionError> {
     if rows.is_empty() {
         bail_boundary_op!("Values", "empty VALUES relations are not supported");
     }
@@ -873,15 +888,13 @@ fn render_values(
     let cols = sql_join(column_names.iter(), ", ", |c| {
         Ok(quote_ident(c).into_owned())
     })?;
-    Ok(format!(
-        "SELECT * FROM (VALUES {rendered_rows}) AS __td_values({cols})"
-    ))
+    Ok(values_leaf_block(&rendered_rows, "__td_values", &cols))
 }
 
-fn render_local_relation(
+fn build_local_relation(
     schema_decl: &StructType,
     rows: &[Vec<Expression>],
-) -> Result<String, EmissionError> {
+) -> Result<SqlUnit, EmissionError> {
     if schema_decl.fields.is_empty() {
         bail_boundary_op!(
             "LocalRelation",
@@ -889,6 +902,7 @@ fn render_local_relation(
         );
     }
     // Special case: no rows → emit an empty relation with the correct schema.
+    // This is a genuine SELECT (no FROM item exists), so it stays a Raw unit.
     if rows.is_empty() {
         // `SELECT CAST(NULL AS T) AS c, ... WHERE 1=0` — zero rows, right shape.
         let cols = sql_join(schema_decl.fields.iter(), ", ", |f| {
@@ -896,7 +910,7 @@ fn render_local_relation(
             let name = quote_ident(&f.name);
             Ok(format!("CAST(NULL AS {ty}) AS {name}"))
         })?;
-        return Ok(format!("SELECT {cols} WHERE 1=0"));
+        return Ok(SqlUnit::Raw(format!("SELECT {cols} WHERE 1=0")));
     }
     let rendered_rows = sql_join(rows.iter(), ", ", |row| {
         let cells = sql_join(row.iter().enumerate(), ", ", |(idx, cell)| {
@@ -912,9 +926,7 @@ fn render_local_relation(
     let cols = sql_join(schema_decl.fields.iter(), ", ", |f| {
         Ok(quote_ident(&f.name).into_owned())
     })?;
-    Ok(format!(
-        "SELECT * FROM (VALUES {rendered_rows}) AS __td_local({cols})"
-    ))
+    Ok(values_leaf_block(&rendered_rows, "__td_local", &cols))
 }
 
 /// Build the DuckDB reader-call SQL fragment for a file scan, e.g.
@@ -963,14 +975,21 @@ pub fn build_file_reader_sql(
     Ok(format!("{reader}({paths_sql}{opts_sql})"))
 }
 
-fn render_file_scan(
+fn build_file_scan(
     format: FileFormat,
     paths: &[String],
-    _schema: &StructType,
     options: &[(String, String)],
-) -> Result<String, EmissionError> {
+) -> Result<SqlUnit, EmissionError> {
     let reader_call = build_file_reader_sql(format, paths, options)?;
-    Ok(format!("SELECT * FROM {reader_call}"))
+    // The reader call is a FROM-item generator: parents merge onto it
+    // (`SELECT cols FROM read_parquet(…) WHERE …`) instead of wrapping.
+    // No alias is exposed — a FileScan's RelScope is empty; nothing
+    // qualifies through it.
+    Ok(SelectBlock::from_item(FromItem::Raw {
+        sql: reader_call,
+        exposed: Vec::new(),
+    })
+    .into())
 }
 
 /// True iff `projections` is exactly one unqualified `*` (i.e. `SELECT *`),
@@ -1801,12 +1820,12 @@ fn build_with_columns_renamed(
 /// The `AS __td_range(id)` column alias renames DuckDB's `range` output column
 /// to Spark's `id`, which the enclosing `SELECT id` then binds. `numPartitions`
 /// is a single-node no-op and is dropped.
-fn render_table_function(
+fn build_table_function(
     name: &str,
     args: &[Expression],
     _with_ordinality: bool,
     schema: &Schema,
-) -> Result<String, EmissionError> {
+) -> Result<SqlUnit, EmissionError> {
     let name_lower = name.to_ascii_lowercase();
     match name_lower.as_str() {
         "range" => {
@@ -1831,10 +1850,17 @@ fn render_table_function(
             let start_sql = render_expr(&start, schema)?;
             let end_sql = render_expr(&end, schema)?;
             let step_sql = render_expr(&step, schema)?;
-            // `range` is end-EXCLUSIVE in both Spark and DuckDB; single `id` column.
-            Ok(format!(
-                "SELECT id FROM range({start_sql}, {end_sql}, {step_sql}) AS __td_range(id)"
-            ))
+            // `range` is end-EXCLUSIVE in both Spark and DuckDB; single `id`
+            // column. The FROM-item alias renames DuckDB's `range` output
+            // column to Spark's `id`; the DEFAULT projection performs the
+            // bind (`SELECT id`) so a merging parent that overwrites it sees
+            // the renamed column, while a bare dispatch keeps today's shape.
+            let mut block = SelectBlock::from_item(FromItem::Raw {
+                sql: format!("range({start_sql}, {end_sql}, {step_sql}) AS __td_range(id)"),
+                exposed: vec!["__td_range".to_owned()],
+            });
+            block.set_default_projections("id".to_owned());
+            Ok(block.into())
         }
         // Bare `FROM explode(array(1,2,3))` — uncorrelated generator as a TVF.
         // Build the canonical FunctionCall and render via the existing render_expr
@@ -1858,7 +1884,9 @@ fn render_table_function(
             };
             let unnest_sql = render_function_call(&fc, schema)?;
             let col_name = quote_ident(&schema.fields[0].name);
-            Ok(format!("SELECT {unnest_sql} AS {col_name}"))
+            // A FROM-less `SELECT unnest(…) AS col` — a genuine SELECT
+            // statement, not a FROM-item generator; stays a Raw unit.
+            Ok(SqlUnit::Raw(format!("SELECT {unnest_sql} AS {col_name}")))
         }
         _ => bail_boundary_op!(
             "TableFunction",
@@ -6127,8 +6155,11 @@ mod tests {
     #[test]
     fn dispatch_project_over_range_binds_id_column() {
         let _g = tap_guard();
-        // Full `SELECT id FROM range(5)` — Project wraps the TVF subquery and
-        // binds the synthetic `id` column (tbl-006).
+        // Full `SELECT id FROM range(5)` — the range TVF is a FROM-item leaf
+        // block whose DEFAULT projection performs the `id` bind; a merging
+        // Project overwrites it and MUST still see the renamed column
+        // (tbl-006; tasks/select-block-follow-ups.md item 1 pin: merge, not
+        // wrap — the `AS __td_range(id)` rename is part of the FROM item).
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::TableFunction {
                 name: "range".to_owned(),
@@ -6147,8 +6178,26 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert_eq!(
             sql,
-            "SELECT id FROM (SELECT id FROM range(CAST(0 AS BIGINT), 5, CAST(1 AS BIGINT)) \
-             AS __td_range(id)) AS __td_sub"
+            "SELECT id FROM range(CAST(0 AS BIGINT), 5, CAST(1 AS BIGINT)) AS __td_range(id)"
+        );
+    }
+
+    /// A BARE range dispatch (no Project) must keep the `id` bind via the
+    /// block's default projection — `SELECT *` would emit DuckDB's raw
+    /// `range` column name instead of Spark's `id`.
+    #[test]
+    fn bare_range_dispatch_keeps_id_default_projection() {
+        let _g = tap_guard();
+        let ast = CommonAst::new(CommonOp::TableFunction {
+            name: "range".to_owned(),
+            args: vec![int_lit(3)],
+            with_ordinality: false,
+        });
+        let typed = analyze(ast, &BaseTypes::empty()).expect("analyze bare range");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT id FROM range(CAST(0 AS BIGINT), 3, CAST(1 AS BIGINT)) AS __td_range(id)"
         );
     }
 

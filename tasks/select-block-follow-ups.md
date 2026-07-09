@@ -99,7 +99,35 @@ last of the three original scope re-derivations.
   differential AnalyzePlan comparison on the new shapes is the oracle
   (ADR-015); add corpus cases (currently expected-error) before flipping.
 
-## 3. Wrap-boundary qualifier rewriting (retire the strand class)
+## 3. Wrap-boundary qualifier rewriting (retire the strand class) — DONE
+
+Implemented 2026-07-09 (this branch). `strip_stranded_qualifiers`
+(emission.rs) rewrites stranded references at the wrap fallbacks of
+`build_filter` / `build_project` / `build_sort` / `block_with_projections`
+(the latter via a slot-closure restructure so `build_with_columns` can
+re-render). Witnesses `filt-016`/`filt-017` flipped green — and the strand
+class turned out live in the wild: the same run flipped 5 TPC-DS SQL cases
+(q003/q004/q011/q031/q052) and the legacy `test_sql_with_join`, all
+previously red on the strand signature. Full suite: zero per-case
+regressions.
+
+**Design deviation from the original plan (important):** the strip
+predicate is NOT the analyzer's `RelScope` (`scope_binds`) — it is the
+emission-side fact `block.exposes(q)` on the PRE-wrap block. Reason:
+filt-017's qualifier (`e` above `select(...).distinct()`) resolves via
+`resolve_column`'s legacy name-only fallback because Project's `RelScope`
+is EMPTY, yet the reference still strands — while the pre-wrap block's
+FROM scope still exposes `e`. The full predicate: strip `q.c` iff (a)
+`block.exposes(q)` (correlated OUTER qualifiers are never exposed by the
+inner FROM and resolve outward through the wrap, so they stay verbatim),
+(b) `q` is not a struct-column access on the child's output
+(`struct_qualifier_info` — struct access survives a wrap as
+column-dot-field syntax), and (c) `c` matches exactly one output column
+case-insensitively (self-join ambiguity keeps today's loud failure).
+Qualified stars are never rewritten; subquery bodies are opaque plans, so
+inner correlated strands stay loud until witnessed. Pinned by an 8-test
+strip/keep matrix in emission.rs
+(`filter_above_limit_strips_stranded_alias_qualifier` etc.).
 
 **Witnesses added 2026-07-09**: `filt-016` (alias-qualified filter above
 LIMIT) and `filt-017` (alias-qualified filter above DISTINCT) in the

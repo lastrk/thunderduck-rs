@@ -207,15 +207,20 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
 
 /// Fill a SELECT slot list over `input`'s open block: merge when the Select
 /// ordinal is free and `vis` holds, else wrap. Shared by every
-/// projection-shaped operator (Project, WithColumns[Renamed], DropColumns,
-/// NaFill, NaReplace).
+/// projection-shaped operator (WithColumns[Renamed], DropColumns, NaFill,
+/// NaReplace). The `slots` closure receives the PRE-wrap block plus whether
+/// the wrap fallback was taken, so an expression-bearing caller can rewrite
+/// wrap-stranded qualifiers (via [`strip_stranded_qualifiers`]) before
+/// rendering its slot list.
 fn block_with_projections(
     input: &TypedAst,
-    slots: String,
     vis: impl FnOnce(&SelectBlock) -> bool,
+    slots: impl FnOnce(&SelectBlock, bool) -> Result<String, EmissionError>,
 ) -> Result<SqlUnit, EmissionError> {
     let mut block = open_block(input)?;
-    if !(block.can_accept(Clause::Select) && vis(&block)) {
+    let merges = block.can_accept(Clause::Select) && vis(&block);
+    let slots = slots(&block, !merges)?;
+    if !merges {
         block = SelectBlock::wrap(block.into());
     }
     block.set_projections(slots);
@@ -616,6 +621,74 @@ fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
         .any(|(name, _)| name.eq_ignore_ascii_case(q))
 }
 
+/// Wrap-boundary qualifier rewrite: when a slot-conflict wrap is about to
+/// bury the child block's FROM aliases behind `__td_sub`, return a clone of
+/// `expr` with each stranded reference `q.c` rewritten to its bare output
+/// name `c`, instead of emitting a qualifier DuckDB can no longer bind
+/// (`Referenced table "q" not found`). A reference is rewritten iff
+///
+/// - the pre-wrap `block` actually exposed `q` — a correlated OUTER
+///   qualifier is never exposed by the inner FROM, and DuckDB's correlated
+///   binder resolves it OUTWARD straight through the wrap, so it must stay
+///   qualified verbatim;
+/// - `q` does not double as a struct-column access on the child's output
+///   (`resolve_column`'s struct-precedence tier): struct access survives a
+///   wrap as column-dot-field syntax, so it needs no rewrite and stripping
+///   would misread the field name as a column; and
+/// - `c` names exactly one output column case-insensitively — an ambiguous
+///   name (a self-join output) cannot be safely unqualified, so it keeps
+///   today's loud binder failure (witnessed by
+///   [`trace_stranded_qualifiers`]).
+///
+/// Qualified stars are NOT rewritten (`q.*` has no bare-name equivalent
+/// against a reshaped output), and subquery bodies are opaque `CommonAst`
+/// plans — not expression children per the τ walker convention — so inner
+/// correlated references are untouched by construction.
+fn strip_stranded_qualifiers(
+    expr: &Expression,
+    block: &SelectBlock,
+    output_schema: &Schema,
+) -> Expression {
+    fn walk(expr: &mut Expression, block: &SelectBlock, output: &Schema) {
+        let strippable = |q: &str, name: &str| {
+            block.exposes(q)
+                && TypeInferenceEngine::struct_qualifier_info(name, q, output).is_none()
+                && output
+                    .fields
+                    .iter()
+                    .filter(|f| f.name.eq_ignore_ascii_case(name))
+                    .count()
+                    == 1
+        };
+        match expr {
+            Expression::ColumnReference(c) => {
+                if c.qualifier
+                    .as_deref()
+                    .is_some_and(|q| strippable(q, &c.name))
+                {
+                    c.qualifier = None;
+                }
+            }
+            Expression::UnresolvedColumn(u) => {
+                if u.qualifier
+                    .as_deref()
+                    .is_some_and(|q| strippable(q, &u.name))
+                {
+                    u.qualifier = None;
+                }
+            }
+            other => {
+                for child in other.children_mut() {
+                    walk(child, block, output);
+                }
+            }
+        }
+    }
+    let mut rewritten = expr.clone();
+    walk(&mut rewritten, block, output_schema);
+    rewritten
+}
+
 /// R7 latent-occlusion witness: when a slot-conflict wrap is about to strand
 /// a qualifier the child block's FROM scope DID expose (the reference will
 /// not resolve through the `__td_sub` boundary), leave a trace. This is not
@@ -653,26 +726,37 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
     if is_unqualified_star_only(projections) {
         return build_unit(&input.op, &input.resolved_schema);
     }
-    let slots = render_projection_slots(projections, &input.resolved_schema)?;
     let mut block = open_block(input)?;
-    if !(block.can_accept(Clause::Select) && exprs_visible_in(projections, &block, &input.scope)) {
-        trace_stranded_qualifiers(&block, projections, &input.scope);
-        block = SelectBlock::wrap(block.into());
+    if block.can_accept(Clause::Select) && exprs_visible_in(projections, &block, &input.scope) {
+        block.set_projections(render_projection_slots(
+            projections,
+            &input.resolved_schema,
+        )?);
+        return Ok(block.into());
     }
-    block.set_projections(slots);
-    Ok(block.into())
+    let projections: Vec<Expression> = projections
+        .iter()
+        .map(|p| strip_stranded_qualifiers(p, &block, &input.resolved_schema))
+        .collect();
+    trace_stranded_qualifiers(&block, &projections, &input.scope);
+    let mut wrapped = SelectBlock::wrap(block.into());
+    wrapped.set_projections(render_projection_slots(
+        &projections,
+        &input.resolved_schema,
+    )?);
+    Ok(wrapped.into())
 }
 
 fn build_filter(input: &TypedAst, condition: &Expression) -> Result<SqlUnit, EmissionError> {
-    let cond_sql = render_expr(condition, &input.resolved_schema)?;
     let mut block = open_block(input)?;
     if block.can_accept(Clause::Where) && exprs_visible_in([condition], &block, &input.scope) {
-        block.push_where(cond_sql);
+        block.push_where(render_expr(condition, &input.resolved_schema)?);
         return Ok(block.into());
     }
-    trace_stranded_qualifiers(&block, [condition], &input.scope);
+    let condition = strip_stranded_qualifiers(condition, &block, &input.resolved_schema);
+    trace_stranded_qualifiers(&block, [&condition], &input.scope);
     let mut wrapped = SelectBlock::wrap(block.into());
-    wrapped.push_where(cond_sql);
+    wrapped.push_where(render_expr(&condition, &input.resolved_schema)?);
     Ok(wrapped.into())
 }
 
@@ -682,10 +766,6 @@ fn build_sort(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<SqlUnit, EmissionError> {
-    let keys = order
-        .iter()
-        .map(|so| render_sort_key(so, &input.resolved_schema))
-        .collect::<Result<Vec<_>, _>>()?;
     let mut block = open_block(input)?;
     // Over an occupied SELECT list, only bare output-name references merge:
     // ORDER BY resolves them against the select list's aliases; expression
@@ -702,9 +782,21 @@ fn build_sort(
         })
     };
     if block.can_accept(Clause::OrderBy) && block.distinct_allows_order() && keys_bind {
+        let keys = order
+            .iter()
+            .map(|so| render_sort_key(so, &input.resolved_schema))
+            .collect::<Result<Vec<_>, _>>()?;
         block.set_order_by(keys, limit, offset);
         return Ok(block.into());
     }
+    let keys = order
+        .iter()
+        .map(|so| {
+            let mut stripped = so.clone();
+            *stripped.expr = strip_stranded_qualifiers(&so.expr, &block, &input.resolved_schema);
+            render_sort_key(&stripped, &input.resolved_schema)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut wrapped = SelectBlock::wrap(block.into());
     wrapped.set_order_by(keys, limit, offset);
     Ok(wrapped.into())
@@ -1280,32 +1372,45 @@ fn build_with_columns(
     // analyzer builds the resolved schema from the same plan, so the SELECT
     // slots and the advertised schema stay aligned by construction.
     let plan = with_columns_plan(input_schema, assignments);
-    let mut slots: Vec<String> = Vec::new();
-    for (f, replaced_by) in input_schema.fields.iter().zip(&plan.replaced) {
-        if let Some(idx) = replaced_by {
-            let (_, expr) = &assignments[*idx];
-            let expr_sql = render_expr(expr, input_schema)?;
-            let name_q = quote_ident(&f.name);
-            slots.push(format!("{expr_sql} AS {name_q}"));
-        } else {
-            slots.push(quote_ident(&f.name).into_owned());
-        }
-    }
-    for &i in &plan.appended {
-        let (name, expr) = &assignments[i];
-        let expr_sql = render_expr(expr, input_schema)?;
-        let name_q = quote_ident(name);
-        slots.push(format!("{expr_sql} AS {name_q}"));
-    }
-    let slots = slots.join(", ");
-    block_with_projections(input, slots, |block| {
-        exprs_visible_in(assignments.iter().map(|(_, e)| e), block, &input.scope)
-    })
+    block_with_projections(
+        input,
+        |block| exprs_visible_in(assignments.iter().map(|(_, e)| e), block, &input.scope),
+        |block, wrapped| {
+            let render_assignment = |expr: &Expression| {
+                if wrapped {
+                    render_expr(
+                        &strip_stranded_qualifiers(expr, block, input_schema),
+                        input_schema,
+                    )
+                } else {
+                    render_expr(expr, input_schema)
+                }
+            };
+            let mut slots: Vec<String> = Vec::new();
+            for (f, replaced_by) in input_schema.fields.iter().zip(&plan.replaced) {
+                if let Some(idx) = replaced_by {
+                    let (_, expr) = &assignments[*idx];
+                    let expr_sql = render_assignment(expr)?;
+                    let name_q = quote_ident(&f.name);
+                    slots.push(format!("{expr_sql} AS {name_q}"));
+                } else {
+                    slots.push(quote_ident(&f.name).into_owned());
+                }
+            }
+            for &i in &plan.appended {
+                let (name, expr) = &assignments[i];
+                let expr_sql = render_assignment(expr)?;
+                let name_q = quote_ident(name);
+                slots.push(format!("{expr_sql} AS {name_q}"));
+            }
+            Ok(slots.join(", "))
+        },
+    )
 }
 
 fn build_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<SqlUnit, EmissionError> {
     let dropped = sql_join(drop_names.iter(), ", ", |n| Ok(quote_ident(n).into_owned()))?;
-    block_with_projections(input, format!("* EXCLUDE ({dropped})"), |_| true)
+    block_with_projections(input, |_| true, |_, _| Ok(format!("* EXCLUDE ({dropped})")))
 }
 
 /// Render `df.na.fill(values, subset=cols)`. For each column in the input
@@ -1340,7 +1445,7 @@ fn build_na_fill(
             Ok(name_q.into_owned())
         }
     })?;
-    block_with_projections(input, slots, |_| true)
+    block_with_projections(input, |_| true, |_, _| Ok(slots))
 }
 
 /// Render `df.na.drop(how, subset, thresh)`. `min_non_nulls=None` means
@@ -1417,7 +1522,7 @@ fn build_na_replace(
             Ok(name_q.into_owned())
         }
     })?;
-    block_with_projections(input, slots, |_| true)
+    block_with_projections(input, |_| true, |_, _| Ok(slots))
 }
 
 /// Render `df.unpivot(ids, values, var_col, val_col)`.
@@ -1833,7 +1938,7 @@ fn build_with_columns_renamed(
         let dst = quote_ident(&dst_name);
         Ok(format!("{src} AS {dst}"))
     })?;
-    block_with_projections(input, slots, |_| true)
+    block_with_projections(input, |_| true, |_, _| Ok(slots))
 }
 
 /// Emit a table-valued function. Only `range` is implemented; the analyzer has
@@ -6086,6 +6191,254 @@ mod tests {
         assert!(
             !sql.contains("__td_sub"),
             "no wrap may bury the inner alias, got: {sql}"
+        );
+    }
+
+    // ── Wrap-boundary qualifier rewriting (strand-class retirement) ──────
+    //
+    // filt-016/filt-017 witness class: a qualified reference above a
+    // slot-conflict wrap is rewritten to its bare output name by
+    // `strip_stranded_qualifiers` instead of stranding the alias behind
+    // `__td_sub` (DuckDB: `Referenced table "e" not found`). The keep-side
+    // of the matrix (ambiguous names, unexposed/correlated qualifiers,
+    // struct precedence) must stay verbatim.
+
+    fn asc_key(expr: Expression) -> SortOrder {
+        SortOrder {
+            expr: Box::new(expr),
+            direction: SortDirection::Ascending,
+            null_ordering: NullOrdering::NullsFirst,
+        }
+    }
+
+    /// filt-016 shape: `emp.alias("e").orderBy("id").limit(5)
+    /// .filter(col("e.salary") > 60000)` — WHERE cannot merge past an
+    /// occupied LIMIT slot; the wrap strips `e.` off the condition.
+    #[test]
+    fn filter_above_limit_strips_stranded_alias_qualifier() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Sort {
+                input: Box::new(aliased_scan("emp", "e")),
+                order: vec![asc_key(ColumnReference::untyped("id"))],
+                limit: Some(5),
+                offset: None,
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Gt,
+                left: Box::new(qcol("e", "salary")),
+                right: Box::new(int_lit(60000)),
+            }),
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS __td_sub WHERE (salary) > (60000)"),
+            "stranded qualifier must be stripped to the bare output name, got: {sql}"
+        );
+        assert!(!sql.contains("e.salary"), "got: {sql}");
+    }
+
+    /// filt-017 shape: `emp.alias("e").select(...).distinct()
+    /// .filter(col("e.dept_id") == 101)` — the input scope above the
+    /// Project is EMPTY (the analyzer resolved `e.dept_id` via the legacy
+    /// name-only fallback), but the pre-wrap BLOCK still exposes `e`; the
+    /// emission-side exposure is what drives the strip.
+    #[test]
+    fn filter_above_distinct_strips_stranded_alias_qualifier() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Deduplicate {
+                input: Box::new(CommonAst::new(CommonOp::Project {
+                    input: Box::new(aliased_scan("emp", "e")),
+                    projections: vec![qcol("e", "dept_id"), qcol("e", "name")],
+                })),
+                on_columns: vec![],
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(101)),
+            }),
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS __td_sub WHERE (dept_id) = (101)"),
+            "stranded qualifier must be stripped to the bare output name, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn sort_above_limit_strips_stranded_alias_qualifier() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Sort {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(aliased_scan("emp", "e")),
+                limit: 5,
+                offset: None,
+            })),
+            order: vec![asc_key(qcol("e", "name"))],
+            limit: None,
+            offset: None,
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS __td_sub ORDER BY name ASC NULLS FIRST"),
+            "stranded sort key must be stripped to the bare output name, got: {sql}"
+        );
+        assert!(!sql.contains("e.name"), "got: {sql}");
+    }
+
+    #[test]
+    fn project_above_limit_strips_stranded_alias_qualifier() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(aliased_scan("emp", "e")),
+                limit: 5,
+                offset: None,
+            })),
+            projections: vec![qcol("e", "salary")],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("__td_sub"), "got: {sql}");
+        assert!(
+            !sql.contains("e.salary"),
+            "stranded projection must be stripped to the bare output name, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn with_columns_above_limit_strips_stranded_alias_qualifier() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::WithColumns {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(aliased_scan("emp", "e")),
+                limit: 5,
+                offset: None,
+            })),
+            assignments: vec![("bonus".to_owned(), qcol("e", "salary"))],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("__td_sub"), "got: {sql}");
+        assert!(
+            !sql.contains("e.salary"),
+            "stranded assignment must be stripped to the bare output name, got: {sql}"
+        );
+    }
+
+    /// Keep-side: a name appearing on BOTH sides of a self-join output is
+    /// ambiguous once unqualified — the reference must stay qualified (loud
+    /// binder failure preserved; stripping would silently bind an arbitrary
+    /// side).
+    #[test]
+    fn ambiguous_output_name_survives_wrap_qualified() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(CommonAst::new(CommonOp::Join {
+                    left: Box::new(aliased_scan("emp", "a")),
+                    right: Box::new(aliased_scan("emp", "b")),
+                    join_type: JoinType::Inner,
+                    condition: Some(Expression::Binary(BinaryExpression {
+                        op: BinaryOp::Eq,
+                        left: Box::new(qcol("a", "id")),
+                        right: Box::new(qcol("b", "id")),
+                    })),
+                    using_columns: vec![],
+                    natural: false,
+                    lateral: false,
+                    left_plan_ids: vec![],
+                    right_plan_ids: vec![],
+                })),
+                limit: 5,
+                offset: None,
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("a", "name")),
+                right: Box::new(str_lit("x")),
+            }),
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("a.name"),
+            "ambiguous output name must NOT be stripped, got: {sql}"
+        );
+    }
+
+    /// Keep-side: a qualifier the pre-wrap block does NOT expose is a
+    /// correlated OUTER reference — DuckDB's correlated binder resolves it
+    /// outward through the wrap, so it must stay qualified verbatim.
+    #[test]
+    fn unexposed_qualifier_survives_wrap_verbatim() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(aliased_scan("emp", "e")),
+                limit: 5,
+                offset: None,
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("outer_e", "salary")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("outer_e.salary"),
+            "unexposed (correlated) qualifier must stay verbatim, got: {sql}"
+        );
+    }
+
+    /// Keep-side: a qualifier that resolves as STRUCT-column access
+    /// (`resolve_column`'s struct-precedence tier) survives the wrap as
+    /// column-dot-field syntax — stripping would misread the field name as
+    /// a column.
+    #[test]
+    fn struct_qualifier_survives_wrap_verbatim() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(scan("addr")),
+                limit: 5,
+                offset: None,
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("addr", "city")),
+                right: Box::new(str_lit("x")),
+            }),
+        });
+        let bt = BaseTypes::build_from_plan(&plan, |name| match name {
+            "addr" => Some(StructType::new(vec![StructField::nullable(
+                "addr",
+                DataType::Struct(StructType::new(vec![StructField::nullable(
+                    "city",
+                    DataType::String,
+                )])),
+            )])),
+            _ => None,
+        });
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("addr.city"),
+            "struct-column access must NOT be stripped, got: {sql}"
         );
     }
 

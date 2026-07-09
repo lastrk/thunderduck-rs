@@ -174,6 +174,7 @@ impl V2RelationConverter {
                 self.convert_input(r.input.as_deref(), "RepartitionByExpression")
             }
             RelType::Repartition(r) => self.convert_input(r.input.as_deref(), "Repartition"),
+            RelType::ToSchema(ts) => self.convert_to_schema(ts),
             RelType::Sql(_) => bail_boundary_proto!(
                 "RelType::Sql",
                 "SQL text is owned by parser_v2, not V2RelationConverter",
@@ -398,6 +399,69 @@ impl V2RelationConverter {
             input: Box::new(input),
             col1: c.col1.clone(),
             col2: c.col2.clone(),
+        }))
+    }
+
+    /// Convert `proto::ToSchema` (Spark `df.to(schema)`).
+    ///
+    /// Desugars to `CommonOp::Project` whose projections are, per target field
+    /// in TARGET ORDER: `Alias(Cast(UnresolvedColumn(name), target_type), name)`.
+    ///
+    /// The unconditional CAST is intentional — the converter is untyped; a
+    /// same-type CAST is a no-op for value, wire type, and nullability
+    /// (expression.rs:732 — non-try Cast preserves child nullability for
+    /// non-string sources).
+    ///
+    /// # Deviations from Spark 4.1.1 `Dataset.to`
+    ///
+    /// The following behaviours are deliberately out of scope (all unexercised
+    /// by the corpus tests):
+    ///
+    /// - **Missing nullable target column**: Spark null-fills columns present
+    ///   in the target schema but absent in the source; τ lets the unresolved
+    ///   column propagate to the analyzer, which surfaces a resolution error.
+    /// - **Analysis-time diagnostics**: Spark raises
+    ///   `NULLABLE_COLUMN_OR_FIELD`, `INVALID_COLUMN_OR_FIELD_DATA_TYPE`,
+    ///   or `AMBIGUOUS_COLUMN_OR_FIELD` during analysis; τ does not emulate
+    ///   these error classes.
+    /// - **Nested struct/array/map reconciliation**: Spark recursively
+    ///   reconciles nested complex types; τ applies a flat top-level CAST only.
+    fn convert_to_schema(&mut self, ts: &proto::ToSchema) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(ts.input.as_deref(), "ToSchema")?;
+        let schema_proto = ts
+            .schema
+            .as_ref()
+            .require_proto("ToSchema::missing_schema", "ToSchema has no target schema")?;
+        let dt = proto_to_data_type(schema_proto);
+        let st = match dt {
+            DataType::Struct(st) => st,
+            _ => {
+                bail_boundary_proto!("ToSchema::schema", "ToSchema schema is not a struct");
+            }
+        };
+        let projections: Vec<Expression> = st
+            .fields
+            .iter()
+            .map(|f| {
+                let col = Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: f.name.clone(),
+                    qualifier: None,
+                    plan_id: None,
+                });
+                let cast = Expression::Cast(CastExpression {
+                    expr: Box::new(col),
+                    to_type: f.data_type.clone(),
+                    try_cast: false,
+                });
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(cast),
+                    alias: f.name.clone(),
+                })
+            })
+            .collect();
+        Ok(CommonAst::new(CommonOp::Project {
+            input: Box::new(input),
+            projections,
         }))
     }
 
@@ -3262,5 +3326,107 @@ mod tests {
         assert_eq!(long_val(&args[0]), 0);
         assert_eq!(long_val(&args[1]), 100);
         assert_eq!(long_val(&args[2]), 1);
+    }
+
+    // ── ToSchema ─────────────────────────────────────────────────────────────
+
+    /// Build a proto `DataType` wrapping a `Struct` with the given fields.
+    fn struct_data_type_proto(fields: Vec<(&str, proto::data_type::Kind)>) -> proto::DataType {
+        let struct_fields = fields
+            .into_iter()
+            .map(|(name, kind)| proto::data_type::StructField {
+                name: name.to_owned(),
+                data_type: Some(proto::DataType { kind: Some(kind) }),
+                nullable: true,
+                metadata: None,
+            })
+            .collect();
+        proto::DataType {
+            kind: Some(proto::data_type::Kind::Struct(proto::data_type::Struct {
+                fields: struct_fields,
+                type_variation_reference: 0,
+            })),
+        }
+    }
+
+    #[test]
+    fn convert_to_schema_reordered_struct_produces_project_with_aliased_casts() {
+        // Target schema: (b: String, a: Integer) — reversed vs hypothetical
+        // source (a, b). The projections must follow TARGET order.
+        let schema = struct_data_type_proto(vec![
+            ("b", proto::data_type::Kind::String(Default::default())),
+            ("a", proto::data_type::Kind::Integer(Default::default())),
+        ]);
+        let r = rel(proto::relation::RelType::ToSchema(Box::new(
+            proto::ToSchema {
+                input: Some(Box::new(table_scan_rel("t"))),
+                schema: Some(schema),
+            },
+        )));
+        let ast = convert_ok(&r);
+        let CommonOp::Project { projections, .. } = &ast.op else {
+            panic!("expected Project, got {:?}", ast.op);
+        };
+        assert_eq!(projections.len(), 2);
+
+        // First projection: CAST(b AS STRING) AS b
+        let Expression::Alias(a0) = &projections[0] else {
+            panic!("expected Alias, got {:?}", projections[0]);
+        };
+        assert_eq!(a0.alias, "b");
+        let Expression::Cast(c0) = a0.expr.as_ref() else {
+            panic!("expected Cast, got {:?}", a0.expr);
+        };
+        assert_eq!(c0.to_type, thunderduck_core::types::DataType::String);
+        assert!(!c0.try_cast);
+        let Expression::UnresolvedColumn(u0) = c0.expr.as_ref() else {
+            panic!("expected UnresolvedColumn, got {:?}", c0.expr);
+        };
+        assert_eq!(u0.name, "b");
+
+        // Second projection: CAST(a AS INTEGER) AS a
+        let Expression::Alias(a1) = &projections[1] else {
+            panic!("expected Alias, got {:?}", projections[1]);
+        };
+        assert_eq!(a1.alias, "a");
+        let Expression::Cast(c1) = a1.expr.as_ref() else {
+            panic!("expected Cast, got {:?}", a1.expr);
+        };
+        assert_eq!(c1.to_type, thunderduck_core::types::DataType::Integer);
+        let Expression::UnresolvedColumn(u1) = c1.expr.as_ref() else {
+            panic!("expected UnresolvedColumn, got {:?}", c1.expr);
+        };
+        assert_eq!(u1.name, "a");
+    }
+
+    #[test]
+    fn convert_to_schema_non_struct_schema_produces_boundary_error() {
+        // schema = Long (not a struct) → must fail.
+        let r = rel(proto::relation::RelType::ToSchema(Box::new(
+            proto::ToSchema {
+                input: Some(Box::new(table_scan_rel("t"))),
+                schema: Some(proto::DataType {
+                    kind: Some(proto::data_type::Kind::Long(Default::default())),
+                }),
+            },
+        )));
+        let name = convert_proto_shape_err(&r);
+        assert_eq!(name, "ToSchema::schema");
+    }
+
+    #[test]
+    fn convert_to_schema_missing_input_produces_boundary_error() {
+        let schema = struct_data_type_proto(vec![(
+            "x",
+            proto::data_type::Kind::Integer(Default::default()),
+        )]);
+        let r = rel(proto::relation::RelType::ToSchema(Box::new(
+            proto::ToSchema {
+                input: None,
+                schema: Some(schema),
+            },
+        )));
+        let name = convert_proto_shape_err(&r);
+        assert_eq!(name, "ToSchema::missing_input");
     }
 }

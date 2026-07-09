@@ -408,3 +408,24 @@ red in any later pass.
   lesson: my `-k "ddl or sql_expressions"` focused-verify filter matched test
   NAMES, not file paths — narrower than intended; use file paths as pytest
   args for file-scoped verification instead of -k.
+
+## Pass 4 — 2026-07-09 — df.to(schema) (RelType::ToSchema)
+
+- **Hypothesis:** all 12 test_to_schema failures = the single ToSchema
+  boundary error.
+- **Architecture (rust-architect, evidence-driven):** read all 12 tests +
+  Spark's Project.matchSchema (basicLogicalOperators.scala): no error-path or
+  nullability-direction cases exercised, and Spark's output nullability is
+  source-derived for accepted inputs — so Option A (converter desugars to
+  `Project [Alias(Cast(UnresolvedColumn(f.name)) AS f.name)]` in target
+  order, no new CommonOp) is faithful for the exercised surface. Option B
+  (analyzer-desugared CommonOp::ToSchema, crosstab precedent) documented as
+  the upgrade path if error-class/null-fill cases ever land; deviations
+  recorded in the method doc comment.
+- **Review:** APPROVE, 0 Critical/High. (Reviewer conjectured Spark widens
+  non-nullable→nullable-target; architect's source reading says
+  source-derived — the 12 green differential cases arbitrate the exercised
+  surface; unexercised directions are documented deviations either way.)
+- **Gate:** 1189→1201 (Δ +12, zero regressions) — exactly the 12 predicted.
+- **Reflect:** clean pass; the architect's "read the tests first, pick the
+  minimal faithful shape" pattern avoided a new AST node.

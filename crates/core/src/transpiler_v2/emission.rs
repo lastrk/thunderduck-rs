@@ -87,12 +87,12 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
 /// decision site of the SELECT-block builder (see `sql_block.rs`).
 fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
     match op {
-        TypedOp::TableScan { table, alias } => Ok(SqlUnit::Select(SelectBlock::from_item(
-            FromItem::Relation {
+        TypedOp::TableScan { table, alias } => {
+            Ok(SqlUnit::from(SelectBlock::from_item(FromItem::Relation {
                 base: table.clone(),
                 alias: alias.clone(),
-            },
-        ))),
+            })))
+        }
         TypedOp::Project { input, projections } => build_project(input, projections),
         TypedOp::Filter { input, condition } => build_filter(input, condition),
         TypedOp::Sort {
@@ -108,8 +108,368 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
         } => build_limit(input, *limit, *offset),
         TypedOp::Deduplicate { input, on_columns } => build_deduplicate(input, on_columns),
         TypedOp::AliasedRelation { input, alias } => build_aliased_relation(input, alias),
+        TypedOp::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            using_columns,
+            lateral,
+            left_requires_synthetic,
+            right_requires_synthetic,
+            ..
+        } => build_join(JoinParts {
+            left,
+            right,
+            join_type: *join_type,
+            condition: condition.as_ref(),
+            using_columns,
+            lateral: *lateral,
+            left_requires_synthetic: *left_requires_synthetic,
+            right_requires_synthetic: *right_requires_synthetic,
+        }),
+        TypedOp::Aggregate {
+            input,
+            grouping,
+            aggregates,
+            grouping_kind,
+            grouping_sets,
+            having,
+        } => build_aggregate(
+            input,
+            grouping,
+            aggregates,
+            *grouping_kind,
+            grouping_sets,
+            having.as_ref(),
+        ),
+        TypedOp::LateralView {
+            input,
+            table_alias,
+            columns,
+        } => build_lateral_view(input, table_alias, columns),
         other => legacy_render(other, schema).map(SqlUnit::Raw),
     }
+}
+
+/// The `TypedOp::Join` fields [`build_join`] consumes (destructured into a
+/// struct to stay within the parameter-count guideline).
+struct JoinParts<'a> {
+    left: &'a TypedAst,
+    right: &'a TypedAst,
+    join_type: crate::transpiler_v2::ast::JoinType,
+    condition: Option<&'a Expression>,
+    using_columns: &'a [String],
+    lateral: bool,
+    left_requires_synthetic: bool,
+    right_requires_synthetic: bool,
+}
+
+/// Lower one join side to a [`FromItem`]. Ladder:
+///
+/// 1. `requires_synthetic` (analyzer-stamped — the plan_id contract) →
+///    `(side) AS __td_jl/__td_jr`. Must win over every hoist.
+/// 2. The side's unit is a pure-FROM block → inline its `FromItem` directly,
+///    keeping user aliases / table names visible (subsumes the old
+///    user-alias hoist, bare-TableScan hoist, and left-spine chain flatten).
+///    Guarded: a nested `Join` item inlines only on the left side of a
+///    non-USING parent, and only when the nested join itself is a plain
+///    ON/CROSS join (CLAUDE.md gotcha 4 — never fold across semi/anti; USING
+///    has its own column-order semantics; lateral correlation must stay
+///    isolated). `Raw` FROM bodies (lateral-view chains) never inline.
+/// 3. Otherwise → `(side) AS __td_jl/__td_jr`.
+///
+/// The duplicate-alias guard runs in [`build_join`] across BOTH lowered
+/// sides (DuckDB rejects `Duplicate alias` in one FROM scope; Spark permits
+/// it) — on collision the offending side falls back to its synthetic wrap.
+fn build_join_side(
+    side: &TypedAst,
+    synthetic_alias: &str,
+    requires_synthetic: bool,
+    may_inline_nested_join: bool,
+    parent_has_using: bool,
+) -> Result<FromItem, EmissionError> {
+    let unit = build_unit(&side.op, &side.resolved_schema)?;
+    if requires_synthetic {
+        return Ok(FromItem::Derived {
+            unit: Box::new(unit),
+            alias: synthetic_alias.to_owned(),
+        });
+    }
+    let block = match unit {
+        SqlUnit::Select(block) => block,
+        raw => {
+            return Ok(FromItem::Derived {
+                unit: Box::new(raw),
+                alias: synthetic_alias.to_owned(),
+            })
+        }
+    };
+    match block.into_pure_from() {
+        Ok(item) => {
+            let inline_ok = match &item {
+                FromItem::Relation { .. } | FromItem::Derived { .. } => true,
+                FromItem::Join { .. } => {
+                    may_inline_nested_join
+                        && !parent_has_using
+                        && matches!(
+                            &side.op,
+                            TypedOp::Join {
+                                join_type,
+                                using_columns,
+                                lateral: false,
+                                ..
+                            } if using_columns.is_empty()
+                                && !matches!(
+                                    join_type,
+                                    super::ast::JoinType::LeftSemi
+                                        | super::ast::JoinType::LeftAnti
+                                )
+                        )
+                }
+                FromItem::Raw { .. } => false,
+            };
+            if inline_ok {
+                Ok(item)
+            } else {
+                Ok(FromItem::Derived {
+                    unit: Box::new(SqlUnit::from(SelectBlock::from_item(item))),
+                    alias: synthetic_alias.to_owned(),
+                })
+            }
+        }
+        Err(block) => Ok(FromItem::Derived {
+            unit: Box::new(SqlUnit::Select(block)),
+            alias: synthetic_alias.to_owned(),
+        }),
+    }
+}
+
+fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
+    use super::ast::JoinType;
+    let JoinParts {
+        left,
+        right,
+        join_type,
+        condition,
+        using_columns,
+        lateral,
+        left_requires_synthetic,
+        right_requires_synthetic,
+    } = parts;
+    let has_using = !using_columns.is_empty();
+    let is_semi_or_anti = matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
+
+    let left_item = build_join_side(left, TD_JOIN_LEFT, left_requires_synthetic, true, has_using)?;
+    let mut right_item = build_join_side(
+        right,
+        TD_JOIN_RIGHT,
+        right_requires_synthetic,
+        false,
+        has_using,
+    )?;
+    // Duplicate-alias guard: DuckDB rejects two `AS x` in one FROM scope
+    // (Spark errors only on ambiguous references). On collision, re-wrap the
+    // RIGHT side under its synthetic alias (isolating scope), matching the
+    // old chain-vs-sibling guard's fallback.
+    {
+        let left_names = left_item.exposed();
+        let collides = right_item
+            .exposed()
+            .iter()
+            .any(|r| left_names.iter().any(|l| l.eq_ignore_ascii_case(r)));
+        if collides {
+            right_item = FromItem::Derived {
+                unit: Box::new(SqlUnit::from(SelectBlock::from_item(right_item))),
+                alias: TD_JOIN_RIGHT.to_owned(),
+            };
+        }
+    }
+
+    // Condition types resolve against the concatenated side schemas (the
+    // analyzer stamped every reference; the schema feeds type lookups only).
+    let cond_schema = StructType::merge(&left.resolved_schema, &right.resolved_schema);
+    let clause = render_join_clause(join_type, condition, using_columns, &cond_schema)?;
+
+    // Hoisted slot list mirroring the analyzer's output-schema order (USING
+    // cols first, then left non-USING, then right non-USING; right side
+    // suppressed for semi/anti). Constructible only when each participating
+    // side exposes exactly one alias; a multi-alias (inlined-chain) side
+    // renders `SELECT *`, whose natural left-then-right order already
+    // matches the declared schema for the plain ON/CROSS joins that allow
+    // chain inlining.
+    let single_alias = |item: &FromItem| -> Option<String> {
+        match item.exposed().as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
+    };
+    let default_slots = {
+        let left_alias = single_alias(&left_item);
+        let right_alias = single_alias(&right_item);
+        let need_right = !is_semi_or_anti;
+        match (left_alias, right_alias) {
+            (Some(la), ra) if !need_right || ra.is_some() => {
+                let using_lower: HashSet<String> =
+                    using_columns.iter().map(|s| s.to_lowercase()).collect();
+                let la_q = quote_ident(&la);
+                let mut slots: Vec<String> = using_columns
+                    .iter()
+                    .map(|c| quote_ident(c).into_owned())
+                    .collect();
+                for f in &left.resolved_schema.fields {
+                    if !using_lower.contains(&f.name.to_lowercase()) {
+                        slots.push(format!("{la_q}.{}", quote_ident(&f.name)));
+                    }
+                }
+                if need_right {
+                    let ra = ra.expect("checked above");
+                    let ra_q = quote_ident(&ra);
+                    for f in &right.resolved_schema.fields {
+                        if !using_lower.contains(&f.name.to_lowercase()) {
+                            slots.push(format!("{ra_q}.{}", quote_ident(&f.name)));
+                        }
+                    }
+                }
+                if slots.is_empty() {
+                    None // SEMI/ANTI on identical USING columns only → `*`.
+                } else {
+                    Some(slots.join(", "))
+                }
+            }
+            _ => None,
+        }
+    };
+
+    let mut block = SelectBlock::from_item(FromItem::Join {
+        left: Box::new(left_item),
+        right: Box::new(right_item),
+        kind: join_kind_sql(join_type),
+        clause,
+        lateral,
+    });
+    if let Some(slots) = default_slots {
+        block.set_default_projections(slots);
+    }
+    Ok(block.into())
+}
+
+fn build_aggregate(
+    input: &TypedAst,
+    grouping: &[Expression],
+    aggregates: &[Expression],
+    grouping_kind: crate::transpiler_v2::ast::GroupingKind,
+    grouping_sets: &[Vec<usize>],
+    having: Option<&Expression>,
+) -> Result<SqlUnit, EmissionError> {
+    use super::ast::GroupingKind;
+    // The SparkSQL front-end populates `grouping_sets` with per-set membership
+    // (indices into `grouping`). The DataFrame `groupingSets` path leaves it
+    // empty, so it stays a Thunderduck-boundary error (ADR-022).
+    if matches!(grouping_kind, GroupingKind::GroupingSets) && grouping_sets.is_empty() {
+        bail_boundary_op!(
+            "Aggregate[GroupingSets]",
+            "GROUPING SETS requires set-membership metadata (DataFrame groupingSets path not implemented in τ)",
+        );
+    }
+    let input_schema = &input.resolved_schema;
+    // Mirror the analyzer's "unfold DataFrame-path grouping" logic — if
+    // the aggregates list doesn't already start with the grouping cols'
+    // output names, prepend them to the SELECT list so the emitted column
+    // count matches the resolved schema.
+    let already_folded = super::analyzer::grouping_already_folded(grouping, aggregates);
+    // Rewrite any no-arg `grouping_id()`/`grouping()` calls to pass the
+    // grouping columns explicitly — DuckDB has no zero-arg form.
+    let rewritten_aggregates: Vec<Expression> = aggregates
+        .iter()
+        .map(|a| with_grouping_id_spliced(a, grouping))
+        .collect();
+    let keys: &[Expression] = if already_folded { &[] } else { grouping };
+    let slots = sql_join(keys.iter().chain(rewritten_aggregates.iter()), ", ", |e| {
+        render_projection_slot(e, input_schema)
+    })?;
+    // HAVING may carry no-arg grouping functions too (Spark-legal over
+    // ROLLUP/CUBE/GROUPING SETS); splice before rendering.
+    let having_sql = having
+        .map(|h| render_expr(&with_grouping_id_spliced(h, grouping), input_schema))
+        .transpose()?;
+    // Emit a GROUP BY whenever there are flat grouping columns, OR when this
+    // is a GROUPING SETS aggregate with at least one set — the all-empty
+    // `GROUP BY GROUPING SETS ((), ())` case still produces one grand-total
+    // row PER SET, so dropping the clause would be a silent wrong row-count.
+    let emit_group_by = !grouping.is_empty()
+        || (matches!(grouping_kind, GroupingKind::GroupingSets) && !grouping_sets.is_empty());
+    let group_body = if emit_group_by {
+        let rendered = render_group_exprs(grouping, input_schema)?;
+        Some(match grouping_kind {
+            GroupingKind::GroupBy => rendered.join(", "),
+            GroupingKind::Rollup => format!("ROLLUP({})", rendered.join(", ")),
+            GroupingKind::Cube => format!("CUBE({})", rendered.join(", ")),
+            GroupingKind::GroupingSets => {
+                let sets: Vec<String> = grouping_sets
+                    .iter()
+                    .map(|s| {
+                        let cols = s
+                            .iter()
+                            .map(|&i| rendered[i].as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("({cols})")
+                    })
+                    .collect();
+                format!("GROUPING SETS ({})", sets.join(", "))
+            }
+        })
+    } else {
+        None
+    };
+
+    let mut block = open_block(input)?;
+    let vis = exprs_visible_in(
+        grouping
+            .iter()
+            .chain(rewritten_aggregates.iter())
+            .chain(having),
+        &block,
+    );
+    if !(block.can_accept(Clause::GroupBy) && vis) {
+        block = SelectBlock::wrap(block.into());
+    }
+    if let Some(g) = group_body {
+        block.set_group_by(g);
+    }
+    if let Some(h) = having_sql {
+        block.set_having(h);
+    }
+    block.set_projections(slots);
+    Ok(block.into())
+}
+
+fn build_lateral_view(
+    input: &TypedAst,
+    table_alias: &str,
+    columns: &[(String, Expression)],
+) -> Result<SqlUnit, EmissionError> {
+    let input_schema = &input.resolved_schema;
+    let inner_select = sql_join(columns.iter(), ", ", |(alias, expr)| {
+        let expr_sql = render_expr(expr, input_schema)?;
+        Ok(format!("{expr_sql} AS {}", quote_ident(alias)))
+    })?;
+    let mut block = open_block(input)?;
+    // The generator expressions reference the input's FROM scope; extending
+    // is sound only on a pure-FROM block whose scope satisfies them.
+    let vis = exprs_visible_in(columns.iter().map(|(_, e)| e), &block);
+    if !(block.pure_from() && vis) {
+        block = SelectBlock::wrap(block.into());
+    }
+    block.extend_from(
+        &format!(
+            ", LATERAL (SELECT {inner_select}) AS {}",
+            quote_ident(table_alias)
+        ),
+        vec![table_alias.to_owned()],
+    );
+    Ok(block.into())
 }
 
 /// Build the child's unit and open it as a block: a `Select` unit is
@@ -117,7 +477,7 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
 /// `(…) AS __td_sub`.
 fn open_block(child: &TypedAst) -> Result<SelectBlock, EmissionError> {
     Ok(match build_unit(&child.op, &child.resolved_schema)? {
-        SqlUnit::Select(block) => block,
+        SqlUnit::Select(block) => *block,
         raw => SelectBlock::wrap(raw),
     })
 }
@@ -179,23 +539,11 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
     }
     let slots = render_projection_slots(projections, &input.resolved_schema)?;
     let mut block = open_block(input)?;
-    if block.can_accept(Clause::Select) && exprs_visible_in(projections, &block) {
-        block.set_projections(slots);
-        return Ok(SqlUnit::Select(block));
+    if !(block.can_accept(Clause::Select) && exprs_visible_in(projections, &block)) {
+        block = SelectBlock::wrap(block.into());
     }
-    // Phase-B bridge: Join / Filter-over-Join / LateralView children are
-    // still legacy-rendered, and their user aliases must stay visible to
-    // qualified projection refs — inline through them as before. Dies in
-    // Phase C when Join/LateralView become block-producing.
-    if let Some(atf) = render_alias_transparent_from(input)? {
-        return Ok(SqlUnit::Raw(match atf.where_sql {
-            Some(w) => format!("SELECT {slots} FROM {} WHERE {w}", atf.from_sql),
-            None => format!("SELECT {slots} FROM {}", atf.from_sql),
-        }));
-    }
-    let mut wrapped = SelectBlock::wrap(SqlUnit::Select(block));
-    wrapped.set_projections(slots);
-    Ok(SqlUnit::Select(wrapped))
+    block.set_projections(slots);
+    Ok(block.into())
 }
 
 fn build_filter(input: &TypedAst, condition: &Expression) -> Result<SqlUnit, EmissionError> {
@@ -203,11 +551,11 @@ fn build_filter(input: &TypedAst, condition: &Expression) -> Result<SqlUnit, Emi
     let mut block = open_block(input)?;
     if block.can_accept(Clause::Where) && exprs_visible_in([condition], &block) {
         block.push_where(cond_sql);
-        return Ok(SqlUnit::Select(block));
+        return Ok(block.into());
     }
-    let mut wrapped = SelectBlock::wrap(SqlUnit::Select(block));
+    let mut wrapped = SelectBlock::wrap(block.into());
     wrapped.push_where(cond_sql);
-    Ok(SqlUnit::Select(wrapped))
+    Ok(wrapped.into())
 }
 
 fn build_sort(
@@ -233,11 +581,11 @@ fn build_sort(
     };
     if block.can_accept(Clause::OrderBy) && block.distinct_allows_order() && keys_bind {
         block.set_order_by(keys, limit, offset);
-        return Ok(SqlUnit::Select(block));
+        return Ok(block.into());
     }
-    let mut wrapped = SelectBlock::wrap(SqlUnit::Select(block));
+    let mut wrapped = SelectBlock::wrap(block.into());
     wrapped.set_order_by(keys, limit, offset);
-    Ok(SqlUnit::Select(wrapped))
+    Ok(wrapped.into())
 }
 
 fn build_limit(
@@ -247,17 +595,17 @@ fn build_limit(
 ) -> Result<SqlUnit, EmissionError> {
     let mut block = open_block(input)?;
     if !block.can_accept(Clause::LimitOffset) {
-        block = SelectBlock::wrap(SqlUnit::Select(block));
+        block = SelectBlock::wrap(block.into());
     }
     block.set_limit(limit, offset);
-    Ok(SqlUnit::Select(block))
+    Ok(block.into())
 }
 
 fn build_deduplicate(input: &TypedAst, on_columns: &[String]) -> Result<SqlUnit, EmissionError> {
     let mut block = open_block(input)?;
     if on_columns.is_empty() {
         if !block.can_accept(Clause::Distinct) {
-            block = SelectBlock::wrap(SqlUnit::Select(block));
+            block = SelectBlock::wrap(block.into());
         }
         block.set_distinct(DistinctKind::Distinct);
     } else {
@@ -267,11 +615,11 @@ fn build_deduplicate(input: &TypedAst, on_columns: &[String]) -> Result<SqlUnit,
         // DISTINCT) so the row-choice surface stays identical to today's
         // wrapped form.
         if !(block.can_accept(Clause::Distinct) && block.select_free()) {
-            block = SelectBlock::wrap(SqlUnit::Select(block));
+            block = SelectBlock::wrap(block.into());
         }
         block.set_distinct(DistinctKind::DistinctOn(cols));
     }
-    Ok(SqlUnit::Select(block))
+    Ok(block.into())
 }
 
 fn build_aliased_relation(input: &TypedAst, alias: &str) -> Result<SqlUnit, EmissionError> {
@@ -290,7 +638,7 @@ fn build_aliased_relation(input: &TypedAst, alias: &str) -> Result<SqlUnit, Emis
             alias: alias.to_owned(),
         }
     };
-    Ok(SqlUnit::Select(SelectBlock::from_item(item)))
+    Ok(SqlUnit::from(SelectBlock::from_item(item)))
 }
 
 /// The pre-SELECT-block string renderers, one arm per not-yet-converted
@@ -374,40 +722,6 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
             seed,
         } => render_sample_by(input, col, fractions, *seed),
 
-        // ── Aggregate (operator + primitive function arms) ───────────────
-        TypedOp::Aggregate {
-            input,
-            grouping,
-            aggregates,
-            grouping_kind,
-            grouping_sets,
-            having,
-        } => render_aggregate_op(
-            input,
-            grouping,
-            aggregates,
-            *grouping_kind,
-            grouping_sets,
-            having.as_ref(),
-        ),
-
-        // ── Join ─────────────────────────────────────────────────────────
-        TypedOp::Join {
-            left,
-            right,
-            join_type,
-            condition,
-            using_columns,
-            lateral,
-            ..
-        } => render_join(
-            left,
-            right,
-            *join_type,
-            condition.as_ref(),
-            using_columns,
-            *lateral,
-        ),
         TypedOp::SetOp {
             kind,
             all,
@@ -430,12 +744,6 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
             with_ordinality,
         } => render_table_function(name, args, *with_ordinality, schema),
 
-        TypedOp::LateralView {
-            input,
-            table_alias,
-            columns,
-        } => render_lateral_view(input, table_alias, columns),
-
         TypedOp::RecursiveCte {
             name,
             anchor,
@@ -457,7 +765,10 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
         | TypedOp::Sort { .. }
         | TypedOp::Limit { .. }
         | TypedOp::Deduplicate { .. }
-        | TypedOp::AliasedRelation { .. } => {
+        | TypedOp::AliasedRelation { .. }
+        | TypedOp::Join { .. }
+        | TypedOp::Aggregate { .. }
+        | TypedOp::LateralView { .. } => {
             unreachable!("block-composable operator routed to legacy_render: {op:?}")
         }
     };
@@ -492,18 +803,6 @@ fn render_single_row() -> Result<String, EmissionError> {
     // stamps SingleRow with an empty schema; no legitimate operator resolves
     // the placeholder column from downstream code, so its presence is inert.
     Ok("SELECT 1".to_owned())
-}
-
-/// The FROM-body for a table scan: the quoted table name, plus an optional
-/// `AS <alias>`. Shared by [`render_table_scan`] and the Project-over-
-/// TableScan inline branch in [`render_project`] so identifier quoting
-/// (schema-qualified / reserved names) is identical on both paths.
-fn table_scan_from_body(table: &str, alias: Option<&str>) -> String {
-    let name = quote_ident(table);
-    match alias {
-        Some(a) => format!("{name} AS {}", quote_ident(a)),
-        None => name.into_owned(),
-    }
 }
 
 fn render_values(
@@ -621,150 +920,6 @@ fn render_file_scan(
     Ok(format!("SELECT * FROM {reader_call}"))
 }
 
-/// `(sql) AS alias`, quoting `alias` — the derived-table wrapper shape shared
-/// by every alias-transparent FROM / join-side renderer below (hoisted user
-/// aliases and synthetic `__td_*` fallbacks alike).
-fn quoted_derived(sql: &str, alias: &str) -> String {
-    format!("({sql}) AS {}", quote_ident(alias))
-}
-
-/// The FROM-body (and, when the shape carries a correlated/comma-join
-/// predicate, the WHERE) of a child subtree that already exposes the user
-/// aliases the enclosing `Project`/`Aggregate` clause references — so the
-/// caller can inline directly instead of wrapping the child in its own
-/// occluding synthetic alias (`__td_proj` / `__td_agg`).
-struct AliasTransparentFrom {
-    from_sql: String,
-    where_sql: Option<String>,
-}
-
-/// Whether `input`'s shape already exposes the aliases an enclosing
-/// `Project`/`Aggregate` clause needs, and if so, its alias-transparent
-/// `FROM`/`WHERE` fragments. Mirrors, on the emission side, the question the
-/// analyzer's `collect_qualifier_bindings` asks of the same shapes. Arms, in
-/// order:
-///
-/// - `Join` → inline the join's FROM/ON via [`render_join_from`], hoisting
-///   user aliases (`df.alias("e").join(...).select(e.name)`).
-/// - `Filter { Join }` → a comma-join lowers to `... → Filter → Join`;
-///   collapse into one FROM + WHERE so aliases stay in scope for both.
-///   Filter is schema-passthrough, so the Filter's own `resolved_schema` and
-///   the Join's carry identical fields.
-/// - `Filter { AliasedRelation }` → correlated subqueries (EXISTS / scalar /
-///   scalar-aggregate) lower to `... → Filter → AliasedRelation`. The
-///   default `__td_filter`/`__td_agg`/`__td_proj` wrap would re-bury the
-///   user alias the WHERE's correlated qualifier needs, so flatten into one
-///   FROM + WHERE, keeping the alias as the FROM table name.
-///
-///   Correlated outer references (e.g. `e.salary` from the outer `emp e`)
-///   are resolved by the analyzer's outer-scope fallback (tier (g) in
-///   `resolve_column`): when the inner schema has no match, the analyzer
-///   stamps the reference with the outer plan's type/nullability. Emission
-///   renders the qualifier verbatim; DuckDB's correlated-subquery binder
-///   resolves it at runtime.
-/// - `AliasedRelation` → transparent on its own too: `(inner) AS alias`.
-///
-/// Returns `Ok(None)` for any other shape — the caller keeps its own default
-/// synthetic wrap.
-fn render_alias_transparent_from(
-    input: &TypedAst,
-) -> Result<Option<AliasTransparentFrom>, EmissionError> {
-    if let TypedOp::Join {
-        left,
-        right,
-        join_type,
-        condition,
-        using_columns,
-        lateral,
-        ..
-    } = &input.op
-    {
-        let from_sql = render_join_from(
-            left,
-            right,
-            *join_type,
-            condition.as_ref(),
-            using_columns,
-            &input.resolved_schema,
-            *lateral,
-        )?;
-        return Ok(Some(AliasTransparentFrom {
-            from_sql,
-            where_sql: None,
-        }));
-    }
-    if let TypedOp::Filter {
-        input: filter_input,
-        condition: filter_cond,
-    } = &input.op
-    {
-        if let TypedOp::Join {
-            left,
-            right,
-            join_type,
-            condition: join_cond,
-            using_columns,
-            lateral,
-            ..
-        } = &filter_input.op
-        {
-            let from_sql = render_join_from(
-                left,
-                right,
-                *join_type,
-                join_cond.as_ref(),
-                using_columns,
-                &filter_input.resolved_schema,
-                *lateral,
-            )?;
-            let where_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
-            return Ok(Some(AliasTransparentFrom {
-                from_sql,
-                where_sql: Some(where_sql),
-            }));
-        }
-        if let TypedOp::AliasedRelation {
-            input: inner,
-            alias,
-        } = &filter_input.op
-        {
-            let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
-            let where_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
-            return Ok(Some(AliasTransparentFrom {
-                from_sql: quoted_derived(&inner_sql, alias),
-                where_sql: Some(where_sql),
-            }));
-        }
-        return Ok(None);
-    }
-    if let TypedOp::AliasedRelation {
-        input: inner,
-        alias,
-    } = &input.op
-    {
-        let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
-        return Ok(Some(AliasTransparentFrom {
-            from_sql: quoted_derived(&inner_sql, alias),
-            where_sql: None,
-        }));
-    }
-    // LateralView already carries the user's table alias (`t`) — Project over
-    // LateralView must inline the LATERAL(SELECT...) FROM body so `e` and `t`
-    // stay in scope (the default `__td_proj` wrap would occlude both).
-    if let TypedOp::LateralView {
-        input,
-        table_alias,
-        columns,
-    } = &input.op
-    {
-        return Ok(Some(AliasTransparentFrom {
-            from_sql: render_lateral_view_from(input, table_alias, columns)?,
-            where_sql: None,
-        }));
-    }
-    Ok(None)
-}
-
 /// True iff `projections` is exactly one unqualified `*` (i.e. `SELECT *`),
 /// whose emitted column order is delegated to the FROM clause rather than an
 /// explicit slot list.
@@ -828,246 +983,6 @@ fn render_join_clause(
     }
 }
 
-/// Whether `expr` contains any `ColumnReference`/`UnresolvedColumn` whose
-/// qualifier matches `q` (ASCII case-insensitive). The join-side decision
-/// ladder's own version of the qualifier scan `qualify_plan_id_refs` (§2.3,
-/// analyzer.rs) uses to stamp `__td_jl`/`__td_jr` in the first place.
-fn expr_uses_qualifier(expr: &Expression, q: &str) -> bool {
-    match expr {
-        Expression::ColumnReference(c) => c
-            .qualifier
-            .as_deref()
-            .is_some_and(|cq| cq.eq_ignore_ascii_case(q)),
-        Expression::UnresolvedColumn(u) => u
-            .qualifier
-            .as_deref()
-            .is_some_and(|cq| cq.eq_ignore_ascii_case(q)),
-        other => other.children().any(|c| expr_uses_qualifier(c, q)),
-    }
-}
-
-/// Whether `side`'s left spine can be folded into one chained `FROM` instead
-/// of wrapping it in a synthetic derived-table alias. Requires, at this
-/// level and recursively down the left spine:
-///
-/// - `using_columns` empty (USING has its own column-order/dedup semantics —
-///   generic [`render_join`]'s explicit slot list exists precisely to fix
-///   USING order; flattening across it would change `SELECT *` order).
-/// - `join_type` is not `LeftSemi`/`LeftAnti` (CLAUDE.md gotcha 4 — the
-///   flat-chain rendering must break at semi/anti boundaries).
-/// - the join condition carries no `__td_jl`/`__td_jr` references (those are
-///   per-level synthetic names; a match means this level was itself produced
-///   under the plan_id contract and must stay wrapped).
-/// - the left side is a user `AliasedRelation` or another flattenable `Join`.
-/// - the right side is a user `AliasedRelation` (user-aliased leaves only —
-///   avoids colliding with the fallback synthetic alias).
-/// - no user alias repeats across the whole flattened scope. DuckDB rejects
-///   `Duplicate alias X in query!` when two `AS X` land in one FROM scope,
-///   whereas the isolating synthetic wrapper (the step-4 fallback) does not —
-///   so a chain that would emit a duplicate stays wrapped. Spark permits
-///   duplicate FROM aliases (it errors only on ambiguous *references*), so
-///   this keeps such queries green rather than flipping them red.
-///
-/// Returns the ordered list of user aliases the flattened chain would emit
-/// into a single FROM scope, or `None` when `side` is not flattenable (by any
-/// of the above rules, including the duplicate-alias guard).
-fn flattenable_chain_aliases(side: &TypedAst) -> Option<Vec<String>> {
-    use super::ast::JoinType;
-    let TypedOp::Join {
-        left,
-        right,
-        join_type,
-        condition,
-        using_columns,
-        lateral,
-        ..
-    } = &side.op
-    else {
-        return None;
-    };
-    // A lateral join's right side is a correlated derived table — flattening
-    // it into a shared FROM scope is unsound (splicing a correlation into a
-    // scope τ never validated).
-    if *lateral {
-        return None;
-    }
-    if !using_columns.is_empty() {
-        return None;
-    }
-    if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
-        return None;
-    }
-    if let Some(cond) = condition {
-        if expr_uses_qualifier(cond, TD_JOIN_LEFT) || expr_uses_qualifier(cond, TD_JOIN_RIGHT) {
-            return None;
-        }
-    }
-    let mut aliases = match &left.op {
-        TypedOp::AliasedRelation { alias, .. } => vec![alias.clone()],
-        TypedOp::Join { .. } => flattenable_chain_aliases(left)?,
-        _ => return None,
-    };
-    let TypedOp::AliasedRelation {
-        alias: right_alias, ..
-    } = &right.op
-    else {
-        return None;
-    };
-    if aliases.iter().any(|a| a.eq_ignore_ascii_case(right_alias)) {
-        return None;
-    }
-    aliases.push(right_alias.clone());
-    Some(aliases)
-}
-
-/// Render one side of a join's `FROM` clause. Decision ladder, in order:
-///
-/// 1. `condition` references `synthetic_alias` (via [`expr_uses_qualifier`])
-///    → `(dispatch_op(side)) AS synthetic_alias`. This is the DataFrame
-///    plan_id-qualified-condition contract (`qualify_plan_id_refs`,
-///    analyzer.rs) — it must win even when `side` is itself a user
-///    `AliasedRelation` (closes the latent `df.alias("e")` + plan_id hazard:
-///    hoisting to the user alias there would leave the plan_id-stamped
-///    condition referencing a qualifier nothing binds).
-/// 2. `side` is a user `AliasedRelation` → hoist `(inner) AS user_alias`.
-/// 3. `allow_flatten` and `side` is a [`flattenable_chain_aliases`] nested
-///    `Join` whose flattened aliases do not collide with `sibling_alias` (the
-///    outer join's other side) → recurse into [`render_join_from`] for a
-///    chained FROM with no wrapper (left-deep join chains parse to the same
-///    tree shape either way — ADR-001 transliteration). The sibling-collision
-///    guard is the spine-vs-outer-right half of the duplicate-alias check:
-///    without it a flattened left spine could reuse the outer right's alias in
-///    the same FROM scope, which DuckDB rejects. On collision we fall through
-///    to the isolating wrapper (step 4).
-/// 4. else → `(dispatch_op(side)) AS synthetic_alias` (existing fallback).
-fn render_join_side(
-    side: &TypedAst,
-    synthetic_alias: &str,
-    condition: Option<&Expression>,
-    allow_flatten: bool,
-    sibling_alias: Option<&str>,
-) -> Result<String, EmissionError> {
-    let condition_uses_synthetic = condition
-        .map(|c| expr_uses_qualifier(c, synthetic_alias))
-        .unwrap_or(false);
-    if condition_uses_synthetic {
-        let side_sql = dispatch_op(&side.op, &side.resolved_schema)?;
-        return Ok(quoted_derived(&side_sql, synthetic_alias));
-    }
-    if let TypedOp::AliasedRelation { input, alias } = &side.op {
-        let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-        return Ok(quoted_derived(&inner_sql, alias));
-    }
-    // Bare unaliased TableScan: hoist using the table's own name as the alias
-    // so that table-name-qualified references (e.g. `emp.dept_id` inside a
-    // LATERAL subquery) stay resolvable. Without this, the __td_jl fallback
-    // buries the table name and DuckDB's binder cannot find it.
-    if let TypedOp::TableScan { table, alias: None } = &side.op {
-        let inner_sql = dispatch_op(&side.op, &side.resolved_schema)?;
-        return Ok(quoted_derived(&inner_sql, table));
-    }
-    if allow_flatten {
-        if let Some(chain_aliases) = flattenable_chain_aliases(side) {
-            let collides_with_sibling = sibling_alias
-                .is_some_and(|s| chain_aliases.iter().any(|a| a.eq_ignore_ascii_case(s)));
-            if !collides_with_sibling {
-                // `flattenable_chain_aliases` has already validated the whole
-                // left spine, so emit it in a single walk via `emit_flat_chain`
-                // rather than recursing through `render_join_from` (which would
-                // re-run the O(spine) validation at every level → O(N^2)).
-                return emit_flat_chain(side);
-            }
-        }
-    }
-    let side_sql = dispatch_op(&side.op, &side.resolved_schema)?;
-    Ok(quoted_derived(&side_sql, synthetic_alias))
-}
-
-/// Emit a validated-flattenable left-deep join chain as one chained `FROM`
-/// body (`(a) AS x K (b) AS y ON .. K (c) AS z ON ..`), walking the spine
-/// exactly once. Precondition: `side` passed [`flattenable_chain_aliases`], so
-/// every leaf is a user `AliasedRelation` and no re-validation is needed. Kept
-/// separate from [`render_join_from`] so the flatten path does not re-invoke
-/// the O(spine) flattenability check at each recursion level.
-fn emit_flat_chain(side: &TypedAst) -> Result<String, EmissionError> {
-    let TypedOp::Join {
-        left,
-        right,
-        join_type,
-        condition,
-        using_columns,
-        ..
-    } = &side.op
-    else {
-        // Precondition guarantees a Join; fall back defensively rather than panic.
-        return dispatch_op(&side.op, &side.resolved_schema);
-    };
-    let left_frag = match &left.op {
-        TypedOp::Join { .. } => emit_flat_chain(left)?,
-        TypedOp::AliasedRelation { input, alias } => {
-            let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-            quoted_derived(&inner_sql, alias)
-        }
-        _ => {
-            let inner_sql = dispatch_op(&left.op, &left.resolved_schema)?;
-            quoted_derived(&inner_sql, TD_JOIN_LEFT)
-        }
-    };
-    let right_frag = match &right.op {
-        TypedOp::AliasedRelation { input, alias } => {
-            let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-            quoted_derived(&inner_sql, alias)
-        }
-        _ => {
-            let inner_sql = dispatch_op(&right.op, &right.resolved_schema)?;
-            quoted_derived(&inner_sql, TD_JOIN_RIGHT)
-        }
-    };
-    let kind = join_kind_sql(*join_type);
-    let clause = render_join_clause(
-        *join_type,
-        condition.as_ref(),
-        using_columns,
-        &side.resolved_schema,
-    )?;
-    Ok(format!("{left_frag} {kind} {right_frag}{clause}"))
-}
-
-/// Render the `FROM` body of a join — the two aliased sides and the
-/// `ON`/`USING`/`CROSS` clause — without an enclosing `SELECT`. Delegates
-/// each side to [`render_join_side`] (left may flatten a nested,
-/// user-aliased join chain; right never does — only the left spine of a
-/// left-deep join chain matches the original SQL FROM-list shape).
-/// `cond_schema` resolves the ON-condition expression.
-fn render_join_from(
-    left: &TypedAst,
-    right: &TypedAst,
-    join_type: crate::transpiler_v2::ast::JoinType,
-    condition: Option<&Expression>,
-    using_columns: &[String],
-    cond_schema: &Schema,
-    lateral: bool,
-) -> Result<String, EmissionError> {
-    // The left spine may flatten into this FROM scope; guard it against reusing
-    // the outer right side's user alias (spine-vs-sibling half of the
-    // duplicate-alias check). The right side never flattens, so it needs no
-    // sibling guard.
-    let right_alias = match &right.op {
-        TypedOp::AliasedRelation { alias, .. } => Some(alias.as_str()),
-        _ => None,
-    };
-    let left_from = render_join_side(left, TD_JOIN_LEFT, condition, true, right_alias)?;
-    let right_from = render_join_side(right, TD_JOIN_RIGHT, condition, false, None)?;
-    let right_from = if lateral {
-        format!("LATERAL {right_from}")
-    } else {
-        right_from
-    };
-    let kind = join_kind_sql(join_type);
-    let clause = render_join_clause(join_type, condition, using_columns, cond_schema)?;
-    Ok(format!("{left_from} {kind} {right_from}{clause}"))
-}
-
 /// Render a projection slot, applying `spark_return_cast` at the top level
 /// (§5.1) — Spark-parity casts only appear as an outermost `CAST(...)` around
 /// the projection expression (with optional preserved alias).
@@ -1088,57 +1003,6 @@ fn render_projection_slot(
     }
     let inner_sql = render_expr(expr, input_schema)?;
     Ok(spark_return_cast(inner_sql, expr, input_schema))
-}
-
-/// Render the FROM-body of a `LATERAL VIEW` operator:
-/// `<input-from-body>, LATERAL (SELECT <expr1> AS <alias1>[, ...]) AS <table_alias>`.
-///
-/// The input FROM resolution follows the same priority as `render_project`:
-/// - TableScan → inline `table_scan_from_body`
-/// - alias-transparent shapes → inline their `from_sql`
-/// - anything else → wrap in a `quoted_derived(dispatch_op(input), "__td_lv")`
-fn render_lateral_view_from(
-    input: &TypedAst,
-    table_alias: &str,
-    columns: &[(String, Expression)],
-) -> Result<String, EmissionError> {
-    let input_schema = &input.resolved_schema;
-    let input_from = if let TypedOp::TableScan { table, alias } = &input.op {
-        table_scan_from_body(table, alias.as_deref())
-    } else if let Some(atf) = render_alias_transparent_from(input)? {
-        // alias-transparent shapes already expose user aliases.
-        // A WHERE from a Filter-over-X is not expected here (LateralView
-        // does not nest with Filter in its immediate input in the current
-        // corpus), but handle it defensively.
-        match atf.where_sql {
-            Some(w) => format!("(SELECT * FROM {} WHERE {w}) AS __td_lv", atf.from_sql),
-            None => atf.from_sql,
-        }
-    } else {
-        let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-        quoted_derived(&inner_sql, "__td_lv")
-    };
-
-    let inner_select = sql_join(columns.iter(), ", ", |(alias, expr)| {
-        let expr_sql = render_expr(expr, input_schema)?;
-        Ok(format!("{expr_sql} AS {}", quote_ident(alias)))
-    })?;
-
-    Ok(format!(
-        "{input_from}, LATERAL (SELECT {inner_select}) AS {}",
-        quote_ident(table_alias)
-    ))
-}
-
-/// Top-level dispatch for `TypedOp::LateralView` —
-/// `SELECT * FROM <render_lateral_view_from(...)>`.
-fn render_lateral_view(
-    input: &TypedAst,
-    table_alias: &str,
-    columns: &[(String, Expression)],
-) -> Result<String, EmissionError> {
-    let from_body = render_lateral_view_from(input, table_alias, columns)?;
-    Ok(format!("SELECT * FROM {from_body}"))
 }
 
 fn render_sort_key(so: &SortOrder, schema: &Schema) -> Result<String, EmissionError> {
@@ -1298,99 +1162,6 @@ fn render_set_op(
     // can wrap it as `FROM (...)` without DuckDB parse errors on the
     // UNION-composed subquery.
     Ok(parts.join(&format!(" {op_kw} ")))
-}
-
-/// Render a binary `Join`. Emits
-/// `SELECT * FROM (left) AS __td_jl <JOIN_KIND> JOIN (right) AS __td_jr
-/// [ON <cond> | USING (<cols>)]`. DuckDB accepts `INNER`, `LEFT`, `RIGHT`,
-/// `FULL`, `CROSS`, `SEMI`, `ANTI` — the last two WITHOUT the `LEFT` prefix
-/// (checklist §5 / CLAUDE.md Known Gotcha #5). SEMI/ANTI join emission never
-/// produces right-side columns (semantically absent); the analyzer already
-/// computes the output schema accordingly (LeftSemi/LeftAnti → left schema
-/// only).
-///
-/// This is the `__td_jl`/`__td_jr` contract renderer `qualify_plan_id_refs`
-/// (analyzer.rs) and [`render_join_side`]'s condition-qualifier check both
-/// key off of — it stays unchanged by the alias-transparent-FROM work above.
-/// A user-qualified ref sitting directly above one of the OTHER synthetic
-/// wrappers (`__td_sort`/`__td_limit`/`__td_filter`) is a known-latent class
-/// of the same root cause with no corpus witness today — out of scope for
-/// this pass (see diagnostic-pass-6.md).
-fn render_join(
-    left: &TypedAst,
-    right: &TypedAst,
-    join_type: crate::transpiler_v2::ast::JoinType,
-    condition: Option<&Expression>,
-    using_columns: &[String],
-    lateral: bool,
-) -> Result<String, EmissionError> {
-    use super::ast::JoinType;
-
-    // Lateral join: delegate to `render_join_from` wrapped in `SELECT * FROM
-    // ...` INSTEAD of the generic explicit-slot-list renderer. The generic
-    // renderer's `(left_sql) AS __td_jl` wrapper buries the left's user alias,
-    // which the correlated reference inside the LATERAL subquery needs to see.
-    // `render_join_side`'s step-2 hoist (`(inner) AS e`) keeps the alias
-    // visible. `SELECT *` is safe: lateral joins are guarded USING-free, and
-    // CROSS/Inner-ON expand `*` left-then-right matching the analyzer's concat
-    // schema.
-    if lateral {
-        let cond_schema = StructType::merge(&left.resolved_schema, &right.resolved_schema);
-        let from = render_join_from(
-            left,
-            right,
-            join_type,
-            condition,
-            using_columns,
-            &cond_schema,
-            true,
-        )?;
-        return Ok(format!("SELECT * FROM {from}"));
-    }
-
-    let left_sql = dispatch_op(&left.op, &left.resolved_schema)?;
-    let right_sql = dispatch_op(&right.op, &right.resolved_schema)?;
-    let kind = join_kind_sql(join_type);
-    let clause = render_join_clause(join_type, condition, using_columns, &left.resolved_schema)?;
-    // Emit an EXPLICIT column list mirroring the analyzer's output schema
-    // (see `analyzer.rs::CommonOp::Join` output-schema block for the
-    // canonical order). Without this, `SELECT *` on a USING-joined
-    // relation returns columns in DuckDB's order, which diverges from the
-    // analyzer's declared order.
-    let is_semi_or_anti = matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
-    let using_lower: std::collections::HashSet<String> =
-        using_columns.iter().map(|s| s.to_lowercase()).collect();
-    let left_alias_q = quote_ident(TD_JOIN_LEFT);
-    let right_alias_q = quote_ident(TD_JOIN_RIGHT);
-    let mut slots: Vec<String> = Vec::new();
-    // USING columns first (Spark hoists them).
-    for c in using_columns {
-        slots.push(quote_ident(c).into_owned());
-    }
-    // Left's non-USING columns in declared order.
-    for f in &left.resolved_schema.fields {
-        if !using_lower.contains(&f.name.to_lowercase()) {
-            slots.push(format!("{}.{}", left_alias_q, quote_ident(&f.name)));
-        }
-    }
-    // Right's non-USING columns — only when NOT semi/anti (which suppresses
-    // right side).
-    if !is_semi_or_anti {
-        for f in &right.resolved_schema.fields {
-            if !using_lower.contains(&f.name.to_lowercase()) {
-                slots.push(format!("{}.{}", right_alias_q, quote_ident(&f.name)));
-            }
-        }
-    }
-    let slots = if slots.is_empty() {
-        // Fallback for SEMI/ANTI on identical USING columns only.
-        "*".to_owned()
-    } else {
-        slots.join(", ")
-    };
-    Ok(format!(
-        "SELECT {slots} FROM ({left_sql}) AS {left_alias_q} {kind} ({right_sql}) AS {right_alias_q}{clause}"
-    ))
 }
 
 fn render_with_columns(
@@ -4782,140 +4553,6 @@ fn with_grouping_id_spliced(expr: &Expression, grouping: &[Expression]) -> Expre
     e
 }
 
-/// Render the `Aggregate` operator. Emits
-/// `SELECT <aggregates> FROM (<child>) AS __td_agg [GROUP BY <groupings>]`.
-/// The analyzer already resolves each `aggregate` expression's type; this
-/// renderer relies on `render_projection_slot` (which applies
-/// [`spark_return_cast`] on non-aggregate slots) and passes aggregate slots
-/// through unchanged — aggregate-return casts are the responsibility of the
-/// aggregate function arm itself (via [`spark_aggregate_return_cast`], wired
-/// per checklist §5.7 when needed).
-fn render_aggregate_op(
-    input: &TypedAst,
-    grouping: &[Expression],
-    aggregates: &[Expression],
-    grouping_kind: crate::transpiler_v2::ast::GroupingKind,
-    grouping_sets: &[Vec<usize>],
-    having: Option<&Expression>,
-) -> Result<String, EmissionError> {
-    use super::ast::GroupingKind;
-    // The SparkSQL front-end populates `grouping_sets` with per-set membership
-    // (indices into `grouping`). The DataFrame `groupingSets` path leaves it
-    // empty, so it stays a Thunderduck-boundary error (ADR-022).
-    if matches!(grouping_kind, GroupingKind::GroupingSets) && grouping_sets.is_empty() {
-        bail_boundary_op!(
-            "Aggregate[GroupingSets]",
-            "GROUPING SETS requires set-membership metadata (DataFrame groupingSets path not implemented in τ)",
-        );
-    }
-    // Aggregate-over-Join / Aggregate-over-Filter-over-Join / Aggregate-over-
-    // Filter-over-AliasedRelation / Aggregate-over-AliasedRelation inlining:
-    // any of these children already expose the aliases the aggregate slots,
-    // GROUP BY, and HAVING reference (`SELECT max(e.salary) FROM emp e WHERE
-    // e.dept_id = d.dept_id`, `SELECT d.dept_name, avg(e.salary) FROM emp e
-    // JOIN dept d ON ... GROUP BY d.dept_name`, etc.). The default `(<child>)
-    // AS __td_agg` FROM buries the user alias, so the aggregate slots /
-    // GROUP BY / HAVING and any correlated WHERE reference `e`/`d` at a
-    // wrapper level nothing binds. Reuse the same alias-transparent-FROM
-    // helper `render_project` inlines through (mirrors the Project branches);
-    // fall back to the `__td_agg` wrap for any other child shape.
-    //
-    // Correlated outer references are now resolved by the analyzer's
-    // outer-scope fallback (tier (g) in `resolve_column`): the inner
-    // subquery plan sees the enclosing plan's schema for columns absent
-    // from the inner schema. Emission renders qualifiers verbatim; DuckDB's
-    // correlated-subquery binder resolves them at runtime.
-    let atf = render_alias_transparent_from(input)?;
-    let from_clause = match &atf {
-        Some(a) => a.from_sql.clone(),
-        None => {
-            let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-            format!("({child_sql}) AS __td_agg")
-        }
-    };
-    let input_schema = &input.resolved_schema;
-    // Aggregates may include folded grouping columns at the SparkSQL path
-    // (see `CommonOp::Aggregate` doc). For the DataFrame path, aggregates
-    // are pure aggregate calls; grouping carries the keys. Both cases emit
-    // identically: SELECT the full `aggregates` list; the GROUP BY clause
-    // uses `grouping` when present.
-    // Mirror the analyzer's "unfold DataFrame-path grouping" logic — if
-    // the aggregates list doesn't already start with the grouping cols'
-    // output names, prepend them to the SELECT list so the emitted column
-    // count matches the resolved schema.
-    let already_folded = super::analyzer::grouping_already_folded(grouping, aggregates);
-    // Rewrite any `grouping_id()` (no-arg) calls inside `aggregates` to
-    // pass the current grouping columns as explicit args — DuckDB requires
-    // them. Generic `children_mut` walk in `rewrite_grouping_id` (see its
-    // doc comment); mutates a per-slot clone in place.
-    let rewritten_aggregates: Vec<Expression> = aggregates
-        .iter()
-        .map(|a| with_grouping_id_spliced(a, grouping))
-        .collect();
-    let keys: &[Expression] = if already_folded { &[] } else { grouping };
-    let slots = sql_join(keys.iter().chain(rewritten_aggregates.iter()), ", ", |e| {
-        render_projection_slot(e, input_schema)
-    })?;
-    let mut sql = format!("SELECT {slots} FROM {from_clause}");
-    // Emitted before GROUP BY: the Filter-over-{Join,AliasedRelation} arms of
-    // `render_alias_transparent_from` carry a WHERE fragment (the comma-join
-    // predicate or the correlated-subquery predicate) alongside their FROM.
-    if let Some(w) = atf.as_ref().and_then(|a| a.where_sql.as_ref()) {
-        sql.push_str(&format!(" WHERE {w}"));
-    }
-    // Emit a GROUP BY whenever there are flat grouping columns, OR when this is
-    // a GROUPING SETS aggregate with at least one set. The latter covers the
-    // all-empty case `GROUP BY GROUPING SETS ((), ())`: the flat grouping list
-    // is empty (no columns referenced) yet `grouping_sets` holds the empty
-    // sets, and each empty set is a distinct grand-total group (Spark returns
-    // one row per set). Without this the GROUP BY would be dropped and every
-    // set would collapse into a single grand-total row — a silent wrong
-    // row-count. DuckDB accepts `GROUP BY GROUPING SETS ((), ())` and returns
-    // the same per-set rows Spark does.
-    let emit_group_by = !grouping.is_empty()
-        || (matches!(grouping_kind, GroupingKind::GroupingSets) && !grouping_sets.is_empty());
-    if emit_group_by {
-        // Render each flat grouping column once (alias-stripped — GROUP BY
-        // doesn't take aliases, so `GROUP BY (expr) AS name` would be a parse
-        // error). GROUPING SETS indexes into this list per set; the other
-        // kinds join it directly (byte-identical to the prior emission).
-        let rendered = render_group_exprs(grouping, input_schema)?;
-        let group_sql = match grouping_kind {
-            GroupingKind::GroupBy => rendered.join(", "),
-            GroupingKind::Rollup => format!("ROLLUP({})", rendered.join(", ")),
-            GroupingKind::Cube => format!("CUBE({})", rendered.join(", ")),
-            GroupingKind::GroupingSets => {
-                let sets: Vec<String> = grouping_sets
-                    .iter()
-                    .map(|s| {
-                        let cols = s
-                            .iter()
-                            .map(|&i| rendered[i].as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("({cols})")
-                    })
-                    .collect();
-                format!("GROUPING SETS ({})", sets.join(", "))
-            }
-        };
-        sql.push_str(&format!(" GROUP BY {group_sql}"));
-    }
-    // SparkSQL HAVING — emitted inside the aggregating SELECT (never an outer
-    // WHERE, which DuckDB rejects for aggregate predicates). Rendered against
-    // the aggregate input schema, same scope as the aggregate slots.
-    if let Some(h) = having {
-        // Mirror the SELECT-slot loop above: HAVING may carry no-arg
-        // `grouping_id()`/`grouping()` (Spark-legal over ROLLUP/CUBE/GROUPING
-        // SETS) which DuckDB has no surface form for. Splice the ambient
-        // grouping columns into a clone before rendering.
-        let h = with_grouping_id_spliced(h, grouping);
-        let having_sql = render_expr(&h, input_schema)?;
-        sql.push_str(&format!(" HAVING {having_sql}"));
-    }
-    Ok(sql)
-}
-
 // ── Literal / atomic expression renderers ────────────────────────────────────
 
 fn render_literal(lit: &Literal) -> Result<String, EmissionError> {
@@ -6665,8 +6302,8 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         // User aliases hoisted into the subquery aliases; no synthetic alias,
         // so the ON clause and projection bind against `e` / `d`.
-        assert!(sql.contains(") AS e INNER JOIN ("), "got: {sql}");
-        assert!(sql.contains(") AS d ON "), "got: {sql}");
+        assert!(sql.contains("emp AS e INNER JOIN "), "got: {sql}");
+        assert!(sql.contains("dept AS d ON "), "got: {sql}");
         assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
         assert!(!sql.contains("__td_jl"), "got: {sql}");
         assert!(!sql.contains("__td_jr"), "got: {sql}");
@@ -6705,8 +6342,8 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         // Project→Filter→Join collapses into one SELECT: aliases hoisted, the
         // predicate lands as an outer WHERE (not a buried subquery filter).
-        assert!(sql.contains(") AS e CROSS JOIN ("), "got: {sql}");
-        assert!(sql.contains(") AS d WHERE "), "got: {sql}");
+        assert!(sql.contains("emp AS e CROSS JOIN "), "got: {sql}");
+        assert!(sql.contains("dept AS d WHERE "), "got: {sql}");
         assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
         assert!(!sql.contains("__td_filter"), "got: {sql}");
         assert!(!sql.contains("__td_proj"), "got: {sql}");
@@ -6764,7 +6401,7 @@ mod tests {
         let bt = base_types_emp_dept(&plan);
         let typed = analyze(plan, &bt).expect("analyze aggregate-over-filter-over-aliased");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e WHERE "), "got: {sql}");
+        assert!(sql.contains("emp AS e WHERE "), "got: {sql}");
         assert!(!sql.contains("__td_filter"), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
     }
@@ -6828,8 +6465,8 @@ mod tests {
         let bt = base_types_emp_dept(&plan);
         let typed = analyze(plan, &bt).expect("analyze aggregate-over-join");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e INNER JOIN ("), "got: {sql}");
-        assert!(sql.contains(") AS d ON "), "got: {sql}");
+        assert!(sql.contains("emp AS e INNER JOIN "), "got: {sql}");
+        assert!(sql.contains("dept AS d ON "), "got: {sql}");
         assert!(sql.contains("GROUP BY d.dept_name"), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
         assert!(!sql.contains("__td_jl"), "got: {sql}");
@@ -6861,7 +6498,7 @@ mod tests {
         let bt = base_types_with_emp();
         let typed = analyze(plan, &bt).expect("analyze aggregate-over-aliased-relation+having");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e"), "got: {sql}");
+        assert!(sql.contains("emp AS e"), "got: {sql}");
         assert!(sql.contains("GROUP BY e.dept_id"), "got: {sql}");
         assert!(sql.contains("HAVING "), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
@@ -6909,8 +6546,8 @@ mod tests {
         let bt = base_types_emp_dept(&plan);
         let typed = analyze(plan, &bt).expect("analyze aggregate-over-filter-over-join");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e CROSS JOIN ("), "got: {sql}");
-        assert!(sql.contains(") AS d WHERE "), "got: {sql}");
+        assert!(sql.contains("emp AS e CROSS JOIN "), "got: {sql}");
+        assert!(sql.contains("dept AS d WHERE "), "got: {sql}");
         assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
         assert!(sql.contains("GROUP BY d.dept_name"), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
@@ -6962,9 +6599,9 @@ mod tests {
         let bt = base_types_emp_dept_emp2(&plan);
         let typed = analyze(plan, &bt).expect("analyze three-way join");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e INNER JOIN ("), "got: {sql}");
-        assert!(sql.contains(") AS d ON "), "got: {sql}");
-        assert!(sql.contains(") AS m ON "), "got: {sql}");
+        assert!(sql.contains("emp AS e INNER JOIN "), "got: {sql}");
+        assert!(sql.contains("dept AS d ON "), "got: {sql}");
+        assert!(sql.contains("emp2 AS m ON "), "got: {sql}");
         assert!(!sql.contains("__td_jl"), "got: {sql}");
         assert!(!sql.contains("__td_jr"), "got: {sql}");
     }
@@ -7017,7 +6654,7 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         // Guard fired: inner join stays wrapped (not flattened into the chain).
         assert!(
-            sql.contains("__td_jl"),
+            sql.contains("__td_jr"),
             "duplicate-alias chain must not flatten; got: {sql}"
         );
     }
@@ -7234,7 +6871,7 @@ mod tests {
         assert!(sql.contains("SEMI JOIN"), "got: {sql}");
         assert!(!sql.contains("LEFT SEMI JOIN"), "got: {sql}");
         assert!(sql.contains("__td_jl"), "got: {sql}");
-        assert!(sql.contains(") AS m ON "), "got: {sql}");
+        assert!(sql.contains("emp2 AS m ON "), "got: {sql}");
     }
 
     fn ucol(name: &str) -> Expression {
@@ -12004,46 +11641,60 @@ mod tests {
         assert!(sql.contains(" ON "), "must contain ON clause, got: {sql}");
     }
 
-    /// `flattenable_chain_aliases` must return `None` for a lateral join,
-    /// while an equivalent non-lateral chain still flattens.
+    /// A nested LATERAL join must stay isolated under its synthetic wrapper
+    /// when it is the side of an enclosing join (its correlation must not be
+    /// spliced into a shared FROM scope), while an equivalent non-lateral
+    /// nested chain inlines flat.
     #[test]
-    fn flattenable_chain_aliases_returns_none_for_lateral_join() {
+    fn nested_lateral_join_side_never_inlines_into_outer_from() {
         let _g = tap_guard();
-        // Build a lateral join node (Inner, no ON).
-        let lateral_node = CommonAst::new(CommonOp::Join {
-            left: Box::new(aliased_scan("emp", "e")),
-            right: Box::new(aliased_scan("dept", "d")),
-            join_type: JoinType::Cross,
-            condition: None,
-            using_columns: vec![],
-            natural: false,
-            lateral: true,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
+        let nested = |lateral: bool| {
+            CommonAst::new(CommonOp::Join {
+                left: Box::new(aliased_scan("emp", "e")),
+                right: Box::new(aliased_scan("dept", "d")),
+                join_type: JoinType::Cross,
+                condition: None,
+                using_columns: vec![],
+                natural: false,
+                lateral,
+                left_plan_ids: vec![],
+                right_plan_ids: vec![],
+            })
+        };
+        let outer = |inner: CommonAst| {
+            CommonAst::new(CommonOp::Join {
+                left: Box::new(inner),
+                right: Box::new(aliased_scan("bonus", "b")),
+                join_type: JoinType::Cross,
+                condition: None,
+                using_columns: vec![],
+                natural: false,
+                lateral: false,
+                left_plan_ids: vec![],
+                right_plan_ids: vec![],
+            })
+        };
+
+        let plan = outer(nested(true));
+        let bt = BaseTypes::build_from_plan(&plan, |name| match name {
+            "emp" => Some(emp_schema()),
+            "dept" => Some(dept_schema()),
+            "bonus" => Some(dept_schema()),
+            _ => None,
         });
-        let bt = base_types_emp_dept(&lateral_node);
-        let typed_lateral = analyze(lateral_node, &bt).expect("analyze lateral");
+        let typed = analyze(plan, &bt).expect("analyze outer-over-lateral");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(
-            flattenable_chain_aliases(&typed_lateral).is_none(),
-            "lateral join must not be flattenable"
+            sql.contains("AS __td_jl"),
+            "lateral nested join must stay wrapped under its synthetic alias, got: {sql}"
         );
 
-        // Build an equivalent non-lateral cross join.
-        let non_lateral_node = CommonAst::new(CommonOp::Join {
-            left: Box::new(aliased_scan("emp", "e")),
-            right: Box::new(aliased_scan("dept", "d")),
-            join_type: JoinType::Cross,
-            condition: None,
-            using_columns: vec![],
-            natural: false,
-            lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
-        });
-        let typed_non_lateral = analyze(non_lateral_node, &bt).expect("analyze non-lateral");
+        let plan = outer(nested(false));
+        let typed = analyze(plan, &bt).expect("analyze outer-over-plain");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(
-            flattenable_chain_aliases(&typed_non_lateral).is_some(),
-            "non-lateral cross join should be flattenable"
+            !sql.contains("__td_jl"),
+            "non-lateral nested chain should inline without a synthetic wrapper, got: {sql}"
         );
     }
 
@@ -12089,7 +11740,7 @@ mod tests {
             "bare TableScan left must not use __td_jl, got: {sql}"
         );
         assert!(
-            sql.contains("AS emp CROSS JOIN LATERAL"),
+            sql.contains("emp CROSS JOIN LATERAL"),
             "bare TableScan left must be aliased as emp, got: {sql}"
         );
         assert!(

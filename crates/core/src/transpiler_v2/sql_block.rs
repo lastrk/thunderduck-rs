@@ -28,10 +28,8 @@ pub(crate) enum Clause {
     /// WHERE — conjunct-composable (`Where` accepts `Where`).
     Where,
     /// GROUP BY (occupied together with `Select` by Aggregate).
-    #[allow(dead_code)] // constructed when Aggregate converts (Phase C)
     GroupBy,
     /// HAVING (analyzer-populated; only Aggregate fills it).
-    #[allow(dead_code)] // constructed when Aggregate converts (Phase C)
     Having,
     /// The SELECT list.
     Select,
@@ -49,10 +47,17 @@ pub(crate) enum Clause {
 /// parents wrap it.
 #[derive(Debug)]
 pub(crate) enum SqlUnit {
-    /// An open SELECT block parents may merge into.
-    Select(SelectBlock),
+    /// An open SELECT block parents may merge into (boxed — a block is an
+    /// order of magnitude larger than the `Raw` string variant).
+    Select(Box<SelectBlock>),
     /// Fully-rendered SQL; parents wrap it as a derived table.
     Raw(String),
+}
+
+impl From<SelectBlock> for SqlUnit {
+    fn from(block: SelectBlock) -> Self {
+        SqlUnit::Select(Box::new(block))
+    }
 }
 
 impl SqlUnit {
@@ -83,6 +88,28 @@ pub(crate) enum FromItem {
         /// Derived-table alias (raw).
         alias: String,
     },
+    /// A join living flat in ONE FROM scope:
+    /// `<left> <kind> [LATERAL ]<right><clause>`.
+    Join {
+        /// Left side.
+        left: Box<FromItem>,
+        /// Right side.
+        right: Box<FromItem>,
+        /// Join keyword (`join_kind_sql` output).
+        kind: &'static str,
+        /// Rendered ` ON …` / ` USING (…)` clause (leading space) or empty.
+        clause: String,
+        /// Render `LATERAL` before the right side.
+        lateral: bool,
+    },
+    /// Verbatim FROM body (lateral-view chains). Carries the aliases it
+    /// exposes so the block's scope stays truthful.
+    Raw {
+        /// The FROM-body SQL.
+        sql: String,
+        /// Alias names (raw) this body exposes.
+        exposed: Vec<String>,
+    },
 }
 
 impl FromItem {
@@ -98,11 +125,22 @@ impl FromItem {
             FromItem::Derived { unit, alias } => {
                 format!("({}) AS {}", unit.to_sql(), quote_ident(alias))
             }
+            FromItem::Join {
+                left,
+                right,
+                kind,
+                clause,
+                lateral,
+            } => {
+                let lat = if *lateral { "LATERAL " } else { "" };
+                format!("{} {kind} {lat}{}{clause}", left.to_sql(), right.to_sql())
+            }
+            FromItem::Raw { sql, .. } => sql.clone(),
         }
     }
 
     /// The alias names this item exposes to the enclosing block's clauses.
-    fn exposed(&self) -> Vec<String> {
+    pub(crate) fn exposed(&self) -> Vec<String> {
         match self {
             // An aliased relation is addressable ONLY by the alias; a bare
             // one by its table name.
@@ -110,6 +148,12 @@ impl FromItem {
                 vec![alias.clone().unwrap_or_else(|| base.clone())]
             }
             FromItem::Derived { alias, .. } => vec![alias.clone()],
+            FromItem::Join { left, right, .. } => {
+                let mut names = left.exposed();
+                names.extend(right.exposed());
+                names
+            }
+            FromItem::Raw { exposed, .. } => exposed.clone(),
         }
     }
 }
@@ -132,12 +176,23 @@ pub(crate) const WRAP_ALIAS: &str = "__td_sub";
 /// content is pre-rendered SQL text; the block only owns clause placement.
 #[derive(Debug)]
 pub(crate) struct SelectBlock {
-    /// Rendered SELECT slot list. `None` = free (renders `*`).
+    /// Rendered SELECT slot list. `None` = free (renders
+    /// `default_projections`, else `*`).
     projections: Option<String>,
+    /// Soft SELECT list a merging Project/Aggregate may overwrite — the join
+    /// builder's hoisted slot list (resolved-schema column order). Rendered
+    /// only while `projections` is `None`; does NOT occupy the `Select`
+    /// ordinal.
+    default_projections: Option<String>,
     distinct: Option<DistinctKind>,
     from: FromItem,
     /// AND-composed WHERE conjuncts.
     where_conjuncts: Vec<String>,
+    /// Fully-rendered GROUP BY body (`a, b` / `ROLLUP(a, b)` /
+    /// `GROUPING SETS ((…), …)`).
+    group_by: Option<String>,
+    /// Rendered HAVING predicate.
+    having: Option<String>,
     /// Rendered `expr DIR NULLS …` sort keys.
     order_by: Vec<String>,
     limit: Option<i64>,
@@ -154,15 +209,64 @@ impl SelectBlock {
         let scope = from.exposed();
         Self {
             projections: None,
+            default_projections: None,
             distinct: None,
             from,
             where_conjuncts: Vec::new(),
+            group_by: None,
+            having: None,
             order_by: Vec::new(),
             limit: None,
             offset: None,
             max_clause: Clause::From,
             scope,
         }
+    }
+
+    /// If nothing but the FROM slot is occupied, surrender the [`FromItem`]
+    /// for inlining into an enclosing FROM scope (join-side hoisting);
+    /// otherwise return the block unchanged. `default_projections` is
+    /// dropped with the block shell — the enclosing scope re-derives its own
+    /// column list.
+    pub(crate) fn into_pure_from(self) -> Result<FromItem, Box<SelectBlock>> {
+        if self.max_clause == Clause::From && self.projections.is_none() {
+            Ok(self.from)
+        } else {
+            Err(Box::new(self))
+        }
+    }
+
+    /// Extend the FROM body in place (lateral-view chaining):
+    /// `FROM <old-from><suffix>`, exposing `extra_aliases` in addition to the
+    /// current scope. Caller must have checked `max_clause == From`.
+    pub(crate) fn extend_from(&mut self, suffix: &str, extra_aliases: Vec<String>) {
+        debug_assert_eq!(self.max_clause, Clause::From);
+        let sql = format!("{}{suffix}", self.from.to_sql());
+        let mut exposed = self.scope.clone();
+        exposed.extend(extra_aliases.iter().cloned());
+        self.from = FromItem::Raw { sql, exposed };
+        self.scope.extend(extra_aliases);
+    }
+
+    /// Install the soft (overridable) SELECT list — the join builder's
+    /// hoisted slot list. Does not occupy the `Select` ordinal.
+    pub(crate) fn set_default_projections(&mut self, slots: String) {
+        self.default_projections = Some(slots);
+    }
+
+    /// Fill GROUP BY (pre-rendered body). Caller must have checked
+    /// `can_accept(GroupBy)`.
+    pub(crate) fn set_group_by(&mut self, body: String) {
+        debug_assert!(self.can_accept(Clause::GroupBy));
+        self.group_by = Some(body);
+        self.bump(Clause::GroupBy);
+    }
+
+    /// Fill HAVING. Caller must have checked `can_accept(Having)`.
+    pub(crate) fn set_having(&mut self, predicate: String) {
+        debug_assert!(self.can_accept(Clause::Having));
+        self.having = Some(predicate);
+        self.bump(Clause::Having);
     }
 
     /// The universal conflict fallback: wrap `unit` as
@@ -190,6 +294,11 @@ impl SelectBlock {
     /// Is the SELECT list still free (renders `*`)?
     pub(crate) fn select_free(&self) -> bool {
         self.max_clause < Clause::Select
+    }
+
+    /// Is nothing but the FROM slot occupied?
+    pub(crate) fn pure_from(&self) -> bool {
+        self.max_clause == Clause::From && self.projections.is_none()
     }
 
     /// Is the DISTINCT slot compatible with adding an ORDER BY?
@@ -270,7 +379,12 @@ impl SelectBlock {
             }
             None => {}
         }
-        sql.push_str(self.projections.as_deref().unwrap_or("*"));
+        sql.push_str(
+            self.projections
+                .as_deref()
+                .or(self.default_projections.as_deref())
+                .unwrap_or("*"),
+        );
         sql.push_str(" FROM ");
         sql.push_str(&self.from.to_sql());
         match self.where_conjuncts.as_slice() {
@@ -291,6 +405,14 @@ impl SelectBlock {
                     .join(" AND ");
                 sql.push_str(&joined);
             }
+        }
+        if let Some(g) = &self.group_by {
+            sql.push_str(" GROUP BY ");
+            sql.push_str(g);
+        }
+        if let Some(h) = &self.having {
+            sql.push_str(" HAVING ");
+            sql.push_str(h);
         }
         if !self.order_by.is_empty() {
             sql.push_str(" ORDER BY ");
@@ -372,7 +494,7 @@ mod tests {
     #[test]
     fn wrap_uses_uniform_alias_and_scope() {
         let inner = scan("t", Some("x"));
-        let b = SelectBlock::wrap(SqlUnit::Select(inner));
+        let b = SelectBlock::wrap(inner.into());
         assert!(b.exposes("__td_sub"));
         assert!(!b.exposes("x"));
         assert_eq!(

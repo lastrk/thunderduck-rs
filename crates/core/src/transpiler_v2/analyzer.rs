@@ -333,6 +333,16 @@ pub enum TypedOp {
         /// The right side's per-column schema **after** outer-join
         /// nullability flipping. Retained for future τ work's join emitter.
         derived_right_schema: StructType,
+        /// True iff an analyzer-stamped `__td_jl` reference — in this join's
+        /// own condition, or in an ancestor expression that resolves through
+        /// schema-passthrough operators down to this join — requires emission
+        /// to alias the LEFT side with the synthetic [`TD_JOIN_LEFT`] name.
+        /// Stamped by the [`mark_join_alias_requirements`] post-pass; the
+        /// single authority for emission's synthetic-vs-user join aliasing.
+        left_requires_synthetic: bool,
+        /// Right-side counterpart of `left_requires_synthetic`
+        /// ([`TD_JOIN_RIGHT`]).
+        right_requires_synthetic: bool,
     },
     /// A set operation (UNION / INTERSECT / EXCEPT).
     SetOp {
@@ -712,7 +722,230 @@ pub fn analyze(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Analy
     // The three logical passes (resolve → assign_types → derive_nullability)
     // are fused into a single bottom-up traversal for efficiency. Section
     // comments below mark where each conceptual pass runs.
-    analyze_node(ast, base_types, None)
+    let mut typed = analyze_node(ast, base_types, None)?;
+    // Post-pass: stamp each Join's per-side synthetic-alias requirement from
+    // the `__td_jl`/`__td_jr` qualifiers resolution left behind (top-down —
+    // demands flow from ancestor expressions DOWN to the join they bind).
+    mark_join_alias_requirements(&mut typed);
+    Ok(typed)
+}
+
+// ── Join synthetic-alias requirement post-pass ──────────────────────────────
+
+/// Stamp every `TypedOp::Join`'s `left_requires_synthetic` /
+/// `right_requires_synthetic` flags: true iff any analyzer-stamped
+/// [`TD_JOIN_LEFT`]/[`TD_JOIN_RIGHT`] qualifier demands that side be
+/// addressable under its synthetic alias in the emitted FROM scope.
+///
+/// Demands arise in the join's own condition (`qualify_plan_id_refs`) or in
+/// an ancestor operator's expressions (`resolve_column`'s plan_id arm stamps
+/// `__td_jl`/`__td_jr` on ambiguous refs above a join). An ancestor demand
+/// reaches the join only through the same schema-passthrough operator class
+/// [`RelScope`] recognizes (Filter / Sort / Limit / Sample / SampleBy /
+/// Deduplicate / NaFill / NaDrop / NaReplace / LateralView) — every other
+/// operator re-scopes, so resolution can never stamp a synthetic qualifier
+/// across it (enforced with a `debug_assert`).
+///
+/// Subquery inner plans are separate resolution universes: they are marked
+/// recursively with fresh demand state. (A correlated inner reference to an
+/// OUTER join's synthetic alias is not propagated — matching today's
+/// resolution scoping, which never stamps one.)
+fn mark_join_alias_requirements(node: &mut TypedAst) {
+    mark_node(node, false, false);
+}
+
+/// Accumulate `__td_jl`/`__td_jr` qualifier uses in `expr`'s immediate tree
+/// (subquery bodies excluded per the τ walker convention — they resolve
+/// against their own scopes).
+fn synthetic_uses(expr: &Expression, jl: &mut bool, jr: &mut bool) {
+    let mut check = |q: Option<&str>| {
+        if let Some(q) = q {
+            if q.eq_ignore_ascii_case(TD_JOIN_LEFT) {
+                *jl = true;
+            } else if q.eq_ignore_ascii_case(TD_JOIN_RIGHT) {
+                *jr = true;
+            }
+        }
+    };
+    match expr {
+        Expression::ColumnReference(c) => check(c.qualifier.as_deref()),
+        Expression::UnresolvedColumn(u) => check(u.qualifier.as_deref()),
+        Expression::Star(s) => check(s.qualifier.as_deref()),
+        other => {
+            for child in other.children() {
+                synthetic_uses(child, jl, jr);
+            }
+        }
+    }
+}
+
+/// Recurse [`mark_node`] into every analyzed subquery plan carried by
+/// `expr` (fresh demand state — inner plans resolve against their own
+/// scopes).
+fn mark_expr_subplans(expr: &mut Expression) {
+    let mark_plan = |plan: &mut SubqueryPlan| {
+        if let SubqueryPlan::Analyzed(inner) = plan {
+            mark_node(inner, false, false);
+        }
+    };
+    match expr {
+        Expression::InSubquery(i) => {
+            mark_plan(&mut i.subquery);
+            mark_expr_subplans(&mut i.expr);
+        }
+        Expression::ExistsSubquery(e) => mark_plan(&mut e.subquery),
+        Expression::ScalarSubquery(s) => mark_plan(&mut s.subquery),
+        other => {
+            for child in other.children_mut() {
+                mark_expr_subplans(child);
+            }
+        }
+    }
+}
+
+/// Collect synthetic-qualifier uses across `exprs` and mark their subquery
+/// plans, returning the accumulated `(jl, jr)` demands.
+fn scan_exprs<'e>(exprs: impl IntoIterator<Item = &'e mut Expression>) -> (bool, bool) {
+    let (mut jl, mut jr) = (false, false);
+    for e in exprs {
+        synthetic_uses(e, &mut jl, &mut jr);
+        mark_expr_subplans(e);
+    }
+    (jl, jr)
+}
+
+fn mark_node(node: &mut TypedAst, pending_jl: bool, pending_jr: bool) {
+    match &mut node.op {
+        TypedOp::Join {
+            left,
+            right,
+            condition,
+            left_requires_synthetic,
+            right_requires_synthetic,
+            ..
+        } => {
+            let (cond_jl, cond_jr) = scan_exprs(condition.iter_mut());
+            *left_requires_synthetic = pending_jl || cond_jl;
+            *right_requires_synthetic = pending_jr || cond_jr;
+            // Synthetic names are per-join-level: demands do not cross into
+            // the sides (inner joins own their own `__td_jl`/`__td_jr`).
+            mark_node(left, false, false);
+            mark_node(right, false, false);
+        }
+        // Schema-passthrough operators: own expression demands compose with
+        // the pending ones and continue toward the join below.
+        TypedOp::Filter { input, condition } => {
+            let (jl, jr) = scan_exprs(std::iter::once(condition));
+            mark_node(input, pending_jl || jl, pending_jr || jr);
+        }
+        TypedOp::Sort { input, order, .. } => {
+            let (jl, jr) = scan_exprs(order.iter_mut().map(|so| so.expr.as_mut()));
+            mark_node(input, pending_jl || jl, pending_jr || jr);
+        }
+        TypedOp::SampleBy { input, col, .. } => {
+            let (jl, jr) = scan_exprs(std::iter::once(col));
+            mark_node(input, pending_jl || jl, pending_jr || jr);
+        }
+        TypedOp::NaFill { input, values, .. } => {
+            let (jl, jr) = scan_exprs(values.iter_mut());
+            mark_node(input, pending_jl || jl, pending_jr || jr);
+        }
+        TypedOp::Limit { input, .. }
+        | TypedOp::Sample { input, .. }
+        | TypedOp::Deduplicate { input, .. }
+        | TypedOp::NaDrop { input, .. }
+        | TypedOp::NaReplace { input, .. } => {
+            mark_node(input, pending_jl, pending_jr);
+        }
+        TypedOp::LateralView { input, columns, .. } => {
+            let (jl, jr) = scan_exprs(columns.iter_mut().map(|(_, e)| e));
+            mark_node(input, pending_jl || jl, pending_jr || jr);
+        }
+        // Re-scoping operators: resolution can never stamp a synthetic
+        // qualifier across them, so no pending demand can arrive here.
+        // Their own expressions resolve against the input scope and start
+        // the demand chain.
+        TypedOp::Project { input, projections } => {
+            debug_assert!(!pending_jl && !pending_jr);
+            let (jl, jr) = scan_exprs(projections.iter_mut());
+            mark_node(input, jl, jr);
+        }
+        TypedOp::Aggregate {
+            input,
+            grouping,
+            aggregates,
+            having,
+            ..
+        } => {
+            debug_assert!(!pending_jl && !pending_jr);
+            let (jl, jr) = scan_exprs(
+                grouping
+                    .iter_mut()
+                    .chain(aggregates.iter_mut())
+                    .chain(having.iter_mut()),
+            );
+            mark_node(input, jl, jr);
+        }
+        TypedOp::WithColumns { input, assignments } => {
+            debug_assert!(!pending_jl && !pending_jr);
+            let (jl, jr) = scan_exprs(assignments.iter_mut().map(|(_, e)| e));
+            mark_node(input, jl, jr);
+        }
+        TypedOp::Pivot {
+            input,
+            grouping,
+            pivot_column,
+            pivot_values,
+            aggregates,
+        } => {
+            debug_assert!(!pending_jl && !pending_jr);
+            let (jl, jr) = scan_exprs(
+                grouping
+                    .iter_mut()
+                    .chain(std::iter::once(pivot_column))
+                    .chain(pivot_values.iter_mut())
+                    .chain(aggregates.iter_mut()),
+            );
+            mark_node(input, jl, jr);
+        }
+        TypedOp::Unpivot { input, .. }
+        | TypedOp::DropColumns { input, .. }
+        | TypedOp::WithColumnsRenamed { input, .. }
+        | TypedOp::Describe { input, .. }
+        | TypedOp::Summary { input, .. }
+        | TypedOp::FreqItems { input, .. } => {
+            debug_assert!(!pending_jl && !pending_jr);
+            mark_node(input, false, false);
+        }
+        // AliasedRelation re-scopes its subtree under the user alias.
+        TypedOp::AliasedRelation { input, .. } => {
+            mark_node(input, false, false);
+        }
+        TypedOp::SetOp { children, .. } => {
+            debug_assert!(!pending_jl && !pending_jr);
+            for child in children {
+                mark_node(child, false, false);
+            }
+        }
+        TypedOp::RecursiveCte {
+            anchor,
+            recursive_term,
+            ..
+        } => {
+            mark_node(anchor, false, false);
+            mark_node(recursive_term, false, false);
+        }
+        // Leaves: `Values`/`LocalRelation` rows and `TableFunction` args are
+        // literal-bearing and resolve against bare scopes — no joins below,
+        // no demands to carry.
+        TypedOp::SingleRow
+        | TypedOp::TableScan { .. }
+        | TypedOp::Values { .. }
+        | TypedOp::LocalRelation { .. }
+        | TypedOp::FileScan { .. }
+        | TypedOp::TableFunction { .. }
+        | TypedOp::Unnest { .. } => {}
+    }
 }
 
 // ── Public helpers ──────────────────────────────────────────────────────────
@@ -1913,6 +2146,10 @@ fn analyze_join(
             right_plan_ids,
             derived_left_schema,
             derived_right_schema,
+            // Stamped by the `mark_join_alias_requirements` post-pass once
+            // the whole tree is analyzed (demands flow top-down).
+            left_requires_synthetic: false,
+            right_requires_synthetic: false,
         },
         output_schema,
     ))
@@ -5281,6 +5518,159 @@ mod tests {
                 ("t".to_owned(), 4..5),
             ]
         );
+    }
+
+    // ── mark_join_alias_requirements ──────────────────────────────────────
+
+    /// Extract a Join's stamped synthetic-alias flags.
+    fn join_flags(typed: &TypedAst) -> (bool, bool) {
+        match &typed.op {
+            TypedOp::Join {
+                left_requires_synthetic,
+                right_requires_synthetic,
+                ..
+            } => (*left_requires_synthetic, *right_requires_synthetic),
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    /// Plan-id-tagged unresolved column (DataFrame disambiguation shape).
+    fn pcol(name: &str, plan_id: i64) -> Expression {
+        Expression::UnresolvedColumn(UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: None,
+            plan_id: Some(plan_id),
+        })
+    }
+
+    /// `emp` (plan_id 1) ⋈ `dept` (plan_id 2) with the given condition.
+    fn plan_id_join(condition: Option<Expression>) -> CommonAst {
+        CommonAst::new(CommonOp::Join {
+            left: Box::new(emp_scan()),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition,
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![1],
+            right_plan_ids: vec![2],
+        })
+    }
+
+    #[test]
+    fn join_flags_set_when_condition_carries_plan_id_ambiguity() {
+        let bt = base_types_with_emp_dept();
+        // `dept_id` exists on both sides — the plan_id-stamped refs become
+        // `__td_jl.dept_id` / `__td_jr.dept_id`, demanding synthetic aliases.
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(pcol("dept_id", 1)),
+            right: Box::new(pcol("dept_id", 2)),
+        });
+        let typed = analyze(plan_id_join(Some(cond)), &bt).unwrap();
+        assert_eq!(join_flags(&typed), (true, true));
+    }
+
+    #[test]
+    fn join_flags_clear_for_user_qualified_condition() {
+        let bt = base_types_with_emp_dept();
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(qcol("e", "dept_id")),
+            right: Box::new(qcol("d", "dept_id")),
+        });
+        let ast = join(
+            aliased_scan("emp", "e"),
+            aliased_scan("dept", "d"),
+            JoinType::Inner,
+            Some(cond),
+        );
+        let typed = analyze(ast, &bt).unwrap();
+        assert_eq!(join_flags(&typed), (false, false));
+    }
+
+    #[test]
+    fn join_flags_propagate_from_ancestor_through_passthrough() {
+        let bt = base_types_with_emp_dept();
+        // Table-name-qualified condition — resolves via the qualifier scope,
+        // so the condition itself stamps no synthetic names…
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(qcol("emp", "dept_id")),
+            right: Box::new(qcol("dept", "dept_id")),
+        });
+        // …but the Project above (through a Filter passthrough) references
+        // the ambiguous `dept_id` with a plan_id → `__td_jl.dept_id` demand.
+        let filtered = CommonAst::new(CommonOp::Filter {
+            input: Box::new(plan_id_join(Some(cond))),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Gt,
+                left: Box::new(unresolved_col("salary")),
+                right: Box::new(lit_double(0.0)),
+            }),
+        });
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(filtered),
+            projections: vec![pcol("dept_id", 1)],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        // Walk Project → Filter → Join and check the stamped flags.
+        let TypedOp::Project { input, .. } = &typed.op else {
+            panic!("expected Project");
+        };
+        let TypedOp::Filter { input, .. } = &input.op else {
+            panic!("expected Filter");
+        };
+        let (left_flag, right_flag) = join_flags(input);
+        assert!(
+            left_flag,
+            "ancestor __td_jl demand must reach the join through the Filter"
+        );
+        // The condition resolved via table-name qualifiers (no synthetic
+        // stamps), and no ancestor demands the right side.
+        assert!(!right_flag);
+    }
+
+    #[test]
+    fn join_flags_do_not_leak_into_nested_joins() {
+        let bt = base_types_for(&[
+            ("emp", emp_schema()),
+            ("dept", dept_schema()),
+            ("bonus", dept_schema()),
+        ]);
+        let inner_cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(qcol("emp", "dept_id")),
+            right: Box::new(qcol("dept", "dept_id")),
+        });
+        let inner = join(emp_scan(), scan("dept"), JoinType::Inner, Some(inner_cond));
+        let outer_cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(pcol("dept_id", 7)),
+            right: Box::new(pcol("dept_name", 8)),
+        });
+        let outer = CommonAst::new(CommonOp::Join {
+            left: Box::new(inner),
+            right: Box::new(scan("bonus")),
+            join_type: JoinType::Inner,
+            condition: Some(outer_cond),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![7],
+            right_plan_ids: vec![8],
+        });
+        let typed = analyze(outer, &bt).unwrap();
+        // Outer: pid-7 `dept_id` is ambiguous across the merged schema
+        // (emp.dept_id, dept.dept_id, bonus.dept_id) → __td_jl stamped.
+        let (outer_left, _) = join_flags(&typed);
+        assert!(outer_left);
+        // Inner join must stay unmarked — synthetic names are per-level.
+        let TypedOp::Join { left, .. } = &typed.op else {
+            panic!("expected Join");
+        };
+        assert_eq!(join_flags(left), (false, false));
     }
 
     // ── shared TypedAst extractors ────────────────────────────────────────

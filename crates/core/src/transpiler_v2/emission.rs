@@ -1079,8 +1079,8 @@ fn render_recursive_cte(
 
 /// Render a `SetOp` (UNION / INTERSECT / EXCEPT). Each child is wrapped
 /// with a per-column `CAST(col AS <widened_type>)` projection so the union'd
-/// column types match the analyzer's widened schema (per ADR-006 refinement
-/// + Open Decision 5). `UNION BY NAME` is deferred (analyzer surfaces it as
+/// column types match the analyzer's widened schema (per ADR-006 refinement +
+/// Open Decision 5). `UNION BY NAME` is deferred (analyzer surfaces it as
 /// `PuntedOperator`); it never reaches this renderer.
 fn render_set_op(
     kind: crate::transpiler_v2::ast::SetOpKind,
@@ -2796,7 +2796,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             if f.args.is_empty() {
                 return Ok("map([]::VARCHAR[], []::VARCHAR[])".to_owned());
             }
-            if f.args.len() % 2 != 0 {
+            if !f.args.len().is_multiple_of(2) {
                 bail_boundary_fn!(f.name.clone(), "`create_map` requires an even arg count");
             }
             let keys = sql_join(f.args.iter().step_by(2), ", ", |k| render_expr(k, schema))?;
@@ -3971,7 +3971,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // Spark's `named_struct(k1, v1, k2, v2, ...)` → DuckDB
         // `struct_pack(k1 := v1, k2 := v2, ...)`.
         "named_struct" => {
-            if f.args.len() % 2 != 0 || f.args.is_empty() {
+            if !f.args.len().is_multiple_of(2) || f.args.is_empty() {
                 bail_boundary_fn!(
                     f.name.clone(),
                     "`named_struct` requires an even, non-zero arg count",
@@ -10925,7 +10925,7 @@ mod tests {
     #[test]
     fn render_double_literal_casts_to_double() {
         let lit = Expression::Literal(Literal {
-            value: LiteralValue::Double(3.14),
+            value: LiteralValue::Double(12.75),
             data_type: DataType::Double,
         });
         let sql = render_expr(&lit, &empty_schema()).expect("render double literal");

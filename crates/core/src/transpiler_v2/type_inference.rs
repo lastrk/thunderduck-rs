@@ -992,7 +992,7 @@ impl TypeInferenceEngine {
             let int_digits = raw_precision - raw_scale;
             let min_scale = raw_scale.min(6);
             let scale = ((38i16 - int_digits).max(min_scale)).max(0);
-            let precision = (int_digits + scale).min(38).max(0);
+            let precision = (int_digits + scale).clamp(0, 38);
             (precision as u8, scale as u8)
         }
     }

@@ -962,7 +962,7 @@ impl Expression {
                 // through to the default arm so the shared inference path
                 // returns `DataType::Unresolved` rather than fabricating a
                 // fake schema.
-                if !f.args.is_empty() && f.args.len() % 2 == 0 {
+                if !f.args.is_empty() && f.args.len().is_multiple_of(2) {
                     let fields: Option<Vec<StructField>> = f
                         .args
                         .chunks_exact(2)
@@ -1047,7 +1047,7 @@ impl Expression {
             // here where the whole arg list is available. Corpus anchor:
             // cx-002. An empty or odd-length arg list falls through to the
             // shared resolver.
-            "map" | "create_map" if !f.args.is_empty() && f.args.len() % 2 == 0 => {
+            "map" | "create_map" if !f.args.is_empty() && f.args.len().is_multiple_of(2) => {
                 let mut key_ty = f.args[0].data_type(schema);
                 let mut val_ty = f.args[1].data_type(schema);
                 let mut value_nullable = f.args[1].nullable(schema);
@@ -1225,7 +1225,7 @@ impl Expression {
                 f.args.iter().all(|a| a.nullable(schema))
             }
             "when" => {
-                if f.args.len() % 2 == 0 {
+                if f.args.len().is_multiple_of(2) {
                     true
                 } else {
                     let then_nullable =

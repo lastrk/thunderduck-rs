@@ -18,6 +18,9 @@ use crate::service::ThunderduckService;
 // Include proto-generated code.
 pub mod proto {
     pub mod spark {
+        // Generated prost types mirror the upstream .proto message shapes
+        // verbatim; we don't control their enum variant sizes.
+        #[allow(clippy::large_enum_variant)]
         pub mod connect {
             tonic::include_proto!("spark.connect");
         }

@@ -70,6 +70,10 @@ static SERVER_SESSION_ID: std::sync::LazyLock<String> =
 /// ([`resolve_implicit_pivots`]) between conversion and [`finalize`] — the
 /// discovery needs the live `DuckDbSession`, which τ's analyzer (per INV10)
 /// cannot reach.
+// `Status` is the standard gRPC error channel used across this whole file
+// (25+ signatures return `Result<_, Status>`); boxing it here alone would be
+// inconsistent with the rest of the layer for one allocation on the reject path.
+#[allow(clippy::result_large_err)]
 pub(crate) fn relation_to_common_ast(relation: &proto::Relation) -> Result<CommonAst, Status> {
     use proto::relation::RelType;
     match &relation.rel_type {
@@ -335,6 +339,9 @@ async fn discover_pivot_values(
 ///
 /// This is the data-dependent discovery half of the schema-less FileScan
 /// support — same architectural pattern as [`discover_pivot_values`].
+// `Status` is the standard gRPC error channel across this file; boxing it
+// here alone would be inconsistent (see `relation_to_common_ast`).
+#[allow(clippy::result_large_err)]
 async fn discover_parquet_schema(
     paths: &[String],
     options: &[(String, String)],
@@ -739,18 +746,18 @@ struct StreamingState {
 /// 1. Emit ONE `ExecutePlanResponse.schema` frame (proto-schema, decoded on
 ///    the client via `proto_schema_to_pyspark_data_type` — has arms for all
 ///    three Spark interval kinds).
-/// 2. For each `thunderduck_core::runtime::StreamBatch::Batch(rb)`:
-///    a. `arrow_interval_transcode::apply` — returns `Vec<ArrayRef>` with
-///       DayTimeInterval columns rewritten from DuckDB's `Interval(MonthDayNano)`
-///       to Spark's `Duration(Microsecond)`. No intermediate `RecordBatch`.
-///    b. The wire `Arc<Schema>` is built ONCE from the first batch (via
-///       `arrow_schema_stamp::build_stamped_schema`) and reused verbatim on
-///       every subsequent batch (Arc::clone is refcount-only).
-///    c. A single `RecordBatch::try_new_with_options(stamped_schema, cols, ...)`
-///       call constructs the outbound batch in one shot — no
-///       transcode→stamp→wrap chain of temporaries (perf finding MED-1,
-///       `.agent-output/004-perf-findings.md`).
-///    d. Emit an `ArrowBatch` frame.
+/// 2. For each `thunderduck_core::runtime::StreamBatch::Batch(rb)`, in order:
+///    `arrow_interval_transcode::apply` returns `Vec<ArrayRef>` with
+///    DayTimeInterval columns rewritten from DuckDB's `Interval(MonthDayNano)`
+///    to Spark's `Duration(Microsecond)` (no intermediate `RecordBatch`); the
+///    wire `Arc<Schema>` is built ONCE from the first batch (via
+///    `arrow_schema_stamp::build_stamped_schema`) and reused verbatim on every
+///    subsequent batch (`Arc::clone` is refcount-only); a single
+///    `RecordBatch::try_new_with_options(stamped_schema, cols, ...)` call then
+///    constructs the outbound batch in one shot — no transcode→stamp→wrap
+///    chain of temporaries (perf finding MED-1,
+///    `.agent-output/004-perf-findings.md`) — before an `ArrowBatch` frame is
+///    emitted.
 /// 3. On `thunderduck_core::runtime::StreamBatch::Complete` — emit `ResultComplete`.
 /// 4. On `thunderduck_core::runtime::StreamBatch::Error(msg)` — reclassify via
 ///    `ThunderduckError::DuckDb(msg).reclassified_spark_runtime()` so the

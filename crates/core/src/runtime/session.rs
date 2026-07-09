@@ -203,7 +203,7 @@ impl VScalar for JsonStripNulls {
         // `duckdb_string_t` and the batch carries exactly `len` rows.
         let values = unsafe { input_vec.as_slice_with_len::<duckdb_string_t>(len) };
         let mut out_vec = output.flat_vector();
-        for i in 0..len {
+        for (i, &str_t) in values.iter().enumerate() {
             if input_vec.row_is_null(i as u64) {
                 out_vec.set_null(i);
                 continue;
@@ -211,7 +211,7 @@ impl VScalar for JsonStripNulls {
             // `DuckString::as_str` borrows through the mutable `string_t`
             // descriptor; copy the descriptor to a local so we do not alias
             // the input slice.
-            let mut str_t = values[i];
+            let mut str_t = str_t;
             let borrowed = DuckString::new(&mut str_t).as_str();
             let raw: &str = borrowed.as_ref();
             let stripped = match serde_json::from_str::<serde_json::Value>(raw) {

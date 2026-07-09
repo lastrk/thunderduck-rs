@@ -279,7 +279,7 @@ fn order_by_all_exprs(
             .clone();
         out.push(OrderByExpr {
             expr,
-            options: options.clone(),
+            options: *options,
             with_fill: None,
         });
     }
@@ -562,11 +562,7 @@ fn lower_select(mut select: Select, cte_scope: &CteScope) -> Result<CommonAst, E
 
     let has_group_by =
         !matches!(&select.group_by, GroupByExpr::Expressions(v, m) if v.is_empty() && m.is_empty());
-    let has_aggregates = has_group_by
-        || select
-            .projection
-            .iter()
-            .any(|item| select_item_has_aggregate(item));
+    let has_aggregates = has_group_by || select.projection.iter().any(select_item_has_aggregate);
 
     let plan = if has_aggregates {
         lower_aggregate_select(

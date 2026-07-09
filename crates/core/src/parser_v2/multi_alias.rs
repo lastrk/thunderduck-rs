@@ -51,7 +51,7 @@ use super::dialect::SparkDialect;
 pub(super) fn strip_trailing_multi_alias(
     expr_sql: &str,
 ) -> Result<(String, Option<Vec<String>>), EmissionError> {
-    let dialect = SparkDialect::default();
+    let dialect = SparkDialect;
     let tokens =
         Tokenizer::new(&dialect, expr_sql)
             .tokenize()

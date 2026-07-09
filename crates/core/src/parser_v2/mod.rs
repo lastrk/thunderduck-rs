@@ -47,7 +47,7 @@ impl SparkSqlParserV2 {
             rewritten_sql.as_str()
         };
 
-        let dialect = SparkDialect::default();
+        let dialect = SparkDialect;
         // τ fix pass (review M2): sqlparser errors are boundary
         // failures — the input never reached `CommonAst`, so the correct
         // category is `ProtoShape` (input τ can't ingest), not `Op`

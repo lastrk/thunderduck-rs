@@ -652,16 +652,83 @@ def corpus_inputs_thunderduck(spark_thunderduck):
 # SQL-corpus input fixtures: register the SQL corpus's temp views (emp, dept,
 # emp2, nums, raw) once per module so `spark.sql("... FROM emp ...")` resolves
 # them. Mirrors the DataFrame corpus_inputs_* fixtures but for the SQL front-end
-# gate (test_sql_corpus_differential.py).
+# gate (test_sql_corpus_differential.py). The corpus's tpch/tpcds clusters
+# additionally reference the parquet-backed TPC tables, registered here from
+# the same data dirs the legacy TPC suites used.
+TPCH_TABLES = [
+    'lineitem', 'orders', 'customer', 'part',
+    'supplier', 'partsupp', 'nation', 'region'
+]
+
+# Table names that exist in BOTH benchmarks with different schemas (TPC-H
+# customer: c_custkey/c_mktsegment/...; TPC-DS customer: c_customer_sk/...).
+# One session namespace cannot hold both at once — these are registered
+# per-category by `tpc_view_switcher`, not at module setup. The legacy suites
+# never collided only because tpch and tpcds tests lived in separate modules.
+TPC_COLLIDING_TABLES = ['customer']
+
+
+def _register_tpc_views(spark, tpch_data_dir, tpcds_data_dir):
+    """Register the TPC-H + TPC-DS parquet-backed temp views on `spark`.
+
+    Registers every non-colliding table from both benchmarks; the colliding
+    ones (see `TPC_COLLIDING_TABLES`) are re-pointed per test category by the
+    `tpc_view_switcher` fixture. Skips the whole module if a parquet file is
+    missing — same behavior as the retired tpch_tables_* / tpcds_tables_*
+    fixtures this replaces.
+    """
+    for data_dir, tables in ((tpch_data_dir, TPCH_TABLES), (tpcds_data_dir, TPCDS_TABLES)):
+        for table in tables:
+            if table in TPC_COLLIDING_TABLES:
+                continue
+            parquet_path = data_dir / f"{table}.parquet"
+            if not parquet_path.exists():
+                pytest.skip(f"TPC table not found: {parquet_path}")
+            spark.read.parquet(str(parquet_path)).createOrReplaceTempView(table)
+
+
 @pytest.fixture(scope="module")
-def sql_corpus_reference(spark_reference):
+def tpc_view_switcher(spark_reference, spark_thunderduck, tpch_data_dir, tpcds_data_dir):
+    """Re-point the benchmark-colliding temp views for a tpch/tpcds case.
+
+    Called by the SQL-corpus test with the case's category before each case.
+    Non-TPC categories are a no-op; consecutive same-category cases are a
+    no-op (the corpus lists all tpch cases, then all tpcds cases, so the
+    re-registration happens at most twice per engine per run). The τ side is
+    tolerant — a registration failure surfaces as that case's own failure
+    (unresolved view) rather than an aborting fixture ERROR.
+    """
+    state = {}
+
+    def switch(category):
+        if category not in ("tpch", "tpcds") or state.get("current") == category:
+            return
+        data_dir = tpch_data_dir if category == "tpch" else tpcds_data_dir
+        for table in TPC_COLLIDING_TABLES:
+            parquet_path = data_dir / f"{table}.parquet"
+            if not parquet_path.exists():
+                pytest.skip(f"TPC table not found: {parquet_path}")
+            spark_reference.read.parquet(str(parquet_path)).createOrReplaceTempView(table)
+            try:
+                spark_thunderduck.read.parquet(str(parquet_path)).createOrReplaceTempView(table)
+            except Exception:
+                pass
+        state["current"] = category
+
+    return switch
+
+
+@pytest.fixture(scope="module")
+def sql_corpus_reference(spark_reference, tpch_data_dir, tpcds_data_dir):
     """Register the SQL corpus's temp views on the Spark reference session."""
     from differential.sql_corpus import build_inputs
-    return build_inputs(spark_reference)
+    inputs = build_inputs(spark_reference)
+    _register_tpc_views(spark_reference, tpch_data_dir, tpcds_data_dir)
+    return inputs
 
 
 @pytest.fixture(scope="module")
-def sql_corpus_thunderduck(spark_thunderduck):
+def sql_corpus_thunderduck(spark_thunderduck, tpch_data_dir, tpcds_data_dir):
     """Register the SQL corpus's temp views on the Thunderduck session.
 
     Tolerant by design: τ's temp-view registration may fail for some inputs, so
@@ -672,7 +739,9 @@ def sql_corpus_thunderduck(spark_thunderduck):
     """
     from differential.sql_corpus import build_inputs
     try:
-        return build_inputs(spark_thunderduck)
+        inputs = build_inputs(spark_thunderduck)
+        _register_tpc_views(spark_thunderduck, tpch_data_dir, tpcds_data_dir)
+        return inputs
     except Exception:
         return {}
 

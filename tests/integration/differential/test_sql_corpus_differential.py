@@ -96,6 +96,7 @@ def test_case(
     spark_thunderduck,
     sql_corpus_reference,
     sql_corpus_thunderduck,
+    tpc_view_switcher,
 ):
     """One pytest test per Case in the SQL corpus.
 
@@ -107,6 +108,11 @@ def test_case(
     the τ side) surfaces as a test FAILURE for that case — the signal this
     corpus exists to drive.
     """
+    # tpch/tpcds cases: re-point the benchmark-colliding temp views (e.g.
+    # `customer` exists in both benchmarks with different schemas). No-op for
+    # every other category and for consecutive same-category cases.
+    tpc_view_switcher(case.category)
+
     # Error-parity cases: BOTH engines are expected to raise the same Spark error
     # class (ADR-006 tri-state / ADR-016 ANSI). Evaluate each side independently
     # and reconcile — mirrors the DataFrame corpus harness. `_sql_outcome` also

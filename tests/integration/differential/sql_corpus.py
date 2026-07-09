@@ -67,6 +67,7 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from pyspark.sql import DataFrame, SparkSession
@@ -691,6 +692,53 @@ case("num-029", "numeric_tower", "sum(DISTINCT)/avg(DISTINCT) over decimal", "SE
 case("num-030", "numeric_tower", "bitwise AND/OR/XOR over short/int/bigint", "SELECT a & b ab, a | b ob, sml ^ a xb, lng & a lb FROM nums", flags=("schema_only",))
 case("num-031", "numeric_tower", "shift/bit_count over integral tower", "SELECT shiftleft(a, 2) shl, shiftright(lng, 1) shr, bit_count(a) bc FROM nums", flags=("schema_only",))
 case("num-032", "numeric_tower", "hex/bin over int vs bigint", "SELECT hex(a) ha, hex(lng) hl, bin(a) ba FROM nums", flags=("schema_only",))
+
+
+# ── 19. TPC-H / TPC-DS clusters (migrated from the legacy differential files) ─
+#
+# Query text is loaded VERBATIM at import time from the canonical .sql files
+# (tests/integration/sql/{tpch,tpcds}_queries/) — those files stay the single
+# source of truth, exactly as the legacy test_differential_v2.py /
+# test_tpcds_differential.py loaders read them. These clusters reference the
+# parquet-backed TPC temp views (lineitem, orders, ..., store_sales, ...),
+# registered by the sql_corpus_* fixtures in conftest.py alongside the
+# in-memory corpus views. Red cases here are the τ fitness signal (ADR-022) —
+# see .agent-output/tpc-baseline.md for the pre-migration pass/fail oracle.
+
+_SQL_QUERIES_DIR = Path(__file__).resolve().parent.parent / "sql"
+
+for _n in range(1, 23):
+    case(
+        f"tpch-q{_n:02d}",
+        "tpch",
+        f"TPC-H Q{_n} (SQL)",
+        (_SQL_QUERIES_DIR / "tpch_queries" / f"q{_n}.sql").read_text(),
+    )
+
+# The exact query set the legacy suite exercised (test_tpcds_differential.py
+# STANDARD_QUERIES + VARIANT_QUERIES): Q36 excluded (DuckDB limitation),
+# Q72 excluded (Spark OOM), Q90 excluded (Spark DIVIDE_BY_ZERO bug).
+_TPCDS_QUERY_IDS = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    11, 12, 13, 15, 16, 17, 18, 19, 20,
+    21, 22, 25, 26, 27, 28, 29, 30,
+    31, 32, 33, 34, 35, 37, 38,
+    40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+    51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+    61, 62, 63, 64, 65, 66, 67, 68, 69, 70,
+    71, 73, 74, 75, 76, 77, 78, 79, 80,
+    81, 82, 83, 84, 85, 86, 87, 88, 89,
+    91, 92, 93, 94, 95, 96, 97, 98, 99,
+    "14a", "14b", "23a", "23b", "24a", "24b", "39a", "39b",
+]
+
+for _q in _TPCDS_QUERY_IDS:
+    case(
+        f"tpcds-q{str(_q):0>3}" if isinstance(_q, int) else f"tpcds-q{_q:0>4}",
+        "tpcds",
+        f"TPC-DS Q{_q} (SQL)",
+        (_SQL_QUERIES_DIR / "tpcds_queries" / f"q{_q}.sql").read_text(),
+    )
 
 
 # ---------------------------------------------------------------------------

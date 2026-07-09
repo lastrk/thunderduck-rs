@@ -459,3 +459,24 @@ red in any later pass.
   as a pytest arg" (silently ran the full suite when given a file path) —
   runner ergonomics fix queued as tech debt. My pass-4 lesson ("pass file
   paths instead of -k") was WRONG for this runner — corrected in lessons.md.
+
+## Pass 6 — 2026-07-09 — ROLLUP/CUBE grouping-column nullability
+
+- **Hypothesis:** the 11 multidim AssertionErrors share one schema root cause.
+- **Confirmed:** Spark's Expand node marks EVERY grouping column of a
+  ROLLUP/CUBE/GROUPING SETS aggregate nullable (super-aggregate rows hold
+  NULL); τ preserved source nullability. grouping()/grouping_id() types were
+  ALREADY correct (Byte/Long) — the nullable mismatch masked everything.
+- **Fix:** 24 lines in analyzer.rs Aggregate arm — force nullable=true on
+  output fields matching grouping-column names under Rollup/Cube/
+  GroupingSets; plain GroupBy untouched (flip_all_nullable precedent).
+- **Review:** APPROVE, 0 Critical/High. Known Medium (follow-up, not
+  blocking): matching is name-based, so an aggregate ALIASED to a grouping
+  column's name would be wrongly forced nullable (Spark matches by ExprId);
+  bounded to alias collisions, errs toward over-nullable, no corpus witness.
+- **Gate:** 1216→1230 (Δ +14, zero regressions): multidim +11 (21/21 file
+  green), SQL corpus +3 collateral (311/396).
+- **Reflect:** clean; single-root-cause hypothesis validated by an 11-case
+  cluster falling to one rule. The "nullable mismatch masks deeper diffs"
+  pattern recurs (pass 18, this) — diagnose schema mismatches BEFORE value
+  mismatches.

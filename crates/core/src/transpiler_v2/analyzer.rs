@@ -921,6 +921,30 @@ fn analyze_node(
                     .iter()
                     .map(|e| expr_field(e, &typed_input.resolved_schema)),
             );
+            // Spark's Expand node (ROLLUP / CUBE / GROUPING SETS) inserts
+            // NULL into every grouping-column position for super-aggregate
+            // rows, so those columns are unconditionally nullable in the
+            // output schema — regardless of source nullability.  Plain
+            // GROUP BY preserves source nullability.  Precedent:
+            // `flip_all_nullable` for outer-join padding.
+            let forces_nullable = matches!(
+                grouping_kind,
+                crate::transpiler_v2::ast::GroupingKind::Rollup
+                    | crate::transpiler_v2::ast::GroupingKind::Cube
+                    | crate::transpiler_v2::ast::GroupingKind::GroupingSets
+            );
+            if forces_nullable && !grouping.is_empty() {
+                let grouping_names: Vec<String> =
+                    grouping.iter().map(expression_output_name).collect();
+                for field in &mut output_fields {
+                    if grouping_names
+                        .iter()
+                        .any(|gn| gn.eq_ignore_ascii_case(&field.name))
+                    {
+                        field.nullable = true;
+                    }
+                }
+            }
             let output_schema = StructType::new(output_fields);
             Ok(TypedAst {
                 op: TypedOp::Aggregate {

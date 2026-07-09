@@ -9196,13 +9196,13 @@ mod tests {
         // client-side, and `materialise_stats_cols` expands empty to all
         // input columns). We call `render_freq_items` directly to exercise
         // the defensive guard.
-        let typed_input = TypedAst {
-            op: TypedOp::TableScan {
+        let typed_input = TypedAst::new(
+            TypedOp::TableScan {
                 table: "emp".to_owned(),
                 alias: None,
             },
-            resolved_schema: StructType::empty(),
-        };
+            StructType::empty(),
+        );
         let err = super::render_freq_items(&typed_input, &[], 0.01).unwrap_err();
         expect_unsupported(err, UnsupportedKind::Op, "FreqItems", &[]);
     }
@@ -9254,13 +9254,13 @@ mod tests {
         // ADR-022 Thunderduck-boundary: DuckDB has no row-level sampling
         // with replacement. Emission surfaces `UnsupportedOp`.
         let _g = tap_guard();
-        let typed_input = TypedAst {
-            op: TypedOp::TableScan {
+        let typed_input = TypedAst::new(
+            TypedOp::TableScan {
                 table: "emp".to_owned(),
                 alias: None,
             },
-            resolved_schema: StructType::empty(),
-        };
+            StructType::empty(),
+        );
         let err = super::render_sample(&typed_input, 0.0, 0.5, true, Some(11)).unwrap_err();
         expect_unsupported(err, UnsupportedKind::Op, "Sample[with_replacement]", &[]);
     }
@@ -9324,13 +9324,13 @@ mod tests {
     #[test]
     fn render_sample_by_empty_fractions_emits_where_false() {
         let _g = tap_guard();
-        let typed_input = TypedAst {
-            op: TypedOp::TableScan {
+        let typed_input = TypedAst::new(
+            TypedOp::TableScan {
                 table: "emp".to_owned(),
                 alias: None,
             },
-            resolved_schema: emp_schema(),
-        };
+            emp_schema(),
+        );
         let col_ref = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: None,
@@ -11615,13 +11615,13 @@ mod tests {
     }
 
     fn typed_table_scan(table: &str, alias: Option<&str>, schema: StructType) -> TypedAst {
-        TypedAst {
-            resolved_schema: schema,
-            op: TypedOp::TableScan {
+        TypedAst::new(
+            TypedOp::TableScan {
                 table: table.to_owned(),
                 alias: alias.map(|s| s.to_owned()),
             },
-        }
+            schema,
+        )
     }
 
     fn tags_col_ref() -> Expression {
@@ -11646,14 +11646,14 @@ mod tests {
             .collect();
         let resolved_schema =
             StructType::merge(&input.resolved_schema, &StructType::new(gen_fields));
-        TypedAst {
-            op: TypedOp::LateralView {
+        TypedAst::new(
+            TypedOp::LateralView {
                 input: Box::new(input),
                 table_alias: "t".to_owned(),
                 columns,
             },
             resolved_schema,
-        }
+        )
     }
 
     #[test]
@@ -11770,16 +11770,16 @@ mod tests {
             data_type: Some(DataType::String),
             nullable: Some(true),
         });
-        let proj = TypedAst {
-            resolved_schema: StructType::new(vec![
-                StructField::not_null("id", DataType::Long),
-                StructField::nullable("tag", DataType::String),
-            ]),
-            op: TypedOp::Project {
+        let proj = TypedAst::new(
+            TypedOp::Project {
                 input: Box::new(lv),
                 projections: vec![id_ref, tag_ref],
             },
-        };
+            StructType::new(vec![
+                StructField::not_null("id", DataType::Long),
+                StructField::nullable("tag", DataType::String),
+            ]),
+        );
         let sql = dispatch_op(&proj.op, &proj.resolved_schema).expect("render");
         // The output must NOT wrap in __td_proj — the alias-transparent-from
         // arm must inline the LATERAL FROM body.

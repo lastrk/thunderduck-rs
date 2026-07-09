@@ -65,14 +65,185 @@ pub type Schema = StructType;
 
 // ── TypedAst / TypedOp ──────────────────────────────────────────────────────
 
-/// A typed plan node: an operator plus its resolved output schema.
-#[derive(Debug, Clone, PartialEq)]
+/// A typed plan node: an operator plus its resolved output schema and the
+/// alias scope that output exposes.
+#[derive(Debug, Clone)]
 pub struct TypedAst {
     /// The typed operator this node represents.
     pub op: TypedOp,
     /// The schema of the relation produced by this node — every field has
     /// a resolved (non-`Unresolved`) [`DataType`] and a known `nullable` flag.
     pub resolved_schema: StructType,
+    /// The alias set this node's output exposes to enclosing clauses —
+    /// stamped once at construction by [`TypedAst::new`] and consumed by
+    /// both the analyzer's [`ResolveContext`] and emission's block builder.
+    /// The single scope authority (INV2: facts are pushed into the node).
+    pub scope: RelScope,
+}
+
+/// Equality deliberately ignores `scope`: it is derived data, fully
+/// determined by `(op, resolved_schema)`, and existing analyzer tests
+/// assert equality over the semantic pair only.
+impl PartialEq for TypedAst {
+    fn eq(&self, other: &Self) -> bool {
+        self.op == other.op && self.resolved_schema == other.resolved_schema
+    }
+}
+
+impl TypedAst {
+    /// Build a typed node, stamping the [`RelScope`] its output exposes.
+    ///
+    /// Analysis is strictly bottom-up, so every child inside `op` is already
+    /// stamped; the scope derivation is therefore shallow (reads children's
+    /// `scope` fields, never re-walks subtrees).
+    pub fn new(op: TypedOp, resolved_schema: StructType) -> Self {
+        let scope = RelScope::of(&op, &resolved_schema);
+        Self {
+            op,
+            resolved_schema,
+            scope,
+        }
+    }
+}
+
+/// The alias scope a relation's OUTPUT exposes: which qualifiers (table
+/// names, user aliases, lateral-view table aliases) bind to which contiguous
+/// field ranges of the node's `resolved_schema`, plus the plan_id →
+/// join-side bindings used for DataFrame `plan_id` disambiguation.
+///
+/// Ranges are relative to THIS node's schema (base 0); consumers offset when
+/// composing (a join's right side shifts by the left side's field count).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RelScope {
+    /// `(qualifier, field-range)` bindings, in tree order.
+    pub aliases: Vec<(String, std::ops::Range<usize>)>,
+    /// `(plan_id, field-range, TD_JOIN_LEFT | TD_JOIN_RIGHT)` bindings,
+    /// OUTERMOST join first — `QualifierScopes::lookup_plan_id` uses first
+    /// match, so the nearest enclosing join's side qualifier wins.
+    pub plan_ids: Vec<(i64, std::ops::Range<usize>, &'static str)>,
+}
+
+impl RelScope {
+    /// Derive the scope a just-built operator exposes. Shallow: children are
+    /// already stamped, so this reads their `scope` fields and offsets
+    /// ranges — it never re-walks a subtree.
+    ///
+    /// Binding rules (formerly `collect_qualifier_bindings`):
+    /// - `TableScan{table, alias}`: bind `table` (and `alias`, if present) to
+    ///   the full range.
+    /// - `AliasedRelation{alias}`: bind `alias` to the full range; the child's
+    ///   scope is dropped — emission re-scopes everything under it to `alias`.
+    /// - `Join` with non-empty `using_columns`: EMPTY. USING output reorders
+    ///   and dedups columns, so no contiguous-range invariant holds — USING
+    ///   joins keep resolving via the legacy name-only path.
+    /// - `Join{LeftSemi | LeftAnti}`: left side only — the right side
+    ///   contributes no columns to the output schema.
+    /// - Any other `Join`: own plan_id entries FIRST (outermost-wins), then
+    ///   the left child's scope at base 0 and the right child's offset by
+    ///   `left.resolved_schema.len()`.
+    /// - Schema-verbatim passthroughs (`Filter` / `Sort` / `Limit` / `Sample`
+    ///   / `SampleBy` / `Deduplicate` / `NaFill` / `NaDrop` / `NaReplace`):
+    ///   the child's scope verbatim — these clone the input schema
+    ///   field-for-field (position/count preserved), so the contiguous-range
+    ///   invariant holds through them.
+    /// - `LateralView`: the input's scope, plus `table_alias` bound to the
+    ///   generated columns' range appended after the input fields.
+    /// - Everything else (`Project` / `Aggregate` / `SetOp` / `WithColumns` /
+    ///   `Values` / `LocalRelation` / `TableFunction` / `Pivot` / ...):
+    ///   EMPTY — these operators retype or reshuffle columns, so no alias
+    ///   binding from further down is valid against the CURRENT schema.
+    fn of(op: &TypedOp, resolved_schema: &StructType) -> Self {
+        match op {
+            TypedOp::TableScan { table, alias } => {
+                let range = 0..resolved_schema.len();
+                let mut aliases = vec![(table.clone(), range.clone())];
+                if let Some(a) = alias {
+                    aliases.push((a.clone(), range));
+                }
+                Self {
+                    aliases,
+                    plan_ids: Vec::new(),
+                }
+            }
+            TypedOp::AliasedRelation { alias, .. } => Self {
+                aliases: vec![(alias.clone(), 0..resolved_schema.len())],
+                plan_ids: Vec::new(),
+            },
+            TypedOp::Join {
+                using_columns,
+                left,
+                right,
+                join_type,
+                left_plan_ids,
+                right_plan_ids,
+                ..
+            } => {
+                if !using_columns.is_empty() {
+                    return Self::default();
+                }
+                let left_len = left.resolved_schema.len();
+                let left_range = 0..left_len;
+                let right_range = left_len..left_len + right.resolved_schema.len();
+                let keep_right = !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
+
+                let mut plan_ids = Vec::new();
+                for &pid in left_plan_ids {
+                    plan_ids.push((pid, left_range.clone(), TD_JOIN_LEFT));
+                }
+                if keep_right {
+                    for &pid in right_plan_ids {
+                        plan_ids.push((pid, right_range.clone(), TD_JOIN_RIGHT));
+                    }
+                }
+                plan_ids.extend(left.scope.plan_ids.iter().cloned());
+                let mut aliases = left.scope.aliases.clone();
+                if keep_right {
+                    let offset = |r: &std::ops::Range<usize>| r.start + left_len..r.end + left_len;
+                    plan_ids.extend(
+                        right
+                            .scope
+                            .plan_ids
+                            .iter()
+                            .map(|(pid, r, side)| (*pid, offset(r), *side)),
+                    );
+                    aliases.extend(
+                        right
+                            .scope
+                            .aliases
+                            .iter()
+                            .map(|(name, r)| (name.clone(), offset(r))),
+                    );
+                }
+                Self { aliases, plan_ids }
+            }
+            TypedOp::Filter { input, .. }
+            | TypedOp::Sort { input, .. }
+            | TypedOp::Limit { input, .. }
+            | TypedOp::Sample { input, .. }
+            | TypedOp::SampleBy { input, .. }
+            | TypedOp::Deduplicate { input, .. }
+            | TypedOp::NaFill { input, .. }
+            | TypedOp::NaDrop { input, .. }
+            | TypedOp::NaReplace { input, .. } => input.scope.clone(),
+            // LateralView appends generated columns after the input. Keep the
+            // input's bindings, then bind the table_alias to the generated
+            // columns' contiguous range. This makes `t.tag` resolve via the
+            // qualifier-scoped path while `e.tag` correctly does NOT resolve.
+            TypedOp::LateralView {
+                input,
+                table_alias,
+                columns,
+            } => {
+                let mut scope = input.scope.clone();
+                let start = input.resolved_schema.len();
+                scope
+                    .aliases
+                    .push((table_alias.clone(), start..start + columns.len()));
+                scope
+            }
+            _ => Self::default(),
+        }
+    }
 }
 
 /// τ's typed operator set — the analyzer output shape.
@@ -685,10 +856,7 @@ fn passthrough_schema_arm(
     let typed_input = analyze_node(input, base_types, outer)?;
     let resolved_schema = typed_input.resolved_schema.clone();
     let op = build_op(typed_input)?;
-    Ok(TypedAst {
-        op,
-        resolved_schema,
-    })
+    Ok(TypedAst::new(op, resolved_schema))
 }
 
 fn analyze_node(
@@ -698,10 +866,7 @@ fn analyze_node(
 ) -> Result<TypedAst, AnalyzerError> {
     match ast.op {
         // ── Leaves ────────────────────────────────────────────────────────
-        CommonOp::SingleRow => Ok(TypedAst {
-            op: TypedOp::SingleRow,
-            resolved_schema: StructType::empty(),
-        }),
+        CommonOp::SingleRow => Ok(TypedAst::new(TypedOp::SingleRow, StructType::empty())),
 
         CommonOp::TableScan { table, alias } => {
             // resolve: seed schema from base_types.
@@ -715,10 +880,7 @@ fn analyze_node(
             // At τ's analyzer, we don't rewrite field qualifiers into names —
             // the alias is preserved on the operator itself. future τ work's
             // renderer handles the alias projection.
-            Ok(TypedAst {
-                op: TypedOp::TableScan { table, alias },
-                resolved_schema: schema,
-            })
+            Ok(TypedAst::new(TypedOp::TableScan { table, alias }, schema))
         }
 
         CommonOp::Values { rows, column_names } => {
@@ -728,22 +890,22 @@ fn analyze_node(
                 .into_iter()
                 .map(|row| resolve_expr_list(row, &ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(TypedAst {
-                op: TypedOp::Values {
+            Ok(TypedAst::new(
+                TypedOp::Values {
                     rows: typed_rows,
                     column_names,
                 },
-                resolved_schema: schema,
-            })
+                schema,
+            ))
         }
 
-        CommonOp::LocalRelation { schema, rows } => Ok(TypedAst {
-            op: TypedOp::LocalRelation {
+        CommonOp::LocalRelation { schema, rows } => Ok(TypedAst::new(
+            TypedOp::LocalRelation {
                 schema: schema.clone(),
                 rows,
             },
-            resolved_schema: schema,
-        }),
+            schema,
+        )),
 
         CommonOp::FileScan {
             format,
@@ -751,15 +913,15 @@ fn analyze_node(
             schema,
             options,
         } => match schema {
-            Some(s) => Ok(TypedAst {
-                op: TypedOp::FileScan {
+            Some(s) => Ok(TypedAst::new(
+                TypedOp::FileScan {
                     format,
                     paths,
                     schema: s.clone(),
                     options,
                 },
-                resolved_schema: s,
-            }),
+                s,
+            )),
             None => Err(AnalyzerError::PuntedOperator {
                 op: "FileScan".to_owned(),
                 reason: "schema-less FileScan (parquet inference) (not implemented in τ)"
@@ -824,13 +986,13 @@ fn analyze_node(
             // Compute output schema — expand Star; take alias name if present.
             let output_schema =
                 project_output_schema(&projections, &typed_input.resolved_schema, &typed_input.op)?;
-            Ok(TypedAst {
-                op: TypedOp::Project {
+            Ok(TypedAst::new(
+                TypedOp::Project {
                     input: Box::new(typed_input),
                     projections,
                 },
-                resolved_schema: output_schema,
-            })
+                output_schema,
+            ))
         }
 
         CommonOp::Filter { input, condition } => {
@@ -946,8 +1108,8 @@ fn analyze_node(
                 }
             }
             let output_schema = StructType::new(output_fields);
-            Ok(TypedAst {
-                op: TypedOp::Aggregate {
+            Ok(TypedAst::new(
+                TypedOp::Aggregate {
                     input: Box::new(typed_input),
                     grouping,
                     aggregates,
@@ -955,8 +1117,8 @@ fn analyze_node(
                     grouping_sets,
                     having,
                 },
-                resolved_schema: output_schema,
-            })
+                output_schema,
+            ))
         }
 
         // ── WithColumns (add-or-replace by name, Spark semantics) ────────
@@ -1128,13 +1290,13 @@ fn analyze_node(
                 output_fields.push(nf);
             }
             let output_schema = StructType::new(output_fields);
-            Ok(TypedAst {
-                op: TypedOp::WithColumnsRenamed {
+            Ok(TypedAst::new(
+                TypedOp::WithColumnsRenamed {
                     input: Box::new(typed_input),
                     renames,
                 },
-                resolved_schema: output_schema,
-            })
+                output_schema,
+            ))
         }
 
         // ── DropColumns (Spark `df.drop(...)`) ───────────────────────────
@@ -1149,13 +1311,13 @@ fn analyze_node(
                 }
             }
             let output_schema = StructType::new(output_fields);
-            Ok(TypedAst {
-                op: TypedOp::DropColumns {
+            Ok(TypedAst::new(
+                TypedOp::DropColumns {
                     input: Box::new(typed_input),
                     drop_names,
                 },
-                resolved_schema: output_schema,
-            })
+                output_schema,
+            ))
         }
 
         // ── LateralView (Hive LATERAL VIEW explode/posexplode) ──────────
@@ -1269,14 +1431,14 @@ fn analyze_lateral_view(
             .collect(),
     );
     let resolved_schema = StructType::merge(&typed_input.resolved_schema, &generated_schema);
-    Ok(TypedAst {
-        op: TypedOp::LateralView {
+    Ok(TypedAst::new(
+        TypedOp::LateralView {
             input: Box::new(typed_input),
             table_alias,
             columns: resolved_columns,
         },
         resolved_schema,
-    })
+    ))
 }
 
 fn analyze_with_columns(
@@ -1321,13 +1483,13 @@ fn analyze_with_columns(
         output_fields.push(StructField::new(name.clone(), dt, nullable));
     }
     let output_schema = StructType::new(output_fields);
-    Ok(TypedAst {
-        op: TypedOp::WithColumns {
+    Ok(TypedAst::new(
+        TypedOp::WithColumns {
             input: Box::new(typed_input),
             assignments: resolved_assignments,
         },
-        resolved_schema: output_schema,
-    })
+        output_schema,
+    ))
 }
 
 /// Slot alignment for `withColumns`: which assignment (if any) replaces each
@@ -1470,14 +1632,14 @@ fn analyze_na_fill(
         output_fields.push(nf);
     }
     let output_schema = StructType::new(output_fields);
-    Ok(TypedAst {
-        op: TypedOp::NaFill {
+    Ok(TypedAst::new(
+        TypedOp::NaFill {
             input: Box::new(typed_input),
             cols,
             values,
         },
-        resolved_schema: output_schema,
-    })
+        output_schema,
+    ))
 }
 
 fn analyze_to_df(
@@ -1512,13 +1674,13 @@ fn analyze_to_df(
         .map(|(f, n)| (f.name.clone(), n.clone()))
         .collect();
     let output_schema = StructType::new(output_fields);
-    Ok(TypedAst {
-        op: TypedOp::WithColumnsRenamed {
+    Ok(TypedAst::new(
+        TypedOp::WithColumnsRenamed {
             input: Box::new(typed_input),
             renames,
         },
-        resolved_schema: output_schema,
-    })
+        output_schema,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1562,18 +1724,7 @@ fn analyze_join(
     // one-level-only invariant (the lateral's inner sees only its
     // immediate left sibling, never the grandparent).
     let typed_right = if lateral {
-        let mut left_scopes_bindings = Vec::new();
-        let mut left_pid_bindings = Vec::new();
-        collect_qualifier_bindings(
-            &typed_left,
-            0,
-            &mut left_scopes_bindings,
-            &mut left_pid_bindings,
-        );
-        let left_scopes = QualifierScopes {
-            bindings: left_scopes_bindings,
-            plan_id_bindings: left_pid_bindings,
-        };
+        let left_scopes = QualifierScopes::from_rel_scope(&typed_left.scope);
         let left_outer = OuterScope {
             schema: &typed_left.resolved_schema,
             scopes: &left_scopes,
@@ -1750,8 +1901,8 @@ fn analyze_join(
         }
     };
 
-    Ok(TypedAst {
-        op: TypedOp::Join {
+    Ok(TypedAst::new(
+        TypedOp::Join {
             left: Box::new(typed_left),
             right: Box::new(typed_right),
             join_type,
@@ -1763,8 +1914,8 @@ fn analyze_join(
             derived_left_schema,
             derived_right_schema,
         },
-        resolved_schema: output_schema,
-    })
+        output_schema,
+    ))
 }
 
 /// Analyze a recursive CTE: two-phase anchor-first.
@@ -1889,14 +2040,14 @@ fn analyze_recursive_cte(
             .collect(),
     );
 
-    Ok(TypedAst {
-        op: TypedOp::RecursiveCte {
+    Ok(TypedAst::new(
+        TypedOp::RecursiveCte {
             name,
             anchor: Box::new(typed_anchor),
             recursive_term: Box::new(typed_recursive),
         },
         resolved_schema,
-    })
+    ))
 }
 
 /// Collect source-case `TableScan.table` names in `ast` that case-insensitively
@@ -2012,8 +2163,8 @@ fn analyze_set_op(
         }
     }
 
-    Ok(TypedAst {
-        op: TypedOp::SetOp {
+    Ok(TypedAst::new(
+        TypedOp::SetOp {
             kind,
             all,
             by_name,
@@ -2021,8 +2172,8 @@ fn analyze_set_op(
             children: typed_children,
             widened_schema: widened_schema.clone(),
         },
-        resolved_schema: widened_schema,
-    })
+        widened_schema,
+    ))
 }
 
 /// Widen a by-name set-op schema across `children`: the ordered union of
@@ -2773,14 +2924,14 @@ fn analyze_table_function(
     let resolved_args = resolve_expr_list(args, &ResolveContext::bare(&empty_schema, base_types))?;
     let name_lower = name.to_ascii_lowercase();
     match name_lower.as_str() {
-        "range" if (1..=4).contains(&resolved_args.len()) => Ok(TypedAst {
-            op: TypedOp::TableFunction {
+        "range" if (1..=4).contains(&resolved_args.len()) => Ok(TypedAst::new(
+            TypedOp::TableFunction {
                 name,
                 args: resolved_args,
                 with_ordinality,
             },
-            resolved_schema: StructType::new(vec![StructField::new("id", DataType::Long, false)]),
-        }),
+            StructType::new(vec![StructField::new("id", DataType::Long, false)]),
+        )),
         // Bare `FROM explode(array(1,2,3))` — uncorrelated generator as a TVF.
         // Derive the output schema from the resolved arg's element type via the
         // existing single-homed `.data_type()` / `.nullable()` arms (type_inference
@@ -2809,16 +2960,14 @@ fn analyze_table_function(
             });
             let elem_type = fc_expr.data_type(&empty_schema);
             let nullable = fc_expr.nullable(&empty_schema);
-            Ok(TypedAst {
-                op: TypedOp::TableFunction {
+            Ok(TypedAst::new(
+                TypedOp::TableFunction {
                     name: name_lower,
                     args: resolved_args,
                     with_ordinality,
                 },
-                resolved_schema: StructType::new(vec![StructField::new(
-                    "col", elem_type, nullable,
-                )]),
-            })
+                StructType::new(vec![StructField::new("col", elem_type, nullable)]),
+            ))
         }
         _ => Err(AnalyzerError::PuntedOperator {
             op: format!("TableFunction[{name}]"),
@@ -3026,6 +3175,15 @@ impl QualifierScopes {
         Self::default()
     }
 
+    /// Adopt a node's stamped [`RelScope`] as this resolution context's
+    /// bindings (base 0 — the node's own schema is the resolution schema).
+    fn from_rel_scope(scope: &RelScope) -> Self {
+        Self {
+            bindings: scope.aliases.clone(),
+            plan_id_bindings: scope.plan_ids.clone(),
+        }
+    }
+
     /// The field range `q` binds to, iff EXACTLY ONE binding matches `q`
     /// case-insensitively. A duplicate name — e.g. a self-join `emp e1 JOIN
     /// emp e2` referenced by the bare table name `emp` — is ambiguous by
@@ -3104,15 +3262,9 @@ impl<'a> ResolveContext<'a> {
         base_types: &'a BaseTypes,
         outer: Option<OuterScope<'a>>,
     ) -> Self {
-        let mut bindings = Vec::new();
-        let mut plan_id_bindings = Vec::new();
-        collect_qualifier_bindings(input, 0, &mut bindings, &mut plan_id_bindings);
         Self {
             schema: &input.resolved_schema,
-            scopes: QualifierScopes {
-                bindings,
-                plan_id_bindings,
-            },
+            scopes: QualifierScopes::from_rel_scope(&input.scope),
             base_types,
             outer,
         }
@@ -3129,12 +3281,25 @@ impl<'a> ResolveContext<'a> {
         base_types: &'a BaseTypes,
         outer: Option<OuterScope<'a>>,
     ) -> Self {
-        let mut bindings = Vec::new();
-        let mut plan_id_bindings = Vec::new();
         let left_len = left.resolved_schema.len();
         let right_len = right.resolved_schema.len();
-        collect_qualifier_bindings(left, 0, &mut bindings, &mut plan_id_bindings);
-        collect_qualifier_bindings(right, left_len, &mut bindings, &mut plan_id_bindings);
+        let offset = |r: &std::ops::Range<usize>| r.start + left_len..r.end + left_len;
+        let mut bindings = left.scope.aliases.clone();
+        bindings.extend(
+            right
+                .scope
+                .aliases
+                .iter()
+                .map(|(name, r)| (name.clone(), offset(r))),
+        );
+        let mut plan_id_bindings = left.scope.plan_ids.clone();
+        plan_id_bindings.extend(
+            right
+                .scope
+                .plan_ids
+                .iter()
+                .map(|(pid, r, side)| (*pid, offset(r), *side)),
+        );
         bindings.push((TD_JOIN_LEFT.to_owned(), 0..left_len));
         bindings.push((TD_JOIN_RIGHT.to_owned(), left_len..left_len + right_len));
         Self {
@@ -3191,120 +3356,6 @@ impl<'a> ResolveContext<'a> {
             );
             in_bounds
         })
-    }
-}
-
-/// Walk `ast`'s operator tree, binding each source relation's alias/table
-/// name to its contiguous field range (`base..base+len`) within the CURRENT
-/// resolution schema. See the module comment above for why a range-based map
-/// is flip-correct at every join-nesting level where retaining a flat
-/// `derived_left_schema` / `derived_right_schema` would not be.
-///
-/// - `TableScan{table, alias}`: bind `table` (and `alias`, if present) to the
-///   full range.
-/// - `AliasedRelation{alias}`: bind `alias` to the full range; do NOT descend
-///   — emission re-scopes everything under it to `alias`.
-/// - `Join` with non-empty `using_columns`: STOP. USING output reorders and
-///   dedups columns, so no contiguous-range invariant holds — USING joins
-///   keep resolving via the legacy name-only path (the only remaining
-///   qualifier-resolution gap; every schema-transparent op is now covered
-///   by the passthrough arm below).
-/// - `Join{LeftSemi | LeftAnti}`: recurse the left side only — the right side
-///   contributes no columns to the output schema.
-/// - Any other `Join`: recurse left at `base`, right at
-///   `base + left.resolved_schema.len()`.
-/// - Schema-verbatim passthroughs (`Filter` / `Sort` / `Limit` / `Sample` /
-///   `SampleBy` / `Deduplicate` / `NaFill` / `NaDrop` / `NaReplace`): recurse
-///   the input at the SAME `base` — needed so e.g. `Project(Filter(Join))` or
-///   `Project(Deduplicate(Join))` still resolves through the join's bindings.
-///   All of these clone the input schema field-for-field (position/count
-///   preserved — `NaFill` may only tighten a field's nullability in place),
-///   so the contiguous-range invariant holds through them.
-/// - Everything else (`Project` / `Aggregate` / `SetOp` / `WithColumns` /
-///   `Values` / `LocalRelation` / `TableFunction` / `Pivot` / ...): STOP —
-///   these operators retype or reshuffle columns, so no alias binding from
-///   further down would be valid against the CURRENT schema.
-fn collect_qualifier_bindings(
-    ast: &TypedAst,
-    base: usize,
-    out: &mut Vec<(String, std::ops::Range<usize>)>,
-    plan_id_out: &mut Vec<(i64, std::ops::Range<usize>, &'static str)>,
-) {
-    match &ast.op {
-        TypedOp::TableScan { table, alias } => {
-            let range = base..base + ast.resolved_schema.len();
-            out.push((table.clone(), range.clone()));
-            if let Some(a) = alias {
-                out.push((a.clone(), range));
-            }
-        }
-        TypedOp::AliasedRelation { alias, .. } => {
-            out.push((alias.clone(), base..base + ast.resolved_schema.len()));
-        }
-        TypedOp::Join {
-            using_columns,
-            left,
-            right,
-            join_type,
-            left_plan_ids,
-            right_plan_ids,
-            ..
-        } => {
-            if !using_columns.is_empty() {
-                return;
-            }
-            let left_range = base..base + left.resolved_schema.len();
-            let right_base = base + left.resolved_schema.len();
-            let right_range = right_base..right_base + right.resolved_schema.len();
-            // Register this (outer) join's plan_id entries FIRST, then
-            // recurse into children. `lookup_plan_id` uses `find` (first
-            // match), so the OUTERMOST entry wins — its qualifier
-            // (`TD_JOIN_LEFT` / `TD_JOIN_RIGHT`) is the one in scope at
-            // the parent operator's resolution point (emission's
-            // alias-transparent rendering exposes the nearest join's
-            // `__td_jl` / `__td_jr` aliases). Inner joins' qualifiers
-            // refer to aliases buried inside subqueries and are NOT in
-            // scope at the parent level.
-            for &pid in left_plan_ids {
-                plan_id_out.push((pid, left_range.clone(), TD_JOIN_LEFT));
-            }
-            if !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
-                for &pid in right_plan_ids {
-                    plan_id_out.push((pid, right_range.clone(), TD_JOIN_RIGHT));
-                }
-            }
-            collect_qualifier_bindings(left, base, out, plan_id_out);
-            if !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
-                collect_qualifier_bindings(right, right_base, out, plan_id_out);
-            }
-        }
-        TypedOp::Filter { input, .. }
-        | TypedOp::Sort { input, .. }
-        | TypedOp::Limit { input, .. }
-        | TypedOp::Sample { input, .. }
-        | TypedOp::SampleBy { input, .. }
-        | TypedOp::Deduplicate { input, .. }
-        | TypedOp::NaFill { input, .. }
-        | TypedOp::NaDrop { input, .. }
-        | TypedOp::NaReplace { input, .. } => {
-            collect_qualifier_bindings(input, base, out, plan_id_out);
-        }
-        // LateralView appends generated columns after the input. Recurse the
-        // input at the same base, then bind the table_alias to the generated
-        // columns' contiguous range. This makes `t.tag` resolve via the
-        // qualifier-scoped path while `e.tag` correctly does NOT resolve
-        // (e.tag is not in the input's range). Without this arm, resolution
-        // would fall through to the legacy name-only fallback.
-        TypedOp::LateralView {
-            input,
-            table_alias,
-            columns,
-        } => {
-            collect_qualifier_bindings(input, base, out, plan_id_out);
-            let start = base + input.resolved_schema.len();
-            out.push((table_alias.clone(), start..start + columns.len()));
-        }
-        _ => {}
     }
 }
 
@@ -3946,16 +3997,16 @@ fn analyze_unpivot(
     ));
     let output_schema = StructType::new(output_fields);
 
-    Ok(TypedAst {
-        op: TypedOp::Unpivot {
+    Ok(TypedAst::new(
+        TypedOp::Unpivot {
             input: Box::new(typed_input),
             ids,
             values: materialised_values,
             variable_column_name,
             value_column_name,
         },
-        resolved_schema: output_schema,
-    })
+        output_schema,
+    ))
 }
 
 // ── Describe / Summary analysis (Pass 80) ───────────────────────────────────
@@ -4018,13 +4069,13 @@ fn analyze_describe(
     let typed_input = analyze_node(input, base_types, outer)?;
     let materialised = materialise_stats_cols(cols, &typed_input.resolved_schema)?;
     let output_schema = build_stats_output_schema(&materialised);
-    Ok(TypedAst {
-        op: TypedOp::Describe {
+    Ok(TypedAst::new(
+        TypedOp::Describe {
             input: Box::new(typed_input),
             cols: materialised,
         },
-        resolved_schema: output_schema,
-    })
+        output_schema,
+    ))
 }
 
 /// Analyze `CommonOp::Summary`: resolve the input, materialise the full
@@ -4053,14 +4104,14 @@ fn analyze_summary(
         statistics
     };
     let output_schema = build_stats_output_schema(&materialised_cols);
-    Ok(TypedAst {
-        op: TypedOp::Summary {
+    Ok(TypedAst::new(
+        TypedOp::Summary {
             input: Box::new(typed_input),
             cols: materialised_cols,
             statistics: materialised_stats,
         },
-        resolved_schema: output_schema,
-    })
+        output_schema,
+    ))
 }
 
 /// Analyze `CommonOp::FreqItems`: resolve the input, materialise `cols`
@@ -4114,14 +4165,14 @@ fn analyze_freq_items(
             )
         })
         .collect();
-    Ok(TypedAst {
-        op: TypedOp::FreqItems {
+    Ok(TypedAst::new(
+        TypedOp::FreqItems {
             input: Box::new(typed_input),
             cols: materialised,
             support,
         },
-        resolved_schema: StructType::new(output_fields),
-    })
+        StructType::new(output_fields),
+    ))
 }
 
 // ── Pivot analysis (Pass 60) ────────────────────────────────────────────────
@@ -4234,16 +4285,16 @@ fn analyze_pivot(
     }
     let output_schema = StructType::new(output_fields);
 
-    Ok(TypedAst {
-        op: TypedOp::Pivot {
+    Ok(TypedAst::new(
+        TypedOp::Pivot {
             input: Box::new(typed_input),
             grouping,
             pivot_column,
             pivot_values,
             aggregates,
         },
-        resolved_schema: output_schema,
-    })
+        output_schema,
+    ))
 }
 
 /// Desugar a `crosstab(col1, col2)` into a conditional-count
@@ -5011,6 +5062,225 @@ mod tests {
 
     fn base_types_with_emp_dept() -> BaseTypes {
         base_types_for(&[("emp", emp_schema()), ("dept", dept_schema())])
+    }
+
+    // ── RelScope stamping ─────────────────────────────────────────────────
+    // Direct parity tests for the stamped scope (formerly the recursive
+    // `collect_qualifier_bindings` walk): binding rules per operator class.
+
+    /// `TableScan` over `table` with an explicit alias.
+    fn aliased_scan(table: &str, alias: &str) -> CommonAst {
+        CommonAst::new(CommonOp::TableScan {
+            table: table.to_owned(),
+            alias: Some(alias.to_owned()),
+        })
+    }
+
+    #[test]
+    fn rel_scope_table_scan_binds_table_and_alias() {
+        let bt = base_types_with_emp_dept();
+        let typed = analyze(aliased_scan("emp", "e"), &bt).unwrap();
+        assert_eq!(
+            typed.scope.aliases,
+            vec![("emp".to_owned(), 0..4), ("e".to_owned(), 0..4)]
+        );
+        assert!(typed.scope.plan_ids.is_empty());
+    }
+
+    #[test]
+    fn rel_scope_aliased_relation_rebinds_and_drops_child_scope() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        // Child's `emp` binding is dropped; only the alias is exposed.
+        assert_eq!(typed.scope.aliases, vec![("e".to_owned(), 0..4)]);
+    }
+
+    #[test]
+    fn rel_scope_join_composes_children_with_right_offset() {
+        let bt = base_types_with_emp_dept();
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(qcol("e", "dept_id")),
+            right: Box::new(qcol("d", "dept_id")),
+        });
+        let ast = join(
+            aliased_scan("emp", "e"),
+            aliased_scan("dept", "d"),
+            JoinType::Inner,
+            Some(cond),
+        );
+        let typed = analyze(ast, &bt).unwrap();
+        assert_eq!(
+            typed.scope.aliases,
+            vec![
+                ("emp".to_owned(), 0..4),
+                ("e".to_owned(), 0..4),
+                ("dept".to_owned(), 4..6),
+                ("d".to_owned(), 4..6),
+            ]
+        );
+    }
+
+    #[test]
+    fn rel_scope_semi_anti_join_binds_left_only() {
+        let bt = base_types_with_emp_dept();
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(qcol("e", "dept_id")),
+            right: Box::new(qcol("d", "dept_id")),
+        });
+        let ast = join(
+            aliased_scan("emp", "e"),
+            aliased_scan("dept", "d"),
+            JoinType::LeftSemi,
+            Some(cond),
+        );
+        let typed = analyze(ast, &bt).unwrap();
+        assert_eq!(
+            typed.scope.aliases,
+            vec![("emp".to_owned(), 0..4), ("e".to_owned(), 0..4)]
+        );
+    }
+
+    #[test]
+    fn rel_scope_using_join_is_empty() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Join {
+            left: Box::new(emp_scan()),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        assert!(typed.scope.aliases.is_empty());
+        assert!(typed.scope.plan_ids.is_empty());
+    }
+
+    #[test]
+    fn rel_scope_passthrough_preserves_child_scope() {
+        let bt = base_types_with_emp_dept();
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Gt,
+            left: Box::new(qcol("e", "salary")),
+            right: Box::new(lit_double(100.0)),
+        });
+        let joined = join(
+            aliased_scan("emp", "e"),
+            aliased_scan("dept", "d"),
+            JoinType::Inner,
+            Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+        );
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(joined),
+            condition: cond,
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        // Filter passes the join's bindings through unchanged.
+        let inner_scope = match &typed.op {
+            TypedOp::Filter { input, .. } => input.scope.clone(),
+            other => panic!("expected Filter, got {other:?}"),
+        };
+        assert_eq!(typed.scope, inner_scope);
+        assert_eq!(typed.scope.aliases.len(), 4);
+    }
+
+    #[test]
+    fn rel_scope_join_plan_ids_outermost_first() {
+        let bt = base_types_for(&[
+            ("emp", emp_schema()),
+            ("dept", dept_schema()),
+            ("bonus", dept_schema()),
+        ]);
+        // inner join (plan_ids 1|2), then outer join (plan_ids 1|3): the
+        // OUTER join's entry for pid 1 must precede the inner join's, so
+        // first-match resolution picks the nearest enclosing join's side.
+        let inner = CommonAst::new(CommonOp::Join {
+            left: Box::new(emp_scan()),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: Some(1),
+                })),
+                right: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    plan_id: Some(2),
+                })),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![1],
+            right_plan_ids: vec![2],
+        });
+        let outer = CommonAst::new(CommonOp::Join {
+            left: Box::new(inner),
+            right: Box::new(scan("bonus")),
+            join_type: JoinType::Cross,
+            condition: None,
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![1],
+            right_plan_ids: vec![3],
+        });
+        let typed = analyze(outer, &bt).unwrap();
+        let pid1_entries: Vec<_> = typed
+            .scope
+            .plan_ids
+            .iter()
+            .filter(|(pid, _, _)| *pid == 1)
+            .collect();
+        assert_eq!(pid1_entries.len(), 2);
+        // Outermost entry first: whole left side of the OUTER join (0..6).
+        assert_eq!(pid1_entries[0].1, 0..6);
+        assert_eq!(pid1_entries[0].2, TD_JOIN_LEFT);
+        // Inner join's entry (0..4) follows.
+        assert_eq!(pid1_entries[1].1, 0..4);
+    }
+
+    #[test]
+    fn rel_scope_lateral_view_appends_generated_range() {
+        let bt = base_types_with_emp_dept();
+        let input = analyze(aliased_scan("emp", "e"), &bt).unwrap();
+        let columns = vec![("tag".to_owned(), lit_str("x"))];
+        let merged = StructType::merge(
+            &input.resolved_schema,
+            &StructType::new(vec![StructField::nullable("tag", DataType::String)]),
+        );
+        let typed = TypedAst::new(
+            TypedOp::LateralView {
+                input: Box::new(input),
+                table_alias: "t".to_owned(),
+                columns,
+            },
+            merged,
+        );
+        assert_eq!(
+            typed.scope.aliases,
+            vec![
+                ("emp".to_owned(), 0..4),
+                ("e".to_owned(), 0..4),
+                ("t".to_owned(), 4..5),
+            ]
+        );
     }
 
     // ── shared TypedAst extractors ────────────────────────────────────────
@@ -6689,26 +6959,20 @@ mod tests {
     fn has_resolved_schema_false_for_unresolved_manually_built_typed_ast() {
         // A TypedAst manually built with an Unresolved schema field must
         // report `has_resolved_schema = false`.
-        let unresolved = TypedAst {
-            op: TypedOp::SingleRow,
-            resolved_schema: StructType::new(vec![StructField::nullable(
-                "x",
-                DataType::Unresolved,
-            )]),
-        };
+        let unresolved = TypedAst::new(
+            TypedOp::SingleRow,
+            StructType::new(vec![StructField::nullable("x", DataType::Unresolved)]),
+        );
         assert!(!has_resolved_schema(&unresolved));
 
         // Or with a Project whose projection contains an UnresolvedColumn.
-        let with_unresolved_expr = TypedAst {
-            op: TypedOp::Project {
-                input: Box::new(TypedAst {
-                    op: TypedOp::SingleRow,
-                    resolved_schema: StructType::empty(),
-                }),
+        let with_unresolved_expr = TypedAst::new(
+            TypedOp::Project {
+                input: Box::new(TypedAst::new(TypedOp::SingleRow, StructType::empty())),
                 projections: vec![unresolved_col("x")],
             },
-            resolved_schema: StructType::new(vec![StructField::nullable("x", DataType::Long)]),
-        };
+            StructType::new(vec![StructField::nullable("x", DataType::Long)]),
+        );
         assert!(!has_resolved_schema(&with_unresolved_expr));
     }
 

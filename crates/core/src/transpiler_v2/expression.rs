@@ -2122,13 +2122,10 @@ mod tests {
         use super::super::analyzer::{TypedAst, TypedOp};
         let s = StructType::empty();
         // A hand-built analyzed inner plan whose single output column is Long.
-        let inner = TypedAst {
-            op: TypedOp::SingleRow,
-            resolved_schema: StructType::new(vec![StructField::nullable(
-                "max_salary",
-                DataType::Long,
-            )]),
-        };
+        let inner = TypedAst::new(
+            TypedOp::SingleRow,
+            StructType::new(vec![StructField::nullable("max_salary", DataType::Long)]),
+        );
         let expr = Expression::ScalarSubquery(ScalarSubquery {
             subquery: SubqueryPlan::Analyzed(Box::new(inner)),
         });

@@ -383,3 +383,20 @@ top of the whole differential/ dir (i.e. it runs everything). For a
 file-scoped run either use a matching group name or invoke pytest directly
 from tests/integration with the venv. Fixing the runner to accept file paths
 is queued tech debt.
+
+## Differential runner only built the server when the binary was MISSING (false-green gates)
+
+**What happened (2026-07-09):** during the SELECT-block emission refactor,
+every `run-differential-tests.sh` corpus run after the first reused the
+binary built at the branch base — the script's build step was inside
+`if [ ! -f "$BINARY_PATH" ]`. Seven per-phase "zero movement / no
+regressions" differential gates were therefore vacuous: they diffed the
+baseline binary against itself. Caught only because a NEW corpus case failed
+with an error message that the new code could not have produced.
+
+**Lesson:** a "no regressions" result is only as good as the binary under
+test. Before trusting any integration gate, verify the artifact's mtime is
+newer than the sources it claims to test (`ls -la target/release/... `
+vs the latest edit). Fixed on this branch: the runner now always runs
+`cargo build --release` (a no-op when the tree is unchanged) unless an
+explicit `THUNDERDUCK_BINARY` is supplied.

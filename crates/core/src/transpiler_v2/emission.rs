@@ -14,12 +14,17 @@
 //!
 //! # What lives here
 //!
-//! - [`dispatch_op`] — the single top-level operator dispatcher. One
-//!   hand-written match arm per [`TypedOp`] variant. Every `Ok` return path
-//!   increments the [`EMIT_TAP`] counter (§5.3).
-//! - Per-operator renderers (`render_project`, `render_filter`, `render_sort`,
-//!   `render_limit`, `render_single_row`, `render_table_scan`, `render_values`,
-//!   `render_local_relation`, `render_file_scan`).
+//! - [`dispatch_op`] — the single top-level operator dispatcher: it renders
+//!   [`build_unit`]'s [`SqlUnit`] and increments the [`EMIT_TAP`] counter
+//!   once per `Ok` (§5.3).
+//! - [`build_unit`] — one hand-written match arm per [`TypedOp`] variant.
+//!   Block-composable operators build/merge a `sql_block::SelectBlock`
+//!   (merge when the clause ordinal and alias-visibility preconditions
+//!   hold, wrap under `__td_sub` on slot conflict — see `sql_block.rs`);
+//!   the analyzer's per-node `RelScope` stamp and the Join
+//!   `*_requires_synthetic` flags are the scope authority. Self-contained
+//!   generators (Values, FileScan, Pivot, Sample, RecursiveCte, …) render
+//!   via [`legacy_render`] into opaque `Raw` units.
 //! - [`render_expr`] — exhaustive match over the [`Expression`] enum.
 //! - [`render_cast`] — includes the `try_cast` → `TRY_CAST(...)` branch
 //!   (checklist §4.2 first item).
@@ -45,6 +50,7 @@ use super::expression::{
     LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan,
     UnaryExpression, UnaryOp,
 };
+use super::sql_block::{Clause, DefaultSlot, DistinctKind, FromItem, SelectBlock, SqlUnit};
 use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
 use crate::types::{DataType, StructType};
 use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
@@ -73,53 +79,967 @@ pub(crate) static EMIT_TAP_MUTEX: Mutex<()> = Mutex::new(());
 ///
 /// One hand-written match arm per [`TypedOp`] variant. No table interpreter.
 pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError> {
-    let result: Result<String, EmissionError> = match op {
-        // ── C.1 wired ────────────────────────────────────────────────────
-        TypedOp::SingleRow => render_single_row(),
-        TypedOp::TableScan { table, alias } => render_table_scan(table, alias.as_deref()),
-        TypedOp::Values { rows, column_names } => render_values(rows, column_names, schema),
-        TypedOp::LocalRelation { schema: s, rows } => render_local_relation(s, rows),
+    let result = build_unit(op, schema).map(|unit| unit.to_sql());
+    if result.is_ok() {
+        EMIT_TAP.fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
+/// Build the [`SqlUnit`] for `op`: an open [`SelectBlock`] for the
+/// block-composable operators, or a `Raw` string from the legacy renderers
+/// for everything not yet converted. This is the per-operator merge/wrap
+/// decision site of the SELECT-block builder (see `sql_block.rs`).
+fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
+    match op {
+        TypedOp::TableScan { table, alias } => {
+            Ok(SqlUnit::from(SelectBlock::from_item(FromItem::Relation {
+                base: table.clone(),
+                alias: alias.clone(),
+            })))
+        }
+        TypedOp::Values { rows, column_names } => build_values(rows, column_names, schema),
+        TypedOp::LocalRelation { schema: s, rows } => build_local_relation(s, rows),
         TypedOp::FileScan {
             format,
             paths,
-            schema: s,
             options,
-        } => render_file_scan(*format, paths, s, options),
-        TypedOp::Project { input, projections } => render_project(input, projections),
-        TypedOp::Filter { input, condition } => render_filter(input, condition),
+            ..
+        } => build_file_scan(*format, paths, options),
+        TypedOp::TableFunction {
+            name,
+            args,
+            with_ordinality,
+        } => build_table_function(name, args, *with_ordinality, schema),
+        TypedOp::Project { input, projections } => build_project(input, projections),
+        TypedOp::Filter { input, condition } => build_filter(input, condition),
         TypedOp::Sort {
             input,
             order,
             limit,
             offset,
-        } => render_sort(input, order, *limit, *offset),
+        } => build_sort(input, order, *limit, *offset),
         TypedOp::Limit {
             input,
             limit,
             offset,
-        } => render_limit(input, *limit, *offset),
-        TypedOp::WithColumns { input, assignments } => render_with_columns(input, assignments),
-        TypedOp::DropColumns { input, drop_names } => render_drop_columns(input, drop_names),
-        TypedOp::AliasedRelation { input, alias } => render_aliased_relation(input, alias),
+        } => build_limit(input, *limit, *offset),
+        TypedOp::Deduplicate { input, on_columns } => build_deduplicate(input, on_columns),
+        TypedOp::AliasedRelation { input, alias } => build_aliased_relation(input, alias),
+        TypedOp::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            using_columns,
+            lateral,
+            left_requires_synthetic,
+            right_requires_synthetic,
+            ..
+        } => build_join(JoinParts {
+            left,
+            right,
+            join_type: *join_type,
+            condition: condition.as_ref(),
+            using_columns,
+            lateral: *lateral,
+            left_requires_synthetic: *left_requires_synthetic,
+            right_requires_synthetic: *right_requires_synthetic,
+        }),
+        TypedOp::Aggregate {
+            input,
+            grouping,
+            aggregates,
+            grouping_kind,
+            grouping_sets,
+            having,
+        } => build_aggregate(
+            input,
+            grouping,
+            aggregates,
+            *grouping_kind,
+            grouping_sets,
+            having.as_ref(),
+        ),
+        TypedOp::LateralView {
+            input,
+            table_alias,
+            columns,
+        } => build_lateral_view(input, table_alias, columns),
+        TypedOp::SetOp {
+            kind,
+            all,
+            by_name,
+            allow_missing_columns,
+            children,
+            widened_schema,
+        } => build_set_op(
+            *kind,
+            *all,
+            *by_name,
+            *allow_missing_columns,
+            children,
+            widened_schema,
+        ),
+        TypedOp::WithColumns { input, assignments } => build_with_columns(input, assignments),
+        TypedOp::DropColumns { input, drop_names } => build_drop_columns(input, drop_names),
         TypedOp::WithColumnsRenamed { input, renames } => {
-            render_with_columns_renamed(input, renames)
+            build_with_columns_renamed(input, renames)
         }
-        TypedOp::Deduplicate { input, on_columns } => render_deduplicate(input, on_columns),
         TypedOp::NaFill {
             input,
             cols,
             values,
-        } => render_na_fill(input, cols, values),
+        } => build_na_fill(input, cols, values),
         TypedOp::NaDrop {
             input,
             cols,
             min_non_nulls,
-        } => render_na_drop(input, cols, *min_non_nulls),
+        } => build_na_drop(input, cols, *min_non_nulls),
         TypedOp::NaReplace {
             input,
             cols,
             replacements,
-        } => render_na_replace(input, cols, replacements),
+        } => build_na_replace(input, cols, replacements),
+        other => legacy_render(other, schema).map(SqlUnit::Raw),
+    }
+}
+
+/// Fill a SELECT slot list over `input`'s open block: merge when the Select
+/// ordinal is free and `vis` holds, else wrap. Shared by every
+/// projection-shaped operator (WithColumns[Renamed], DropColumns, NaFill,
+/// NaReplace). The `slots` closure receives the PRE-wrap block plus whether
+/// the wrap fallback was taken, so an expression-bearing caller can rewrite
+/// wrap-stranded qualifiers (via [`strip_stranded_qualifiers`]) before
+/// rendering its slot list.
+fn block_with_projections(
+    input: &TypedAst,
+    vis: impl FnOnce(&SelectBlock) -> bool,
+    slots: impl FnOnce(&SelectBlock, bool) -> Result<String, EmissionError>,
+) -> Result<SqlUnit, EmissionError> {
+    let mut block = open_block(input)?;
+    let merges = block.can_accept(Clause::Select) && vis(&block);
+    let slots = slots(&block, !merges)?;
+    if !merges {
+        block = SelectBlock::wrap(block.into());
+    }
+    block.set_projections(slots);
+    Ok(block.into())
+}
+
+/// The `TypedOp::Join` fields [`build_join`] consumes (destructured into a
+/// struct to stay within the parameter-count guideline).
+struct JoinParts<'a> {
+    left: &'a TypedAst,
+    right: &'a TypedAst,
+    join_type: crate::transpiler_v2::ast::JoinType,
+    condition: Option<&'a Expression>,
+    using_columns: &'a [String],
+    lateral: bool,
+    left_requires_synthetic: bool,
+    right_requires_synthetic: bool,
+}
+
+/// Alias that qualifies field `i` of `side.resolved_schema` in the
+/// enclosing FROM scope: the FIRST alias in `side`'s stamped
+/// [`RelScope`](super::analyzer::RelScope) whose range covers `i`
+/// (`TableScan` binds table and alias to the SAME range; first-match is
+/// canonical, matching `RelScope::lookup`) — but ONLY if `item`, the
+/// [`FromItem`] actually emitted for this side, exposes that alias too
+/// (case-insensitive membership in [`FromItem::exposed`]). A RelScope alias
+/// the emitted item does NOT expose cannot qualify anything: a nested-join
+/// side whose OWN sub-sides are synthetic-wrapped
+/// (`left/right_requires_synthetic`) renders those sub-sides under
+/// `__td_jl`/`__td_jr`, not the analyzer-scoped logical alias RelScope
+/// still reports — this predicate is what stops that mismatch from
+/// producing an unbindable qualified reference. Returns `None` when no
+/// covering, exposed alias exists for field `i`.
+fn covering_alias(side: &TypedAst, item: &FromItem, i: usize) -> Option<String> {
+    let (name, _) = side
+        .scope
+        .aliases
+        .iter()
+        .find(|(_, range)| range.contains(&i))?;
+    let exposed = item.exposed();
+    exposed
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(name))
+        .then(|| name.clone())
+}
+
+/// Whether every field index of `side.resolved_schema` is coverable by an
+/// alias that `item` (the [`FromItem`] actually emitted for this side)
+/// exposes — the shared coverage predicate, built on [`covering_alias`] so
+/// it can never drift from [`side_slot_quals`]'s per-field lookup.
+/// [`build_join_side`]'s `inline_ok` uses it to decide whether a
+/// multi-alias nested-`Join` side may inline under a USING parent (F5).
+fn scope_covers_fields(side: &TypedAst, item: &FromItem) -> bool {
+    (0..side.resolved_schema.len()).all(|i| covering_alias(side, item, i).is_some())
+}
+
+/// Per-field qualifier list for one join side: which alias qualifies each
+/// column of `side.resolved_schema` in the enclosing FROM scope. A
+/// single-alias `item` (a bare relation, derived table, or synthetic wrap)
+/// qualifies every field with that one alias; a multi-alias item (an
+/// inlined nested-join chain, F5) derives each field's alias via
+/// [`covering_alias`]. Returns `None` if any field index has no covering,
+/// exposed alias — un-hoistable; the caller must fall back to `*` (no
+/// default slot list) for this join instead of building one from an
+/// incomplete qualifier map.
+fn side_slot_quals(side: &TypedAst, item: &FromItem) -> Option<Vec<String>> {
+    if let [only] = item.exposed().as_slice() {
+        return Some(vec![only.clone(); side.resolved_schema.len()]);
+    }
+    (0..side.resolved_schema.len())
+        .map(|i| covering_alias(side, item, i))
+        .collect()
+}
+
+/// Lower one join side to a [`FromItem`]. Ladder:
+///
+/// 1. `requires_synthetic` (analyzer-stamped — the plan_id contract) →
+///    `(side) AS __td_jl/__td_jr`. Must win over every hoist.
+/// 2. The side's unit is a pure-FROM block → inline its `FromItem` directly,
+///    keeping user aliases / table names visible (subsumes the old
+///    user-alias hoist, bare-TableScan hoist, and left-spine chain flatten).
+///    Guarded: a nested `Join` item inlines only on the left side, and only
+///    when the nested join itself is a plain ON/CROSS join (CLAUDE.md
+///    gotcha 4 — never fold across semi/anti; lateral correlation must stay
+///    isolated). Under a non-USING parent this is unconditional; under a
+///    USING parent (F5) it additionally requires [`scope_covers_fields`] to
+///    hold for the nested side — the USING parent's own hoisted-slot
+///    qualifiers must be derivable per field from an alias the nested join's
+///    emitted `FromItem` actually exposes, or the side stays wrapped under
+///    its synthetic alias instead (see [`side_slot_quals`]). `Raw` FROM
+///    bodies (lateral-view chains) never inline.
+/// 3. Otherwise → `(side) AS __td_jl/__td_jr`.
+///
+/// The duplicate-alias guard runs in [`build_join`] across BOTH lowered
+/// sides (DuckDB rejects `Duplicate alias` in one FROM scope; Spark permits
+/// it) — on collision the offending side falls back to its synthetic wrap.
+fn build_join_side(
+    side: &TypedAst,
+    synthetic_alias: &str,
+    requires_synthetic: bool,
+    may_inline_nested_join: bool,
+    parent_has_using: bool,
+) -> Result<FromItem, EmissionError> {
+    let unit = build_unit(&side.op, &side.resolved_schema)?;
+    if requires_synthetic {
+        return Ok(FromItem::Derived {
+            unit: Box::new(unit),
+            alias: synthetic_alias.to_owned(),
+        });
+    }
+    let block = match unit {
+        SqlUnit::Select(block) => block,
+        raw => {
+            return Ok(FromItem::Derived {
+                unit: Box::new(raw),
+                alias: synthetic_alias.to_owned(),
+            })
+        }
+    };
+    // Peek eligibility on the block's FROM item BEFORE consuming it — a
+    // block that does not inline still needs its defaults intact for the
+    // wrap path below (F2: the former `SelectBlock::from_item(item)` rebuild
+    // silently discarded the join builder's hoisted slot list).
+    let inline_ok = block.pure_from()
+        && match block.from_ref() {
+            FromItem::Relation { .. } | FromItem::Derived { .. } => true,
+            item @ FromItem::Join { .. } => {
+                may_inline_nested_join
+                    && (!parent_has_using || scope_covers_fields(side, item))
+                    && matches!(
+                        &side.op,
+                        TypedOp::Join {
+                            join_type,
+                            using_columns,
+                            lateral: false,
+                            ..
+                        } if using_columns.is_empty()
+                            && !matches!(
+                                join_type,
+                                super::ast::JoinType::LeftSemi
+                                    | super::ast::JoinType::LeftAnti
+                            )
+                    )
+            }
+            FromItem::Raw { .. } => false,
+        };
+    if inline_ok {
+        // `pure_from()` above already established this cannot fail; the Err
+        // arm is a defensive fallback, never a panic path.
+        match block.into_pure_from() {
+            Ok(item) => Ok(item),
+            Err(block) => Ok(FromItem::Derived {
+                unit: Box::new(SqlUnit::Select(block)),
+                alias: synthetic_alias.to_owned(),
+            }),
+        }
+    } else {
+        Ok(FromItem::Derived {
+            unit: Box::new(SqlUnit::Select(block)),
+            alias: synthetic_alias.to_owned(),
+        })
+    }
+}
+
+fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
+    use super::ast::JoinType;
+    let JoinParts {
+        left,
+        right,
+        join_type,
+        condition,
+        using_columns,
+        lateral,
+        left_requires_synthetic,
+        right_requires_synthetic,
+    } = parts;
+    let has_using = !using_columns.is_empty();
+    let is_semi_or_anti = matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
+
+    let left_item = build_join_side(left, TD_JOIN_LEFT, left_requires_synthetic, true, has_using)?;
+    let mut right_item = build_join_side(
+        right,
+        TD_JOIN_RIGHT,
+        right_requires_synthetic,
+        false,
+        has_using,
+    )?;
+    // Duplicate-alias guard: DuckDB rejects two `AS x` in one FROM scope
+    // (Spark errors only on ambiguous references). On collision, re-wrap the
+    // RIGHT side under its synthetic alias (isolating scope), matching the
+    // old chain-vs-sibling guard's fallback.
+    {
+        let left_names = left_item.exposed();
+        let collides = right_item
+            .exposed()
+            .iter()
+            .any(|r| left_names.iter().any(|l| l.eq_ignore_ascii_case(r)));
+        if collides {
+            right_item = FromItem::Derived {
+                unit: Box::new(SqlUnit::from(SelectBlock::from_item(right_item))),
+                alias: TD_JOIN_RIGHT.to_owned(),
+            };
+        }
+    }
+
+    // Condition types resolve against the concatenated side schemas (the
+    // analyzer stamped every reference; the schema feeds type lookups only).
+    let cond_schema = StructType::merge(&left.resolved_schema, &right.resolved_schema);
+    let clause = render_join_clause(join_type, condition, using_columns, &cond_schema)?;
+
+    // Hoisted slot list mirroring the analyzer's output-schema order (USING
+    // cols first, then left non-USING, then right non-USING; right side
+    // suppressed for semi/anti).
+    let need_right = !is_semi_or_anti;
+    let default_slots = if using_columns.is_empty() {
+        // Non-USING joins: unchanged from before F5 — a default slot list is
+        // built only when each participating side exposes exactly one
+        // alias; a multi-alias (inlined-chain) side renders `SELECT *`,
+        // whose natural left-then-right order already matches the declared
+        // schema for the plain ON/CROSS joins that allow chain inlining. Do
+        // not churn those shapes with the per-field machinery below.
+        let single_alias = |item: &FromItem| -> Option<String> {
+            match item.exposed().as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            }
+        };
+        let left_alias = single_alias(&left_item);
+        let right_alias = single_alias(&right_item);
+        match (left_alias, right_alias) {
+            (Some(la), ra) if !need_right || ra.is_some() => {
+                let la_q = quote_ident(&la);
+                let mut slots: Vec<DefaultSlot> = left
+                    .resolved_schema
+                    .fields
+                    .iter()
+                    .map(|f| DefaultSlot {
+                        name: f.name.clone(),
+                        sql: format!("{la_q}.{}", quote_ident(&f.name)),
+                    })
+                    .collect();
+                if need_right {
+                    if let Some(ra) = &ra {
+                        let ra_q = quote_ident(ra);
+                        slots.extend(right.resolved_schema.fields.iter().map(|f| DefaultSlot {
+                            name: f.name.clone(),
+                            sql: format!("{ra_q}.{}", quote_ident(&f.name)),
+                        }));
+                    }
+                }
+                Some(slots)
+            }
+            _ => None,
+        }
+    } else {
+        // USING joins (F5): per-field qualifiers from the RelScope stamp,
+        // rather than a single alias per side — this is what lets a
+        // multi-alias inlined nested-join side (change 2's
+        // `scope_covers_fields` gate) hoist its slots under a USING parent
+        // instead of staying buried under a synthetic wrap alias. Honestly
+        // stated (fix round 1): `side_slot_quals` requires every covering
+        // RelScope alias to ALSO be one `left_item`/`right_item` actually
+        // exposes — a covering alias RelScope reports but the emitted item
+        // does not expose (e.g. a nested-join side whose own children are
+        // synthetic-wrapped, rendering under `__td_jl`/`__td_jr` instead of
+        // their logical aliases) does not count. `build_join_side`'s
+        // `inline_ok` gates on that SAME exposure-aware
+        // `scope_covers_fields(side, &item)` predicate, against the SAME
+        // item, before ever inlining a multi-alias side under a USING
+        // parent — so `side_slot_quals(left, &left_item)` is guaranteed
+        // `Some` for every inlined multi-alias left side by construction.
+        // The right side is never inlined under USING
+        // (`may_inline_nested_join` is always `false` for it in
+        // `build_join_side`), so it stays single-alias and hits the
+        // `item.exposed()` fast path in `side_slot_quals` unconditionally.
+        // If either is ever `None` here regardless, fall back to bare `*`
+        // rather than panic — this function only consumes that guarantee,
+        // it does not reprove it locally.
+        let left_quals = side_slot_quals(left, &left_item);
+        let right_quals = if need_right {
+            side_slot_quals(right, &right_item)
+        } else {
+            None
+        };
+        match (left_quals, right_quals) {
+            (Some(lq), rq) if !need_right || rq.is_some() => {
+                let using_lower: HashSet<String> =
+                    using_columns.iter().map(|s| s.to_lowercase()).collect();
+                let mut slots: Vec<DefaultSlot> = using_columns
+                    .iter()
+                    .map(|c| DefaultSlot {
+                        name: c.clone(),
+                        sql: quote_ident(c).into_owned(),
+                    })
+                    .collect();
+                for (f, qual) in left.resolved_schema.fields.iter().zip(lq.iter()) {
+                    if !using_lower.contains(&f.name.to_lowercase()) {
+                        slots.push(DefaultSlot {
+                            name: f.name.clone(),
+                            sql: format!("{}.{}", quote_ident(qual), quote_ident(&f.name)),
+                        });
+                    }
+                }
+                if need_right {
+                    if let Some(rq) = &rq {
+                        for (f, qual) in right.resolved_schema.fields.iter().zip(rq.iter()) {
+                            if !using_lower.contains(&f.name.to_lowercase()) {
+                                slots.push(DefaultSlot {
+                                    name: f.name.clone(),
+                                    sql: format!("{}.{}", quote_ident(qual), quote_ident(&f.name)),
+                                });
+                            }
+                        }
+                    }
+                }
+                Some(slots)
+            }
+            _ => None,
+        }
+    }
+    .filter(|slots: &Vec<DefaultSlot>| !slots.is_empty());
+
+    let mut block = SelectBlock::from_item(FromItem::Join {
+        left: Box::new(left_item),
+        right: Box::new(right_item),
+        kind: join_kind_sql(join_type),
+        clause,
+        lateral,
+    });
+    if let Some(slots) = default_slots {
+        block.set_default_projections(slots);
+    }
+    Ok(block.into())
+}
+
+fn build_aggregate(
+    input: &TypedAst,
+    grouping: &[Expression],
+    aggregates: &[Expression],
+    grouping_kind: crate::transpiler_v2::ast::GroupingKind,
+    grouping_sets: &[Vec<usize>],
+    having: Option<&Expression>,
+) -> Result<SqlUnit, EmissionError> {
+    use super::ast::GroupingKind;
+    // The SparkSQL front-end populates `grouping_sets` with per-set membership
+    // (indices into `grouping`). The DataFrame `groupingSets` path leaves it
+    // empty, so it stays a Thunderduck-boundary error (ADR-022).
+    if matches!(grouping_kind, GroupingKind::GroupingSets) && grouping_sets.is_empty() {
+        bail_boundary_op!(
+            "Aggregate[GroupingSets]",
+            "GROUPING SETS requires set-membership metadata (DataFrame groupingSets path not implemented in τ)",
+        );
+    }
+    let input_schema = &input.resolved_schema;
+    // Mirror the analyzer's "unfold DataFrame-path grouping" logic — if
+    // the aggregates list doesn't already start with the grouping cols'
+    // output names, prepend them to the SELECT list so the emitted column
+    // count matches the resolved schema.
+    let already_folded = super::analyzer::grouping_already_folded(grouping, aggregates);
+    // Rewrite any no-arg `grouping_id()`/`grouping()` calls to pass the
+    // grouping columns explicitly — DuckDB has no zero-arg form.
+    let rewritten_aggregates: Vec<Expression> = aggregates
+        .iter()
+        .map(|a| with_grouping_id_spliced(a, grouping))
+        .collect();
+    let keys: &[Expression] = if already_folded { &[] } else { grouping };
+    let slots = sql_join(keys.iter().chain(rewritten_aggregates.iter()), ", ", |e| {
+        render_projection_slot(e, input_schema)
+    })?;
+    // HAVING may carry no-arg grouping functions too (Spark-legal over
+    // ROLLUP/CUBE/GROUPING SETS); splice before rendering.
+    let having_sql = having
+        .map(|h| render_expr(&with_grouping_id_spliced(h, grouping), input_schema))
+        .transpose()?;
+    // Emit a GROUP BY whenever there are flat grouping columns, OR when this
+    // is a GROUPING SETS aggregate with at least one set — the all-empty
+    // `GROUP BY GROUPING SETS ((), ())` case still produces one grand-total
+    // row PER SET, so dropping the clause would be a silent wrong row-count.
+    let emit_group_by = !grouping.is_empty()
+        || (matches!(grouping_kind, GroupingKind::GroupingSets) && !grouping_sets.is_empty());
+    let group_body = if emit_group_by {
+        let rendered = render_group_exprs(grouping, input_schema)?;
+        Some(match grouping_kind {
+            GroupingKind::GroupBy => rendered.join(", "),
+            GroupingKind::Rollup => format!("ROLLUP({})", rendered.join(", ")),
+            GroupingKind::Cube => format!("CUBE({})", rendered.join(", ")),
+            GroupingKind::GroupingSets => {
+                let sets: Vec<String> = grouping_sets
+                    .iter()
+                    .map(|s| {
+                        let cols = s
+                            .iter()
+                            .map(|&i| rendered[i].as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("({cols})")
+                    })
+                    .collect();
+                format!("GROUPING SETS ({})", sets.join(", "))
+            }
+        })
+    } else {
+        None
+    };
+
+    let mut block = open_block(input)?;
+    let vis = exprs_visible_in(
+        grouping
+            .iter()
+            .chain(rewritten_aggregates.iter())
+            .chain(having),
+        &block,
+        &input.scope,
+    );
+    if !(block.can_accept(Clause::GroupBy) && vis) {
+        block = SelectBlock::wrap(block.into());
+    }
+    if let Some(g) = group_body {
+        block.set_group_by(g);
+    }
+    if let Some(h) = having_sql {
+        block.set_having(h);
+    }
+    block.set_projections(slots);
+    Ok(block.into())
+}
+
+fn build_lateral_view(
+    input: &TypedAst,
+    table_alias: &str,
+    columns: &[(String, Expression)],
+) -> Result<SqlUnit, EmissionError> {
+    let input_schema = &input.resolved_schema;
+    let inner_select = sql_join(columns.iter(), ", ", |(alias, expr)| {
+        let expr_sql = render_expr(expr, input_schema)?;
+        Ok(format!("{expr_sql} AS {}", quote_ident(alias)))
+    })?;
+    let mut block = open_block(input)?;
+    // The generator expressions reference the input's FROM scope; extending
+    // is sound only on a pure-FROM block whose scope satisfies them.
+    let vis = exprs_visible_in(columns.iter().map(|(_, e)| e), &block, &input.scope);
+    if !(block.pure_from() && vis) {
+        block = SelectBlock::wrap(block.into());
+    }
+    block.extend_from(
+        &format!(
+            ", LATERAL (SELECT {inner_select}) AS {}",
+            quote_ident(table_alias)
+        ),
+        vec![table_alias.to_owned()],
+    );
+    // F3: a merged (not wrapped) block's hoisted default slot list must
+    // widen to include the LATERAL VIEW's generated columns, or a
+    // downstream merging Project that renders the bare-star default would
+    // never see them. A no-op when there are no defaults to extend (a fresh
+    // wrap, or a plain-scan child, keeps rendering `*`, which already covers
+    // the newly appended FROM columns — cx-007..009 shape unchanged).
+    let ta_q = quote_ident(table_alias);
+    block.extend_default_projections(
+        columns
+            .iter()
+            .map(|(alias, _)| {
+                let a_q = quote_ident(alias);
+                DefaultSlot {
+                    name: alias.clone(),
+                    sql: format!("{ta_q}.{a_q}"),
+                }
+            })
+            .collect(),
+    );
+    Ok(block.into())
+}
+
+/// Build the child's unit and open it as a block: a `Select` unit is
+/// returned as-is (merge candidate); a `Raw` unit is wrapped as
+/// `(…) AS __td_sub`.
+fn open_block(child: &TypedAst) -> Result<SelectBlock, EmissionError> {
+    Ok(match build_unit(&child.op, &child.resolved_schema)? {
+        SqlUnit::Select(block) => *block,
+        raw => SelectBlock::wrap(raw),
+    })
+}
+
+/// Collect the qualifiers of every analyzer-stamped column reference in
+/// `expr` into `out` (immediate tree only — `Expression::children` excludes
+/// subquery bodies by the τ walker convention, which is exactly the merge
+/// visibility contract: correlated inner refs bind against whatever FROM
+/// aliases the enclosing block keeps visible, same as today's shapes).
+fn expr_qualifiers<'e>(expr: &'e Expression, out: &mut Vec<&'e str>) {
+    match expr {
+        Expression::ColumnReference(c) => {
+            if let Some(q) = c.qualifier.as_deref() {
+                out.push(q);
+            }
+        }
+        Expression::UnresolvedColumn(u) => {
+            if let Some(q) = u.qualifier.as_deref() {
+                out.push(q);
+            }
+        }
+        Expression::Star(StarExpression { qualifier }) => {
+            if let Some(q) = qualifier.as_deref() {
+                out.push(q);
+            }
+        }
+        other => {
+            for child in other.children() {
+                expr_qualifiers(child, out);
+            }
+        }
+    }
+}
+
+/// Merge visibility: every qualifier stamped on `exprs` that the input's own
+/// [`RelScope`] binds must be an alias the block's FROM scope actually
+/// emits. Qualifiers the input scope does NOT know are exempt: they are
+/// correlated outer references (DuckDB's correlated-subquery binder resolves
+/// them OUTWARD, so no inner FROM shape can bind them), struct-column
+/// qualifiers (rendered as struct access, scope-independent), or the
+/// synthetic `__td_jl`/`__td_jr` names (whose exposure the analyzer's
+/// `*_requires_synthetic` flags already guarantee). A failed check falls
+/// back to the wrap path (merging only ever WIDENS what a clause can see).
+fn exprs_visible_in<'e>(
+    exprs: impl IntoIterator<Item = &'e Expression>,
+    block: &SelectBlock,
+    input_scope: &super::analyzer::RelScope,
+) -> bool {
+    let mut quals = Vec::new();
+    for e in exprs {
+        expr_qualifiers(e, &mut quals);
+    }
+    quals
+        .iter()
+        .filter(|q| scope_binds(input_scope, q))
+        .all(|q| block.exposes(q))
+}
+
+/// Whether the analyzer's stamped scope binds `q` (case-insensitive, any
+/// number of matches — ambiguity is the resolver's concern, not vis's).
+fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
+    scope
+        .aliases
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(q))
+}
+
+/// Wrap-boundary qualifier rewrite: when a slot-conflict wrap is about to
+/// bury the child block's FROM aliases behind `__td_sub`, return a clone of
+/// `expr` with each stranded reference `q.c` rewritten to its bare output
+/// name `c`, instead of emitting a qualifier DuckDB can no longer bind
+/// (`Referenced table "q" not found`). A reference is rewritten iff
+///
+/// - the pre-wrap `block` actually exposed `q` — a correlated OUTER
+///   qualifier is never exposed by the inner FROM, and DuckDB's correlated
+///   binder resolves it OUTWARD straight through the wrap, so it must stay
+///   qualified verbatim;
+/// - `q` does not double as a struct-column access on the child's output
+///   (`resolve_column`'s struct-precedence tier): struct access survives a
+///   wrap as column-dot-field syntax, so it needs no rewrite and stripping
+///   would misread the field name as a column; and
+/// - `c` names exactly one output column case-insensitively — an ambiguous
+///   name (a self-join output) cannot be safely unqualified, so it keeps
+///   today's loud binder failure (witnessed by
+///   [`trace_stranded_qualifiers`]).
+///
+/// Qualified stars are NOT rewritten (`q.*` has no bare-name equivalent
+/// against a reshaped output), and subquery bodies are opaque `CommonAst`
+/// plans — not expression children per the τ walker convention — so inner
+/// correlated references are untouched by construction.
+fn strip_stranded_qualifiers(
+    expr: &Expression,
+    block: &SelectBlock,
+    output_schema: &Schema,
+) -> Expression {
+    fn walk(expr: &mut Expression, block: &SelectBlock, output: &Schema) {
+        let strippable = |q: &str, name: &str| {
+            block.exposes(q)
+                && TypeInferenceEngine::struct_qualifier_info(name, q, output).is_none()
+                && output
+                    .fields
+                    .iter()
+                    .filter(|f| f.name.eq_ignore_ascii_case(name))
+                    .count()
+                    == 1
+        };
+        match expr {
+            Expression::ColumnReference(c) => {
+                if c.qualifier
+                    .as_deref()
+                    .is_some_and(|q| strippable(q, &c.name))
+                {
+                    c.qualifier = None;
+                }
+            }
+            Expression::UnresolvedColumn(u) => {
+                if u.qualifier
+                    .as_deref()
+                    .is_some_and(|q| strippable(q, &u.name))
+                {
+                    u.qualifier = None;
+                }
+            }
+            other => {
+                for child in other.children_mut() {
+                    walk(child, block, output);
+                }
+            }
+        }
+    }
+    let mut rewritten = expr.clone();
+    walk(&mut rewritten, block, output_schema);
+    rewritten
+}
+
+/// R7 latent-occlusion witness: when a slot-conflict wrap is about to strand
+/// a qualifier the child block's FROM scope DID expose (the reference will
+/// not resolve through the `__td_sub` boundary), leave a trace. This is not
+/// an error path — it reproduces the pre-block-builder behavior exactly —
+/// but each hit is a corpus witness for a case class the merge rules could
+/// be widened to cover.
+fn trace_stranded_qualifiers<'e>(
+    block: &SelectBlock,
+    exprs: impl IntoIterator<Item = &'e Expression>,
+    input_scope: &super::analyzer::RelScope,
+) {
+    let mut quals = Vec::new();
+    for e in exprs {
+        expr_qualifiers(e, &mut quals);
+    }
+    let stranded: Vec<&str> = quals
+        .into_iter()
+        .filter(|q| scope_binds(input_scope, q) && block.exposes(q))
+        .collect();
+    if !stranded.is_empty() {
+        tracing::debug!(
+            ?stranded,
+            "SELECT-block wrap strands qualifiers the child scope exposed"
+        );
+    }
+}
+
+/// Render `build_project`'s merge-path SELECT list: identical to
+/// [`render_projection_slots`] EXCEPT a bare unqualified `Star` expands to
+/// the merged-into block's hoisted default slot list (F4) instead of a
+/// literal `*` — a raw `*` sitting inside a multi-slot list shadows the join
+/// builder's hoisted USING-key ordering, the same shadowing `* EXCLUDE`
+/// suffers without the F1 fix. A no-op (falls through to
+/// `render_projection_slots` verbatim) when there are no default slots to
+/// substitute, or no bare star to substitute them for.
+fn render_project_merge_slots(
+    projections: &[Expression],
+    input_schema: &Schema,
+    default_slots: Option<&[DefaultSlot]>,
+) -> Result<String, EmissionError> {
+    let has_bare_star = projections
+        .iter()
+        .any(|p| matches!(p, Expression::Star(StarExpression { qualifier: None })));
+    let Some(slots) = default_slots.filter(|_| has_bare_star) else {
+        return render_projection_slots(projections, input_schema);
+    };
+    let star_sql = slots
+        .iter()
+        .map(|s| s.sql.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql_join(projections.iter(), ", ", |p| {
+        if matches!(p, Expression::Star(StarExpression { qualifier: None })) {
+            Ok(star_sql.clone())
+        } else {
+            render_projection_slot(p, input_schema)
+        }
+    })
+}
+
+fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit, EmissionError> {
+    // A lone unqualified `*` is a pure identity projection: return the child
+    // unit verbatim (ADR-001 cosmetic "SELECT * over SELECT *" collapse).
+    // This subsumes the former USING-join delegate branch — a `*` over a
+    // USING join yields the join renderer's explicit hoisted slot list,
+    // which is exactly the column order the resolved schema declares; plain
+    // ON/CROSS joins expand `*` left-then-right, which already matches.
+    if is_unqualified_star_only(projections) {
+        return build_unit(&input.op, &input.resolved_schema);
+    }
+    let mut block = open_block(input)?;
+    if block.can_accept(Clause::Select) && exprs_visible_in(projections, &block, &input.scope) {
+        let slots_sql =
+            render_project_merge_slots(projections, &input.resolved_schema, block.default_slots())?;
+        block.set_projections(slots_sql);
+        return Ok(block.into());
+    }
+    let projections: Vec<Expression> = projections
+        .iter()
+        .map(|p| strip_stranded_qualifiers(p, &block, &input.resolved_schema))
+        .collect();
+    trace_stranded_qualifiers(&block, &projections, &input.scope);
+    let mut wrapped = SelectBlock::wrap(block.into());
+    wrapped.set_projections(render_projection_slots(
+        &projections,
+        &input.resolved_schema,
+    )?);
+    Ok(wrapped.into())
+}
+
+fn build_filter(input: &TypedAst, condition: &Expression) -> Result<SqlUnit, EmissionError> {
+    let mut block = open_block(input)?;
+    if block.can_accept(Clause::Where) && exprs_visible_in([condition], &block, &input.scope) {
+        block.push_where(render_expr(condition, &input.resolved_schema)?);
+        return Ok(block.into());
+    }
+    let condition = strip_stranded_qualifiers(condition, &block, &input.resolved_schema);
+    trace_stranded_qualifiers(&block, [&condition], &input.scope);
+    let mut wrapped = SelectBlock::wrap(block.into());
+    wrapped.push_where(render_expr(&condition, &input.resolved_schema)?);
+    Ok(wrapped.into())
+}
+
+fn build_sort(
+    input: &TypedAst,
+    order: &[SortOrder],
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<SqlUnit, EmissionError> {
+    let mut block = open_block(input)?;
+    // Over an occupied SELECT list, only bare output-name references merge:
+    // ORDER BY resolves them against the select list's aliases; expression
+    // keys would re-bind against FROM columns and could diverge.
+    let keys_bind = if block.select_free() {
+        exprs_visible_in(
+            order.iter().map(|so| so.expr.as_ref()),
+            &block,
+            &input.scope,
+        )
+    } else {
+        order.iter().all(|so| {
+            matches!(so.expr.as_ref(), Expression::ColumnReference(c) if c.qualifier.is_none())
+        })
+    };
+    if block.can_accept(Clause::OrderBy) && block.distinct_allows_order() && keys_bind {
+        let keys = order
+            .iter()
+            .map(|so| render_sort_key(so, &input.resolved_schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        block.set_order_by(keys, limit, offset);
+        return Ok(block.into());
+    }
+    let keys = order
+        .iter()
+        .map(|so| {
+            let mut stripped = so.clone();
+            *stripped.expr = strip_stranded_qualifiers(&so.expr, &block, &input.resolved_schema);
+            render_sort_key(&stripped, &input.resolved_schema)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut wrapped = SelectBlock::wrap(block.into());
+    wrapped.set_order_by(keys, limit, offset);
+    Ok(wrapped.into())
+}
+
+fn build_limit(
+    input: &TypedAst,
+    limit: i64,
+    offset: Option<i64>,
+) -> Result<SqlUnit, EmissionError> {
+    let mut block = open_block(input)?;
+    if !block.can_accept(Clause::LimitOffset) {
+        block = SelectBlock::wrap(block.into());
+    }
+    block.set_limit(limit, offset);
+    Ok(block.into())
+}
+
+fn build_deduplicate(input: &TypedAst, on_columns: &[String]) -> Result<SqlUnit, EmissionError> {
+    let mut block = open_block(input)?;
+    if on_columns.is_empty() {
+        if !block.can_accept(Clause::Distinct) {
+            block = SelectBlock::wrap(block.into());
+        }
+        block.set_distinct(DistinctKind::Distinct);
+    } else {
+        let cols = sql_join(on_columns.iter(), ", ", |c| Ok(quote_ident(c).into_owned()))?;
+        // DISTINCT ON picks an arbitrary representative row per key; it only
+        // merges into a star block (no computed select list, no prior
+        // DISTINCT) so the row-choice surface stays identical to today's
+        // wrapped form.
+        if !(block.can_accept(Clause::Distinct) && block.select_free()) {
+            block = SelectBlock::wrap(block.into());
+        }
+        block.set_distinct(DistinctKind::DistinctOn(cols));
+    }
+    Ok(block.into())
+}
+
+fn build_aliased_relation(input: &TypedAst, alias: &str) -> Result<SqlUnit, EmissionError> {
+    // `df.alias("e")` over a bare table scan collapses to `FROM emp AS e`;
+    // anything else becomes a derived table under the user alias. Either
+    // way the alias is the block's whole scope — the analyzer's RelScope
+    // for AliasedRelation binds exactly this alias.
+    let item = if let TypedOp::TableScan { table, alias: None } = &input.op {
+        FromItem::Relation {
+            base: table.clone(),
+            alias: Some(alias.to_owned()),
+        }
+    } else {
+        FromItem::Derived {
+            unit: Box::new(build_unit(&input.op, &input.resolved_schema)?),
+            alias: alias.to_owned(),
+        }
+    };
+    Ok(SqlUnit::from(SelectBlock::from_item(item)))
+}
+
+/// The pre-SELECT-block string renderers, one arm per not-yet-converted
+/// operator. Arms migrate from here into [`build_unit`] phase by phase;
+/// the match stays exhaustive so a new `TypedOp` variant is a compile error.
+fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError> {
+    let result: Result<String, EmissionError> = match op {
+        // ── C.1 wired ────────────────────────────────────────────────────
+        TypedOp::SingleRow => render_single_row(),
         TypedOp::Unpivot {
             input,
             ids,
@@ -166,68 +1086,6 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             seed,
         } => render_sample_by(input, col, fractions, *seed),
 
-        // ── Aggregate (operator + primitive function arms) ───────────────
-        TypedOp::Aggregate {
-            input,
-            grouping,
-            aggregates,
-            grouping_kind,
-            grouping_sets,
-            having,
-        } => render_aggregate_op(
-            input,
-            grouping,
-            aggregates,
-            *grouping_kind,
-            grouping_sets,
-            having.as_ref(),
-        ),
-
-        // ── Join ─────────────────────────────────────────────────────────
-        TypedOp::Join {
-            left,
-            right,
-            join_type,
-            condition,
-            using_columns,
-            lateral,
-            ..
-        } => render_join(
-            left,
-            right,
-            *join_type,
-            condition.as_ref(),
-            using_columns,
-            *lateral,
-        ),
-        TypedOp::SetOp {
-            kind,
-            all,
-            by_name,
-            allow_missing_columns,
-            children,
-            widened_schema,
-        } => render_set_op(
-            *kind,
-            *all,
-            *by_name,
-            *allow_missing_columns,
-            children,
-            widened_schema,
-        ),
-
-        TypedOp::TableFunction {
-            name,
-            args,
-            with_ordinality,
-        } => render_table_function(name, args, *with_ordinality, schema),
-
-        TypedOp::LateralView {
-            input,
-            table_alias,
-            columns,
-        } => render_lateral_view(input, table_alias, columns),
-
         TypedOp::RecursiveCte {
             name,
             anchor,
@@ -240,11 +1098,33 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             name: "Unnest".to_owned(),
             reason: "unnest emission (not implemented in τ)".to_owned(),
         }),
-    };
 
-    if result.is_ok() {
-        EMIT_TAP.fetch_add(1, Ordering::Relaxed);
-    }
+        // Converted to the SELECT-block builder — reaching a legacy arm for
+        // these is a `build_unit` dispatch bug.
+        TypedOp::Values { .. }
+        | TypedOp::LocalRelation { .. }
+        | TypedOp::FileScan { .. }
+        | TypedOp::TableFunction { .. }
+        | TypedOp::TableScan { .. }
+        | TypedOp::Project { .. }
+        | TypedOp::Filter { .. }
+        | TypedOp::Sort { .. }
+        | TypedOp::Limit { .. }
+        | TypedOp::Deduplicate { .. }
+        | TypedOp::AliasedRelation { .. }
+        | TypedOp::Join { .. }
+        | TypedOp::Aggregate { .. }
+        | TypedOp::LateralView { .. }
+        | TypedOp::SetOp { .. }
+        | TypedOp::WithColumns { .. }
+        | TypedOp::DropColumns { .. }
+        | TypedOp::WithColumnsRenamed { .. }
+        | TypedOp::NaFill { .. }
+        | TypedOp::NaDrop { .. }
+        | TypedOp::NaReplace { .. } => {
+            unreachable!("block-composable operator routed to legacy_render: {op:?}")
+        }
+    };
     result
 }
 
@@ -270,38 +1150,31 @@ fn sql_join<T>(
 fn render_single_row() -> Result<String, EmissionError> {
     // DuckDB requires a subquery to have a projection list — bare `SELECT`
     // parses at top-level but fails inside `FROM (...)`. Emit `SELECT 1` so
-    // `SingleRow` is subquery-safe under `Project` (which wraps as
-    // `SELECT expr FROM (<child>) AS __td_proj` — the placeholder column is
+    // `SingleRow` is subquery-safe under `Project` (which wraps the Raw unit
+    // as `SELECT expr FROM (<child>) AS __td_sub` — the placeholder column is
     // unused because Project provides its own SELECT list). The analyzer
     // stamps SingleRow with an empty schema; no legitimate operator resolves
     // the placeholder column from downstream code, so its presence is inert.
     Ok("SELECT 1".to_owned())
 }
 
-/// The FROM-body for a table scan: the quoted table name, plus an optional
-/// `AS <alias>`. Shared by [`render_table_scan`] and the Project-over-
-/// TableScan inline branch in [`render_project`] so identifier quoting
-/// (schema-qualified / reserved names) is identical on both paths.
-fn table_scan_from_body(table: &str, alias: Option<&str>) -> String {
-    let name = quote_ident(table);
-    match alias {
-        Some(a) => format!("{name} AS {}", quote_ident(a)),
-        None => name.into_owned(),
-    }
+/// A leaf block over a `(VALUES …) AS <alias>(cols)` derived table — the
+/// shared shape of `Values` and non-empty `LocalRelation`. The alias is
+/// exposed truthfully in the block scope; nothing qualifies through it
+/// today (both ops have an empty `RelScope`).
+fn values_leaf_block(rendered_rows: &str, alias: &str, cols: &str) -> SqlUnit {
+    SelectBlock::from_item(FromItem::Raw {
+        sql: format!("(VALUES {rendered_rows}) AS {alias}({cols})"),
+        exposed: vec![alias.to_owned()],
+    })
+    .into()
 }
 
-fn render_table_scan(table: &str, alias: Option<&str>) -> Result<String, EmissionError> {
-    Ok(format!(
-        "SELECT * FROM {}",
-        table_scan_from_body(table, alias)
-    ))
-}
-
-fn render_values(
+fn build_values(
     rows: &[Vec<Expression>],
     column_names: &[String],
     schema: &Schema,
-) -> Result<String, EmissionError> {
+) -> Result<SqlUnit, EmissionError> {
     if rows.is_empty() {
         bail_boundary_op!("Values", "empty VALUES relations are not supported");
     }
@@ -312,15 +1185,13 @@ fn render_values(
     let cols = sql_join(column_names.iter(), ", ", |c| {
         Ok(quote_ident(c).into_owned())
     })?;
-    Ok(format!(
-        "SELECT * FROM (VALUES {rendered_rows}) AS __td_values({cols})"
-    ))
+    Ok(values_leaf_block(&rendered_rows, "__td_values", &cols))
 }
 
-fn render_local_relation(
+fn build_local_relation(
     schema_decl: &StructType,
     rows: &[Vec<Expression>],
-) -> Result<String, EmissionError> {
+) -> Result<SqlUnit, EmissionError> {
     if schema_decl.fields.is_empty() {
         bail_boundary_op!(
             "LocalRelation",
@@ -328,6 +1199,7 @@ fn render_local_relation(
         );
     }
     // Special case: no rows → emit an empty relation with the correct schema.
+    // This is a genuine SELECT (no FROM item exists), so it stays a Raw unit.
     if rows.is_empty() {
         // `SELECT CAST(NULL AS T) AS c, ... WHERE 1=0` — zero rows, right shape.
         let cols = sql_join(schema_decl.fields.iter(), ", ", |f| {
@@ -335,7 +1207,7 @@ fn render_local_relation(
             let name = quote_ident(&f.name);
             Ok(format!("CAST(NULL AS {ty}) AS {name}"))
         })?;
-        return Ok(format!("SELECT {cols} WHERE 1=0"));
+        return Ok(SqlUnit::Raw(format!("SELECT {cols} WHERE 1=0")));
     }
     let rendered_rows = sql_join(rows.iter(), ", ", |row| {
         let cells = sql_join(row.iter().enumerate(), ", ", |(idx, cell)| {
@@ -351,9 +1223,7 @@ fn render_local_relation(
     let cols = sql_join(schema_decl.fields.iter(), ", ", |f| {
         Ok(quote_ident(&f.name).into_owned())
     })?;
-    Ok(format!(
-        "SELECT * FROM (VALUES {rendered_rows}) AS __td_local({cols})"
-    ))
+    Ok(values_leaf_block(&rendered_rows, "__td_local", &cols))
 }
 
 /// Build the DuckDB reader-call SQL fragment for a file scan, e.g.
@@ -411,202 +1281,21 @@ pub fn build_file_reader_sql(
     Ok(format!("{reader}({paths_sql}{opts_sql})"))
 }
 
-fn render_file_scan(
+fn build_file_scan(
     format: FileFormat,
     paths: &[String],
-    _schema: &StructType,
     options: &[(String, String)],
-) -> Result<String, EmissionError> {
+) -> Result<SqlUnit, EmissionError> {
     let reader_call = build_file_reader_sql(format, paths, options)?;
-    Ok(format!("SELECT * FROM {reader_call}"))
-}
-
-/// `(sql) AS alias`, quoting `alias` — the derived-table wrapper shape shared
-/// by every alias-transparent FROM / join-side renderer below (hoisted user
-/// aliases and synthetic `__td_*` fallbacks alike).
-fn quoted_derived(sql: &str, alias: &str) -> String {
-    format!("({sql}) AS {}", quote_ident(alias))
-}
-
-/// The FROM-body (and, when the shape carries a correlated/comma-join
-/// predicate, the WHERE) of a child subtree that already exposes the user
-/// aliases the enclosing `Project`/`Aggregate` clause references — so the
-/// caller can inline directly instead of wrapping the child in its own
-/// occluding synthetic alias (`__td_proj` / `__td_agg`).
-struct AliasTransparentFrom {
-    from_sql: String,
-    where_sql: Option<String>,
-}
-
-/// Whether `input`'s shape already exposes the aliases an enclosing
-/// `Project`/`Aggregate` clause needs, and if so, its alias-transparent
-/// `FROM`/`WHERE` fragments. Mirrors, on the emission side, the question the
-/// analyzer's `collect_qualifier_bindings` asks of the same shapes. Arms, in
-/// order:
-///
-/// - `Join` → inline the join's FROM/ON via [`render_join_from`], hoisting
-///   user aliases (`df.alias("e").join(...).select(e.name)`).
-/// - `Filter { Join }` → a comma-join lowers to `... → Filter → Join`;
-///   collapse into one FROM + WHERE so aliases stay in scope for both.
-///   Filter is schema-passthrough, so the Filter's own `resolved_schema` and
-///   the Join's carry identical fields.
-/// - `Filter { AliasedRelation }` → correlated subqueries (EXISTS / scalar /
-///   scalar-aggregate) lower to `... → Filter → AliasedRelation`. The
-///   default `__td_filter`/`__td_agg`/`__td_proj` wrap would re-bury the
-///   user alias the WHERE's correlated qualifier needs, so flatten into one
-///   FROM + WHERE, keeping the alias as the FROM table name.
-///
-///   Correlated outer references (e.g. `e.salary` from the outer `emp e`)
-///   are resolved by the analyzer's outer-scope fallback (tier (g) in
-///   `resolve_column`): when the inner schema has no match, the analyzer
-///   stamps the reference with the outer plan's type/nullability. Emission
-///   renders the qualifier verbatim; DuckDB's correlated-subquery binder
-///   resolves it at runtime.
-/// - `AliasedRelation` → transparent on its own too: `(inner) AS alias`.
-///
-/// Returns `Ok(None)` for any other shape — the caller keeps its own default
-/// synthetic wrap.
-fn render_alias_transparent_from(
-    input: &TypedAst,
-) -> Result<Option<AliasTransparentFrom>, EmissionError> {
-    if let TypedOp::Join {
-        left,
-        right,
-        join_type,
-        condition,
-        using_columns,
-        lateral,
-        ..
-    } = &input.op
-    {
-        let from_sql = render_join_from(
-            left,
-            right,
-            *join_type,
-            condition.as_ref(),
-            using_columns,
-            &input.resolved_schema,
-            *lateral,
-        )?;
-        return Ok(Some(AliasTransparentFrom {
-            from_sql,
-            where_sql: None,
-        }));
-    }
-    if let TypedOp::Filter {
-        input: filter_input,
-        condition: filter_cond,
-    } = &input.op
-    {
-        if let TypedOp::Join {
-            left,
-            right,
-            join_type,
-            condition: join_cond,
-            using_columns,
-            lateral,
-            ..
-        } = &filter_input.op
-        {
-            let from_sql = render_join_from(
-                left,
-                right,
-                *join_type,
-                join_cond.as_ref(),
-                using_columns,
-                &filter_input.resolved_schema,
-                *lateral,
-            )?;
-            let where_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
-            return Ok(Some(AliasTransparentFrom {
-                from_sql,
-                where_sql: Some(where_sql),
-            }));
-        }
-        if let TypedOp::AliasedRelation {
-            input: inner,
-            alias,
-        } = &filter_input.op
-        {
-            let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
-            let where_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
-            return Ok(Some(AliasTransparentFrom {
-                from_sql: quoted_derived(&inner_sql, alias),
-                where_sql: Some(where_sql),
-            }));
-        }
-        return Ok(None);
-    }
-    if let TypedOp::AliasedRelation {
-        input: inner,
-        alias,
-    } = &input.op
-    {
-        let inner_sql = dispatch_op(&inner.op, &inner.resolved_schema)?;
-        return Ok(Some(AliasTransparentFrom {
-            from_sql: quoted_derived(&inner_sql, alias),
-            where_sql: None,
-        }));
-    }
-    // LateralView already carries the user's table alias (`t`) — Project over
-    // LateralView must inline the LATERAL(SELECT...) FROM body so `e` and `t`
-    // stay in scope (the default `__td_proj` wrap would occlude both).
-    if let TypedOp::LateralView {
-        input,
-        table_alias,
-        columns,
-    } = &input.op
-    {
-        return Ok(Some(AliasTransparentFrom {
-            from_sql: render_lateral_view_from(input, table_alias, columns)?,
-            where_sql: None,
-        }));
-    }
-    Ok(None)
-}
-
-fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String, EmissionError> {
-    let input_schema = &input.resolved_schema;
-    // `SELECT *` over a USING/NATURAL join: DuckDB's `*` keeps the join key in
-    // its natural (left-table) position, but the analyzer's resolved_schema
-    // HOISTS the coalesced key(s) to the front (Spark semantics). If we emitted
-    // `SELECT * FROM (... USING (k))` the wire column order would diverge from
-    // the declared schema. Delegate to the generic join renderer, which emits
-    // an explicit hoisted slot list mirroring resolved_schema. Only fires for a
-    // lone unqualified `*` over a Join carrying USING columns; plain ON/CROSS
-    // joins expand `*` in left-then-right order, which already matches the
-    // declared schema.
-    if is_unqualified_star_only(projections) {
-        if let TypedOp::Join { using_columns, .. } = &input.op {
-            if !using_columns.is_empty() {
-                return dispatch_op(&input.op, &input.resolved_schema);
-            }
-        }
-    }
-    // Join / Filter-over-Join / Filter-over-AliasedRelation / AliasedRelation
-    // children already expose the aliases the projection list references —
-    // inline through them instead of wrapping in a synthetic `__td_proj`.
-    if let Some(atf) = render_alias_transparent_from(input)? {
-        let slots_sql = render_projection_slots(projections, input_schema)?;
-        return Ok(match atf.where_sql {
-            Some(w) => format!("SELECT {slots_sql} FROM {} WHERE {w}", atf.from_sql),
-            None => format!("SELECT {slots_sql} FROM {}", atf.from_sql),
-        });
-    }
-    // Project over a bare TableScan: inline `FROM t` (optionally `AS alias`)
-    // instead of wrapping the child in `(SELECT * FROM t) AS __td_proj`. This
-    // keeps the table name / alias in scope so qualified refs and qualified
-    // stars (`emp.col` / `emp.*`) bind (Fix A stamps the schema accordingly).
-    if let TypedOp::TableScan { table, alias } = &input.op {
-        let slots_sql = render_projection_slots(projections, input_schema)?;
-        let from = table_scan_from_body(table, alias.as_deref());
-        return Ok(format!("SELECT {slots_sql} FROM {from}"));
-    }
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let slots_sql = render_projection_slots(projections, input_schema)?;
-    Ok(format!(
-        "SELECT {slots_sql} FROM ({child_sql}) AS __td_proj"
-    ))
+    // The reader call is a FROM-item generator: parents merge onto it
+    // (`SELECT cols FROM read_parquet(…) WHERE …`) instead of wrapping.
+    // No alias is exposed — a FileScan's RelScope is empty; nothing
+    // qualifies through it.
+    Ok(SelectBlock::from_item(FromItem::Raw {
+        sql: reader_call,
+        exposed: Vec::new(),
+    })
+    .into())
 }
 
 /// True iff `projections` is exactly one unqualified `*` (i.e. `SELECT *`),
@@ -672,246 +1361,6 @@ fn render_join_clause(
     }
 }
 
-/// Whether `expr` contains any `ColumnReference`/`UnresolvedColumn` whose
-/// qualifier matches `q` (ASCII case-insensitive). The join-side decision
-/// ladder's own version of the qualifier scan `qualify_plan_id_refs` (§2.3,
-/// analyzer.rs) uses to stamp `__td_jl`/`__td_jr` in the first place.
-fn expr_uses_qualifier(expr: &Expression, q: &str) -> bool {
-    match expr {
-        Expression::ColumnReference(c) => c
-            .qualifier
-            .as_deref()
-            .is_some_and(|cq| cq.eq_ignore_ascii_case(q)),
-        Expression::UnresolvedColumn(u) => u
-            .qualifier
-            .as_deref()
-            .is_some_and(|cq| cq.eq_ignore_ascii_case(q)),
-        other => other.children().any(|c| expr_uses_qualifier(c, q)),
-    }
-}
-
-/// Whether `side`'s left spine can be folded into one chained `FROM` instead
-/// of wrapping it in a synthetic derived-table alias. Requires, at this
-/// level and recursively down the left spine:
-///
-/// - `using_columns` empty (USING has its own column-order/dedup semantics —
-///   generic [`render_join`]'s explicit slot list exists precisely to fix
-///   USING order; flattening across it would change `SELECT *` order).
-/// - `join_type` is not `LeftSemi`/`LeftAnti` (CLAUDE.md gotcha 4 — the
-///   flat-chain rendering must break at semi/anti boundaries).
-/// - the join condition carries no `__td_jl`/`__td_jr` references (those are
-///   per-level synthetic names; a match means this level was itself produced
-///   under the plan_id contract and must stay wrapped).
-/// - the left side is a user `AliasedRelation` or another flattenable `Join`.
-/// - the right side is a user `AliasedRelation` (user-aliased leaves only —
-///   avoids colliding with the fallback synthetic alias).
-/// - no user alias repeats across the whole flattened scope. DuckDB rejects
-///   `Duplicate alias X in query!` when two `AS X` land in one FROM scope,
-///   whereas the isolating synthetic wrapper (the step-4 fallback) does not —
-///   so a chain that would emit a duplicate stays wrapped. Spark permits
-///   duplicate FROM aliases (it errors only on ambiguous *references*), so
-///   this keeps such queries green rather than flipping them red.
-///
-/// Returns the ordered list of user aliases the flattened chain would emit
-/// into a single FROM scope, or `None` when `side` is not flattenable (by any
-/// of the above rules, including the duplicate-alias guard).
-fn flattenable_chain_aliases(side: &TypedAst) -> Option<Vec<String>> {
-    use super::ast::JoinType;
-    let TypedOp::Join {
-        left,
-        right,
-        join_type,
-        condition,
-        using_columns,
-        lateral,
-        ..
-    } = &side.op
-    else {
-        return None;
-    };
-    // A lateral join's right side is a correlated derived table — flattening
-    // it into a shared FROM scope is unsound (splicing a correlation into a
-    // scope τ never validated).
-    if *lateral {
-        return None;
-    }
-    if !using_columns.is_empty() {
-        return None;
-    }
-    if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
-        return None;
-    }
-    if let Some(cond) = condition {
-        if expr_uses_qualifier(cond, TD_JOIN_LEFT) || expr_uses_qualifier(cond, TD_JOIN_RIGHT) {
-            return None;
-        }
-    }
-    let mut aliases = match &left.op {
-        TypedOp::AliasedRelation { alias, .. } => vec![alias.clone()],
-        TypedOp::Join { .. } => flattenable_chain_aliases(left)?,
-        _ => return None,
-    };
-    let TypedOp::AliasedRelation {
-        alias: right_alias, ..
-    } = &right.op
-    else {
-        return None;
-    };
-    if aliases.iter().any(|a| a.eq_ignore_ascii_case(right_alias)) {
-        return None;
-    }
-    aliases.push(right_alias.clone());
-    Some(aliases)
-}
-
-/// Render one side of a join's `FROM` clause. Decision ladder, in order:
-///
-/// 1. `condition` references `synthetic_alias` (via [`expr_uses_qualifier`])
-///    → `(dispatch_op(side)) AS synthetic_alias`. This is the DataFrame
-///    plan_id-qualified-condition contract (`qualify_plan_id_refs`,
-///    analyzer.rs) — it must win even when `side` is itself a user
-///    `AliasedRelation` (closes the latent `df.alias("e")` + plan_id hazard:
-///    hoisting to the user alias there would leave the plan_id-stamped
-///    condition referencing a qualifier nothing binds).
-/// 2. `side` is a user `AliasedRelation` → hoist `(inner) AS user_alias`.
-/// 3. `allow_flatten` and `side` is a [`flattenable_chain_aliases`] nested
-///    `Join` whose flattened aliases do not collide with `sibling_alias` (the
-///    outer join's other side) → recurse into [`render_join_from`] for a
-///    chained FROM with no wrapper (left-deep join chains parse to the same
-///    tree shape either way — ADR-001 transliteration). The sibling-collision
-///    guard is the spine-vs-outer-right half of the duplicate-alias check:
-///    without it a flattened left spine could reuse the outer right's alias in
-///    the same FROM scope, which DuckDB rejects. On collision we fall through
-///    to the isolating wrapper (step 4).
-/// 4. else → `(dispatch_op(side)) AS synthetic_alias` (existing fallback).
-fn render_join_side(
-    side: &TypedAst,
-    synthetic_alias: &str,
-    condition: Option<&Expression>,
-    allow_flatten: bool,
-    sibling_alias: Option<&str>,
-) -> Result<String, EmissionError> {
-    let condition_uses_synthetic = condition
-        .map(|c| expr_uses_qualifier(c, synthetic_alias))
-        .unwrap_or(false);
-    if condition_uses_synthetic {
-        let side_sql = dispatch_op(&side.op, &side.resolved_schema)?;
-        return Ok(quoted_derived(&side_sql, synthetic_alias));
-    }
-    if let TypedOp::AliasedRelation { input, alias } = &side.op {
-        let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-        return Ok(quoted_derived(&inner_sql, alias));
-    }
-    // Bare unaliased TableScan: hoist using the table's own name as the alias
-    // so that table-name-qualified references (e.g. `emp.dept_id` inside a
-    // LATERAL subquery) stay resolvable. Without this, the __td_jl fallback
-    // buries the table name and DuckDB's binder cannot find it.
-    if let TypedOp::TableScan { table, alias: None } = &side.op {
-        let inner_sql = dispatch_op(&side.op, &side.resolved_schema)?;
-        return Ok(quoted_derived(&inner_sql, table));
-    }
-    if allow_flatten {
-        if let Some(chain_aliases) = flattenable_chain_aliases(side) {
-            let collides_with_sibling = sibling_alias
-                .is_some_and(|s| chain_aliases.iter().any(|a| a.eq_ignore_ascii_case(s)));
-            if !collides_with_sibling {
-                // `flattenable_chain_aliases` has already validated the whole
-                // left spine, so emit it in a single walk via `emit_flat_chain`
-                // rather than recursing through `render_join_from` (which would
-                // re-run the O(spine) validation at every level → O(N^2)).
-                return emit_flat_chain(side);
-            }
-        }
-    }
-    let side_sql = dispatch_op(&side.op, &side.resolved_schema)?;
-    Ok(quoted_derived(&side_sql, synthetic_alias))
-}
-
-/// Emit a validated-flattenable left-deep join chain as one chained `FROM`
-/// body (`(a) AS x K (b) AS y ON .. K (c) AS z ON ..`), walking the spine
-/// exactly once. Precondition: `side` passed [`flattenable_chain_aliases`], so
-/// every leaf is a user `AliasedRelation` and no re-validation is needed. Kept
-/// separate from [`render_join_from`] so the flatten path does not re-invoke
-/// the O(spine) flattenability check at each recursion level.
-fn emit_flat_chain(side: &TypedAst) -> Result<String, EmissionError> {
-    let TypedOp::Join {
-        left,
-        right,
-        join_type,
-        condition,
-        using_columns,
-        ..
-    } = &side.op
-    else {
-        // Precondition guarantees a Join; fall back defensively rather than panic.
-        return dispatch_op(&side.op, &side.resolved_schema);
-    };
-    let left_frag = match &left.op {
-        TypedOp::Join { .. } => emit_flat_chain(left)?,
-        TypedOp::AliasedRelation { input, alias } => {
-            let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-            quoted_derived(&inner_sql, alias)
-        }
-        _ => {
-            let inner_sql = dispatch_op(&left.op, &left.resolved_schema)?;
-            quoted_derived(&inner_sql, TD_JOIN_LEFT)
-        }
-    };
-    let right_frag = match &right.op {
-        TypedOp::AliasedRelation { input, alias } => {
-            let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-            quoted_derived(&inner_sql, alias)
-        }
-        _ => {
-            let inner_sql = dispatch_op(&right.op, &right.resolved_schema)?;
-            quoted_derived(&inner_sql, TD_JOIN_RIGHT)
-        }
-    };
-    let kind = join_kind_sql(*join_type);
-    let clause = render_join_clause(
-        *join_type,
-        condition.as_ref(),
-        using_columns,
-        &side.resolved_schema,
-    )?;
-    Ok(format!("{left_frag} {kind} {right_frag}{clause}"))
-}
-
-/// Render the `FROM` body of a join — the two aliased sides and the
-/// `ON`/`USING`/`CROSS` clause — without an enclosing `SELECT`. Delegates
-/// each side to [`render_join_side`] (left may flatten a nested,
-/// user-aliased join chain; right never does — only the left spine of a
-/// left-deep join chain matches the original SQL FROM-list shape).
-/// `cond_schema` resolves the ON-condition expression.
-fn render_join_from(
-    left: &TypedAst,
-    right: &TypedAst,
-    join_type: crate::transpiler_v2::ast::JoinType,
-    condition: Option<&Expression>,
-    using_columns: &[String],
-    cond_schema: &Schema,
-    lateral: bool,
-) -> Result<String, EmissionError> {
-    // The left spine may flatten into this FROM scope; guard it against reusing
-    // the outer right side's user alias (spine-vs-sibling half of the
-    // duplicate-alias check). The right side never flattens, so it needs no
-    // sibling guard.
-    let right_alias = match &right.op {
-        TypedOp::AliasedRelation { alias, .. } => Some(alias.as_str()),
-        _ => None,
-    };
-    let left_from = render_join_side(left, TD_JOIN_LEFT, condition, true, right_alias)?;
-    let right_from = render_join_side(right, TD_JOIN_RIGHT, condition, false, None)?;
-    let right_from = if lateral {
-        format!("LATERAL {right_from}")
-    } else {
-        right_from
-    };
-    let kind = join_kind_sql(join_type);
-    let clause = render_join_clause(join_type, condition, using_columns, cond_schema)?;
-    Ok(format!("{left_from} {kind} {right_from}{clause}"))
-}
-
 /// Render a projection slot, applying `spark_return_cast` at the top level
 /// (§5.1) — Spark-parity casts only appear as an outermost `CAST(...)` around
 /// the projection expression (with optional preserved alias).
@@ -934,88 +1383,6 @@ fn render_projection_slot(
     Ok(spark_return_cast(inner_sql, expr, input_schema))
 }
 
-/// Render the FROM-body of a `LATERAL VIEW` operator:
-/// `<input-from-body>, LATERAL (SELECT <expr1> AS <alias1>[, ...]) AS <table_alias>`.
-///
-/// The input FROM resolution follows the same priority as `render_project`:
-/// - TableScan → inline `table_scan_from_body`
-/// - alias-transparent shapes → inline their `from_sql`
-/// - anything else → wrap in a `quoted_derived(dispatch_op(input), "__td_lv")`
-fn render_lateral_view_from(
-    input: &TypedAst,
-    table_alias: &str,
-    columns: &[(String, Expression)],
-) -> Result<String, EmissionError> {
-    let input_schema = &input.resolved_schema;
-    let input_from = if let TypedOp::TableScan { table, alias } = &input.op {
-        table_scan_from_body(table, alias.as_deref())
-    } else if let Some(atf) = render_alias_transparent_from(input)? {
-        // alias-transparent shapes already expose user aliases.
-        // A WHERE from a Filter-over-X is not expected here (LateralView
-        // does not nest with Filter in its immediate input in the current
-        // corpus), but handle it defensively.
-        match atf.where_sql {
-            Some(w) => format!("(SELECT * FROM {} WHERE {w}) AS __td_lv", atf.from_sql),
-            None => atf.from_sql,
-        }
-    } else {
-        let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-        quoted_derived(&inner_sql, "__td_lv")
-    };
-
-    let inner_select = sql_join(columns.iter(), ", ", |(alias, expr)| {
-        let expr_sql = render_expr(expr, input_schema)?;
-        Ok(format!("{expr_sql} AS {}", quote_ident(alias)))
-    })?;
-
-    Ok(format!(
-        "{input_from}, LATERAL (SELECT {inner_select}) AS {}",
-        quote_ident(table_alias)
-    ))
-}
-
-/// Top-level dispatch for `TypedOp::LateralView` —
-/// `SELECT * FROM <render_lateral_view_from(...)>`.
-fn render_lateral_view(
-    input: &TypedAst,
-    table_alias: &str,
-    columns: &[(String, Expression)],
-) -> Result<String, EmissionError> {
-    let from_body = render_lateral_view_from(input, table_alias, columns)?;
-    Ok(format!("SELECT * FROM {from_body}"))
-}
-
-fn render_filter(input: &TypedAst, condition: &Expression) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let cond_sql = render_expr(condition, &input.resolved_schema)?;
-    Ok(format!(
-        "SELECT * FROM ({child_sql}) AS __td_filter WHERE {cond_sql}"
-    ))
-}
-
-fn render_sort(
-    input: &TypedAst,
-    order: &[SortOrder],
-    limit: Option<i64>,
-    offset: Option<i64>,
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let mut sql = format!("SELECT * FROM ({child_sql}) AS __td_sort");
-    if !order.is_empty() {
-        sql.push_str(" ORDER BY ");
-        sql.push_str(&sql_join(order.iter(), ", ", |so| {
-            render_sort_key(so, &input.resolved_schema)
-        })?);
-    }
-    if let Some(l) = limit {
-        sql.push_str(&format!(" LIMIT {l}"));
-    }
-    if let Some(o) = offset {
-        sql.push_str(&format!(" OFFSET {o}"));
-    }
-    Ok(sql)
-}
-
 fn render_sort_key(so: &SortOrder, schema: &Schema) -> Result<String, EmissionError> {
     let expr_sql = render_expr(&so.expr, schema)?;
     let dir = match so.direction {
@@ -1027,19 +1394,6 @@ fn render_sort_key(so: &SortOrder, schema: &Schema) -> Result<String, EmissionEr
         NullOrdering::NullsLast => "NULLS LAST",
     };
     Ok(format!("{expr_sql} {dir} {nulls}"))
-}
-
-fn render_limit(
-    input: &TypedAst,
-    limit: i64,
-    offset: Option<i64>,
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let mut sql = format!("SELECT * FROM ({child_sql}) AS __td_limit LIMIT {limit}");
-    if let Some(o) = offset {
-        sql.push_str(&format!(" OFFSET {o}"));
-    }
-    Ok(sql)
 }
 
 // ── Unwired renderer (Decision 13-A) ─────────────────────────────────────────
@@ -1091,14 +1445,14 @@ fn render_recursive_cte(
 /// column types match the analyzer's widened schema (per ADR-006 refinement +
 /// Open Decision 5). `UNION BY NAME` is deferred (analyzer surfaces it as
 /// `PuntedOperator`); it never reaches this renderer.
-fn render_set_op(
+fn build_set_op(
     kind: crate::transpiler_v2::ast::SetOpKind,
     all: bool,
     by_name: bool,
     allow_missing_columns: bool,
     children: &[TypedAst],
     widened_schema: &StructType,
-) -> Result<String, EmissionError> {
+) -> Result<SqlUnit, EmissionError> {
     use super::ast::SetOpKind;
     if children.is_empty() {
         bail_boundary_op!("SetOp", "set-op with no children");
@@ -1130,7 +1484,6 @@ fn render_set_op(
     };
     let mut parts: Vec<String> = Vec::with_capacity(children.len());
     for child in children {
-        let child_sql = dispatch_op(&child.op, &child.resolved_schema)?;
         // Per-column CAST to widened parent schema.
         //   - by-position: children have identical arity (analyzer verified);
         //     zip position-wise, CAST each column to widened_schema[i] and
@@ -1180,112 +1533,24 @@ fn render_set_op(
                 })
             },
         )?;
-        parts.push(format!("SELECT {slots} FROM ({child_sql}) AS __td_setop"));
+        // Every child is a block barrier: the cast list references the
+        // child's OUTPUT names, which are unambiguous only across a
+        // derived-table boundary (a join child's FROM scope could bind the
+        // same unqualified name on both sides).
+        let child_unit = build_unit(&child.op, &child.resolved_schema)?;
+        let mut cast_block = SelectBlock::wrap(child_unit);
+        cast_block.set_projections(slots);
+        parts.push(cast_block.to_sql());
     }
-    // Wrap the union expression in an outer SELECT so downstream operators
-    // can wrap it as `FROM (...)` without DuckDB parse errors on the
-    // UNION-composed subquery.
-    Ok(parts.join(&format!(" {op_kw} ")))
+    // The chain stays a bare `a UNION b …` Raw unit; a parent embedding it
+    // as a FROM item adds the parentheses via its Derived wrap.
+    Ok(SqlUnit::Raw(parts.join(&format!(" {op_kw} "))))
 }
 
-/// Render a binary `Join`. Emits
-/// `SELECT * FROM (left) AS __td_jl <JOIN_KIND> JOIN (right) AS __td_jr
-/// [ON <cond> | USING (<cols>)]`. DuckDB accepts `INNER`, `LEFT`, `RIGHT`,
-/// `FULL`, `CROSS`, `SEMI`, `ANTI` — the last two WITHOUT the `LEFT` prefix
-/// (checklist §5 / CLAUDE.md Known Gotcha #5). SEMI/ANTI join emission never
-/// produces right-side columns (semantically absent); the analyzer already
-/// computes the output schema accordingly (LeftSemi/LeftAnti → left schema
-/// only).
-///
-/// This is the `__td_jl`/`__td_jr` contract renderer `qualify_plan_id_refs`
-/// (analyzer.rs) and [`render_join_side`]'s condition-qualifier check both
-/// key off of — it stays unchanged by the alias-transparent-FROM work above.
-/// A user-qualified ref sitting directly above one of the OTHER synthetic
-/// wrappers (`__td_sort`/`__td_limit`/`__td_filter`) is a known-latent class
-/// of the same root cause with no corpus witness today — out of scope for
-/// this pass (see diagnostic-pass-6.md).
-fn render_join(
-    left: &TypedAst,
-    right: &TypedAst,
-    join_type: crate::transpiler_v2::ast::JoinType,
-    condition: Option<&Expression>,
-    using_columns: &[String],
-    lateral: bool,
-) -> Result<String, EmissionError> {
-    use super::ast::JoinType;
-
-    // Lateral join: delegate to `render_join_from` wrapped in `SELECT * FROM
-    // ...` INSTEAD of the generic explicit-slot-list renderer. The generic
-    // renderer's `(left_sql) AS __td_jl` wrapper buries the left's user alias,
-    // which the correlated reference inside the LATERAL subquery needs to see.
-    // `render_join_side`'s step-2 hoist (`(inner) AS e`) keeps the alias
-    // visible. `SELECT *` is safe: lateral joins are guarded USING-free, and
-    // CROSS/Inner-ON expand `*` left-then-right matching the analyzer's concat
-    // schema.
-    if lateral {
-        let cond_schema = StructType::merge(&left.resolved_schema, &right.resolved_schema);
-        let from = render_join_from(
-            left,
-            right,
-            join_type,
-            condition,
-            using_columns,
-            &cond_schema,
-            true,
-        )?;
-        return Ok(format!("SELECT * FROM {from}"));
-    }
-
-    let left_sql = dispatch_op(&left.op, &left.resolved_schema)?;
-    let right_sql = dispatch_op(&right.op, &right.resolved_schema)?;
-    let kind = join_kind_sql(join_type);
-    let clause = render_join_clause(join_type, condition, using_columns, &left.resolved_schema)?;
-    // Emit an EXPLICIT column list mirroring the analyzer's output schema
-    // (see `analyzer.rs::CommonOp::Join` output-schema block for the
-    // canonical order). Without this, `SELECT *` on a USING-joined
-    // relation returns columns in DuckDB's order, which diverges from the
-    // analyzer's declared order.
-    let is_semi_or_anti = matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
-    let using_lower: std::collections::HashSet<String> =
-        using_columns.iter().map(|s| s.to_lowercase()).collect();
-    let left_alias_q = quote_ident(TD_JOIN_LEFT);
-    let right_alias_q = quote_ident(TD_JOIN_RIGHT);
-    let mut slots: Vec<String> = Vec::new();
-    // USING columns first (Spark hoists them).
-    for c in using_columns {
-        slots.push(quote_ident(c).into_owned());
-    }
-    // Left's non-USING columns in declared order.
-    for f in &left.resolved_schema.fields {
-        if !using_lower.contains(&f.name.to_lowercase()) {
-            slots.push(format!("{}.{}", left_alias_q, quote_ident(&f.name)));
-        }
-    }
-    // Right's non-USING columns — only when NOT semi/anti (which suppresses
-    // right side).
-    if !is_semi_or_anti {
-        for f in &right.resolved_schema.fields {
-            if !using_lower.contains(&f.name.to_lowercase()) {
-                slots.push(format!("{}.{}", right_alias_q, quote_ident(&f.name)));
-            }
-        }
-    }
-    let slots = if slots.is_empty() {
-        // Fallback for SEMI/ANTI on identical USING columns only.
-        "*".to_owned()
-    } else {
-        slots.join(", ")
-    };
-    Ok(format!(
-        "SELECT {slots} FROM ({left_sql}) AS {left_alias_q} {kind} ({right_sql}) AS {right_alias_q}{clause}"
-    ))
-}
-
-fn render_with_columns(
+fn build_with_columns(
     input: &TypedAst,
     assignments: &[(String, Expression)],
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+) -> Result<SqlUnit, EmissionError> {
     let input_schema = &input.resolved_schema;
     // Column-order contract with the analyzer is single-homed in
     // [`with_columns_plan`] (see its doc): input columns emit in their
@@ -1294,33 +1559,70 @@ fn render_with_columns(
     // analyzer builds the resolved schema from the same plan, so the SELECT
     // slots and the advertised schema stay aligned by construction.
     let plan = with_columns_plan(input_schema, assignments);
-    let mut slots: Vec<String> = Vec::new();
-    for (f, replaced_by) in input_schema.fields.iter().zip(&plan.replaced) {
-        if let Some(idx) = replaced_by {
-            let (_, expr) = &assignments[*idx];
-            let expr_sql = render_expr(expr, input_schema)?;
-            let name_q = quote_ident(&f.name);
-            slots.push(format!("{expr_sql} AS {name_q}"));
-        } else {
-            slots.push(quote_ident(&f.name).into_owned());
-        }
-    }
-    for &i in &plan.appended {
-        let (name, expr) = &assignments[i];
-        let expr_sql = render_expr(expr, input_schema)?;
-        let name_q = quote_ident(name);
-        slots.push(format!("{expr_sql} AS {name_q}"));
-    }
-    let slots = slots.join(", ");
-    Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_with"))
+    block_with_projections(
+        input,
+        |block| exprs_visible_in(assignments.iter().map(|(_, e)| e), block, &input.scope),
+        |block, wrapped| {
+            let render_assignment = |expr: &Expression| {
+                if wrapped {
+                    render_expr(
+                        &strip_stranded_qualifiers(expr, block, input_schema),
+                        input_schema,
+                    )
+                } else {
+                    render_expr(expr, input_schema)
+                }
+            };
+            let mut slots: Vec<String> = Vec::new();
+            for (f, replaced_by) in input_schema.fields.iter().zip(&plan.replaced) {
+                if let Some(idx) = replaced_by {
+                    let (_, expr) = &assignments[*idx];
+                    let expr_sql = render_assignment(expr)?;
+                    let name_q = quote_ident(&f.name);
+                    slots.push(format!("{expr_sql} AS {name_q}"));
+                } else {
+                    slots.push(quote_ident(&f.name).into_owned());
+                }
+            }
+            for &i in &plan.appended {
+                let (name, expr) = &assignments[i];
+                let expr_sql = render_assignment(expr)?;
+                let name_q = quote_ident(name);
+                slots.push(format!("{expr_sql} AS {name_q}"));
+            }
+            Ok(slots.join(", "))
+        },
+    )
 }
 
-fn render_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+fn build_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<SqlUnit, EmissionError> {
     let dropped = sql_join(drop_names.iter(), ", ", |n| Ok(quote_ident(n).into_owned()))?;
-    Ok(format!(
-        "SELECT * EXCLUDE ({dropped}) FROM ({child_sql}) AS __td_drop"
-    ))
+    block_with_projections(
+        input,
+        |_| true,
+        |block, wrapped| {
+            // A merging (un-wrapped) block whose hoisted default slots are
+            // still live can filter them directly by name (F1) — `* EXCLUDE`
+            // over a USING join lets DuckDB keep the excluded set's sibling
+            // column at ITS natural (non-hoisted) FROM position, silently
+            // un-hoisting the USING key. A wrapped child already rendered its
+            // own defaults inside `__td_sub`'s `*`, so `* EXCLUDE` there is
+            // correct as-is.
+            if !wrapped {
+                if let Some(slots) = block.default_slots() {
+                    let remaining: Vec<&str> = slots
+                        .iter()
+                        .filter(|s| !drop_names.iter().any(|d| d.eq_ignore_ascii_case(&s.name)))
+                        .map(|s| s.sql.as_str())
+                        .collect();
+                    if !remaining.is_empty() {
+                        return Ok(remaining.join(", "));
+                    }
+                }
+            }
+            Ok(format!("* EXCLUDE ({dropped})"))
+        },
+    )
 }
 
 /// Render `df.na.fill(values, subset=cols)`. For each column in the input
@@ -1329,12 +1631,11 @@ fn render_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<String
 /// Single-value form (`values.len()==1`) applies that value to all cols in
 /// the subset. Per-column form (`values.len()==cols.len()`) pairs
 /// position-wise.
-fn render_na_fill(
+fn build_na_fill(
     input: &TypedAst,
     cols: &[String],
     values: &[Expression],
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+) -> Result<SqlUnit, EmissionError> {
     let input_schema = &input.resolved_schema;
     if values.is_empty() {
         bail_boundary_op!("NaFill", "NaFill requires at least one fill value");
@@ -1356,19 +1657,18 @@ fn render_na_fill(
             Ok(name_q.into_owned())
         }
     })?;
-    Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_nafill"))
+    block_with_projections(input, |_| true, |_, _| Ok(slots))
 }
 
 /// Render `df.na.drop(how, subset, thresh)`. `min_non_nulls=None` means
 /// how="any" (drop if ANY subset col is null); `Some(1)` means how="all"
 /// (drop only if ALL subset cols are null); other values are Spark's
 /// `thresh` semantic.
-fn render_na_drop(
+fn build_na_drop(
     input: &TypedAst,
     cols: &[String],
     min_non_nulls: Option<i32>,
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+) -> Result<SqlUnit, EmissionError> {
     let input_schema = &input.resolved_schema;
     // Resolve subset — empty means all columns.
     let subset: Vec<&str> = if cols.is_empty() {
@@ -1381,7 +1681,8 @@ fn render_na_drop(
         cols.iter().map(|s| s.as_str()).collect()
     };
     if subset.is_empty() {
-        return Ok(format!("SELECT * FROM ({child_sql}) AS __td_nadrop"));
+        // Nothing to test — the operator is an identity.
+        return build_unit(&input.op, input_schema);
     }
     let condition = if let Some(thresh) = min_non_nulls {
         // Row kept iff at least `thresh` of subset cols are non-null.
@@ -1398,20 +1699,22 @@ fn render_na_drop(
             Ok(format!("{q} IS NOT NULL"))
         })?
     };
-    Ok(format!(
-        "SELECT * FROM ({child_sql}) AS __td_nadrop WHERE {condition}"
-    ))
+    let mut block = open_block(input)?;
+    if !block.can_accept(Clause::Where) {
+        block = SelectBlock::wrap(block.into());
+    }
+    block.push_where(condition);
+    Ok(block.into())
 }
 
 /// Render `df.na.replace([old_vals], [new_vals], subset=cols)`. Emit
 /// `SELECT CASE WHEN col = old1 THEN new1 ... ELSE col END AS col` for each
 /// column in subset (or all cols if empty).
-fn render_na_replace(
+fn build_na_replace(
     input: &TypedAst,
     cols: &[String],
     replacements: &[(Expression, Expression)],
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+) -> Result<SqlUnit, EmissionError> {
     let input_schema = &input.resolved_schema;
     let in_subset = |name: &str| -> bool {
         cols.is_empty() || cols.iter().any(|c| c.eq_ignore_ascii_case(name))
@@ -1431,9 +1734,7 @@ fn render_na_replace(
             Ok(name_q.into_owned())
         }
     })?;
-    Ok(format!(
-        "SELECT {slots} FROM ({child_sql}) AS __td_nareplace"
-    ))
+    block_with_projections(input, |_| true, |_, _| Ok(slots))
 }
 
 /// Render `df.unpivot(ids, values, var_col, val_col)`.
@@ -1832,25 +2133,10 @@ fn render_sample_by(
     ))
 }
 
-fn render_deduplicate(input: &TypedAst, on_columns: &[String]) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    if on_columns.is_empty() {
-        Ok(format!(
-            "SELECT DISTINCT * FROM ({child_sql}) AS __td_dedup"
-        ))
-    } else {
-        let cols = sql_join(on_columns.iter(), ", ", |c| Ok(quote_ident(c).into_owned()))?;
-        Ok(format!(
-            "SELECT DISTINCT ON ({cols}) * FROM ({child_sql}) AS __td_dedup"
-        ))
-    }
-}
-
-fn render_with_columns_renamed(
+fn build_with_columns_renamed(
     input: &TypedAst,
     renames: &[(String, String)],
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+) -> Result<SqlUnit, EmissionError> {
     let rename_map: std::collections::HashMap<String, String> = renames
         .iter()
         .map(|(old, new)| (old.to_lowercase(), new.clone()))
@@ -1864,13 +2150,7 @@ fn render_with_columns_renamed(
         let dst = quote_ident(&dst_name);
         Ok(format!("{src} AS {dst}"))
     })?;
-    Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_rename"))
-}
-
-fn render_aliased_relation(input: &TypedAst, alias: &str) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let a = quote_ident(alias);
-    Ok(format!("SELECT * FROM ({child_sql}) AS {a}"))
+    block_with_projections(input, |_| true, |_, _| Ok(slots))
 }
 
 /// Emit a table-valued function. Only `range` is implemented; the analyzer has
@@ -1884,12 +2164,12 @@ fn render_aliased_relation(input: &TypedAst, alias: &str) -> Result<String, Emis
 /// The `AS __td_range(id)` column alias renames DuckDB's `range` output column
 /// to Spark's `id`, which the enclosing `SELECT id` then binds. `numPartitions`
 /// is a single-node no-op and is dropped.
-fn render_table_function(
+fn build_table_function(
     name: &str,
     args: &[Expression],
     _with_ordinality: bool,
     schema: &Schema,
-) -> Result<String, EmissionError> {
+) -> Result<SqlUnit, EmissionError> {
     let name_lower = name.to_ascii_lowercase();
     match name_lower.as_str() {
         "range" => {
@@ -1914,10 +2194,20 @@ fn render_table_function(
             let start_sql = render_expr(&start, schema)?;
             let end_sql = render_expr(&end, schema)?;
             let step_sql = render_expr(&step, schema)?;
-            // `range` is end-EXCLUSIVE in both Spark and DuckDB; single `id` column.
-            Ok(format!(
-                "SELECT id FROM range({start_sql}, {end_sql}, {step_sql}) AS __td_range(id)"
-            ))
+            // `range` is end-EXCLUSIVE in both Spark and DuckDB; single `id`
+            // column. The FROM-item alias renames DuckDB's `range` output
+            // column to Spark's `id`; the DEFAULT projection performs the
+            // bind (`SELECT id`) so a merging parent that overwrites it sees
+            // the renamed column, while a bare dispatch keeps today's shape.
+            let mut block = SelectBlock::from_item(FromItem::Raw {
+                sql: format!("range({start_sql}, {end_sql}, {step_sql}) AS __td_range(id)"),
+                exposed: vec!["__td_range".to_owned()],
+            });
+            block.set_default_projections(vec![DefaultSlot {
+                name: "id".to_owned(),
+                sql: "id".to_owned(),
+            }]);
+            Ok(block.into())
         }
         // Bare `FROM explode(array(1,2,3))` — uncorrelated generator as a TVF.
         // Build the canonical FunctionCall and render via the existing render_expr
@@ -1941,7 +2231,9 @@ fn render_table_function(
             };
             let unnest_sql = render_function_call(&fc, schema)?;
             let col_name = quote_ident(&schema.fields[0].name);
-            Ok(format!("SELECT {unnest_sql} AS {col_name}"))
+            // A FROM-less `SELECT unnest(…) AS col` — a genuine SELECT
+            // statement, not a FROM-item generator; stays a Raw unit.
+            Ok(SqlUnit::Raw(format!("SELECT {unnest_sql} AS {col_name}")))
         }
         _ => bail_boundary_op!(
             "TableFunction",
@@ -4690,140 +4982,6 @@ fn with_grouping_id_spliced(expr: &Expression, grouping: &[Expression]) -> Expre
     e
 }
 
-/// Render the `Aggregate` operator. Emits
-/// `SELECT <aggregates> FROM (<child>) AS __td_agg [GROUP BY <groupings>]`.
-/// The analyzer already resolves each `aggregate` expression's type; this
-/// renderer relies on `render_projection_slot` (which applies
-/// [`spark_return_cast`] on non-aggregate slots) and passes aggregate slots
-/// through unchanged — aggregate-return casts are the responsibility of the
-/// aggregate function arm itself (via [`spark_aggregate_return_cast`], wired
-/// per checklist §5.7 when needed).
-fn render_aggregate_op(
-    input: &TypedAst,
-    grouping: &[Expression],
-    aggregates: &[Expression],
-    grouping_kind: crate::transpiler_v2::ast::GroupingKind,
-    grouping_sets: &[Vec<usize>],
-    having: Option<&Expression>,
-) -> Result<String, EmissionError> {
-    use super::ast::GroupingKind;
-    // The SparkSQL front-end populates `grouping_sets` with per-set membership
-    // (indices into `grouping`). The DataFrame `groupingSets` path leaves it
-    // empty, so it stays a Thunderduck-boundary error (ADR-022).
-    if matches!(grouping_kind, GroupingKind::GroupingSets) && grouping_sets.is_empty() {
-        bail_boundary_op!(
-            "Aggregate[GroupingSets]",
-            "GROUPING SETS requires set-membership metadata (DataFrame groupingSets path not implemented in τ)",
-        );
-    }
-    // Aggregate-over-Join / Aggregate-over-Filter-over-Join / Aggregate-over-
-    // Filter-over-AliasedRelation / Aggregate-over-AliasedRelation inlining:
-    // any of these children already expose the aliases the aggregate slots,
-    // GROUP BY, and HAVING reference (`SELECT max(e.salary) FROM emp e WHERE
-    // e.dept_id = d.dept_id`, `SELECT d.dept_name, avg(e.salary) FROM emp e
-    // JOIN dept d ON ... GROUP BY d.dept_name`, etc.). The default `(<child>)
-    // AS __td_agg` FROM buries the user alias, so the aggregate slots /
-    // GROUP BY / HAVING and any correlated WHERE reference `e`/`d` at a
-    // wrapper level nothing binds. Reuse the same alias-transparent-FROM
-    // helper `render_project` inlines through (mirrors the Project branches);
-    // fall back to the `__td_agg` wrap for any other child shape.
-    //
-    // Correlated outer references are now resolved by the analyzer's
-    // outer-scope fallback (tier (g) in `resolve_column`): the inner
-    // subquery plan sees the enclosing plan's schema for columns absent
-    // from the inner schema. Emission renders qualifiers verbatim; DuckDB's
-    // correlated-subquery binder resolves them at runtime.
-    let atf = render_alias_transparent_from(input)?;
-    let from_clause = match &atf {
-        Some(a) => a.from_sql.clone(),
-        None => {
-            let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-            format!("({child_sql}) AS __td_agg")
-        }
-    };
-    let input_schema = &input.resolved_schema;
-    // Aggregates may include folded grouping columns at the SparkSQL path
-    // (see `CommonOp::Aggregate` doc). For the DataFrame path, aggregates
-    // are pure aggregate calls; grouping carries the keys. Both cases emit
-    // identically: SELECT the full `aggregates` list; the GROUP BY clause
-    // uses `grouping` when present.
-    // Mirror the analyzer's "unfold DataFrame-path grouping" logic — if
-    // the aggregates list doesn't already start with the grouping cols'
-    // output names, prepend them to the SELECT list so the emitted column
-    // count matches the resolved schema.
-    let already_folded = super::analyzer::grouping_already_folded(grouping, aggregates);
-    // Rewrite any `grouping_id()` (no-arg) calls inside `aggregates` to
-    // pass the current grouping columns as explicit args — DuckDB requires
-    // them. Generic `children_mut` walk in `rewrite_grouping_id` (see its
-    // doc comment); mutates a per-slot clone in place.
-    let rewritten_aggregates: Vec<Expression> = aggregates
-        .iter()
-        .map(|a| with_grouping_id_spliced(a, grouping))
-        .collect();
-    let keys: &[Expression] = if already_folded { &[] } else { grouping };
-    let slots = sql_join(keys.iter().chain(rewritten_aggregates.iter()), ", ", |e| {
-        render_projection_slot(e, input_schema)
-    })?;
-    let mut sql = format!("SELECT {slots} FROM {from_clause}");
-    // Emitted before GROUP BY: the Filter-over-{Join,AliasedRelation} arms of
-    // `render_alias_transparent_from` carry a WHERE fragment (the comma-join
-    // predicate or the correlated-subquery predicate) alongside their FROM.
-    if let Some(w) = atf.as_ref().and_then(|a| a.where_sql.as_ref()) {
-        sql.push_str(&format!(" WHERE {w}"));
-    }
-    // Emit a GROUP BY whenever there are flat grouping columns, OR when this is
-    // a GROUPING SETS aggregate with at least one set. The latter covers the
-    // all-empty case `GROUP BY GROUPING SETS ((), ())`: the flat grouping list
-    // is empty (no columns referenced) yet `grouping_sets` holds the empty
-    // sets, and each empty set is a distinct grand-total group (Spark returns
-    // one row per set). Without this the GROUP BY would be dropped and every
-    // set would collapse into a single grand-total row — a silent wrong
-    // row-count. DuckDB accepts `GROUP BY GROUPING SETS ((), ())` and returns
-    // the same per-set rows Spark does.
-    let emit_group_by = !grouping.is_empty()
-        || (matches!(grouping_kind, GroupingKind::GroupingSets) && !grouping_sets.is_empty());
-    if emit_group_by {
-        // Render each flat grouping column once (alias-stripped — GROUP BY
-        // doesn't take aliases, so `GROUP BY (expr) AS name` would be a parse
-        // error). GROUPING SETS indexes into this list per set; the other
-        // kinds join it directly (byte-identical to the prior emission).
-        let rendered = render_group_exprs(grouping, input_schema)?;
-        let group_sql = match grouping_kind {
-            GroupingKind::GroupBy => rendered.join(", "),
-            GroupingKind::Rollup => format!("ROLLUP({})", rendered.join(", ")),
-            GroupingKind::Cube => format!("CUBE({})", rendered.join(", ")),
-            GroupingKind::GroupingSets => {
-                let sets: Vec<String> = grouping_sets
-                    .iter()
-                    .map(|s| {
-                        let cols = s
-                            .iter()
-                            .map(|&i| rendered[i].as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("({cols})")
-                    })
-                    .collect();
-                format!("GROUPING SETS ({})", sets.join(", "))
-            }
-        };
-        sql.push_str(&format!(" GROUP BY {group_sql}"));
-    }
-    // SparkSQL HAVING — emitted inside the aggregating SELECT (never an outer
-    // WHERE, which DuckDB rejects for aggregate predicates). Rendered against
-    // the aggregate input schema, same scope as the aggregate slots.
-    if let Some(h) = having {
-        // Mirror the SELECT-slot loop above: HAVING may carry no-arg
-        // `grouping_id()`/`grouping()` (Spark-legal over ROLLUP/CUBE/GROUPING
-        // SETS) which DuckDB has no surface form for. Splice the ambient
-        // grouping columns into a clone before rendering.
-        let h = with_grouping_id_spliced(h, grouping);
-        let having_sql = render_expr(&h, input_schema)?;
-        sql.push_str(&format!(" HAVING {having_sql}"));
-    }
-    Ok(sql)
-}
-
 // ── Literal / atomic expression renderers ────────────────────────────────────
 
 fn render_literal(lit: &Literal) -> Result<String, EmissionError> {
@@ -6195,6 +6353,310 @@ mod tests {
         assert!(sql.ends_with(')'), "got: {sql}");
     }
 
+    /// Regression pin (sq-003/sq-004 corpus cluster): a correlated scalar
+    /// subquery's inner plan — Aggregate over Filter over
+    /// `AliasedRelation(e2)` with the filter referencing the OUTER alias `e`
+    /// — must merge into ONE inner block. The correlated qualifier `e` is
+    /// not bound by the inner scope, so merge visibility must EXEMPT it
+    /// (DuckDB's correlated binder resolves it outward); treating it as a
+    /// visibility failure wraps the inner FROM under `__td_sub`, burying
+    /// `e2` and breaking `e2.dept_id`.
+    #[test]
+    fn correlated_scalar_subquery_inner_filter_merges_into_one_block() {
+        let _g = tap_guard();
+        use super::super::expression::ScalarSubquery;
+        // Inner: SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id = e.dept_id
+        let inner = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(aliased_scan("emp", "e2")),
+                condition: Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Eq,
+                    left: Box::new(qcol("e2", "dept_id")),
+                    right: Box::new(qcol("e", "dept_id")),
+                }),
+            })),
+            grouping: vec![],
+            aggregates: vec![Expression::FunctionCall(FunctionCall {
+                name: "avg".to_owned(),
+                args: vec![qcol("e2", "salary")],
+                distinct: false,
+            })],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        // Outer: SELECT name, (<inner>) AS dept_avg FROM emp e
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased_scan("emp", "e")),
+            projections: vec![Expression::Alias(AliasExpression {
+                expr: Box::new(Expression::ScalarSubquery(ScalarSubquery {
+                    subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+                })),
+                alias: "dept_avg".to_owned(),
+            })],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze correlated scalar");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("FROM emp AS e2 WHERE"),
+            "inner filter must merge into the aliased block (correlated \
+             qualifier exempt from visibility), got: {sql}"
+        );
+        assert!(
+            !sql.contains("__td_sub"),
+            "no wrap may bury the inner alias, got: {sql}"
+        );
+    }
+
+    // ── Wrap-boundary qualifier rewriting (strand-class retirement) ──────
+    //
+    // filt-016/filt-017 witness class: a qualified reference above a
+    // slot-conflict wrap is rewritten to its bare output name by
+    // `strip_stranded_qualifiers` instead of stranding the alias behind
+    // `__td_sub` (DuckDB: `Referenced table "e" not found`). The keep-side
+    // of the matrix (ambiguous names, unexposed/correlated qualifiers,
+    // struct precedence) must stay verbatim.
+
+    fn asc_key(expr: Expression) -> SortOrder {
+        SortOrder {
+            expr: Box::new(expr),
+            direction: SortDirection::Ascending,
+            null_ordering: NullOrdering::NullsFirst,
+        }
+    }
+
+    /// filt-016 shape: `emp.alias("e").orderBy("id").limit(5)
+    /// .filter(col("e.salary") > 60000)` — WHERE cannot merge past an
+    /// occupied LIMIT slot; the wrap strips `e.` off the condition.
+    #[test]
+    fn filter_above_limit_strips_stranded_alias_qualifier() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Sort {
+                input: Box::new(aliased_scan("emp", "e")),
+                order: vec![asc_key(ColumnReference::untyped("id"))],
+                limit: Some(5),
+                offset: None,
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Gt,
+                left: Box::new(qcol("e", "salary")),
+                right: Box::new(int_lit(60000)),
+            }),
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS __td_sub WHERE (salary) > (60000)"),
+            "stranded qualifier must be stripped to the bare output name, got: {sql}"
+        );
+        assert!(!sql.contains("e.salary"), "got: {sql}");
+    }
+
+    /// filt-017 shape: `emp.alias("e").select(...).distinct()
+    /// .filter(col("e.dept_id") == 101)` — the input scope above the
+    /// Project is EMPTY (the analyzer resolved `e.dept_id` via the legacy
+    /// name-only fallback), but the pre-wrap BLOCK still exposes `e`; the
+    /// emission-side exposure is what drives the strip.
+    #[test]
+    fn filter_above_distinct_strips_stranded_alias_qualifier() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Deduplicate {
+                input: Box::new(CommonAst::new(CommonOp::Project {
+                    input: Box::new(aliased_scan("emp", "e")),
+                    projections: vec![qcol("e", "dept_id"), qcol("e", "name")],
+                })),
+                on_columns: vec![],
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(101)),
+            }),
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS __td_sub WHERE (dept_id) = (101)"),
+            "stranded qualifier must be stripped to the bare output name, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn sort_above_limit_strips_stranded_alias_qualifier() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Sort {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(aliased_scan("emp", "e")),
+                limit: 5,
+                offset: None,
+            })),
+            order: vec![asc_key(qcol("e", "name"))],
+            limit: None,
+            offset: None,
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS __td_sub ORDER BY name ASC NULLS FIRST"),
+            "stranded sort key must be stripped to the bare output name, got: {sql}"
+        );
+        assert!(!sql.contains("e.name"), "got: {sql}");
+    }
+
+    #[test]
+    fn project_above_limit_strips_stranded_alias_qualifier() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(aliased_scan("emp", "e")),
+                limit: 5,
+                offset: None,
+            })),
+            projections: vec![qcol("e", "salary")],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("__td_sub"), "got: {sql}");
+        assert!(
+            !sql.contains("e.salary"),
+            "stranded projection must be stripped to the bare output name, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn with_columns_above_limit_strips_stranded_alias_qualifier() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::WithColumns {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(aliased_scan("emp", "e")),
+                limit: 5,
+                offset: None,
+            })),
+            assignments: vec![("bonus".to_owned(), qcol("e", "salary"))],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("__td_sub"), "got: {sql}");
+        assert!(
+            !sql.contains("e.salary"),
+            "stranded assignment must be stripped to the bare output name, got: {sql}"
+        );
+    }
+
+    /// Keep-side: a name appearing on BOTH sides of a self-join output is
+    /// ambiguous once unqualified — the reference must stay qualified (loud
+    /// binder failure preserved; stripping would silently bind an arbitrary
+    /// side).
+    #[test]
+    fn ambiguous_output_name_survives_wrap_qualified() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(CommonAst::new(CommonOp::Join {
+                    left: Box::new(aliased_scan("emp", "a")),
+                    right: Box::new(aliased_scan("emp", "b")),
+                    join_type: JoinType::Inner,
+                    condition: Some(Expression::Binary(BinaryExpression {
+                        op: BinaryOp::Eq,
+                        left: Box::new(qcol("a", "id")),
+                        right: Box::new(qcol("b", "id")),
+                    })),
+                    using_columns: vec![],
+                    natural: false,
+                    lateral: false,
+                    left_plan_ids: vec![],
+                    right_plan_ids: vec![],
+                })),
+                limit: 5,
+                offset: None,
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("a", "name")),
+                right: Box::new(str_lit("x")),
+            }),
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("a.name"),
+            "ambiguous output name must NOT be stripped, got: {sql}"
+        );
+    }
+
+    /// Keep-side: a qualifier the pre-wrap block does NOT expose is a
+    /// correlated OUTER reference — DuckDB's correlated binder resolves it
+    /// outward through the wrap, so it must stay qualified verbatim.
+    #[test]
+    fn unexposed_qualifier_survives_wrap_verbatim() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(aliased_scan("emp", "e")),
+                limit: 5,
+                offset: None,
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("outer_e", "salary")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("outer_e.salary"),
+            "unexposed (correlated) qualifier must stay verbatim, got: {sql}"
+        );
+    }
+
+    /// Keep-side: a qualifier that resolves as STRUCT-column access
+    /// (`resolve_column`'s struct-precedence tier) survives the wrap as
+    /// column-dot-field syntax — stripping would misread the field name as
+    /// a column.
+    #[test]
+    fn struct_qualifier_survives_wrap_verbatim() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(scan("addr")),
+                limit: 5,
+                offset: None,
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("addr", "city")),
+                right: Box::new(str_lit("x")),
+            }),
+        });
+        let bt = BaseTypes::build_from_plan(&plan, |name| match name {
+            "addr" => Some(StructType::new(vec![StructField::nullable(
+                "addr",
+                DataType::Struct(StructType::new(vec![StructField::nullable(
+                    "city",
+                    DataType::String,
+                )])),
+            )])),
+            _ => None,
+        });
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("addr.city"),
+            "struct-column access must NOT be stripped, got: {sql}"
+        );
+    }
+
     #[test]
     fn not_in_subquery_renders_lhs_not_in_select() {
         let _g = tap_guard();
@@ -6344,8 +6806,11 @@ mod tests {
     #[test]
     fn dispatch_project_over_range_binds_id_column() {
         let _g = tap_guard();
-        // Full `SELECT id FROM range(5)` — Project wraps the TVF subquery and
-        // binds the synthetic `id` column (tbl-006).
+        // Full `SELECT id FROM range(5)` — the range TVF is a FROM-item leaf
+        // block whose DEFAULT projection performs the `id` bind; a merging
+        // Project overwrites it and MUST still see the renamed column
+        // (tbl-006; tasks/select-block-follow-ups.md item 1 pin: merge, not
+        // wrap — the `AS __td_range(id)` rename is part of the FROM item).
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::TableFunction {
                 name: "range".to_owned(),
@@ -6364,8 +6829,26 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert_eq!(
             sql,
-            "SELECT id FROM (SELECT id FROM range(CAST(0 AS BIGINT), 5, CAST(1 AS BIGINT)) \
-             AS __td_range(id)) AS __td_proj"
+            "SELECT id FROM range(CAST(0 AS BIGINT), 5, CAST(1 AS BIGINT)) AS __td_range(id)"
+        );
+    }
+
+    /// A BARE range dispatch (no Project) must keep the `id` bind via the
+    /// block's default projection — `SELECT *` would emit DuckDB's raw
+    /// `range` column name instead of Spark's `id`.
+    #[test]
+    fn bare_range_dispatch_keeps_id_default_projection() {
+        let _g = tap_guard();
+        let ast = CommonAst::new(CommonOp::TableFunction {
+            name: "range".to_owned(),
+            args: vec![int_lit(3)],
+            with_ordinality: false,
+        });
+        let typed = analyze(ast, &BaseTypes::empty()).expect("analyze bare range");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT id FROM range(CAST(0 AS BIGINT), 3, CAST(1 AS BIGINT)) AS __td_range(id)"
         );
     }
 
@@ -6545,6 +7028,438 @@ mod tests {
         assert_eq!(typed.resolved_schema.fields[0].name, "dept_id");
     }
 
+    // ── Plan 006 F1-F4: structured hoisted-slot-list pins ────────────────
+
+    #[test]
+    fn drop_over_using_join_renders_hoisted_slots() {
+        let _g = tap_guard();
+        // F1 regression pin (review findings #1): `emp.join(dept,
+        // on='dept_id').drop('dept_name')` must keep the join builder's
+        // USING-key-first hoisted slot list — a bare `* EXCLUDE (dept_name)`
+        // would let DuckDB's `*` place `dept_id` at its natural (dept-side)
+        // position instead of the analyzer's hoisted-first schema order.
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::DropColumns {
+            input: Box::new(join),
+            drop_names: vec!["dept_name".to_owned()],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze drop-over-using-join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.starts_with("SELECT dept_id,"),
+            "USING key must stay hoisted first; got: {sql}"
+        );
+        assert!(!sql.contains("* EXCLUDE"), "got: {sql}");
+        assert!(
+            !sql.contains("dept_name"),
+            "dropped column must be absent from the slot list; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn drop_above_occupied_block_keeps_exclude() {
+        let _g = tap_guard();
+        // Over an already-occupied block (Select cannot merge downstream of
+        // Limit's LimitOffset ordinal), DropColumns wraps in `__td_sub` and
+        // must keep today's `* EXCLUDE (...)` shape — the wrapped child
+        // already rendered its own defaults (if any) inside that `*`.
+        let plan = CommonAst::new(CommonOp::DropColumns {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(scan("emp")),
+                limit: 5,
+                offset: None,
+            })),
+            drop_names: vec!["salary".to_owned()],
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze drop-over-limit");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("* EXCLUDE (salary)") && sql.contains("AS __td_sub"),
+            "occupied block must fall back to `* EXCLUDE` over the wrap; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn multi_slot_star_over_using_join_expands_hoisted_slots() {
+        let _g = tap_guard();
+        // F4 regression pin: a bare `*` mixed into a multi-slot projection
+        // list must expand to the join builder's hoisted slot list, not
+        // render a raw `*` token that shadows the USING-key-first order
+        // (the same shadowing `* EXCLUDE` suffers without the F1 fix).
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(join),
+            projections: vec![
+                Expression::Star(StarExpression { qualifier: None }),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(int_lit(1)),
+                    alias: "one".to_owned(),
+                }),
+            ],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze multi-slot star over using join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.starts_with("SELECT dept_id,"),
+            "hoisted slot list must expand in place of the bare star; got: {sql}"
+        );
+        assert!(sql.contains("1 AS one"), "got: {sql}");
+        assert!(
+            !sql.contains("*,"),
+            "bare `*` must not shadow the hoisted list; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn using_join_side_wrap_preserves_hoisted_slots() {
+        let _g = tap_guard();
+        // F2 regression pin (review findings #2): the RIGHT side of an
+        // outer ON join is itself a USING join (`dept JOIN emp2 USING
+        // (dept_id)`). The right side never inlines (`may_inline_nested_join`
+        // is always false for the right side), so it always wraps — the wrap
+        // must carry the block's hoisted USING-key-first defaults into `AS
+        // __td_jr`, not rebuild a bare `SELECT *` shell that lets DuckDB's
+        // `*` place `dept_id` back at its natural (dept-side) position.
+        let nested_using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("dept")),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let outer_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(nested_using_join),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(1)),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(outer_join),
+            projections: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze nested USING join-side wrap");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains(
+                "SELECT dept_id, dept.dept_name, emp2.id, emp2.country \
+                 FROM dept INNER JOIN emp2 USING (dept_id)) AS __td_jr"
+            ),
+            "wrapped __td_jr body must preserve the hoisted USING slot list; got: {sql}"
+        );
+        assert!(
+            !sql.contains("(SELECT * FROM dept INNER JOIN emp2 USING (dept_id)) AS __td_jr"),
+            "must not discard hoisted slots for a bare `SELECT *`; got: {sql}"
+        );
+    }
+
+    // ── Plan 007 F5: inline under USING parents; RelScope-qualified
+    // hoisted slots ───────────────────────────────────────────────────────
+
+    #[test]
+    fn alias_ref_above_using_parent_inlines_and_binds() {
+        let _g = tap_guard();
+        // join-021 (F5 regression pin): a plain-ON nested join (`emp e JOIN
+        // dept d ON e.dept_id = d.dept_id`) is the LEFT side of an outer
+        // USING(dept_id) join against `emp2`. Before F5, the USING parent's
+        // `parent_has_using` guard unconditionally refused to inline the
+        // nested join, burying `e` under `AS __td_jl` — and the outer USING
+        // join's EMPTY `RelScope` made the qualifier vis-exempt in
+        // `exprs_visible_in`, so the merge went ahead anyway and emitted an
+        // unbindable `e.name`. F5 widens the guard to inline whenever the
+        // nested join's own `RelScope` covers every field (it does here:
+        // `e` covers 0..4, `d` covers 4..6), so `e` stays visible in the
+        // outer FROM scope and `e.name` binds.
+        let nested_on_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let outer_using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(nested_on_join),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(outer_using_join),
+            projections: vec![qcol("e", "name")],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze alias-ref-above-using-parent");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS e"),
+            "left alias must not be buried; got: {sql}"
+        );
+        assert!(
+            sql.contains("e.name"),
+            "projection must bind against the now-visible alias; got: {sql}"
+        );
+        assert!(
+            !sql.contains("__td_jl"),
+            "the nested join must inline, not wrap under the synthetic alias; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn using_parent_hoisted_slots_qualify_by_covering_alias() {
+        let _g = tap_guard();
+        // Same shape as `alias_ref_above_using_parent_inlines_and_binds`,
+        // dispatched with no enclosing Project: the join builder's own
+        // hoisted default-slot list must qualify each left-side field by
+        // whichever alias's `RelScope` range covers it (`e` for emp's
+        // fields, `d` for dept's), not a single side-wide alias.
+        let nested_on_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Join {
+            left: Box::new(nested_on_join),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze bare using-parent join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.starts_with("SELECT dept_id, e.id, e.name, e.salary, d.dept_name"),
+            "hoisted slots must lead with the bare USING key, then e.-qualified, \
+             then d.-qualified fields in schema order; got: {sql}"
+        );
+        assert!(
+            !sql.contains("__td_jl"),
+            "left side must inline; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn using_parent_with_uncoverable_side_still_wraps() {
+        let _g = tap_guard();
+        // Residual gap (plan 007, tracked not fixed here): when the nested
+        // join's OWN children re-scope (each a `Project` over a scan, whose
+        // `RelScope` is empty per `RelScope::of`), the nested join's own
+        // `RelScope` has zero coverage — `scope_covers_fields` fails, so the
+        // left side must still wrap under `AS __td_jl` exactly as before
+        // F5. F5 only WIDENS inlining to coverable multi-alias sides; it
+        // never removes the wrap fallback for an uncoverable one.
+        let left_child = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![
+                ColumnReference::untyped("id"),
+                ColumnReference::untyped("dept_id"),
+            ],
+        });
+        let right_child = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("dept")),
+            projections: vec![
+                ColumnReference::untyped("dept_id"),
+                ColumnReference::untyped("dept_name"),
+            ],
+        });
+        let nested_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(left_child),
+            right: Box::new(right_child),
+            join_type: JoinType::Cross,
+            condition: None,
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let outer_using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(nested_join),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(outer_using_join),
+            projections: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze uncoverable-side USING wrap");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS __td_jl"),
+            "an uncoverable multi-alias side must still wrap; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn using_parent_with_synthetic_scoped_side_stays_wrapped() {
+        let _g = tap_guard();
+        // Fix round 1 (Medium finding on plan 007/F5): the nested join's OWN
+        // sides are synthetic-stamped — its condition carries plan_id-tagged
+        // `dept_id` refs ambiguous across `emp`/`dept` (mirrors
+        // `analyzer::tests::join_flags_set_when_condition_carries_plan_id_ambiguity`'s
+        // `plan_id_join` construction), so the analyzer sets the nested
+        // join's OWN `left_requires_synthetic`/`right_requires_synthetic` to
+        // true. That makes the nested join render its children under `(emp)
+        // AS __td_jl` / `(dept) AS __td_jr` — but the nested join's stamped
+        // `RelScope` (`RelScope::of` for a plain, non-USING `Join`) still
+        // reports the LOGICAL `emp`/`dept` aliases over those same field
+        // ranges, because scope derivation is independent of the
+        // synthetic-wrap emission decision. Before fix round 1,
+        // `scope_covers_fields`/`side_slot_quals` trusted `RelScope` alone,
+        // inlined this side under the outer USING(dept_id) parent, and
+        // qualified its hoisted default slots with the now-invisible
+        // `emp`/`dept` names — an unbindable reference (`emp.id` when the
+        // FROM only exposes `__td_jl`). The exposure-aware predicate must
+        // instead treat this side as uncoverable and keep it wrapped under
+        // its OWN synthetic alias at the outer level, exactly as an
+        // ordinary uncoverable side would.
+        let nested_on_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(Expression::UnresolvedColumn(
+                    crate::transpiler_v2::expression::UnresolvedColumn {
+                        name: "dept_id".to_owned(),
+                        qualifier: None,
+                        plan_id: Some(10),
+                    },
+                )),
+                right: Box::new(Expression::UnresolvedColumn(
+                    crate::transpiler_v2::expression::UnresolvedColumn {
+                        name: "dept_id".to_owned(),
+                        qualifier: None,
+                        plan_id: Some(20),
+                    },
+                )),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![10],
+            right_plan_ids: vec![20],
+        });
+        let outer_using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(nested_on_join),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&outer_using_join);
+        let typed = analyze(outer_using_join, &bt).expect("analyze synthetic-scoped side");
+        // Sanity: confirm the nested join really did get its own synthetic
+        // flags stamped (the premise this test pins), not just that the
+        // outer wrap happens to look right for an unrelated reason.
+        let TypedOp::Join { left, .. } = &typed.op else {
+            panic!("expected outer Join, got {:?}", typed.op);
+        };
+        let TypedOp::Join {
+            left_requires_synthetic,
+            right_requires_synthetic,
+            ..
+        } = &left.op
+        else {
+            panic!("expected nested Join, got {:?}", left.op);
+        };
+        assert!(
+            *left_requires_synthetic && *right_requires_synthetic,
+            "premise: the nested join's own sides must be synthetic-stamped"
+        );
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("AS __td_jl"),
+            "a nested-join side whose OWN children are synthetic-wrapped must \
+             stay wrapped at the outer level (Derived under its synthetic \
+             alias), not inline with a stranded logical-alias qualifier; \
+             got: {sql}"
+        );
+        assert!(
+            !sql.contains("emp."),
+            "no logical-name-qualified slot may appear once the covering \
+             alias is not exposed by the emitted FromItem; got: {sql}"
+        );
+        assert!(
+            !sql.contains("dept."),
+            "same requirement for the nested join's right side; got: {sql}"
+        );
+    }
+
     #[test]
     fn render_project_over_join_hoists_user_aliases() {
         let _g = tap_guard();
@@ -6573,8 +7488,8 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         // User aliases hoisted into the subquery aliases; no synthetic alias,
         // so the ON clause and projection bind against `e` / `d`.
-        assert!(sql.contains(") AS e INNER JOIN ("), "got: {sql}");
-        assert!(sql.contains(") AS d ON "), "got: {sql}");
+        assert!(sql.contains("emp AS e INNER JOIN "), "got: {sql}");
+        assert!(sql.contains("dept AS d ON "), "got: {sql}");
         assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
         assert!(!sql.contains("__td_jl"), "got: {sql}");
         assert!(!sql.contains("__td_jr"), "got: {sql}");
@@ -6613,8 +7528,8 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         // Project→Filter→Join collapses into one SELECT: aliases hoisted, the
         // predicate lands as an outer WHERE (not a buried subquery filter).
-        assert!(sql.contains(") AS e CROSS JOIN ("), "got: {sql}");
-        assert!(sql.contains(") AS d WHERE "), "got: {sql}");
+        assert!(sql.contains("emp AS e CROSS JOIN "), "got: {sql}");
+        assert!(sql.contains("dept AS d WHERE "), "got: {sql}");
         assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
         assert!(!sql.contains("__td_filter"), "got: {sql}");
         assert!(!sql.contains("__td_proj"), "got: {sql}");
@@ -6641,7 +7556,7 @@ mod tests {
         let bt = base_types_emp_dept(&plan);
         let typed = analyze(plan, &bt).expect("analyze project-over-filter-over-aliased");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e WHERE "), "got: {sql}");
+        assert!(sql.contains("emp AS e WHERE "), "got: {sql}");
         assert!(!sql.contains("__td_filter"), "got: {sql}");
         assert!(!sql.contains("__td_proj"), "got: {sql}");
     }
@@ -6672,7 +7587,7 @@ mod tests {
         let bt = base_types_emp_dept(&plan);
         let typed = analyze(plan, &bt).expect("analyze aggregate-over-filter-over-aliased");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e WHERE "), "got: {sql}");
+        assert!(sql.contains("emp AS e WHERE "), "got: {sql}");
         assert!(!sql.contains("__td_filter"), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
     }
@@ -6736,8 +7651,8 @@ mod tests {
         let bt = base_types_emp_dept(&plan);
         let typed = analyze(plan, &bt).expect("analyze aggregate-over-join");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e INNER JOIN ("), "got: {sql}");
-        assert!(sql.contains(") AS d ON "), "got: {sql}");
+        assert!(sql.contains("emp AS e INNER JOIN "), "got: {sql}");
+        assert!(sql.contains("dept AS d ON "), "got: {sql}");
         assert!(sql.contains("GROUP BY d.dept_name"), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
         assert!(!sql.contains("__td_jl"), "got: {sql}");
@@ -6769,7 +7684,7 @@ mod tests {
         let bt = base_types_with_emp();
         let typed = analyze(plan, &bt).expect("analyze aggregate-over-aliased-relation+having");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e"), "got: {sql}");
+        assert!(sql.contains("emp AS e"), "got: {sql}");
         assert!(sql.contains("GROUP BY e.dept_id"), "got: {sql}");
         assert!(sql.contains("HAVING "), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
@@ -6817,8 +7732,8 @@ mod tests {
         let bt = base_types_emp_dept(&plan);
         let typed = analyze(plan, &bt).expect("analyze aggregate-over-filter-over-join");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e CROSS JOIN ("), "got: {sql}");
-        assert!(sql.contains(") AS d WHERE "), "got: {sql}");
+        assert!(sql.contains("emp AS e CROSS JOIN "), "got: {sql}");
+        assert!(sql.contains("dept AS d WHERE "), "got: {sql}");
         assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
         assert!(sql.contains("GROUP BY d.dept_name"), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
@@ -6870,9 +7785,9 @@ mod tests {
         let bt = base_types_emp_dept_emp2(&plan);
         let typed = analyze(plan, &bt).expect("analyze three-way join");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e INNER JOIN ("), "got: {sql}");
-        assert!(sql.contains(") AS d ON "), "got: {sql}");
-        assert!(sql.contains(") AS m ON "), "got: {sql}");
+        assert!(sql.contains("emp AS e INNER JOIN "), "got: {sql}");
+        assert!(sql.contains("dept AS d ON "), "got: {sql}");
+        assert!(sql.contains("emp2 AS m ON "), "got: {sql}");
         assert!(!sql.contains("__td_jl"), "got: {sql}");
         assert!(!sql.contains("__td_jr"), "got: {sql}");
     }
@@ -6925,7 +7840,7 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         // Guard fired: inner join stays wrapped (not flattened into the chain).
         assert!(
-            sql.contains("__td_jl"),
+            sql.contains("__td_jr"),
             "duplicate-alias chain must not flatten; got: {sql}"
         );
     }
@@ -7041,11 +7956,11 @@ mod tests {
         let typed = analyze(plan, &bt).expect("analyze plan_id-tagged aliased join");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(
-            sql.contains("(SELECT * FROM (SELECT * FROM emp) AS e) AS __td_jl"),
+            sql.contains("(SELECT * FROM emp AS e) AS __td_jl"),
             "got: {sql}"
         );
         assert!(
-            sql.contains("(SELECT * FROM (SELECT * FROM dept) AS d) AS __td_jr"),
+            sql.contains("(SELECT * FROM dept AS d) AS __td_jr"),
             "got: {sql}"
         );
     }
@@ -7142,7 +8057,7 @@ mod tests {
         assert!(sql.contains("SEMI JOIN"), "got: {sql}");
         assert!(!sql.contains("LEFT SEMI JOIN"), "got: {sql}");
         assert!(sql.contains("__td_jl"), "got: {sql}");
-        assert!(sql.contains(") AS m ON "), "got: {sql}");
+        assert!(sql.contains("emp2 AS m ON "), "got: {sql}");
     }
 
     fn ucol(name: &str) -> Expression {
@@ -9237,13 +10152,13 @@ mod tests {
         // client-side, and `materialise_stats_cols` expands empty to all
         // input columns). We call `render_freq_items` directly to exercise
         // the defensive guard.
-        let typed_input = TypedAst {
-            op: TypedOp::TableScan {
+        let typed_input = TypedAst::new(
+            TypedOp::TableScan {
                 table: "emp".to_owned(),
                 alias: None,
             },
-            resolved_schema: StructType::empty(),
-        };
+            StructType::empty(),
+        );
         let err = super::render_freq_items(&typed_input, &[], 0.01).unwrap_err();
         expect_unsupported(err, UnsupportedKind::Op, "FreqItems", &[]);
     }
@@ -9295,13 +10210,13 @@ mod tests {
         // ADR-022 Thunderduck-boundary: DuckDB has no row-level sampling
         // with replacement. Emission surfaces `UnsupportedOp`.
         let _g = tap_guard();
-        let typed_input = TypedAst {
-            op: TypedOp::TableScan {
+        let typed_input = TypedAst::new(
+            TypedOp::TableScan {
                 table: "emp".to_owned(),
                 alias: None,
             },
-            resolved_schema: StructType::empty(),
-        };
+            StructType::empty(),
+        );
         let err = super::render_sample(&typed_input, 0.0, 0.5, true, Some(11)).unwrap_err();
         expect_unsupported(err, UnsupportedKind::Op, "Sample[with_replacement]", &[]);
     }
@@ -9365,13 +10280,13 @@ mod tests {
     #[test]
     fn render_sample_by_empty_fractions_emits_where_false() {
         let _g = tap_guard();
-        let typed_input = TypedAst {
-            op: TypedOp::TableScan {
+        let typed_input = TypedAst::new(
+            TypedOp::TableScan {
                 table: "emp".to_owned(),
                 alias: None,
             },
-            resolved_schema: emp_schema(),
-        };
+            emp_schema(),
+        );
         let col_ref = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: None,
@@ -11656,13 +12571,13 @@ mod tests {
     }
 
     fn typed_table_scan(table: &str, alias: Option<&str>, schema: StructType) -> TypedAst {
-        TypedAst {
-            resolved_schema: schema,
-            op: TypedOp::TableScan {
+        TypedAst::new(
+            TypedOp::TableScan {
                 table: table.to_owned(),
                 alias: alias.map(|s| s.to_owned()),
             },
-        }
+            schema,
+        )
     }
 
     fn tags_col_ref() -> Expression {
@@ -11687,14 +12602,14 @@ mod tests {
             .collect();
         let resolved_schema =
             StructType::merge(&input.resolved_schema, &StructType::new(gen_fields));
-        TypedAst {
-            op: TypedOp::LateralView {
+        TypedAst::new(
+            TypedOp::LateralView {
                 input: Box::new(input),
                 table_alias: "t".to_owned(),
                 columns,
             },
             resolved_schema,
-        }
+        )
     }
 
     #[test]
@@ -11811,16 +12726,16 @@ mod tests {
             data_type: Some(DataType::String),
             nullable: Some(true),
         });
-        let proj = TypedAst {
-            resolved_schema: StructType::new(vec![
-                StructField::not_null("id", DataType::Long),
-                StructField::nullable("tag", DataType::String),
-            ]),
-            op: TypedOp::Project {
+        let proj = TypedAst::new(
+            TypedOp::Project {
                 input: Box::new(lv),
                 projections: vec![id_ref, tag_ref],
             },
-        };
+            StructType::new(vec![
+                StructField::not_null("id", DataType::Long),
+                StructField::nullable("tag", DataType::String),
+            ]),
+        );
         let sql = dispatch_op(&proj.op, &proj.resolved_schema).expect("render");
         // The output must NOT wrap in __td_proj — the alias-transparent-from
         // arm must inline the LATERAL FROM body.
@@ -11833,6 +12748,66 @@ mod tests {
         assert!(
             sql.contains("LATERAL (SELECT"),
             "must contain LATERAL(SELECT), got: {sql}"
+        );
+    }
+
+    // ── Plan 006 F3: LateralView default-slot widening pins ─────────────
+
+    #[test]
+    fn lateral_view_over_range_appends_generated_column() {
+        let _g = tap_guard();
+        // F3 regression pin (review findings #3): `range(3)`'s FROM-item
+        // leaf carries a default `id` bind (tbl-006); a merged LateralView
+        // must widen that default list to include its own generated column
+        // too, or a downstream bare-star consumer would never see it.
+        let range_input = TypedAst::new(
+            TypedOp::TableFunction {
+                name: "range".to_owned(),
+                args: vec![int_lit(3)],
+                with_ordinality: false,
+            },
+            StructType::new(vec![StructField::not_null("id", DataType::Long)]),
+        );
+        let lv = lateral_view_typed(
+            vec![(
+                "c".to_owned(),
+                fexpr(
+                    "explode",
+                    vec![fexpr("array", vec![int_lit(1), int_lit(2)])],
+                ),
+            )],
+            range_input,
+        );
+        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
+        assert!(
+            sql.starts_with("SELECT id, t.c FROM range("),
+            "default projection must widen to include the generated column; got: {sql}"
+        );
+        assert!(
+            sql.contains("AS __td_range(id)"),
+            "range's own id bind must survive; got: {sql}"
+        );
+        assert!(
+            sql.contains("LATERAL (SELECT"),
+            "must contain LATERAL(SELECT), got: {sql}"
+        );
+    }
+
+    #[test]
+    fn lateral_view_over_table_scan_still_renders_star() {
+        let _g = tap_guard();
+        // F3 no-op guard: a plain table-scan child has no default
+        // projections (`None`), so extending must stay a no-op — the merged
+        // block keeps rendering `SELECT *` (protects the cx-007..009 shape).
+        let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
+        let lv = lateral_view_typed(
+            vec![("tag".to_owned(), fexpr("explode", vec![tags_col_ref()]))],
+            input,
+        );
+        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
+        assert!(
+            sql.starts_with("SELECT * FROM"),
+            "LateralView over a plain scan must still render SELECT *; got: {sql}"
         );
     }
 
@@ -11944,46 +12919,60 @@ mod tests {
         assert!(sql.contains(" ON "), "must contain ON clause, got: {sql}");
     }
 
-    /// `flattenable_chain_aliases` must return `None` for a lateral join,
-    /// while an equivalent non-lateral chain still flattens.
+    /// A nested LATERAL join must stay isolated under its synthetic wrapper
+    /// when it is the side of an enclosing join (its correlation must not be
+    /// spliced into a shared FROM scope), while an equivalent non-lateral
+    /// nested chain inlines flat.
     #[test]
-    fn flattenable_chain_aliases_returns_none_for_lateral_join() {
+    fn nested_lateral_join_side_never_inlines_into_outer_from() {
         let _g = tap_guard();
-        // Build a lateral join node (Inner, no ON).
-        let lateral_node = CommonAst::new(CommonOp::Join {
-            left: Box::new(aliased_scan("emp", "e")),
-            right: Box::new(aliased_scan("dept", "d")),
-            join_type: JoinType::Cross,
-            condition: None,
-            using_columns: vec![],
-            natural: false,
-            lateral: true,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
+        let nested = |lateral: bool| {
+            CommonAst::new(CommonOp::Join {
+                left: Box::new(aliased_scan("emp", "e")),
+                right: Box::new(aliased_scan("dept", "d")),
+                join_type: JoinType::Cross,
+                condition: None,
+                using_columns: vec![],
+                natural: false,
+                lateral,
+                left_plan_ids: vec![],
+                right_plan_ids: vec![],
+            })
+        };
+        let outer = |inner: CommonAst| {
+            CommonAst::new(CommonOp::Join {
+                left: Box::new(inner),
+                right: Box::new(aliased_scan("bonus", "b")),
+                join_type: JoinType::Cross,
+                condition: None,
+                using_columns: vec![],
+                natural: false,
+                lateral: false,
+                left_plan_ids: vec![],
+                right_plan_ids: vec![],
+            })
+        };
+
+        let plan = outer(nested(true));
+        let bt = BaseTypes::build_from_plan(&plan, |name| match name {
+            "emp" => Some(emp_schema()),
+            "dept" => Some(dept_schema()),
+            "bonus" => Some(dept_schema()),
+            _ => None,
         });
-        let bt = base_types_emp_dept(&lateral_node);
-        let typed_lateral = analyze(lateral_node, &bt).expect("analyze lateral");
+        let typed = analyze(plan, &bt).expect("analyze outer-over-lateral");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(
-            flattenable_chain_aliases(&typed_lateral).is_none(),
-            "lateral join must not be flattenable"
+            sql.contains("AS __td_jl"),
+            "lateral nested join must stay wrapped under its synthetic alias, got: {sql}"
         );
 
-        // Build an equivalent non-lateral cross join.
-        let non_lateral_node = CommonAst::new(CommonOp::Join {
-            left: Box::new(aliased_scan("emp", "e")),
-            right: Box::new(aliased_scan("dept", "d")),
-            join_type: JoinType::Cross,
-            condition: None,
-            using_columns: vec![],
-            natural: false,
-            lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
-        });
-        let typed_non_lateral = analyze(non_lateral_node, &bt).expect("analyze non-lateral");
+        let plan = outer(nested(false));
+        let typed = analyze(plan, &bt).expect("analyze outer-over-plain");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(
-            flattenable_chain_aliases(&typed_non_lateral).is_some(),
-            "non-lateral cross join should be flattenable"
+            !sql.contains("__td_jl"),
+            "non-lateral nested chain should inline without a synthetic wrapper, got: {sql}"
         );
     }
 
@@ -12029,7 +13018,7 @@ mod tests {
             "bare TableScan left must not use __td_jl, got: {sql}"
         );
         assert!(
-            sql.contains("AS emp CROSS JOIN LATERAL"),
+            sql.contains("emp CROSS JOIN LATERAL"),
             "bare TableScan left must be aliased as emp, got: {sql}"
         );
         assert!(

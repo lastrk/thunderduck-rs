@@ -301,6 +301,15 @@ case("jn-017", "join", "bare first table + aliased tables in comma join", "SELEC
 # (Parser Error at `AS at`). The fix is τ quoting keyword-like aliases on
 # emission — this case is the fitness witness for that gap.
 case("jn-018", "join", "keyword-like alias `at` before CROSS JOIN (TPC-DS Q90 parse shape)", "SELECT name, dept_name FROM (SELECT id, name FROM emp) at CROSS JOIN (SELECT dept_name FROM dept) d")
+case("jn-019", "join", "qualified star over join (left side + extra col)", "SELECT e.*, d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id")
+case("jn-020", "join", "qualified star over outer join (right side, null-extended)", "SELECT d.* FROM emp e LEFT JOIN dept d ON e.dept_id = d.dept_id")
+case("jn-021", "join", "qualified star through post-join WHERE", "SELECT e.* FROM emp e JOIN dept d ON e.dept_id = d.dept_id WHERE d.budget > 0")
+case("jn-022", "join", "both sides qualified star", "SELECT e.*, d.* FROM emp e JOIN dept d ON e.dept_id = d.dept_id")
+# USING-join star-order witness (review finding 4, SQL front-end variant):
+# a multi-slot star bypasses the lone-star hoisted-slot delegate, and DuckDB's
+# raw `*` keeps the USING key at its natural position — silent positional
+# mislabeling vs Spark's key-hoisted schema. Born red by design.
+case("jn-023", "join", "multi-slot star over USING join (star-order witness)", "SELECT *, 1 AS one FROM emp JOIN dept USING (dept_id)")
 
 # ── 4. GROUP BY / aggregates ─────────────────────────────────────────────────
 case("agg-001", "aggregate", "COUNT(*)", "SELECT count(*) AS n FROM emp")
@@ -565,6 +574,14 @@ case("cx-011", "complex_type", "explode map -> key,value", "SELECT id, explode(a
 case("cx-012", "complex_type", "inline (array<struct> -> cols)", "SELECT inline(array(named_struct('a', 1, 'b', 'x'), named_struct('a', 2, 'b', 'y')))")
 case("cx-013", "complex_type", "higher-order transform lambda", "SELECT transform(tags, x -> upper(x)) AS up_tags FROM emp")
 case("cx-014", "complex_type", "higher-order filter / exists", "SELECT filter(tags, x -> x LIKE 'r%') r_tags, exists(tags, x -> x = 'rust') has_rust FROM emp")
+# Stale default-projection witnesses (review finding 3 in
+# tasks/select-block-review-findings.md): a LATERAL VIEW merged onto a block
+# that carries default_projections (range's `id` bind; a join's hoisted slot
+# list) must extend the SELECT list with the generated columns — today the
+# stale defaults win and the generated columns silently vanish from the wire.
+# Born red by design; the evidence gate for the emission fix.
+case("cx-015", "complex_type", "LATERAL VIEW over range() (stale default-projection witness)", "SELECT * FROM range(3) LATERAL VIEW explode(array(1, 2)) t AS c")
+case("cx-016", "complex_type", "LATERAL VIEW over join (stale default-projection witness)", "SELECT * FROM emp e JOIN dept d ON e.dept_id = d.dept_id LATERAL VIEW explode(e.tags) t AS tag")
 
 # ── 14. Table-valued / FROM-clause expressions ───────────────────────────────
 case("tbl-001", "table_expr", "inline table VALUES", "SELECT * FROM VALUES (1, 'a'), (2, 'b'), (3, 'c') AS t(n, s)")

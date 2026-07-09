@@ -742,7 +742,7 @@ case("win2-002", "window_time", "tumbling time window aggregate", lambda I: I["e
 #
 # Query logic lives in sibling modules, extracted/moved VERBATIM from the
 # retired legacy test files:
-#   - tpch_dataframe_queries.py  (was test_tpch_differential.py's inner
+#   - tpch_dataframe_queries.py  (was the legacy TPC-H DataFrame test file's inner
 #     build_qNN closures; EPSILONS preserves each test's float tolerance)
 #   - tpcds_dataframe_queries.py (was tests/integration/tpcds_dataframe/;
 #     same module, new home)

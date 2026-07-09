@@ -1,6 +1,6 @@
 """TPC-H queries implemented in pure PySpark DataFrame API.
 
-Extracted VERBATIM from the retired differential/test_tpch_differential.py
+Extracted VERBATIM from the retired legacy TPC-H DataFrame test file
 (each function was that test's inner `build_qNN(session)` closure) so the
 DataFrame corpus's tpch cluster runs byte-identical query logic to the
 legacy suite. Each function takes a SparkSession whose catalog has the

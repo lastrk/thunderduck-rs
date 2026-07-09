@@ -233,44 +233,9 @@ def tpch_data_dir():
     return data_dir
 
 
-@pytest.fixture(scope="session")
-def tpch_queries_dir():
-    """Path to TPC-H queries directory"""
-    queries_dir = Path(__file__).parent / "sql" / "tpch_queries"
-    if not queries_dir.exists():
-        pytest.skip(f"TPC-H queries not found at {queries_dir}")
-    return queries_dir
-
-
-# Utility functions
-
-def load_query(query_num: int, queries_dir: Path) -> str:
-    """
-    Load a TPC-H query from file
-
-    Args:
-        query_num: Query number (1-22)
-        queries_dir: Path to queries directory
-
-    Returns:
-        Query SQL string
-    """
-    query_file = queries_dir / f"q{query_num}.sql"
-    if not query_file.exists():
-        pytest.skip(f"Query file not found: {query_file}")
-
-    with open(query_file) as f:
-        return f.read()
-
-
-@pytest.fixture
-def load_tpch_query(tpch_queries_dir):
-    """
-    Fixture that returns a function to load TPC-H queries
-    """
-    def _load(query_num: int) -> str:
-        return load_query(query_num, tpch_queries_dir)
-    return _load
+# TPC query loading now happens at corpus import time (sql_corpus.py reads
+# the canonical .sql files directly); the tpch_queries_dir / load_tpch_query
+# fixtures were retired with the legacy TPC test files they served.
 
 
 # Pytest configuration
@@ -387,30 +352,8 @@ def tpcds_data_dir():
     return data_dir
 
 
-@pytest.fixture(scope="session")
-def tpcds_queries_dir():
-    """Path to TPC-DS queries directory"""
-    queries_dir = Path(__file__).parent / "sql" / "tpcds_queries"
-    if not queries_dir.exists():
-        pytest.skip(f"TPC-DS queries not found at {queries_dir}")
-    return queries_dir
-
-
-@pytest.fixture
-def load_tpcds_query(tpcds_queries_dir):
-    """Load TPC-DS query by number or variant name"""
-    def _load_query(qnum):
-        """
-        Load a TPC-DS query.
-
-        Args:
-            qnum: Query number (1-99) or variant string ('14a', '14b', '23a', etc.)
-        """
-        query_file = tpcds_queries_dir / f"q{qnum}.sql"
-        if not query_file.exists():
-            pytest.skip(f"Query file not found: {query_file}")
-        return query_file.read_text()
-    return _load_query
+# (tpcds_queries_dir / load_tpcds_query retired — see the note at the former
+# tpch_queries_dir site above.)
 
 
 # ============================================================================
@@ -675,6 +618,14 @@ TPCH_TABLES = [
     'supplier', 'partsupp', 'nation', 'region'
 ]
 
+TPCDS_TABLES = [
+    'call_center', 'catalog_page', 'catalog_returns', 'catalog_sales',
+    'customer', 'customer_address', 'customer_demographics', 'date_dim',
+    'household_demographics', 'income_band', 'inventory', 'item',
+    'promotion', 'reason', 'ship_mode', 'store', 'store_returns', 'store_sales',
+    'time_dim', 'warehouse', 'web_page', 'web_returns', 'web_sales', 'web_site'
+]
+
 # Table names that exist in BOTH benchmarks with different schemas (TPC-H
 # customer: c_custkey/c_mktsegment/...; TPC-DS customer: c_customer_sk/...).
 # One session namespace cannot hold both at once — these are registered
@@ -819,101 +770,7 @@ def fresh_thunderduck_server(orchestrator):
     _release_session_without_shutdown(session)
 
 
-# ============================================================================
-# TPC-H Differential Testing Fixtures
-# ============================================================================
-
-@pytest.fixture(scope="module")
-def tpch_tables_reference(spark_reference, tpch_data_dir):
-    """
-    Load TPC-H tables into Spark Reference session (module-scoped).
-    """
-    tables = [
-        'lineitem', 'orders', 'customer', 'part',
-        'supplier', 'partsupp', 'nation', 'region'
-    ]
-
-    print("\nLoading TPC-H tables into Spark Reference...")
-    for table in tables:
-        parquet_path = tpch_data_dir / f"{table}.parquet"
-        if not parquet_path.exists():
-            pytest.skip(f"TPC-H table not found: {parquet_path}")
-
-        df = spark_reference.read.parquet(str(parquet_path))
-        df.createOrReplaceTempView(table)
-
-    print(f"✓ All {len(tables)} TPC-H tables loaded into Spark Reference")
-    return tables
-
-
-@pytest.fixture(scope="module")
-def tpch_tables_thunderduck(spark_thunderduck, tpch_data_dir):
-    """
-    Load TPC-H tables into Thunderduck session (module-scoped).
-    """
-    tables = [
-        'lineitem', 'orders', 'customer', 'part',
-        'supplier', 'partsupp', 'nation', 'region'
-    ]
-
-    print("\nLoading TPC-H tables into Thunderduck...")
-    for table in tables:
-        parquet_path = tpch_data_dir / f"{table}.parquet"
-        if not parquet_path.exists():
-            pytest.skip(f"TPC-H table not found: {parquet_path}")
-
-        df = spark_thunderduck.read.parquet(str(parquet_path))
-        df.createOrReplaceTempView(table)
-
-    print(f"✓ All {len(tables)} TPC-H tables loaded into Thunderduck")
-    return tables
-
-
-# ============================================================================
-# TPC-DS Differential Testing Fixtures
-# ============================================================================
-
-# List of all TPC-DS tables
-TPCDS_TABLES = [
-    'call_center', 'catalog_page', 'catalog_returns', 'catalog_sales',
-    'customer', 'customer_address', 'customer_demographics', 'date_dim',
-    'household_demographics', 'income_band', 'inventory', 'item',
-    'promotion', 'reason', 'ship_mode', 'store', 'store_returns', 'store_sales',
-    'time_dim', 'warehouse', 'web_page', 'web_returns', 'web_sales', 'web_site'
-]
-
-
-@pytest.fixture(scope="module")
-def tpcds_tables_reference(spark_reference, tpcds_data_dir):
-    """
-    Load TPC-DS tables into Spark Reference session (module-scoped).
-    """
-    print(f"\nLoading {len(TPCDS_TABLES)} TPC-DS tables into Spark Reference...")
-    for table in TPCDS_TABLES:
-        parquet_path = tpcds_data_dir / f"{table}.parquet"
-        if not parquet_path.exists():
-            pytest.skip(f"TPC-DS table not found: {parquet_path}")
-
-        df = spark_reference.read.parquet(str(parquet_path))
-        df.createOrReplaceTempView(table)
-
-    print(f"✓ All {len(TPCDS_TABLES)} TPC-DS tables loaded into Spark Reference")
-    return TPCDS_TABLES
-
-
-@pytest.fixture(scope="module")
-def tpcds_tables_thunderduck(spark_thunderduck, tpcds_data_dir):
-    """
-    Load TPC-DS tables into Thunderduck session (module-scoped).
-    """
-    print(f"\nLoading {len(TPCDS_TABLES)} TPC-DS tables into Thunderduck...")
-    for table in TPCDS_TABLES:
-        parquet_path = tpcds_data_dir / f"{table}.parquet"
-        if not parquet_path.exists():
-            pytest.skip(f"TPC-DS table not found: {parquet_path}")
-
-        df = spark_thunderduck.read.parquet(str(parquet_path))
-        df.createOrReplaceTempView(table)
-
-    print(f"✓ All {len(TPCDS_TABLES)} TPC-DS tables loaded into Thunderduck")
-    return TPCDS_TABLES
+# TPC table registration now lives in `_register_tpc_views` /
+# `tpc_view_switcher` above (used by the corpus fixtures) — the legacy
+# tpch_tables_* / tpcds_tables_* module fixtures were retired with the
+# legacy TPC test files they served.

@@ -292,6 +292,15 @@ case("jn-016", "join", "USING with subsequent unqualified col", "SELECT dept_id,
 # Q7/Q8/Q21 (`FROM supplier, lineitem l1, ..., nation n1, nation n2`) after
 # FileScan landed.
 case("jn-017", "join", "bare first table + aliased tables in comma join", "SELECT n1.dept_name, n2.dept_name FROM emp, dept n1, dept n2 WHERE emp.dept_id = n1.dept_id AND emp.dept_id = n2.dept_id")
+# Migrated from the retired legacy TPC-DS suite (its q90-at-cross-join τ-only check)
+# (a τ-only check: TPC-DS Q90 aliases a derived table `at` before CROSS JOIN;
+# Q90 itself can't be a differential case because Spark hits its own
+# DIVIDE_BY_ZERO bug on it). EXPECTED RED, same as the legacy test was red in
+# the migration baseline: Spark 4.1.1 accepts the keyword-like alias `at`
+# (verified live), but τ emits it unquoted and DuckDB reserves `at`
+# (Parser Error at `AS at`). The fix is τ quoting keyword-like aliases on
+# emission — this case is the fitness witness for that gap.
+case("jn-018", "join", "keyword-like alias `at` before CROSS JOIN (TPC-DS Q90 parse shape)", "SELECT name, dept_name FROM (SELECT id, name FROM emp) at CROSS JOIN (SELECT dept_name FROM dept) d")
 
 # ── 4. GROUP BY / aggregates ─────────────────────────────────────────────────
 case("agg-001", "aggregate", "COUNT(*)", "SELECT count(*) AS n FROM emp")
@@ -698,8 +707,8 @@ case("num-032", "numeric_tower", "hex/bin over int vs bigint", "SELECT hex(a) ha
 #
 # Query text is loaded VERBATIM at import time from the canonical .sql files
 # (tests/integration/sql/{tpch,tpcds}_queries/) — those files stay the single
-# source of truth, exactly as the legacy test_differential_v2.py /
-# test_tpcds_differential.py loaders read them. These clusters reference the
+# source of truth, exactly as the legacy TPC-H /
+# TPC-DS suites read them. These clusters reference the
 # parquet-backed TPC temp views (lineitem, orders, ..., store_sales, ...),
 # registered by the sql_corpus_* fixtures in conftest.py alongside the
 # in-memory corpus views. Red cases here are the τ fitness signal (ADR-022) —
@@ -715,7 +724,7 @@ for _n in range(1, 23):
         (_SQL_QUERIES_DIR / "tpch_queries" / f"q{_n}.sql").read_text(),
     )
 
-# The exact query set the legacy suite exercised (test_tpcds_differential.py
+# The exact query set the legacy TPC-DS suite exercised (its
 # STANDARD_QUERIES + VARIANT_QUERIES): Q36 excluded (DuckDB limitation),
 # Q72 excluded (Spark OOM), Q90 excluded (Spark DIVIDE_BY_ZERO bug).
 _TPCDS_QUERY_IDS = [

@@ -527,7 +527,7 @@ pub fn analyze(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Analy
     // The three logical passes (resolve → assign_types → derive_nullability)
     // are fused into a single bottom-up traversal for efficiency. Section
     // comments below mark where each conceptual pass runs.
-    analyze_node(ast, base_types)
+    analyze_node(ast, base_types, None)
 }
 
 // ── Public helpers ──────────────────────────────────────────────────────────
@@ -660,9 +660,10 @@ pub(super) fn analyzer_error_to_emission_error(e: AnalyzerError) -> EmissionErro
 fn passthrough_schema_arm(
     input: CommonAst,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
     build_op: impl FnOnce(TypedAst) -> Result<TypedOp, AnalyzerError>,
 ) -> Result<TypedAst, AnalyzerError> {
-    let typed_input = analyze_node(input, base_types)?;
+    let typed_input = analyze_node(input, base_types, outer)?;
     let resolved_schema = typed_input.resolved_schema.clone();
     let op = build_op(typed_input)?;
     Ok(TypedAst {
@@ -671,7 +672,11 @@ fn passthrough_schema_arm(
     })
 }
 
-fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, AnalyzerError> {
+fn analyze_node(
+    ast: CommonAst,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<TypedAst, AnalyzerError> {
     match ast.op {
         // ── Leaves ────────────────────────────────────────────────────────
         CommonOp::SingleRow => Ok(TypedAst {
@@ -759,7 +764,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
 
         // ── Unary ─────────────────────────────────────────────────────────
         CommonOp::Project { input, projections } => {
-            let typed_input = analyze_node(*input, base_types)?;
+            let typed_input = analyze_node(*input, base_types, outer)?;
             // Pass 85 — expand `df.colRegex("`.*_id`")` projections BEFORE
             // resolution. Each `UnresolvedRegex` becomes N `UnresolvedColumn`
             // refs (one per matching input field, schema order preserved).
@@ -792,7 +797,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             // the rest of resolution/typing is completely unaware of LCA.
             let projections =
                 expand_lateral_column_aliases(projections, &typed_input.resolved_schema)?;
-            let ctx = ResolveContext::of_input(&typed_input, base_types);
+            let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
             let projections = projections
                 .into_iter()
                 .map(|e| resolve_and_stamp(e, &ctx))
@@ -809,22 +814,24 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             })
         }
 
-        CommonOp::Filter { input, condition } => passthrough_schema_arm(*input, base_types, |ti| {
-            let ctx = ResolveContext::of_input(&ti, base_types);
-            let condition = resolve_boolean_predicate(condition, &ctx, "filter-condition")?;
-            Ok(TypedOp::Filter {
-                input: Box::new(ti),
-                condition,
+        CommonOp::Filter { input, condition } => {
+            passthrough_schema_arm(*input, base_types, outer, |ti| {
+                let ctx = ResolveContext::of_input(&ti, base_types, outer);
+                let condition = resolve_boolean_predicate(condition, &ctx, "filter-condition")?;
+                Ok(TypedOp::Filter {
+                    input: Box::new(ti),
+                    condition,
+                })
             })
-        }),
+        }
 
         CommonOp::Sort {
             input,
             order,
             limit,
             offset,
-        } => passthrough_schema_arm(*input, base_types, |ti| {
-            let ctx = ResolveContext::of_input(&ti, base_types);
+        } => passthrough_schema_arm(*input, base_types, outer, |ti| {
+            let ctx = ResolveContext::of_input(&ti, base_types, outer);
             let order = order
                 .into_iter()
                 .map(|so| {
@@ -848,7 +855,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             input,
             limit,
             offset,
-        } => passthrough_schema_arm(*input, base_types, |ti| {
+        } => passthrough_schema_arm(*input, base_types, outer, |ti| {
             Ok(TypedOp::Limit {
                 input: Box::new(ti),
                 limit,
@@ -864,8 +871,8 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             grouping_sets,
             having,
         } => {
-            let typed_input = analyze_node(*input, base_types)?;
-            let ctx = ResolveContext::of_input(&typed_input, base_types);
+            let typed_input = analyze_node(*input, base_types, outer)?;
+            let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
             let grouping = resolve_expr_list(grouping, &ctx)?;
             let aggregates = resolve_expr_list(aggregates, &ctx)?;
             // HAVING resolves against the aggregate INPUT schema (aggregate
@@ -911,7 +918,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
 
         // ── WithColumns (add-or-replace by name, Spark semantics) ────────
         CommonOp::WithColumns { input, assignments } => {
-            analyze_with_columns(*input, assignments, base_types)
+            analyze_with_columns(*input, assignments, base_types, outer)
         }
 
         // ── NA family ────────────────────────────────────────────────────
@@ -919,12 +926,12 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             input,
             cols,
             values,
-        } => analyze_na_fill(*input, cols, values, base_types),
+        } => analyze_na_fill(*input, cols, values, base_types, outer),
         CommonOp::NaDrop {
             input,
             cols,
             min_non_nulls,
-        } => passthrough_schema_arm(*input, base_types, |ti| {
+        } => passthrough_schema_arm(*input, base_types, outer, |ti| {
             Ok(TypedOp::NaDrop {
                 input: Box::new(ti),
                 cols,
@@ -935,7 +942,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             input,
             cols,
             replacements,
-        } => passthrough_schema_arm(*input, base_types, |ti| {
+        } => passthrough_schema_arm(*input, base_types, outer, |ti| {
             Ok(TypedOp::NaReplace {
                 input: Box::new(ti),
                 cols,
@@ -957,20 +964,23 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             variable_column_name,
             value_column_name,
             base_types,
+            outer,
         ),
 
         // ── Describe (Spark `df.describe(...)`) ─────────────────────────
-        CommonOp::Describe { input, cols } => analyze_describe(*input, cols, base_types),
+        CommonOp::Describe { input, cols } => analyze_describe(*input, cols, base_types, outer),
 
         // ── Summary (Spark `df.summary(...)`) ───────────────────────────
-        CommonOp::Summary { input, statistics } => analyze_summary(*input, statistics, base_types),
+        CommonOp::Summary { input, statistics } => {
+            analyze_summary(*input, statistics, base_types, outer)
+        }
 
         // ── FreqItems (Spark `df.stat.freqItems(...)`) ──────────────────
         CommonOp::FreqItems {
             input,
             cols,
             support,
-        } => analyze_freq_items(*input, cols, support, base_types),
+        } => analyze_freq_items(*input, cols, support, base_types, outer),
 
         // ── Crosstab — Thunderduck-boundary (ADR-022) ───────────────────
         // Output columns are DISTINCT(col2) — unknowable at plan time.
@@ -995,11 +1005,12 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             pivot_values,
             aggregates,
             base_types,
+            outer,
         ),
 
         // ── Deduplicate (Spark `df.dropDuplicates` / `df.distinct`) ──────
         CommonOp::Deduplicate { input, on_columns } => {
-            passthrough_schema_arm(*input, base_types, |ti| {
+            passthrough_schema_arm(*input, base_types, outer, |ti| {
                 Ok(TypedOp::Deduplicate {
                     input: Box::new(ti),
                     on_columns,
@@ -1014,7 +1025,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             upper_bound,
             with_replacement,
             seed,
-        } => passthrough_schema_arm(*input, base_types, |ti| {
+        } => passthrough_schema_arm(*input, base_types, outer, |ti| {
             Ok(TypedOp::Sample {
                 input: Box::new(ti),
                 lower_bound,
@@ -1030,8 +1041,8 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             col,
             fractions,
             seed,
-        } => passthrough_schema_arm(*input, base_types, |ti| {
-            let col = resolve_and_stamp(col, &ResolveContext::of_input(&ti, base_types))?;
+        } => passthrough_schema_arm(*input, base_types, outer, |ti| {
+            let col = resolve_and_stamp(col, &ResolveContext::of_input(&ti, base_types, outer))?;
             Ok(TypedOp::SampleBy {
                 input: Box::new(ti),
                 col,
@@ -1044,11 +1055,11 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
         CommonOp::ToDf {
             input,
             column_names,
-        } => analyze_to_df(*input, column_names, base_types),
+        } => analyze_to_df(*input, column_names, base_types, outer),
 
         // ── AliasedRelation (Spark `df.alias(name)`) ─────────────────────
         CommonOp::AliasedRelation { input, alias } => {
-            passthrough_schema_arm(*input, base_types, |ti| {
+            passthrough_schema_arm(*input, base_types, outer, |ti| {
                 Ok(TypedOp::AliasedRelation {
                     input: Box::new(ti),
                     alias,
@@ -1058,7 +1069,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
 
         // ── WithColumnsRenamed (Spark `df.withColumnsRenamed(...)`) ──────
         CommonOp::WithColumnsRenamed { input, renames } => {
-            let typed_input = analyze_node(*input, base_types)?;
+            let typed_input = analyze_node(*input, base_types, outer)?;
             let rename_map: HashMap<String, String> = renames
                 .iter()
                 .map(|(old, new)| (old.to_lowercase(), new.clone()))
@@ -1085,7 +1096,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
 
         // ── DropColumns (Spark `df.drop(...)`) ───────────────────────────
         CommonOp::DropColumns { input, drop_names } => {
-            let typed_input = analyze_node(*input, base_types)?;
+            let typed_input = analyze_node(*input, base_types, outer)?;
             let drop_lower: HashSet<String> = drop_names.iter().map(|s| s.to_lowercase()).collect();
             let mut output_fields: Vec<StructField> =
                 Vec::with_capacity(typed_input.resolved_schema.fields.len());
@@ -1109,7 +1120,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             input,
             table_alias,
             columns,
-        } => analyze_lateral_view(*input, table_alias, columns, base_types),
+        } => analyze_lateral_view(*input, table_alias, columns, base_types, outer),
 
         // ── Binary: Join ──────────────────────────────────────────────────
         CommonOp::Join {
@@ -1131,6 +1142,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             left_plan_ids,
             right_plan_ids,
             base_types,
+            outer,
         ),
 
         // ── N-ary: SetOp with widening sub-sweep ──────────────────────────
@@ -1147,6 +1159,7 @@ fn analyze_node(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Anal
             allow_missing_columns,
             children,
             base_types,
+            outer,
         ),
     }
 }
@@ -1161,9 +1174,10 @@ fn analyze_lateral_view(
     table_alias: String,
     columns: Vec<(String, Expression)>,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
-    let typed_input = analyze_node(input, base_types)?;
-    let ctx = ResolveContext::of_input(&typed_input, base_types);
+    let typed_input = analyze_node(input, base_types, outer)?;
+    let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
     let input_schema = &typed_input.resolved_schema;
     let resolved_columns: Vec<(String, Expression)> = columns
         .into_iter()
@@ -1207,10 +1221,11 @@ fn analyze_with_columns(
     input: CommonAst,
     assignments: Vec<(String, Expression)>,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
-    let typed_input = analyze_node(input, base_types)?;
+    let typed_input = analyze_node(input, base_types, outer)?;
     let input_schema = &typed_input.resolved_schema;
-    let ctx = ResolveContext::of_input(&typed_input, base_types);
+    let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
     // Resolve each assignment expression against the INPUT schema —
     // Spark semantics: later assignments see the input value, not
     // intermediate replacements.
@@ -1361,8 +1376,9 @@ fn analyze_na_fill(
     cols: Vec<String>,
     values: Vec<Expression>,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
-    let typed_input = analyze_node(input, base_types)?;
+    let typed_input = analyze_node(input, base_types, outer)?;
     // Columns filled with a non-null value become non-nullable — but only
     // for columns whose static type is compatible with the fill value's type
     // (Spark's `fillValue` silently skips type-incompatible columns). See
@@ -1406,8 +1422,9 @@ fn analyze_to_df(
     input: CommonAst,
     column_names: Vec<String>,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
-    let typed_input = analyze_node(input, base_types)?;
+    let typed_input = analyze_node(input, base_types, outer)?;
     let input_fields = &typed_input.resolved_schema.fields;
     if input_fields.len() != column_names.len() {
         return Err(AnalyzerError::Other {
@@ -1453,9 +1470,10 @@ fn analyze_join(
     left_plan_ids: Vec<i64>,
     right_plan_ids: Vec<i64>,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
-    let typed_left = analyze_node(left, base_types)?;
-    let typed_right = analyze_node(right, base_types)?;
+    let typed_left = analyze_node(left, base_types, outer)?;
+    let typed_right = analyze_node(right, base_types, outer)?;
 
     // NATURAL-join desugar (Spark's `ResolveNaturalAndUsingJoin`): rewrite
     // NATURAL into the equivalent USING(...) shape now that both sides'
@@ -1536,6 +1554,7 @@ fn analyze_join(
                 &typed_left,
                 &typed_right,
                 base_types,
+                outer,
             );
             Some(resolve_and_stamp(c, &ctx)?)
         }
@@ -1639,6 +1658,7 @@ fn analyze_set_op(
     allow_missing_columns: bool,
     children: Vec<CommonAst>,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
     // UNION BY NAME is analyzed by name-matching each column across
     // children; INTERSECT / EXCEPT BY NAME are not supported by
@@ -1664,7 +1684,7 @@ fn analyze_set_op(
     }
     let mut typed_children: Vec<TypedAst> = children
         .into_iter()
-        .map(|c| analyze_node(c, base_types))
+        .map(|c| analyze_node(c, base_types, outer))
         .collect::<Result<Vec<_>, _>>()?;
 
     // set-op widening sub-sweep (§5):
@@ -2546,15 +2566,14 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
             let stamped = stamp_column_reference(c, ctx.schema);
             Ok(Expression::ColumnReference(stamped))
         }
-        // Uncorrelated subqueries: analyze the inner plan against the SAME
-        // `base_types` and carry the typed plan forward so emission renders it
-        // node-local (ADR-007 A / INV2). A correlated inner ref to an outer
-        // column is an `UnresolvedColumn` this isolated `analyze` cannot
-        // resolve → resolution error → honest Thunderduck boundary (ADR-022).
+        // Subqueries: analyze the inner plan with the enclosing context
+        // threaded as the outer scope so correlated outer references (e.g.
+        // `e.salary` referencing the outer `emp e`) resolve against the
+        // parent plan's schema when the inner plan has no match (ADR-008).
         Expression::ScalarSubquery(mut s) => {
             s.subquery = analyze_single_column_subquery(
                 s.subquery,
-                ctx.base_types,
+                ctx,
                 "scalar subquery must return exactly one column",
             )?;
             Ok(Expression::ScalarSubquery(s))
@@ -2563,13 +2582,13 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
             i.expr = Box::new(resolve_and_stamp(*i.expr, ctx)?);
             i.subquery = analyze_single_column_subquery(
                 i.subquery,
-                ctx.base_types,
+                ctx,
                 "IN subquery must return exactly one column",
             )?;
             Ok(Expression::InSubquery(i))
         }
         Expression::ExistsSubquery(mut e) => {
-            let inner = analyze_subquery_plan(e.subquery, ctx.base_types)?;
+            let inner = analyze_subquery_plan(e.subquery, ctx)?;
             e.subquery = SubqueryPlan::Analyzed(Box::new(inner));
             Ok(Expression::ExistsSubquery(e))
         }
@@ -2626,15 +2645,27 @@ fn resolve_expr_list(
         .collect()
 }
 
-/// Analyze an embedded subquery's inner plan against `base_types`. The plan is
-/// `Unanalyzed` when produced by the front-end; an already-`Analyzed` plan is
-/// returned unchanged (idempotent — the analyzer normally runs each plan once).
+/// Analyze an embedded subquery's inner plan. Builds an [`OuterScope`] from
+/// the enclosing [`ResolveContext`] so that correlated references to columns
+/// present ONLY in the outer plan's schema resolve correctly (tier (g) in
+/// [`resolve_column`]). The outer scope REPLACES (does not chain onto)
+/// whatever outer the enclosing context had — a doubly-nested subquery's
+/// inner plan only ever sees its immediate parent's scope, never a
+/// grandparent's.
+///
+/// An already-`Analyzed` plan is returned unchanged (idempotent).
 fn analyze_subquery_plan(
     plan: SubqueryPlan,
-    base_types: &BaseTypes,
+    ctx: &ResolveContext,
 ) -> Result<TypedAst, AnalyzerError> {
     match plan {
-        SubqueryPlan::Unanalyzed(inner) => analyze(*inner, base_types),
+        SubqueryPlan::Unanalyzed(inner) => {
+            let enclosing_outer = OuterScope {
+                schema: ctx.schema,
+                scopes: &ctx.scopes,
+            };
+            analyze_node(*inner, ctx.base_types, Some(enclosing_outer))
+        }
         SubqueryPlan::Analyzed(inner) => Ok(*inner),
     }
 }
@@ -2645,10 +2676,10 @@ fn analyze_subquery_plan(
 /// differently).
 fn analyze_single_column_subquery(
     plan: SubqueryPlan,
-    base_types: &BaseTypes,
+    ctx: &ResolveContext,
     error_reason: &str,
 ) -> Result<SubqueryPlan, AnalyzerError> {
-    let inner = analyze_subquery_plan(plan, base_types)?;
+    let inner = analyze_subquery_plan(plan, ctx)?;
     if inner.resolved_schema.fields.len() != 1 {
         return Err(AnalyzerError::Other {
             reason: error_reason.to_owned(),
@@ -2734,6 +2765,21 @@ impl QualifierScopes {
     }
 }
 
+/// The enclosing (parent) plan's resolution schema, threaded into subquery
+/// analysis so a correlated outer reference (e.g. `e.salary` inside
+/// `SELECT d.dept_id FROM dept d WHERE d.budget > e.salary`) resolves
+/// against the parent plan's schema when the inner plan has no match.
+///
+/// Deliberately has NO `outer` field: a doubly-nested subquery's inner plan
+/// only ever sees its immediate parent's scope, never a grandparent's.
+/// This makes multi-level correlation (which Spark itself rejects)
+/// unrepresentable by construction.
+#[derive(Debug, Clone, Copy)]
+struct OuterScope<'a> {
+    schema: &'a StructType,
+    scopes: &'a QualifierScopes,
+}
+
 /// The schema + alias-scope bindings a column reference resolves against.
 /// Threaded through `resolve_and_stamp` / `resolve_column` / `resolve_expr_list`
 /// / `resolve_boolean_predicate` in place of the bare `&StructType` they
@@ -2749,19 +2795,28 @@ struct ResolveContext<'a> {
     /// bind (e.g. `Values` rows, table-valued-function args).
     scopes: QualifierScopes,
     base_types: &'a BaseTypes,
+    /// The enclosing plan's scope for correlated subquery resolution.
+    /// `Some` when this context is analyzing a subquery's inner plan;
+    /// `None` at the top level.
+    outer: Option<OuterScope<'a>>,
 }
 
 impl<'a> ResolveContext<'a> {
     /// Resolve against a unary operator's already-typed `input` — the common
     /// case (Project / Filter / Sort / Aggregate / WithColumns / SampleBy /
     /// ... all resolve against their child's resolved schema).
-    fn of_input(input: &'a TypedAst, base_types: &'a BaseTypes) -> Self {
+    fn of_input(
+        input: &'a TypedAst,
+        base_types: &'a BaseTypes,
+        outer: Option<OuterScope<'a>>,
+    ) -> Self {
         let mut bindings = Vec::new();
         collect_qualifier_bindings(input, 0, &mut bindings);
         Self {
             schema: &input.resolved_schema,
             scopes: QualifierScopes { bindings },
             base_types,
+            outer,
         }
     }
 
@@ -2774,6 +2829,7 @@ impl<'a> ResolveContext<'a> {
         left: &'a TypedAst,
         right: &'a TypedAst,
         base_types: &'a BaseTypes,
+        outer: Option<OuterScope<'a>>,
     ) -> Self {
         let mut bindings = Vec::new();
         let left_len = left.resolved_schema.len();
@@ -2786,6 +2842,7 @@ impl<'a> ResolveContext<'a> {
             schema,
             scopes: QualifierScopes { bindings },
             base_types,
+            outer,
         }
     }
 
@@ -2796,6 +2853,7 @@ impl<'a> ResolveContext<'a> {
             schema,
             scopes: QualifierScopes::empty(),
             base_types,
+            outer: None,
         }
     }
 
@@ -2980,6 +3038,46 @@ fn try_rewrite_nested_struct_path(u: &UnresolvedColumn, schema: &StructType) -> 
     Some(expr)
 }
 
+/// Attempt to resolve an [`UnresolvedColumn`] against the outer (enclosing)
+/// plan's scope. Used as a final fallback (tier (g)) in [`resolve_column`]
+/// when ALL inner tiers have failed — i.e. the column name+qualifier does not
+/// match anything in the inner plan's schema.
+///
+/// **Qualifier-strict**: a qualified reference (`e.salary`) only resolves if
+/// the qualifier binds a scope in the outer context (struct-column precedence
+/// first, then relation-alias scope). An unqualified reference resolves only
+/// when exactly one case-insensitive match exists across the outer schema's
+/// fields (zero or 2+ matches yield `None`).
+fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<(DataType, bool)> {
+    if let Some(q) = u.qualifier.as_deref() {
+        // Struct-column precedence in the outer schema (matches resolve_column's
+        // existing tier ordering).
+        if let Some(info) = TypeInferenceEngine::struct_qualifier_info(&u.name, q, outer.schema) {
+            return Some(info);
+        }
+        // Relation-alias scope in the outer context.
+        let range = outer.scopes.lookup(q)?;
+        // Guard against out-of-bounds (same pattern as ResolveContext::scoped_range).
+        if range.end > outer.schema.fields.len() {
+            return None;
+        }
+        TypeInferenceEngine::column_info_in(&u.name, &outer.schema.fields[range])
+    } else {
+        // Unqualified: exactly-one case-insensitive match in the outer schema.
+        let mut found: Option<(DataType, bool)> = None;
+        for f in &outer.schema.fields {
+            if f.name.eq_ignore_ascii_case(&u.name) {
+                if found.is_some() {
+                    // 2+ matches — ambiguous; do not silently pick one.
+                    return None;
+                }
+                found = Some((f.data_type.clone(), f.nullable));
+            }
+        }
+        found
+    }
+}
+
 fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expression, AnalyzerError> {
     // Multi-level nested-struct navigation: `F.col("address.geo.lat")` arrives
     // here as `UnresolvedColumn { qualifier: Some("address"), name: "geo.lat" }`
@@ -3079,6 +3177,23 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         TypeInferenceEngine::qualified_column_info(&u.name, None, ctx.schema)
     };
     if matches!(dt, DataType::Unresolved) {
+        // (g) Outer-scope fallback: when ALL inner tiers have failed and an
+        // enclosing plan's scope is available (inside a subquery), attempt to
+        // resolve the reference against the outer plan's schema. On hit, stamp
+        // the ColumnReference with the outer type/nullability and preserve the
+        // qualifier verbatim — emission renders it as-is, and DuckDB's own
+        // correlated-subquery binder resolves it at runtime (same mechanism
+        // the 13 existing green correlated subquery cases ride).
+        if let Some(outer) = ctx.outer {
+            if let Some((outer_dt, outer_nullable)) = resolve_in_outer(&u, outer) {
+                return Ok(Expression::ColumnReference(ColumnReference {
+                    name: u.name,
+                    qualifier: u.qualifier,
+                    data_type: Some(outer_dt),
+                    nullable: Some(outer_nullable),
+                }));
+            }
+        }
         return Err(AnalyzerError::UnknownColumn {
             name: u.name,
             qualifier: u.qualifier,
@@ -3269,8 +3384,9 @@ fn analyze_unpivot(
     variable_column_name: String,
     value_column_name: String,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
-    let typed_input = analyze_node(input, base_types)?;
+    let typed_input = analyze_node(input, base_types, outer)?;
     let input_schema = &typed_input.resolved_schema;
 
     // OPT-1: build a lowercase-keyed lookup once (case-insensitive per Spark
@@ -3509,8 +3625,9 @@ fn analyze_describe(
     input: CommonAst,
     cols: Vec<String>,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
-    let typed_input = analyze_node(input, base_types)?;
+    let typed_input = analyze_node(input, base_types, outer)?;
     let materialised = materialise_stats_cols(cols, &typed_input.resolved_schema)?;
     let output_schema = build_stats_output_schema(&materialised);
     Ok(TypedAst {
@@ -3530,8 +3647,9 @@ fn analyze_summary(
     input: CommonAst,
     statistics: Vec<String>,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
-    let typed_input = analyze_node(input, base_types)?;
+    let typed_input = analyze_node(input, base_types, outer)?;
     let materialised_cols: Vec<String> = typed_input
         .resolved_schema
         .fields
@@ -3581,8 +3699,9 @@ fn analyze_freq_items(
     cols: Vec<String>,
     support: f64,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
-    let typed_input = analyze_node(input, base_types)?;
+    let typed_input = analyze_node(input, base_types, outer)?;
     let materialised = materialise_stats_cols(cols, &typed_input.resolved_schema)?;
     let output_fields: Vec<StructField> = materialised
         .iter()
@@ -3650,6 +3769,7 @@ fn analyze_pivot(
     pivot_values: Vec<Expression>,
     aggregates: Vec<Expression>,
     base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
     // Thunderduck-boundary (ADR-022): implicit pivot values require an
     // eager DISTINCT query against DuckDB (Spark's Analyzer does this
@@ -3665,9 +3785,9 @@ fn analyze_pivot(
                     .to_owned(),
         });
     }
-    let typed_input = analyze_node(input, base_types)?;
+    let typed_input = analyze_node(input, base_types, outer)?;
     let input_schema = &typed_input.resolved_schema;
-    let ctx = ResolveContext::of_input(&typed_input, base_types);
+    let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
     // Resolve the pivot column and aggregates first: the implicit-grouping
     // derivation needs to know which columns the aggregates reference.
     let pivot_column = resolve_and_stamp(pivot_column, &ctx)?;
@@ -4725,6 +4845,370 @@ mod tests {
         });
         let err = analyze(ast, &bt).unwrap_err();
         assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
+    }
+
+    // ── Pass 16 — correlated subquery outer-scope fallback ─────────────
+
+    /// Dept schema with a `budget` column (not present in emp) for sq-010.
+    fn dept_schema_with_budget() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("dept_id", DataType::Integer),
+            StructField::nullable("dept_name", DataType::String),
+            StructField::nullable("budget", DataType::Double),
+        ])
+    }
+
+    /// sq-010 shape: correlated IN subquery where the inner WHERE references
+    /// an outer column (`e.salary`) that exists ONLY in the outer table
+    /// (`emp`), not in the inner table (`dept`). The analyzer must resolve
+    /// `e.salary` against the outer scope and stamp it with `Double` /
+    /// `nullable=true` (matching emp's `salary` field).
+    #[test]
+    fn correlated_in_subquery_outer_ref_absent_from_inner_resolves() {
+        let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
+        // SELECT * FROM emp e WHERE e.dept_id IN (
+        //     SELECT d.dept_id FROM dept d WHERE d.budget > e.salary
+        // )
+        let inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(scan("dept")),
+                    alias: "d".to_owned(),
+                })),
+                condition: Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Gt,
+                    left: Box::new(qcol("d", "budget")),
+                    right: Box::new(qcol("e", "salary")),
+                }),
+            })),
+            projections: vec![qcol("d", "dept_id")],
+        });
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(scan("emp")),
+                alias: "e".to_owned(),
+            })),
+            condition: Expression::InSubquery(InSubquery {
+                expr: Box::new(qcol("e", "dept_id")),
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+                negated: false,
+            }),
+        });
+        let typed = analyze(ast, &bt).expect("sq-010 must resolve");
+        // Verify the outer `e.dept_id` resolved (outer type stamped).
+        assert_eq!(typed.resolved_schema, emp_schema());
+    }
+
+    /// Same absent-column correlation shape as sq-010, but using
+    /// ExistsSubquery. Verifies the `analyze_subquery_plan` path threads
+    /// the outer scope correctly.
+    #[test]
+    fn correlated_exists_subquery_outer_ref_absent_from_inner_resolves() {
+        let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
+        // SELECT * FROM emp e WHERE EXISTS (
+        //     SELECT 1 FROM dept d WHERE d.budget > e.salary
+        // )
+        let inner = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(scan("dept")),
+                alias: "d".to_owned(),
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Gt,
+                left: Box::new(qcol("d", "budget")),
+                right: Box::new(qcol("e", "salary")),
+            }),
+        });
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(scan("emp")),
+                alias: "e".to_owned(),
+            })),
+            condition: Expression::ExistsSubquery(ExistsSubquery {
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+                negated: false,
+            }),
+        });
+        let typed = analyze(ast, &bt).expect("EXISTS with outer ref must resolve");
+        assert_eq!(typed.resolved_schema, emp_schema());
+    }
+
+    /// Same absent-column correlation shape via ScalarSubquery.
+    #[test]
+    fn correlated_scalar_subquery_outer_ref_absent_from_inner_resolves() {
+        let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
+        // SELECT (SELECT max(d.budget) FROM dept d WHERE d.dept_id = e.dept_id
+        //         AND d.budget > e.salary) FROM emp e
+        let inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(scan("dept")),
+                    alias: "d".to_owned(),
+                })),
+                condition: Expression::Binary(BinaryExpression {
+                    op: BinaryOp::And,
+                    left: Box::new(Expression::Binary(BinaryExpression {
+                        op: BinaryOp::Eq,
+                        left: Box::new(qcol("d", "dept_id")),
+                        right: Box::new(qcol("e", "dept_id")),
+                    })),
+                    right: Box::new(Expression::Binary(BinaryExpression {
+                        op: BinaryOp::Gt,
+                        left: Box::new(qcol("d", "budget")),
+                        right: Box::new(qcol("e", "salary")),
+                    })),
+                }),
+            })),
+            projections: vec![func("max", vec![qcol("d", "budget")])],
+        });
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(scan("emp")),
+                alias: "e".to_owned(),
+            })),
+            projections: vec![Expression::ScalarSubquery(ScalarSubquery {
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+            })],
+        });
+        let typed = analyze(ast, &bt).expect("scalar subquery with outer ref must resolve");
+        // Scalar subquery resolves; output schema carries the scalar column.
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+    }
+
+    /// E2E emission test: sq-010 shape parsed → analyzed → dispatched.
+    /// The emitted SQL must contain the qualifier `e` on `salary` verbatim
+    /// inside the subquery (DuckDB's correlated-subquery binder uses it).
+    #[test]
+    fn correlated_in_subquery_emission_preserves_outer_qualifier() {
+        let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
+        // Build the same sq-010 shape as above but wrapped in a Project *
+        // so dispatch_op has a Project root.
+        let inner_filter = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(scan("dept")),
+                    alias: "d".to_owned(),
+                })),
+                condition: Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Gt,
+                    left: Box::new(qcol("d", "budget")),
+                    right: Box::new(qcol("e", "salary")),
+                }),
+            })),
+            projections: vec![qcol("d", "dept_id")],
+        });
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(scan("emp")),
+                    alias: "e".to_owned(),
+                })),
+                condition: Expression::InSubquery(InSubquery {
+                    expr: Box::new(qcol("e", "dept_id")),
+                    subquery: SubqueryPlan::Unanalyzed(Box::new(inner_filter)),
+                    negated: false,
+                }),
+            })),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+        let typed = analyze(ast, &bt).expect("sq-010 must resolve");
+        let sql = super::super::emission::dispatch_op(&typed.op, &typed.resolved_schema).unwrap();
+        // The emitted SQL must contain the outer qualifier verbatim.
+        assert!(
+            sql.contains("e.salary"),
+            "emission must preserve outer qualifier `e` on `salary`; got:\n{sql}"
+        );
+    }
+
+    /// One-level-only lock: a two-level-nested correlation where the
+    /// innermost subquery references the OUTERMOST alias via a column name
+    /// absent from BOTH inner schemas must still fail as UnknownColumn.
+    /// `OuterScope` deliberately has no `outer` field, so the grandparent's
+    /// scope is unrepresentable — the innermost plan only sees its
+    /// immediate parent.
+    #[test]
+    fn two_level_nested_correlation_to_grandparent_still_fails() {
+        let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
+        // Innermost subquery: SELECT 1 FROM dept d2 WHERE d2.dept_id = e.salary
+        // `e.salary` is from the grandparent (emp e), absent from both
+        // the immediate parent (dept d1) and the innermost (dept d2).
+        let innermost = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(scan("dept")),
+                alias: "d2".to_owned(),
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("d2", "dept_id")),
+                right: Box::new(qcol("e", "salary")),
+            }),
+        });
+        // Middle subquery: SELECT d1.dept_id FROM dept d1
+        //     WHERE EXISTS (innermost)
+        let middle = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(scan("dept")),
+                    alias: "d1".to_owned(),
+                })),
+                condition: Expression::ExistsSubquery(ExistsSubquery {
+                    subquery: SubqueryPlan::Unanalyzed(Box::new(innermost)),
+                    negated: false,
+                }),
+            })),
+            projections: vec![qcol("d1", "dept_id")],
+        });
+        // Outer: SELECT * FROM emp e WHERE e.dept_id IN (middle)
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(scan("emp")),
+                alias: "e".to_owned(),
+            })),
+            condition: Expression::InSubquery(InSubquery {
+                expr: Box::new(qcol("e", "dept_id")),
+                subquery: SubqueryPlan::Unanalyzed(Box::new(middle)),
+                negated: false,
+            }),
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(
+            matches!(err, AnalyzerError::UnknownColumn { .. }),
+            "two-level nested correlation to grandparent must fail; got: {err:?}"
+        );
+    }
+
+    /// Inner-precedence regression: when a column name exists in BOTH
+    /// the inner and outer schemas with DIFFERENT types, the inner type
+    /// must win (tier (f) resolves before tier (g)). This protects the 13
+    /// existing green correlated subquery cases.
+    #[test]
+    fn correlated_subquery_inner_type_takes_precedence_over_outer() {
+        // emp.dept_id = Integer(nullable), dept.dept_id = Integer(not-null).
+        // Create a variation where emp has dept_id as Long to differentiate.
+        let emp_long_dept_id = StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("dept_id", DataType::Long), // Long, not Integer
+            StructField::nullable("salary", DataType::Double),
+        ]);
+        let bt = base_types_for(&[("emp", emp_long_dept_id), ("dept", dept_schema())]);
+        // SELECT * FROM emp e WHERE e.dept_id IN (
+        //     SELECT dept_id FROM dept d WHERE d.dept_id = e.dept_id
+        // )
+        // The inner `dept_id` unqualified reference matches dept's Integer column.
+        // The inner `e.dept_id` should resolve via tier (f) (name-only fallback
+        // finds `dept_id` in the inner schema) and be stamped as Integer (the
+        // inner type), NOT Long (the outer type).
+        let inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(scan("dept")),
+                    alias: "d".to_owned(),
+                })),
+                condition: Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Eq,
+                    left: Box::new(qcol("d", "dept_id")),
+                    // e.dept_id: qualifier `e` not bound in inner scope → tier (f)
+                    // name-only lookup finds `dept_id` in dept's schema → Integer.
+                    right: Box::new(qcol("e", "dept_id")),
+                }),
+            })),
+            projections: vec![unresolved_col("dept_id")],
+        });
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(scan("emp")),
+                alias: "e".to_owned(),
+            })),
+            condition: Expression::InSubquery(InSubquery {
+                expr: Box::new(qcol("e", "dept_id")),
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+                negated: false,
+            }),
+        });
+        let typed = analyze(ast, &bt).expect("inner-precedence case must resolve");
+        // Dig into the inner subquery's filter condition to check the
+        // `e.dept_id` column reference's resolved type.
+        // Dig: outer Filter -> InSubquery -> Analyzed(Project(Filter(...)))
+        let inner_cond = match &typed.op {
+            TypedOp::Filter { condition, .. } => match condition {
+                Expression::InSubquery(i) => match &i.subquery {
+                    SubqueryPlan::Analyzed(inner_typed) => match &inner_typed.op {
+                        TypedOp::Project {
+                            input: inner_filter,
+                            ..
+                        } => match &inner_filter.op {
+                            TypedOp::Filter { condition: c, .. } => c,
+                            other => panic!("expected inner Filter, got {other:?}"),
+                        },
+                        other => panic!("expected inner Project, got {other:?}"),
+                    },
+                    SubqueryPlan::Unanalyzed(_) => panic!("subquery must be analyzed"),
+                },
+                other => panic!("expected InSubquery, got {other:?}"),
+            },
+            other => panic!("expected outer Filter, got {other:?}"),
+        };
+        match inner_cond {
+            Expression::Binary(b) => match &*b.right {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(c.qualifier.as_deref(), Some("e"));
+                    assert_eq!(c.name, "dept_id");
+                    // Must be Integer (inner type), NOT Long (outer).
+                    assert_eq!(
+                        c.data_type,
+                        Some(DataType::Integer),
+                        "inner type must take precedence over outer"
+                    );
+                }
+                other => panic!("expected ColumnReference for e.dept_id, got {other:?}"),
+            },
+            other => panic!("expected Binary condition, got {other:?}"),
+        }
+    }
+
+    /// Qualifier-strictness: a qualified outer reference whose qualifier
+    /// binds NO scope in the outer context, but whose bare name exists in
+    /// the outer schema, must still fail as UnknownColumn. This locks the
+    /// "no name-only scan in the outer tier" invariant.
+    #[test]
+    fn correlated_subquery_qualified_outer_ref_with_unbound_qualifier_fails() {
+        let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
+        // SELECT * FROM emp WHERE dept_id IN (
+        //     SELECT dept_id FROM dept d WHERE d.budget > bogus.salary
+        // )
+        // `bogus` is not the alias of any table in the outer scope.
+        // Even though `salary` exists in the outer emp schema, the
+        // qualifier-strict outer lookup must not find it.
+        let inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(scan("dept")),
+                    alias: "d".to_owned(),
+                })),
+                condition: Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Gt,
+                    left: Box::new(qcol("d", "budget")),
+                    right: Box::new(qcol("bogus", "salary")),
+                }),
+            })),
+            projections: vec![qcol("d", "dept_id")],
+        });
+        // NOTE: outer emp has NO alias — so its name is "emp" in the scope,
+        // but the inner reference uses "bogus" as qualifier.
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(scan("emp")),
+            condition: Expression::InSubquery(InSubquery {
+                expr: Box::new(unresolved_col("dept_id")),
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+                negated: false,
+            }),
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(
+            matches!(err, AnalyzerError::UnknownColumn { .. }),
+            "qualified outer ref with unbound qualifier must fail; got: {err:?}"
+        );
     }
 
     // ── assign_types pass ────────────────────────────────────────────────

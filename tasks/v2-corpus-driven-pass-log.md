@@ -1793,3 +1793,45 @@ each guards genuinely different output shapes (array-append vs map key/val selec
 TVF), so the spread is justified, not duplication.
 Gate green (823 unit tests, zero new clippy warnings in the touched regions). Corpora unchanged: SQL
 261/9/270, DataFrame 329/329 (verified — touches v2_lowering.rs/analyzer.rs generator dispatch logic).
+
+## Pass 16 — sq-010 (261→262)
+
+- **Case:** sq-010 `SELECT * FROM emp e WHERE e.dept_id IN (SELECT d.dept_id FROM dept d WHERE
+  d.budget > e.salary)` — correlated IN subquery, inner WHERE references outer `e.salary`.
+- **Owning layer:** analyzer only (`crates/core/src/transpiler_v2/analyzer.rs`). Emission code
+  UNCHANGED (2 stale doc comments refreshed only).
+- **Root cause:** τ's correlated-subquery support was "accidental correctness" — `analyze_subquery_plan`
+  analyzed inner plans in ISOLATION; a correlated ref with an unbound qualifier fell to a name-only
+  fallback that resolved ONLY when the column name happened to also exist in the inner table's own
+  schema. 13 subquery cases pass this way. sq-010 breaks because `salary` doesn't exist in `dept`, so
+  the accidental fallback genuinely fails and the analyzer throws before emission is ever reached.
+- **IMPORTANT CORRECTION during diagnosis:** the originally-suspected 2-case cluster (sq-010 + sq-016)
+  turned out to be TWO SEPARATE situations. sq-016 (doubly-nested correlation skipping a level) was
+  found to be INVALID Spark SQL (verified live: Spark itself throws `UNRESOLVED_COLUMN.WITH_SUGGESTION`
+  — correlation only reaches one level up) — documented in `.agent-output/unsolvable.md` as the 5th
+  invalid corpus case. A further correction during architecture: τ does NOT currently reject sq-016 —
+  it silently SUCCEEDS via the same accidental fallback (an over-permissive latent bug, separately
+  noted, not fixed this pass — no corpus-visible symptom since Spark throws before comparison).
+- **Fix:** new `OuterScope<'a> { schema, scopes }` (Copy, deliberately NO `outer` field — makes
+  multi-level/grandparent correlation unrepresentable by construction) threaded as a new
+  `Option<OuterScope>` parameter through `analyze_node` + 13 op-helpers + `ResolveContext`.
+  `analyze_subquery_plan`/`analyze_single_column_subquery` build a FRESH OuterScope from the immediately
+  enclosing context (REPLACING, never chaining, any prior outer) before analyzing the inner plan. New
+  `resolve_in_outer` — qualifier-STRICT (no name-only scan against the outer schema) — consulted only
+  as a new tier (g) at `resolve_column`'s final miss exit, strictly after all inner tiers (including the
+  accidental tier-(f) fallback) have failed, so the 13 green cases' inner-precedence is untouched.
+  Applies uniformly to InSubquery/ExistsSubquery/ScalarSubquery (all funnel through the same functions).
+- **ADRs:** ADR-008 ("τ emits Spark's correlated subquery structure verbatim... No rewrite to lateral";
+  "Correlation remains an annotation concern... must stage outer-before-inner resolution — but it
+  produces no rewrite" — this pass completes that approved annotation half, emission half already
+  proven by the 13 green cases). Not an escalation — zero rewrites added, a resolution tier only.
+  ADR-022 unchanged (genuine miss stays UnknownColumn, cat-1).
+- **Findings closed:** reviewer Critical=0 High=0 (exhaustively verified the one-level-only invariant
+  holds by construction — traced a doubly-nested case by hand — and independently confirmed all ~15
+  threaded call sites, the riskiest parts of a wide mechanical change); perf High=0 Medium=0.
+- **Before→after:** SQL 261 → 262 passed (270 total), +1, no regression — all 21 subquery corpus cases
+  (sq-003 through sq-022) individually confirmed green. DataFrame 329/329.
+- **Tests:** 7 new analyzer tests (IN/EXISTS/Scalar outer-resolution witnesses, E2E emission-untouched
+  proof, one-level-only lock, inner-precedence regression, qualifier-strictness lock).
+- **Diagnostic:** `.agent-output/diagnostic-pass-16.md` · **Architecture:** `.agent-output/architecture-pass-16.md`
+- **SHA-to-be:** feat(v2-corpus): pass 16 — sq-010 (261→262)

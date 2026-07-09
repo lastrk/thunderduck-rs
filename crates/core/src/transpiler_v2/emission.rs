@@ -416,10 +416,12 @@ struct AliasTransparentFrom {
 ///   user alias the WHERE's correlated qualifier needs, so flatten into one
 ///   FROM + WHERE, keeping the alias as the FROM table name.
 ///
-///   KNOWN LIMITATION: the correlated outer reference resolves by-NAME
-///   against the inner schema (accidentally correct when the correlation
-///   key's name+type coincide; the analyzer rejects the absent-column case,
-///   sq-010). A proper outer-scope stack is out of scope (ADR-008).
+///   Correlated outer references (e.g. `e.salary` from the outer `emp e`)
+///   are resolved by the analyzer's outer-scope fallback (tier (g) in
+///   `resolve_column`): when the inner schema has no match, the analyzer
+///   stamps the reference with the outer plan's type/nullability. Emission
+///   renders the qualifier verbatim; DuckDB's correlated-subquery binder
+///   resolves it at runtime.
 /// - `AliasedRelation` → transparent on its own too: `(inner) AS alias`.
 ///
 /// Returns `Ok(None)` for any other shape — the caller keeps its own default
@@ -4613,11 +4615,11 @@ fn render_aggregate_op(
     // helper `render_project` inlines through (mirrors the Project branches);
     // fall back to the `__td_agg` wrap for any other child shape.
     //
-    // KNOWN LIMITATION (Filter-over-AliasedRelation carve-out only): the
-    // correlated outer reference resolves by-NAME against the inner schema
-    // (accidentally correct when the correlation key's name+type coincide;
-    // the analyzer rejects the absent-column case, sq-010). A proper
-    // outer-scope stack is out of scope for this pass (ADR-008).
+    // Correlated outer references are now resolved by the analyzer's
+    // outer-scope fallback (tier (g) in `resolve_column`): the inner
+    // subquery plan sees the enclosing plan's schema for columns absent
+    // from the inner schema. Emission renders qualifiers verbatim; DuckDB's
+    // correlated-subquery binder resolves them at runtime.
     let atf = render_alias_transparent_from(input)?;
     let from_clause = match &atf {
         Some(a) => a.from_sql.clone(),

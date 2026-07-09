@@ -165,6 +165,7 @@ impl V2RelationConverter {
             RelType::Crosstab(c) => self.convert_crosstab(c),
             RelType::Sample(s) => self.convert_sample(s),
             RelType::SampleBy(s) => self.convert_sample_by(s),
+            RelType::Range(r) => self.convert_range(r),
             // Cosmetic ops per Spark 4 semantics — semantically no-op.
             // Thunderduck ignores them and continues with the input relation
             // (ADR-001 "result-irrelevant cosmetic" carve-out).
@@ -362,6 +363,29 @@ impl V2RelationConverter {
             col,
             fractions,
             seed: s.seed,
+        }))
+    }
+
+    /// Convert `proto::Range` into a `CommonOp::TableFunction { name: "range" }`.
+    ///
+    /// Proto fields: `start` (optional, default 0), `end` (required), `step`
+    /// (required, client-side default 1). `num_partitions` is a distribution
+    /// hint irrelevant to a single-node engine and is silently dropped (same
+    /// "cosmetic carve-out" precedent as the `Repartition` / `Hint` arms).
+    ///
+    /// The resulting `TableFunction` node carries three `Expression::Literal`
+    /// `Long` args in `(start, end, step)` order — the same shape the SQL
+    /// front-end produces for `SELECT * FROM range(...)`.
+    fn convert_range(&mut self, r: &proto::Range) -> Result<CommonAst, EmissionError> {
+        let long_lit = |v: i64| -> Expression { lit(LiteralValue::Long(v), DataType::Long) };
+        let start = long_lit(r.start.unwrap_or(0));
+        let end = long_lit(r.end);
+        let step = long_lit(r.step);
+        // num_partitions is silently ignored (single-node engine).
+        Ok(CommonAst::new(CommonOp::TableFunction {
+            name: "range".to_owned(),
+            args: vec![start, end, step],
+            with_ordinality: false,
         }))
     }
 
@@ -3157,5 +3181,86 @@ mod tests {
             }
             other => panic!("expected UnresolvedRegex, got {other:?}"),
         }
+    }
+
+    // ── Range ─────────────────────────────────────────────────────────────
+
+    /// Build a `proto::Range` with the given fields.
+    fn range_proto(
+        start: Option<i64>,
+        end: i64,
+        step: i64,
+        num_partitions: Option<i32>,
+    ) -> proto::Relation {
+        rel(proto::relation::RelType::Range(proto::Range {
+            start,
+            end,
+            step,
+            num_partitions,
+        }))
+    }
+
+    /// Assert that a `CommonOp::TableFunction` carries `name = "range"` and
+    /// return the args for further inspection.
+    fn assert_range_table_fn(ast: &CommonAst) -> &[Expression] {
+        match &ast.op {
+            CommonOp::TableFunction {
+                name,
+                args,
+                with_ordinality,
+            } => {
+                assert_eq!(name, "range");
+                assert!(!with_ordinality);
+                args
+            }
+            other => panic!("expected TableFunction(range), got {other:?}"),
+        }
+    }
+
+    /// Extract the i64 value from an `Expression::Literal(Long(v))`.
+    fn long_val(expr: &Expression) -> i64 {
+        match expr {
+            Expression::Literal(Literal {
+                value: LiteralValue::Long(v),
+                data_type: DataType::Long,
+            }) => *v,
+            other => panic!("expected Long literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_range_default_start() {
+        // spark.range(5) — start absent → default 0, step = 1
+        let r = range_proto(None, 5, 1, None);
+        let ast = convert_ok(&r);
+        let args = assert_range_table_fn(&ast);
+        assert_eq!(args.len(), 3);
+        assert_eq!(long_val(&args[0]), 0); // start
+        assert_eq!(long_val(&args[1]), 5); // end
+        assert_eq!(long_val(&args[2]), 1); // step
+    }
+
+    #[test]
+    fn convert_range_explicit_start_end_step() {
+        // spark.range(2, 10, 3)
+        let r = range_proto(Some(2), 10, 3, None);
+        let ast = convert_ok(&r);
+        let args = assert_range_table_fn(&ast);
+        assert_eq!(args.len(), 3);
+        assert_eq!(long_val(&args[0]), 2);
+        assert_eq!(long_val(&args[1]), 10);
+        assert_eq!(long_val(&args[2]), 3);
+    }
+
+    #[test]
+    fn convert_range_num_partitions_ignored() {
+        // spark.range(0, 100, 1, numPartitions=8) — partitions silently dropped
+        let r = range_proto(Some(0), 100, 1, Some(8));
+        let ast = convert_ok(&r);
+        let args = assert_range_table_fn(&ast);
+        assert_eq!(args.len(), 3);
+        assert_eq!(long_val(&args[0]), 0);
+        assert_eq!(long_val(&args[1]), 100);
+        assert_eq!(long_val(&args[2]), 1);
     }
 }

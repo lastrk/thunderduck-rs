@@ -338,3 +338,21 @@ red in any later pass.
     differential/test_type_literals_differential.py::TestMapLiterals_Differential::test_map_pyspark_create_map
     differential/test_type_literals_differential.py::TestStructLiterals_Differential::test_struct_field_access
     differential/test_type_literals_differential.py::TestStructLiterals_Differential::test_struct_pyspark_literal
+
+## Pass 1 — 2026-07-09 — spark.range() (DataFrame front-end)
+
+- **Hypothesis:** all 17 test_range_operations failures share one root cause —
+  `RelType::Range` unhandled in V2RelationConverter (boundary error).
+- **Fix (root-cause general):** new `convert_range` arm maps `proto::Range`
+  onto the EXISTING `CommonOp::TableFunction { name: "range" }` path the SQL
+  front-end already uses (no new AST node; analyzer + emission untouched).
+  `num_partitions` ignored per the Repartition/Hint cosmetic carve-out.
+- **Review:** rust-reviewer APPROVE, 0 Critical/High (cross-front-end arg
+  parity verified: both front-ends normalize to `range(start,end,step)`).
+- **Gate:** 1085→1116 passed (Δ +31, zero regressions). Collateral greens:
+  offset_operations +10, type_literals +3, column_operations +2 (range-based
+  fixtures). test_range_join_via_sql stays red on an UNRELATED pre-existing
+  self-join `id` ambiguity — future pass candidate, not documented-unsolvable.
+- **Reflect:** subagents clean this pass; no attributable skill gaps. Lesson
+  reinforced: check for an existing CommonOp before assuming a new node
+  (TableFunction already carried `range` for SQL).

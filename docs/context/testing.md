@@ -73,7 +73,7 @@ cd tests/integration && python3 -m pytest \
 ### Test tiers
 
 - **DataFrame corpus** (`test_dataframe_corpus_differential.py`) — 384 cases (incl. 22 `tpch-*` + 33 `tpcds-*` DataFrame cluster cases); the τ fitness function.
-- **SQL corpus** (`test_sql_corpus_differential.py`) — 396 cases (incl. 22 `tpch-*` + 100 `tpcds-*` SQL cluster cases); the τ SQL front-end fitness function. Red TPC cases are expected fitness signal (ADR-022), not suite breakage.
+- **SQL corpus** (`test_sql_corpus_differential.py`) — 396 cases (incl. 22 `tpch-*` + 100 `tpcds-*` SQL cluster cases); the τ SQL front-end fitness function. TPC cases are held to the same standard as every other case — a red TPC case is a defect to fix.
 - **Full suite**: `pytest differential/` — both corpora plus the remaining feature-family legacy files (joins, aggregations, window functions, datetime, ...).
 - **TPC clusters**: `run-differential-tests.sh tpch` / `tpcds`.
 - **Single case**: `-k <case-id>` or the explicit `test_case[<id>]` node id.

@@ -20,8 +20,8 @@
 #       there (for per-case failure diffs against a baseline).
 #
 # The goal is for the overall PASSED count to climb monotonically toward the
-# suite total. Red cases are expected fitness signal (ADR-022); the gate
-# requirement is "no previously-green case regresses."
+# suite total. Every red case (TPC included) is a defect to drive to green;
+# the hard gate requirement is "no previously-green case regresses."
 
 set -eu
 

@@ -172,6 +172,17 @@ pub(crate) enum DistinctKind {
 /// nothing binds through it.
 pub(crate) const WRAP_ALIAS: &str = "__td_sub";
 
+/// One soft SELECT slot: the analyzer-declared output column name plus its
+/// rendered SQL. Named so consumers can filter (`DropColumns`) or extend
+/// (`LateralView`) the list without parsing SQL text.
+#[derive(Debug, Clone)]
+pub(crate) struct DefaultSlot {
+    /// The output column name, in analyzer casing.
+    pub(crate) name: String,
+    /// The rendered slot SQL, e.g. `e.salary` or `dept_id`.
+    pub(crate) sql: String,
+}
+
 /// An open SELECT block being composed bottom-up. All expression-level
 /// content is pre-rendered SQL text; the block only owns clause placement.
 #[derive(Debug)]
@@ -180,10 +191,11 @@ pub(crate) struct SelectBlock {
     /// `default_projections`, else `*`).
     projections: Option<String>,
     /// Soft SELECT list a merging Project/Aggregate may overwrite — the join
-    /// builder's hoisted slot list (resolved-schema column order). Rendered
+    /// builder's hoisted slot list (resolved-schema column order), named so
+    /// consumers can filter/extend it without parsing SQL text. Rendered
     /// only while `projections` is `None`; does NOT occupy the `Select`
     /// ordinal.
-    default_projections: Option<String>,
+    default_projections: Option<Vec<DefaultSlot>>,
     distinct: Option<DistinctKind>,
     from: FromItem,
     /// AND-composed WHERE conjuncts.
@@ -226,14 +238,29 @@ impl SelectBlock {
     /// If nothing but the FROM slot is occupied, surrender the [`FromItem`]
     /// for inlining into an enclosing FROM scope (join-side hoisting);
     /// otherwise return the block unchanged. `default_projections` is
-    /// dropped with the block shell — the enclosing scope re-derives its own
-    /// column list.
+    /// dropped ONLY here, on a true inline: the enclosing FROM scope takes
+    /// over binding (either re-deriving its own column list, or — for a
+    /// flattened plain-join chain — rendering `*` in natural left-then-right
+    /// order, which already matches the declared schema). A block that is
+    /// NOT inlined (the caller wraps it instead) keeps its defaults intact —
+    /// see [`SelectBlock::from_ref`] for the read-only peek that lets a
+    /// caller decide eligibility before consuming the block.
     pub(crate) fn into_pure_from(self) -> Result<FromItem, Box<SelectBlock>> {
         if self.max_clause == Clause::From && self.projections.is_none() {
             Ok(self.from)
         } else {
             Err(Box::new(self))
         }
+    }
+
+    /// Read-only peek at the FROM item, for inline-eligibility checks that
+    /// must run BEFORE consuming the block (a caller that decides not to
+    /// inline needs the block, defaults and all, still intact to wrap).
+    // `from_ref` names the `from` field being peeked, not a `From`-trait-style
+    // conversion; clippy's from_* convention heuristic doesn't apply here.
+    #[allow(clippy::wrong_self_convention)]
+    pub(crate) fn from_ref(&self) -> &FromItem {
+        &self.from
     }
 
     /// Extend the FROM body in place (lateral-view chaining):
@@ -250,8 +277,25 @@ impl SelectBlock {
 
     /// Install the soft (overridable) SELECT list — the join builder's
     /// hoisted slot list. Does not occupy the `Select` ordinal.
-    pub(crate) fn set_default_projections(&mut self, slots: String) {
+    pub(crate) fn set_default_projections(&mut self, slots: Vec<DefaultSlot>) {
         self.default_projections = Some(slots);
+    }
+
+    /// Read-only access to the soft SELECT slot list, for consumers that
+    /// need to filter (`DropColumns`) or substitute (`Project`'s bare-star
+    /// merge) individual slots by name rather than the joined SQL string.
+    pub(crate) fn default_slots(&self) -> Option<&[DefaultSlot]> {
+        self.default_projections.as_deref()
+    }
+
+    /// Extend the soft SELECT slot list with `extra` (lateral-view
+    /// chaining's generated columns) — a no-op when defaults are `None`,
+    /// since a free block already renders `*`, which covers appended
+    /// columns without an explicit slot list.
+    pub(crate) fn extend_default_projections(&mut self, extra: Vec<DefaultSlot>) {
+        if let Some(slots) = &mut self.default_projections {
+            slots.extend(extra);
+        }
     }
 
     /// Fill GROUP BY (pre-rendered body). Caller must have checked
@@ -379,10 +423,17 @@ impl SelectBlock {
             }
             None => {}
         }
+        let default_list: Option<String> = self.default_projections.as_ref().map(|slots| {
+            slots
+                .iter()
+                .map(|s| s.sql.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
         sql.push_str(
             self.projections
                 .as_deref()
-                .or(self.default_projections.as_deref())
+                .or(default_list.as_deref())
                 .unwrap_or("*"),
         );
         sql.push_str(" FROM ");

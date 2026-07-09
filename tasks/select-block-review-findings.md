@@ -15,7 +15,7 @@ Severity legend: **corruption** = silently wrong data on the wire;
 
 ## Confirmed findings
 
-### 1. `drop()` over a USING join returns silently mislabeled data — corruption (CONFIRMED, empirical)
+### 1. `drop()` over a USING join returns silently mislabeled data — corruption (CONFIRMED, empirical) — **FIXED 2026-07-09** (structured `DefaultSlot` list; drop filters slots by name — witness join-018 green)
 `emission.rs:1413` — `build_drop_columns` merges `* EXCLUDE (…)` onto the
 USING-join block, and `set_projections` shadows the hoisted
 `default_projections` that alone enforce Spark's key-first order
@@ -25,7 +25,7 @@ re-stamp then mislabels every column left of the key.
 Repro: `emp.join(dept, on='dept_id').drop('budget')` → live server returned
 `Row(dept_id=<id value>, id=<name value>, …)` with no error.
 
-### 2. Nested USING-join side loses its hoisted slots inside the synthetic wrap — corruption + regression (CONFIRMED, empirical)
+### 2. Nested USING-join side loses its hoisted slots inside the synthetic wrap — corruption + regression (CONFIRMED, empirical) — **FIXED 2026-07-09** (`build_join_side` non-inline path wraps the original block, defaults intact — witness join-020 green)
 `emission.rs:311` — `build_join_side`'s non-inlinable path rebuilds the side
 via `SelectBlock::from_item(item)` after `into_pure_from` has dropped
 `default_projections` ("dropped with the block shell"), rendering
@@ -34,7 +34,7 @@ Repro: `t1.join(t2, id==id2).join(a.join(b, on='k'), id==k)` → live server
 returned `Row(k=10, x=1, …)` — k/x data swapped vs Spark. The pre-branch
 renderer always baked explicit hoisted slots into every wrap.
 
-### 3. Lateral view over range()/join silently drops generated columns — corruption (CONFIRMED, empirical)
+### 3. Lateral view over range()/join silently drops generated columns — corruption (CONFIRMED, empirical) — **FIXED 2026-07-09** (`extend_default_projections` appends generated columns — witnesses cx-015/cx-016 green)
 `sql_block.rs:242` — `extend_from` widens FROM + scope but leaves
 `default_projections` stale; `pure_from()` ignores defaults so the merge
 proceeds; `to_sql` prefers the stale defaults over `*`.
@@ -42,7 +42,7 @@ Repro: `SELECT * FROM range(3) LATERAL VIEW explode(array(1,2)) t AS c` →
 schema declares `struct<id,c>`, wire batch has 1 column (c missing).
 Corpus lateral cases all sit over TableScan (no defaults) — untested gap.
 
-### 4. Multi-slot star over a USING join mislabels columns — corruption, pre-existing (CONFIRMED, empirical)
+### 4. Multi-slot star over a USING join mislabels columns — corruption, pre-existing (CONFIRMED, empirical) — **FIXED 2026-07-09** (bare star in a merge-path slot list expands to the default slots — witnesses join-019/jn-023 green)
 `emission.rs:731` — `select('*', extra)` bypasses the lone-star identity
 branch; the bare `Star` contributes no qualifier so the merge proceeds and
 the raw `*` shadows the hoisted list.

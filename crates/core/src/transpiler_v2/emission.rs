@@ -50,7 +50,7 @@ use super::expression::{
     LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan,
     UnaryExpression, UnaryOp,
 };
-use super::sql_block::{Clause, DistinctKind, FromItem, SelectBlock, SqlUnit};
+use super::sql_block::{Clause, DefaultSlot, DistinctKind, FromItem, SelectBlock, SqlUnit};
 use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
 use crate::types::{DataType, StructType};
 use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
@@ -280,43 +280,48 @@ fn build_join_side(
             })
         }
     };
-    match block.into_pure_from() {
-        Ok(item) => {
-            let inline_ok = match &item {
-                FromItem::Relation { .. } | FromItem::Derived { .. } => true,
-                FromItem::Join { .. } => {
-                    may_inline_nested_join
-                        && !parent_has_using
-                        && matches!(
-                            &side.op,
-                            TypedOp::Join {
+    // Peek eligibility on the block's FROM item BEFORE consuming it — a
+    // block that does not inline still needs its defaults intact for the
+    // wrap path below (F2: the former `SelectBlock::from_item(item)` rebuild
+    // silently discarded the join builder's hoisted slot list).
+    let inline_ok = block.pure_from()
+        && match block.from_ref() {
+            FromItem::Relation { .. } | FromItem::Derived { .. } => true,
+            FromItem::Join { .. } => {
+                may_inline_nested_join
+                    && !parent_has_using
+                    && matches!(
+                        &side.op,
+                        TypedOp::Join {
+                            join_type,
+                            using_columns,
+                            lateral: false,
+                            ..
+                        } if using_columns.is_empty()
+                            && !matches!(
                                 join_type,
-                                using_columns,
-                                lateral: false,
-                                ..
-                            } if using_columns.is_empty()
-                                && !matches!(
-                                    join_type,
-                                    super::ast::JoinType::LeftSemi
-                                        | super::ast::JoinType::LeftAnti
-                                )
-                        )
-                }
-                FromItem::Raw { .. } => false,
-            };
-            if inline_ok {
-                Ok(item)
-            } else {
-                Ok(FromItem::Derived {
-                    unit: Box::new(SqlUnit::from(SelectBlock::from_item(item))),
-                    alias: synthetic_alias.to_owned(),
-                })
+                                super::ast::JoinType::LeftSemi
+                                    | super::ast::JoinType::LeftAnti
+                            )
+                    )
             }
+            FromItem::Raw { .. } => false,
+        };
+    if inline_ok {
+        // `pure_from()` above already established this cannot fail; the Err
+        // arm is a defensive fallback, never a panic path.
+        match block.into_pure_from() {
+            Ok(item) => Ok(item),
+            Err(block) => Ok(FromItem::Derived {
+                unit: Box::new(SqlUnit::Select(block)),
+                alias: synthetic_alias.to_owned(),
+            }),
         }
-        Err(block) => Ok(FromItem::Derived {
+    } else {
+        Ok(FromItem::Derived {
             unit: Box::new(SqlUnit::Select(block)),
             alias: synthetic_alias.to_owned(),
-        }),
+        })
     }
 }
 
@@ -388,28 +393,38 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
                 let using_lower: HashSet<String> =
                     using_columns.iter().map(|s| s.to_lowercase()).collect();
                 let la_q = quote_ident(&la);
-                let mut slots: Vec<String> = using_columns
+                let mut slots: Vec<DefaultSlot> = using_columns
                     .iter()
-                    .map(|c| quote_ident(c).into_owned())
+                    .map(|c| DefaultSlot {
+                        name: c.clone(),
+                        sql: quote_ident(c).into_owned(),
+                    })
                     .collect();
                 for f in &left.resolved_schema.fields {
                     if !using_lower.contains(&f.name.to_lowercase()) {
-                        slots.push(format!("{la_q}.{}", quote_ident(&f.name)));
+                        slots.push(DefaultSlot {
+                            name: f.name.clone(),
+                            sql: format!("{la_q}.{}", quote_ident(&f.name)),
+                        });
                     }
                 }
                 if need_right {
-                    let ra = ra.expect("checked above");
-                    let ra_q = quote_ident(&ra);
-                    for f in &right.resolved_schema.fields {
-                        if !using_lower.contains(&f.name.to_lowercase()) {
-                            slots.push(format!("{ra_q}.{}", quote_ident(&f.name)));
+                    if let Some(ra) = &ra {
+                        let ra_q = quote_ident(ra);
+                        for f in &right.resolved_schema.fields {
+                            if !using_lower.contains(&f.name.to_lowercase()) {
+                                slots.push(DefaultSlot {
+                                    name: f.name.clone(),
+                                    sql: format!("{ra_q}.{}", quote_ident(&f.name)),
+                                });
+                            }
                         }
                     }
                 }
                 if slots.is_empty() {
                     None // SEMI/ANTI on identical USING columns only → `*`.
                 } else {
-                    Some(slots.join(", "))
+                    Some(slots)
                 }
             }
             _ => None,
@@ -544,6 +559,25 @@ fn build_lateral_view(
             quote_ident(table_alias)
         ),
         vec![table_alias.to_owned()],
+    );
+    // F3: a merged (not wrapped) block's hoisted default slot list must
+    // widen to include the LATERAL VIEW's generated columns, or a
+    // downstream merging Project that renders the bare-star default would
+    // never see them. A no-op when there are no defaults to extend (a fresh
+    // wrap, or a plain-scan child, keeps rendering `*`, which already covers
+    // the newly appended FROM columns — cx-007..009 shape unchanged).
+    let ta_q = quote_ident(table_alias);
+    block.extend_default_projections(
+        columns
+            .iter()
+            .map(|(alias, _)| {
+                let a_q = quote_ident(alias);
+                DefaultSlot {
+                    name: alias.clone(),
+                    sql: format!("{ta_q}.{a_q}"),
+                }
+            })
+            .collect(),
     );
     Ok(block.into())
 }
@@ -716,6 +750,39 @@ fn trace_stranded_qualifiers<'e>(
     }
 }
 
+/// Render `build_project`'s merge-path SELECT list: identical to
+/// [`render_projection_slots`] EXCEPT a bare unqualified `Star` expands to
+/// the merged-into block's hoisted default slot list (F4) instead of a
+/// literal `*` — a raw `*` sitting inside a multi-slot list shadows the join
+/// builder's hoisted USING-key ordering, the same shadowing `* EXCLUDE`
+/// suffers without the F1 fix. A no-op (falls through to
+/// `render_projection_slots` verbatim) when there are no default slots to
+/// substitute, or no bare star to substitute them for.
+fn render_project_merge_slots(
+    projections: &[Expression],
+    input_schema: &Schema,
+    default_slots: Option<&[DefaultSlot]>,
+) -> Result<String, EmissionError> {
+    let has_bare_star = projections
+        .iter()
+        .any(|p| matches!(p, Expression::Star(StarExpression { qualifier: None })));
+    let Some(slots) = default_slots.filter(|_| has_bare_star) else {
+        return render_projection_slots(projections, input_schema);
+    };
+    let star_sql = slots
+        .iter()
+        .map(|s| s.sql.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    sql_join(projections.iter(), ", ", |p| {
+        if matches!(p, Expression::Star(StarExpression { qualifier: None })) {
+            Ok(star_sql.clone())
+        } else {
+            render_projection_slot(p, input_schema)
+        }
+    })
+}
+
 fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit, EmissionError> {
     // A lone unqualified `*` is a pure identity projection: return the child
     // unit verbatim (ADR-001 cosmetic "SELECT * over SELECT *" collapse).
@@ -728,10 +795,9 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
     }
     let mut block = open_block(input)?;
     if block.can_accept(Clause::Select) && exprs_visible_in(projections, &block, &input.scope) {
-        block.set_projections(render_projection_slots(
-            projections,
-            &input.resolved_schema,
-        )?);
+        let slots_sql =
+            render_project_merge_slots(projections, &input.resolved_schema, block.default_slots())?;
+        block.set_projections(slots_sql);
         return Ok(block.into());
     }
     let projections: Vec<Expression> = projections
@@ -1410,7 +1476,32 @@ fn build_with_columns(
 
 fn build_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<SqlUnit, EmissionError> {
     let dropped = sql_join(drop_names.iter(), ", ", |n| Ok(quote_ident(n).into_owned()))?;
-    block_with_projections(input, |_| true, |_, _| Ok(format!("* EXCLUDE ({dropped})")))
+    block_with_projections(
+        input,
+        |_| true,
+        |block, wrapped| {
+            // A merging (un-wrapped) block whose hoisted default slots are
+            // still live can filter them directly by name (F1) — `* EXCLUDE`
+            // over a USING join lets DuckDB keep the excluded set's sibling
+            // column at ITS natural (non-hoisted) FROM position, silently
+            // un-hoisting the USING key. A wrapped child already rendered its
+            // own defaults inside `__td_sub`'s `*`, so `* EXCLUDE` there is
+            // correct as-is.
+            if !wrapped {
+                if let Some(slots) = block.default_slots() {
+                    let remaining: Vec<&str> = slots
+                        .iter()
+                        .filter(|s| !drop_names.iter().any(|d| d.eq_ignore_ascii_case(&s.name)))
+                        .map(|s| s.sql.as_str())
+                        .collect();
+                    if !remaining.is_empty() {
+                        return Ok(remaining.join(", "));
+                    }
+                }
+            }
+            Ok(format!("* EXCLUDE ({dropped})"))
+        },
+    )
 }
 
 /// Render `df.na.fill(values, subset=cols)`. For each column in the input
@@ -1991,7 +2082,10 @@ fn build_table_function(
                 sql: format!("range({start_sql}, {end_sql}, {step_sql}) AS __td_range(id)"),
                 exposed: vec!["__td_range".to_owned()],
             });
-            block.set_default_projections("id".to_owned());
+            block.set_default_projections(vec![DefaultSlot {
+                name: "id".to_owned(),
+                sql: "id".to_owned(),
+            }]);
             Ok(block.into())
         }
         // Bare `FROM explode(array(1,2,3))` — uncorrelated generator as a TVF.
@@ -6811,6 +6905,167 @@ mod tests {
         );
         // The declared schema's first column is the hoisted key.
         assert_eq!(typed.resolved_schema.fields[0].name, "dept_id");
+    }
+
+    // ── Plan 006 F1-F4: structured hoisted-slot-list pins ────────────────
+
+    #[test]
+    fn drop_over_using_join_renders_hoisted_slots() {
+        let _g = tap_guard();
+        // F1 regression pin (review findings #1): `emp.join(dept,
+        // on='dept_id').drop('dept_name')` must keep the join builder's
+        // USING-key-first hoisted slot list — a bare `* EXCLUDE (dept_name)`
+        // would let DuckDB's `*` place `dept_id` at its natural (dept-side)
+        // position instead of the analyzer's hoisted-first schema order.
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::DropColumns {
+            input: Box::new(join),
+            drop_names: vec!["dept_name".to_owned()],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze drop-over-using-join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.starts_with("SELECT dept_id,"),
+            "USING key must stay hoisted first; got: {sql}"
+        );
+        assert!(!sql.contains("* EXCLUDE"), "got: {sql}");
+        assert!(
+            !sql.contains("dept_name"),
+            "dropped column must be absent from the slot list; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn drop_above_occupied_block_keeps_exclude() {
+        let _g = tap_guard();
+        // Over an already-occupied block (Select cannot merge downstream of
+        // Limit's LimitOffset ordinal), DropColumns wraps in `__td_sub` and
+        // must keep today's `* EXCLUDE (...)` shape — the wrapped child
+        // already rendered its own defaults (if any) inside that `*`.
+        let plan = CommonAst::new(CommonOp::DropColumns {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(scan("emp")),
+                limit: 5,
+                offset: None,
+            })),
+            drop_names: vec!["salary".to_owned()],
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze drop-over-limit");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("* EXCLUDE (salary)") && sql.contains("AS __td_sub"),
+            "occupied block must fall back to `* EXCLUDE` over the wrap; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn multi_slot_star_over_using_join_expands_hoisted_slots() {
+        let _g = tap_guard();
+        // F4 regression pin: a bare `*` mixed into a multi-slot projection
+        // list must expand to the join builder's hoisted slot list, not
+        // render a raw `*` token that shadows the USING-key-first order
+        // (the same shadowing `* EXCLUDE` suffers without the F1 fix).
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(join),
+            projections: vec![
+                Expression::Star(StarExpression { qualifier: None }),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(int_lit(1)),
+                    alias: "one".to_owned(),
+                }),
+            ],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze multi-slot star over using join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.starts_with("SELECT dept_id,"),
+            "hoisted slot list must expand in place of the bare star; got: {sql}"
+        );
+        assert!(sql.contains("1 AS one"), "got: {sql}");
+        assert!(
+            !sql.contains("*,"),
+            "bare `*` must not shadow the hoisted list; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn using_join_side_wrap_preserves_hoisted_slots() {
+        let _g = tap_guard();
+        // F2 regression pin (review findings #2): the RIGHT side of an
+        // outer ON join is itself a USING join (`dept JOIN emp2 USING
+        // (dept_id)`). The right side never inlines (`may_inline_nested_join`
+        // is always false for the right side), so it always wraps — the wrap
+        // must carry the block's hoisted USING-key-first defaults into `AS
+        // __td_jr`, not rebuild a bare `SELECT *` shell that lets DuckDB's
+        // `*` place `dept_id` back at its natural (dept-side) position.
+        let nested_using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("dept")),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let outer_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(nested_using_join),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(1)),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(outer_join),
+            projections: vec![],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze nested USING join-side wrap");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains(
+                "SELECT dept_id, dept.dept_name, emp2.id, emp2.country \
+                 FROM dept INNER JOIN emp2 USING (dept_id)) AS __td_jr"
+            ),
+            "wrapped __td_jr body must preserve the hoisted USING slot list; got: {sql}"
+        );
+        assert!(
+            !sql.contains("(SELECT * FROM dept INNER JOIN emp2 USING (dept_id)) AS __td_jr"),
+            "must not discard hoisted slots for a bare `SELECT *`; got: {sql}"
+        );
     }
 
     #[test]
@@ -12069,6 +12324,66 @@ mod tests {
         assert!(
             sql.contains("LATERAL (SELECT"),
             "must contain LATERAL(SELECT), got: {sql}"
+        );
+    }
+
+    // ── Plan 006 F3: LateralView default-slot widening pins ─────────────
+
+    #[test]
+    fn lateral_view_over_range_appends_generated_column() {
+        let _g = tap_guard();
+        // F3 regression pin (review findings #3): `range(3)`'s FROM-item
+        // leaf carries a default `id` bind (tbl-006); a merged LateralView
+        // must widen that default list to include its own generated column
+        // too, or a downstream bare-star consumer would never see it.
+        let range_input = TypedAst::new(
+            TypedOp::TableFunction {
+                name: "range".to_owned(),
+                args: vec![int_lit(3)],
+                with_ordinality: false,
+            },
+            StructType::new(vec![StructField::not_null("id", DataType::Long)]),
+        );
+        let lv = lateral_view_typed(
+            vec![(
+                "c".to_owned(),
+                fexpr(
+                    "explode",
+                    vec![fexpr("array", vec![int_lit(1), int_lit(2)])],
+                ),
+            )],
+            range_input,
+        );
+        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
+        assert!(
+            sql.starts_with("SELECT id, t.c FROM range("),
+            "default projection must widen to include the generated column; got: {sql}"
+        );
+        assert!(
+            sql.contains("AS __td_range(id)"),
+            "range's own id bind must survive; got: {sql}"
+        );
+        assert!(
+            sql.contains("LATERAL (SELECT"),
+            "must contain LATERAL(SELECT), got: {sql}"
+        );
+    }
+
+    #[test]
+    fn lateral_view_over_table_scan_still_renders_star() {
+        let _g = tap_guard();
+        // F3 no-op guard: a plain table-scan child has no default
+        // projections (`None`), so extending must stay a no-op — the merged
+        // block keeps rendering `SELECT *` (protects the cx-007..009 shape).
+        let input = typed_table_scan("emp", Some("e"), emp_tags_schema());
+        let lv = lateral_view_typed(
+            vec![("tag".to_owned(), fexpr("explode", vec![tags_col_ref()]))],
+            input,
+        );
+        let sql = dispatch_op(&lv.op, &lv.resolved_schema).expect("render");
+        assert!(
+            sql.starts_with("SELECT * FROM"),
+            "LateralView over a plain scan must still render SELECT *; got: {sql}"
         );
     }
 

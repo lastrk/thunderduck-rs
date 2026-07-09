@@ -21,7 +21,7 @@ drives the SQL implementation, exactly as `core_v2` did for the DataFrame API.
 Running:
     cargo test -p thunderduck-connect-server --test differential sql_v2 -- --ignored --nocapture
     tests/scripts/run-differential-tests.sh sql_v2
-    tests/scripts/v2-sql-progress.sh          # records a progress row
+    tests/scripts/differential-progress.sh    # full suite + progress row
 """
 import os
 import sys

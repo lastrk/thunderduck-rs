@@ -39,6 +39,6 @@ cargo check
 ```bash
 ./tests/scripts/kill-test-servers.sh 2>/dev/null
 cargo build --release
-./tests/scripts/v2-progress.sh
+./tests/scripts/differential-progress.sh   # full suite + progress row (fast iteration: run-differential-tests.sh <group>)
 ./tests/scripts/kill-test-servers.sh 2>/dev/null
 ```

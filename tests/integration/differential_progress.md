@@ -1,0 +1,15 @@
+# Differential suite progress
+
+One row per `tests/scripts/differential-progress.sh` invocation. Each row
+records per-test outcomes of the FULL differential suite
+(`run-differential-tests.sh all`) at the given commit, bucketed into the
+DataFrame corpus, the SQL corpus, and the remaining legacy feature-family
+files ("Other"). Bucket cells are passed/total. The goal is for the overall
+Passed count to climb monotonically toward the suite total.
+
+Supersedes the per-corpus ledgers `v2_progress.md` and `v2_sql_progress.md`
+(frozen 2026-07-09).
+
+| Timestamp UTC        | Commit  | DF corpus | SQL corpus |   Other | Passed | Failed | Skipped | Total | Δ passed |
+| -------------------- | ------- | --------: | ---------: | ------: | -----: | -----: | ------: | ----: | -------: |
+| 2026-07-09T09:16:56Z | bf17f49 |   369/384 |    308/396 | 408/625 |   1085 |    320 |       0 |  1405 |      n/a |

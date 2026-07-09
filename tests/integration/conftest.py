@@ -701,7 +701,7 @@ def sql_corpus_thunderduck(spark_thunderduck, tpch_data_dir, tpcds_data_dir):
     `build_inputs` may raise. Swallow it here so setup does NOT abort the whole
     parametrized module with a fixture ERROR — instead each case fails
     individually when its `spark.sql(...)` can't resolve the (unregistered) view,
-    which keeps `v2-sql-progress.sh`'s pass/fail parse meaningful.
+    which keeps `differential-progress.sh`'s pass/fail parse meaningful.
     """
     from differential.sql_corpus import build_inputs
     try:

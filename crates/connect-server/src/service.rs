@@ -1466,7 +1466,7 @@ mod tests {
     /// path successfully submits SQL to the session, receives the DuckDB
     /// error, and maps it through `ThunderduckError → ConnectError →
     /// Status::internal`, as designed. The E.0 wiring is validated at the
-    /// corpus level via `tests/scripts/v2-progress.sh`.
+    /// corpus level via `tests/scripts/run-differential-tests.sh core`.
     #[tokio::test(flavor = "multi_thread")]
     async fn execute_plan_single_row_round_trips_through_duckdb() {
         use arrow::array::Int32Array;

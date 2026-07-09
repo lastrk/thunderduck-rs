@@ -1,5 +1,9 @@
 # τ SQL front-end progress
 
+> **FROZEN 2026-07-09.** The per-corpus recorder `v2-sql-progress.sh` was
+> retired; `tests/scripts/differential-progress.sh` now records the full suite
+> into `differential_progress.md`. Rows below are history.
+
 One row per `tests/scripts/v2-sql-progress.sh` invocation. Each row records the
 `sql_v2` suite (Spark SQL conformance corpus `differential/sql_corpus.py`,
 run through τ) PASSED count at the given commit. The goal is for PASSED to climb

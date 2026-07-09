@@ -1,5 +1,9 @@
 # τ corpus progress
 
+> **FROZEN 2026-07-09.** The per-corpus recorder `v2-progress.sh` was retired;
+> `tests/scripts/differential-progress.sh` now records the full suite into
+> `differential_progress.md`. Rows below are history.
+
 One row per `tests/scripts/v2-progress.sh` invocation. Each row records the
 `core_v2` suite (DataFrame corpus — the τ fitness gate) PASSED count at the
 given commit. The goal is for PASSED to climb monotonically toward 324 (the

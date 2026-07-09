@@ -1,6 +1,6 @@
 # Testing Guide
 
-> **Scope: τ (the only production path per ADR-022).** The differential oracle validates τ against Apache Spark 4.1.1 as the Spark-parity contract; the two corpora are the fitness functions — the DataFrame corpus (`tests/scripts/v2-progress.sh`, 384 cases) and the SQL corpus (`run-differential-tests.sh sql_v2`, 396 cases). TPC-H/TPC-DS live INSIDE the corpora as `tpch-*`/`tpcds-*` cases (migrated 2026-07-09; the standalone TPC test files are gone).
+> **Scope: τ (the only production path per ADR-022).** The differential oracle validates τ against Apache Spark 4.1.1 as the Spark-parity contract; the two corpora are the fitness functions — the DataFrame corpus (`run-differential-tests.sh core`, 384 cases) and the SQL corpus (`run-differential-tests.sh sql_v2`, 396 cases); `tests/scripts/differential-progress.sh` runs the entire suite and records the progress row. TPC-H/TPC-DS live INSIDE the corpora as `tpch-*`/`tpcds-*` cases (migrated 2026-07-09; the standalone TPC test files are gone).
 
 ## Unit Tests (`cargo test`)
 
@@ -28,11 +28,17 @@ The differential suite validates Thunderduck against Apache Spark 4.1.1 by runni
 extra pytest args verbatim (quoting preserved).
 
 ```bash
-# DataFrame corpus — the primary τ fitness gate (records a progress row)
-./tests/scripts/v2-progress.sh
+# DataFrame corpus — the primary τ fitness gate
+./tests/scripts/run-differential-tests.sh core
 
-# SQL corpus — the τ SQL front-end gate (v2-sql-progress.sh records a row)
+# SQL corpus — the τ SQL front-end gate
 ./tests/scripts/run-differential-tests.sh sql_v2
+
+# ENTIRE suite + progress row — runs `all` once, buckets outcomes
+# (DataFrame corpus / SQL corpus / other), appends a row to
+# tests/integration/differential_progress.md (the single progress ledger;
+# it replaced v2-progress.sh / v2-sql-progress.sh on 2026-07-09)
+./tests/scripts/differential-progress.sh
 
 # Full differential test suite (both corpora + all remaining legacy files)
 ./tests/scripts/run-differential-tests.sh all

@@ -76,10 +76,9 @@ fn core() {
     run_suite("core");
 }
 
-/// Same corpus as `core`, retained as an alias for tooling (notably
-/// `tests/scripts/v2-progress.sh` and the tracked
-/// `tests/integration/v2_progress.md` log) that already references
-/// `core_v2` by name. Both suites route through τ.
+/// Same corpus as `core`, retained as an alias for tooling and history
+/// (notably the frozen `tests/integration/v2_progress.md` ledger) that
+/// references `core_v2` by name. Both suites route through τ.
 #[test]
 #[ignore]
 fn core_v2() {

@@ -19,8 +19,9 @@ Older ADRs under [docs/adrs/legacy-transpiler/](docs/adrs/legacy-transpiler/) ar
 **Two error categories** (ADR-022): (1) **Spark-emulated errors** — inputs Spark itself would reject; τ matches Spark's error semantics. (2) **Thunderduck-boundary errors** — inputs Spark accepts but τ has not implemented; honest "not implemented in Thunderduck."
 
 **Practical implications:**
-- The DataFrame corpus (`tests/scripts/v2-progress.sh`, 384 cases incl. the migrated `tpch`/`tpcds` clusters) is the fitness function; red TPC cases within it are the signal until τ covers their query surface.
-- The SQL corpus (`differential/sql_corpus.py`, 396 `spark.sql` cases incl. the migrated `tpch`/`tpcds` clusters) is the fitness function for the τ SQL front-end — run it with `./tests/scripts/run-differential-tests.sh sql_v2` (or `tests/scripts/v2-sql-progress.sh` to record a progress row in `tests/integration/v2_sql_progress.md`).
+- The DataFrame corpus (`./tests/scripts/run-differential-tests.sh core`, 384 cases incl. the migrated `tpch`/`tpcds` clusters) is the fitness function; red TPC cases within it are the signal until τ covers their query surface.
+- The SQL corpus (`differential/sql_corpus.py`, 396 `spark.sql` cases incl. the migrated `tpch`/`tpcds` clusters) is the fitness function for the τ SQL front-end — run it with `./tests/scripts/run-differential-tests.sh sql_v2`.
+- `tests/scripts/differential-progress.sh` runs the ENTIRE suite (`all`) once and records a bucketed progress row (DataFrame corpus / SQL corpus / other) in `tests/integration/differential_progress.md` — the single progress ledger. It replaced the per-corpus recorders `v2-progress.sh`/`v2-sql-progress.sh` on 2026-07-09; their ledgers (`v2_progress.md`, `v2_sql_progress.md`) are frozen history.
 - TPC-H/TPC-DS live INSIDE the corpora as `tpch-*`/`tpcds-*` cases (the legacy standalone TPC test files were deleted 2026-07-09); `./tests/scripts/run-differential-tests.sh tpch` (or `tpcds`) selects just that cluster across both corpora. `tests/scripts/check-tpc-migration.sh` verifies the migration invariants.
 - The v1 transpiler modules (`crates/core/src/{logical,expression,generator,functions,parser}/`) were deleted on 2026-07-05. INV3/INV10 in `crates/core/src/transpiler_v2/invariants.rs` mechanically enforce that τ does not import from those (now-absent) prefixes.
 
@@ -43,7 +44,7 @@ Never mark a task complete without proving it works. For any non-trivial change,
 1. **Format** — `cargo fmt --check` must be clean.
 2. **Lint** — `cargo clippy -- -D warnings` must be clean (zero warnings).
 3. **Unit tests** — `cargo test` must pass across all crates.
-4. **Corpus differential** — `./tests/scripts/v2-progress.sh` (DataFrame corpus, 384 cases) and `./tests/scripts/run-differential-tests.sh sql_v2` (SQL corpus, 396 cases) are the fitness gates. Both corpora now CONTAIN the TPC-H/TPC-DS clusters (`tpch-*`/`tpcds-*` case ids); red TPC cases are expected fitness signal (ADR-022), not gate failures — the gate requirement is "no previously-green case regresses."
+4. **Corpus differential** — `./tests/scripts/run-differential-tests.sh core` (DataFrame corpus, 384 cases) and `./tests/scripts/run-differential-tests.sh sql_v2` (SQL corpus, 396 cases) are the fitness gates; `./tests/scripts/differential-progress.sh` runs the whole suite once and records the progress row. Both corpora now CONTAIN the TPC-H/TPC-DS clusters (`tpch-*`/`tpcds-*` case ids); red TPC cases are expected fitness signal (ADR-022), not gate failures — the gate requirement is "no previously-green case regresses."
 5. **TPC cluster check (when touching TPC-relevant surface)** — `./tests/scripts/run-differential-tests.sh tpch` / `tpcds` runs just those clusters across both corpora (~30s / ~1min). The former standalone TPC suites were migrated into the corpora on 2026-07-09; there is no separate TPC path anymore.
 
 A task is **not** done if any step is red. Do not commit, do not declare success, do not move on. If a step is intentionally skipped (e.g., docs-only change skips clippy, or TPC-H is deferred per ADR-022 above), state which step and why.
@@ -61,8 +62,8 @@ This is the **agent-pipeline gate** — the checks the orchestrated agents in
 every review-fix pass. The differential test suites are **intentionally
 excluded** from this gate: `core_v2` is the v2-transpiler progress signal,
 currently expected to be partially red, measured separately via
-`tests/scripts/v2-progress.sh` (or `cargo test -p thunderduck-connect-server
---test differential core_v2 -- --ignored`).
+`tests/scripts/run-differential-tests.sh core` (or `cargo test -p
+thunderduck-connect-server --test differential core_v2 -- --ignored`).
 
 Run, in order, after every implementation and after every review fix:
 
@@ -454,7 +455,7 @@ Run in this order; each must pass before the next is meaningful. See [Verificati
 - `cargo fmt --check`
 - `cargo clippy -- -D warnings`
 - `cargo test`
-- `./tests/scripts/v2-progress.sh` (DataFrame corpus — the τ fitness gate)
+- `./tests/scripts/differential-progress.sh` (full differential suite — the τ fitness gate; records the progress row)
 
 ### Code Style & Invariants
 - No `.unwrap()` in library code. `.expect()` only for proven invariants.

@@ -509,3 +509,32 @@ red in any later pass.
   match-arm addition with the Spark rule cited from bytecode, unit-locked,
   full gate arbitrates.
 - **Gate:** 1237→1242 (Δ +5, zero regressions); lambda file 27/27.
+
+## Pass 9 — 2026-07-09 — plan_id-scoped join column disambiguation
+
+- **Diagnosis (rust-diagnostician):** all 9 join-ambiguity reds (8
+  join_advanced + range_join_via_sql) share ONE cause — Spark Connect
+  disambiguates DataFrame refs solely by plan_id; τ honored plan_id only in
+  join CONDITIONS (qualify_plan_id_refs), never in parent-operator
+  expressions, so resolve_column's ambiguity scan threw AmbiguousColumn.
+- **Fix (Option A):** QualifierScopes carries plan_id→(range, side-qualifier)
+  bindings registered at Join arms (outermost-first, stops at
+  schema-reshaping ops — same depth rule as name qualifiers);
+  resolve_column consults plan_id before the ambiguity scan.
+- **In-pass regression + fix:** first version stamped __td_jl/__td_jr
+  UNCONDITIONALLY → 5 TPC-DS DataFrame cases (q015/q032/q037/q048/q092)
+  regressed: those aliases are only in scope under alias-transparent
+  rendering; Filter-over-Join wraps as __td_filter → binder error. Fixed by
+  stamping the qualifier ONLY when the name is genuinely ambiguous across
+  the join schema. All 5 back green; 27/27 held.
+- **Review:** APPROVE, 0 Critical/High. Known Medium (documented): nested
+  non-self joins with a column name duplicated WITHIN one outer side can
+  mis-resolve (inner aliases not in parent scope); self-join shapes immune;
+  no corpus witness.
+- **Gate:** 1242→1253 (Δ +11, zero regressions vs oracle): join_advanced +8,
+  joins +2, range +1.
+- **Reflect:** coder misread its own corpus check — called 364/20 "all TPC,
+  expected" when baseline was 369/15; ADR-022's "red TPC is expected
+  fitness signal" does NOT mean TPC regressions are exempt from the oracle.
+  Orchestrator caught it by comparing counts. Noted in
+  subagent-improvement-notes.

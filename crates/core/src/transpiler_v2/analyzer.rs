@@ -1563,9 +1563,16 @@ fn analyze_join(
     // immediate left sibling, never the grandparent).
     let typed_right = if lateral {
         let mut left_scopes_bindings = Vec::new();
-        collect_qualifier_bindings(&typed_left, 0, &mut left_scopes_bindings);
+        let mut left_pid_bindings = Vec::new();
+        collect_qualifier_bindings(
+            &typed_left,
+            0,
+            &mut left_scopes_bindings,
+            &mut left_pid_bindings,
+        );
         let left_scopes = QualifierScopes {
             bindings: left_scopes_bindings,
+            plan_id_bindings: left_pid_bindings,
         };
         let left_outer = OuterScope {
             schema: &typed_left.resolved_schema,
@@ -3000,6 +3007,18 @@ fn qualify_plan_id_refs(expr: &mut Expression, left_ids: &[i64], right_ids: &[i6
 #[derive(Debug, Default)]
 struct QualifierScopes {
     bindings: Vec<(String, std::ops::Range<usize>)>,
+    /// Plan-id → (contiguous field-range, join-side qualifier) bindings,
+    /// populated from `TypedOp::Join { left_plan_ids, right_plan_ids, .. }`
+    /// by [`collect_qualifier_bindings`]. Used by [`resolve_column`] to
+    /// disambiguate `UnresolvedColumn { qualifier: None, plan_id: Some(N) }`
+    /// above a join — the same plan_id tagging that `qualify_plan_id_refs`
+    /// handles for join CONDITIONS, extended to parent Project/Filter/Sort.
+    ///
+    /// The third tuple element is the synthetic join-side qualifier
+    /// ([`TD_JOIN_LEFT`] or [`TD_JOIN_RIGHT`]) that emission should render
+    /// so DuckDB can resolve the reference against the correct side of the
+    /// enclosing join's `(left) AS __td_jl ... (right) AS __td_jr` FROM.
+    plan_id_bindings: Vec<(i64, std::ops::Range<usize>, &'static str)>,
 }
 
 impl QualifierScopes {
@@ -3023,6 +3042,20 @@ impl QualifierScopes {
             }
         }
         found
+    }
+
+    /// The field range and join-side qualifier a plan_id maps to.  When a
+    /// plan_id appears in multiple ancestor joins (nested join trees), the
+    /// OUTERMOST entry wins — `collect_qualifier_bindings` pushes parent
+    /// entries before child entries, so the first match carries the
+    /// qualifier that is in scope at the parent operator's resolution point
+    /// (emission's alias-transparent rendering exposes the nearest join's
+    /// `__td_jl` / `__td_jr` aliases).
+    fn lookup_plan_id(&self, pid: i64) -> Option<(std::ops::Range<usize>, &'static str)> {
+        self.plan_id_bindings
+            .iter()
+            .find(|(id, _, _)| *id == pid)
+            .map(|(_, range, qualifier)| (range.clone(), *qualifier))
     }
 }
 
@@ -3072,10 +3105,14 @@ impl<'a> ResolveContext<'a> {
         outer: Option<OuterScope<'a>>,
     ) -> Self {
         let mut bindings = Vec::new();
-        collect_qualifier_bindings(input, 0, &mut bindings);
+        let mut plan_id_bindings = Vec::new();
+        collect_qualifier_bindings(input, 0, &mut bindings, &mut plan_id_bindings);
         Self {
             schema: &input.resolved_schema,
-            scopes: QualifierScopes { bindings },
+            scopes: QualifierScopes {
+                bindings,
+                plan_id_bindings,
+            },
             base_types,
             outer,
         }
@@ -3093,15 +3130,19 @@ impl<'a> ResolveContext<'a> {
         outer: Option<OuterScope<'a>>,
     ) -> Self {
         let mut bindings = Vec::new();
+        let mut plan_id_bindings = Vec::new();
         let left_len = left.resolved_schema.len();
         let right_len = right.resolved_schema.len();
-        collect_qualifier_bindings(left, 0, &mut bindings);
-        collect_qualifier_bindings(right, left_len, &mut bindings);
+        collect_qualifier_bindings(left, 0, &mut bindings, &mut plan_id_bindings);
+        collect_qualifier_bindings(right, left_len, &mut bindings, &mut plan_id_bindings);
         bindings.push((TD_JOIN_LEFT.to_owned(), 0..left_len));
         bindings.push((TD_JOIN_RIGHT.to_owned(), left_len..left_len + right_len));
         Self {
             schema,
-            scopes: QualifierScopes { bindings },
+            scopes: QualifierScopes {
+                bindings,
+                plan_id_bindings,
+            },
             base_types,
             outer,
         }
@@ -3132,6 +3173,20 @@ impl<'a> ResolveContext<'a> {
             debug_assert!(
                 in_bounds,
                 "qualifier `{q}` scope range {range:?} exceeds schema of {} fields",
+                self.schema.len()
+            );
+            in_bounds
+        })
+    }
+
+    /// Look up a plan_id's field range and join-side qualifier, with the
+    /// same out-of-bounds guard as [`scoped_range`](Self::scoped_range).
+    fn plan_id_lookup(&self, pid: i64) -> Option<(std::ops::Range<usize>, &'static str)> {
+        self.scopes.lookup_plan_id(pid).filter(|(range, _)| {
+            let in_bounds = range.end <= self.schema.len();
+            debug_assert!(
+                in_bounds,
+                "plan_id `{pid}` scope range {range:?} exceeds schema of {} fields",
                 self.schema.len()
             );
             in_bounds
@@ -3173,6 +3228,7 @@ fn collect_qualifier_bindings(
     ast: &TypedAst,
     base: usize,
     out: &mut Vec<(String, std::ops::Range<usize>)>,
+    plan_id_out: &mut Vec<(i64, std::ops::Range<usize>, &'static str)>,
 ) {
     match &ast.op {
         TypedOp::TableScan { table, alias } => {
@@ -3190,14 +3246,36 @@ fn collect_qualifier_bindings(
             left,
             right,
             join_type,
+            left_plan_ids,
+            right_plan_ids,
             ..
         } => {
             if !using_columns.is_empty() {
                 return;
             }
-            collect_qualifier_bindings(left, base, out);
+            let left_range = base..base + left.resolved_schema.len();
+            let right_base = base + left.resolved_schema.len();
+            let right_range = right_base..right_base + right.resolved_schema.len();
+            // Register this (outer) join's plan_id entries FIRST, then
+            // recurse into children. `lookup_plan_id` uses `find` (first
+            // match), so the OUTERMOST entry wins — its qualifier
+            // (`TD_JOIN_LEFT` / `TD_JOIN_RIGHT`) is the one in scope at
+            // the parent operator's resolution point (emission's
+            // alias-transparent rendering exposes the nearest join's
+            // `__td_jl` / `__td_jr` aliases). Inner joins' qualifiers
+            // refer to aliases buried inside subqueries and are NOT in
+            // scope at the parent level.
+            for &pid in left_plan_ids {
+                plan_id_out.push((pid, left_range.clone(), TD_JOIN_LEFT));
+            }
             if !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
-                collect_qualifier_bindings(right, base + left.resolved_schema.len(), out);
+                for &pid in right_plan_ids {
+                    plan_id_out.push((pid, right_range.clone(), TD_JOIN_RIGHT));
+                }
+            }
+            collect_qualifier_bindings(left, base, out, plan_id_out);
+            if !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+                collect_qualifier_bindings(right, right_base, out, plan_id_out);
             }
         }
         TypedOp::Filter { input, .. }
@@ -3209,7 +3287,7 @@ fn collect_qualifier_bindings(
         | TypedOp::NaFill { input, .. }
         | TypedOp::NaDrop { input, .. }
         | TypedOp::NaReplace { input, .. } => {
-            collect_qualifier_bindings(input, base, out);
+            collect_qualifier_bindings(input, base, out, plan_id_out);
         }
         // LateralView appends generated columns after the input. Recurse the
         // input at the same base, then bind the table_alias to the generated
@@ -3222,7 +3300,7 @@ fn collect_qualifier_bindings(
             table_alias,
             columns,
         } => {
-            collect_qualifier_bindings(input, base, out);
+            collect_qualifier_bindings(input, base, out, plan_id_out);
             let start = base + input.resolved_schema.len();
             out.push((table_alias.clone(), start..start + columns.len()));
         }
@@ -3368,7 +3446,56 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         u.qualifier.as_deref(),
         Some(TD_JOIN_LEFT) | Some(TD_JOIN_RIGHT)
     );
+    // ── plan_id-scoped resolution (above-join disambiguation) ────────
+    // When the ref is unqualified but carries a plan_id that maps to a
+    // known join side, restrict resolution to that side's field range.
+    // This is the above-join analogue of `qualify_plan_id_refs` (which
+    // only handles join CONDITIONS). Fall through to legacy behavior
+    // when the plan_id is unknown (e.g. ref to a non-join child —
+    // Spark tolerates refs resolvable unambiguously without it).
     if u.qualifier.is_none() {
+        if let Some(pid) = u.plan_id {
+            if let Some((range, side_qualifier)) = ctx.plan_id_lookup(pid) {
+                let info = TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range]);
+                if let Some((dt, nullable)) = info {
+                    // Only stamp the join-side qualifier when the column
+                    // name is AMBIGUOUS in the full schema (appears on
+                    // both sides of the join). Unambiguous names must NOT
+                    // be qualified: `__td_jl`/`__td_jr` are only in scope
+                    // when emission uses alias-transparent rendering
+                    // (Project-over-Join). In other render shapes
+                    // (Filter-over-Join → `__td_filter`, Sort-over-Join →
+                    // `__td_sort`, aggregate-over-join, etc.) the join's
+                    // synthetic aliases are buried inside a subquery and
+                    // the qualifier would cause a "table not found" error.
+                    let is_ambiguous = ctx
+                        .schema
+                        .fields
+                        .iter()
+                        .filter(|f| f.name.eq_ignore_ascii_case(&u.name))
+                        .count()
+                        > 1;
+                    return Ok(Expression::ColumnReference(ColumnReference {
+                        name: u.name,
+                        qualifier: if is_ambiguous {
+                            Some(side_qualifier.to_owned())
+                        } else {
+                            None
+                        },
+                        data_type: Some(dt),
+                        nullable: Some(nullable),
+                    }));
+                }
+                // plan_id scope found but column name not in that range —
+                // UnknownColumn, not ambiguity.
+                return Err(AnalyzerError::UnknownColumn {
+                    name: u.name,
+                    qualifier: u.qualifier,
+                });
+            }
+            // plan_id unknown in scope map — fall through to legacy
+            // resolution (the ref may be unambiguous without it).
+        }
         let matches: Vec<&StructField> = ctx
             .schema
             .fields
@@ -9749,5 +9876,259 @@ mod tests {
             DataType::Integer,
             "c.lvl must resolve as Integer from the injected anchor schema"
         );
+    }
+
+    // ── plan_id-scoped resolution above joins ──────────────────────────
+
+    /// Unqualified unresolved column WITH a plan_id tag.
+    fn plan_id_col(name: &str, pid: i64) -> Expression {
+        Expression::UnresolvedColumn(UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: None,
+            plan_id: Some(pid),
+        })
+    }
+
+    /// `Join` with plan_id sets but no USING columns.
+    fn join_with_plan_ids(
+        left: CommonAst,
+        right: CommonAst,
+        join_type: JoinType,
+        condition: Option<Expression>,
+        left_plan_ids: Vec<i64>,
+        right_plan_ids: Vec<i64>,
+    ) -> CommonAst {
+        CommonAst::new(CommonOp::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type,
+            condition,
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids,
+            right_plan_ids,
+        })
+    }
+
+    #[test]
+    fn plan_id_disambiguates_self_join_project_above() {
+        // Self-join `emp(plan_id=1) JOIN emp(plan_id=2)` with a Project
+        // above selecting `id` tagged with plan_id=2 — must resolve to the
+        // RIGHT side's `id`, not raise AmbiguousColumn. The resolved
+        // ColumnReference must carry qualifier `__td_jr` so emission renders
+        // `__td_jr.id` (unambiguous in the alias-transparent FROM clause).
+        let bt = base_types_with_emp_dept();
+        let join_cond = Expression::Binary(BinaryExpression {
+            left: Box::new(qcol("__td_jl", "id")),
+            op: BinaryOp::Eq,
+            right: Box::new(qcol("__td_jr", "id")),
+        });
+        let joined = join_with_plan_ids(
+            scan("emp"),
+            scan("emp"),
+            JoinType::Inner,
+            Some(join_cond),
+            vec![1],
+            vec![2],
+        );
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![plan_id_col("id", 2)],
+        });
+        let typed = analyze(project, &bt).expect("plan_id should disambiguate above join");
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        assert_eq!(typed.resolved_schema.fields[0].name, "id");
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
+        // Verify the resolved projection carries the join-side qualifier.
+        if let TypedOp::Project { projections, .. } = &typed.op {
+            match &projections[0] {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(
+                        c.qualifier.as_deref(),
+                        Some(TD_JOIN_RIGHT),
+                        "plan_id=2 must resolve with __td_jr qualifier"
+                    );
+                }
+                other => panic!("expected ColumnReference, got: {other:?}"),
+            }
+        } else {
+            panic!("expected Project op");
+        }
+    }
+
+    #[test]
+    fn plan_id_disambiguates_filter_above_join() {
+        // Filter above a self-join: `WHERE salary > 5` with plan_id=1 must
+        // resolve to the LEFT side without ambiguity error, and carry the
+        // `__td_jl` qualifier.
+        let bt = base_types_with_emp_dept();
+        let join_cond = Expression::Binary(BinaryExpression {
+            left: Box::new(qcol("__td_jl", "salary")),
+            op: BinaryOp::Eq,
+            right: Box::new(qcol("__td_jr", "salary")),
+        });
+        let joined = join_with_plan_ids(
+            scan("emp"),
+            scan("emp"),
+            JoinType::Inner,
+            Some(join_cond),
+            vec![1],
+            vec![2],
+        );
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(joined),
+            condition: Expression::Binary(BinaryExpression {
+                left: Box::new(plan_id_col("salary", 1)),
+                op: BinaryOp::Gt,
+                right: Box::new(int_lit(5)),
+            }),
+        });
+        let typed = analyze(filter, &bt).expect("plan_id should disambiguate filter above join");
+        // Output schema is the full join (8 fields: 4 left + 4 right).
+        assert_eq!(typed.resolved_schema.fields.len(), 8);
+        // Verify the resolved condition's left operand carries __td_jl.
+        if let TypedOp::Filter { condition, .. } = &typed.op {
+            if let Expression::Binary(b) = condition {
+                match b.left.as_ref() {
+                    Expression::ColumnReference(c) => {
+                        assert_eq!(
+                            c.qualifier.as_deref(),
+                            Some(TD_JOIN_LEFT),
+                            "plan_id=1 must resolve with __td_jl qualifier"
+                        );
+                    }
+                    other => panic!("expected ColumnReference, got: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plan_id_three_way_nested_join() {
+        // Three-way join: (emp(pid=1) JOIN emp(pid=2)) JOIN dept(pid=3)
+        // with a Project above selecting `dept_id` tagged with plan_id=3
+        // (the right side of the OUTER join) — must resolve to dept's
+        // `dept_id`, not emp's `dept_id`.
+        let bt = base_types_with_emp_dept();
+        let inner_cond = Expression::Binary(BinaryExpression {
+            left: Box::new(qcol("__td_jl", "id")),
+            op: BinaryOp::Eq,
+            right: Box::new(qcol("__td_jr", "id")),
+        });
+        let inner_join = join_with_plan_ids(
+            scan("emp"),
+            scan("emp"),
+            JoinType::Inner,
+            Some(inner_cond),
+            vec![1],
+            vec![2],
+        );
+        let outer_cond = Expression::Binary(BinaryExpression {
+            left: Box::new(qcol("__td_jl", "dept_id")),
+            op: BinaryOp::Eq,
+            right: Box::new(qcol("__td_jr", "dept_id")),
+        });
+        let outer_join = join_with_plan_ids(
+            inner_join,
+            scan("dept"),
+            JoinType::Inner,
+            Some(outer_cond),
+            vec![1, 2],
+            vec![3],
+        );
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(outer_join),
+            projections: vec![plan_id_col("dept_id", 3)],
+        });
+        let typed = analyze(project, &bt).expect("plan_id 3 should resolve to dept side");
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        assert_eq!(typed.resolved_schema.fields[0].name, "dept_id");
+        // dept's dept_id is Integer (not_null); emp's dept_id is also
+        // Integer but nullable. The dept-side field is NOT NULL.
+        assert!(!typed.resolved_schema.fields[0].nullable);
+    }
+
+    #[test]
+    fn plan_id_unique_column_omits_qualifier() {
+        // When the column name is UNIQUE across both sides of a join,
+        // the qualifier must NOT be stamped — __td_jl/__td_jr are only
+        // in scope under alias-transparent rendering (Project-over-Join).
+        // Other shapes (Filter-over-Join → __td_filter, etc.) would
+        // break if the qualifier were present. Verify that `value`
+        // (unique to the left side emp) and `dept_name` (unique to the
+        // right side dept) resolve without qualifiers.
+        let bt = base_types_with_emp_dept();
+        let join_cond = Expression::Binary(BinaryExpression {
+            left: Box::new(qcol("__td_jl", "dept_id")),
+            op: BinaryOp::Eq,
+            right: Box::new(qcol("__td_jr", "dept_id")),
+        });
+        let joined = join_with_plan_ids(
+            scan("emp"),
+            scan("dept"),
+            JoinType::Inner,
+            Some(join_cond),
+            vec![1],
+            vec![2],
+        );
+        // Filter above the join: references unique columns by plan_id.
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(joined),
+            condition: Expression::Binary(BinaryExpression {
+                left: Box::new(plan_id_col("salary", 1)),
+                op: BinaryOp::Gt,
+                right: Box::new(int_lit(0)),
+            }),
+        });
+        let typed = analyze(filter, &bt).expect("unique column should resolve without qualifier");
+        if let TypedOp::Filter { condition, .. } = &typed.op {
+            if let Expression::Binary(b) = condition {
+                match b.left.as_ref() {
+                    Expression::ColumnReference(c) => {
+                        assert_eq!(
+                            c.qualifier, None,
+                            "unique column 'salary' must NOT carry a synthetic qualifier"
+                        );
+                    }
+                    other => panic!("expected ColumnReference, got: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plan_id_unknown_falls_back_to_legacy() {
+        // A plan_id that does not appear in any join's plan_id sets
+        // should fall through to the legacy name-only resolution.
+        // With a simple (non-join) scan, `id` with plan_id=99 resolves
+        // normally because there is exactly one `id` field.
+        let bt = base_types_with_emp_dept();
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![plan_id_col("id", 99)],
+        });
+        let typed = analyze(project, &bt).expect("unknown plan_id should fall back");
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        assert_eq!(typed.resolved_schema.fields[0].name, "id");
+    }
+
+    #[test]
+    fn plan_id_under_plain_non_join_input_unaffected() {
+        // A plan_id-tagged ref under a non-join input (no join in tree)
+        // must resolve via the legacy path as long as the column is
+        // unambiguous. This verifies we do not error on plan_id when
+        // no join is present.
+        let bt = base_types_with_emp_dept();
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(scan("emp")),
+            condition: Expression::Binary(BinaryExpression {
+                left: Box::new(plan_id_col("salary", 42)),
+                op: BinaryOp::Gt,
+                right: Box::new(int_lit(100)),
+            }),
+        });
+        let typed = analyze(filter, &bt).expect("plan_id with no join should resolve normally");
+        assert_eq!(typed.resolved_schema.fields.len(), 4);
     }
 }

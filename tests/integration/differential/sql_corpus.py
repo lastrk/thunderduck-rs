@@ -280,6 +280,17 @@ case("jn-013", "join", "three-way join", "SELECT e.name, d.dept_name FROM emp e 
 case("jn-014", "join", "self join on manager", "SELECT e.name AS emp, m.name AS mgr FROM emp e LEFT JOIN emp m ON e.manager_id = m.id")
 case("jn-015", "join", "join then aggregate", "SELECT d.dept_name, avg(e.salary) AS avg_sal FROM emp e JOIN dept d ON e.dept_id = d.dept_id GROUP BY d.dept_name")
 case("jn-016", "join", "USING with subsequent unqualified col", "SELECT dept_id, count(*) AS n FROM emp JOIN dept USING (dept_id) GROUP BY dept_id")
+# LATENT BUG WITNESS (expected red until fixed — see .agent-output/unsolvable.md
+# "Latent bugs"): a BARE (unaliased) first table in a >=3-way comma join with
+# aliased tables after it — τ's flat-chain folding buries the bare table's
+# binding (DuckDB: `Referenced table "emp" not found`). An aliased first table
+# (`FROM emp e, ...`) works; two aliases of the same table alone work; the
+# trigger is specifically bare-first + aliased-rest in one comma chain. Same
+# "__td_jl wrapper buries a qualifier" family as passes 7/11/13/17, on a spine
+# shape pass 17's bare-TableScan hoist did not cover. Uncovered by TPC-H
+# Q7/Q8/Q21 (`FROM supplier, lineitem l1, ..., nation n1, nation n2`) after
+# FileScan landed.
+case("jn-017", "join", "bare first table + aliased tables in comma join", "SELECT n1.dept_name, n2.dept_name FROM emp, dept n1, dept n2 WHERE emp.dept_id = n1.dept_id AND emp.dept_id = n2.dept_id")
 
 # ── 4. GROUP BY / aggregates ─────────────────────────────────────────────────
 case("agg-001", "aggregate", "COUNT(*)", "SELECT count(*) AS n FROM emp")
@@ -323,6 +334,16 @@ case("agg-021", "aggregate", "GROUP BY ALL excludes aggregate nested in fn args 
 # CompoundFieldAccess), so both cases group only by `dept_id` — matching Spark.
 case("agg-022", "aggregate", "aggregate nested in EXTRACT special form under GROUP BY ALL", "SELECT dept_id, extract(YEAR FROM max(last_login)) y FROM emp GROUP BY ALL", flags=("spark4",))
 case("agg-023", "aggregate", "aggregate nested in SUBSTRING special form under GROUP BY ALL", "SELECT dept_id, substring(max(name) FROM 1 FOR 2) s FROM emp GROUP BY ALL", flags=("spark4",))
+# LATENT BUG WITNESS (expected red until fixed — see .agent-output/unsolvable.md
+# "Latent bugs"): τ's resolved schema for avg(DECIMAL) is correct
+# (decimal(14,6), matches Spark) but the EMITTED SQL produces DOUBLE data — the
+# Arrow batch carries float64 while the schema frame claims decimal, so
+# collected values come back as Python floats vs Spark's Decimals. num-026
+# covers the same expression but is schema_only, which is exactly how this
+# slipped through. Rows 2/4/8 give a non-terminating average (13499.99/3) so
+# the decimal-rounded reference value can never equal the raw double.
+# Uncovered by TPC-H Q1 (avg_qty/avg_price/avg_disc) after FileScan landed.
+case("agg-024", "aggregate", "avg(DECIMAL) must return decimal DATA, not just decimal schema", "SELECT avg(bonus) AS avg_bonus FROM emp WHERE id IN (2, 4, 8)")
 
 # ── 5. ORDER BY / LIMIT ──────────────────────────────────────────────────────
 case("ord-001", "ordering", "ORDER BY asc (default)", "SELECT * FROM emp ORDER BY salary")
@@ -428,6 +449,17 @@ case("sq-019", "subquery", "multiple correlated subqueries", "SELECT e.name, (SE
 case("sq-020", "subquery", "subquery in CASE branch", "SELECT name, CASE WHEN salary > (SELECT avg(salary) FROM emp) THEN 'above' ELSE 'below' END AS rel FROM emp")
 case("sq-021", "subquery", "IN (group HAVING) -> semi-join (TPC-H Q18 shape)", "SELECT * FROM emp WHERE dept_id IN (SELECT dept_id FROM emp GROUP BY dept_id HAVING sum(salary) > 200000)")
 case("sq-022", "subquery", "de-correlatable avg (TPC-H Q17 shape)", "SELECT sum(e.salary) / 7.0 AS avg_yearly FROM emp e WHERE e.salary < 0.2 * (SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id <=> e.dept_id)")
+# LATENT BUG WITNESS (expected red until fixed — see .agent-output/unsolvable.md
+# "Latent bugs"): this is sq-016's ORIGINAL level-skipping SQL — the innermost
+# subquery (e3) references the OUTERMOST alias `e`, skipping the middle level
+# (e2). Spark's correlation resolution reaches only ONE level up, so Spark
+# rejects this eagerly at .sql() with UNRESOLVED_COLUMN.WITH_SUGGESTION. τ,
+# however, silently SUCCEEDS: its resolver falls back to a name-only lookup
+# when a qualifier is unbound, accidentally binding `e.dept_id` to
+# `e3.dept_id`. The fix is a Spark-emulated error (ADR-022 cat-1): an
+# unresolvable qualified reference must raise UNRESOLVED_COLUMN instead of
+# silently mis-binding. This case goes green when τ raises the same class.
+case("sq-023", "subquery", "level-skipping correlation must raise UNRESOLVED_COLUMN (Spark parity)", "SELECT e.name FROM emp e WHERE e.salary > (SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id <=> e.dept_id AND e2.age > (SELECT min(e3.age) FROM emp e3 WHERE e3.dept_id <=> e.dept_id))", expected_error="UNRESOLVED_COLUMN.WITH_SUGGESTION")
 
 # ── 9. CTEs (WITH) ───────────────────────────────────────────────────────────
 case("cte-001", "cte", "single CTE", "WITH ds AS (SELECT dept_id, avg(salary) a FROM emp GROUP BY dept_id) SELECT e.name, s.a FROM emp e JOIN ds s ON e.dept_id = s.dept_id")
@@ -566,6 +598,14 @@ case("tbl-011", "table_expr", "LATERAL table function with column alias list", "
 # valid Spark 4.x (SPARK-41961) but fails end-to-end in τ today. Flips green
 # once both the swallowed `lateral` flag and generator-TVF analysis land.
 case("tbl-012", "table_expr", "correlated LATERAL table function over outer column (known gap)", "SELECT e.id, r.v FROM emp e, LATERAL explode(e.tags) AS r(v)")
+# LATENT BUG WITNESS (expected red until fixed — see .agent-output/unsolvable.md
+# "Latent bugs"): a derived table with a COLUMN ALIAS LIST `AS t (a, b)` whose
+# body contains a JOIN — referencing the renamed aggregate column fails
+# (DuckDB: `Referenced column "count" not found; Candidate bindings:
+# "count(d.dept_id)"`). The same shape WITHOUT the join inside works, so the
+# join is the trigger. Uncovered by TPC-H Q13 (`... AS c_orders (c_custkey,
+# c_count)`) after FileScan landed.
+case("tbl-013", "table_expr", "derived-table column alias list over a JOIN body", "SELECT b, count(*) AS n FROM (SELECT e.dept_id, count(d.dept_id) FROM emp e LEFT OUTER JOIN dept d ON e.dept_id = d.dept_id GROUP BY e.dept_id) AS t (a, b) GROUP BY b")
 
 # ── 15. Advanced predicates / SQL-specific operators ─────────────────────────
 case("pr-001", "predicate_adv", "IS DISTINCT FROM", "SELECT * FROM emp WHERE dept_id IS DISTINCT FROM 10")

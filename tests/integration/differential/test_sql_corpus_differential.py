@@ -35,9 +35,11 @@ import pytest
 
 from utils.dataframe_diff import (
     DataFrameDiff,
+    SideOutcome,
     assert_dataframes_equal,
     capture_outcome,
     reconcile_error_parity,
+    spark_error_class,
 )
 from differential.sql_corpus import CASES, Case
 
@@ -70,6 +72,22 @@ def _canonicalize_rows(df):
     return df.sparkSession.createDataFrame(rows, df.schema)
 
 
+def _sql_outcome(spark, sql: str, timeout: int, name: str):
+    """Evaluate one engine end-to-end for an `expected_error` case.
+
+    Unlike `capture_outcome` (collect-time only), this also captures EAGER
+    analysis-time errors raised by `spark.sql(...)` itself — Spark's Connect
+    session analyzes eagerly, so classes like UNRESOLVED_COLUMN surface at
+    `.sql()`, before any DataFrame exists (e.g. sq-023). Returns
+    `(df_or_None, SideOutcome)`; `df` is None iff `.sql()` itself threw.
+    """
+    try:
+        df = spark.sql(sql)
+    except Exception as exc:  # noqa: BLE001 — any analysis error becomes an outcome
+        return None, SideOutcome(error=exc, error_class=spark_error_class(exc))
+    return df, capture_outcome(df, timeout, name)
+
+
 @pytest.mark.differential
 @pytest.mark.parametrize("case", CASES, ids=_case_id)
 def test_case(
@@ -89,28 +107,31 @@ def test_case(
     the τ side) surfaces as a test FAILURE for that case — the signal this
     corpus exists to drive.
     """
-    ref_df = spark_reference.sql(case.sql)
-    td_df = spark_thunderduck.sql(case.sql)
-
     # Error-parity cases: BOTH engines are expected to raise the same Spark error
     # class (ADR-006 tri-state / ADR-016 ANSI). Evaluate each side independently
-    # and reconcile — mirrors the DataFrame corpus harness.
+    # and reconcile — mirrors the DataFrame corpus harness. `_sql_outcome` also
+    # captures EAGER `.sql()`-time analysis errors (not just collect-time), so
+    # classes Spark raises at analysis (UNRESOLVED_COLUMN, ...) participate too.
     if case.expected_error is not None:
         timeout = int(os.environ.get("DIFFERENTIAL_TIMEOUT", "60"))
-        ref = capture_outcome(ref_df, timeout, "Spark Reference")
-        td = capture_outcome(td_df, timeout, "Thunderduck")
+        ref_df, ref = _sql_outcome(spark_reference, case.sql, timeout, "Spark Reference")
+        td_df, td = _sql_outcome(spark_thunderduck, case.sql, timeout, "Thunderduck")
         outcome = reconcile_error_parity(
             ref, td, case.id, expected_class=case.expected_error
         )
         if outcome is None:
             return  # both threw the matching class → PASS
         ref_rows, td_rows = outcome  # both returned values → normal row diff
+        # Both sides returned rows, so neither `.sql()` threw — dfs are non-None.
         assert_dataframes_equal(
             ref_df.sparkSession.createDataFrame(sorted(ref_rows, key=repr), ref_df.schema),
             td_df.sparkSession.createDataFrame(sorted(td_rows, key=repr), td_df.schema),
             query_name=case.id,
         )
         return
+
+    ref_df = spark_reference.sql(case.sql)
+    td_df = spark_thunderduck.sql(case.sql)
 
     schema_only = "schema_only" in case.flags or "nondeterministic" in case.flags
     if schema_only:

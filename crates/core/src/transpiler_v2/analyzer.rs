@@ -398,6 +398,18 @@ pub enum TypedOp {
         /// Per-output-column `(alias, generator FunctionCall)` pairs.
         columns: Vec<(String, Expression)>,
     },
+    /// `WITH RECURSIVE name(cols) AS (anchor UNION ALL recursive_term)
+    /// SELECT * FROM name` — post-analysis recursive CTE. The `union_all`
+    /// field from the parser is dropped (the analyzer rejects `UNION`-without-
+    /// ALL as a Spark-emulated error before constructing this variant).
+    RecursiveCte {
+        /// The CTE name.
+        name: String,
+        /// The typed anchor leg.
+        anchor: Box<TypedAst>,
+        /// The typed recursive leg.
+        recursive_term: Box<TypedAst>,
+    },
     /// `df.groupBy(...).pivot(col, [values]).agg(...)`. See
     /// [`CommonOp::Pivot`] for the semantic contract. The analyzer resolves
     /// grouping / pivot column / aggregates against the input schema and
@@ -613,6 +625,11 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
         // never reaches this arm — `analyze_pivot` punts with a
         // Thunderduck-boundary error before constructing the `TypedOp::Pivot`.
         TypedOp::Pivot { input, .. } => has_resolved_schema(input),
+        TypedOp::RecursiveCte {
+            anchor,
+            recursive_term,
+            ..
+        } => has_resolved_schema(anchor) && has_resolved_schema(recursive_term),
         TypedOp::LateralView { input, columns, .. } => {
             has_resolved_schema(input)
                 && columns.iter().all(|(_, e)| expression_is_fully_resolved(e))
@@ -1123,6 +1140,23 @@ fn analyze_node(
             table_alias,
             columns,
         } => analyze_lateral_view(*input, table_alias, columns, base_types, outer),
+
+        // ── RecursiveCte (two-phase anchor-first) ──────────────────────
+        CommonOp::RecursiveCte {
+            name,
+            column_names,
+            union_all,
+            anchor,
+            recursive_term,
+        } => analyze_recursive_cte(
+            name,
+            column_names,
+            union_all,
+            *anchor,
+            *recursive_term,
+            base_types,
+            outer,
+        ),
 
         // ── Binary: Join ──────────────────────────────────────────────────
         CommonOp::Join {
@@ -1700,6 +1734,158 @@ fn analyze_join(
         },
         resolved_schema: output_schema,
     })
+}
+
+/// Analyze a recursive CTE: two-phase anchor-first.
+///
+/// (a) analyze anchor against ordinary base_types;
+/// (b) rename the anchor's resolved schema positionally by column_names;
+/// (c) reject `!union_all` (Spark: `UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE`);
+/// (d) validate column-name arity;
+/// (e) build augmented base_types with the CTE schema injected;
+/// (f) analyze recursive_term against augmented;
+/// (g) validate recursive_term schema arity matches anchor;
+/// (h) push setop casts to pin recursive term's types to anchor's;
+/// (i) return `TypedOp::RecursiveCte`.
+fn analyze_recursive_cte(
+    name: String,
+    column_names: Vec<String>,
+    union_all: bool,
+    anchor: CommonAst,
+    recursive_term: CommonAst,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<TypedAst, AnalyzerError> {
+    // (a) Analyze anchor.
+    let typed_anchor = analyze_node(anchor, base_types, outer)?;
+
+    // (b) Rename anchor schema by column_names (positional).
+    let cte_schema = if column_names.is_empty() {
+        typed_anchor.resolved_schema.clone()
+    } else {
+        // (d) Arity check — column list length must match anchor output width.
+        if column_names.len() != typed_anchor.resolved_schema.fields.len() {
+            return Err(AnalyzerError::Other {
+                reason: format!(
+                    "recursive CTE `{name}` column list has {} names but the anchor produces {} columns",
+                    column_names.len(),
+                    typed_anchor.resolved_schema.fields.len()
+                ),
+            });
+        }
+        let fields = typed_anchor
+            .resolved_schema
+            .fields
+            .iter()
+            .zip(column_names.iter())
+            .map(|(f, col_name)| {
+                StructField::new(col_name.clone(), f.data_type.clone(), f.nullable)
+            })
+            .collect();
+        StructType::new(fields)
+    };
+
+    // (c) Reject UNION (without ALL) — Spark's UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE.
+    if !union_all {
+        return Err(AnalyzerError::Other {
+            reason: "UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE: recursive CTE body must use UNION ALL"
+                .to_owned(),
+        });
+    }
+
+    // (e) Inject CTE schema into base_types so self-references resolve. The
+    // self-reference sees ALL fields as nullable regardless of the anchor's
+    // own nullability — verified against the 4.1.1 reference: a self-ref
+    // column (e.g. cte-010's `c.lvl`) always types nullable, while a column
+    // untouched by self-reference (cte-010's `e.id`, sourced from the real
+    // `emp` table) keeps its own non-nullable type. This models the
+    // recursive relation's schema being fixed-point-uncertain across
+    // iterations, distinct from the final OR-folded output schema below.
+    // Insert under the lowercase key (which `name` already is from lowering).
+    // Also collect any self-referencing TableScan names from the recursive term
+    // that match case-insensitively but differ in case (e.g. the user wrote
+    // `WITH RECURSIVE Chain(...) ... FROM Chain c`), and insert the schema
+    // under those exact-case keys too — BaseTypes::lookup is case-sensitive.
+    let self_ref_schema = StructType::new(
+        cte_schema
+            .fields
+            .iter()
+            .map(|f| StructField::new(f.name.clone(), f.data_type.clone(), true))
+            .collect(),
+    );
+    let mut augmented = base_types.with_entry(&name, self_ref_schema.clone());
+    for source_case_name in self_ref_table_names(&recursive_term, &name) {
+        if source_case_name != name {
+            augmented = augmented.with_entry(&source_case_name, self_ref_schema.clone());
+        }
+    }
+
+    // (f) Analyze recursive term with augmented base_types.
+    let mut typed_recursive = analyze_node(recursive_term, &augmented, outer)?;
+
+    // (g) Arity match — recursive term must produce the same number of columns.
+    if typed_recursive.resolved_schema.fields.len() != cte_schema.fields.len() {
+        return Err(AnalyzerError::Other {
+            reason: format!(
+                "recursive CTE `{name}` anchor has {} columns but the recursive term produces {}",
+                cte_schema.fields.len(),
+                typed_recursive.resolved_schema.fields.len()
+            ),
+        });
+    }
+
+    // Final output nullability = OR-fold across anchor and recursive-term legs
+    // (standard UNION ALL nullability rule, same as `widen_by_name`'s
+    // pairwise fold for ordinary set operations) — captured BEFORE
+    // `push_setop_casts` below overwrites `typed_recursive.resolved_schema`
+    // with the anchor-typed schema.
+    let output_nullable: Vec<bool> = cte_schema
+        .fields
+        .iter()
+        .zip(typed_recursive.resolved_schema.fields.iter())
+        .map(|(anchor_f, rec_f)| anchor_f.nullable || rec_f.nullable)
+        .collect();
+
+    // (h) Pin recursive term types to anchor (anchor-directional).
+    push_setop_casts(&mut typed_recursive, &cte_schema);
+
+    let resolved_schema = StructType::new(
+        cte_schema
+            .fields
+            .iter()
+            .zip(output_nullable)
+            .map(|(f, nullable)| StructField::new(f.name.clone(), f.data_type.clone(), nullable))
+            .collect(),
+    );
+
+    Ok(TypedAst {
+        op: TypedOp::RecursiveCte {
+            name,
+            anchor: Box::new(typed_anchor),
+            recursive_term: Box::new(typed_recursive),
+        },
+        resolved_schema,
+    })
+}
+
+/// Collect source-case `TableScan.table` names in `ast` that case-insensitively
+/// match `cte_name_lower`. Used by `analyze_recursive_cte` to ensure the
+/// injected `BaseTypes` entry covers every casing of the self-reference.
+fn self_ref_table_names(ast: &CommonAst, cte_name_lower: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_self_ref_names(ast, cte_name_lower, &mut out);
+    out
+}
+
+fn collect_self_ref_names(ast: &CommonAst, cte_name_lower: &str, out: &mut Vec<String>) {
+    if let CommonOp::TableScan { table, .. } = &ast.op {
+        if table.to_lowercase() == cte_name_lower && !out.contains(table) {
+            out.push(table.clone());
+        }
+    }
+    for child in ast.op.children() {
+        collect_self_ref_names(child, cte_name_lower, out);
+    }
 }
 
 fn analyze_set_op(
@@ -4458,9 +4644,10 @@ mod tests {
     use super::super::analyzer_fixtures;
     use super::super::ast::CommonAst;
     use super::super::expression::{
-        BetweenExpression, BinaryExpression, BinaryOp, ExistsSubquery, FunctionCall, InSubquery,
-        LambdaExpression, LambdaVariableExpression, Literal, LiteralValue, ScalarSubquery,
-        StarExpression, UnresolvedRegexExpression,
+        AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, ExistsSubquery,
+        FunctionCall, InSubquery, LambdaExpression, LambdaVariableExpression, Literal,
+        LiteralValue, ScalarSubquery, StarExpression, UnaryExpression, UnaryOp,
+        UnresolvedRegexExpression,
     };
     use super::*;
 
@@ -9056,5 +9243,487 @@ mod tests {
         // dispatch_op should error (boundary: non-cross join without ON/USING).
         let result = crate::transpiler_v2::emission::dispatch_op(&typed.op, &typed.resolved_schema);
         assert!(result.is_err(), "non-lateral clauseless Inner must error");
+    }
+
+    // ── Pass 18: RecursiveCte analyzer tests ──────────────────────────────
+
+    /// emp schema with `manager_id` for recursive CTE tests (cte-010).
+    fn emp_schema_with_manager() -> StructType {
+        StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("manager_id", DataType::Integer),
+            StructField::nullable("salary", DataType::Double),
+        ])
+    }
+
+    /// Build a `RecursiveCte` AST node directly (bypasses the parser).
+    fn recursive_cte(
+        name: &str,
+        column_names: Vec<&str>,
+        union_all: bool,
+        anchor: CommonAst,
+        recursive_term: CommonAst,
+    ) -> CommonAst {
+        CommonAst::new(CommonOp::RecursiveCte {
+            name: name.to_owned(),
+            column_names: column_names.into_iter().map(|s| s.to_owned()).collect(),
+            union_all,
+            anchor: Box::new(anchor),
+            recursive_term: Box::new(recursive_term),
+        })
+    }
+
+    #[test]
+    fn analyze_recursive_cte_009_simple_sequence() {
+        // cte-009: `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1
+        // FROM seq WHERE n < 5) SELECT * FROM seq`.
+        // Anchor: `SELECT 1` → Project over SingleRow with INT literal.
+        let anchor = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![int_lit(1)],
+        });
+        // Recursive term: `SELECT n + 1 FROM seq WHERE n < 5`.
+        // In SQL, WHERE filters before SELECT projects:
+        // Project { input: Filter { input: scan("seq"), cond }, projections }
+        let recursive_term = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(scan("seq")),
+                condition: Expression::Binary(BinaryExpression {
+                    left: Box::new(unresolved_col("n")),
+                    op: BinaryOp::Lt,
+                    right: Box::new(int_lit(5)),
+                }),
+            })),
+            projections: vec![Expression::Binary(BinaryExpression {
+                left: Box::new(unresolved_col("n")),
+                op: BinaryOp::Add,
+                right: Box::new(int_lit(1)),
+            })],
+        });
+        // Wrap in the CTE reference: AliasedRelation { RecursiveCte, "seq" }
+        let cte_node = recursive_cte("seq", vec!["n"], true, anchor, recursive_term);
+        let outer = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(cte_node),
+                alias: "seq".to_owned(),
+            })),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+
+        let bt = BaseTypes::empty();
+        let typed = analyze(outer, &bt).expect("analyze cte-009");
+        // resolved_schema should be the anchor's renamed schema: n:Integer.
+        assert_eq!(field_names(&typed), vec!["n"]);
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Integer);
+        // Nullability is always true for recursive-CTE output, regardless of
+        // the anchor's own (non-nullable) literal — matches Spark's reference
+        // behavior verified against the 4.1.1 pin.
+        assert!(typed.resolved_schema.fields[0].nullable);
+    }
+
+    #[test]
+    fn analyze_recursive_cte_010_join_form() {
+        // cte-010: `WITH RECURSIVE chain(id, name, manager_id, lvl) AS (
+        //   SELECT id, name, manager_id, 0 FROM emp WHERE manager_id IS NULL
+        //   UNION ALL
+        //   SELECT e.id, e.name, e.manager_id, c.lvl + 1
+        //   FROM emp e JOIN chain c ON e.manager_id = c.id
+        // ) SELECT * FROM chain`.
+        // In SQL, WHERE filters before SELECT projects.
+        let anchor = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(scan("emp")),
+                condition: Expression::Unary(UnaryExpression {
+                    op: UnaryOp::IsNull,
+                    operand: Box::new(unresolved_col("manager_id")),
+                }),
+            })),
+            projections: vec![
+                unresolved_col("id"),
+                unresolved_col("name"),
+                unresolved_col("manager_id"),
+                int_lit(0),
+            ],
+        });
+        // Recursive term: join emp e with chain c.
+        let emp_aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(scan("emp")),
+            alias: "e".to_owned(),
+        });
+        let chain_aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(scan("chain")),
+            alias: "c".to_owned(),
+        });
+        let join_cond = Expression::Binary(BinaryExpression {
+            left: Box::new(qcol("e", "manager_id")),
+            op: BinaryOp::Eq,
+            right: Box::new(qcol("c", "id")),
+        });
+        let joined = join(emp_aliased, chain_aliased, JoinType::Inner, Some(join_cond));
+        let recursive_term = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![
+                qcol("e", "id"),
+                qcol("e", "name"),
+                qcol("e", "manager_id"),
+                Expression::Binary(BinaryExpression {
+                    left: Box::new(qcol("c", "lvl")),
+                    op: BinaryOp::Add,
+                    right: Box::new(int_lit(1)),
+                }),
+            ],
+        });
+
+        let cte_node = recursive_cte(
+            "chain",
+            vec!["id", "name", "manager_id", "lvl"],
+            true,
+            anchor,
+            recursive_term,
+        );
+        let outer = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(cte_node),
+                alias: "chain".to_owned(),
+            })),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+
+        // emp_schema_with_manager has id:Long, name:String, manager_id:Integer
+        // (nullable), salary:Double. We need emp in base_types for the anchor's
+        // scan AND the recursive term's `FROM emp e`. chain resolves via the
+        // injected entry.
+        let bt = base_types_for(&[("emp", emp_schema_with_manager())]);
+        let typed = analyze(outer, &bt).expect("analyze cte-010");
+
+        assert_eq!(field_names(&typed), vec!["id", "name", "manager_id", "lvl"]);
+        // id comes from emp.id (Long NOT NULL).
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
+        // lvl: anchor is int_lit(0) → Integer.
+        assert_eq!(typed.resolved_schema.fields[3].data_type, DataType::Integer);
+        // id: both legs source from the real `emp` table's NOT NULL id — no
+        // self-reference touches this column, so nullability stays false
+        // (verified against the 4.1.1 reference: Reference nullable=false).
+        assert!(!typed.resolved_schema.fields[0].nullable);
+        // lvl: the recursive leg's `c.lvl + 1` reads the self-reference
+        // (`chain c`), which is always typed nullable — OR-folded with the
+        // anchor's non-nullable `0` literal, the output is nullable.
+        assert!(typed.resolved_schema.fields[3].nullable);
+    }
+
+    #[test]
+    fn analyze_recursive_cte_union_without_all_rejected() {
+        // UNION (without ALL) → Spark-emulated UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE.
+        let anchor = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![int_lit(1)],
+        });
+        let recursive_term = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("seq")),
+            projections: vec![unresolved_col("n")],
+        });
+        let cte_node = recursive_cte("seq", vec!["n"], false, anchor, recursive_term);
+        let outer = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(cte_node),
+                alias: "seq".to_owned(),
+            })),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+        let bt = BaseTypes::empty();
+        let err = analyze(outer, &bt).expect_err("should reject UNION without ALL");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE"),
+            "error should mention UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn analyze_recursive_cte_column_list_arity_mismatch() {
+        // column_names has 2 entries but anchor produces 1 column.
+        let anchor = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![int_lit(1)],
+        });
+        let recursive_term = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("seq")),
+            projections: vec![unresolved_col("n")],
+        });
+        let cte_node = recursive_cte("seq", vec!["a", "b"], true, anchor, recursive_term);
+        let outer = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(cte_node),
+                alias: "seq".to_owned(),
+            })),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+        let bt = BaseTypes::empty();
+        let err = analyze(outer, &bt).expect_err("should reject arity mismatch");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("2 names") && msg.contains("1 columns"),
+            "error should cite the arity mismatch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn analyze_recursive_cte_anchor_recursive_arity_mismatch() {
+        // Anchor produces 1 column but recursive term produces 2.
+        let anchor = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![int_lit(1)],
+        });
+        // Recursive term produces 2 columns.
+        let recursive_term = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("seq")),
+            projections: vec![unresolved_col("n"), int_lit(99)],
+        });
+        let cte_node = recursive_cte("seq", vec!["n"], true, anchor, recursive_term);
+        let outer = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(cte_node),
+                alias: "seq".to_owned(),
+            })),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+        let bt = BaseTypes::empty();
+        let err = analyze(outer, &bt).expect_err("should reject recursive term arity mismatch");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("anchor has 1 columns") && msg.contains("produces 2"),
+            "error should cite the anchor/recursive arity mismatch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn analyze_recursive_cte_shadowing_base_types_entry() {
+        // BaseTypes already has an entry for "seq" (a catalog table with a
+        // STRING column). The CTE injection must shadow it — the recursive
+        // term must resolve `n` via the INJECTED schema (Integer from anchor),
+        // not the pre-existing catalog entry. If injection-wins is broken, the
+        // recursive term's `n + 1` would attempt Integer + Integer on a String
+        // column (from catalog) and produce a wrong type or fail.
+        let catalog_seq_schema = StructType::new(vec![
+            StructField::nullable("n", DataType::String), // different type!
+        ]);
+        let bt = base_types_for(&[("seq", catalog_seq_schema)]);
+
+        let anchor = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![int_lit(1)],
+        });
+        // The recursive term's `n + 1` can only succeed as Integer + Integer.
+        // If the catalog's String schema leaks through (injection-wins broken),
+        // `n` resolves as String and the Add expression types differently.
+        let recursive_term = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("seq")),
+            projections: vec![Expression::Binary(BinaryExpression {
+                left: Box::new(unresolved_col("n")),
+                op: BinaryOp::Add,
+                right: Box::new(int_lit(1)),
+            })],
+        });
+        let cte_node = recursive_cte("seq", vec!["n"], true, anchor, recursive_term);
+        let outer = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(cte_node),
+                alias: "seq".to_owned(),
+            })),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+
+        let typed = analyze(outer, &bt).expect("analyze should succeed (CTE shadows catalog)");
+        // n should be Integer (from anchor), NOT String (from catalog).
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Integer);
+        // Verify the recursive term resolved `n` as Integer (injection-wins
+        // proof): drill into RecursiveCte → recursive_term → its input
+        // TableScan resolves to the Integer schema, not the catalog String.
+        let cte_op = match &typed.op {
+            TypedOp::Project { input, .. } => match &input.op {
+                TypedOp::AliasedRelation { input, .. } => &input.op,
+                other => panic!("expected AliasedRelation, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        };
+        match cte_op {
+            TypedOp::RecursiveCte { recursive_term, .. } => {
+                // The recursive term's input (under Project) is a TableScan
+                // whose resolved_schema must be the INJECTED Integer schema.
+                let inner_input = match &recursive_term.op {
+                    TypedOp::Project { input, .. } => input,
+                    other => panic!("expected Project in recursive term, got {other:?}"),
+                };
+                assert_eq!(
+                    inner_input.resolved_schema.fields[0].data_type,
+                    DataType::Integer,
+                    "recursive term's TableScan must resolve via injected schema (Integer), \
+                     not catalog (String)"
+                );
+            }
+            other => panic!("expected RecursiveCte, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_recursive_cte_case_mismatch_self_ref_resolves() {
+        // Regression: `WITH RECURSIVE Seq(n) AS (... FROM Seq ...)` — the CTE
+        // name is lowercased to "seq" for BaseTypes injection, but the
+        // self-reference TableScan preserves source case "Seq". Without the
+        // case-insensitive injection fix, BaseTypes::lookup("Seq") misses and
+        // produces a spurious UnknownTable error.
+        let anchor = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![int_lit(1)],
+        });
+        // Self-reference uses source-case "Seq" (not "seq").
+        let recursive_term = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(scan("Seq")),
+                condition: Expression::Binary(BinaryExpression {
+                    left: Box::new(unresolved_col("n")),
+                    op: BinaryOp::Lt,
+                    right: Box::new(int_lit(5)),
+                }),
+            })),
+            projections: vec![Expression::Binary(BinaryExpression {
+                left: Box::new(unresolved_col("n")),
+                op: BinaryOp::Add,
+                right: Box::new(int_lit(1)),
+            })],
+        });
+        // CTE name is lowercase "seq" (from lowering).
+        let cte_node = recursive_cte("seq", vec!["n"], true, anchor, recursive_term);
+        let outer = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(cte_node),
+                alias: "seq".to_owned(),
+            })),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+
+        let bt = BaseTypes::empty();
+        let typed = analyze(outer, &bt)
+            .expect("case-mismatched self-reference must resolve, not UnknownTable");
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Integer);
+    }
+
+    #[test]
+    fn analyze_recursive_cte_uppercase_self_ref_shadows_catalog() {
+        // Regression (silent-wrong-results variant): a catalog table "Seq"
+        // exists with a STRING column. The CTE injection under lowercase "seq"
+        // misses the case-sensitive lookup for "Seq", which would fall through
+        // to the catalog entry and bind with the wrong schema.
+        let catalog_schema = StructType::new(vec![StructField::nullable("n", DataType::String)]);
+        let bt = base_types_for(&[("Seq", catalog_schema)]);
+
+        let anchor = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![int_lit(1)],
+        });
+        // Self-reference uses "Seq" (matching the catalog entry's case).
+        let recursive_term = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("Seq")),
+            projections: vec![Expression::Binary(BinaryExpression {
+                left: Box::new(unresolved_col("n")),
+                op: BinaryOp::Add,
+                right: Box::new(int_lit(1)),
+            })],
+        });
+        let cte_node = recursive_cte("seq", vec!["n"], true, anchor, recursive_term);
+        let outer = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(cte_node),
+                alias: "seq".to_owned(),
+            })),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+
+        let typed =
+            analyze(outer, &bt).expect("CTE injection must shadow the catalog entry for 'Seq'");
+        // Must be Integer (CTE anchor), not String (catalog).
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Integer);
+    }
+
+    #[test]
+    fn analyze_recursive_cte_010_c_lvl_resolves_integer() {
+        // Specifically verify that `c.lvl` inside the recursive term's JOIN
+        // condition resolves with the correct type (Integer), proving the
+        // self-reference binds through the injected BaseTypes entry.
+        let anchor = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(scan("emp")),
+                condition: Expression::Unary(UnaryExpression {
+                    op: UnaryOp::IsNull,
+                    operand: Box::new(unresolved_col("manager_id")),
+                }),
+            })),
+            projections: vec![
+                unresolved_col("id"),
+                unresolved_col("name"),
+                unresolved_col("manager_id"),
+                int_lit(0),
+            ],
+        });
+        let emp_aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(scan("emp")),
+            alias: "e".to_owned(),
+        });
+        let chain_aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(scan("chain")),
+            alias: "c".to_owned(),
+        });
+        let join_cond = Expression::Binary(BinaryExpression {
+            left: Box::new(qcol("e", "manager_id")),
+            op: BinaryOp::Eq,
+            right: Box::new(qcol("c", "id")),
+        });
+        let joined = join(emp_aliased, chain_aliased, JoinType::Inner, Some(join_cond));
+        let recursive_term = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![
+                qcol("e", "id"),
+                qcol("e", "name"),
+                qcol("e", "manager_id"),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(Expression::Binary(BinaryExpression {
+                        left: Box::new(qcol("c", "lvl")),
+                        op: BinaryOp::Add,
+                        right: Box::new(int_lit(1)),
+                    })),
+                    alias: "lvl_plus_1".to_owned(),
+                }),
+            ],
+        });
+
+        let cte_node = recursive_cte(
+            "chain",
+            vec!["id", "name", "manager_id", "lvl"],
+            true,
+            anchor,
+            recursive_term,
+        );
+        let outer = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(cte_node),
+                alias: "chain".to_owned(),
+            })),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+
+        let bt = base_types_for(&[("emp", emp_schema_with_manager())]);
+        let typed = analyze(outer, &bt).expect("analyze cte-010 join form");
+
+        // lvl field type must be Integer (anchor's int_lit(0)).
+        let lvl_field = typed
+            .resolved_schema
+            .field_by_name("lvl")
+            .expect("lvl field should exist");
+        assert_eq!(
+            lvl_field.data_type,
+            DataType::Integer,
+            "c.lvl must resolve as Integer from the injected anchor schema"
+        );
     }
 }

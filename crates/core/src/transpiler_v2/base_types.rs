@@ -84,6 +84,17 @@ impl BaseTypes {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Return a **new** overlay with an additional `(table, schema)` entry.
+    ///
+    /// If `table` already exists it is replaced (shadowing semantics — a CTE
+    /// correctly shadows a catalog table of the same name per Spark). The
+    /// receiver is `&self` + `Clone` — no mutation, no aliasing.
+    pub fn with_entry(&self, table: &str, schema: StructType) -> Self {
+        let mut entries = self.entries.clone();
+        entries.insert(table.to_owned(), schema);
+        Self { entries }
+    }
 }
 
 /// Enumerate every empty-scan `TableScan` table name in `plan`, in tree order
@@ -232,7 +243,8 @@ fn for_each_node_expr(op: &CommonOp, f: &mut dyn FnMut(&Expression)) {
         | CommonOp::ToDf { .. }
         | CommonOp::WithColumnsRenamed { .. }
         | CommonOp::DropColumns { .. }
-        | CommonOp::Sample { .. } => {}
+        | CommonOp::Sample { .. }
+        | CommonOp::RecursiveCte { .. } => {}
     }
 }
 

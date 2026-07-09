@@ -90,14 +90,15 @@ fn lower_query(query: Query, cte_scope: &CteScope) -> Result<CommonAst, Emission
     // Build the effective CTE scope: inherit the outer scope, then fold in
     // this query's own `WITH` clause. Each CTE body is lowered with the scope
     // built so far, so a nested CTE (`b AS (... FROM a ...)`) sees its
-    // predecessors. `WITH RECURSIVE` is not inlinable (self-reference) and is a
-    // Thunderduck-boundary reject (ADR-022).
+    // predecessors. `WITH RECURSIVE` takes a fully separate code path
+    // (`lower_recursive_with`) — the self-referencing body cannot be inlined.
     let mut local_scope: CteScope;
     let effective_scope: &CteScope = match query.with {
+        Some(with) if with.recursive => {
+            local_scope = lower_recursive_with(with, cte_scope)?;
+            &local_scope
+        }
         Some(with) => {
-            if with.recursive {
-                bail_boundary_proto!("sql::recursive_cte", "WITH RECURSIVE not supported");
-            }
             local_scope = cte_scope.clone();
             for cte in with.cte_tables {
                 let body = lower_query(*cte.query, &local_scope)?;
@@ -145,6 +146,111 @@ fn lower_query(query: Query, cte_scope: &CteScope) -> Result<CommonAst, Emission
         offset_expr_opt,
         effective_scope,
     )
+}
+
+/// Lower a `WITH RECURSIVE` clause into the CTE scope.
+///
+/// A recursive CTE's body self-references its own name, so it CANNOT be
+/// inlined (infinite expansion). Instead the parser builds a
+/// [`CommonOp::RecursiveCte`] node that survives to emitted SQL as a genuine
+/// `WITH RECURSIVE ... AS (anchor UNION ALL recursive_term)`.
+///
+/// **Boundary guards (ADR-022 cat-2):**
+/// - Only a single CTE is allowed under one `WITH RECURSIVE`.
+/// - The CTE body must be a `SetOperation { op: Union, .. }`.
+/// - ORDER BY / LIMIT / nested `WITH` on the CTE body's own query are rejected.
+fn lower_recursive_with(
+    with: sqlparser::ast::With,
+    cte_scope: &CteScope,
+) -> Result<CteScope, EmissionError> {
+    // Guard: only one CTE under a single WITH RECURSIVE.
+    if with.cte_tables.len() != 1 {
+        bail_boundary_proto!(
+            "sql::recursive_cte::multiple",
+            format!(
+                "WITH RECURSIVE with {} CTEs not supported (expected exactly 1)",
+                with.cte_tables.len()
+            )
+        );
+    }
+
+    let cte = with
+        .cte_tables
+        .into_iter()
+        .next()
+        .expect("cte_tables is non-empty (len checked above)");
+    // Preserve declared-case in the AST node (used by emission + analyzer
+    // BaseTypes injection); CteScope key is lowercased (matching non-recursive
+    // CTE convention).
+    let declared_name = cte.alias.name.value;
+    let cte_name_lower = declared_name.to_lowercase();
+    let column_names: Vec<String> = cte
+        .alias
+        .columns
+        .into_iter()
+        .map(|c| c.name.value)
+        .collect();
+
+    let inner_query = *cte.query;
+
+    // Reject modifiers on the CTE body's own Query wrapper.
+    if inner_query.order_by.is_some() {
+        bail_boundary_proto!(
+            "sql::recursive_cte::modifier",
+            "ORDER BY on a recursive CTE body is not supported"
+        );
+    }
+    if inner_query.limit_clause.is_some() {
+        bail_boundary_proto!(
+            "sql::recursive_cte::modifier",
+            "LIMIT on a recursive CTE body is not supported"
+        );
+    }
+    if inner_query.with.is_some() {
+        bail_boundary_proto!(
+            "sql::recursive_cte::modifier",
+            "nested WITH inside a recursive CTE body is not supported"
+        );
+    }
+
+    // The body must be a SetOperation { Union, .. }.
+    let (set_quantifier, left, right) = match *inner_query.body {
+        SetExpr::SetOperation {
+            op: SetOperator::Union,
+            set_quantifier,
+            left,
+            right,
+        } => (set_quantifier, left, right),
+        _ => {
+            bail_boundary_proto!(
+                "sql::recursive_cte::body",
+                "recursive CTE body must be anchor UNION ALL recursive_term"
+            );
+        }
+    };
+
+    let union_all = matches!(set_quantifier, SetQuantifier::All);
+
+    // Lower both legs with the CURRENT scope — the CTE's own name is NOT
+    // added, so the self-reference falls through CteScope-miss into an
+    // ordinary TableScan (or AliasedRelation { TableScan, alias }).
+    let anchor = lower_set_expr(*left, cte_scope)?;
+    let recursive_term = lower_set_expr(*right, cte_scope)?;
+
+    let node = CommonAst::new(CommonOp::RecursiveCte {
+        name: cte_name_lower.clone(),
+        column_names,
+        union_all,
+        anchor: Box::new(anchor),
+        recursive_term: Box::new(recursive_term),
+    });
+
+    // Register in scope — FROM <name> resolves to this node (cloned per ref,
+    // mirroring non-recursive CTE registration). Uses lowercase key, matching
+    // the non-recursive CTE convention.
+    let mut scope = cte_scope.clone();
+    scope.insert(cte_name_lower, node);
+    Ok(scope)
 }
 
 /// Synthesize `ORDER BY ALL` into one sort key per SELECT output column, each
@@ -5115,12 +5221,194 @@ mod tests {
     }
 
     #[test]
-    fn parse_recursive_cte_rejected() {
-        // WITH RECURSIVE is not inlinable (self-reference) — honest boundary.
+    fn parse_recursive_cte_non_union_body_rejected() {
+        // A recursive CTE whose body is a plain SELECT (not UNION ALL) is
+        // rejected as a boundary error — the body must be anchor UNION ALL
+        // recursive_term.
         assert_eq!(
             boundary_shape("WITH RECURSIVE r(n) AS (SELECT 1) SELECT * FROM r"),
-            "sql::recursive_cte"
+            "sql::recursive_cte::body"
         );
+    }
+
+    // ── Pass 18: WITH RECURSIVE lowering ──────────────────────────────────
+
+    #[test]
+    fn parse_recursive_cte_009_lowers_to_recursive_cte_with_self_ref_table_scan() {
+        // cte-009 shape: `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL
+        // SELECT n + 1 FROM seq WHERE n < 5) SELECT * FROM seq`.
+        // The self-reference (`FROM seq`) in the recursive term falls through
+        // CteScope-miss into a bare `TableScan { table: "seq" }`.
+        let plan = parse(
+            "WITH RECURSIVE seq(n) AS (\
+               SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5\
+             ) SELECT * FROM seq",
+        )
+        .expect("should parse recursive CTE");
+        // Top level: Project { AliasedRelation { RecursiveCte { .. }, "seq" } }
+        let body = expect_aliased(project_input(plan), "seq");
+        match body.op {
+            CommonOp::RecursiveCte {
+                ref name,
+                ref column_names,
+                union_all,
+                ref anchor,
+                ref recursive_term,
+            } => {
+                assert_eq!(name, "seq");
+                assert_eq!(column_names, &["n".to_owned()]);
+                assert!(union_all);
+                // Anchor is a Project over SingleRow (SELECT 1).
+                assert!(
+                    matches!(anchor.op, CommonOp::Project { .. }),
+                    "expected anchor Project, got {:?}",
+                    anchor.op
+                );
+                // Recursive term: Filter over Project over TableScan("seq").
+                // Drill into Filter → Project → input to find the self-ref.
+                fn find_table_scan(ast: &CommonAst) -> Option<&str> {
+                    if let CommonOp::TableScan { table, .. } = &ast.op {
+                        return Some(table);
+                    }
+                    for child in ast.op.children() {
+                        if let Some(t) = find_table_scan(child) {
+                            return Some(t);
+                        }
+                    }
+                    None
+                }
+                assert_eq!(
+                    find_table_scan(recursive_term),
+                    Some("seq"),
+                    "recursive term must contain a TableScan(seq) self-reference"
+                );
+            }
+            other => panic!("expected RecursiveCte, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_recursive_cte_010_lowers_with_join_self_ref() {
+        // cte-010 shape: `WITH RECURSIVE chain(id, name, manager_id, lvl) AS (
+        //   SELECT id, name, manager_id, 0 FROM emp WHERE manager_id IS NULL
+        //   UNION ALL
+        //   SELECT e.id, e.name, e.manager_id, c.lvl + 1
+        //   FROM emp e JOIN chain c ON e.manager_id = c.id
+        // ) SELECT * FROM chain`.
+        // The self-reference is `chain c` on the right side of the JOIN.
+        let plan = parse(
+            "WITH RECURSIVE chain(id, name, manager_id, lvl) AS (\
+               SELECT id, name, manager_id, 0 FROM emp WHERE manager_id IS NULL \
+               UNION ALL \
+               SELECT e.id, e.name, e.manager_id, c.lvl + 1 \
+               FROM emp e JOIN chain c ON e.manager_id = c.id\
+             ) SELECT * FROM chain",
+        )
+        .expect("should parse recursive CTE with join");
+        let body = expect_aliased(project_input(plan), "chain");
+        match body.op {
+            CommonOp::RecursiveCte {
+                ref name,
+                ref column_names,
+                union_all,
+                ref recursive_term,
+                ..
+            } => {
+                assert_eq!(name, "chain");
+                assert_eq!(
+                    column_names,
+                    &[
+                        "id".to_owned(),
+                        "name".to_owned(),
+                        "manager_id".to_owned(),
+                        "lvl".to_owned()
+                    ]
+                );
+                assert!(union_all);
+                // The recursive term's input (under the Project) is a Join.
+                // The right side of the Join should be AliasedRelation("c")
+                // wrapping TableScan("chain").
+                let inner = match &recursive_term.op {
+                    CommonOp::Project { input, .. } => input,
+                    other => panic!("expected Project in recursive term, got {other:?}"),
+                };
+                let (right, _) = match &inner.op {
+                    CommonOp::Join { right, left, .. } => (right, left),
+                    other => panic!("expected Join in recursive term, got {other:?}"),
+                };
+                // Right side: AliasedRelation { input: TableScan("chain"), alias: "c" }
+                match &right.op {
+                    CommonOp::AliasedRelation { input, alias } => {
+                        assert_eq!(alias, "c");
+                        assert!(
+                            matches!(&input.op, CommonOp::TableScan { table, .. } if table == "chain"),
+                            "expected TableScan(chain) under AliasedRelation, got {:?}",
+                            input.op
+                        );
+                    }
+                    other => panic!("expected AliasedRelation(c) on join right, got {other:?}"),
+                }
+            }
+            other => panic!("expected RecursiveCte, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_recursive_cte_multiple_ctes_rejected() {
+        // More than 1 CTE under a single WITH RECURSIVE is rejected.
+        assert_eq!(
+            boundary_shape(
+                "WITH RECURSIVE a(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM a WHERE n<5), \
+                 b(m) AS (SELECT 1 UNION ALL SELECT m+1 FROM b WHERE m<3) \
+                 SELECT * FROM a"
+            ),
+            "sql::recursive_cte::multiple"
+        );
+    }
+
+    #[test]
+    fn parse_recursive_cte_intersect_body_rejected() {
+        // A body using INTERSECT instead of UNION ALL is rejected.
+        assert_eq!(
+            boundary_shape(
+                "WITH RECURSIVE r(n) AS (\
+                   SELECT 1 INTERSECT SELECT n+1 FROM r WHERE n<5\
+                 ) SELECT * FROM r"
+            ),
+            "sql::recursive_cte::body"
+        );
+    }
+
+    #[test]
+    fn parse_recursive_cte_order_by_on_body_rejected() {
+        // ORDER BY on the CTE body's own query wrapper is rejected.
+        assert_eq!(
+            boundary_shape(
+                "WITH RECURSIVE r(n) AS (\
+                   SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<5 ORDER BY n\
+                 ) SELECT * FROM r"
+            ),
+            "sql::recursive_cte::modifier"
+        );
+    }
+
+    #[test]
+    fn parse_recursive_cte_plain_union_carries_union_all_false() {
+        // Bare UNION (without ALL) is NOT parser-rejected — it is carried as
+        // union_all: false and the analyzer rejects it.
+        let plan = parse(
+            "WITH RECURSIVE seq(n) AS (\
+               SELECT 1 UNION SELECT n + 1 FROM seq WHERE n < 5\
+             ) SELECT * FROM seq",
+        )
+        .expect("should parse (UNION without ALL)");
+        let body = expect_aliased(project_input(plan), "seq");
+        match body.op {
+            CommonOp::RecursiveCte { union_all, .. } => {
+                assert!(!union_all, "bare UNION must carry union_all=false");
+            }
+            other => panic!("expected RecursiveCte, got {other:?}"),
+        }
     }
 
     #[test]

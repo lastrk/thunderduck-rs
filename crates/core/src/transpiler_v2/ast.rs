@@ -507,6 +507,30 @@ pub enum CommonOp {
         columns: Vec<(String, Expression)>,
     },
 
+    /// `WITH RECURSIVE name(cols) AS (anchor UNION ALL recursive_term)
+    /// SELECT * FROM name` — a recursive CTE whose fixpoint is executed by
+    /// DuckDB. The self-reference inside `recursive_term` is an ordinary
+    /// `TableScan { table: name }` (not inlined — infinite expansion).
+    ///
+    /// `union_all = false` is carried from the parser but is an illegal state
+    /// for Spark (`UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE`); the analyzer rejects
+    /// it before constructing `TypedOp::RecursiveCte` (which drops the field).
+    RecursiveCte {
+        /// The CTE name (used in the emitted `WITH RECURSIVE` clause and
+        /// matches self-reference `TableScan` nodes in the recursive term).
+        name: String,
+        /// Explicit column-name list from `name(c1, c2, ...)`; empty = inherit
+        /// column names from the anchor's output schema.
+        column_names: Vec<String>,
+        /// `true` for `UNION ALL` (the only legal Spark form); `false` for
+        /// bare `UNION` (analyzer-rejected as Spark-emulated error).
+        union_all: bool,
+        /// The anchor leg — must not self-reference.
+        anchor: Box<CommonAst>,
+        /// The recursive leg — self-references are `TableScan { table: name }`.
+        recursive_term: Box<CommonAst>,
+    },
+
     // ── Join with first-class plan_ids (§2.3) ────────────────────────────
     /// A binary join.
     ///
@@ -574,6 +598,11 @@ macro_rules! common_op_children {
             | CommonOp::Sample { input, .. }
             | CommonOp::SampleBy { input, .. }
             | CommonOp::LateralView { input, .. } => vec![input.$as_child()],
+            CommonOp::RecursiveCte {
+                anchor,
+                recursive_term,
+                ..
+            } => vec![anchor.$as_child(), recursive_term.$as_child()],
             CommonOp::Join { left, right, .. } => vec![left.$as_child(), right.$as_child()],
             CommonOp::SetOp { children, .. } => children.$iter().collect(),
             // Leaves: no child *plan* to descend into. `TableFunction` /

@@ -228,6 +228,12 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             columns,
         } => render_lateral_view(input, table_alias, columns),
 
+        TypedOp::RecursiveCte {
+            name,
+            anchor,
+            recursive_term,
+        } => render_recursive_cte(name, anchor, recursive_term, schema),
+
         // ── future τ work owns (analyzer PuntedOperator today; defensive) ──────
         TypedOp::Unnest { .. } => Err(EmissionError::Unsupported {
             kind: UnsupportedKind::Op,
@@ -1027,6 +1033,30 @@ fn render_tail(input: &TypedAst, n: i64) -> Result<String, EmissionError> {
          SELECT * EXCLUDE (__td_row_num__) \
          FROM (SELECT *, ROW_NUMBER() OVER () AS __td_row_num__ FROM __td_child) \
          WHERE __td_row_num__ > (SELECT COUNT(*) FROM __td_child) - {n}"
+    ))
+}
+
+/// Render a `RecursiveCte`:
+/// `WITH RECURSIVE {name}({cols}) AS ({anchor_sql} UNION ALL {rec_sql}) SELECT * FROM {name}`.
+fn render_recursive_cte(
+    name: &str,
+    anchor: &TypedAst,
+    recursive_term: &TypedAst,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
+    let anchor_sql = dispatch_op(&anchor.op, &anchor.resolved_schema)?;
+    let recursive_sql = dispatch_op(&recursive_term.op, &recursive_term.resolved_schema)?;
+
+    let quoted_name = quote_ident(name);
+    let col_list: String = schema
+        .fields
+        .iter()
+        .map(|f| quote_ident(&f.name).into_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Ok(format!(
+        "WITH RECURSIVE {quoted_name}({col_list}) AS ({anchor_sql} UNION ALL {recursive_sql}) SELECT * FROM {quoted_name}"
     ))
 }
 
@@ -11890,6 +11920,84 @@ mod tests {
         assert!(
             sql.contains("LATERAL"),
             "must contain LATERAL keyword, got: {sql}"
+        );
+    }
+
+    // ── Pass 18: RecursiveCte emission tests ──────────────────────────────
+
+    /// Full pipeline (lower→analyze→dispatch) for cte-009.
+    #[test]
+    fn render_recursive_cte_009_full_pipeline() {
+        use crate::parser_v2::SparkSqlParserV2;
+        let sql_input = "WITH RECURSIVE seq(n) AS (\
+            SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5\
+        ) SELECT * FROM seq";
+        let ast = SparkSqlParserV2::parse(sql_input).expect("parse cte-009");
+        // The self-reference `seq` in the recursive term is a TableScan that
+        // needs a BaseTypes entry — but here it resolves via the injected entry
+        // inside analyze_recursive_cte, so empty base_types suffices.
+        let bt = BaseTypes::empty();
+        let sql = generate(&ast, &bt).expect("generate cte-009");
+        // The outer query wraps RecursiveCte in AliasedRelation:
+        // `SELECT * FROM (WITH RECURSIVE seq(n) AS (...) SELECT * FROM seq) AS seq`
+        assert!(
+            sql.contains("WITH RECURSIVE seq(n) AS ("),
+            "must contain WITH RECURSIVE seq(n) AS (, got: {sql}"
+        );
+        assert!(
+            sql.contains("UNION ALL"),
+            "must contain UNION ALL, got: {sql}"
+        );
+        // The inner `SELECT * FROM seq` terminates the WITH RECURSIVE CTE.
+        assert!(
+            sql.contains("SELECT * FROM seq"),
+            "must contain SELECT * FROM seq, got: {sql}"
+        );
+    }
+
+    /// Full pipeline (lower→analyze→dispatch) for cte-010.
+    #[test]
+    fn render_recursive_cte_010_full_pipeline() {
+        use crate::parser_v2::SparkSqlParserV2;
+        let sql_input = "WITH RECURSIVE chain(id, name, manager_id, lvl) AS (\
+            SELECT id, name, manager_id, 0 FROM emp WHERE manager_id IS NULL \
+            UNION ALL \
+            SELECT e.id, e.name, e.manager_id, c.lvl + 1 \
+            FROM emp e JOIN chain c ON e.manager_id = c.id\
+        ) SELECT * FROM chain";
+        let ast = SparkSqlParserV2::parse(sql_input).expect("parse cte-010");
+        // emp schema needs `manager_id` column for cte-010.
+        let emp_schema_m = StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("manager_id", DataType::Integer),
+            StructField::nullable("salary", DataType::Double),
+        ]);
+        let plan = scan("emp");
+        let bt = BaseTypes::build_from_plan(&plan, |name| match name {
+            "emp" => Some(emp_schema_m.clone()),
+            _ => None,
+        });
+        let sql = generate(&ast, &bt).expect("generate cte-010");
+        // Assert the WITH RECURSIVE template shape.
+        assert!(
+            sql.contains("WITH RECURSIVE chain(id, name, manager_id, lvl) AS ("),
+            "must contain WITH RECURSIVE chain(id, name, manager_id, lvl) AS (, got: {sql}"
+        );
+        assert!(
+            sql.contains("UNION ALL"),
+            "must contain UNION ALL, got: {sql}"
+        );
+        assert!(
+            sql.contains("SELECT * FROM chain"),
+            "must contain SELECT * FROM chain, got: {sql}"
+        );
+        // The join-form self-reference: `chain` appears in the recursive SQL
+        // as a table reference (not inlined).
+        let after_union = sql.split("UNION ALL").nth(1).expect("text after UNION ALL");
+        assert!(
+            after_union.contains("chain"),
+            "recursive term must reference `chain`, got after UNION ALL: {after_union}"
         );
     }
 }

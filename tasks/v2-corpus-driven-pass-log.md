@@ -1888,4 +1888,75 @@ Gate green (823 unit tests, zero new clippy warnings in the touched regions). Co
 - **Diagnostic:** `.agent-output/diagnostic-pass-17.md` · **Architecture:** `.agent-output/architecture-pass-17.md`
 - **Remaining:** only cte-009/cte-010 (WITH RECURSIVE) are real fixable cases; sq-011/012/013/016 +
   pv-006 (5 total) confirmed invalid Spark SQL on the 4.1.1 pin. Ceiling 265/270.
+
+## Pass 18 — cte-009/cte-010 (263→265)
+
+- **Case(s):** cte-009 `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<5)
+  SELECT * FROM seq`; cte-010 `WITH RECURSIVE chain(id,name,manager_id,lvl) AS (anchor UNION ALL
+  SELECT e.id,e.name,e.manager_id,c.lvl+1 FROM emp e JOIN chain c ON e.manager_id=c.id) SELECT * FROM
+  chain`.
+- **Root cause:** deliberate existing boundary bail — `sql::recursive_cte: WITH RECURSIVE not
+  supported` (v2_lowering.rs). Verified live: Spark 4.1.1 and DuckDB support identical
+  `name(cols) AS (anchor UNION ALL recursive_term)` syntax with identical rows/types for both corpus
+  cases; existing CTE inlining (`CteScope`) can't be reused since a self-referencing body would inline
+  infinitely — recursion must survive to emitted SQL as a genuine `WITH RECURSIVE` and let DuckDB run
+  the fixpoint (ADR-001/ADR-008-adjacent transliteration).
+- **Fix:** new `CommonOp::RecursiveCte { name, column_names, union_all, anchor, recursive_term }`
+  (ADR-003 irreducible — pass-11 `LateralView` precedent, not an escalation), registered in `CteScope`
+  and cloned at each `FROM name` reference like any non-recursive CTE. Parser: `lower_recursive_with`
+  splits sqlparser's pre-split `SetExpr::SetOperation{op:Union, left, right}` into anchor/recursive_term
+  with no FROM-clause inspection needed; self-reference falls through `CteScope`-miss into an ordinary
+  `TableScan{name}` (or aliased, for cte-010's `JOIN chain c`) — no structural self-ref check needed.
+  Boundary guards (ADR-022 cat-2): multiple recursive CTEs, non-`SetOperation` body, ORDER BY/LIMIT
+  modifiers. Plain `UNION` (not `ALL`) carried through as `union_all: bool` into the analyzer as a
+  Spark-emulated reject (`UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE`) since `EmissionError` is boundary-only
+  by design. Analyzer: new `analyze_recursive_cte` — two-phase anchor-first: (a) analyze anchor; (b)
+  rename its schema positionally by `column_names`; (c) `BaseTypes::with_entry` (pass-11 plumbing,
+  clone+insert) injects the CTE schema so the self-reference resolves through the *existing* unchanged
+  `TableScan` arm — zero new resolution code; (d) analyze recursive term against the augmented types;
+  (e) reuse `push_setop_casts` to pin the recursive leg's types to the anchor's (anchor-directional, not
+  bidirectional widening — Spark's `UnionLoop.output` = anchor output). Emission: `render_recursive_cte`
+  produces `WITH RECURSIVE {name}({cols}) AS ({anchor_sql} UNION ALL {rec_sql}) SELECT * FROM {name}`.
+- **Reviewer-caught Medium (fixed in-pass):** `BaseTypes::with_entry` only inserted the lowercase CTE
+  name key, but a self-reference `TableScan.table` preserves source case and `BaseTypes::lookup` is
+  case-sensitive — spurious `UnknownTable` (or worse, silent mis-resolution against a same-uppercase
+  catalog table) for non-lowercase CTE names like `WITH RECURSIVE Chain(...) ... JOIN Chain c`. Fixed
+  with new `self_ref_table_names`/`collect_self_ref_names` helpers that detect case-variant self-
+  reference names in the recursive term and inject additional exact-case `BaseTypes` entries.
+  Nullability rule needed **two rounds of empirical correction post-implementation**, both found by
+  running the real dual-corpus acceptance (not by construction — this pipeline's discipline of trusting
+  the differential oracle over assumption paid off here):
+  - **Round 1 (wrong):** initial architecture adopted "anchor-defined nullability" (`UnionLoop.output` =
+    anchor's own schema, non-nullable if the anchor's literal is non-nullable). The corpus run threw
+    `Schema mismatch: Column 'n'/'lvl': nullable mismatch - Reference=True, Test=False` — Spark marks
+    both anchor-non-nullable columns as nullable.
+  - **Round 2 (also wrong):** switched to "always nullable=true unconditionally" per the architecture's
+    documented fallback. cte-009 flipped green, but cte-010 then failed on `id`:
+    `Reference=False, Test=True` — Spark does NOT mark every recursive-CTE column nullable.
+  - **Round 3 (correct, empirically confirmed against both cases):** the self-reference relation's
+    schema (what a `TableScan` resolving `FROM seq` / `JOIN chain c` sees) is **forced nullable on every
+    field**, independent of the anchor's own nullability — modeling that the recursive relation's values
+    are fixed-point-uncertain across iterations. The CTE's own **output** nullability is then the
+    standard UNION ALL OR-fold across the anchor leg and the recursive-term leg (same pairwise-OR rule
+    `widen_by_name` already uses for ordinary set operations), captured *before* `push_setop_casts`
+    overwrites `typed_recursive.resolved_schema` with the anchor-cast schema. This correctly predicts
+    cte-009's `n` (self-ref `n` forced nullable → `n+1` nullable → OR-fold with anchor's non-nullable
+    `1` → **true**) AND cte-010's `id` (both legs source the real `emp.id` NOT NULL column, untouched by
+    the self-ref override → OR-fold false||false → **false**) AND cte-010's `lvl` (recursive leg reads
+    the self-ref `c.lvl`, forced nullable → OR-fold with anchor's non-nullable `0` → **true**) in one
+    pass, with zero further live-Spark queries needed once the rule was stated correctly.
+- **ADRs:** ADR-003 (new node, irreducible), ADR-001/ADR-008-adjacent (transliterate, DuckDB iterates —
+  no unroll/rewrite), ADR-015 (Spark-parity nullability derived empirically, not assumed), ADR-022
+  (parser boundary errors for structural gaps; analyzer Spark-emulated for UNION-not-ALL/arity). INV7
+  unaffected (SQL-front-end-only). INV10 trivially satisfied (schema is statically derivable from the
+  anchor — no session/runtime pre-pass, unlike gotcha-11's data-dependent pivot schema).
+- **Findings closed:** reviewer Critical=0 High=0 (1 Medium, fixed — case-mismatched self-reference
+  `BaseTypes` lookup); perf High=0 Medium=0.
+- **Before→after:** SQL 263 → 265 passed (270 total), +2, no regression. DataFrame 329/329.
+- **Tests:** 18 tests (4 lowering incl. 3 boundary-guard arms, 8 analyzer incl. case-mismatch self-ref +
+  shadowing + the OR-fold nullability lock for both cases, 2 emission full-pipeline snapshots, plus the
+  pre-existing UNION-without-ALL/arity-mismatch guard tests).
+- **Diagnostic:** `.agent-output/diagnostic-pass-18.md` · **Architecture:** `.agent-output/architecture-pass-18.md`
+- **Remaining:** none — all real fixable cases resolved. sq-011/012/013/016 + pv-006 (5 total) confirmed
+  invalid Spark SQL on the 4.1.1 pin; 265/270 is the achievable ceiling on the current corpus as authored.
 - **SHA-to-be:** feat(v2-corpus): pass 17 — tbl-005 (262→263)

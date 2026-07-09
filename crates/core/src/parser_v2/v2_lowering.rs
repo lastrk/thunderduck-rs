@@ -261,16 +261,6 @@ fn lower_set_expr(body: SetExpr, cte_scope: &CteScope) -> Result<CommonAst, Emis
     }
 }
 
-/// Fold `lateral_views` into the plan tree — each `LATERAL VIEW [OUTER]
-/// generator(arg) table_alias AS col1[, col2]` becomes a
-/// [`CommonOp::LateralView`] wrapping `base`.
-///
-/// Dispatch table (generator name lowercased, alias count):
-/// - `explode` / `explode_outer`, 1 alias → single-column LateralView
-/// - `posexplode`, 2 aliases → split into `posexplode_pos` + `posexplode_val`
-/// - Chained (2+) LATERAL VIEWs → boundary error
-/// - OUTER posexplode → boundary error (no CASE-wrapped pos/val renderer)
-/// - Everything else (wrong alias count, unknown generator, non-1-arg) → boundary error
 /// Dispatch table mapping a generator function name + outer flag + column aliases
 /// to the `(alias, FunctionCall)` column pairs consumed by `CommonOp::LateralView`.
 ///
@@ -283,19 +273,18 @@ fn generator_view_columns(
     arg: Expression,
     aliases: Vec<String>,
 ) -> Result<Vec<(String, Expression)>, EmissionError> {
+    // `explode` + OUTER and `explode_outer` emit the same shape — normalize once
+    // here so the match below needs only a single arm for it.
+    let gen_name = if outer && gen_name == "explode" {
+        "explode_outer"
+    } else {
+        gen_name
+    };
     match gen_name {
-        "explode" if !outer && aliases.len() == 1 => Ok(vec![(
+        "explode" if aliases.len() == 1 => Ok(vec![(
             aliases.into_iter().next().expect("len checked == 1"),
             Expression::FunctionCall(FunctionCall {
                 name: "explode".to_owned(),
-                args: vec![arg],
-                distinct: false,
-            }),
-        )]),
-        "explode" if outer && aliases.len() == 1 => Ok(vec![(
-            aliases.into_iter().next().expect("len checked == 1"),
-            Expression::FunctionCall(FunctionCall {
-                name: "explode_outer".to_owned(),
                 args: vec![arg],
                 distinct: false,
             }),
@@ -352,6 +341,17 @@ fn generator_view_columns(
     }
 }
 
+/// Fold `lateral_views` into the plan tree — each `LATERAL VIEW [OUTER]
+/// generator(arg) table_alias AS col1[, col2]` becomes a
+/// [`CommonOp::LateralView`] wrapping `base`.
+///
+/// Dispatch table (generator name lowercased, alias count), via
+/// [`generator_view_columns`]:
+/// - `explode` / `explode_outer`, 1 alias → single-column LateralView
+/// - `posexplode`, 2 aliases → split into `posexplode_pos` + `posexplode_val`
+/// - Chained (2+) LATERAL VIEWs → boundary error
+/// - OUTER posexplode → boundary error (no CASE-wrapped pos/val renderer)
+/// - Everything else (wrong alias count, unknown generator, non-1-arg) → boundary error
 fn lower_lateral_views(
     base: CommonAst,
     lateral_views: Vec<LateralView>,

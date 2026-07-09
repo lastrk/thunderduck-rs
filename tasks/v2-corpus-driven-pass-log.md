@@ -1769,3 +1769,27 @@ Gate green (core 778, connect-server 97 unit tests). Corpora unchanged: SQL 254/
 - **Before→after:** SQL 260 → 261 passed (270 total), +1, no regression. DataFrame 329/329.
 - **Diagnostic:** `.agent-output/diagnostic-pass-14.md` · **Architecture:** `.agent-output/architecture-pass-14.md`
 - **SHA-to-be:** feat(v2-corpus): pass 14 — pv-002 (260→261)
+
+## Pass 15 — tech-debt sweep (261→261, behavior-preserving)
+
+rust-reviewer swept the code touched by passes 11-14; 4 trivial/low findings applied (no Critical/
+High). Applied: (1) fixed a doc-comment merge bug from pass 12's extraction — `lower_lateral_views`'s
+doc block had been accidentally left stacked onto `generator_view_columns` (and vice versa was
+undocumented), which was also the source of 2 new clippy `doc_lazy_continuation` warnings; relocated
+each doc to its actual owner, clearing both warnings; (2) `SparkDialect::default()` → `SparkDialect`
+in the new `rewrite_multi_aliases` (pass 12) — the sibling occurrence in the pre-existing
+`strip_trailing_multi_alias` is baseline and left untouched; (3) refreshed `analyze_table_function`'s
+doc to describe the explode/explode_outer arm added in pass 13 (was stale, still read "explode(...)
+land here until τ implements them" after explode WAS implemented), and removed an adjacent stray
+wrong-function doc fragment while touching this block; (4) collapsed two byte-identical
+`explode`+OUTER / `explode_outer` match arms in `generator_view_columns` into one, via a name
+normalization at the top of the function — test-covered by `lateral_view_outer_folds_to_explode_outer`
+and both comma-LATERAL convergence tests from passes 11-13.
+Confirmed pass 13's `lower_lateral_generator_item` genuinely reuses the pass-12
+`generator_view_columns` helper (no third reimplementation of generator dispatch) — no action needed.
+Deliberately NOT pursued (informational only): consolidating the 3 generator-dispatch call sites
+(LATERAL VIEW / comma-LATERAL / multi-alias splice / bare TVF) into one module — the reviewer confirmed
+each guards genuinely different output shapes (array-append vs map key/val select-items vs single-`col`
+TVF), so the spread is justified, not duplication.
+Gate green (823 unit tests, zero new clippy warnings in the touched regions). Corpora unchanged: SQL
+261/9/270, DataFrame 329/329 (verified — touches v2_lowering.rs/analyzer.rs generator dispatch logic).

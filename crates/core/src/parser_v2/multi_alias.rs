@@ -221,7 +221,7 @@ pub(super) fn rewrite_multi_aliases(
         return Ok((sql.to_owned(), Vec::new()));
     }
 
-    let dialect = SparkDialect::default();
+    let dialect = SparkDialect;
     let tokens =
         Tokenizer::new(&dialect, sql)
             .tokenize()

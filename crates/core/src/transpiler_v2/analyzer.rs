@@ -2464,16 +2464,17 @@ fn resolve_boolean_predicate(
     Ok(resolved)
 }
 
-/// Resolve every `UnresolvedColumn` in `expr` against `schema` and stamp
-/// resolved `ColumnReference`s with `data_type` and `nullable`.
 /// Analyze a table-valued function call. Arguments resolve against an empty
 /// schema — Spark's TVF arguments must be foldable constants, so a bare column
 /// ref correctly fails `UnknownColumn`. `range(end)` / `range(start, end)` /
 /// `range(start, end, step)` / `range(start, end, step, numPartitions)` (arity
 /// 1..=4) resolves to a single non-nullable `id: Long` column, end-exclusive
-/// (ADR-005; Spark 4.1.1 `range`). Any other TVF — or `range` with the wrong
-/// arity — is an honest Thunderduck boundary (`PuntedOperator`, ADR-022);
-/// `explode(...)` and friends land here until τ implements them.
+/// (ADR-005; Spark 4.1.1 `range`). `explode`/`explode_outer` over a resolved
+/// `Array` argument (exactly 1 arg) resolves to a single `col` column typed/
+/// nulled via the shared `Expression::data_type`/`nullable` arms (same logic
+/// SELECT-position explode already uses — not duplicated here). Any other TVF,
+/// `range` with the wrong arity, or `explode` over a non-`Array` argument is an
+/// honest Thunderduck boundary (`PuntedOperator`, ADR-022).
 fn analyze_table_function(
     name: String,
     args: Vec<Expression>,

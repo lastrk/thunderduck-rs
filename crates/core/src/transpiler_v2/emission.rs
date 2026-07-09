@@ -390,6 +390,15 @@ pub fn build_file_reader_sql(
                 "ORC file scanning is not supported by DuckDB"
             );
         }
+        FileFormat::Delta => {
+            if paths.len() > 1 {
+                bail_boundary_op!(
+                    "FileScan[Delta]",
+                    "Delta Lake tables are a single directory; multiple paths are not supported"
+                );
+            }
+            "delta_scan"
+        }
     };
     let opts_sql = if options.is_empty() {
         String::new()
@@ -7919,6 +7928,38 @@ mod tests {
         let sql = build_file_reader_sql(FileFormat::Csv, &["/data/test.csv".to_owned()], &[])
             .expect("build");
         assert_eq!(sql, "read_csv('/data/test.csv')");
+    }
+
+    #[test]
+    fn build_file_reader_sql_delta_single_path() {
+        let sql =
+            build_file_reader_sql(FileFormat::Delta, &["/tmp/x".to_owned()], &[]).expect("build");
+        assert_eq!(sql, "delta_scan('/tmp/x')");
+    }
+
+    #[test]
+    fn build_file_reader_sql_delta_multi_path_errors() {
+        let result = build_file_reader_sql(
+            FileFormat::Delta,
+            &["/tmp/a".to_owned(), "/tmp/b".to_owned()],
+            &[],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn render_file_scan_delta_emits_select_star_from_delta_scan() {
+        let _g = tap_guard();
+        let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
+        let ast = CommonAst::new(CommonOp::FileScan {
+            format: FileFormat::Delta,
+            paths: vec!["/tmp/x".to_owned()],
+            schema: Some(schema),
+            options: vec![],
+        });
+        let typed = analyze(ast, &BaseTypes::empty()).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(sql, "SELECT * FROM delta_scan('/tmp/x')");
     }
 
     #[test]

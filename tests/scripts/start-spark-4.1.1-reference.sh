@@ -22,6 +22,13 @@ SPARK_DRIVER_MEMORY="${SPARK_DRIVER_MEMORY:-4g}"
 SPARK_MASTER="${SPARK_MASTER:-local[*]}"
 SPARK_AQE_ENABLED="${SPARK_AQE_ENABLED:-false}"
 SPARK_BROADCAST_THRESHOLD="${SPARK_BROADCAST_THRESHOLD:--1}"
+# Delta Lake on the reference server: enables read/write `.format("delta")`,
+# `delta.`path`` SQL, and `MERGE INTO` over Spark Connect. delta-spark 4.3.0 is
+# built on Spark 4.1 (Scala 2.13). This is the reference oracle for the Delta
+# corpus (differential/test_delta_corpus_differential.py); the τ-side extension
+# is the separate cross-repo dev loop (docs/context/delta-cross-repo-dev-loop.md).
+# First launch downloads the jars from Maven (network). Override to re-pin.
+DELTA_SPARK_PACKAGE="${DELTA_SPARK_PACKAGE:-io.delta:delta-spark_4.1_2.13:4.3.0}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -83,6 +90,9 @@ fi
 "$SPARK_HOME/sbin/start-connect-server.sh" \
     --master "${SPARK_MASTER}" \
     --driver-memory ${SPARK_DRIVER_MEMORY} \
+    --packages "${DELTA_SPARK_PACKAGE}" \
+    --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+    --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
     --conf spark.driver.host=localhost \
     --conf spark.driver.bindAddress=127.0.0.1 \
     --conf spark.connect.grpc.binding.port=${SPARK_PORT} \

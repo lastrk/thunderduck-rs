@@ -1824,6 +1824,7 @@ fn classify_file_format(
         Some("csv") | Some("text") => Some(FileFormat::Csv),
         Some("json") => Some(FileFormat::Json),
         Some("orc") => Some(FileFormat::Orc),
+        Some("delta") => Some(FileFormat::Delta),
         Some("") | None => None,
         Some(other) => {
             bail_boundary_proto!(

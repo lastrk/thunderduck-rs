@@ -35,7 +35,7 @@ use sqlparser::ast::{
 
 use crate::bail_boundary_proto;
 use crate::transpiler_v2::ast::{
-    CommonAst, CommonOp, GroupingKind, JoinType, PivotGrouping, SetOpKind, UnpivotIds,
+    CommonAst, CommonOp, FileFormat, GroupingKind, JoinType, PivotGrouping, SetOpKind, UnpivotIds,
 };
 use crate::transpiler_v2::error::UnsupportedKind;
 use crate::transpiler_v2::expression::{
@@ -1928,6 +1928,38 @@ fn lower_table_factor(
             ..
         } => match args {
             None => {
+                // Spark's `<format>.`path`` table syntax: a 2-part ObjectName
+                // whose first part (case-insensitive) is a file-format keyword
+                // and whose second part is the filesystem path → FileScan.
+                // Examples: `delta.`/tmp/t``, `parquet.`/data/f.parquet``.
+                if name.0.len() == 2 {
+                    let parts: Vec<&sqlparser::ast::ObjectNamePart> = name.0.iter().collect();
+                    if let (
+                        ObjectNamePart::Identifier(format_ident),
+                        ObjectNamePart::Identifier(path_ident),
+                    ) = (parts[0], parts[1])
+                    {
+                        let fmt_lower = format_ident.value.to_ascii_lowercase();
+                        let file_format = match fmt_lower.as_str() {
+                            "delta" => Some(FileFormat::Delta),
+                            "parquet" => Some(FileFormat::Parquet),
+                            "json" => Some(FileFormat::Json),
+                            "csv" => Some(FileFormat::Csv),
+                            "orc" => Some(FileFormat::Orc),
+                            _ => None,
+                        };
+                        if let Some(format) = file_format {
+                            let scan = CommonAst::new(CommonOp::FileScan {
+                                format,
+                                paths: vec![path_ident.value.clone()],
+                                schema: None,
+                                options: vec![],
+                            });
+                            return apply_table_alias(scan, alias);
+                        }
+                    }
+                }
+
                 let table = object_name_to_string(&name);
                 // A single-part name matching a CTE in scope inlines the CTE
                 // body (Spark: a CTE shadows a catalog table of the same name).
@@ -8170,6 +8202,46 @@ mod tests {
                 assert_eq!(join_type, JoinType::Cross, "comma fold uses Cross");
             }
             other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delta_backtick_path_lowers_to_file_scan() {
+        // `SELECT * FROM delta.`/tmp/t`` → Project { FileScan { Delta, ["/tmp/t"] } }
+        let plan = parse("SELECT * FROM delta.`/tmp/t`").expect("should parse");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        match input.op {
+            CommonOp::FileScan {
+                format,
+                ref paths,
+                ref schema,
+                ..
+            } => {
+                assert_eq!(format, FileFormat::Delta);
+                assert_eq!(paths, &["/tmp/t".to_owned()]);
+                assert!(schema.is_none(), "schema should be None (discovered later)");
+            }
+            other => panic!("expected FileScan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parquet_backtick_path_lowers_to_file_scan() {
+        // Also test the parquet variant of the same syntax.
+        let plan = parse("SELECT * FROM parquet.`/data/f.parquet`").expect("should parse");
+        let CommonOp::Project { input, .. } = plan.op else {
+            panic!("expected Project");
+        };
+        match input.op {
+            CommonOp::FileScan {
+                format, ref paths, ..
+            } => {
+                assert_eq!(format, FileFormat::Parquet);
+                assert_eq!(paths, &["/data/f.parquet".to_owned()]);
+            }
+            other => panic!("expected FileScan, got {other:?}"),
         }
     }
 }

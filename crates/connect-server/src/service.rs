@@ -111,7 +111,7 @@ async fn relation_to_common_ast_with_session(
 /// it into DuckDB SQL + resolved schema via τ.
 ///
 /// Runs the eager data-dependent-schema discovery pass ([`resolve_implicit_pivots`]
-/// — values-less pivot/crosstab, schema-less Parquet `FileScan`) before
+/// — values-less pivot/crosstab, schema-less Parquet/Delta `FileScan`) before
 /// `finalize`, exactly like the `execute_plan`/`analyze_plan` Root-relation
 /// arms — this is the shared entry point for the `Command` arms
 /// (`CreateDataframeView`, `SqlCommand`, `WriteOperation`) that don't inline
@@ -272,22 +272,21 @@ async fn resolve_implicit_pivots(
         );
     }
 
-    // If THIS node is a schema-less Parquet FileScan, discover the schema from
-    // the live session via `SELECT * FROM read_parquet(...) LIMIT 0` and stamp
-    // the `schema` field to `Some(inferred)`. This is the same pattern as the
-    // pivot/crosstab arms above: a data-dependent schema that τ's pure
-    // synchronous analyzer (INV10) cannot resolve on its own.
-    //
-    // Only Parquet is handled — Csv/Json/Orc schema-less remain as
-    // `PuntedOperator` boundary errors until implemented.
+    // If THIS node is a schema-less FileScan (Parquet or Delta), discover the
+    // schema from the live session via `SELECT * FROM <reader>(...) LIMIT 0`
+    // and stamp the `schema` field to `Some(inferred)`. This is the same
+    // pattern as the pivot/crosstab arms above: a data-dependent schema that
+    // τ's pure synchronous analyzer (INV10) cannot resolve on its own.
     if let CommonOp::FileScan {
-        format: thunderduck_core::transpiler_v2::ast::FileFormat::Parquet,
+        format:
+            format @ (thunderduck_core::transpiler_v2::ast::FileFormat::Parquet
+            | thunderduck_core::transpiler_v2::ast::FileFormat::Delta),
         paths,
         schema: schema @ None,
         options,
     } = &mut ast.op
     {
-        let inferred = discover_parquet_schema(paths, options, session).await?;
+        let inferred = discover_file_schema(*format, paths, options, session).await?;
         *schema = Some(inferred);
     }
 
@@ -351,29 +350,26 @@ async fn discover_pivot_values(
     Ok(values)
 }
 
-/// Discover the schema of a Parquet file (or file set) by executing a
-/// zero-row `SELECT * FROM read_parquet(...) LIMIT 0` against the live
-/// session. DuckDB returns an empty `RecordBatch` whose Arrow schema is the
-/// file's inferred schema; we convert that to τ's `StructType`.
+/// Discover the schema of a file-backed relation by executing a zero-row
+/// `SELECT * FROM <reader>(...) LIMIT 0` against the live session. DuckDB
+/// returns an empty `RecordBatch` whose Arrow schema is the file's inferred
+/// schema; we convert that to τ's `StructType`.
 ///
+/// Supports Parquet (`read_parquet`) and Delta Lake (`delta_scan`).
 /// This is the data-dependent discovery half of the schema-less FileScan
 /// support — same architectural pattern as [`discover_pivot_values`].
 // `Status` is the standard gRPC error channel across this file; boxing it
 // here alone would be inconsistent (see `relation_to_common_ast`).
 #[allow(clippy::result_large_err)]
-async fn discover_parquet_schema(
+async fn discover_file_schema(
+    format: thunderduck_core::transpiler_v2::ast::FileFormat,
     paths: &[String],
     options: &[(String, String)],
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
 ) -> Result<StructType, Status> {
-    use thunderduck_core::transpiler_v2::ast::FileFormat;
-
-    let reader_call = thunderduck_core::transpiler_v2::emission::build_file_reader_sql(
-        FileFormat::Parquet,
-        paths,
-        options,
-    )
-    .map_err(|e| Status::from(ConnectError::from(e)))?;
+    let reader_call =
+        thunderduck_core::transpiler_v2::emission::build_file_reader_sql(format, paths, options)
+            .map_err(|e| Status::from(ConnectError::from(e)))?;
     let discovery_sql = format!("SELECT * FROM {reader_call} LIMIT 0");
 
     let batches = session
@@ -385,7 +381,7 @@ async fn discover_parquet_schema(
     // rows) whose schema reflects the file's columns. If DuckDB returns no
     // batches at all (shouldn't happen), surface a clear error.
     let arrow_schema = batches.first().map(|b| b.schema()).ok_or_else(|| {
-        Status::internal("discover_parquet_schema: DuckDB returned no batches for LIMIT 0 query")
+        Status::internal("discover_file_schema: DuckDB returned no batches for LIMIT 0 query")
     })?;
 
     let fields = arrow_schema
@@ -664,8 +660,8 @@ async fn handle_command(
                 .input
                 .take()
                 .ok_or_else(|| Status::invalid_argument("WriteOperation missing input"))?;
-            let (common_ast, _sql, _schema) = transpile_relation(session, &input_rel).await?;
-            handle_write_operation(session, session_id, operation_id, &common_ast, &write_cmd).await
+            let (_common_ast, sql, _schema) = transpile_relation(session, &input_rel).await?;
+            handle_write_operation(session, session_id, operation_id, &sql, &write_cmd).await
         }
         _ => Err(Status::unimplemented("Unsupported command type")),
     }
@@ -1256,15 +1252,133 @@ async fn handle_sql_create_temp_view(
 
 /// Handle `WriteOperation` after successful transpile.
 ///
-/// **future τ work (owner):** external write path over `CommonAst`.
+/// Dispatches on `(format, mode, save_type)`:
+/// - `(delta, Append, Path)` → ATTACH + INSERT INTO the pre-existing Delta table.
+/// - `(parquet, Overwrite, Path)` → `COPY (<sql>) TO '<path>' (FORMAT parquet)`.
+/// - `(delta, Overwrite|ErrorIfExists|Ignore, *)` → typed rejection (ADR-017).
+/// - everything else → `Status::unimplemented`.
 async fn handle_write_operation(
-    _session: &Arc<thunderduck_core::runtime::DuckDbSession>,
-    _session_id: &str,
-    _operation_id: &str,
-    _common_ast: &CommonAst,
-    _write_cmd: &proto::WriteOperation,
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    session_id: &str,
+    operation_id: &str,
+    source_sql: &str,
+    write_cmd: &proto::WriteOperation,
 ) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
-    Err(Status::unimplemented("WriteOperation over CommonAst"))
+    use proto::write_operation::{SaveMode, SaveType};
+
+    let format = write_cmd
+        .source
+        .as_deref()
+        .unwrap_or("parquet")
+        .to_ascii_lowercase();
+    let mode = SaveMode::try_from(write_cmd.mode).unwrap_or(SaveMode::Unspecified);
+    let path = match &write_cmd.save_type {
+        Some(SaveType::Path(p)) => p.as_str(),
+        Some(SaveType::Table(_)) => {
+            return Err(Status::unimplemented(
+                "WriteOperation with SaveType::Table is not supported in Thunderduck",
+            ));
+        }
+        None => {
+            return Err(Status::invalid_argument(
+                "WriteOperation missing save_type (path or table)",
+            ));
+        }
+    };
+
+    match (format.as_str(), mode) {
+        // ── Delta append into a pre-existing table (ADR-017) ────────────
+        ("delta", SaveMode::Append) => {
+            write_delta_append(session, session_id, operation_id, source_sql, path).await
+        }
+
+        // ── Parquet overwrite (single-file COPY) ────────────────────────
+        ("parquet", SaveMode::Overwrite) => {
+            write_parquet_overwrite(session, session_id, operation_id, source_sql, path).await
+        }
+
+        // ── Delta typed rejections (ADR-017 gated) ──────────────────────
+        ("delta", SaveMode::Overwrite) => Err(Status::unimplemented(
+            "ADR-017: delta overwrite needs delete/truncate in duckdb-delta; \
+             revisit when it ships delete",
+        )),
+        ("delta", SaveMode::ErrorIfExists) => Err(Status::unimplemented(
+            "ADR-017: CREATE-on-write DDL is duckdb-delta future work; \
+             revisit when confirmed in a pinned build",
+        )),
+        ("delta", SaveMode::Ignore) => Err(Status::unimplemented(
+            "ADR-017: CREATE-on-write DDL is duckdb-delta future work; \
+             revisit when confirmed in a pinned build",
+        )),
+
+        // ── Catch-all ───────────────────────────────────────────────────
+        _ => Err(Status::unimplemented(format!(
+            "WriteOperation format={format}, mode={} is not supported in Thunderduck",
+            mode.as_str_name(),
+        ))),
+    }
+}
+
+/// Delta append: ATTACH the Delta table, INSERT INTO, DETACH.
+///
+/// INV9: a writable Delta table is reached via an ATTACH, never a path-scan.
+/// ADR-017: one Spark write action → one DuckDB transaction → one Delta version.
+///
+/// The ATTACH alias `__td_dw` is session-scoped and deterministic — within a
+/// single DuckDB connection there is no concurrency (the session thread
+/// serializes commands).
+async fn write_delta_append(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    session_id: &str,
+    operation_id: &str,
+    source_sql: &str,
+    path: &str,
+) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
+    let escaped_path = path.replace('\'', "''");
+    let attach_sql = format!("ATTACH '{escaped_path}' AS __td_dw (TYPE delta)");
+    let insert_sql = format!("INSERT INTO __td_dw.main.__td_dw {source_sql}");
+    let detach_sql = "DETACH __td_dw";
+
+    // ATTACH the Delta table.
+    session
+        .execute(&attach_sql)
+        .await
+        .map_err(|e| Status::internal(format!("delta ATTACH failed: {e}")))?;
+
+    // INSERT source rows; on failure still DETACH to avoid a dangling catalog.
+    let insert_result = session.execute(&insert_sql).await;
+    if let Err(ref e) = insert_result {
+        tracing::warn!(path, "delta INSERT failed, detaching: {e}");
+        let _ = session.execute(detach_sql).await;
+        return Err(Status::internal(format!("delta INSERT failed: {e}")));
+    }
+
+    // DETACH the catalog.
+    session
+        .execute(detach_sql)
+        .await
+        .map_err(|e| Status::internal(format!("delta DETACH failed: {e}")))?;
+
+    Ok(vec![result_complete_response(session_id, operation_id)])
+}
+
+/// Parquet overwrite: `COPY (<sql>) TO '<path>' (FORMAT parquet)`.
+async fn write_parquet_overwrite(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    session_id: &str,
+    operation_id: &str,
+    source_sql: &str,
+    path: &str,
+) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
+    let escaped_path = path.replace('\'', "''");
+    let copy_sql = format!("COPY ({source_sql}) TO '{escaped_path}' (FORMAT parquet)");
+
+    session
+        .execute(&copy_sql)
+        .await
+        .map_err(|e| Status::internal(format!("parquet COPY failed: {e}")))?;
+
+    Ok(vec![result_complete_response(session_id, operation_id)])
 }
 
 // ── Response builders ────────────────────────────────────────────────────────
@@ -2452,5 +2566,140 @@ mod tests {
         )
         .await;
         assert_eq!(frames.len(), 1);
+    }
+
+    // ── WriteOperation dispatch tests ──────────────────────────────────────
+    //
+    // These test the format/mode/save_type routing without a live DuckDB
+    // session. Typed rejections and unsupported shapes must surface as
+    // Status::unimplemented; valid shapes that need a session are tested via
+    // the differential corpus.
+
+    /// Build a minimal `WriteOperation` proto for dispatch testing.
+    fn write_op(format: &str, mode: i32, path: &str) -> proto::WriteOperation {
+        proto::WriteOperation {
+            input: None,
+            source: Some(format.to_owned()),
+            mode,
+            sort_column_names: vec![],
+            partitioning_columns: vec![],
+            bucket_by: None,
+            options: Default::default(),
+            clustering_columns: vec![],
+            save_type: Some(proto::write_operation::SaveType::Path(path.to_owned())),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_delta_overwrite_returns_unimplemented() {
+        let session = test_session("test-write-delta-ow").await;
+        let cmd = write_op(
+            "delta",
+            proto::write_operation::SaveMode::Overwrite as i32,
+            "/tmp/t",
+        );
+        let err = handle_write_operation(&session, "s", "o", "SELECT 1", &cmd)
+            .await
+            .expect_err("delta overwrite must be rejected");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(
+            err.message().contains("ADR-017"),
+            "rejection must cite ADR-017; got: {}",
+            err.message(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_delta_error_if_exists_returns_unimplemented() {
+        let session = test_session("test-write-delta-eie").await;
+        let cmd = write_op(
+            "delta",
+            proto::write_operation::SaveMode::ErrorIfExists as i32,
+            "/tmp/t",
+        );
+        let err = handle_write_operation(&session, "s", "o", "SELECT 1", &cmd)
+            .await
+            .expect_err("delta error_if_exists must be rejected");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("ADR-017"), "got: {}", err.message());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_delta_ignore_returns_unimplemented() {
+        let session = test_session("test-write-delta-ign").await;
+        let cmd = write_op(
+            "delta",
+            proto::write_operation::SaveMode::Ignore as i32,
+            "/tmp/t",
+        );
+        let err = handle_write_operation(&session, "s", "o", "SELECT 1", &cmd)
+            .await
+            .expect_err("delta ignore must be rejected");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(err.message().contains("ADR-017"), "got: {}", err.message());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_unsupported_format_returns_unimplemented() {
+        let session = test_session("test-write-unsup-fmt").await;
+        let cmd = write_op(
+            "orc",
+            proto::write_operation::SaveMode::Overwrite as i32,
+            "/tmp/t",
+        );
+        let err = handle_write_operation(&session, "s", "o", "SELECT 1", &cmd)
+            .await
+            .expect_err("unsupported format must be rejected");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert!(
+            err.message().contains("orc"),
+            "message must name the format; got: {}",
+            err.message(),
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_missing_save_type_returns_invalid_argument() {
+        let session = test_session("test-write-no-save-type").await;
+        let cmd = proto::WriteOperation {
+            input: None,
+            source: Some("parquet".to_owned()),
+            mode: proto::write_operation::SaveMode::Overwrite as i32,
+            sort_column_names: vec![],
+            partitioning_columns: vec![],
+            bucket_by: None,
+            options: Default::default(),
+            clustering_columns: vec![],
+            save_type: None,
+        };
+        let err = handle_write_operation(&session, "s", "o", "SELECT 1", &cmd)
+            .await
+            .expect_err("missing save_type must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_table_save_type_returns_unimplemented() {
+        let session = test_session("test-write-table-save-type").await;
+        let cmd = proto::WriteOperation {
+            input: None,
+            source: Some("delta".to_owned()),
+            mode: proto::write_operation::SaveMode::Append as i32,
+            sort_column_names: vec![],
+            partitioning_columns: vec![],
+            bucket_by: None,
+            options: Default::default(),
+            clustering_columns: vec![],
+            save_type: Some(proto::write_operation::SaveType::Table(
+                proto::write_operation::SaveTable {
+                    table_name: "t".to_owned(),
+                    save_method: 0,
+                },
+            )),
+        };
+        let err = handle_write_operation(&session, "s", "o", "SELECT 1", &cmd)
+            .await
+            .expect_err("SaveType::Table must be rejected");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 }

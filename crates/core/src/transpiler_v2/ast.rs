@@ -672,6 +672,8 @@ pub enum FileFormat {
     Json,
     /// Apache ORC.
     Orc,
+    /// Delta Lake (backed by `delta_scan`).
+    Delta,
 }
 
 /// The set-operation kind carried by [`CommonOp::SetOp`].

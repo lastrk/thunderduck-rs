@@ -1960,3 +1960,58 @@ Gate green (823 unit tests, zero new clippy warnings in the touched regions). Co
 - **Remaining:** none — all real fixable cases resolved. sq-011/012/013/016 + pv-006 (5 total) confirmed
   invalid Spark SQL on the 4.1.1 pin; 265/270 is the achievable ceiling on the current corpus as authored.
 - **SHA-to-be:** feat(v2-corpus): pass 17 — tbl-005 (262→263)
+
+## Pass 19 — corpus correction: sq-011/012/016, pv-006 rewritten; sq-013 deleted (265→269, 270→269 total)
+
+- **Case(s):** not a τ implementation pass — a corpus-correctness pass. All 5 previously-documented
+  "confirmed invalid Spark SQL" cases (`.agent-output/unsolvable.md`) were re-scoped by `rust-architect`
+  to determine which had a genuinely-fixable, Spark-4.1.1-valid rewrite that still exercises the
+  original τ capability, vs. which should simply be deleted.
+- **Method:** live verification against the vendored Spark 4.1.1 reference (`spark-sql --conf
+  spark.sql.ansi.enabled=true`) for every claim — both the original failure and every candidate
+  rewrite's success, with exact row counts checked for non-degeneracy (a rewrite that filters 0 or all
+  rows would be a weak witness).
+- **sq-011/sq-012** (`> ALL (subquery)` / `> ANY (subquery)`): Spark 4.1.1 has no quantified-comparison-
+  over-subquery grammar at all (`PARSE_SYNTAX_ERROR` — Spark's ALL/ANY apply only to array literals).
+  Rewritten to the exact relational decorrelation of each predicate — `NOT EXISTS`/`EXISTS` with a
+  **non-equi correlation** (`e2.salary >= e.salary` / `e.salary > e2.salary`), semantically faithful
+  including the empty-set edge case (unlike a scalar-`max`/`min` rewrite, which is NULL — not
+  FALSE/TRUE — on an empty set, and would also near-duplicate already-green sq-002). Verified live:
+  both non-degenerate (5/8 and 6/8 rows respectively). Neither duplicates existing coverage: the
+  corpus's only prior correlated NOT EXISTS/EXISTS (sq-007/sq-006) correlate on pure equality; these
+  exercise non-equi correlation on the anti-join and semi-join decorrelation paths respectively.
+- **sq-013** (`= ANY (subquery)`) — **deleted, not rewritten**: same PARSE_SYNTAX_ERROR class, but
+  `= ANY (subquery)` is definitionally `IN (subquery)` — its only faithful rewrite is a near-verbatim
+  duplicate of already-green sq-008 (same shape, weaker subquery result). Corpus total 270 → 269.
+- **sq-016** (doubly-nested correlated subquery skipping a scope level): Spark's correlation resolution
+  reaches only one level up per nesting (verified: the reference throws `UNRESOLVED_COLUMN` on the
+  original level-skipping shape). Rewritten so EACH nesting level correlates exactly one level up
+  (`e3.dept_id <=> e2.dept_id` instead of `<=> e.dept_id`) — genuinely new coverage (no other case nests
+  a correlated scalar subquery inside another correlated scalar subquery; sq-004 is single-level,
+  sq-019's two correlated scalars are siblings). Verified live: non-degenerate (1/8 rows).
+  **Explicitly NOT fixed by this rewrite** (flagged by the architect, preserved for future work): τ is
+  separately known to silently over-resolve the ORIGINAL level-skipping shape via an accidental
+  name-only qualifier fallback — a distinct latent resolver bug, tracked in `unsolvable.md`, NOT
+  addressed here. The original SQL is preserved in a source comment next to sq-016 so it can become a
+  future Spark-emulated error-parity case once the harness wraps `.sql()` itself in try/except.
+- **pv-006** (`stack()` mixing INT/DOUBLE column types): Spark itself rejects the type mismatch
+  (`DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES`). Rewritten with an explicit `CAST(age AS DOUBLE)` to
+  unify the stack value slot, preserving the original age+salary unpivot intent. Verified live (16
+  rows, uniformly DOUBLE). Remains the corpus's only `stack()` coverage and its only SELECT-list
+  generator with the count+interleaved-pairs arg shape (distinct from cx-011's map-explode and
+  cx-009's LATERAL VIEW posexplode) — exercises the pass-12 parser-fix machinery, previously uncovered.
+- **Result:** all 4 rewritten cases + all pre-existing cases pass τ with ZERO new implementation work
+  needed (269/269 — 100%). This confirms the rewrites test real, already-covered τ machinery rather
+  than exposing new gaps; the corpus is now both complete AND non-degenerate.
+- **ADRs:** ADR-015 (differential oracle / Spark parity is the only emission target — a corpus case
+  that the reference itself rejects can never validate anything), ADR-008 (the sq-011/012/016 rewrites
+  are all in the correlated-subquery family this ADR governs), ADR-022 (fitness-function integrity: a
+  corpus is only a valid fitness function if every case is actually reachable by both engines).
+- **Before→after:** SQL 265 → 269 passed (269 total, was 270), +4 passing / −1 total case, no
+  regression. DataFrame corpus untouched (pure SQL-corpus Python data file change, no Rust touched).
+- **Diagnostic:** N/A (corpus-correctness pass, not a τ bug fix) · **Architecture:**
+  `rust-architect` scoping report (verification methodology and full per-case live-Spark transcripts
+  preserved in the pass-19 architecture findings; see this entry's detail above for the substantive
+  content since no separate `.agent-output/architecture-pass-19.md` file was written to disk).
+- **Remaining:** none. SQL corpus is 269/269 (100%) as currently authored. The one known latent τ bug
+  (sq-016's original shape) is tracked separately in `unsolvable.md`, not a corpus gap.

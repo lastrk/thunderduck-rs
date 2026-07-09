@@ -1,11 +1,16 @@
 # v2 Corpus-Driven Pipeline — Final Report
 
-**Corpus:** `tests/integration/differential/sql_corpus.py` (`sql_v2`, 270 `spark.sql` cases) —
+**Corpus:** `tests/integration/differential/sql_corpus.py` (`sql_v2`) —
 the fitness function for τ's SQL front-end, per `CLAUDE.md` / ADR-022.
 
-**Final state: 265/270 (98.1%).** This is the achievable ceiling for the corpus as currently
-authored — the remaining 5 cases are confirmed invalid Spark SQL on the pinned Spark 4.1.1
-reference and cannot pass the differential oracle regardless of τ implementation work.
+**Final state: 269/269 (100%).** Passes 4-18 (below) closed every genuinely-fixable τ gap,
+reaching 265/270 with 5 cases documented as confirmed-invalid Spark SQL on the pinned Spark
+4.1.1 reference. A follow-up pass 19 (corpus-correctness, not a τ fix) had `rust-architect`
+empirically re-verify all 5 against live Spark: 4 had a semantically-faithful, Spark-valid
+rewrite that still exercises genuinely distinct τ machinery (not near-duplicates of existing
+coverage), and 1 (sq-013) had no useful rewrite and was deleted. All 4 rewrites pass τ with
+zero new implementation work — see `tasks/v2-corpus-driven-pass-log.md` pass 19 and
+`.agent-output/unsolvable.md` for full live-verification detail and exact rewritten SQL.
 
 ## Trajectory (passes 4→18, this pipeline invocation)
 
@@ -26,37 +31,46 @@ reference and cannot pass the differential oracle regardless of τ implementatio
 | 16 | sq-010 | +1 | 261 → 262 |
 | 17 | tbl-005 (JOIN LATERAL) | +1 | 262 → 263 |
 | 18 | cte-009, cte-010 (WITH RECURSIVE) | +2 | 263 → 265 |
+| 19 | corpus correction: sq-011/012/016, pv-006 rewritten; sq-013 deleted | +4 / −1 total | 265 → 269 (269 total) |
 
 Full per-pass root cause / fix / ADR citations in `tasks/v2-corpus-driven-pass-log.md`.
 Every pass ran the complete diagnostician → architect → coder → reviewer → perf-reviewer
 loop with zero DEFERred Medium/Low findings, and zero regressions on either corpus
 (`sql_v2` or the 329-case DataFrame `core_v2` corpus) at every step.
 
-## The 5 confirmed-unsolvable cases
+## The corpus-correctness pass (pass 19)
 
-Documented in full in `.agent-output/unsolvable.md` (gitignored working-tree artifact —
-summarized here since that file is not committed):
+Passes 4-18 left 5 cases documented as confirmed-invalid Spark SQL — in each, the REFERENCE
+Spark session itself threw before τ was ever exercised or compared, so no amount of τ work
+could make them pass. Rather than accept 265/270 as a permanent ceiling, `rust-architect` was
+tasked with empirically determining (against the live vendored Spark 4.1.1 reference, not
+assumption) which of the 5 had a genuinely-fixable rewrite that still tested the original τ
+capability, vs. which should just be deleted as not worth fixing:
 
-1. **sq-011** — `salary > ALL (subquery)` — Spark 4.1.1 rejects quantified-comparison
-   subquery predicates at parse (`PARSE_SYNTAX_ERROR`); Spark's `ALL`/`ANY`/`SOME` apply
-   only to array expressions, not subqueries.
-2. **sq-012** — `salary > ANY (subquery)` — same class as sq-011.
-3. **sq-013** — `dept_id = ANY (subquery)` — same class as sq-011.
-4. **sq-016** — doubly-nested correlated subquery skipping a scope level
-   (`e3`'s subquery references the outermost `e`, not the immediate parent `e2`) — Spark's
-   own correlation resolution reaches only one level up; the reference session itself
-   throws `UNRESOLVED_COLUMN.WITH_SUGGESTION`. (Separately noted: τ is currently MORE
-   permissive than Spark on this exact shape — an accidental-permissiveness latent bug,
-   tracked but out of scope since it produces no corpus-visible symptom.)
-5. **pv-006** — `stack(2, 'age', age, 'salary', salary)` mixing an INT and a DOUBLE column
-   in the same output slot — Spark 4.1.1's analyzer itself rejects this with
-   `DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES`.
+1. **sq-011/sq-012** (`salary > ALL/ANY (subquery)`) — Spark 4.1.1 has no quantified-comparison-
+   over-subquery grammar at all. Rewritten to the exact relational decorrelation (`NOT EXISTS`/
+   `EXISTS` with a **non-equi** correlation) — semantically faithful including the empty-set
+   edge case, and exercising anti-/semi-join decorrelation machinery no other case covered
+   (existing correlated NOT EXISTS/EXISTS cases correlate on pure equality only).
+2. **sq-013** (`dept_id = ANY (subquery)`) — **deleted**. `= ANY (subquery)` is definitionally
+   `IN (subquery)`; its only faithful rewrite is a near-verbatim duplicate of already-green
+   sq-008. Total corpus size 270 → 269.
+3. **sq-016** (doubly-nested correlated subquery skipping a scope level) — rewritten so each
+   nesting level correlates exactly one level up (Spark's actual rule), which is genuinely new
+   coverage (no other case nests a correlated scalar subquery inside another). The *original*
+   level-skipping shape is separately known to expose a latent τ over-permissiveness bug
+   (accidental qualifier-fallback mis-binding) — NOT fixed by this rewrite, explicitly flagged
+   and tracked in `.agent-output/unsolvable.md` with the original SQL preserved for a future
+   Spark-emulated error-parity case.
+4. **pv-006** (`stack()` mixing INT/DOUBLE column types) — rewritten with an explicit
+   `CAST(age AS DOUBLE)` to unify the stack value slot, preserving the original unpivot intent.
+   Remains the corpus's only `stack()` coverage.
 
-In every case the REFERENCE Spark session throws before τ is ever exercised or compared —
-these are corpus-authoring issues (assuming SQL-standard or type-lenient behavior Spark
-4.1.1 does not actually have), not τ gaps. A human maintainer should either delete these
-5 cases or rewrite them to valid Spark-accepted equivalents; doing so is out of scope for
-a transpiler-implementation pipeline.
+All 4 rewrites were verified live against Spark 4.1.1 (non-degenerate row counts, not
+vacuously-true/false predicates) before being committed to `sql_corpus.py`, and all 4 pass τ
+with **zero new implementation work** — confirming they test real, already-covered machinery
+rather than exposing new gaps. Full live-verification transcripts and exact SQL in
+`.agent-output/unsolvable.md` (gitignored) and `tasks/v2-corpus-driven-pass-log.md` pass 19.
 
 ## Headline mechanisms built this pipeline
 
@@ -78,7 +92,9 @@ a transpiler-implementation pipeline.
 
 ## Recommendation
 
-No further corpus-witnessed fixable cases remain. Future work on the SQL front-end should
-either (a) wait for new corpus cases that exercise genuinely unimplemented τ surface, or
-(b) have a human correct the 5 mis-authored cases above so the ceiling can rise past
-265/270. This pipeline invocation terminates here.
+The SQL corpus is 269/269 (100%) and internally consistent — no case that the reference
+Spark session itself cannot execute remains. Future work on the SQL front-end should wait for
+new corpus cases that exercise genuinely unimplemented τ surface. One known latent τ bug
+remains tracked outside the corpus: sq-016's original (level-skipping) shape exposes an
+over-permissive qualifier-resolution fallback in the analyzer; see `.agent-output/unsolvable.md`
+for the fix + future error-parity-case follow-up. This pipeline invocation terminates here.

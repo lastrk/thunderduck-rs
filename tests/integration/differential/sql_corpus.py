@@ -389,12 +389,39 @@ case("sq-007", "subquery", "correlated NOT EXISTS (orphans)", "SELECT * FROM emp
 case("sq-008", "subquery", "IN (subquery)", "SELECT * FROM emp WHERE dept_id IN (SELECT dept_id FROM dept WHERE country = 'AT')")
 case("sq-009", "subquery", "NOT IN with NULL (3VL trap)", "SELECT * FROM emp WHERE dept_id NOT IN (SELECT dept_id FROM dept WHERE budget IS NULL OR dept_id = 40)")
 case("sq-010", "subquery", "correlated IN with predicate", "SELECT * FROM emp e WHERE e.dept_id IN (SELECT d.dept_id FROM dept d WHERE d.budget > e.salary)")
-case("sq-011", "subquery", "> ALL", "SELECT * FROM emp WHERE salary > ALL (SELECT salary FROM emp WHERE dept_id = 20)")
-case("sq-012", "subquery", "> ANY / SOME", "SELECT * FROM emp WHERE salary > ANY (SELECT salary FROM emp WHERE dept_id = 30)")
-case("sq-013", "subquery", "= ANY (membership)", "SELECT * FROM emp WHERE dept_id = ANY (SELECT dept_id FROM dept WHERE country = 'CH')")
+# sq-011/sq-012 were originally authored as `> ALL (subquery)` / `> ANY (subquery)`
+# (SQL-standard quantified comparison predicates). Spark 4.1.1 does not support this
+# grammar at all (PARSE_SYNTAX_ERROR — Spark's ALL/ANY apply only to array literals,
+# not subqueries), verified live against the vendored reference. Rewritten to the
+# exact relational decorrelation of each predicate (NOT EXISTS / EXISTS with a
+# non-equi correlation), which is semantically faithful including the empty-set edge
+# and exercises non-equi-correlated anti-/semi-join machinery not covered elsewhere
+# in the corpus (sq-007/sq-006's correlations are pure equality).
+case("sq-011", "subquery", "> ALL rewritten as correlated NOT EXISTS (non-equi correlation)", "SELECT * FROM emp e WHERE NOT EXISTS (SELECT 1 FROM emp e2 WHERE e2.dept_id = 20 AND e2.salary >= e.salary)")
+case("sq-012", "subquery", "> ANY / SOME rewritten as correlated EXISTS (non-equi correlation)", "SELECT * FROM emp e WHERE EXISTS (SELECT 1 FROM emp e2 WHERE e2.dept_id = 30 AND e.salary > e2.salary)")
+# sq-013 ("= ANY (subquery)") deleted: same PARSE_SYNTAX_ERROR class as sq-011/012,
+# but `= ANY (subquery)` is definitionally `IN (subquery)` — its only faithful
+# rewrite is verbatim sq-008 (modulo the country constant), so it adds no coverage.
 case("sq-014", "subquery", "derived table (subquery in FROM)", "SELECT dept_id, n FROM (SELECT dept_id, count(*) AS n FROM emp GROUP BY dept_id) t WHERE n > 1")
 case("sq-015", "subquery", "correlated subquery in HAVING", "SELECT e.dept_id, count(*) AS n FROM emp e GROUP BY e.dept_id HAVING count(*) > (SELECT avg(cnt) FROM (SELECT count(*) AS cnt FROM emp GROUP BY dept_id))")
-case("sq-016", "subquery", "nested correlated (2 levels)", "SELECT e.name FROM emp e WHERE e.salary > (SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id <=> e.dept_id AND e2.age > (SELECT min(e3.age) FROM emp e3 WHERE e3.dept_id <=> e.dept_id))")
+# sq-016 was originally authored with the innermost subquery (e3) referencing the
+# OUTERMOST alias `e`, skipping the middle nesting level `e2` — verified live that
+# Spark's own correlation resolution only reaches one level up, so the reference
+# itself throws UNRESOLVED_COLUMN.WITH_SUGGESTION before τ is ever compared.
+# (Separately: τ was found to silently over-resolve this exact skipped-level shape
+# via an accidental name-only qualifier fallback — a distinct latent bug, tracked
+# separately, NOT fixed by this rewrite. Original SQL preserved here for whoever
+# picks that up as a future Spark-emulated error-parity case once the harness
+# wraps `.sql()` itself in try/except:
+#   SELECT e.name FROM emp e WHERE e.salary > (SELECT avg(e2.salary) FROM emp e2
+#     WHERE e2.dept_id <=> e.dept_id AND e2.age > (SELECT min(e3.age) FROM emp e3
+#     WHERE e3.dept_id <=> e.dept_id))
+# )
+# Rewritten so each nesting level correlates exactly one level up (e3 -> e2 instead
+# of e3 -> e), which is Spark's actual rule and is a genuinely new shape: no other
+# corpus case nests a correlated scalar subquery inside another correlated scalar
+# subquery (sq-004 is single-level; sq-019's two correlated scalars are siblings).
+case("sq-016", "subquery", "nested correlated (2 levels, one-level-up at each level)", "SELECT e.name FROM emp e WHERE e.salary > (SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id <=> e.dept_id AND e2.age > (SELECT min(e3.age) FROM emp e3 WHERE e3.dept_id <=> e2.dept_id))")
 case("sq-017", "subquery", "scalar subquery -> NULL when no match", "SELECT d.dept_name, (SELECT max(e.salary) FROM emp e WHERE e.dept_id = d.dept_id) AS top_sal FROM dept d")
 case("sq-018", "subquery", "subquery inside COALESCE", "SELECT e.name, coalesce((SELECT d.dept_name FROM dept d WHERE d.dept_id = e.dept_id), 'UNASSIGNED') AS dept FROM emp e")
 case("sq-019", "subquery", "multiple correlated subqueries", "SELECT e.name, (SELECT min(e2.salary) FROM emp e2 WHERE e2.dept_id <=> e.dept_id) AS lo, (SELECT max(e2.salary) FROM emp e2 WHERE e2.dept_id <=> e.dept_id) AS hi FROM emp e")
@@ -558,7 +585,15 @@ case("pv-002", "pivot", "PIVOT count", "SELECT * FROM (SELECT dept_id, active FR
 case("pv-003", "pivot", "PIVOT multiple aggregates", "SELECT * FROM (SELECT dept_id, active, salary FROM emp) PIVOT (avg(salary) AS a, max(salary) AS m FOR active IN (true AS act))")
 case("pv-004", "pivot", "UNPIVOT (spark4)", "SELECT id, metric, val FROM (SELECT id, age, salary FROM emp) UNPIVOT (val FOR metric IN (age, salary))", flags=("spark4",))
 case("pv-005", "pivot", "PIVOT on dept_id", "SELECT * FROM (SELECT active, dept_id, salary FROM emp) PIVOT (avg(salary) FOR dept_id IN (10, 20, 30))")
-case("pv-006", "pivot", "stack() unpivot form", "SELECT id, stack(2, 'age', age, 'salary', salary) AS (metric, value) FROM emp")
+# Originally mixed an INT column (age) and a DOUBLE column (salary) in the same
+# stack() output slot — Spark 4.1.1 itself rejects this at analysis
+# (DATATYPE_MISMATCH.STACK_COLUMN_DIFF_TYPES), verified live. Rewritten with an
+# explicit CAST to unify the slot type, preserving the original age+salary
+# unpivot intent while staying Spark-valid — still the corpus's only stack() case
+# and its only SELECT-list generator with the count+interleaved-pairs arg shape
+# (cx-011's explode(...) AS (k,v) and cx-009's posexplode are different functions
+# on different code paths).
+case("pv-006", "pivot", "stack() unpivot form (cast-unified value slot)", "SELECT id, stack(2, 'age', cast(age AS double), 'salary', salary) AS (metric, value) FROM emp")
 
 # ── 17. Typed literals & intervals ───────────────────────────────────────────
 case("lit-001", "typed_literal", "DATE literal", "SELECT DATE '2026-01-15' AS d")

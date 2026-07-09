@@ -430,6 +430,29 @@ case("join-015", "join", "qualified star over join (left side + extra col)", lam
 case("join-016", "join", "qualified star over outer join (right side, null-extended)", lambda I: I["emp"].alias("e").join(I["dept"].alias("d"), F.col("e.dept_id") == F.col("d.dept_id"), "left").select("d.*"))
 case("join-017", "join", "qualified star through post-join filter", lambda I: I["emp"].alias("e").join(I["dept"].alias("d"), F.col("e.dept_id") == F.col("d.dept_id"), "inner").filter(F.col("d.budget") > 0).select("e.*"))
 
+
+# USING-join / default_projections corruption witnesses (review findings 1, 2,
+# 4, 5, 7 in tasks/select-block-review-findings.md). Spark hoists the USING
+# key first; DuckDB's `*` keeps it at its natural left position, so any path
+# that loses or shadows the join block's hoisted slot list silently mislabels
+# columns positionally on the wire. Born red by design — they are the
+# evidence gate that must flip green when the emission fixes land.
+def _join_022(I):
+    # Inner join condition uses plan_id refs on an ambiguous name, so both
+    # inner sides are stamped `__td_jl`/`__td_jr`; the inner join then inlines
+    # as the outer LEFT, exposing those names. The ancestor filter's plan_id
+    # ref stamps `__td_jr` for the OUTER right side too — two `AS __td_jr` in
+    # one FROM scope plus a qualified `__td_jr` reference in the WHERE.
+    inner = I["emp"].join(I["emp2"], I["emp"]["dept_id"] == I["emp2"]["dept_id"])
+    d3 = I["dept"].select("dept_id", "dept_name")
+    return inner.join(d3, F.col("dept_name") == F.lit("Data")).filter(d3["dept_id"] == 20)
+
+case("join-018", "join", "drop over USING join (hoisted-order overwrite witness)", lambda I: I["emp"].join(I["dept"], on="dept_id").drop("budget"))
+case("join-019", "join", "multi-slot star over USING join (star-order witness)", lambda I: I["emp"].join(I["dept"], on="dept_id").select("*", F.lit(1).alias("one")))
+case("join-020", "join", "nested USING join as re-wrapped join side (hoisted-slot drop witness)", lambda I: I["emp"].alias("a").join(I["nums"].alias("n"), F.col("a.id") == F.col("n.a")).join(I["emp2"].join(I["dept"], on="dept_id"), F.col("dept_name") == F.lit("Infrastructure")))
+case("join-021", "join", "user alias buried under USING parent (vis-exemption strand witness)", lambda I: I["emp"].alias("e").join(I["nums"].alias("n"), F.col("e.id") == F.col("n.a")).join(I["dept"], on="dept_id").select("e.name"))
+case("join-022", "join", "duplicate synthetic join alias (__td_jr collision witness)", _join_022)
+
 # ── 12. Set operations (type widening) ──────────────────────────────────────
 def _emp_proj(I):
     return I["emp"].select("id", "name", "dept_id", "age", "salary")

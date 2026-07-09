@@ -156,14 +156,33 @@ Refuted along the way: `FROM emp AS emp` qualified-star rejection
 (TableScan{alias:Some} unreachable from both front-ends); quadratic
 child re-emission (every parent builds its child exactly once).
 
-## Cross-cutting note: corpus blind spot
+## Cross-cutting note: corpus blind spot — CLOSED 2026-07-09
 
-None of findings 1–5, 7 are covered by the corpora — no case combines a
+None of findings 1–5, 7 were covered by the corpora — no case combined a
 USING join with `drop`/multi-slot star/nested-join-side/buried-alias
-shapes, and no lateral case sits over a defaults-carrying input. That is
+shapes, and no lateral case sat over a defaults-carrying input. That is
 why the branch's zero-regression gate stayed green through all of them.
-Witness cases for the USING/default_projections cluster should precede any
-fix (ADR-001 evidence discipline), mirroring the filt-016/017 pattern.
+
+**Witnesses added (all born red with the exact predicted signatures;
+they are the evidence gate for the emission fixes):**
+
+| Finding | Case | Red signature |
+|---|---|---|
+| 1 | `join-018` (DF) — USING + `drop` | ArrowInvalid: `'Alice'` (string) under an int64-stamped column — positional mislabel |
+| 2 | `join-020` (DF) — nested USING side re-wrapped | ArrowInvalid: `'Ivan'` under int64 — nested-side swap |
+| 3 | `cx-015` (SQL) — lateral over `range()` | AXIS_LENGTH_MISMATCH: schema 2 cols, wire 1 (generated col dropped) |
+| 3 | `cx-016` (SQL) — lateral over join | AXIS_LENGTH_MISMATCH: 20 vs 19 (generated `tag` dropped) |
+| 4 | `join-019` (DF) + `jn-023` (SQL) — multi-slot star over USING | ArrowInvalid mislabel, both front-ends |
+| 5 | `join-021` (DF) — buried alias under USING parent | `Referenced table "e" not found! Candidate tables: "__td_jl"` |
+| 7 | `join-022` (DF) — duplicate synthetic alias | `Ambiguous reference to table "__td_jr" (duplicate alias)` |
+
+Both corpora re-run after the additions: zero previously-green cases moved
+(the 8 witnesses are the only new reds). Findings 8–12 remain un-witnessed
+at corpus level: 8/10/11 need the fix direction decided first (their
+correct expected behavior is a Spark ERROR, i.e. `expected_error` cases),
+9 mirrors filt-016 for aggregates (add alongside the aggregate-strip fix),
+12/13 are error-category/debug-only concerns pinned by unit tests when
+addressed.
 
 ## Deferred cleanup candidates (not in the ranked 15)
 

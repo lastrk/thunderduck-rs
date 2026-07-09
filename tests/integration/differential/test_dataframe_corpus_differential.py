@@ -66,13 +66,18 @@ def _canonicalize_rows(df):
 
 @pytest.mark.differential
 @pytest.mark.parametrize("case", CASES, ids=_case_id)
-def test_case(case: Case, corpus_inputs_reference, corpus_inputs_thunderduck):
+def test_case(case: Case, corpus_inputs_reference, corpus_inputs_thunderduck, tpc_view_switcher):
     """One pytest test per Case in the corpus.
 
     Schema is always compared. For `nondeterministic` / `schema_only` cases the
     row comparison is skipped; everything else is row-compared after
     `repr`-sort canonicalization.
     """
+    # tpch/tpcds cases: re-point the benchmark-colliding temp views (e.g.
+    # `customer` exists in both benchmarks with different schemas). No-op for
+    # every other category and for consecutive same-category cases.
+    tpc_view_switcher(case.category)
+
     ref_df = case.build(corpus_inputs_reference)
     td_df = case.build(corpus_inputs_thunderduck)
 
@@ -102,8 +107,12 @@ def test_case(case: Case, corpus_inputs_reference, corpus_inputs_thunderduck):
         _assert_schema_equal(ref_df, td_df, case.id)
         return
 
+    # Per-case epsilon override (tpch cluster preserves the legacy suite's
+    # 0.01 tolerance on monetary aggregates); None = harness default.
+    extra = {"epsilon": case.epsilon} if case.epsilon is not None else {}
     assert_dataframes_equal(
         _canonicalize_rows(ref_df),
         _canonicalize_rows(td_df),
         query_name=case.id,
+        **extra,
     )

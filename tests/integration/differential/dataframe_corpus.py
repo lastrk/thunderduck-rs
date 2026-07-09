@@ -205,13 +205,19 @@ class Case:
     # value diff: both engines must raise this class to PASS. See
     # utils.dataframe_diff.reconcile_error_parity.
     expected_error: Optional[str] = None
+    # Per-case float-comparison tolerance override for the harness's
+    # assert_dataframes_equal (None = harness default 1e-6). Used by the tpch
+    # cluster to preserve the legacy suite's epsilon=0.01 on monetary
+    # aggregates — tightening it during the migration would flip
+    # baseline-passing queries red for a reason unrelated to τ.
+    epsilon: Optional[float] = None
 
 
 CASES: List[Case] = []
 
 
-def case(id, category, description, build, flags=(), expected_error=None):
-    CASES.append(Case(id, category, description, build, tuple(flags), expected_error))
+def case(id, category, description, build, flags=(), expected_error=None, epsilon=None):
+    CASES.append(Case(id, category, description, build, tuple(flags), expected_error, epsilon))
 
 
 # ── 1. Projection & column manipulation ────────────────────────────────────
@@ -730,6 +736,54 @@ case("struc-006", "structural", "reduce HOF (alias of aggregate, spark4)", lambd
 
 # ── 32. Time-window aggregate (tumbling) ────────────────────────────────────
 case("win2-002", "window_time", "tumbling time window aggregate", lambda I: I["emp"].filter(F.col("last_login").isNotNull()).groupBy(F.window("last_login", "1 day")).agg(F.count(F.lit(1)).alias("n")))
+
+
+# ── 33. TPC-H / TPC-DS clusters (migrated from the legacy differential files) ─
+#
+# Query logic lives in sibling modules, extracted/moved VERBATIM from the
+# retired legacy test files:
+#   - tpch_dataframe_queries.py  (was test_tpch_differential.py's inner
+#     build_qNN closures; EPSILONS preserves each test's float tolerance)
+#   - tpcds_dataframe_queries.py (was tests/integration/tpcds_dataframe/;
+#     same module, new home)
+# Both implement queries against `session.table(...)`, so the cases adapt via
+# the session that built I (`I["emp"].sparkSession`) — the harness registers
+# the parquet-backed TPC temp views on both engines' sessions (see
+# conftest._register_tpc_views + tpc_view_switcher for the benchmark-colliding
+# `customer` view). Red cases here are the τ fitness signal (ADR-022); see
+# .agent-output/tpc-baseline.md for the pre-migration pass/fail oracle.
+
+from differential.tpch_dataframe_queries import (  # noqa: E402
+    EPSILONS as _TPCH_EPSILONS,
+    QUERY_IMPLEMENTATIONS as _TPCH_DF_QUERIES,
+)
+from differential.tpcds_dataframe_queries import (  # noqa: E402
+    COMPATIBLE_QUERIES as _TPCDS_DF_QUERY_NUMS,
+    get_query_implementation as _tpcds_impl,
+)
+
+
+def _session_case(fn):
+    """Adapt a session-based TPC query fn to the corpus's build(I) shape."""
+    return lambda I: fn(I["emp"].sparkSession)
+
+
+for _n in sorted(_TPCH_DF_QUERIES):
+    case(
+        f"tpch-q{_n:02d}",
+        "tpch",
+        f"TPC-H Q{_n} (DataFrame)",
+        _session_case(_TPCH_DF_QUERIES[_n]),
+        epsilon=_TPCH_EPSILONS[_n],
+    )
+
+for _n in _TPCDS_DF_QUERY_NUMS:
+    case(
+        f"tpcds-q{_n:03d}",
+        "tpcds",
+        f"TPC-DS Q{_n} (DataFrame)",
+        _session_case(_tpcds_impl(_n)),
+    )
 
 
 # ---------------------------------------------------------------------------

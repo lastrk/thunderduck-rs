@@ -636,17 +636,32 @@ def spark_thunderduck(orchestrator, dual_server_manager):
 # Module-scoped matches `spark_reference` / `spark_thunderduck` and shares one build
 # across the whole corpus test file.
 @pytest.fixture(scope="module")
-def corpus_inputs_reference(spark_reference):
-    """Build the corpus's 5 input DataFrames once against the Spark reference session."""
+def corpus_inputs_reference(spark_reference, tpch_data_dir, tpcds_data_dir):
+    """Build the corpus's 5 input DataFrames once against the Spark reference session.
+
+    Also registers the parquet-backed TPC temp views the corpus's tpch/tpcds
+    clusters resolve via `session.table(...)`.
+    """
     from differential.dataframe_corpus import build_inputs
-    return build_inputs(spark_reference)
+    inputs = build_inputs(spark_reference)
+    _register_tpc_views(spark_reference, tpch_data_dir, tpcds_data_dir)
+    return inputs
 
 
 @pytest.fixture(scope="module")
-def corpus_inputs_thunderduck(spark_thunderduck):
-    """Build the corpus's 5 input DataFrames once against the Thunderduck session."""
+def corpus_inputs_thunderduck(spark_thunderduck, tpch_data_dir, tpcds_data_dir):
+    """Build the corpus's 5 input DataFrames once against the Thunderduck session.
+
+    TPC view registration is tolerant on the τ side — a failure surfaces as
+    the affected cases' own failures, not an aborting fixture ERROR.
+    """
     from differential.dataframe_corpus import build_inputs
-    return build_inputs(spark_thunderduck)
+    inputs = build_inputs(spark_thunderduck)
+    try:
+        _register_tpc_views(spark_thunderduck, tpch_data_dir, tpcds_data_dir)
+    except Exception:
+        pass
+    return inputs
 
 
 # SQL-corpus input fixtures: register the SQL corpus's temp views (emp, dept,

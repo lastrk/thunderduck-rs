@@ -190,8 +190,16 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             join_type,
             condition,
             using_columns,
+            lateral,
             ..
-        } => render_join(left, right, *join_type, condition.as_ref(), using_columns),
+        } => render_join(
+            left,
+            right,
+            *join_type,
+            condition.as_ref(),
+            using_columns,
+            *lateral,
+        ),
         TypedOp::SetOp {
             kind,
             all,
@@ -435,6 +443,7 @@ fn render_alias_transparent_from(
         join_type,
         condition,
         using_columns,
+        lateral,
         ..
     } = &input.op
     {
@@ -445,6 +454,7 @@ fn render_alias_transparent_from(
             condition.as_ref(),
             using_columns,
             &input.resolved_schema,
+            *lateral,
         )?;
         return Ok(Some(AliasTransparentFrom {
             from_sql,
@@ -462,6 +472,7 @@ fn render_alias_transparent_from(
             join_type,
             condition: join_cond,
             using_columns,
+            lateral,
             ..
         } = &filter_input.op
         {
@@ -472,6 +483,7 @@ fn render_alias_transparent_from(
                 join_cond.as_ref(),
                 using_columns,
                 &filter_input.resolved_schema,
+                *lateral,
             )?;
             let where_sql = render_expr(filter_cond, &filter_input.resolved_schema)?;
             return Ok(Some(AliasTransparentFrom {
@@ -679,11 +691,18 @@ fn flattenable_chain_aliases(side: &TypedAst) -> Option<Vec<String>> {
         join_type,
         condition,
         using_columns,
+        lateral,
         ..
     } = &side.op
     else {
         return None;
     };
+    // A lateral join's right side is a correlated derived table — flattening
+    // it into a shared FROM scope is unsound (splicing a correlation into a
+    // scope τ never validated).
+    if *lateral {
+        return None;
+    }
     if !using_columns.is_empty() {
         return None;
     }
@@ -750,6 +769,14 @@ fn render_join_side(
     if let TypedOp::AliasedRelation { input, alias } = &side.op {
         let inner_sql = dispatch_op(&input.op, &input.resolved_schema)?;
         return Ok(quoted_derived(&inner_sql, alias));
+    }
+    // Bare unaliased TableScan: hoist using the table's own name as the alias
+    // so that table-name-qualified references (e.g. `emp.dept_id` inside a
+    // LATERAL subquery) stay resolvable. Without this, the __td_jl fallback
+    // buries the table name and DuckDB's binder cannot find it.
+    if let TypedOp::TableScan { table, alias: None } = &side.op {
+        let inner_sql = dispatch_op(&side.op, &side.resolved_schema)?;
+        return Ok(quoted_derived(&inner_sql, table));
     }
     if allow_flatten {
         if let Some(chain_aliases) = flattenable_chain_aliases(side) {
@@ -831,6 +858,7 @@ fn render_join_from(
     condition: Option<&Expression>,
     using_columns: &[String],
     cond_schema: &Schema,
+    lateral: bool,
 ) -> Result<String, EmissionError> {
     // The left spine may flatten into this FROM scope; guard it against reusing
     // the outer right side's user alias (spine-vs-sibling half of the
@@ -842,6 +870,11 @@ fn render_join_from(
     };
     let left_from = render_join_side(left, TD_JOIN_LEFT, condition, true, right_alias)?;
     let right_from = render_join_side(right, TD_JOIN_RIGHT, condition, false, None)?;
+    let right_from = if lateral {
+        format!("LATERAL {right_from}")
+    } else {
+        right_from
+    };
     let kind = join_kind_sql(join_type);
     let clause = render_join_clause(join_type, condition, using_columns, cond_schema)?;
     Ok(format!("{left_from} {kind} {right_from}{clause}"))
@@ -1121,8 +1154,32 @@ fn render_join(
     join_type: crate::transpiler_v2::ast::JoinType,
     condition: Option<&Expression>,
     using_columns: &[String],
+    lateral: bool,
 ) -> Result<String, EmissionError> {
     use super::ast::JoinType;
+
+    // Lateral join: delegate to `render_join_from` wrapped in `SELECT * FROM
+    // ...` INSTEAD of the generic explicit-slot-list renderer. The generic
+    // renderer's `(left_sql) AS __td_jl` wrapper buries the left's user alias,
+    // which the correlated reference inside the LATERAL subquery needs to see.
+    // `render_join_side`'s step-2 hoist (`(inner) AS e`) keeps the alias
+    // visible. `SELECT *` is safe: lateral joins are guarded USING-free, and
+    // CROSS/Inner-ON expand `*` left-then-right matching the analyzer's concat
+    // schema.
+    if lateral {
+        let cond_schema = StructType::merge(&left.resolved_schema, &right.resolved_schema);
+        let from = render_join_from(
+            left,
+            right,
+            join_type,
+            condition,
+            using_columns,
+            &cond_schema,
+            true,
+        )?;
+        return Ok(format!("SELECT * FROM {from}"));
+    }
+
     let left_sql = dispatch_op(&left.op, &left.resolved_schema)?;
     let right_sql = dispatch_op(&right.op, &right.resolved_schema)?;
     let kind = join_kind_sql(join_type);
@@ -6408,6 +6465,7 @@ mod tests {
             condition: None,
             using_columns: vec!["dept_id".to_owned()],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6446,6 +6504,7 @@ mod tests {
             })),
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6477,6 +6536,7 @@ mod tests {
             condition: None,
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6599,6 +6659,7 @@ mod tests {
             })),
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6671,6 +6732,7 @@ mod tests {
             condition: None,
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6726,6 +6788,7 @@ mod tests {
             })),
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6740,6 +6803,7 @@ mod tests {
             })),
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6777,6 +6841,7 @@ mod tests {
             })),
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6791,6 +6856,7 @@ mod tests {
             })),
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6823,6 +6889,7 @@ mod tests {
             condition: None,
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6853,6 +6920,7 @@ mod tests {
             condition: Some(outer_condition),
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![1],
             right_plan_ids: vec![2],
         });
@@ -6905,6 +6973,7 @@ mod tests {
             condition: Some(condition),
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![1],
             right_plan_ids: vec![2],
         });
@@ -6940,6 +7009,7 @@ mod tests {
             condition: None,
             using_columns: vec!["dept_id".to_owned()],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6987,6 +7057,7 @@ mod tests {
             })),
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -7001,6 +7072,7 @@ mod tests {
             })),
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -11616,6 +11688,208 @@ mod tests {
         assert!(
             sql.contains("LATERAL (SELECT"),
             "must contain LATERAL(SELECT), got: {sql}"
+        );
+    }
+
+    // ── Pass-17: LATERAL derived-table join emission ────────────────────
+
+    /// E2E analyze + emit of the tbl-005 shape: the SQL must contain
+    /// `CROSS JOIN LATERAL` and NOT contain `__td_jl`.
+    #[test]
+    fn render_lateral_join_cross_emits_lateral_keyword_no_td_jl() {
+        let _g = tap_guard();
+        // Build: `SELECT e.name, t.dept_avg FROM emp e
+        //   CROSS JOIN LATERAL (SELECT avg(e2.salary) AS dept_avg
+        //     FROM emp e2 WHERE e2.dept_id = e.dept_id) t`
+        // Simplified to avoid aggregate complexity: the right side just
+        // projects a correlated column from the left.
+        let left = aliased_scan("emp", "e");
+        let right_inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("dept")),
+            projections: vec![Expression::Alias(
+                crate::transpiler_v2::expression::AliasExpression {
+                    expr: Box::new(qcol("e", "name")),
+                    alias: "dept_avg".to_owned(),
+                },
+            )],
+        });
+        let right = aliased_scan_from(right_inner, "t");
+        let lateral_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec![],
+            natural: false,
+            lateral: true,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(lateral_join),
+            projections: vec![qcol("e", "name"), qcol("t", "dept_avg")],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze lateral join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("CROSS JOIN LATERAL"),
+            "must contain CROSS JOIN LATERAL, got: {sql}"
+        );
+        assert!(
+            !sql.contains("__td_jl"),
+            "lateral join must not use __td_jl wrapper, got: {sql}"
+        );
+        assert!(
+            sql.contains("AS e CROSS JOIN LATERAL"),
+            "left alias must be hoisted as e before LATERAL, got: {sql}"
+        );
+    }
+
+    /// Helper: wrap a plan in an AliasedRelation.
+    fn aliased_scan_from(inner: CommonAst, alias: &str) -> CommonAst {
+        CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(inner),
+            alias: alias.to_owned(),
+        })
+    }
+
+    /// Lateral join with ON clause: must emit `INNER JOIN LATERAL ... ON`.
+    #[test]
+    fn render_lateral_join_with_on_emits_inner_join_lateral_on() {
+        let _g = tap_guard();
+        let left = aliased_scan("emp", "e");
+        let right_inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![Expression::Alias(
+                crate::transpiler_v2::expression::AliasExpression {
+                    expr: Box::new(int_lit(1)),
+                    alias: "x".to_owned(),
+                },
+            )],
+        });
+        let right = aliased_scan_from(right_inner, "t");
+        let condition = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(qcol("t", "x")),
+            right: Box::new(qcol("e", "id")),
+        });
+        let lateral_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            condition: Some(condition),
+            using_columns: vec![],
+            natural: false,
+            lateral: true,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(lateral_join),
+            projections: vec![qcol("e", "name")],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze lateral-with-ON");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("INNER JOIN LATERAL"),
+            "must contain INNER JOIN LATERAL, got: {sql}"
+        );
+        assert!(sql.contains(" ON "), "must contain ON clause, got: {sql}");
+    }
+
+    /// `flattenable_chain_aliases` must return `None` for a lateral join,
+    /// while an equivalent non-lateral chain still flattens.
+    #[test]
+    fn flattenable_chain_aliases_returns_none_for_lateral_join() {
+        let _g = tap_guard();
+        // Build a lateral join node (Inner, no ON).
+        let lateral_node = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Cross,
+            condition: None,
+            using_columns: vec![],
+            natural: false,
+            lateral: true,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let bt = base_types_emp_dept(&lateral_node);
+        let typed_lateral = analyze(lateral_node, &bt).expect("analyze lateral");
+        assert!(
+            flattenable_chain_aliases(&typed_lateral).is_none(),
+            "lateral join must not be flattenable"
+        );
+
+        // Build an equivalent non-lateral cross join.
+        let non_lateral_node = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Cross,
+            condition: None,
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let typed_non_lateral = analyze(non_lateral_node, &bt).expect("analyze non-lateral");
+        assert!(
+            flattenable_chain_aliases(&typed_non_lateral).is_some(),
+            "non-lateral cross join should be flattenable"
+        );
+    }
+
+    /// Regression: bare unaliased TableScan left with a lateral join must
+    /// expose the table name as the FROM alias (not __td_jl), so that
+    /// table-name-qualified correlated references inside the subquery resolve.
+    #[test]
+    fn render_lateral_join_bare_table_scan_left_exposes_table_name() {
+        let _g = tap_guard();
+        // `FROM emp JOIN LATERAL (SELECT emp.name AS x) t` — no alias on emp.
+        let left = scan("emp");
+        let right_inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![Expression::Alias(
+                crate::transpiler_v2::expression::AliasExpression {
+                    expr: Box::new(qcol("emp", "name")),
+                    alias: "x".to_owned(),
+                },
+            )],
+        });
+        let right = aliased_scan_from(right_inner, "t");
+        let lateral_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec![],
+            natural: false,
+            lateral: true,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(lateral_join),
+            projections: vec![qcol("emp", "name"), qcol("t", "x")],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze lateral with bare TableScan left");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // The emitted SQL must expose "emp" as the left alias, not __td_jl.
+        assert!(
+            !sql.contains("__td_jl"),
+            "bare TableScan left must not use __td_jl, got: {sql}"
+        );
+        assert!(
+            sql.contains("AS emp CROSS JOIN LATERAL"),
+            "bare TableScan left must be aliased as emp, got: {sql}"
+        );
+        assert!(
+            sql.contains("LATERAL"),
+            "must contain LATERAL keyword, got: {sql}"
         );
     }
 }

@@ -374,6 +374,7 @@ mod tests {
             condition: None,
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -409,6 +410,7 @@ mod tests {
             condition: None,
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });

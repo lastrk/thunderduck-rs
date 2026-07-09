@@ -737,6 +737,10 @@ fn lower_from(from: Vec<TableWithJoins>, cte_scope: &CteScope) -> Result<CommonA
             // machinery resolves the correlated arg against the left plan's schema.
             lower_lateral_generator_item(acc, twj.relation, cte_scope)?
         } else {
+            // Detect comma-form LATERAL derived table: `, LATERAL (subquery) t`
+            // (Spark treats it identically to `JOIN LATERAL (subquery) t`).
+            let lateral = twj.joins.is_empty()
+                && matches!(&twj.relation, TableFactor::Derived { lateral: true, .. });
             let right = lower_table_with_joins(twj, cte_scope)?;
             CommonAst::new(CommonOp::Join {
                 left: Box::new(acc),
@@ -745,6 +749,7 @@ fn lower_from(from: Vec<TableWithJoins>, cte_scope: &CteScope) -> Result<CommonA
                 condition: None,
                 using_columns: vec![],
                 natural: false,
+                lateral,
                 left_plan_ids: vec![],
                 right_plan_ids: vec![],
             })
@@ -834,6 +839,9 @@ fn lower_table_with_joins(
 ) -> Result<CommonAst, EmissionError> {
     let mut plan = lower_table_factor(twj.relation, cte_scope)?;
     for join in twj.joins {
+        // Read `lateral` from the right relation BEFORE moving it into
+        // `lower_table_factor` (which swallows the flag with `..`).
+        let lateral = matches!(&join.relation, TableFactor::Derived { lateral: true, .. });
         let right = lower_table_factor(join.relation, cte_scope)?;
         let (join_type, condition, using_columns, natural) =
             lower_join_operator(join.join_operator, cte_scope)?;
@@ -844,6 +852,7 @@ fn lower_table_with_joins(
             condition,
             using_columns,
             natural,
+            lateral,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -6817,5 +6826,84 @@ mod tests {
             comma_plan, lv_plan,
             "comma-LATERAL and LATERAL VIEW posexplode must produce identical CommonAst"
         );
+    }
+
+    // ── Pass-17: LATERAL derived-table join lowering ────────────────────
+
+    #[test]
+    fn lateral_join_no_on_lowers_to_join_with_lateral_true() {
+        // tbl-005 shape: `JOIN LATERAL (subquery) t` with no ON clause.
+        let plan = parse(
+            "SELECT e.name, t.dept_avg \
+             FROM emp e \
+             JOIN LATERAL (SELECT avg(e2.salary) AS dept_avg FROM emp e2 WHERE e2.dept_id = e.dept_id) t",
+        )
+        .expect("LATERAL join should parse");
+        match project_input(plan).op {
+            CommonOp::Join {
+                join_type,
+                condition,
+                natural,
+                lateral,
+                using_columns,
+                ..
+            } => {
+                assert_eq!(join_type, JoinType::Inner, "no ON → Inner at parse time");
+                assert!(condition.is_none(), "no ON clause");
+                assert!(using_columns.is_empty());
+                assert!(!natural);
+                assert!(lateral, "LATERAL derived table must set lateral: true");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lateral_join_with_on_lowers_to_join_with_lateral_true_and_condition() {
+        // `JOIN LATERAL (...) t ON <cond>` → lateral:true + condition:Some.
+        let plan = parse(
+            "SELECT * FROM emp e \
+             JOIN LATERAL (SELECT 1 AS x) t ON t.x = e.id",
+        )
+        .expect("LATERAL join with ON should parse");
+        match project_input(plan).op {
+            CommonOp::Join {
+                lateral, condition, ..
+            } => {
+                assert!(lateral, "LATERAL must be true");
+                assert!(condition.is_some(), "ON clause must be present");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_on_join_lowers_with_lateral_false() {
+        // Regression: a plain `JOIN ... ON` must not set lateral.
+        let plan = parse("SELECT * FROM emp JOIN dept ON emp.dept_id = dept.dept_id")
+            .expect("should parse");
+        match project_input(plan).op {
+            CommonOp::Join { lateral, .. } => {
+                assert!(!lateral, "plain ON join must not set lateral");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comma_lateral_subquery_lowers_with_lateral_true() {
+        // Comma form: `, LATERAL (subquery) t` — Spark treats identically to
+        // `JOIN LATERAL (subquery) t`.
+        let plan = parse("SELECT e.name, t.x FROM emp e, LATERAL (SELECT 1 AS x) t")
+            .expect("comma LATERAL subquery should parse");
+        match project_input(plan).op {
+            CommonOp::Join {
+                lateral, join_type, ..
+            } => {
+                assert!(lateral, "comma LATERAL subquery must set lateral: true");
+                assert_eq!(join_type, JoinType::Cross, "comma fold uses Cross");
+            }
+            other => panic!("expected Join, got {other:?}"),
+        }
     }
 }

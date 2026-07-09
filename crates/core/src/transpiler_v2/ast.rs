@@ -531,6 +531,12 @@ pub enum CommonOp {
         /// `using_columns` (or a `Cross`/`TRUE`-condition rewrite when the two
         /// sides share no column names) before it reaches `TypedOp::Join`.
         natural: bool,
+        /// Whether the right side is a `LATERAL` derived table (correlated
+        /// subquery at the join level). Invariant (analyzer-enforced):
+        /// `lateral` implies `!natural && using_columns.is_empty()`.
+        /// Orthogonal to `condition` — a lateral join may carry an ON clause
+        /// (`JOIN LATERAL (...) t ON cond`).
+        lateral: bool,
         /// Plan-ids appearing anywhere under the left side.
         left_plan_ids: Vec<i64>,
         /// Plan-ids appearing anywhere under the right side.
@@ -727,6 +733,7 @@ mod tests {
             condition: None,
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![1, 2],
             right_plan_ids: vec![3],
         });

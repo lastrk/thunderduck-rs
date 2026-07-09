@@ -1835,3 +1835,57 @@ Gate green (823 unit tests, zero new clippy warnings in the touched regions). Co
   proof, one-level-only lock, inner-precedence regression, qualifier-strictness lock).
 - **Diagnostic:** `.agent-output/diagnostic-pass-16.md` · **Architecture:** `.agent-output/architecture-pass-16.md`
 - **SHA-to-be:** feat(v2-corpus): pass 16 — sq-010 (261→262)
+
+## Pass 17 — tbl-005 (262→263)
+
+- **Case:** tbl-005 `SELECT e.name, t.dept_avg FROM emp e JOIN LATERAL (SELECT avg(e2.salary) AS
+  dept_avg FROM emp e2 WHERE e2.dept_id <=> e.dept_id) t` — LATERAL derived-table join, no ON/USING
+  (correlation itself substitutes for the join condition). Third distinct LATERAL consumption path
+  (after pass-11's LATERAL VIEW generator and pass-13's LATERAL table-function).
+- **Owning layers:** ast.rs (new `lateral: bool` field), v2_lowering.rs (read the flag), analyzer.rs
+  (guards + OuterScope-from-left-sibling + Inner→Cross rewrite), emission.rs (LATERAL wrapping +
+  __td_jl bypass + flatten exclusion).
+- **Root cause (two residual problems):** (A) `render_join_clause` rejects a clause-less Inner join.
+  (B) `analyze_join` analyzed the right child (the subquery) with whatever `outer` was inherited, never
+  built from the LEFT sibling's own resolved schema — so `e.dept_id` inside the lateral subquery
+  couldn't resolve. Pass-16's OuterScope mechanism (sq-010's fix) was exactly the right tool, just
+  needed invoking at the join level.
+- **Fix:** `lateral: bool` on `CommonOp::Join`/`TypedOp::Join` (mirrors pass-7's `natural` pattern
+  exactly — same compile-forced-construction-site enforcement). CORRECTED premise during architecture:
+  `natural` and `lateral` CAN grammatically co-occur (different AST positions — join-operator
+  constraint vs relation flag), so the analyzer explicitly guards lateral+natural and lateral+USING as
+  Spark-emulated errors, and restricts lateral join_type to {Inner, Cross} (others → boundary). When
+  lateral, the right child analyzes against an `OuterScope` built from the LEFT sibling's resolved
+  schema (reusing `collect_qualifier_bindings`, REPLACING not composing any inherited outer — preserves
+  pass-16's one-level-only invariant). A condition-less lateral Inner rewrites to Cross (mirrors the
+  NATURAL empty-intersection precedent), making the EXISTING Cross clause-exemption apply naturally —
+  `render_join_clause` needed ZERO changes, so the non-lateral clause-less-join boundary error stays
+  structurally intact. Emission wraps the right side in `LATERAL (...)`; the generic `render_join`
+  renderer's `__td_jl` wrapper (which buries the left's user alias) is bypassed for lateral joins in
+  favor of delegating to `render_join_from`'s alias-hoisting `render_join_side` ladder.
+  `flattenable_chain_aliases` explicitly excludes lateral joins (a correlated derived table must not be
+  spliced into a shared FROM scope).
+- **Reviewer-caught Medium (fixed in-pass):** the alias-hoisting ladder only covered `AliasedRelation`
+  and flattenable chains — a BARE UNALIASED TableScan left (`FROM emp JOIN LATERAL (...)`) still fell
+  through to `__td_jl`, burying the table name a correlated reference like `emp.dept_id` would need.
+  Fixed by adding a TableScan-hoists-its-own-table-name arm to `render_join_side` (mirrors the identical
+  existing convention in `render_project`'s own bare-TableScan branch — not a new pattern).
+- **Reviewer-caught Low (fixed in-pass):** the original one-level-only test used a non-lateral outer
+  join (passes `outer=None`), so it couldn't actually distinguish "replaces" from "composes" semantics.
+  Strengthened to nest the lateral join inside a genuinely correlated EXISTS subquery (supplies a
+  real, non-None inherited outer) and confirm the grandparent reference still fails.
+- **ADRs:** ADR-008 (this IS the correlated-subquery-at-join-level class — emit directly, DuckDB binds
+  at runtime; analyzer only stamps types via OuterScope), ADR-003/004 (one bool field, additive,
+  compile-forced both front-ends — same class as pass-7's `natural`, not a new-node extension;
+  DataFrame converter sets `lateral: false`, proto `LateralJoin` mapping deferred), ADR-022 (unimplemented
+  lateral variants stay honest boundaries).
+- **Findings closed:** reviewer Critical=0 High=0 (1 Medium + 1 Low, both fixed in a coder fix-loop —
+  exhaustive scrutiny of the one-level-only invariant and the __td_jl-bypass's generality, the two
+  riskiest properties in a wide-touching join-machinery change); perf High=0 Medium=0.
+- **Before→after:** SQL 262 → 263 passed (270 total), +1, no regression. DataFrame 329/329.
+- **Tests:** 15 new tests (4 lowering incl. comma-form, 7 analyzer incl. 3 guard arms + strengthened
+  one-level-only, 4 emission incl. the bare-TableScan-hoist regression).
+- **Diagnostic:** `.agent-output/diagnostic-pass-17.md` · **Architecture:** `.agent-output/architecture-pass-17.md`
+- **Remaining:** only cte-009/cte-010 (WITH RECURSIVE) are real fixable cases; sq-011/012/013/016 +
+  pv-006 (5 total) confirmed invalid Spark SQL on the 4.1.1 pin. Ceiling 265/270.
+- **SHA-to-be:** feat(v2-corpus): pass 17 — tbl-005 (262→263)

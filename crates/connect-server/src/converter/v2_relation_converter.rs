@@ -752,6 +752,10 @@ impl V2RelationConverter {
             // the DataFrame front-end can never produce a NATURAL join; only
             // the SparkSQL front-end (`v2_lowering.rs`) can set this true.
             natural: false,
+            // Spark 4.x's `LateralJoin` proto relation is deferred to a
+            // future pass — the DataFrame front-end has no equivalent syntax
+            // for explicit `JOIN LATERAL (subquery)` yet.
+            lateral: false,
             left_plan_ids,
             right_plan_ids,
         }))

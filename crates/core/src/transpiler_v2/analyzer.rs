@@ -150,6 +150,8 @@ pub enum TypedOp {
         condition: Option<Expression>,
         /// USING column names.
         using_columns: Vec<String>,
+        /// Whether this is a LATERAL join (correlated derived-table join).
+        lateral: bool,
         /// Plan-ids appearing anywhere under the left side.
         left_plan_ids: Vec<i64>,
         /// Plan-ids appearing anywhere under the right side.
@@ -1130,6 +1132,7 @@ fn analyze_node(
             condition,
             using_columns,
             natural,
+            lateral,
             left_plan_ids,
             right_plan_ids,
         } => analyze_join(
@@ -1139,6 +1142,7 @@ fn analyze_node(
             condition,
             using_columns,
             natural,
+            lateral,
             left_plan_ids,
             right_plan_ids,
             base_types,
@@ -1467,13 +1471,52 @@ fn analyze_join(
     condition: Option<Expression>,
     using_columns: Vec<String>,
     natural: bool,
+    lateral: bool,
     left_plan_ids: Vec<i64>,
     right_plan_ids: Vec<i64>,
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<TypedAst, AnalyzerError> {
     let typed_left = analyze_node(left, base_types, outer)?;
-    let typed_right = analyze_node(right, base_types, outer)?;
+
+    // ── LATERAL guards (analyzer-enforced invariants) ──────────────────
+    if lateral && natural {
+        return Err(AnalyzerError::Other {
+            reason: "UNSUPPORTED_FEATURE: LATERAL join with NATURAL join".to_owned(),
+        });
+    }
+    if lateral && !using_columns.is_empty() {
+        return Err(AnalyzerError::Other {
+            reason: "UNSUPPORTED_FEATURE: LATERAL join with USING join".to_owned(),
+        });
+    }
+    if lateral && !matches!(join_type, JoinType::Inner | JoinType::Cross) {
+        return Err(AnalyzerError::PuntedOperator {
+            op: format!("Join[lateral-{join_type:?}]"),
+            reason: "lateral join type not implemented in τ".to_owned(),
+        });
+    }
+
+    // ── Right-child analysis ───────────────────────────────────────────
+    // When `lateral`, the right child sees the left sibling's schema as
+    // its OuterScope (correlated refs like `e.dept_id` resolve there).
+    // This REPLACES whatever `outer` was passed in — preserving pass-16's
+    // one-level-only invariant (the lateral's inner sees only its
+    // immediate left sibling, never the grandparent).
+    let typed_right = if lateral {
+        let mut left_scopes_bindings = Vec::new();
+        collect_qualifier_bindings(&typed_left, 0, &mut left_scopes_bindings);
+        let left_scopes = QualifierScopes {
+            bindings: left_scopes_bindings,
+        };
+        let left_outer = OuterScope {
+            schema: &typed_left.resolved_schema,
+            scopes: &left_scopes,
+        };
+        analyze_node(right, base_types, Some(left_outer))?
+    } else {
+        analyze_node(right, base_types, outer)?
+    };
 
     // NATURAL-join desugar (Spark's `ResolveNaturalAndUsingJoin`): rewrite
     // NATURAL into the equivalent USING(...) shape now that both sides'
@@ -1526,6 +1569,13 @@ fn analyze_join(
         } else {
             using_columns = common;
         }
+    }
+
+    // LATERAL clause-less Inner → Cross rewrite: `JOIN LATERAL (subq) t`
+    // with no ON clause is a cross-lateral join (Spark's `LateralJoin(Inner, None)`).
+    // Mirrors the NATURAL empty-intersection rewrite above.
+    if lateral && condition.is_none() && matches!(join_type, JoinType::Inner) {
+        join_type = JoinType::Cross;
     }
 
     // resolve+assign_types: resolve condition against merged schema.
@@ -1642,6 +1692,7 @@ fn analyze_join(
             join_type,
             condition,
             using_columns,
+            lateral,
             left_plan_ids,
             right_plan_ids,
             derived_left_schema,
@@ -4542,6 +4593,7 @@ mod tests {
             condition,
             using_columns: vec![],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         })
@@ -5323,6 +5375,7 @@ mod tests {
             condition: None,
             using_columns: vec![],
             natural: true,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         })
@@ -5365,6 +5418,7 @@ mod tests {
             condition: None,
             using_columns: vec!["dept_id".to_owned()],
             natural: false,
+            lateral: false,
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
@@ -8297,6 +8351,7 @@ mod tests {
                 condition: None,
                 using_columns: vec!["dept_id".to_owned()],
                 natural: false,
+                lateral: false,
                 left_plan_ids: vec![],
                 right_plan_ids: vec![],
             })),
@@ -8776,5 +8831,230 @@ mod tests {
         // posexplode_val nullable depends on containsNull of the array.
         assert!(typed.resolved_schema.fields[4].nullable);
         assert_eq!(typed.resolved_schema.fields[4].data_type, DataType::String);
+    }
+
+    // ── Pass-17: LATERAL derived-table join ─────────────────────────────
+
+    /// Build a `lateral_join` AST node.
+    fn lateral_join(
+        left: CommonAst,
+        right: CommonAst,
+        join_type: JoinType,
+        condition: Option<Expression>,
+    ) -> CommonAst {
+        CommonAst::new(CommonOp::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type,
+            condition,
+            using_columns: vec![],
+            natural: false,
+            lateral: true,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        })
+    }
+
+    /// tbl-005 shape: `emp e JOIN LATERAL (SELECT avg(e2.salary) AS dept_avg
+    /// FROM emp e2 WHERE e2.dept_id <=> e.dept_id) t`.
+    /// Simplified to: `emp e CROSS JOIN LATERAL (SELECT e.name AS dept_avg) t`
+    /// — the right subquery references the left's column via OuterScope.
+    #[test]
+    fn lateral_join_analyzes_with_outer_scope_from_left_sibling() {
+        let bt = base_types_with_emp_dept();
+        // Left: `emp` aliased as `e`.
+        let left = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(scan("emp")),
+            alias: "e".to_owned(),
+        });
+        // Right: a subquery that references e.name from the left side.
+        let right_inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("dept")),
+            projections: vec![Expression::Alias(
+                crate::transpiler_v2::expression::AliasExpression {
+                    expr: Box::new(qcol("e", "name")),
+                    alias: "dept_avg".to_owned(),
+                },
+            )],
+        });
+        let right = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(right_inner),
+            alias: "t".to_owned(),
+        });
+        let lateral = lateral_join(left, right, JoinType::Inner, None);
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(lateral),
+            projections: vec![qcol("e", "name"), qcol("t", "dept_avg")],
+        });
+        let typed = analyze(plan, &bt).expect("lateral join must analyze");
+        // Output schema: [name, dept_avg].
+        assert_eq!(typed.resolved_schema.fields.len(), 2);
+        assert_eq!(typed.resolved_schema.fields[0].name, "name");
+        assert_eq!(typed.resolved_schema.fields[1].name, "dept_avg");
+        // The join should be rewritten to Cross (Inner + no ON + lateral).
+        match &typed.op {
+            TypedOp::Project { input, .. } => match &input.op {
+                TypedOp::Join {
+                    join_type, lateral, ..
+                } => {
+                    assert_eq!(*join_type, JoinType::Cross, "lateral Inner no ON → Cross");
+                    assert!(*lateral, "lateral must be stamped on TypedOp::Join");
+                }
+                other => panic!("expected Join, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lateral_join_with_natural_errors() {
+        let bt = base_types_with_emp_dept();
+        let left = scan("emp");
+        let right = scan("dept");
+        let ast = CommonAst::new(CommonOp::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec![],
+            natural: true,
+            lateral: true,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let err = analyze(ast, &bt).expect_err("lateral + natural must error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("LATERAL join with NATURAL join"), "got: {msg}");
+    }
+
+    #[test]
+    fn lateral_join_with_using_errors() {
+        let bt = base_types_with_emp_dept();
+        let left = scan("emp");
+        let right = scan("dept");
+        let ast = CommonAst::new(CommonOp::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: true,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let err = analyze(ast, &bt).expect_err("lateral + USING must error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("LATERAL join with USING join"), "got: {msg}");
+    }
+
+    #[test]
+    fn lateral_join_with_left_semi_punts() {
+        let bt = base_types_with_emp_dept();
+        let left = scan("emp");
+        let right = scan("dept");
+        let ast = lateral_join(left, right, JoinType::LeftSemi, None);
+        let err = analyze(ast, &bt).expect_err("lateral LeftSemi must punt");
+        assert!(
+            matches!(err, AnalyzerError::PuntedOperator { .. }),
+            "expected PuntedOperator, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn lateral_join_with_right_join_type_punts() {
+        let bt = base_types_with_emp_dept();
+        let left = scan("emp");
+        let right = scan("dept");
+        let ast = lateral_join(left, right, JoinType::Right, None);
+        let err = analyze(ast, &bt).expect_err("lateral Right must punt");
+        assert!(
+            matches!(err, AnalyzerError::PuntedOperator { .. }),
+            "expected PuntedOperator, got {err:?}"
+        );
+    }
+
+    /// One-level-only witness: a lateral join nested inside a genuinely
+    /// CORRELATED subquery context (EXISTS over `dept d`) that supplies a
+    /// non-None inherited `outer`. The lateral's right child references
+    /// `d.dept_name` from the inherited outer. If the lateral branch
+    /// COMPOSED (rather than replaced) outer scopes, `d.dept_name` would
+    /// resolve via the leaked inherited outer. Must fail with UnknownColumn
+    /// because the lateral REPLACES the inherited outer with only its
+    /// immediate left sibling (`e`).
+    #[test]
+    fn lateral_join_one_level_only_grandparent_ref_fails() {
+        use crate::transpiler_v2::expression::{ExistsSubquery, SubqueryPlan};
+        let bt = base_types_with_emp_dept();
+        // The lateral join that will live inside the EXISTS subquery:
+        // `emp e JOIN LATERAL (SELECT d.dept_name AS x) t`
+        // The right subquery references `d.dept_name` from the outer scope.
+        let lateral_left = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(scan("emp")),
+            alias: "e".to_owned(),
+        });
+        let lateral_right_subq = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::SingleRow)),
+            projections: vec![Expression::Alias(
+                crate::transpiler_v2::expression::AliasExpression {
+                    expr: Box::new(qcol("d", "dept_name")),
+                    alias: "x".to_owned(),
+                },
+            )],
+        });
+        let lateral_right = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(lateral_right_subq),
+            alias: "t".to_owned(),
+        });
+        let lateral_node = lateral_join(lateral_left, lateral_right, JoinType::Inner, None);
+        // Wrap the lateral join in an EXISTS subquery expression.
+        // The EXISTS is the filter condition of `SELECT * FROM dept d WHERE EXISTS(...)`.
+        // `analyze_subquery_plan` will analyze the inner plan with
+        // `outer = Some(OuterScope { schema: &dept_d_schema, scopes: ... })`,
+        // so a non-None outer IS available. If the lateral composed instead of
+        // replaced, `d.dept_name` would resolve via the leaked outer.
+        let exists_subq = Expression::ExistsSubquery(ExistsSubquery {
+            subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::Project {
+                input: Box::new(lateral_node),
+                projections: vec![unresolved_col("x")],
+            }))),
+            negated: false,
+        });
+        let outer_plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(scan("dept")),
+                    alias: "d".to_owned(),
+                })),
+                condition: exists_subq,
+            })),
+            projections: vec![qcol("d", "dept_name")],
+        });
+        let err = analyze(outer_plan, &bt).expect_err("grandparent ref must fail");
+        let msg = format!("{err:?}");
+        // The lateral's right child sees only `e` (its left sibling), not `d`
+        // from the inherited outer. `d.dept_name` must be UnknownColumn.
+        assert!(
+            msg.contains("UnknownColumn") || msg.contains("unknown column"),
+            "expected UnknownColumn for d.dept_name leaked from inherited outer, got: {msg}"
+        );
+    }
+
+    /// Regression: a non-lateral Inner join with no ON/USING still triggers the
+    /// existing boundary error (it was not converted to Cross).
+    #[test]
+    fn non_lateral_inner_join_no_on_still_boundary_errors() {
+        let bt = base_types_with_emp_dept();
+        let left = scan("emp");
+        let right = scan("dept");
+        let ast = join(left, right, JoinType::Inner, None);
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(ast),
+            projections: vec![unresolved_col("name")],
+        });
+        let typed = analyze(plan, &bt).expect("non-lateral analyze OK");
+        // dispatch_op should error (boundary: non-cross join without ON/USING).
+        let result = crate::transpiler_v2::emission::dispatch_op(&typed.op, &typed.resolved_schema);
+        assert!(result.is_err(), "non-lateral clauseless Inner must error");
     }
 }

@@ -106,6 +106,27 @@ impl TypedAst {
     }
 }
 
+/// The schema/scope-PASSTHROUGH operator class: position/count-preserving
+/// unary operators through which alias bindings (bottom-up, [`RelScope::of`])
+/// and synthetic-alias demands (top-down, [`mark_node`]) flow unchanged.
+/// The single authority for that classification — both walks match on this
+/// pattern, so adding a variant here updates them in lockstep, and both
+/// matches are exhaustive so a NEW `TypedOp` variant is a compile error in
+/// each until classified.
+macro_rules! scope_passthrough {
+    ($input:ident) => {
+        TypedOp::Filter { input: $input, .. }
+            | TypedOp::Sort { input: $input, .. }
+            | TypedOp::Limit { input: $input, .. }
+            | TypedOp::Sample { input: $input, .. }
+            | TypedOp::SampleBy { input: $input, .. }
+            | TypedOp::Deduplicate { input: $input, .. }
+            | TypedOp::NaFill { input: $input, .. }
+            | TypedOp::NaDrop { input: $input, .. }
+            | TypedOp::NaReplace { input: $input, .. }
+    };
+}
+
 /// The alias scope a relation's OUTPUT exposes: which qualifiers (table
 /// names, user aliases, lateral-view table aliases) bind to which contiguous
 /// field ranges of the node's `resolved_schema`, plus the plan_id →
@@ -118,12 +139,45 @@ pub struct RelScope {
     /// `(qualifier, field-range)` bindings, in tree order.
     pub aliases: Vec<(String, std::ops::Range<usize>)>,
     /// `(plan_id, field-range, TD_JOIN_LEFT | TD_JOIN_RIGHT)` bindings,
-    /// OUTERMOST join first — `QualifierScopes::lookup_plan_id` uses first
-    /// match, so the nearest enclosing join's side qualifier wins.
+    /// OUTERMOST join first — [`RelScope::lookup_plan_id`] uses first
+    /// match, so the nearest enclosing join's side qualifier wins. The
+    /// third element is the synthetic join-side qualifier emission renders
+    /// so DuckDB resolves the reference against the correct side of the
+    /// enclosing join's `(left) AS __td_jl … (right) AS __td_jr` FROM.
     pub plan_ids: Vec<(i64, std::ops::Range<usize>, &'static str)>,
 }
 
 impl RelScope {
+    /// The field range `q` binds to, iff EXACTLY ONE binding matches `q`
+    /// case-insensitively. A duplicate name — e.g. a self-join `emp e1 JOIN
+    /// emp e2` referenced by the bare table name `emp` — is ambiguous by
+    /// construction; return `None` so the caller falls back to the legacy
+    /// name-only resolution instead of picking an arbitrary side.
+    fn lookup(&self, q: &str) -> Option<std::ops::Range<usize>> {
+        let mut found: Option<std::ops::Range<usize>> = None;
+        for (name, range) in &self.aliases {
+            if name.eq_ignore_ascii_case(q) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(range.clone());
+            }
+        }
+        found
+    }
+
+    /// The field range and join-side qualifier a plan_id maps to. When a
+    /// plan_id appears in multiple ancestor joins (nested join trees), the
+    /// OUTERMOST entry wins — [`RelScope::of`] pushes parent entries before
+    /// child entries, so the first match carries the qualifier in scope at
+    /// the parent operator's resolution point.
+    fn lookup_plan_id(&self, pid: i64) -> Option<(std::ops::Range<usize>, &'static str)> {
+        self.plan_ids
+            .iter()
+            .find(|(id, _, _)| *id == pid)
+            .map(|(_, range, qualifier)| (range.clone(), *qualifier))
+    }
+
     /// Derive the scope a just-built operator exposes. Shallow: children are
     /// already stamped, so this reads their `scope` fields and offsets
     /// ranges — it never re-walks a subtree.
@@ -216,15 +270,7 @@ impl RelScope {
                 }
                 Self { aliases, plan_ids }
             }
-            TypedOp::Filter { input, .. }
-            | TypedOp::Sort { input, .. }
-            | TypedOp::Limit { input, .. }
-            | TypedOp::Sample { input, .. }
-            | TypedOp::SampleBy { input, .. }
-            | TypedOp::Deduplicate { input, .. }
-            | TypedOp::NaFill { input, .. }
-            | TypedOp::NaDrop { input, .. }
-            | TypedOp::NaReplace { input, .. } => input.scope.clone(),
+            scope_passthrough!(input) => input.scope.clone(),
             // LateralView appends generated columns after the input. Keep the
             // input's bindings, then bind the table_alias to the generated
             // columns' contiguous range. This makes `t.tag` resolve via the
@@ -241,7 +287,29 @@ impl RelScope {
                     .push((table_alias.clone(), start..start + columns.len()));
                 scope
             }
-            _ => Self::default(),
+            // Everything below retypes or reshuffles columns: no alias
+            // binding from further down is valid against the CURRENT schema.
+            // Deliberately exhaustive (no `_`) so a new TypedOp variant
+            // forces an explicit scope classification here AND in
+            // `mark_node` (the compiler enforces the parallel update).
+            TypedOp::Project { .. }
+            | TypedOp::Aggregate { .. }
+            | TypedOp::SetOp { .. }
+            | TypedOp::SingleRow
+            | TypedOp::Values { .. }
+            | TypedOp::LocalRelation { .. }
+            | TypedOp::FileScan { .. }
+            | TypedOp::TableFunction { .. }
+            | TypedOp::Unnest { .. }
+            | TypedOp::WithColumns { .. }
+            | TypedOp::DropColumns { .. }
+            | TypedOp::WithColumnsRenamed { .. }
+            | TypedOp::Describe { .. }
+            | TypedOp::Summary { .. }
+            | TypedOp::FreqItems { .. }
+            | TypedOp::Unpivot { .. }
+            | TypedOp::Pivot { .. }
+            | TypedOp::RecursiveCte { .. } => Self::default(),
         }
     }
 }
@@ -327,12 +395,6 @@ pub enum TypedOp {
         left_plan_ids: Vec<i64>,
         /// Plan-ids appearing anywhere under the right side.
         right_plan_ids: Vec<i64>,
-        /// The left side's per-column schema **after** outer-join nullability
-        /// flipping. Retained for future τ work's join emitter.
-        derived_left_schema: StructType,
-        /// The right side's per-column schema **after** outer-join
-        /// nullability flipping. Retained for future τ work's join emitter.
-        derived_right_schema: StructType,
         /// True iff an analyzer-stamped `__td_jl` reference — in this join's
         /// own condition, or in an ancestor expression that resolves through
         /// schema-passthrough operators down to this join — requires emission
@@ -815,111 +877,54 @@ fn scan_exprs<'e>(exprs: impl IntoIterator<Item = &'e mut Expression>) -> (bool,
 }
 
 fn mark_node(node: &mut TypedAst, pending_jl: bool, pending_jr: bool) {
+    let (own_jl, own_jr) = own_expr_demands(&mut node.op);
     match &mut node.op {
         TypedOp::Join {
             left,
             right,
-            condition,
             left_requires_synthetic,
             right_requires_synthetic,
             ..
         } => {
-            let (cond_jl, cond_jr) = scan_exprs(condition.iter_mut());
-            *left_requires_synthetic = pending_jl || cond_jl;
-            *right_requires_synthetic = pending_jr || cond_jr;
+            *left_requires_synthetic = pending_jl || own_jl;
+            *right_requires_synthetic = pending_jr || own_jr;
             // Synthetic names are per-join-level: demands do not cross into
             // the sides (inner joins own their own `__td_jl`/`__td_jr`).
             mark_node(left, false, false);
             mark_node(right, false, false);
         }
-        // Schema-passthrough operators: own expression demands compose with
-        // the pending ones and continue toward the join below.
-        TypedOp::Filter { input, condition } => {
-            let (jl, jr) = scan_exprs(std::iter::once(condition));
-            mark_node(input, pending_jl || jl, pending_jr || jr);
+        // Schema-passthrough operators (single authority: the
+        // `scope_passthrough!` class shared with `RelScope::of`): own
+        // expression demands compose with the pending ones and continue
+        // toward the join below.
+        scope_passthrough!(input) => {
+            mark_node(input, pending_jl || own_jl, pending_jr || own_jr);
         }
-        TypedOp::Sort { input, order, .. } => {
-            let (jl, jr) = scan_exprs(order.iter_mut().map(|so| so.expr.as_mut()));
-            mark_node(input, pending_jl || jl, pending_jr || jr);
+        // LateralView is scope-passthrough-plus-append; its generator
+        // expressions resolve against the input scope.
+        TypedOp::LateralView { input, .. } => {
+            mark_node(input, pending_jl || own_jl, pending_jr || own_jr);
         }
-        TypedOp::SampleBy { input, col, .. } => {
-            let (jl, jr) = scan_exprs(std::iter::once(col));
-            mark_node(input, pending_jl || jl, pending_jr || jr);
+        // AliasedRelation re-scopes its subtree under the user alias.
+        TypedOp::AliasedRelation { input, .. } => {
+            mark_node(input, false, false);
         }
-        TypedOp::NaFill { input, values, .. } => {
-            let (jl, jr) = scan_exprs(values.iter_mut());
-            mark_node(input, pending_jl || jl, pending_jr || jr);
-        }
-        TypedOp::Limit { input, .. }
-        | TypedOp::Sample { input, .. }
-        | TypedOp::Deduplicate { input, .. }
-        | TypedOp::NaDrop { input, .. }
-        | TypedOp::NaReplace { input, .. } => {
-            mark_node(input, pending_jl, pending_jr);
-        }
-        TypedOp::LateralView { input, columns, .. } => {
-            let (jl, jr) = scan_exprs(columns.iter_mut().map(|(_, e)| e));
-            mark_node(input, pending_jl || jl, pending_jr || jr);
-        }
-        // Re-scoping operators: resolution can never stamp a synthetic
-        // qualifier across them, so no pending demand can arrive here.
-        // Their own expressions resolve against the input scope and start
-        // the demand chain.
-        TypedOp::Project { input, projections } => {
-            debug_assert!(!pending_jl && !pending_jr);
-            let (jl, jr) = scan_exprs(projections.iter_mut());
-            mark_node(input, jl, jr);
-        }
-        TypedOp::Aggregate {
-            input,
-            grouping,
-            aggregates,
-            having,
-            ..
-        } => {
-            debug_assert!(!pending_jl && !pending_jr);
-            let (jl, jr) = scan_exprs(
-                grouping
-                    .iter_mut()
-                    .chain(aggregates.iter_mut())
-                    .chain(having.iter_mut()),
-            );
-            mark_node(input, jl, jr);
-        }
-        TypedOp::WithColumns { input, assignments } => {
-            debug_assert!(!pending_jl && !pending_jr);
-            let (jl, jr) = scan_exprs(assignments.iter_mut().map(|(_, e)| e));
-            mark_node(input, jl, jr);
-        }
-        TypedOp::Pivot {
-            input,
-            grouping,
-            pivot_column,
-            pivot_values,
-            aggregates,
-        } => {
-            debug_assert!(!pending_jl && !pending_jr);
-            let (jl, jr) = scan_exprs(
-                grouping
-                    .iter_mut()
-                    .chain(std::iter::once(pivot_column))
-                    .chain(pivot_values.iter_mut())
-                    .chain(aggregates.iter_mut()),
-            );
-            mark_node(input, jl, jr);
-        }
-        TypedOp::Unpivot { input, .. }
+        // Re-scoping unary operators: resolution can never stamp a synthetic
+        // qualifier across them, so no pending demand can arrive here. Their
+        // own expressions resolve against the input scope and start the
+        // demand chain.
+        TypedOp::Project { input, .. }
+        | TypedOp::Aggregate { input, .. }
+        | TypedOp::WithColumns { input, .. }
+        | TypedOp::Pivot { input, .. }
+        | TypedOp::Unpivot { input, .. }
         | TypedOp::DropColumns { input, .. }
         | TypedOp::WithColumnsRenamed { input, .. }
         | TypedOp::Describe { input, .. }
         | TypedOp::Summary { input, .. }
         | TypedOp::FreqItems { input, .. } => {
             debug_assert!(!pending_jl && !pending_jr);
-            mark_node(input, false, false);
-        }
-        // AliasedRelation re-scopes its subtree under the user alias.
-        TypedOp::AliasedRelation { input, .. } => {
-            mark_node(input, false, false);
+            mark_node(input, own_jl, own_jr);
         }
         TypedOp::SetOp { children, .. } => {
             debug_assert!(!pending_jl && !pending_jr);
@@ -936,7 +941,7 @@ fn mark_node(node: &mut TypedAst, pending_jl: bool, pending_jr: bool) {
             mark_node(recursive_term, false, false);
         }
         // Leaves: `Values`/`LocalRelation` rows and `TableFunction` args are
-        // literal-bearing and resolve against bare scopes — no joins below,
+        // literal-bearing and resolve against bare scopes - no joins below,
         // no demands to carry.
         TypedOp::SingleRow
         | TypedOp::TableScan { .. }
@@ -945,6 +950,75 @@ fn mark_node(node: &mut TypedAst, pending_jl: bool, pending_jr: bool) {
         | TypedOp::FileScan { .. }
         | TypedOp::TableFunction { .. }
         | TypedOp::Unnest { .. } => {}
+    }
+}
+
+/// Scan the operator's OWN expressions for `__td_jl`/`__td_jr` demands and
+/// recurse [`mark_node`] into any analyzed subquery plans they carry.
+/// Exhaustive over expression-carrying variants: a new variant with
+/// expressions must decide here whether its expressions resolve against the
+/// input scope (scan them) or a bare scope (skip).
+fn own_expr_demands(op: &mut TypedOp) -> (bool, bool) {
+    match op {
+        TypedOp::Join { condition, .. } => scan_exprs(condition.iter_mut()),
+        TypedOp::Filter { condition, .. } => scan_exprs(std::iter::once(condition)),
+        TypedOp::Sort { order, .. } => scan_exprs(order.iter_mut().map(|so| so.expr.as_mut())),
+        TypedOp::SampleBy { col, .. } => scan_exprs(std::iter::once(col)),
+        TypedOp::NaFill { values, .. } => scan_exprs(values.iter_mut()),
+        TypedOp::NaReplace { replacements, .. } => {
+            scan_exprs(replacements.iter_mut().flat_map(|(old, new)| [old, new]))
+        }
+        TypedOp::LateralView { columns, .. } => scan_exprs(columns.iter_mut().map(|(_, e)| e)),
+        TypedOp::Project { projections, .. } => scan_exprs(projections.iter_mut()),
+        TypedOp::Aggregate {
+            grouping,
+            aggregates,
+            having,
+            ..
+        } => scan_exprs(
+            grouping
+                .iter_mut()
+                .chain(aggregates.iter_mut())
+                .chain(having.iter_mut()),
+        ),
+        TypedOp::WithColumns { assignments, .. } => {
+            scan_exprs(assignments.iter_mut().map(|(_, e)| e))
+        }
+        TypedOp::Pivot {
+            grouping,
+            pivot_column,
+            pivot_values,
+            aggregates,
+            ..
+        } => scan_exprs(
+            grouping
+                .iter_mut()
+                .chain(std::iter::once(pivot_column))
+                .chain(pivot_values.iter_mut())
+                .chain(aggregates.iter_mut()),
+        ),
+        // Literal-bearing rows / args resolve against bare scopes; the
+        // remaining variants carry no expressions.
+        TypedOp::Limit { .. }
+        | TypedOp::Sample { .. }
+        | TypedOp::Deduplicate { .. }
+        | TypedOp::NaDrop { .. }
+        | TypedOp::AliasedRelation { .. }
+        | TypedOp::DropColumns { .. }
+        | TypedOp::WithColumnsRenamed { .. }
+        | TypedOp::Describe { .. }
+        | TypedOp::Summary { .. }
+        | TypedOp::FreqItems { .. }
+        | TypedOp::Unpivot { .. }
+        | TypedOp::SetOp { .. }
+        | TypedOp::RecursiveCte { .. }
+        | TypedOp::SingleRow
+        | TypedOp::TableScan { .. }
+        | TypedOp::Values { .. }
+        | TypedOp::LocalRelation { .. }
+        | TypedOp::FileScan { .. }
+        | TypedOp::TableFunction { .. }
+        | TypedOp::Unnest { .. } => (false, false),
     }
 }
 
@@ -1957,10 +2031,9 @@ fn analyze_join(
     // one-level-only invariant (the lateral's inner sees only its
     // immediate left sibling, never the grandparent).
     let typed_right = if lateral {
-        let left_scopes = QualifierScopes::from_rel_scope(&typed_left.scope);
         let left_outer = OuterScope {
             schema: &typed_left.resolved_schema,
-            scopes: &left_scopes,
+            scopes: &typed_left.scope,
         };
         analyze_node(right, base_types, Some(left_outer))?
     } else {
@@ -2144,8 +2217,6 @@ fn analyze_join(
             lateral,
             left_plan_ids,
             right_plan_ids,
-            derived_left_schema,
-            derived_right_schema,
             // Stamped by the `mark_join_alias_requirements` post-pass once
             // the whole tree is analyzed (demands flow top-down).
             left_requires_synthetic: false,
@@ -2998,8 +3069,8 @@ fn expand_stack_projections(
 
 /// Left-to-right accumulator of LCA definitions built while folding one
 /// `Project`'s projection list. Append-only MULTIMAP — mirrors
-/// `QualifierScopes`'s "exactly one match or bail" shape, but (unlike
-/// `QualifierScopes::lookup`, which collapses both to `None`) distinguishes
+/// `RelScope::lookup`'s "exactly one match or bail" shape, but (unlike
+/// `RelScope::lookup`, which collapses both to `None`) distinguishes
 /// 0 matches (fall through to ordinary resolution) from 2+ (a hard
 /// ambiguity error) — see [`Self::lookup`].
 #[derive(Debug, Default)]
@@ -3381,78 +3452,12 @@ fn qualify_plan_id_refs(expr: &mut Expression, left_ids: &[i64], right_ids: &[i6
 // `apply_join_nullability` both preserve field count and order, so each
 // source relation occupies a CONTIGUOUS range of the CURRENT resolution
 // schema at every nesting level (already outer-join-flip-correct).
-// `QualifierScopes` maps each alias / table name to that range;
+// The stamped [`RelScope`] maps each alias / table name to that range;
 // `resolve_column`'s qualifier arm restricts a name-only lookup to
 // `schema.fields[range]` when the qualifier binds exactly one scope — so
 // `d.dept_id` resolves against dept's own fields instead of a first-match-by-
 // name scan that can silently pick the wrong side's (wrongly typed / wrongly
 // nullable) column.
-
-/// Alias/table-name → contiguous field-range bindings for a resolution
-/// schema. Built once per [`ResolveContext`] by [`collect_qualifier_bindings`].
-#[derive(Debug, Default)]
-struct QualifierScopes {
-    bindings: Vec<(String, std::ops::Range<usize>)>,
-    /// Plan-id → (contiguous field-range, join-side qualifier) bindings,
-    /// populated from `TypedOp::Join { left_plan_ids, right_plan_ids, .. }`
-    /// by [`collect_qualifier_bindings`]. Used by [`resolve_column`] to
-    /// disambiguate `UnresolvedColumn { qualifier: None, plan_id: Some(N) }`
-    /// above a join — the same plan_id tagging that `qualify_plan_id_refs`
-    /// handles for join CONDITIONS, extended to parent Project/Filter/Sort.
-    ///
-    /// The third tuple element is the synthetic join-side qualifier
-    /// ([`TD_JOIN_LEFT`] or [`TD_JOIN_RIGHT`]) that emission should render
-    /// so DuckDB can resolve the reference against the correct side of the
-    /// enclosing join's `(left) AS __td_jl ... (right) AS __td_jr` FROM.
-    plan_id_bindings: Vec<(i64, std::ops::Range<usize>, &'static str)>,
-}
-
-impl QualifierScopes {
-    fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Adopt a node's stamped [`RelScope`] as this resolution context's
-    /// bindings (base 0 — the node's own schema is the resolution schema).
-    fn from_rel_scope(scope: &RelScope) -> Self {
-        Self {
-            bindings: scope.aliases.clone(),
-            plan_id_bindings: scope.plan_ids.clone(),
-        }
-    }
-
-    /// The field range `q` binds to, iff EXACTLY ONE binding matches `q`
-    /// case-insensitively. A duplicate name — e.g. a self-join `emp e1 JOIN
-    /// emp e2` referenced by the bare table name `emp` — is ambiguous by
-    /// construction; return `None` so the caller falls back to the legacy
-    /// name-only resolution instead of picking an arbitrary side.
-    fn lookup(&self, q: &str) -> Option<std::ops::Range<usize>> {
-        let mut found: Option<std::ops::Range<usize>> = None;
-        for (name, range) in &self.bindings {
-            if name.eq_ignore_ascii_case(q) {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(range.clone());
-            }
-        }
-        found
-    }
-
-    /// The field range and join-side qualifier a plan_id maps to.  When a
-    /// plan_id appears in multiple ancestor joins (nested join trees), the
-    /// OUTERMOST entry wins — `collect_qualifier_bindings` pushes parent
-    /// entries before child entries, so the first match carries the
-    /// qualifier that is in scope at the parent operator's resolution point
-    /// (emission's alias-transparent rendering exposes the nearest join's
-    /// `__td_jl` / `__td_jr` aliases).
-    fn lookup_plan_id(&self, pid: i64) -> Option<(std::ops::Range<usize>, &'static str)> {
-        self.plan_id_bindings
-            .iter()
-            .find(|(id, _, _)| *id == pid)
-            .map(|(_, range, qualifier)| (range.clone(), *qualifier))
-    }
-}
 
 /// The enclosing (parent) plan's resolution schema, threaded into subquery
 /// analysis so a correlated outer reference (e.g. `e.salary` inside
@@ -3466,7 +3471,7 @@ impl QualifierScopes {
 #[derive(Debug, Clone, Copy)]
 struct OuterScope<'a> {
     schema: &'a StructType,
-    scopes: &'a QualifierScopes,
+    scopes: &'a RelScope,
 }
 
 /// The schema + alias-scope bindings a column reference resolves against.
@@ -3479,10 +3484,13 @@ struct ResolveContext<'a> {
     /// and positionally merged, per [`apply_join_nullability`] /
     /// [`StructType::merge`]).
     schema: &'a StructType,
-    /// Alias/table-name → field-range bindings derived from the input
-    /// operator tree. Empty when there is no join/table-alias structure to
-    /// bind (e.g. `Values` rows, table-valued-function args).
-    scopes: QualifierScopes,
+    /// Alias/table-name → field-range bindings the current node resolves
+    /// against — the input's stamped [`RelScope`], borrowed in the common
+    /// case; owned only when composed (join conditions bind both sides plus
+    /// the synthetic whole-side qualifiers). Empty when there is no
+    /// join/table-alias structure to bind (e.g. `Values` rows,
+    /// table-valued-function args).
+    scopes: std::borrow::Cow<'a, RelScope>,
     base_types: &'a BaseTypes,
     /// The enclosing plan's scope for correlated subquery resolution.
     /// `Some` when this context is analyzing a subquery's inner plan;
@@ -3501,7 +3509,7 @@ impl<'a> ResolveContext<'a> {
     ) -> Self {
         Self {
             schema: &input.resolved_schema,
-            scopes: QualifierScopes::from_rel_scope(&input.scope),
+            scopes: std::borrow::Cow::Borrowed(&input.scope),
             base_types,
             outer,
         }
@@ -3521,30 +3529,27 @@ impl<'a> ResolveContext<'a> {
         let left_len = left.resolved_schema.len();
         let right_len = right.resolved_schema.len();
         let offset = |r: &std::ops::Range<usize>| r.start + left_len..r.end + left_len;
-        let mut bindings = left.scope.aliases.clone();
-        bindings.extend(
+        let mut aliases = left.scope.aliases.clone();
+        aliases.extend(
             right
                 .scope
                 .aliases
                 .iter()
                 .map(|(name, r)| (name.clone(), offset(r))),
         );
-        let mut plan_id_bindings = left.scope.plan_ids.clone();
-        plan_id_bindings.extend(
+        let mut plan_ids = left.scope.plan_ids.clone();
+        plan_ids.extend(
             right
                 .scope
                 .plan_ids
                 .iter()
                 .map(|(pid, r, side)| (*pid, offset(r), *side)),
         );
-        bindings.push((TD_JOIN_LEFT.to_owned(), 0..left_len));
-        bindings.push((TD_JOIN_RIGHT.to_owned(), left_len..left_len + right_len));
+        aliases.push((TD_JOIN_LEFT.to_owned(), 0..left_len));
+        aliases.push((TD_JOIN_RIGHT.to_owned(), left_len..left_len + right_len));
         Self {
             schema,
-            scopes: QualifierScopes {
-                bindings,
-                plan_id_bindings,
-            },
+            scopes: std::borrow::Cow::Owned(RelScope { aliases, plan_ids }),
             base_types,
             outer,
         }
@@ -3555,14 +3560,14 @@ impl<'a> ResolveContext<'a> {
     fn bare(schema: &'a StructType, base_types: &'a BaseTypes) -> Self {
         Self {
             schema,
-            scopes: QualifierScopes::empty(),
+            scopes: std::borrow::Cow::Owned(RelScope::default()),
             base_types,
             outer: None,
         }
     }
 
     /// Look up `q`'s alias-scope range, guarding it against the current
-    /// schema's length. `QualifierScopes::lookup` only ever binds ranges
+    /// schema's length. [`RelScope::lookup`] only ever binds ranges
     /// within the schema they were built from, so an out-of-bounds range is
     /// an analyzer invariant violation — surface it loudly in debug builds,
     /// but degrade to `None` (the caller's legacy fallback) in release
@@ -3957,7 +3962,7 @@ fn expr_field(e: &Expression, schema: &StructType) -> StructField {
 /// alias`), or the LEFT of a semi/anti `Join` (render_project_over_join).
 /// Multi-relation joins (other than semi/anti) → false: this is an EMISSION
 /// scoping question, not a resolvability one — `resolve_column`'s per-column
-/// qualifier resolution is alias-aware over ALL join shapes (`QualifierScopes`
+/// qualifier resolution is alias-aware over ALL join shapes (`RelScope`
 /// / `collect_qualifier_bindings`; USING joins are the only qualifier-
 /// resolution gap remaining, since USING's output reorder/dedup breaks the
 /// contiguous-range invariant those bindings rely on). `q.*` star-expansion
@@ -6296,7 +6301,10 @@ mod tests {
     // ── derive_nullability pass — outer join flipping ────────────────────
 
     /// Analyze `emp JOIN dept` with the given join type and condition; return
-    /// `(derived_left_schema, derived_right_schema, resolved_schema)`.
+    /// the flipped per-side schemas plus the resolved schema. The join output
+    /// IS the positional concatenation of the flipped sides (left-only for
+    /// semi/anti), so the sides are recovered by slicing at the left child's
+    /// field count.
     fn analyze_emp_dept_join(
         jt: JoinType,
         cond: Option<Expression>,
@@ -6305,12 +6313,13 @@ mod tests {
         let ast = join(scan("emp"), scan("dept"), jt, cond);
         let typed = analyze(ast, &bt).unwrap();
         let resolved = typed.resolved_schema;
-        match typed.op {
-            TypedOp::Join {
-                derived_left_schema,
-                derived_right_schema,
-                ..
-            } => (derived_left_schema, derived_right_schema, resolved),
+        match &typed.op {
+            TypedOp::Join { left, .. } => {
+                let left_len = left.resolved_schema.len();
+                let flipped_left = StructType::new(resolved.fields[..left_len].to_vec());
+                let flipped_right = StructType::new(resolved.fields[left_len..].to_vec());
+                (flipped_left, flipped_right, resolved)
+            }
             _ => panic!("expected Join"),
         }
     }
@@ -9242,7 +9251,7 @@ mod tests {
     fn self_join_duplicate_alias_binding_falls_back_to_legacy_no_panic() {
         // `emp AS e1 JOIN emp AS e2`, referenced by the bare TABLE NAME
         // `emp` (not either alias): `collect_qualifier_bindings` binds
-        // `emp` TWICE (once per side), so `QualifierScopes::lookup` returns
+        // `emp` TWICE (once per side), so `RelScope::lookup` returns
         // `None` (ambiguous binding) and resolution falls back to the
         // legacy first-match path instead of panicking or guessing a side.
         let bt = base_types_with_emp_dept();

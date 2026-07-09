@@ -480,3 +480,17 @@ red in any later pass.
   cluster falling to one rule. The "nullable mismatch masks deeper diffs"
   pattern recurs (pass 18, this) — diagnose schema mismatches BEFORE value
   mismatches.
+
+## Pass 7 — 2026-07-09 — df.stat cov/corr/approxQuantile
+
+- **Root cause:** RelType::Cov/Corr/ApproxQuantile converter gaps (boundary).
+- **Fix:** converter desugar to global CommonOp::Aggregate (no new node, no
+  core changes). Spark-parity findings: cov applies na.fill(0) before
+  covar_samp (verified from Spark bytecode + Java reference) → COALESCE(col,
+  0); corr does NOT fill; approxQuantile emitted as nested ArrayLiteral of
+  percentile_approx → DuckDB quantile_disc (GK-on-small-data returns actual
+  elements; t-digest approx_quantile would diverge); relativeError ignored
+  (exact computation subsumes it, documented).
+- **Review:** APPROVE, 0 Critical/High; nested-aggregate-in-array emission
+  risk discharged by the 16/16 statistics run.
+- **Gate:** 1230→1237 (Δ +7, zero regressions); statistics file 16/16.

@@ -162,6 +162,9 @@ impl V2RelationConverter {
             RelType::Describe(d) => self.convert_describe(d),
             RelType::Summary(s) => self.convert_summary(s),
             RelType::FreqItems(f) => self.convert_freq_items(f),
+            RelType::Cov(c) => self.convert_cov(c),
+            RelType::Corr(c) => self.convert_corr(c),
+            RelType::ApproxQuantile(a) => self.convert_approx_quantile(a),
             RelType::Crosstab(c) => self.convert_crosstab(c),
             RelType::Sample(s) => self.convert_sample(s),
             RelType::SampleBy(s) => self.convert_sample_by(s),
@@ -399,6 +402,149 @@ impl V2RelationConverter {
             input: Box::new(input),
             col1: c.col1.clone(),
             col2: c.col2.clone(),
+        }))
+    }
+
+    /// Convert `proto::StatCov` (`df.stat.cov(col1, col2)`).
+    ///
+    /// Desugars to a global `Aggregate` (no grouping) whose single aggregate
+    /// expression is `covar_samp(COALESCE(col1, 0), COALESCE(col2, 0))`.
+    /// Both DuckDB and Spark expose `covar_samp` natively; τ's type inference
+    /// already registers the name (returns `Double`, always nullable).
+    ///
+    /// **NULL semantics (Spark parity):** Spark's `StatFunctions.calculateCovImpl`
+    /// calls `ds.na.fill(0L)` before aggregating — NULLs in numeric columns
+    /// are replaced with zero, so rows with a NULL in one column still
+    /// participate in the covariance (contributing zero for the missing value).
+    /// DuckDB's bare `covar_samp` skips NULL pairs entirely, which produces a
+    /// different result when NULLs are present.  Wrapping each column ref in
+    /// `COALESCE(col, 0)` aligns DuckDB with Spark.
+    ///
+    /// PySpark wire contract: single row, single column; the client extracts
+    /// `table[0][0].as_py()` — column name is immaterial.
+    fn convert_cov(&mut self, c: &proto::StatCov) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(c.input.as_deref(), "StatCov")?;
+        let col1 = coalesce_zero(&c.col1);
+        let col2 = coalesce_zero(&c.col2);
+        let agg_expr = Expression::FunctionCall(FunctionCall {
+            name: "covar_samp".to_owned(),
+            args: vec![col1, col2],
+            distinct: false,
+        });
+        Ok(CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(input),
+            grouping: vec![],
+            aggregates: vec![agg_expr],
+            grouping_kind: thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        }))
+    }
+
+    /// Convert `proto::StatCorr` (`df.stat.corr(col1, col2)`).
+    ///
+    /// Desugars to a global `Aggregate` with `corr(col1, col2)`.  Spark only
+    /// supports the Pearson correlation coefficient; the PySpark client
+    /// validates this client-side, but the proto carries an optional `method`
+    /// field — τ rejects non-Pearson methods as a Spark-emulated error (they
+    /// would also fail Spark-side).
+    ///
+    /// PySpark wire contract: single row, single column (`table[0][0].as_py()`).
+    fn convert_corr(&mut self, c: &proto::StatCorr) -> Result<CommonAst, EmissionError> {
+        // Validate method if present.
+        if let Some(ref method) = c.method {
+            if !method.eq_ignore_ascii_case("pearson") {
+                return Err(EmissionError::Unsupported {
+                    kind: UnsupportedKind::ProtoShape,
+                    name: "StatCorr::method".to_owned(),
+                    reason: format!(
+                        "only the Pearson correlation coefficient is supported, got '{method}'"
+                    ),
+                });
+            }
+        }
+        let input = self.convert_input(c.input.as_deref(), "StatCorr")?;
+        let col1 = unresolved_col(&c.col1);
+        let col2 = unresolved_col(&c.col2);
+        let agg_expr = Expression::FunctionCall(FunctionCall {
+            name: "corr".to_owned(),
+            args: vec![col1, col2],
+            distinct: false,
+        });
+        Ok(CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(input),
+            grouping: vec![],
+            aggregates: vec![agg_expr],
+            grouping_kind: thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        }))
+    }
+
+    /// Convert `proto::StatApproxQuantile` (`df.stat.approxQuantile(...)`).
+    ///
+    /// Spark uses a Greenwald-Khanna sketch whose accuracy depends on
+    /// `relative_error`.  On small datasets (the corpus witnesses) the sketch
+    /// returns exact order statistics (actual data elements).  τ maps to
+    /// DuckDB's exact `quantile_disc` (discrete sample value) which matches
+    /// the small-data behavior; `relative_error` is intentionally ignored
+    /// because exact computation subsumes any accuracy parameter.
+    ///
+    /// PySpark wire contract: single row, single column of type
+    /// `Array(Array(Double))`.  Outer array has one element per input column;
+    /// inner array has one element per probability.  The client decodes as
+    /// `[q.as_py() for q in table[0][0]]`.
+    ///
+    /// Desugars to a global `Aggregate` whose single aggregate expression is
+    /// a nested `ArrayLiteral`:
+    /// ```text
+    /// [[percentile_approx(col1, p1), percentile_approx(col1, p2), ...],
+    ///  [percentile_approx(col2, p1), percentile_approx(col2, p2), ...]]
+    /// ```
+    /// Each `percentile_approx` call flows through the existing
+    /// `render_aggregate` emission arm which maps to `quantile_disc`.
+    fn convert_approx_quantile(
+        &mut self,
+        a: &proto::StatApproxQuantile,
+    ) -> Result<CommonAst, EmissionError> {
+        let input = self.convert_input(a.input.as_deref(), "StatApproxQuantile")?;
+        // Build per-column inner arrays: [percentile_approx(col, p1), ... , percentile_approx(col, pN)]
+        let per_col_arrays: Vec<Expression> = a
+            .cols
+            .iter()
+            .map(|col_name| {
+                let elements: Vec<Expression> = a
+                    .probabilities
+                    .iter()
+                    .map(|&prob| {
+                        Expression::FunctionCall(FunctionCall {
+                            name: "percentile_approx".to_owned(),
+                            args: vec![
+                                unresolved_col(col_name),
+                                lit(LiteralValue::Double(prob), DataType::Double),
+                            ],
+                            distinct: false,
+                        })
+                    })
+                    .collect();
+                Expression::ArrayLiteral(ArrayLiteralExpression {
+                    elements,
+                    element_type: DataType::Double,
+                })
+            })
+            .collect();
+        // Outer array wrapping per-column arrays.
+        let outer = Expression::ArrayLiteral(ArrayLiteralExpression {
+            elements: per_col_arrays,
+            element_type: DataType::Array(Box::new(DataType::Double), true),
+        });
+        Ok(CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(input),
+            grouping: vec![],
+            aggregates: vec![outer],
+            grouping_kind: thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
         }))
     }
 
@@ -1438,6 +1584,31 @@ fn extract_column_name(expr: &proto::Expression) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Construct an [`Expression::UnresolvedColumn`] from a bare column name.
+fn unresolved_col(name: &str) -> Expression {
+    Expression::UnresolvedColumn(UnresolvedColumn {
+        name: name.to_owned(),
+        qualifier: None,
+        plan_id: None,
+    })
+}
+
+/// Wrap a column reference in `COALESCE(col, 0)` — fills NULLs with zero.
+///
+/// Used by [`V2RelationConverter::convert_cov`] to match Spark's
+/// `StatFunctions.calculateCovImpl` semantics, which calls `na.fill(0L)`
+/// before `covar_samp`.
+fn coalesce_zero(col_name: &str) -> Expression {
+    Expression::FunctionCall(FunctionCall {
+        name: "coalesce".to_owned(),
+        args: vec![
+            unresolved_col(col_name),
+            lit(LiteralValue::Long(0), DataType::Long),
+        ],
+        distinct: false,
+    })
 }
 
 fn null_literal() -> Expression {
@@ -3051,6 +3222,174 @@ mod tests {
             }
             _ => panic!("expected CommonOp::Crosstab"),
         }
+    }
+
+    // ── StatCov / StatCorr / ApproxQuantile converters ─────────────────────
+
+    #[test]
+    fn convert_cov_desugars_to_global_aggregate_with_covar_samp() {
+        let input = table_scan_rel("emp");
+        let cov = rel(proto::relation::RelType::Cov(Box::new(proto::StatCov {
+            input: Some(Box::new(input)),
+            col1: "val1".to_owned(),
+            col2: "val2".to_owned(),
+        })));
+        let out = convert_ok(&cov);
+        match &out.op {
+            CommonOp::Aggregate {
+                grouping,
+                aggregates,
+                ..
+            } => {
+                assert!(grouping.is_empty(), "cov is a global aggregate");
+                assert_eq!(aggregates.len(), 1);
+                match &aggregates[0] {
+                    Expression::FunctionCall(f) => {
+                        assert_eq!(f.name, "covar_samp");
+                        assert_eq!(f.args.len(), 2);
+                        // Each arg should be coalesce(col, 0) per Spark's na.fill(0L).
+                        for arg in &f.args {
+                            match arg {
+                                Expression::FunctionCall(inner) => {
+                                    assert_eq!(inner.name, "coalesce");
+                                }
+                                other => panic!("expected coalesce FunctionCall, got {other:?}"),
+                            }
+                        }
+                    }
+                    other => panic!("expected FunctionCall, got {other:?}"),
+                }
+            }
+            other => panic!("expected CommonOp::Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_cov_missing_input_surfaces_unsupported_proto_shape() {
+        let cov = rel(proto::relation::RelType::Cov(Box::new(proto::StatCov {
+            input: None,
+            col1: "a".to_owned(),
+            col2: "b".to_owned(),
+        })));
+        convert_proto_shape_err(&cov);
+    }
+
+    #[test]
+    fn convert_corr_desugars_to_global_aggregate_with_corr() {
+        let input = table_scan_rel("emp");
+        let corr = rel(proto::relation::RelType::Corr(Box::new(proto::StatCorr {
+            input: Some(Box::new(input)),
+            col1: "val1".to_owned(),
+            col2: "val2".to_owned(),
+            method: Some("pearson".to_owned()),
+        })));
+        let out = convert_ok(&corr);
+        match &out.op {
+            CommonOp::Aggregate {
+                grouping,
+                aggregates,
+                ..
+            } => {
+                assert!(grouping.is_empty(), "corr is a global aggregate");
+                assert_eq!(aggregates.len(), 1);
+                match &aggregates[0] {
+                    Expression::FunctionCall(f) => {
+                        assert_eq!(f.name, "corr");
+                        assert_eq!(f.args.len(), 2);
+                    }
+                    other => panic!("expected FunctionCall, got {other:?}"),
+                }
+            }
+            other => panic!("expected CommonOp::Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_corr_rejects_non_pearson_method() {
+        let input = table_scan_rel("emp");
+        let corr = rel(proto::relation::RelType::Corr(Box::new(proto::StatCorr {
+            input: Some(Box::new(input)),
+            col1: "a".to_owned(),
+            col2: "b".to_owned(),
+            method: Some("spearman".to_owned()),
+        })));
+        let err = V2RelationConverter::new().convert(&corr).unwrap_err();
+        assert!(
+            err.to_string().contains("Pearson"),
+            "should mention Pearson: {err}"
+        );
+    }
+
+    #[test]
+    fn convert_corr_accepts_no_method_as_pearson() {
+        let input = table_scan_rel("emp");
+        let corr = rel(proto::relation::RelType::Corr(Box::new(proto::StatCorr {
+            input: Some(Box::new(input)),
+            col1: "a".to_owned(),
+            col2: "b".to_owned(),
+            method: None,
+        })));
+        let out = convert_ok(&corr);
+        assert!(matches!(out.op, CommonOp::Aggregate { .. }));
+    }
+
+    #[test]
+    fn convert_approx_quantile_single_col_multiple_probs() {
+        let input = table_scan_rel("emp");
+        let aq = rel(proto::relation::RelType::ApproxQuantile(Box::new(
+            proto::StatApproxQuantile {
+                input: Some(Box::new(input)),
+                cols: vec!["val1".to_owned()],
+                probabilities: vec![0.0, 0.5, 1.0],
+                relative_error: 0.0,
+            },
+        )));
+        let out = convert_ok(&aq);
+        match &out.op {
+            CommonOp::Aggregate {
+                grouping,
+                aggregates,
+                ..
+            } => {
+                assert!(grouping.is_empty(), "approxQuantile is a global aggregate");
+                assert_eq!(aggregates.len(), 1);
+                // Outer array wraps one inner array (single column).
+                match &aggregates[0] {
+                    Expression::ArrayLiteral(outer) => {
+                        assert_eq!(outer.elements.len(), 1, "one col → one inner array");
+                        match &outer.elements[0] {
+                            Expression::ArrayLiteral(inner) => {
+                                assert_eq!(inner.elements.len(), 3, "3 probabilities");
+                                for elem in &inner.elements {
+                                    match elem {
+                                        Expression::FunctionCall(f) => {
+                                            assert_eq!(f.name, "percentile_approx");
+                                        }
+                                        other => panic!("expected FunctionCall, got {other:?}"),
+                                    }
+                                }
+                            }
+                            other => panic!("expected inner ArrayLiteral, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected outer ArrayLiteral, got {other:?}"),
+                }
+            }
+            other => panic!("expected CommonOp::Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_approx_quantile_missing_input_surfaces_unsupported_proto_shape() {
+        let aq = rel(proto::relation::RelType::ApproxQuantile(Box::new(
+            proto::StatApproxQuantile {
+                input: None,
+                cols: vec!["a".to_owned()],
+                probabilities: vec![0.5],
+                relative_error: 0.0,
+            },
+        )));
+        convert_proto_shape_err(&aq);
     }
 
     // ── Sample / SampleBy converters (Pass 83) ────────────────────────────

@@ -45,6 +45,7 @@ use super::expression::{
     LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan,
     UnaryExpression, UnaryOp,
 };
+use super::sql_block::{Clause, DistinctKind, FromItem, SelectBlock, SqlUnit};
 use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
 use crate::types::{DataType, StructType};
 use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
@@ -73,10 +74,232 @@ pub(crate) static EMIT_TAP_MUTEX: Mutex<()> = Mutex::new(());
 ///
 /// One hand-written match arm per [`TypedOp`] variant. No table interpreter.
 pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError> {
+    let result = build_unit(op, schema).map(|unit| unit.to_sql());
+    if result.is_ok() {
+        EMIT_TAP.fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
+/// Build the [`SqlUnit`] for `op`: an open [`SelectBlock`] for the
+/// block-composable operators, or a `Raw` string from the legacy renderers
+/// for everything not yet converted. This is the per-operator merge/wrap
+/// decision site of the SELECT-block builder (see `sql_block.rs`).
+fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
+    match op {
+        TypedOp::TableScan { table, alias } => Ok(SqlUnit::Select(SelectBlock::from_item(
+            FromItem::Relation {
+                base: table.clone(),
+                alias: alias.clone(),
+            },
+        ))),
+        TypedOp::Project { input, projections } => build_project(input, projections),
+        TypedOp::Filter { input, condition } => build_filter(input, condition),
+        TypedOp::Sort {
+            input,
+            order,
+            limit,
+            offset,
+        } => build_sort(input, order, *limit, *offset),
+        TypedOp::Limit {
+            input,
+            limit,
+            offset,
+        } => build_limit(input, *limit, *offset),
+        TypedOp::Deduplicate { input, on_columns } => build_deduplicate(input, on_columns),
+        TypedOp::AliasedRelation { input, alias } => build_aliased_relation(input, alias),
+        other => legacy_render(other, schema).map(SqlUnit::Raw),
+    }
+}
+
+/// Build the child's unit and open it as a block: a `Select` unit is
+/// returned as-is (merge candidate); a `Raw` unit is wrapped as
+/// `(…) AS __td_sub`.
+fn open_block(child: &TypedAst) -> Result<SelectBlock, EmissionError> {
+    Ok(match build_unit(&child.op, &child.resolved_schema)? {
+        SqlUnit::Select(block) => block,
+        raw => SelectBlock::wrap(raw),
+    })
+}
+
+/// Collect the qualifiers of every analyzer-stamped column reference in
+/// `expr` into `out` (immediate tree only — `Expression::children` excludes
+/// subquery bodies by the τ walker convention, which is exactly the merge
+/// visibility contract: correlated inner refs bind against whatever FROM
+/// aliases the enclosing block keeps visible, same as today's shapes).
+fn expr_qualifiers<'e>(expr: &'e Expression, out: &mut Vec<&'e str>) {
+    match expr {
+        Expression::ColumnReference(c) => {
+            if let Some(q) = c.qualifier.as_deref() {
+                out.push(q);
+            }
+        }
+        Expression::UnresolvedColumn(u) => {
+            if let Some(q) = u.qualifier.as_deref() {
+                out.push(q);
+            }
+        }
+        Expression::Star(StarExpression { qualifier }) => {
+            if let Some(q) = qualifier.as_deref() {
+                out.push(q);
+            }
+        }
+        other => {
+            for child in other.children() {
+                expr_qualifiers(child, out);
+            }
+        }
+    }
+}
+
+/// Merge visibility: every qualifier stamped on `exprs` must be an alias the
+/// block's FROM scope actually emits. A failed check falls back to the wrap
+/// path, which reproduces today's occlusion behavior exactly (merging only
+/// ever WIDENS what a clause can see).
+fn exprs_visible_in<'e>(
+    exprs: impl IntoIterator<Item = &'e Expression>,
+    block: &SelectBlock,
+) -> bool {
+    let mut quals = Vec::new();
+    for e in exprs {
+        expr_qualifiers(e, &mut quals);
+    }
+    quals.iter().all(|q| block.exposes(q))
+}
+
+fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit, EmissionError> {
+    // A lone unqualified `*` is a pure identity projection: return the child
+    // unit verbatim (ADR-001 cosmetic "SELECT * over SELECT *" collapse).
+    // This subsumes the former USING-join delegate branch — a `*` over a
+    // USING join yields the join renderer's explicit hoisted slot list,
+    // which is exactly the column order the resolved schema declares; plain
+    // ON/CROSS joins expand `*` left-then-right, which already matches.
+    if is_unqualified_star_only(projections) {
+        return build_unit(&input.op, &input.resolved_schema);
+    }
+    let slots = render_projection_slots(projections, &input.resolved_schema)?;
+    let mut block = open_block(input)?;
+    if block.can_accept(Clause::Select) && exprs_visible_in(projections, &block) {
+        block.set_projections(slots);
+        return Ok(SqlUnit::Select(block));
+    }
+    // Phase-B bridge: Join / Filter-over-Join / LateralView children are
+    // still legacy-rendered, and their user aliases must stay visible to
+    // qualified projection refs — inline through them as before. Dies in
+    // Phase C when Join/LateralView become block-producing.
+    if let Some(atf) = render_alias_transparent_from(input)? {
+        return Ok(SqlUnit::Raw(match atf.where_sql {
+            Some(w) => format!("SELECT {slots} FROM {} WHERE {w}", atf.from_sql),
+            None => format!("SELECT {slots} FROM {}", atf.from_sql),
+        }));
+    }
+    let mut wrapped = SelectBlock::wrap(SqlUnit::Select(block));
+    wrapped.set_projections(slots);
+    Ok(SqlUnit::Select(wrapped))
+}
+
+fn build_filter(input: &TypedAst, condition: &Expression) -> Result<SqlUnit, EmissionError> {
+    let cond_sql = render_expr(condition, &input.resolved_schema)?;
+    let mut block = open_block(input)?;
+    if block.can_accept(Clause::Where) && exprs_visible_in([condition], &block) {
+        block.push_where(cond_sql);
+        return Ok(SqlUnit::Select(block));
+    }
+    let mut wrapped = SelectBlock::wrap(SqlUnit::Select(block));
+    wrapped.push_where(cond_sql);
+    Ok(SqlUnit::Select(wrapped))
+}
+
+fn build_sort(
+    input: &TypedAst,
+    order: &[SortOrder],
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<SqlUnit, EmissionError> {
+    let keys = order
+        .iter()
+        .map(|so| render_sort_key(so, &input.resolved_schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut block = open_block(input)?;
+    // Over an occupied SELECT list, only bare output-name references merge:
+    // ORDER BY resolves them against the select list's aliases; expression
+    // keys would re-bind against FROM columns and could diverge.
+    let keys_bind = if block.select_free() {
+        exprs_visible_in(order.iter().map(|so| so.expr.as_ref()), &block)
+    } else {
+        order.iter().all(|so| {
+            matches!(so.expr.as_ref(), Expression::ColumnReference(c) if c.qualifier.is_none())
+        })
+    };
+    if block.can_accept(Clause::OrderBy) && block.distinct_allows_order() && keys_bind {
+        block.set_order_by(keys, limit, offset);
+        return Ok(SqlUnit::Select(block));
+    }
+    let mut wrapped = SelectBlock::wrap(SqlUnit::Select(block));
+    wrapped.set_order_by(keys, limit, offset);
+    Ok(SqlUnit::Select(wrapped))
+}
+
+fn build_limit(
+    input: &TypedAst,
+    limit: i64,
+    offset: Option<i64>,
+) -> Result<SqlUnit, EmissionError> {
+    let mut block = open_block(input)?;
+    if !block.can_accept(Clause::LimitOffset) {
+        block = SelectBlock::wrap(SqlUnit::Select(block));
+    }
+    block.set_limit(limit, offset);
+    Ok(SqlUnit::Select(block))
+}
+
+fn build_deduplicate(input: &TypedAst, on_columns: &[String]) -> Result<SqlUnit, EmissionError> {
+    let mut block = open_block(input)?;
+    if on_columns.is_empty() {
+        if !block.can_accept(Clause::Distinct) {
+            block = SelectBlock::wrap(SqlUnit::Select(block));
+        }
+        block.set_distinct(DistinctKind::Distinct);
+    } else {
+        let cols = sql_join(on_columns.iter(), ", ", |c| Ok(quote_ident(c).into_owned()))?;
+        // DISTINCT ON picks an arbitrary representative row per key; it only
+        // merges into a star block (no computed select list, no prior
+        // DISTINCT) so the row-choice surface stays identical to today's
+        // wrapped form.
+        if !(block.can_accept(Clause::Distinct) && block.select_free()) {
+            block = SelectBlock::wrap(SqlUnit::Select(block));
+        }
+        block.set_distinct(DistinctKind::DistinctOn(cols));
+    }
+    Ok(SqlUnit::Select(block))
+}
+
+fn build_aliased_relation(input: &TypedAst, alias: &str) -> Result<SqlUnit, EmissionError> {
+    // `df.alias("e")` over a bare table scan collapses to `FROM emp AS e`;
+    // anything else becomes a derived table under the user alias. Either
+    // way the alias is the block's whole scope — the analyzer's RelScope
+    // for AliasedRelation binds exactly this alias.
+    let item = if let TypedOp::TableScan { table, alias: None } = &input.op {
+        FromItem::Relation {
+            base: table.clone(),
+            alias: Some(alias.to_owned()),
+        }
+    } else {
+        FromItem::Derived {
+            unit: Box::new(build_unit(&input.op, &input.resolved_schema)?),
+            alias: alias.to_owned(),
+        }
+    };
+    Ok(SqlUnit::Select(SelectBlock::from_item(item)))
+}
+
+/// The pre-SELECT-block string renderers, one arm per not-yet-converted
+/// operator. Arms migrate from here into [`build_unit`] phase by phase;
+/// the match stays exhaustive so a new `TypedOp` variant is a compile error.
+fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError> {
     let result: Result<String, EmissionError> = match op {
         // ── C.1 wired ────────────────────────────────────────────────────
         TypedOp::SingleRow => render_single_row(),
-        TypedOp::TableScan { table, alias } => render_table_scan(table, alias.as_deref()),
         TypedOp::Values { rows, column_names } => render_values(rows, column_names, schema),
         TypedOp::LocalRelation { schema: s, rows } => render_local_relation(s, rows),
         TypedOp::FileScan {
@@ -85,26 +308,11 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             schema: s,
             options,
         } => render_file_scan(*format, paths, s, options),
-        TypedOp::Project { input, projections } => render_project(input, projections),
-        TypedOp::Filter { input, condition } => render_filter(input, condition),
-        TypedOp::Sort {
-            input,
-            order,
-            limit,
-            offset,
-        } => render_sort(input, order, *limit, *offset),
-        TypedOp::Limit {
-            input,
-            limit,
-            offset,
-        } => render_limit(input, *limit, *offset),
         TypedOp::WithColumns { input, assignments } => render_with_columns(input, assignments),
         TypedOp::DropColumns { input, drop_names } => render_drop_columns(input, drop_names),
-        TypedOp::AliasedRelation { input, alias } => render_aliased_relation(input, alias),
         TypedOp::WithColumnsRenamed { input, renames } => {
             render_with_columns_renamed(input, renames)
         }
-        TypedOp::Deduplicate { input, on_columns } => render_deduplicate(input, on_columns),
         TypedOp::NaFill {
             input,
             cols,
@@ -240,11 +448,19 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
             name: "Unnest".to_owned(),
             reason: "unnest emission (not implemented in τ)".to_owned(),
         }),
-    };
 
-    if result.is_ok() {
-        EMIT_TAP.fetch_add(1, Ordering::Relaxed);
-    }
+        // Converted to the SELECT-block builder — reaching a legacy arm for
+        // these is a `build_unit` dispatch bug.
+        TypedOp::TableScan { .. }
+        | TypedOp::Project { .. }
+        | TypedOp::Filter { .. }
+        | TypedOp::Sort { .. }
+        | TypedOp::Limit { .. }
+        | TypedOp::Deduplicate { .. }
+        | TypedOp::AliasedRelation { .. } => {
+            unreachable!("block-composable operator routed to legacy_render: {op:?}")
+        }
+    };
     result
 }
 
@@ -288,13 +504,6 @@ fn table_scan_from_body(table: &str, alias: Option<&str>) -> String {
         Some(a) => format!("{name} AS {}", quote_ident(a)),
         None => name.into_owned(),
     }
-}
-
-fn render_table_scan(table: &str, alias: Option<&str>) -> Result<String, EmissionError> {
-    Ok(format!(
-        "SELECT * FROM {}",
-        table_scan_from_body(table, alias)
-    ))
 }
 
 fn render_values(
@@ -554,50 +763,6 @@ fn render_alias_transparent_from(
         }));
     }
     Ok(None)
-}
-
-fn render_project(input: &TypedAst, projections: &[Expression]) -> Result<String, EmissionError> {
-    let input_schema = &input.resolved_schema;
-    // `SELECT *` over a USING/NATURAL join: DuckDB's `*` keeps the join key in
-    // its natural (left-table) position, but the analyzer's resolved_schema
-    // HOISTS the coalesced key(s) to the front (Spark semantics). If we emitted
-    // `SELECT * FROM (... USING (k))` the wire column order would diverge from
-    // the declared schema. Delegate to the generic join renderer, which emits
-    // an explicit hoisted slot list mirroring resolved_schema. Only fires for a
-    // lone unqualified `*` over a Join carrying USING columns; plain ON/CROSS
-    // joins expand `*` in left-then-right order, which already matches the
-    // declared schema.
-    if is_unqualified_star_only(projections) {
-        if let TypedOp::Join { using_columns, .. } = &input.op {
-            if !using_columns.is_empty() {
-                return dispatch_op(&input.op, &input.resolved_schema);
-            }
-        }
-    }
-    // Join / Filter-over-Join / Filter-over-AliasedRelation / AliasedRelation
-    // children already expose the aliases the projection list references —
-    // inline through them instead of wrapping in a synthetic `__td_proj`.
-    if let Some(atf) = render_alias_transparent_from(input)? {
-        let slots_sql = render_projection_slots(projections, input_schema)?;
-        return Ok(match atf.where_sql {
-            Some(w) => format!("SELECT {slots_sql} FROM {} WHERE {w}", atf.from_sql),
-            None => format!("SELECT {slots_sql} FROM {}", atf.from_sql),
-        });
-    }
-    // Project over a bare TableScan: inline `FROM t` (optionally `AS alias`)
-    // instead of wrapping the child in `(SELECT * FROM t) AS __td_proj`. This
-    // keeps the table name / alias in scope so qualified refs and qualified
-    // stars (`emp.col` / `emp.*`) bind (Fix A stamps the schema accordingly).
-    if let TypedOp::TableScan { table, alias } = &input.op {
-        let slots_sql = render_projection_slots(projections, input_schema)?;
-        let from = table_scan_from_body(table, alias.as_deref());
-        return Ok(format!("SELECT {slots_sql} FROM {from}"));
-    }
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let slots_sql = render_projection_slots(projections, input_schema)?;
-    Ok(format!(
-        "SELECT {slots_sql} FROM ({child_sql}) AS __td_proj"
-    ))
 }
 
 /// True iff `projections` is exactly one unqualified `*` (i.e. `SELECT *`),
@@ -976,37 +1141,6 @@ fn render_lateral_view(
     Ok(format!("SELECT * FROM {from_body}"))
 }
 
-fn render_filter(input: &TypedAst, condition: &Expression) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let cond_sql = render_expr(condition, &input.resolved_schema)?;
-    Ok(format!(
-        "SELECT * FROM ({child_sql}) AS __td_filter WHERE {cond_sql}"
-    ))
-}
-
-fn render_sort(
-    input: &TypedAst,
-    order: &[SortOrder],
-    limit: Option<i64>,
-    offset: Option<i64>,
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let mut sql = format!("SELECT * FROM ({child_sql}) AS __td_sort");
-    if !order.is_empty() {
-        sql.push_str(" ORDER BY ");
-        sql.push_str(&sql_join(order.iter(), ", ", |so| {
-            render_sort_key(so, &input.resolved_schema)
-        })?);
-    }
-    if let Some(l) = limit {
-        sql.push_str(&format!(" LIMIT {l}"));
-    }
-    if let Some(o) = offset {
-        sql.push_str(&format!(" OFFSET {o}"));
-    }
-    Ok(sql)
-}
-
 fn render_sort_key(so: &SortOrder, schema: &Schema) -> Result<String, EmissionError> {
     let expr_sql = render_expr(&so.expr, schema)?;
     let dir = match so.direction {
@@ -1018,19 +1152,6 @@ fn render_sort_key(so: &SortOrder, schema: &Schema) -> Result<String, EmissionEr
         NullOrdering::NullsLast => "NULLS LAST",
     };
     Ok(format!("{expr_sql} {dir} {nulls}"))
-}
-
-fn render_limit(
-    input: &TypedAst,
-    limit: i64,
-    offset: Option<i64>,
-) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let mut sql = format!("SELECT * FROM ({child_sql}) AS __td_limit LIMIT {limit}");
-    if let Some(o) = offset {
-        sql.push_str(&format!(" OFFSET {o}"));
-    }
-    Ok(sql)
 }
 
 // ── Unwired renderer (Decision 13-A) ─────────────────────────────────────────
@@ -1823,20 +1944,6 @@ fn render_sample_by(
     ))
 }
 
-fn render_deduplicate(input: &TypedAst, on_columns: &[String]) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    if on_columns.is_empty() {
-        Ok(format!(
-            "SELECT DISTINCT * FROM ({child_sql}) AS __td_dedup"
-        ))
-    } else {
-        let cols = sql_join(on_columns.iter(), ", ", |c| Ok(quote_ident(c).into_owned()))?;
-        Ok(format!(
-            "SELECT DISTINCT ON ({cols}) * FROM ({child_sql}) AS __td_dedup"
-        ))
-    }
-}
-
 fn render_with_columns_renamed(
     input: &TypedAst,
     renames: &[(String, String)],
@@ -1856,12 +1963,6 @@ fn render_with_columns_renamed(
         Ok(format!("{src} AS {dst}"))
     })?;
     Ok(format!("SELECT {slots} FROM ({child_sql}) AS __td_rename"))
-}
-
-fn render_aliased_relation(input: &TypedAst, alias: &str) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let a = quote_ident(alias);
-    Ok(format!("SELECT * FROM ({child_sql}) AS {a}"))
 }
 
 /// Emit a table-valued function. Only `range` is implemented; the analyzer has
@@ -6356,7 +6457,7 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT id FROM (SELECT id FROM range(CAST(0 AS BIGINT), 5, CAST(1 AS BIGINT)) \
-             AS __td_range(id)) AS __td_proj"
+             AS __td_range(id)) AS __td_sub"
         );
     }
 
@@ -6632,7 +6733,7 @@ mod tests {
         let bt = base_types_emp_dept(&plan);
         let typed = analyze(plan, &bt).expect("analyze project-over-filter-over-aliased");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(sql.contains(") AS e WHERE "), "got: {sql}");
+        assert!(sql.contains("emp AS e WHERE "), "got: {sql}");
         assert!(!sql.contains("__td_filter"), "got: {sql}");
         assert!(!sql.contains("__td_proj"), "got: {sql}");
     }
@@ -7032,11 +7133,11 @@ mod tests {
         let typed = analyze(plan, &bt).expect("analyze plan_id-tagged aliased join");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(
-            sql.contains("(SELECT * FROM (SELECT * FROM emp) AS e) AS __td_jl"),
+            sql.contains("(SELECT * FROM emp AS e) AS __td_jl"),
             "got: {sql}"
         );
         assert!(
-            sql.contains("(SELECT * FROM (SELECT * FROM dept) AS d) AS __td_jr"),
+            sql.contains("(SELECT * FROM dept AS d) AS __td_jr"),
             "got: {sql}"
         );
     }

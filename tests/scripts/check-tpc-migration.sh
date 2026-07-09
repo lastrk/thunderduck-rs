@@ -37,7 +37,8 @@ for f in $LEGACY; do
     [ -e "$INTEGRATION_DIR/differential/$f.py" ] && fail "legacy file still exists: $f.py"
 done
 ok "all four legacy files gone"
-REFS="$(cd "$WORKSPACE_DIR" && git grep -l -E "test_differential_v2|test_tpch_differential|test_tpcds_differential|test_tpcds_dataframe" -- tests/ 2>/dev/null || true)"
+# (this script necessarily names the legacy modules — exclude itself)
+REFS="$(cd "$WORKSPACE_DIR" && git grep -l -E "test_differential_v2|test_tpch_differential|test_tpcds_differential|test_tpcds_dataframe" -- tests/ ':!tests/scripts/check-tpc-migration.sh' 2>/dev/null || true)"
 [ -n "$REFS" ] && fail "references to legacy modules remain under tests/: $REFS"
 ok "no references under tests/ (incl. tests/scripts/)"
 

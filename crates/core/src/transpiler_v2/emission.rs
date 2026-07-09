@@ -356,10 +356,17 @@ fn render_local_relation(
     ))
 }
 
-fn render_file_scan(
+/// Build the DuckDB reader-call SQL fragment for a file scan, e.g.
+/// `read_parquet('/path/to/file.parquet')` or
+/// `read_csv(['/a.csv', '/b.csv'], header='true')`.
+///
+/// This is the shared core between [`render_file_scan`] (which wraps it in
+/// `SELECT * FROM ...`) and the schema-less Parquet discovery path in
+/// `connect-server`'s `resolve_implicit_pivots` (which wraps it in
+/// `SELECT * FROM ... LIMIT 0`).
+pub fn build_file_reader_sql(
     format: FileFormat,
     paths: &[String],
-    _schema: &StructType,
     options: &[(String, String)],
 ) -> Result<String, EmissionError> {
     if paths.is_empty() {
@@ -392,7 +399,17 @@ fn render_file_scan(
         })?;
         format!(", {opts}")
     };
-    Ok(format!("SELECT * FROM {reader}({paths_sql}{opts_sql})"))
+    Ok(format!("{reader}({paths_sql}{opts_sql})"))
+}
+
+fn render_file_scan(
+    format: FileFormat,
+    paths: &[String],
+    _schema: &StructType,
+    options: &[(String, String)],
+) -> Result<String, EmissionError> {
+    let reader_call = build_file_reader_sql(format, paths, options)?;
+    Ok(format!("SELECT * FROM {reader_call}"))
 }
 
 /// `(sql) AS alias`, quoting `alias` — the derived-table wrapper shape shared
@@ -7851,6 +7868,63 @@ mod tests {
         let typed = analyze(ast, &BaseTypes::empty()).expect("analyze");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert_eq!(sql, "SELECT * FROM read_parquet('/tmp/x.parquet')");
+    }
+
+    // ── build_file_reader_sql (shared helper) ───────────────────────────
+
+    #[test]
+    fn build_file_reader_sql_parquet_single_path() {
+        let sql = build_file_reader_sql(
+            FileFormat::Parquet,
+            &["/data/orders.parquet".to_owned()],
+            &[],
+        )
+        .expect("build");
+        assert_eq!(sql, "read_parquet('/data/orders.parquet')");
+    }
+
+    #[test]
+    fn build_file_reader_sql_parquet_multi_path() {
+        let sql = build_file_reader_sql(
+            FileFormat::Parquet,
+            &[
+                "/data/part1.parquet".to_owned(),
+                "/data/part2.parquet".to_owned(),
+            ],
+            &[],
+        )
+        .expect("build");
+        assert_eq!(
+            sql,
+            "read_parquet(['/data/part1.parquet', '/data/part2.parquet'])"
+        );
+    }
+
+    #[test]
+    fn build_file_reader_sql_parquet_with_options() {
+        let sql = build_file_reader_sql(
+            FileFormat::Parquet,
+            &["/data/orders.parquet".to_owned()],
+            &[("hive_partitioning".to_owned(), "true".to_owned())],
+        )
+        .expect("build");
+        assert_eq!(
+            sql,
+            "read_parquet('/data/orders.parquet', hive_partitioning='true')"
+        );
+    }
+
+    #[test]
+    fn build_file_reader_sql_csv_single_path() {
+        let sql = build_file_reader_sql(FileFormat::Csv, &["/data/test.csv".to_owned()], &[])
+            .expect("build");
+        assert_eq!(sql, "read_csv('/data/test.csv')");
+    }
+
+    #[test]
+    fn build_file_reader_sql_empty_paths_errors() {
+        let result = build_file_reader_sql(FileFormat::Parquet, &[], &[]);
+        assert!(result.is_err());
     }
 
     // ── 14-15. render_cast (§4.2 first item) ─────────────────────────────

@@ -87,6 +87,15 @@ pub(crate) fn relation_to_common_ast(relation: &proto::Relation) -> Result<Commo
 /// Convert a Spark Connect [`proto::Relation`] into a [`CommonAst`] and finalize
 /// it into DuckDB SQL + resolved schema via τ.
 ///
+/// Runs the eager data-dependent-schema discovery pass ([`resolve_implicit_pivots`]
+/// — values-less pivot/crosstab, schema-less Parquet `FileScan`) before
+/// `finalize`, exactly like the `execute_plan`/`analyze_plan` Root-relation
+/// arms — this is the shared entry point for the `Command` arms
+/// (`CreateDataframeView`, `SqlCommand`, `WriteOperation`) that don't inline
+/// that sequence themselves, so e.g. `spark.read.parquet(path)
+/// .createOrReplaceTempView(...)` gets the same schema discovery a bare
+/// `execute_plan` Root relation would.
+///
 /// `finalize` runs the analyzer + emission; it succeeds for every plan τ covers
 /// and returns a Thunderduck-boundary `Status` (`UnsupportedOp` /
 /// `UnsupportedProtoShape`) for shapes it does not. The emitted SQL feeds
@@ -95,7 +104,8 @@ pub(crate) async fn transpile_relation(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     relation: &proto::Relation,
 ) -> Result<(CommonAst, String, StructType), Status> {
-    let common_ast = relation_to_common_ast(relation)?;
+    let mut common_ast = relation_to_common_ast(relation)?;
+    resolve_implicit_pivots(&mut common_ast, session).await?;
     let (sql, schema) = finalize(session, &common_ast).await?;
     Ok((common_ast, sql, schema))
 }
@@ -238,6 +248,26 @@ async fn resolve_implicit_pivots(
             distinct_values,
         );
     }
+
+    // If THIS node is a schema-less Parquet FileScan, discover the schema from
+    // the live session via `SELECT * FROM read_parquet(...) LIMIT 0` and stamp
+    // the `schema` field to `Some(inferred)`. This is the same pattern as the
+    // pivot/crosstab arms above: a data-dependent schema that τ's pure
+    // synchronous analyzer (INV10) cannot resolve on its own.
+    //
+    // Only Parquet is handled — Csv/Json/Orc schema-less remain as
+    // `PuntedOperator` boundary errors until implemented.
+    if let CommonOp::FileScan {
+        format: thunderduck_core::transpiler_v2::ast::FileFormat::Parquet,
+        paths,
+        schema: schema @ None,
+        options,
+    } = &mut ast.op
+    {
+        let inferred = discover_parquet_schema(paths, options, session).await?;
+        *schema = Some(inferred);
+    }
+
     Ok(())
 }
 
@@ -296,6 +326,52 @@ async fn discover_pivot_values(
         )));
     }
     Ok(values)
+}
+
+/// Discover the schema of a Parquet file (or file set) by executing a
+/// zero-row `SELECT * FROM read_parquet(...) LIMIT 0` against the live
+/// session. DuckDB returns an empty `RecordBatch` whose Arrow schema is the
+/// file's inferred schema; we convert that to τ's `StructType`.
+///
+/// This is the data-dependent discovery half of the schema-less FileScan
+/// support — same architectural pattern as [`discover_pivot_values`].
+async fn discover_parquet_schema(
+    paths: &[String],
+    options: &[(String, String)],
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+) -> Result<StructType, Status> {
+    use thunderduck_core::transpiler_v2::ast::FileFormat;
+
+    let reader_call = thunderduck_core::transpiler_v2::emission::build_file_reader_sql(
+        FileFormat::Parquet,
+        paths,
+        options,
+    )
+    .map_err(|e| Status::from(ConnectError::from(e)))?;
+    let discovery_sql = format!("SELECT * FROM {reader_call} LIMIT 0");
+
+    let batches = session
+        .execute(&discovery_sql)
+        .await
+        .map_err(|e| Status::from(ConnectError::from(e)))?;
+
+    // The LIMIT 0 query always returns at least one batch (possibly with zero
+    // rows) whose schema reflects the file's columns. If DuckDB returns no
+    // batches at all (shouldn't happen), surface a clear error.
+    let arrow_schema = batches.first().map(|b| b.schema()).ok_or_else(|| {
+        Status::internal("discover_parquet_schema: DuckDB returned no batches for LIMIT 0 query")
+    })?;
+
+    let fields = arrow_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            crate::converter::v2_relation_converter::arrow_field_to_struct_field(f)
+                .map_err(|e| Status::from(ConnectError::from(e)))
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+
+    Ok(StructType::new(fields))
 }
 
 // ── gRPC service impl ─────────────────────────────────────────────────────────

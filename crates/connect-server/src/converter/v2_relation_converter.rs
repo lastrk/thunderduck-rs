@@ -1382,7 +1382,7 @@ fn single_name_part(parts: &[String], name: &str, reason: &str) -> Result<String
 
 /// Convert an Arrow schema [`Field`] into a τ [`StructField`], preserving
 /// name and nullability.
-fn arrow_field_to_struct_field(f: &Field) -> Result<StructField, EmissionError> {
+pub(crate) fn arrow_field_to_struct_field(f: &Field) -> Result<StructField, EmissionError> {
     let dt = arrow_data_type_to_core(f.data_type())?;
     Ok(if f.is_nullable() {
         StructField::nullable(f.name().clone(), dt)
@@ -1664,7 +1664,7 @@ fn arrow_ipc_to_schema_and_rows(
     Ok((schema, rows))
 }
 
-fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, EmissionError> {
+pub(crate) fn arrow_data_type_to_core(dt: &ArrowDT) -> Result<DataType, EmissionError> {
     Ok(match dt {
         ArrowDT::Null => DataType::Null,
         ArrowDT::Boolean => DataType::Boolean,

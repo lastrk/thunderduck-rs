@@ -371,8 +371,15 @@ reviewer caught it as a Medium and a fix iteration was spent removing it.
 Rule: relay type skeletons verbatim; any field the plan doesn't have needs a
 Spark-source/empirical check BEFORE it enters a brief.
 
-## 2026-07-09 — pytest -k matches node names, not file paths
+## 2026-07-09 — pytest -k matches node names, not file paths (AMENDED)
 A focused-verify instruction of the form `-k "ddl or sql_expressions"`
 selects tests whose NODE NAME (class/test/param id) contains the substring —
 it does not select by filename. For file-scoped runs pass the file paths as
 positional pytest args (the runner forwards them verbatim).
+AMENDMENT (pass 5): run-differential-tests.sh does NOT forward a bare `.py`
+first argument as a file selection — it falls back to group "all" with the
+path appended as a pytest arg, which pytest treats as an ADDITIONAL target on
+top of the whole differential/ dir (i.e. it runs everything). For a
+file-scoped run either use a matching group name or invoke pytest directly
+from tests/integration with the venv. Fixing the runner to accept file paths
+is queued tech debt.

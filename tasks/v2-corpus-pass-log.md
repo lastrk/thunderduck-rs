@@ -429,3 +429,33 @@ red in any later pass.
 - **Gate:** 1189→1201 (Δ +12, zero regressions) — exactly the 12 predicted.
 - **Reflect:** clean pass; the architect's "read the tests first, pick the
   minimal faithful shape" pattern avoided a new AST node.
+
+## Pass 5 — 2026-07-09 — catalog operations (RelType::Catalog, 8 ops)
+
+- **Hypothesis:** all 13 test_catalog_operations reds share the
+  RelType::Catalog boundary root cause.
+- **Architecture (rust-architect):** connect-server pre-pass
+  (`catalog_ops::resolve_catalog_relation`, resolve_implicit_pivots
+  precedent) rewrites root Catalog relations to CommonOp::Values so the
+  unchanged finalize/streaming path (schema frame incl.) serves ExecutePlan
+  AND AnalyzePlan. Constants (currentCatalog/currentDatabase/databaseExists),
+  a new pure 249-entry `function_catalog` roster in core (INV10-safe) for
+  functionExists/getFunction/listFunctions, session-backed
+  tableExists/dropTempView (duckdb_tables()/duckdb_views() probes +
+  execute_ddl with SchemaCacheEffect::Evict). Other 18 cat_type variants =
+  named Status::unimplemented; exhaustiveness compile-enforced.
+- **Spark probe:** getFunction metadata mirrored where cheap (name,
+  isTemporary, currentCatalog "spark_catalog", currentDatabase "default");
+  description/className = typed NULLs (untested by corpus, 249-entry
+  boilerplate refused).
+- **Review:** APPROVE, 0 Critical/High. Injection surface verified safe
+  (quote-doubling escaping; hostile names stay inside literals). Lows:
+  escaping helpers duplicated from core emission (re-export later);
+  roster contains special-syntax pseudo-functions (cast/if/not/extract).
+- **Gate:** 1201→1216 (Δ +15, zero regressions): catalog +13,
+  array_functions +2 (collateral). Coder recovered cleanly from a mid-task
+  API disconnect (resumed via transcript).
+- **Reflect:** the runner treats a bare `.py` first arg as "run ALL with it
+  as a pytest arg" (silently ran the full suite when given a file path) —
+  runner ergonomics fix queued as tech debt. My pass-4 lesson ("pass file
+  paths instead of -k") was WRONG for this runner — corrected in lessons.md.

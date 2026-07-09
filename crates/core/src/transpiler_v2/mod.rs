@@ -21,6 +21,7 @@ pub mod base_types;
 pub mod emission;
 pub mod error;
 pub mod expression;
+pub mod function_catalog;
 pub mod invariants;
 pub mod macros;
 pub mod rewrites;

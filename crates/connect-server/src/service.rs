@@ -88,6 +88,25 @@ pub(crate) fn relation_to_common_ast(relation: &proto::Relation) -> Result<Commo
     }
 }
 
+/// Catalog-aware wrapper around [`relation_to_common_ast`].
+///
+/// Intercepts `Relation { Catalog(..) }` BEFORE the normal τ pipeline and
+/// rewrites supported catalog operations into `CommonOp::Values` ASTs.
+/// Non-catalog relations fall through to [`relation_to_common_ast`].
+/// The resulting `CommonAst` then flows through the unchanged
+/// `resolve_implicit_pivots` → `finalize` pipeline.
+async fn relation_to_common_ast_with_session(
+    relation: &proto::Relation,
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+) -> Result<CommonAst, Status> {
+    // Try catalog intercept first.
+    if let Some(ast) = crate::catalog_ops::resolve_catalog_relation(relation, session).await? {
+        return Ok(ast);
+    }
+    // Normal pipeline.
+    relation_to_common_ast(relation)
+}
+
 /// Convert a Spark Connect [`proto::Relation`] into a [`CommonAst`] and finalize
 /// it into DuckDB SQL + resolved schema via τ.
 ///
@@ -108,7 +127,7 @@ pub(crate) async fn transpile_relation(
     session: &Arc<thunderduck_core::runtime::DuckDbSession>,
     relation: &proto::Relation,
 ) -> Result<(CommonAst, String, StructType), Status> {
-    let mut common_ast = relation_to_common_ast(relation)?;
+    let mut common_ast = relation_to_common_ast_with_session(relation, session).await?;
     resolve_implicit_pivots(&mut common_ast, session).await?;
     let (sql, schema) = finalize(session, &common_ast).await?;
     Ok((common_ast, sql, schema))
@@ -417,7 +436,8 @@ impl SparkConnectService for ThunderduckService {
                 // (needs the live session) BEFORE finalize — see
                 // `resolve_implicit_pivots`. `finalize` succeeds for every
                 // plan τ covers, so `execute_streaming_query` is live.
-                let mut common_ast = relation_to_common_ast(&relation)?;
+                let mut common_ast =
+                    relation_to_common_ast_with_session(&relation, &session).await?;
                 resolve_implicit_pivots(&mut common_ast, &session).await?;
                 let (sql, resolved_schema) = finalize(&session, &common_ast).await?;
                 return execute_streaming_query(
@@ -485,7 +505,8 @@ impl SparkConnectService for ThunderduckService {
                 // ExecutePlan achieves the same on the response path via
                 // `arrow_schema_stamp::build_stamped_schema` in
                 // `execute_streaming_query`. Do not modify this arm.
-                let mut common_ast = relation_to_common_ast(&relation)?;
+                let mut common_ast =
+                    relation_to_common_ast_with_session(&relation, &session).await?;
                 resolve_implicit_pivots(&mut common_ast, &session).await?;
                 let struct_type = analyze_schema(&session, &common_ast).await?;
                 // ADR-022 boundary hygiene: `DataType::Unresolved` maps to

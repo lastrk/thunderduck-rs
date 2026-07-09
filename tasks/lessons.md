@@ -370,3 +370,9 @@ views at parse time, so the field was unrepresentable-by-design — the
 reviewer caught it as a Medium and a fix iteration was spent removing it.
 Rule: relay type skeletons verbatim; any field the plan doesn't have needs a
 Spark-source/empirical check BEFORE it enters a brief.
+
+## 2026-07-09 — pytest -k matches node names, not file paths
+A focused-verify instruction of the form `-k "ddl or sql_expressions"`
+selects tests whose NODE NAME (class/test/param id) contains the substring —
+it does not select by filename. For file-scoped runs pass the file paths as
+positional pytest args (the runner forwards them verbatim).

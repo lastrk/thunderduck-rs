@@ -36,7 +36,7 @@ pub use ast::{CommonAst, CommonOp};
 pub use base_types::BaseTypes;
 pub use error::EmissionError;
 pub use expression::Expression;
-pub use statement::{DdlStatement, SqlStatement};
+pub use statement::{render_ddl, DdlStatement, SqlStatement};
 pub use type_inference::TypeInferenceEngine;
 
 /// τ's top-level entry point.

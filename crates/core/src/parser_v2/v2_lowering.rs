@@ -80,20 +80,21 @@ pub fn lower_statement_or_ddl(
     stmt: Statement,
 ) -> Result<crate::transpiler_v2::SqlStatement, EmissionError> {
     use crate::transpiler_v2::statement::{DdlStatement, SqlStatement};
-    use sqlparser::ast::CreateView;
+    use crate::types::{StructField, StructType};
+    use sqlparser::ast::{CreateTable, CreateView, Insert, ObjectType, TableObject, Truncate};
 
     match stmt {
         Statement::Query(q) => {
             let ast = lower_query(*q, &CteScope::new())?;
             Ok(SqlStatement::Query(ast))
         }
+        // ── CREATE [OR REPLACE] TEMP[ORARY] VIEW ──────────────────────────
         Statement::CreateView(CreateView {
             temporary: true,
             name,
             query,
             or_replace,
             if_not_exists,
-            // Reject unsupported clauses loudly.
             columns,
             comment,
             options,
@@ -109,10 +110,6 @@ pub fn lower_statement_or_ddl(
             // Spark-emulated parse errors (match Spark 4.1.1 ParseException
             // wording exactly). These fire before unsupported-clause guards
             // because Spark itself rejects these at parse time.
-            //
-            // Rule 1: OR REPLACE + IF NOT EXISTS on ANY view (including
-            // temp). Spark: "CREATE VIEW with both IF NOT EXISTS and REPLACE
-            // is not allowed."
             if or_replace && if_not_exists {
                 return Err(EmissionError::Unsupported {
                     kind: UnsupportedKind::ProtoShape,
@@ -122,8 +119,6 @@ pub fn lower_statement_or_ddl(
                         .to_owned(),
                 });
             }
-            // Rule 2: IF NOT EXISTS on any temporary view. Spark: "It is
-            // not allowed to define a TEMPORARY view with IF NOT EXISTS."
             if if_not_exists {
                 return Err(EmissionError::Unsupported {
                     kind: UnsupportedKind::ProtoShape,
@@ -133,104 +128,873 @@ pub fn lower_statement_or_ddl(
                         .to_owned(),
                 });
             }
-
-            // Reject unsupported clauses loudly — no silent drops.
-            if !columns.is_empty() {
-                bail_boundary_proto!(
-                    "sql::create_view::column_list",
-                    "column alias list on CREATE TEMP VIEW is not implemented in τ"
-                );
-            }
-            if comment.is_some() {
-                bail_boundary_proto!(
-                    "sql::create_view::comment",
-                    "COMMENT on CREATE TEMP VIEW is not implemented in τ"
-                );
-            }
-            if !matches!(options, sqlparser::ast::CreateTableOptions::None) {
-                bail_boundary_proto!(
-                    "sql::create_view::options",
-                    "OPTIONS / WITH on CREATE TEMP VIEW is not implemented in τ"
-                );
-            }
-            if !cluster_by.is_empty() {
-                bail_boundary_proto!(
-                    "sql::create_view::cluster_by",
-                    "CLUSTER BY on CREATE TEMP VIEW is not implemented in τ"
-                );
-            }
-            if with_no_schema_binding {
-                bail_boundary_proto!(
-                    "sql::create_view::no_schema_binding",
-                    "WITH NO SCHEMA BINDING on CREATE TEMP VIEW is not implemented in τ"
-                );
-            }
-            if materialized {
-                bail_boundary_proto!(
-                    "sql::create_view::materialized",
-                    "CREATE MATERIALIZED TEMP VIEW is not implemented in τ"
-                );
-            }
-            if to.is_some() {
-                bail_boundary_proto!(
-                    "sql::create_view::to",
-                    "TO clause on CREATE TEMP VIEW is not implemented in τ"
-                );
-            }
-            if params.is_some() {
-                bail_boundary_proto!(
-                    "sql::create_view::params",
-                    "algorithm/security params on CREATE TEMP VIEW is not implemented in τ"
-                );
-            }
-            if or_alter {
-                bail_boundary_proto!(
-                    "sql::create_view::or_alter",
-                    "CREATE OR ALTER TEMP VIEW is not implemented in τ"
-                );
-            }
-            if secure {
-                bail_boundary_proto!(
-                    "sql::create_view::secure",
-                    "CREATE SECURE TEMP VIEW is not implemented in τ"
-                );
-            }
-
-            // Extract unqualified view name.
+            reject_unsupported_view_clauses(
+                &columns,
+                &comment,
+                &options,
+                &cluster_by,
+                with_no_schema_binding,
+                materialized,
+                &to,
+                &params,
+                or_alter,
+                secure,
+            )?;
             let view_name = extract_simple_name(&name, "sql::create_view::name")?;
-
-            // Lower the body query.
             let body_ast = lower_query(*query, &CteScope::new())?;
-
             Ok(SqlStatement::Ddl(DdlStatement::CreateTempView {
                 name: view_name,
                 or_replace,
                 query: body_ast,
             }))
         }
-        // Non-temporary CREATE VIEW → Spark-emulated parse error if
-        // OR REPLACE + IF NOT EXISTS combo (Spark rejects on ALL views),
-        // else Thunderduck boundary error.
+
+        // ── Non-temporary CREATE VIEW ─────────────────────────────────────
         Statement::CreateView(ref cv) if cv.or_replace && cv.if_not_exists => {
-            return Err(EmissionError::Unsupported {
+            Err(EmissionError::Unsupported {
                 kind: UnsupportedKind::ProtoShape,
                 name: "sql::parse_error".to_owned(),
                 reason: "CREATE VIEW with both IF NOT EXISTS and REPLACE \
                          is not allowed."
                     .to_owned(),
-            });
+            })
         }
-        Statement::CreateView(_) => {
-            bail_boundary_proto!(
-                "sql::create_view",
-                "non-temporary CREATE VIEW is not implemented in τ"
-            )
+        Statement::CreateView(CreateView {
+            temporary: false,
+            name,
+            query,
+            or_replace,
+            if_not_exists: _,
+            columns,
+            comment,
+            options,
+            cluster_by,
+            with_no_schema_binding,
+            materialized,
+            to,
+            params,
+            or_alter,
+            secure,
+            name_before_not_exists: _,
+        }) => {
+            reject_unsupported_view_clauses(
+                &columns,
+                &comment,
+                &options,
+                &cluster_by,
+                with_no_schema_binding,
+                materialized,
+                &to,
+                &params,
+                or_alter,
+                secure,
+            )?;
+            let view_name = extract_simple_name(&name, "sql::create_view::name")?;
+            let body_ast = lower_query(*query, &CteScope::new())?;
+            Ok(SqlStatement::Ddl(DdlStatement::CreateView {
+                name: view_name,
+                or_replace,
+                query: body_ast,
+            }))
         }
+
+        // ── CREATE TABLE ──────────────────────────────────────────────────
+        Statement::CreateTable(CreateTable {
+            name,
+            columns,
+            if_not_exists,
+            constraints,
+            query,
+            or_replace,
+            temporary,
+            external,
+            dynamic,
+            global,
+            transient,
+            volatile,
+            iceberg,
+            hive_distribution: _,
+            hive_formats: _,
+            table_options,
+            file_format,
+            location,
+            without_rowid,
+            like,
+            clone,
+            version: _,
+            comment,
+            on_commit,
+            on_cluster,
+            primary_key,
+            order_by,
+            partition_by,
+            cluster_by,
+            clustered_by,
+            inherits,
+            partition_of,
+            for_values,
+            strict,
+            copy_grants,
+            enable_schema_evolution,
+            change_tracking,
+            data_retention_time_in_days,
+            max_data_extension_time_in_days,
+            default_ddl_collation,
+            with_aggregation_policy,
+            with_row_access_policy,
+            with_tags,
+            external_volume,
+            base_location,
+            catalog,
+            catalog_sync,
+            storage_serialization_policy,
+            target_lag,
+            warehouse,
+            refresh_mode,
+            initialize,
+            require_user,
+        }) => {
+            // Bail loudly on unsupported clauses.
+            if or_replace {
+                bail_boundary_proto!(
+                    "sql::create_table::or_replace",
+                    "CREATE OR REPLACE TABLE is not implemented in τ"
+                );
+            }
+            if temporary {
+                bail_boundary_proto!(
+                    "sql::create_table::temporary",
+                    "CREATE TEMPORARY TABLE is not supported — Spark 4.1.1 \
+                     does not allow CREATE TEMPORARY TABLE"
+                );
+            }
+            if external {
+                bail_boundary_proto!(
+                    "sql::create_table::external",
+                    "CREATE EXTERNAL TABLE is not implemented in τ"
+                );
+            }
+            if dynamic {
+                bail_boundary_proto!(
+                    "sql::create_table::dynamic",
+                    "CREATE DYNAMIC TABLE is not implemented in τ"
+                );
+            }
+            if global.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::global",
+                    "GLOBAL clause on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if transient {
+                bail_boundary_proto!(
+                    "sql::create_table::transient",
+                    "CREATE TRANSIENT TABLE is not implemented in τ"
+                );
+            }
+            if volatile {
+                bail_boundary_proto!(
+                    "sql::create_table::volatile",
+                    "CREATE VOLATILE TABLE is not implemented in τ"
+                );
+            }
+            if iceberg {
+                bail_boundary_proto!(
+                    "sql::create_table::iceberg",
+                    "CREATE ICEBERG TABLE is not implemented in τ"
+                );
+            }
+            if !constraints.is_empty() {
+                bail_boundary_proto!(
+                    "sql::create_table::constraints",
+                    "table constraints on CREATE TABLE are not implemented in τ"
+                );
+            }
+            if query.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::ctas",
+                    "CREATE TABLE AS SELECT (CTAS) is not implemented in τ"
+                );
+            }
+            if !matches!(table_options, sqlparser::ast::CreateTableOptions::None) {
+                bail_boundary_proto!(
+                    "sql::create_table::options",
+                    "OPTIONS / USING / TBLPROPERTIES on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if file_format.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::file_format",
+                    "STORED AS on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if location.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::location",
+                    "LOCATION on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if without_rowid {
+                bail_boundary_proto!(
+                    "sql::create_table::without_rowid",
+                    "WITHOUT ROWID is not implemented in τ"
+                );
+            }
+            if like.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::like",
+                    "LIKE on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if clone.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::clone",
+                    "CLONE on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if comment.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::comment",
+                    "COMMENT on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if on_commit.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::on_commit",
+                    "ON COMMIT on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if on_cluster.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::on_cluster",
+                    "ON CLUSTER on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if primary_key.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::primary_key",
+                    "PRIMARY KEY on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if order_by.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::order_by",
+                    "ORDER BY on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if partition_by.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::partition_by",
+                    "PARTITION BY on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if cluster_by.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::cluster_by",
+                    "CLUSTER BY on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if clustered_by.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::clustered_by",
+                    "CLUSTERED BY on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if inherits.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::inherits",
+                    "INHERITS on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if partition_of.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::partition_of",
+                    "PARTITION OF on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if for_values.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::for_values",
+                    "FOR VALUES on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if strict {
+                bail_boundary_proto!(
+                    "sql::create_table::strict",
+                    "STRICT on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if copy_grants {
+                bail_boundary_proto!(
+                    "sql::create_table::copy_grants",
+                    "COPY GRANTS on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if enable_schema_evolution.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::enable_schema_evolution",
+                    "ENABLE_SCHEMA_EVOLUTION on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if change_tracking.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::change_tracking",
+                    "CHANGE_TRACKING on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if data_retention_time_in_days.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::data_retention",
+                    "DATA_RETENTION_TIME_IN_DAYS on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if max_data_extension_time_in_days.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::max_data_extension",
+                    "MAX_DATA_EXTENSION_TIME_IN_DAYS on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if default_ddl_collation.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::default_ddl_collation",
+                    "DEFAULT_DDL_COLLATION on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if with_aggregation_policy.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::aggregation_policy",
+                    "WITH AGGREGATION POLICY on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if with_row_access_policy.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::row_access_policy",
+                    "WITH ROW ACCESS POLICY on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if with_tags.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::with_tags",
+                    "WITH TAG on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if external_volume.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::external_volume",
+                    "EXTERNAL_VOLUME on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if base_location.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::base_location",
+                    "BASE_LOCATION on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if catalog.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::catalog",
+                    "CATALOG on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if catalog_sync.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::catalog_sync",
+                    "CATALOG_SYNC on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if storage_serialization_policy.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::storage_serialization_policy",
+                    "STORAGE_SERIALIZATION_POLICY on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if target_lag.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::target_lag",
+                    "TARGET_LAG on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if warehouse.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::warehouse",
+                    "WAREHOUSE on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if refresh_mode.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::refresh_mode",
+                    "REFRESH_MODE on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if initialize.is_some() {
+                bail_boundary_proto!(
+                    "sql::create_table::initialize",
+                    "INITIALIZE on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if require_user {
+                bail_boundary_proto!(
+                    "sql::create_table::require_user",
+                    "REQUIRE USER on CREATE TABLE is not implemented in τ"
+                );
+            }
+            if columns.is_empty() {
+                bail_boundary_proto!(
+                    "sql::create_table::no_columns",
+                    "CREATE TABLE requires at least one column definition"
+                );
+            }
+
+            let table_name = extract_simple_name(&name, "sql::create_table::name")?;
+
+            // Lower column definitions: name + type, with bail on constraints
+            // (DEFAULT, NOT NULL, CHECK, etc.).
+            let fields: Vec<StructField> = columns
+                .into_iter()
+                .map(|col| {
+                    if !col.options.is_empty() {
+                        bail_boundary_proto!(
+                            "sql::create_table::column_options",
+                            format!(
+                                "column options (DEFAULT, NOT NULL, etc.) on column `{}` \
+                                 are not implemented in τ",
+                                col.name.value
+                            )
+                        );
+                    }
+                    let dt = lower_data_type(col.data_type)?;
+                    Ok(StructField::nullable(col.name.value, dt))
+                })
+                .collect::<Result<_, EmissionError>>()?;
+
+            Ok(SqlStatement::Ddl(DdlStatement::CreateTable {
+                name: table_name,
+                if_not_exists,
+                columns: StructType::new(fields),
+            }))
+        }
+
+        // ── DROP TABLE / DROP VIEW ────────────────────────────────────────
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            if_exists,
+            names,
+            cascade,
+            restrict,
+            purge,
+            temporary,
+            table,
+        } => {
+            if cascade {
+                bail_boundary_proto!(
+                    "sql::drop_table::cascade",
+                    "CASCADE on DROP TABLE is not implemented in τ"
+                );
+            }
+            if restrict {
+                bail_boundary_proto!(
+                    "sql::drop_table::restrict",
+                    "RESTRICT on DROP TABLE is not implemented in τ"
+                );
+            }
+            if purge {
+                bail_boundary_proto!(
+                    "sql::drop_table::purge",
+                    "PURGE on DROP TABLE is not implemented in τ"
+                );
+            }
+            if temporary {
+                bail_boundary_proto!(
+                    "sql::drop_table::temporary",
+                    "DROP TEMPORARY TABLE is not implemented in τ"
+                );
+            }
+            if table.is_some() {
+                bail_boundary_proto!(
+                    "sql::drop_table::table_ref",
+                    "table reference on DROP TABLE is not implemented in τ"
+                );
+            }
+            if names.len() != 1 {
+                bail_boundary_proto!(
+                    "sql::drop_table::multi_name",
+                    "DROP TABLE with multiple names is not implemented in τ"
+                );
+            }
+            let table_name = extract_simple_name(&names[0], "sql::drop_table::name")?;
+            Ok(SqlStatement::Ddl(DdlStatement::DropTable {
+                name: table_name,
+                if_exists,
+            }))
+        }
+        Statement::Drop {
+            object_type: ObjectType::View,
+            if_exists,
+            names,
+            cascade,
+            restrict,
+            purge,
+            temporary,
+            table,
+        } => {
+            if cascade {
+                bail_boundary_proto!(
+                    "sql::drop_view::cascade",
+                    "CASCADE on DROP VIEW is not implemented in τ"
+                );
+            }
+            if restrict {
+                bail_boundary_proto!(
+                    "sql::drop_view::restrict",
+                    "RESTRICT on DROP VIEW is not implemented in τ"
+                );
+            }
+            if purge {
+                bail_boundary_proto!(
+                    "sql::drop_view::purge",
+                    "PURGE on DROP VIEW is not implemented in τ"
+                );
+            }
+            if temporary {
+                bail_boundary_proto!(
+                    "sql::drop_view::temporary",
+                    "DROP TEMPORARY VIEW is not implemented in τ"
+                );
+            }
+            if table.is_some() {
+                bail_boundary_proto!(
+                    "sql::drop_view::table_ref",
+                    "table reference on DROP VIEW is not implemented in τ"
+                );
+            }
+            if names.len() != 1 {
+                bail_boundary_proto!(
+                    "sql::drop_view::multi_name",
+                    "DROP VIEW with multiple names is not implemented in τ"
+                );
+            }
+            let view_name = extract_simple_name(&names[0], "sql::drop_view::name")?;
+            Ok(SqlStatement::Ddl(DdlStatement::DropView {
+                name: view_name,
+                if_exists,
+            }))
+        }
+
+        // ── INSERT INTO ───────────────────────────────────────────────────
+        Statement::Insert(Insert {
+            insert_token: _,
+            optimizer_hint,
+            or,
+            ignore,
+            into: _,
+            table,
+            table_alias,
+            columns,
+            overwrite,
+            source,
+            assignments,
+            partitioned,
+            after_columns,
+            has_table_keyword: _,
+            on,
+            returning,
+            replace_into,
+            priority,
+            insert_alias,
+            settings,
+            format_clause,
+        }) => {
+            // Bail loudly on unsupported clauses.
+            if optimizer_hint.is_some() {
+                bail_boundary_proto!(
+                    "sql::insert::optimizer_hint",
+                    "optimizer hints on INSERT are not implemented in τ"
+                );
+            }
+            if or.is_some() {
+                bail_boundary_proto!(
+                    "sql::insert::or_conflict",
+                    "ON CONFLICT on INSERT is not implemented in τ"
+                );
+            }
+            if ignore {
+                bail_boundary_proto!(
+                    "sql::insert::ignore",
+                    "INSERT IGNORE is not implemented in τ"
+                );
+            }
+            if table_alias.is_some() {
+                bail_boundary_proto!(
+                    "sql::insert::table_alias",
+                    "table alias on INSERT is not implemented in τ"
+                );
+            }
+            if !columns.is_empty() {
+                bail_boundary_proto!(
+                    "sql::insert::column_list",
+                    "INSERT INTO <table> (col1, col2, ...) column list is not implemented in τ"
+                );
+            }
+            if overwrite {
+                bail_boundary_proto!(
+                    "sql::insert::overwrite",
+                    "INSERT OVERWRITE is not implemented in τ"
+                );
+            }
+            if !assignments.is_empty() {
+                bail_boundary_proto!("sql::insert::set", "INSERT ... SET is not implemented in τ");
+            }
+            if partitioned.is_some() {
+                bail_boundary_proto!(
+                    "sql::insert::partitioned",
+                    "PARTITION on INSERT is not implemented in τ"
+                );
+            }
+            if !after_columns.is_empty() {
+                bail_boundary_proto!(
+                    "sql::insert::after_columns",
+                    "columns after PARTITION on INSERT are not implemented in τ"
+                );
+            }
+            if on.is_some() {
+                bail_boundary_proto!(
+                    "sql::insert::on",
+                    "ON clause on INSERT is not implemented in τ"
+                );
+            }
+            if returning.is_some() {
+                bail_boundary_proto!(
+                    "sql::insert::returning",
+                    "RETURNING on INSERT is not implemented in τ"
+                );
+            }
+            if replace_into {
+                bail_boundary_proto!(
+                    "sql::insert::replace_into",
+                    "REPLACE INTO is not implemented in τ"
+                );
+            }
+            if priority.is_some() {
+                bail_boundary_proto!(
+                    "sql::insert::priority",
+                    "INSERT priority is not implemented in τ"
+                );
+            }
+            if insert_alias.is_some() {
+                bail_boundary_proto!(
+                    "sql::insert::insert_alias",
+                    "INSERT alias is not implemented in τ"
+                );
+            }
+            if settings.is_some() {
+                bail_boundary_proto!(
+                    "sql::insert::settings",
+                    "INSERT SETTINGS is not implemented in τ"
+                );
+            }
+            if format_clause.is_some() {
+                bail_boundary_proto!(
+                    "sql::insert::format_clause",
+                    "INSERT FORMAT is not implemented in τ"
+                );
+            }
+
+            // Extract the table name.
+            let table_name = match table {
+                TableObject::TableName(ref obj_name) => {
+                    extract_simple_name(obj_name, "sql::insert::table_name")?
+                }
+                TableObject::TableFunction(_) => {
+                    bail_boundary_proto!(
+                        "sql::insert::table_function",
+                        "INSERT INTO TABLE FUNCTION is not implemented in τ"
+                    );
+                }
+            };
+
+            let source_query = source.ok_or_else(|| EmissionError::Unsupported {
+                kind: UnsupportedKind::ProtoShape,
+                name: "sql::insert::no_source".to_owned(),
+                reason: "INSERT without a source query is not supported".to_owned(),
+            })?;
+
+            // Determine whether this is INSERT ... VALUES or INSERT ... SELECT.
+            // VALUES bodies arrive as `Query { body: SetExpr::Values(..) }`.
+            let body = *source_query;
+            if body.with.is_some() || body.order_by.is_some() || body.limit_clause.is_some() {
+                // INSERT ... SELECT with ORDER BY / LIMIT / WITH — lower as
+                // a full query.
+                let ast = lower_query(body, &CteScope::new())?;
+                return Ok(SqlStatement::Ddl(DdlStatement::InsertSelect {
+                    table: table_name,
+                    query: ast,
+                }));
+            }
+            match *body.body {
+                SetExpr::Values(values) => {
+                    // Lower each row of literal values.
+                    let rows: Vec<Vec<Expression>> = values
+                        .rows
+                        .into_iter()
+                        .map(|row| {
+                            row.into_iter()
+                                .map(|e| lower_expr(e, &CteScope::new()))
+                                .collect::<Result<_, _>>()
+                        })
+                        .collect::<Result<_, _>>()?;
+                    Ok(SqlStatement::Ddl(DdlStatement::InsertValues {
+                        table: table_name,
+                        rows,
+                    }))
+                }
+                _ => {
+                    // Reassemble the Query and lower it.
+                    let reassembled = Query {
+                        with: None,
+                        body: body.body,
+                        order_by: None,
+                        limit_clause: None,
+                        fetch: None,
+                        locks: vec![],
+                        for_clause: None,
+                        settings: None,
+                        format_clause: None,
+                        pipe_operators: vec![],
+                    };
+                    let ast = lower_query(reassembled, &CteScope::new())?;
+                    Ok(SqlStatement::Ddl(DdlStatement::InsertSelect {
+                        table: table_name,
+                        query: ast,
+                    }))
+                }
+            }
+        }
+
+        // ── TRUNCATE TABLE ────────────────────────────────────────────────
+        Statement::Truncate(Truncate {
+            table_names,
+            partitions,
+            table: _,
+            if_exists: _,
+            identity,
+            cascade,
+            on_cluster,
+        }) => {
+            if partitions.is_some() {
+                bail_boundary_proto!(
+                    "sql::truncate::partitions",
+                    "TRUNCATE TABLE with PARTITION is not implemented in τ"
+                );
+            }
+            if identity.is_some() {
+                bail_boundary_proto!(
+                    "sql::truncate::identity",
+                    "TRUNCATE TABLE with IDENTITY option is not implemented in τ"
+                );
+            }
+            if cascade.is_some() {
+                bail_boundary_proto!(
+                    "sql::truncate::cascade",
+                    "TRUNCATE TABLE with CASCADE/RESTRICT is not implemented in τ"
+                );
+            }
+            if on_cluster.is_some() {
+                bail_boundary_proto!(
+                    "sql::truncate::on_cluster",
+                    "TRUNCATE TABLE ON CLUSTER is not implemented in τ"
+                );
+            }
+            if table_names.len() != 1 {
+                bail_boundary_proto!(
+                    "sql::truncate::multi_table",
+                    "TRUNCATE with multiple tables is not implemented in τ"
+                );
+            }
+            let name = extract_simple_name(&table_names[0].name, "sql::truncate::name")?;
+            Ok(SqlStatement::Ddl(DdlStatement::TruncateTable { name }))
+        }
+
         other => bail_boundary_proto!(
             format!("sql::{}", statement_kind(&other)),
-            "parser_v2 only supports SELECT queries in τ"
+            "parser_v2 only supports SELECT queries and basic DDL/DML in τ"
         ),
     }
+}
+
+/// Reject unsupported clauses common to both temp and non-temp CREATE VIEW.
+fn reject_unsupported_view_clauses(
+    columns: &[sqlparser::ast::ViewColumnDef],
+    comment: &Option<String>,
+    options: &sqlparser::ast::CreateTableOptions,
+    cluster_by: &[sqlparser::ast::Ident],
+    with_no_schema_binding: bool,
+    materialized: bool,
+    to: &Option<ObjectName>,
+    params: &Option<sqlparser::ast::CreateViewParams>,
+    or_alter: bool,
+    secure: bool,
+) -> Result<(), EmissionError> {
+    if !columns.is_empty() {
+        bail_boundary_proto!(
+            "sql::create_view::column_list",
+            "column alias list on CREATE VIEW is not implemented in τ"
+        );
+    }
+    if comment.is_some() {
+        bail_boundary_proto!(
+            "sql::create_view::comment",
+            "COMMENT on CREATE VIEW is not implemented in τ"
+        );
+    }
+    if !matches!(options, sqlparser::ast::CreateTableOptions::None) {
+        bail_boundary_proto!(
+            "sql::create_view::options",
+            "OPTIONS / WITH on CREATE VIEW is not implemented in τ"
+        );
+    }
+    if !cluster_by.is_empty() {
+        bail_boundary_proto!(
+            "sql::create_view::cluster_by",
+            "CLUSTER BY on CREATE VIEW is not implemented in τ"
+        );
+    }
+    if with_no_schema_binding {
+        bail_boundary_proto!(
+            "sql::create_view::no_schema_binding",
+            "WITH NO SCHEMA BINDING on CREATE VIEW is not implemented in τ"
+        );
+    }
+    if materialized {
+        bail_boundary_proto!(
+            "sql::create_view::materialized",
+            "CREATE MATERIALIZED VIEW is not implemented in τ"
+        );
+    }
+    if to.is_some() {
+        bail_boundary_proto!(
+            "sql::create_view::to",
+            "TO clause on CREATE VIEW is not implemented in τ"
+        );
+    }
+    if params.is_some() {
+        bail_boundary_proto!(
+            "sql::create_view::params",
+            "algorithm/security params on CREATE VIEW is not implemented in τ"
+        );
+    }
+    if or_alter {
+        bail_boundary_proto!(
+            "sql::create_view::or_alter",
+            "CREATE OR ALTER VIEW is not implemented in τ"
+        );
+    }
+    if secure {
+        bail_boundary_proto!(
+            "sql::create_view::secure",
+            "CREATE SECURE VIEW is not implemented in τ"
+        );
+    }
+    Ok(())
 }
 
 /// Extract a simple (unqualified, single-part) identifier from an
@@ -265,7 +1029,7 @@ fn statement_kind(stmt: &Statement) -> &'static str {
         Statement::CreateTable(_) => "create_table",
         Statement::CreateView(_) => "create_view",
         Statement::AlterTable { .. } => "alter_table",
-        Statement::Truncate { .. } => "truncate",
+        Statement::Truncate(_) => "truncate",
         _ => "other",
     }
 }
@@ -3619,6 +4383,20 @@ fn lower_data_type(dt: SqlDataType) -> Result<DataType, EmissionError> {
         Date => DataType::Date,
         Timestamp(_, _) => DataType::Timestamp,
         Numeric(info) | Decimal(info) => decimal_from_exact_number(&info),
+        // Spark uses LONG, STRING, etc. as type names that sqlparser does
+        // not recognise as keywords — they arrive as `Custom(ObjectName)`.
+        // Handle the common Spark aliases case-insensitively.
+        Custom(ref name, ref modifiers) if modifiers.is_empty() => {
+            match lower_spark_custom_type(name) {
+                Some(mapped) => mapped,
+                None => {
+                    bail_boundary_proto!(
+                        format!("sql::data_type::{dt:?}"),
+                        "data type not supported in τ"
+                    );
+                }
+            }
+        }
         other => {
             bail_boundary_proto!(
                 format!("sql::data_type::{other:?}"),
@@ -3626,6 +4404,26 @@ fn lower_data_type(dt: SqlDataType) -> Result<DataType, EmissionError> {
             );
         }
     })
+}
+
+/// Map Spark-specific type names that sqlparser parses as `Custom(ObjectName)`
+/// to τ `DataType`. Returns `None` for unrecognised names.
+fn lower_spark_custom_type(name: &ObjectName) -> Option<DataType> {
+    let parts = &name.0;
+    if parts.len() != 1 {
+        return None;
+    }
+    let ident = match &parts[0] {
+        ObjectNamePart::Identifier(id) => &id.value,
+        ObjectNamePart::Function(_) => return None,
+    };
+    match ident.to_uppercase().as_str() {
+        "LONG" => Some(DataType::Long),
+        "SHORT" => Some(DataType::Short),
+        "BYTE" => Some(DataType::Byte),
+        "STRING" => Some(DataType::String),
+        _ => None,
+    }
 }
 
 fn decimal_from_exact_number(info: &ExactNumberInfo) -> DataType {

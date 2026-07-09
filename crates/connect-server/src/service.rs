@@ -1005,7 +1005,174 @@ async fn handle_sql_command_dispatch(
             )
             .await
         }
+        SqlStatement::Ddl(ddl) => handle_sql_ddl(session, session_id, operation_id, &ddl).await,
     }
+}
+
+/// Handle DDL/DML statements from a `SqlCommand`.
+///
+/// Renders the DDL to DuckDB SQL, executes it via `execute_ddl` with the
+/// appropriate schema-cache side effect, and returns a `ResultComplete`
+/// response (matching Spark's empty DataFrame result for DDL commands).
+///
+/// DuckDB catalog errors are mapped to Spark error classes by statement kind.
+async fn handle_sql_ddl(
+    session: &Arc<thunderduck_core::runtime::DuckDbSession>,
+    session_id: &str,
+    operation_id: &str,
+    ddl: &thunderduck_core::transpiler_v2::DdlStatement,
+) -> Result<Vec<proto::ExecutePlanResponse>, Status> {
+    use thunderduck_core::transpiler_v2::{render_ddl, DdlStatement};
+
+    type CacheEffect = thunderduck_core::runtime::SchemaCacheEffect;
+
+    // For body-bearing variants, finalize the body query first.
+    // CreateView also needs the resolved schema for the view cache.
+    let (body_sql, view_schema): (Option<String>, Option<StructType>) = match ddl {
+        DdlStatement::CreateView { query, .. } => {
+            let mut body_ast = query.clone();
+            resolve_implicit_pivots(&mut body_ast, session).await?;
+            let (sql, schema) = finalize(session, &body_ast).await?;
+            (Some(sql), Some(schema))
+        }
+        DdlStatement::InsertSelect { query, .. } => {
+            let mut body_ast = query.clone();
+            resolve_implicit_pivots(&mut body_ast, session).await?;
+            let (sql, _schema) = finalize(session, &body_ast).await?;
+            (Some(sql), None)
+        }
+        _ => (None, None),
+    };
+
+    // Render the DDL to DuckDB SQL.
+    let sql =
+        render_ddl(ddl, body_sql.as_deref()).map_err(|e| Status::from(ConnectError::from(e)))?;
+
+    // Determine the schema-cache side effect.
+    let effect = match ddl {
+        DdlStatement::CreateTable {
+            name,
+            columns,
+            if_not_exists,
+        } => {
+            if *if_not_exists {
+                // IF NOT EXISTS: DuckDB's DDL is a no-op when the table
+                // exists, so the cache must NOT overwrite the live schema.
+                CacheEffect::CacheIfAbsent {
+                    name: name.clone(),
+                    schema: columns.clone(),
+                }
+            } else {
+                CacheEffect::Cache {
+                    name: name.clone(),
+                    schema: columns.clone(),
+                }
+            }
+        }
+        DdlStatement::CreateView { name, .. } => {
+            // Cache the view's resolved schema so subsequent queries can
+            // resolve `SELECT * FROM <view>` via build_base_types.
+            if let Some(schema) = view_schema {
+                CacheEffect::Cache {
+                    name: name.clone(),
+                    schema,
+                }
+            } else {
+                CacheEffect::None
+            }
+        }
+        DdlStatement::DropTable { name, .. } | DdlStatement::DropView { name, .. } => {
+            CacheEffect::Evict { name: name.clone() }
+        }
+        DdlStatement::TruncateTable { .. }
+        | DdlStatement::InsertValues { .. }
+        | DdlStatement::InsertSelect { .. } => CacheEffect::None,
+        DdlStatement::CreateTempView { .. } => {
+            // Should not reach here — handled by handle_sql_create_temp_view.
+            CacheEffect::None
+        }
+    };
+
+    // Execute with Spark error-class mapping.
+    match session.execute_ddl(&sql, effect).await {
+        Ok(()) => Ok(vec![result_complete_response(session_id, operation_id)]),
+        Err(e) => Err(map_ddl_error(ddl, e)),
+    }
+}
+
+/// Map a DuckDB catalog error from a DDL statement to a Spark error class.
+///
+/// DuckDB's error messages for catalog conflicts are recognizable by
+/// pattern. We re-clothe them in Spark's error taxonomy.
+fn map_ddl_error(
+    ddl: &thunderduck_core::transpiler_v2::DdlStatement,
+    err: thunderduck_core::error::ThunderduckError,
+) -> Status {
+    use thunderduck_core::transpiler_v2::DdlStatement;
+
+    let msg = err.to_string();
+
+    match ddl {
+        DdlStatement::CreateTable {
+            name,
+            if_not_exists,
+            ..
+        } => {
+            // DuckDB: "Catalog Error: Table with name \"x\" already exists!"
+            if !if_not_exists && msg.contains("already exists") {
+                return Status::already_exists(format!(
+                    "[TABLE_OR_VIEW_ALREADY_EXISTS] The table or view `{name}` \
+                     already exists. Choose a different name, drop or replace \
+                     the existing object, or add the IF NOT EXISTS clause to \
+                     tolerate a pre-existing object."
+                ));
+            }
+        }
+        DdlStatement::DropTable {
+            name, if_exists, ..
+        } => {
+            if !if_exists && (msg.contains("does not exist") || msg.contains("not found")) {
+                return Status::not_found(format!(
+                    "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{name}` \
+                     cannot be found. Verify the spelling and correctness of \
+                     the schema and catalog.\n\
+                     If you did not qualify the name with a schema, verify the \
+                     current_schema() output, or qualify the name with the \
+                     correct schema and catalog."
+                ));
+            }
+        }
+        DdlStatement::DropView {
+            name, if_exists, ..
+        } => {
+            if !if_exists && (msg.contains("does not exist") || msg.contains("not found")) {
+                return Status::not_found(format!(
+                    "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{name}` \
+                     cannot be found. Verify the spelling and correctness of \
+                     the schema and catalog.\n\
+                     If you did not qualify the name with a schema, verify the \
+                     current_schema() output, or qualify the name with the \
+                     correct schema and catalog."
+                ));
+            }
+        }
+        DdlStatement::InsertValues { table, .. } | DdlStatement::InsertSelect { table, .. } => {
+            if msg.contains("does not exist") || msg.contains("not found") {
+                return Status::not_found(format!(
+                    "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{table}` \
+                     cannot be found. Verify the spelling and correctness of \
+                     the schema and catalog.\n\
+                     If you did not qualify the name with a schema, verify the \
+                     current_schema() output, or qualify the name with the \
+                     correct schema and catalog."
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    // Fallback: surface the DuckDB error as internal.
+    Status::from(ConnectError::from(err))
 }
 
 /// Handle a pure-query `SqlCommand` — echo the relation as a

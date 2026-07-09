@@ -152,7 +152,35 @@ pub(crate) enum SessionCommand {
         sql: String,
         batch_tx: mpsc::Sender<StreamBatch>,
     },
+    /// Execute a DDL/DML statement and apply a schema-cache side effect
+    /// atomically on success.
+    ExecuteDdl {
+        sql: String,
+        effect: SchemaCacheEffect,
+        resp: oneshot::Sender<SessionResult>,
+    },
     Shutdown,
+}
+
+/// Side effect on the session's view-schema cache after a DDL succeeds.
+///
+/// Applied atomically with the DuckDB statement execution on the session
+/// thread — only when the statement succeeds. This keeps the cache
+/// consistent with the DuckDB catalog without crossing `!Send` boundaries.
+#[derive(Debug, Clone)]
+pub enum SchemaCacheEffect {
+    /// Cache the declared schema under the given name (unconditional).
+    Cache { name: String, schema: StructType },
+    /// Cache the declared schema only if no entry already exists.
+    ///
+    /// Used for `CREATE TABLE IF NOT EXISTS`: DuckDB's DDL succeeds as a
+    /// no-op when the table exists, so the cache must NOT overwrite the
+    /// live table's schema with the redeclaration.
+    CacheIfAbsent { name: String, schema: StructType },
+    /// Evict the cached schema for the given name.
+    Evict { name: String },
+    /// No schema-cache side effect.
+    None,
 }
 
 pub(crate) enum SessionResult {
@@ -811,6 +839,32 @@ impl DuckDbSession {
         Ok(rx)
     }
 
+    /// Execute a DDL/DML statement and apply a schema-cache side effect
+    /// atomically on success.
+    ///
+    /// The `effect` is applied to the session's view-schema cache only when
+    /// the statement executes successfully; on error the cache is untouched.
+    pub async fn execute_ddl(&self, sql: &str, effect: SchemaCacheEffect) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SessionCommand::ExecuteDdl {
+                sql: sql.to_string(),
+                effect,
+                resp: resp_tx,
+            })
+            .await
+            .map_err(|_| ThunderduckError::DuckDb("session channel closed".into()))?;
+
+        match resp_rx
+            .await
+            .map_err(|_| ThunderduckError::DuckDb("session thread died".into()))?
+        {
+            SessionResult::Ok => Ok(()),
+            SessionResult::Error(e) => Err(e),
+            _ => unreachable!("ExecuteDdl never returns batches"),
+        }
+    }
+
     /// Retrieve the cached Spark schema for a temp view.
     ///
     /// Returns `None` if no cached schema exists (e.g. the view was created
@@ -882,6 +936,33 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
                 let msg = match result {
                     Ok(()) => {
                         view_schemas.insert(name.to_lowercase(), schema);
+                        SessionResult::Ok
+                    }
+                    Err(e) => SessionResult::Error(e),
+                };
+                let _ = resp.send(msg);
+            }
+            SessionCommand::ExecuteDdl { sql, effect, resp } => {
+                let result = conn
+                    .execute_batch(&sql)
+                    .map_err(|e| ThunderduckError::DuckDb(e.to_string()));
+                let msg = match result {
+                    Ok(()) => {
+                        match effect {
+                            SchemaCacheEffect::Cache { name, schema } => {
+                                view_schemas.insert(name.to_lowercase(), schema);
+                            }
+                            SchemaCacheEffect::CacheIfAbsent { name, schema } => {
+                                let key = name.to_lowercase();
+                                if !view_schemas.contains_key(&key) {
+                                    view_schemas.insert(key, schema);
+                                }
+                            }
+                            SchemaCacheEffect::Evict { name } => {
+                                view_schemas.remove(&name.to_lowercase());
+                            }
+                            SchemaCacheEffect::None => {}
+                        }
                         SessionResult::Ok
                     }
                     Err(e) => SessionResult::Error(e),
@@ -1276,5 +1357,110 @@ mod tests {
         assert_eq!(strip_str("42"), "42");
         assert_eq!(strip_str(r#""hello""#), r#""hello""#);
         assert_eq!(strip_str("true"), "true");
+    }
+
+    // ── SchemaCacheEffect unit tests ────────────────────────────────────
+
+    use super::SchemaCacheEffect;
+    use crate::types::{DataType, StructField, StructType};
+
+    /// Apply a `SchemaCacheEffect` to a HashMap, mirroring the session
+    /// thread's logic.
+    fn apply_effect(
+        cache: &mut std::collections::HashMap<String, StructType>,
+        effect: SchemaCacheEffect,
+    ) {
+        match effect {
+            SchemaCacheEffect::Cache { name, schema } => {
+                cache.insert(name.to_lowercase(), schema);
+            }
+            SchemaCacheEffect::CacheIfAbsent { name, schema } => {
+                let key = name.to_lowercase();
+                if !cache.contains_key(&key) {
+                    cache.insert(key, schema);
+                }
+            }
+            SchemaCacheEffect::Evict { name } => {
+                cache.remove(&name.to_lowercase());
+            }
+            SchemaCacheEffect::None => {}
+        }
+    }
+
+    #[test]
+    fn cache_effect_inserts_schema() {
+        let mut cache = std::collections::HashMap::new();
+        let schema = StructType::new(vec![StructField::nullable("a", DataType::Integer)]);
+        apply_effect(
+            &mut cache,
+            SchemaCacheEffect::Cache {
+                name: "t".to_owned(),
+                schema: schema.clone(),
+            },
+        );
+        assert_eq!(cache.get("t"), Some(&schema));
+    }
+
+    #[test]
+    fn cache_if_absent_does_not_overwrite_existing() {
+        let mut cache = std::collections::HashMap::new();
+        let original = StructType::new(vec![StructField::nullable("a", DataType::Integer)]);
+        let redeclared = StructType::new(vec![StructField::nullable("b", DataType::String)]);
+
+        // Simulate: CREATE TABLE t (a INT)
+        apply_effect(
+            &mut cache,
+            SchemaCacheEffect::Cache {
+                name: "t".to_owned(),
+                schema: original.clone(),
+            },
+        );
+
+        // Simulate: CREATE TABLE IF NOT EXISTS t (b VARCHAR)
+        apply_effect(
+            &mut cache,
+            SchemaCacheEffect::CacheIfAbsent {
+                name: "t".to_owned(),
+                schema: redeclared,
+            },
+        );
+
+        // Cache must still hold the original schema, not the redeclaration.
+        let cached = cache.get("t").expect("schema must be cached");
+        assert_eq!(cached.fields.len(), 1);
+        assert_eq!(cached.fields[0].name, "a");
+        assert_eq!(cached.fields[0].data_type, DataType::Integer);
+    }
+
+    #[test]
+    fn cache_if_absent_inserts_when_missing() {
+        let mut cache = std::collections::HashMap::new();
+        let schema = StructType::new(vec![StructField::nullable("x", DataType::Long)]);
+
+        apply_effect(
+            &mut cache,
+            SchemaCacheEffect::CacheIfAbsent {
+                name: "t".to_owned(),
+                schema: schema.clone(),
+            },
+        );
+
+        assert_eq!(cache.get("t"), Some(&schema));
+    }
+
+    #[test]
+    fn evict_removes_cached_schema() {
+        let mut cache = std::collections::HashMap::new();
+        let schema = StructType::new(vec![StructField::nullable("a", DataType::Integer)]);
+        cache.insert("t".to_owned(), schema);
+
+        apply_effect(
+            &mut cache,
+            SchemaCacheEffect::Evict {
+                name: "t".to_owned(),
+            },
+        );
+
+        assert!(cache.get("t").is_none());
     }
 }

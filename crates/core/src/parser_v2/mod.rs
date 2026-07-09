@@ -777,18 +777,17 @@ mod tests {
         }
 
         #[test]
-        fn persistent_create_view_bails_with_create_view() {
-            let err = SparkSqlParserV2::parse_statement("CREATE VIEW v AS SELECT 1 AS x")
-                .expect_err("persistent CREATE VIEW must bail");
-            match err {
-                EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
-                    name,
-                    ..
-                } => {
-                    assert_eq!(name, "sql::create_view");
+        fn persistent_create_view_parses_to_create_view_ddl() {
+            let result = SparkSqlParserV2::parse_statement("CREATE VIEW v AS SELECT 1 AS x")
+                .expect("persistent CREATE VIEW must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::CreateView {
+                    name, or_replace, ..
+                }) => {
+                    assert_eq!(name, "v");
+                    assert!(!or_replace);
                 }
-                other => panic!("expected sql::create_view boundary, got {other:?}"),
+                other => panic!("expected CreateView, got {other:?}"),
             }
         }
 
@@ -808,19 +807,185 @@ mod tests {
             }
         }
 
+        // ── CREATE TABLE tests ──────────────────────────────────────────
+
         #[test]
-        fn create_table_bails_with_create_table() {
-            let err = SparkSqlParserV2::parse_statement("CREATE TABLE t (id INT)")
-                .expect_err("CREATE TABLE must bail");
-            match err {
-                EmissionError::Unsupported {
-                    kind: UnsupportedKind::ProtoShape,
+        fn create_table_parses() {
+            let result = SparkSqlParserV2::parse_statement("CREATE TABLE t (id INT, name STRING)")
+                .expect("CREATE TABLE must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::CreateTable {
                     name,
-                    ..
-                } => {
-                    assert_eq!(name, "sql::create_table");
+                    if_not_exists,
+                    columns,
+                }) => {
+                    assert_eq!(name, "t");
+                    assert!(!if_not_exists);
+                    assert_eq!(columns.fields.len(), 2);
+                    assert_eq!(columns.fields[0].name, "id");
+                    assert_eq!(columns.fields[1].name, "name");
                 }
-                other => panic!("expected sql::create_table boundary, got {other:?}"),
+                other => panic!("expected CreateTable, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn create_table_if_not_exists() {
+            let result = SparkSqlParserV2::parse_statement("CREATE TABLE IF NOT EXISTS t (id INT)")
+                .expect("CREATE TABLE IF NOT EXISTS must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::CreateTable { if_not_exists, .. }) => {
+                    assert!(if_not_exists);
+                }
+                other => panic!("expected CreateTable, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn create_temporary_table_bails() {
+            let err = SparkSqlParserV2::parse_statement("CREATE TEMPORARY TABLE t (id INT)")
+                .expect_err("CREATE TEMPORARY TABLE must bail");
+            match err {
+                EmissionError::Unsupported { name, .. } => {
+                    assert_eq!(name, "sql::create_table::temporary");
+                }
+                other => panic!("expected temporary bail, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn create_table_ctas_bails() {
+            let err = SparkSqlParserV2::parse_statement("CREATE TABLE t AS SELECT 1 AS id")
+                .expect_err("CTAS must bail");
+            match err {
+                EmissionError::Unsupported { name, .. } => {
+                    assert_eq!(name, "sql::create_table::ctas");
+                }
+                other => panic!("expected CTAS bail, got {other:?}"),
+            }
+        }
+
+        // ── DROP TABLE / VIEW tests ───────────────────────────────────────
+
+        #[test]
+        fn drop_table_parses() {
+            let result =
+                SparkSqlParserV2::parse_statement("DROP TABLE t").expect("DROP TABLE must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::DropTable { name, if_exists }) => {
+                    assert_eq!(name, "t");
+                    assert!(!if_exists);
+                }
+                other => panic!("expected DropTable, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn drop_table_if_exists() {
+            let result = SparkSqlParserV2::parse_statement("DROP TABLE IF EXISTS t")
+                .expect("DROP TABLE IF EXISTS must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::DropTable { if_exists, .. }) => {
+                    assert!(if_exists);
+                }
+                other => panic!("expected DropTable, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn drop_view_parses() {
+            let result =
+                SparkSqlParserV2::parse_statement("DROP VIEW v").expect("DROP VIEW must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::DropView { name, if_exists }) => {
+                    assert_eq!(name, "v");
+                    assert!(!if_exists);
+                }
+                other => panic!("expected DropView, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn drop_view_if_exists() {
+            let result = SparkSqlParserV2::parse_statement("DROP VIEW IF EXISTS v")
+                .expect("DROP VIEW IF EXISTS must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::DropView { if_exists, .. }) => {
+                    assert!(if_exists);
+                }
+                other => panic!("expected DropView, got {other:?}"),
+            }
+        }
+
+        // ── INSERT tests ──────────────────────────────────────────────────
+
+        #[test]
+        fn insert_values_parses() {
+            let result =
+                SparkSqlParserV2::parse_statement("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+                    .expect("INSERT VALUES must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::InsertValues { table, rows }) => {
+                    assert_eq!(table, "t");
+                    assert_eq!(rows.len(), 2);
+                    assert_eq!(rows[0].len(), 2);
+                }
+                other => panic!("expected InsertValues, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn insert_select_parses() {
+            let result = SparkSqlParserV2::parse_statement("INSERT INTO dst SELECT * FROM src")
+                .expect("INSERT SELECT must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::InsertSelect { table, .. }) => {
+                    assert_eq!(table, "dst");
+                }
+                other => panic!("expected InsertSelect, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn insert_column_list_bails() {
+            let err = SparkSqlParserV2::parse_statement("INSERT INTO t (a, b) VALUES (1, 2)")
+                .expect_err("INSERT with column list must bail");
+            match err {
+                EmissionError::Unsupported { name, .. } => {
+                    assert_eq!(name, "sql::insert::column_list");
+                }
+                other => panic!("expected column_list bail, got {other:?}"),
+            }
+        }
+
+        // ── TRUNCATE TABLE tests ──────────────────────────────────────────
+
+        #[test]
+        fn truncate_table_parses() {
+            let result = SparkSqlParserV2::parse_statement("TRUNCATE TABLE t")
+                .expect("TRUNCATE TABLE must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::TruncateTable { name }) => {
+                    assert_eq!(name, "t");
+                }
+                other => panic!("expected TruncateTable, got {other:?}"),
+            }
+        }
+
+        // ── CREATE VIEW (non-temp) tests ──────────────────────────────────
+
+        #[test]
+        fn persistent_create_view_parses() {
+            let result = SparkSqlParserV2::parse_statement("CREATE VIEW v AS SELECT 1 AS x")
+                .expect("CREATE VIEW must parse");
+            match result {
+                SqlStatement::Ddl(DdlStatement::CreateView {
+                    name, or_replace, ..
+                }) => {
+                    assert_eq!(name, "v");
+                    assert!(!or_replace);
+                }
+                other => panic!("expected CreateView, got {other:?}"),
             }
         }
 

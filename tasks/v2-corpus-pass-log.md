@@ -381,3 +381,30 @@ red in any later pass.
   skeletons through verbatim; any added surface needs a Spark-source check
   first. Coder did well: verified Spark's actual rule empirically and made
   the invalid state unrepresentable.
+
+## Pass 3 — 2026-07-09 — SQL DDL stage 2 (CREATE TABLE / DROP / INSERT / TRUNCATE / persistent CREATE VIEW)
+
+- **Hypothesis:** remaining ddl_* + sql_expressions reds share the
+  sql::create_table / sql::drop / sql::insert boundary root cause.
+- **Fix:** DdlStatement grew CreateTable/DropTable/DropView/InsertValues/
+  InsertSelect/TruncateTable/CreateView; `render_ddl` builds DuckDB SQL from
+  typed parts (quote_ident + render_expr + render_data_type — zero input-SQL
+  string manipulation); `SessionCommand::ExecuteDdl` + `SchemaCacheEffect`
+  applies cache effects atomically on the session thread; `map_ddl_error`
+  re-clothes DuckDB catalog errors as TABLE_OR_VIEW_ALREADY_EXISTS /
+  TABLE_OR_VIEW_NOT_FOUND scoped by statement kind. Spark-parity verified
+  empirically: CREATE TEMPORARY TABLE rejected (parse), INSERT column-list
+  bails loudly (unexercised by corpus).
+- **Review:** APPROVE, 0 Critical/High. Medium fixed in-pass:
+  `CacheIfAbsent` variant so CREATE TABLE IF NOT EXISTS on an existing table
+  cannot overwrite the cached live schema with the redeclaration.
+- **Gate:** 1147→1189 (Δ +42, zero regressions): ddl_operations +13,
+  ddl_parser +12, sql_expressions +8, dataframe_basic_operations +7 (DDL
+  fixtures), ddl_corrected +2. Deferred: ALTER TABLE ADD COLUMN (stage 3),
+  from_json, RelType::Sql-in-root, join alias scoping (separate causes).
+- **Reflect:** coder reporting slip — quoted the all-ignored differential
+  result block ("0 passed") as the connect-server gate result; orchestrator
+  re-verified (102 passed). Noted in subagent-improvement-notes. Orchestrator
+  lesson: my `-k "ddl or sql_expressions"` focused-verify filter matched test
+  NAMES, not file paths — narrower than intended; use file paths as pytest
+  args for file-scoped verification instead of -k.

@@ -5814,7 +5814,7 @@ fn regex_escape(s: &str) -> String {
 
 /// Render a [`DataType`] as its DuckDB SQL type-string (`BIGINT`, `VARCHAR`,
 /// `DECIMAL(p,s)`, `TIMESTAMP`, ...).
-fn render_data_type(dt: &DataType) -> String {
+pub(crate) fn render_data_type(dt: &DataType) -> String {
     match dt {
         DataType::Boolean => "BOOLEAN".to_owned(),
         DataType::Byte => "TINYINT".to_owned(),

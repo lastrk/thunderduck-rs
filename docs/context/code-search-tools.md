@@ -1,33 +1,88 @@
 # Code Search Tools
 
-> Two MCP-backed search tools are preinstalled in the devcontainer. They answer
-> different kinds of questions — pick the right one. Prefer either over raw grep
-> for code questions.
+> Four tools answer code-navigation questions on this repo. Pick by the rules
+> below — they are empirically validated on thunderduck-rs (21-op bake-off,
+> 2026-07-10), not guesses. Prefer them over ad-hoc file reading.
 
-## codegraph — structural queries over a parsed AST/symbol graph
+The four:
 
-Use when you have a symbol name or want to trace relationships. Exact,
-deterministic, AST-backed — answers grep can't give (callers, callees, impact).
+- **codegraph** — `mcp__codegraph__codegraph_explore { query, projectPath }`. Tree-sitter
+  symbol/edge graph in SQLite. Returns verbatim source + call paths + a
+  dependent-**site** blast radius in one (verbose, ~2–6.5k tok) call.
+- **semble** — `mcp__semble__search { query, repo }` / `mcp__semble__find_related { repo,
+  file_path, line }`. Hybrid semantic+lexical chunk search. Cheap (~0.5–0.9k tok);
+  best when you have *intent* but no symbol name. Pass `repo` = project root
+  (`/workspace`) or it errors.
+- **scip-nav** — `Bash: python3 .claude/skills/scip-nav/scip_query.py <refs|def|sym> <NAME>
+  [--count]`. Type/trait-resolved refs, exact defs, symbol search from a static
+  rust-analyzer SCIP snapshot. **Tiny** (5–160 tok), exact. Fails closed if the
+  index is stale (`refresh`, or `--stale-ok`/`--auto-refresh`). See the
+  `scip-nav` skill.
+- **rg** — `Bash: rg`. The lexical baseline. Cheapest (40–60 tok) and *correct*
+  for text, string literals, imports, and macro call-sites. Don't overlook it.
+  Note: `rg` here is a **Claude Code shell shim** (ripgrep 14.1.1), not a `$PATH`
+  binary — it works in agent/Bash-tool calls but a raw subprocess that doesn't load
+  the Claude shell won't have it (there is no standalone `rg`; the Grep *tool* is
+  also absent on native builds). Scripts should not assume a bare `rg` binary.
 
-- "Where is `SqlGenerator` defined?" → `codegraph_search`
-- "What calls `visit_join`?" → `codegraph_callers`
-- "What does `convert_aggregate` call?" → `codegraph_callees`
-- "What would break if I change `LogicalPlan`?" → `codegraph_impact`
-- "Show me the signature / source of `to_sql`" → `codegraph_node`
-- "Give me focused context for an area" → `codegraph_context`
+## The 5 rules (cover ~everything)
 
-## semble — semantic / hybrid search over code chunks
+1. **Know the symbol name → `scip-nav` (`def`/`refs`/`sym`).** Exact, trait/type-resolved,
+   5–160 tok. Default for go-to-def, callers, rename, dead-code, cross-crate endpoints.
+2. **Concept / no name yet → `semble` first, then `scip-nav` to pin exact lines.**
+   The cheap discovery→resolution combo.
+3. **Text / string literal / imports / macro call-sites → `rg`.** Exact and cheapest;
+   beats the fancy tools when the target is lexical.
+4. **Dependency *graph* (blast-radius, call-path, "what tests cover this", subsystem
+   survey) → `codegraph`.** The only tool returning dependent *sites* + call flow +
+   test-caller flags. Worth its ~3–4k tok *only here*.
+5. **Never trust codegraph for a caller *count*** (undercounts trait-dispatch: 26 vs
+   true 44 for `require_proto`) **nor `rg`** (overcounts defs/docs: 48 vs 44). Use
+   `scip-nav refs --count`.
 
-Use when you don't know the symbol name yet, just intent. Fuzzy, intent-based;
-good for unfamiliar areas; can also index remote git URLs.
+## Per-op prescription (winner · winner tokens · best alternative)
 
-- "How does session lifecycle work?" → `semble.search`
-- "Where do we stream Arrow back to the client?" → `semble.search`
-- "Find code similar to this snippet" → `semble.find_related`
-- **Pass the project root as `repo`** (the working directory, e.g. `/workspace`) — without it, semble errors with "No repo specified and no default index."
+| Op | ✅ Use | Tok | Best alternative (tok · why worse) |
+|---|---|---|---|
+| Concept→location | `semble` → `scip def` | 800 | semble alone 650 (misses a leg); codegraph 4000 (0/3) |
+| Exact symbol by name | `rg 'pub (struct\|enum\|fn) X'` | 60 | scip def 3800 (exact, floods members) |
+| String / error-literal | `rg` | 40 | semble 460 (literal escapes embedding); codegraph 2500 (wrong) |
+| Subsystem survey | `codegraph explore` | 3000 | semble 875 (chunks, no graph — good pre-step) |
+| Go-to-definition | `scip def` | 90 | codegraph 4600 (50×); semble 390 (misses `Option<T>` impl) |
+| All trait impls | `scip def` | 130 | codegraph 6000 (45×); rg 120 (misses aliased/generic) |
+| Type API surface | `scip sym` | 1340 | codegraph 4600 (dup noise). *count = struct+fields+methods, not method tally* |
+| Type-at-point / return type | `rg 'fn X'` → `scip def` | 450 | codegraph 2000 (4–6×); scip alone **can't** (no hover) |
+| All callers / references | `scip refs [--count]` | 85 | rg 1813 (→52, over); codegraph 2100 (→26, under) |
+| Blast-radius | `codegraph explore` | 3000 | scip/rg give *occurrences* (780/815), wrong unit |
+| Call-path between symbols | `codegraph explore (flow)` | 3800 | semble 650 (names bridge, no ordered chain) |
+| Cross-crate flow endpoints | `scip def + sym` | 160 | codegraph 3600 (accurate, 23×, buries endpoints) |
+| Enum-variant handler | `scip sym` → `scip refs` | 150 | codegraph 6000 (40×); semble 470 (near-miss) |
+| Macro call-site enumeration | `rg -c 'macro!'` | 40 | scip **wrong** (macros aren't SCIP refs) |
+| Macro-generated body | `semble` → `Read range` | 710 | scip sym→Read 285 (if macro name known); codegraph trims body |
+| Async/channel hop | `semble` → `scip refs` | 570 | codegraph 2300 (most complete, 4×); scip alone = recv side only |
+| Dead / narrowly-used? | `scip refs --count` | 5 | rg 48 (over); codegraph 26 (under by 18) |
+| Rename safety (all sites) | `scip refs + def` | 700 | rg 1800 (52, no trait awareness); codegraph 6500 (26) |
+| Test coverage of a symbol | `codegraph explore` | 3200 | scip refs 130 (Rust-level 0). **Neither sees the Python corpus** — pair w/ corpus grep |
+| Invariant / banned imports | `rg` (anchored `use`) | 50 | scip 10 (not import-scoped, 0 acc); codegraph 4500 (90×) |
+| Find duplication / siblings | `scip sym <prefix>` | 2800 | semble `find_related` **wrong** (cross-file, misses in-file siblings) |
 
-## Rule of thumb
+## Token economics
 
-Named symbol or relationship → codegraph; fuzzy intent or unfamiliar area →
-semble. If semble surfaces a candidate symbol, hand it to codegraph for the
-precise structural follow-up.
+- **scip-nav 5–160 tok** — the workhorse; `--count` ≈ free. Wins/co-wins ~9 ops.
+- **rg 40–60 tok** — outright wins 4 ops (lexical targets); often the cheapest *correct* answer.
+- **semble 460–875 tok** — the discovery front-end; rarely the final answer, often the right first step.
+- **codegraph 2000–6500 tok** — wins exactly 4 ops (blast-radius, call-path, survey, test-coverage);
+  elsewhere 20–90× the winner's cost for equal-or-worse accuracy.
+
+## Caveats worth remembering
+
+- **codegraph undercounts trait dispatch** through `Option<T>`/generics and **rg overcounts**
+  (defs + doc-comments). For any *count* that gates a decision (dead code, rename, narrow-use),
+  use `scip-nav refs --count`.
+- **SCIP has no hover types and does not expand macros**; macro call-sites aren't first-class
+  SCIP refs. Use `rg` for macro sites and `codegraph`/source-read for macro bodies.
+- **Test coverage in this repo lives in the Python differential corpus**
+  (`tests/integration/differential/*`), invisible to all four Rust tools — a Rust "no covering
+  tests" flag is not the whole story; grep the corpus too.
+- **scip-nav is a snapshot**: run `refresh` (~15 s, ~3 GB transient, then freed) after edits, or
+  a query will fail closed. `status` reports freshness.

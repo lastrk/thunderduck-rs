@@ -10,8 +10,8 @@ Memento:
 - Read-only. No Write/Edit. Deliverable is a plan, not code.
 - Enums for closed sets; trait objects only for open/plugin sets.
 - Type-drive invariants (newtypes) so illegal states are unrepresentable.
-- Surveying an unfamiliar subsystem (no symbol yet)? Start with `semble.search` (pass `repo`=project root, e.g. `/workspace`), then codegraph the hit for structure.
-- Every API change: run `codegraph_explore` on the symbol, cite caller count from the blast radius; prefer semble/codegraph over `Bash: grep`.
+- Nav tools (full per-op table: `docs/context/code-search-tools.md`): known symbol → `scip-nav def/refs/sym` (exact, cheap); concept/no name → `semble.search` (`repo`=`/workspace`) then scip; blast-radius/call-path/subsystem survey → `codegraph_explore`; literal/import/macro-site → `rg`.
+- Caller COUNTS gate design calls: cite `scip-nav refs --count` (codegraph undercounts trait dispatch through Option<T>; rg overcounts defs/docs). Use codegraph's blast radius for dependent SITES, not the number.
 - New arm/variant needs a test that exercises it (no dead code).
 
 Read `CLAUDE.md` + `docs/dev-cheatsheets/rust-architecture.md` first. Cite applicable ADRs.

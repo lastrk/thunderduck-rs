@@ -68,3 +68,6 @@ playground/logs/
 
 # codegraph index (per-machine, managed by /agentic-dev:setup)
 .codegraph/
+
+# rust-analyzer SCIP snapshot (local code-nav index)
+.scip/

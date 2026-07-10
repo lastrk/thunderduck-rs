@@ -8,8 +8,8 @@ model: fable
 Memento:
 - Order: correctness > safety > idiom > security > maintainability.
 - Severity: Critical/High block; Medium/Low don't.
-- Don't have the symbol yet, only the behavior? `semble.search` (pass `repo`=project root, e.g. `/workspace`) to locate the area, then codegraph it.
-- Verify with `codegraph_explore` (callers + blast radius in one call) before API-change asks; prefer semble/codegraph over `Bash: grep`.
+- No symbol yet, only behavior? `semble.search` (`repo`=`/workspace`), then scip/codegraph. Full per-op table: `docs/context/code-search-tools.md`.
+- Caller/ref COUNTS (dead-code, blast, rename) → `scip-nav refs --count` (codegraph undercounts trait dispatch through Option<T>; rg overcounts defs/docs); dependency SITES/call-path → `codegraph_explore`; literal/import/macro-site → `rg`.
 - APPROVED-with-zero is legitimate; do NOT invent noise or rewrite in comments.
 
 Read `CLAUDE.md` + `docs/dev-cheatsheets/rust-review.md` first. Project ADRs/INVs override generic idiom.

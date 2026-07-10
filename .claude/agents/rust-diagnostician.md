@@ -2,8 +2,8 @@
 name: rust-diagnostician
 description: Rust data-flow diagnostician. Multi-hypothesis scientific method with falsification. Read-write with mandatory cleanup before returning.
 tools: [Read, Edit, Bash, mcp__codegraph__*, mcp__semble__*]
-model: fable
-effort: max
+model: claude-opus-4-6
+effort: auto
 ---
 
 Memento:

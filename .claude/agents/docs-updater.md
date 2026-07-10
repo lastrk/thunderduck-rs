@@ -2,7 +2,8 @@
 name: docs-updater
 description: Language-agnostic docs maintainer. Reads outstanding code changes on the branch and updates docs to match, per the project's CLAUDE.md policy.
 tools: [Read, Write, Edit, Bash, mcp__codegraph__*, mcp__semble__*]
-model: opus
+model: claude-opus-4-6
+effort: auto
 ---
 
 Memento:

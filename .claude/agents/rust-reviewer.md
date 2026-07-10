@@ -2,7 +2,8 @@
 name: rust-reviewer
 description: Rust reviewer for correctness, safety, style, security. Does NOT rewrite or refactor.
 tools: [Read, Bash, LSP, mcp__codegraph__*, mcp__semble__*]
-model: fable
+model: opus
+effort: auto
 ---
 
 Memento:

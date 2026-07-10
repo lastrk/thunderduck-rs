@@ -490,6 +490,12 @@ case("join-022", "join", "duplicate synthetic join alias (__td_jr collision witn
 # qualified-resolution path with F8/F10; gated by the ADR-023 lineage fix.
 # NOT in the witness-progress baseline (born red, stays red until then).
 case("join-023", "join", "F11 DEFERRED — duplicate user alias on both join sides (Spark AMBIGUOUS_REFERENCE; τ silently binds left)", lambda I: I["emp"].alias("x").join(I["emp2"].alias("x"), F.col("x.id") == F.col("x.id")).select("x.salary"), expected_error="AMBIGUOUS_REFERENCE")
+# join-024 (Phase 3a): the un-realiased self-join `df.join(df, ...)` — the
+# SAME plan_id tagged on BOTH sides of the join's OWN condition. Spark Connect
+# resolves both refs depth-0 against the same plan_id and the merge fold
+# throws AMBIGUOUS_COLUMN_REFERENCE (42702) at condition analysis — distinct
+# from the bare-name AMBIGUOUS_REFERENCE (42704) class join-023 pins above.
+case("join-024", "join", "self-join same plan_id both sides of own condition (AMBIGUOUS_COLUMN_REFERENCE)", lambda I: I["emp"].join(I["emp"], I["emp"]["id"] == I["emp"]["id"]), expected_error="AMBIGUOUS_COLUMN_REFERENCE")
 
 # ── 12. Set operations (type widening) ──────────────────────────────────────
 def _emp_proj(I):

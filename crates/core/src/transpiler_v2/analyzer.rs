@@ -1125,6 +1125,17 @@ pub enum AnalyzerError {
         candidates: Vec<String>,
     },
 
+    /// A plan_id-tagged reference binds the SAME join-side plan_id on BOTH sides
+    /// of one join (the un-realiased self-join `df.join(df, …)`). Spark cannot
+    /// tell which side is meant. Distinct Spark class from `AmbiguousColumn`
+    /// (bare-name ambiguity): AMBIGUOUS_COLUMN_REFERENCE (42702) vs
+    /// AMBIGUOUS_REFERENCE (42704).
+    #[error("[SPARK-EMULATED] column `{name}` is ambiguous — the same DataFrame is joined on both sides")]
+    AmbiguousColumnReference {
+        /// The ambiguous column name.
+        name: String,
+    },
+
     /// A later SELECT-list item references an earlier item's alias (Spark's
     /// Lateral Column Alias feature, pr-007) but 2+ earlier items in the same
     /// projection list share that alias name — Spark's own
@@ -1195,6 +1206,7 @@ impl AnalyzerError {
             Self::UnknownTable { .. } => Some("TABLE_OR_VIEW_NOT_FOUND"),
             Self::UnknownColumn { .. } => Some("UNRESOLVED_COLUMN.WITH_SUGGESTION"),
             Self::AmbiguousColumn { .. } => Some("AMBIGUOUS_REFERENCE"),
+            Self::AmbiguousColumnReference { .. } => Some("AMBIGUOUS_COLUMN_REFERENCE"),
             Self::AmbiguousLateralColumnAlias { .. } => Some("AMBIGUOUS_LATERAL_COLUMN_ALIAS"),
             Self::TypeMismatch { .. } => Some("DATATYPE_MISMATCH"),
             Self::Other { .. } | Self::PuntedOperator { .. } | Self::UnsupportedRule { .. } => None,
@@ -1228,12 +1240,12 @@ pub fn analyze(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Analy
 /// [`TD_JOIN_LEFT`]/[`TD_JOIN_RIGHT`] qualifier demands that side be
 /// addressable under its synthetic alias in the emitted FROM scope.
 ///
-/// ADR-023 Phase 2: a demand arising in the join's OWN condition
-/// (`qualify_plan_id_refs`) is deliberately NOT folded into these flags
-/// anymore — a join's own condition is resolved positionally at emission
-/// time instead (`emission::requalify_join_condition`), against whichever
-/// alias its sides actually render under, falling back to a fresh synthetic
-/// wrap only when no unambiguous covering alias exists. Only a demand from
+/// ADR-023 Phase 2/3a: a demand arising in the join's OWN condition is
+/// deliberately NOT folded into these flags — a join's own condition is
+/// resolved positionally at emission time instead
+/// (`emission::requalify_join_condition`), against whichever alias its sides
+/// actually render under, falling back to a fresh synthetic wrap only when no
+/// unambiguous covering alias exists. Only a demand from
 /// an ANCESTOR operator's expressions (`resolve_column`'s plan_id arm stamps
 /// `__td_jl`/`__td_jr` on ambiguous refs above a join) reaches these flags.
 /// An ancestor demand reaches the join only through the same
@@ -1607,6 +1619,7 @@ pub(super) fn analyzer_error_to_emission_error(e: AnalyzerError) -> EmissionErro
                 AnalyzerError::UnknownTable { .. }
                 | AnalyzerError::UnknownColumn { .. }
                 | AnalyzerError::AmbiguousColumn { .. }
+                | AnalyzerError::AmbiguousColumnReference { .. }
                 | AnalyzerError::AmbiguousLateralColumnAlias { .. }
                 | AnalyzerError::TypeMismatch { .. } => {
                     unreachable!("spark_class() returns Some for these variants")
@@ -2580,22 +2593,21 @@ fn analyze_join(
     // condition here, or in projections/filters/sort keys above —
     // that resolves to more than one field raises `AmbiguousColumn`.
     //
-    // BUT: proto `Expression.Attribute.plan_id` is Spark's mechanism
-    // to disambiguate `emp.dept_id == dept.dept_id` — the two refs
-    // share a name but carry different plan_ids. Pre-process the
-    // condition to synthesize the emission-facing qualifier
-    // (`__td_jl` / `__td_jr`) from plan_id membership; that turns a
-    // plan_id-tagged unqualified reference into a "trust the
-    // caller" qualified reference that `resolve_column` accepts and
-    // emission renders as `__td_jl.dept_id` — matching the aliases
-    // `render_join` emits.
+    // `Expression.Attribute.plan_id` is Spark's mechanism to disambiguate
+    // `emp.dept_id == dept.dept_id` — the two refs share a name but carry
+    // different plan_ids. `ResolveContext::for_join_condition` binds the
+    // join's OWN `left_plan_ids`/`right_plan_ids` into its scope (the same
+    // plan_id arm in `resolve_column` that resolves above-join refs), so a
+    // plan_id-tagged unqualified reference reaching `resolve_and_stamp`
+    // resolves to the correct side directly — no pre-processing needed.
     let condition = match condition {
-        Some(mut c) => {
-            qualify_plan_id_refs(&mut c, &left_plan_ids, &right_plan_ids);
+        Some(c) => {
             let ctx = ResolveContext::for_join_condition(
                 &combined_input_schema,
                 &typed_left,
                 &typed_right,
+                &left_plan_ids,
+                &right_plan_ids,
                 base_types,
                 outer,
             );
@@ -3891,30 +3903,6 @@ fn analyze_single_column_subquery(
 pub(crate) const TD_JOIN_LEFT: &str = "__td_jl";
 pub(crate) const TD_JOIN_RIGHT: &str = "__td_jr";
 
-/// Walk an expression in place and rewrite `UnresolvedColumn { qualifier:
-/// None, plan_id: Some(N) }` to carry `qualifier: Some("__td_jl")` or
-/// `Some("__td_jr")` based on which side `N` belongs to. Leaves
-/// qualifier-set references and plan_id-free references untouched.
-fn qualify_plan_id_refs(expr: &mut Expression, left_ids: &[i64], right_ids: &[i64]) {
-    match expr {
-        Expression::UnresolvedColumn(u) if u.qualifier.is_none() => {
-            let synth = match u.plan_id {
-                Some(pid) if left_ids.contains(&pid) => Some(TD_JOIN_LEFT.to_owned()),
-                Some(pid) if right_ids.contains(&pid) => Some(TD_JOIN_RIGHT.to_owned()),
-                _ => None,
-            };
-            if let Some(q) = synth {
-                u.qualifier = Some(q);
-            }
-        }
-        other => {
-            for c in other.children_mut() {
-                qualify_plan_id_refs(c, left_ids, right_ids);
-            }
-        }
-    }
-}
-
 // ── Alias-aware qualified-column resolution over joins ─────────────────────
 //
 // A relation alias (`d` in `... CROSS JOIN dept d`) is not a schema field —
@@ -3987,13 +3975,22 @@ impl<'a> ResolveContext<'a> {
     }
 
     /// Resolve a join condition against the merged `left ⋈ right` schema.
-    /// Binds both sides' qualifiers at their positional offsets, plus the
-    /// synthetic `__td_jl` / `__td_jr` plan_id-derived qualifiers (whole-side
-    /// ranges) that [`qualify_plan_id_refs`] may have attached.
+    /// Binds the join's OWN `left_plan_ids`/`right_plan_ids` first (mirroring
+    /// [`RelScope::of`]'s Join arm so lookup's first-match picks the nearest
+    /// side), then both children's alias/plan_id scopes at their positional
+    /// offsets, plus the synthetic `__td_jl` / `__td_jr` qualifiers (whole-side
+    /// ranges) — shared with the above-join `resolve_column` plan_id arm.
+    ///
+    /// Deliberately diverges from [`RelScope::of`]: there is NO `keep_right`
+    /// gate here — the condition resolves against the full merged schema
+    /// regardless of join type (SEMI/ANTI included), since Spark's own
+    /// resolution runs the fold over both children irrespective of join type.
     fn for_join_condition(
         schema: &'a StructType,
         left: &'a TypedAst,
         right: &'a TypedAst,
+        left_plan_ids: &[i64],
+        right_plan_ids: &[i64],
         base_types: &'a BaseTypes,
         outer: Option<OuterScope<'a>>,
     ) -> Self {
@@ -4008,7 +4005,16 @@ impl<'a> ResolveContext<'a> {
                 .iter()
                 .map(|(name, r)| (name.clone(), offset(r))),
         );
-        let mut plan_ids = left.scope.plan_ids.clone();
+        let left_range = 0..left_len;
+        let right_range = left_len..left_len + right_len;
+        let mut plan_ids = Vec::new();
+        for &pid in left_plan_ids {
+            plan_ids.push((pid, left_range.clone(), JoinSide::Left));
+        }
+        for &pid in right_plan_ids {
+            plan_ids.push((pid, right_range.clone(), JoinSide::Right));
+        }
+        plan_ids.extend(left.scope.plan_ids.iter().cloned());
         plan_ids.extend(
             right
                 .scope
@@ -4016,7 +4022,12 @@ impl<'a> ResolveContext<'a> {
                 .iter()
                 .map(|(pid, r, side)| (*pid, offset(r), *side)),
         );
-        let mut ambiguous_plan_ids = left.scope.ambiguous_plan_ids.clone();
+        let mut ambiguous_plan_ids: Vec<i64> = left_plan_ids
+            .iter()
+            .filter(|p| right_plan_ids.contains(p))
+            .copied()
+            .collect();
+        ambiguous_plan_ids.extend(left.scope.ambiguous_plan_ids.iter().copied());
         ambiguous_plan_ids.extend(right.scope.ambiguous_plan_ids.iter().copied());
         aliases.push((TD_JOIN_LEFT.to_owned(), 0..left_len));
         aliases.push((TD_JOIN_RIGHT.to_owned(), left_len..left_len + right_len));
@@ -4234,10 +4245,12 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     // it catches ambiguity everywhere a column reference is resolved
     // (projections, filters, sort keys, join conditions, ...), not just in
     // join conditions.
-    // Synthetic __td_jl / __td_jr qualifiers set by `qualify_plan_id_refs`
-    // are "trust the caller" markers for a join condition. Emission renders
-    // them verbatim, so nullability/type must be resolved against the
-    // correct SIDE via `ctx.scopes` (populated by
+    // Synthetic __td_jl / __td_jr qualifiers no longer arrive from any
+    // production pre-pass (Phase 3a routes condition plan_id refs through
+    // the shared plan_id arm below); this branch now fires only for a
+    // user-typed reserved qualifier (F13) or a hand-built test condition.
+    // When it does, nullability/type must be resolved against the correct
+    // SIDE via `ctx.scopes` (populated by
     // `ResolveContext::for_join_condition` with whole-side ranges). A miss
     // (`scoped_range` None, or name absent from the side) is now a clean
     // `UnknownColumn` — a user-typed reserved qualifier `__td_jl`/`__td_jr`
@@ -4250,24 +4263,27 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     // ── plan_id-scoped resolution (above-join disambiguation) ────────
     // When the ref is unqualified but carries a plan_id that maps to a
     // known join side, restrict resolution to that side's field range.
-    // This is the above-join analogue of `qualify_plan_id_refs` (which
-    // only handles join CONDITIONS). Fall through to legacy behavior
-    // when the plan_id is unknown (e.g. ref to a non-join child —
-    // Spark tolerates refs resolvable unambiguously without it).
+    // The condition and above-join paths now share this arm: `resolve_column`
+    // is the single unification point, reached whether the plan_id-tagged
+    // ref lives in the join's own condition (via
+    // `ResolveContext::for_join_condition` binding the join's own
+    // `left_plan_ids`/`right_plan_ids`) or above the join. Fall through to
+    // legacy behavior when the plan_id is unknown (e.g. ref to a non-join
+    // child — Spark tolerates refs resolvable unambiguously without it).
     if u.qualifier.is_none() {
         if let Some(pid) = u.plan_id {
             // ADR-023 3b-i: a plan_id bound on BOTH sides of the SAME join
             // (the un-realiased self-join `df.join(df, ...)`) is genuinely
             // ambiguous — Spark itself cannot tell which side is meant.
             // Checked BEFORE `plan_id_lookup`'s first-match so we raise
-            // `AmbiguousColumn` instead of silently binding the left side.
+            // `AmbiguousColumnReference` instead of silently binding the left
+            // side. Phase 3a: this arm is the unification point, reached from
+            // both the join-CONDITION path (`ResolveContext::for_join_condition`
+            // seeds the own-intersection) and the above-join path
+            // (`RelScope::of`'s Join arm).
             if ctx.scopes.plan_id_is_ambiguous(pid) {
-                return Err(AnalyzerError::AmbiguousColumn {
+                return Err(AnalyzerError::AmbiguousColumnReference {
                     name: u.name.clone(),
-                    candidates: vec![
-                        format!("{TD_JOIN_LEFT}.{}", u.name),
-                        format!("{TD_JOIN_RIGHT}.{}", u.name),
-                    ],
                 });
             }
             if let Some((range, side_qualifier)) = ctx.plan_id_lookup(pid) {
@@ -8911,6 +8927,38 @@ mod tests {
     }
 
     #[test]
+    fn analyzer_error_bridge_maps_ambiguous_column_reference_to_spark_emulated() {
+        // Phase 3a: `AmbiguousColumnReference` has a known `spark_class()`
+        // (`AMBIGUOUS_COLUMN_REFERENCE`), so the bridge routes it to
+        // `EmissionError::SparkEmulated` with the Display leading the exact
+        // Spark class token (mirrors `mod.rs`'s
+        // `generate_surfaces_ambiguous_column_with_spark_class_leading`).
+        let e = AnalyzerError::AmbiguousColumnReference {
+            name: "id".to_owned(),
+        };
+        let bridged = analyzer_error_to_emission_error(e);
+        match bridged {
+            EmissionError::SparkEmulated { class, message } => {
+                assert_eq!(class, "AMBIGUOUS_COLUMN_REFERENCE");
+                assert!(
+                    !message.starts_with("[SPARK-EMULATED]"),
+                    "message must not double the internal prefix, got: {message}"
+                );
+                let display = EmissionError::SparkEmulated {
+                    class,
+                    message: message.clone(),
+                }
+                .to_string();
+                assert!(
+                    display.starts_with("[AMBIGUOUS_COLUMN_REFERENCE]"),
+                    "expected leading Spark class token, got: {display}",
+                );
+            }
+            other => panic!("expected EmissionError::SparkEmulated, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn analyzer_error_bridge_maps_other_to_unsupported_expression() {
         // `Other` has no specific Spark class (`spark_class() == None`), so
         // the bridge keeps the legacy `Unsupported{name:
@@ -8960,6 +9008,13 @@ mod tests {
             }
             .spark_class(),
             Some("AMBIGUOUS_REFERENCE")
+        );
+        assert_eq!(
+            AnalyzerError::AmbiguousColumnReference {
+                name: "c".to_owned(),
+            }
+            .spark_class(),
+            Some("AMBIGUOUS_COLUMN_REFERENCE")
         );
         assert_eq!(
             AnalyzerError::AmbiguousLateralColumnAlias {
@@ -12300,7 +12355,7 @@ mod tests {
         // ADR-023 3b-i, join-023 shape: the un-realiased self-join
         // `df.join(df, ...)` — the SAME plan_id (1) tagged on BOTH the left
         // AND right side of the SAME join. A reference carrying that plan_id
-        // must raise `AmbiguousColumn`, not silently bind the left side.
+        // must raise `AmbiguousColumnReference`, not silently bind the left side.
         let bt = base_types_with_emp_dept();
         let joined = join_with_plan_ids(
             scan("emp"),
@@ -12316,15 +12371,92 @@ mod tests {
         });
         let err = analyze(project, &bt).unwrap_err();
         match err {
-            AnalyzerError::AmbiguousColumn {
-                ref name,
-                ref candidates,
-            } => {
+            AnalyzerError::AmbiguousColumnReference { ref name } => {
                 assert_eq!(name, "id");
-                assert_eq!(candidates.len(), 2);
             }
-            other => panic!("expected AmbiguousColumn, got {other:?}"),
+            other => panic!("expected AmbiguousColumnReference, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn condition_binds_both_sides_of_same_join_is_ambiguous_column_reference() {
+        // Phase 3a: the un-realiased self-join `df.join(df, ...)` — the SAME
+        // plan_id (1) tagged on BOTH sides of the SAME join, referenced from
+        // the join's OWN condition (not above it, unlike the
+        // `plan_id_binds_both_sides_of_same_join_is_ambiguous` test above).
+        // `ResolveContext::for_join_condition`'s own-intersection seeding
+        // must raise `AmbiguousColumnReference` here too — the unification
+        // point (`resolve_column`'s plan_id-ambiguous arm) is shared with the
+        // above-join path.
+        let bt = base_types_with_emp_dept();
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(pcol("id", 1)),
+            right: Box::new(pcol("id", 1)),
+        });
+        let joined = join_with_plan_ids(
+            scan("emp"),
+            scan("emp"),
+            JoinType::Inner,
+            Some(cond),
+            vec![1],
+            vec![1],
+        );
+        let err = analyze(joined, &bt).unwrap_err();
+        match err {
+            AnalyzerError::AmbiguousColumnReference { ref name } => {
+                assert_eq!(name, "id");
+            }
+            other => panic!("expected AmbiguousColumnReference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn for_join_condition_binds_own_plan_ids_not_just_children_scope() {
+        // Anti-regression sentinel (Phase 3a): `left`/`right` here are bare
+        // `TableScan`s, whose own `RelScope` (per `RelScope::of`) carries NO
+        // `plan_ids` at all — only a `Join` node's OWN arm populates that
+        // field. Before this change, `qualify_plan_id_refs` pre-processed the
+        // condition using the join's own `left_plan_ids`/`right_plan_ids`
+        // (the analyzer_join parameters) directly, bypassing `RelScope`
+        // entirely; deleting it means `ResolveContext::for_join_condition`
+        // MUST bind those same own plan_ids into its scope itself, or a
+        // plan_id-tagged condition ref against a bare-scan child would fall
+        // through to legacy name resolution and never see the `__td_jl` /
+        // `__td_jr` qualifier stamp this test asserts.
+        //
+        // Left schema: 6 fields, `dept_id` first (merged ordinal 0). Right
+        // schema: 1 field, `dept_id` (merged ordinal 6 = left's length).
+        let left_schema = StructType::new(vec![
+            StructField::not_null("dept_id", DataType::Integer),
+            StructField::not_null("f1", DataType::Integer),
+            StructField::not_null("f2", DataType::Integer),
+            StructField::not_null("f3", DataType::Integer),
+            StructField::not_null("f4", DataType::Integer),
+            StructField::not_null("f5", DataType::Integer),
+        ]);
+        let right_schema =
+            StructType::new(vec![StructField::not_null("dept_id", DataType::Integer)]);
+        let bt = base_types_for(&[("left_t", left_schema), ("right_t", right_schema)]);
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(pcol("dept_id", 1)),
+            right: Box::new(pcol("dept_id", 2)),
+        });
+        let joined = join_with_plan_ids(
+            scan("left_t"),
+            scan("right_t"),
+            JoinType::Inner,
+            Some(cond),
+            vec![1],
+            vec![2],
+        );
+        let typed = analyze(joined, &bt).expect("distinct-pid dept_id condition should resolve");
+        let (l, r) = join_condition_refs(&typed);
+        assert_eq!(l.qualifier.as_deref(), Some(TD_JOIN_LEFT));
+        assert_eq!(l.ordinal, Some(0));
+        assert_eq!(r.qualifier.as_deref(), Some(TD_JOIN_RIGHT));
+        assert_eq!(r.ordinal, Some(6));
     }
 
     #[test]
@@ -12456,8 +12588,8 @@ mod tests {
     }
 
     // ── F13 — user-typed reserved qualifier must not panic ─────────────────
-    // `__td_jl`/`__td_jr` are analyzer-internal join-condition markers
-    // (`qualify_plan_id_refs`), only ever scoped inside a join condition via
+    // `__td_jl`/`__td_jr` are analyzer-internal join-side markers, only ever
+    // scoped inside a join condition via
     // `ResolveContext::for_join_condition`. A user typing them directly
     // (outside a join condition, so `ctx.scoped_range` misses) must get a
     // clean `UnknownColumn` — Spark itself raises `UNRESOLVED_COLUMN` for

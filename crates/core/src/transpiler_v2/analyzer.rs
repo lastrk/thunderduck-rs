@@ -129,6 +129,25 @@ macro_rules! scope_passthrough {
     };
 }
 
+/// Which side of a join a plan_id-bound range belongs to. Replaces the
+/// `&'static str` side marker in `RelScope::plan_ids`. Phase 0: maps to the
+/// SAME synthetic emission qualifier via `qualifier()`; the TD_JOIN_* strings
+/// are NOT removed here, only the stringly-typed marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinSide {
+    Left,
+    Right,
+}
+
+impl JoinSide {
+    fn qualifier(self) -> &'static str {
+        match self {
+            JoinSide::Left => TD_JOIN_LEFT,
+            JoinSide::Right => TD_JOIN_RIGHT,
+        }
+    }
+}
+
 /// The alias scope a relation's OUTPUT exposes: which qualifiers (table
 /// names, user aliases, lateral-view table aliases) bind to which contiguous
 /// field ranges of the node's `resolved_schema`, plus the plan_id →
@@ -140,13 +159,14 @@ macro_rules! scope_passthrough {
 pub struct RelScope {
     /// `(qualifier, field-range)` bindings, in tree order.
     pub aliases: Vec<(String, std::ops::Range<usize>)>,
-    /// `(plan_id, field-range, TD_JOIN_LEFT | TD_JOIN_RIGHT)` bindings,
-    /// OUTERMOST join first — [`RelScope::lookup_plan_id`] uses first
-    /// match, so the nearest enclosing join's side qualifier wins. The
-    /// third element is the synthetic join-side qualifier emission renders
-    /// so DuckDB resolves the reference against the correct side of the
-    /// enclosing join's `(left) AS __td_jl … (right) AS __td_jr` FROM.
-    pub plan_ids: Vec<(i64, std::ops::Range<usize>, &'static str)>,
+    /// `(plan_id, field-range, JoinSide)` bindings, OUTERMOST join first —
+    /// [`RelScope::lookup_plan_id`] uses first match, so the nearest
+    /// enclosing join's side qualifier wins. The third element is which
+    /// side of the enclosing join the range belongs to; emission renders
+    /// its [`JoinSide::qualifier`] so DuckDB resolves the reference against
+    /// the correct side of the enclosing join's `(left) AS __td_jl …
+    /// (right) AS __td_jr` FROM.
+    pub(crate) plan_ids: Vec<(i64, std::ops::Range<usize>, JoinSide)>,
     /// plan_ids bound on BOTH the left AND right side of the SAME join —
     /// the un-realiased self-join `df.join(df, ...)` reusing the identical
     /// underlying relation on both sides without a fresh alias. Any
@@ -221,7 +241,7 @@ impl RelScope {
     /// OUTERMOST entry wins — [`RelScope::of`] pushes parent entries before
     /// child entries, so the first match carries the qualifier in scope at
     /// the parent operator's resolution point.
-    fn lookup_plan_id(&self, pid: i64) -> Option<(std::ops::Range<usize>, &'static str)> {
+    fn lookup_plan_id(&self, pid: i64) -> Option<(std::ops::Range<usize>, JoinSide)> {
         self.plan_ids
             .iter()
             .find(|(id, _, _)| *id == pid)
@@ -326,11 +346,11 @@ impl RelScope {
 
                 let mut plan_ids = Vec::new();
                 for &pid in left_plan_ids {
-                    plan_ids.push((pid, left_range.clone(), TD_JOIN_LEFT));
+                    plan_ids.push((pid, left_range.clone(), JoinSide::Left));
                 }
                 if keep_right {
                     for &pid in right_plan_ids {
-                        plan_ids.push((pid, right_range.clone(), TD_JOIN_RIGHT));
+                        plan_ids.push((pid, right_range.clone(), JoinSide::Right));
                     }
                 }
                 plan_ids.extend(left.scope.plan_ids.iter().cloned());
@@ -4031,7 +4051,7 @@ impl<'a> ResolveContext<'a> {
 
     /// Look up a plan_id's field range and join-side qualifier, with the
     /// same out-of-bounds guard as [`scoped_range`](Self::scoped_range).
-    fn plan_id_lookup(&self, pid: i64) -> Option<(std::ops::Range<usize>, &'static str)> {
+    fn plan_id_lookup(&self, pid: i64) -> Option<(std::ops::Range<usize>, JoinSide)> {
         self.scopes.lookup_plan_id(pid).filter(|(range, _)| {
             let in_bounds = range.end <= self.schema.len();
             debug_assert!(
@@ -4251,7 +4271,7 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                     return Ok(Expression::ColumnReference(ColumnReference {
                         name: u.name,
                         qualifier: if is_ambiguous {
-                            Some(side_qualifier.to_owned())
+                            Some(side_qualifier.qualifier().to_owned())
                         } else {
                             None
                         },
@@ -6109,9 +6129,15 @@ mod tests {
         assert_eq!(pid1_entries.len(), 2);
         // Outermost entry first: whole left side of the OUTER join (0..6).
         assert_eq!(pid1_entries[0].1, 0..6);
-        assert_eq!(pid1_entries[0].2, TD_JOIN_LEFT);
+        assert_eq!(pid1_entries[0].2, JoinSide::Left);
         // Inner join's entry (0..4) follows.
         assert_eq!(pid1_entries[1].1, 0..4);
+    }
+
+    #[test]
+    fn join_side_qualifier_maps_to_synthetic_emission_alias() {
+        assert_eq!(JoinSide::Left.qualifier(), TD_JOIN_LEFT);
+        assert_eq!(JoinSide::Right.qualifier(), TD_JOIN_RIGHT);
     }
 
     #[test]

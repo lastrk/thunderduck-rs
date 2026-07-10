@@ -242,59 +242,67 @@ struct JoinParts<'a> {
     right_requires_synthetic: bool,
 }
 
-/// Alias that qualifies field `i` of `side.resolved_schema` in the
-/// enclosing FROM scope: the FIRST alias in `side`'s stamped
-/// [`RelScope`](super::analyzer::RelScope) whose range covers `i`
-/// (`TableScan` binds table and alias to the SAME range; first-match is
-/// canonical, matching `RelScope::lookup`) — but ONLY if `item`, the
-/// [`FromItem`] actually emitted for this side, exposes that alias too
-/// (case-insensitive membership in [`FromItem::exposed`]). A RelScope alias
-/// the emitted item does NOT expose cannot qualify anything: a nested-join
-/// side whose OWN sub-sides are synthetic-wrapped
-/// (`left/right_requires_synthetic`) renders those sub-sides under
-/// `__td_jl`/`__td_jr`, not the analyzer-scoped logical alias RelScope
-/// still reports — this predicate is what stops that mismatch from
-/// producing an unbindable qualified reference. Returns `None` when no
-/// covering, exposed alias exists for field `i`.
-fn covering_alias(side: &TypedAst, item: &FromItem, i: usize) -> Option<String> {
-    let (name, _) = side
-        .scope
-        .aliases
-        .iter()
-        .find(|(_, range)| range.contains(&i))?;
-    let exposed = item.exposed();
-    exposed
-        .iter()
-        .any(|e| e.eq_ignore_ascii_case(name))
-        .then(|| name.clone())
+/// One join side's per-ordinal alias coverage in the enclosing FROM scope,
+/// from `side.scope.aliases` ∩ `item.exposed()`. Phase 0 (ADR-023 __td_jl/jr
+/// retirement, neutral groundwork): preserves the pre-existing `covering_alias`
+/// algorithm byte-for-byte. Phase 1 will re-source spans from the ITEM TREE
+/// (a `Derived` wrap's own alias covering its range) — a behavior change that
+/// flips `using_parent_with_synthetic_scoped_side_stays_wrapped`, NOT done here.
+struct FromScope<'a> {
+    aliases: &'a [(String, std::ops::Range<usize>)],
+    exposed: Vec<String>,
+    width: usize,
 }
 
-/// Whether every field index of `side.resolved_schema` is coverable by an
-/// alias that `item` (the [`FromItem`] actually emitted for this side)
-/// exposes — the shared coverage predicate, built on [`covering_alias`] so
-/// it can never drift from [`side_slot_quals`]'s per-field lookup.
-/// [`build_join_side`]'s `inline_ok` uses it to decide whether a
-/// multi-alias nested-`Join` side may inline under a USING parent (F5).
-fn scope_covers_fields(side: &TypedAst, item: &FromItem) -> bool {
-    (0..side.resolved_schema.len()).all(|i| covering_alias(side, item, i).is_some())
-}
-
-/// Per-field qualifier list for one join side: which alias qualifies each
-/// column of `side.resolved_schema` in the enclosing FROM scope. A
-/// single-alias `item` (a bare relation, derived table, or synthetic wrap)
-/// qualifies every field with that one alias; a multi-alias item (an
-/// inlined nested-join chain, F5) derives each field's alias via
-/// [`covering_alias`]. Returns `None` if any field index has no covering,
-/// exposed alias — un-hoistable; the caller must fall back to `*` (no
-/// default slot list) for this join instead of building one from an
-/// incomplete qualifier map.
-fn side_slot_quals(side: &TypedAst, item: &FromItem) -> Option<Vec<String>> {
-    if let [only] = item.exposed().as_slice() {
-        return Some(vec![only.clone(); side.resolved_schema.len()]);
+impl<'a> FromScope<'a> {
+    fn of(side: &'a TypedAst, item: &FromItem) -> Self {
+        Self {
+            aliases: &side.scope.aliases,
+            exposed: item.exposed(),
+            width: side.resolved_schema.len(),
+        }
     }
-    (0..side.resolved_schema.len())
-        .map(|i| covering_alias(side, item, i))
-        .collect()
+
+    /// Exact legacy `covering_alias` semantics (first covering range, gated by
+    /// exposed, NO dup guard). Backs the two neutral accessors.
+    fn covering(&self, i: usize) -> Option<&str> {
+        let (name, _) = self.aliases.iter().find(|(_, r)| r.contains(&i))?;
+        self.exposed
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(name))
+            .then_some(name.as_str())
+    }
+
+    /// Canonical per-ordinal accessor: unambiguous exposed alias for `i`, else
+    /// None (uncovered OR covering alias exposed >1). Phase-1 entry point; kept
+    /// OFF the production path in Phase 0 so neutrality needs no probe — exercised
+    /// only by this module's tests until Phase 1 wires it in.
+    #[allow(dead_code)]
+    fn alias_for(&self, i: usize) -> Option<&str> {
+        let name = self.covering(i)?;
+        (self
+            .exposed
+            .iter()
+            .filter(|e| e.eq_ignore_ascii_case(name))
+            .count()
+            == 1)
+            .then_some(name)
+    }
+
+    /// Replaces `scope_covers_fields`.
+    fn covers_all(&self) -> bool {
+        (0..self.width).all(|i| self.covering(i).is_some())
+    }
+
+    /// Replaces `side_slot_quals`: single-exposed fast path, else per-field covering.
+    fn slot_quals(&self) -> Option<Vec<String>> {
+        if let [only] = self.exposed.as_slice() {
+            return Some(vec![only.clone(); self.width]);
+        }
+        (0..self.width)
+            .map(|i| self.covering(i).map(str::to_owned))
+            .collect()
+    }
 }
 
 /// Whether `fields` (a `(name, qualifier)` sequence — one entry per hoisted
@@ -329,11 +337,11 @@ fn has_unsafe_qualified_duplicate<'a>(
 ///    when the nested join itself is a plain ON/CROSS join (CLAUDE.md
 ///    gotcha 4 — never fold across semi/anti; lateral correlation must stay
 ///    isolated). Under a non-USING parent this is unconditional; under a
-///    USING parent (F5) it additionally requires [`scope_covers_fields`] to
+///    USING parent (F5) it additionally requires [`FromScope::covers_all`] to
 ///    hold for the nested side — the USING parent's own hoisted-slot
 ///    qualifiers must be derivable per field from an alias the nested join's
 ///    emitted `FromItem` actually exposes, or the side stays wrapped under
-///    its synthetic alias instead (see [`side_slot_quals`]). `Raw` FROM
+///    its synthetic alias instead (see [`FromScope::slot_quals`]). `Raw` FROM
 ///    bodies (lateral-view chains) never inline.
 /// 3. Otherwise → `(side) AS __td_jl/__td_jr`.
 ///
@@ -372,7 +380,7 @@ fn build_join_side(
             FromItem::Relation { .. } | FromItem::Derived { .. } => true,
             item @ FromItem::Join { .. } => {
                 may_inline_nested_join
-                    && (!parent_has_using || scope_covers_fields(side, item))
+                    && (!parent_has_using || FromScope::of(side, item).covers_all())
                     && matches!(
                         &side.op,
                         TypedOp::Join {
@@ -529,29 +537,29 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
         // USING joins (F5): per-field qualifiers from the RelScope stamp,
         // rather than a single alias per side — this is what lets a
         // multi-alias inlined nested-join side (change 2's
-        // `scope_covers_fields` gate) hoist its slots under a USING parent
+        // `FromScope::covers_all` gate) hoist its slots under a USING parent
         // instead of staying buried under a synthetic wrap alias. Honestly
-        // stated (fix round 1): `side_slot_quals` requires every covering
+        // stated (fix round 1): `FromScope::slot_quals` requires every covering
         // RelScope alias to ALSO be one `left_item`/`right_item` actually
         // exposes — a covering alias RelScope reports but the emitted item
         // does not expose (e.g. a nested-join side whose own children are
         // synthetic-wrapped, rendering under `__td_jl`/`__td_jr` instead of
         // their logical aliases) does not count. `build_join_side`'s
         // `inline_ok` gates on that SAME exposure-aware
-        // `scope_covers_fields(side, &item)` predicate, against the SAME
+        // `FromScope::of(side, &item).covers_all()` predicate, against the SAME
         // item, before ever inlining a multi-alias side under a USING
-        // parent — so `side_slot_quals(left, &left_item)` is guaranteed
+        // parent — so `FromScope::of(left, &left_item).slot_quals()` is guaranteed
         // `Some` for every inlined multi-alias left side by construction.
         // The right side is never inlined under USING
         // (`may_inline_nested_join` is always `false` for it in
         // `build_join_side`), so it stays single-alias and hits the
-        // `item.exposed()` fast path in `side_slot_quals` unconditionally.
+        // `item.exposed()` fast path in `FromScope::slot_quals` unconditionally.
         // If either is ever `None` here regardless, fall back to bare `*`
         // rather than panic — this function only consumes that guarantee,
         // it does not reprove it locally.
-        let left_quals = side_slot_quals(left, &left_item);
+        let left_quals = FromScope::of(left, &left_item).slot_quals();
         let right_quals = if need_right {
-            side_slot_quals(right, &right_item)
+            FromScope::of(right, &right_item).slot_quals()
         } else {
             None
         };
@@ -902,8 +910,8 @@ fn output_uniquified(schema: &Schema) -> Option<Vec<String>> {
 
 /// The position in `schema` that `(q, name)` resolves to, iff `scope` binds
 /// `q` to a field range (first match — the same first-match convention
-/// [`scope_binds`]/[`covering_alias`] use) containing a field named `name`
-/// case-insensitively. `None` when `q` isn't a scope alias at all (the F10
+/// [`scope_binds`]/`FromScope::covering` use) containing a field named
+/// `name` case-insensitively. `None` when `q` isn't a scope alias at all (the F10
 /// dead-alias class [`reproject_qualifiers`] must leave untouched) or `name`
 /// isn't found within the range `q` binds.
 fn scope_position(
@@ -7355,6 +7363,131 @@ mod tests {
             qualifier: Some(qualifier.to_owned()),
             plan_id: None,
         })
+    }
+
+    // ── FromScope (Phase 0, ADR-023 __td_jl/jr retirement groundwork) ───────
+
+    /// Placeholder `SqlUnit` for a `FromItem::Derived` wrap in tests that
+    /// only exercise `FromScope`'s alias bookkeeping, never render this unit.
+    fn placeholder_unit(base: &str) -> SqlUnit {
+        SqlUnit::from(SelectBlock::from_item(FromItem::Relation {
+            base: base.to_owned(),
+            alias: None,
+        }))
+    }
+
+    #[test]
+    fn from_scope_bare_relation_side() {
+        let _g = tap_guard();
+        let typed = analyze(scan("emp"), &base_types_with_emp()).expect("analyze bare emp scan");
+        let item = FromItem::Relation {
+            base: "emp".to_owned(),
+            alias: None,
+        };
+        let fs = FromScope::of(&typed, &item);
+        assert_eq!(fs.alias_for(0), Some("emp"));
+        assert!(fs.covers_all());
+        assert_eq!(
+            fs.slot_quals(),
+            Some(vec!["emp".to_owned(); typed.resolved_schema.len()])
+        );
+    }
+
+    #[test]
+    fn from_scope_derived_wrapped_side() {
+        let _g = tap_guard();
+        let plan = aliased_scan("emp", "e");
+        let bt = BaseTypes::build_from_plan(&plan, |name| match name {
+            "emp" => Some(emp_schema()),
+            _ => None,
+        });
+        let typed = analyze(plan, &bt).expect("analyze aliased emp scan");
+        let item = FromItem::Derived {
+            unit: Box::new(placeholder_unit("emp")),
+            alias: "__td_jl".to_owned(),
+        };
+        let fs = FromScope::of(&typed, &item);
+        // Phase 1 will flip this to `Some("__td_jl")` once spans are
+        // re-sourced from the item tree instead of the analyzer's logical
+        // `e` alias — NOT done here.
+        assert_eq!(fs.alias_for(0), None);
+        assert!(!fs.covers_all());
+        assert_eq!(
+            fs.slot_quals(),
+            Some(vec!["__td_jl".to_owned(); typed.resolved_schema.len()])
+        );
+    }
+
+    #[test]
+    fn from_scope_inlined_nested_join_side() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Cross,
+            condition: None,
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze bare emp/dept cross join");
+        let k = emp_schema().len();
+        let n = typed.resolved_schema.len();
+        let item = FromItem::Join {
+            left: Box::new(FromItem::Relation {
+                base: "emp".to_owned(),
+                alias: Some("e".to_owned()),
+            }),
+            right: Box::new(FromItem::Relation {
+                base: "dept".to_owned(),
+                alias: Some("d".to_owned()),
+            }),
+            kind: "JOIN",
+            clause: String::new(),
+            lateral: false,
+        };
+        let fs = FromScope::of(&typed, &item);
+        assert_eq!(fs.alias_for(0), Some("e"));
+        assert_eq!(fs.alias_for(k), Some("d"));
+        assert!(fs.covers_all());
+        let mut expected = vec!["e".to_owned(); k];
+        expected.extend(vec!["d".to_owned(); n - k]);
+        assert_eq!(fs.slot_quals(), Some(expected));
+    }
+
+    #[test]
+    fn from_scope_dup_exposed_side_covers_but_is_ambiguous() {
+        let _g = tap_guard();
+        let plan = aliased_scan("emp", "t");
+        let bt = BaseTypes::build_from_plan(&plan, |name| match name {
+            "emp" => Some(emp_schema()),
+            _ => None,
+        });
+        let typed = analyze(plan, &bt).expect("analyze aliased emp scan");
+        let n = typed.resolved_schema.len();
+        // The covering alias `t` is exposed TWICE by this (contrived) item —
+        // documents why `covers_all`/`slot_quals` key off `covering` (any
+        // exposed match), not `alias_for` (unambiguous match).
+        let item = FromItem::Join {
+            left: Box::new(FromItem::Relation {
+                base: "x".to_owned(),
+                alias: Some("t".to_owned()),
+            }),
+            right: Box::new(FromItem::Relation {
+                base: "y".to_owned(),
+                alias: Some("t".to_owned()),
+            }),
+            kind: "JOIN",
+            clause: String::new(),
+            lateral: false,
+        };
+        let fs = FromScope::of(&typed, &item);
+        assert_eq!(fs.alias_for(0), None);
+        assert!(fs.covers_all());
+        assert_eq!(fs.slot_quals(), Some(vec!["t".to_owned(); n]));
     }
 
     #[test]

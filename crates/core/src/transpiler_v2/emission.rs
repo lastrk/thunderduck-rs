@@ -6383,7 +6383,7 @@ mod tests {
         LikeExpression, Literal, LiteralValue, MapLiteralExpression, StarExpression,
         UnaryExpression, UnaryOp, UpdateFieldsExpression,
     };
-    use crate::transpiler_v2::{analyze, generate};
+    use crate::transpiler_v2::{analyze, generate, AnalyzerError};
     use crate::types::StructField;
 
     fn tap_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -6570,6 +6570,9 @@ mod tests {
                         "reason must contain {frag:?}; got: {reason}"
                     );
                 }
+            }
+            other @ EmissionError::SparkEmulated { .. } => {
+                panic!("expected EmissionError::Unsupported, got: {other:?}")
             }
         }
     }
@@ -8328,8 +8331,21 @@ mod tests {
         // reuse a user alias must NOT flatten, or DuckDB rejects the FROM with
         // "Duplicate alias". Here the inner join's left is `emp m` and the
         // OUTER right is `emp2 m` — flattening would put two `AS m` in one FROM
-        // scope. The sibling-collision guard must keep the inner join wrapped
-        // in `__td_jl` instead.
+        // scope.
+        //
+        // ADR-023 3b-i: the OUTER join's own condition (`d.dept_id ==
+        // m.dept_id`) resolves `m` against the outer join's combined scope,
+        // where `m` is now bound TWICE (once via the inner join's `emp AS m`
+        // inherited on the left, once via `emp2 AS m` on the right) — a
+        // qualifier binding 2+ ranges is exactly the ambiguity this chunk
+        // makes `resolve_column` catch. Analysis now correctly rejects this
+        // input as `AmbiguousColumn` before emission's SQL-shape flatten
+        // guard is ever reached, which is the right outcome: this AST is a
+        // genuinely ambiguous reference (Spark would reject the equivalent
+        // query too), not merely a defensive SQL-rendering concern. The
+        // flatten guard itself (`build_join`'s sibling-collision check) is
+        // unchanged and still fires for inputs where the duplicated alias is
+        // never referenced by qualifier.
         let inner_join = CommonAst::new(CommonOp::Join {
             left: Box::new(aliased_scan("emp", "m")),
             right: Box::new(aliased_scan("dept", "d")),
@@ -8365,12 +8381,10 @@ mod tests {
             projections: vec![qcol("d", "dept_name")],
         });
         let bt = base_types_emp_dept_emp2(&plan);
-        let typed = analyze(plan, &bt).expect("analyze duplicate-alias join");
-        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        // Guard fired: inner join stays wrapped (not flattened into the chain).
+        let err = analyze(plan, &bt).unwrap_err();
         assert!(
-            sql.contains("__td_jr"),
-            "duplicate-alias chain must not flatten; got: {sql}"
+            matches!(err, AnalyzerError::AmbiguousColumn { .. }),
+            "expected AmbiguousColumn, got {err:?}"
         );
     }
 

@@ -1693,9 +1693,11 @@ mod tests {
         }
     }
 
-    /// A structurally-valid `Project` relation reaches τ and surfaces the
-    /// emission boundary as `Status::unimplemented` (not `internal`) — this
-    /// pins `ConnectError::TranspilerV2Emission → Status::unimplemented`.
+    /// A structurally-valid `Project` relation reaches τ and surfaces either
+    /// τ's emission boundary (`Status::unimplemented`) or, since the input
+    /// table doesn't exist under the test's empty `BaseTypes` overlay, the
+    /// analyzer's Spark-emulated `TABLE_OR_VIEW_NOT_FOUND` re-surfaced per
+    /// ADR-023 chunk 3b (`Status::invalid_argument`) — never `internal`.
     #[tokio::test(flavor = "multi_thread")]
     async fn transpile_relation_project_returns_unsupported_op() {
         let session = test_session("test-transpile-project").await;
@@ -1712,24 +1714,28 @@ mod tests {
         let err = transpile_relation(&session, &project)
             .await
             .expect_err("τ emission must error at A.3");
-        assert_eq!(
-            err.code(),
-            tonic::Code::Unimplemented,
-            "boundary errors must surface as Status::unimplemented, not internal; got {err:?}"
+        assert!(
+            matches!(
+                err.code(),
+                tonic::Code::Unimplemented | tonic::Code::InvalidArgument
+            ),
+            "boundary/Spark-emulated errors must surface as Status::unimplemented or \
+             Status::invalid_argument, not internal; got {err:?}"
         );
         // τ's emission boundary is what should be surfaced — NOT
         // `V2RelationConverter`'s `UnsupportedProtoShape` (the proto shape is
         // supported). Since τ's analyzer, this can be either the τ analyzer's
         // Spark-emulated error (unknown table `t` — the test uses an empty
-        // BaseTypes overlay) or τ's `UnsupportedOp` (`<tau-analyzer-ok>`
-        // when the analyzer succeeds). Both signal we reached τ, not the
-        // proto-shape gate.
+        // BaseTypes overlay, re-surfaced per ADR-023 chunk 3b leading
+        // `[TABLE_OR_VIEW_NOT_FOUND]`) or τ's `UnsupportedOp`
+        // (`<tau-analyzer-ok>` when the analyzer succeeds). Both signal we
+        // reached τ, not the proto-shape gate.
         let message = err.message();
         assert!(
             message.contains("unsupported operator")
                 || message.contains("unsupported expression")
                 || message.contains("<tau-analyzer-ok>")
-                || message.contains("[SPARK-EMULATED]")
+                || message.contains("[TABLE_OR_VIEW_NOT_FOUND]")
                 || message.contains("<a.2-substrate>"),
             "message must identify τ's boundary error; got: {message}",
         );

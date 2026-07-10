@@ -657,17 +657,17 @@ fn build_aggregate(
     let input_schema = &input.resolved_schema;
     // Rewrite any no-arg `grouping_id()`/`grouping()` calls to pass the
     // grouping columns explicitly — DuckDB has no zero-arg form. Splice
-    // against the ORIGINAL (unstripped) `grouping`; the wrap-path strip
-    // below then walks into the spliced args the same way it walks the
-    // flat GROUP BY list, so the two stay textually consistent regardless
-    // of splice-then-strip vs strip-then-splice ordering.
+    // against the ORIGINAL `grouping`; the wrap-path reprojection below
+    // then walks into the spliced args the same way it walks the flat
+    // GROUP BY list, so the two stay textually consistent regardless of
+    // splice-then-reproject vs reproject-then-splice ordering.
     let rewritten_aggregates: Vec<Expression> = aggregates
         .iter()
         .map(|a| with_grouping_id_spliced(a, grouping))
         .collect();
 
     // Open the child block and decide merge-vs-wrap BEFORE rendering — the
-    // visibility check must run over the ORIGINAL (unstripped) expressions
+    // visibility check must run over the ORIGINAL (un-reprojected) expressions
     // against the pre-wrap block, exactly like `build_filter`/`build_sort`.
     let mut block = open_block(input)?;
     let vis = exprs_visible_in(
@@ -691,48 +691,26 @@ fn build_aggregate(
     // (no cosmetic churn), or each reprojected against the PRE-wrap block
     // when wrapping onto a duplicate-name output — otherwise a qualifier
     // like `e.dept_id` strands behind the freshly introduced `__td_sub`.
-    let maybe_strip = |e: &Expression| -> Expression {
+    let reproject = |e: &Expression| -> Expression {
         if merge {
             e.clone()
         } else {
-            match &uniquified {
-                Some(u) => reproject_qualifiers(e, input, u),
-                None => e.clone(),
-            }
+            reproject_or_clone(e, input, &uniquified)
         }
     };
-    let grouping_r: Vec<Expression> = grouping.iter().map(&maybe_strip).collect();
-    let aggregates_r: Vec<Expression> = rewritten_aggregates.iter().map(&maybe_strip).collect();
-    let having_r: Option<Expression> =
-        having
-            .map(|h| with_grouping_id_spliced(h, grouping))
-            .map(|h| {
-                if merge {
-                    h
-                } else {
-                    match &uniquified {
-                        Some(u) => reproject_qualifiers(&h, input, u),
-                        None => h,
-                    }
-                }
-            });
-    if !merge {
-        trace_stranded_qualifiers(
-            &block,
-            grouping_r
-                .iter()
-                .chain(aggregates_r.iter())
-                .chain(having_r.iter()),
-            &input.scope,
-        );
-    }
+    let grouping_r: Vec<Expression> = grouping.iter().map(&reproject).collect();
+    let aggregates_r: Vec<Expression> = rewritten_aggregates.iter().map(&reproject).collect();
+    let having_r: Option<Expression> = having
+        .map(|h| with_grouping_id_spliced(h, grouping))
+        .map(|h| reproject(&h));
 
     // Mirror the analyzer's "unfold DataFrame-path grouping" logic — if
     // the aggregates list doesn't already start with the grouping cols'
     // output names, prepend them to the SELECT list so the emitted column
-    // count matches the resolved schema. Stripping only drops a qualifier
-    // (structure-preserving), so computing this over the chosen (possibly
-    // stripped) expression set keeps it consistent with what is rendered.
+    // count matches the resolved schema. Reprojection only rewrites a
+    // qualifier to a positional bare name (structure-preserving), so
+    // computing this over the chosen (possibly reprojected) expression set
+    // keeps it consistent with what is rendered.
     let already_folded = super::analyzer::grouping_already_folded(&grouping_r, &aggregates_r);
     let keys: &[Expression] = if already_folded { &[] } else { &grouping_r };
     let slots = sql_join(keys.iter().chain(aggregates_r.iter()), ", ", |e| {
@@ -774,10 +752,7 @@ fn build_aggregate(
     };
 
     if !merge {
-        block = match &uniquified {
-            Some(u) => SelectBlock::wrap_reprojected(block.into(), u),
-            None => SelectBlock::wrap(block.into()),
-        };
+        block = wrap_maybe_reprojected(block.into(), &uniquified);
     }
     if let Some(g) = group_body {
         block.set_group_by(g);
@@ -1006,30 +981,28 @@ fn reproject_qualifiers(expr: &Expression, input: &TypedAst, uniquified: &[Strin
     rewritten
 }
 
-/// R7 latent-occlusion witness: when a slot-conflict wrap is about to strand
-/// a qualifier the child block's FROM scope DID expose (the reference will
-/// not resolve through the `__td_sub` boundary), leave a trace. This is not
-/// an error path — it reproduces the pre-block-builder behavior exactly —
-/// but each hit is a corpus witness for a case class the merge rules could
-/// be widened to cover.
-fn trace_stranded_qualifiers<'e>(
-    block: &SelectBlock,
-    exprs: impl IntoIterator<Item = &'e Expression>,
-    input_scope: &super::analyzer::RelScope,
-) {
-    let mut quals = Vec::new();
-    for e in exprs {
-        expr_qualifiers(e, &mut quals);
+/// Reproject `expr`'s qualifiers against the pre-wrap `input` when the wrap
+/// boundary reshaped output names (`Some`), else clone it unchanged (`None`) —
+/// the shared body of every wrap-path expression rewrite
+/// (`build_project`/`build_filter`/`build_sort`/`build_aggregate`).
+fn reproject_or_clone(
+    expr: &Expression,
+    input: &TypedAst,
+    uniquified: &Option<Vec<String>>,
+) -> Expression {
+    match uniquified {
+        Some(u) => reproject_qualifiers(expr, input, u),
+        None => expr.clone(),
     }
-    let stranded: Vec<&str> = quals
-        .into_iter()
-        .filter(|q| scope_binds(input_scope, q) && block.exposes(q))
-        .collect();
-    if !stranded.is_empty() {
-        tracing::debug!(
-            ?stranded,
-            "SELECT-block wrap strands qualifiers the child scope exposed"
-        );
+}
+
+/// Wrap `unit` as `(…) AS __td_sub`: the reprojected (column-aliased) wrap
+/// when the output has a duplicate name (`Some`), the plain wrap otherwise
+/// (`None`). The wrap-site counterpart of [`reproject_or_clone`].
+fn wrap_maybe_reprojected(unit: SqlUnit, uniquified: &Option<Vec<String>>) -> SelectBlock {
+    match uniquified {
+        Some(u) => SelectBlock::wrap_reprojected(unit, u),
+        None => SelectBlock::wrap(unit),
     }
 }
 
@@ -1133,16 +1106,9 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
     let projections: Vec<Expression> = projections
         .iter()
         .map(|p| expand_stranded_whole_relation_star(p, &block, input))
-        .map(|p| match &uniquified {
-            Some(u) => reproject_qualifiers(&p, input, u),
-            None => p.clone(),
-        })
+        .map(|p| reproject_or_clone(&p, input, &uniquified))
         .collect();
-    trace_stranded_qualifiers(&block, &projections, &input.scope);
-    let mut wrapped = match &uniquified {
-        Some(u) => SelectBlock::wrap_reprojected(block.into(), u),
-        None => SelectBlock::wrap(block.into()),
-    };
+    let mut wrapped = wrap_maybe_reprojected(block.into(), &uniquified);
     wrapped.set_projections(render_projection_slots(
         &projections,
         &input.resolved_schema,
@@ -1157,15 +1123,8 @@ fn build_filter(input: &TypedAst, condition: &Expression) -> Result<SqlUnit, Emi
         return Ok(block.into());
     }
     let uniquified = output_uniquified(&input.resolved_schema);
-    let condition = match &uniquified {
-        Some(u) => reproject_qualifiers(condition, input, u),
-        None => condition.clone(),
-    };
-    trace_stranded_qualifiers(&block, [&condition], &input.scope);
-    let mut wrapped = match &uniquified {
-        Some(u) => SelectBlock::wrap_reprojected(block.into(), u),
-        None => SelectBlock::wrap(block.into()),
-    };
+    let condition = reproject_or_clone(condition, input, &uniquified);
+    let mut wrapped = wrap_maybe_reprojected(block.into(), &uniquified);
     wrapped.push_where(render_expr(&condition, &input.resolved_schema)?);
     Ok(wrapped.into())
 }
@@ -1203,18 +1162,12 @@ fn build_sort(
     let keys = order
         .iter()
         .map(|so| {
-            let mut stripped = so.clone();
-            *stripped.expr = match &uniquified {
-                Some(u) => reproject_qualifiers(&so.expr, input, u),
-                None => (*so.expr).clone(),
-            };
-            render_sort_key(&stripped, &input.resolved_schema)
+            let mut reprojected = so.clone();
+            *reprojected.expr = reproject_or_clone(&so.expr, input, &uniquified);
+            render_sort_key(&reprojected, &input.resolved_schema)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut wrapped = match &uniquified {
-        Some(u) => SelectBlock::wrap_reprojected(block.into(), u),
-        None => SelectBlock::wrap(block.into()),
-    };
+    let mut wrapped = wrap_maybe_reprojected(block.into(), &uniquified);
     wrapped.set_order_by(keys, limit, offset);
     Ok(wrapped.into())
 }
@@ -1802,6 +1755,8 @@ fn build_with_columns(
         input,
         |block| exprs_visible_in(assignments.iter().map(|(_, e)| e), block, &input.scope),
         |_block, _wrapped| {
+            // Post strip-removal WithColumns no longer needs the wrap-vs-merge
+            // distinction: assignments render identically on either path.
             let render_assignment = |expr: &Expression| render_expr(expr, input_schema);
             let mut slots: Vec<String> = Vec::new();
             for (f, replaced_by) in input_schema.fields.iter().zip(&plan.replaced) {

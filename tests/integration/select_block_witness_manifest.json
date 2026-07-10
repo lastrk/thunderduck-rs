@@ -1,5 +1,5 @@
 {
-  "description": "Witness cases for tasks/select-block-review-findings.md — each pins one confirmed finding and is born red; flipping green is the acceptance signal for that finding's fix. Extended in the same commit whenever a cycle adds witnesses (F9, F10, ...). Entries with \"deferred\": true pin the DEFERRED attribute-lineage cluster (F8/F10/F11) whose acceptance gate is the future ADR-023 lineage fix — they are born red and EXPECTED TO STAY red until then; they are NOT in select_block_corpus_baseline.txt, so their redness is not a regression.",
+  "description": "Witness cases for tasks/select-block-review-findings.md — each pins one confirmed finding and is born red; flipping green is the acceptance signal for that finding's fix. Extended in the same commit whenever a cycle adds witnesses (F9, F10, ...). Entries with \"deferred\": true pin the DEFERRED qualified-resolution cluster (F8/F10/F11) whose acceptance gate is ADR-023's ordinal-based qualified resolution — they are born red and EXPECTED TO STAY red until then; they are NOT in select_block_corpus_baseline.txt, so their redness is not a regression.",
   "witnesses": [
     { "case": "join-018", "finding": "F1", "pins": "drop over USING join — hoisted-order overwrite" },
     { "case": "join-020", "finding": "F2", "pins": "nested USING join side re-wrapped — hoisted-slot drop" },
@@ -11,9 +11,9 @@
     { "case": "join-022", "finding": "F7", "pins": "duplicate __td_jr synthetic-alias collision" },
     { "case": "agg-025",  "finding": "F9", "pins": "groupBy alias-qualified key over limit — aggregate wrap-path strand" },
     { "case": "proj-016", "finding": "F12", "pins": "relation-qualified star over limit-wrapped block — star wrap-boundary strand" },
-    { "case": "filt-019", "finding": "F8",  "deferred": true, "pins": "DEFERRED (ADR-023 lineage fix) — dead-alias qualifying a select-created alias must ERROR (Spark UNRESOLVED_COLUMN.WITH_SUGGESTION); τ silently returns rows" },
-    { "case": "filt-018", "finding": "F10", "deferred": true, "pins": "DEFERRED (ADR-023 lineage fix) — dead-alias projected-through column, double filter must SUCCEED (Spark empty result); τ strands e over __td_sub (binder error)" },
-    { "case": "join-023", "finding": "F11", "deferred": true, "pins": "DEFERRED (ADR-023 lineage fix) — duplicate user alias on both join sides must ERROR (Spark AMBIGUOUS_REFERENCE); τ silently binds left (DataFrame)" },
-    { "case": "jn-024",   "finding": "F11", "deferred": true, "pins": "DEFERRED (ADR-023 lineage fix) — duplicate alias both join sides must ERROR (Spark AMBIGUOUS_REFERENCE); τ silently binds left (SQL)" }
+    { "case": "filt-019", "finding": "F8",  "deferred": true, "pins": "DEFERRED (ADR-023 ordinal-based qualified resolution) — dead-alias qualifying a select-created alias must ERROR (Spark UNRESOLVED_COLUMN.WITH_SUGGESTION); τ silently returns rows" },
+    { "case": "filt-018", "finding": "F10", "deferred": true, "pins": "DEFERRED (ADR-023 ordinal-based qualified resolution) — dead-alias projected-through column, double filter must SUCCEED (Spark empty result); τ strands e over __td_sub (binder error)" },
+    { "case": "join-023", "finding": "F11", "deferred": true, "pins": "DEFERRED (ADR-023 ordinal-based qualified resolution) — duplicate user alias on both join sides must ERROR (Spark AMBIGUOUS_REFERENCE); τ silently binds left (DataFrame)" },
+    { "case": "jn-024",   "finding": "F11", "deferred": true, "pins": "DEFERRED (ADR-023 ordinal-based qualified resolution) — duplicate alias both join sides must ERROR (Spark AMBIGUOUS_REFERENCE); τ silently binds left (SQL)" }
   ]
 }

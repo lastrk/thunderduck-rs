@@ -140,7 +140,7 @@ So the permitted transformations fall in three categories: *expressibility-force
 
 **Status:** Proposed
 **Depends on:** ADR-000, ADR-002 (defines the boundary), ADR-003 (the IR it annotates), ADR-004 (must serve both front-ends), ADR-012 (catalog seed)
-**Depended on by:** ADR-006, ADR-007, ADR-009, ADR-010, ADR-012, ADR-014, ADR-015, ADR-017, ADR-018
+**Depended on by:** ADR-006, ADR-007, ADR-009, ADR-010, ADR-012, ADR-014, ADR-015, ADR-017, ADR-018, ADR-023
 
 **Context.** Every dispatch decision in τ keys on resolved Spark types (ADR-009). The common AST (ADR-003) arrives unresolved (`UnresolvedAttribute`, `UnresolvedRelation`) from both front-ends; types and nullability live in the catalog and in Spark's analyzer rules, not in the AST. DuckDB's native inference gives DuckDB types, which diverge from Spark. Per ADR-000, embedding real Catalyst (which would supply correct types) is rejected, so thunderduck must reimplement this slice.
 
@@ -163,7 +163,7 @@ So the permitted transformations fall in three categories: *expressibility-force
 
 **Status:** Proposed
 **Depends on:** ADR-000, ADR-005
-**Depended on by:** ADR-007
+**Depended on by:** ADR-007, ADR-023
 
 **Context.** Spark's Catalyst analyzer applies rules in `FixedPoint` batches — it re-runs each batch until the tree stops changing — because Catalyst's rules are deliberately small, self-contained, and uncoordinated, so global behavior emerges only from iteration, and because the optimizer keeps mutating the tree (requiring re-analysis). thunderduck does **neither** of those things: it does not optimize (ADR-001), so there is no optimization-churn re-analysis; and it can write analysis as a single coordinated pass rather than uncoordinated re-scanned rules. The question is therefore which of Catalyst's fixed-points are *essential to the analysis* versus *artifacts of Catalyst's architecture*.
 
@@ -179,6 +179,8 @@ So the permitted transformations fall in three categories: *expressibility-force
 **Refinement hooks.** Enumerate the pass sequence explicitly (e.g. CTE/substitution staging → unified resolve-and-type bottom-up pass → set-operation widening down-propagation → correlated-subquery outer-first staging). For each analysis rule, classify its information-flow direction (up / down / outside-in) and confirm against the actual Spark 4.1.1 rule set whether any rule beyond the named three is non-upward. The AnalyzePlan differential (ADR-015) is the backstop: a divergence localizes the rule whose flow direction was modelled wrongly.
 
 **Set-op widened schema wins at emission time.** The downward set-op sub-sweep (UNION / INTERSECT / EXCEPT) produces a widened schema on the set-op node. At emission time, that widened schema wins over any child projection's declared cast target. Concretely, if one child projection declares `CAST(a AS DECIMAL(5,0))` and its sibling declares `CAST(b AS DECIMAL(10,2))`, the parent's widened schema is `DECIMAL(10,2)` and the emitter wraps each child's projected column in `CAST(... AS DECIMAL(10,2))` regardless of the child's declared cast target. This is not a "clean-up" cast; it is the load-bearing rule for set-op parity with Spark, whose analyzer computes the widened set-op type before the child projections' types are pinned. Codified: the analyzer's sub-sweep computes the widened schema; the emitter's `render_union` / `render_intersect` / `render_except` applies a per-column CAST wrapper from that widened schema. Neither pass may defer the CAST to the other — the analyzer does not rewrite child projections in place; the emitter reads the widened schema on the parent, not the child-declared cast.
+
+**Ordinal reference resolution (ADR-023).** The resolve pass performs name resolution exactly once, validator-style — a scope maps each (qualified or bare) name to (input, ordinal) with match count 0 → `UnknownColumn`, 1 → bound, 2+ → `AmbiguousColumn` — and downstream passes and emission reference columns by ordinal; qualifiers are regenerated at emission against the then-current alias, never carried as analysis facts.
 
 ---
 
@@ -561,7 +563,7 @@ That positioning has shifted. ADR-010 already classifies the extension functions
 
 **Status:** Proposed
 **Depends on:** ADR-002 (delegation boundary), ADR-003 (common AST), ADR-004 (front-end convergence), ADR-005 (owned inference), ADR-014 (two decision spaces), ADR-015 (differential oracle)
-**Depended on by:** every implementation slice; ADR-022 (τ is the only path — runtime-position companion)
+**Depended on by:** every implementation slice; ADR-022 (τ is the only path — runtime-position companion); ADR-023 (the ordinal reference model lives in the τ-owned `TypedOp`/`RelScope` substrate)
 
 **Context.** τ must own its substrate — the protobuf-to-CommonAST converter, the `Expression` payload in CommonAST, and the `TypeInferenceEngine`. If τ consumed an upstream plan type produced by a converter it does not own, τ inherits every quirk of that converter: synthesized-SQL shortcut shapes for structured operations (VALUES, table functions, file scans, Arrow-IPC LocalRelation), stringly-typed qualifier encodings (`__plan_id_{N}__`), silent-NULL fallbacks in Arrow value marshalling. If τ delegated type/nullability calls to an upstream inference engine, symmetric-omission gaps in that engine (a function present in `aggregate_return_type` but missing from `aggregate_is_nullable`) transit silently — τ arms can be individually correct yet the corpus stays red because the input's schema or nullability was wrong before the arm ran. Substrate ownership is the design lever that makes τ's correctness a τ-local concern.
 
@@ -596,7 +598,7 @@ That positioning has shifted. ADR-010 already classifies the extension functions
 
 **Status:** Proposed
 **Depends on:** ADR-000 (no-JVM premise), ADR-002 (delegation boundary), ADR-021 (substrate ownership)
-**Depended on by:** every implementation slice
+**Depended on by:** every implementation slice; ADR-023 (qualified-reference Spark-emulated errors)
 
 **Context.** τ is the transpiler. When τ does not implement a Spark input, τ says so — it produces a typed error to the caller, not a partial or synthetic SQL string, and not a route to some other execution path. The correctness contract is Spark parity or a named limitation; there is no third choice ("silently different"). This ADR pins that contract.
 
@@ -622,8 +624,48 @@ Neither category triggers a runtime fallback. Both surface directly to the clien
 **Refinement hooks.**
 - **Timing of non-τ source cleanup** is a scheduling decision, not an ADR one — delete once no test, no CI job, and no build step references it. Incremental per-slice deletion is permitted.
 - **Boundary-error precision.** Over time, the set of `Unsupported*` variants shrinks as τ grows. A future ADR (post-corpus-green) may enumerate the residual *permanent* unsupported set — inputs Spark accepts that τ will never support (e.g. distributed-only operators). Until then, boundary errors are pragmatic — "not yet" is a valid reason.
+- **Qualified-reference emulation is produced by ADR-023's ordinal resolver.** The Spark-emulated category-1 errors for qualified references — `AmbiguousColumn` when a qualifier binds 2+ candidates, `UnknownColumn` when it binds none — fall out of the resolve-time 0/1/2+ match count of ADR-023's ordinal resolution; without it, those inputs ride the permissive name-only fallback into exactly the forbidden silent-divergence / opaque-error modes.
 
 **Carve-out register (for permanent Thunderduck-boundary errors).** *Currently empty.* When a boundary error is deemed permanent (Thunderduck will not implement this feature), it is recorded here with a written justification. Non-permanent "not yet" boundary errors are the ADR-022 category-2 default (surfaced to the caller with an honest `Unsupported*` reason) — they are not tracked here.
+
+---
+
+## ADR-023 — τ references columns by ordinal internally; qualifiers are regenerated at emission, not carried
+
+**Status:** Proposed
+**Depends on:** ADR-005 (schema-threading analysis — resolution binds references to schema positions), ADR-006 (analyzer pass structure — resolution runs exactly once, in the resolve pass), ADR-021 (τ owns its substrate — `TypedOp`, `RelScope`, and the reference model are τ-local), ADR-022 (two error categories — the resolver's match count produces the qualified-reference Spark-emulated errors)
+**Depended on by:** the qualified-resolution slices (closure of findings F8/F10/F11); the retirement of the emission strip machinery (F5/F9/F12 rewrites, F14 walkers)
+
+**Context.** τ today carries **string qualifiers** (`e.name`, `__td_jl.col`) from the analyzer all the way into emitted SQL. The moment `SelectBlock::wrap` (sql_block.rs) buries a child under `(…) AS __td_sub`, every carried qualifier that named a pre-wrap alias is **stranded** — the alias it points at no longer exists at that syntactic level. This single class consumed findings F5, F9, F12, and item-3 of the SELECT-block review (`tasks/select-block-review-findings.md`), each patched case-by-case at the emission boundary (`strip_stranded_qualifiers`, per-arm wrap-boundary rewrites, `exprs_visible_in` exemptions), and it leaves the DEFERRED cluster F8/F10/F11 that string machinery **cannot** cleanly solve: F8 (`e.k`, a select-**created** alias → Spark errors `UNRESOLVED_COLUMN`) and F10 (`e.name`, a projected-**through** original column → Spark succeeds) present the *identical* string-shaped analyzer input with *opposite* required outcomes, and the correlated LATERAL case tbl-005 presents that same shape a third time with a **live outer** qualifier that a strip would silently rebind to the local relation.
+
+A study of Apache Calcite (tip `e15c395`, `core/src/main/java/org/apache/calcite/`) shows the structural alternative. Calcite **never carries string qualifiers into its algebra**. Columns are referenced by **ordinal**: `rex/RexInputRef.java` is a bare integer index into the input row type — its `equals`/`hashCode` are the index alone — and `rel/type/RelDataTypeField` carries (name, ordinal, type) with names unique within a row type. Name resolution happens **once**, in the validator: `sql/validate/DelegatingScope.fullyQualify` (under the `SqlValidatorScope`/`ListScope` hierarchy) maps an identifier to a (namespace, field-ordinal) pair, raising `columnNotFound` on 0 matches and `columnAmbiguous` on 2+; `sql2rel/SqlToRelConverter`'s `Blackboard.lookupExp` then hands the name off to an ordinal via cumulative field offsets across inputs. Qualifiers are **regenerated at emission**: `rel/rel2sql/SqlImplementor.AliasContext.field(int)` synthesizes a fresh `alias.fieldName` for ordinal *k* against whatever alias wraps the child *now* — so wrapping under a subquery *cannot* strand a reference; after the wrap, ordinal *k* simply renders against the wrapper's alias. And the F8-vs-F10 distinction **dissolves structurally**: a projected-through column *is* a `RexInputRef(k)`; a created column *is* a computed `RexNode` that acquires a name only on entering a row type — pass-through vs created is carried by the algebra itself, not by a flag or a qualifier set. Calcite's clause-merge/wrap engine (`SqlImplementor.needNewSubQuery`, comparing clause ordinals and wrapping via `subSelect`) is the same design as τ's `SelectBlock`; the difference is that on wrap Calcite builds a fresh `AliasContext`, so every reference re-resolves. Calcite even hit τ's exact wrap-boundary bug and carries two borrowable fixes: `rel/rel2sql/RelToSqlConverter.wrapNestedJoin` re-projects every column as `expr AS fieldName` at the wrap boundary (a tactical string-space patch), and `sql/validate/SqlValidatorUtil.uniquify` de-dupes field names once per row type.
+
+**Decision.** τ adopts the ordinal reference model: **names are resolved exactly once, at analysis time, to (input, ordinal); qualifiers are synthesized at emission from the current block's alias; a string qualifier is never carried as a long-lived fact.** Adoption is a spectrum of four tiers, least to most invasive — each independently shippable and corpus-gated:
+
+1. **`uniquify` field names once per row type** (a ~40-line utility after Calcite's `SqlValidatorUtil.uniquify`) — establishes the invariant ordinals rely on (names unique within a row type) and kills duplicate-name ambiguity on its own.
+2. **An emission-side `AliasContext.field(ordinal)`-style shim** — emission consumes ordinals and synthesizes the qualified name at the leaf from the current block's alias map. Structurally prevents stranding without touching the analyzer: after a wrap, ordinal *k* renders against the wrapper's alias by construction.
+3. **Analysis-time ordinal resolution** — the resolve pass resolves every name to (input, ordinal) through a validator-style scope with the 0 → `UnknownColumn` / 1 → bound / 2+ → `AmbiguousColumn` match discipline, and `TypedOp` carries the ordinal. This is the full ordinal direction: F8/F10/F11 become correct **by construction** (F8's created alias has no input-ref reachable under the dead qualifier; F10's pass-through *is* an input-ref that renders against whatever alias is current; F11's 2+ match count *is* the ambiguity error), and the emission strip machinery — `strip_stranded_qualifiers`, the F5/F9/F12 wrap-boundary rewrites, `exprs_visible_in`'s qualifier exemptions, F14's three hand-rolled walkers — retires.
+4. **`wrapNestedJoin`-style re-projection at every `SelectBlock::wrap`** — re-project every column as `expr AS fieldName` at the wrap boundary so nothing above the wrap needs a pre-wrap qualifier. A tactical patch in string space, shippable independently of the other tiers.
+
+τ commits to **tiers 1+2 as the near-term structural fix** (uniquify + the emission ordinal shim close the strand class without an analyzer migration), with **tier 3 as the target state** — it is what makes F8/F10/F11 correct by construction and lets the strip machinery be deleted rather than maintained. Tier 4 is the sanctioned tactical fallback if a strand bug must be closed before tier 2 lands. τ adopts Calcite's *reference model*, not its pipeline: the full validate→algebra→optimize→rel2sql machinery is far heavier than a single-node SQL-in/SQL-out transpiler needs (and ADR-001 forbids the optimize stage outright).
+
+**Alternatives considered (and rejected).**
+- *Per-output-column source-qualifier SET lineage, carried as strings* (the reverted first draft of this ADR). Thread a set of source qualifiers through every operator's scope derivation (inherited by scans/aliased relations, preserved on pass-through projection, emptied on created columns, union'd with offset through joins) and consult it before the name-only fallback. This re-derives in string space what ordinals give for free: "projected-through" *is* a positional reference (Calcite's `RexInputRef(k)`) and "created" *is* a computed expression — the lineage set is a hand-maintained shadow of that structure, needs a per-operator rule audit forever, and still leaves emission carrying strings that strand at wrap boundaries (the F5/F9/F12 machinery survives it).
+- *Pure emission-side strip/rewrite* (the current mechanism, extended). `strip_stranded_qualifiers` cannot know whether a qualifier legitimately bound the referenced column; the killer is the correlated-LATERAL trap: tbl-005's inner `e.dept_id` (live outer qualifier — must resolve outward) is string-identical at emission to F10's dead-alias shape (must resolve locally) — a strip silently rebinds the correlation to the local relation. And the F5/F9/F12/item-3 history shows every new wrap site needs its own rewrite: whack-a-mole, not a fix.
+- *Strict tier-(f) fallback* (a qualifier binding no local/outer scope ⇒ `UnknownColumn`). Bounded, but fixes F8 by breaking F10 — the projected-through case becomes a clean-but-divergent error where Spark succeeds — and regresses the USING-join and correlated-subquery shapes that currently ride the permissive fallback.
+
+**Consequences.**
+- (+) Eliminates the strand class at the root: a reference that survives analysis *cannot* dangle at emission, because the qualifier is synthesized from the alias that is current at render time. F8/F10/F11 become correct by construction rather than by case analysis.
+- (+) Retires machinery instead of growing it: `strip_stranded_qualifiers`, the wrap-boundary rewrites (F5/F9/F12/item-3), the `exprs_visible_in` qualifier exemptions, and F14's three qualifier walkers all exist only to chase carried strings; under tier 3 they are deleted, not unified.
+- (+) The qualified-reference error semantics (ADR-022 category 1) fall out of the resolver's match count — `UnknownColumn` on 0, `AmbiguousColumn` on 2+ — instead of being approximated by fallback tiers.
+- (−) Ordinal space has a real cost: offset arithmetic on every join concatenation and projection reorder. Calcite pays it with dedicated shuttles (`RexShuttle`, `rex/RexPermuteInputsShuttle.java`); τ must adopt the same discipline — a single shared remap facility, not ad-hoc index math per operator — and an off-by-one there is a silent wrong-column bug, the very class ADR-014's differential oracle exists to catch.
+- (−) Tier 3 is a migration touching `TypedOp`, the analyzer's resolution tiers, and emission's reference rendering — staged behind tiers 1+2 precisely so the structural win lands before the invasive part.
+- (neutral) The `SelectBlock` merge/wrap engine already mirrors Calcite's `needNewSubQuery` (clause-ordinal comparison, wrap via subquery) — the wrap machinery stays; only the reference model underneath it changes.
+
+**Refinement hooks.**
+- **Adoption sequencing.** uniquify → emission ordinal shim → analysis-time ordinal resolution → delete the strip machinery; each step lands under the standing zero-regression corpus gate before the next begins.
+- **Offset-arithmetic discipline.** One shared ordinal-remap helper (the `RexPermuteInputsShuttle` analog) used by every operator that concatenates or reorders inputs; no operator does its own index math.
+- **Evidence gate.** The four deferred witnesses (`filt-018`/`filt-019`, `join-023`, `jn-024` in `tests/integration/select_block_witness_manifest.json` — born red, expected red until this ADR lands) flip green, the 10 green strand witnesses (join-018..022, cx-015/016, jn-023, agg-025, proj-016) stay green, and the full DataFrame + SQL corpora show zero regressions.
 
 ---
 
@@ -641,7 +683,7 @@ The ADRs are not peers; they form four strata.
 
 **Substrate & front-ends (the IR and how it is populated and analyzed):** ADR-003 (common AST), ADR-004 (both front-ends lower to it; relation-vs-command by parse-root), ADR-006 (analyzer pass structure), ADR-021 (τ owns its protobuf converter, Expression, TypeInferenceEngine). These define the representation and the substrate boundary.
 
-**Consequences (the spine applied to surfaces):** ADR-007 (A/B/C, B retained) from 001+002+005+006+008; ADR-008 (correlated direct) from 001; ADR-009 (declarative table, hand-written match arms) from 003+005+007; ADR-010 (extension fns, C++ project) from 005; ADR-011 (commands) from 001+004; ADR-012 (catalog overlay) from 011+005; ADR-013 (external/lakehouse reads, delegated) from 000+002+012; ADR-017 (Delta append writes) and ADR-018 (UC-managed Iceberg CTAS/INSERT/DELETE/MERGE writes) — the per-format write specializations — both from 005+011+013+016; ADR-019 (the native-read / Iceberg-write lakehouse I/O contract) composing 013+018.
+**Consequences (the spine applied to surfaces):** ADR-007 (A/B/C, B retained) from 001+002+005+006+008; ADR-008 (correlated direct) from 001; ADR-009 (declarative table, hand-written match arms) from 003+005+007; ADR-010 (extension fns, C++ project) from 005; ADR-011 (commands) from 001+004; ADR-012 (catalog overlay) from 011+005; ADR-013 (external/lakehouse reads, delegated) from 000+002+012; ADR-017 (Delta append writes) and ADR-018 (UC-managed Iceberg CTAS/INSERT/DELETE/MERGE writes) — the per-format write specializations — both from 005+011+013+016; ADR-019 (the native-read / Iceberg-write lakehouse I/O contract) composing 013+018; ADR-023 (ordinal column references; emission-time qualifier regeneration) from 005+006+021+022 — a refinement of the owned analysis-and-emission reference model.
 
 **Enabled (the testing architecture the rest makes possible):** ADR-014 (two decision spaces), ADR-015 (differential + AnalyzePlan oracle), ADR-016 (version pin). These exist *because* the spine made τ minimal and its decisions enumerable; they are not free-standing choices.
 
@@ -658,8 +700,8 @@ Implication for refinement: a change to the premise (ADR-000) or a spine ADR (es
 | 002 delegation | 000, DuckDB-correct (LB2) | 003, 005, 007, 013 |
 | 003 common AST | 000, 002 | 004, 005, 009 |
 | 004 front-ends → AST | 000, 003 | 005, 011, 015 |
-| 005 type/null inference | 000, 002, 003, 004, 012 | 006, 007, 009, 010, 012, 014, 015, 017, 018 |
-| 006 analyzer passes | 000, 005 | 007 |
+| 005 type/null inference | 000, 002, 003, 004, 012 | 006, 007, 009, 010, 012, 014, 015, 017, 018, 023 |
+| 006 analyzer passes | 000, 005 | 007, 023 |
 | 007 A/B/C | 001, 002, 005, 006, 008 | 009 |
 | 008 correlated direct | 001 | 007 |
 | 009 declarative table | 003, 005, 007 | 014, 015 |
@@ -674,8 +716,9 @@ Implication for refinement: a change to the premise (ADR-000) or a spine ADR (es
 | 018 Iceberg writes (UC managed) | 005, 011, 013, 016 | 015, 019 |
 | 019 lakehouse I/O contract | 013, 018 | — |
 | 020 strict-only extension | 000, 001, 010 | 009, 015 (simplified) |
-| 021 τ owns substrate | 002, 003, 004, 005, 014, 015 | every implementation slice; INV10 |
-| 022 τ is the only path | 000, 002, 021 | every implementation slice; two-error-category rule |
+| 021 τ owns substrate | 002, 003, 004, 005, 014, 015 | every implementation slice; INV10; 023 |
+| 022 τ is the only path | 000, 002, 021 | every implementation slice; two-error-category rule; 023 |
+| 023 ordinal references | 005, 006, 021, 022 | the qualified-resolution slices (F8/F10/F11 closure); retirement of the emission strip machinery |
 
 **New external dependency:** the [`thunderduck-duckdb-extension`](https://github.com/lastrk/thunderduck-duckdb-extension) C++ project is an external build artifact that ADR-010 depends on. It is not an ADR but it participates in the dependency graph: the dispatch table's `Extension(...)` targets must match its exported functions (INV6), its behavior must be differentially validated (edge 010 → 014), and it is the third member of the version-coordination set (edge 010 → 015, alongside Spark 4.1.1 and the dispatch table).
 
@@ -762,6 +805,7 @@ Review premise-first, then spine, then substrate, then consequences, then the en
 4. **ADR-007 → 013** (consequences) in dependency order per CV.2 — this group now includes external/lakehouse reads (ADR-013), which depends only on the delegation premise (000/002) and the overlay (012).
 5. **ADR-016** (version pin — it scopes the coverage claims, so fix it first) then **ADR-014 → 015** (the enabled testing architecture).
 6. **ADR-020** (strict-only extension), **ADR-021** (τ owns substrate), and **ADR-022** (τ is the only path). ADR-020 consolidates the emission target; ADR-021 pins the substrate boundary (τ owns its protobuf converter, Expression, TypeInferenceEngine); ADR-022 pins the runtime position (τ is the only path; two error categories; no fallback). Together with ADR-000's premise, these three shape every implementation slice.
+7. **ADR-023** (ordinal column references) last — it refines ADR-005/006's resolve pass and presupposes ADR-021's substrate ownership and ADR-022's error categories, all ratified in the steps above.
 
 Defer no ADR's *ratification* past the point where something depending on it is ratified — the matrix in CV.2 gives the order. The two highest-value review items are **ADR-000's no-JVM premise** (widest blast radius; if it moves, Alternative 1 deletes ADR-005/006) and **ADR-005's scope together with LB1** (where the implementation cost and risk concentrate).
 

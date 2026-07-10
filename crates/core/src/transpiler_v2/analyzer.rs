@@ -4326,6 +4326,31 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                     Some((dt, nullable)) => {
                         let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
                             .map(|i| range.start + i);
+                        // ADR-023 Phase 1: a synthetic join-side qualifier whose column name
+                        // is UNIQUE in the merged condition schema needs no side alias — the
+                        // bare name binds positionally in the merged FROM. Drop it (mirrors
+                        // tier-(e) 3e-ii and the above-join plan_id arm) so `mark_node` stamps
+                        // no `*_requires_synthetic` demand and the side inlines. Ambiguous
+                        // names (self-join / dup key) keep the synthetic qualifier and stay on
+                        // the wrap path.
+                        let name_count = ctx
+                            .schema
+                            .fields
+                            .iter()
+                            .filter(|f| f.name.eq_ignore_ascii_case(&u.name))
+                            .count();
+                        if name_count == 1 {
+                            if let Some(k) = ordinal {
+                                let f = &ctx.schema.fields[k];
+                                return Ok(Expression::ColumnReference(ColumnReference {
+                                    name: u.name,
+                                    qualifier: None,
+                                    ordinal: Some(k),
+                                    data_type: Some(f.data_type.clone()),
+                                    nullable: Some(f.nullable),
+                                }));
+                            }
+                        }
                         (dt, nullable, ordinal)
                     }
                     // `q` is a real synthetic side scope but `name` is not on it.
@@ -6217,6 +6242,92 @@ mod tests {
         });
         let typed = analyze(plan_id_join(Some(cond)), &bt).unwrap();
         assert_eq!(join_flags(&typed), (true, true));
+    }
+
+    /// Pull the `(left, right)` `ColumnReference`s out of a resolved `Join`'s
+    /// binary equality condition, for asserting the resolved qualifier /
+    /// ordinal ADR-023 Phase 1 stamps (or drops).
+    fn join_condition_refs(typed: &TypedAst) -> (ColumnReference, ColumnReference) {
+        let TypedOp::Join { condition, .. } = &typed.op else {
+            panic!("expected Join, got {:?}", typed.op);
+        };
+        let Expression::Binary(BinaryExpression { left, right, .. }) =
+            condition.as_ref().expect("condition")
+        else {
+            panic!("expected Binary condition, got {condition:?}");
+        };
+        let Expression::ColumnReference(l) = left.as_ref() else {
+            panic!("expected ColumnReference (left), got {left:?}");
+        };
+        let Expression::ColumnReference(r) = right.as_ref() else {
+            panic!("expected ColumnReference (right), got {right:?}");
+        };
+        (l.clone(), r.clone())
+    }
+
+    #[test]
+    fn adr023_phase1_unique_name_condition_drops_qualifier_and_clears_flags() {
+        let bt = base_types_with_emp_dept();
+        // `id` (emp-only) and `dept_name` (dept-only) are each unique across
+        // the merged emp⋈dept condition schema — ADR-023 Phase 1 drops the
+        // synthetic qualifier at resolution, so neither side needs its
+        // `__td_jl`/`__td_jr` wrap alias.
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(pcol("id", 1)),
+            right: Box::new(pcol("dept_name", 2)),
+        });
+        let typed = analyze(plan_id_join(Some(cond)), &bt).unwrap();
+        assert_eq!(join_flags(&typed), (false, false));
+        let (l, r) = join_condition_refs(&typed);
+        assert_eq!(l.qualifier, None);
+        assert_eq!(l.ordinal, Some(0));
+        assert_eq!(r.qualifier, None);
+        assert_eq!(r.ordinal, Some(5));
+    }
+
+    #[test]
+    fn adr023_phase1_dup_name_condition_still_wraps() {
+        let bt = base_types_with_emp_dept();
+        // `dept_id` is duplicated across emp/dept — the synthetic qualifier
+        // must be KEPT here; the join-side wrap is still required to
+        // disambiguate.
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(pcol("dept_id", 1)),
+            right: Box::new(pcol("dept_id", 2)),
+        });
+        let typed = analyze(plan_id_join(Some(cond)), &bt).unwrap();
+        assert_eq!(join_flags(&typed), (true, true));
+        let (l, r) = join_condition_refs(&typed);
+        assert_eq!(l.qualifier.as_deref(), Some(TD_JOIN_LEFT));
+        assert_eq!(r.qualifier.as_deref(), Some(TD_JOIN_RIGHT));
+    }
+
+    #[test]
+    fn adr023_phase1_self_join_condition_still_wraps() {
+        let bt = base_types_with_emp_dept();
+        // Self-join emp(plan_id=1) ⋈ emp(plan_id=2) ON id==id — `id` is
+        // duplicated in the merged self-join schema, so it stays genuinely
+        // ambiguous and must not have its synthetic qualifier dropped.
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(pcol("id", 1)),
+            right: Box::new(pcol("id", 2)),
+        });
+        let joined = join_with_plan_ids(
+            scan("emp"),
+            scan("emp"),
+            JoinType::Inner,
+            Some(cond),
+            vec![1],
+            vec![2],
+        );
+        let typed = analyze(joined, &bt).unwrap();
+        assert_eq!(join_flags(&typed), (true, true));
+        let (l, r) = join_condition_refs(&typed);
+        assert_eq!(l.qualifier.as_deref(), Some(TD_JOIN_LEFT));
+        assert_eq!(r.qualifier.as_deref(), Some(TD_JOIN_RIGHT));
     }
 
     #[test]

@@ -8470,9 +8470,11 @@ mod tests {
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
-        // `id` (unique to `emp` within the inner join's merged schema) and
-        // `country` (unique to `emp2`) avoid an unrelated `AmbiguousColumn`
-        // from the `dept_id` name that both `dept` and `emp2` share.
+        // `id` (unique to `emp` within the inner join's OWN merged schema,
+        // but duplicated against `emp2.id` in the OUTER join's full merged
+        // schema) and `country` (unique across the whole outer schema)
+        // avoid an unrelated `AmbiguousColumn` from the `dept_id` name that
+        // both `dept` and `emp2` share.
         let outer_condition = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(Expression::UnresolvedColumn(
@@ -8508,12 +8510,66 @@ mod tests {
         let bt = base_types_emp_dept_emp2(&plan);
         let typed = analyze(plan, &bt).expect("analyze DataFrame join-of-join");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        // Both outer sides carry a plan_id-stamped reference in the outer
-        // condition, so both stay wrapped in their synthetic alias — no
-        // flatten, no hoisted user alias at the outer level.
+        // ADR-023 Phase 1: uniqueness is judged over the FULL outer merged
+        // schema, not each side in isolation. `id` is duplicated (emp AND
+        // emp2 both have it), so the LEFT (nested join) side keeps its
+        // `__td_jl` qualifier and stays wrapped — no flatten. `country` is
+        // unique to `emp2`, so the RIGHT side's condition ref drops its
+        // qualifier and the right side inlines directly (no `__td_jr` wrap).
         assert!(
-            sql.contains("AS __td_jl INNER JOIN (SELECT * FROM emp2) AS __td_jr"),
+            sql.contains("AS __td_jl INNER JOIN emp2 ON (__td_jl.id) = (country)"),
             "got: {sql}"
+        );
+        assert!(!sql.contains("__td_jr"), "got: {sql}");
+    }
+
+    #[test]
+    fn adr023_phase1_unique_name_plan_id_condition_inlines_both_sides() {
+        let _g = tap_guard();
+        // ADR-023 Phase 1: `id` (emp-only) and `dept_name` (dept-only) are
+        // each unique in the merged emp⋈dept condition schema, so the
+        // resolved condition drops its synthetic qualifier and neither join
+        // side needs a __td_jl/__td_jr wrap — both inline directly into a
+        // single FROM ... INNER JOIN.
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(Expression::UnresolvedColumn(
+                    crate::transpiler_v2::expression::UnresolvedColumn {
+                        name: "id".to_owned(),
+                        qualifier: None,
+                        plan_id: Some(1),
+                    },
+                )),
+                right: Box::new(Expression::UnresolvedColumn(
+                    crate::transpiler_v2::expression::UnresolvedColumn {
+                        name: "dept_name".to_owned(),
+                        qualifier: None,
+                        plan_id: Some(2),
+                    },
+                )),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![1],
+            right_plan_ids: vec![2],
+        });
+        let bt = base_types_emp_dept(&join);
+        let typed = analyze(join, &bt).expect("analyze unique-name plan_id join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(!sql.contains("__td_jl"), "got: {sql}");
+        assert!(!sql.contains("__td_jr"), "got: {sql}");
+        assert!(
+            sql.contains("FROM emp INNER JOIN dept ON "),
+            "both sides must inline directly, no synthetic wrap; got: {sql}"
+        );
+        assert!(
+            sql.contains("(id) = (dept_name)"),
+            "ON clause must render bare names, not __td_jl./__td_jr.-qualified; got: {sql}"
         );
     }
 

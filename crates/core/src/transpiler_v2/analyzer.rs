@@ -487,10 +487,56 @@ fn source_quals_of(
             ..
         } => {
             if !using_columns.is_empty() {
-                // TODO(ADR-023 3d/3e): USING output reorders/dedups columns,
-                // so no positional lineage holds yet — fill this in before
-                // the USING legacy name-only resolution path is retired.
-                empty_set()
+                // ADR-023 3e-i: mirror `analyze_join`'s USING output-schema
+                // construction EXACTLY (keys first in `using_columns` order,
+                // then left's non-USING fields, then right's non-USING
+                // fields — right omitted for LeftSemi/LeftAnti) so this
+                // lineage vector aligns 1:1 with `resolved_schema`.
+                let keep_right = !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
+                let using_lower: HashSet<String> =
+                    using_columns.iter().map(|s| s.to_lowercase()).collect();
+                let find_idx = |schema: &StructType, name: &str| -> Option<usize> {
+                    schema
+                        .fields
+                        .iter()
+                        .position(|f| f.name.eq_ignore_ascii_case(name))
+                };
+                let mut quals: Vec<BTreeSet<String>> = Vec::with_capacity(resolved_schema.len());
+                // USING keys: union of both sides' lineage for that name — a
+                // USING key is referenceable via either side's qualifier. Push
+                // only when the key resolves on at least one side, mirroring
+                // `build_using_prefix`'s `_ => {}` skip so the length invariant
+                // holds even for a (Spark-invalid) key present in neither side.
+                for k in using_columns {
+                    let mut set = BTreeSet::new();
+                    let mut found = false;
+                    if let Some(i) = find_idx(&left.resolved_schema, k) {
+                        set.extend(left.scope.source_quals[i].iter().cloned());
+                        found = true;
+                    }
+                    if let Some(i) = find_idx(&right.resolved_schema, k) {
+                        set.extend(right.scope.source_quals[i].iter().cloned());
+                        found = true;
+                    }
+                    if found {
+                        quals.push(set);
+                    }
+                }
+                // Left's non-USING fields, in left-schema order.
+                for (i, f) in left.resolved_schema.fields.iter().enumerate() {
+                    if !using_lower.contains(&f.name.to_lowercase()) {
+                        quals.push(left.scope.source_quals[i].clone());
+                    }
+                }
+                // Right's non-USING fields (omitted for LeftSemi/LeftAnti).
+                if keep_right {
+                    for (i, f) in right.resolved_schema.fields.iter().enumerate() {
+                        if !using_lower.contains(&f.name.to_lowercase()) {
+                            quals.push(right.scope.source_quals[i].clone());
+                        }
+                    }
+                }
+                quals
             } else if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
                 left.scope.source_quals.clone()
             } else {
@@ -583,15 +629,16 @@ fn source_quals_tracked_of(op: &TypedOp, resolved_schema: &StructType) -> bool {
             }
         }
         TypedOp::Join {
-            using_columns,
             left,
             right,
             join_type,
             ..
         } => {
-            if !using_columns.is_empty() {
-                false
-            } else if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+            // ADR-023 3e-i: the `left && right` (or `left`-only for
+            // SEMI/ANTI) formula is identical whether or not this is a
+            // USING join — `using_columns` no longer forces `false` here;
+            // see `source_quals_of`'s USING arm for the lineage itself.
+            if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
                 left.scope.source_quals_tracked
             } else {
                 left.scope.source_quals_tracked && right.scope.source_quals_tracked
@@ -6596,6 +6643,38 @@ mod tests {
     }
 
     #[test]
+    fn source_quals_using_join_key_column_unions_both_sides() {
+        // ADR-023 3e-i: `emp e JOIN dept d USING(dept_id)`. Output schema
+        // (mirrors `analyze_join`'s USING construction): [dept_id(key), id,
+        // name, salary, dept_name] — the key first, then left's non-USING
+        // fields, then right's non-USING fields. The key's lineage is the
+        // UNION of both sides (a USING key is referenceable via either
+        // side's qualifier); a left non-key inherits only the left set, a
+        // right non-key only the right set.
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        let e: BTreeSet<String> = ["emp".to_owned(), "e".to_owned()].into_iter().collect();
+        let d: BTreeSet<String> = ["dept".to_owned(), "d".to_owned()].into_iter().collect();
+        let key: BTreeSet<String> = e.union(&d).cloned().collect();
+        assert_eq!(
+            typed.scope.source_quals,
+            vec![key, e.clone(), e.clone(), e, d]
+        );
+        assert!(typed.scope.source_quals_tracked);
+    }
+
+    #[test]
     fn source_quals_aggregate_grouping_col_inherits_source_aggregate_col_empty() {
         // df.groupBy("dept_id").count() shape — grouping col inherits its
         // source's qualifier set, the created `count` output col does not.
@@ -6624,21 +6703,30 @@ mod tests {
 
     #[test]
     fn source_quals_length_invariant_holds_for_using_join() {
+        // ADR-023 3e-i: USING joins are now TRACKED (real lineage, not the
+        // size-correct empty fallback) — the length invariant holds for
+        // BOTH an INNER USING join and a LeftSemi USING join (right's
+        // columns dropped from the output schema entirely).
         let bt = base_types_with_emp_dept();
-        let ast = CommonAst::new(CommonOp::Join {
-            left: Box::new(emp_scan()),
-            right: Box::new(scan("dept")),
-            join_type: JoinType::Inner,
-            condition: None,
-            using_columns: vec!["dept_id".to_owned()],
-            natural: false,
-            lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
-        });
-        let typed = analyze(ast, &bt).unwrap();
-        assert_eq!(typed.scope.source_quals.len(), typed.resolved_schema.len());
-        assert!(typed.scope.source_quals.iter().all(BTreeSet::is_empty));
+        for join_type in [JoinType::Inner, JoinType::LeftSemi] {
+            let ast = CommonAst::new(CommonOp::Join {
+                left: Box::new(emp_scan()),
+                right: Box::new(scan("dept")),
+                join_type,
+                condition: None,
+                using_columns: vec!["dept_id".to_owned()],
+                natural: false,
+                lateral: false,
+                left_plan_ids: vec![],
+                right_plan_ids: vec![],
+            });
+            let typed = analyze(ast, &bt).unwrap();
+            assert_eq!(
+                typed.scope.source_quals.len(),
+                typed.resolved_schema.len(),
+                "length invariant violated for {join_type:?}"
+            );
+        }
     }
 
     // ── ADR-023 tier 3d — resolver consults source_quals lineage ─────────
@@ -6840,7 +6928,7 @@ mod tests {
     }
 
     #[test]
-    fn source_quals_tracked_true_for_project_of_columns_false_for_using_join() {
+    fn source_quals_tracked_true_for_project_of_columns() {
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -6852,10 +6940,44 @@ mod tests {
         });
         let typed = analyze(project, &bt).unwrap();
         assert!(typed.scope.source_quals_tracked);
+    }
 
+    #[test]
+    fn source_quals_tracked_true_for_using_join_with_tracked_children() {
+        // ADR-023 3e-i: `emp e JOIN dept d USING(dept_id)` — both children
+        // are TableScan{alias} (authoritative), so the USING join is now
+        // tracked too (formerly hard-coded `false`).
+        let bt = base_types_with_emp_dept();
         let using_join = CommonAst::new(CommonOp::Join {
-            left: Box::new(emp_scan()),
-            right: Box::new(scan("dept")),
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let typed_using = analyze(using_join, &bt).unwrap();
+        assert!(typed_using.scope.source_quals_tracked);
+    }
+
+    #[test]
+    fn source_quals_tracked_false_for_using_join_over_untracked_child() {
+        // The USING arm's tracked formula is `left && right` (SEMI/ANTI:
+        // `left` only) — same as the non-USING arm. An untracked child (a
+        // Star projection defers its lineage — see
+        // `source_quals_length_invariant_holds_for_star_projection`) keeps
+        // the USING join conservatively untracked too.
+        let bt = base_types_with_emp_dept();
+        let untracked_left = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+        let using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(untracked_left),
+            right: Box::new(aliased_scan("dept", "d")),
             join_type: JoinType::Inner,
             condition: None,
             using_columns: vec!["dept_id".to_owned()],
@@ -6866,6 +6988,10 @@ mod tests {
         });
         let typed_using = analyze(using_join, &bt).unwrap();
         assert!(!typed_using.scope.source_quals_tracked);
+        assert_eq!(
+            typed_using.scope.source_quals.len(),
+            typed_using.resolved_schema.len()
+        );
     }
 
     // ── Pass 106 — uncorrelated subquery analysis ────────────────────────

@@ -7723,9 +7723,16 @@ mod tests {
             sql.contains("AS e"),
             "left alias must not be buried; got: {sql}"
         );
+        // ADR-023 3e-i: the outer USING join is now `source_quals`-tracked, so
+        // `e.name` resolves projected-through (source_quals `{e}`, single hit)
+        // to qualifier=None → emission drops the qualifier and renders bare
+        // `name`, which binds positionally over the join. F5's structural
+        // guarantee (the nested join inlines and `e` stays visible in the FROM
+        // scope) is what this test pins; the reference no longer needs to carry
+        // the `e.` qualifier to bind.
         assert!(
-            sql.contains("e.name"),
-            "projection must bind against the now-visible alias; got: {sql}"
+            sql.contains("SELECT name") && !sql.contains("e.name"),
+            "projection must resolve projected-through to bare `name`; got: {sql}"
         );
         assert!(
             !sql.contains("__td_jl"),

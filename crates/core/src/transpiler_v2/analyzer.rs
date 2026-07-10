@@ -793,12 +793,20 @@ pub enum TypedOp {
         left_plan_ids: Vec<i64>,
         /// Plan-ids appearing anywhere under the right side.
         right_plan_ids: Vec<i64>,
-        /// True iff an analyzer-stamped `__td_jl` reference — in this join's
-        /// own condition, or in an ancestor expression that resolves through
-        /// schema-passthrough operators down to this join — requires emission
-        /// to alias the LEFT side with the synthetic [`TD_JOIN_LEFT`] name.
-        /// Stamped by the [`mark_join_alias_requirements`] post-pass; the
-        /// single authority for emission's synthetic-vs-user join aliasing.
+        /// True iff an ANCESTOR expression — one that resolves through
+        /// schema-passthrough operators down to this join, past this node —
+        /// carries an analyzer-stamped `__td_jl` reference, requiring
+        /// emission to alias the LEFT side with the synthetic
+        /// [`TD_JOIN_LEFT`] name. Stamped by the
+        /// [`mark_join_alias_requirements`] post-pass.
+        ///
+        /// ADR-023 Phase 2 narrowed this to ANCESTOR-only demands: this
+        /// join's OWN condition no longer forces a `true` here (a bare
+        /// `false`/`false` join can still emit a fully-qualified ON clause)
+        /// — emission resolves a join's own condition positionally instead
+        /// (`emission::requalify_join_condition`), against whatever alias
+        /// the sides actually render under, falling back to a fresh
+        /// synthetic wrap only when no unambiguous covering alias exists.
         left_requires_synthetic: bool,
         /// Right-side counterpart of `left_requires_synthetic`
         /// ([`TD_JOIN_RIGHT`]).
@@ -1216,18 +1224,23 @@ pub fn analyze(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Analy
 // ── Join synthetic-alias requirement post-pass ──────────────────────────────
 
 /// Stamp every `TypedOp::Join`'s `left_requires_synthetic` /
-/// `right_requires_synthetic` flags: true iff any analyzer-stamped
+/// `right_requires_synthetic` flags: true iff an ANCESTOR-stamped
 /// [`TD_JOIN_LEFT`]/[`TD_JOIN_RIGHT`] qualifier demands that side be
 /// addressable under its synthetic alias in the emitted FROM scope.
 ///
-/// Demands arise in the join's own condition (`qualify_plan_id_refs`) or in
-/// an ancestor operator's expressions (`resolve_column`'s plan_id arm stamps
-/// `__td_jl`/`__td_jr` on ambiguous refs above a join). An ancestor demand
-/// reaches the join only through the same schema-passthrough operator class
-/// [`RelScope`] recognizes (Filter / Sort / Limit / Sample / SampleBy /
-/// Deduplicate / NaFill / NaDrop / NaReplace / LateralView) — every other
-/// operator re-scopes, so resolution can never stamp a synthetic qualifier
-/// across it (enforced with a `debug_assert`).
+/// ADR-023 Phase 2: a demand arising in the join's OWN condition
+/// (`qualify_plan_id_refs`) is deliberately NOT folded into these flags
+/// anymore — a join's own condition is resolved positionally at emission
+/// time instead (`emission::requalify_join_condition`), against whichever
+/// alias its sides actually render under, falling back to a fresh synthetic
+/// wrap only when no unambiguous covering alias exists. Only a demand from
+/// an ANCESTOR operator's expressions (`resolve_column`'s plan_id arm stamps
+/// `__td_jl`/`__td_jr` on ambiguous refs above a join) reaches these flags.
+/// An ancestor demand reaches the join only through the same
+/// schema-passthrough operator class [`RelScope`] recognizes (Filter / Sort
+/// / Limit / Sample / SampleBy / Deduplicate / NaFill / NaDrop / NaReplace /
+/// LateralView) — every other operator re-scopes, so resolution can never
+/// stamp a synthetic qualifier across it (enforced with a `debug_assert`).
 ///
 /// Subquery inner plans are separate resolution universes: they are marked
 /// recursively with fresh demand state. (A correlated inner reference to an
@@ -1307,8 +1320,18 @@ fn mark_node(node: &mut TypedAst, pending_jl: bool, pending_jr: bool) {
             right_requires_synthetic,
             ..
         } => {
-            *left_requires_synthetic = pending_jl || own_jl;
-            *right_requires_synthetic = pending_jr || own_jr;
+            // ADR-023 Phase 2: narrowed to ANCESTOR-only demands. A join's
+            // OWN condition never forces a synthetic alias here anymore —
+            // `own_jl`/`own_jr` (still computed above, for its
+            // `mark_expr_subplans` side effect over condition subqueries)
+            // are deliberately NOT folded in. Emission now resolves the
+            // join's own condition positionally
+            // (`emission::requalify_join_condition`) against whatever alias
+            // the sides actually render under, wrapping under a fresh
+            // synthetic name only if a genuinely ambiguous ordinal has no
+            // unambiguous covering alias.
+            *left_requires_synthetic = pending_jl;
+            *right_requires_synthetic = pending_jr;
             // Synthetic names are per-join-level: demands do not cross into
             // the sides (inner joins own their own `__td_jl`/`__td_jr`).
             mark_node(left, false, false);
@@ -6233,15 +6256,20 @@ mod tests {
     #[test]
     fn join_flags_set_when_condition_carries_plan_id_ambiguity() {
         let bt = base_types_with_emp_dept();
-        // `dept_id` exists on both sides — the plan_id-stamped refs become
-        // `__td_jl.dept_id` / `__td_jr.dept_id`, demanding synthetic aliases.
+        // `dept_id` exists on both sides — the plan_id-stamped refs still
+        // resolve to synthetic `__td_jl.dept_id` / `__td_jr.dept_id`
+        // qualifiers (Phase 1, unaffected). But this join's OWN condition is
+        // the ONLY demand present (no ancestor references either side), and
+        // ADR-023 Phase 2 narrows `mark_node`'s Join arm to ANCESTOR-only
+        // demands — so the flags stay clear; emission resolves the
+        // condition positionally instead (`requalify_join_condition`).
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("dept_id", 1)),
             right: Box::new(pcol("dept_id", 2)),
         });
         let typed = analyze(plan_id_join(Some(cond)), &bt).unwrap();
-        assert_eq!(join_flags(&typed), (true, true));
+        assert_eq!(join_flags(&typed), (false, false));
     }
 
     /// Pull the `(left, right)` `ColumnReference`s out of a resolved `Join`'s
@@ -6290,15 +6318,19 @@ mod tests {
     fn adr023_phase1_dup_name_condition_still_wraps() {
         let bt = base_types_with_emp_dept();
         // `dept_id` is duplicated across emp/dept — the synthetic qualifier
-        // must be KEPT here; the join-side wrap is still required to
-        // disambiguate.
+        // must be KEPT on the resolved refs (Phase 1, unaffected: emission's
+        // `requalify_join_condition` positional rewrite depends on it). But
+        // ADR-023 Phase 2 narrows `mark_node`'s Join arm to ANCESTOR-only
+        // demands — this join's OWN condition is the only demand present,
+        // so the flags themselves now stay clear; the side wrap (if any)
+        // is decided at emission time instead, positionally.
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("dept_id", 1)),
             right: Box::new(pcol("dept_id", 2)),
         });
         let typed = analyze(plan_id_join(Some(cond)), &bt).unwrap();
-        assert_eq!(join_flags(&typed), (true, true));
+        assert_eq!(join_flags(&typed), (false, false));
         let (l, r) = join_condition_refs(&typed);
         assert_eq!(l.qualifier.as_deref(), Some(TD_JOIN_LEFT));
         assert_eq!(r.qualifier.as_deref(), Some(TD_JOIN_RIGHT));
@@ -6309,7 +6341,14 @@ mod tests {
         let bt = base_types_with_emp_dept();
         // Self-join emp(plan_id=1) ⋈ emp(plan_id=2) ON id==id — `id` is
         // duplicated in the merged self-join schema, so it stays genuinely
-        // ambiguous and must not have its synthetic qualifier dropped.
+        // ambiguous and must not have its synthetic qualifier dropped
+        // (Phase 1, unaffected). But ADR-023 Phase 2 narrows `mark_node`'s
+        // Join arm to ANCESTOR-only demands — this join's OWN condition is
+        // the only demand present, so the flags themselves now stay clear;
+        // emission's `requalify_join_condition` resolves the condition
+        // positionally instead, wrapping under a fresh alias only if
+        // needed (a self-join, both sides bare `emp`, is exactly the
+        // "duplicate-alias guard" shape).
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("id", 1)),
@@ -6324,7 +6363,7 @@ mod tests {
             vec![2],
         );
         let typed = analyze(joined, &bt).unwrap();
-        assert_eq!(join_flags(&typed), (true, true));
+        assert_eq!(join_flags(&typed), (false, false));
         let (l, r) = join_condition_refs(&typed);
         assert_eq!(l.qualifier.as_deref(), Some(TD_JOIN_LEFT));
         assert_eq!(r.qualifier.as_deref(), Some(TD_JOIN_RIGHT));
@@ -6403,6 +6442,10 @@ mod tests {
             right: Box::new(qcol("dept", "dept_id")),
         });
         let inner = join(emp_scan(), scan("dept"), JoinType::Inner, Some(inner_cond));
+        // ADR-023 Phase 2: the outer join's OWN condition (pid-7/8) is its
+        // own demand and no longer sets its flags by itself — an ANCESTOR
+        // Filter re-demanding pid-7's `dept_id` (below) is what legitimately
+        // sets `outer_left` now.
         let outer_cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("dept_id", 7)),
@@ -6419,13 +6462,32 @@ mod tests {
             left_plan_ids: vec![7],
             right_plan_ids: vec![8],
         });
-        let typed = analyze(outer, &bt).unwrap();
-        // Outer: pid-7 `dept_id` is ambiguous across the merged schema
-        // (emp.dept_id, dept.dept_id, bonus.dept_id) → __td_jl stamped.
-        let (outer_left, _) = join_flags(&typed);
+        let filtered = CommonAst::new(CommonOp::Filter {
+            input: Box::new(outer),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Gt,
+                left: Box::new(pcol("dept_id", 7)),
+                right: Box::new(lit_double(0.0)),
+            }),
+        });
+        let typed = analyze(filtered, &bt).unwrap();
+        let TypedOp::Filter {
+            input: outer_typed, ..
+        } = &typed.op
+        else {
+            panic!("expected Filter");
+        };
+        // Outer: the ANCESTOR Filter's pid-7 `dept_id` demand is ambiguous
+        // across the merged outer schema (emp.dept_id, dept.dept_id,
+        // bonus.dept_id) → __td_jl stamped, reaching the outer join through
+        // the Filter passthrough.
+        let (outer_left, _) = join_flags(outer_typed);
         assert!(outer_left);
-        // Inner join must stay unmarked — synthetic names are per-level.
-        let TypedOp::Join { left, .. } = &typed.op else {
+        // Inner join must stay unmarked — synthetic names are per-level:
+        // neither the outer's own (now-inert) condition demand nor the
+        // ancestor Filter's demand ON the outer leaks down into the nested
+        // inner join.
+        let TypedOp::Join { left, .. } = &outer_typed.op else {
             panic!("expected Join");
         };
         assert_eq!(join_flags(left), (false, false));

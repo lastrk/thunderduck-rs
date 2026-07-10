@@ -218,12 +218,31 @@ pub fn decimal_value_precision_scale(s: &str) -> (u8, u8) {
 }
 
 /// A resolved column reference with schema-recorded type/nullability info.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ColumnReference {
     pub name: String,
     pub qualifier: Option<String>,
     pub data_type: Option<DataType>,
     pub nullable: Option<bool>,
+    /// ADR-023 tier 3: 0-based position of the resolved column in the
+    /// PRODUCING node's output schema (`ctx.schema` at resolution time).
+    /// `None` when resolution did not pin a position (pre-analysis
+    /// `untyped`, or a tier that resolves by name/outer-scope only).
+    /// Derived data — excluded from `PartialEq` (see below).
+    pub ordinal: Option<usize>,
+}
+
+impl PartialEq for ColumnReference {
+    /// Excludes `ordinal`: it is derived data recording *where* a column
+    /// resolved, not part of the reference's logical identity. Mirrors
+    /// `TypedAst`'s scope-excluding `Eq` — keeps every pre-existing
+    /// equality-based test unchanged.
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.qualifier == other.qualifier
+            && self.data_type == other.data_type
+            && self.nullable == other.nullable
+    }
 }
 
 /// An unresolved (pre-analysis) column reference.
@@ -1684,6 +1703,7 @@ impl ColumnReference {
             qualifier: None,
             data_type: None,
             nullable: None,
+            ordinal: None,
         })
     }
 }
@@ -2229,6 +2249,7 @@ mod tests {
             qualifier: None,
             data_type: Some(address_struct_type()),
             nullable: Some(true),
+            ordinal: None,
         })
     }
 

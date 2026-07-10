@@ -325,8 +325,9 @@ impl SelectBlock {
     /// output names. Used exactly when `unit`'s declared output has a
     /// duplicate name: [`crate::types::pyspark_parity::uniquify`]'s result
     /// names every column distinctly, so the enclosing block can reference
-    /// any of them by bare name with no ambiguity — closing the one class
-    /// `strip_stranded_qualifiers` cannot rewrite around. `unit`'s own
+    /// any of them by bare name with no ambiguity — closing the
+    /// duplicate-output-name class that resolution-time bare-name dropping
+    /// (ADR-023 tier 3e-ii) cannot disambiguate on its own. `unit`'s own
     /// SELECT list is untouched; only the derived table's exposed name list
     /// changes, confirmed by an empirical DuckDB smoke check that the
     /// alias-list syntax binds positionally over a duplicate-named inner

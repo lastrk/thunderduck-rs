@@ -210,9 +210,10 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
 /// ordinal is free and `vis` holds, else wrap. Shared by every
 /// projection-shaped operator (WithColumns[Renamed], DropColumns, NaFill,
 /// NaReplace). The `slots` closure receives the PRE-wrap block plus whether
-/// the wrap fallback was taken, so an expression-bearing caller can rewrite
-/// wrap-stranded qualifiers (via [`strip_stranded_qualifiers`]) before
-/// rendering its slot list.
+/// the wrap fallback was taken; a stranded qualifier on a wrapped
+/// expression needs no rewrite here — ADR-023 tier 3e-ii/iii already dropped
+/// it at resolution time — so today only [`build_drop_columns`]'s `* EXCLUDE`
+/// choice reads the flag.
 fn block_with_projections(
     input: &TypedAst,
     vis: impl FnOnce(&SelectBlock) -> bool,
@@ -681,21 +682,22 @@ fn build_aggregate(
 
     // ADR-023 tier 2: activate the wrap-boundary reprojection only when the
     // wrapped child's output has a duplicate name — the one class
-    // `strip_stranded_qualifiers` cannot rewrite around. `None` on the
-    // common (already-unique) case keeps every branch below byte-identical
-    // to the pre-tier-2 strip path.
+    // resolution's unique-name qualifier drop (tier 3e-ii/iii) cannot cover.
+    // `None` on the common (already-unique) case means the reference already
+    // resolved bare at analysis time, so every branch below passes the
+    // expression through unchanged.
     let uniquified = output_uniquified(input_schema);
     // Choose the expression set to render from: the originals when merging
-    // (no cosmetic churn), or each stripped/reprojected against the
-    // PRE-wrap block when wrapping — otherwise a qualifier like
-    // `e.dept_id` strands behind the freshly introduced `__td_sub`.
+    // (no cosmetic churn), or each reprojected against the PRE-wrap block
+    // when wrapping onto a duplicate-name output — otherwise a qualifier
+    // like `e.dept_id` strands behind the freshly introduced `__td_sub`.
     let maybe_strip = |e: &Expression| -> Expression {
         if merge {
             e.clone()
         } else {
             match &uniquified {
                 Some(u) => reproject_qualifiers(e, input, u),
-                None => strip_stranded_qualifiers(e, &block, input_schema),
+                None => e.clone(),
             }
         }
     };
@@ -710,7 +712,7 @@ fn build_aggregate(
                 } else {
                     match &uniquified {
                         Some(u) => reproject_qualifiers(&h, input, u),
-                        None => strip_stranded_qualifiers(&h, &block, input_schema),
+                        None => h,
                     }
                 }
             });
@@ -906,82 +908,15 @@ fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
         .any(|(name, _)| name.eq_ignore_ascii_case(q))
 }
 
-/// Wrap-boundary qualifier rewrite: when a slot-conflict wrap is about to
-/// bury the child block's FROM aliases behind `__td_sub`, return a clone of
-/// `expr` with each stranded reference `q.c` rewritten to its bare output
-/// name `c`, instead of emitting a qualifier DuckDB can no longer bind
-/// (`Referenced table "q" not found`). A reference is rewritten iff
-///
-/// - the pre-wrap `block` actually exposed `q` — a correlated OUTER
-///   qualifier is never exposed by the inner FROM, and DuckDB's correlated
-///   binder resolves it OUTWARD straight through the wrap, so it must stay
-///   qualified verbatim;
-/// - `q` does not double as a struct-column access on the child's output
-///   (`resolve_column`'s struct-precedence tier): struct access survives a
-///   wrap as column-dot-field syntax, so it needs no rewrite and stripping
-///   would misread the field name as a column; and
-/// - `c` names exactly one output column case-insensitively — an ambiguous
-///   name (a self-join output) cannot be safely unqualified, so it keeps
-///   today's loud binder failure (witnessed by
-///   [`trace_stranded_qualifiers`]).
-///
-/// Qualified stars are NOT rewritten (`q.*` has no bare-name equivalent
-/// against a reshaped output), and subquery bodies are opaque `CommonAst`
-/// plans — not expression children per the τ walker convention — so inner
-/// correlated references are untouched by construction.
-fn strip_stranded_qualifiers(
-    expr: &Expression,
-    block: &SelectBlock,
-    output_schema: &Schema,
-) -> Expression {
-    fn walk(expr: &mut Expression, block: &SelectBlock, output: &Schema) {
-        let strippable = |q: &str, name: &str| {
-            block.exposes(q)
-                && TypeInferenceEngine::struct_qualifier_info(name, q, output).is_none()
-                && output
-                    .fields
-                    .iter()
-                    .filter(|f| f.name.eq_ignore_ascii_case(name))
-                    .count()
-                    == 1
-        };
-        match expr {
-            Expression::ColumnReference(c) => {
-                if c.qualifier
-                    .as_deref()
-                    .is_some_and(|q| strippable(q, &c.name))
-                {
-                    c.qualifier = None;
-                }
-            }
-            Expression::UnresolvedColumn(u) => {
-                if u.qualifier
-                    .as_deref()
-                    .is_some_and(|q| strippable(q, &u.name))
-                {
-                    u.qualifier = None;
-                }
-            }
-            other => {
-                for child in other.children_mut() {
-                    walk(child, block, output);
-                }
-            }
-        }
-    }
-    let mut rewritten = expr.clone();
-    walk(&mut rewritten, block, output_schema);
-    rewritten
-}
-
 /// ADR-023 tier 2 activation gate: `schema`'s field names, [`uniquify`]d,
 /// iff they contain a duplicate — `None` when the names are already unique,
 /// the common case. Every wrap site checks this FIRST and only reaches the
 /// tier-2 reprojection path (`wrap_reprojected` + [`reproject_qualifiers`])
-/// on `Some`; the `None` (common) case keeps the existing
-/// `SelectBlock::wrap` + [`strip_stranded_qualifiers`] pairing byte-for-byte
-/// unchanged, which is what confines the corpus delta to the duplicate-name
-/// shape this closes.
+/// on `Some`; the `None` (common) case now simply passes each expression
+/// through unchanged — the unique-name case's qualifier drop happens at
+/// RESOLUTION (ADR-023 tier 3e-ii: tier-(e) drops a unique-name qualifier as
+/// part of resolving the reference; tier 3e-iii extends this to
+/// folded-aggregate lineage), so emission has nothing left to rewrite here.
 fn output_uniquified(schema: &Schema) -> Option<Vec<String>> {
     let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
     let mut seen: HashSet<&str> = HashSet::with_capacity(names.len());
@@ -1011,24 +946,23 @@ fn scope_position(
         .map(|offset| range.start + offset)
 }
 
-/// ADR-023 tier 2: the duplicate-output-name counterpart of
-/// [`strip_stranded_qualifiers`], paired with
+/// ADR-023 tier 2: the duplicate-output-name counterpart of the
+/// resolution-time unique-name qualifier drop (tier 3e-ii/iii), paired with
 /// [`SelectBlock::wrap_reprojected`]. That wrap re-exposes the wrapped
-/// child's columns under `uniquified`'s names, positionally — so, unlike
-/// `strip_stranded_qualifiers` (which only rewrites `q.name -> name` when
-/// `name` is unique in the pre-wrap output and therefore declines on a
-/// duplicate), this rewrite is always safe for any qualifier `input.scope`
-/// resolves: `q.name` becomes the bare `uniquified[pos]` at `name`'s
-/// resolved position, which the reprojected wrap guarantees is bindable.
+/// child's columns under `uniquified`'s names, positionally — so, unlike a
+/// unique-name reference (which resolution already leaves bare and needs no
+/// rewrite here), this rewrite is always safe for any qualifier
+/// `input.scope` resolves: `q.name` becomes the bare `uniquified[pos]` at
+/// `name`'s resolved position, which the reprojected wrap guarantees is
+/// bindable.
 ///
 /// A qualifier `input.scope` does NOT bind (the F10 dead-alias class) is
 /// left untouched — Tier 3's job — as is a `q` that doubles as a struct
-/// column access on the input schema (mirrors `strip_stranded_qualifiers`'s
-/// own struct-precedence guard: struct access survives a wrap as
+/// column access on the input schema (mirrors resolution's own
+/// struct-precedence guard: struct access survives a wrap as
 /// column-dot-field syntax and needs no rewrite). Qualified stars are not
 /// rewritten, and subquery bodies are opaque `CommonAst` plans (not
-/// expression children per the τ walker convention), same as
-/// `strip_stranded_qualifiers`.
+/// expression children per the τ walker convention).
 fn reproject_qualifiers(expr: &Expression, input: &TypedAst, uniquified: &[String]) -> Expression {
     fn walk(
         expr: &mut Expression,
@@ -1132,17 +1066,17 @@ fn render_project_merge_slots(
     })
 }
 
-/// Wrap-boundary star rewrite (F12): [`strip_stranded_qualifiers`] never
-/// touches a `Star` (`q.*` has no bare-name equivalent for a reshaped output,
-/// per its doc), so a stranded relation-qualified star sails through
-/// untouched and `render_star` emits `q.*` verbatim over `__td_sub` — a
-/// qualifier DuckDB can no longer bind once the wrap buries the pre-wrap
-/// block's own FROM alias (`Referenced table "q" not found`). The strand
-/// precondition mirrors [`strip_stranded_qualifiers`]'s own: the PRE-wrap
-/// `block` must actually expose `q` (`block.exposes(q)`) — that is precisely
-/// what the wrap is about to bury; a `q` the pre-wrap block does NOT expose
-/// is a correlated OUTER reference (resolved outward through the wrap by
-/// DuckDB's correlated binder) and must stay qualified verbatim.
+/// Wrap-boundary star rewrite (F12): a `Star` (`q.*`) has no bare-name
+/// equivalent for a reshaped output, so neither the resolution-time
+/// unique-name qualifier drop nor `reproject_qualifiers` ever touches one —
+/// a stranded relation-qualified star sails through untouched and
+/// `render_star` emits `q.*` verbatim over `__td_sub` — a qualifier DuckDB
+/// can no longer bind once the wrap buries the pre-wrap block's own FROM
+/// alias (`Referenced table "q" not found`). The strand precondition: the
+/// PRE-wrap `block` must actually expose `q` (`block.exposes(q)`) — that is
+/// precisely what the wrap is about to bury; a `q` the pre-wrap block does
+/// NOT expose is a correlated OUTER reference (resolved outward through the
+/// wrap by DuckDB's correlated binder) and must stay qualified verbatim.
 ///
 /// Given the strand precondition holds, the rewrite itself is safe only when
 /// `q` covers the WHOLE input relation — exactly one
@@ -1201,7 +1135,7 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
         .map(|p| expand_stranded_whole_relation_star(p, &block, input))
         .map(|p| match &uniquified {
             Some(u) => reproject_qualifiers(&p, input, u),
-            None => strip_stranded_qualifiers(&p, &block, &input.resolved_schema),
+            None => p.clone(),
         })
         .collect();
     trace_stranded_qualifiers(&block, &projections, &input.scope);
@@ -1225,7 +1159,7 @@ fn build_filter(input: &TypedAst, condition: &Expression) -> Result<SqlUnit, Emi
     let uniquified = output_uniquified(&input.resolved_schema);
     let condition = match &uniquified {
         Some(u) => reproject_qualifiers(condition, input, u),
-        None => strip_stranded_qualifiers(condition, &block, &input.resolved_schema),
+        None => condition.clone(),
     };
     trace_stranded_qualifiers(&block, [&condition], &input.scope);
     let mut wrapped = match &uniquified {
@@ -1272,7 +1206,7 @@ fn build_sort(
             let mut stripped = so.clone();
             *stripped.expr = match &uniquified {
                 Some(u) => reproject_qualifiers(&so.expr, input, u),
-                None => strip_stranded_qualifiers(&so.expr, &block, &input.resolved_schema),
+                None => (*so.expr).clone(),
             };
             render_sort_key(&stripped, &input.resolved_schema)
         })
@@ -1867,17 +1801,8 @@ fn build_with_columns(
     block_with_projections(
         input,
         |block| exprs_visible_in(assignments.iter().map(|(_, e)| e), block, &input.scope),
-        |block, wrapped| {
-            let render_assignment = |expr: &Expression| {
-                if wrapped {
-                    render_expr(
-                        &strip_stranded_qualifiers(expr, block, input_schema),
-                        input_schema,
-                    )
-                } else {
-                    render_expr(expr, input_schema)
-                }
-            };
+        |_block, _wrapped| {
+            let render_assignment = |expr: &Expression| render_expr(expr, input_schema);
             let mut slots: Vec<String> = Vec::new();
             for (f, replaced_by) in input_schema.fields.iter().zip(&plan.replaced) {
                 if let Some(idx) = replaced_by {
@@ -6720,17 +6645,18 @@ mod tests {
 
     // ── ADR-023 tier 2: wrap-boundary re-projection over duplicate names ──
     //
-    // `output_uniquified` gates every wrap site's `strip_stranded_qualifiers`
-    // vs. `reproject_qualifiers` choice on whether the wrapped child's
-    // output has a duplicate name. The common (unique) case must render
-    // byte-identically to the pre-tier-2 shape; the duplicate case (see
+    // `output_uniquified` gates every wrap site's pass-through vs.
+    // `reproject_qualifiers` choice on whether the wrapped child's output
+    // has a duplicate name. The common (unique) case renders the expression
+    // unchanged — the unique-name reference already resolved bare at
+    // analysis time (tier 3e-ii/iii); the duplicate case (see
     // `ambiguous_output_name_wrap_reprojects_to_unique_position` above) must
     // reproject uniquely and rewrite the outer reference by position.
 
     /// The common case: the wrapped child's output names are already
     /// unique, so `output_uniquified` returns `None` and every wrap site
-    /// takes the pre-tier-2 `SelectBlock::wrap` + `strip_stranded_qualifiers`
-    /// path verbatim — zero delta on the shape tier 2 does not target.
+    /// wraps with `SelectBlock::wrap` and renders the expression unchanged —
+    /// zero delta on the shape tier 2 does not target.
     #[test]
     fn wrap_over_unique_names_is_unchanged() {
         let _g = tap_guard();
@@ -6759,7 +6685,7 @@ mod tests {
 
     /// ADR-023 tier 2's namesake pin: a duplicate name across a self-join
     /// output forces `build_filter`'s wrap path onto `wrap_reprojected` +
-    /// `reproject_qualifiers` instead of the (declining) strip path — the
+    /// `reproject_qualifiers` instead of a plain pass-through — the
     /// scope-resolvable `a.name` reference is rewritten to the unique
     /// positional name (`name`, the left side's occurrence) rather than
     /// stranding qualified over the buried `a` alias.
@@ -6806,11 +6732,12 @@ mod tests {
     // ── Wrap-boundary qualifier rewriting (strand-class retirement) ──────
     //
     // filt-016/filt-017 witness class: a qualified reference above a
-    // slot-conflict wrap is rewritten to its bare output name by
-    // `strip_stranded_qualifiers` instead of stranding the alias behind
-    // `__td_sub` (DuckDB: `Referenced table "e" not found`). The keep-side
-    // of the matrix (ambiguous names, unexposed/correlated qualifiers,
-    // struct precedence) must stay verbatim.
+    // slot-conflict wrap resolves to its bare output name at RESOLUTION
+    // time (ADR-023 tier 3e-ii/iii) instead of stranding the alias behind
+    // `__td_sub` (DuckDB: `Referenced table "e" not found`), so emission has
+    // nothing left to rewrite for this class. The keep-side of the matrix
+    // (ambiguous names, unexposed/correlated qualifiers, struct precedence)
+    // must stay verbatim.
 
     fn asc_key(expr: Expression) -> SortOrder {
         SortOrder {

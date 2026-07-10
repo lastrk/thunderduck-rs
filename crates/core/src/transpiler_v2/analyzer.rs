@@ -4355,12 +4355,13 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                                 .map(|i| range.start + i);
                             // ADR-023 3e-ii: a qualifier that binds a local
                             // scope AND resolves to a name UNIQUE in the
-                            // output is exactly what
-                            // `strip_stranded_qualifiers` rewrites to bare at
-                            // every wrap site (pre-wrap `exposes(q)` ⟺ this
-                            // `scoped_range(q) == Some`; struct access already
-                            // handled above). Drop it now, at resolution: a
-                            // unique bare name binds positionally over any
+                            // output is the projected-through case the (now
+                            // retired) emission-side stranded-qualifier
+                            // rewrite handled at every wrap site (pre-wrap
+                            // `exposes(q)` ⟺ this `scoped_range(q) == Some`;
+                            // struct access already handled above). Drop it
+                            // now, at resolution: a unique bare name binds
+                            // positionally over any
                             // wrapper, so the carried qualifier is never
                             // needed and never strands. Duplicated names keep
                             // the qualifier (the uniquify/reproject path).

@@ -551,25 +551,38 @@ fn source_quals_of(
             aggregates,
             ..
         } => {
-            // The resolved_schema is grouping cols then aggregate cols
-            // (CommonOp::Aggregate ordering) ONLY when the SparkSQL path has
-            // not already folded grouping into `aggregates` — that fold
-            // isn't visible here, so guard on length instead of guessing.
-            if grouping.len() + aggregates.len() == resolved_schema.len() {
-                let mut quals: Vec<BTreeSet<String>> = grouping
-                    .iter()
-                    .map(|g| match g {
-                        Expression::ColumnReference(cr) => match cr.ordinal {
-                            Some(k) if k < input.scope.source_quals.len() => {
-                                input.scope.source_quals[k].clone()
+            // ADR-023 3e-iii: reuse `grouping_already_folded` (the same
+            // predicate `analyze`'s CommonOp::Aggregate arm uses) to pick the
+            // output layout, then map lineage with the identical
+            // passthrough-ColumnReference-inherits-by-ordinal rule the
+            // `Project` arm uses above. On the SparkSQL folded path, the
+            // grouping columns are themselves passthrough ColumnReferences
+            // inside `aggregates`, so they pick up real lineage there; on the
+            // DataFrame (!folded) path this is behavior-identical to before.
+            let lineage_of = |e: &Expression| -> BTreeSet<String> {
+                match e {
+                    Expression::ColumnReference(cr) => match cr.ordinal {
+                        Some(k) if k < input.scope.source_quals.len() => {
+                            let mut s = input.scope.source_quals[k].clone();
+                            if let Some(q) = &cr.qualifier {
+                                s.insert(q.clone());
                             }
-                            _ => BTreeSet::new(),
-                        },
+                            s
+                        }
                         _ => BTreeSet::new(),
-                    })
-                    .collect();
-                // Aggregate output columns are created — no inherited lineage.
-                quals.extend(aggregates.iter().map(|_| BTreeSet::new()));
+                    },
+                    _ => BTreeSet::new(),
+                }
+            };
+            let mut quals: Vec<BTreeSet<String>> = Vec::new();
+            if !grouping_already_folded(grouping, aggregates) {
+                // DataFrame path: grouping fields precede the aggregate
+                // fields (mirrors `analyze`'s !already_folded prepend).
+                quals.extend(grouping.iter().map(&lineage_of));
+            }
+            // Folded (SparkSQL) OR the aggregate fields of the DataFrame path.
+            quals.extend(aggregates.iter().map(&lineage_of));
+            if quals.len() == resolved_schema.len() {
                 quals
             } else {
                 empty_set()
@@ -650,10 +663,14 @@ fn source_quals_tracked_of(op: &TypedOp, resolved_schema: &StructType) -> bool {
             aggregates,
             ..
         } => {
-            // Mirrors the `grouping.len() + aggregates.len() ==
-            // resolved_schema.len()` guard in `source_quals_of`'s Aggregate arm.
-            grouping.len() + aggregates.len() == resolved_schema.len()
-                && input.scope.source_quals_tracked
+            // Mirrors the layout `source_quals_of`'s Aggregate arm computes
+            // via `grouping_already_folded`.
+            let computed_len = if grouping_already_folded(grouping, aggregates) {
+                aggregates.len()
+            } else {
+                grouping.len() + aggregates.len()
+            };
+            computed_len == resolved_schema.len() && input.scope.source_quals_tracked
         }
         TypedOp::SetOp { .. }
         | TypedOp::LateralView { .. }
@@ -6716,6 +6733,29 @@ mod tests {
         let typed = analyze(ast, &bt).unwrap();
         let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
         assert_eq!(typed.scope.source_quals, vec![emp, BTreeSet::new()]);
+    }
+
+    #[test]
+    fn source_quals_aggregate_folded_grouping_col_inherits_source_aggregate_col_empty() {
+        // ADR-023 3e-iii: SparkSQL `SELECT dept_id, SUM(salary) FROM emp
+        // GROUP BY dept_id` shape — `grouping_already_folded` sees `dept_id`
+        // already present in `aggregates` (folded), so the output schema is
+        // `aggregates` as-is (no grouping prepend). The folded `dept_id`
+        // passthrough column-reference must still inherit its source
+        // qualifier lineage, and the whole node must be TRACKED.
+        let bt = base_types_with_emp_dept();
+        let ast = aggregate(
+            scan("emp"),
+            vec![unresolved_col("dept_id")],
+            vec![
+                unresolved_col("dept_id"),
+                func("sum", vec![unresolved_col("salary")]),
+            ],
+        );
+        let typed = analyze(ast, &bt).unwrap();
+        let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
+        assert_eq!(typed.scope.source_quals, vec![emp, BTreeSet::new()]);
+        assert!(typed.scope.source_quals_tracked);
     }
 
     #[test]

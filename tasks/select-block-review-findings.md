@@ -77,7 +77,9 @@ tolerates unreferenced duplicates; a qualified `__td_jr` reference (e.g. an
 ancestor ambiguous plan_id ref merged into the block) fails:
 `Ambiguous reference to table "__td_jr" (duplicate alias)` vs Spark success.
 
-### 8. Strip legitimizes bogus qualifiers — divergence, in item 3 (CONFIRMED)
+### 8. Strip legitimizes bogus qualifiers — divergence, in item 3 (CONFIRMED) — **DEFERRED 2026-07-10 (attribute-lineage cluster with F10/F11)**
+**Empirical Spark 4.1.1:** `emp.alias('e').select(col('dept_id').alias('k')).filter(col('e.k')==101)` → `UNRESOLVED_COLUMN.WITH_SUGGESTION` (Spark ERRORS). τ silently returns rows (over-permissive tier-(f)).
+**Why deferred:** F8 (`e.k`, a `select`-CREATED alias → must ERROR) and F10 (`e.name`, a projected-THROUGH original column → must SUCCEED) present the IDENTICAL analyzer input (`e.<local-col>`, qualifier `e` binds no local scope) with OPPOSITE Spark outcomes. Distinguishing them requires Spark's attribute-lineage qualifier tracking (each output column carries the set of source qualifiers it inherits) — a feature τ does not model. The bounded alternative (make tier-(f) strict: a qualifier binding no local/outer scope → `UnknownColumn`) would fix F8 but (a) turn F10 into a clean-but-divergent boundary error where Spark succeeds, and (b) risk the USING-join and correlated-subquery cases that rely on the permissive name-only fallback (`RelScope::of` leaves USING joins' scope empty by design; `collect_qualifier_bindings` STOPs there). F8/F10/F11 all live in the tier-(e)/(f) qualified-resolution path and are best fixed together as a dedicated attribute-lineage analyzer work item with full corpus validation, not squeezed into this cycle. **What's needed:** per-output-column source-qualifier sets threaded through `RelScope`/`analyze_node`, consulted by `resolve_column` before the name-only fallback.
 `emission.rs:647` — `strip_stranded_qualifiers` never checks the qualifier
 actually bound the referenced column, so a qualifier kept only by the
 analyzer's tier-(f) name-only fallback gets stripped instead of failing.
@@ -125,7 +127,9 @@ therefore fixed together with F8/F11/F12 in the error-semantics cluster
 (matching this report's own note that "8/10/11 need the fix direction
 decided first").
 
-### 11. Duplicate user alias on both join sides now silently binds LEFT — divergence window (PLAUSIBLE)
+### 11. Duplicate user alias on both join sides now silently binds LEFT — divergence window (PLAUSIBLE→CONFIRMED) — **DEFERRED 2026-07-10 (qualified-resolution rework, with F8/F10)**
+**Empirical Spark 4.1.1:** `emp.alias('x').join(emp2.alias('x'), x.id==x.id).select(col('x.salary'))` → `AMBIGUOUS_REFERENCE` (`Reference x.id is ambiguous, could be: [x.id, x.id]`) — Spark rejects the qualified ref (even in the ON clause) when the qualifier binds both sides. τ resolves first-match (left).
+**Why deferred:** the fix is an ambiguity check for QUALIFIED refs — when a qualifier binds 2+ scopes, raise `AmbiguousColumn` instead of falling through to the name-only fallback. But `RelScope::lookup` deliberately returns `None` on 2+ matches and the caller falls back to the legacy name-only path; a test (`self_join_duplicate_alias_binding_falls_back_to_legacy_no_panic`) pins that fallback for the bare-table-name self-join shape (where Spark's outcome is UNRESOLVED, not AMBIGUOUS — a different class). Adding the 2+-binding ambiguity check is therefore entangled with self-join / table-name resolution semantics and shares the tier-(e)/(f) path with F8/F10. Done as part of the same qualified-resolution / attribute-lineage rework, with full self-join + join-corpus revalidation. **What's needed:** `RelScope` match-count (0 / 1 / 2+) distinguishing UnknownColumn vs resolve vs AmbiguousColumn, Spark-class-matched per shape.
 `emission.rs:359` — the new dup-alias guard re-wraps the right side, so
 `x.salary` binds the left where the old code failed loudly (`AS x … AS x` →
 DuckDB duplicate-alias error). When the name exists on BOTH sides the
@@ -134,7 +138,7 @@ runs only for unqualified refs) → τ returns left-side data where Spark
 raises AMBIGUOUS_REFERENCE. (Name-unique case matches Spark — the guard is
 a fix there.)
 
-### 12. Stranded `q.*` emits an opaque engine error across the wire — error category (CONFIRMED, empirical)
+### 12. Stranded `q.*` emits an opaque engine error across the wire — error category (CONFIRMED, empirical) — **FIXED 2026-07-10** (Spark parity: SUCCESS). `build_project`'s wrap path now rewrites a stranded WHOLE-RELATION qualified star (`q.*` where the pre-wrap block exposes `q` and `q` binds exactly one full-range `input.scope` entry) to bare `*`, so it binds to `__td_sub` and returns all columns — the star analog of the F9/filt strand strip. Empirically Spark 4.1.1 SUCCEEDS (all columns); witness `proj-016` flips red→PASSED. Documented residual (un-witnessed): a PARTIAL-range stranded star (one join side) is left verbatim — bare-name expansion could collide with the other side's duplicate names under the wrap, and joins normally keep aliases exposed so they do not strand here.
 `analyzer.rs:4004` — qualified-star now resolves through passthrough
 scopes, but stars are never rewritten at wrap boundaries, so
 `df.alias('e').orderBy('id').limit(2).select('e.*')` sends gRPC INTERNAL

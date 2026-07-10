@@ -239,6 +239,12 @@ case("proj-015", "projection", "chained withColumn (5 deep)", lambda I: (I["emp"
     .withColumn("c1", F.col("age") + 1).withColumn("c2", F.col("c1") * 2)
     .withColumn("c3", F.col("c2") - 3).withColumn("c4", F.col("c3") % 7)
     .withColumn("c5", F.col("c4").cast("string"))))
+# proj-016 (F12): a relation-qualified star `e.*` over an orderBy/limit-wrapped
+# block. The select can't merge below the occupied LIMIT, so it wraps under
+# `__td_sub`; `e.*` then strands (emission renders it verbatim, never rewrites
+# stars at wrap boundaries) → opaque DuckDB binder error over gRPC. Spark
+# succeeds (all columns, 2 rows); τ must return the same, cleanly.
+case("proj-016", "projection", "qualified star over limit-wrapped block (F12 star-strand witness)", lambda I: I["emp"].alias("e").orderBy("id").limit(2).select("e.*"))
 
 # ── 2. Filtering & predicates ──────────────────────────────────────────────
 case("filt-001", "filter", "filter by Column predicate", lambda I: I["emp"].filter(F.col("age") > 30))

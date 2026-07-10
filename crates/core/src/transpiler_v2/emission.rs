@@ -1018,6 +1018,52 @@ fn render_project_merge_slots(
     })
 }
 
+/// Wrap-boundary star rewrite (F12): [`strip_stranded_qualifiers`] never
+/// touches a `Star` (`q.*` has no bare-name equivalent for a reshaped output,
+/// per its doc), so a stranded relation-qualified star sails through
+/// untouched and `render_star` emits `q.*` verbatim over `__td_sub` — a
+/// qualifier DuckDB can no longer bind once the wrap buries the pre-wrap
+/// block's own FROM alias (`Referenced table "q" not found`). The strand
+/// precondition mirrors [`strip_stranded_qualifiers`]'s own: the PRE-wrap
+/// `block` must actually expose `q` (`block.exposes(q)`) — that is precisely
+/// what the wrap is about to bury; a `q` the pre-wrap block does NOT expose
+/// is a correlated OUTER reference (resolved outward through the wrap by
+/// DuckDB's correlated binder) and must stay qualified verbatim.
+///
+/// Given the strand precondition holds, the rewrite itself is safe only when
+/// `q` covers the WHOLE input relation — exactly one
+/// [`RelScope`](super::analyzer::RelScope) alias entry named `q`, spanning
+/// the full `0..input.resolved_schema.len()` range — because then the wrap's
+/// output IS exactly that input's columns, positionally: `q.*` is
+/// semantically the bare `*` over `__td_sub`. `q` binding a PARTIAL range
+/// (one side of a join) is left untouched: expanding it to bare names could
+/// collide with the other side's duplicate names under the wrap (documented
+/// residual, un-witnessed — a join side's own alias usually stays exposed
+/// through the wrap and so rarely strands here at all). `q` binding 2+
+/// ranges is ambiguous and is likewise left untouched.
+fn expand_stranded_whole_relation_star(
+    expr: &Expression,
+    block: &SelectBlock,
+    input: &TypedAst,
+) -> Expression {
+    if let Expression::Star(StarExpression { qualifier: Some(q) }) = expr {
+        if block.exposes(q) {
+            let full = 0..input.resolved_schema.len();
+            let mut matching = input
+                .scope
+                .aliases
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case(q));
+            if let (Some((_, range)), None) = (matching.next(), matching.next()) {
+                if *range == full {
+                    return Expression::Star(StarExpression { qualifier: None });
+                }
+            }
+        }
+    }
+    expr.clone()
+}
+
 fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit, EmissionError> {
     // A lone unqualified `*` is a pure identity projection: return the child
     // unit verbatim (ADR-001 cosmetic "SELECT * over SELECT *" collapse).
@@ -1037,7 +1083,8 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
     }
     let projections: Vec<Expression> = projections
         .iter()
-        .map(|p| strip_stranded_qualifiers(p, &block, &input.resolved_schema))
+        .map(|p| expand_stranded_whole_relation_star(p, &block, input))
+        .map(|p| strip_stranded_qualifiers(&p, &block, &input.resolved_schema))
         .collect();
     trace_stranded_qualifiers(&block, &projections, &input.scope);
     let mut wrapped = SelectBlock::wrap(block.into());
@@ -6650,6 +6697,67 @@ mod tests {
         assert!(
             !sql.contains("e.salary"),
             "stranded projection must be stripped to the bare output name, got: {sql}"
+        );
+    }
+
+    /// proj-016 (F12): `emp.alias("e").orderBy("id").limit(2).select("e.*")`
+    /// — the select cannot merge below the occupied LIMIT slot, so
+    /// `build_project` wraps under `__td_sub`. Confirmed via a temporary
+    /// probe that `analyze` keeps the projection as `Star{qualifier:
+    /// Some("e")}` all the way into `build_project` (no analyzer-side
+    /// pre-expansion): before the fix, this dispatched to
+    /// `SELECT e.* FROM (...) AS __td_sub ...` — an unbindable qualifier
+    /// (DuckDB: `Referenced table "e" not found`). After the fix, `e.*`
+    /// (which covers the WHOLE input relation) expands to the bare `*`.
+    #[test]
+    fn qualified_star_over_limit_wrap_expands_to_bare_star() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Sort {
+                input: Box::new(aliased_scan("emp", "e")),
+                order: vec![asc_key(qcol("e", "id"))],
+                limit: Some(2),
+                offset: None,
+            })),
+            projections: vec![Expression::Star(StarExpression {
+                qualifier: Some("e".to_owned()),
+            })],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT * FROM emp AS e ORDER BY e.id ASC NULLS FIRST LIMIT 2) AS __td_sub",
+            "got: {sql}"
+        );
+        assert!(
+            !sql.contains("e.*"),
+            "no stranded qualified star, got: {sql}"
+        );
+    }
+
+    /// Regression (merge path): `emp.alias("e").select("e.*")` with no
+    /// occupied slots ahead of it merges straight into the aliased scan's
+    /// still-open block, which still exposes `e` — the fix's wrap-only gate
+    /// (`block.exposes(q)` checked against the PRE-wrap block, only reached
+    /// on the wrap path) must not perturb this merge-path rendering.
+    #[test]
+    fn qualified_star_that_merges_keeps_alias() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased_scan("emp", "e")),
+            projections: vec![Expression::Star(StarExpression {
+                qualifier: Some("e".to_owned()),
+            })],
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(sql, "SELECT e.* FROM emp AS e", "got: {sql}");
+        assert!(
+            !sql.contains("__td_sub"),
+            "merge path must not wrap, got: {sql}"
         );
     }
 

@@ -97,7 +97,8 @@ impl TypedAst {
     /// stamped; the scope derivation is therefore shallow (reads children's
     /// `scope` fields, never re-walks subtrees).
     pub fn new(op: TypedOp, resolved_schema: StructType) -> Self {
-        let scope = RelScope::of(&op, &resolved_schema);
+        let mut scope = RelScope::of(&op, &resolved_schema);
+        scope.source_quals = source_quals_of(&op, &resolved_schema);
         Self {
             op,
             resolved_schema,
@@ -134,7 +135,7 @@ macro_rules! scope_passthrough {
 ///
 /// Ranges are relative to THIS node's schema (base 0); consumers offset when
 /// composing (a join's right side shifts by the left side's field count).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct RelScope {
     /// `(qualifier, field-range)` bindings, in tree order.
     pub aliases: Vec<(String, std::ops::Range<usize>)>,
@@ -155,6 +156,26 @@ pub struct RelScope {
     /// repeated at multiple NESTING levels on the SAME side (outermost-wins,
     /// see `plan_ids` above) — that case never lands here.
     ambiguous_plan_ids: Vec<i64>,
+    /// ADR-023 tier 3: per-OUTPUT-column source-qualifier lineage (Spark attribute
+    /// lineage). `source_quals[i]` = the set of relation qualifiers output column `i`
+    /// inherits. A passthrough ColumnReference inherits its source column's set; an
+    /// Alias/computed column inherits ∅. Populated by `source_quals_of` in
+    /// `TypedAst::new`; derived, so EXCLUDED from PartialEq. Invariant:
+    /// `source_quals.len() == resolved_schema.len()` for every node.
+    pub source_quals: Vec<std::collections::BTreeSet<String>>,
+}
+
+/// Equality deliberately ignores `source_quals`: it is derived data, fully
+/// determined by `(op, resolved_schema)` (via `source_quals_of`), and
+/// existing scope-equality tests assert equality over the binding facts
+/// (`aliases` / `plan_ids` / `ambiguous_plan_ids`) only. Mirrors
+/// `ColumnReference`'s hand-written `PartialEq` excluding `ordinal`.
+impl PartialEq for RelScope {
+    fn eq(&self, other: &Self) -> bool {
+        self.aliases == other.aliases
+            && self.plan_ids == other.plan_ids
+            && self.ambiguous_plan_ids == other.ambiguous_plan_ids
+    }
 }
 
 impl RelScope {
@@ -244,12 +265,16 @@ impl RelScope {
                     aliases,
                     plan_ids: Vec::new(),
                     ambiguous_plan_ids: Vec::new(),
+                    // Populated by `source_quals_of` in `TypedAst::new`.
+                    source_quals: Vec::new(),
                 }
             }
             TypedOp::AliasedRelation { alias, .. } => Self {
                 aliases: vec![(alias.clone(), 0..resolved_schema.len())],
                 plan_ids: Vec::new(),
                 ambiguous_plan_ids: Vec::new(),
+                // Populated by `source_quals_of` in `TypedAst::new`.
+                source_quals: Vec::new(),
             },
             TypedOp::Join {
                 using_columns,
@@ -319,6 +344,8 @@ impl RelScope {
                     aliases,
                     plan_ids,
                     ambiguous_plan_ids,
+                    // Populated by `source_quals_of` in `TypedAst::new`.
+                    source_quals: Vec::new(),
                 }
             }
             scope_passthrough!(input) => input.scope.clone(),
@@ -363,6 +390,159 @@ impl RelScope {
             | TypedOp::RecursiveCte { .. } => Self::default(),
         }
     }
+}
+
+/// ADR-023 tier 3c — derive the per-OUTPUT-column source-qualifier lineage a
+/// just-built operator's schema carries. Shallow, like [`RelScope::of`]:
+/// children are already stamped, so this reads their `scope.source_quals`
+/// and never re-walks a subtree. ADDITIVE-only (this chunk): not yet
+/// consulted by `resolve_column` or emission.
+///
+/// Exhaustively matches `TypedOp` (no `_`) so a new variant is a compile
+/// error here until classified.
+fn source_quals_of(
+    op: &TypedOp,
+    resolved_schema: &StructType,
+) -> Vec<std::collections::BTreeSet<String>> {
+    use std::collections::BTreeSet;
+
+    let empty_set = || vec![BTreeSet::new(); resolved_schema.len()];
+
+    let out = match op {
+        TypedOp::TableScan { table, alias } => {
+            let mut quals = BTreeSet::new();
+            quals.insert(table.clone());
+            if let Some(a) = alias {
+                quals.insert(a.clone());
+            }
+            vec![quals; resolved_schema.len()]
+        }
+        TypedOp::AliasedRelation { alias, .. } => {
+            let mut quals = BTreeSet::new();
+            quals.insert(alias.clone());
+            vec![quals; resolved_schema.len()]
+        }
+        scope_passthrough!(input) => input.scope.source_quals.clone(),
+        TypedOp::Project { input, projections } => {
+            if projections
+                .iter()
+                .any(|p| matches!(p, Expression::Star(_)))
+            {
+                // Star note (ADR-023 3c plan): precisely expanding `Star`/
+                // `q.*` to a column count is deferred to 3d/3e. The
+                // size-correct empty fallback keeps the invariant AND stays
+                // corpus-neutral (3d reads ∅ → conservative unknown path).
+                empty_set()
+            } else {
+                let mapped: Vec<BTreeSet<String>> = projections
+                    .iter()
+                    .map(|p| match p {
+                        Expression::ColumnReference(cr) => match cr.ordinal {
+                            Some(k) if k < input.scope.source_quals.len() => {
+                                let mut quals = input.scope.source_quals[k].clone();
+                                if let Some(q) = &cr.qualifier {
+                                    quals.insert(q.clone());
+                                }
+                                quals
+                            }
+                            _ => BTreeSet::new(),
+                        },
+                        // Alias/computed columns are created — no inherited
+                        // lineage. filt-019/F8 hinge.
+                        _ => BTreeSet::new(),
+                    })
+                    .collect();
+                if mapped.len() == resolved_schema.len() {
+                    mapped
+                } else {
+                    // Defensive: projection-list length should always match
+                    // the (non-Star) output schema length; fall back rather
+                    // than mis-align if that invariant is ever violated.
+                    empty_set()
+                }
+            }
+        }
+        TypedOp::Join {
+            using_columns,
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            if !using_columns.is_empty() {
+                // TODO(ADR-023 3d/3e): USING output reorders/dedups columns,
+                // so no positional lineage holds yet — fill this in before
+                // the USING legacy name-only resolution path is retired.
+                empty_set()
+            } else if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+                left.scope.source_quals.clone()
+            } else {
+                let mut quals = left.scope.source_quals.clone();
+                quals.extend(right.scope.source_quals.iter().cloned());
+                quals
+            }
+        }
+        TypedOp::Aggregate {
+            input,
+            grouping,
+            aggregates,
+            ..
+        } => {
+            // The resolved_schema is grouping cols then aggregate cols
+            // (CommonOp::Aggregate ordering) ONLY when the SparkSQL path has
+            // not already folded grouping into `aggregates` — that fold
+            // isn't visible here, so guard on length instead of guessing.
+            if grouping.len() + aggregates.len() == resolved_schema.len() {
+                let mut quals: Vec<BTreeSet<String>> = grouping
+                    .iter()
+                    .map(|g| match g {
+                        Expression::ColumnReference(cr) => match cr.ordinal {
+                            Some(k) if k < input.scope.source_quals.len() => {
+                                input.scope.source_quals[k].clone()
+                            }
+                            _ => BTreeSet::new(),
+                        },
+                        _ => BTreeSet::new(),
+                    })
+                    .collect();
+                // Aggregate output columns are created — no inherited lineage.
+                quals.extend(aggregates.iter().map(|_| BTreeSet::new()));
+                quals
+            } else {
+                empty_set()
+            }
+        }
+        // TODO(ADR-023 3d/3e): a set operation's output positionally aligns
+        // with its first child (by construction of the widened schema);
+        // real per-column lineage is deferred — stay neutral for now.
+        TypedOp::SetOp { .. }
+        // TODO(ADR-023 3d/3e): `LateralView`'s input columns are positionally
+        // unchanged (generated columns appended) — real lineage deferred.
+        | TypedOp::LateralView { .. }
+        // TODO(ADR-023 3d/3e): `WithColumns` is positional passthrough for
+        // untouched input columns — real lineage deferred.
+        | TypedOp::WithColumns { .. }
+        // TODO(ADR-023 3d/3e): `WithColumnsRenamed` is a pure positional
+        // passthrough (renames only) — real lineage deferred.
+        | TypedOp::WithColumnsRenamed { .. }
+        // TODO(ADR-023 3d/3e): `DropColumns` is positional passthrough minus
+        // the dropped columns — real lineage deferred.
+        | TypedOp::DropColumns { .. }
+        | TypedOp::SingleRow
+        | TypedOp::Values { .. }
+        | TypedOp::LocalRelation { .. }
+        | TypedOp::FileScan { .. }
+        | TypedOp::TableFunction { .. }
+        | TypedOp::Unnest { .. }
+        | TypedOp::Describe { .. }
+        | TypedOp::Summary { .. }
+        | TypedOp::FreqItems { .. }
+        | TypedOp::Unpivot { .. }
+        | TypedOp::Pivot { .. }
+        | TypedOp::RecursiveCte { .. } => empty_set(),
+    };
+    debug_assert_eq!(out.len(), resolved_schema.len());
+    out
 }
 
 /// τ's typed operator set — the analyzer output shape.
@@ -3655,6 +3835,10 @@ impl<'a> ResolveContext<'a> {
                 aliases,
                 plan_ids,
                 ambiguous_plan_ids,
+                // Compile fix only (ADR-023 3c): this synthetic composite
+                // scope is resolution-time-only and never flows through
+                // `TypedAst::new`'s `source_quals_of` stamping.
+                source_quals: Vec::new(),
             }),
             base_types,
             outer,
@@ -5272,6 +5456,8 @@ fn infer_values_schema(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::super::analyzer_fixtures;
     use super::super::ast::CommonAst;
     use super::super::expression::{
@@ -6192,6 +6378,118 @@ mod tests {
             },
             _ => panic!("expected Project"),
         }
+    }
+
+    // ── ADR-023 tier 3c — per-output-column source-qualifier lineage ─────
+    // Additive, dormant field: `source_quals_of` stamps `scope.source_quals`
+    // in `TypedAst::new`. Not yet consulted by `resolve_column` or emission
+    // (that is 3d); these tests pin the derivation itself.
+
+    #[test]
+    fn source_quals_aliased_relation_binds_every_col_to_alias() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
+        assert_eq!(typed.scope.source_quals, vec![e; 4]);
+    }
+
+    #[test]
+    fn source_quals_project_passthrough_column_inherits_source() {
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        // SELECT e.dept_id, e.name FROM (emp AS e)
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased),
+            projections: vec![qcol("e", "dept_id"), qcol("e", "name")],
+        });
+        let typed = analyze(project, &bt).unwrap();
+        let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
+        assert_eq!(typed.scope.source_quals, vec![e.clone(), e]);
+    }
+
+    #[test]
+    fn source_quals_project_alias_creates_empty_lineage() {
+        // filt-019/F8 hinge: an Alias'd projection is a CREATED column — it
+        // does NOT inherit its source's qualifier set, even though the
+        // aliased expression is itself a plain passthrough column.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        // SELECT dept_id AS k FROM (emp AS e)
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased),
+            projections: vec![alias_expr(unresolved_col("dept_id"), "k")],
+        });
+        let typed = analyze(project, &bt).unwrap();
+        assert_eq!(typed.scope.source_quals, vec![BTreeSet::new()]);
+    }
+
+    #[test]
+    fn source_quals_plain_join_composes_left_and_right() {
+        // emp e JOIN dept d ON e.dept_id = d.dept_id — TableScan{alias}'s
+        // rule binds BOTH the table name and the alias to every column.
+        let bt = base_types_with_emp_dept();
+        let typed = analyze(emp_dept_aliased_join(), &bt).unwrap();
+        let e: BTreeSet<String> = ["emp".to_owned(), "e".to_owned()].into_iter().collect();
+        let d: BTreeSet<String> = ["dept".to_owned(), "d".to_owned()].into_iter().collect();
+        let mut expected = vec![e; 4];
+        expected.extend(vec![d; 2]);
+        assert_eq!(typed.scope.source_quals, expected);
+    }
+
+    #[test]
+    fn source_quals_aggregate_grouping_col_inherits_source_aggregate_col_empty() {
+        // df.groupBy("dept_id").count() shape — grouping col inherits its
+        // source's qualifier set, the created `count` output col does not.
+        let bt = base_types_with_emp_dept();
+        let ast = aggregate(
+            scan("emp"),
+            vec![unresolved_col("dept_id")],
+            vec![func("count", vec![int_lit(1)])],
+        );
+        let typed = analyze(ast, &bt).unwrap();
+        let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
+        assert_eq!(typed.scope.source_quals, vec![emp, BTreeSet::new()]);
+    }
+
+    #[test]
+    fn source_quals_length_invariant_holds_for_star_projection() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        assert_eq!(typed.scope.source_quals.len(), typed.resolved_schema.len());
+        assert!(typed.scope.source_quals.iter().all(BTreeSet::is_empty));
+    }
+
+    #[test]
+    fn source_quals_length_invariant_holds_for_using_join() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Join {
+            left: Box::new(emp_scan()),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        assert_eq!(typed.scope.source_quals.len(), typed.resolved_schema.len());
+        assert!(typed.scope.source_quals.iter().all(BTreeSet::is_empty));
     }
 
     // ── Pass 106 — uncorrelated subquery analysis ────────────────────────

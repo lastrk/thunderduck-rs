@@ -13,6 +13,32 @@ Severity legend: **corruption** = silently wrong data on the wire;
 **regression** = green before this branch, red after; **divergence** =
 τ succeeds/errs where Spark does the opposite; **infra** = gate integrity.
 
+## Closure status (2026-07-10)
+
+All 15 findings resolved — **11 FIXED, 4 DEFERRED** (each with a recorded
+rationale and, where relevant, the empirical Spark 4.1.1 behavior and what a
+correct fix requires):
+
+- **FIXED:** F1–F5 (USING/default_projections corruption cluster), F6 (runner
+  guard), F7 (duplicate `__td_jr`), F9 (aggregate wrap-path strand; lateral
+  half verified unreachable), F12 (qualified-star wrap-boundary strand), F13
+  (reserved-qualifier panic → clean `UnknownColumn`), F15 (`SelectBlock.scope`
+  simplification).
+- **DEFERRED (attribute-lineage / qualified-resolution cluster):** F8
+  (`e.k` created-alias must ERROR) and F10 (`e.name` projected-through must
+  SUCCEED) are opposite horns of the same tier-(f) fallback — identical τ
+  input, opposite Spark outcomes — separable only with Spark attribute-lineage
+  qualifier tracking; F11 (dup-alias-both-sides ambiguity) shares that
+  resolution path and entangles with self-join semantics. A dedicated,
+  fully-gated analyzer work item.
+- **DEFERRED (hygiene):** F14 (unify the three qualifier walkers) — a
+  cross-module refactor of load-bearing walkers, not a mechanical dedup.
+
+Witnesses (manifest `select_block_witness_manifest.json`): 10/10 green
+(join-018/019/020/021/022, cx-015/016, jn-023, agg-025, proj-016). Every
+FIXED cycle gated on `witness-progress.sh`: **0 regressions** against the
+719-case baseline.
+
 ## Confirmed findings
 
 ### 1. `drop()` over a USING join returns silently mislabeled data — corruption (CONFIRMED, empirical) — **FIXED 2026-07-09** (structured `DefaultSlot` list; drop filters slots by name — witness join-018 green)
@@ -97,7 +123,7 @@ the wrap decision, unstripped (`build_lateral_view` likewise).
 filt-016 witness item 3 fixes. (Empirically confirmed Spark 4.1.1 SUCCEEDS:
 `struct<dept_id:int,count:bigint>`, 3 rows.)
 
-### 10. Strand class also leaks through the MERGE path (CONFIRMED) — **REGROUPED with F8/F11 (2026-07-10): shares the tier-(f) attribute-lineage root cause; deferred to the error-semantics cluster.**
+### 10. Strand class also leaks through the MERGE path (CONFIRMED) — **DEFERRED 2026-07-10 (regrouped with F8/F11: shares the tier-(f) attribute-lineage root cause).**
 `emission.rs:753` — a scope-unbound qualifier is vis-exempt, so a second
 filter merges WHERE-onto-WHERE onto an already-wrapped block; no wrap ⇒ no
 strip. `emp.alias('e').select('e.dept_id','e.name').distinct()
@@ -175,7 +201,7 @@ strand fix (F5/F9/F12/item-3) depends on — worth doing as a dedicated,
 fully-gated pass, not folded into this cycle. Pure quality (no behavior change);
 tracked here. F15 (below) is done.
 
-### 15. `SelectBlock.scope` double-bookkeeps `FromItem::exposed()` — simplification (CONFIRMED)
+### 15. `SelectBlock.scope` double-bookkeeps `FromItem::exposed()` — simplification (CONFIRMED) — **FIXED 2026-07-10** (removed the hand-maintained `scope: Vec<String>` field; `exposes()` derives from `self.from.exposed()` — single visibility authority. Pure refactor, 979/979 tests unchanged, gate 0 regressions.)
 `sql_block.rs:203` — the merge-visibility authority (`exposes()`) is a
 stored copy maintained by hand in `from_item`/`extend_from`; a future
 mutation of `from` without mirroring `scope` silently mis-merges. Deriving

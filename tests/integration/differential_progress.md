@@ -34,3 +34,4 @@ Supersedes the per-corpus ledgers `v2_progress.md` and `v2_sql_progress.md`
 > SELECT-block emission refactor: +32 vs the same-day baseline with zero
 > per-case regressions (verified by full per-case log diff).
 | 2026-07-09T20:10:44Z | 0b944bd |   378/389 |    341/400 | 574/625 |   1293 |    121 |       0 |  1414 |       +8 |
+| 2026-07-10T01:17:44Z | 1d32e1d |   385/396 |    344/403 | 585/641 |   1314 |    121 |       5 |  1440 |      +21 |

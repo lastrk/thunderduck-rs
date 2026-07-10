@@ -224,10 +224,10 @@ pub struct ColumnReference {
     pub qualifier: Option<String>,
     pub data_type: Option<DataType>,
     pub nullable: Option<bool>,
-    /// ADR-023 tier 3: 0-based position of the resolved column in the
+    /// 0-based position of the resolved column in the
     /// PRODUCING node's output schema (`ctx.schema` at resolution time).
     /// `None` when resolution did not pin a position (pre-analysis
-    /// `untyped`, or a tier that resolves by name/outer-scope only).
+    /// `untyped`, or a name/outer-scope-only resolution).
     /// Derived data — excluded from `PartialEq` (see below).
     pub ordinal: Option<usize>,
 }

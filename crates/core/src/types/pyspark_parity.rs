@@ -55,12 +55,12 @@ pub fn dedup_names(names: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// ADR-023 tier 1 — the SUBSTRATE name-plane uniquify: rename entries so the
+/// The SUBSTRATE name-plane uniquify: rename entries so the
 /// result is GUARANTEED unique within the list (collision-safe), deterministic,
 /// and stable in appearance order. Unlike [`dedup_names`] (which reproduces
 /// PySpark's wire `_dedup_names` convention and is NOT collision-safe, e.g.
 /// `["a","a","a_0"] -> ["a_0","a_1","a_0"]`), this is for INTERNAL emitted-SQL
-/// names only (subquery SELECT-list aliases, per ADR-023 tier 2) and must never
+/// names only (subquery SELECT-list aliases) and must never
 /// touch `resolved_schema` or the outbound wire stamp (ADR-005 dup-name parity).
 /// An already-unique input is returned unchanged. On collision the suffix
 /// counter keeps advancing past any name already present in the (original or

@@ -318,7 +318,7 @@ impl SelectBlock {
         })
     }
 
-    /// ADR-023 tier 2: like [`wrap`], but the derived table's exposed
+    /// Like [`wrap`], but the derived table's exposed
     /// columns are the caller-supplied UNIQUE names, positionally —
     /// `(…) AS __td_sub(c0, c1, …)`, the SQL-92 derived-table
     /// column-alias-list — instead of `unit`'s own (possibly duplicate)
@@ -328,9 +328,9 @@ impl SelectBlock {
     /// any of them by bare name with no ambiguity — closing the one class
     /// `strip_stranded_qualifiers` cannot rewrite around. `unit`'s own
     /// SELECT list is untouched; only the derived table's exposed name list
-    /// changes, confirmed by an empirical DuckDB smoke check (ADR-023 tier
-    /// 2 plan) that the alias-list syntax binds positionally over a
-    /// duplicate-named inner projection.
+    /// changes, confirmed by an empirical DuckDB smoke check that the
+    /// alias-list syntax binds positionally over a duplicate-named inner
+    /// projection.
     pub(crate) fn wrap_reprojected(unit: SqlUnit, uniquified: &[String]) -> Self {
         let cols = uniquified
             .iter()

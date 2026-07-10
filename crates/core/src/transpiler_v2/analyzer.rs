@@ -161,7 +161,7 @@ impl RelScope {
     /// ALL field ranges bound to `q`, case-insensitively, in tree order.
     /// Distinguishes 0 / 1 / 2+ matches — [`RelScope::lookup`] collapses 2+
     /// into `None` for the legacy name-only fallback; callers that must
-    /// raise `AmbiguousColumn` on 2+ (tier e/f in `resolve_column`) use this
+    /// raise `AmbiguousColumn` on 2+ (in `resolve_column`) use this
     /// instead.
     fn lookup_all(&self, q: &str) -> Vec<std::ops::Range<usize>> {
         self.aliases
@@ -3472,8 +3472,8 @@ fn resolve_expr_list(
 
 /// Analyze an embedded subquery's inner plan. Builds an [`OuterScope`] from
 /// the enclosing [`ResolveContext`] so that correlated references to columns
-/// present ONLY in the outer plan's schema resolve correctly (tier (g) in
-/// [`resolve_column`]). The outer scope REPLACES (does not chain onto)
+/// present ONLY in the outer plan's schema resolve correctly in
+/// [`resolve_column`]. The outer scope REPLACES (does not chain onto)
 /// whatever outer the enclosing context had — a doubly-nested subquery's
 /// inner plan only ever sees its immediate parent's scope, never a
 /// grandparent's.
@@ -3678,8 +3678,8 @@ impl<'a> ResolveContext<'a> {
     /// an analyzer invariant violation — surface it loudly in debug builds,
     /// but degrade to `None` (the caller's legacy fallback) in release
     /// rather than panicking on the index. Shared by the synthetic
-    /// `__td_jl`/`__td_jr` join-qualifier arm and tier (e) in
-    /// `resolve_column`, so both get the identical guard.
+    /// `__td_jl`/`__td_jr` join-qualifier arm and the `resolve_column` logic,
+    /// so both get the identical guard.
     fn scoped_range(&self, q: &str) -> Option<std::ops::Range<usize>> {
         self.scopes.lookup(q).filter(|range| {
             let in_bounds = range.end <= self.schema.len();
@@ -3778,7 +3778,7 @@ fn try_rewrite_nested_struct_path(u: &UnresolvedColumn, schema: &StructType) -> 
 }
 
 /// Attempt to resolve an [`UnresolvedColumn`] against the outer (enclosing)
-/// plan's scope. Used as a final fallback (tier (g)) in [`resolve_column`]
+/// plan's scope. Used as a final fallback in [`resolve_column`]
 /// when ALL inner tiers have failed — i.e. the column name+qualifier does not
 /// match anything in the inner plan's schema.
 ///
@@ -3790,7 +3790,7 @@ fn try_rewrite_nested_struct_path(u: &UnresolvedColumn, schema: &StructType) -> 
 fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<(DataType, bool)> {
     if let Some(q) = u.qualifier.as_deref() {
         // Struct-column precedence in the outer schema (matches resolve_column's
-        // existing tier ordering).
+        // existing ordering).
         if let Some(info) = TypeInferenceEngine::struct_qualifier_info(&u.name, q, outer.schema) {
             return Some(info);
         }
@@ -3817,7 +3817,7 @@ fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<(Data
     }
 }
 
-/// ADR-023 tier 3: 0-based position of the field that resolves `name` within
+/// 0-based position of the field that resolves `name` within
 /// `fields` (first case-insensitive match), mirroring
 /// [`TypeInferenceEngine::column_info_in`]'s own lookup order — exact name
 /// first, then the struct-qualified first segment for a dotted name — so the
@@ -3949,7 +3949,7 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     }
     let (dt, nullable, ordinal) = if is_synthetic_join_qualifier {
         let q = u.qualifier.as_deref().unwrap_or_default();
-        // `scoped_range` mirrors tier (e) below: `q` spells a reserved
+        // `scoped_range` mirrors the behavior below: `q` spells a reserved
         // synthetic qualifier (`__td_jl`/`__td_jr`), but the analyzer only
         // ever binds a scope for it inside a join condition, via
         // `ResolveContext::for_join_condition`. Both misses below therefore
@@ -6105,7 +6105,6 @@ mod tests {
         assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
     }
 
-    // ── ADR-023 tier 3a — resolved `ordinal` on ColumnReference ──────────
     // Additive, dormant field: `resolve_column` stamps the 0-based position
     // of the resolved column within the producing node's `ctx.schema`.
     // Emission ignores it (dormant until a later ADR-023 sub-chunk); these
@@ -6134,10 +6133,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_column_ordinal_qualified_tier_e_matches_schema_index() {
+    fn resolve_column_ordinal_qualified_join_scope_matches_schema_index() {
         let bt = base_types_with_emp_dept();
         // SELECT d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id
-        // — tier (e): qualifier `d` binds the join's right-side scope range
+        // — qualifier `d` binds the join's right-side scope range
         // (dept fields start at absolute index 4 in the merged schema).
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(emp_dept_aliased_join()),
@@ -6530,7 +6529,7 @@ mod tests {
 
     /// Inner-precedence regression: when a column name exists in BOTH
     /// the inner and outer schemas with DIFFERENT types, the inner type
-    /// must win (tier (f) resolves before tier (g)). This protects the 13
+    /// must win. This protects the 13
     /// existing green correlated subquery cases.
     #[test]
     fn correlated_subquery_inner_type_takes_precedence_over_outer() {
@@ -6547,8 +6546,8 @@ mod tests {
         //     SELECT dept_id FROM dept d WHERE d.dept_id = e.dept_id
         // )
         // The inner `dept_id` unqualified reference matches dept's Integer column.
-        // The inner `e.dept_id` should resolve via tier (f) (name-only fallback
-        // finds `dept_id` in the inner schema) and be stamped as Integer (the
+        // The inner `e.dept_id` should resolve via name-only fallback
+        // (finds `dept_id` in the inner schema) and be stamped as Integer (the
         // inner type), NOT Long (the outer type).
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
@@ -6559,8 +6558,8 @@ mod tests {
                 condition: Expression::Binary(BinaryExpression {
                     op: BinaryOp::Eq,
                     left: Box::new(qcol("d", "dept_id")),
-                    // e.dept_id: qualifier `e` not bound in inner scope → tier (f)
-                    // name-only lookup finds `dept_id` in dept's schema → Integer.
+                    // e.dept_id: qualifier `e` not bound in inner scope → name-only fallback
+                    // (finds `dept_id` in dept's schema → Integer).
                     right: Box::new(qcol("e", "dept_id")),
                 }),
             })),
@@ -6621,7 +6620,7 @@ mod tests {
     /// Qualifier-strictness: a qualified outer reference whose qualifier
     /// binds NO scope in the outer context, but whose bare name exists in
     /// the outer schema, must still fail as UnknownColumn. This locks the
-    /// "no name-only scan in the outer tier" invariant.
+    /// "no name-only scan in the outer scope" invariant.
     #[test]
     fn correlated_subquery_qualified_outer_ref_with_unbound_qualifier_fails() {
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
@@ -9699,7 +9698,7 @@ mod tests {
     fn unqualified_duplicate_name_over_join_is_ambiguous() {
         // `dept_id` exists on both sides of `emp e CROSS JOIN dept d` — an
         // UNQUALIFIED reference must still raise `AmbiguousColumn`, exactly
-        // as before this pass (tier (c) is unchanged).
+        // as before this pass.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(join(
@@ -9823,7 +9822,7 @@ mod tests {
         // `emp` has a top-level STRUCT column named `address`; alias the
         // `emp` scan itself as `address` too, so the qualifier `address` is
         // BOTH a relation alias (whole-schema range) AND a struct column
-        // name. Tier (d) — struct-column qualifier — must still win: the
+        // name. The struct-column qualifier must still win: the
         // reference resolves as `address.city` (a struct field), not as
         // relation-alias lookup for a top-level `city` column (which does
         // not exist and would raise `UnknownColumn` if alias precedence won).

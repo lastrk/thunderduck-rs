@@ -679,11 +679,11 @@ fn build_aggregate(
     );
     let merge = block.can_accept(Clause::GroupBy) && vis;
 
-    // ADR-023 tier 2: activate the wrap-boundary reprojection only when the
+    // Activate the wrap-boundary reprojection only when the
     // wrapped child's output has a duplicate name — the one class
     // `strip_stranded_qualifiers` cannot rewrite around. `None` on the
     // common (already-unique) case keeps every branch below byte-identical
-    // to the pre-tier-2 strip path.
+    // to the existing strip path.
     let uniquified = output_uniquified(input_schema);
     // Choose the expression set to render from: the originals when merging
     // (no cosmetic churn), or each stripped/reprojected against the
@@ -917,7 +917,7 @@ fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
 ///   binder resolves it OUTWARD straight through the wrap, so it must stay
 ///   qualified verbatim;
 /// - `q` does not double as a struct-column access on the child's output
-///   (`resolve_column`'s struct-precedence tier): struct access survives a
+///   (`resolve_column`'s struct-precedence): struct access survives a
 ///   wrap as column-dot-field syntax, so it needs no rewrite and stripping
 ///   would misread the field name as a column; and
 /// - `c` names exactly one output column case-insensitively — an ambiguous
@@ -974,10 +974,10 @@ fn strip_stranded_qualifiers(
     rewritten
 }
 
-/// ADR-023 tier 2 activation gate: `schema`'s field names, [`uniquify`]d,
+/// Activation gate: `schema`'s field names, [`uniquify`]d,
 /// iff they contain a duplicate — `None` when the names are already unique,
 /// the common case. Every wrap site checks this FIRST and only reaches the
-/// tier-2 reprojection path (`wrap_reprojected` + [`reproject_qualifiers`])
+/// reprojection path (`wrap_reprojected` + [`reproject_qualifiers`])
 /// on `Some`; the `None` (common) case keeps the existing
 /// `SelectBlock::wrap` + [`strip_stranded_qualifiers`] pairing byte-for-byte
 /// unchanged, which is what confines the corpus delta to the duplicate-name
@@ -1011,7 +1011,7 @@ fn scope_position(
         .map(|offset| range.start + offset)
 }
 
-/// ADR-023 tier 2: the duplicate-output-name counterpart of
+/// The duplicate-output-name counterpart of
 /// [`strip_stranded_qualifiers`], paired with
 /// [`SelectBlock::wrap_reprojected`]. That wrap re-exposes the wrapped
 /// child's columns under `uniquified`'s names, positionally — so, unlike
@@ -1022,7 +1022,7 @@ fn scope_position(
 /// resolved position, which the reprojected wrap guarantees is bindable.
 ///
 /// A qualifier `input.scope` does NOT bind (the F10 dead-alias class) is
-/// left untouched — Tier 3's job — as is a `q` that doubles as a struct
+/// left untouched — as is a `q` that doubles as a struct
 /// column access on the input schema (mirrors `strip_stranded_qualifiers`'s
 /// own struct-precedence guard: struct access survives a wrap as
 /// column-dot-field syntax and needs no rewrite). Qualified stars are not
@@ -6718,19 +6718,17 @@ mod tests {
         );
     }
 
-    // ── ADR-023 tier 2: wrap-boundary re-projection over duplicate names ──
-    //
     // `output_uniquified` gates every wrap site's `strip_stranded_qualifiers`
     // vs. `reproject_qualifiers` choice on whether the wrapped child's
     // output has a duplicate name. The common (unique) case must render
-    // byte-identically to the pre-tier-2 shape; the duplicate case (see
+    // byte-identically to the pre-projection shape; the duplicate case (see
     // `ambiguous_output_name_wrap_reprojects_to_unique_position` above) must
     // reproject uniquely and rewrite the outer reference by position.
 
     /// The common case: the wrapped child's output names are already
     /// unique, so `output_uniquified` returns `None` and every wrap site
-    /// takes the pre-tier-2 `SelectBlock::wrap` + `strip_stranded_qualifiers`
-    /// path verbatim — zero delta on the shape tier 2 does not target.
+    /// takes the `SelectBlock::wrap` + `strip_stranded_qualifiers`
+    /// path verbatim — zero delta on the shape this optimization does not target.
     #[test]
     fn wrap_over_unique_names_is_unchanged() {
         let _g = tap_guard();
@@ -6757,7 +6755,7 @@ mod tests {
         );
     }
 
-    /// ADR-023 tier 2's namesake pin: a duplicate name across a self-join
+    /// A duplicate name across a self-join
     /// output forces `build_filter`'s wrap path onto `wrap_reprojected` +
     /// `reproject_qualifiers` instead of the (declining) strip path — the
     /// scope-resolvable `a.name` reference is rewritten to the unique
@@ -7006,10 +7004,10 @@ mod tests {
         );
     }
 
-    /// ADR-023 tier 2: a name appearing on BOTH sides of a self-join output
-    /// is ambiguous once bare-stripped to its ORIGINAL name — the pre-tier-2
+    /// A name appearing on BOTH sides of a self-join output
+    /// is ambiguous once bare-stripped to its ORIGINAL name — the previous
     /// fallback therefore left it qualified (a loud binder failure over the
-    /// buried `a` alias). Tier 2 instead reprojects the wrapped join under
+    /// buried `a` alias). The optimization instead reprojects the wrapped join under
     /// per-column unique names and rewrites `a.name` to the unique name at
     /// its position (`name`, the left side's first occurrence) — resolving
     /// correctly instead of failing loudly.
@@ -7081,7 +7079,7 @@ mod tests {
     }
 
     /// Keep-side: a qualifier that resolves as STRUCT-column access
-    /// (`resolve_column`'s struct-precedence tier) survives the wrap as
+    /// (`resolve_column`'s struct-precedence) survives the wrap as
     /// column-dot-field syntax — stripping would misread the field name as
     /// a column.
     #[test]

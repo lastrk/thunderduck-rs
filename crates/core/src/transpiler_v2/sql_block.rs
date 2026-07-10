@@ -10,10 +10,11 @@
 //!
 //! A block stores **already-rendered SQL fragments** (projection slot lists,
 //! predicates, sort keys) produced by `emission`'s expression layer; this
-//! module never renders expressions itself. Alias visibility is tracked in
-//! [`SelectBlock::scope`]: the set of FROM-scope aliases the block actually
-//! emits, which merging operators check their analyzer-stamped qualifiers
-//! against (the emission-side counterpart of the analyzer's `RelScope`).
+//! module never renders expressions itself. Alias visibility is tracked via
+//! [`SelectBlock::exposes`] (backed by [`FromItem::exposed`]): the set of
+//! FROM-scope aliases the block actually emits, which merging operators
+//! check their analyzer-stamped qualifiers against (the emission-side
+//! counterpart of the analyzer's `RelScope`).
 
 use super::emission::quote_ident;
 
@@ -211,14 +212,11 @@ pub(crate) struct SelectBlock {
     offset: Option<i64>,
     /// Highest occupied clause ordinal (`From` for a fresh block).
     max_clause: Clause,
-    /// Raw alias names the FROM scope exposes (case-insensitive matching).
-    scope: Vec<String>,
 }
 
 impl SelectBlock {
     /// A fresh block over `from`, with every other slot free.
     pub(crate) fn from_item(from: FromItem) -> Self {
-        let scope = from.exposed();
         Self {
             projections: None,
             default_projections: None,
@@ -231,7 +229,6 @@ impl SelectBlock {
             limit: None,
             offset: None,
             max_clause: Clause::From,
-            scope,
         }
     }
 
@@ -269,10 +266,9 @@ impl SelectBlock {
     pub(crate) fn extend_from(&mut self, suffix: &str, extra_aliases: Vec<String>) {
         debug_assert_eq!(self.max_clause, Clause::From);
         let sql = format!("{}{suffix}", self.from.to_sql());
-        let mut exposed = self.scope.clone();
-        exposed.extend(extra_aliases.iter().cloned());
+        let mut exposed = self.from.exposed();
+        exposed.extend(extra_aliases);
         self.from = FromItem::Raw { sql, exposed };
-        self.scope.extend(extra_aliases);
     }
 
     /// Install the soft (overridable) SELECT list — the join builder's
@@ -332,7 +328,10 @@ impl SelectBlock {
     /// (ASCII case-insensitive) — the merge visibility precondition for any
     /// analyzer-stamped qualified reference.
     pub(crate) fn exposes(&self, qualifier: &str) -> bool {
-        self.scope.iter().any(|a| a.eq_ignore_ascii_case(qualifier))
+        self.from
+            .exposed()
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(qualifier))
     }
 
     /// Is the SELECT list still free (renders `*`)?

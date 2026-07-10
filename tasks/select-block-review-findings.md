@@ -155,12 +155,25 @@ raises a pending demand that reaches the re-scoping arm's
 debug-assertions build (`df.select('x').filter(col('__td_jl.x') > 0)`).
 Release builds silently drop the demand (loud binder error).
 
-### 14. Third hand-rolled qualifier walker — reuse (CONFIRMED)
+### 14. Third hand-rolled qualifier walker — reuse (CONFIRMED) — **DEFERRED 2026-07-10 (hygiene)**
 `emission.rs:652` — `strip_stranded_qualifiers::walk` re-encodes the
 qualifier-leaf variant list + subquery-opacity convention already encoded
 in `expr_qualifiers` and the analyzer's `synthetic_uses`. Divergence
 between the collector and the rewriter reintroduces the strand class; one
 shared visitor removes the drift surface.
+**Why deferred:** the three walkers are not a mechanical dedup — they have
+intentional differences that a safe unification must reconcile: `expr_qualifiers`
+(emission) and `synthetic_uses` (analyzer) are IMMUTABLE, qualifier-only
+collectors over `{ColumnReference, UnresolvedColumn, Star}`; `strip::walk`
+(emission) is a MUTABLE, NAME-aware rewriter that deliberately touches only
+`{ColumnReference, UnresolvedColumn}` (it must NOT rewrite `Star` — F12 handles
+whole-relation stars separately). A shared visitor therefore needs a
+name+qualifier leaf abstraction (a `QualLeaf`/`QualLeafMut` view) living where
+BOTH `analyzer` and `emission` can import it (`expression.rs`), plus mutable and
+immutable variants. That is a genuine design refactor of the exact walkers every
+strand fix (F5/F9/F12/item-3) depends on — worth doing as a dedicated,
+fully-gated pass, not folded into this cycle. Pure quality (no behavior change);
+tracked here. F15 (below) is done.
 
 ### 15. `SelectBlock.scope` double-bookkeeps `FromItem::exposed()` — simplification (CONFIRMED)
 `sql_block.rs:203` — the merge-visibility authority (`exposes()`) is a

@@ -143,7 +143,7 @@ gate returned a clean UnknownColumn and its doc predicted exactly this
 (ADR-016/ADR-022). Both old and new fail the Spark-valid query; the new
 failure mode is the forbidden opaque one.
 
-### 13. `mark_node` debug_assert reachable from untrusted input (CONFIRMED)
+### 13. `mark_node` debug_assert reachable from untrusted input (CONFIRMED) — **FIXED 2026-07-10** (unit-pinned). Two parts: (1) `resolve_column`'s `is_synthetic_join_qualifier` arm now returns a clean `UnknownColumn` when `scoped_range` misses (a user-typed `__td_jl`/`__td_jr` binds no stamped side scope — legitimate stamped uses always resolve under `for_join_condition`, so they are unaffected), matching Spark 4.1.1 (`UNRESOLVED_COLUMN.WITH_SUGGESTION`, empirically confirmed) instead of the over-permissive name-only fallback; analysis now fails before `mark_node` runs. (2) The two `mark_node` `debug_assert!(!pending_jl && !pending_jr)` are removed (defensive tolerant drop — the session thread must never panic on untrusted input; a stray pending demand only ever degrades to a loud downstream binder error, never silent wrong data). Pinned by `user_typed_td_jl/jr_qualifier_is_unknown_column*`.
 `analyzer.rs:926` — `resolve_column` treats any user qualifier literally
 named `__td_jl`/`__td_jr` as synthetic and keeps it; `own_expr_demands`
 raises a pending demand that reaches the re-scoping arm's

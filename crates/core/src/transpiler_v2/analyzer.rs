@@ -923,11 +923,20 @@ fn mark_node(node: &mut TypedAst, pending_jl: bool, pending_jr: bool) {
         | TypedOp::Describe { input, .. }
         | TypedOp::Summary { input, .. }
         | TypedOp::FreqItems { input, .. } => {
-            debug_assert!(!pending_jl && !pending_jr);
+            // No pending demand SHOULD arrive here (these operators
+            // re-scope, so resolution can never stamp a synthetic qualifier
+            // across them) — but this walk runs on untrusted, analyzed user
+            // input, and a session thread must never panic on it. A
+            // user-typed reserved qualifier is rejected during resolution
+            // (`resolve_column`, F13), but that is not the only path a
+            // `pending_jl`/`pending_jr` demand could theoretically reach
+            // here (e.g. a qualified star — F12 territory), so tolerate and
+            // drop the demand rather than assert.
             mark_node(input, own_jl, own_jr);
         }
         TypedOp::SetOp { children, .. } => {
-            debug_assert!(!pending_jl && !pending_jr);
+            // See the comment above: tolerate a stray pending demand rather
+            // than panic on untrusted input.
             for child in children {
                 mark_node(child, false, false);
             }
@@ -3730,10 +3739,12 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     // Synthetic __td_jl / __td_jr qualifiers set by `qualify_plan_id_refs`
     // are "trust the caller" markers for a join condition. Emission renders
     // them verbatim, so nullability/type must be resolved against the
-    // correct SIDE — consult `ctx.scopes` (populated by
-    // `ResolveContext::for_join_condition` with whole-side ranges) first;
-    // only fall back to the legacy first-match-by-name scan if the scope map
-    // somehow misses (defensive — should not happen in practice).
+    // correct SIDE via `ctx.scopes` (populated by
+    // `ResolveContext::for_join_condition` with whole-side ranges). A miss
+    // (`scoped_range` None, or name absent from the side) is now a clean
+    // `UnknownColumn` — a user-typed reserved qualifier `__td_jl`/`__td_jr`
+    // outside a join condition is rejected (Spark parity:
+    // UNRESOLVED_COLUMN), not silently resolved by name (F13).
     let is_synthetic_join_qualifier = matches!(
         u.qualifier.as_deref(),
         Some(TD_JOIN_LEFT) | Some(TD_JOIN_RIGHT)
@@ -3802,20 +3813,39 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     }
     let (dt, nullable) = if is_synthetic_join_qualifier {
         let q = u.qualifier.as_deref().unwrap_or_default();
-        // `scoped_range` guards the slice exactly as tier (e) below: an
-        // out-of-bounds range would be an analyzer invariant violation
-        // (`for_join_condition` only ever binds ranges within the schema it
-        // built). Filter it out so a violation degrades to the legacy
-        // field-by-name fallback rather than panicking on the index.
-        match ctx.scoped_range(q).and_then(|range| {
-            TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range])
-        }) {
-            Some(info) => info,
-            None => ctx
-                .schema
-                .field_by_name(&u.name)
-                .map(|f| (f.data_type.clone(), f.nullable))
-                .unwrap_or((DataType::Unresolved, true)),
+        // `scoped_range` mirrors tier (e) below: `q` spells a reserved
+        // synthetic qualifier (`__td_jl`/`__td_jr`), but the analyzer only
+        // ever binds a scope for it inside a join condition, via
+        // `ResolveContext::for_join_condition`. Both misses below therefore
+        // mean the same thing — an untrusted, user-typed reference to a
+        // reserved qualifier the analyzer never stamped a scope for — so
+        // both reject with `UnknownColumn` (Spark itself raises
+        // `UNRESOLVED_COLUMN` for e.g. `col("__td_jl.x")`) rather than
+        // falling back to a permissive name-only lookup that would later
+        // trip `mark_node`'s join-side bookkeeping on a column the join
+        // never introduced (F13).
+        match ctx.scoped_range(q) {
+            Some(range) => {
+                match TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range]) {
+                    Some(info) => info,
+                    // `q` is a real synthetic side scope but `name` is not on it.
+                    None => {
+                        return Err(AnalyzerError::UnknownColumn {
+                            name: u.name.clone(),
+                            qualifier: u.qualifier.clone(),
+                        });
+                    }
+                }
+            }
+            // `q` is `__td_jl`/`__td_jr` by spelling but binds no synthetic
+            // side scope — a user-typed reserved qualifier outside a join
+            // condition.
+            None => {
+                return Err(AnalyzerError::UnknownColumn {
+                    name: u.name.clone(),
+                    qualifier: u.qualifier.clone(),
+                });
+            }
         }
     } else if let Some(q) = u.qualifier.as_deref() {
         // Qualified, non-synthetic: (d) a qualifier naming a top-level STRUCT
@@ -10889,5 +10919,65 @@ mod tests {
         });
         let typed = analyze(filter, &bt).expect("plan_id with no join should resolve normally");
         assert_eq!(typed.resolved_schema.fields.len(), 4);
+    }
+
+    // ── F13 — user-typed reserved qualifier must not panic ─────────────────
+    // `__td_jl`/`__td_jr` are analyzer-internal join-condition markers
+    // (`qualify_plan_id_refs`), only ever scoped inside a join condition via
+    // `ResolveContext::for_join_condition`. A user typing them directly
+    // (outside a join condition, so `ctx.scoped_range` misses) must get a
+    // clean `UnknownColumn` — Spark itself raises `UNRESOLVED_COLUMN` for
+    // `col("__td_jl.x")` — never a `mark_node` debug_assert panic.
+
+    #[test]
+    fn user_typed_td_jl_qualifier_is_unknown_column_not_panic() {
+        let bt = base_types_for(&[("emp", emp_schema())]);
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![unresolved_col("id")],
+        });
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(project),
+            condition: Expression::Binary(BinaryExpression {
+                left: Box::new(qcol("__td_jl", "id")),
+                op: BinaryOp::Gt,
+                right: Box::new(int_lit(0)),
+            }),
+        });
+        // A returned Err (rather than a panic) is itself the regression
+        // proof for F13.
+        let err = analyze(ast, &bt).expect_err("user-typed __td_jl qualifier must be rejected");
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "id");
+                assert_eq!(qualifier, Some("__td_jl".to_owned()));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_typed_td_jr_qualifier_is_unknown_column() {
+        let bt = base_types_for(&[("emp", emp_schema())]);
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![unresolved_col("id")],
+        });
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(project),
+            condition: Expression::Binary(BinaryExpression {
+                left: Box::new(qcol("__td_jr", "id")),
+                op: BinaryOp::Gt,
+                right: Box::new(int_lit(0)),
+            }),
+        });
+        let err = analyze(ast, &bt).expect_err("user-typed __td_jr qualifier must be rejected");
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "id");
+                assert_eq!(qualifier, Some("__td_jr".to_owned()));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
     }
 }

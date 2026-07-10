@@ -6950,9 +6950,11 @@ mod tests {
         let bt = base_types_emp_dept(&plan);
         let typed = analyze(plan, &bt).expect("analyze");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // ADR-023 3e-ii: `id` is unique in `emp`, so the qualifier is dropped
+        // at resolution (a bare bind is positionally equivalent).
         assert_eq!(
             sql,
-            "SELECT * FROM (SELECT * FROM emp AS e ORDER BY e.id ASC NULLS FIRST LIMIT 2) AS __td_sub",
+            "SELECT * FROM (SELECT * FROM emp AS e ORDER BY id ASC NULLS FIRST LIMIT 2) AS __td_sub",
             "got: {sql}"
         );
         assert!(
@@ -7431,7 +7433,9 @@ mod tests {
         });
         let typed = analyze(ast, &bt).expect("analyze");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert_eq!(sql, "SELECT emp.id FROM emp");
+        // ADR-023 3e-ii: `id` is unique in `emp`, so the qualifier is dropped
+        // at resolution (a bare bind is positionally equivalent).
+        assert_eq!(sql, "SELECT id FROM emp");
         assert!(!sql.contains("__td_proj"), "got: {sql}");
     }
 
@@ -8140,7 +8144,11 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(sql.contains("emp AS e INNER JOIN "), "got: {sql}");
         assert!(sql.contains("dept AS d ON "), "got: {sql}");
-        assert!(sql.contains("GROUP BY d.dept_name"), "got: {sql}");
+        // ADR-023 3e-ii: `dept_name` is unique across `emp`+`dept`, so the
+        // qualifier is dropped at resolution (a bare bind is positionally
+        // equivalent).
+        assert!(sql.contains("GROUP BY dept_name"), "got: {sql}");
+        assert!(!sql.contains("GROUP BY d.dept_name"), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
         assert!(!sql.contains("__td_jl"), "got: {sql}");
         assert!(!sql.contains("__td_jr"), "got: {sql}");
@@ -8172,7 +8180,10 @@ mod tests {
         let typed = analyze(plan, &bt).expect("analyze aggregate-over-aliased-relation+having");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(sql.contains("emp AS e"), "got: {sql}");
-        assert!(sql.contains("GROUP BY e.dept_id"), "got: {sql}");
+        // ADR-023 3e-ii: `dept_id` is unique in `emp`, so the qualifier is
+        // dropped at resolution (a bare bind is positionally equivalent).
+        assert!(sql.contains("GROUP BY dept_id"), "got: {sql}");
+        assert!(!sql.contains("GROUP BY e.dept_id"), "got: {sql}");
         assert!(sql.contains("HAVING "), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
     }
@@ -8245,7 +8256,10 @@ mod tests {
         let typed = analyze(plan, &bt).expect("analyze aggregate-merges");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(sql.contains("emp AS e"), "got: {sql}");
-        assert!(sql.contains("GROUP BY e.dept_id"), "got: {sql}");
+        // ADR-023 3e-ii: `dept_id` is unique in `emp`, so the qualifier is
+        // dropped at resolution (a bare bind is positionally equivalent).
+        assert!(sql.contains("GROUP BY dept_id"), "got: {sql}");
+        assert!(!sql.contains("GROUP BY e.dept_id"), "got: {sql}");
         assert!(!sql.contains("__td_sub"), "got: {sql}");
     }
 
@@ -8294,7 +8308,12 @@ mod tests {
         assert!(sql.contains("emp AS e CROSS JOIN "), "got: {sql}");
         assert!(sql.contains("dept AS d WHERE "), "got: {sql}");
         assert!(sql.contains("(e.dept_id) = (d.dept_id)"), "got: {sql}");
-        assert!(sql.contains("GROUP BY d.dept_name"), "got: {sql}");
+        // ADR-023 3e-ii: `dept_name` is unique across `emp`+`dept`, so the
+        // qualifier is dropped at resolution (a bare bind is positionally
+        // equivalent). `dept_id` is duplicated (both sides), so it keeps its
+        // qualifier — asserted above.
+        assert!(sql.contains("GROUP BY dept_name"), "got: {sql}");
+        assert!(!sql.contains("GROUP BY d.dept_name"), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
         assert!(!sql.contains("__td_filter"), "got: {sql}");
         let where_pos = sql.find(" WHERE ").expect("where clause present");

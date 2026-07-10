@@ -6504,6 +6504,7 @@ mod tests {
             qualifier: None,
             data_type: Some(dt),
             nullable: Some(true),
+            ordinal: None,
         })
     }
 
@@ -10243,6 +10244,7 @@ mod tests {
             qualifier: Some("emp".to_owned()),
             data_type: Some(DataType::Long),
             nullable: Some(false),
+            ordinal: None,
         };
         let sql = render_column_reference(&c).expect("render");
         assert_eq!(sql, "emp.id");
@@ -11101,6 +11103,7 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Integer),
             nullable: Some(true),
+            ordinal: None,
         });
         let sql =
             super::render_sample_by(&typed_input, &col_ref, &[], None).expect("empty fractions ok");
@@ -11359,6 +11362,7 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::Timestamp),
                     nullable: Some(true),
+                    ordinal: None,
                 }),
                 str_lit("yyyy-MM-dd HH:mm:ss"),
             ],
@@ -11402,6 +11406,7 @@ mod tests {
                 qualifier: None,
                 data_type: Some(DataType::String),
                 nullable: Some(true),
+                ordinal: None,
             })),
             updates: vec![("x".to_owned(), None)],
         });
@@ -11422,6 +11427,7 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
+            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_5".to_owned()],
@@ -11454,6 +11460,7 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
+            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_7".to_owned()],
@@ -11493,6 +11500,7 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
+            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x".to_owned(), "i".to_owned()],
@@ -11544,6 +11552,7 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
+            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x".to_owned()],
@@ -11581,6 +11590,7 @@ mod tests {
                         qualifier: None,
                         data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
                         nullable: Some(true),
+                        ordinal: None,
                     }),
                     Expression::Lambda(LambdaExpression {
                         params: vec!["i".to_owned()],
@@ -11694,6 +11704,7 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::Array(Box::new(DataType::String), true)),
                     nullable: Some(true),
+                    ordinal: None,
                 }),
             ],
         );
@@ -11761,6 +11772,7 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
+            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_1".to_owned(), "y_2".to_owned()],
@@ -11808,6 +11820,7 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
+            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -11845,6 +11858,7 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
+            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -11877,6 +11891,7 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
+            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -11929,6 +11944,7 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
+            ordinal: None,
         });
         let sql = render_fn("array_union", vec![a, b]);
         assert!(
@@ -11955,6 +11971,7 @@ mod tests {
                 true,
             )),
             nullable: Some(true),
+            ordinal: None,
         });
         let sql = render_fn("flatten", vec![outer]);
         assert!(
@@ -12015,6 +12032,7 @@ mod tests {
                         qualifier: None,
                         data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
                         nullable: Some(true),
+                        ordinal: None,
                     }),
                     Expression::Lambda(LambdaExpression {
                         params: vec!["k".to_owned()],
@@ -12377,6 +12395,7 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
+            ordinal: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("team")]);
         assert_eq!(sql, "element_at(attrs, 'team')[1]");
@@ -12394,6 +12413,7 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
+            ordinal: None,
         });
         let sql = render_fn(
             "element_at",
@@ -12453,6 +12473,7 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
+            ordinal: None,
         });
         let sql = render_fn(
             "element_at",
@@ -12484,6 +12505,7 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
+            ordinal: None,
         });
         let sql = render_fn(
             "try_element_at",
@@ -12517,6 +12539,7 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
+            ordinal: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("missing")]);
         assert_eq!(sql, "element_at(attrs, 'missing')[1]");
@@ -12616,6 +12639,7 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
+            ordinal: None,
         });
         let sql = render_fn("concat_ws", vec![str_lit(","), arr_col]);
         assert_eq!(sql, "COALESCE(array_to_string(tags, ','), '')");
@@ -12730,6 +12754,7 @@ mod tests {
                     scale: 2,
                 }),
                 nullable: Some(true),
+                ordinal: None,
             })),
             op: BinaryOp::Div,
             right: Box::new(Expression::ColumnReference(ColumnReference {
@@ -12740,6 +12765,7 @@ mod tests {
                     scale: 3,
                 }),
                 nullable: Some(true),
+                ordinal: None,
             })),
         });
         let sql = render_expr(&expr, &schema).expect("render decimal div");
@@ -12923,6 +12949,7 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
+                    ordinal: None,
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("qty INT, label STRING, price DOUBLE".to_owned()),
@@ -12984,6 +13011,7 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
+                    ordinal: None,
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("qty INT, label STRING".to_owned()),
@@ -13013,6 +13041,7 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
+                    ordinal: None,
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("a INT, b STRING".to_owned()),
@@ -13045,12 +13074,14 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
+                    ordinal: None,
                 }),
                 Expression::ColumnReference(ColumnReference {
                     name: "schema_col".to_owned(),
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
+                    ordinal: None,
                 }),
             ],
         );
@@ -13148,6 +13179,7 @@ mod tests {
                 qualifier: None,
                 data_type: None,
                 nullable: None,
+                ordinal: None,
             }),
             str_lit(field),
         ]
@@ -13197,6 +13229,7 @@ mod tests {
                 qualifier: None,
                 data_type: None,
                 nullable: None,
+                ordinal: None,
             })],
         );
         let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
@@ -13231,6 +13264,7 @@ mod tests {
                     qualifier: None,
                     data_type: None,
                     nullable: None,
+                    ordinal: None,
                 }),
                 str_lit("a"),
             ],
@@ -13250,6 +13284,7 @@ mod tests {
                 qualifier: None,
                 data_type: None,
                 nullable: None,
+                ordinal: None,
             })],
         );
         let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
@@ -13395,6 +13430,7 @@ mod tests {
             qualifier: Some("e".to_owned()),
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
+            ordinal: None,
         })
     }
 
@@ -13528,12 +13564,14 @@ mod tests {
             qualifier: Some("e".to_owned()),
             data_type: Some(DataType::Long),
             nullable: Some(false),
+            ordinal: None,
         });
         let tag_ref = Expression::ColumnReference(ColumnReference {
             name: "tag".to_owned(),
             qualifier: Some("t".to_owned()),
             data_type: Some(DataType::String),
             nullable: Some(true),
+            ordinal: None,
         });
         let proj = TypedAst::new(
             TypedOp::Project {

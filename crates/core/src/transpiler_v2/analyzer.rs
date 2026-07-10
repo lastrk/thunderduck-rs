@@ -3665,6 +3665,7 @@ fn try_rewrite_nested_struct_path(u: &UnresolvedColumn, schema: &StructType) -> 
         qualifier: None,
         data_type: Some(root_field.data_type.clone()),
         nullable: Some(root_field.nullable),
+        ordinal: None,
     });
     for seg in &segments {
         expr = Expression::ExtractValue(ExtractValueExpression {
@@ -3718,6 +3719,25 @@ fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<(Data
     }
 }
 
+/// ADR-023 tier 3: 0-based position of the field that resolves `name` within
+/// `fields` (first case-insensitive match), mirroring
+/// [`TypeInferenceEngine::column_info_in`]'s own lookup order — exact name
+/// first, then the struct-qualified first segment for a dotted name — so the
+/// stamped ordinal always agrees with the value actually resolved.
+fn field_index(fields: &[StructField], name: &str) -> Option<usize> {
+    if let Some(i) = fields
+        .iter()
+        .position(|f| f.name.eq_ignore_ascii_case(name))
+    {
+        return Some(i);
+    }
+    let dot_pos = name.find('.')?;
+    let struct_name = &name[..dot_pos];
+    fields
+        .iter()
+        .position(|f| f.name.eq_ignore_ascii_case(struct_name))
+}
+
 fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expression, AnalyzerError> {
     // Multi-level nested-struct navigation: `F.col("address.geo.lat")` arrives
     // here as `UnresolvedColumn { qualifier: Some("address"), name: "geo.lat" }`
@@ -3759,8 +3779,11 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     if u.qualifier.is_none() {
         if let Some(pid) = u.plan_id {
             if let Some((range, side_qualifier)) = ctx.plan_id_lookup(pid) {
-                let info = TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range]);
+                let info =
+                    TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range.clone()]);
                 if let Some((dt, nullable)) = info {
+                    let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
+                        .map(|i| range.start + i);
                     // Only stamp the join-side qualifier when the column
                     // name is AMBIGUOUS in the full schema (appears on
                     // both sides of the join). Unambiguous names must NOT
@@ -3785,6 +3808,7 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                         },
                         data_type: Some(dt),
                         nullable: Some(nullable),
+                        ordinal,
                     }));
                 }
                 // plan_id scope found but column name not in that range —
@@ -3811,7 +3835,7 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
             });
         }
     }
-    let (dt, nullable) = if is_synthetic_join_qualifier {
+    let (dt, nullable, ordinal) = if is_synthetic_join_qualifier {
         let q = u.qualifier.as_deref().unwrap_or_default();
         // `scoped_range` mirrors tier (e) below: `q` spells a reserved
         // synthetic qualifier (`__td_jl`/`__td_jr`), but the analyzer only
@@ -3826,8 +3850,15 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         // never introduced (F13).
         match ctx.scoped_range(q) {
             Some(range) => {
-                match TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range]) {
-                    Some(info) => info,
+                match TypeInferenceEngine::column_info_in(
+                    &u.name,
+                    &ctx.schema.fields[range.clone()],
+                ) {
+                    Some((dt, nullable)) => {
+                        let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
+                            .map(|i| range.start + i);
+                        (dt, nullable, ordinal)
+                    }
                     // `q` is a real synthetic side scope but `name` is not on it.
                     None => {
                         return Err(AnalyzerError::UnknownColumn {
@@ -3851,8 +3882,12 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         // Qualified, non-synthetic: (d) a qualifier naming a top-level STRUCT
         // column wins over a relation-alias scope — struct-field access takes
         // precedence, matching the pre-existing behavior this pass preserves.
-        if let Some(info) = TypeInferenceEngine::struct_qualifier_info(&u.name, q, ctx.schema) {
-            info
+        // The resolved field lives inside the struct, not at a top-level
+        // position in `ctx.schema` — no ordinal to stamp.
+        if let Some((dt, nullable)) =
+            TypeInferenceEngine::struct_qualifier_info(&u.name, q, ctx.schema)
+        {
+            (dt, nullable, None)
         } else {
             match ctx.scoped_range(q) {
                 // (e) qualifier binds exactly one in-bounds relation scope —
@@ -3862,8 +3897,15 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                 // `UnknownColumn` (ADR-022 cat-1), not an opaque DuckDB bind
                 // error.
                 Some(range) => {
-                    match TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range]) {
-                        Some(info) => info,
+                    match TypeInferenceEngine::column_info_in(
+                        &u.name,
+                        &ctx.schema.fields[range.clone()],
+                    ) {
+                        Some((dt, nullable)) => {
+                            let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
+                                .map(|i| range.start + i);
+                            (dt, nullable, ordinal)
+                        }
                         None => {
                             return Err(AnalyzerError::UnknownColumn {
                                 name: u.name.clone(),
@@ -3878,11 +3920,18 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                 // caught an out-of-bounds invariant violation (defensive,
                 // never expected in practice) and degraded here. Both cases
                 // share the identical legacy fallback.
-                None => TypeInferenceEngine::qualified_column_info(&u.name, Some(q), ctx.schema),
+                None => {
+                    let (dt, nullable) =
+                        TypeInferenceEngine::qualified_column_info(&u.name, Some(q), ctx.schema);
+                    let ordinal = field_index(&ctx.schema.fields, &u.name);
+                    (dt, nullable, ordinal)
+                }
             }
         }
     } else {
-        TypeInferenceEngine::qualified_column_info(&u.name, None, ctx.schema)
+        let (dt, nullable) = TypeInferenceEngine::qualified_column_info(&u.name, None, ctx.schema);
+        let ordinal = field_index(&ctx.schema.fields, &u.name);
+        (dt, nullable, ordinal)
     };
     if matches!(dt, DataType::Unresolved) {
         // (g) Outer-scope fallback: when ALL inner tiers have failed and an
@@ -3899,6 +3948,10 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                     qualifier: u.qualifier,
                     data_type: Some(outer_dt),
                     nullable: Some(outer_nullable),
+                    // (g) The column is not in `ctx.schema` — its position
+                    // lives in an enclosing scope; correlated ordinal
+                    // handling is a later concern.
+                    ordinal: None,
                 }));
             }
         }
@@ -3912,6 +3965,7 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         qualifier: u.qualifier,
         data_type: Some(dt),
         nullable: Some(nullable),
+        ordinal,
     }))
 }
 
@@ -4714,6 +4768,7 @@ fn derive_implicit_grouping(
                 qualifier: None,
                 data_type: Some(f.data_type.clone()),
                 nullable: Some(f.nullable),
+                ordinal: None,
             })
         })
         .collect()
@@ -5922,6 +5977,95 @@ mod tests {
         );
         let err = analyze(qstar_project(dup_join, "x"), &bt).unwrap_err();
         assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
+    }
+
+    // ── ADR-023 tier 3a — resolved `ordinal` on ColumnReference ──────────
+    // Additive, dormant field: `resolve_column` stamps the 0-based position
+    // of the resolved column within the producing node's `ctx.schema`.
+    // Emission ignores it (dormant until a later ADR-023 sub-chunk); these
+    // tests pin the stamped value against the field's actual index in the
+    // resolved schema.
+
+    #[test]
+    fn resolve_column_ordinal_unqualified_matches_schema_index() {
+        let bt = base_types_with_emp_dept();
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![unresolved_col("salary")],
+        });
+        let typed = analyze(project, &bt).expect("unqualified salary must resolve");
+        match &typed.op {
+            TypedOp::Project { projections, .. } => match &projections[0] {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(c.name, "salary");
+                    // `salary` is the 4th (0-based index 3) field of `emp_schema`.
+                    assert_eq!(c.ordinal, Some(3));
+                }
+                other => panic!("expected ColumnReference, got {other:?}"),
+            },
+            _ => panic!("expected Project"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_ordinal_qualified_tier_e_matches_schema_index() {
+        let bt = base_types_with_emp_dept();
+        // SELECT d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id
+        // — tier (e): qualifier `d` binds the join's right-side scope range
+        // (dept fields start at absolute index 4 in the merged schema).
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_dept_aliased_join()),
+            projections: vec![qcol("d", "dept_name")],
+        });
+        let typed = analyze(project, &bt).expect("d.dept_name must resolve");
+        match &typed.op {
+            TypedOp::Project { projections, .. } => match &projections[0] {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(c.name, "dept_name");
+                    // `dept_name` is dept's 2nd field (offset 1), and dept
+                    // starts at absolute index 4 in the merged join schema.
+                    assert_eq!(c.ordinal, Some(5));
+                }
+                other => panic!("expected ColumnReference, got {other:?}"),
+            },
+            _ => panic!("expected Project"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_ordinal_plan_id_over_join_matches_correct_side() {
+        // Self-join `emp(plan_id=1) JOIN emp(plan_id=2)`; a Project above
+        // selecting `id` tagged plan_id=2 must resolve to the RIGHT side's
+        // `id` — absolute index 4 (0-based) in the merged 8-field schema.
+        let bt = base_types_with_emp_dept();
+        let join_cond = Expression::Binary(BinaryExpression {
+            left: Box::new(qcol("__td_jl", "id")),
+            op: BinaryOp::Eq,
+            right: Box::new(qcol("__td_jr", "id")),
+        });
+        let joined = join_with_plan_ids(
+            scan("emp"),
+            scan("emp"),
+            JoinType::Inner,
+            Some(join_cond),
+            vec![1],
+            vec![2],
+        );
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![plan_id_col("id", 2)],
+        });
+        let typed = analyze(project, &bt).expect("plan_id should disambiguate above join");
+        match &typed.op {
+            TypedOp::Project { projections, .. } => match &projections[0] {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(c.qualifier.as_deref(), Some(TD_JOIN_RIGHT));
+                    assert_eq!(c.ordinal, Some(4));
+                }
+                other => panic!("expected ColumnReference, got {other:?}"),
+            },
+            _ => panic!("expected Project"),
+        }
     }
 
     // ── Pass 106 — uncorrelated subquery analysis ────────────────────────

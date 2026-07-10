@@ -653,34 +653,88 @@ fn build_aggregate(
         );
     }
     let input_schema = &input.resolved_schema;
-    // Mirror the analyzer's "unfold DataFrame-path grouping" logic — if
-    // the aggregates list doesn't already start with the grouping cols'
-    // output names, prepend them to the SELECT list so the emitted column
-    // count matches the resolved schema.
-    let already_folded = super::analyzer::grouping_already_folded(grouping, aggregates);
     // Rewrite any no-arg `grouping_id()`/`grouping()` calls to pass the
-    // grouping columns explicitly — DuckDB has no zero-arg form.
+    // grouping columns explicitly — DuckDB has no zero-arg form. Splice
+    // against the ORIGINAL (unstripped) `grouping`; the wrap-path strip
+    // below then walks into the spliced args the same way it walks the
+    // flat GROUP BY list, so the two stay textually consistent regardless
+    // of splice-then-strip vs strip-then-splice ordering.
     let rewritten_aggregates: Vec<Expression> = aggregates
         .iter()
         .map(|a| with_grouping_id_spliced(a, grouping))
         .collect();
-    let keys: &[Expression] = if already_folded { &[] } else { grouping };
-    let slots = sql_join(keys.iter().chain(rewritten_aggregates.iter()), ", ", |e| {
+
+    // Open the child block and decide merge-vs-wrap BEFORE rendering — the
+    // visibility check must run over the ORIGINAL (unstripped) expressions
+    // against the pre-wrap block, exactly like `build_filter`/`build_sort`.
+    let mut block = open_block(input)?;
+    let vis = exprs_visible_in(
+        grouping
+            .iter()
+            .chain(rewritten_aggregates.iter())
+            .chain(having),
+        &block,
+        &input.scope,
+    );
+    let merge = block.can_accept(Clause::GroupBy) && vis;
+
+    // Choose the expression set to render from: the originals when merging
+    // (no cosmetic churn), or each stripped against the PRE-wrap block when
+    // wrapping — otherwise a qualifier like `e.dept_id` strands behind the
+    // freshly introduced `__td_sub`.
+    let maybe_strip = |e: &Expression| -> Expression {
+        if merge {
+            e.clone()
+        } else {
+            strip_stranded_qualifiers(e, &block, input_schema)
+        }
+    };
+    let grouping_r: Vec<Expression> = grouping.iter().map(&maybe_strip).collect();
+    let aggregates_r: Vec<Expression> = rewritten_aggregates.iter().map(&maybe_strip).collect();
+    let having_r: Option<Expression> =
+        having
+            .map(|h| with_grouping_id_spliced(h, grouping))
+            .map(|h| {
+                if merge {
+                    h
+                } else {
+                    strip_stranded_qualifiers(&h, &block, input_schema)
+                }
+            });
+    if !merge {
+        trace_stranded_qualifiers(
+            &block,
+            grouping_r
+                .iter()
+                .chain(aggregates_r.iter())
+                .chain(having_r.iter()),
+            &input.scope,
+        );
+    }
+
+    // Mirror the analyzer's "unfold DataFrame-path grouping" logic — if
+    // the aggregates list doesn't already start with the grouping cols'
+    // output names, prepend them to the SELECT list so the emitted column
+    // count matches the resolved schema. Stripping only drops a qualifier
+    // (structure-preserving), so computing this over the chosen (possibly
+    // stripped) expression set keeps it consistent with what is rendered.
+    let already_folded = super::analyzer::grouping_already_folded(&grouping_r, &aggregates_r);
+    let keys: &[Expression] = if already_folded { &[] } else { &grouping_r };
+    let slots = sql_join(keys.iter().chain(aggregates_r.iter()), ", ", |e| {
         render_projection_slot(e, input_schema)
     })?;
-    // HAVING may carry no-arg grouping functions too (Spark-legal over
-    // ROLLUP/CUBE/GROUPING SETS); splice before rendering.
-    let having_sql = having
-        .map(|h| render_expr(&with_grouping_id_spliced(h, grouping), input_schema))
+    let having_sql = having_r
+        .as_ref()
+        .map(|h| render_expr(h, input_schema))
         .transpose()?;
     // Emit a GROUP BY whenever there are flat grouping columns, OR when this
     // is a GROUPING SETS aggregate with at least one set — the all-empty
     // `GROUP BY GROUPING SETS ((), ())` case still produces one grand-total
     // row PER SET, so dropping the clause would be a silent wrong row-count.
-    let emit_group_by = !grouping.is_empty()
+    let emit_group_by = !grouping_r.is_empty()
         || (matches!(grouping_kind, GroupingKind::GroupingSets) && !grouping_sets.is_empty());
     let group_body = if emit_group_by {
-        let rendered = render_group_exprs(grouping, input_schema)?;
+        let rendered = render_group_exprs(&grouping_r, input_schema)?;
         Some(match grouping_kind {
             GroupingKind::GroupBy => rendered.join(", "),
             GroupingKind::Rollup => format!("ROLLUP({})", rendered.join(", ")),
@@ -704,16 +758,7 @@ fn build_aggregate(
         None
     };
 
-    let mut block = open_block(input)?;
-    let vis = exprs_visible_in(
-        grouping
-            .iter()
-            .chain(rewritten_aggregates.iter())
-            .chain(having),
-        &block,
-        &input.scope,
-    );
-    if !(block.can_accept(Clause::GroupBy) && vis) {
+    if !merge {
         block = SelectBlock::wrap(block.into());
     }
     if let Some(g) = group_body {
@@ -7766,6 +7811,78 @@ mod tests {
         assert!(sql.contains("GROUP BY e.dept_id"), "got: {sql}");
         assert!(sql.contains("HAVING "), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
+    }
+
+    /// agg-025 (F9): `emp.alias("e").orderBy("id").limit(5)
+    /// .groupBy(col("e.dept_id")).count()` — GROUP BY cannot merge past an
+    /// occupied LIMIT slot, so the wrap strips `e.` off both the grouping
+    /// key and the SELECT-list copy of it (structure-preserving; only the
+    /// qualifier drops) before rendering GROUP BY, mirroring
+    /// `filter_above_limit_strips_stranded_alias_qualifier` /
+    /// `sort_above_limit_strips_stranded_alias_qualifier` for `build_filter`
+    /// / `build_sort`.
+    #[test]
+    fn aggregate_over_limit_strips_stranded_alias_on_wrap() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(CommonAst::new(CommonOp::Sort {
+                input: Box::new(aliased_scan("emp", "e")),
+                order: vec![asc_key(ColumnReference::untyped("id"))],
+                limit: Some(5),
+                offset: None,
+            })),
+            grouping: vec![qcol("e", "dept_id")],
+            aggregates: vec![
+                qcol("e", "dept_id"),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(fexpr(
+                        "count",
+                        vec![Expression::Star(StarExpression { qualifier: None })],
+                    )),
+                    alias: "count".to_owned(),
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze aggregate-over-limit");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("AS __td_sub GROUP BY dept_id"), "got: {sql}");
+        assert!(!sql.contains("e.dept_id"), "got: {sql}");
+    }
+
+    /// Merge-path regression pin: the same `emp e` groupBy `e.dept_id` shape
+    /// with NO occupied clause above it merges into a single SELECT — the
+    /// reorder must not perturb this common case (alias stays exposed, no
+    /// `__td_sub`).
+    #[test]
+    fn aggregate_over_aliased_relation_merges_keeps_alias() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(aliased_scan("emp", "e")),
+            grouping: vec![qcol("e", "dept_id")],
+            aggregates: vec![
+                qcol("e", "dept_id"),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(fexpr(
+                        "count",
+                        vec![Expression::Star(StarExpression { qualifier: None })],
+                    )),
+                    alias: "count".to_owned(),
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze aggregate-merges");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("emp AS e"), "got: {sql}");
+        assert!(sql.contains("GROUP BY e.dept_id"), "got: {sql}");
+        assert!(!sql.contains("__td_sub"), "got: {sql}");
     }
 
     #[test]

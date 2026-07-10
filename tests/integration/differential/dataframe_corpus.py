@@ -381,6 +381,11 @@ case("agg-021", "aggregate", "bool aggs any / every (some/all)", lambda I: I["em
 case("agg-022", "aggregate", "bit_and / bit_or / bit_xor", lambda I: I["nums"].agg(F.bit_and("a").alias("ba"), F.bit_or("a").alias("bo"), F.bit_xor("a").alias("bx")))
 case("agg-023", "aggregate", "agg(count) immediately after filter", lambda I: I["emp"].filter(F.col("active")).groupBy("dept_id").agg(F.count(F.lit(1)).alias("n")))
 case("agg-024", "aggregate", "aggregate then filter (HAVING analog)", lambda I: I["emp"].groupBy("dept_id").agg(F.avg("salary").alias("avg_sal")).filter(F.col("avg_sal") > 80000))
+# agg-025 (F9): groupBy an alias-qualified key over a limit-wrapped block.
+# `build_aggregate` renders the GROUP BY / SELECT before the wrap decision and
+# never strips (unlike `build_filter`/`build_sort`), so `e.dept_id` strands
+# under `__td_sub`. Spark succeeds; τ must too.
+case("agg-025", "aggregate", "groupBy alias-qualified key over limit (F9 aggregate strand witness)", lambda I: I["emp"].alias("e").orderBy("id").limit(5).groupBy(F.col("e.dept_id")).count())
 
 # ── 9. Grouping extensions (rollup / cube / pivot) ─────────────────────────
 case("grp-001", "grouping", "rollup", lambda I: I["emp"].rollup("dept_id", "active").agg(F.count(F.lit(1)).alias("n")))

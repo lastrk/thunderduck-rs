@@ -87,19 +87,43 @@ qualifier); τ now silently returns rows. Root cause is the over-permissive
 tier-(f) fallback (`qualified_column_info` ignores the relation qualifier);
 the strip converts its loud failure into silent divergence.
 
-### 9. Aggregate/lateral wrap fallbacks don't strip — strand class survives (CONFIRMED)
+### 9. Aggregate/lateral wrap fallbacks don't strip — strand class survives (CONFIRMED) — **FIXED 2026-07-10** (aggregate half; `build_aggregate` now strips stranded qualifiers on the wrap path before rendering GROUP BY/SELECT/HAVING, mirroring `build_filter`/`build_sort`/`build_project` — witness agg-025 green. **Lateral half: verified UNREACHABLE, no fix** — `build_lateral_view`'s wrap branch cannot fire from either front-end: SQL `LATERAL VIEW` always attaches to a pure-FROM relation, and the DataFrame `select(explode(col('e.tags')))` over a wrapped block routes through `build_project` (which already strips), confirmed green as `arr-018` before removal. Left as a latent-only defensive gap.)
 `emission.rs:512` — `build_aggregate` renders slots/GROUP BY/HAVING before
 the wrap decision, unstripped (`build_lateral_view` likewise).
 `emp.alias('e').orderBy('id').limit(5).groupBy(col('e.dept_id')).count()` →
 `Referenced table "e" not found` while Spark succeeds — same class as the
-filt-016 witness item 3 fixes.
+filt-016 witness item 3 fixes. (Empirically confirmed Spark 4.1.1 SUCCEEDS:
+`struct<dept_id:int,count:bigint>`, 3 rows.)
 
-### 10. Strand class also leaks through the MERGE path (CONFIRMED)
+### 10. Strand class also leaks through the MERGE path (CONFIRMED) — **REGROUPED with F8/F11 (2026-07-10): shares the tier-(f) attribute-lineage root cause; deferred to the error-semantics cluster.**
 `emission.rs:753` — a scope-unbound qualifier is vis-exempt, so a second
 filter merges WHERE-onto-WHERE onto an already-wrapped block; no wrap ⇒ no
 strip. `emp.alias('e').select('e.dept_id','e.name').distinct()
 .filter(e.dept_id==101).filter(e.name=='x')` → second conjunct emits
 `e.name` over `__td_sub` → binder error while Spark succeeds.
+
+**Empirical (2026-07-10): Spark 4.1.1 SUCCEEDS** (`struct<dept_id,name>`, 0
+rows — valid) — so the cross-cutting note below is WRONG to group F10 with
+"Spark ERROR"; F10's target is success. Witness `filt-018` born red with the
+exact predicted signature (`... AS __td_sub WHERE ((dept_id)=(101)) AND
+((e.name)=('x'))`), then removed pending the coordinated fix.
+
+**Why it cannot be fixed in isolation:** the analyzer resolves `e.name`
+(F10, dead alias, projected-through column → Spark SUCCEEDS) and `e.dept_id`
+in a correlated LATERAL inner filter (tbl-005, outer alias → must resolve
+OUTWARD) through the *identical* tier-(f) name-only fallback
+(`qualified_column_info` ignores the qualifier), producing the identical
+`ColumnReference{qualifier:Some("e")}` shape. tbl-005 is green only because
+DuckDB's LATERAL binder resolves `e` outward; naïvely stripping the
+qualifier on the merge path would bind `e.dept_id` to the LOCAL `e2.dept_id`
+and silently break the correlation. Worse, F10 (`e.name`, projected-through
+→ success) and F8 (`e.k`, a `select`-created alias → Spark ERRORS
+UNRESOLVED_COLUMN) present the SAME analyzer input (`e.<local-col>`, dead
+`e`) with OPPOSITE Spark outcomes — telling them apart needs Spark's
+attribute-lineage qualifier tracking, which τ does not model. F10 is
+therefore fixed together with F8/F11/F12 in the error-semantics cluster
+(matching this report's own note that "8/10/11 need the fix direction
+decided first").
 
 ### 11. Duplicate user alias on both join sides now silently binds LEFT — divergence window (PLAUSIBLE)
 `emission.rs:359` — the new dup-alias guard re-wraps the right side, so

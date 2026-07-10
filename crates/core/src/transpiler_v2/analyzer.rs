@@ -99,6 +99,7 @@ impl TypedAst {
     pub fn new(op: TypedOp, resolved_schema: StructType) -> Self {
         let mut scope = RelScope::of(&op, &resolved_schema);
         scope.source_quals = source_quals_of(&op, &resolved_schema);
+        scope.source_quals_tracked = source_quals_tracked_of(&op, &resolved_schema);
         Self {
             op,
             resolved_schema,
@@ -163,13 +164,23 @@ pub struct RelScope {
     /// `TypedAst::new`; derived, so EXCLUDED from PartialEq. Invariant:
     /// `source_quals.len() == resolved_schema.len()` for every node.
     pub source_quals: Vec<std::collections::BTreeSet<String>>,
+    /// ADR-023 3d: `true` iff `source_quals` is AUTHORITATIVE for every output
+    /// column of this node — an empty set then means "created, inherits no
+    /// qualifier" (reject a stranded qualifier). `false` for operators whose
+    /// lineage 3c deferred (USING joins, Star projections, SetOp, WithColumns/
+    /// Renamed/Drop, LateralView, and the terminal sources) — the resolver then
+    /// keeps the legacy name-only fallback for them. Derived; EXCLUDED from
+    /// PartialEq (extend the hand-written impl — do NOT add to the compared
+    /// fields). Populated by `source_quals_tracked_of` in `TypedAst::new`.
+    pub source_quals_tracked: bool,
 }
 
-/// Equality deliberately ignores `source_quals`: it is derived data, fully
-/// determined by `(op, resolved_schema)` (via `source_quals_of`), and
-/// existing scope-equality tests assert equality over the binding facts
-/// (`aliases` / `plan_ids` / `ambiguous_plan_ids`) only. Mirrors
-/// `ColumnReference`'s hand-written `PartialEq` excluding `ordinal`.
+/// Equality deliberately ignores `source_quals` / `source_quals_tracked`: both
+/// are derived data, fully determined by `(op, resolved_schema)` (via
+/// `source_quals_of` / `source_quals_tracked_of`), and existing scope-equality
+/// tests assert equality over the binding facts (`aliases` / `plan_ids` /
+/// `ambiguous_plan_ids`) only. Mirrors `ColumnReference`'s hand-written
+/// `PartialEq` excluding `ordinal`.
 impl PartialEq for RelScope {
     fn eq(&self, other: &Self) -> bool {
         self.aliases == other.aliases
@@ -265,16 +276,20 @@ impl RelScope {
                     aliases,
                     plan_ids: Vec::new(),
                     ambiguous_plan_ids: Vec::new(),
-                    // Populated by `source_quals_of` in `TypedAst::new`.
+                    // Populated by `source_quals_of` / `source_quals_tracked_of`
+                    // in `TypedAst::new`.
                     source_quals: Vec::new(),
+                    source_quals_tracked: false,
                 }
             }
             TypedOp::AliasedRelation { alias, .. } => Self {
                 aliases: vec![(alias.clone(), 0..resolved_schema.len())],
                 plan_ids: Vec::new(),
                 ambiguous_plan_ids: Vec::new(),
-                // Populated by `source_quals_of` in `TypedAst::new`.
+                // Populated by `source_quals_of` / `source_quals_tracked_of`
+                // in `TypedAst::new`.
                 source_quals: Vec::new(),
+                source_quals_tracked: false,
             },
             TypedOp::Join {
                 using_columns,
@@ -344,8 +359,10 @@ impl RelScope {
                     aliases,
                     plan_ids,
                     ambiguous_plan_ids,
-                    // Populated by `source_quals_of` in `TypedAst::new`.
+                    // Populated by `source_quals_of` / `source_quals_tracked_of`
+                    // in `TypedAst::new`.
                     source_quals: Vec::new(),
+                    source_quals_tracked: false,
                 }
             }
             scope_passthrough!(input) => input.scope.clone(),
@@ -543,6 +560,72 @@ fn source_quals_of(
     };
     debug_assert_eq!(out.len(), resolved_schema.len());
     out
+}
+
+/// ADR-023 tier 3d — `true` iff [`source_quals_of`]'s output for this node is
+/// AUTHORITATIVE (every empty set means "created, no inherited qualifier"),
+/// `false` when 3c deferred the lineage to a size-correct empty fallback (the
+/// resolver then keeps the legacy name-only path for those nodes). A sibling
+/// of `source_quals_of` rather than a shared return value, so each function
+/// stays a single flat match on `op` — kept in lockstep by mirroring its arms
+/// one-for-one; exhaustive (no `_`) for the same reason.
+fn source_quals_tracked_of(op: &TypedOp, resolved_schema: &StructType) -> bool {
+    match op {
+        TypedOp::TableScan { .. } | TypedOp::AliasedRelation { .. } => true,
+        scope_passthrough!(input) => input.scope.source_quals_tracked,
+        TypedOp::Project { input, projections } => {
+            if projections.iter().any(|p| matches!(p, Expression::Star(_))) {
+                false
+            } else {
+                // Mirrors the `mapped.len() == resolved_schema.len()` guard
+                // in `source_quals_of`'s non-Star arm.
+                input.scope.source_quals_tracked && projections.len() == resolved_schema.len()
+            }
+        }
+        TypedOp::Join {
+            using_columns,
+            left,
+            right,
+            join_type,
+            ..
+        } => {
+            if !using_columns.is_empty() {
+                false
+            } else if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
+                left.scope.source_quals_tracked
+            } else {
+                left.scope.source_quals_tracked && right.scope.source_quals_tracked
+            }
+        }
+        TypedOp::Aggregate {
+            input,
+            grouping,
+            aggregates,
+            ..
+        } => {
+            // Mirrors the `grouping.len() + aggregates.len() ==
+            // resolved_schema.len()` guard in `source_quals_of`'s Aggregate arm.
+            grouping.len() + aggregates.len() == resolved_schema.len()
+                && input.scope.source_quals_tracked
+        }
+        TypedOp::SetOp { .. }
+        | TypedOp::LateralView { .. }
+        | TypedOp::WithColumns { .. }
+        | TypedOp::WithColumnsRenamed { .. }
+        | TypedOp::DropColumns { .. }
+        | TypedOp::SingleRow
+        | TypedOp::Values { .. }
+        | TypedOp::LocalRelation { .. }
+        | TypedOp::FileScan { .. }
+        | TypedOp::TableFunction { .. }
+        | TypedOp::Unnest { .. }
+        | TypedOp::Describe { .. }
+        | TypedOp::Summary { .. }
+        | TypedOp::FreqItems { .. }
+        | TypedOp::Unpivot { .. }
+        | TypedOp::Pivot { .. }
+        | TypedOp::RecursiveCte { .. } => false,
+    }
 }
 
 /// τ's typed operator set — the analyzer output shape.
@@ -1010,14 +1093,15 @@ impl AnalyzerError {
     /// and for the Thunderduck-boundary variants (no Spark class applies —
     /// these are τ's own gaps, not a Spark-emulated error).
     ///
-    /// Best-effort mappings (subclass not reproduced): `UnknownColumn` →
-    /// `UNRESOLVED_COLUMN` (Spark's `.WITH_SUGGESTION` subclass is not
-    /// reachable here); `AmbiguousLateralColumnAlias` and `TypeMismatch` are
-    /// likewise base-class only.
+    /// Best-effort mappings (subclass not reproduced): `AmbiguousLateralColumnAlias`
+    /// and `TypeMismatch` are base-class only. `UnknownColumn` → the
+    /// `.WITH_SUGGESTION` subclass — ADR-023 3d: Spark emits it whenever
+    /// candidate columns exist in scope, which holds for every shape that
+    /// reaches `UnknownColumn` here.
     pub fn spark_class(&self) -> Option<&'static str> {
         match self {
             Self::UnknownTable { .. } => Some("TABLE_OR_VIEW_NOT_FOUND"),
-            Self::UnknownColumn { .. } => Some("UNRESOLVED_COLUMN"),
+            Self::UnknownColumn { .. } => Some("UNRESOLVED_COLUMN.WITH_SUGGESTION"),
             Self::AmbiguousColumn { .. } => Some("AMBIGUOUS_REFERENCE"),
             Self::AmbiguousLateralColumnAlias { .. } => Some("AMBIGUOUS_LATERAL_COLUMN_ALIAS"),
             Self::TypeMismatch { .. } => Some("DATATYPE_MISMATCH"),
@@ -3835,10 +3919,15 @@ impl<'a> ResolveContext<'a> {
                 aliases,
                 plan_ids,
                 ambiguous_plan_ids,
-                // Compile fix only (ADR-023 3c): this synthetic composite
+                // Compile fix only (ADR-023 3c/3d): this synthetic composite
                 // scope is resolution-time-only and never flows through
-                // `TypedAst::new`'s `source_quals_of` stamping.
+                // `TypedAst::new`'s `source_quals_of` / `source_quals_tracked_of`
+                // stamping. `false` keeps it on the legacy fallback (it is
+                // never consulted by tier (f)'s tracked branch anyway — this
+                // scope only backs the synthetic `__td_jl`/`__td_jr` tier and
+                // tier (e), never the qualified-non-synthetic `None` arm).
                 source_quals: Vec::new(),
+                source_quals_tracked: false,
             }),
             base_types,
             outer,
@@ -4218,8 +4307,8 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                 // `collect_qualifier_bindings` STOPs there). ADR-023 3b-i:
                 // distinguish them via `lookup_all` — 2+ is genuinely
                 // ambiguous (Spark: AMBIGUOUS_REFERENCE) and must not fall
-                // through to the permissive legacy name-only lookup; 0
-                // keeps the existing legacy fallback unchanged.
+                // through to the permissive legacy name-only lookup; 0 is
+                // resolved below.
                 None => {
                     let matches = ctx.scopes.lookup_all(q);
                     if matches.len() > 1 {
@@ -4231,10 +4320,70 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                             candidates,
                         });
                     }
-                    let (dt, nullable) =
-                        TypeInferenceEngine::qualified_column_info(&u.name, Some(q), ctx.schema);
-                    let ordinal = field_index(&ctx.schema.fields, &u.name);
-                    (dt, nullable, ordinal)
+                    // Genuinely 0 scope hits for `q`.
+                    if ctx.scopes.source_quals_tracked {
+                        // ADR-023 3d: authoritative lineage for this node.
+                        // `q` binds no local alias scope, so consult
+                        // per-output-column source_quals instead of falling
+                        // back to a permissive name-only lookup.
+                        let hits: Vec<usize> = ctx
+                            .schema
+                            .fields
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, f)| {
+                                f.name.eq_ignore_ascii_case(&u.name)
+                                    && ctx.scopes.source_quals.get(*i).is_some_and(|s| {
+                                        s.iter().any(|qq| qq.eq_ignore_ascii_case(q))
+                                    })
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        match hits.len() {
+                            1 => {
+                                // Projected-through (F10): resolve by
+                                // ORDINAL and DROP the qualifier so emission
+                                // renders the bare column, which binds
+                                // positionally over any wrapper — no strand.
+                                let k = hits[0];
+                                let f = &ctx.schema.fields[k];
+                                return Ok(Expression::ColumnReference(ColumnReference {
+                                    name: u.name,
+                                    qualifier: None,
+                                    ordinal: Some(k),
+                                    data_type: Some(f.data_type.clone()),
+                                    nullable: Some(f.nullable),
+                                }));
+                            }
+                            n if n >= 2 => {
+                                return Err(AnalyzerError::AmbiguousColumn {
+                                    name: u.name.clone(),
+                                    candidates: hits
+                                        .iter()
+                                        .map(|&i| ctx.schema.fields[i].name.clone())
+                                        .collect(),
+                                });
+                            }
+                            // 0 hits under authoritative lineage: NOT
+                            // projected-through. Degrade to Unresolved so
+                            // the shared tier-(g) tail below tries the OUTER
+                            // scope (correlation, tbl-005/sq-*) and
+                            // otherwise raises UnknownColumn (F8) — NO
+                            // permissive name-only fallback here.
+                            _ => (DataType::Unresolved, false, None),
+                        }
+                    } else {
+                        // Deferred lineage (USING / Star / SetOp / …): keep
+                        // the legacy name-only fallback so those cases stay
+                        // green (retired in 3e as their lineage is filled in).
+                        let (dt, nullable) = TypeInferenceEngine::qualified_column_info(
+                            &u.name,
+                            Some(q),
+                            ctx.schema,
+                        );
+                        let ordinal = field_index(&ctx.schema.fields, &u.name);
+                        (dt, nullable, ordinal)
+                    }
                 }
             }
         }
@@ -6492,6 +6641,233 @@ mod tests {
         assert!(typed.scope.source_quals.iter().all(BTreeSet::is_empty));
     }
 
+    // ── ADR-023 tier 3d — resolver consults source_quals lineage ─────────
+    // The resolver now ACTS on `source_quals` (3d), gated by
+    // `source_quals_tracked` so only nodes with AUTHORITATIVE lineage take
+    // the new path; USING/Star/deferred cases stay on the legacy fallback.
+
+    #[test]
+    fn resolve_column_projected_through_qualifier_drops_to_ordinal() {
+        // filt-018/F10 shape: `emp.alias("e").select("e.dept_id",
+        // "e.name").filter(...).filter(e.name==...)`. The SECOND filter
+        // resolves `e.name` against the Project's RESET alias scope (no "e"
+        // binding survives a Project) — tier (f) must consult
+        // `source_quals` (authoritative here) and resolve by ORDINAL with
+        // the qualifier DROPPED, so emission renders the bare column and it
+        // binds positionally over any wrapper.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased),
+            projections: vec![qcol("e", "dept_id"), qcol("e", "name")],
+        });
+        let filter1 = CommonAst::new(CommonOp::Filter {
+            input: Box::new(project),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(101)),
+            }),
+        });
+        let filter2 = CommonAst::new(CommonOp::Filter {
+            input: Box::new(filter1),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "name")),
+                right: Box::new(lit_str("x")),
+            }),
+        });
+        let typed = analyze(filter2, &bt).expect("filt-018 shape must resolve");
+        match &typed.op {
+            TypedOp::Filter {
+                condition: Expression::Binary(b),
+                ..
+            } => match b.left.as_ref() {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(c.qualifier, None);
+                    assert_eq!(c.ordinal, Some(1));
+                    assert_eq!(c.name, "name");
+                }
+                other => panic!("expected ColumnReference, got {other:?}"),
+            },
+            other => panic!("expected Filter/Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_created_alias_authoritative_empty_rejects() {
+        // filt-019/F8 shape: `emp.alias("e").select(col("dept_id").alias(
+        // "k")).filter(e.k==101)` — `k` is CREATED (source_quals ∅,
+        // authoritative for this Project). Tier (f) must NOT fall back to
+        // the permissive name-only lookup; it degrades to Unresolved so
+        // tier (g) raises `UnknownColumn` (no outer scope at the top level).
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased),
+            projections: vec![alias_expr(unresolved_col("dept_id"), "k")],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(project),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "k")),
+                right: Box::new(int_lit(101)),
+            }),
+        });
+        let err = analyze(filter, &bt).unwrap_err();
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "k");
+                assert_eq!(qualifier.as_deref(), Some("e"));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+        assert_eq!(
+            AnalyzerError::UnknownColumn {
+                name: "k".to_owned(),
+                qualifier: Some("e".to_owned()),
+            }
+            .spark_class(),
+            Some("UNRESOLVED_COLUMN.WITH_SUGGESTION")
+        );
+    }
+
+    #[test]
+    fn resolve_column_correlated_outer_ref_preserves_qualifier() {
+        // tbl-005/sq-* shape: a correlated outer reference absent from the
+        // inner (tracked) scope must still resolve via tier (g)'s outer
+        // fallback, preserving the qualifier verbatim — DuckDB's own
+        // correlated-subquery binder resolves it at runtime.
+        let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
+        // SELECT * FROM emp e WHERE e.dept_id IN (
+        //     SELECT d.dept_id FROM dept d WHERE d.budget > e.salary
+        // )
+        let inner = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Filter {
+                input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                    input: Box::new(scan("dept")),
+                    alias: "d".to_owned(),
+                })),
+                condition: Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Gt,
+                    left: Box::new(qcol("d", "budget")),
+                    right: Box::new(qcol("e", "salary")),
+                }),
+            })),
+            projections: vec![qcol("d", "dept_id")],
+        });
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(scan("emp")),
+                alias: "e".to_owned(),
+            })),
+            condition: Expression::InSubquery(InSubquery {
+                expr: Box::new(qcol("e", "dept_id")),
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+                negated: false,
+            }),
+        });
+        let typed = analyze(ast, &bt).expect("correlated outer ref must resolve");
+        match &typed.op {
+            TypedOp::Filter {
+                condition: Expression::InSubquery(in_sq),
+                ..
+            } => match &in_sq.subquery {
+                SubqueryPlan::Analyzed(inner_typed) => match &inner_typed.op {
+                    TypedOp::Project {
+                        input: inner_filter,
+                        ..
+                    } => match &inner_filter.op {
+                        TypedOp::Filter {
+                            condition: Expression::Binary(b),
+                            ..
+                        } => match b.right.as_ref() {
+                            Expression::ColumnReference(c) => {
+                                assert_eq!(c.qualifier.as_deref(), Some("e"));
+                                assert_eq!(c.name, "salary");
+                                assert_eq!(c.data_type, Some(DataType::Double));
+                            }
+                            other => panic!("expected ColumnReference, got {other:?}"),
+                        },
+                        other => panic!("expected inner Filter/Binary, got {other:?}"),
+                    },
+                    other => panic!("expected inner Project, got {other:?}"),
+                },
+                other => panic!("expected Analyzed subquery, got {other:?}"),
+            },
+            other => panic!("expected Filter/InSubquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_using_join_untracked_keeps_legacy_qualified_fallback() {
+        // USING joins keep `source_quals_tracked = false` (3c deferred
+        // their lineage) — a qualified reference must still resolve via the
+        // legacy name-only fallback, NOT raise `UnknownColumn`.
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(CommonAst::new(CommonOp::Join {
+                left: Box::new(aliased_scan("emp", "e")),
+                right: Box::new(aliased_scan("dept", "d")),
+                join_type: JoinType::Inner,
+                condition: None,
+                using_columns: vec!["dept_id".to_owned()],
+                natural: false,
+                lateral: false,
+                left_plan_ids: vec![],
+                right_plan_ids: vec![],
+            })),
+            projections: vec![qcol("e", "name")],
+        });
+        let typed = analyze(ast, &bt).expect("USING join qualified ref must still resolve");
+        match &typed.op {
+            TypedOp::Project { projections, .. } => match &projections[0] {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(c.name, "name");
+                    assert_eq!(c.data_type, Some(DataType::String));
+                }
+                other => panic!("expected ColumnReference, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_quals_tracked_true_for_project_of_columns_false_for_using_join() {
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(aliased),
+            projections: vec![qcol("e", "dept_id"), qcol("e", "name")],
+        });
+        let typed = analyze(project, &bt).unwrap();
+        assert!(typed.scope.source_quals_tracked);
+
+        let using_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(emp_scan()),
+            right: Box::new(scan("dept")),
+            join_type: JoinType::Inner,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let typed_using = analyze(using_join, &bt).unwrap();
+        assert!(!typed_using.scope.source_quals_tracked);
+    }
+
     // ── Pass 106 — uncorrelated subquery analysis ────────────────────────
 
     /// Inner plan `SELECT <col> FROM emp` — a single-column subquery body.
@@ -6826,12 +7202,20 @@ mod tests {
         );
     }
 
-    /// Inner-precedence regression: when a column name exists in BOTH
-    /// the inner and outer schemas with DIFFERENT types, the inner type
-    /// must win (tier (f) resolves before tier (g)). This protects the 13
-    /// existing green correlated subquery cases.
+    /// ADR-023 3d update: this test used to pin the tier-(f) PERMISSIVE
+    /// name-only fallback — `e.dept_id` inside the inner query, where `e`
+    /// binds no inner scope, resolved by bare name against the inner
+    /// (`dept`) schema, ignoring the qualifier mismatch entirely, and won
+    /// over the outer type. That is exactly the F8-class bug 3d closes:
+    /// the inner Filter/AliasedRelation(dept,"d") is `source_quals_tracked`
+    /// (AUTHORITATIVE), so tier (f) now correctly finds ZERO lineage hits
+    /// for a qualifier the inner scope never bound, degrades to
+    /// `Unresolved`, and tier (g) resolves `e.dept_id` as a genuine
+    /// correlated OUTER reference — matching real Spark semantics (`e` is
+    /// the outer alias; a coincidental inner name match must not shadow
+    /// it). The outer type (`Long`) now wins, not the inner (`Integer`).
     #[test]
-    fn correlated_subquery_inner_type_takes_precedence_over_outer() {
+    fn correlated_subquery_mismatched_qualifier_resolves_as_outer_reference() {
         // emp.dept_id = Integer(nullable), dept.dept_id = Integer(not-null).
         // Create a variation where emp has dept_id as Long to differentiate.
         let emp_long_dept_id = StructType::new(vec![
@@ -6845,9 +7229,10 @@ mod tests {
         //     SELECT dept_id FROM dept d WHERE d.dept_id = e.dept_id
         // )
         // The inner `dept_id` unqualified reference matches dept's Integer column.
-        // The inner `e.dept_id` should resolve via tier (f) (name-only fallback
-        // finds `dept_id` in the inner schema) and be stamped as Integer (the
-        // inner type), NOT Long (the outer type).
+        // The inner `e.dept_id` has NO local binding for `e` (only `d` is
+        // bound) — under 3d's authoritative source_quals lineage it must
+        // resolve as a correlated OUTER reference (Long), not shadow onto
+        // dept's coincidentally-same-named Integer column.
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
                 input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
@@ -6903,11 +7288,13 @@ mod tests {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.qualifier.as_deref(), Some("e"));
                     assert_eq!(c.name, "dept_id");
-                    // Must be Integer (inner type), NOT Long (outer).
+                    // Must be Long (outer type, via correlation), NOT
+                    // Integer (dept's coincidentally-same-named column) —
+                    // ADR-023 3d.
                     assert_eq!(
                         c.data_type,
-                        Some(DataType::Integer),
-                        "inner type must take precedence over outer"
+                        Some(DataType::Long),
+                        "mismatched qualifier must resolve as a correlated outer reference"
                     );
                 }
                 other => panic!("expected ColumnReference for e.dept_id, got {other:?}"),
@@ -8107,8 +8494,8 @@ mod tests {
 
     #[test]
     fn analyzer_error_bridge_maps_spark_emulated_with_class_to_spark_emulated() {
-        // ADR-023 chunk 3b: `UnknownColumn` has a known `spark_class()`
-        // (`UNRESOLVED_COLUMN`), so the bridge routes it to
+        // ADR-023 chunk 3b/3d: `UnknownColumn` has a known `spark_class()`
+        // (`UNRESOLVED_COLUMN.WITH_SUGGESTION`), so the bridge routes it to
         // `EmissionError::SparkEmulated` — NOT the legacy
         // `Unsupported{name: "analyzer-spark-emulated"}` path.
         let e = AnalyzerError::UnknownColumn {
@@ -8118,7 +8505,7 @@ mod tests {
         let bridged = analyzer_error_to_emission_error(e);
         match bridged {
             EmissionError::SparkEmulated { class, message } => {
-                assert_eq!(class, "UNRESOLVED_COLUMN");
+                assert_eq!(class, "UNRESOLVED_COLUMN.WITH_SUGGESTION");
                 assert!(
                     !message.starts_with("[SPARK-EMULATED]"),
                     "message must not double the internal prefix, got: {message}"
@@ -8154,6 +8541,8 @@ mod tests {
     #[test]
     fn spark_class_mapping_matches_adr023_chunk_3b_table() {
         // Direct pin of the `AnalyzerError::spark_class()` mapping table.
+        // ADR-023 3d: `UnknownColumn` now maps to the `.WITH_SUGGESTION`
+        // subclass (see `spark_class`'s doc comment).
         assert_eq!(
             AnalyzerError::UnknownTable {
                 name: "t".to_owned()
@@ -8167,7 +8556,7 @@ mod tests {
                 qualifier: None
             }
             .spark_class(),
-            Some("UNRESOLVED_COLUMN")
+            Some("UNRESOLVED_COLUMN.WITH_SUGGESTION")
         );
         assert_eq!(
             AnalyzerError::AmbiguousColumn {

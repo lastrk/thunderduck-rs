@@ -7056,24 +7056,44 @@ mod tests {
     /// Keep-side: a qualifier the pre-wrap block does NOT expose is a
     /// correlated OUTER reference — DuckDB's correlated binder resolves it
     /// outward through the wrap, so it must stay qualified verbatim.
+    ///
+    /// ADR-023 3d: `analyze()` itself now correctly REJECTS `outer_e.salary`
+    /// at the top level (there is no real outer scope here to resolve it
+    /// against — the old pass permissively resolved it by bare name alone,
+    /// which is exactly the F8-class bug 3d closes). This test is
+    /// EMISSION-only (the wrap/strip logic downstream of resolution), so it
+    /// hand-stamps the `TypedAst` the way a genuine correlated outer
+    /// reference would arrive already resolved, bypassing `analyze()`.
     #[test]
     fn unexposed_qualifier_survives_wrap_verbatim() {
         let _g = tap_guard();
-        let plan = CommonAst::new(CommonOp::Filter {
-            input: Box::new(CommonAst::new(CommonOp::Limit {
-                input: Box::new(aliased_scan("emp", "e")),
+        let scan = typed_table_scan("emp", Some("e"), emp_schema());
+        let limit = TypedAst::new(
+            TypedOp::Limit {
+                input: Box::new(scan),
                 limit: 5,
                 offset: None,
-            })),
-            condition: Expression::Binary(BinaryExpression {
-                op: BinaryOp::Eq,
-                left: Box::new(qcol("outer_e", "salary")),
-                right: Box::new(int_lit(1)),
-            }),
-        });
-        let bt = base_types_emp_dept(&plan);
-        let typed = analyze(plan, &bt).expect("analyze");
-        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+            },
+            emp_schema(),
+        );
+        let filter = TypedAst::new(
+            TypedOp::Filter {
+                input: Box::new(limit),
+                condition: Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Eq,
+                    left: Box::new(Expression::ColumnReference(ColumnReference {
+                        name: "salary".to_owned(),
+                        qualifier: Some("outer_e".to_owned()),
+                        data_type: Some(DataType::Double),
+                        nullable: Some(true),
+                        ordinal: None,
+                    })),
+                    right: Box::new(int_lit(1)),
+                }),
+            },
+            emp_schema(),
+        );
+        let sql = dispatch_op(&filter.op, &filter.resolved_schema).expect("dispatch");
         assert!(
             sql.contains("outer_e.salary"),
             "unexposed (correlated) qualifier must stay verbatim, got: {sql}"

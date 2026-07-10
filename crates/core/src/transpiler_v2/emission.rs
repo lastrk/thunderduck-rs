@@ -689,8 +689,9 @@ fn build_aggregate(
     let uniquified = output_uniquified(input_schema);
     // Choose the expression set to render from: the originals when merging
     // (no cosmetic churn), or each reprojected against the PRE-wrap block
-    // when wrapping onto a duplicate-name output — otherwise a qualifier
-    // like `e.dept_id` strands behind the freshly introduced `__td_sub`.
+    // when wrapping onto a duplicate-name output — unique-name qualifiers are
+    // already dropped at resolution, so only the duplicate-name wrap case needs
+    // reprojection here; nothing strands in the non-duplicate case.
     let reproject = |e: &Expression| -> Expression {
         if merge {
             e.clone()
@@ -6704,9 +6705,10 @@ mod tests {
 
     /// filt-016 shape: `emp.alias("e").orderBy("id").limit(5)
     /// .filter(col("e.salary") > 60000)` — WHERE cannot merge past an
-    /// occupied LIMIT slot; the wrap strips `e.` off the condition.
+    /// occupied LIMIT slot; `e.salary` is dropped to a bare name at resolution
+    /// (unique name), so it renders bare over the wrap.
     #[test]
-    fn filter_above_limit_strips_stranded_alias_qualifier() {
+    fn filter_above_limit_drops_alias_qualifier_at_resolution() {
         let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::Sort {
@@ -6726,18 +6728,18 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(
             sql.contains("AS __td_sub WHERE (salary) > (60000)"),
-            "stranded qualifier must be stripped to the bare output name, got: {sql}"
+            "qualifier must be dropped at resolution to the bare output name, got: {sql}"
         );
         assert!(!sql.contains("e.salary"), "got: {sql}");
     }
 
     /// filt-017 shape: `emp.alias("e").select(...).distinct()
-    /// .filter(col("e.dept_id") == 101)` — the input scope above the
-    /// Project is EMPTY (the analyzer resolved `e.dept_id` via the legacy
-    /// name-only fallback), but the pre-wrap BLOCK still exposes `e`; the
-    /// emission-side exposure is what drives the strip.
+    /// .filter(col("e.dept_id") == 101)` — the analyzer resolves `e.dept_id`
+    /// at analysis time (tier-(e)/(f)) to a bare name (the Project's scope is
+    /// empty, so it resolves projected-through), so emission renders it bare —
+    /// there is no emission-side strip.
     #[test]
-    fn filter_above_distinct_strips_stranded_alias_qualifier() {
+    fn filter_above_distinct_drops_alias_qualifier_at_resolution() {
         let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::Deduplicate {
@@ -6763,7 +6765,7 @@ mod tests {
     }
 
     #[test]
-    fn sort_above_limit_strips_stranded_alias_qualifier() {
+    fn sort_above_limit_drops_alias_qualifier_at_resolution() {
         let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Sort {
             input: Box::new(CommonAst::new(CommonOp::Limit {
@@ -6886,7 +6888,7 @@ mod tests {
         assert!(sql.contains("__td_sub"), "got: {sql}");
         assert!(
             !sql.contains("e.salary"),
-            "stranded assignment must be stripped to the bare output name, got: {sql}"
+            "assignment qualifier must be dropped at resolution to the bare output name, got: {sql}"
         );
     }
 
@@ -6945,9 +6947,9 @@ mod tests {
     /// at the top level (there is no real outer scope here to resolve it
     /// against — the old pass permissively resolved it by bare name alone,
     /// which is exactly the F8-class bug 3d closes). This test is
-    /// EMISSION-only (the wrap/strip logic downstream of resolution), so it
-    /// hand-stamps the `TypedAst` the way a genuine correlated outer
-    /// reference would arrive already resolved, bypassing `analyze()`.
+    /// EMISSION-only in that it hand-stamps a resolved TypedAst (a correlated
+    /// qualifier the resolver kept) and checks emission renders it verbatim.
+    /// The wrap/strip logic no longer exists.
     #[test]
     fn unexposed_qualifier_survives_wrap_verbatim() {
         let _g = tap_guard();
@@ -6985,9 +6987,9 @@ mod tests {
     }
 
     /// Keep-side: a qualifier that resolves as STRUCT-column access
-    /// (`resolve_column`'s struct-precedence tier) survives the wrap as
-    /// column-dot-field syntax — stripping would misread the field name as
-    /// a column.
+    /// (`resolve_column`'s struct-precedence tier) survives because resolution
+    /// never drops a struct qualifier (the struct-precedence tier runs at
+    /// analysis time); the old strip's misread hazard no longer applies.
     #[test]
     fn struct_qualifier_survives_wrap_verbatim() {
         let _g = tap_guard();
@@ -8072,14 +8074,14 @@ mod tests {
 
     /// agg-025 (F9): `emp.alias("e").orderBy("id").limit(5)
     /// .groupBy(col("e.dept_id")).count()` — GROUP BY cannot merge past an
-    /// occupied LIMIT slot, so the wrap strips `e.` off both the grouping
-    /// key and the SELECT-list copy of it (structure-preserving; only the
-    /// qualifier drops) before rendering GROUP BY, mirroring
-    /// `filter_above_limit_strips_stranded_alias_qualifier` /
-    /// `sort_above_limit_strips_stranded_alias_qualifier` for `build_filter`
+    /// occupied LIMIT slot; the qualifier is dropped at resolution (unique
+    /// name) so both the grouping key and its SELECT copy render bare
+    /// (structure-preserving; only the qualifier drops), mirroring
+    /// `filter_above_limit_drops_alias_qualifier_at_resolution` /
+    /// `sort_above_limit_drops_alias_qualifier_at_resolution` for `build_filter`
     /// / `build_sort`.
     #[test]
-    fn aggregate_over_limit_strips_stranded_alias_on_wrap() {
+    fn aggregate_over_limit_drops_alias_qualifier_at_resolution() {
         let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Aggregate {
             input: Box::new(CommonAst::new(CommonOp::Sort {

@@ -140,7 +140,7 @@ So the permitted transformations fall in three categories: *expressibility-force
 
 **Status:** Proposed
 **Depends on:** ADR-000, ADR-002 (defines the boundary), ADR-003 (the IR it annotates), ADR-004 (must serve both front-ends), ADR-012 (catalog seed)
-**Depended on by:** ADR-006, ADR-007, ADR-009, ADR-010, ADR-012, ADR-014, ADR-015, ADR-017, ADR-018
+**Depended on by:** ADR-006, ADR-007, ADR-009, ADR-010, ADR-012, ADR-014, ADR-015, ADR-017, ADR-018, ADR-023
 
 **Context.** Every dispatch decision in τ keys on resolved Spark types (ADR-009). The common AST (ADR-003) arrives unresolved (`UnresolvedAttribute`, `UnresolvedRelation`) from both front-ends; types and nullability live in the catalog and in Spark's analyzer rules, not in the AST. DuckDB's native inference gives DuckDB types, which diverge from Spark. Per ADR-000, embedding real Catalyst (which would supply correct types) is rejected, so thunderduck must reimplement this slice.
 
@@ -163,7 +163,7 @@ So the permitted transformations fall in three categories: *expressibility-force
 
 **Status:** Proposed
 **Depends on:** ADR-000, ADR-005
-**Depended on by:** ADR-007
+**Depended on by:** ADR-007, ADR-023
 
 **Context.** Spark's Catalyst analyzer applies rules in `FixedPoint` batches — it re-runs each batch until the tree stops changing — because Catalyst's rules are deliberately small, self-contained, and uncoordinated, so global behavior emerges only from iteration, and because the optimizer keeps mutating the tree (requiring re-analysis). thunderduck does **neither** of those things: it does not optimize (ADR-001), so there is no optimization-churn re-analysis; and it can write analysis as a single coordinated pass rather than uncoordinated re-scanned rules. The question is therefore which of Catalyst's fixed-points are *essential to the analysis* versus *artifacts of Catalyst's architecture*.
 
@@ -179,6 +179,8 @@ So the permitted transformations fall in three categories: *expressibility-force
 **Refinement hooks.** Enumerate the pass sequence explicitly (e.g. CTE/substitution staging → unified resolve-and-type bottom-up pass → set-operation widening down-propagation → correlated-subquery outer-first staging). For each analysis rule, classify its information-flow direction (up / down / outside-in) and confirm against the actual Spark 4.1.1 rule set whether any rule beyond the named three is non-upward. The AnalyzePlan differential (ADR-015) is the backstop: a divergence localizes the rule whose flow direction was modelled wrongly.
 
 **Set-op widened schema wins at emission time.** The downward set-op sub-sweep (UNION / INTERSECT / EXCEPT) produces a widened schema on the set-op node. At emission time, that widened schema wins over any child projection's declared cast target. Concretely, if one child projection declares `CAST(a AS DECIMAL(5,0))` and its sibling declares `CAST(b AS DECIMAL(10,2))`, the parent's widened schema is `DECIMAL(10,2)` and the emitter wraps each child's projected column in `CAST(... AS DECIMAL(10,2))` regardless of the child's declared cast target. This is not a "clean-up" cast; it is the load-bearing rule for set-op parity with Spark, whose analyzer computes the widened set-op type before the child projections' types are pinned. Codified: the analyzer's sub-sweep computes the widened schema; the emitter's `render_union` / `render_intersect` / `render_except` applies a per-column CAST wrapper from that widened schema. Neither pass may defer the CAST to the other — the analyzer does not rewrite child projections in place; the emitter reads the widened schema on the parent, not the child-declared cast.
+
+**Per-output-column source-qualifier lineage (ADR-023).** The resolve pass additionally computes, for each output column, the set of source qualifiers it inherits — one more upward-flowing fact carried alongside type and nullability in the same bottom-up sweep (inherited by scans/aliased relations, preserved on bare-column pass-through projection, emptied on alias-creating/computed projections, union'd with offset through joins). Qualified-column resolution consults this lineage before falling back to name-only lookup; the derivation rules and the match-count → Spark-error-class mapping are fixed by ADR-023.
 
 ---
 
@@ -561,7 +563,7 @@ That positioning has shifted. ADR-010 already classifies the extension functions
 
 **Status:** Proposed
 **Depends on:** ADR-002 (delegation boundary), ADR-003 (common AST), ADR-004 (front-end convergence), ADR-005 (owned inference), ADR-014 (two decision spaces), ADR-015 (differential oracle)
-**Depended on by:** every implementation slice; ADR-022 (τ is the only path — runtime-position companion)
+**Depended on by:** every implementation slice; ADR-022 (τ is the only path — runtime-position companion); ADR-023 (per-column lineage threads through the τ-owned `RelScope`)
 
 **Context.** τ must own its substrate — the protobuf-to-CommonAST converter, the `Expression` payload in CommonAST, and the `TypeInferenceEngine`. If τ consumed an upstream plan type produced by a converter it does not own, τ inherits every quirk of that converter: synthesized-SQL shortcut shapes for structured operations (VALUES, table functions, file scans, Arrow-IPC LocalRelation), stringly-typed qualifier encodings (`__plan_id_{N}__`), silent-NULL fallbacks in Arrow value marshalling. If τ delegated type/nullability calls to an upstream inference engine, symmetric-omission gaps in that engine (a function present in `aggregate_return_type` but missing from `aggregate_is_nullable`) transit silently — τ arms can be individually correct yet the corpus stays red because the input's schema or nullability was wrong before the arm ran. Substrate ownership is the design lever that makes τ's correctness a τ-local concern.
 
@@ -596,7 +598,7 @@ That positioning has shifted. ADR-010 already classifies the extension functions
 
 **Status:** Proposed
 **Depends on:** ADR-000 (no-JVM premise), ADR-002 (delegation boundary), ADR-021 (substrate ownership)
-**Depended on by:** every implementation slice
+**Depended on by:** every implementation slice; ADR-023 (qualified-reference Spark-emulated errors)
 
 **Context.** τ is the transpiler. When τ does not implement a Spark input, τ says so — it produces a typed error to the caller, not a partial or synthetic SQL string, and not a route to some other execution path. The correctness contract is Spark parity or a named limitation; there is no third choice ("silently different"). This ADR pins that contract.
 
@@ -622,8 +624,50 @@ Neither category triggers a runtime fallback. Both surface directly to the clien
 **Refinement hooks.**
 - **Timing of non-τ source cleanup** is a scheduling decision, not an ADR one — delete once no test, no CI job, and no build step references it. Incremental per-slice deletion is permitted.
 - **Boundary-error precision.** Over time, the set of `Unsupported*` variants shrinks as τ grows. A future ADR (post-corpus-green) may enumerate the residual *permanent* unsupported set — inputs Spark accepts that τ will never support (e.g. distributed-only operators). Until then, boundary errors are pragmatic — "not yet" is a valid reason.
+- **Qualified-reference emulation depends on ADR-023.** The Spark-emulated category for qualified references — `AmbiguousColumn` on a duplicate user alias, `UnknownColumn` on a qualifier that names no source of the referenced column — requires ADR-023's per-output-column source-qualifier lineage; without it, those inputs ride the permissive name-only fallback and land in exactly the forbidden silent-divergence / opaque-error modes.
 
 **Carve-out register (for permanent Thunderduck-boundary errors).** *Currently empty.* When a boundary error is deemed permanent (Thunderduck will not implement this feature), it is recorded here with a written justification. Non-permanent "not yet" boundary errors are the ADR-022 category-2 default (surfaced to the caller with an honest `Unsupported*` reason) — they are not tracked here.
+
+---
+
+## ADR-023 — τ tracks per-output-column source-qualifier lineage; qualified resolution consults it before the name-only fallback
+
+**Status:** Proposed
+**Depends on:** ADR-005 (schema-threading analysis — lineage is one more fact in the same family as type/nullability), ADR-006 (analyzer pass structure — lineage is computed in the resolve pass), ADR-021 (τ owns its substrate, including `RelScope`), ADR-022 (two error categories — lineage is what makes the qualified-reference errors *Spark-emulated*)
+**Depended on by:** the qualified-resolution slices (closure of findings F8/F10/F11)
+
+**Context.** τ's analyzer models qualifier visibility per **relation**, not per column: `RelScope.aliases` (analyzer.rs) is a `Vec<(String, Range<usize>)>` binding each qualifier to a contiguous field range of the current node's schema, and `RelScope::of` derives the next scope shallowly from the operator shape. Any operator that reshapes columns — `Project`, `Aggregate`, `SetOp`, `WithColumns` — and any USING join resets the scope to EMPTY, so a user alias is dead the moment the chain passes through a `select()`. Spark's analyzer instead tracks **attribute lineage per output column**: each output attribute carries the set of source qualifiers it inherits, and that set survives projecting the bare column through but not minting a new alias. The gap was pinned empirically against Spark 4.1.1 (findings F8/F10/F11, `tasks/select-block-review-findings.md`):
+
+- **F8** — `emp.alias('e').select(col('dept_id').alias('k')).filter(col('e.k')==101)`: `k` is a select-**created** alias, so no output attribute carries qualifier `e` → Spark errors `UNRESOLVED_COLUMN.WITH_SUGGESTION`. τ's tier-(f) name-only fallback (`TypeInferenceEngine::qualified_column_info` ignores the relation qualifier) resolves it and silently returns rows.
+- **F10** — `emp.alias('e').select('e.dept_id','e.name').distinct().filter(e.dept_id==101).filter(e.name=='x')`: `name` is a projected-**through** original column, so its lineage still carries `e` → Spark succeeds. τ strands the qualifier over the wrapped block and fails with an opaque binder error over `__td_sub`.
+- **F11** — `emp.alias('x').join(emp2.alias('x'), x.id==x.id).select(col('x.salary'))`: the qualifier binds **both** sides → Spark errors `AMBIGUOUS_REFERENCE`. `RelScope::lookup` deliberately returns `None` on 2+ matches, the caller falls through to the name-only path, and τ silently binds the LEFT side.
+
+F8 and F10 present the **identical** analyzer input — `e.<local-col>` where `e` binds no local range scope — yet require opposite outcomes; per-relation range scopes cannot separate them, per-column lineage can. Nor is this fixable at emission: the correlated-LATERAL case (tbl-005, `… WHERE e2.dept_id <=> e.dept_id`) presents the exact F10 shape but its `e` is a **live outer** qualifier.
+
+**Decision.** The resolve pass threads a **per-output-column source-qualifier set** through `RelScope`/analysis, as one more upward-flowing fact alongside type and nullability (ADR-005/006). Derivation rules per operator:
+
+1. **Inherited** — a `TableScan` stamps every column with `{table}` (plus the alias when present); an `AliasedRelation` re-stamps every column with `{alias}`, replacing the child's sets (mirroring `RelScope::of` dropping the child scope).
+2. **Preserved** — pass-through projection of a bare column carries the source column's set unchanged; schema-verbatim passthroughs (`Filter`/`Sort`/`Limit`/…) carry all sets verbatim.
+3. **Emptied** — a projection-created alias or any computed expression yields the EMPTY set: a freshly minted attribute carries no source qualifier (this is exactly what makes F8 an error in Spark).
+4. **Union'd through joins** — each side's per-column sets carry over, the right side offset by the left's width; per-column sets are positional, so they survive USING joins even though the per-relation range scope stays empty there.
+
+`resolve_column` consults lineage **before** the tier-(f) name-only fallback. For a qualified reference `(q, n)` reaching that point: (i) exactly one output column named `n` whose lineage contains `q` ⇒ resolve to it; (ii) the column exists but no candidate's lineage carries `q` ⇒ Spark-emulated `UnknownColumn` — **unless** the outer scope binds `q`, in which case the qualifier is kept verbatim and resolution proceeds via the tier-(g) outer-scope fallback so the correlation survives; (iii) two or more candidates carry `q` ⇒ Spark-emulated `AmbiguousColumn`.
+
+**Alternatives considered (and rejected).**
+- *Emission-side qualifier strip.* `strip_stranded_qualifiers` cannot know whether the qualifier legitimately bound the referenced column. The killer is the correlated-LATERAL trap: tbl-005's inner `e.dept_id` is shape-identical to F10's dead-alias reference at emission, but its `e` is a live OUTER qualifier — a naive strip rebinds it to the local `e2` and silently corrupts the correlation. Only the analyzer, holding lineage plus outer-scope knowledge, can classify.
+- *Strict tier-(f): a qualifier binding no local/outer scope ⇒ `UnknownColumn`.* Bounded, but fixes F8 by breaking F10: the projected-through case becomes a clean-but-divergent boundary error where Spark succeeds, and the USING-join and correlated-subquery cases that rely on the permissive fallback regress.
+- *Keep the permissive name-only fallback.* Leaves F8/F11 as silent divergence and F10 as an opaque strand/binder error — precisely the two failure modes ADR-022 forbids.
+
+**Consequences.**
+- (+) Converts the current silent-divergence cases (F8 returns rows Spark rejects; F11 binds left where Spark rejects) and the opaque-error/strand case (F10) into correct Spark-parity results and Spark-emulated errors (ADR-022 category 1).
+- (+) Gives `resolve_column` a principled 0/1/2+ discipline for qualified references, symmetric with the existing central unqualified-ambiguity check.
+- (−) A per-column qualifier set must be threaded through every operator's scope derivation (`RelScope::of` and the analyze arms) — a real cost in representation and in per-operator rules, each of which must match Spark.
+- (neutral) Lineage flows strictly upward, like type and nullability, so it fits ADR-006's single coordinated bottom-up resolve pass — no new pass, no fixed-point iteration.
+
+**Refinement hooks.**
+- **Match-count → error-class mapping.** `RelScope::lookup` currently collapses 2+ matches to `None`; it must surface the raw 0/1/2+ count, mapped per shape to Spark's error class: duplicate **user alias** ⇒ `AmbiguousColumn` (`AMBIGUOUS_REFERENCE`); bare-**table-name** self-join reference ⇒ `UnknownColumn` (`UNRESOLVED_COLUMN`) — the pinned test `self_join_duplicate_alias_binding_falls_back_to_legacy_no_panic` marks the shape split.
+- **Per-operator lineage rules.** Enumerate the inherit/preserve/empty/union rule for every operator in `RelScope::of`'s inventory (including `WithColumns` replace-by-name, `WithColumnsRenamed`, `ToDf`, `Pivot`, set-ops) and validate each against Spark 4.1.1.
+- **Evidence gate.** This is a dedicated, fully-gated analyzer work item: F8 and F11 land as `expected_error` corpus witnesses, F10 and `filt-018` as success witnesses, with full self-join + join-corpus revalidation under the standing zero-regression gate.
 
 ---
 
@@ -641,7 +685,7 @@ The ADRs are not peers; they form four strata.
 
 **Substrate & front-ends (the IR and how it is populated and analyzed):** ADR-003 (common AST), ADR-004 (both front-ends lower to it; relation-vs-command by parse-root), ADR-006 (analyzer pass structure), ADR-021 (τ owns its protobuf converter, Expression, TypeInferenceEngine). These define the representation and the substrate boundary.
 
-**Consequences (the spine applied to surfaces):** ADR-007 (A/B/C, B retained) from 001+002+005+006+008; ADR-008 (correlated direct) from 001; ADR-009 (declarative table, hand-written match arms) from 003+005+007; ADR-010 (extension fns, C++ project) from 005; ADR-011 (commands) from 001+004; ADR-012 (catalog overlay) from 011+005; ADR-013 (external/lakehouse reads, delegated) from 000+002+012; ADR-017 (Delta append writes) and ADR-018 (UC-managed Iceberg CTAS/INSERT/DELETE/MERGE writes) — the per-format write specializations — both from 005+011+013+016; ADR-019 (the native-read / Iceberg-write lakehouse I/O contract) composing 013+018.
+**Consequences (the spine applied to surfaces):** ADR-007 (A/B/C, B retained) from 001+002+005+006+008; ADR-008 (correlated direct) from 001; ADR-009 (declarative table, hand-written match arms) from 003+005+007; ADR-010 (extension fns, C++ project) from 005; ADR-011 (commands) from 001+004; ADR-012 (catalog overlay) from 011+005; ADR-013 (external/lakehouse reads, delegated) from 000+002+012; ADR-017 (Delta append writes) and ADR-018 (UC-managed Iceberg CTAS/INSERT/DELETE/MERGE writes) — the per-format write specializations — both from 005+011+013+016; ADR-019 (the native-read / Iceberg-write lakehouse I/O contract) composing 013+018; ADR-023 (per-output-column source-qualifier lineage) from 005+006+021+022 — a refinement of the owned analysis substrate.
 
 **Enabled (the testing architecture the rest makes possible):** ADR-014 (two decision spaces), ADR-015 (differential + AnalyzePlan oracle), ADR-016 (version pin). These exist *because* the spine made τ minimal and its decisions enumerable; they are not free-standing choices.
 
@@ -658,8 +702,8 @@ Implication for refinement: a change to the premise (ADR-000) or a spine ADR (es
 | 002 delegation | 000, DuckDB-correct (LB2) | 003, 005, 007, 013 |
 | 003 common AST | 000, 002 | 004, 005, 009 |
 | 004 front-ends → AST | 000, 003 | 005, 011, 015 |
-| 005 type/null inference | 000, 002, 003, 004, 012 | 006, 007, 009, 010, 012, 014, 015, 017, 018 |
-| 006 analyzer passes | 000, 005 | 007 |
+| 005 type/null inference | 000, 002, 003, 004, 012 | 006, 007, 009, 010, 012, 014, 015, 017, 018, 023 |
+| 006 analyzer passes | 000, 005 | 007, 023 |
 | 007 A/B/C | 001, 002, 005, 006, 008 | 009 |
 | 008 correlated direct | 001 | 007 |
 | 009 declarative table | 003, 005, 007 | 014, 015 |
@@ -674,8 +718,9 @@ Implication for refinement: a change to the premise (ADR-000) or a spine ADR (es
 | 018 Iceberg writes (UC managed) | 005, 011, 013, 016 | 015, 019 |
 | 019 lakehouse I/O contract | 013, 018 | — |
 | 020 strict-only extension | 000, 001, 010 | 009, 015 (simplified) |
-| 021 τ owns substrate | 002, 003, 004, 005, 014, 015 | every implementation slice; INV10 |
-| 022 τ is the only path | 000, 002, 021 | every implementation slice; two-error-category rule |
+| 021 τ owns substrate | 002, 003, 004, 005, 014, 015 | every implementation slice; INV10; 023 |
+| 022 τ is the only path | 000, 002, 021 | every implementation slice; two-error-category rule; 023 |
+| 023 qualifier lineage | 005, 006, 021, 022 | the qualified-resolution slices (F8/F10/F11 closure) |
 
 **New external dependency:** the [`thunderduck-duckdb-extension`](https://github.com/lastrk/thunderduck-duckdb-extension) C++ project is an external build artifact that ADR-010 depends on. It is not an ADR but it participates in the dependency graph: the dispatch table's `Extension(...)` targets must match its exported functions (INV6), its behavior must be differentially validated (edge 010 → 014), and it is the third member of the version-coordination set (edge 010 → 015, alongside Spark 4.1.1 and the dispatch table).
 
@@ -762,6 +807,7 @@ Review premise-first, then spine, then substrate, then consequences, then the en
 4. **ADR-007 → 013** (consequences) in dependency order per CV.2 — this group now includes external/lakehouse reads (ADR-013), which depends only on the delegation premise (000/002) and the overlay (012).
 5. **ADR-016** (version pin — it scopes the coverage claims, so fix it first) then **ADR-014 → 015** (the enabled testing architecture).
 6. **ADR-020** (strict-only extension), **ADR-021** (τ owns substrate), and **ADR-022** (τ is the only path). ADR-020 consolidates the emission target; ADR-021 pins the substrate boundary (τ owns its protobuf converter, Expression, TypeInferenceEngine); ADR-022 pins the runtime position (τ is the only path; two error categories; no fallback). Together with ADR-000's premise, these three shape every implementation slice.
+7. **ADR-023** (per-column qualifier lineage) last — it refines ADR-005/006's analysis and presupposes ADR-021's `RelScope` ownership and ADR-022's error categories, all ratified in the steps above.
 
 Defer no ADR's *ratification* past the point where something depending on it is ratified — the matrix in CV.2 gives the order. The two highest-value review items are **ADR-000's no-JVM premise** (widest blast radius; if it moves, Alternative 1 deletes ADR-005/006) and **ADR-005's scope together with LB1** (where the implementation cost and risk concentrate).
 

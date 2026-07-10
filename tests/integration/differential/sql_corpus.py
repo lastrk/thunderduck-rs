@@ -310,6 +310,22 @@ case("jn-022", "join", "both sides qualified star", "SELECT e.*, d.* FROM emp e 
 # raw `*` keeps the USING key at its natural position — silent positional
 # mislabeling vs Spark's key-hoisted schema. Born red by design.
 case("jn-023", "join", "multi-slot star over USING join (star-order witness)", "SELECT *, 1 AS one FROM emp JOIN dept USING (dept_id)")
+# jn-024 (F11): DEFERRED — the SAME alias `x` on BOTH join sides. Spark ERRORS
+# AMBIGUOUS_REFERENCE (`x.id` could be x.id or x.id) even in the ON clause,
+# because the qualifier binds both scopes. τ resolves first-match (left) and
+# silently returns left-side data. SQL analog of DataFrame join-023; shares
+# the tier-(e)/(f) qualified-resolution path with F8/F10, gated by the ADR-023
+# lineage fix. Born red, NOT in the witness-progress baseline.
+case("jn-024", "join", "F11 DEFERRED — duplicate alias both join sides (Spark AMBIGUOUS_REFERENCE; τ binds left)", "SELECT x.salary FROM emp x JOIN emp2 x ON x.id = x.id", expected_error="AMBIGUOUS_REFERENCE")
+# NOTE (F8/F10 have NO faithful SQL witness): F8's DataFrame plan is a filter
+# ABOVE a projection that created the alias; the only SQL form with that plan
+# is a derived table (`... FROM (SELECT dept_id AS k FROM emp) e WHERE e.k=101`),
+# where `e.k` gains a LIVE binding and BOTH engines succeed (0 rows) — not
+# born red. The single-SELECT form `SELECT dept_id AS k FROM emp e WHERE e.k`
+# errors in BOTH engines (a WHERE cannot see a select-list alias — a different
+# scoping rule, not F8's dead-alias lineage). F10's derived-table analog
+# likewise gains a live binding and succeeds in both. See the DataFrame
+# witnesses filt-018/filt-019 and tasks/select-block-review-findings.md.
 
 # ── 4. GROUP BY / aggregates ─────────────────────────────────────────────────
 case("agg-001", "aggregate", "COUNT(*)", "SELECT count(*) AS n FROM emp")

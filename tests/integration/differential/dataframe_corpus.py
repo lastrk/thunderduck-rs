@@ -270,6 +270,25 @@ case("filt-015", "filter", "filter on computed column", lambda I: I["emp"].withC
 # fitness signal item 3 is gated on (ADR-022).
 case("filt-016", "filter", "alias-qualified filter above limit (strand witness)", lambda I: I["emp"].alias("e").orderBy("id").limit(5).filter(F.col("e.salary") > 60000))
 case("filt-017", "filter", "alias-qualified filter above distinct (strand witness)", lambda I: I["emp"].alias("e").select("e.dept_id", "e.active").distinct().filter(F.col("e.dept_id") == 101))
+# DEFERRED witnesses — attribute-lineage / qualified-resolution cluster
+# (findings F8, F10 in tasks/select-block-review-findings.md; the ADR-023
+# lineage fix is their acceptance gate). Born RED against τ and expected to
+# STAY red until that work lands — they are NOT in the witness-progress
+# baseline. See select_block_witness_manifest.json ("deferred": true).
+#
+# filt-018 (F10): a dead alias `e` projected THROUGH to two original columns,
+# then filtered twice. The second filter merges WHERE-onto-WHERE onto an
+# already-wrapped block (no wrap ⇒ no strip), so `e.name` strands over
+# __td_sub → τ binder error. Spark SUCCEEDS (0 rows over struct<dept_id,name>
+# is a valid empty result) because the projected-through column keeps a live
+# binding. Opposite horn of filt-019 (F8) from the SAME analyzer input.
+case("filt-018", "filter", "F10 DEFERRED — dead-alias projected-through column, double filter (Spark succeeds empty; τ strands e over __td_sub)", lambda I: I["emp"].alias("e").select("e.dept_id", "e.name").distinct().filter(F.col("e.dept_id") == 101).filter(F.col("e.name") == "x"))
+# filt-019 (F8): a dead alias `e` qualifying a select-CREATED alias `k`.
+# Spark ERRORS UNRESOLVED_COLUMN.WITH_SUGGESTION (a select-created alias
+# carries no source qualifier, so `e.k` resolves nothing). τ's over-permissive
+# tier-(f) name-only fallback strips the bogus qualifier and silently returns
+# rows — the exact divergence F8 documents.
+case("filt-019", "filter", "F8 DEFERRED — dead-alias qualifying a select-created alias (Spark UNRESOLVED_COLUMN; τ silently returns rows)", lambda I: I["emp"].alias("e").select(F.col("dept_id").alias("k")).filter(F.col("e.k") == 101), expected_error="UNRESOLVED_COLUMN.WITH_SUGGESTION")
 
 # ── 3. Literals, typed columns & casts (type-source stress) ─────────────────
 case("cast-001", "cast", "lit int / string / bool / double", lambda I: I["emp"].select(F.lit(1).alias("i"), F.lit("x").alias("s"), F.lit(True).alias("b"), F.lit(3.14).alias("d")))
@@ -463,6 +482,14 @@ case("join-019", "join", "multi-slot star over USING join (star-order witness)",
 case("join-020", "join", "nested USING join as re-wrapped join side (hoisted-slot drop witness)", lambda I: I["emp"].alias("a").join(I["nums"].alias("n"), F.col("a.id") == F.col("n.a")).join(I["emp2"].join(I["dept"], on="dept_id"), F.col("dept_name") == F.lit("Infrastructure")))
 case("join-021", "join", "user alias buried under USING parent (vis-exemption strand witness)", lambda I: I["emp"].alias("e").join(I["nums"].alias("n"), F.col("e.id") == F.col("n.a")).join(I["dept"], on="dept_id").select("e.name"))
 case("join-022", "join", "duplicate synthetic join alias (__td_jr collision witness)", _join_022)
+# join-023 (F11): DEFERRED — the SAME user alias `x` on BOTH join sides.
+# Spark ERRORS AMBIGUOUS_REFERENCE (`x.id` could be x.id or x.id) — it rejects
+# the qualified ref, even in the ON clause, when the qualifier binds both
+# sides. τ's dup-alias guard re-wraps the right side, so `x.salary` binds the
+# LEFT first-match and silently returns left-side data. Shares the tier-(e)/(f)
+# qualified-resolution path with F8/F10; gated by the ADR-023 lineage fix.
+# NOT in the witness-progress baseline (born red, stays red until then).
+case("join-023", "join", "F11 DEFERRED — duplicate user alias on both join sides (Spark AMBIGUOUS_REFERENCE; τ silently binds left)", lambda I: I["emp"].alias("x").join(I["emp2"].alias("x"), F.col("x.id") == F.col("x.id")).select("x.salary"), expected_error="AMBIGUOUS_REFERENCE")
 
 # ── 12. Set operations (type widening) ──────────────────────────────────────
 def _emp_proj(I):

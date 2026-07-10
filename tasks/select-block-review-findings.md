@@ -260,6 +260,69 @@ correct expected behavior is a Spark ERROR, i.e. `expected_error` cases),
 12/13 are error-category/debug-only concerns pinned by unit tests when
 addressed.
 
+## ADR-023 tier-3 closure + strip-machinery retirement (2026-07-10)
+
+The DEFERRED "qualified-resolution cluster" above (F8/F10/F11) and the
+strand-class machinery it entangled are now CLOSED on `feat/v2-transpiler`
+(not pushed). Tiers 3a–3e committed, each gated on `witness-progress.sh`
+(REGRESSIONS 0) with an independent opus review:
+
+- 3a `62e5c1b` carry ordinal on ColumnReference · 3b `85a4069` F11 ambiguity +
+  Spark-emulated error surfacing · 3c `3bc668e` source_quals lineage (additive)
+  · 3d `dc15711` resolver consults lineage (F8/F10 flip).
+- 3e (retire strip machinery): 3e-i `8d0bee4` USING joins → tracked lineage ·
+  3e-ii `605c540` tier-(e) drops the qualifier for unique output names
+  (relocates the strip rewrite to resolution time) · 3e-iii `fc86f21`
+  Aggregate source_quals on the SparkSQL folded-grouping path · 3e-iv
+  `94daf03` **DELETE `strip_stranded_qualifiers`** (net −73 lines).
+
+Witnesses: the manifest now carries 14 (the original 10 + filt-018/F10,
+filt-019/F8, join-023/jn-024/F11) and ALL 14 are green; baseline 719 PASS,
+0 regressions throughout.
+
+**Method note (reusable):** before deleting `strip_stranded_qualifiers`, it
+was instrumented to append every real fire to a file while still stripping
+(non-destructive → corpus stays green → captures ALL fires). Post-3e-ii it
+fired for exactly one ref — `dt.d_year` in tpcds-q3/q52 (a folded-aggregate
+`ORDER BY` over the aggregate's reset scope → tier-(f) legacy). 3e-iii fixed
+that; the re-probe showed ZERO fires → deletion proven safe. Use this
+"prove-it-dead" probe before removing any suspected-dead path.
+
+### Remaining strip-machinery item — `__td_jl`/`__td_jr` (NOT done; own work item)
+
+ADR-023 (line 637/659) also lists the `__td_jl`/`__td_jr` synthetic-alias
+machinery for retirement. This was scoped and deliberately left as a separate
+effort — it is NOT a small chunk and **no red witness demands it** (all 14
+green without touching it). It spans join-condition resolution
+(`ResolveContext::for_join_condition`, `TD_JOIN_LEFT`/`TD_JOIN_RIGHT`, 8+8
+call sites in analyzer.rs), the `mark_join_alias_requirements` top-down
+post-pass, `TypedOp::Join`'s `*_requires_synthetic` flags, and join emission
+(`build_join`/`build_join_side`, with the join-022 self-collision handling).
+
+Crucially it has TWO roles, only one of which ADR-023 can remove:
+1. **`requires_synthetic` (migratable):** forces a side wrap `AS __td_jl/jr` so
+   an ambiguous join-condition ref can name a specific side. This is what an
+   ordinal-based resolution (the ordinal already rides on `ColumnReference`
+   from 3a) could replace — resolve the condition ref to (side, ordinal) and
+   have emission qualify by the side's real alias positionally, no synthetic
+   name. BUT `render_column_reference` currently renders purely off the string
+   qualifier and IGNORES the ordinal, so this needs a NEW render-by-ordinal
+   emission path for join conditions.
+2. **Structural fallback (permanent):** when a complex side (a block with
+   WHERE/GROUP BY/etc.) cannot inline, it must be wrapped as a derived table,
+   which needs *some* alias — `__td_jl`/`__td_jr` is just that fresh name.
+   This is not band-aid and cannot be "retired"; at most renamed.
+
+Because the two roles share `build_join_side`'s ladder, migrating role 1
+cleanly means separating condition-ref qualification from the derived-table
+wrap decision — a correctness-critical join-emission change where a silent
+wrong-column is the hazard (ADR-023's stated (−) consequence). Recommended as
+a dedicated, freshly-designed, heavily-adversarially-verified work item, not a
+tail-end chunk. Lower-priority siblings also still open: `reproject_qualifiers`
+/`output_uniquified` are the ADR's INTENDED regenerate-at-emission path
+(keepers, not band-aid); `exprs_visible_in`/`scope_binds` are the structural
+merge-vs-wrap gate; `trace_stranded_qualifiers` is the F14 diagnostic.
+
 ## Deferred cleanup candidates (not in the ranked 15)
 
 - `max_clause` derivable from slot occupancy (sql_block.rs).

@@ -4,61 +4,83 @@ description: >-
   Type-accurate Rust code navigation from a static rust-analyzer SCIP snapshot —
   no resident language server. Use to answer "who calls / references this symbol",
   "where is this defined", and "find symbols named X" with TRUE, trait- and
-  type-resolved results. Reach for it specifically to FILL THE GAPS that codegraph
-  (syntactic tree-sitter) and semble (embeddings) get wrong on this codebase:
-  trait-method call sites dispatched through Option<T>/generics (codegraph
-  undercounts these badly), exact cross-crate definitions, and def-vs-reference
-  separation. NOT for concept/NL search (use semble) or macro-body/blast-radius
+  type-resolved results, and (heavyweight `expand` mode) "show the code a macro
+  generates". Reach for it specifically to FILL THE GAPS that codegraph (syntactic
+  tree-sitter) and semble (embeddings) get wrong on this codebase: trait-method
+  call sites dispatched through Option<T>/generics (codegraph undercounts these
+  badly), exact cross-crate definitions, def-vs-reference separation, and macro
+  expansion. NOT for concept/NL search (use semble) or blast-radius/call-path
   survey (use codegraph). SCIP carries symbols/defs/refs/docs but NOT hover types
-  or macro expansion — those need a live LSP session.
-allowed-tools: Bash(python3:*), Bash(rust-analyzer:*)
+  — those still need a live LSP session.
+allowed-tools: Bash(python3:*), Bash(rust-analyzer:*), Bash(cargo:*)
 ---
 
 # scip-nav — SCIP-snapshot code navigation
 
-A memory-cheap gap-filler for Rust code intelligence. It queries a static
-`.scip/index.scip` produced by `rust-analyzer scip`. Generation costs a ~3 GB /
-~17 s transient spike (fits the 8 GiB devcontainer cap — see the
-`rust-analyzer-lsp-viability` memory); after that the index is a 10 MB file
-queried at ~zero resident memory, unlike a warm MCP language server.
+A memory-cheap gap-filler for Rust code intelligence. Cheap queries (`refs`/`def`/
+`sym`) read a static `.scip/index.scip` produced by `rust-analyzer scip`
+(~15–17 s / ~3 GB transient to build, then a ~10 MB file queried at ~zero resident
+memory — unlike a warm MCP language server). A separate heavyweight `expand` mode
+shells out to nightly `rustc` for macro-expanded source.
 
 ## When to use (and not)
 
-- ✅ **"Who calls / references `X`?"** — trait/type-resolved, so it counts
-  `.method()` calls dispatched through `Option<T>`, generics, and across crates
-  that codegraph misses. Validated: `require_proto` → 44 refs (codegraph reported
-  1, then 26; ripgrep 45 with a doc-comment false positive).
-- ✅ **"Where is `X` defined?"** — exact, and separates the trait decl from each impl.
+- ✅ **"Who calls / references `X`?"** — trait/type-resolved, counts `.method()` calls
+  dispatched through `Option<T>`, generics, and across crates that codegraph misses.
+  Validated: `require_proto` → 44 refs (codegraph reported 1, then 26; ripgrep 45 with
+  a doc-comment false positive).
+- ✅ **"Where is `X` defined?"** — exact, separates the trait decl from each impl.
 - ✅ **"What symbols are named like `X`?"** — workspace symbol search.
+- ✅ **"What code does this macro generate?"** — `expand` mode (nightly). Validated: the
+  `common_op_children!` invocation expands to the concrete 22-arm `CommonOp::children`
+  match; `bail_boundary_op!("Values", …)` expands to `return Err(EmissionError::Unsupported{…})`.
 - ❌ Concept / natural-language search → use **semble**.
-- ❌ Macro-body inspection, blast-radius/call-path survey, verbatim source → use **codegraph**.
-- ❌ Type-at-point (hover) or macro expansion → SCIP can't; needs a live LSP session.
+- ❌ Blast-radius / call-path / subsystem survey → use **codegraph**.
+- ❌ Type-at-point (hover) → SCIP can't; needs a live LSP session.
 
 ## Usage
 
 ```bash
 S=.claude/skills/scip-nav/scip_query.py
-python3 $S status                 # index freshness; warns if a .rs file is newer
+python3 $S status                 # index freshness (git-fingerprint based)
 python3 $S refs   <symbol>        # all references (call sites), grouped by file
 python3 $S def    <symbol>        # definition(s), trait decl + each impl
 python3 $S sym    <query>         # fuzzy symbol search (substring, case-insensitive)
-python3 $S refresh                # regenerate the index (bounded ulimit + timeout)
-# append --count to refs/def/sym for a terse integer (scripting/validation)
+python3 $S expand <crate> [pat]   # macro-EXPANDED source; slice by regex `pat`
+python3 $S refresh                # regenerate the SCIP index + fingerprint
+# flags: --count (terse int, refs/def/sym) · --stale-ok · --auto-refresh
 ```
 
-`<symbol>` is a bare identifier (e.g. `require_proto`, `CommonAst`, `convert`);
-matching is identifier-boundary against the SCIP symbol string.
+`<symbol>` is a bare identifier (`require_proto`, `CommonAst`, `convert`); matching is
+identifier-boundary against the SCIP symbol string. `<crate>` accepts `core` / `server`
+aliases or a full package name.
 
-## Refresh policy
+## Freshness is structural (fail-closed)
 
-The snapshot is **point-in-time**. Run `refresh` after meaningful edits (or wire it
-to a post-edit/pre-review hook). `status` flags staleness by comparing the index
-mtime against the newest `.rs` file. `refresh` is bounded (`ulimit -v`, `nice`,
-`timeout`) so a runaway rust-analyzer dies instead of the container.
+The snapshot is **point-in-time**. Every `refs`/`def`/`sym` runs a ~70 ms git
+fingerprint (`HEAD` + `git status --porcelain -uall` + mtime/size of dirty paths)
+against `.scip/index.fingerprint`; if the working tree changed it **refuses** (exit 1)
+rather than serve stale results — override with `--stale-ok` or `--auto-refresh`.
+`refresh` is bounded (`ulimit -v`, `nice`, `timeout`). `status` reports what's out of sync.
+
+## `expand` mode — macro expansion (heavyweight, use in exploration/review, not tight loops)
+
+Fills the one gap SCIP/codegraph/semble/rg cannot: the actual code generated by
+`macro_rules!`/derive/proc-macros. Runs `cargo +nightly rustc -p <pkg> --lib --
+-Zunpretty=expanded`, caches to `.scip/expanded-<pkg>.rs` with its own fingerprint,
+and slices the output by your regex.
+
+Trade-offs (very different from the cheap SCIP queries — by design it's opt-in):
+- **Compile-bound** (~cargo-check cost; the first `+nightly` run recompiles deps under
+  nightly — several minutes, then cached).
+- **Crate-scoped** (rustc can't expand a single item) → large output, hence cache-then-grep.
+- **Needs a green tree** (parse/macro errors abort) and the **nightly** toolchain.
+- Not surgical to one invocation like live LSP `expandMacro`; grep the region instead.
 
 ## How it works
 
 `scip_query.py` is a dependency-free SCIP protobuf reader (no `protoc`, no `scip`
 CLI). It walks `Index.documents[].occurrences[]`, matching `Occurrence.symbol` and
 testing the `Definition` bit of `symbol_roles` to split definitions from references.
-Field numbers follow github.com/sourcegraph/scip `scip.proto`.
+Field numbers follow github.com/sourcegraph/scip `scip.proto`. `expand` is a separate
+nightly-`rustc` path, gated on freshness and a green tree.

@@ -16,8 +16,10 @@ The four:
 - **scip-nav** — `Bash: python3 .claude/skills/scip-nav/scip_query.py <refs|def|sym> <NAME>
   [--count]`. Type/trait-resolved refs, exact defs, symbol search from a static
   rust-analyzer SCIP snapshot. **Tiny** (5–160 tok), exact. Fails closed if the
-  index is stale (`refresh`, or `--stale-ok`/`--auto-refresh`). See the
-  `scip-nav` skill.
+  index is stale (`refresh`, or `--stale-ok`/`--auto-refresh`). Also has a
+  heavyweight **`expand <crate> [pat]`** mode (nightly `rustc -Zunpretty=expanded`)
+  that shows **macro-generated code** — compile-bound, crate-scoped, needs a green
+  tree; for exploration/review, not tight loops. See the `scip-nav` skill.
 - **rg** — `Bash: rg`. The lexical baseline. Cheapest (40–60 tok) and *correct*
   for text, string literals, imports, and macro call-sites. Don't overlook it.
   Note: `rg` here is a **Claude Code shell shim** (ripgrep 14.1.1), not a `$PATH`
@@ -58,7 +60,8 @@ The four:
 | Cross-crate flow endpoints | `scip def + sym` | 160 | codegraph 3600 (accurate, 23×, buries endpoints) |
 | Enum-variant handler | `scip sym` → `scip refs` | 150 | codegraph 6000 (40×); semble 470 (near-miss) |
 | Macro call-site enumeration | `rg -c 'macro!'` | 40 | scip **wrong** (macros aren't SCIP refs) |
-| Macro-generated body | `semble` → `Read range` | 710 | scip sym→Read 285 (if macro name known); codegraph trims body |
+| Macro-generated body (definition) | `semble` → `Read range` | 710 | scip sym→Read 285 (if macro name known); codegraph trims body |
+| Macro-EXPANDED code (what it generates) | `scip-nav expand <crate> <pat>` | compile-bound | **only tool that can** — codegraph/semble/rg/SCIP see source, not expansion; live LSP `expandMacro` is the only surgical alt |
 | Async/channel hop | `semble` → `scip refs` | 570 | codegraph 2300 (most complete, 4×); scip alone = recv side only |
 | Dead / narrowly-used? | `scip refs --count` | 5 | rg 48 (over); codegraph 26 (under by 18) |
 | Rename safety (all sites) | `scip refs + def` | 700 | rg 1800 (52, no trait awareness); codegraph 6500 (26) |
@@ -79,8 +82,9 @@ The four:
 - **codegraph undercounts trait dispatch** through `Option<T>`/generics and **rg overcounts**
   (defs + doc-comments). For any *count* that gates a decision (dead code, rename, narrow-use),
   use `scip-nav refs --count`.
-- **SCIP has no hover types and does not expand macros**; macro call-sites aren't first-class
-  SCIP refs. Use `rg` for macro sites and `codegraph`/source-read for macro bodies.
+- **SCIP has no hover types**; macro call-sites aren't first-class SCIP refs (use `rg`).
+  For a macro's *definition* read the source; for the *generated code* use `scip-nav
+  expand` (nightly, compile-bound, green tree). Hover/type-at-point still needs live LSP.
 - **Test coverage in this repo lives in the Python differential corpus**
   (`tests/integration/differential/*`), invisible to all four Rust tools — a Rust "no covering
   tests" flag is not the whole story; grep the corpus too.

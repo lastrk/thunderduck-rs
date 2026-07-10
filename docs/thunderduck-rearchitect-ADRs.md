@@ -659,7 +659,7 @@ Neither category triggers a runtime fallback. Both surface directly to the clien
 - (+) Retires machinery rather than growing it: `strip_stranded_qualifiers`, the F5/F9/F12 wrap rewrites, `exprs_visible_in` exemptions, F14's walkers, and the `__td_jl`/`__td_jr` synthetic-alias machinery all exist only to chase carried strings.
 - (−) A migration touching `TypedOp`/`RelScope`/the resolver/emission; the per-operator ordinal + lineage derivation must be Spark-exact — a silent wrong-column is the hazard, and ADR-014's differential oracle is the gate.
 
-**Refinement hooks / adoption sequence** (each corpus-gated, zero-regression): substrate-name uniquify → emission ordinal shim → carry the ordinal → ambiguity (F11) + Spark-emulated error surfacing → add `source_quals` lineage → resolver consults lineage (flip F8/F10, preserve USING + correlation) → retire the strip machinery. Evidence gate: the four deferred witnesses (`filt-018`/`filt-019`, `join-023`, `jn-024`) flip; the ten strand witnesses (`join-018..022`, `cx-015/016`, `jn-023`, `agg-025`, `proj-016`) stay green; corpora show zero regressions. Design detail: [`tasks/adr023-tier3-resolver-design.md`](../tasks/adr023-tier3-resolver-design.md).
+**Refinement hooks / adoption sequence** (each corpus-gated, zero-regression): substrate-name uniquify → emission ordinal shim → carry the ordinal → ambiguity (F11) + Spark-emulated error surfacing → add `source_quals` lineage → resolver consults lineage (flip F8/F10, preserve USING + correlation) → retire the strip machinery. Evidence gate: the four deferred witnesses (`filt-018`/`filt-019`, `join-023`, `jn-024`) flip; the ten strand witnesses (`join-018..022`, `cx-015/016`, `jn-023`, `agg-025`, `proj-016`) stay green; corpora show zero regressions.
 
 ---
 

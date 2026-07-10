@@ -1,25 +1,18 @@
-//! τ emission errors — Thunderduck-boundary category per ADR-022, plus the
-//! ADR-023 chunk 3b Spark-emulated re-surfacing carve-out.
+//! τ emission errors — Thunderduck-boundary category per ADR-022.
 //!
-//! [`EmissionError::Unsupported`] is exclusively **Thunderduck-boundary**: no
-//! variant may ever signal a fallback path — under ADR-022 there is no
-//! fallback. Callers see boundary errors verbatim.
-//!
-//! [`EmissionError::SparkEmulated`] is the one carve-out: it re-surfaces a
-//! Spark-emulated `AnalyzerError` (unknown column, ambiguous column, type
-//! mismatch, ...) with the real Spark error-class token leading the wire
-//! message, so the client sees the same error class Spark itself would
-//! raise. It does not signal a Thunderduck-boundary gap.
+//! `EmissionError` is exclusively **Thunderduck-boundary**. Spark-emulated
+//! errors (unknown column, ambiguous column, type mismatch) live in τ's analyzer's
+//! `AnalyzerError` and are not part of this type. No variant of
+//! `EmissionError` may ever signal a fallback path — under ADR-022 there is
+//! no fallback. Callers see boundary errors verbatim.
 
 /// The categories of errors τ can surface at emission time.
 ///
-/// [`EmissionError::Unsupported`] carries the four Thunderduck-boundary
-/// flavours through its [`UnsupportedKind`] tag: `Op` (top-level operator not
-/// yet emitted), `Expression` (un-seeded expression shape), `Function` (no
-/// emission arm for a Spark function name), and `ProtoShape` (input never
-/// reached [`CommonAst`]). [`EmissionError::SparkEmulated`] carries a
-/// Spark-emulated analyzer error re-surfaced with its Spark class token
-/// (ADR-023 chunk 3b).
+/// A single [`EmissionError::Unsupported`] variant carries the four
+/// Thunderduck-boundary flavours through its [`UnsupportedKind`] tag:
+/// `Op` (top-level operator not yet emitted), `Expression`
+/// (un-seeded expression shape), `Function` (no emission arm for a Spark
+/// function name), and `ProtoShape` (input never reached [`CommonAst`]).
 ///
 /// [`CommonAst`]: crate::transpiler_v2::ast::CommonAst
 #[derive(thiserror::Error, Debug)]
@@ -39,25 +32,6 @@ pub enum EmissionError {
         name: String,
         /// Explanation for why the shape is not yet supported.
         reason: String,
-    },
-
-    /// A Spark-emulated analyzer error, re-surfaced with its Spark
-    /// error-class token leading the message (ADR-023 chunk 3b), bridged
-    /// from `AnalyzerError` by
-    /// `analyzer::analyzer_error_to_emission_error`. Unlike
-    /// [`Self::Unsupported`], this does not signal a Thunderduck-boundary
-    /// gap: `class` is the real Spark error-class token (e.g.
-    /// `"AMBIGUOUS_REFERENCE"`) so the client-side differential harness can
-    /// key off it exactly as it would for Spark itself.
-    #[error("[{class}] {message}")]
-    SparkEmulated {
-        /// The Spark error-class token (e.g. `"AMBIGUOUS_REFERENCE"`,
-        /// `"UNRESOLVED_COLUMN"`).
-        class: &'static str,
-        /// The human-readable message, without the analyzer's
-        /// `[SPARK-EMULATED]` τ-internal prefix (the class token above
-        /// replaces it as the leading token).
-        message: String,
     },
 }
 
@@ -161,18 +135,6 @@ mod tests {
             composed,
             ThunderduckError::TranspilerV2Emission(_)
         ));
-    }
-
-    #[test]
-    fn spark_emulated_display_leads_with_class_token() {
-        let e = EmissionError::SparkEmulated {
-            class: "AMBIGUOUS_REFERENCE",
-            message: "column `id` is ambiguous, candidates: [\"l.id\", \"r.id\"]".to_owned(),
-        };
-        assert_eq!(
-            e.to_string(),
-            "[AMBIGUOUS_REFERENCE] column `id` is ambiguous, candidates: [\"l.id\", \"r.id\"]"
-        );
     }
 
     #[test]

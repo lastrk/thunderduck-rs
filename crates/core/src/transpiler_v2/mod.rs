@@ -96,6 +96,7 @@ pub fn analyze_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transpiler_v2::error::UnsupportedKind;
 
     #[test]
     fn generate_single_row_emits_subquery_safe_select() {
@@ -113,10 +114,7 @@ mod tests {
     #[test]
     fn generate_surfaces_analyzer_error_not_pipeline_marker() {
         // A plan referencing an unknown table must surface the analyzer's
-        // Spark-emulated error re-clothed with its Spark class token
-        // (ADR-023 chunk 3b), not the legacy `analyzer-spark-emulated`
-        // marker — `UnknownTable` has a known `spark_class()`
-        // (`TABLE_OR_VIEW_NOT_FOUND`).
+        // Spark-emulated error, not the τ's analyzer marker.
         let plan = CommonAst::new(CommonOp::TableScan {
             table: "no_such_table".to_owned(),
             alias: None,
@@ -124,89 +122,20 @@ mod tests {
         let base_types = BaseTypes::empty();
         let result = generate(&plan, &base_types);
         match result {
-            Err(EmissionError::SparkEmulated { class, message }) => {
-                assert_eq!(class, "TABLE_OR_VIEW_NOT_FOUND");
+            Err(EmissionError::Unsupported {
+                kind: UnsupportedKind::Expression,
+                name,
+                reason,
+            }) => {
+                assert_eq!(name, "analyzer-spark-emulated");
                 assert!(
-                    !message.contains("[SPARK-EMULATED]"),
-                    "message must not double the internal prefix, got: {message}",
-                );
-                let display = EmissionError::SparkEmulated { class, message }.to_string();
-                assert!(
-                    display.starts_with("[TABLE_OR_VIEW_NOT_FOUND]"),
-                    "expected leading Spark class token, got: {display}",
-                );
-            }
-            other => panic!("expected EmissionError::SparkEmulated, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn generate_surfaces_ambiguous_column_with_spark_class_leading() {
-        // ADR-023 chunk 3b must-have: an ambiguous-column plan surfaces
-        // `EmissionError::SparkEmulated { class: "AMBIGUOUS_REFERENCE", .. }`
-        // whose Display leads with the exact Spark error-class token, so the
-        // client-side differential harness's `spark_error_class` extracts
-        // `AMBIGUOUS_REFERENCE` (flips join-023 / jn-024, F11).
-        use crate::transpiler_v2::ast::JoinType;
-        use crate::transpiler_v2::expression::UnresolvedColumn;
-        use crate::types::{DataType, StructField, StructType};
-
-        let emp_schema = StructType::new(vec![
-            StructField::not_null("id", DataType::Integer),
-            StructField::not_null("dept_id", DataType::Integer),
-        ]);
-        let dept_schema = StructType::new(vec![
-            StructField::not_null("dept_id", DataType::Integer),
-            StructField::nullable("dept_name", DataType::String),
-        ]);
-        let base_types = BaseTypes::empty()
-            .with_entry("emp", emp_schema)
-            .with_entry("dept", dept_schema);
-
-        let scan = |table: &str| {
-            CommonAst::new(CommonOp::TableScan {
-                table: table.to_owned(),
-                alias: None,
-            })
-        };
-        // `dept_id` is present on both sides of the join — unqualified
-        // reference is ambiguous.
-        let ambiguous_condition = Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "dept_id".to_owned(),
-            qualifier: None,
-            plan_id: None,
-        });
-        let plan = CommonAst::new(CommonOp::Join {
-            left: Box::new(scan("emp")),
-            right: Box::new(scan("dept")),
-            join_type: JoinType::Inner,
-            condition: Some(ambiguous_condition),
-            using_columns: vec![],
-            natural: false,
-            lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
-        });
-
-        let err = generate(&plan, &base_types).expect_err("ambiguous column must error");
-        match err {
-            EmissionError::SparkEmulated { class, message } => {
-                assert_eq!(class, "AMBIGUOUS_REFERENCE");
-                let display = EmissionError::SparkEmulated {
-                    class,
-                    message: message.clone(),
-                }
-                .to_string();
-                assert!(
-                    display.starts_with("[AMBIGUOUS_REFERENCE]"),
-                    "expected leading Spark class token, got: {display}",
-                );
-                assert!(
-                    message.contains("dept_id"),
-                    "message should still name the ambiguous column, got: {message}",
+                    reason.starts_with("[SPARK-EMULATED]"),
+                    "expected `[SPARK-EMULATED]` prefix, got: {reason}",
                 );
             }
-            other => panic!("expected EmissionError::SparkEmulated, got: {other:?}"),
+            other => {
+                panic!("expected UnsupportedExpression(analyzer-spark-emulated), got: {other:?}")
+            }
         }
     }
 

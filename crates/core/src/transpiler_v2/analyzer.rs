@@ -145,43 +145,25 @@ pub struct RelScope {
     /// so DuckDB resolves the reference against the correct side of the
     /// enclosing join's `(left) AS __td_jl … (right) AS __td_jr` FROM.
     pub plan_ids: Vec<(i64, std::ops::Range<usize>, &'static str)>,
-    /// plan_ids bound on BOTH the left AND right side of the SAME join —
-    /// the un-realiased self-join `df.join(df, ...)` reusing the identical
-    /// underlying relation on both sides without a fresh alias. Any
-    /// reference to one of these plan_ids is genuinely ambiguous (Spark
-    /// itself cannot tell which side is meant), so
-    /// [`RelScope::plan_id_is_ambiguous`] is checked BEFORE
-    /// [`RelScope::lookup_plan_id`]'s first-match. Distinct from a plan_id
-    /// repeated at multiple NESTING levels on the SAME side (outermost-wins,
-    /// see `plan_ids` above) — that case never lands here.
-    ambiguous_plan_ids: Vec<i64>,
 }
 
 impl RelScope {
-    /// ALL field ranges bound to `q`, case-insensitively, in tree order.
-    /// Distinguishes 0 / 1 / 2+ matches — [`RelScope::lookup`] collapses 2+
-    /// into `None` for the legacy name-only fallback; callers that must
-    /// raise `AmbiguousColumn` on 2+ (in `resolve_column`) use this
-    /// instead.
-    fn lookup_all(&self, q: &str) -> Vec<std::ops::Range<usize>> {
-        self.aliases
-            .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case(q))
-            .map(|(_, range)| range.clone())
-            .collect()
-    }
-
     /// The field range `q` binds to, iff EXACTLY ONE binding matches `q`
     /// case-insensitively. A duplicate name — e.g. a self-join `emp e1 JOIN
     /// emp e2` referenced by the bare table name `emp` — is ambiguous by
     /// construction; return `None` so the caller falls back to the legacy
     /// name-only resolution instead of picking an arbitrary side.
     fn lookup(&self, q: &str) -> Option<std::ops::Range<usize>> {
-        let matches = self.lookup_all(q);
-        match matches.len() {
-            1 => Some(matches.into_iter().next().expect("len checked")),
-            _ => None,
+        let mut found: Option<std::ops::Range<usize>> = None;
+        for (name, range) in &self.aliases {
+            if name.eq_ignore_ascii_case(q) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(range.clone());
+            }
         }
+        found
     }
 
     /// The field range and join-side qualifier a plan_id maps to. When a
@@ -194,14 +176,6 @@ impl RelScope {
             .iter()
             .find(|(id, _, _)| *id == pid)
             .map(|(_, range, qualifier)| (range.clone(), *qualifier))
-    }
-
-    /// `true` iff `pid` is bound on both sides of the SAME join (see
-    /// `ambiguous_plan_ids` doc) — checked BEFORE [`RelScope::lookup_plan_id`]
-    /// so callers raise `AmbiguousColumn` instead of silently binding the
-    /// left side.
-    fn plan_id_is_ambiguous(&self, pid: i64) -> bool {
-        self.ambiguous_plan_ids.contains(&pid)
     }
 
     /// Derive the scope a just-built operator exposes. Shallow: children are
@@ -243,13 +217,11 @@ impl RelScope {
                 Self {
                     aliases,
                     plan_ids: Vec::new(),
-                    ambiguous_plan_ids: Vec::new(),
                 }
             }
             TypedOp::AliasedRelation { alias, .. } => Self {
                 aliases: vec![(alias.clone(), 0..resolved_schema.len())],
                 plan_ids: Vec::new(),
-                ambiguous_plan_ids: Vec::new(),
             },
             TypedOp::Join {
                 using_columns,
@@ -268,22 +240,6 @@ impl RelScope {
                 let right_range = left_len..left_len + right.resolved_schema.len();
                 let keep_right = !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
 
-                // ADR-023 3b-i: a plan_id present in BOTH this join's OWN
-                // left and right sides is the un-realiased self-join
-                // `df.join(df, ...)` — genuinely ambiguous (Spark cannot
-                // tell which side is meant). When the right side is dropped
-                // (LeftSemi/LeftAnti) it contributes no output columns, so
-                // there is no ambiguity to raise.
-                let own_ambiguous: Vec<i64> = if keep_right {
-                    left_plan_ids
-                        .iter()
-                        .filter(|pid| right_plan_ids.contains(pid))
-                        .copied()
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-
                 let mut plan_ids = Vec::new();
                 for &pid in left_plan_ids {
                     plan_ids.push((pid, left_range.clone(), TD_JOIN_LEFT));
@@ -294,8 +250,6 @@ impl RelScope {
                     }
                 }
                 plan_ids.extend(left.scope.plan_ids.iter().cloned());
-                let mut ambiguous_plan_ids = own_ambiguous;
-                ambiguous_plan_ids.extend(left.scope.ambiguous_plan_ids.iter().copied());
                 let mut aliases = left.scope.aliases.clone();
                 if keep_right {
                     let offset = |r: &std::ops::Range<usize>| r.start + left_len..r.end + left_len;
@@ -306,7 +260,6 @@ impl RelScope {
                             .iter()
                             .map(|(pid, r, side)| (*pid, offset(r), *side)),
                     );
-                    ambiguous_plan_ids.extend(right.scope.ambiguous_plan_ids.iter().copied());
                     aliases.extend(
                         right
                             .scope
@@ -315,11 +268,7 @@ impl RelScope {
                             .map(|(name, r)| (name.clone(), offset(r))),
                     );
                 }
-                Self {
-                    aliases,
-                    plan_ids,
-                    ambiguous_plan_ids,
-                }
+                Self { aliases, plan_ids }
             }
             scope_passthrough!(input) => input.scope.clone(),
             // LateralView appends generated columns after the input. Keep the
@@ -824,28 +773,6 @@ pub enum AnalyzerError {
     },
 }
 
-impl AnalyzerError {
-    /// The exact Spark error-class token this variant emulates, if any
-    /// (ADR-023 chunk 3b). `None` for `Other` (no specific class to surface)
-    /// and for the Thunderduck-boundary variants (no Spark class applies —
-    /// these are τ's own gaps, not a Spark-emulated error).
-    ///
-    /// Best-effort mappings (subclass not reproduced): `UnknownColumn` →
-    /// `UNRESOLVED_COLUMN` (Spark's `.WITH_SUGGESTION` subclass is not
-    /// reachable here); `AmbiguousLateralColumnAlias` and `TypeMismatch` are
-    /// likewise base-class only.
-    pub fn spark_class(&self) -> Option<&'static str> {
-        match self {
-            Self::UnknownTable { .. } => Some("TABLE_OR_VIEW_NOT_FOUND"),
-            Self::UnknownColumn { .. } => Some("UNRESOLVED_COLUMN"),
-            Self::AmbiguousColumn { .. } => Some("AMBIGUOUS_REFERENCE"),
-            Self::AmbiguousLateralColumnAlias { .. } => Some("AMBIGUOUS_LATERAL_COLUMN_ALIAS"),
-            Self::TypeMismatch { .. } => Some("DATATYPE_MISMATCH"),
-            Self::Other { .. } | Self::PuntedOperator { .. } | Self::UnsupportedRule { .. } => None,
-        }
-    }
-}
-
 // ── analyze() — the top-level entry point ───────────────────────────────────
 
 /// Analyze a plan: resolve columns, assign types, derive nullability.
@@ -1199,49 +1126,30 @@ pub fn has_resolved_schema(ast: &TypedAst) -> bool {
 }
 
 /// Bridge an [`AnalyzerError`] into an [`EmissionError`] preserving the
-/// two-category classification. Spark-emulated variants with a known
-/// [`AnalyzerError::spark_class`] surface as [`EmissionError::SparkEmulated`]
-/// so the class token leads the wire message (ADR-023 chunk 3b); `Other`
-/// (no class) keeps the legacy `Unsupported{name: "analyzer-spark-emulated"}`
-/// path. Thunderduck-boundary variants (`[TDCK-BOUNDARY]`) are unaffected.
-/// Called by `transpiler_v2::generate()`.
+/// two-category classification via the Display prefix (`[SPARK-EMULATED]` /
+/// `[TDCK-BOUNDARY]`). Called by `transpiler_v2::generate()`.
 pub(super) fn analyzer_error_to_emission_error(e: AnalyzerError) -> EmissionError {
-    match e.spark_class() {
-        Some(class) => {
-            let full = e.to_string();
-            let message = full
-                .strip_prefix("[SPARK-EMULATED] ")
-                .unwrap_or(&full)
-                .to_owned();
-            EmissionError::SparkEmulated { class, message }
-        }
-        None => {
-            let full = e.to_string();
-            match e {
-                AnalyzerError::Other { .. } => EmissionError::Unsupported {
-                    kind: UnsupportedKind::Expression,
-                    name: "analyzer-spark-emulated".to_owned(),
-                    reason: full,
-                },
-                AnalyzerError::PuntedOperator { op, reason } => EmissionError::Unsupported {
-                    kind: UnsupportedKind::Op,
-                    name: op,
-                    reason,
-                },
-                AnalyzerError::UnsupportedRule { rule, reason } => EmissionError::Unsupported {
-                    kind: UnsupportedKind::Expression,
-                    name: rule,
-                    reason,
-                },
-                AnalyzerError::UnknownTable { .. }
-                | AnalyzerError::UnknownColumn { .. }
-                | AnalyzerError::AmbiguousColumn { .. }
-                | AnalyzerError::AmbiguousLateralColumnAlias { .. }
-                | AnalyzerError::TypeMismatch { .. } => {
-                    unreachable!("spark_class() returns Some for these variants")
-                }
-            }
-        }
+    match e {
+        AnalyzerError::UnknownTable { .. }
+        | AnalyzerError::UnknownColumn { .. }
+        | AnalyzerError::AmbiguousColumn { .. }
+        | AnalyzerError::AmbiguousLateralColumnAlias { .. }
+        | AnalyzerError::TypeMismatch { .. }
+        | AnalyzerError::Other { .. } => EmissionError::Unsupported {
+            kind: UnsupportedKind::Expression,
+            name: "analyzer-spark-emulated".to_owned(),
+            reason: e.to_string(),
+        },
+        AnalyzerError::PuntedOperator { op, reason } => EmissionError::Unsupported {
+            kind: UnsupportedKind::Op,
+            name: op,
+            reason,
+        },
+        AnalyzerError::UnsupportedRule { rule, reason } => EmissionError::Unsupported {
+            kind: UnsupportedKind::Expression,
+            name: rule,
+            reason,
+        },
     }
 }
 
@@ -3472,8 +3380,8 @@ fn resolve_expr_list(
 
 /// Analyze an embedded subquery's inner plan. Builds an [`OuterScope`] from
 /// the enclosing [`ResolveContext`] so that correlated references to columns
-/// present ONLY in the outer plan's schema resolve correctly in
-/// [`resolve_column`]. The outer scope REPLACES (does not chain onto)
+/// present ONLY in the outer plan's schema resolve correctly (tier (g) in
+/// [`resolve_column`]). The outer scope REPLACES (does not chain onto)
 /// whatever outer the enclosing context had — a doubly-nested subquery's
 /// inner plan only ever sees its immediate parent's scope, never a
 /// grandparent's.
@@ -3645,17 +3553,11 @@ impl<'a> ResolveContext<'a> {
                 .iter()
                 .map(|(pid, r, side)| (*pid, offset(r), *side)),
         );
-        let mut ambiguous_plan_ids = left.scope.ambiguous_plan_ids.clone();
-        ambiguous_plan_ids.extend(right.scope.ambiguous_plan_ids.iter().copied());
         aliases.push((TD_JOIN_LEFT.to_owned(), 0..left_len));
         aliases.push((TD_JOIN_RIGHT.to_owned(), left_len..left_len + right_len));
         Self {
             schema,
-            scopes: std::borrow::Cow::Owned(RelScope {
-                aliases,
-                plan_ids,
-                ambiguous_plan_ids,
-            }),
+            scopes: std::borrow::Cow::Owned(RelScope { aliases, plan_ids }),
             base_types,
             outer,
         }
@@ -3678,8 +3580,8 @@ impl<'a> ResolveContext<'a> {
     /// an analyzer invariant violation — surface it loudly in debug builds,
     /// but degrade to `None` (the caller's legacy fallback) in release
     /// rather than panicking on the index. Shared by the synthetic
-    /// `__td_jl`/`__td_jr` join-qualifier arm and the `resolve_column` logic,
-    /// so both get the identical guard.
+    /// `__td_jl`/`__td_jr` join-qualifier arm and tier (e) in
+    /// `resolve_column`, so both get the identical guard.
     fn scoped_range(&self, q: &str) -> Option<std::ops::Range<usize>> {
         self.scopes.lookup(q).filter(|range| {
             let in_bounds = range.end <= self.schema.len();
@@ -3763,7 +3665,6 @@ fn try_rewrite_nested_struct_path(u: &UnresolvedColumn, schema: &StructType) -> 
         qualifier: None,
         data_type: Some(root_field.data_type.clone()),
         nullable: Some(root_field.nullable),
-        ordinal: None,
     });
     for seg in &segments {
         expr = Expression::ExtractValue(ExtractValueExpression {
@@ -3778,7 +3679,7 @@ fn try_rewrite_nested_struct_path(u: &UnresolvedColumn, schema: &StructType) -> 
 }
 
 /// Attempt to resolve an [`UnresolvedColumn`] against the outer (enclosing)
-/// plan's scope. Used as a final fallback in [`resolve_column`]
+/// plan's scope. Used as a final fallback (tier (g)) in [`resolve_column`]
 /// when ALL inner tiers have failed — i.e. the column name+qualifier does not
 /// match anything in the inner plan's schema.
 ///
@@ -3790,7 +3691,7 @@ fn try_rewrite_nested_struct_path(u: &UnresolvedColumn, schema: &StructType) -> 
 fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<(DataType, bool)> {
     if let Some(q) = u.qualifier.as_deref() {
         // Struct-column precedence in the outer schema (matches resolve_column's
-        // existing ordering).
+        // existing tier ordering).
         if let Some(info) = TypeInferenceEngine::struct_qualifier_info(&u.name, q, outer.schema) {
             return Some(info);
         }
@@ -3815,25 +3716,6 @@ fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<(Data
         }
         found
     }
-}
-
-/// 0-based position of the field that resolves `name` within
-/// `fields` (first case-insensitive match), mirroring
-/// [`TypeInferenceEngine::column_info_in`]'s own lookup order — exact name
-/// first, then the struct-qualified first segment for a dotted name — so the
-/// stamped ordinal always agrees with the value actually resolved.
-fn field_index(fields: &[StructField], name: &str) -> Option<usize> {
-    if let Some(i) = fields
-        .iter()
-        .position(|f| f.name.eq_ignore_ascii_case(name))
-    {
-        return Some(i);
-    }
-    let dot_pos = name.find('.')?;
-    let struct_name = &name[..dot_pos];
-    fields
-        .iter()
-        .position(|f| f.name.eq_ignore_ascii_case(struct_name))
 }
 
 fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expression, AnalyzerError> {
@@ -3876,26 +3758,9 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     // Spark tolerates refs resolvable unambiguously without it).
     if u.qualifier.is_none() {
         if let Some(pid) = u.plan_id {
-            // ADR-023 3b-i: a plan_id bound on BOTH sides of the SAME join
-            // (the un-realiased self-join `df.join(df, ...)`) is genuinely
-            // ambiguous — Spark itself cannot tell which side is meant.
-            // Checked BEFORE `plan_id_lookup`'s first-match so we raise
-            // `AmbiguousColumn` instead of silently binding the left side.
-            if ctx.scopes.plan_id_is_ambiguous(pid) {
-                return Err(AnalyzerError::AmbiguousColumn {
-                    name: u.name.clone(),
-                    candidates: vec![
-                        format!("{TD_JOIN_LEFT}.{}", u.name),
-                        format!("{TD_JOIN_RIGHT}.{}", u.name),
-                    ],
-                });
-            }
             if let Some((range, side_qualifier)) = ctx.plan_id_lookup(pid) {
-                let info =
-                    TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range.clone()]);
+                let info = TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range]);
                 if let Some((dt, nullable)) = info {
-                    let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
-                        .map(|i| range.start + i);
                     // Only stamp the join-side qualifier when the column
                     // name is AMBIGUOUS in the full schema (appears on
                     // both sides of the join). Unambiguous names must NOT
@@ -3920,7 +3785,6 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                         },
                         data_type: Some(dt),
                         nullable: Some(nullable),
-                        ordinal,
                     }));
                 }
                 // plan_id scope found but column name not in that range —
@@ -3947,9 +3811,9 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
             });
         }
     }
-    let (dt, nullable, ordinal) = if is_synthetic_join_qualifier {
+    let (dt, nullable) = if is_synthetic_join_qualifier {
         let q = u.qualifier.as_deref().unwrap_or_default();
-        // `scoped_range` mirrors the behavior below: `q` spells a reserved
+        // `scoped_range` mirrors tier (e) below: `q` spells a reserved
         // synthetic qualifier (`__td_jl`/`__td_jr`), but the analyzer only
         // ever binds a scope for it inside a join condition, via
         // `ResolveContext::for_join_condition`. Both misses below therefore
@@ -3962,15 +3826,8 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         // never introduced (F13).
         match ctx.scoped_range(q) {
             Some(range) => {
-                match TypeInferenceEngine::column_info_in(
-                    &u.name,
-                    &ctx.schema.fields[range.clone()],
-                ) {
-                    Some((dt, nullable)) => {
-                        let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
-                            .map(|i| range.start + i);
-                        (dt, nullable, ordinal)
-                    }
+                match TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range]) {
+                    Some(info) => info,
                     // `q` is a real synthetic side scope but `name` is not on it.
                     None => {
                         return Err(AnalyzerError::UnknownColumn {
@@ -3994,12 +3851,8 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         // Qualified, non-synthetic: (d) a qualifier naming a top-level STRUCT
         // column wins over a relation-alias scope — struct-field access takes
         // precedence, matching the pre-existing behavior this pass preserves.
-        // The resolved field lives inside the struct, not at a top-level
-        // position in `ctx.schema` — no ordinal to stamp.
-        if let Some((dt, nullable)) =
-            TypeInferenceEngine::struct_qualifier_info(&u.name, q, ctx.schema)
-        {
-            (dt, nullable, None)
+        if let Some(info) = TypeInferenceEngine::struct_qualifier_info(&u.name, q, ctx.schema) {
+            info
         } else {
             match ctx.scoped_range(q) {
                 // (e) qualifier binds exactly one in-bounds relation scope —
@@ -4009,15 +3862,8 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                 // `UnknownColumn` (ADR-022 cat-1), not an opaque DuckDB bind
                 // error.
                 Some(range) => {
-                    match TypeInferenceEngine::column_info_in(
-                        &u.name,
-                        &ctx.schema.fields[range.clone()],
-                    ) {
-                        Some((dt, nullable)) => {
-                            let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
-                                .map(|i| range.start + i);
-                            (dt, nullable, ordinal)
-                        }
+                    match TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range]) {
+                        Some(info) => info,
                         None => {
                             return Err(AnalyzerError::UnknownColumn {
                                 name: u.name.clone(),
@@ -4026,38 +3872,17 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                         }
                     }
                 }
-                // (f) qualifier binds no in-bounds scope. Two cases collapse
-                // to this arm: `q` binds 2+ ranges (a duplicate alias / bare
-                // table name on both sides of a join — `RelScope::lookup`
-                // collapses 2+ matches to `None`, same as 0), or `q` binds no
-                // scope at all (e.g. USING joins stay on the legacy path —
-                // `collect_qualifier_bindings` STOPs there). ADR-023 3b-i:
-                // distinguish them via `lookup_all` — 2+ is genuinely
-                // ambiguous (Spark: AMBIGUOUS_REFERENCE) and must not fall
-                // through to the permissive legacy name-only lookup; 0
-                // keeps the existing legacy fallback unchanged.
-                None => {
-                    let matches = ctx.scopes.lookup_all(q);
-                    if matches.len() > 1 {
-                        let candidates = (0..matches.len())
-                            .map(|i| format!("{q}#{i}.{}", u.name))
-                            .collect();
-                        return Err(AnalyzerError::AmbiguousColumn {
-                            name: u.name.clone(),
-                            candidates,
-                        });
-                    }
-                    let (dt, nullable) =
-                        TypeInferenceEngine::qualified_column_info(&u.name, Some(q), ctx.schema);
-                    let ordinal = field_index(&ctx.schema.fields, &u.name);
-                    (dt, nullable, ordinal)
-                }
+                // (f) qualifier binds no in-bounds scope — either no scope at
+                // all (e.g. USING joins stay on the legacy path —
+                // `collect_qualifier_bindings` STOPs there), or `scoped_range`
+                // caught an out-of-bounds invariant violation (defensive,
+                // never expected in practice) and degraded here. Both cases
+                // share the identical legacy fallback.
+                None => TypeInferenceEngine::qualified_column_info(&u.name, Some(q), ctx.schema),
             }
         }
     } else {
-        let (dt, nullable) = TypeInferenceEngine::qualified_column_info(&u.name, None, ctx.schema);
-        let ordinal = field_index(&ctx.schema.fields, &u.name);
-        (dt, nullable, ordinal)
+        TypeInferenceEngine::qualified_column_info(&u.name, None, ctx.schema)
     };
     if matches!(dt, DataType::Unresolved) {
         // (g) Outer-scope fallback: when ALL inner tiers have failed and an
@@ -4074,10 +3899,6 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                     qualifier: u.qualifier,
                     data_type: Some(outer_dt),
                     nullable: Some(outer_nullable),
-                    // (g) The column is not in `ctx.schema` — its position
-                    // lives in an enclosing scope; correlated ordinal
-                    // handling is a later concern.
-                    ordinal: None,
                 }));
             }
         }
@@ -4091,7 +3912,6 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         qualifier: u.qualifier,
         data_type: Some(dt),
         nullable: Some(nullable),
-        ordinal,
     }))
 }
 
@@ -4894,7 +4714,6 @@ fn derive_implicit_grouping(
                 qualifier: None,
                 data_type: Some(f.data_type.clone()),
                 nullable: Some(f.nullable),
-                ordinal: None,
             })
         })
         .collect()
@@ -6105,94 +5924,6 @@ mod tests {
         assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
     }
 
-    // Additive, dormant field: `resolve_column` stamps the 0-based position
-    // of the resolved column within the producing node's `ctx.schema`.
-    // Emission ignores it (dormant until a later ADR-023 sub-chunk); these
-    // tests pin the stamped value against the field's actual index in the
-    // resolved schema.
-
-    #[test]
-    fn resolve_column_ordinal_unqualified_matches_schema_index() {
-        let bt = base_types_with_emp_dept();
-        let project = CommonAst::new(CommonOp::Project {
-            input: Box::new(scan("emp")),
-            projections: vec![unresolved_col("salary")],
-        });
-        let typed = analyze(project, &bt).expect("unqualified salary must resolve");
-        match &typed.op {
-            TypedOp::Project { projections, .. } => match &projections[0] {
-                Expression::ColumnReference(c) => {
-                    assert_eq!(c.name, "salary");
-                    // `salary` is the 4th (0-based index 3) field of `emp_schema`.
-                    assert_eq!(c.ordinal, Some(3));
-                }
-                other => panic!("expected ColumnReference, got {other:?}"),
-            },
-            _ => panic!("expected Project"),
-        }
-    }
-
-    #[test]
-    fn resolve_column_ordinal_qualified_join_scope_matches_schema_index() {
-        let bt = base_types_with_emp_dept();
-        // SELECT d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id
-        // — qualifier `d` binds the join's right-side scope range
-        // (dept fields start at absolute index 4 in the merged schema).
-        let project = CommonAst::new(CommonOp::Project {
-            input: Box::new(emp_dept_aliased_join()),
-            projections: vec![qcol("d", "dept_name")],
-        });
-        let typed = analyze(project, &bt).expect("d.dept_name must resolve");
-        match &typed.op {
-            TypedOp::Project { projections, .. } => match &projections[0] {
-                Expression::ColumnReference(c) => {
-                    assert_eq!(c.name, "dept_name");
-                    // `dept_name` is dept's 2nd field (offset 1), and dept
-                    // starts at absolute index 4 in the merged join schema.
-                    assert_eq!(c.ordinal, Some(5));
-                }
-                other => panic!("expected ColumnReference, got {other:?}"),
-            },
-            _ => panic!("expected Project"),
-        }
-    }
-
-    #[test]
-    fn resolve_column_ordinal_plan_id_over_join_matches_correct_side() {
-        // Self-join `emp(plan_id=1) JOIN emp(plan_id=2)`; a Project above
-        // selecting `id` tagged plan_id=2 must resolve to the RIGHT side's
-        // `id` — absolute index 4 (0-based) in the merged 8-field schema.
-        let bt = base_types_with_emp_dept();
-        let join_cond = Expression::Binary(BinaryExpression {
-            left: Box::new(qcol("__td_jl", "id")),
-            op: BinaryOp::Eq,
-            right: Box::new(qcol("__td_jr", "id")),
-        });
-        let joined = join_with_plan_ids(
-            scan("emp"),
-            scan("emp"),
-            JoinType::Inner,
-            Some(join_cond),
-            vec![1],
-            vec![2],
-        );
-        let project = CommonAst::new(CommonOp::Project {
-            input: Box::new(joined),
-            projections: vec![plan_id_col("id", 2)],
-        });
-        let typed = analyze(project, &bt).expect("plan_id should disambiguate above join");
-        match &typed.op {
-            TypedOp::Project { projections, .. } => match &projections[0] {
-                Expression::ColumnReference(c) => {
-                    assert_eq!(c.qualifier.as_deref(), Some(TD_JOIN_RIGHT));
-                    assert_eq!(c.ordinal, Some(4));
-                }
-                other => panic!("expected ColumnReference, got {other:?}"),
-            },
-            _ => panic!("expected Project"),
-        }
-    }
-
     // ── Pass 106 — uncorrelated subquery analysis ────────────────────────
 
     /// Inner plan `SELECT <col> FROM emp` — a single-column subquery body.
@@ -6529,7 +6260,7 @@ mod tests {
 
     /// Inner-precedence regression: when a column name exists in BOTH
     /// the inner and outer schemas with DIFFERENT types, the inner type
-    /// must win. This protects the 13
+    /// must win (tier (f) resolves before tier (g)). This protects the 13
     /// existing green correlated subquery cases.
     #[test]
     fn correlated_subquery_inner_type_takes_precedence_over_outer() {
@@ -6546,8 +6277,8 @@ mod tests {
         //     SELECT dept_id FROM dept d WHERE d.dept_id = e.dept_id
         // )
         // The inner `dept_id` unqualified reference matches dept's Integer column.
-        // The inner `e.dept_id` should resolve via name-only fallback
-        // (finds `dept_id` in the inner schema) and be stamped as Integer (the
+        // The inner `e.dept_id` should resolve via tier (f) (name-only fallback
+        // finds `dept_id` in the inner schema) and be stamped as Integer (the
         // inner type), NOT Long (the outer type).
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
@@ -6558,8 +6289,8 @@ mod tests {
                 condition: Expression::Binary(BinaryExpression {
                     op: BinaryOp::Eq,
                     left: Box::new(qcol("d", "dept_id")),
-                    // e.dept_id: qualifier `e` not bound in inner scope → name-only fallback
-                    // (finds `dept_id` in dept's schema → Integer).
+                    // e.dept_id: qualifier `e` not bound in inner scope → tier (f)
+                    // name-only lookup finds `dept_id` in dept's schema → Integer.
                     right: Box::new(qcol("e", "dept_id")),
                 }),
             })),
@@ -6620,7 +6351,7 @@ mod tests {
     /// Qualifier-strictness: a qualified outer reference whose qualifier
     /// binds NO scope in the outer context, but whose bare name exists in
     /// the outer schema, must still fail as UnknownColumn. This locks the
-    /// "no name-only scan in the outer scope" invariant.
+    /// "no name-only scan in the outer tier" invariant.
     #[test]
     fn correlated_subquery_qualified_outer_ref_with_unbound_qualifier_fails() {
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
@@ -7807,36 +7538,10 @@ mod tests {
     // ── analyzer_error_to_emission_error bridge ─────────────────────────
 
     #[test]
-    fn analyzer_error_bridge_maps_spark_emulated_with_class_to_spark_emulated() {
-        // ADR-023 chunk 3b: `UnknownColumn` has a known `spark_class()`
-        // (`UNRESOLVED_COLUMN`), so the bridge routes it to
-        // `EmissionError::SparkEmulated` — NOT the legacy
-        // `Unsupported{name: "analyzer-spark-emulated"}` path.
+    fn analyzer_error_bridge_maps_spark_emulated_to_unsupported_expression() {
         let e = AnalyzerError::UnknownColumn {
             name: "c".to_owned(),
             qualifier: None,
-        };
-        let bridged = analyzer_error_to_emission_error(e);
-        match bridged {
-            EmissionError::SparkEmulated { class, message } => {
-                assert_eq!(class, "UNRESOLVED_COLUMN");
-                assert!(
-                    !message.starts_with("[SPARK-EMULATED]"),
-                    "message must not double the internal prefix, got: {message}"
-                );
-            }
-            other => panic!("expected EmissionError::SparkEmulated, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn analyzer_error_bridge_maps_other_to_unsupported_expression() {
-        // `Other` has no specific Spark class (`spark_class() == None`), so
-        // the bridge keeps the legacy `Unsupported{name:
-        // "analyzer-spark-emulated"}` path — the ADR-023 chunk 3b carve-out
-        // only applies to variants with a known class.
-        let e = AnalyzerError::Other {
-            reason: "catch-all".to_owned(),
         };
         let bridged = analyzer_error_to_emission_error(e);
         match bridged {
@@ -7848,76 +7553,8 @@ mod tests {
                 assert_eq!(name, "analyzer-spark-emulated");
                 assert!(reason.starts_with("[SPARK-EMULATED]"));
             }
-            other => panic!("expected EmissionError::Unsupported, got: {other:?}"),
+            _ => panic!("expected UnsupportedExpression"),
         }
-    }
-
-    #[test]
-    fn spark_class_mapping_matches_adr023_chunk_3b_table() {
-        // Direct pin of the `AnalyzerError::spark_class()` mapping table.
-        assert_eq!(
-            AnalyzerError::UnknownTable {
-                name: "t".to_owned()
-            }
-            .spark_class(),
-            Some("TABLE_OR_VIEW_NOT_FOUND")
-        );
-        assert_eq!(
-            AnalyzerError::UnknownColumn {
-                name: "c".to_owned(),
-                qualifier: None
-            }
-            .spark_class(),
-            Some("UNRESOLVED_COLUMN")
-        );
-        assert_eq!(
-            AnalyzerError::AmbiguousColumn {
-                name: "c".to_owned(),
-                candidates: vec!["l.c".to_owned(), "r.c".to_owned()],
-            }
-            .spark_class(),
-            Some("AMBIGUOUS_REFERENCE")
-        );
-        assert_eq!(
-            AnalyzerError::AmbiguousLateralColumnAlias {
-                name: "a".to_owned(),
-                count: 2,
-            }
-            .spark_class(),
-            Some("AMBIGUOUS_LATERAL_COLUMN_ALIAS")
-        );
-        assert_eq!(
-            AnalyzerError::TypeMismatch {
-                expected: DataType::Boolean,
-                actual: DataType::Integer,
-                context: "filter-condition".to_owned(),
-            }
-            .spark_class(),
-            Some("DATATYPE_MISMATCH")
-        );
-        assert_eq!(
-            AnalyzerError::Other {
-                reason: "catch-all".to_owned()
-            }
-            .spark_class(),
-            None
-        );
-        assert_eq!(
-            AnalyzerError::PuntedOperator {
-                op: "FileScan".to_owned(),
-                reason: "wip".to_owned(),
-            }
-            .spark_class(),
-            None
-        );
-        assert_eq!(
-            AnalyzerError::UnsupportedRule {
-                rule: "r".to_owned(),
-                reason: "wip".to_owned(),
-            }
-            .spark_class(),
-            None
-        );
     }
 
     #[test]
@@ -9698,7 +9335,7 @@ mod tests {
     fn unqualified_duplicate_name_over_join_is_ambiguous() {
         // `dept_id` exists on both sides of `emp e CROSS JOIN dept d` — an
         // UNQUALIFIED reference must still raise `AmbiguousColumn`, exactly
-        // as before this pass.
+        // as before this pass (tier (c) is unchanged).
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(join(
@@ -9741,29 +9378,10 @@ mod tests {
     #[test]
     fn self_join_duplicate_alias_binding_falls_back_to_legacy_no_panic() {
         // `emp AS e1 JOIN emp AS e2`, referenced by the bare TABLE NAME
-        // `emp` (not either alias): the `TableScan` scope arm binds the bare
-        // table name `emp` on BOTH sides (once per side), so the qualifier
-        // `emp` binds 2+ ranges. ADR-023 3b-i: this is exactly the qualifier
-        // 2+ case — `resolve_column` now raises `AmbiguousColumn` here
-        // instead of silently falling back to the legacy first-match path
-        // (this test's name predates that fix; a rename is deliberately
-        // deferred to the next chunk that touches this test's other
-        // assertions, to keep this diff to the ambiguity-discipline change).
-        //
-        // Empirically (probed against Spark 4.1.1 via
-        // `differential.dataframe_corpus.build_inputs`), Spark's real error
-        // class for THIS exact shape is `UNRESOLVED_COLUMN.WITH_SUGGESTION`,
-        // not `AMBIGUOUS_REFERENCE`: once a relation is aliased, Spark's
-        // analyzer treats the base table name as shadowed/unresolvable
-        // entirely (even for a single, non-duplicated alias), so `emp` never
-        // reaches ambiguity-checking in Spark at all. τ's `RelScope`
-        // TableScan arm does not implement that alias-shadowing (a
-        // pre-existing, separate divergence out of scope for this chunk) —
-        // it still binds both the table name and the alias unconditionally,
-        // which is what surfaces the qualifier-2+ ambiguity fixed here.
-        // `AmbiguousColumn` is still the strictly better outcome versus the
-        // previous silent first-match fallback, so we pin it rather than
-        // leave the divergence undocumented.
+        // `emp` (not either alias): `collect_qualifier_bindings` binds
+        // `emp` TWICE (once per side), so `RelScope::lookup` returns
+        // `None` (ambiguous binding) and resolution falls back to the
+        // legacy first-match path instead of panicking or guessing a side.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(join(
@@ -9774,47 +9392,10 @@ mod tests {
             )),
             projections: vec![qcol("emp", "id")],
         });
-        let err = analyze(ast, &bt).unwrap_err();
-        match err {
-            AnalyzerError::AmbiguousColumn {
-                ref name,
-                ref candidates,
-            } => {
-                assert_eq!(name, "id");
-                assert_eq!(candidates.len(), 2);
-            }
-            other => panic!("expected AmbiguousColumn, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn qualifier_binds_both_sides_of_join_is_ambiguous() {
-        // ADR-023 3b-i, jn-024 shape: the SAME user alias `x` on BOTH sides
-        // of a join (`emp AS x JOIN dept AS x`) — `x` binds 2+ ranges, so a
-        // qualified reference to it must raise `AmbiguousColumn` rather than
-        // resolve via the legacy first-match fallback. Matches Spark 4.1.1's
-        // `AMBIGUOUS_REFERENCE` for this shape (probed empirically).
-        let bt = base_types_with_emp_dept();
-        let ast = CommonAst::new(CommonOp::Project {
-            input: Box::new(join(
-                aliased("emp", "x"),
-                aliased("dept", "x"),
-                JoinType::Inner,
-                None,
-            )),
-            projections: vec![qcol("x", "id")],
-        });
-        let err = analyze(ast, &bt).unwrap_err();
-        match err {
-            AnalyzerError::AmbiguousColumn {
-                ref name,
-                ref candidates,
-            } => {
-                assert_eq!(name, "id");
-                assert_eq!(candidates.len(), 2);
-            }
-            other => panic!("expected AmbiguousColumn, got {other:?}"),
-        }
+        let typed = analyze(ast, &bt).expect("duplicate binding must fall back, not panic");
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
+        assert!(!typed.resolved_schema.fields[0].nullable);
     }
 
     #[test]
@@ -9822,7 +9403,7 @@ mod tests {
         // `emp` has a top-level STRUCT column named `address`; alias the
         // `emp` scan itself as `address` too, so the qualifier `address` is
         // BOTH a relation alias (whole-schema range) AND a struct column
-        // name. The struct-column qualifier must still win: the
+        // name. Tier (d) — struct-column qualifier — must still win: the
         // reference resolves as `address.city` (a struct field), not as
         // relation-alias lookup for a top-level `city` column (which does
         // not exist and would raise `UnknownColumn` if alias precedence won).
@@ -11209,38 +10790,6 @@ mod tests {
                     other => panic!("expected ColumnReference, got: {other:?}"),
                 }
             }
-        }
-    }
-
-    #[test]
-    fn plan_id_binds_both_sides_of_same_join_is_ambiguous() {
-        // ADR-023 3b-i, join-023 shape: the un-realiased self-join
-        // `df.join(df, ...)` — the SAME plan_id (1) tagged on BOTH the left
-        // AND right side of the SAME join. A reference carrying that plan_id
-        // must raise `AmbiguousColumn`, not silently bind the left side.
-        let bt = base_types_with_emp_dept();
-        let joined = join_with_plan_ids(
-            scan("emp"),
-            scan("emp"),
-            JoinType::Inner,
-            None,
-            vec![1],
-            vec![1],
-        );
-        let project = CommonAst::new(CommonOp::Project {
-            input: Box::new(joined),
-            projections: vec![plan_id_col("id", 1)],
-        });
-        let err = analyze(project, &bt).unwrap_err();
-        match err {
-            AnalyzerError::AmbiguousColumn {
-                ref name,
-                ref candidates,
-            } => {
-                assert_eq!(name, "id");
-                assert_eq!(candidates.len(), 2);
-            }
-            other => panic!("expected AmbiguousColumn, got {other:?}"),
         }
     }
 

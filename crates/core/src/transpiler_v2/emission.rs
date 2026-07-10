@@ -679,11 +679,11 @@ fn build_aggregate(
     );
     let merge = block.can_accept(Clause::GroupBy) && vis;
 
-    // Activate the wrap-boundary reprojection only when the
+    // ADR-023 tier 2: activate the wrap-boundary reprojection only when the
     // wrapped child's output has a duplicate name — the one class
     // `strip_stranded_qualifiers` cannot rewrite around. `None` on the
     // common (already-unique) case keeps every branch below byte-identical
-    // to the existing strip path.
+    // to the pre-tier-2 strip path.
     let uniquified = output_uniquified(input_schema);
     // Choose the expression set to render from: the originals when merging
     // (no cosmetic churn), or each stripped/reprojected against the
@@ -917,7 +917,7 @@ fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
 ///   binder resolves it OUTWARD straight through the wrap, so it must stay
 ///   qualified verbatim;
 /// - `q` does not double as a struct-column access on the child's output
-///   (`resolve_column`'s struct-precedence): struct access survives a
+///   (`resolve_column`'s struct-precedence tier): struct access survives a
 ///   wrap as column-dot-field syntax, so it needs no rewrite and stripping
 ///   would misread the field name as a column; and
 /// - `c` names exactly one output column case-insensitively — an ambiguous
@@ -974,10 +974,10 @@ fn strip_stranded_qualifiers(
     rewritten
 }
 
-/// Activation gate: `schema`'s field names, [`uniquify`]d,
+/// ADR-023 tier 2 activation gate: `schema`'s field names, [`uniquify`]d,
 /// iff they contain a duplicate — `None` when the names are already unique,
 /// the common case. Every wrap site checks this FIRST and only reaches the
-/// reprojection path (`wrap_reprojected` + [`reproject_qualifiers`])
+/// tier-2 reprojection path (`wrap_reprojected` + [`reproject_qualifiers`])
 /// on `Some`; the `None` (common) case keeps the existing
 /// `SelectBlock::wrap` + [`strip_stranded_qualifiers`] pairing byte-for-byte
 /// unchanged, which is what confines the corpus delta to the duplicate-name
@@ -1011,7 +1011,7 @@ fn scope_position(
         .map(|offset| range.start + offset)
 }
 
-/// The duplicate-output-name counterpart of
+/// ADR-023 tier 2: the duplicate-output-name counterpart of
 /// [`strip_stranded_qualifiers`], paired with
 /// [`SelectBlock::wrap_reprojected`]. That wrap re-exposes the wrapped
 /// child's columns under `uniquified`'s names, positionally — so, unlike
@@ -1022,7 +1022,7 @@ fn scope_position(
 /// resolved position, which the reprojected wrap guarantees is bindable.
 ///
 /// A qualifier `input.scope` does NOT bind (the F10 dead-alias class) is
-/// left untouched — as is a `q` that doubles as a struct
+/// left untouched — Tier 3's job — as is a `q` that doubles as a struct
 /// column access on the input schema (mirrors `strip_stranded_qualifiers`'s
 /// own struct-precedence guard: struct access survives a wrap as
 /// column-dot-field syntax and needs no rewrite). Qualified stars are not
@@ -6383,7 +6383,7 @@ mod tests {
         LikeExpression, Literal, LiteralValue, MapLiteralExpression, StarExpression,
         UnaryExpression, UnaryOp, UpdateFieldsExpression,
     };
-    use crate::transpiler_v2::{analyze, generate, AnalyzerError};
+    use crate::transpiler_v2::{analyze, generate};
     use crate::types::StructField;
 
     fn tap_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -6504,7 +6504,6 @@ mod tests {
             qualifier: None,
             data_type: Some(dt),
             nullable: Some(true),
-            ordinal: None,
         })
     }
 
@@ -6570,9 +6569,6 @@ mod tests {
                         "reason must contain {frag:?}; got: {reason}"
                     );
                 }
-            }
-            other @ EmissionError::SparkEmulated { .. } => {
-                panic!("expected EmissionError::Unsupported, got: {other:?}")
             }
         }
     }
@@ -6718,17 +6714,19 @@ mod tests {
         );
     }
 
+    // ── ADR-023 tier 2: wrap-boundary re-projection over duplicate names ──
+    //
     // `output_uniquified` gates every wrap site's `strip_stranded_qualifiers`
     // vs. `reproject_qualifiers` choice on whether the wrapped child's
     // output has a duplicate name. The common (unique) case must render
-    // byte-identically to the pre-projection shape; the duplicate case (see
+    // byte-identically to the pre-tier-2 shape; the duplicate case (see
     // `ambiguous_output_name_wrap_reprojects_to_unique_position` above) must
     // reproject uniquely and rewrite the outer reference by position.
 
     /// The common case: the wrapped child's output names are already
     /// unique, so `output_uniquified` returns `None` and every wrap site
-    /// takes the `SelectBlock::wrap` + `strip_stranded_qualifiers`
-    /// path verbatim — zero delta on the shape this optimization does not target.
+    /// takes the pre-tier-2 `SelectBlock::wrap` + `strip_stranded_qualifiers`
+    /// path verbatim — zero delta on the shape tier 2 does not target.
     #[test]
     fn wrap_over_unique_names_is_unchanged() {
         let _g = tap_guard();
@@ -6755,7 +6753,7 @@ mod tests {
         );
     }
 
-    /// A duplicate name across a self-join
+    /// ADR-023 tier 2's namesake pin: a duplicate name across a self-join
     /// output forces `build_filter`'s wrap path onto `wrap_reprojected` +
     /// `reproject_qualifiers` instead of the (declining) strip path — the
     /// scope-resolvable `a.name` reference is rewritten to the unique
@@ -7004,10 +7002,10 @@ mod tests {
         );
     }
 
-    /// A name appearing on BOTH sides of a self-join output
-    /// is ambiguous once bare-stripped to its ORIGINAL name — the previous
+    /// ADR-023 tier 2: a name appearing on BOTH sides of a self-join output
+    /// is ambiguous once bare-stripped to its ORIGINAL name — the pre-tier-2
     /// fallback therefore left it qualified (a loud binder failure over the
-    /// buried `a` alias). The optimization instead reprojects the wrapped join under
+    /// buried `a` alias). Tier 2 instead reprojects the wrapped join under
     /// per-column unique names and rewrites `a.name` to the unique name at
     /// its position (`name`, the left side's first occurrence) — resolving
     /// correctly instead of failing loudly.
@@ -7079,7 +7077,7 @@ mod tests {
     }
 
     /// Keep-side: a qualifier that resolves as STRUCT-column access
-    /// (`resolve_column`'s struct-precedence) survives the wrap as
+    /// (`resolve_column`'s struct-precedence tier) survives the wrap as
     /// column-dot-field syntax — stripping would misread the field name as
     /// a column.
     #[test]
@@ -8329,21 +8327,8 @@ mod tests {
         // reuse a user alias must NOT flatten, or DuckDB rejects the FROM with
         // "Duplicate alias". Here the inner join's left is `emp m` and the
         // OUTER right is `emp2 m` — flattening would put two `AS m` in one FROM
-        // scope.
-        //
-        // ADR-023 3b-i: the OUTER join's own condition (`d.dept_id ==
-        // m.dept_id`) resolves `m` against the outer join's combined scope,
-        // where `m` is now bound TWICE (once via the inner join's `emp AS m`
-        // inherited on the left, once via `emp2 AS m` on the right) — a
-        // qualifier binding 2+ ranges is exactly the ambiguity this chunk
-        // makes `resolve_column` catch. Analysis now correctly rejects this
-        // input as `AmbiguousColumn` before emission's SQL-shape flatten
-        // guard is ever reached, which is the right outcome: this AST is a
-        // genuinely ambiguous reference (Spark would reject the equivalent
-        // query too), not merely a defensive SQL-rendering concern. The
-        // flatten guard itself (`build_join`'s sibling-collision check) is
-        // unchanged and still fires for inputs where the duplicated alias is
-        // never referenced by qualifier.
+        // scope. The sibling-collision guard must keep the inner join wrapped
+        // in `__td_jl` instead.
         let inner_join = CommonAst::new(CommonOp::Join {
             left: Box::new(aliased_scan("emp", "m")),
             right: Box::new(aliased_scan("dept", "d")),
@@ -8379,10 +8364,12 @@ mod tests {
             projections: vec![qcol("d", "dept_name")],
         });
         let bt = base_types_emp_dept_emp2(&plan);
-        let err = analyze(plan, &bt).unwrap_err();
+        let typed = analyze(plan, &bt).expect("analyze duplicate-alias join");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // Guard fired: inner join stays wrapped (not flattened into the chain).
         assert!(
-            matches!(err, AnalyzerError::AmbiguousColumn { .. }),
-            "expected AmbiguousColumn, got {err:?}"
+            sql.contains("__td_jr"),
+            "duplicate-alias chain must not flatten; got: {sql}"
         );
     }
 
@@ -10256,7 +10243,6 @@ mod tests {
             qualifier: Some("emp".to_owned()),
             data_type: Some(DataType::Long),
             nullable: Some(false),
-            ordinal: None,
         };
         let sql = render_column_reference(&c).expect("render");
         assert_eq!(sql, "emp.id");
@@ -11115,7 +11101,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Integer),
             nullable: Some(true),
-            ordinal: None,
         });
         let sql =
             super::render_sample_by(&typed_input, &col_ref, &[], None).expect("empty fractions ok");
@@ -11374,7 +11359,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::Timestamp),
                     nullable: Some(true),
-                    ordinal: None,
                 }),
                 str_lit("yyyy-MM-dd HH:mm:ss"),
             ],
@@ -11418,7 +11402,6 @@ mod tests {
                 qualifier: None,
                 data_type: Some(DataType::String),
                 nullable: Some(true),
-                ordinal: None,
             })),
             updates: vec![("x".to_owned(), None)],
         });
@@ -11439,7 +11422,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_5".to_owned()],
@@ -11472,7 +11454,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_7".to_owned()],
@@ -11512,7 +11493,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x".to_owned(), "i".to_owned()],
@@ -11564,7 +11544,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x".to_owned()],
@@ -11602,7 +11581,6 @@ mod tests {
                         qualifier: None,
                         data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
                         nullable: Some(true),
-                        ordinal: None,
                     }),
                     Expression::Lambda(LambdaExpression {
                         params: vec!["i".to_owned()],
@@ -11716,7 +11694,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::Array(Box::new(DataType::String), true)),
                     nullable: Some(true),
-                    ordinal: None,
                 }),
             ],
         );
@@ -11784,7 +11761,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_1".to_owned(), "y_2".to_owned()],
@@ -11832,7 +11808,6 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
-            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -11870,7 +11845,6 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
-            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -11903,7 +11877,6 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
-            ordinal: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -11956,7 +11929,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
         });
         let sql = render_fn("array_union", vec![a, b]);
         assert!(
@@ -11983,7 +11955,6 @@ mod tests {
                 true,
             )),
             nullable: Some(true),
-            ordinal: None,
         });
         let sql = render_fn("flatten", vec![outer]);
         assert!(
@@ -12044,7 +12015,6 @@ mod tests {
                         qualifier: None,
                         data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
                         nullable: Some(true),
-                        ordinal: None,
                     }),
                     Expression::Lambda(LambdaExpression {
                         params: vec!["k".to_owned()],
@@ -12407,7 +12377,6 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
-            ordinal: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("team")]);
         assert_eq!(sql, "element_at(attrs, 'team')[1]");
@@ -12425,7 +12394,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
         });
         let sql = render_fn(
             "element_at",
@@ -12485,7 +12453,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
         });
         let sql = render_fn(
             "element_at",
@@ -12517,7 +12484,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
         });
         let sql = render_fn(
             "try_element_at",
@@ -12551,7 +12517,6 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
-            ordinal: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("missing")]);
         assert_eq!(sql, "element_at(attrs, 'missing')[1]");
@@ -12651,7 +12616,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
         });
         let sql = render_fn("concat_ws", vec![str_lit(","), arr_col]);
         assert_eq!(sql, "COALESCE(array_to_string(tags, ','), '')");
@@ -12766,7 +12730,6 @@ mod tests {
                     scale: 2,
                 }),
                 nullable: Some(true),
-                ordinal: None,
             })),
             op: BinaryOp::Div,
             right: Box::new(Expression::ColumnReference(ColumnReference {
@@ -12777,7 +12740,6 @@ mod tests {
                     scale: 3,
                 }),
                 nullable: Some(true),
-                ordinal: None,
             })),
         });
         let sql = render_expr(&expr, &schema).expect("render decimal div");
@@ -12961,7 +12923,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
-                    ordinal: None,
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("qty INT, label STRING, price DOUBLE".to_owned()),
@@ -13023,7 +12984,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
-                    ordinal: None,
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("qty INT, label STRING".to_owned()),
@@ -13053,7 +13013,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
-                    ordinal: None,
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("a INT, b STRING".to_owned()),
@@ -13086,14 +13045,12 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
-                    ordinal: None,
                 }),
                 Expression::ColumnReference(ColumnReference {
                     name: "schema_col".to_owned(),
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
-                    ordinal: None,
                 }),
             ],
         );
@@ -13191,7 +13148,6 @@ mod tests {
                 qualifier: None,
                 data_type: None,
                 nullable: None,
-                ordinal: None,
             }),
             str_lit(field),
         ]
@@ -13241,7 +13197,6 @@ mod tests {
                 qualifier: None,
                 data_type: None,
                 nullable: None,
-                ordinal: None,
             })],
         );
         let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
@@ -13276,7 +13231,6 @@ mod tests {
                     qualifier: None,
                     data_type: None,
                     nullable: None,
-                    ordinal: None,
                 }),
                 str_lit("a"),
             ],
@@ -13296,7 +13250,6 @@ mod tests {
                 qualifier: None,
                 data_type: None,
                 nullable: None,
-                ordinal: None,
             })],
         );
         let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
@@ -13442,7 +13395,6 @@ mod tests {
             qualifier: Some("e".to_owned()),
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
         })
     }
 
@@ -13576,14 +13528,12 @@ mod tests {
             qualifier: Some("e".to_owned()),
             data_type: Some(DataType::Long),
             nullable: Some(false),
-            ordinal: None,
         });
         let tag_ref = Expression::ColumnReference(ColumnReference {
             name: "tag".to_owned(),
             qualifier: Some("t".to_owned()),
             data_type: Some(DataType::String),
             nullable: Some(true),
-            ordinal: None,
         });
         let proj = TypedAst::new(
             TypedOp::Project {

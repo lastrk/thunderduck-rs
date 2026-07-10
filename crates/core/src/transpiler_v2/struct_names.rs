@@ -74,7 +74,6 @@ mod tests {
             qualifier: None,
             data_type: None,
             nullable: None,
-            ordinal: None,
         })
     }
 

@@ -65,7 +65,6 @@ pub fn dedup_names(names: &[&str]) -> Vec<String> {
 /// An already-unique input is returned unchanged. On collision the suffix
 /// counter keeps advancing past any name already present in the (original or
 /// so-far-emitted) set, mirroring Calcite's `SqlValidatorUtil.uniquify`.
-#[allow(dead_code)] // ADR-023 tier 1; consumed by tier 2 (allow removed then).
 pub(crate) fn uniquify(names: &[&str]) -> Vec<String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut result = Vec::with_capacity(names.len());

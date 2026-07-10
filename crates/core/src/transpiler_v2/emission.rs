@@ -52,6 +52,7 @@ use super::expression::{
 };
 use super::sql_block::{Clause, DefaultSlot, DistinctKind, FromItem, SelectBlock, SqlUnit};
 use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
+use crate::types::pyspark_parity::uniquify;
 use crate::types::{DataType, StructType};
 use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
 
@@ -678,15 +679,24 @@ fn build_aggregate(
     );
     let merge = block.can_accept(Clause::GroupBy) && vis;
 
+    // ADR-023 tier 2: activate the wrap-boundary reprojection only when the
+    // wrapped child's output has a duplicate name — the one class
+    // `strip_stranded_qualifiers` cannot rewrite around. `None` on the
+    // common (already-unique) case keeps every branch below byte-identical
+    // to the pre-tier-2 strip path.
+    let uniquified = output_uniquified(input_schema);
     // Choose the expression set to render from: the originals when merging
-    // (no cosmetic churn), or each stripped against the PRE-wrap block when
-    // wrapping — otherwise a qualifier like `e.dept_id` strands behind the
-    // freshly introduced `__td_sub`.
+    // (no cosmetic churn), or each stripped/reprojected against the
+    // PRE-wrap block when wrapping — otherwise a qualifier like
+    // `e.dept_id` strands behind the freshly introduced `__td_sub`.
     let maybe_strip = |e: &Expression| -> Expression {
         if merge {
             e.clone()
         } else {
-            strip_stranded_qualifiers(e, &block, input_schema)
+            match &uniquified {
+                Some(u) => reproject_qualifiers(e, input, u),
+                None => strip_stranded_qualifiers(e, &block, input_schema),
+            }
         }
     };
     let grouping_r: Vec<Expression> = grouping.iter().map(&maybe_strip).collect();
@@ -698,7 +708,10 @@ fn build_aggregate(
                 if merge {
                     h
                 } else {
-                    strip_stranded_qualifiers(&h, &block, input_schema)
+                    match &uniquified {
+                        Some(u) => reproject_qualifiers(&h, input, u),
+                        None => strip_stranded_qualifiers(&h, &block, input_schema),
+                    }
                 }
             });
     if !merge {
@@ -759,7 +772,10 @@ fn build_aggregate(
     };
 
     if !merge {
-        block = SelectBlock::wrap(block.into());
+        block = match &uniquified {
+            Some(u) => SelectBlock::wrap_reprojected(block.into(), u),
+            None => SelectBlock::wrap(block.into()),
+        };
     }
     if let Some(g) = group_body {
         block.set_group_by(g);
@@ -958,6 +974,104 @@ fn strip_stranded_qualifiers(
     rewritten
 }
 
+/// ADR-023 tier 2 activation gate: `schema`'s field names, [`uniquify`]d,
+/// iff they contain a duplicate — `None` when the names are already unique,
+/// the common case. Every wrap site checks this FIRST and only reaches the
+/// tier-2 reprojection path (`wrap_reprojected` + [`reproject_qualifiers`])
+/// on `Some`; the `None` (common) case keeps the existing
+/// `SelectBlock::wrap` + [`strip_stranded_qualifiers`] pairing byte-for-byte
+/// unchanged, which is what confines the corpus delta to the duplicate-name
+/// shape this closes.
+fn output_uniquified(schema: &Schema) -> Option<Vec<String>> {
+    let names: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).collect();
+    let mut seen: HashSet<&str> = HashSet::with_capacity(names.len());
+    let all_unique = names.iter().all(|n| seen.insert(n));
+    (!all_unique).then(|| uniquify(&names))
+}
+
+/// The position in `schema` that `(q, name)` resolves to, iff `scope` binds
+/// `q` to a field range (first match — the same first-match convention
+/// [`scope_binds`]/[`covering_alias`] use) containing a field named `name`
+/// case-insensitively. `None` when `q` isn't a scope alias at all (the F10
+/// dead-alias class [`reproject_qualifiers`] must leave untouched) or `name`
+/// isn't found within the range `q` binds.
+fn scope_position(
+    scope: &super::analyzer::RelScope,
+    q: &str,
+    name: &str,
+    schema: &Schema,
+) -> Option<usize> {
+    let (_, range) = scope
+        .aliases
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(q))?;
+    schema.fields[range.clone()]
+        .iter()
+        .position(|f| f.name.eq_ignore_ascii_case(name))
+        .map(|offset| range.start + offset)
+}
+
+/// ADR-023 tier 2: the duplicate-output-name counterpart of
+/// [`strip_stranded_qualifiers`], paired with
+/// [`SelectBlock::wrap_reprojected`]. That wrap re-exposes the wrapped
+/// child's columns under `uniquified`'s names, positionally — so, unlike
+/// `strip_stranded_qualifiers` (which only rewrites `q.name -> name` when
+/// `name` is unique in the pre-wrap output and therefore declines on a
+/// duplicate), this rewrite is always safe for any qualifier `input.scope`
+/// resolves: `q.name` becomes the bare `uniquified[pos]` at `name`'s
+/// resolved position, which the reprojected wrap guarantees is bindable.
+///
+/// A qualifier `input.scope` does NOT bind (the F10 dead-alias class) is
+/// left untouched — Tier 3's job — as is a `q` that doubles as a struct
+/// column access on the input schema (mirrors `strip_stranded_qualifiers`'s
+/// own struct-precedence guard: struct access survives a wrap as
+/// column-dot-field syntax and needs no rewrite). Qualified stars are not
+/// rewritten, and subquery bodies are opaque `CommonAst` plans (not
+/// expression children per the τ walker convention), same as
+/// `strip_stranded_qualifiers`.
+fn reproject_qualifiers(expr: &Expression, input: &TypedAst, uniquified: &[String]) -> Expression {
+    fn walk(
+        expr: &mut Expression,
+        scope: &super::analyzer::RelScope,
+        schema: &Schema,
+        uniquified: &[String],
+    ) {
+        let resolve = |q: &str, name: &str| -> Option<usize> {
+            if TypeInferenceEngine::struct_qualifier_info(name, q, schema).is_some() {
+                return None;
+            }
+            scope_position(scope, q, name, schema)
+        };
+        match expr {
+            Expression::ColumnReference(c) => {
+                if let Some(pos) = c.qualifier.as_deref().and_then(|q| resolve(q, &c.name)) {
+                    c.qualifier = None;
+                    c.name = uniquified[pos].clone();
+                }
+            }
+            Expression::UnresolvedColumn(u) => {
+                if let Some(pos) = u.qualifier.as_deref().and_then(|q| resolve(q, &u.name)) {
+                    u.qualifier = None;
+                    u.name = uniquified[pos].clone();
+                }
+            }
+            other => {
+                for child in other.children_mut() {
+                    walk(child, scope, schema, uniquified);
+                }
+            }
+        }
+    }
+    let mut rewritten = expr.clone();
+    walk(
+        &mut rewritten,
+        &input.scope,
+        &input.resolved_schema,
+        uniquified,
+    );
+    rewritten
+}
+
 /// R7 latent-occlusion witness: when a slot-conflict wrap is about to strand
 /// a qualifier the child block's FROM scope DID expose (the reference will
 /// not resolve through the `__td_sub` boundary), leave a trace. This is not
@@ -1081,13 +1195,20 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
         block.set_projections(slots_sql);
         return Ok(block.into());
     }
+    let uniquified = output_uniquified(&input.resolved_schema);
     let projections: Vec<Expression> = projections
         .iter()
         .map(|p| expand_stranded_whole_relation_star(p, &block, input))
-        .map(|p| strip_stranded_qualifiers(&p, &block, &input.resolved_schema))
+        .map(|p| match &uniquified {
+            Some(u) => reproject_qualifiers(&p, input, u),
+            None => strip_stranded_qualifiers(&p, &block, &input.resolved_schema),
+        })
         .collect();
     trace_stranded_qualifiers(&block, &projections, &input.scope);
-    let mut wrapped = SelectBlock::wrap(block.into());
+    let mut wrapped = match &uniquified {
+        Some(u) => SelectBlock::wrap_reprojected(block.into(), u),
+        None => SelectBlock::wrap(block.into()),
+    };
     wrapped.set_projections(render_projection_slots(
         &projections,
         &input.resolved_schema,
@@ -1101,9 +1222,16 @@ fn build_filter(input: &TypedAst, condition: &Expression) -> Result<SqlUnit, Emi
         block.push_where(render_expr(condition, &input.resolved_schema)?);
         return Ok(block.into());
     }
-    let condition = strip_stranded_qualifiers(condition, &block, &input.resolved_schema);
+    let uniquified = output_uniquified(&input.resolved_schema);
+    let condition = match &uniquified {
+        Some(u) => reproject_qualifiers(condition, input, u),
+        None => strip_stranded_qualifiers(condition, &block, &input.resolved_schema),
+    };
     trace_stranded_qualifiers(&block, [&condition], &input.scope);
-    let mut wrapped = SelectBlock::wrap(block.into());
+    let mut wrapped = match &uniquified {
+        Some(u) => SelectBlock::wrap_reprojected(block.into(), u),
+        None => SelectBlock::wrap(block.into()),
+    };
     wrapped.push_where(render_expr(&condition, &input.resolved_schema)?);
     Ok(wrapped.into())
 }
@@ -1137,15 +1265,22 @@ fn build_sort(
         block.set_order_by(keys, limit, offset);
         return Ok(block.into());
     }
+    let uniquified = output_uniquified(&input.resolved_schema);
     let keys = order
         .iter()
         .map(|so| {
             let mut stripped = so.clone();
-            *stripped.expr = strip_stranded_qualifiers(&so.expr, &block, &input.resolved_schema);
+            *stripped.expr = match &uniquified {
+                Some(u) => reproject_qualifiers(&so.expr, input, u),
+                None => strip_stranded_qualifiers(&so.expr, &block, &input.resolved_schema),
+            };
             render_sort_key(&stripped, &input.resolved_schema)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut wrapped = SelectBlock::wrap(block.into());
+    let mut wrapped = match &uniquified {
+        Some(u) => SelectBlock::wrap_reprojected(block.into(), u),
+        None => SelectBlock::wrap(block.into()),
+    };
     wrapped.set_order_by(keys, limit, offset);
     Ok(wrapped.into())
 }
@@ -6579,6 +6714,91 @@ mod tests {
         );
     }
 
+    // ── ADR-023 tier 2: wrap-boundary re-projection over duplicate names ──
+    //
+    // `output_uniquified` gates every wrap site's `strip_stranded_qualifiers`
+    // vs. `reproject_qualifiers` choice on whether the wrapped child's
+    // output has a duplicate name. The common (unique) case must render
+    // byte-identically to the pre-tier-2 shape; the duplicate case (see
+    // `ambiguous_output_name_wrap_reprojects_to_unique_position` above) must
+    // reproject uniquely and rewrite the outer reference by position.
+
+    /// The common case: the wrapped child's output names are already
+    /// unique, so `output_uniquified` returns `None` and every wrap site
+    /// takes the pre-tier-2 `SelectBlock::wrap` + `strip_stranded_qualifiers`
+    /// path verbatim — zero delta on the shape tier 2 does not target.
+    #[test]
+    fn wrap_over_unique_names_is_unchanged() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Sort {
+                input: Box::new(aliased_scan("emp", "e")),
+                order: vec![asc_key(ColumnReference::untyped("id"))],
+                limit: Some(5),
+                offset: None,
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Gt,
+                left: Box::new(qcol("e", "salary")),
+                right: Box::new(int_lit(60000)),
+            }),
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT * FROM emp AS e ORDER BY id ASC NULLS FIRST LIMIT 5) \
+             AS __td_sub WHERE (salary) > (60000)"
+        );
+    }
+
+    /// ADR-023 tier 2's namesake pin: a duplicate name across a self-join
+    /// output forces `build_filter`'s wrap path onto `wrap_reprojected` +
+    /// `reproject_qualifiers` instead of the (declining) strip path — the
+    /// scope-resolvable `a.name` reference is rewritten to the unique
+    /// positional name (`name`, the left side's occurrence) rather than
+    /// stranding qualified over the buried `a` alias.
+    #[test]
+    fn wrap_over_duplicate_names_reprojects_uniquely() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::Limit {
+                input: Box::new(CommonAst::new(CommonOp::Join {
+                    left: Box::new(aliased_scan("emp", "a")),
+                    right: Box::new(aliased_scan("emp", "b")),
+                    join_type: JoinType::Inner,
+                    condition: Some(Expression::Binary(BinaryExpression {
+                        op: BinaryOp::Eq,
+                        left: Box::new(qcol("a", "id")),
+                        right: Box::new(qcol("b", "id")),
+                    })),
+                    using_columns: vec![],
+                    natural: false,
+                    lateral: false,
+                    left_plan_ids: vec![],
+                    right_plan_ids: vec![],
+                })),
+                limit: 5,
+                offset: None,
+            })),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("b", "name")),
+                right: Box::new(str_lit("y")),
+            }),
+        });
+        let bt = base_types_emp_dept(&plan);
+        let typed = analyze(plan, &bt).expect("analyze");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT * FROM emp AS a INNER JOIN emp AS b ON (a.id) = (b.id) LIMIT 5) \
+             AS __td_sub(id, name, dept_id, salary, id_1, name_1, dept_id_1, salary_1) \
+             WHERE (name_1) = ('y')"
+        );
+    }
+
     // ── Wrap-boundary qualifier rewriting (strand-class retirement) ──────
     //
     // filt-016/filt-017 witness class: a qualified reference above a
@@ -6782,12 +7002,15 @@ mod tests {
         );
     }
 
-    /// Keep-side: a name appearing on BOTH sides of a self-join output is
-    /// ambiguous once unqualified — the reference must stay qualified (loud
-    /// binder failure preserved; stripping would silently bind an arbitrary
-    /// side).
+    /// ADR-023 tier 2: a name appearing on BOTH sides of a self-join output
+    /// is ambiguous once bare-stripped to its ORIGINAL name — the pre-tier-2
+    /// fallback therefore left it qualified (a loud binder failure over the
+    /// buried `a` alias). Tier 2 instead reprojects the wrapped join under
+    /// per-column unique names and rewrites `a.name` to the unique name at
+    /// its position (`name`, the left side's first occurrence) — resolving
+    /// correctly instead of failing loudly.
     #[test]
-    fn ambiguous_output_name_survives_wrap_qualified() {
+    fn ambiguous_output_name_wrap_reprojects_to_unique_position() {
         let _g = tap_guard();
         let plan = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::Limit {
@@ -6818,9 +7041,11 @@ mod tests {
         let bt = base_types_emp_dept(&plan);
         let typed = analyze(plan, &bt).expect("analyze");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        assert!(
-            sql.contains("a.name"),
-            "ambiguous output name must NOT be stripped, got: {sql}"
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT * FROM emp AS a INNER JOIN emp AS b ON (a.id) = (b.id) LIMIT 5) \
+             AS __td_sub(id, name, dept_id, salary, id_1, name_1, dept_id_1, salary_1) \
+             WHERE (name) = ('x')"
         );
     }
 

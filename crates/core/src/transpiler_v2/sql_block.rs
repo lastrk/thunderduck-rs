@@ -318,6 +318,31 @@ impl SelectBlock {
         })
     }
 
+    /// ADR-023 tier 2: like [`wrap`], but the derived table's exposed
+    /// columns are the caller-supplied UNIQUE names, positionally —
+    /// `(…) AS __td_sub(c0, c1, …)`, the SQL-92 derived-table
+    /// column-alias-list — instead of `unit`'s own (possibly duplicate)
+    /// output names. Used exactly when `unit`'s declared output has a
+    /// duplicate name: [`crate::types::pyspark_parity::uniquify`]'s result
+    /// names every column distinctly, so the enclosing block can reference
+    /// any of them by bare name with no ambiguity — closing the one class
+    /// `strip_stranded_qualifiers` cannot rewrite around. `unit`'s own
+    /// SELECT list is untouched; only the derived table's exposed name list
+    /// changes, confirmed by an empirical DuckDB smoke check (ADR-023 tier
+    /// 2 plan) that the alias-list syntax binds positionally over a
+    /// duplicate-named inner projection.
+    pub(crate) fn wrap_reprojected(unit: SqlUnit, uniquified: &[String]) -> Self {
+        let cols = uniquified
+            .iter()
+            .map(|c| quote_ident(c).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self::from_item(FromItem::Raw {
+            sql: format!("({}) AS {}({cols})", unit.to_sql(), quote_ident(WRAP_ALIAS)),
+            exposed: vec![WRAP_ALIAS.to_owned()],
+        })
+    }
+
     /// May `clause` still be filled? Strictly downstream of everything
     /// occupied, except WHERE-onto-WHERE (conjuncts compose).
     pub(crate) fn can_accept(&self, clause: Clause) -> bool {

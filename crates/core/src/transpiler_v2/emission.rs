@@ -5132,10 +5132,14 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         }
         // Spark `sha`/`sha1` → DuckDB `sha1`.
         "sha" => "sha1",
-        // Spark's `add_months(date, n)` — DuckDB uses `date + INTERVAL n MONTH`.
+        // Spark's `add_months(date, n)` — DuckDB uses `date + INTERVAL n MONTH`,
+        // but DuckDB promotes `DATE + INTERVAL` to TIMESTAMP. Spark's
+        // `add_months` always returns DATE; CAST back so collected values
+        // come back as date, not datetime. DuckDB's end-of-month clamp
+        // (e.g. Jan 31 + 1 month = Feb 29 in a leap year) survives the CAST.
         "add_months" => {
             let [d, n] = exact_args(f, schema, "`add_months` requires exactly 2 arguments")?;
-            return Ok(format!("({d} + INTERVAL ({n}) MONTH)"));
+            return Ok(format!("CAST(({d} + INTERVAL ({n}) MONTH) AS DATE)"));
         }
         // Spark's `datediff(end, start)` (2 args, days-diff) → DuckDB's
         // `datediff('day', start, end)` (3 args, unit-prefixed).
@@ -5194,13 +5198,16 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                   (CAST(extract('day' FROM {a}) - extract('day' FROM {b}) AS DOUBLE) / 31.0))"
             ));
         }
+        // DuckDB promotes `DATE + INTERVAL` to TIMESTAMP; Spark's `date_add`
+        // always returns DATE. CAST back to DATE (same rule as `add_months`
+        // above).
         "date_add" => {
             let [d, n] = exact_args(f, schema, "`date_add` requires exactly 2 arguments")?;
-            return Ok(format!("({d} + INTERVAL ({n}) DAY)"));
+            return Ok(format!("CAST(({d} + INTERVAL ({n}) DAY) AS DATE)"));
         }
         "date_sub" => {
             let [d, n] = exact_args(f, schema, "`date_sub` requires exactly 2 arguments")?;
-            return Ok(format!("({d} - INTERVAL ({n}) DAY)"));
+            return Ok(format!("CAST(({d} - INTERVAL ({n}) DAY) AS DATE)"));
         }
         // Spark's `concat(s1, s2, ...)` on strings PROPAGATES NULL:
         // any NULL arg makes the result NULL. DuckDB's `concat` ignores
@@ -5858,8 +5865,10 @@ fn render_literal(lit: &Literal) -> Result<String, EmissionError> {
         LiteralValue::Date(days) => {
             // Days since Unix epoch → DATE. DuckDB `epoch_us`/`epoch_ms` only
             // extract from timestamps, not construct — use the epoch anchor +
-            // INTERVAL construction so DuckDB parses both directions correctly.
-            Ok(format!("(DATE '1970-01-01' + INTERVAL ({days}) DAY)"))
+            // a plain INTEGER day offset (root cause 026: `DATE + INTERVAL`
+            // promotes to TIMESTAMP in DuckDB, but `DATE + INTEGER` stays
+            // DATE, exactly matching Spark's DATE literal type).
+            Ok(format!("(DATE '1970-01-01' + ({days}))"))
         }
         LiteralValue::Timestamp(micros) => Ok(format!(
             "CAST(make_timestamp(CAST({micros} AS BIGINT)) AS TIMESTAMP WITH TIME ZONE)"
@@ -5998,6 +6007,26 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
         BinaryOp::BitXor => "#",
     };
     let inner = format!("({l}) {op} ({r})");
+    // Date ± Interval: DuckDB promotes `DATE ± INTERVAL` to TIMESTAMP, but
+    // Spark's `Date ± Interval` stays DATE (`binary_data_type` in
+    // expression.rs preserves the date-like side). CAST back to DATE so
+    // collected values come back as date, not datetime. Guarded on the
+    // *inferred* type being Date (not merely one side being Date) so a
+    // Timestamp ± Interval — which correctly infers Timestamp — is left
+    // untouched.
+    let inner = if matches!(b.op, BinaryOp::Add | BinaryOp::Sub) {
+        let lt = b.left.data_type(schema);
+        let rt = b.right.data_type(schema);
+        let is_date_plus_interval = (matches!(lt, DataType::Date) && rt.is_interval())
+            || (matches!(rt, DataType::Date) && lt.is_interval());
+        if is_date_plus_interval {
+            format!("CAST({inner} AS DATE)")
+        } else {
+            inner
+        }
+    } else {
+        inner
+    };
     // ADR-006: guard divide/mod-by-zero with Spark's ANSI error class.
     let guard = match b.op {
         BinaryOp::Div | BinaryOp::IntDiv => Some(super::spark_errors::SparkError::DivideByZero),
@@ -7954,6 +7983,27 @@ mod tests {
         })
         .expect("render");
         assert_eq!(sql, r"CAST('\x1F\x2A' AS BLOB)");
+    }
+
+    /// Root cause 026: the DATE literal used to be built as
+    /// `DATE '1970-01-01' + INTERVAL (n) DAY`, which DuckDB promotes to
+    /// TIMESTAMP (`DATE ± INTERVAL` → TIMESTAMP). Build it with a plain
+    /// INTEGER day offset instead — `DATE + INTEGER` stays DATE in DuckDB —
+    /// so a bare `DATE '...'` literal collects back as date, not datetime.
+    /// Corpus: test_interval_date_arithmetic's `d` column.
+    #[test]
+    fn render_literal_date_uses_integer_offset_not_interval() {
+        let sql = render_literal(&Literal {
+            value: LiteralValue::Date(20103),
+            data_type: DataType::Date,
+        })
+        .expect("render");
+        assert_eq!(sql, "(DATE '1970-01-01' + (20103))");
+        assert!(
+            !sql.contains("INTERVAL"),
+            "DATE literal must not use INTERVAL construction (promotes to \
+             TIMESTAMP in DuckDB); got: {sql}"
+        );
     }
 
     #[test]
@@ -14762,6 +14812,145 @@ mod tests {
             "expected plain division, got: {sql}"
         );
         assert_eq!(sql, "(CAST(6.0 AS DOUBLE)) / (CAST(2.0 AS DOUBLE))");
+    }
+
+    // ── Date ± Interval arithmetic returns DATE (root cause: 026) ──────────
+    //
+    // DuckDB promotes `DATE ± INTERVAL` to TIMESTAMP; Spark's Date ± Interval
+    // stays DATE (`binary_data_type` in expression.rs preserves the
+    // date-like side). `render_binary` must CAST the result back to DATE —
+    // but ONLY when the inferred type is actually Date, never for a
+    // Timestamp-base interval add (which correctly infers Timestamp).
+
+    #[test]
+    fn render_binary_date_plus_interval_casts_to_date() {
+        let i = IntervalExpression {
+            months: 0,
+            days: 5,
+            microseconds: 0,
+            kind: IntervalKind::Calendar,
+        };
+        let b = BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(col_with_type("d", DataType::Date)),
+            right: Box::new(Expression::Interval(i)),
+        };
+        let sql = render_binary(&b, &empty_schema()).expect("render");
+        assert!(
+            sql.starts_with("CAST(") && sql.ends_with("AS DATE)"),
+            "expected a DATE cast wrapping the addition, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_binary_interval_plus_date_casts_to_date() {
+        // Same rule with the operands reversed (`INTERVAL + DATE`).
+        let i = IntervalExpression {
+            months: 1,
+            days: 0,
+            microseconds: 0,
+            kind: IntervalKind::YearMonth,
+        };
+        let b = BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(Expression::Interval(i)),
+            right: Box::new(col_with_type("d", DataType::Date)),
+        };
+        let sql = render_binary(&b, &empty_schema()).expect("render");
+        assert!(
+            sql.starts_with("CAST(") && sql.ends_with("AS DATE)"),
+            "expected a DATE cast wrapping the addition, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn render_binary_date_minus_interval_casts_to_date() {
+        let i = IntervalExpression {
+            months: 0,
+            days: 3,
+            microseconds: 0,
+            kind: IntervalKind::Calendar,
+        };
+        let b = BinaryExpression {
+            op: BinaryOp::Sub,
+            left: Box::new(col_with_type("d", DataType::Date)),
+            right: Box::new(Expression::Interval(i)),
+        };
+        let sql = render_binary(&b, &empty_schema()).expect("render");
+        assert!(
+            sql.starts_with("CAST(") && sql.ends_with("AS DATE)"),
+            "expected a DATE cast wrapping the subtraction, got: {sql}"
+        );
+    }
+
+    /// No-regression guard: a Timestamp-base interval add must NOT get the
+    /// DATE cast — `binary_data_type` infers `Timestamp` here (not `Date`),
+    /// so the currently-GREEN `test_day_time_interval_*` / timestamp-base
+    /// interval corpus cases stay untouched.
+    #[test]
+    fn render_binary_timestamp_plus_interval_is_not_cast_to_date() {
+        let i = IntervalExpression {
+            months: 0,
+            days: 5,
+            microseconds: 0,
+            kind: IntervalKind::Calendar,
+        };
+        let b = BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(ts_col_ref("ts")),
+            right: Box::new(Expression::Interval(i)),
+        };
+        let sql = render_binary(&b, &empty_schema()).expect("render");
+        assert!(
+            !sql.contains("AS DATE"),
+            "Timestamp ± Interval must not be cast to DATE, got: {sql}"
+        );
+    }
+
+    // ── add_months / date_add / date_sub return DATE (root cause: 026) ─────
+    //
+    // DuckDB's `DATE + INTERVAL n MONTH|DAY` promotes to TIMESTAMP; Spark's
+    // `add_months`/`date_add`/`date_sub` always return DATE. Corpus:
+    // test_date_add, test_date_sub, test_add_months.
+
+    #[test]
+    fn add_months_casts_result_to_date() {
+        let f = fcall(
+            "add_months",
+            vec![col_with_type("d", DataType::Date), int_lit(1)],
+        );
+        let sql = render_function_call(&f, &empty_schema()).expect("render add_months");
+        assert!(
+            sql.starts_with("CAST(") && sql.ends_with("AS DATE)"),
+            "expected add_months to CAST its result to DATE, got: {sql}"
+        );
+        assert!(sql.contains("INTERVAL"), "got: {sql}");
+    }
+
+    #[test]
+    fn date_add_casts_result_to_date() {
+        let f = fcall(
+            "date_add",
+            vec![col_with_type("d", DataType::Date), int_lit(5)],
+        );
+        let sql = render_function_call(&f, &empty_schema()).expect("render date_add");
+        assert!(
+            sql.starts_with("CAST(") && sql.ends_with("AS DATE)"),
+            "expected date_add to CAST its result to DATE, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn date_sub_casts_result_to_date() {
+        let f = fcall(
+            "date_sub",
+            vec![col_with_type("d", DataType::Date), int_lit(5)],
+        );
+        let sql = render_function_call(&f, &empty_schema()).expect("render date_sub");
+        assert!(
+            sql.starts_with("CAST(") && sql.ends_with("AS DATE)"),
+            "expected date_sub to CAST its result to DATE, got: {sql}"
+        );
     }
 
     fn decimal_col(name: &str, precision: u8, scale: u8) -> Expression {

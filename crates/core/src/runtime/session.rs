@@ -455,19 +455,8 @@ CREATE OR REPLACE MACRO to_char(x, fmt) AS
             'mm', '%M'),
             'ss', '%S'),
         x);
--- next_day(date, day_name): next occurrence of named weekday after date
-CREATE OR REPLACE MACRO next_day(d, day_name) AS
-    CAST(d AS DATE) + CAST(
-        CASE lower(left(day_name, 3))
-            WHEN 'sun' THEN ((0 - DAYOFWEEK(d) + 6) % 7) + 1
-            WHEN 'mon' THEN ((1 - DAYOFWEEK(d) + 6) % 7) + 1
-            WHEN 'tue' THEN ((2 - DAYOFWEEK(d) + 6) % 7) + 1
-            WHEN 'wed' THEN ((3 - DAYOFWEEK(d) + 6) % 7) + 1
-            WHEN 'thu' THEN ((4 - DAYOFWEEK(d) + 6) % 7) + 1
-            WHEN 'fri' THEN ((5 - DAYOFWEEK(d) + 6) % 7) + 1
-            WHEN 'sat' THEN ((6 - DAYOFWEEK(d) + 6) % 7) + 1
-            ELSE 0
-        END AS INTEGER) * INTERVAL 1 DAY;
+-- next_day(d, day_name) is registered separately below (NEXT_DAY_MACRO_SQL)
+-- so unit tests can pin its DATE-return contract on a plain connection.
 -- _spark_size(x): returns size for arrays (LEN) or maps (LEN(MAP_KEYS(x)))
 -- Used as fallback when type is unknown at code-gen time.
 -- Note: this macro cannot work for maps because DuckDB macros type-check both CASE branches.
@@ -583,6 +572,15 @@ CREATE OR REPLACE MACRO str_to_map(s, pair_delim, kv_delim) AS
                 if let Err(e) = conn.execute_batch(SPARK_CRC32_MACRO_SQL) {
                     let _ = ready_tx.send(Err(ThunderduckError::DuckDb(format!(
                         "spark_crc32 macro registration failed: {e}"
+                    ))));
+                    return;
+                }
+                // `next_day` lives in its own `execute_batch` (same rationale
+                // as `spark_crc32` above) so unit tests can pin its DATE
+                // return type without a full session spawn.
+                if let Err(e) = conn.execute_batch(NEXT_DAY_MACRO_SQL) {
+                    let _ = ready_tx.send(Err(ThunderduckError::DuckDb(format!(
+                        "next_day macro registration failed: {e}"
                     ))));
                     return;
                 }
@@ -739,6 +737,28 @@ CREATE OR REPLACE MACRO spark_crc32(b) AS
                   4294967295::UINTEGER
               )::BIGINT
     END;
+";
+
+/// SQL fragment that registers `next_day(d, day_name)`: the next occurrence
+/// of the named weekday after `d`. Spark's `next_day` returns DATE. DuckDB's
+/// `DATE + INTEGER` stays DATE, but `DATE + (n * INTERVAL 1 DAY)` promotes
+/// to TIMESTAMP — the macro adds the plain INTEGER day offset instead of
+/// multiplying by an INTERVAL. Kept as a module-level constant (same
+/// rationale as [`SPARK_CRC32_MACRO_SQL`]) so unit tests can pin the
+/// DATE-return contract on a plain `duckdb::Connection`.
+pub(crate) const NEXT_DAY_MACRO_SQL: &str = "
+CREATE OR REPLACE MACRO next_day(d, day_name) AS
+    CAST(d AS DATE) + CAST(
+        CASE lower(left(day_name, 3))
+            WHEN 'sun' THEN ((0 - DAYOFWEEK(d) + 6) % 7) + 1
+            WHEN 'mon' THEN ((1 - DAYOFWEEK(d) + 6) % 7) + 1
+            WHEN 'tue' THEN ((2 - DAYOFWEEK(d) + 6) % 7) + 1
+            WHEN 'wed' THEN ((3 - DAYOFWEEK(d) + 6) % 7) + 1
+            WHEN 'thu' THEN ((4 - DAYOFWEEK(d) + 6) % 7) + 1
+            WHEN 'fri' THEN ((5 - DAYOFWEEK(d) + 6) % 7) + 1
+            WHEN 'sat' THEN ((6 - DAYOFWEEK(d) + 6) % 7) + 1
+            ELSE 0
+        END AS INTEGER);
 ";
 
 impl DuckDbSession {
@@ -1060,6 +1080,7 @@ fn run_query(conn: &duckdb::Connection, sql: &str) -> Result<Vec<RecordBatch>> {
 #[cfg(test)]
 mod tests {
     use super::configure_s3_credential_chain;
+    use super::NEXT_DAY_MACRO_SQL;
     use super::SPARK_CRC32_MACRO_SQL;
 
     fn fresh_conn() -> duckdb::Connection {
@@ -1085,6 +1106,37 @@ mod tests {
     fn query_i64(conn: &duckdb::Connection, sql: &str) -> i64 {
         conn.query_row::<i64, _, _>(sql, [], |row| row.get(0))
             .expect("query_row failed")
+    }
+
+    /// Open a plain in-memory DuckDB connection and register the `next_day`
+    /// macro (same isolation rationale as [`conn_with_crc32`]).
+    fn conn_with_next_day() -> duckdb::Connection {
+        let conn = fresh_conn();
+        conn.execute_batch(NEXT_DAY_MACRO_SQL)
+            .expect("register next_day macro");
+        conn
+    }
+
+    /// Root cause 026: DuckDB promotes `DATE + (n * INTERVAL 1 DAY)` to
+    /// TIMESTAMP. `next_day` must return DATE (Spark parity) — pin both the
+    /// result value and its runtime type.
+    #[test]
+    fn next_day_returns_date_not_timestamp() {
+        let conn = conn_with_next_day();
+        // 2024-01-01 is a Monday; next Friday is 2024-01-05.
+        let (value, type_name): (String, String) = conn
+            .query_row(
+                "SELECT next_day(DATE '2024-01-01', 'Fri')::VARCHAR, \
+                 typeof(next_day(DATE '2024-01-01', 'Fri'))",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query_row failed");
+        assert_eq!(value, "2024-01-05", "next_day value mismatch");
+        assert_eq!(
+            type_name, "DATE",
+            "next_day must return DATE, got {type_name}"
+        );
     }
 
     /// ADR-006 Piece B1 contract: a runtime error thrown *during result

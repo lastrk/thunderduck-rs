@@ -1074,3 +1074,43 @@ red in any later pass.
   null-safety bug in the pattern it was told to mirror. Remaining ~38: ORDER BY
   increment 2 (q098 + substr q062/q079/q085/q099), Cluster-A lone (jn-018,
   tbl-013, q044, q066), feature-family (date-arith, math, interval), singletons.
+
+## Pass 24 — 2026-07-11 — DATE-arithmetic result coercion (Date ± INTERVAL → DATE)
+
+- **Baseline (post-Pass-23, commit dc3810e):** 1404 passed / 38 failed.
+- **Root cause (ONE):** DuckDB promotes `DATE ± INTERVAL` (and the next_day
+  macro, and bare `DATE '...'` literals emitted as `+ INTERVAL n DAY`) to
+  TIMESTAMP. τ's analyzer correctly declares DATE, but emission yielded a
+  TIMESTAMP runtime value → collected as datetime not date (schemas matched,
+  values diverged). Diagnosis `.agent-output/026-diagnostic-date-interval.md`.
+- **Fix (emission.rs + session.rs — coerce to DATE where inferred type is Date),
+  4 sites, all verified vs live DuckDB:**
+  1. `add_months`/`date_add`/`date_sub` scalar arms → `CAST(... AS DATE)`
+     (add_months end-of-month clamp preserved under the cast).
+  2. `render_binary`: CAST-to-DATE guard when `op ∈ {Add,Sub}` & one operand
+     Date & other `is_interval()` — the exact structural twin of
+     `binary_data_type`'s Date±interval arm, so Timestamp±interval (disjoint
+     enum arm) is NEVER wrapped (no regression to day-time-interval cases).
+  3. `next_day` macro → integer-day add (dropped `* INTERVAL 1 DAY`).
+  4. **`LiteralValue::Date` renderer** (coder's 4th find): bare `DATE '...'` was
+     `DATE '1970-01-01' + INTERVAL n DAY` → TIMESTAMP; changed to integer-day
+     `+ (n)` → DATE (broad: every date literal; a fix, re-aligning emission with
+     the already-declared Date type).
+- **Review (`rust-reviewer`, no-tree-mutation):** APPROVE. Confirmed the
+  render_binary guard mirrors `binary_data_type` exactly (timestamp-safe by
+  disjoint enum arms), the DATE-literal change is a strict fix (no green case
+  relied on the timestamp promotion — that would itself be red), next_day/
+  add_months semantics preserved. Lows (non-blocking): O(n²) type re-derivation
+  on deep Add/Sub chains (negligible); reversed-Sub guard fires on invalid
+  `interval - date` (harmless, DuckDB rejects). Correctly predicted intv-004
+  (Date+DayTimeInterval) flips green — Spark casts that to DATE too.
+- **Gate:** 1404→1412 (**Δ +8, zero regressions** — the broad DATE-literal
+  change touched every date literal with zero green→red). Newly green: the 7
+  date/interval targets + bonus test_date_to_string. `cargo test -p
+  thunderduck-core --lib` 1123.
+- **Reflect:** one root cause (DuckDB DATE→TIMESTAMP promotion), 4 emission
+  sites, +8. The coder's 4th-site discovery (DATE literal renderer) via dumping
+  emitted SQL is the pattern that keeps finding latent siblings. Remaining 30:
+  ORDER BY increment 2 (q098 + substr q062/q079/q085/q099), Cluster-A lone
+  (jn-018, tbl-013, q044, q066), math (ceil_floor/exp/log/round), map, and
+  singletons (Tail, json_tuple, alter_table, write, split_with_limit, etc.).

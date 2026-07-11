@@ -6,6 +6,11 @@ Goal: zero UNDOCUMENTED failures in the full differential suite
 AND the pass-0 regression oracle: no case listed as green at pass 0 may go
 red in any later pass.
 
+**Deferred fixable defects/parity gaps** discovered during these passes are
+consolidated in [`tasks/v2-corpus-followups.md`](v2-corpus-followups.md)
+(distinct from `unsolvable.md`, which is only for ADR-022 unsolvable cases).
+When a pass defers a reviewer finding or STOPs on a sub-case, record it there.
+
 ## Pass 0 — 2026-07-09 — baseline
 
 - Recorder row (commit 50ac9c4): **1085 passed / 320 failed / 1405 total**

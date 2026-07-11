@@ -1393,3 +1393,39 @@ When a pass defers a reviewer finding or STOPs on a sub-case, record it there.
   feature-family "other" bucket (Tail, write, split_with_limit, json_tuple,
   alter_table, encode, from_json-DF, empty_array, explode_map, combined_sql_df,
   dl-write-append-002) + the concurrent-added F-orderby test.
+
+---
+
+## Pass 34 — split(str, regex, limit) 3-arg limit semantics
+
+- **Baseline:** 1428 passed / 15 failed @ `55577ef` (both corpora 100%). Targets:
+  the two feature-family "other"-bucket cases `test_array_functions_differential.py
+  ::TestArrayFunctionsDifferential::{test_split_with_limit,test_split_with_limit_dataframe_api}`.
+- **Root cause:** the `"split"` emission arm (emission.rs) dropped the `limit`
+  argument unconditionally — every call (2-arg or 3-arg) rendered as plain
+  `split({a},{b})`. DuckDB `split`/`string_split_regex` has no limit parameter.
+- **Fix (1 file, `emission.rs`):** the split arm now branches on `f.args.len() >= 3`.
+  3-arg emits a CASE implementing Java/Spark `String.split(regex, limit)`:
+  `limit <= 0` → unlimited (trailing empties preserved, per Spark 4.1.1 verified
+  live — the differential test's own "limit=0 trims" docstring is wrong);
+  `limit >= len(full)` → unbounded split; else first `limit-1` pieces via
+  `list_slice` + the delimiter-**rejoined** remainder (`array_to_string(...,{b})`).
+  NULL in any arg → NULL. 2-arg path byte-identical. Core builtins only — no
+  extension. Coder verified every in-scope case against live DuckDB
+  (`.duckdb-delta/build/release/duckdb`) and live Spark 4.1.1.
+- **Review:** documented-skip — bounded additive emission arm, unit-locked
+  (4 new tests: 2-arg-unchanged, positive-limit-caps-and-rejoins,
+  nonpositive-unlimited, null-propagates) and live-verified against both engines.
+- **Gate:** full-suite **1430 passed / 12 failed (Δ +2)**, both split_with_limit
+  cases red→green, **zero regressions** vs the P33 baseline (identical concurrent
+  test set → clean diff). Core `cargo test -p thunderduck-core --lib` 1141 passed.
+  (A third case, the concurrent session's `test_order_by_grouping_expression_over_
+  multikey_aggregate`, also flipped green from their own work landing — not mine,
+  not a regression.)
+- **Out-of-scope carry-over:** splitting `""` gives Spark `[]` vs DuckDB `['']` —
+  inherited from the untouched 2-arg path, no red witness.
+- **Reflect:** first "other"-bucket case cleared. ~11 feature-family cases remain
+  (Tail, write csv/json, json_tuple, alter_table, encode, from_json-DF,
+  empty_array, explode_map, combined_sql_df, dl-write-append-002), several
+  structural. Goal was cleared by the user after this pass; committing this fix
+  and stopping per instruction.

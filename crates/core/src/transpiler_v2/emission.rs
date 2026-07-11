@@ -5126,10 +5126,26 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let [a, b] = exact_args(f, schema, "`eqNullSafe` requires exactly 2 arguments")?;
             return Ok(format!("({a} IS NOT DISTINCT FROM {b})"));
         }
-        // Spark's `split(str, pattern, limit)` — DuckDB's `split(str, pat)`
-        // has no limit. Drop the limit arg (Spark's default is -1 = no
-        // limit; corpus cases pass -1 so this is safe).
+        // Spark's `split(str, pattern[, limit])` — DuckDB's `split(str,
+        // pat)` has no limit argument. `limit <= 0` means "unlimited",
+        // identical to the 2-arg form (verified live against Spark 4.1.1:
+        // trailing empty strings survive at limit 0 same as limit < 0).
+        // `limit > 0` caps the result at `limit` elements: the first
+        // `limit - 1` pieces come from the unlimited split verbatim, and
+        // the last piece is the delimiter-rejoined remainder (Java/Spark
+        // `String.split(regex, limit)` semantics — the pattern is applied
+        // at most `limit - 1` times, so the tail is never re-split).
         "split" => {
+            if f.args.len() >= 3 {
+                let [a, b, c] = min_args(f, schema, "`split` requires at least 2 arguments")?;
+                let full = format!("split({a}, {b})");
+                let full_len = format!("len({full})");
+                return Ok(format!(
+                    "CASE WHEN ({a}) IS NULL OR ({b}) IS NULL OR ({c}) IS NULL THEN NULL \
+WHEN ({c}) <= 0 OR {full_len} <= ({c}) THEN {full} \
+ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c}), {full_len}), {b})] END"
+                ));
+            }
             let [a, b] = min_args(f, schema, "`split` requires at least 2 arguments")?;
             return Ok(format!("split({a}, {b})"));
         }
@@ -15232,6 +15248,84 @@ mod tests {
         assert!(
             sql.starts_with("CAST(") && sql.ends_with("AS DATE)"),
             "expected date_sub to CAST its result to DATE, got: {sql}"
+        );
+    }
+
+    // ── split(str, pattern[, limit]) limit semantics ────────────────────
+    //
+    // Spark's 3-arg `split` caps the result at `limit` elements (limit > 0)
+    // or behaves unlimited (limit <= 0). Verified live against Spark 4.1.1
+    // and DuckDB (`split`/`list_slice`/`array_to_string`). Corpus:
+    // test_split_with_limit, test_split_with_limit_dataframe_api.
+
+    #[test]
+    fn split_2arg_unchanged() {
+        let f = fcall(
+            "split",
+            vec![col_with_type("val", DataType::String), str_lit("-")],
+        );
+        let sql = render_function_call(&f, &empty_schema()).expect("render split");
+        assert_eq!(sql, "split(val, '-')");
+    }
+
+    #[test]
+    fn split_3arg_positive_limit_caps_and_rejoins_remainder() {
+        let f = fcall(
+            "split",
+            vec![
+                col_with_type("val", DataType::String),
+                str_lit("-"),
+                int_lit(2),
+            ],
+        );
+        let sql = render_function_call(&f, &empty_schema()).expect("render split");
+        // Unlimited split is capped at `limit` elements; the tail is the
+        // delimiter-rejoined remainder (not re-split).
+        assert!(
+            sql.contains("list_slice(split(val, '-'), 1, (2) - 1)"),
+            "got: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "array_to_string(list_slice(split(val, '-'), (2), len(split(val, '-'))), '-')"
+            ),
+            "got: {sql}"
+        );
+        // Below the limit, falls through to the plain unlimited split.
+        assert!(
+            sql.contains("len(split(val, '-')) <= (2) THEN split(val, '-')"),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn split_3arg_nonpositive_limit_is_unlimited() {
+        let f = fcall(
+            "split",
+            vec![
+                col_with_type("val", DataType::String),
+                str_lit("-"),
+                int_lit(-1),
+            ],
+        );
+        let sql = render_function_call(&f, &empty_schema()).expect("render split");
+        assert!(sql.contains("(-1) <= 0 OR"), "got: {sql}");
+    }
+
+    #[test]
+    fn split_3arg_null_args_propagate_null() {
+        let f = fcall(
+            "split",
+            vec![
+                col_with_type("val", DataType::String),
+                str_lit("-"),
+                int_lit(2),
+            ],
+        );
+        let sql = render_function_call(&f, &empty_schema()).expect("render split");
+        assert!(
+            sql.starts_with("CASE WHEN (val) IS NULL OR ('-') IS NULL OR (2) IS NULL THEN NULL"),
+            "got: {sql}"
         );
     }
 

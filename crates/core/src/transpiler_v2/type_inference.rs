@@ -748,13 +748,21 @@ impl TypeInferenceEngine {
             // Spark's `array_intersect(a, b)` returns `Array<T>` with
             // `containsNull = leftContainsNull AND rightContainsNull` per
             // Catalyst's `ArrayIntersect` — a NULL in the output requires
-            // BOTH inputs to contain NULL. For corpus arr2-005 the second
-            // arg is a non-nullable array literal, so the output is
-            // stamped `containsNull=false`. We conservatively stamp
-            // `containsNull=false` here (matching the corpus witness);
-            // a fully-general answer would inspect both args' containsNull
-            // flags.
-            "array_intersect" => Self::rewrap_array(first_arg_type, Some(false)),
+            // BOTH inputs to contain NULL. Both args' element type is
+            // available in `arg_types`, so compute the AND directly rather
+            // than approximating. For corpus `arr2-005` the second arg is
+            // a non-nullable array literal (`rightContainsNull=false`), so
+            // the AND still collapses to `containsNull=false`, matching the
+            // prior hardcoded stamp. When either arg's type isn't a
+            // resolved `Array` (should not happen for a well-typed call),
+            // conservatively fall back to the old `containsNull=false`
+            // stamp. Corpus: `arr2-005`; differential: `test_array_intersect`.
+            "array_intersect" => match arg_types {
+                [Array(_, left_contains_null), Array(_, right_contains_null), ..] => {
+                    Self::rewrap_array(first_arg_type, Some(*left_contains_null && *right_contains_null))
+                }
+                _ => Self::rewrap_array(first_arg_type, Some(false)),
+            },
             // `array_position(arr, item)` returns the 1-based index of the
             // first match, or 0 if not found. Spark returns `Long` (BIGINT)
             // regardless of the array element type. Corpus: `arr-007`.
@@ -1920,11 +1928,33 @@ mod tests {
     }
 
     #[test]
-    fn array_intersect_stamps_contains_null_false() {
-        // Pass 72: Spark stamps `containsNull = leftContainsNull AND
-        // rightContainsNull` on `array_intersect`. τ conservatively
-        // stamps `false` — matches corpus arr2-005 (the second arg is a
-        // non-nullable array literal, so the AND collapses to false).
+    fn array_intersect_contains_null_is_left_and_right() {
+        // Spark's `ArrayIntersect`: containsNull = leftContainsNull AND
+        // rightContainsNull. Both args nullable-element → true (matches
+        // the differential `test_array_intersect` fixture, where both
+        // `arr1`/`arr2` are `ArrayType(IntegerType(), True)`).
+        let left = DataType::Array(Box::new(DataType::String), true);
+        let right_nullable = DataType::Array(Box::new(DataType::String), true);
+        assert_eq!(
+            frt("array_intersect", &[left.clone(), right_nullable]),
+            DataType::Array(Box::new(DataType::String), true)
+        );
+        // Right arg non-nullable-element → AND collapses to false — matches
+        // corpus `arr2-005`, whose second arg is a non-nullable array
+        // literal.
+        let right_non_nullable = DataType::Array(Box::new(DataType::String), false);
+        assert_eq!(
+            frt("array_intersect", &[left, right_non_nullable]),
+            DataType::Array(Box::new(DataType::String), false)
+        );
+    }
+
+    #[test]
+    fn array_intersect_falls_back_to_contains_null_false_without_a_second_array_arg() {
+        // Defensive fallback (should not happen for a well-typed Spark
+        // call): when the second arg isn't a resolved `Array` type, keep
+        // the previous conservative `containsNull=false` stamp rather than
+        // panicking or guessing.
         let a = DataType::Array(Box::new(DataType::String), true);
         assert_eq!(
             frt("array_intersect", &[a]),

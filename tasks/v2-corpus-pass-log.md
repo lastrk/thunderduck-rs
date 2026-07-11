@@ -1039,3 +1039,38 @@ red in any later pass.
   cases (jn-018 reserved-word quoting, tbl-013 qualified-arg naming, q044
   subquery-arity, q066 decimal-union), feature-family clusters (array-ordering,
   date-arith, math, interval), and singletons (RelType::Tail, json_tuple, etc.).
+
+## Pass 23 — 2026-07-11 — order-preserving array set-ops + array_intersect typing
+
+- **Baseline (post-Pass-22, commit f665796):** 1401 passed / 41 failed.
+- **Root cause:** τ emitted Spark array set-ops via DuckDB ops that reorder by
+  hash and/or mishandle NULL: `array_distinct→list_distinct`,
+  `array_intersect→list_intersect` (both hash-reorder), `array_union` never
+  deduped `a`, and the Pass-20 `array_except` idiom `NOT list_contains(b,x)` was
+  null-unsafe (dropped a shared NULL Spark keeps). Plus `array_intersect` typed
+  its element `containsNull=false` unconditionally.
+- **Fix (emission.rs + type_inference.rs), all verified vs live DuckDB + Spark:**
+  order-preserving/null-safe idioms — `array_distinct(a)`→`list_filter(a,(x,i)->
+  list_position(a,x)=i)`; `array_union(a,b)`→`array_distinct(list_concat(a,b))`;
+  `array_intersect(a,b)`→`list_filter(a,(x,i)->list_position(a,x)=i AND
+  list_position(b,x) IS NOT NULL)`; `array_except` membership switched to the
+  null-safe `list_position(b,x) IS NULL` (non-null result byte-identical to
+  before; shared-NULL now Spark-correct — fixes a latent unwitnessed bug). All
+  wrapped in the existing NULL-propagation CASE. Typing: `array_intersect`
+  element containsNull = `leftContainsNull AND rightContainsNull` (Catalyst;
+  arr2-005 unaffected — right arg non-nullable).
+- **Review (`rust-reviewer`, no-tree-mutation):** APPROVE-WITH-NITS. Verified
+  every NULL/order claim directly against the DuckDB binary; confirmed
+  array_except (previously green) is non-null-byte-identical and its shared-NULL
+  change is a strict correctness improvement; 1-based list_position/list_filter
+  indexing correct; typing sound. Lows (non-blocking): repeated-subexpr fan-out
+  (volatile-arg, same tradeoff as existing array ops); pre-existing `->` lambda
+  deprecation warning.
+- **Gate:** 1401→1404 (**Δ +3, zero regressions**; array_except stayed green).
+  Newly green: test_array_distinct, test_array_intersect, test_array_union.
+  `cargo test -p thunderduck-core --lib` 1114.
+- **Reflect:** the Pass-17 array_except lambda pattern generalized cleanly to the
+  three set-ops; the coder's live-DuckDB+Spark verification caught a real
+  null-safety bug in the pattern it was told to mirror. Remaining ~38: ORDER BY
+  increment 2 (q098 + substr q062/q079/q085/q099), Cluster-A lone (jn-018,
+  tbl-013, q044, q066), feature-family (date-arith, math, interval), singletons.

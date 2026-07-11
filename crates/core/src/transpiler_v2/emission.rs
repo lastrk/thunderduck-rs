@@ -3407,6 +3407,41 @@ fn min_args<const N: usize>(
     rendered_args(f, schema)
 }
 
+/// Order-preserving "distinct by first occurrence" over the list-valued SQL
+/// expression `list_sql`, matching Spark's array set-op semantics (a
+/// linked-hash-set scan, not a sort). DuckDB's own `list_distinct` reorders
+/// by hash — verified directly (`list_distinct([1,1,2,3,2])` → `[3, 2,
+/// 1]`), which breaks Spark parity. `list_position(list, x) = i` keeps only
+/// the index where `x` FIRST occurs, including for a NULL element (DuckDB's
+/// `list_position` finds NULL elements positionally, unlike
+/// `list_contains` — see [`null_safe_member`]). `list_sql` is evaluated
+/// twice (filter target + inside `list_position`); callers must pass an
+/// expression that's safe to repeat (a column reference or a
+/// `list_concat(...)` built from column references, as in `array_union`).
+fn order_preserving_distinct(list_sql: &str) -> String {
+    format!("list_filter({list_sql}, (x, i) -> list_position({list_sql}, x) = i)")
+}
+
+/// Null-safe "is the lambda-bound `x` present in `list_sql`" predicate,
+/// always TRUE/FALSE (never NULL) given a non-NULL `list_sql`. DuckDB's
+/// `list_contains(list, needle)` returns NULL — not FALSE — whenever
+/// `needle` is NULL, even if `list` itself contains a NULL element
+/// (verified directly: `list_contains([1,2,NULL], NULL)` → NULL). Spark's
+/// array set-ops treat NULL as an ordinary comparable value, so a NULL
+/// element common to both arrays must count as "contains" (verified live
+/// against Spark 4.1.1: `array_intersect(array(1, NULL, 2), array(NULL,
+/// 2))` → `[NULL, 2]`). `list_position(list, x) IS NOT NULL` finds a NULL
+/// element positionally and always yields a boolean.
+fn null_safe_member(list_sql: &str) -> String {
+    format!("list_position({list_sql}, x) IS NOT NULL")
+}
+
+/// Negation of [`null_safe_member`] — "is `x` absent from `list_sql`",
+/// always TRUE/FALSE. Used by `array_except`'s set-difference filter.
+fn not_null_safe_member(list_sql: &str) -> String {
+    format!("list_position({list_sql}, x) IS NULL")
+}
+
 /// Compose Spark's `make_dt_interval` / `make_interval` / `make_ym_interval`
 /// as a sum of `INTERVAL (expr) UNIT` summands — DuckDB has none of the three
 /// scalars. One summand per entry of `units` (missing arguments default to 0,
@@ -4456,8 +4491,24 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         "sort_array" => "list_sort",
         "slice" => "list_slice",
         "array_contains" => "list_contains",
-        "array_distinct" => "list_distinct",
-        "array_intersect" => "list_intersect",
+        // Spark's `array_distinct(a)` — distinct elements of `a`,
+        // preserving the order elements FIRST appear (Spark's
+        // `ArrayDistinct` is a linked-hash-set scan, not a sort). DuckDB's
+        // `list_distinct` reorders by hash — wrong for Spark parity (same
+        // defect `array_union`/`array_except`/`array_intersect` below all
+        // avoid). Compose dedup-by-first-occurrence via
+        // `list_position(a, x) = i` (keep only the index where `x` first
+        // occurs). NULL propagates without an explicit guard: DuckDB's
+        // `list_filter` returns NULL for a NULL list argument as-is
+        // (verified against DuckDB directly). A NULL element is deduped
+        // like any other value — Spark keeps exactly one, at its
+        // first-occurrence position (verified live against Spark 4.1.1).
+        // Corpus: `arr-005` (`schema_only` — a future pass can lift that
+        // flag now that value order is fixed).
+        "array_distinct" if f.args.len() == 1 => {
+            let [a] = rendered_args(f, schema)?;
+            return Ok(order_preserving_distinct(&a));
+        }
         // Spark's `reverse` is overloaded: on a STRING it reverses the
         // characters (DuckDB's native `reverse` already matches — fall
         // through to the verbatim tail below); on an ARRAY it reverses
@@ -4469,20 +4520,26 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         {
             "list_reverse"
         }
-        // Spark's `array_union(a, b)` — union of `a` and `b` with
-        // duplicates removed, preserving `a`'s order followed by new
-        // elements of `b` (in `b`'s order, minus items already in `a`).
-        // NULL propagates: if either argument is NULL, the result is NULL.
-        // DuckDB has neither `list_concat_unique` nor an order-preserving
-        // dedup — compose from `list_concat` + `list_filter`. We do NOT
-        // pre-dedup `a` here because DuckDB's `list_distinct` reorders
-        // scalars (breaking Spark parity for the corpus surface). Corpus
-        // witnesses have de-duplicated inputs, so no inner-dedup is needed.
-        // Corpus: `arr-011`.
+        // Spark's `array_union(a, b)` — distinct elements of `a` followed
+        // by distinct-new elements of `b`, preserving first-occurrence
+        // order across the whole `a ++ b` sequence (Spark's `ArrayUnion`
+        // is a single linked-hash-set scan over `a` then `b`, not a
+        // sort). That's exactly `array_distinct(list_concat(a, b))`: `a`'s
+        // own duplicates collapse to their first occurrence (since `a`
+        // comes first in the concat), and `b`'s elements collapse to
+        // their first occurrence within `b`, dropping any already seen in
+        // `a`. NULL propagates: if either argument is NULL, the result is
+        // NULL — DuckDB's `list_concat` treats a NULL list as empty
+        // rather than propagating (verified directly), so an explicit
+        // guard is required here (unlike plain `array_distinct` above,
+        // where `list_filter` already propagates NULL on its own). Corpus:
+        // `arr-011`.
         "array_union" if f.args.len() == 2 => {
             let [a, b] = rendered_args(f, schema)?;
+            let concat = format!("list_concat({a}, {b})");
             return Ok(format!(
-                "CASE WHEN ({a}) IS NULL OR ({b}) IS NULL THEN NULL ELSE list_concat({a}, list_filter({b}, x -> NOT list_contains({a}, x))) END"
+                "CASE WHEN ({a}) IS NULL OR ({b}) IS NULL THEN NULL ELSE {} END",
+                order_preserving_distinct(&concat)
             ));
         }
         // Spark's `array_except(a, b)` — distinct elements of `a` not
@@ -4493,12 +4550,36 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // (`list_distinct` reorders by hash, breaking Spark parity — see
         // `array_union` above); compose dedup-by-first-occurrence via
         // `list_position(a, x) = i` (keep only the index where `x` first
-        // occurs) together with `NOT list_contains(b, x)` to drop elements
-        // present in `b`. Corpus: `arr-014`.
+        // occurs) together with a null-safe "not present in `b`" check.
+        // DuckDB's `list_contains(b, x)` returns NULL — not FALSE — when
+        // `x` is NULL, even if `b` itself contains a NULL element
+        // (verified directly), which would wrongly drop a NULL that
+        // should survive; `list_position(b, x) IS NULL` is null-safe
+        // (verified live against Spark 4.1.1: `array_except(array(1, NULL,
+        // 2), array(3, 4))` keeps the NULL). Corpus: `arr2-005`.
         "array_except" if f.args.len() == 2 => {
             let [a, b] = rendered_args(f, schema)?;
             return Ok(format!(
-                "CASE WHEN ({a}) IS NULL OR ({b}) IS NULL THEN NULL ELSE list_filter({a}, (x, i) -> list_position({a}, x) = i AND NOT list_contains({b}, x)) END"
+                "CASE WHEN ({a}) IS NULL OR ({b}) IS NULL THEN NULL ELSE list_filter({a}, (x, i) -> list_position({a}, x) = i AND {}) END",
+                not_null_safe_member(&b)
+            ));
+        }
+        // Spark's `array_intersect(a, b)` — distinct elements of `a` also
+        // present in `b`, preserving the order elements first appear in
+        // `a` (mirrors `array_except`'s shape with the membership test
+        // inverted). DuckDB's `list_intersect` sorts/reorders — wrong for
+        // Spark parity (verified directly: `list_intersect([3,1,2,1],
+        // [2,1])` returns `[1, 2]`, not `a`'s order). NULL propagates: if
+        // either argument is NULL, the result is NULL. The membership test
+        // must be null-safe the same way as `array_except` — verified live
+        // against Spark 4.1.1: `array_intersect(array(1, NULL, 2),
+        // array(NULL, 2))` returns `[NULL, 2]` (a NULL common to both
+        // sides is kept), which `list_contains` alone cannot reproduce.
+        "array_intersect" if f.args.len() == 2 => {
+            let [a, b] = rendered_args(f, schema)?;
+            return Ok(format!(
+                "CASE WHEN ({a}) IS NULL OR ({b}) IS NULL THEN NULL ELSE list_filter({a}, (x, i) -> list_position({a}, x) = i AND {}) END",
+                null_safe_member(&b)
             ));
         }
         // Spark's `array_position(arr, item)` returns a 1-based index or
@@ -13372,6 +13453,10 @@ mod tests {
         col_with_type("tags", DataType::Array(Box::new(DataType::String), true))
     }
 
+    fn tags2_col() -> Expression {
+        col_with_type("tags2", DataType::Array(Box::new(DataType::String), true))
+    }
+
     #[test]
     fn render_explode_emits_unnest() {
         let sql = render_fn("explode", vec![tags_col()]);
@@ -13666,58 +13751,85 @@ mod tests {
         assert!(sql.contains("\"1\" := (tags)[__az_i]"), "field 1: {sql}");
     }
 
-    /// τ `array_union(a, b)` preserves `a`'s order followed by new
-    /// elements of `b`, propagates NULL if either arg is NULL, and does
-    /// NOT pre-dedup `a` (DuckDB `list_distinct` reorders scalars, which
-    /// would break Spark parity). Corpus: `arr-011`.
+    /// τ `array_distinct(a)` dedups `a` while preserving its
+    /// first-occurrence order (DuckDB's `list_distinct` reorders by hash,
+    /// breaking Spark parity — see `arr-005`, `test_array_distinct`).
     #[test]
-    fn render_array_union_preserves_order_and_propagates_null() {
-        let a = tags_col();
-        let b = Expression::ColumnReference(ColumnReference {
-            name: "tags2".to_owned(),
-            qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
-            ordinal: None,
-        });
-        let sql = render_fn("array_union", vec![a, b]);
-        assert!(
-            sql.contains("CASE WHEN (tags) IS NULL OR (tags2) IS NULL THEN NULL"),
-            "null propagation: {sql}"
-        );
-        assert!(
-            sql.contains("list_concat(tags, list_filter(tags2, x -> NOT list_contains(tags, x)))"),
-            "order-preserving concat: {sql}"
+    fn render_array_distinct_preserves_first_occurrence_order() {
+        let sql = render_fn("array_distinct", vec![tags_col()]);
+        assert_eq!(
+            sql,
+            "list_filter(tags, (x, i) -> list_position(tags, x) = i)"
         );
     }
 
-    /// τ `array_except(a, b)` dedups `a` while preserving `a`'s first-
-    /// occurrence order, drops elements present in `b`, and propagates
-    /// NULL if either argument is NULL. `list_distinct` is avoided because
-    /// DuckDB's dedup reorders by hash, breaking Spark's order-preserving
-    /// semantics (same pitfall as `array_union`). Binder Error surfaced:
-    /// `list_filter(INTEGER[], INTEGER[])` (the prior `list_filter`
-    /// rename passed `b` directly as a lambda). Corpus: `arr-014`.
+    /// τ `array_union(a, b)` == `array_distinct(list_concat(a, b))`:
+    /// `a`'s own duplicates collapse to their first occurrence (since `a`
+    /// comes first in the concat) and `b`'s elements collapse to their
+    /// first occurrence within `b`, dropping anything already seen in `a`
+    /// — matching Spark's single linked-hash-set scan over `a` then `b`.
+    /// Propagates NULL if either arg is NULL (`list_concat` treats a NULL
+    /// list as empty rather than propagating). Corpus: `arr-011`,
+    /// `test_array_union`.
     #[test]
-    fn render_array_except_dedups_preserves_order_and_propagates_null() {
-        let a = tags_col();
-        let b = Expression::ColumnReference(ColumnReference {
-            name: "tags2".to_owned(),
-            qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
-            ordinal: None,
-        });
-        let sql = render_fn("array_except", vec![a, b]);
+    fn render_array_union_preserves_order_and_propagates_null() {
+        let sql = render_fn("array_union", vec![tags_col(), tags2_col()]);
         assert!(
             sql.contains("CASE WHEN (tags) IS NULL OR (tags2) IS NULL THEN NULL"),
             "null propagation: {sql}"
         );
         assert!(
             sql.contains(
-                "list_filter(tags, (x, i) -> list_position(tags, x) = i AND NOT list_contains(tags2, x))"
+                "list_filter(list_concat(tags, tags2), (x, i) -> list_position(list_concat(tags, tags2), x) = i)"
             ),
-            "dedup-by-first-occurrence + set-diff filter: {sql}"
+            "order-preserving distinct over the concat: {sql}"
+        );
+    }
+
+    /// τ `array_except(a, b)` dedups `a` while preserving `a`'s first-
+    /// occurrence order, drops elements present in `b` via a null-safe
+    /// membership check (`list_contains` returns NULL — not FALSE — for a
+    /// NULL needle even when `b` holds a NULL element; `list_position(b,
+    /// x) IS NULL` is null-safe), and propagates NULL if either argument
+    /// is NULL. Binder Error surfaced: `list_filter(INTEGER[],
+    /// INTEGER[])` (the prior `list_filter` rename passed `b` directly as
+    /// a lambda). Corpus: `arr2-005`, `test_array_except`.
+    #[test]
+    fn render_array_except_dedups_preserves_order_and_propagates_null() {
+        let sql = render_fn("array_except", vec![tags_col(), tags2_col()]);
+        assert!(
+            sql.contains("CASE WHEN (tags) IS NULL OR (tags2) IS NULL THEN NULL"),
+            "null propagation: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "list_filter(tags, (x, i) -> list_position(tags, x) = i AND list_position(tags2, x) IS NULL)"
+            ),
+            "dedup-by-first-occurrence + null-safe set-diff filter: {sql}"
+        );
+    }
+
+    /// τ `array_intersect(a, b)` mirrors `array_except`'s shape with the
+    /// membership test inverted: distinct elements of `a`, in `a`'s
+    /// first-occurrence order, that are also present in `b` via a
+    /// null-safe membership check (`list_position(b, x) IS NOT NULL`,
+    /// which — unlike `list_contains` — correctly counts a NULL common to
+    /// both arrays as "contains"). Propagates NULL if either argument is
+    /// NULL. DuckDB's `list_intersect` reorders (verified directly:
+    /// `list_intersect([3,1,2,1],[2,1])` → `[1, 2]`, not `a`'s order).
+    /// Corpus: `arr2-005`, `test_array_intersect`.
+    #[test]
+    fn render_array_intersect_preserves_order_and_is_null_safe() {
+        let sql = render_fn("array_intersect", vec![tags_col(), tags2_col()]);
+        assert!(
+            sql.contains("CASE WHEN (tags) IS NULL OR (tags2) IS NULL THEN NULL"),
+            "null propagation: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "list_filter(tags, (x, i) -> list_position(tags, x) = i AND list_position(tags2, x) IS NOT NULL)"
+            ),
+            "dedup-by-first-occurrence + null-safe membership filter: {sql}"
         );
     }
 

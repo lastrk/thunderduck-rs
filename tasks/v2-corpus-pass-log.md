@@ -634,3 +634,47 @@ red in any later pass.
   Pass 11), 4 (q053/q063/q079/q098) advanced to distinct downstream blockers for
   future passes. Lesson banked: never run a reviewer that can mutate the tree in
   parallel with a differential gate on the same worktree — serialize, or isolate.
+
+## Pass 12 — 2026-07-11 — spark_decimal_div DOUBLE-operand crash eliminated (decimal-div type-safety)
+
+- **Baseline (post-Pass-11, commit 3c999fd):** 1329 passed / 113 failed / 5
+  skipped / 1447 total.
+- **Cluster:** the `spark_decimal_div requires DECIMAL … got DOUBLE and DOUBLE`
+  crash (5 SQL corpus cases: tpcds-q047, q053, q057, q063, q089; q053/q063 are
+  two Family-A cases that advanced in Pass 10). Diagnosis:
+  `.agent-output/diagnostic-decimal-div.md`.
+- **Root cause:** `render_binary` (emission.rs ~5662) routes `Div` →
+  `spark_decimal_div` when BOTH operands' ANALYZER types are Decimal, but τ
+  emits DuckDB-native `avg` (DOUBLE even over DECIMAL) — a type-lie (the
+  reconciling `spark_aggregate_return_cast` is dead/unwired; the ADR-020
+  `spark_avg`/`spark_sum` routing was half-reverted). The extension then rejected
+  the DOUBLE operands. ADR-022 Thunderduck-boundary correctness bug.
+- **Fix (minimal, local):** at the `spark_decimal_div` site, CAST each operand to
+  its analyzer-declared `DECIMAL(p,s)`. No-op re-cast for a genuine decimal;
+  coerces a native-double operand — so the extension always gets real decimals
+  and Spark DECIMAL/DECIMAL division semantics are preserved. 2 unit tests.
+- **Review (`rust-reviewer`, no-tree-mutation brief):** APPROVE-WITH-NITS, 0
+  Critical/High. Verified the CAST-wrapped render, that the one green case taking
+  this path (`type-005`) is a no-op re-cast (unaffected), and that the new
+  overflow surface applies ONLY to the previously-crashing double path (cannot
+  regress green). Nits (Low, deferred): mixed decimal/int not asserted; overflow
+  parity (Spark ansi=false → NULL vs DuckDB throw) — relevant only to the Option-B
+  avg pass.
+- **Gate:** 1329→1329 (**Δ +0 green, zero regressions**). The
+  `spark_decimal_div … DOUBLE` error occurrences dropped **10→0** — the crash
+  CLASS is eliminated. But all 5 target cases ADVANCED from the crash to a
+  downstream `AssertionError`: the projected windowed-`avg` column emits as
+  DuckDB DOUBLE while Spark yields DECIMAL, so the value/type now mismatches.
+  This is the avg type-lie itself, a SEPARATE (bigger) root cause. `cargo test
+  -p thunderduck-core --lib` 1039 green.
+- **Reflect:** honest +0-green pass — a correct, zero-regression crash-class
+  elimination and a necessary robustness layer (τ must never feed DOUBLE to
+  `spark_decimal_div`), but NOT sufficient to green these 5. The empirical result
+  pinpoints the next target: **decimal-`avg` type coherence** (make emission
+  produce the Decimal the analyzer declares). Two paths — Path A: rewrite
+  `avg(x)`→`CAST(spark_decimal_div(sum(x) OVER w, count(x) OVER w) AS DECIMAL(...))`
+  with a `count=0→NULL` guard, reusing existing primitives (no new extension);
+  Path B: implement/wire the ADR-020 `spark_avg`/`spark_sum` extension aggregates.
+  Next pass starts with Path A (reuse-first); escalate to Path B only if Path A
+  can't match Spark precision. Expected to green these 5 PLUS the decimal-scale
+  cluster (q058/q067/q083).

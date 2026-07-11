@@ -5662,8 +5662,19 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
     if matches!(b.op, BinaryOp::Div) {
         let lt = b.left.data_type(schema);
         let rt = b.right.data_type(schema);
-        if matches!(lt, DataType::Decimal { .. }) && matches!(rt, DataType::Decimal { .. }) {
-            return Ok(format!("spark_decimal_div(({l}), ({r}))"));
+        if let (DataType::Decimal { .. }, DataType::Decimal { .. }) = (&lt, &rt) {
+            // The analyzer types both operands Decimal (Spark parity), but a
+            // DuckDB-native aggregate operand (e.g. `avg` over DECIMAL) is
+            // emitted as DOUBLE, so passing it raw makes the extension reject
+            // DOUBLE args. Cast each operand to its declared DECIMAL(p,s): a
+            // no-op re-cast for a genuine decimal, and a coercion for a
+            // native-double operand — keeping Spark's DECIMAL/DECIMAL
+            // division semantics either way.
+            let lty = render_data_type(&lt);
+            let rty = render_data_type(&rt);
+            return Ok(format!(
+                "spark_decimal_div(CAST(({l}) AS {lty}), CAST(({r}) AS {rty}))"
+            ));
         }
     }
     let op = match b.op {
@@ -14178,6 +14189,47 @@ mod tests {
             sql.contains("spark_decimal_div"),
             "expected spark_decimal_div, got: {sql}"
         );
+    }
+
+    /// Pass 12 — `spark_decimal_div` operands must be CAST to their declared
+    /// `DECIMAL(p,s)`: the analyzer types both operands Decimal, but a
+    /// DuckDB-native aggregate (e.g. windowed `avg` over DECIMAL) emits
+    /// DOUBLE at runtime, and the extension rejects DOUBLE args. Corpus:
+    /// tpcds-q047/q053/q057/q063/q089.
+    #[test]
+    fn decimal_div_casts_operands_to_declared_decimal() {
+        let l = decimal_lit("1.23", 10, 2);
+        let r = decimal_lit("4.56", 6, 3);
+        let b = BinaryExpression {
+            op: BinaryOp::Div,
+            left: Box::new(l),
+            right: Box::new(r),
+        };
+        let sql = render_binary(&b, &empty_schema()).expect("render");
+        assert_eq!(
+            sql,
+            "spark_decimal_div(CAST((CAST('1.23' AS DECIMAL(10, 2))) AS DECIMAL(10, 2)), \
+             CAST((CAST('4.56' AS DECIMAL(6, 3))) AS DECIMAL(6, 3)))"
+        );
+    }
+
+    /// Pass 12 — a `Div` whose operands are not both analyzer-Decimal must
+    /// NOT be routed to `spark_decimal_div`; it renders the plain operator
+    /// (with the existing ANSI divide-by-zero guard, skipped here since the
+    /// divisor is a nonzero literal). Guards against over-routing.
+    #[test]
+    fn div_non_decimal_operands_render_plain_slash() {
+        let b = BinaryExpression {
+            op: BinaryOp::Div,
+            left: Box::new(double_lit(6.0)),
+            right: Box::new(double_lit(2.0)),
+        };
+        let sql = render_binary(&b, &empty_schema()).expect("render");
+        assert!(
+            !sql.contains("spark_decimal_div"),
+            "expected plain division, got: {sql}"
+        );
+        assert_eq!(sql, "(CAST(6.0 AS DOUBLE)) / (CAST(2.0 AS DOUBLE))");
     }
 
     /// Pass 74 (`agg-013`) — Spark's `percentile_approx(col, q)` returns

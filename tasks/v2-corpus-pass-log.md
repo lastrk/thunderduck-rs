@@ -589,3 +589,48 @@ red in any later pass.
   by mechanism, one per pass. (3) "6 cases share a signature" ≠ "6 cases flip";
   fixing the root cause flipped 2 and advanced 4 to their next blocker, which is
   honest forward progress. Family B is Pass 11.
+
+## Pass 11 — 2026-07-11 — bare ORDER BY key over a self-join → DuckDB ambiguous (Family B)
+
+- **Baseline (post-Pass-10, commit 2b19b57):** 1326 passed / 116 failed / 5
+  skipped / 1447 total.
+- **Cluster:** Family B from the Pass-10 diagnosis (`.agent-output/diagnostic-ambiguous-ref.md`
+  §1B/§3B): tpcds-q039a, q039b, q064 — self-joins of a CTE where the SELECT
+  projects the SAME output name from both sides (two `w_warehouse_sk` / two
+  `cnt`). The analyzer's tier-(f) source_quals arm drops the qualifier on the
+  projected-through ORDER BY key (→ `qualifier:None, ordinal:Some(k)`), then
+  `build_sort` merged it BARE into the duplicate-name SELECT list → DuckDB
+  `Binder Error: Ambiguous reference`. Spark runs these → ADR-022
+  Thunderduck-boundary correctness bug; all three pass-0 reds.
+- **Fix (root-cause, one conjunct + tests):** in `build_sort`'s occupied-SELECT
+  merge predicate `keys_bind` (emission.rs ~1501), require additionally that
+  `bare_dup_ordinal(c, &input.resolved_schema).is_none()`. A bare key whose
+  output name is duplicated in the input schema now fails `keys_bind` and falls
+  through to the PRE-EXISTING wrap+uniquify branch (`output_uniquified` →
+  `reproject_qualifiers`'s bare-ordinal arm rewrites the key to the uniquified
+  name, `wrap_reprojected` re-exposes the child as `__td_sub(name, name_1)`), so
+  the key binds unambiguously. Pure reuse — no analyzer change, no new operator.
+  The guard is strictly stricter, so it can only remove ambiguous merges (a green
+  case that merged a dup-name-ordinal key would already be a hard DuckDB error).
+- **Review (`rust-reviewer`):** APPROVE, 0 Critical/High. Verified the
+  fall-through emits unambiguous SQL (incl. the k==0 sub-case), mixed/qualified
+  key sets, and LIMIT/OFFSET+DISTINCT placement unchanged; confirmed the
+  discrimination test fails on revert. Informational (pre-existing, not
+  worsened): a bare dup-name key with `ordinal==None` would still merge —
+  unreachable in practice (analyzer stamps the ordinal when it drops the
+  qualifier). PROCESS NOTE: the reviewer reverted emission.rs via Bash+Python to
+  test discrimination WHILE the gate ran on the same tree; validated harmless
+  here because cargo compiles a coherent snapshot and the gate flipped exactly
+  the 3 targets (a reverted build would be +0), but future passes must not run a
+  mutating reviewer in parallel with the gate.
+- **Gate:** 1326→1329 (Δ +3, **zero regressions** vs the 2b19b57 oracle — full
+  per-case set diff). DuckDB "Ambiguous reference to column name" occurrences
+  6→0. Newly green: **tpcds-q039a, tpcds-q039b, tpcds-q064** (SQL corpus).
+  `cargo test -p thunderduck-core --lib` 1037 green.
+- **Reflect:** the Pass-10 diagnostic's Family-B split paid off directly — a
+  clean, pre-scoped one-conjunct fix landed all 3 predicted cases with zero
+  surprises. The AMBIGUOUS_REFERENCE cluster (both families) is now fully
+  resolved: 9 cases diagnosed, 5 turned green (q046/q068 Pass 10; q039a/b/q064
+  Pass 11), 4 (q053/q063/q079/q098) advanced to distinct downstream blockers for
+  future passes. Lesson banked: never run a reviewer that can mutate the tree in
+  parallel with a differential gate on the same worktree — serialize, or isolate.

@@ -1499,7 +1499,10 @@ fn build_sort(
         requalify_visible(order.iter().map(|so| so.expr.as_ref()), &block, input)
     } else {
         let keys_bind = order.iter().all(|so| {
-            matches!(so.expr.as_ref(), Expression::ColumnReference(c) if c.qualifier.is_none())
+            matches!(so.expr.as_ref(),
+                Expression::ColumnReference(c)
+                    if c.qualifier.is_none()
+                        && bare_dup_ordinal(c, &input.resolved_schema).is_none())
         });
         keys_bind.then(|| order.iter().map(|so| (*so.expr).clone()).collect())
     };
@@ -9864,6 +9867,91 @@ mod tests {
         assert!(
             !sql.contains("__td_"),
             "no wrap of any kind expected; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn sort_bare_dup_name_ordinal_key_wraps_and_uniquifies() {
+        let _g = tap_guard();
+        // Family B (tpcds-q039a/q039b/q064 shape): the SELECT list projects
+        // the SAME output name (`dept_id`) from BOTH join sides — a genuine
+        // duplicate, like the self-join CTE's two `w_warehouse_sk`/`cnt`
+        // columns. The ORDER BY key sources from `emp2`'s `dept_id`
+        // specifically; over the Project (whose own `RelScope` binds no
+        // local aliases), `resolve_column`'s tier-(f) source_quals arm
+        // resolves it by ORDINAL and DROPS the qualifier, landing at
+        // emission as a bare `ColumnReference { ordinal: Some(1) }` — and
+        // that ordinal's name IS duplicated in the Project's own
+        // `resolved_schema`. Before this fix, `build_sort`'s `keys_bind`
+        // predicate admitted this bare key and merged it straight into the
+        // occupied (duplicate-name) SELECT block, emitting an ambiguous bare
+        // `ORDER BY dept_id` DuckDB cannot bind (two same-named SELECT
+        // items). The fix routes it through the existing wrap+uniquify path
+        // instead, so the ORDER BY binds against the uniquified alias.
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_join_emp2()),
+            projections: vec![pidcol("dept_id", 1), pidcol("dept_id", 2)],
+        });
+        let sort = CommonAst::new(CommonOp::Sort {
+            input: Box::new(project),
+            order: vec![asc_key(qcol("emp2", "dept_id"))],
+            limit: None,
+            offset: None,
+        });
+        let bt = base_types_emp_dept_emp2(&sort);
+        let typed = analyze(sort, &bt).expect("analyze dup-name-project-then-sort");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT emp.dept_id, emp2.dept_id FROM emp INNER JOIN emp2 ON \
+             (emp.dept_id) = (emp2.dept_id)) AS __td_sub(dept_id, dept_id_1) ORDER BY \
+             dept_id_1 ASC NULLS FIRST"
+        );
+        assert!(
+            sql.contains("__td_sub"),
+            "a bare dup-name ordinal ORDER BY key over an occupied SELECT list \
+             must reject the merge and fall back to the reprojected wrap; got: {sql}"
+        );
+        assert!(
+            !sql.contains("ORDER BY dept_id ASC") && !sql.contains("ORDER BY dept_id\n"),
+            "must never emit a bare ORDER BY key that binds ambiguously against \
+             duplicate-named SELECT items; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn sort_bare_unique_name_ordinal_key_still_merges() {
+        let _g = tap_guard();
+        // Guard against over-wrapping: the SAME shape as the test above, but
+        // the Project selects only ONE occurrence of each name (`id` from
+        // `emp`, `dept_id` from `emp2`) so the Project's own output schema
+        // has no duplicate name. The ORDER BY key (`emp2.dept_id`) still
+        // resolves through the same tier-(f) source_quals arm to a bare
+        // ordinal ref, but `bare_dup_ordinal` returns `None` (the name is
+        // unique in the schema) — `keys_bind` must stay `true` and the key
+        // must still merge into the occupied SELECT block, with NO wrap.
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_join_emp2()),
+            projections: vec![pidcol("id", 1), pidcol("dept_id", 2)],
+        });
+        let sort = CommonAst::new(CommonOp::Sort {
+            input: Box::new(project),
+            order: vec![asc_key(qcol("emp2", "dept_id"))],
+            limit: None,
+            offset: None,
+        });
+        let bt = base_types_emp_dept_emp2(&sort);
+        let typed = analyze(sort, &bt).expect("analyze unique-name-project-then-sort");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT emp.id, emp2.dept_id FROM emp INNER JOIN emp2 ON (emp.dept_id) = \
+             (emp2.dept_id) ORDER BY dept_id ASC NULLS FIRST"
+        );
+        assert!(
+            !sql.contains("__td_"),
+            "a unique-name ordinal ORDER BY key must still take the merge \
+             shortcut, no wrap; got: {sql}"
         );
     }
 

@@ -732,3 +732,37 @@ red in any later pass.
   attributable; left native); (2) the analyzer declared-schema typing cluster
   (q058/q067/q083/q093/tpch-q11/q061 — τ's AnalyzePlan decimal types differ from
   Spark's over set-op/rollup-derived inputs; emission changes cannot fix these).
+
+## Pass 14 — 2026-07-11 — dot-in-bracket-chain field access (parser_v2 boundary expansion)
+
+- **Baseline (post-Pass-13, commit f8de854):** 1348 passed / 94 failed / 5 skipped.
+- **Cluster / root cause:** `parser_v2/v2_lowering.rs` `Expr::CompoundFieldAccess`
+  arm bailed on `AccessExpr::Dot(_)` (`sql::field_access::dot` boundary). 5 cases:
+  4× `from_json(...).field` (test_json_functions FromJsonDifferential) + 1×
+  `named_struct('x',100,...).x` (test_type_literals StructLiterals). All are a
+  plain single-identifier dot-access on a function-call root. ADR-022
+  Thunderduck-boundary (Spark supports it); currently red.
+- **Fix (boundary expansion, one arm):** lower `AccessExpr::Dot(Expr::Identifier(id))`
+  to a string-key `ExtractValue` via the existing `str_lit(id.value)` helper —
+  `.field` ≡ `['field']`, byte-identical to the bracket string-key path, so it
+  inherits the already-green analyzer (`extract_value_data_type` dispatches on the
+  child type → Struct field-by-name) + emission (`extract_struct_field` →
+  `(child).field`) pipeline. Non-identifier `Dot` (`.true`, `.5`,
+  `CompoundIdentifier`) still bails (honest boundary). sqlparser flattens chained
+  dots (`a['k'].b.c`) into successive `Dot(Identifier)` elements, so multi-segment
+  chains fold for free. 4 unit tests (3 positive + 1 negative).
+- **Review (`rust-reviewer`, no-tree-mutation brief):** APPROVE, 0 findings.
+  Traced lowering→analyzer→emission; confirmed node identity with the bracket
+  path, precise match placement, chained-dot folding, and quote_ident'd field
+  names. Informational (pre-existing, not introduced): array-of-struct field
+  projection via string key mis-emits — same latent gap as the `['field']`
+  spelling, outside these 5 cases.
+- **Gate:** 1348→1353 (**Δ +5, zero regressions**). `field_access::dot`
+  boundary occurrences 10→0. Newly green: the 5 target cases exactly.
+  `cargo test -p thunderduck-core --lib` 1050 green.
+- **Reflect:** clean boundary-expansion pass — pinpointed site + mirror-an-existing-
+  path fix + structurally-can't-regress (erroring→supported). The compressed
+  investigate-then-implement coder brief (skipping a separate diagnostician for a
+  pinpointed small gap) worked well; one API-error retry cost nothing (no partial
+  edits). Note for future: sqlparser 0.61 `CompoundFieldAccess` flattening
+  behavior is a useful parser fact.

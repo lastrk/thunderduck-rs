@@ -3216,13 +3216,19 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
         // num-002, num-003.
         Expr::Ceil { expr, field } => lower_ceil_floor("ceil", *expr, field, cte_scope),
         Expr::Floor { expr, field } => lower_ceil_floor("floor", *expr, field, cte_scope),
-        // Bracket-chain field access: `array(1,2,3)[0]`, `map('a',1)['a']`.
+        // Compound field access: `array(1,2,3)[0]`, `map('a',1)['a']`,
+        // `named_struct('x',1).x`, `from_json(s, '...').field`.
         // sqlparser parses these as `CompoundFieldAccess{root, access_chain}`.
-        // Fold each subscript into a nested `ExtractValue`; the analyzer resolves
-        // the extraction type from the child (array elem / map value / struct
-        // field) and emission dispatches on that child type. Only bracket
-        // `Subscript::Index` lands live (int index or string key — cx-001/cx-002);
-        // dot-in-bracket and slices are honest Thunderduck boundaries.
+        // Fold each subscript/dot into a nested `ExtractValue`; the analyzer
+        // resolves the extraction type from the child (array elem / map value /
+        // struct field) and emission dispatches on that child type. Bracket
+        // `Subscript::Index` (int index or string key — cx-001/cx-002) and a
+        // plain identifier `.field` (struct dot-access — same extraction shape
+        // as a string-keyed subscript, since `extract_value_data_type`
+        // (expression.rs) resolves a `Struct` child by the extraction's string
+        // literal regardless of dot-vs-bracket spelling) both land live. Any
+        // other `Dot` shape (non-identifier, e.g. `CompoundIdentifier`) and
+        // slices are honest Thunderduck boundaries.
         Expr::CompoundFieldAccess { root, access_chain } => {
             let mut expr = lower_expr(*root, cte_scope)?;
             for acc in access_chain {
@@ -3230,6 +3236,7 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
                     AccessExpr::Subscript(Subscript::Index { index }) => {
                         lower_expr(index, cte_scope)?
                     }
+                    AccessExpr::Dot(Expr::Identifier(id)) => str_lit(id.value),
                     AccessExpr::Dot(_) => bail_boundary_proto!(
                         "sql::field_access::dot",
                         "dot-in-bracket-chain field access not supported in τ"
@@ -7696,6 +7703,93 @@ mod tests {
             },
             other => panic!("expected ExtractValue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lower_dot_field_access_on_compound_root_builds_extract_value_with_string_key() {
+        // `named_struct(...).x` parses as a `CompoundFieldAccess` whose access
+        // chain is a plain identifier `Dot` (not a bracket subscript). `.field`
+        // on a compound root folds to the same `ExtractValue(_, String(..))`
+        // shape as a bracket string key (cx-005).
+        let plan =
+            parse("SELECT named_struct('x', 100, 'y', 200).x AS val").expect("should parse+lower");
+        match first_projection(plan) {
+            Expression::ExtractValue(ev) => {
+                match ev.child.as_ref() {
+                    Expression::FunctionCall(f) => assert_eq!(f.name, "named_struct"),
+                    other => panic!("expected named_struct FunctionCall child, got {other:?}"),
+                }
+                match ev.extraction.as_ref() {
+                    Expression::Literal(l) => {
+                        assert!(matches!(&l.value, LiteralValue::String(s) if s == "x"));
+                    }
+                    other => panic!("expected String(\"x\") extraction, got {other:?}"),
+                }
+            }
+            other => panic!("expected ExtractValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_chained_bracket_then_dot_field_access_builds_nested_extract_value() {
+        // `arr[0].field`-style chain: a bracket index followed by a dotted
+        // field access in the same `CompoundFieldAccess`.
+        let plan = parse("SELECT array(named_struct('x', 1))[0].x").expect("should parse+lower");
+        match first_projection(plan) {
+            Expression::ExtractValue(outer) => {
+                match outer.extraction.as_ref() {
+                    Expression::Literal(l) => {
+                        assert!(matches!(&l.value, LiteralValue::String(s) if s == "x"));
+                    }
+                    other => panic!("expected String(\"x\") extraction, got {other:?}"),
+                }
+                match outer.child.as_ref() {
+                    Expression::ExtractValue(inner) => match inner.extraction.as_ref() {
+                        Expression::Literal(l) => {
+                            assert!(matches!(l.value, LiteralValue::Int(0)));
+                        }
+                        other => panic!("expected Int(0) extraction, got {other:?}"),
+                    },
+                    other => panic!("expected inner ExtractValue, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer ExtractValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_multi_dot_chain_builds_nested_extract_value_per_segment() {
+        // `a['k'].b.c` — sqlparser flattens the trailing `.b.c` into two
+        // separate `Dot(Identifier)` access-chain elements (not a single
+        // `Dot(CompoundIdentifier(..))`), so each segment folds into its own
+        // nested `ExtractValue`.
+        let plan = parse("SELECT map('k', named_struct('b', named_struct('c', 1)))['k'].b.c")
+            .expect("should parse+lower");
+        match first_projection(plan) {
+            Expression::ExtractValue(c_level) => {
+                assert!(
+                    matches!(c_level.extraction.as_ref(), Expression::Literal(l) if matches!(&l.value, LiteralValue::String(s) if s == "c"))
+                );
+                match c_level.child.as_ref() {
+                    Expression::ExtractValue(b_level) => {
+                        assert!(
+                            matches!(b_level.extraction.as_ref(), Expression::Literal(l) if matches!(&l.value, LiteralValue::String(s) if s == "b"))
+                        );
+                    }
+                    other => panic!("expected inner ExtractValue for `.b`, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer ExtractValue for `.c`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lower_dot_access_of_non_identifier_shape_stays_a_boundary() {
+        // `x.true` parses as `CompoundFieldAccess` with an access chain of
+        // `Dot(Expr::Value(Boolean(true)))` — a non-identifier `Dot` shape.
+        // Only a plain identifier dot (`.field`) is folded into ExtractValue;
+        // this must remain a Thunderduck boundary.
+        assert_boundary_shape_prefix("SELECT named_struct('x', 1).true", "sql::field_access::dot");
     }
 
     #[test]

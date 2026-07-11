@@ -7,10 +7,11 @@ Two documents form the corpus-driven pair:
 - **This file** — the `/goal` prompt template. Kept ≤4000 chars so it fits
   the `/goal` size budget. Contains the mandatory pointer to the methodology
   and the top-level Loop summary.
-- **`tasks/v2-corpus-driven-iteration-methodology.md`** — the detailed
+- **`tasks/archive/v2-corpus-driven-iteration-methodology.md`** (retired
+  2026-07-11; folded into `tasks/goal-corpus-to-100.md`) — the detailed
   per-pass discipline (Pick / Diagnose / Architect / Implement / Review+Perf,
   5-iteration cap, HALT-AND-FLAG triggers, zero-DEFER rule, compiler-warning
-  discipline, pass-log format). MUST be read at pass start.
+  discipline, pass-log format). Kept for reference only.
 
 Supersedes `v2-slice-goal-prompt-template.md`. The slice-based top-down
 approach was retired 2026-07-02 after 4 slices (A/B/C.1/E.0) produced 0
@@ -175,7 +176,7 @@ diagnostic hypothesis is wrong; re-run step 2 with fresh instrumentation.
 
 **Secondary goal (non-negotiable).** Zero DEFER items — review + perf findings closed in the pass they surface. No new compiler warnings on files this pass modifies. No slice-based housekeeping.
 
-**Methodology (mandatory, read at pass start):** `tasks/v2-corpus-driven-iteration-methodology.md` — per-pass discipline (Pick / Diagnose / Architect / Implement / Review+Perf), 5-fix-iteration cap, HALT-AND-FLAG triggers, zero-DEFER rule, compiler-warning discipline, pass-log format.
+**Methodology (retired 2026-07-11, folded into `tasks/goal-corpus-to-100.md`):** `tasks/archive/v2-corpus-driven-iteration-methodology.md` — per-pass discipline (Pick / Diagnose / Architect / Implement / Review+Perf), 5-fix-iteration cap, HALT-AND-FLAG triggers, zero-DEFER rule, compiler-warning discipline, pass-log format.
 
 **Design authority:** `docs/thunderduck-rearchitect-ADRs.md` (ADR-000..ADR-022). Every fix cites applicable ADR.
 **Open decisions:** `tasks/v2-restart-open-decisions.md` — 13 RESOLVED. New gaps → Decision 14+ (HALT-AND-FLAG-3).

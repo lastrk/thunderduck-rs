@@ -1,7 +1,8 @@
 # v2 Corpus-Driven Pass Log
 
 Append one entry per corpus-driven pass. Format per
-`tasks/v2-corpus-driven-iteration-methodology.md` §Pass log.
+`tasks/archive/v2-corpus-driven-iteration-methodology.md` §Pass log
+(retired 2026-07-11; kept for reference).
 
 ## Session 2026-07-02 → 2026-07-03 (retroactive summary)
 

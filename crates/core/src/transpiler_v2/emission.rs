@@ -4401,6 +4401,17 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         "array_contains" => "list_contains",
         "array_distinct" => "list_distinct",
         "array_intersect" => "list_intersect",
+        // Spark's `reverse` is overloaded: on a STRING it reverses the
+        // characters (DuckDB's native `reverse` already matches — fall
+        // through to the verbatim tail below); on an ARRAY it reverses
+        // element order, which DuckDB's `reverse` does not accept
+        // (`reverse(VARCHAR)` only) — dispatch to `list_reverse`.
+        "reverse"
+            if f.args.len() == 1
+                && matches!(f.args[0].data_type(schema), DataType::Array(_, _)) =>
+        {
+            "list_reverse"
+        }
         // Spark's `array_union(a, b)` — union of `a` and `b` with
         // duplicates removed, preserving `a`'s order followed by new
         // elements of `b` (in `b`'s order, minus items already in `a`).
@@ -4417,7 +4428,22 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
                 "CASE WHEN ({a}) IS NULL OR ({b}) IS NULL THEN NULL ELSE list_concat({a}, list_filter({b}, x -> NOT list_contains({a}, x))) END"
             ));
         }
-        "array_except" => "list_filter",
+        // Spark's `array_except(a, b)` — distinct elements of `a` not
+        // present in `b`, preserving the order elements first appear in
+        // `a` (Spark's `ArrayExcept` is a linear hash-set scan over `a`,
+        // not a sort). NULL propagates: if either argument is NULL, the
+        // result is NULL. DuckDB has no order-preserving distinct-filter
+        // (`list_distinct` reorders by hash, breaking Spark parity — see
+        // `array_union` above); compose dedup-by-first-occurrence via
+        // `list_position(a, x) = i` (keep only the index where `x` first
+        // occurs) together with `NOT list_contains(b, x)` to drop elements
+        // present in `b`. Corpus: `arr-014`.
+        "array_except" if f.args.len() == 2 => {
+            let [a, b] = rendered_args(f, schema)?;
+            return Ok(format!(
+                "CASE WHEN ({a}) IS NULL OR ({b}) IS NULL THEN NULL ELSE list_filter({a}, (x, i) -> list_position({a}, x) = i AND NOT list_contains({b}, x)) END"
+            ));
+        }
         // Spark's `array_position(arr, item)` returns a 1-based index or
         // `0` if the item is not found (NULL only when the array itself is
         // NULL). DuckDB's `list_position` returns NULL for not-found.
@@ -4503,6 +4529,21 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // `list_has_any(a, b)` (no `arrays_overlap` function).
         // Corpus: `arr-011`.
         "arrays_overlap" => "list_has_any",
+        // Spark's `size`/`cardinality` on a MAP → element count. DuckDB's
+        // `len` rejects MAP (`len(VARCHAR|BIT|ANY[])` only); `cardinality`
+        // is the MAP-only counterpart (DuckDB rejects `cardinality` on a
+        // LIST). DuckDB's `cardinality` returns UBIGINT — Arrow UInt64,
+        // which PySpark's Arrow→Spark type conversion rejects outright
+        // (`UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION`); cast down to
+        // BIGINT (signed) to match the sibling `len` branch's native
+        // return type and keep the wire type Arrow-safe. Array/other args
+        // keep the existing `len` rename.
+        "size" | "cardinality"
+            if f.args.len() == 1 && matches!(f.args[0].data_type(schema), DataType::Map { .. }) =>
+        {
+            let [a] = rendered_args(f, schema)?;
+            return Ok(format!("CAST(cardinality({a}) AS BIGINT)"));
+        }
         "size" | "cardinality" => "len",
         // Spark's `element_at(coll, k)` — for Array, DuckDB's
         // `element_at(list, i)` returns a 1-element list containing the
@@ -13485,6 +13526,83 @@ mod tests {
             sql.contains("list_concat(tags, list_filter(tags2, x -> NOT list_contains(tags, x)))"),
             "order-preserving concat: {sql}"
         );
+    }
+
+    /// τ `array_except(a, b)` dedups `a` while preserving `a`'s first-
+    /// occurrence order, drops elements present in `b`, and propagates
+    /// NULL if either argument is NULL. `list_distinct` is avoided because
+    /// DuckDB's dedup reorders by hash, breaking Spark's order-preserving
+    /// semantics (same pitfall as `array_union`). Binder Error surfaced:
+    /// `list_filter(INTEGER[], INTEGER[])` (the prior `list_filter`
+    /// rename passed `b` directly as a lambda). Corpus: `arr-014`.
+    #[test]
+    fn render_array_except_dedups_preserves_order_and_propagates_null() {
+        let a = tags_col();
+        let b = Expression::ColumnReference(ColumnReference {
+            name: "tags2".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
+            nullable: Some(true),
+            ordinal: None,
+        });
+        let sql = render_fn("array_except", vec![a, b]);
+        assert!(
+            sql.contains("CASE WHEN (tags) IS NULL OR (tags2) IS NULL THEN NULL"),
+            "null propagation: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "list_filter(tags, (x, i) -> list_position(tags, x) = i AND NOT list_contains(tags2, x))"
+            ),
+            "dedup-by-first-occurrence + set-diff filter: {sql}"
+        );
+    }
+
+    /// τ `reverse` is type-dependent: on a STRING, DuckDB's native
+    /// `reverse` already matches Spark and is left untouched; on an
+    /// ARRAY, DuckDB's `reverse(VARCHAR)` rejects list arguments (Binder
+    /// Error surfaced: `reverse(INTEGER[])`) — dispatch to `list_reverse`.
+    /// Corpus: `arr-XXX` / `test_reverse_array`.
+    #[test]
+    fn render_reverse_array_uses_list_reverse() {
+        let sql = render_fn("reverse", vec![tags_col()]);
+        assert_eq!(sql, "list_reverse(tags)");
+    }
+
+    #[test]
+    fn render_reverse_string_stays_native() {
+        let sql = render_fn("reverse", vec![col_ref_expr("name")]);
+        assert_eq!(sql, "reverse(name)");
+    }
+
+    /// τ `size`/`cardinality` is type-dependent: DuckDB's `len` rejects
+    /// MAP (`len(VARCHAR|BIT|ANY[])` only — Binder Error surfaced:
+    /// `len(MAP(VARCHAR, INTEGER))`), so a MAP-typed argument dispatches
+    /// to DuckDB's MAP-only `cardinality`, cast down from DuckDB's native
+    /// UBIGINT to BIGINT (Arrow UInt64 is rejected outright by PySpark's
+    /// Arrow→Spark type conversion). Array (and other) args keep the
+    /// existing `len` rename. Corpus: `test_size_map`.
+    #[test]
+    fn render_size_map_uses_cardinality() {
+        let map_col = Expression::ColumnReference(ColumnReference {
+            name: "attrs".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::Integer),
+                value_nullable: true,
+            }),
+            nullable: Some(true),
+            ordinal: None,
+        });
+        let sql = render_fn("size", vec![map_col]);
+        assert_eq!(sql, "CAST(cardinality(attrs) AS BIGINT)");
+    }
+
+    #[test]
+    fn render_size_array_unchanged() {
+        let sql = render_fn("size", vec![tags_col()]);
+        assert_eq!(sql, "len(tags)");
     }
 
     /// τ `flatten(Array<Array<T>>)` propagates NULL when the outer array

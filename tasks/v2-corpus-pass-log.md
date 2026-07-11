@@ -836,3 +836,39 @@ red in any later pass.
   `function_return_type` arm + shared rename locus) held exactly. Next: batch 2
   (emission renames reverse→list_reverse, size(map)→cardinality,
   array_except→list_filter lambda).
+
+## Pass 17 — 2026-07-11 — scalar-function batch 2: reverse / size(map) / array_except
+
+- **Baseline (post-Pass-16, commit 2d48baa):** 1369 passed / 73 failed.
+- **Root cause:** 3 DuckDB `Binder Error: No function matches` boundaries (survey
+  batch 2, emission-only — analyzer already types them). τ emitted `reverse(array)`
+  (DuckDB reverse is VARCHAR-only), `len(MAP)` (unsupported), and `list_filter`
+  with two arrays for `array_except`.
+- **Fix (emission.rs, type-dependent dispatch in render_function_call):**
+  - `reverse`: Array arg → `list_reverse`; String stays native `reverse`.
+  - `size`/`cardinality`: Map arg → `CAST(cardinality(map) AS BIGINT)` (native
+    cardinality returns UBIGINT which Arrow rejects); Array/other → `len`.
+  - `array_except(a,b)` → `list_filter(a, (x,i) -> list_position(a,x)=i AND NOT
+    list_contains(b,x))` wrapped in NULL-propagation CASE — order-preserving
+    distinct (the survey's `list_distinct(...)` form was verified WRONG: it
+    reorders by hash; corrected against live PySpark).
+  - **Root-cause dig (session.rs):** removed a global session-init macro
+    `CREATE OR REPLACE MACRO cardinality(x) AS len(x)` that shadowed DuckDB's
+    native MAP-aware `cardinality` (user macros outrank builtins) — the actual
+    reason size(map) still failed after the emission arm alone.
+- **Review (`rust-reviewer`, no-tree-mutation):** APPROVE. Confirmed the macro
+  removal is SAFE (only emitter of `cardinality(` is the new map arm; array
+  `cardinality`/`size` route to `len`, identical to the macro; map cardinality
+  was already broken, now fixed). Type dispatch correct; 5 tests pin each arm.
+  Latent NULL-parity gap in `array_except` (drops a NULL element Spark would
+  keep) — NOT a regression (byte-identical to the old macro's behavior), no
+  corpus witness → recorded as a follow-up, not blocking. Also noted (out of
+  scope): several now-shadowed dead macros in session.rs + a pre-existing
+  `array_distinct → list_distinct` reordering smell — future cleanup tickets.
+- **Gate:** 1369→1372 (**Δ +3, zero regressions**). Newly green: test_array_except,
+  test_reverse_array, test_size_map. `cargo test -p thunderduck-core --lib` 1071.
+- **Reflect:** the survey's "emission-only rename" batch was 2/3 renames but
+  array_except needed real semantic derivation + a live-Spark check, and size(map)
+  needed the macro-shadowing root-cause dig — good example of not trusting a
+  "trivial" label. Follow-ups banked: array_except NULL parity; dead-macro sweep;
+  array_distinct order.

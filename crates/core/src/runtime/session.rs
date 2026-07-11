@@ -379,8 +379,12 @@ CREATE OR REPLACE MACRO array_remove(arr, elem) AS
 CREATE OR REPLACE MACRO array_compact(arr) AS
     list_filter(arr, x -> x IS NOT NULL);
 CREATE OR REPLACE MACRO sequence(s, e, step := 1) AS generate_series(s, e, step);
--- cardinality(arr_or_map) → len works for both
-CREATE OR REPLACE MACRO cardinality(x) AS len(x);
+-- NOTE: no `cardinality` macro here (deliberately) — DuckDB's built-in
+-- `cardinality` is MAP-only and already matches Spark's `size`/`cardinality`
+-- on a MAP argument; τ's emission (`emission.rs`'s `size`/`cardinality` arm)
+-- dispatches ARRAY args to `len` before a call ever reaches DuckDB as a bare
+-- `cardinality(...)`, so shadowing the built-in here would only break the
+-- MAP case (DuckDB macros take precedence over built-ins of the same name).
 -- array_prepend(arr, elem) → DuckDB list_prepend has reversed arg order
 CREATE OR REPLACE MACRO array_prepend(arr, elem) AS list_prepend(elem, arr);
 -- btrim(str[, trimStr]) → TRIM BOTH

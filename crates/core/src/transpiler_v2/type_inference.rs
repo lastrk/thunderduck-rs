@@ -551,7 +551,7 @@ impl TypeInferenceEngine {
             | "regexp_replace" | "regexp_extract" | "translate" | "initcap" | "space" | "repeat"
             | "overlay" | "format_string" | "format_number" | "base64" | "unbase64"
             | "url_encode" | "url_decode" | "encode" | "decode" | "soundex" | "sentences"
-            | "split_part" => String,
+            | "split_part" | "substring_index" => String,
             // `regexp_extract_all(str, pattern[, group])` returns Array<String>.
             // Spark 4.x — corpus case `str-020`.
             "regexp_extract_all" => Array(Box::new(String), true),
@@ -1997,6 +1997,17 @@ mod tests {
         assert_eq!(frt("btrim", &[DataType::String]), DataType::String);
         assert_eq!(
             frt("btrim", &[DataType::String, DataType::String]),
+            DataType::String
+        );
+    }
+
+    #[test]
+    fn substring_index_returns_string() {
+        assert_eq!(
+            frt(
+                "substring_index",
+                &[DataType::String, DataType::String, DataType::Integer]
+            ),
             DataType::String
         );
     }

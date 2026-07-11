@@ -3714,6 +3714,29 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // has the identical signature and semantics — same name, same arg
         // order; just rename.
         "btrim" => "trim",
+        // Spark's `substring_index(str, delim, count)` returns the substring
+        // of `str` before the `count`-th occurrence of `delim`: `count > 0`
+        // counts from the left (keep the first `count` delimited pieces),
+        // `count < 0` counts from the right (keep the last `|count|`
+        // pieces), `count == 0` yields an empty string. DuckDB has no
+        // direct equivalent; emulate via `string_split` + `list_slice` +
+        // `array_to_string`. `list_slice` clamps out-of-range bounds (a
+        // count larger than the number of occurrences returns the whole
+        // list, matching Spark) and propagates NULL through a NULL `str`
+        // unchanged, so no separate NULL guard is needed. Empirically
+        // verified against live Spark 4.1.1 for count > 0 / < 0 / == 0, a
+        // count exceeding the occurrence count, and `delim` absent from
+        // `str`. Corpus: `test_substring_index`.
+        "substring_index" => {
+            let [s, delim, count] =
+                exact_args(f, schema, "`substring_index` requires exactly 3 arguments")?;
+            return Ok(format!(
+                "CASE WHEN ({count}) >= 0 \
+                 THEN array_to_string(list_slice(string_split({s}, {delim}), 1, ({count})), {delim}) \
+                 ELSE array_to_string(list_slice(string_split({s}, {delim}), ({count}), -1), {delim}) \
+                 END"
+            ));
+        }
         // Spark's `dayofweek(x)` returns 1..7 (Sunday=1); DuckDB's returns
         // 0..6 (Sunday=0). Add 1 to align with Spark.
         "dayofweek" => {
@@ -5648,6 +5671,34 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
     let zero_arg_ok = matches!(duck_name, "grouping_id" | "grouping") && f.args.is_empty();
     if f.args.is_empty() && !zero_arg_ok {
         bail_boundary_fn!(f.name.clone(), "aggregate function call has no arguments");
+    }
+    // Spark's `count(DISTINCT a, b, ...)` counts distinct (a, b, ...) tuples,
+    // excluding any row where ANY argument is NULL — verified empirically
+    // against live Spark 4.1.1: a row with a NULL in either column is
+    // dropped from the distinct count entirely, not counted as a distinct
+    // NULL-bearing tuple. DuckDB's ROW/STRUCT constructor is non-NULL even
+    // when every field is NULL, so a bare `count(DISTINCT (a, b))` counts
+    // such rows as one extra distinct tuple (probed: 4 vs Spark's 2 on the
+    // corpus's 4-row witness). Guard by collapsing the tuple to SQL NULL
+    // whenever any argument is NULL; COUNT DISTINCT's ordinary NULL-skip
+    // then drops those rows, matching Spark. Single-arg `count(DISTINCT x)`
+    // is unaffected (DuckDB's own NULL-skip already matches Spark there).
+    // Corpus: `test_count_distinct_multiple_columns`.
+    if (f.distinct || force_distinct) && duck_name == "count" && f.args.len() > 1 {
+        let cols = f
+            .args
+            .iter()
+            .map(|arg| render_expr(arg, schema))
+            .collect::<Result<Vec<String>, EmissionError>>()?;
+        let null_check = cols
+            .iter()
+            .map(|c| format!("{c} IS NULL"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let tuple = format!("({})", cols.join(", "));
+        return Ok(format!(
+            "count(DISTINCT CASE WHEN {null_check} THEN NULL ELSE {tuple} END)"
+        ));
     }
     let args_sql = sql_join(f.args.iter(), ", ", |arg| render_expr(arg, schema))?;
     let distinct = if f.distinct || force_distinct {
@@ -13017,6 +13068,55 @@ mod tests {
         assert_eq!(sql, "trim(s, 'xy')");
     }
 
+    /// `test_substring_index` (test_string_collection_differential):
+    /// positive `count` keeps the first `count` delimited pieces from the
+    /// left. Empirically verified against live Spark 4.1.1.
+    #[test]
+    fn render_substring_index_positive_count_takes_from_left() {
+        let sql = render_fn(
+            "substring_index",
+            vec![col_ref_expr("domain"), str_lit("."), int_lit(2)],
+        );
+        assert_eq!(
+            sql,
+            "CASE WHEN (2) >= 0 \
+             THEN array_to_string(list_slice(string_split(domain, '.'), 1, (2)), '.') \
+             ELSE array_to_string(list_slice(string_split(domain, '.'), (2), -1), '.') \
+             END"
+        );
+    }
+
+    /// Negative `count` keeps the last `|count|` pieces from the right.
+    #[test]
+    fn render_substring_index_negative_count_takes_from_right() {
+        let sql = render_fn(
+            "substring_index",
+            vec![col_ref_expr("domain"), str_lit("."), int_lit(-2)],
+        );
+        assert!(sql.contains("(-2) >= 0"), "sql = {sql}");
+        assert!(
+            sql.contains("list_slice(string_split(domain, '.'), (-2), -1)"),
+            "sql = {sql}"
+        );
+    }
+
+    /// `count == 0` renders through the `>= 0` (left) branch with an empty
+    /// slice bound (`list_slice(..., 1, 0)`), which DuckDB clamps to an
+    /// empty list — `array_to_string` of an empty list is `''`, matching
+    /// Spark's `substring_index(s, delim, 0) == ''` (verified live).
+    #[test]
+    fn render_substring_index_zero_count_renders_empty_slice() {
+        let sql = render_fn(
+            "substring_index",
+            vec![col_ref_expr("domain"), str_lit("."), int_lit(0)],
+        );
+        assert!(sql.contains("(0) >= 0"), "sql = {sql}");
+        assert!(
+            sql.contains("list_slice(string_split(domain, '.'), 1, (0))"),
+            "sql = {sql}"
+        );
+    }
+
     #[test]
     fn render_dayname_passes_through_native() {
         let sql = render_fn("dayname", vec![col_ref_expr("d")]);
@@ -14583,6 +14683,44 @@ mod tests {
         );
         let sql = render_aggregate(&f, &empty_schema()).expect("render min_by");
         assert_eq!(sql, "arg_min(name, val)");
+    }
+
+    /// `test_count_distinct_multiple_columns`: Spark's
+    /// `count(DISTINCT a, b)` counts distinct (a, b) tuples, skipping any
+    /// row where either argument is NULL. DuckDB's `count` rejects >1
+    /// non-ROW argument outright (Binder error), and a bare
+    /// `count(DISTINCT (a, b))` ROW-tuple would over-count NULL-bearing
+    /// rows (DuckDB ROWs are non-NULL even with NULL fields). τ must emit
+    /// the NULL-guarded CASE form. Verified against live Spark 4.1.1 and
+    /// the DuckDB binary for both all-non-null and mixed-null inputs.
+    #[test]
+    fn count_distinct_multi_arg_renders_null_guarded_tuple() {
+        let f = FunctionCall {
+            name: "count".to_owned(),
+            args: vec![
+                col_with_type("name", DataType::String),
+                col_with_type("value", DataType::Integer),
+            ],
+            distinct: true,
+        };
+        let sql = render_aggregate(&f, &empty_schema()).expect("render count(DISTINCT a, b)");
+        assert_eq!(
+            sql,
+            "count(DISTINCT CASE WHEN name IS NULL OR value IS NULL THEN NULL ELSE (name, value) END)"
+        );
+    }
+
+    /// Single-arg `count(DISTINCT x)` is untouched by the multi-arg guard —
+    /// DuckDB's own NULL-skip on a scalar argument already matches Spark.
+    #[test]
+    fn count_distinct_single_arg_unaffected_by_tuple_guard() {
+        let f = FunctionCall {
+            name: "count".to_owned(),
+            args: vec![col_with_type("value", DataType::Integer)],
+            distinct: true,
+        };
+        let sql = render_aggregate(&f, &empty_schema()).expect("render count(DISTINCT x)");
+        assert_eq!(sql, "count(DISTINCT value)");
     }
 
     /// Pass 13 — `avg`/`mean` over a DECIMAL argument routes through the

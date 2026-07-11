@@ -920,3 +920,42 @@ red in any later pass.
   count(DISTINCT a,b) null-guarded ROW — the two MODERATE ones), then the hard
   from_json DataFrame-API case, ~32 TPC AssertionErrors, and singletons
   (RelType::Tail, json_tuple, alter_table, Array-type, RelType::Sql, Parser).
+
+## Pass 20 — 2026-07-11 — scalar-function batch 5: substring_index / count(DISTINCT a,b)
+
+- **Baseline (post-Pass-19, commit 94d72eb):** 1378 passed / 64 failed.
+- **Root cause:** substring_index — no type arm (analyzer `unresolved type`);
+  count(DISTINCT a,b) multi-arg — τ emitted illegal DuckDB `count(DISTINCT a, b)`
+  (Binder error). Survey batch 5 (the two moderate ones).
+- **Fix (both native, no extension):**
+  - substring_index: String return arm; emission CASE on count sign —
+    `string_split` + `list_slice` (count>0 → slice(1,count); count<0 →
+    slice(count,-1); count=0 → empty) + `array_to_string`. list_slice clamps
+    out-of-range and propagates NULL, matching Spark for ± / 0 / overflow /
+    delim-absent / NULL.
+  - count(DISTINCT a,b): guard in render_aggregate (`f.distinct && duck_name==
+    "count" && args.len()>1`) emits `count(DISTINCT CASE WHEN a IS NULL OR b IS
+    NULL THEN NULL ELSE (a,b) END)` — Spark drops any row with a NULL distinct
+    arg; DuckDB's bare ROW(a,b) is non-NULL even all-NULL, so the naive form
+    over-counts. Single-arg count(DISTINCT x)/count(x)/count(*) UNCHANGED.
+  - 6 unit tests (incl. `count_distinct_single_arg_unaffected_by_tuple_guard`).
+- **Review (`rust-reviewer`, no-tree-mutation):** APPROVE. Confirmed the guard
+  fires ONLY for multi-arg count-DISTINCT (single-arg byte-identical); NULL
+  semantics + 3-arg generalization + substring_index sign/clamp/NULL all
+  re-verified live. Non-blocking Lows (follow-ups): non-DISTINCT multi-arg
+  `count(a,b)` still emits invalid SQL (Spark ACCEPTS it — pre-existing gap, task
+  premise was wrong that Spark rejects it); substring_index repeats sub-exprs
+  (cosmetic, CASE short-circuits).
+- **Gate:** 1378→1380 (**Δ +2, zero regressions** — single-arg count-distinct
+  intact across all green cases). Newly green: test_count_distinct_multiple_columns,
+  test_substring_index. `cargo test -p thunderduck-core --lib` 1091.
+- **Reflect:** **scalar-function arc COMPLETE** — survey batches 1-6 all landed
+  across Passes 16-20 (14 functions, +14: dayname, monthname, btrim, reverse,
+  size(map), array_except, max_by, min_by, json_object_keys, positive, bit_get,
+  to_char, substring_index, count-distinct-multi). Remaining 62: the HARD tail —
+  ~32 TPC AssertionErrors (data diffs, each needs individual diagnosis),
+  from_json DataFrame-API (JSON-schema parsing, flagged hard), and singletons
+  (RelType::Tail×2, json_tuple, alter_table, Array-type, RelType::Sql, 2 Parser
+  errors, negative-emission, jn-018, tbl-013). Follow-up tickets banked:
+  array_except NULL, json_keys non-object, negative emission, non-distinct
+  multi-count.

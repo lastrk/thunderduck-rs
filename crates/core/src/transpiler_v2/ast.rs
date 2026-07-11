@@ -93,28 +93,29 @@ pub enum CommonOp {
     /// `grouping_kind` / `grouping_sets`. Pivot is a separate variant
     /// ([`CommonOp::Pivot`]).
     ///
-    /// # τ invariant on `aggregates`
+    /// # `aggregates` layout — [`AggregateProjection`]
     ///
-    /// The SparkSQL front-end (`parser_v2::v2_lowering::
-    /// lower_aggregate_select`) folds the SELECT projection list — grouping
-    /// columns and aggregate calls both — into `aggregates` when the query
-    /// has a GROUP BY, mirroring the raw projection. This matches the
-    /// protobuf `Aggregate` semantics where `aggregate_expressions` already
-    /// carries the composite output list. τ's emission substrate's emission table will
-    /// unfold this back into a strict `{grouping, aggregates}` split at
-    /// emission time.
-    ///
-    // TODO: unfold parser-folded grouping columns from `aggregates`.
+    /// Each front-end tells τ, via the `projection` field, whether
+    /// `aggregates` already IS the complete output list ([`AggregateProjection::Folded`]
+    /// — the SparkSQL front-end's `lower_aggregate_select` folds the whole
+    /// SELECT projection list, grouping columns and aggregate calls alike,
+    /// into `aggregates`) or holds only the aggregate expressions
+    /// ([`AggregateProjection::Grouped`] — the DataFrame front-end's
+    /// `.groupBy(...).agg(...)`, whose Spark-parity output is `grouping ++
+    /// aggregates`). The flag is a CONSTANT per front-end, never inferred.
     Aggregate {
         /// The input relation.
         input: Box<CommonAst>,
         /// The grouping expressions (may be empty for global aggregation).
         grouping: Vec<Expression>,
-        /// The aggregate expressions. See variant-level doc for the τ
-        /// folding invariant — the SparkSQL front-end may include grouping
-        /// columns here alongside the actual aggregate calls until τ's emission substrate
-        /// unfolds them.
+        /// The aggregate expressions. See variant-level doc — whether this
+        /// is the complete output list or just the aggregate calls is given
+        /// by `projection`.
         aggregates: Vec<Expression>,
+        /// Whether `aggregates` already carries the full output projection
+        /// (SQL) or only the aggregate expressions (DataFrame). See
+        /// variant-level doc.
+        projection: AggregateProjection,
         /// The grouping kind — GroupBy (default), Rollup, Cube, or
         /// GroupingSets (Pivot lives elsewhere).
         grouping_kind: GroupingKind,
@@ -703,6 +704,28 @@ pub enum GroupingKind {
     /// and is applied at emission time. The SparkSQL front-end populates it;
     /// the DataFrame path leaves it empty and stays a boundary error.
     GroupingSets,
+}
+
+/// Which layout [`CommonOp::Aggregate`]'s (and [`TypedOp::Aggregate`]'s)
+/// `aggregates` field carries — an explicit, per-front-end CONSTANT (never
+/// inferred) that replaced the `grouping_already_folded` heuristic.
+///
+/// [`TypedOp::Aggregate`]: crate::transpiler_v2::analyzer::TypedOp::Aggregate
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AggregateProjection {
+    /// `aggregates` IS the complete SELECT list (grouping columns and
+    /// aggregate calls alike) — the output schema is `aggregates` as-is,
+    /// never prepended with `grouping`. Set by the SparkSQL front-end
+    /// (`parser_v2::v2_lowering::lower_aggregate_select`), the only SQL
+    /// construction site.
+    Folded,
+    /// `aggregates` holds only the aggregate expressions — the output is
+    /// `grouping ++ aggregates` (Spark's DataFrame `.groupBy(...).agg(...)`
+    /// semantics; a no-op when `grouping` is empty). Set by every DataFrame
+    /// construction site (`v2_relation_converter::convert_aggregate` /
+    /// `convert_cov` / `convert_corr` / `convert_approx_quantile`) and by
+    /// `crosstab_to_aggregate`.
+    Grouped,
 }
 
 /// The join types supported by [`CommonOp::Join`].

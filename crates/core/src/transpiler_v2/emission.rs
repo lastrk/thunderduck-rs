@@ -146,6 +146,7 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
             input,
             grouping,
             aggregates,
+            projection,
             grouping_kind,
             grouping_sets,
             having,
@@ -153,6 +154,7 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
             input,
             grouping,
             aggregates,
+            *projection,
             *grouping_kind,
             grouping_sets,
             having.as_ref(),
@@ -874,6 +876,7 @@ fn build_aggregate(
     input: &TypedAst,
     grouping: &[Expression],
     aggregates: &[Expression],
+    projection: crate::transpiler_v2::ast::AggregateProjection,
     grouping_kind: crate::transpiler_v2::ast::GroupingKind,
     grouping_sets: &[Vec<usize>],
     having: Option<&Expression>,
@@ -956,15 +959,17 @@ fn build_aggregate(
         (grouping_r, aggregates_r, having_r)
     };
 
-    // Mirror the analyzer's "unfold DataFrame-path grouping" logic — if
-    // the aggregates list doesn't already start with the grouping cols'
-    // output names, prepend them to the SELECT list so the emitted column
-    // count matches the resolved schema. Reprojection only rewrites a
-    // qualifier to a positional bare name (structure-preserving), so
-    // computing this over the chosen (possibly reprojected) expression set
-    // keeps it consistent with what is rendered.
-    let already_folded = super::analyzer::grouping_already_folded(&grouping_r, &aggregates_r);
-    let keys: &[Expression] = if already_folded { &[] } else { &grouping_r };
+    // Mirror the analyzer's schema construction (analyzer.rs `analyze_node`'s
+    // `Aggregate` arm): the SAME `projection` flag decides whether the
+    // grouping columns are a genuine leading output column (DataFrame
+    // `Grouped`) or already present verbatim in `aggregates` (SQL `Folded`).
+    // Reading the immutable flag off the node — rather than re-deriving it
+    // over the (possibly reprojected) expression set — keeps this in
+    // lockstep with the analyzer by construction.
+    let keys: &[Expression] = match projection {
+        crate::transpiler_v2::ast::AggregateProjection::Folded => &[],
+        crate::transpiler_v2::ast::AggregateProjection::Grouped => &grouping_r,
+    };
     let slots = sql_join(keys.iter().chain(aggregates_r.iter()), ", ", |e| {
         render_projection_slot(e, input_schema)
     })?;
@@ -7010,7 +7015,7 @@ pub(crate) fn extension_targets() -> HashSet<&'static str> {
 mod tests {
     use super::*;
     use crate::transpiler_v2::ast::{
-        CommonAst, CommonOp, JoinType, PivotGrouping, SetOpKind, UnpivotIds,
+        AggregateProjection, CommonAst, CommonOp, JoinType, PivotGrouping, SetOpKind, UnpivotIds,
     };
     use crate::transpiler_v2::base_types::BaseTypes;
     use crate::transpiler_v2::expression::{
@@ -7327,6 +7332,7 @@ mod tests {
                 args: vec![qcol("e2", "salary")],
                 distinct: false,
             })],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -9009,6 +9015,7 @@ mod tests {
             input: Box::new(filter),
             grouping: vec![],
             aggregates: vec![fexpr("max", vec![qcol("e", "salary")])],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -9073,6 +9080,7 @@ mod tests {
                     alias: "avg_sal".to_owned(),
                 }),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -9110,6 +9118,7 @@ mod tests {
                     alias: "n".to_owned(),
                 }),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: Some(count_star_gt_one()),
@@ -9155,6 +9164,7 @@ mod tests {
                     alias: "count".to_owned(),
                 }),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -9186,6 +9196,7 @@ mod tests {
                     alias: "count".to_owned(),
                 }),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -9236,6 +9247,7 @@ mod tests {
                     alias: "avg_sal".to_owned(),
                 }),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -9873,6 +9885,7 @@ mod tests {
                     alias: "n".to_owned(),
                 }),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -9925,6 +9938,7 @@ mod tests {
                 qcol("e", "dept_id"),
                 fexpr("count", vec![qcol("d", "dept_id")]),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -9950,6 +9964,7 @@ mod tests {
                     alias: "n".to_owned(),
                 }),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -10336,6 +10351,7 @@ mod tests {
             input: Box::new(emp_join_emp2()),
             grouping: vec![pidcol("dept_id", 1)],
             aggregates: vec![fexpr("max", vec![pidcol("salary", 1)])],
+            projection: AggregateProjection::Grouped,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -10813,6 +10829,7 @@ mod tests {
                     vec![Expression::Star(StarExpression { qualifier: None })],
                 ),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: Some(count_star_gt_one()),
@@ -10859,6 +10876,7 @@ mod tests {
                     alias: "s".to_owned(),
                 }),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -10881,6 +10899,79 @@ mod tests {
         );
     }
 
+    /// Design 035: an `AggregateProjection::Folded` aggregate (SQL front-end
+    /// shape) must NOT prepend the grouping key to the output — `aggregates`
+    /// IS the complete SELECT list. `dept_id` appears once, from `GROUP BY`
+    /// only.
+    #[test]
+    fn aggregate_folded_projection_does_not_prepend_grouping_key() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(scan("emp")),
+            grouping: vec![ucol("dept_id")],
+            aggregates: vec![fexpr(
+                "count",
+                vec![Expression::Star(StarExpression { qualifier: None })],
+            )],
+            projection: AggregateProjection::Folded,
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze folded aggregate");
+        assert_eq!(
+            typed.resolved_schema.fields.len(),
+            1,
+            "Folded must not prepend the grouping key to the resolved schema"
+        );
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql.matches("dept_id").count(),
+            1,
+            "dept_id must appear exactly once (GROUP BY only), got: {sql}"
+        );
+    }
+
+    /// Design 035: an `AggregateProjection::Grouped` aggregate (DataFrame
+    /// front-end shape) must prepend the grouping key ahead of the aggregate
+    /// expressions — Spark's `.groupBy(k).agg(f(x))` semantics. `dept_id`
+    /// appears twice: once in the prepended SELECT slot, once in `GROUP BY`.
+    #[test]
+    fn aggregate_grouped_projection_prepends_grouping_key() {
+        let _g = tap_guard();
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(scan("emp")),
+            grouping: vec![ucol("dept_id")],
+            aggregates: vec![fexpr(
+                "count",
+                vec![Expression::Star(StarExpression { qualifier: None })],
+            )],
+            projection: AggregateProjection::Grouped,
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_with_emp();
+        let typed = analyze(plan, &bt).expect("analyze grouped aggregate");
+        assert_eq!(
+            typed.resolved_schema.fields.len(),
+            2,
+            "Grouped must prepend the grouping key to the resolved schema"
+        );
+        assert_eq!(typed.resolved_schema.fields[0].name, "dept_id");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql.matches("dept_id").count(),
+            2,
+            "dept_id must appear twice (prepended SELECT slot + GROUP BY), got: {sql}"
+        );
+        assert!(
+            sql.starts_with("SELECT dept_id, "),
+            "grouping key must be the first SELECT slot, got: {sql}"
+        );
+    }
+
     #[test]
     fn render_aggregate_all_empty_grouping_sets_emits_group_by() {
         let _g = tap_guard();
@@ -10897,6 +10988,7 @@ mod tests {
                 "count",
                 vec![Expression::Star(StarExpression { qualifier: None })],
             )],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
             grouping_sets: vec![vec![], vec![]],
             having: None,
@@ -10924,6 +11016,7 @@ mod tests {
                     vec![Expression::Star(StarExpression { qualifier: None })],
                 ),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::Rollup,
             grouping_sets: vec![],
             having: Some(count_star_gt_one()),
@@ -10958,6 +11051,7 @@ mod tests {
                     vec![Expression::Star(StarExpression { qualifier: None })],
                 ),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::Rollup,
             grouping_sets: vec![],
             having: Some(Expression::Binary(BinaryExpression {
@@ -10995,6 +11089,7 @@ mod tests {
                     vec![Expression::Star(StarExpression { qualifier: None })],
                 ),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
             grouping_sets: vec![vec![0, 1], vec![0], vec![]],
             having: None,
@@ -11023,6 +11118,7 @@ mod tests {
                     vec![Expression::Star(StarExpression { qualifier: None })],
                 ),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupingSets,
             grouping_sets: vec![],
             having: None,
@@ -11190,6 +11286,7 @@ mod tests {
                     vec![Expression::Star(StarExpression { qualifier: None })],
                 ),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::Rollup,
             grouping_sets: vec![],
             having: None,

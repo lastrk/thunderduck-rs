@@ -1347,3 +1347,49 @@ When a pass defers a reviewer finding or STOPs on a sub-case, record it there.
   Remaining 15: q085 + ~14 feature-family/singletons (Tail, write,
   split_with_limit, json_tuple, alter_table, encode, from_json-DF, empty_array,
   explode_map, combined_sql_df, dl-write-append-002).
+
+## Pass 33 — 2026-07-11 — retire grouping_already_folded via explicit AggregateProjection flag (tpcds-q085) — SQL CORPUS 100%
+
+- **Baseline (post-Pass-32, commit 422cc3e):** 1427 passed / 15 failed (corpus).
+- **Root cause (recurring — bit Passes 10, 27, 29, and blocked q085):** the
+  `grouping_already_folded` heuristic guessed SQL-folded vs DataFrame-grouped
+  Aggregate shape by name-matching grouping keys against aggregates. q085's GROUP
+  BY key appears only NESTED in a SELECT expr (`substr(r_reason_desc,1,20)`) →
+  false-negative → spurious prepend → column-count mismatch. UNFIXABLE by nested
+  matching (a DataFrame `.groupBy(a).agg(sum(a+1))` legitimately nests the key yet
+  Spark prepends) — the SQL-vs-DataFrame distinction is an ORIGIN property.
+- **Fix (design `.agent-output/035`, 6 files):** explicit `AggregateProjection
+  {Folded, Grouped}` on CommonOp/TypedOp::Aggregate, set per front-end (SQL
+  lower_aggregate_select=Folded — the sole SQL site; DataFrame convert_aggregate/
+  cov/corr/approx_quantile/crosstab=Grouped). All 6 `grouping_already_folded`
+  consumers (analyzer schema, ADR-023 source_quals ×2, Pass-27 rebind offset,
+  emission build_aggregate) read the immutable flag in lockstep (emission's
+  recompute-over-reprojected desync hazard gone). Heuristic DELETED (~65 lines).
+  Pass-29 `unfold_ungrouped_aggregate_subquery` DELETED (provably dead: SQL
+  subqueries now Folded → never prepend → strip condition can't fire). ~25 test
+  fixtures migrated zero-churn (flag := old heuristic verdict).
+- **Review (`rust-reviewer`, no-tree-mutation):** APPROVE. Verified all 6
+  construction-site flags (lower_aggregate_select subsumes GROUP BY ALL/ordinal/
+  ROLLUP/CUBE/HAVING/implicit-global; no Default derive → field mandatory →
+  clean build proves coverage), faithful fixture migration (self-checking —
+  wrong flag breaks byte-exact assertions), lockstep consumer reads, dead Pass-29
+  deletion, and both regression directions (SQL false→prepend never load-bearing;
+  DataFrame divergence set empty across 54 sites). Also CLOSES the Pass-10
+  `.groupBy(k1,k2).agg(k1,…)` edge. Low nits: substring-count test fragility.
+- **Gate:** SQL corpus 403→**404/404 (100%!)**, DataFrame 402/402 (100%),
+  q085 red→green, **zero corpus regressions**, zero feature-family regressions
+  (excluding a CONCURRENT review session's newly-added test files present in the
+  shared worktree). Recorder full-suite row 1428 passed; core 1137 + connect-server
+  132 unit tests green.
+- **Concurrent-worktree note:** a parallel review session (writing
+  `tasks/v2-review-findings-2026-07-11.md`) added `test_sorting_differential.py::
+  ...test_order_by_grouping_expression_over_multikey_aggregate` — a failing
+  witness for F-orderby-computed-groupkey (unfixed missing-match half). It was
+  ABSENT from the P32 baseline (not a regression of this change). Committed ONLY
+  my files (explicit paths), not the concurrent session's test/doc changes.
+- **Reflect:** BOTH corpora now 100% green (SQL 404/404, DataFrame 402/402).
+  Retired the fold heuristic + 2 follow-ups (F-groupfold-nested, F-agg-folded-flag)
+  + resolved the desync half of F-orderby-computed-groupkey. Remaining 14 are the
+  feature-family "other" bucket (Tail, write, split_with_limit, json_tuple,
+  alter_table, encode, from_json-DF, empty_array, explode_map, combined_sql_df,
+  dl-write-append-002) + the concurrent-added F-orderby test.

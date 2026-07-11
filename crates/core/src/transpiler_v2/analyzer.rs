@@ -40,7 +40,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::ast::{CommonAst, CommonOp, FileFormat, JoinType, PivotGrouping, UnpivotIds};
+use super::ast::{
+    AggregateProjection, CommonAst, CommonOp, FileFormat, JoinType, PivotGrouping, UnpivotIds,
+};
 use super::base_types::BaseTypes;
 use super::error::{EmissionError, UnsupportedKind};
 use super::expression::{
@@ -548,16 +550,17 @@ fn source_quals_of(
             input,
             grouping,
             aggregates,
+            projection,
             ..
         } => {
-            // ADR-023 3e-iii: reuse `grouping_already_folded` (the same
-            // predicate `analyze`'s CommonOp::Aggregate arm uses) to pick the
-            // output layout, then map lineage with the identical
+            // ADR-023 3e-iii: use the explicit `projection` flag (set by
+            // `analyze`'s CommonOp::Aggregate arm) to pick the output layout,
+            // then map lineage with the identical
             // passthrough-ColumnReference-inherits-by-ordinal rule the
-            // `Project` arm uses above. On the SparkSQL folded path, the
+            // `Project` arm uses above. On the SparkSQL `Folded` path, the
             // grouping columns are themselves passthrough ColumnReferences
             // inside `aggregates`, so they pick up real lineage there; on the
-            // DataFrame (!folded) path this is behavior-identical to before.
+            // DataFrame `Grouped` path this is behavior-identical to before.
             let lineage_of = |e: &Expression| -> BTreeSet<String> {
                 match e {
                     Expression::ColumnReference(cr) => match cr.ordinal {
@@ -574,9 +577,9 @@ fn source_quals_of(
                 }
             };
             let mut quals: Vec<BTreeSet<String>> = Vec::new();
-            if !grouping_already_folded(grouping, aggregates) {
+            if matches!(projection, AggregateProjection::Grouped) {
                 // DataFrame path: grouping fields precede the aggregate
-                // fields (mirrors `analyze`'s !already_folded prepend).
+                // fields (mirrors `analyze`'s `Grouped` prepend).
                 quals.extend(grouping.iter().map(&lineage_of));
             }
             // Folded (SparkSQL) OR the aggregate fields of the DataFrame path.
@@ -660,14 +663,14 @@ fn source_quals_tracked_of(op: &TypedOp, resolved_schema: &StructType) -> bool {
             input,
             grouping,
             aggregates,
+            projection,
             ..
         } => {
             // Mirrors the layout `source_quals_of`'s Aggregate arm computes
-            // via `grouping_already_folded`.
-            let computed_len = if grouping_already_folded(grouping, aggregates) {
-                aggregates.len()
-            } else {
-                grouping.len() + aggregates.len()
+            // via the explicit `projection` flag.
+            let computed_len = match projection {
+                AggregateProjection::Folded => aggregates.len(),
+                AggregateProjection::Grouped => grouping.len() + aggregates.len(),
             };
             computed_len == resolved_schema.len() && input.scope.source_quals_tracked
         }
@@ -739,9 +742,13 @@ pub enum TypedOp {
         input: Box<TypedAst>,
         /// Grouping expressions.
         grouping: Vec<Expression>,
-        /// Aggregate expressions (may fold grouping columns
-        /// invariant — see [`CommonOp::Aggregate`]).
+        /// Aggregate expressions — see [`CommonOp::Aggregate`]'s doc for the
+        /// `projection`-governed layout.
         aggregates: Vec<Expression>,
+        /// Whether `aggregates` is the complete output list (`Folded`, SQL)
+        /// or just the aggregate expressions (`Grouped`, DataFrame) — see
+        /// [`AggregateProjection`].
+        projection: AggregateProjection,
         /// GROUP BY variant.
         grouping_kind: crate::transpiler_v2::ast::GroupingKind,
         /// Per-set column membership for [`GroupingKind::GroupingSets`] —
@@ -1569,6 +1576,7 @@ fn analyze_node(
             input,
             grouping,
             aggregates,
+            projection,
             grouping_kind,
             grouping_sets,
             having,
@@ -1583,16 +1591,13 @@ fn analyze_node(
             let having = having
                 .map(|h| resolve_boolean_predicate(h, &ctx, "having-condition"))
                 .transpose()?;
-            // Output schema construction:
-            // SparkSQL path folds grouping cols into `aggregates` already
-            // (per CommonOp::Aggregate invariant), so output = aggregates as-is.
-            // DataFrame path keeps them separate — detect by seeing whether
-            // the aggregates list already begins with the grouping's output
-            // names; if not, prepend grouping. Empty grouping = global agg
-            // (no unfolding needed).
-            let already_folded = grouping_already_folded(&grouping, &aggregates);
+            // Output schema construction: the front-end-supplied `projection`
+            // flag (a constant, never inferred) says whether `aggregates` is
+            // already the complete output list (`Folded`, SQL) or needs
+            // `grouping` prepended (`Grouped`, DataFrame — a no-op when
+            // `grouping` is empty).
             let mut output_fields: Vec<StructField> = Vec::new();
-            if !already_folded {
+            if matches!(projection, AggregateProjection::Grouped) {
                 output_fields.extend(
                     grouping
                         .iter()
@@ -1634,6 +1639,7 @@ fn analyze_node(
                     input: Box::new(typed_input),
                     grouping,
                     aggregates,
+                    projection,
                     grouping_kind,
                     grouping_sets,
                     having,
@@ -3700,11 +3706,15 @@ fn rebind_sort_key(
             input,
             grouping,
             aggregates,
+            projection,
             ..
         } => rebind_over_aggregate(
             original,
-            input,
-            grouping,
+            AggregateRebindCtx {
+                child_input: input,
+                grouping,
+                projection: *projection,
+            },
             aggregates,
             &mut ti.resolved_schema,
             base_types,
@@ -3725,25 +3735,40 @@ fn rebind_sort_key(
 }
 
 /// [`rebind_sort_key`]'s `TypedOp::Aggregate` case. `grouping`/`aggregates`
-/// invariant (see [`CommonOp::Aggregate`]): when the grouping keys are NOT
-/// already folded into `aggregates` (DataFrame-style Aggregate), the output
-/// schema is `[grouping fields..., aggregate fields...]` — `offset` accounts
-/// for that prefix so `aggregates[k]` always lines up with
-/// `schema.fields[offset + k]`. A prior version of this bailed whenever
-/// `!already_folded` (comparing `aggregates.len()` directly against
+/// layout (see [`CommonOp::Aggregate`]): when `projection` is `Grouped`
+/// (DataFrame-style Aggregate), the output schema is `[grouping
+/// fields..., aggregate fields...]` — `offset` accounts for that prefix so
+/// `aggregates[k]` always lines up with `schema.fields[offset + k]`. A prior
+/// version of this bailed whenever the grouping keys were not (heuristically)
+/// "already folded" (comparing `aggregates.len()` directly against
 /// `schema.len()`), which wrongly rejected an otherwise-valid whole-key match
 /// any time the GROUP BY keys were not restated bare in SELECT (tpcds-q085).
+/// Bundles [`rebind_over_aggregate`]'s immutable per-node borrows — keeps the
+/// function under clippy's argument-count lint without losing the
+/// individually-named fields at the call site.
+struct AggregateRebindCtx<'a> {
+    child_input: &'a TypedAst,
+    grouping: &'a [Expression],
+    projection: AggregateProjection,
+}
+
 fn rebind_over_aggregate(
     original: Expression,
-    child_input: &TypedAst,
-    grouping: &[Expression],
+    ctx: AggregateRebindCtx<'_>,
     aggregates: &mut Vec<Expression>,
     schema: &mut StructType,
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<Expression, AnalyzerError> {
-    let already_folded = grouping_already_folded(grouping, aggregates);
-    let offset = if already_folded { 0 } else { grouping.len() };
+    let AggregateRebindCtx {
+        child_input,
+        grouping,
+        projection,
+    } = ctx;
+    let offset = match projection {
+        AggregateProjection::Folded => 0,
+        AggregateProjection::Grouped => grouping.len(),
+    };
     // Star projections (and any other schema-expanding rewrite that runs
     // BEFORE `resolve_and_stamp`) break the 1:1 alignment between
     // `aggregates`' positions and `schema`'s fields that the rewrite below
@@ -3992,9 +4017,8 @@ fn promote_project_subtree(
 }
 
 /// A hidden-promotion output name, uniquified against `aggregates`' EXISTING
-/// names (case-insensitive, matching [`grouping_already_folded`]'s own name
-/// comparison) so two structurally-different promoted subtrees never
-/// collide on the same schema field name.
+/// names (case-insensitive) so two structurally-different promoted subtrees
+/// never collide on the same schema field name.
 fn unique_hidden_output_name(expr: &Expression, aggregates: &[Expression]) -> String {
     let base = expression_output_name(expr);
     let taken: HashSet<String> = aggregates
@@ -4230,73 +4254,12 @@ fn analyze_single_column_subquery(
     error_reason: &str,
 ) -> Result<SubqueryPlan, AnalyzerError> {
     let inner = analyze_subquery_plan(plan, ctx)?;
-    let inner = unfold_ungrouped_aggregate_subquery(inner);
     if inner.resolved_schema.fields.len() != 1 {
         return Err(AnalyzerError::Other {
             reason: error_reason.to_owned(),
         });
     }
     Ok(SubqueryPlan::Analyzed(Box::new(inner)))
-}
-
-/// Strip a spuriously-prepended GROUP BY key prefix from a scalar/IN
-/// subquery body whose top-level operator is a `TypedOp::Aggregate`.
-///
-/// `ScalarSubquery`/`InSubquery` are constructed ONLY by the SQL front-end
-/// (`parser_v2::v2_lowering`) — the DataFrame Connect proto path never
-/// builds these expression variants. `lower_aggregate_select`'s documented
-/// invariant (see `CommonOp::Aggregate`) therefore applies unconditionally
-/// here: `aggregates` IS the verbatim SELECT list — the subquery's true and
-/// complete output — whether or not it happens to restate the GROUP BY key
-/// (e.g. `SELECT avg(x) rank_col FROM t GROUP BY k`, a fully legal SQL
-/// subquery whose output is the single column `rank_col`).
-///
-/// The general `Aggregate` output-schema construction (shared with the
-/// DataFrame `.groupBy(k).agg(f(x))` shape, where the grouping key IS a real
-/// extra output column Spark itself prepends) can't tell the two shapes
-/// apart and conservatively prepends `grouping` to the schema whenever
-/// [`grouping_already_folded`] doesn't find positive evidence the key is
-/// already present. Inside a subquery body that prepend is always a
-/// schema-construction artifact, never a genuine output column — dropped
-/// here by wrapping the body in a `Project` over just the trailing
-/// `aggregates.len()` fields, so both the arity check right below and the
-/// SQL this subquery renders (via `dispatch_op` on the wrapping `Project`)
-/// see the correct, Spark-parity output.
-fn unfold_ungrouped_aggregate_subquery(inner: TypedAst) -> TypedAst {
-    let TypedOp::Aggregate {
-        ref grouping,
-        ref aggregates,
-        ..
-    } = inner.op
-    else {
-        return inner;
-    };
-    if grouping.is_empty() || grouping_already_folded(grouping, aggregates) {
-        return inner;
-    }
-    let offset = grouping.len();
-    let tail = &inner.resolved_schema.fields[offset..];
-    let projections: Vec<Expression> = tail
-        .iter()
-        .enumerate()
-        .map(|(k, field)| {
-            Expression::ColumnReference(ColumnReference {
-                name: field.name.clone(),
-                qualifier: None,
-                data_type: Some(field.data_type.clone()),
-                nullable: Some(field.nullable),
-                ordinal: Some(offset + k),
-            })
-        })
-        .collect();
-    let resolved_schema = StructType::new(tail.to_vec());
-    TypedAst::new(
-        TypedOp::Project {
-            input: Box::new(inner),
-            projections,
-        },
-        resolved_schema,
-    )
 }
 
 /// Synthetic qualifier attached to plan_id-tagged column refs during Join
@@ -5698,6 +5661,10 @@ pub fn crosstab_to_aggregate(
         grouping,
         grouping_sets: Vec::new(),
         aggregates,
+        // The grouping key is intentionally NOT folded into `aggregates`
+        // (see doc above) — `Grouped` makes the analyzer prepend col0 ahead
+        // of the count columns.
+        projection: AggregateProjection::Grouped,
         grouping_kind: GroupingKind::GroupBy,
         having: None,
     }
@@ -5843,9 +5810,8 @@ fn expression_output_name(expr: &Expression) -> String {
         // function name — verified against Spark 4.1.1's own column naming
         // (incl. multi-aggregate PIVOT, which names unaliased buckets
         // `<value>_<fn(args)>`, e.g. `a_sum(val)`, not `<value>_<fn>`). See
-        // `grouping_already_folded` (symmetric name compare, unaffected) and
-        // the pivot naming call site (`analyze_pivot`, ~L4843), both of which
-        // route through this function and stay correct under the rename.
+        // the pivot naming call site (`analyze_pivot`, ~L4843), which routes
+        // through this function and stays correct under the rename.
         // Spark toPrettySQL special-case: the time-`window` / `session_window`
         // functions produce a named STRUCT column whose output name is the bare
         // function name (`window` / `session_window`), NOT `fn(args)`. Every
@@ -6015,71 +5981,6 @@ fn pretty_unary(u: &UnaryExpression) -> String {
         UnaryOp::Negate => format!("(- {x})"),
         UnaryOp::IsNaN => format!("isnan({x})"),
         UnaryOp::IsNotNaN => format!("(NOT isnan({x}))"),
-    }
-}
-
-/// Whether the grouping keys are "already folded" into `aggregates` and so
-/// must NOT be re-prepended to the output schema / SELECT list.
-///
-/// True iff the grouping is empty (global aggregate), OR **at least one**
-/// grouping key either name-matches (case-insensitive, via
-/// [`expression_output_name`]) or structurally equals (alias-stripped) some
-/// entry in `aggregates`. This predicate is shared by the analyzer's
-/// resolved-schema construction and emission's SELECT-list rendering so their
-/// prepend decisions stay in lockstep — a divergence would desync the wire
-/// schema from the emitted column count. Note the two call sites feed
-/// *structurally different* inputs (the analyzer folds over resolved
-/// expressions; emission over reprojected/requalified ones), so identical
-/// verdicts rely on reprojection being name/structure-preserving for the
-/// matched keys — true for every shape the corpora exercise; see the residual
-/// edge below.
-///
-/// # Why `any`, not `all`
-/// The two front-ends populate `aggregates` differently, and an any-match
-/// discriminates between them correctly:
-/// - **SQL path**: the SparkSQL front-end folds the *entire* SELECT
-///   projection list — grouping columns and aggregate calls alike — into
-///   `aggregates` (see the `CommonOp::Aggregate` doc). `aggregates` is
-///   therefore the authoritative, already-complete output list, and a
-///   `GROUP BY` key that is not itself selected (e.g. `GROUP BY a, b` with
-///   `SELECT a, sum(x)`) is normal SQL, not evidence of an unfolded plan. As
-///   long as at least one grouping key shows up in `aggregates`, the plan is
-///   folded; prepending would duplicate the keys that already ARE selected.
-/// - **DataFrame path**: τ's DataFrame converter puts *only* the aggregate
-///   expressions into `aggregates` (grouping columns are never mixed in), so
-///   no grouping key can match and `any` is `false` — the grouping list is
-///   still prepended, matching Spark's `grouping ++ aggExprs` DataFrame
-///   semantics.
-///
-/// # Known residual edge (documented, witness-free)
-/// A DataFrame call of the shape `.groupBy(k1, k2).agg(k1, aggExpr)` — i.e.
-/// re-listing *one* (but not all) grouping keys inside `.agg(...)` — would be
-/// folded here (because `k1` matches) even though Spark still prepends the
-/// full grouping list ahead of `.agg`'s arguments. No corpus case exercises
-/// this shape today, so it is left as a documented gap rather than plumbed
-/// around: the robust fix is to thread an explicit `folded: bool` flag from
-/// each front-end through `CommonOp::Aggregate` (see the TODO on
-/// `CommonOp::Aggregate` at `ast.rs:107`) instead of inferring it
-/// structurally here. Revisit if/when a corpus witness for this DataFrame
-/// shape appears.
-///
-/// A second, narrower corner is newly reachable now that a *partial* match
-/// returns `true`: if an aggregate sits directly over a duplicate-name input
-/// (e.g. a self-join with no intervening projection) and emission's
-/// reprojection renames a matched key, the emission verdict could flip while
-/// the analyzer's stays — a column-count desync surfacing as a hard error, not
-/// silent corruption. No corpus case constructs it; the same front-end `folded`
-/// flag would eliminate it.
-pub(super) fn grouping_already_folded(grouping: &[Expression], aggregates: &[Expression]) -> bool {
-    grouping.is_empty() || {
-        let agg_names: Vec<String> = aggregates.iter().map(expression_output_name).collect();
-        grouping.iter().any(|gk| {
-            let name = expression_output_name(gk);
-            let name_match = agg_names.iter().any(|an| an.eq_ignore_ascii_case(&name));
-            let bare = gk.unaliased();
-            let struct_match = aggregates.iter().any(|agg| agg.unaliased() == bare);
-            name_match || struct_match
-        })
     }
 }
 
@@ -6412,17 +6313,20 @@ mod tests {
     }
 
     /// `Aggregate` with plain `GROUP BY` (no grouping sets) and the given
-    /// HAVING clause.
+    /// HAVING clause. `projection` must be the flag today's fixture would
+    /// need for zero-churn parity with the (now-retired) heuristic verdict.
     fn aggregate_having(
         input: CommonAst,
         grouping: Vec<Expression>,
         aggregates: Vec<Expression>,
+        projection: AggregateProjection,
         having: Option<Expression>,
     ) -> CommonAst {
         CommonAst::new(CommonOp::Aggregate {
             input: Box::new(input),
             grouping,
             aggregates,
+            projection,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having,
@@ -6434,8 +6338,9 @@ mod tests {
         input: CommonAst,
         grouping: Vec<Expression>,
         aggregates: Vec<Expression>,
+        projection: AggregateProjection,
     ) -> CommonAst {
-        aggregate_having(input, grouping, aggregates, None)
+        aggregate_having(input, grouping, aggregates, projection, None)
     }
 
     // ── shared BaseTypes builders ─────────────────────────────────────────
@@ -7334,6 +7239,7 @@ mod tests {
             scan("emp"),
             vec![unresolved_col("dept_id")],
             vec![func("count", vec![int_lit(1)])],
+            AggregateProjection::Grouped,
         );
         let typed = analyze(ast, &bt).unwrap();
         let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
@@ -7343,9 +7249,9 @@ mod tests {
     #[test]
     fn source_quals_aggregate_folded_grouping_col_inherits_source_aggregate_col_empty() {
         // ADR-023 3e-iii: SparkSQL `SELECT dept_id, SUM(salary) FROM emp
-        // GROUP BY dept_id` shape — `grouping_already_folded` sees `dept_id`
-        // already present in `aggregates` (folded), so the output schema is
-        // `aggregates` as-is (no grouping prepend). The folded `dept_id`
+        // GROUP BY dept_id` shape — `AggregateProjection::Folded` means
+        // `dept_id` is already present in `aggregates`, so the output schema
+        // is `aggregates` as-is (no grouping prepend). The folded `dept_id`
         // passthrough column-reference must still inherit its source
         // qualifier lineage, and the whole node must be TRACKED.
         let bt = base_types_with_emp_dept();
@@ -7356,6 +7262,7 @@ mod tests {
                 unresolved_col("dept_id"),
                 func("sum", vec![unresolved_col("salary")]),
             ],
+            AggregateProjection::Folded,
         );
         let typed = analyze(ast, &bt).unwrap();
         let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
@@ -7710,11 +7617,11 @@ mod tests {
     /// tpcds-q044 shape: `(SELECT avg(salary) rank_col FROM emp GROUP BY
     /// dept_id)` — the GROUP BY key is NOT in the SELECT list, a fully legal
     /// SQL scalar subquery whose Spark output arity is 1 (`rank_col` only).
-    /// `Aggregate`'s output-schema construction can't tell this SQL shape
-    /// apart from a DataFrame `.groupBy(k).agg(f(x))` (where `k` IS a real
-    /// extra output column) and conservatively prepends `dept_id`, over-
-    /// counting the arity to 2 — a Spark-emulated false positive
-    /// (`unfold_ungrouped_aggregate_subquery` strips it back off).
+    /// `ScalarSubquery`/`InSubquery` bodies are constructed ONLY by the SQL
+    /// front-end, whose `Aggregate` nodes are always `AggregateProjection::
+    /// Folded` — `aggregates` IS the complete SELECT list, so the output
+    /// schema is `aggregates` as-is (no grouping prepend, no arity
+    /// over-count, nothing to strip back off).
     #[test]
     fn scalar_subquery_grouped_single_column_not_restated_analyzes_ok() {
         let bt = base_types_with_emp_dept();
@@ -7725,6 +7632,7 @@ mod tests {
                 func("avg", vec![unresolved_col("salary")]),
                 "rank_col",
             )],
+            projection: AggregateProjection::Folded,
             grouping_kind: GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -7744,8 +7652,8 @@ mod tests {
                         assert_eq!(inner.resolved_schema.fields.len(), 1);
                         assert_eq!(inner.resolved_schema.fields[0].name, "rank_col");
                         assert!(
-                            matches!(inner.op, TypedOp::Project { .. }),
-                            "expected the grouping-key prefix to be stripped via a wrapping Project, got {:?}",
+                            matches!(inner.op, TypedOp::Aggregate { .. }),
+                            "Folded aggregate needs no wrapping Project, got {:?}",
                             inner.op
                         );
                     }
@@ -7759,8 +7667,7 @@ mod tests {
 
     /// A genuine 2-column scalar subquery over a grouped aggregate (the
     /// GROUP BY key IS separately selected alongside the aggregate) must
-    /// still be rejected — `unfold_ungrouped_aggregate_subquery` must not
-    /// weaken this real Spark-emulated arity error.
+    /// still be rejected.
     #[test]
     fn scalar_subquery_grouped_two_columns_is_still_spark_emulated_error() {
         let bt = base_types_with_emp_dept();
@@ -7771,6 +7678,7 @@ mod tests {
                 unresolved_col("dept_id"),
                 alias_expr(func("avg", vec![unresolved_col("salary")]), "rank_col"),
             ],
+            projection: AggregateProjection::Folded,
             grouping_kind: GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -9703,6 +9611,7 @@ mod tests {
             scan("emp"),
             vec![],
             vec![func("count", vec![unresolved_col("id")])],
+            AggregateProjection::Folded,
         );
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(typed.resolved_schema.fields.len(), 1);
@@ -9729,6 +9638,7 @@ mod tests {
             scan("emp"),
             vec![senior()],
             vec![alias_expr(senior(), "senior"), alias_expr(avg_salary, "s")],
+            AggregateProjection::Folded,
         );
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(
@@ -9754,6 +9664,7 @@ mod tests {
             scan("emp"),
             vec![unresolved_col("dept_id"), unresolved_col("salary")],
             vec![unresolved_col("dept_id"), alias_expr(avg_salary, "a")],
+            AggregateProjection::Folded,
         );
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(
@@ -9778,6 +9689,7 @@ mod tests {
             scan("emp"),
             vec![unresolved_col("dept_id"), unresolved_col("salary")],
             vec![alias_expr(avg_salary, "a")],
+            AggregateProjection::Grouped,
         );
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(
@@ -9806,6 +9718,7 @@ mod tests {
             scan("emp"),
             vec![unresolved_col("dept_id")],
             vec![unresolved_col("dept_id"), avg_salary()],
+            AggregateProjection::Folded,
             Some(having),
         );
         let typed = analyze(ast, &bt).expect("HAVING over input column should resolve");
@@ -9830,6 +9743,7 @@ mod tests {
                 "count",
                 vec![Expression::Star(StarExpression { qualifier: None })],
             )],
+            AggregateProjection::Folded,
             // A bare integer literal is not a boolean predicate.
             Some(int_lit(5)),
         );
@@ -13350,6 +13264,7 @@ mod tests {
             emp_scan(),
             vec![unresolved_col("dept_id")],
             vec![unresolved_col("dept_id"), sum_salary()],
+            AggregateProjection::Folded,
         );
         let ast = CommonAst::new(CommonOp::Sort {
             input: Box::new(agg),
@@ -13479,7 +13394,12 @@ mod tests {
                 vec![Expression::Star(StarExpression { qualifier: None })],
             )
         };
-        let agg = aggregate(emp_scan(), vec![], vec![count_star()]);
+        let agg = aggregate(
+            emp_scan(),
+            vec![],
+            vec![count_star()],
+            AggregateProjection::Folded,
+        );
         let ast = CommonAst::new(CommonOp::Sort {
             input: Box::new(agg),
             order: vec![asc_key(count_star())],
@@ -13525,6 +13445,7 @@ mod tests {
                 unresolved_col("dept_id"),
                 alias_expr(func("sum", vec![unresolved_col("salary")]), "total"),
             ],
+            AggregateProjection::Folded,
         );
         let ast = CommonAst::new(CommonOp::Sort {
             input: Box::new(agg),
@@ -13623,6 +13544,7 @@ mod tests {
                 unresolved_col("dept_id"),
                 func("sum", vec![unresolved_col("salary")]),
             ],
+            AggregateProjection::Folded,
         );
         let ast = CommonAst::new(CommonOp::Sort {
             input: Box::new(agg),
@@ -13701,7 +13623,7 @@ mod tests {
     fn sort_promotes_missing_grouping_key_and_trims_q098_shape() {
         // `SELECT name, sum(salary) FROM emp GROUP BY dept_id, name
         //  ORDER BY dept_id` (tpcds-q098 shape) — `name` is folded/restated
-        // so `grouping_already_folded` is true and the Aggregate's own
+        // so this is `AggregateProjection::Folded` and the Aggregate's own
         // schema is exactly `[name, sum(salary)]`; `dept_id` is a SECOND
         // grouping key never restated anywhere in SELECT. Step 1 fails
         // (`dept_id` is not an output field); increment 1's whole-key match
@@ -13719,6 +13641,7 @@ mod tests {
                 unresolved_col("name"),
                 func("sum", vec![unresolved_col("salary")]),
             ],
+            AggregateProjection::Folded,
         );
         let ast = CommonAst::new(CommonOp::Sort {
             input: Box::new(agg),
@@ -13877,6 +13800,7 @@ mod tests {
             emp_scan(),
             vec![unresolved_col("dept_id")],
             vec![unresolved_col("dept_id")],
+            AggregateProjection::Folded,
         );
         let ast = CommonAst::new(CommonOp::Sort {
             input: Box::new(agg),
@@ -13908,6 +13832,7 @@ mod tests {
             emp_scan(),
             vec![unresolved_col("dept_id")],
             vec![unresolved_col("dept_id")],
+            AggregateProjection::Folded,
         );
         let dedup = CommonAst::new(CommonOp::Deduplicate {
             input: Box::new(agg),

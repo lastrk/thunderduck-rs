@@ -34,7 +34,7 @@ use arrow::datatypes::{DataType as ArrowDT, Field, IntervalUnit, TimeUnit};
 use arrow_ipc::reader::StreamReader;
 use thunderduck_core::bail_boundary_proto;
 use thunderduck_core::transpiler_v2::ast::{
-    CommonAst, CommonOp, FileFormat, JoinType, PivotGrouping, UnpivotIds,
+    AggregateProjection, CommonAst, CommonOp, FileFormat, JoinType, PivotGrouping, UnpivotIds,
 };
 use thunderduck_core::transpiler_v2::error::UnsupportedKind;
 use thunderduck_core::transpiler_v2::expression::{
@@ -435,6 +435,7 @@ impl V2RelationConverter {
             input: Box::new(input),
             grouping: vec![],
             aggregates: vec![agg_expr],
+            projection: AggregateProjection::Grouped,
             grouping_kind: thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -475,6 +476,7 @@ impl V2RelationConverter {
             input: Box::new(input),
             grouping: vec![],
             aggregates: vec![agg_expr],
+            projection: AggregateProjection::Grouped,
             grouping_kind: thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -542,6 +544,7 @@ impl V2RelationConverter {
             input: Box::new(input),
             grouping: vec![],
             aggregates: vec![outer],
+            projection: AggregateProjection::Grouped,
             grouping_kind: thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,
@@ -834,6 +837,11 @@ impl V2RelationConverter {
             input: Box::new(input),
             grouping,
             aggregates,
+            // The DataFrame converter puts only the aggregate expressions
+            // into `aggregates` (grouping columns are never mixed in) — the
+            // output is `grouping ++ aggregates`, Spark's DataFrame
+            // `.groupBy(...).agg(...)` semantics.
+            projection: AggregateProjection::Grouped,
             grouping_kind,
             // DataFrame `groupingSets` path is not implemented in τ — leave the
             // per-set membership empty so emission surfaces the boundary error

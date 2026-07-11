@@ -1114,3 +1114,27 @@ red in any later pass.
   ORDER BY increment 2 (q098 + substr q062/q079/q085/q099), Cluster-A lone
   (jn-018, tbl-013, q044, q066), math (ceil_floor/exp/log/round), map, and
   singletons (Tail, json_tuple, alter_table, write, split_with_limit, etc.).
+
+## Pass 25 — 2026-07-11 — math-function nullability (ceil/floor/round/exp/log family)
+
+- **Baseline (post-Pass-24, commit 81e3841):** 1412 passed / 30 failed.
+- **Root cause (ONE):** `function_call_nullable` (expression.rs ~1274) had no arm
+  for ceil/ceiling/floor/round/bround/exp/ln/log/log10/log2, so they fell to the
+  default any-arg-nullable → declared non-nullable over a non-nullable input.
+  Spark declares these UNCONDITIONALLY nullable (verified live vs Spark 4.1.1;
+  `abs`/`pow(x,lit)` do NOT get the override — not a blanket rule). Values were
+  already byte-identical; only the wire nullability flag diverged.
+- **Fix:** add those 10 names to the always-nullable arm. 1 unit test.
+- **Review:** documented-skip (additive nullability-table entry, unit-locked,
+  live-Spark-verified; a green case can't rely on non-nullable where Spark says
+  nullable — that would be red). Gate arbitrated.
+- **Gate:** 1412→1416 (**Δ +4, zero regressions**). Newly green: test_ceil_floor,
+  test_exp, test_log, test_round. `cargo test -p thunderduck-core --lib` 1124.
+- **Follow-up noted:** sqrt/cbrt/sin/cos and the rest of Spark's UnaryMathExpression
+  family show the same always-nullable override empirically but have no failing
+  witness — deferred.
+- **Reflect:** the "nullable mismatch masks nothing here, it IS the defect"
+  variant. Remaining 26: ORDER BY inc-2 (q098 + substr q062/q079/q085/q099),
+  Cluster-A lone (jn-018/tbl-013/q044/q066), map (explode_map/map_from_arrays),
+  singletons (Tail, write, split_with_limit, json_tuple, alter_table, encode,
+  from_json-DF, empty_array, dl-write-append-002).

@@ -1382,7 +1382,25 @@ impl Expression {
             // and `list_reduce` HOFs.
             // Corpus: lambda aggregate_sum / aggregate_product /
             // aggregate_with_init / sql_aggregate / sql_aggregate_product.
-            | "aggregate" | "reduce" | "list_reduce" => true,
+            | "aggregate" | "reduce" | "list_reduce"
+            // `ceil`/`ceiling`/`floor` (Spark's `Ceil`/`Floor`) declare
+            // `nullable = true` unconditionally — the Double→Long widening
+            // can overflow for inputs outside `Long`'s range, so Spark's
+            // static schema is conservative regardless of the child's own
+            // nullability. `round`/`bround` (`RoundBase`) follow the same
+            // unconditional-`true` rule. Verified against Apache Spark
+            // 4.1.1: `ceil(non_null_double)` / `floor(...)` /
+            // `round(non_null_double, n)` / `bround(...)` all report
+            // `nullable=True` on a non-nullable input column.
+            // Differential: TestMathFunctions::test_ceil_floor, test_round.
+            | "ceil" | "ceiling" | "floor" | "round" | "bround"
+            // `exp`/`ln`/`log`/`log10`/`log2` (Spark's `UnaryMathExpression`
+            // family) also declare `nullable = true` unconditionally — the
+            // domain guard above (`x <= 0 -> NULL`) and NaN-to-NULL
+            // conversion mean even a non-nullable input can still produce
+            // NULL. Verified against Apache Spark 4.1.1.
+            // Differential: TestMathFunctions::test_exp, test_log.
+            | "exp" | "ln" | "log" | "log10" | "log2" => true,
             // Spark's `If.nullable = trueValue.nullable || falseValue.nullable`
             // — the predicate (args[0]) is excluded. `iif` is a Spark alias for
             // `If`, and `nvl2(cond, ifNotNull, ifNull)` shares the same
@@ -2007,6 +2025,40 @@ mod tests {
                 "hash family `{name}` must report nullable=false",
             );
         }
+    }
+
+    /// `ceil`/`ceiling`/`floor`/`round`/`bround` and the `exp`/`ln`/`log`/
+    /// `log10`/`log2` family declare `nullable = true` unconditionally in
+    /// Spark, even over a non-nullable input column — verified against
+    /// Apache Spark 4.1.1 (see the `function_call_nullable` comment).
+    /// Differential: TestMathFunctions::test_ceil_floor / test_round /
+    /// test_exp / test_log.
+    #[test]
+    fn math_functions_are_always_nullable_over_non_null_input() {
+        let schema = StructType::new(vec![StructField::not_null("x", DataType::Double)]);
+        let unary_cases: &[&str] = &[
+            "ceil", "ceiling", "floor", "exp", "ln", "log", "log10", "log2",
+        ];
+        for name in unary_cases {
+            let expr = fcall(name, vec![ColumnReference::untyped("x")]);
+            assert!(
+                expr.nullable(&schema),
+                "`{name}` over a non-nullable arg must still report nullable=true",
+            );
+        }
+        for name in ["round", "bround"] {
+            let expr = fcall(name, vec![ColumnReference::untyped("x"), int_lit(2)]);
+            assert!(
+                expr.nullable(&schema),
+                "`{name}` over a non-nullable arg must still report nullable=true",
+            );
+        }
+        // Two-arg `log(base, x)` form must also stay always-nullable.
+        let expr = fcall("log", vec![int_lit(10), ColumnReference::untyped("x")]);
+        assert!(
+            expr.nullable(&schema),
+            "`log(base, x)` must be nullable=true"
+        );
     }
 
     // ── Data-type derivations sanity ────────────────────────────────────────

@@ -5133,7 +5133,27 @@ fn expression_output_name(expr: &Expression) -> String {
         Expression::Alias(a) => a.alias.clone(),
         Expression::ColumnReference(c) => c.name.clone(),
         Expression::UnresolvedColumn(u) => u.name.clone(),
-        Expression::FunctionCall(f) => f.name.clone(),
+        // An unaliased function call is named by Spark's `toPrettySQL`
+        // rendering (`fn(args)`, e.g. `sum(ss_net_profit)`), not the bare
+        // function name — verified against Spark 4.1.1's own column naming
+        // (incl. multi-aggregate PIVOT, which names unaliased buckets
+        // `<value>_<fn(args)>`, e.g. `a_sum(val)`, not `<value>_<fn>`). See
+        // `grouping_already_folded` (symmetric name compare, unaffected) and
+        // the pivot naming call site (`analyze_pivot`, ~L4843), both of which
+        // route through this function and stay correct under the rename.
+        // Spark toPrettySQL special-case: the time-`window` / `session_window`
+        // functions produce a named STRUCT column whose output name is the bare
+        // function name (`window` / `session_window`), NOT `fn(args)`. Every
+        // other unaliased function call is named `fn(args)`.
+        Expression::FunctionCall(f)
+            if matches!(
+                f.name.to_ascii_lowercase().as_str(),
+                "window" | "session_window"
+            ) =>
+        {
+            f.name.to_ascii_lowercase()
+        }
+        Expression::FunctionCall(_) => pretty_name(expr),
         Expression::Literal(_) => "col".to_owned(),
         _ => pretty_name(expr),
     }
@@ -5170,14 +5190,15 @@ fn pretty_binary_symbol(op: &BinaryOp) -> &'static str {
 /// expression (Spark `UnresolvedAlias` → `Column.named` → `toPrettySQL`).
 ///
 /// This is deliberately distinct from both [`expression_output_name`] (which
-/// names top-level `Literal`s `"col"` and `FunctionCall`s by function name) and
-/// the emission `render_*` family (which uses DuckDB symbols, ANSI guards, and
-/// casts). It is value-aware — a literal renders its value, not its type — and
-/// recursive over the structural variants Spark inlines into a pretty name.
+/// names top-level `Literal`s `"col"`, and now defers `FunctionCall` straight
+/// to this function) and the emission `render_*` family (which uses DuckDB
+/// symbols, ANSI guards, and DuckDB-substrate CAST target spellings). It is
+/// value-aware — a literal renders its value, not its type — and recursive
+/// over the structural variants Spark inlines into a pretty name.
 ///
-/// Variants Spark renders in a shape τ does not yet match exactly (`Cast`,
-/// `CaseWhen`, windows, subqueries, complex-type literals, …) keep the
-/// Thunderduck-boundary fallback name `"expr"`.
+/// Variants Spark renders in a shape τ does not yet match exactly (`CaseWhen`,
+/// windows, subqueries, complex-type literals, …) keep the Thunderduck-
+/// boundary fallback name `"expr"`.
 fn pretty_name(expr: &Expression) -> String {
     match expr {
         Expression::ColumnReference(c) => c.name.clone(),
@@ -5195,6 +5216,18 @@ fn pretty_name(expr: &Expression) -> String {
             let args: Vec<String> = f.args.iter().map(pretty_name).collect();
             format!("{}({})", f.name, args.join(", "))
         }
+        // Spark's `Cast.sql` / `TryCast.sql` renders `CAST(<child> AS <TYPE>)`
+        // / `TRY_CAST(<child> AS <TYPE>)` with the UPPERCASE Catalyst type
+        // spelling (`DECIMAL(15,4)`, not DuckDB's `DECIMAL(15, 4)` substrate
+        // spelling with the internal space — see `spark_type_sql`).
+        Expression::Cast(c) => {
+            let kw = if c.try_cast { "TRY_CAST" } else { "CAST" };
+            format!(
+                "{kw}({} AS {})",
+                pretty_name(&c.expr),
+                spark_type_sql(&c.to_type)
+            )
+        }
         Expression::Star(s) => match &s.qualifier {
             Some(q) => format!("{q}.*"),
             None => "*".to_owned(),
@@ -5209,6 +5242,48 @@ fn pretty_name(expr: &Expression) -> String {
             _ => "expr".to_owned(),
         },
         _ => "expr".to_owned(),
+    }
+}
+
+/// Spark `DataType.sql` UPPERCASE type-name spelling, used by [`pretty_name`]'s
+/// `Cast` arm to reproduce Spark's `toPrettySQL` rendering (e.g.
+/// `CAST(x AS DECIMAL(15,4))`). Deliberately distinct from
+/// `emission::render_data_type`, which spells DuckDB-substrate CAST targets
+/// (`VARCHAR`, `BLOB`, `TIMESTAMP WITH TIME ZONE`, `DECIMAL(15, 4)` with an
+/// internal space, …) for emitted SQL — a different consumer with different
+/// spelling rules.
+fn spark_type_sql(dt: &DataType) -> String {
+    match dt {
+        DataType::Boolean => "BOOLEAN".to_owned(),
+        DataType::Byte => "TINYINT".to_owned(),
+        DataType::Short => "SMALLINT".to_owned(),
+        DataType::Integer => "INT".to_owned(),
+        DataType::Long => "BIGINT".to_owned(),
+        DataType::Float => "FLOAT".to_owned(),
+        DataType::Double => "DOUBLE".to_owned(),
+        DataType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
+        DataType::String => "STRING".to_owned(),
+        DataType::Binary => "BINARY".to_owned(),
+        DataType::Date => "DATE".to_owned(),
+        DataType::Timestamp => "TIMESTAMP".to_owned(),
+        DataType::TimestampNtz => "TIMESTAMP_NTZ".to_owned(),
+        DataType::YearMonthInterval => "INTERVAL YEAR TO MONTH".to_owned(),
+        DataType::DayTimeInterval => "INTERVAL DAY TO SECOND".to_owned(),
+        DataType::Interval => "INTERVAL".to_owned(),
+        DataType::Null => "VOID".to_owned(),
+        DataType::Unresolved => "STRING".to_owned(),
+        DataType::Array(elem, _) => format!("ARRAY<{}>", spark_type_sql(elem)),
+        DataType::Map { key, value, .. } => {
+            format!("MAP<{}, {}>", spark_type_sql(key), spark_type_sql(value))
+        }
+        DataType::Struct(st) => {
+            let fields: Vec<String> = st
+                .fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, spark_type_sql(&f.data_type)))
+                .collect();
+            format!("STRUCT<{}>", fields.join(", "))
+        }
     }
 }
 
@@ -9065,6 +9140,34 @@ mod tests {
         );
     }
 
+    /// Pass 021 — multi-aggregate PIVOT with UNALIASED aggregates names
+    /// outputs `<value>_<fn(args)>` per Spark's `toPrettySQL`, e.g.
+    /// `10_sum(salary)`, NOT the bare `10_sum` — verified empirically against
+    /// Spark 4.1.1 Connect (`groupBy(id).pivot(cat).agg(sum(val), avg(val))`
+    /// → columns `a_sum(val)`, `a_avg(val)`). No corpus case previously
+    /// exercised this unaliased shape (`pv-003` aliases both aggregates), so
+    /// this closes that gap and locks in the Spark-parity naming this pass
+    /// introduces (`expression_output_name`'s `FunctionCall` arm now routes
+    /// through `pretty_name`, which the pivot naming call site consumes).
+    #[test]
+    fn analyze_pivot_multi_agg_unaliased_names_outputs_value_underscore_pretty_name() {
+        let bt = base_types_with_emp_dept();
+        let emp_scan = scan("emp");
+        let ast = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(emp_scan),
+            grouping: PivotGrouping::Explicit(vec![unresolved_col("dept_id")]),
+            pivot_column: unresolved_col("dept_id"),
+            pivot_values: vec![int_lit(10)],
+            aggregates: vec![
+                func("sum", vec![unresolved_col("salary")]),
+                func("avg", vec![unresolved_col("salary")]),
+            ],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        let names = field_names(&typed);
+        assert_eq!(names, vec!["dept_id", "10_sum(salary)", "10_avg(salary)"]);
+    }
+
     /// Pass 60 H1 — Spark's Catalyst `Literal.sql` renders integral doubles
     /// with a `.0` suffix. `lit(1.0d)` becomes pivot column `"1.0"`, not
     /// `"1"`. Non-integral doubles use their natural decimal repr.
@@ -10445,6 +10548,130 @@ mod tests {
             })),
             "NULL"
         );
+    }
+
+    // ── Pass 021 — toPrettySQL naming for unaliased aggregate/scalar columns ──
+
+    #[test]
+    fn pretty_name_cast_decimal_uppercase_spelling() {
+        let expr = Expression::Cast(CastExpression {
+            expr: Box::new(unresolved_col("x")),
+            to_type: DataType::Decimal {
+                precision: 15,
+                scale: 4,
+            },
+            try_cast: false,
+        });
+        assert_eq!(pretty_name(&expr), "CAST(x AS DECIMAL(15,4))");
+    }
+
+    #[test]
+    fn pretty_name_try_cast_uses_try_cast_keyword() {
+        let expr = Expression::Cast(CastExpression {
+            expr: Box::new(unresolved_col("x")),
+            to_type: DataType::Long,
+            try_cast: true,
+        });
+        assert_eq!(pretty_name(&expr), "TRY_CAST(x AS BIGINT)");
+    }
+
+    /// q061 shape: `((CAST(promotions AS DECIMAL(15,4)) / CAST(total AS
+    /// DECIMAL(15,4))) * 100)` — nested Cast operands inside a Binary tree.
+    #[test]
+    fn pretty_name_q061_nested_cast_division_times_literal() {
+        let dec = DataType::Decimal {
+            precision: 15,
+            scale: 4,
+        };
+        let cast = |col: &str| {
+            Expression::Cast(CastExpression {
+                expr: Box::new(unresolved_col(col)),
+                to_type: dec.clone(),
+                try_cast: false,
+            })
+        };
+        let div = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Div,
+            left: Box::new(cast("promotions")),
+            right: Box::new(cast("total")),
+        });
+        let expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Mul,
+            left: Box::new(div),
+            right: Box::new(int_lit(100)),
+        });
+        assert_eq!(
+            pretty_name(&expr),
+            "((CAST(promotions AS DECIMAL(15,4)) / CAST(total AS DECIMAL(15,4))) * 100)"
+        );
+    }
+
+    #[test]
+    fn expression_output_name_unaliased_sum_uses_pretty_name() {
+        let expr = func("sum", vec![unresolved_col("ss_net_profit")]);
+        assert_eq!(expression_output_name(&expr), "sum(ss_net_profit)");
+    }
+
+    #[test]
+    fn expression_output_name_unaliased_avg_uses_pretty_name() {
+        let expr = func("avg", vec![unresolved_col("x")]);
+        assert_eq!(expression_output_name(&expr), "avg(x)");
+    }
+
+    /// win2-002 regression guard: Spark names the time-`window` /
+    /// `session_window` struct column by the BARE function name, not
+    /// `window(args)`. Everything else stays `fn(args)`.
+    #[test]
+    fn expression_output_name_time_window_stays_bare() {
+        let w = func(
+            "window",
+            vec![unresolved_col("last_login"), lit_str("1 day")],
+        );
+        assert_eq!(expression_output_name(&w), "window");
+        let sw = func(
+            "session_window",
+            vec![unresolved_col("ts"), lit_str("5 minutes")],
+        );
+        assert_eq!(expression_output_name(&sw), "session_window");
+    }
+
+    /// q002 shape: `round(a / b, 2)`, unaliased — nested Binary inside the
+    /// FunctionCall's arg list must render through `pretty_name` recursively.
+    #[test]
+    fn expression_output_name_unaliased_nested_round_uses_pretty_name() {
+        let div = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Div,
+            left: Box::new(unresolved_col("s1")),
+            right: Box::new(unresolved_col("s2")),
+        });
+        let expr = func("round", vec![div, int_lit(2)]);
+        assert_eq!(expression_output_name(&expr), "round((s1 / s2), 2)");
+    }
+
+    /// Regression guard: an ALIASED FunctionCall must still be named by its
+    /// alias, not `pretty_name` — the `Alias` arm short-circuits before the
+    /// `FunctionCall` arm is ever reached.
+    #[test]
+    fn expression_output_name_aliased_function_call_keeps_alias() {
+        let expr = alias_expr(func("sum", vec![unresolved_col("salary")]), "total");
+        assert_eq!(expression_output_name(&expr), "total");
+    }
+
+    /// Regression guard: a passthrough column keeps naming by its bare column
+    /// name (unaffected by the FunctionCall rename).
+    #[test]
+    fn expression_output_name_passthrough_column_unchanged() {
+        assert_eq!(
+            expression_output_name(&unresolved_col("dept_id")),
+            "dept_id"
+        );
+    }
+
+    /// Regression guard: a top-level literal still names `"col"` (Spark's
+    /// literal-projection convention), NOT its `pretty_name` value rendering.
+    #[test]
+    fn expression_output_name_literal_unchanged() {
+        assert_eq!(expression_output_name(&int_lit(1)), "col");
     }
 
     #[test]

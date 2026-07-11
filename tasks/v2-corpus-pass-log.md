@@ -959,3 +959,42 @@ red in any later pass.
   errors, negative-emission, jn-018, tbl-013). Follow-up tickets banked:
   array_except NULL, json_keys non-object, negative emission, non-distinct
   multi-count.
+
+## Pass 21 — 2026-07-11 — Spark toPrettySQL naming for unaliased FunctionCall columns
+
+- **Baseline (post-Pass-20, commit e2f30af):** 1380 passed / 62 failed.
+- **Cluster (survey `.agent-output/021-diagnostic-tpc-assertion.md`):** 11 of 12
+  TPC AssertionErrors were SCHEMA-NAME diffs — τ named an unaliased
+  aggregate/function column by its BARE name (`sum`) where Spark toPrettySQL
+  uses `fn(args)` (`sum(ss_net_profit)`, `round((s1 / s2), 2)`). q061 also names
+  Cast operands. (q066 is a separate decimal-typing case, out of scope.)
+- **Fix:** analyzer.rs — `expression_output_name`'s FunctionCall arm →
+  `pretty_name(expr)` (Spark toPrettySQL); added a `Cast` arm to `pretty_name`
+  with a new `spark_type_sql` helper (uppercase Catalyst spelling
+  `DECIMAL(15,4)`, distinct from emission's DuckDB `render_data_type`). Coder
+  verified against LIVE Spark that unaliased multi-agg PIVOT is also `{pv}_fn(args)`
+  (τ's old bare form was an untested parity bug, not a regression risk).
+- **Fix-loop (regression caught at gate, then fixed):** the first gate flipped
+  the 11 targets +tpch-q13 (+12) but REGRESSED **win2-002** green→red: Spark's
+  time-`window` function names its struct column BARE `window`, not
+  `window(last_login, 1 day)` — the one case where the OLD bare name MATCHED
+  Spark. Added a special-case to `expression_output_name` (window/session_window
+  → bare name) + a regression-guard unit test. Re-gated clean.
+- **Review (`rust-reviewer`, no-tree-mutation):** APPROVE-WITH-NITS. Confirmed
+  the strict-name harness means no OTHER green case had an unaliased-function
+  column (bare name never matched Spark EXCEPT window/session_window, now
+  handled). Residual stay-red gaps banked as follow-ups (NOT regressions): M1
+  `pretty_name` ignores `f.distinct` (unaliased count(DISTINCT x)→count(x)); M2
+  DataFrame `count(*)`→`count(*)` vs Spark `count(1)`; M3 uppercase SQL func
+  names not lowercased; N1 stale v2_lowering comment; N2 interval/struct type
+  spellings.
+- **Gate (re-gate, window fix):** 1380→1392 (**Δ +12, zero regressions**;
+  win2-002 recovered). DataFrame corpus back to 402/402; SQL corpus 373→385.
+  Newly green: tpcds-q002/q008/q013/q014a/q015/q023a/q035/q045/q048/q061 +
+  tpch-q13/q18. `cargo test -p thunderduck-core --lib` 1102.
+- **Reflect:** biggest remaining cluster cleared; the fix-loop validated the
+  gate as the safety net (the reviewer's "bare never matches Spark" premise
+  had exactly one exception — window — that only the corpus gate surfaced).
+  Remaining ~50: q066 (decimal typing), from_json DF-API, singletons
+  (RelType::Tail, json_tuple, alter_table, Array-type, RelType::Sql, Parser),
+  and the residual-naming M1/M2/M3 gaps.

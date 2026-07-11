@@ -104,6 +104,58 @@ mod tests {
         assert!(load_optional_extension(&conn(), None).is_ok());
     }
 
+    /// PROBE (pass 13, `spark_avg` decimal-coherence wiring): pins the
+    /// shipped ext6 `spark_avg` aggregate's native DECIMAL result type,
+    /// grouped and windowed. `emission.rs`'s `render_decimal_avg` wraps this
+    /// call in an outer `CAST(... AS DECIMAL(pa,sa))` regardless (idempotent
+    /// if this probe's observed native type already matches Spark's declared
+    /// `(pa,sa)`), so this test exists to catch the extension ever ceasing to
+    /// return DECIMAL (or ceasing to run under a window) — either of which
+    /// would silently reroute the emitted CAST onto a non-decimal substrate.
+    #[test]
+    fn spark_avg_decimal_probe() {
+        let conn = conn();
+        load(&conn).expect("load thdck_spark_funcs");
+
+        let grouped_type: String = conn
+            .query_row(
+                "SELECT typeof(spark_avg(x)) FROM (VALUES \
+                 (CAST('123.45' AS DECIMAL(9,2))), \
+                 (CAST('67.89' AS DECIMAL(9,2)))) AS t(x)",
+                [],
+                |r| r.get(0),
+            )
+            .expect("spark_avg(DECIMAL(9,2)) should execute");
+        eprintln!("PROBE P1.1 grouped spark_avg(DECIMAL(9,2)) native type: {grouped_type}");
+        // Lock the EXACT type, not just the DECIMAL family: emission's
+        // `render_decimal_avg` casts to Spark's AvgLike type DECIMAL(13,6) for a
+        // (9,2) arg, and its no-rounding-seam correctness relies on spark_avg
+        // ALREADY returning exactly (13,6) so that outer CAST is a no-op. If a
+        // future extension build widened the native scale, a silent HALF_UP
+        // rounding step would appear — this exact-match assert catches that.
+        assert_eq!(
+            grouped_type, "DECIMAL(13,6)",
+            "spark_avg(DECIMAL(9,2)) native type must equal Spark's AvgLike type \
+             so the emission-side CAST stays a no-op; got: {grouped_type}"
+        );
+
+        let windowed_type: String = conn
+            .query_row(
+                "SELECT typeof(spark_avg(x) OVER (PARTITION BY k)) FROM (VALUES \
+                 (1, CAST('123.45' AS DECIMAL(9,2))), \
+                 (1, CAST('67.89' AS DECIMAL(9,2)))) AS t(k, x) LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("windowed spark_avg(DECIMAL(9,2)) should execute");
+        eprintln!("PROBE P1.2 windowed spark_avg(DECIMAL(9,2)) native type: {windowed_type}");
+        assert_eq!(
+            windowed_type, "DECIMAL(13,6)",
+            "windowed spark_avg(DECIMAL(9,2)) native type must equal Spark's AvgLike \
+             type so the emission-side CAST stays a no-op; got: {windowed_type}"
+        );
+    }
+
     #[test]
     fn missing_extension_file_is_a_hard_error() {
         let err = load_optional_extension(

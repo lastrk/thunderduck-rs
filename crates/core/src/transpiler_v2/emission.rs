@@ -2960,15 +2960,17 @@ pub(crate) fn render_expr(expr: &Expression, schema: &Schema) -> Result<String, 
     }
 }
 
-/// Render a window function application:
-/// `<func> OVER (PARTITION BY ... ORDER BY ... [frame])`. ORDER BY items
+/// Render a `WindowFunction`'s `OVER (PARTITION BY ... ORDER BY ...
+/// [frame])` clause text (without the leading function SQL). ORDER BY items
 /// share [`render_sort_key`] with the `Sort` operator (byte-identical
-/// `{expr} {ASC|DESC} {NULLS FIRST|NULLS LAST}` shape).
-fn render_window(
+/// `{expr} {ASC|DESC} {NULLS FIRST|NULLS LAST}` shape). Extracted from
+/// `render_window` so [`render_decimal_avg`] can splice the same OVER text
+/// onto `spark_avg(...)` before the outer Spark-parity CAST — `CAST(...)
+/// OVER (...)` is invalid SQL, so the OVER must land *inside* the CAST.
+fn render_over_clause(
     w: &crate::transpiler_v2::expression::WindowFunction,
     schema: &Schema,
 ) -> Result<String, EmissionError> {
-    let func_sql = render_expr(&w.func, schema)?;
     let mut over = String::from("OVER (");
     let mut had_content = false;
     if !w.partition_by.is_empty() {
@@ -3018,6 +3020,30 @@ fn render_window(
         over.push_str(&format!("{unit_kw} BETWEEN {lo} AND {up}"));
     }
     over.push(')');
+    Ok(over)
+}
+
+/// Render a window function application:
+/// `<func> OVER (PARTITION BY ... ORDER BY ... [frame])`.
+///
+/// Decimal `avg`/`mean` are intercepted before the generic
+/// `render_expr(&w.func)` path: [`render_decimal_avg`] must wrap the whole
+/// `spark_avg(...) OVER (...)` expression in the outer Spark-parity CAST,
+/// since `CAST(...) OVER (...)` is invalid SQL — the generic path below
+/// (which appends OVER after an already-rendered function) cannot produce
+/// that shape.
+fn render_window(
+    w: &crate::transpiler_v2::expression::WindowFunction,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
+    if let Expression::FunctionCall(f) = w.func.as_ref() {
+        if is_decimal_avg(f, schema) {
+            let over = render_over_clause(w, schema)?;
+            return render_decimal_avg(f, Some(&over), schema);
+        }
+    }
+    let func_sql = render_expr(&w.func, schema)?;
+    let over = render_over_clause(w, schema)?;
     Ok(format!("{func_sql} {over}"))
 }
 
@@ -5307,6 +5333,50 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
     Ok(format!("{duck_name}({args_sql})"))
 }
 
+/// Is `f` a single-argument `avg`/`mean` call over a `DECIMAL` argument?
+/// Shared predicate between the grouped ([`render_aggregate`]) and windowed
+/// ([`render_window`]) decimal-avg interception points — `sum`/`try_sum`,
+/// `try_avg`, and integer/float `avg` all return `false` here and keep
+/// their existing (unrelated) emission paths.
+fn is_decimal_avg(f: &FunctionCall, schema: &Schema) -> bool {
+    let lower = f.name.to_ascii_lowercase();
+    matches!(lower.as_str(), "avg" | "mean")
+        && f.args.len() == 1
+        && matches!(f.args[0].data_type(schema), DataType::Decimal { .. })
+}
+
+/// Render a decimal `avg`/`mean` call routed through the ext6 extension's
+/// `spark_avg` aggregate, which returns DECIMAL natively (unlike DuckDB's
+/// native `avg`, which widens a DECIMAL argument to DOUBLE). `over`, when
+/// `Some`, is a pre-rendered `OVER (...)` clause text (from
+/// [`render_over_clause`]) spliced onto `spark_avg(...)` — the OVER must
+/// land *inside* the outer CAST since `CAST(...) OVER (...)` is invalid SQL.
+///
+/// The outer CAST targets the aggregate's Spark-analyzer-declared return
+/// type (`TypeInferenceEngine::aggregate_return_type`'s `AvgLike` formula —
+/// the same source [`render_projection_slot`]/[`spark_return_cast`] use for
+/// their Spark-parity casts). The shipped `spark_avg` already returns this
+/// exact `(precision, scale)` for the corpus's decimal shapes (pass-13
+/// probe), so the CAST is idempotent there; it stays for correctness on any
+/// other precision/scale and to make the emitted type explicit.
+fn render_decimal_avg(
+    f: &FunctionCall,
+    over: Option<&str>,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
+    let arg_type = f.args[0].data_type(schema);
+    let distinct = if f.distinct { "DISTINCT " } else { "" };
+    let arg_sql = render_expr(&f.args[0], schema)?;
+    let inner = format!("spark_avg({distinct}{arg_sql})");
+    let inner = match over {
+        Some(o) => format!("{inner} {o}"),
+        None => inner,
+    };
+    let ret_type =
+        TypeInferenceEngine::aggregate_return_type(&f.name.to_ascii_lowercase(), &arg_type);
+    Ok(format!("CAST({inner} AS {})", render_data_type(&ret_type)))
+}
+
 /// Render an aggregate function call. Primitives (`count`, `sum`, `avg`,
 /// `min`, `max`, `count_distinct`) pass through with Spark-parity CASTs
 /// applied by [`spark_aggregate_return_cast`]. Unknown aggregate names
@@ -5358,6 +5428,18 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         let col = render_expr(&f.args[0], schema)?;
         let q = render_expr(&f.args[1], schema)?;
         return Ok(format!("quantile_cont({col}, CAST({q} AS DOUBLE))"));
+    }
+    // Spark `avg`/`mean` over a DECIMAL argument — DuckDB's native `avg`
+    // returns DOUBLE over a DECIMAL input (precision loss vs Spark, which
+    // widens to a wider DECIMAL per `AggRet::AvgLike`). Route through the
+    // ext6 extension's `spark_avg`, which already returns DECIMAL natively
+    // (re-honors rearchitect ADR-020; `try_avg` from the same extension
+    // family is wired above at the `try_avg` arm). Guard MUST come before
+    // the `"avg" | "mean"` pass-through arm below (else the pass-through
+    // catches it first). Integer/float `avg` and `try_avg` are untouched —
+    // `is_decimal_avg` only fires on a single DECIMAL argument.
+    if is_decimal_avg(f, schema) {
+        return render_decimal_avg(f, None, schema);
     }
     let (duck_name, force_distinct) = match lower.as_str() {
         // Direct pass-through — DuckDB accepts the Spark name unchanged.
@@ -5984,14 +6066,17 @@ fn spark_return_cast(expr_sql: String, expr: &Expression, schema: &Schema) -> St
 /// Aggregate Spark-parity return-type CAST.
 ///
 /// Handles integer SUM/AVG widening (BIGINT), decimal aggregate widening, etc.
-/// In practice τ delegates SUM/AVG to the `thdck_spark_funcs` extension
-/// (`spark_sum`, `spark_avg`) per rearchitect ADR-020, so this function is
-/// currently unwired — but the §5.1 anchor test
+/// In practice τ's decimal `avg`/`mean` delegates to the `thdck_spark_funcs`
+/// extension's `spark_avg` in a dedicated [`render_decimal_avg`] (own outer
+/// CAST, per rearchitect ADR-020); `sum` stays on DuckDB's native pass-through
+/// (already value- and scale-exact over DECIMAL — only Arrow-wire precision
+/// differs, which is harness-invisible). So this function is currently
+/// unwired — but the §5.1 anchor test
 /// (`spark_return_cast_and_spark_aggregate_return_cast_are_distinct`) requires
 /// it to exist as a distinct `fn` item from `spark_return_cast`.
 ///
 /// **§5.1 anchor.** MUST NOT share body with [`spark_return_cast`].
-#[allow(dead_code)] // §5.1 anchor requires the item; extension-delegated aggregates make it unwired.
+#[allow(dead_code)] // §5.1 anchor requires the item; decimal-avg is wired through render_decimal_avg instead.
 fn spark_aggregate_return_cast(agg_sql: String, agg: &FunctionCall, schema: &Schema) -> String {
     let lower = agg.name.to_lowercase();
     if let Some(arg) = agg.args.first() {
@@ -14230,6 +14315,109 @@ mod tests {
             "expected plain division, got: {sql}"
         );
         assert_eq!(sql, "(CAST(6.0 AS DOUBLE)) / (CAST(2.0 AS DOUBLE))");
+    }
+
+    fn decimal_col(name: &str, precision: u8, scale: u8) -> Expression {
+        col_with_type(name, DataType::Decimal { precision, scale })
+    }
+
+    /// Pass 13 — `avg`/`mean` over a DECIMAL argument routes through the
+    /// ext6 extension's `spark_avg` (native DECIMAL) instead of DuckDB's
+    /// native `avg` (widens DECIMAL to DOUBLE), wrapped in the Spark-parity
+    /// outer CAST to the analyzer-declared `AvgLike` type — DECIMAL(9,2) →
+    /// DECIMAL(13,6). Corpus: tpcds-q047/q053/q057/q063/q089, agg-024.
+    #[test]
+    fn avg_of_decimal_routes_through_spark_avg() {
+        let f = fcall("avg", vec![decimal_col("bonus", 9, 2)]);
+        let sql = render_aggregate(&f, &empty_schema()).expect("render avg(decimal)");
+        assert!(
+            sql.contains("spark_avg("),
+            "expected spark_avg(, got: {sql}"
+        );
+        assert!(
+            sql.contains("AS DECIMAL(13, 6)"),
+            "expected AS DECIMAL(13, 6), got: {sql}"
+        );
+    }
+
+    /// Pass 13 — `mean` is Spark's alias for `avg`; same decimal routing.
+    #[test]
+    fn mean_of_decimal_routes_through_spark_avg() {
+        let f = fcall("mean", vec![decimal_col("bonus", 9, 2)]);
+        let sql = render_aggregate(&f, &empty_schema()).expect("render mean(decimal)");
+        assert!(
+            sql.contains("spark_avg("),
+            "expected spark_avg(, got: {sql}"
+        );
+        assert!(
+            sql.contains("AS DECIMAL(13, 6)"),
+            "expected AS DECIMAL(13, 6), got: {sql}"
+        );
+    }
+
+    /// Pass 13 — windowed decimal `avg` must wrap the WHOLE `spark_avg(...)
+    /// OVER (...)` expression in the outer CAST (`CAST(...) OVER (...)` is
+    /// invalid SQL), unlike the generic window path which appends OVER
+    /// after an already-rendered function.
+    #[test]
+    fn windowed_decimal_avg_wraps_spark_avg_over() {
+        use crate::transpiler_v2::expression::WindowFunction;
+        let w = WindowFunction {
+            func: Box::new(Expression::FunctionCall(fcall(
+                "avg",
+                vec![decimal_col("bonus", 9, 2)],
+            ))),
+            partition_by: vec![col_with_type("k", DataType::Integer)],
+            order_by: vec![],
+            frame: None,
+        };
+        let sql = render_window(&w, &empty_schema()).expect("render windowed avg(decimal)");
+        assert_eq!(
+            sql,
+            "CAST(spark_avg(bonus) OVER (PARTITION BY k) AS DECIMAL(13, 6))"
+        );
+    }
+
+    /// Pass 13 — `avg(DISTINCT d)` must propagate `DISTINCT` into
+    /// `spark_avg(DISTINCT ...)`, not drop it.
+    #[test]
+    fn distinct_decimal_avg_propagates_distinct() {
+        let mut f = fcall("avg", vec![decimal_col("bonus", 9, 2)]);
+        f.distinct = true;
+        let sql = render_aggregate(&f, &empty_schema()).expect("render avg(distinct decimal)");
+        assert!(
+            sql.contains("spark_avg(DISTINCT "),
+            "expected spark_avg(DISTINCT , got: {sql}"
+        );
+    }
+
+    /// Pass 13 (negative) — `avg` over a non-DECIMAL (DOUBLE) argument must
+    /// stay on DuckDB's native `avg`, guarding the decimal-only routing
+    /// predicate against over-firing on integer/float `avg`.
+    #[test]
+    fn avg_of_double_stays_native() {
+        let f = fcall("avg", vec![col_with_type("salary", DataType::Double)]);
+        let sql = render_aggregate(&f, &empty_schema()).expect("render avg(double)");
+        assert!(
+            !sql.contains("spark_avg"),
+            "avg(DOUBLE) must stay native, got: {sql}"
+        );
+        assert_eq!(sql, "avg(salary)");
+    }
+
+    /// Pass 13 (negative) — `avg` over an INTEGER argument must also stay on
+    /// DuckDB's native `avg` (Spark's AvgLike over a non-decimal is DOUBLE,
+    /// which DuckDB `avg` already yields): the decimal-only predicate must not
+    /// fire on integer `avg`.
+    #[test]
+    fn avg_of_integer_stays_native() {
+        let f = fcall("avg", vec![col_with_type("cnt", DataType::Integer)]);
+        let sql = render_aggregate(&f, &empty_schema()).expect("render avg(int)");
+        assert!(
+            !sql.contains("spark_avg"),
+            "avg(INT) must stay native, got: {sql}"
+        );
+        assert_eq!(sql, "avg(cnt)");
     }
 
     /// Pass 74 (`agg-013`) — Spark's `percentile_approx(col, q)` returns

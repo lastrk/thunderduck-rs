@@ -678,3 +678,57 @@ red in any later pass.
   Next pass starts with Path A (reuse-first); escalate to Path B only if Path A
   can't match Spark precision. Expected to green these 5 PLUS the decimal-scale
   cluster (q058/q067/q083).
+
+## Pass 13 — 2026-07-11 — decimal-avg type coherence: re-wire shipped spark_avg (B-lite)
+
+- **Baseline (post-Pass-12, commit 6d67c5f):** 1329 passed / 113 failed / 5
+  skipped / 1447 total.
+- **Cluster / root cause:** the decimal-`avg` type-lie behind Pass 12's residual
+  AssertionErrors. Analyzer types `avg(Decimal(p,s))` as Spark's DECIMAL(p+4,s+4)
+  (type_inference.rs AvgLike), but emission passed `avg` through as DuckDB-native
+  `avg`, which returns DOUBLE over DECIMAL — so the projected/derived avg value
+  and type diverged from Spark. Full design: `.agent-output/013-design-avg-coherence.md`.
+- **KEY DISCOVERY (durable):** `spark_avg`/`spark_sum` with DECIMAL overloads
+  ALREADY ship in the ext6 binary (`extensions/ext6/thdck_spark_funcs-v1.5.4-*`,
+  verified via `strings`; contract in `docs/context/dependencies.md:30-32`), and
+  `spark_try_avg`/`spark_try_sum` from the same family are wired today
+  (emission.rs:5451-5452). The τ-side `avg`/`sum` routing was deleted as
+  COLLATERAL in the v2-restart commit `d846663`, not a deliberate revert (it was
+  differential-validated pre-restart, commit 610618b). So this is restoring lost
+  wiring, not new extension work — re-honoring ADR-020.
+- **Decision (user-approved):** Path B-lite (re-wire shipped `spark_avg`) over
+  Path A (compose sum/count/spark_decimal_div). Simpler, native NULL-on-empty,
+  no rounding seam.
+- **Probe P1 (kept test, extension_loader.rs):** loads real ext6, confirms
+  `spark_avg(DECIMAL(9,2))` → native `DECIMAL(13,6)` (== Spark's AvgLike type)
+  both grouped and windowed. So the emission-side outer CAST is a no-op on the
+  canonical shape (no rounding seam). Probe asserts the EXACT (13,6) to guard
+  that invariant against future extension rebuilds.
+- **Fix:** decimal-only `avg`/`mean` (1 arg, `DataType::Decimal`) →
+  `CAST(spark_avg({DISTINCT }x) [OVER (...)] AS DECIMAL(pa,sa))`, `(pa,sa)` from
+  the analyzer's `aggregate_return_type` (so wire schema == emitted type). Hooks:
+  extracted `render_over_clause`, new `render_decimal_avg` + `is_decimal_avg`,
+  guard arm in `render_aggregate`, interception in `render_window` (CAST wraps the
+  whole `spark_avg(...) OVER (...)`). `sum`/`try_sum`/`try_avg`/integer+float
+  `avg` untouched. INV6 `extension_targets()` is an unlanded `todo!()` stub
+  (existing extension arms aren't registered either) — correctly left alone.
+- **Review (`rust-reviewer`, no-tree-mutation brief):** APPROVE-WITH-NITS, 0
+  Critical/High. Verified all 7 focus points (decimal-only predicate; windowed
+  CAST-outside-OVER; type-source coherence analyzer↔emission; DISTINCT; canary
+  safety; INV6; tests). 2 Low nits — BOTH APPLIED: probe tightened to exact
+  `DECIMAL(13,6)`; added `avg_of_integer_stays_native` negative test.
+- **Gate:** 1329→1348 (**Δ +19, zero regressions** — including zero among the 16
+  currently-green cases whose emission changed; canaries tpch-q17/q22,
+  tpcds-q024a/b, q032, q092 all held). SQL corpus 351→364 (+13), DF 393→398 (+5).
+  Newly green (19): tpcds-q047/q053/q057/q063/q089 (the target cluster), agg-024
+  (witness), tpch-q01 (SQL+DF+temp-view), and the co-failure cases
+  tpcds-q007/q009/q013/q018/q026/q027/q028 (SQL and/or DF) that were gated on
+  decimal-avg. `cargo test -p thunderduck-core --lib` 1051 green.
+- **Reflect:** biggest pass of the session — exact-decimal emission matched Spark
+  better than the old double-truncation, and the type-lie was gating far more
+  than the design's conservative +7-8 estimate (many "co-failure" TPC cases were
+  primarily blocked by it). Deferred, distinct root causes for future passes:
+  (1) `sum(Decimal)` → `spark_sum` for strict ADR-020 fidelity (no red cases
+  attributable; left native); (2) the analyzer declared-schema typing cluster
+  (q058/q067/q083/q093/tpch-q11/q061 — τ's AnalyzePlan decimal types differ from
+  Spark's over set-op/rollup-derived inputs; emission changes cannot fix these).

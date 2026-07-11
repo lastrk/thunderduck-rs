@@ -288,7 +288,30 @@ fired for exactly one ref — `dt.d_year` in tpcds-q3/q52 (a folded-aggregate
 that; the re-probe showed ZERO fires → deletion proven safe. Use this
 "prove-it-dead" probe before removing any suspected-dead path.
 
-### Remaining strip-machinery item — `__td_jl`/`__td_jr` (NOT done; own work item)
+### Remaining strip-machinery item — `__td_jl`/`__td_jr` — **DONE 2026-07-11**
+
+**Status: RETIRED.** Executed as a 6-phase, corpus-gated effort on
+`feat/v2-transpiler`, each phase design(opus)→code(sonnet)→review(opus)→
+witness gate (REGRESSIONS 0, 14/14 throughout): Phase 0 `93333f7` (FromScope +
+enum JoinSide, neutral) · Phase 1 `4d8102b` (unique-name drop in the synthetic
+tier — most DataFrame joins stop double-wrapping) · Phase 2+2.1 `2b3d06c`
+(ordinal requalifier + demand-driven wrap; the join-022 collision dance
+collapses; the 2.1 USING-dup-key guard closes the one gap the first attempt
+surfaced, live-DuckDB-validated) · Phase 3a `b85590e` (condition plan_id
+resolution unified, `qualify_plan_id_refs` deleted; un-realiased self-join now
+raises Spark-parity `AMBIGUOUS_COLUMN_REFERENCE` — new green witness join-024)
+· Phase 3b `f431044` (above-join refs bare+ordinal; synthetic resolver arm
+collapses to the F13 rejection; new data-flip witnesses join-025/026) ·
+Phase 4 `1b7bf0a` (prove-dead-then-delete: rung-1 probe showed ZERO fires
+corpus-wide → the whole `mark_join_alias_requirements` post-pass, the
+`*_requires_synthetic` flags, and rung-1 deleted; net −444 lines).
+Role 2 (a wrapped derived table needs *an* alias) remains by design —
+`TD_JOIN_LEFT/RIGHT` survive only as emission wrap-alias names, plus the F13
+user-typed-reserved-qualifier rejection. The analyzer is single-pass again
+(ADR-006 restored). Design specs: tasks/phase2-design.md,
+tasks/phase3a-design.md, tasks/phase3b-design.md (incl. the Phase-4 charter).
+
+The original scoping analysis (kept for the record):
 
 ADR-023 (line 637/659) also lists the `__td_jl`/`__td_jr` synthetic-alias
 machinery for retirement. This was scoped and deliberately left as a separate

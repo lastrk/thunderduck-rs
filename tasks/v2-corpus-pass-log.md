@@ -896,3 +896,27 @@ red in any later pass.
   batches: 4 (positive, bit_get), 5 (substring_index, count(DISTINCT a,b)),
   6 (to_char date-form). Then the hard from_json DataFrame-API case + TPC
   AssertionErrors + singletons (Tail, json_tuple, alter_table, Array type).
+
+## Pass 19 — 2026-07-11 — scalar-function batches 4+6: positive / bit_get / to_char
+
+- **Baseline (post-Pass-18, commit 2ff1510):** 1375 passed / 67 failed.
+- **Root cause:** 3 feature-family functions with no type_inference entry
+  (analyzer `unresolved type` boundary). Survey batches 4 (positive, bit_get) +
+  6 (to_char) — combined as one easy pass.
+- **Fix:** type_inference.rs — positive → first-arg type (mirrors negative),
+  bit_get/getbit → Byte, to_char folded into the date_format String arm.
+  emission.rs — positive → `(x)`; bit_get → `CAST(((x >> pos) & 1) AS TINYINT)`;
+  to_char → strftime via the shared `spark_fmt_to_duckdb` helper (mirrors
+  date_format, date-form only — corpus has no number-format arg). 6 unit tests.
+- **Review:** documented-skip (additive boundary expansion, unit-locked, DuckDB
+  shapes verified against the live duckdb binary; all 3 confirmed end-to-end).
+- **Gate:** 1375→1378 (**Δ +3, zero regressions**). Newly green: test_positive,
+  test_bit_get, test_to_char. `cargo test -p thunderduck-core --lib` 1085.
+- **Follow-up noted (out of scope):** `negative`/`negate` has a type arm but NO
+  emission arm → would emit invalid `negative(x)`; no current witness. Batch with
+  a future scalar pass.
+- **Reflect:** scalar-function tail nearly done — batches 1/2/3/4/6 landed (12
+  functions, +12 total). Remaining: batch 5 (substring_index emulation +
+  count(DISTINCT a,b) null-guarded ROW — the two MODERATE ones), then the hard
+  from_json DataFrame-API case, ~32 TPC AssertionErrors, and singletons
+  (RelType::Tail, json_tuple, alter_table, Array-type, RelType::Sql, Parser).

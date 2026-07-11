@@ -3732,6 +3732,16 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let duck_fmt = spark_fmt_to_duckdb(&fmt);
             return Ok(format!("strftime({d}, {duck_fmt})"));
         }
+        // Spark's `to_char(x, fmt)` — corpus witness is the DATE form (a
+        // number-format model would need its own translation and is out of
+        // scope here). DuckDB has no native `to_char`; mirror `date_format`
+        // above via `strftime` + the shared Spark→DuckDB token helper.
+        // Corpus: `test_to_char` (test_string_collection_differential).
+        "to_char" if f.args.len() == 2 => {
+            let [d, fmt] = rendered_args(f, schema)?;
+            let duck_fmt = spark_fmt_to_duckdb(&fmt);
+            return Ok(format!("strftime({d}, {duck_fmt})"));
+        }
         // Spark's `trunc(date, format)` → DuckDB `date_trunc(format, date)`.
         // Spark's arg order is (date, fmt); DuckDB's is (fmt, date).
         "trunc" if f.args.len() == 2 => {
@@ -4114,6 +4124,23 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         "sign" | "signum" => {
             let [a] = min_args(f, schema, "`signum` requires at least 1 argument")?;
             return Ok(format!("CAST(sign({a}) AS DOUBLE)"));
+        }
+        // Spark's `positive(x)` (`UnaryPositive`) is the identity — DuckDB
+        // has no native `positive` scalar, so emit the argument unchanged
+        // (parenthesized). Corpus: `test_positive`
+        // (test_math_bitwise_date_differential).
+        "positive" => {
+            let [a] = exact_args(f, schema, "`positive` requires exactly 1 argument")?;
+            return Ok(format!("({a})"));
+        }
+        // Spark's `bit_get`/`getbit(x, pos)` return the bit at 0-indexed
+        // `pos` (from the LSB) of integral `x`, as a Byte (TINYINT). DuckDB
+        // has no integral `bit_get` (`get_bit` only accepts BIT); compose
+        // via shift + mask, cast to TINYINT to match type_inference. Corpus:
+        // `test_bit_get` (test_math_bitwise_date_differential).
+        "bit_get" | "getbit" => {
+            let [x, pos] = exact_args(f, schema, "`bit_get` requires exactly 2 arguments")?;
+            return Ok(format!("CAST((({x} >> {pos}) & 1) AS TINYINT)"));
         }
         // Spark's `make_dt_interval([days[, hours[, mins[, secs]]]])` builds a
         // day-time INTERVAL. DuckDB has no `make_dt_interval` scalar but
@@ -12963,6 +12990,21 @@ mod tests {
         assert!(sql.contains("'yyyy/MM/dd'"));
     }
 
+    /// `test_to_char` (test_string_collection_differential): the corpus
+    /// witness is `to_char(dt, 'yyyy-MM-dd')` on a DATE column. DuckDB has
+    /// no native `to_char`; τ mirrors `date_format`'s `strftime` +
+    /// Spark→DuckDB token translation.
+    #[test]
+    fn render_to_char_date_form_translates_to_strftime() {
+        let sql = render_fn(
+            "to_char",
+            vec![col_with_type("dt", DataType::Date), str_lit("yyyy-MM-dd")],
+        );
+        assert!(sql.starts_with("strftime(dt, "), "sql = {sql}");
+        assert!(sql.contains("'yyyy'"));
+        assert!(sql.contains("'%Y'"));
+    }
+
     #[test]
     fn render_btrim_one_arg_renames_to_trim() {
         let sql = render_fn("btrim", vec![col_ref_expr("s")]);
@@ -13780,6 +13822,31 @@ mod tests {
              WHEN isnan(CAST((x) AS DOUBLE)) THEN CAST(0 AS BIGINT) \
              ELSE CAST(ceil(x) AS BIGINT) END"
         );
+    }
+
+    /// `test_positive` (test_math_bitwise_date_differential): Spark's
+    /// `positive(x)` (`UnaryPositive`) is the identity — DuckDB has no
+    /// native `positive` scalar, so τ emits the argument unchanged.
+    #[test]
+    fn render_positive_is_identity() {
+        let sql = render_fn("positive", vec![double_lit(10.5)]);
+        assert_eq!(sql, "(CAST(10.5 AS DOUBLE))");
+    }
+
+    /// `test_bit_get` (test_math_bitwise_date_differential): Spark's
+    /// `bit_get(x, pos)` returns the bit at 0-indexed `pos` (from the LSB)
+    /// of integral `x` as a Byte (TINYINT). DuckDB has no integral
+    /// `bit_get`; τ composes shift + mask + cast.
+    #[test]
+    fn render_bit_get_shifts_masks_and_casts_to_tinyint() {
+        let sql = render_fn("bit_get", vec![col_ref_expr("id"), int_lit(1)]);
+        assert_eq!(sql, "CAST(((id >> 1) & 1) AS TINYINT)");
+    }
+
+    #[test]
+    fn render_getbit_alias_matches_bit_get() {
+        let sql = render_fn("getbit", vec![col_ref_expr("id"), int_lit(2)]);
+        assert_eq!(sql, "CAST(((id >> 2) & 1) AS TINYINT)");
     }
 
     /// `intv-003` regression: `make_dt_interval(1, 2, 30, 0)` — DuckDB has no

@@ -601,6 +601,10 @@ impl TypeInferenceEngine {
             // `dataType` equals the child type (int→int, decimal→decimal).
             // Corpus: `num-008`.
             "negative" | "negate" => first_arg_or(Unresolved),
+            // Spark's `positive(x)` (`UnaryPositive`) is the identity —
+            // `dataType` equals the child type, mirroring `negative` above.
+            // Corpus: `test_positive` (test_math_bitwise_date_differential).
+            "positive" => first_arg_or(Unresolved),
             "factorial" => Long,
             // `mod(a, b)` / `pmod(a, b)` — when BOTH operands are Decimal,
             // Spark's `Remainder`/`Pmod` result decimal type widens per
@@ -644,6 +648,11 @@ impl TypeInferenceEngine {
             "shiftleft" | "shiftright" | "shiftrightunsigned" | "bitwise_and" | "bitwise_or"
             | "bitwise_xor" | "bitwise_not" | "bit_count" | "bit_length_arg" | "bitwise_or_agg"
             | "&" | "|" | "^" | "bitwiseand" | "bitwiseor" | "bitwisexor" => first_arg_or(Integer),
+            // Spark's `bit_get(x, pos)`/`getbit(x, pos)` return the bit at
+            // 0-indexed `pos` (from the LSB) of the integral `x`, as a Byte
+            // (TINYINT) — independent of `x`'s own width. Corpus:
+            // `test_bit_get` (test_math_bitwise_date_differential).
+            "bit_get" | "getbit" => Byte,
 
             // ── Date/time functions ──────────────────────────────────────
             "current_date" => Date,
@@ -667,7 +676,12 @@ impl TypeInferenceEngine {
             // format `yyyy-MM-dd HH:mm:ss`), not Timestamp. `dayname`/
             // `monthname` return the day-of-week / month name as String
             // (DuckDB-native — emission passes them through unchanged).
-            "from_unixtime" | "date_format" | "date_part" | "dayname" | "monthname" => String,
+            // `to_char(x, fmt)` formats `x` (date/timestamp form, per the
+            // corpus witness) as a String, mirroring `date_format` below.
+            // Corpus: `test_to_char` (test_string_collection_differential).
+            "from_unixtime" | "date_format" | "date_part" | "dayname" | "monthname" | "to_char" => {
+                String
+            }
             // `unix_timestamp` returns Long (BIGINT) in Spark; the other
             // date-field extractors (`year`, `month`, `hour`, …) return
             // Integer. Keep them separate.
@@ -1681,6 +1695,41 @@ mod tests {
     fn try_divide_returns_double_for_integers() {
         assert_eq!(frt("try_divide", &[DataType::Integer]), DataType::Double);
         assert_eq!(frt("try_divide", &[DataType::Long]), DataType::Double);
+    }
+
+    /// `test_positive` (test_math_bitwise_date_differential): Spark's
+    /// `positive(x)` (`UnaryPositive`) is the identity — dataType == child,
+    /// mirroring `negative` above.
+    #[test]
+    fn positive_preserves_arg_type() {
+        assert_eq!(frt("positive", &[DataType::Double]), DataType::Double);
+        assert_eq!(frt("positive", &[DataType::Integer]), DataType::Integer);
+    }
+
+    /// `test_bit_get` (test_math_bitwise_date_differential): Spark's
+    /// `bit_get`/`getbit(x, pos)` return the bit as a Byte (TINYINT),
+    /// independent of `x`'s own type.
+    #[test]
+    fn bit_get_returns_byte() {
+        assert_eq!(
+            frt("bit_get", &[DataType::Integer, DataType::Integer]),
+            DataType::Byte
+        );
+        assert_eq!(
+            frt("getbit", &[DataType::Long, DataType::Integer]),
+            DataType::Byte
+        );
+    }
+
+    /// `test_to_char` (test_string_collection_differential): the corpus
+    /// witness is the DATE form; return type is String regardless of the
+    /// input's own type, mirroring `date_format`.
+    #[test]
+    fn to_char_returns_string() {
+        assert_eq!(
+            frt("to_char", &[DataType::Date, DataType::String]),
+            DataType::String
+        );
     }
 
     #[test]

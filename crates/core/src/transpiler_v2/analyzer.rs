@@ -129,25 +129,6 @@ macro_rules! scope_passthrough {
     };
 }
 
-/// Which side of a join a plan_id-bound range belongs to. Replaces the
-/// `&'static str` side marker in `RelScope::plan_ids`. Phase 0: maps to the
-/// SAME synthetic emission qualifier via `qualifier()`; the TD_JOIN_* strings
-/// are NOT removed here, only the stringly-typed marker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum JoinSide {
-    Left,
-    Right,
-}
-
-impl JoinSide {
-    fn qualifier(self) -> &'static str {
-        match self {
-            JoinSide::Left => TD_JOIN_LEFT,
-            JoinSide::Right => TD_JOIN_RIGHT,
-        }
-    }
-}
-
 /// The alias scope a relation's OUTPUT exposes: which qualifiers (table
 /// names, user aliases, lateral-view table aliases) bind to which contiguous
 /// field ranges of the node's `resolved_schema`, plus the plan_id →
@@ -159,14 +140,13 @@ impl JoinSide {
 pub struct RelScope {
     /// `(qualifier, field-range)` bindings, in tree order.
     pub aliases: Vec<(String, std::ops::Range<usize>)>,
-    /// `(plan_id, field-range, JoinSide)` bindings, OUTERMOST join first —
+    /// `(plan_id, field-range)` bindings, OUTERMOST join first —
     /// [`RelScope::lookup_plan_id`] uses first match, so the nearest
-    /// enclosing join's side qualifier wins. The third element is which
-    /// side of the enclosing join the range belongs to; emission renders
-    /// its [`JoinSide::qualifier`] so DuckDB resolves the reference against
-    /// the correct side of the enclosing join's `(left) AS __td_jl …
-    /// (right) AS __td_jr` FROM.
-    pub(crate) plan_ids: Vec<(i64, std::ops::Range<usize>, JoinSide)>,
+    /// enclosing join's range wins. Phase 3b: no side tag — `resolve_column`
+    /// always binds a plan_id ref bare (qualifier `None`) plus the ordinal
+    /// into the emitting operator's schema; emission derives which side to
+    /// bind against positionally (see the module's governing invariant).
+    pub(crate) plan_ids: Vec<(i64, std::ops::Range<usize>)>,
     /// plan_ids bound on BOTH the left AND right side of the SAME join —
     /// the un-realiased self-join `df.join(df, ...)` reusing the identical
     /// underlying relation on both sides without a fresh alias. Any
@@ -236,16 +216,15 @@ impl RelScope {
         }
     }
 
-    /// The field range and join-side qualifier a plan_id maps to. When a
-    /// plan_id appears in multiple ancestor joins (nested join trees), the
-    /// OUTERMOST entry wins — [`RelScope::of`] pushes parent entries before
-    /// child entries, so the first match carries the qualifier in scope at
-    /// the parent operator's resolution point.
-    fn lookup_plan_id(&self, pid: i64) -> Option<(std::ops::Range<usize>, JoinSide)> {
+    /// The field range a plan_id maps to. When a plan_id appears in multiple
+    /// ancestor joins (nested join trees), the OUTERMOST entry wins —
+    /// [`RelScope::of`] pushes parent entries before child entries, so the
+    /// first match wins at the parent operator's resolution point.
+    fn lookup_plan_id(&self, pid: i64) -> Option<std::ops::Range<usize>> {
         self.plan_ids
             .iter()
-            .find(|(id, _, _)| *id == pid)
-            .map(|(_, range, qualifier)| (range.clone(), *qualifier))
+            .find(|(id, _)| *id == pid)
+            .map(|(_, range)| range.clone())
     }
 
     /// `true` iff `pid` is bound on both sides of the SAME join (see
@@ -346,11 +325,11 @@ impl RelScope {
 
                 let mut plan_ids = Vec::new();
                 for &pid in left_plan_ids {
-                    plan_ids.push((pid, left_range.clone(), JoinSide::Left));
+                    plan_ids.push((pid, left_range.clone()));
                 }
                 if keep_right {
                     for &pid in right_plan_ids {
-                        plan_ids.push((pid, right_range.clone(), JoinSide::Right));
+                        plan_ids.push((pid, right_range.clone()));
                     }
                 }
                 plan_ids.extend(left.scope.plan_ids.iter().cloned());
@@ -364,7 +343,7 @@ impl RelScope {
                             .scope
                             .plan_ids
                             .iter()
-                            .map(|(pid, r, side)| (*pid, offset(r), *side)),
+                            .map(|(pid, r)| (*pid, offset(r))),
                     );
                     ambiguous_plan_ids.extend(right.scope.ambiguous_plan_ids.iter().copied());
                     aliases.extend(
@@ -1258,6 +1237,16 @@ pub fn analyze(ast: CommonAst, base_types: &BaseTypes) -> Result<TypedAst, Analy
 /// recursively with fresh demand state. (A correlated inner reference to an
 /// OUTER join's synthetic alias is not propagated — matching today's
 /// resolution scoping, which never stamps one.)
+///
+/// Vestigial post-Phase-3b: `resolve_column`'s plan_id arm now ALWAYS
+/// returns a bare qualifier (§1.1) and `ResolveContext::for_join_condition`
+/// no longer binds a scope for `__td_jl`/`__td_jr` (§1.3), so no production
+/// resolution path stamps a synthetic qualifier anymore — `synthetic_uses`
+/// can only fire on a hand-built test AST or a literal user-typed reserved
+/// qualifier (rejected by F13 before it ever reaches a passthrough). This
+/// pass, the two `TypedOp::Join` flags, `build_join_side`'s rung 1, and
+/// `apply_duplicate_alias_guard`'s flag parameters are all now dead weight —
+/// Phase 4 deletes them.
 fn mark_join_alias_requirements(node: &mut TypedAst) {
     mark_node(node, false, false);
 }
@@ -3978,8 +3967,11 @@ impl<'a> ResolveContext<'a> {
     /// Binds the join's OWN `left_plan_ids`/`right_plan_ids` first (mirroring
     /// [`RelScope::of`]'s Join arm so lookup's first-match picks the nearest
     /// side), then both children's alias/plan_id scopes at their positional
-    /// offsets, plus the synthetic `__td_jl` / `__td_jr` qualifiers (whole-side
-    /// ranges) — shared with the above-join `resolve_column` plan_id arm.
+    /// offsets. Phase 3b: no synthetic `__td_jl`/`__td_jr` whole-side aliases
+    /// are pushed anymore — this composite scope exists only to offset-merge
+    /// the two sides' own aliases/plan_ids into one range space; a plan_id
+    /// ref resolves bare+ordinal via [`resolve_column`]'s plan_id arm exactly
+    /// as it would above the join.
     ///
     /// Deliberately diverges from [`RelScope::of`]: there is NO `keep_right`
     /// gate here — the condition resolves against the full merged schema
@@ -4009,10 +4001,10 @@ impl<'a> ResolveContext<'a> {
         let right_range = left_len..left_len + right_len;
         let mut plan_ids = Vec::new();
         for &pid in left_plan_ids {
-            plan_ids.push((pid, left_range.clone(), JoinSide::Left));
+            plan_ids.push((pid, left_range.clone()));
         }
         for &pid in right_plan_ids {
-            plan_ids.push((pid, right_range.clone(), JoinSide::Right));
+            plan_ids.push((pid, right_range.clone()));
         }
         plan_ids.extend(left.scope.plan_ids.iter().cloned());
         plan_ids.extend(
@@ -4020,7 +4012,7 @@ impl<'a> ResolveContext<'a> {
                 .scope
                 .plan_ids
                 .iter()
-                .map(|(pid, r, side)| (*pid, offset(r), *side)),
+                .map(|(pid, r)| (*pid, offset(r))),
         );
         let mut ambiguous_plan_ids: Vec<i64> = left_plan_ids
             .iter()
@@ -4029,8 +4021,6 @@ impl<'a> ResolveContext<'a> {
             .collect();
         ambiguous_plan_ids.extend(left.scope.ambiguous_plan_ids.iter().copied());
         ambiguous_plan_ids.extend(right.scope.ambiguous_plan_ids.iter().copied());
-        aliases.push((TD_JOIN_LEFT.to_owned(), 0..left_len));
-        aliases.push((TD_JOIN_RIGHT.to_owned(), left_len..left_len + right_len));
         Self {
             schema,
             scopes: std::borrow::Cow::Owned(RelScope {
@@ -4083,10 +4073,10 @@ impl<'a> ResolveContext<'a> {
         })
     }
 
-    /// Look up a plan_id's field range and join-side qualifier, with the
-    /// same out-of-bounds guard as [`scoped_range`](Self::scoped_range).
-    fn plan_id_lookup(&self, pid: i64) -> Option<(std::ops::Range<usize>, JoinSide)> {
-        self.scopes.lookup_plan_id(pid).filter(|(range, _)| {
+    /// Look up a plan_id's field range, with the same out-of-bounds guard as
+    /// [`scoped_range`](Self::scoped_range).
+    fn plan_id_lookup(&self, pid: i64) -> Option<std::ops::Range<usize>> {
+        self.scopes.lookup_plan_id(pid).filter(|range| {
             let in_bounds = range.end <= self.schema.len();
             debug_assert!(
                 in_bounds,
@@ -4245,17 +4235,13 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     // it catches ambiguity everywhere a column reference is resolved
     // (projections, filters, sort keys, join conditions, ...), not just in
     // join conditions.
-    // Synthetic __td_jl / __td_jr qualifiers no longer arrive from any
-    // production pre-pass (Phase 3a routes condition plan_id refs through
-    // the shared plan_id arm below); this branch now fires only for a
-    // user-typed reserved qualifier (F13) or a hand-built test condition.
-    // When it does, nullability/type must be resolved against the correct
-    // SIDE via `ctx.scopes` (populated by
-    // `ResolveContext::for_join_condition` with whole-side ranges). A miss
-    // (`scoped_range` None, or name absent from the side) is now a clean
-    // `UnknownColumn` — a user-typed reserved qualifier `__td_jl`/`__td_jr`
-    // outside a join condition is rejected (Spark parity:
-    // UNRESOLVED_COLUMN), not silently resolved by name (F13).
+    // Phase 3b: `ResolveContext::for_join_condition` no longer binds a scope
+    // for `__td_jl`/`__td_jr` (condition plan_id refs resolve through the
+    // shared plan_id arm below, bare+ordinal). A qualifier spelled
+    // `__td_jl`/`__td_jr` can therefore only be a user-typed reserved
+    // qualifier (F13) or a hand-built test AST — the analyzer never binds a
+    // scope for it, so it is rejected unconditionally below rather than
+    // falling through to tier (f)'s permissive name-only fallback.
     let is_synthetic_join_qualifier = matches!(
         u.qualifier.as_deref(),
         Some(TD_JOIN_LEFT) | Some(TD_JOIN_RIGHT)
@@ -4286,34 +4272,22 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                     name: u.name.clone(),
                 });
             }
-            if let Some((range, side_qualifier)) = ctx.plan_id_lookup(pid) {
+            if let Some(range) = ctx.plan_id_lookup(pid) {
                 let info =
                     TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range.clone()]);
                 if let Some((dt, nullable)) = info {
                     let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
                         .map(|i| range.start + i);
-                    // Only stamp the join-side qualifier when the column
-                    // name is AMBIGUOUS in the full schema (appears on
-                    // both sides of the join). Unambiguous names must NOT
-                    // be qualified — they resolve by name in any FROM
-                    // scope, and every stamped synthetic qualifier obliges
-                    // emission (via the `mark_join_alias_requirements`
-                    // flags) to pin that join side under its `__td_jl` /
-                    // `__td_jr` alias instead of hoisting the user's.
-                    let is_ambiguous = ctx
-                        .schema
-                        .fields
-                        .iter()
-                        .filter(|f| f.name.eq_ignore_ascii_case(&u.name))
-                        .count()
-                        > 1;
+                    // Phase 3b (governing invariant): always bare — a
+                    // plan_id-scoped ref binds by ORDINAL into the emitting
+                    // operator's schema, never by a stamped join-side
+                    // qualifier. Emission binds `ColumnReference{qualifier:
+                    // None, ordinal: Some(k)}` positionally against
+                    // `input.resolved_schema.fields[k]`, whether or not the
+                    // name is duplicated elsewhere in the schema.
                     return Ok(Expression::ColumnReference(ColumnReference {
                         name: u.name,
-                        qualifier: if is_ambiguous {
-                            Some(side_qualifier.qualifier().to_owned())
-                        } else {
-                            None
-                        },
+                        qualifier: None,
                         data_type: Some(dt),
                         nullable: Some(nullable),
                         ordinal,
@@ -4343,75 +4317,17 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
             });
         }
     }
-    let (dt, nullable, ordinal) = if is_synthetic_join_qualifier {
-        let q = u.qualifier.as_deref().unwrap_or_default();
-        // `scoped_range` mirrors tier (e) below: `q` spells a reserved
-        // synthetic qualifier (`__td_jl`/`__td_jr`), but the analyzer only
-        // ever binds a scope for it inside a join condition, via
-        // `ResolveContext::for_join_condition`. Both misses below therefore
-        // mean the same thing — an untrusted, user-typed reference to a
-        // reserved qualifier the analyzer never stamped a scope for — so
-        // both reject with `UnknownColumn` (Spark itself raises
-        // `UNRESOLVED_COLUMN` for e.g. `col("__td_jl.x")`) rather than
-        // falling back to a permissive name-only lookup that would later
-        // trip `mark_node`'s join-side bookkeeping on a column the join
-        // never introduced (F13).
-        match ctx.scoped_range(q) {
-            Some(range) => {
-                match TypeInferenceEngine::column_info_in(
-                    &u.name,
-                    &ctx.schema.fields[range.clone()],
-                ) {
-                    Some((dt, nullable)) => {
-                        let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
-                            .map(|i| range.start + i);
-                        // ADR-023 Phase 1: a synthetic join-side qualifier whose column name
-                        // is UNIQUE in the merged condition schema needs no side alias — the
-                        // bare name binds positionally in the merged FROM. Drop it (mirrors
-                        // tier-(e) 3e-ii and the above-join plan_id arm) so `mark_node` stamps
-                        // no `*_requires_synthetic` demand and the side inlines. Ambiguous
-                        // names (self-join / dup key) keep the synthetic qualifier and stay on
-                        // the wrap path.
-                        let name_count = ctx
-                            .schema
-                            .fields
-                            .iter()
-                            .filter(|f| f.name.eq_ignore_ascii_case(&u.name))
-                            .count();
-                        if name_count == 1 {
-                            if let Some(k) = ordinal {
-                                let f = &ctx.schema.fields[k];
-                                return Ok(Expression::ColumnReference(ColumnReference {
-                                    name: u.name,
-                                    qualifier: None,
-                                    ordinal: Some(k),
-                                    data_type: Some(f.data_type.clone()),
-                                    nullable: Some(f.nullable),
-                                }));
-                            }
-                        }
-                        (dt, nullable, ordinal)
-                    }
-                    // `q` is a real synthetic side scope but `name` is not on it.
-                    None => {
-                        return Err(AnalyzerError::UnknownColumn {
-                            name: u.name.clone(),
-                            qualifier: u.qualifier.clone(),
-                        });
-                    }
-                }
-            }
-            // `q` is `__td_jl`/`__td_jr` by spelling but binds no synthetic
-            // side scope — a user-typed reserved qualifier outside a join
-            // condition.
-            None => {
-                return Err(AnalyzerError::UnknownColumn {
-                    name: u.name.clone(),
-                    qualifier: u.qualifier.clone(),
-                });
-            }
-        }
-    } else if let Some(q) = u.qualifier.as_deref() {
+    if is_synthetic_join_qualifier {
+        // F13: reserved emission-namespace qualifier. The analyzer never binds a
+        // scope for __td_jl/__td_jr (Phase 3b); reject unconditionally (Spark
+        // parity: UNRESOLVED_COLUMN), never fall through to tier (f)'s
+        // permissive name-only fallback.
+        return Err(AnalyzerError::UnknownColumn {
+            name: u.name,
+            qualifier: u.qualifier,
+        });
+    }
+    let (dt, nullable, ordinal) = if let Some(q) = u.qualifier.as_deref() {
         // Qualified, non-synthetic: (d) a qualifier naming a top-level STRUCT
         // column wins over a relation-alias scope — struct-field access takes
         // precedence, matching the pre-existing behavior this pass preserves.
@@ -6188,20 +6104,13 @@ mod tests {
             .scope
             .plan_ids
             .iter()
-            .filter(|(pid, _, _)| *pid == 1)
+            .filter(|(pid, _)| *pid == 1)
             .collect();
         assert_eq!(pid1_entries.len(), 2);
         // Outermost entry first: whole left side of the OUTER join (0..6).
         assert_eq!(pid1_entries[0].1, 0..6);
-        assert_eq!(pid1_entries[0].2, JoinSide::Left);
         // Inner join's entry (0..4) follows.
         assert_eq!(pid1_entries[1].1, 0..4);
-    }
-
-    #[test]
-    fn join_side_qualifier_maps_to_synthetic_emission_alias() {
-        assert_eq!(JoinSide::Left.qualifier(), TD_JOIN_LEFT);
-        assert_eq!(JoinSide::Right.qualifier(), TD_JOIN_RIGHT);
     }
 
     #[test]
@@ -6331,15 +6240,15 @@ mod tests {
     }
 
     #[test]
-    fn adr023_phase1_dup_name_condition_still_wraps() {
+    fn adr023_phase1_dup_name_condition_resolves_bare_ordinal() {
         let bt = base_types_with_emp_dept();
-        // `dept_id` is duplicated across emp/dept — the synthetic qualifier
-        // must be KEPT on the resolved refs (Phase 1, unaffected: emission's
-        // `requalify_join_condition` positional rewrite depends on it). But
-        // ADR-023 Phase 2 narrows `mark_node`'s Join arm to ANCESTOR-only
-        // demands — this join's OWN condition is the only demand present,
-        // so the flags themselves now stay clear; the side wrap (if any)
-        // is decided at emission time instead, positionally.
+        // `dept_id` is duplicated across emp/dept. Phase 3b: the plan_id arm
+        // ALWAYS returns bare qualifier + ordinal (never a stamped
+        // `__td_jl`/`__td_jr` side qualifier) — emission binds the ref
+        // positionally against the merged condition schema instead
+        // (`requalify_column_ref`'s `is_left = k < left_len` split). The
+        // join's own condition sets no flags either way (ANCESTOR-only
+        // `mark_node` narrowing, unaffected by this change).
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("dept_id", 1)),
@@ -6348,8 +6257,10 @@ mod tests {
         let typed = analyze(plan_id_join(Some(cond)), &bt).unwrap();
         assert_eq!(join_flags(&typed), (false, false));
         let (l, r) = join_condition_refs(&typed);
-        assert_eq!(l.qualifier.as_deref(), Some(TD_JOIN_LEFT));
-        assert_eq!(r.qualifier.as_deref(), Some(TD_JOIN_RIGHT));
+        assert_eq!(l.qualifier, None);
+        assert_eq!(l.ordinal, Some(2));
+        assert_eq!(r.qualifier, None);
+        assert_eq!(r.ordinal, Some(4));
     }
 
     #[test]
@@ -6357,14 +6268,11 @@ mod tests {
         let bt = base_types_with_emp_dept();
         // Self-join emp(plan_id=1) ⋈ emp(plan_id=2) ON id==id — `id` is
         // duplicated in the merged self-join schema, so it stays genuinely
-        // ambiguous and must not have its synthetic qualifier dropped
-        // (Phase 1, unaffected). But ADR-023 Phase 2 narrows `mark_node`'s
-        // Join arm to ANCESTOR-only demands — this join's OWN condition is
-        // the only demand present, so the flags themselves now stay clear;
-        // emission's `requalify_join_condition` resolves the condition
-        // positionally instead, wrapping under a fresh alias only if
-        // needed (a self-join, both sides bare `emp`, is exactly the
-        // "duplicate-alias guard" shape).
+        // ambiguous by NAME. Phase 3b: the plan_id arm nonetheless ALWAYS
+        // returns bare qualifier + ordinal — the ordinal alone (0 vs. 4)
+        // disambiguates the side; emission binds positionally instead of via
+        // a stamped synthetic qualifier. The join's own condition still sets
+        // no flags (ANCESTOR-only `mark_node` narrowing, unaffected).
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("id", 1)),
@@ -6381,8 +6289,10 @@ mod tests {
         let typed = analyze(joined, &bt).unwrap();
         assert_eq!(join_flags(&typed), (false, false));
         let (l, r) = join_condition_refs(&typed);
-        assert_eq!(l.qualifier.as_deref(), Some(TD_JOIN_LEFT));
-        assert_eq!(r.qualifier.as_deref(), Some(TD_JOIN_RIGHT));
+        assert_eq!(l.qualifier, None);
+        assert_eq!(l.ordinal, Some(0));
+        assert_eq!(r.qualifier, None);
+        assert_eq!(r.ordinal, Some(4));
     }
 
     #[test]
@@ -6413,8 +6323,13 @@ mod tests {
             left: Box::new(qcol("emp", "dept_id")),
             right: Box::new(qcol("dept", "dept_id")),
         });
-        // …but the Project above (through a Filter passthrough) references
-        // the ambiguous `dept_id` with a plan_id → `__td_jl.dept_id` demand.
+        // …and Phase 3b: the ancestor Project's plan_id-tagged `dept_id`
+        // reference (through the Filter passthrough) ALSO never stamps a
+        // synthetic qualifier anymore — the plan_id arm always resolves
+        // bare+ordinal, so `mark_node` never sees a `__td_jl`/`__td_jr`
+        // qualifier to propagate. Both flags stay clear at every level; the
+        // ordinal alone (2, into the merged emp⋈dept schema, emp's
+        // `dept_id`) is the vestigial above-join disambiguation witness.
         let filtered = CommonAst::new(CommonOp::Filter {
             input: Box::new(plan_id_join(Some(cond))),
             condition: Expression::Binary(BinaryExpression {
@@ -6429,20 +6344,24 @@ mod tests {
         });
         let typed = analyze(ast, &bt).unwrap();
         // Walk Project → Filter → Join and check the stamped flags.
-        let TypedOp::Project { input, .. } = &typed.op else {
+        let TypedOp::Project {
+            input, projections, ..
+        } = &typed.op
+        else {
             panic!("expected Project");
         };
+        let Expression::ColumnReference(proj_ref) = &projections[0] else {
+            panic!(
+                "expected resolved ColumnReference, got {:?}",
+                projections[0]
+            );
+        };
+        assert_eq!(proj_ref.qualifier, None);
+        assert_eq!(proj_ref.ordinal, Some(2));
         let TypedOp::Filter { input, .. } = &input.op else {
             panic!("expected Filter");
         };
-        let (left_flag, right_flag) = join_flags(input);
-        assert!(
-            left_flag,
-            "ancestor __td_jl demand must reach the join through the Filter"
-        );
-        // The condition resolved via table-name qualifiers (no synthetic
-        // stamps), and no ancestor demands the right side.
-        assert!(!right_flag);
+        assert_eq!(join_flags(input), (false, false));
     }
 
     #[test]
@@ -6458,10 +6377,11 @@ mod tests {
             right: Box::new(qcol("dept", "dept_id")),
         });
         let inner = join(emp_scan(), scan("dept"), JoinType::Inner, Some(inner_cond));
-        // ADR-023 Phase 2: the outer join's OWN condition (pid-7/8) is its
-        // own demand and no longer sets its flags by itself — an ANCESTOR
-        // Filter re-demanding pid-7's `dept_id` (below) is what legitimately
-        // sets `outer_left` now.
+        // Phase 3b: the outer join's OWN condition (pid-7/8) never stamps a
+        // synthetic qualifier — the plan_id arm always resolves bare+ordinal.
+        // No ancestor demand can set the flags either: they stay clear at
+        // every level, including through the ancestor Filter's own pid-7
+        // `dept_id` reference below.
         let outer_cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(pcol("dept_id", 7)),
@@ -6488,21 +6408,29 @@ mod tests {
         });
         let typed = analyze(filtered, &bt).unwrap();
         let TypedOp::Filter {
-            input: outer_typed, ..
+            input: outer_typed,
+            condition,
         } = &typed.op
         else {
             panic!("expected Filter");
         };
-        // Outer: the ANCESTOR Filter's pid-7 `dept_id` demand is ambiguous
-        // across the merged outer schema (emp.dept_id, dept.dept_id,
-        // bonus.dept_id) → __td_jl stamped, reaching the outer join through
-        // the Filter passthrough.
-        let (outer_left, _) = join_flags(outer_typed);
-        assert!(outer_left);
-        // Inner join must stay unmarked — synthetic names are per-level:
-        // neither the outer's own (now-inert) condition demand nor the
-        // ancestor Filter's demand ON the outer leaks down into the nested
-        // inner join.
+        // Ancestor ref resolves bare+ordinal (vestigial witness): pid-7's
+        // own range is the whole inner join (0..6), and `dept_id`'s first
+        // occurrence within it is emp's `dept_id` at ordinal 2 — no
+        // synthetic qualifier is ever stamped, regardless of the name being
+        // duplicated elsewhere in the outer schema.
+        let Expression::Binary(BinaryExpression { left, .. }) = condition else {
+            panic!("expected Binary condition");
+        };
+        let Expression::ColumnReference(ancestor_ref) = left.as_ref() else {
+            panic!("expected ColumnReference, got {left:?}");
+        };
+        assert_eq!(ancestor_ref.qualifier, None);
+        assert_eq!(ancestor_ref.ordinal, Some(2));
+        // Outer join's flags stay clear — no synthetic stamp ever reaches it.
+        assert_eq!(join_flags(outer_typed), (false, false));
+        // Inner join must stay unmarked too — synthetic names are per-level
+        // and, post-3b, never stamped at all.
         let TypedOp::Join { left, .. } = &outer_typed.op else {
             panic!("expected Join");
         };
@@ -6807,11 +6735,13 @@ mod tests {
         // Self-join `emp(plan_id=1) JOIN emp(plan_id=2)`; a Project above
         // selecting `id` tagged plan_id=2 must resolve to the RIGHT side's
         // `id` — absolute index 4 (0-based) in the merged 8-field schema.
+        // Phase 3b: the condition's own plan_id refs resolve bare+ordinal
+        // too (no synthetic `__td_jl`/`__td_jr` qualifier is ever stamped).
         let bt = base_types_with_emp_dept();
         let join_cond = Expression::Binary(BinaryExpression {
-            left: Box::new(qcol("__td_jl", "id")),
+            left: Box::new(pcol("id", 1)),
             op: BinaryOp::Eq,
-            right: Box::new(qcol("__td_jr", "id")),
+            right: Box::new(pcol("id", 2)),
         });
         let joined = join_with_plan_ids(
             scan("emp"),
@@ -6829,7 +6759,7 @@ mod tests {
         match &typed.op {
             TypedOp::Project { projections, .. } => match &projections[0] {
                 Expression::ColumnReference(c) => {
-                    assert_eq!(c.qualifier.as_deref(), Some(TD_JOIN_RIGHT));
+                    assert_eq!(c.qualifier, None);
                     assert_eq!(c.ordinal, Some(4));
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
@@ -12261,14 +12191,15 @@ mod tests {
     fn plan_id_disambiguates_self_join_project_above() {
         // Self-join `emp(plan_id=1) JOIN emp(plan_id=2)` with a Project
         // above selecting `id` tagged with plan_id=2 — must resolve to the
-        // RIGHT side's `id`, not raise AmbiguousColumn. The resolved
-        // ColumnReference must carry qualifier `__td_jr` so emission renders
-        // `__td_jr.id` (unambiguous in the alias-transparent FROM clause).
+        // RIGHT side's `id`, not raise AmbiguousColumn. Phase 3b: the
+        // resolved ColumnReference is bare (qualifier `None`) with ordinal 4
+        // (the right side's `id`) — emission binds it positionally instead
+        // of via a stamped join-side qualifier.
         let bt = base_types_with_emp_dept();
         let join_cond = Expression::Binary(BinaryExpression {
-            left: Box::new(qcol("__td_jl", "id")),
+            left: Box::new(pcol("id", 1)),
             op: BinaryOp::Eq,
-            right: Box::new(qcol("__td_jr", "id")),
+            right: Box::new(pcol("id", 2)),
         });
         let joined = join_with_plan_ids(
             scan("emp"),
@@ -12286,15 +12217,15 @@ mod tests {
         assert_eq!(typed.resolved_schema.fields.len(), 1);
         assert_eq!(typed.resolved_schema.fields[0].name, "id");
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
-        // Verify the resolved projection carries the join-side qualifier.
+        // Verify the resolved projection is bare+ordinal, positionally bound.
         if let TypedOp::Project { projections, .. } = &typed.op {
             match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(
-                        c.qualifier.as_deref(),
-                        Some(TD_JOIN_RIGHT),
-                        "plan_id=2 must resolve with __td_jr qualifier"
+                        c.qualifier, None,
+                        "plan_id=2 must resolve bare (Phase 3b: no synthetic qualifier)"
                     );
+                    assert_eq!(c.ordinal, Some(4));
                 }
                 other => panic!("expected ColumnReference, got: {other:?}"),
             }
@@ -12306,13 +12237,13 @@ mod tests {
     #[test]
     fn plan_id_disambiguates_filter_above_join() {
         // Filter above a self-join: `WHERE salary > 5` with plan_id=1 must
-        // resolve to the LEFT side without ambiguity error, and carry the
-        // `__td_jl` qualifier.
+        // resolve to the LEFT side without ambiguity error. Phase 3b: bare
+        // qualifier, ordinal 3 (the left side's `salary`).
         let bt = base_types_with_emp_dept();
         let join_cond = Expression::Binary(BinaryExpression {
-            left: Box::new(qcol("__td_jl", "salary")),
+            left: Box::new(pcol("salary", 1)),
             op: BinaryOp::Eq,
-            right: Box::new(qcol("__td_jr", "salary")),
+            right: Box::new(pcol("salary", 2)),
         });
         let joined = join_with_plan_ids(
             scan("emp"),
@@ -12333,16 +12264,16 @@ mod tests {
         let typed = analyze(filter, &bt).expect("plan_id should disambiguate filter above join");
         // Output schema is the full join (8 fields: 4 left + 4 right).
         assert_eq!(typed.resolved_schema.fields.len(), 8);
-        // Verify the resolved condition's left operand carries __td_jl.
+        // Verify the resolved condition's left operand is bare+ordinal.
         if let TypedOp::Filter { condition, .. } = &typed.op {
             if let Expression::Binary(b) = condition {
                 match b.left.as_ref() {
                     Expression::ColumnReference(c) => {
                         assert_eq!(
-                            c.qualifier.as_deref(),
-                            Some(TD_JOIN_LEFT),
-                            "plan_id=1 must resolve with __td_jl qualifier"
+                            c.qualifier, None,
+                            "plan_id=1 must resolve bare (Phase 3b: no synthetic qualifier)"
                         );
+                        assert_eq!(c.ordinal, Some(3));
                     }
                     other => panic!("expected ColumnReference, got: {other:?}"),
                 }
@@ -12413,17 +12344,17 @@ mod tests {
 
     #[test]
     fn for_join_condition_binds_own_plan_ids_not_just_children_scope() {
-        // Anti-regression sentinel (Phase 3a): `left`/`right` here are bare
-        // `TableScan`s, whose own `RelScope` (per `RelScope::of`) carries NO
-        // `plan_ids` at all — only a `Join` node's OWN arm populates that
-        // field. Before this change, `qualify_plan_id_refs` pre-processed the
-        // condition using the join's own `left_plan_ids`/`right_plan_ids`
-        // (the analyzer_join parameters) directly, bypassing `RelScope`
-        // entirely; deleting it means `ResolveContext::for_join_condition`
-        // MUST bind those same own plan_ids into its scope itself, or a
-        // plan_id-tagged condition ref against a bare-scan child would fall
-        // through to legacy name resolution and never see the `__td_jl` /
-        // `__td_jr` qualifier stamp this test asserts.
+        // Anti-regression sentinel (Phase 3a, updated 3b): `left`/`right`
+        // here are bare `TableScan`s, whose own `RelScope` (per
+        // `RelScope::of`) carries NO `plan_ids` at all — only a `Join`
+        // node's OWN arm populates that field. `ResolveContext::for_join_
+        // condition` MUST bind those same own plan_ids into its scope
+        // itself, or a plan_id-tagged condition ref against a bare-scan
+        // child would fall through to legacy name resolution and never
+        // resolve by ordinal the way this test asserts. Phase 3b: the bind
+        // is bare+ordinal (no synthetic qualifier stamp) — the ordinal
+        // alone (0 vs. 6) is the positional witness that both sides bound
+        // through their OWN plan_ids, not a fallback.
         //
         // Left schema: 6 fields, `dept_id` first (merged ordinal 0). Right
         // schema: 1 field, `dept_id` (merged ordinal 6 = left's length).
@@ -12453,9 +12384,9 @@ mod tests {
         );
         let typed = analyze(joined, &bt).expect("distinct-pid dept_id condition should resolve");
         let (l, r) = join_condition_refs(&typed);
-        assert_eq!(l.qualifier.as_deref(), Some(TD_JOIN_LEFT));
+        assert_eq!(l.qualifier, None);
         assert_eq!(l.ordinal, Some(0));
-        assert_eq!(r.qualifier.as_deref(), Some(TD_JOIN_RIGHT));
+        assert_eq!(r.qualifier, None);
         assert_eq!(r.ordinal, Some(6));
     }
 
@@ -12467,9 +12398,9 @@ mod tests {
         // `dept_id`, not emp's `dept_id`.
         let bt = base_types_with_emp_dept();
         let inner_cond = Expression::Binary(BinaryExpression {
-            left: Box::new(qcol("__td_jl", "id")),
+            left: Box::new(pcol("id", 1)),
             op: BinaryOp::Eq,
-            right: Box::new(qcol("__td_jr", "id")),
+            right: Box::new(pcol("id", 2)),
         });
         let inner_join = join_with_plan_ids(
             scan("emp"),
@@ -12480,9 +12411,9 @@ mod tests {
             vec![2],
         );
         let outer_cond = Expression::Binary(BinaryExpression {
-            left: Box::new(qcol("__td_jl", "dept_id")),
+            left: Box::new(pcol("dept_id", 1)),
             op: BinaryOp::Eq,
-            right: Box::new(qcol("__td_jr", "dept_id")),
+            right: Box::new(pcol("dept_id", 3)),
         });
         let outer_join = join_with_plan_ids(
             inner_join,
@@ -12515,9 +12446,9 @@ mod tests {
         // right side dept) resolve without qualifiers.
         let bt = base_types_with_emp_dept();
         let join_cond = Expression::Binary(BinaryExpression {
-            left: Box::new(qcol("__td_jl", "dept_id")),
+            left: Box::new(pcol("dept_id", 1)),
             op: BinaryOp::Eq,
-            right: Box::new(qcol("__td_jr", "dept_id")),
+            right: Box::new(pcol("dept_id", 2)),
         });
         let joined = join_with_plan_ids(
             scan("emp"),

@@ -273,6 +273,39 @@ impl<'a> FromScope<'a> {
             .then_some(name.as_str())
     }
 
+    /// Phase 3b merge-path binding for ordinal `i` of a bare duplicate
+    /// `name`: the covering alias iff it is the unique aliases-entry for its
+    /// name, uniquely exposed, and `name` is unique within its span.
+    /// Deliberately NOT [`Self::alias_for`]: no single-exposed fast path (an
+    /// internally-dup span must reject), and analyzer-binding uniqueness is
+    /// required, not just exposure.
+    fn unique_binding_alias(&self, i: usize, name: &str, schema: &Schema) -> Option<&str> {
+        let (alias, range) = self.aliases.iter().find(|(_, r)| r.contains(&i))?;
+        // (i) `alias` names exactly ONE aliases entry (ci) — homonym-alias
+        // hazard (H8-2): two distinct scope entries sharing the same alias
+        // text make "the" covering alias ambiguous even though `i` itself
+        // falls in only one of their ranges.
+        let alias_entries = self
+            .aliases
+            .iter()
+            .filter(|(a, _)| a.eq_ignore_ascii_case(alias))
+            .count();
+        // (ii) `alias` appears exactly ONCE in the block's exposed FROM
+        // aliases — the merge-visibility counterpart of (i).
+        let exposed_count = self
+            .exposed
+            .iter()
+            .filter(|e| e.eq_ignore_ascii_case(alias))
+            .count();
+        // (iii) `name` occurs exactly ONCE within the covering span — an
+        // internally-dup span would leftmost-bind the wrong physical column.
+        let within_span = schema.fields[range.clone()]
+            .iter()
+            .filter(|f| f.name.eq_ignore_ascii_case(name))
+            .count();
+        (alias_entries == 1 && exposed_count == 1 && within_span == 1).then_some(alias.as_str())
+    }
+
     /// Canonical per-ordinal accessor: unambiguous exposed alias for `i`, else
     /// None (uncovered OR covering alias exposed >1). Phase 2 (ADR-023
     /// `__td_jl`/`__td_jr` retirement) entry point: backs
@@ -375,10 +408,14 @@ struct SideNeedsAlias {
 
 /// Rewrite every join-CONDITION [`ColumnReference`] to the qualifier the
 /// EMITTED sides make true, resolved POSITIONALLY from the reference's
-/// analyzer-stamped `ordinal` (ADR-023 Phase 2, `__td_jl`/`__td_jr`
+/// analyzer-stamped `ordinal` (ADR-023 Phase 2/3b, `__td_jl`/`__td_jr`
 /// retirement for condition references): a name unique in `cond_schema`
 /// binds bare (`qualifier = None`); an ambiguous one binds through
 /// [`FromScope::alias_for`] against whichever side the ordinal falls in.
+/// Phase 3b: the analyzer never stamps a synthetic `__td_jl`/`__td_jr`
+/// qualifier anymore (every plan_id-scoped ref resolves bare+ordinal), so
+/// the ordinal's side (`k < left_len`) is the ONLY signal this rewrite ever
+/// consults.
 ///
 /// Left untouched: a reference whose `ordinal` is `None` (correlated /
 /// deferred resolution) and one carrying a real, non-synthetic user-alias
@@ -460,15 +497,16 @@ fn requalify_expr(
 }
 
 /// The rewrite predicate (H8 boundary). `c.ordinal` must be in-bounds in
-/// `cond_schema` AND either (a) `c.qualifier` spells a synthetic
-/// `__td_jl`/`__td_jr` name, or (b) `c.qualifier` is `None` and `c.name` is
-/// ambiguous (count `>= 2`) in `cond_schema` — otherwise `c` is left
-/// untouched (correlated/deferred, or a real alias that already binds).
+/// `cond_schema` AND `c.qualifier` must be `None` with `c.name` ambiguous
+/// (count `>= 2`) in `cond_schema` — otherwise `c` is left untouched
+/// (correlated/deferred, or a real alias that already binds). Phase 3b: the
+/// analyzer never stamps a synthetic `__td_jl`/`__td_jr` qualifier anymore,
+/// so this is the only shape a rewritable reference can take.
 ///
-/// By construction (see `resolve_column`), a reference that reaches here
-/// with a synthetic qualifier, or with no qualifier and an ambiguous name,
-/// is already guaranteed ambiguous in `cond_schema` — the `name_count == 1`
-/// branch below is a defensive fallback, not a reachable case today.
+/// By construction (see `resolve_column`), a bare reference with an
+/// ambiguous name that reaches here is already guaranteed ambiguous in
+/// `cond_schema` — the `name_count == 1` branch below is a defensive
+/// fallback, not a reachable case today.
 fn requalify_column_ref(
     c: &mut ColumnReference,
     cond_schema: &Schema,
@@ -481,21 +519,12 @@ fn requalify_column_ref(
     if k >= cond_schema.len() {
         return;
     }
-    let q_is_jl = c
-        .qualifier
-        .as_deref()
-        .is_some_and(|q| q.eq_ignore_ascii_case(TD_JOIN_LEFT));
-    let q_is_jr = c
-        .qualifier
-        .as_deref()
-        .is_some_and(|q| q.eq_ignore_ascii_case(TD_JOIN_RIGHT));
-    let is_synthetic = q_is_jl || q_is_jr;
     let name_count = cond_schema
         .fields
         .iter()
         .filter(|f| f.name.eq_ignore_ascii_case(&c.name))
         .count();
-    if !(is_synthetic || (c.qualifier.is_none() && name_count >= 2)) {
+    if !(c.qualifier.is_none() && name_count >= 2) {
         return;
     }
     // H8 assert 1 (load-bearing): the ordinal must name the SAME column the
@@ -507,21 +536,7 @@ fn requalify_column_ref(
         cond_schema.fields[k].name,
         c.name
     );
-    let side_from_ordinal_is_left = k < left_len;
-    if is_synthetic {
-        // H8 assert 2 (case a): the synthetic qualifier's spelled side must
-        // agree with the ordinal's side — two independent signals for the
-        // SAME fact must never diverge.
-        debug_assert!(
-            q_is_jl == side_from_ordinal_is_left,
-            "synthetic qualifier side must agree with the ordinal's side"
-        );
-    }
-    let is_left = if is_synthetic {
-        q_is_jl
-    } else {
-        side_from_ordinal_is_left
-    };
+    let is_left = k < left_len;
     let local = if is_left { k } else { k - left_len };
     let scope = if is_left { left_scope } else { right_scope };
     // H8 assert 3: the local index must be in-bounds for its own side —
@@ -940,20 +955,31 @@ fn build_aggregate(
         .iter()
         .map(|a| with_grouping_id_spliced(a, grouping))
         .collect();
+    // Splice BEFORE the merge decision (not just before rendering) — the
+    // fused merge-path rewrite below must see the SAME having expression the
+    // render path later uses, so a bare duplicate-name ordinal inside a
+    // spliced `grouping_id()` call is visible to the rewrite too.
+    let having_spliced: Option<Expression> = having.map(|h| with_grouping_id_spliced(h, grouping));
 
     // Open the child block and decide merge-vs-wrap BEFORE rendering — the
-    // visibility check must run over the ORIGINAL (un-reprojected) expressions
-    // against the pre-wrap block, exactly like `build_filter`/`build_sort`.
+    // fused visibility+rewrite check must run over the ORIGINAL (pre-wrap)
+    // expressions against the pre-wrap block, exactly like
+    // `build_filter`/`build_sort`.
     let mut block = open_block(input)?;
-    let vis = exprs_visible_in(
-        grouping
-            .iter()
-            .chain(rewritten_aggregates.iter())
-            .chain(having),
-        &block,
-        &input.scope,
-    );
-    let merge = block.can_accept(Clause::GroupBy) && vis;
+    let merge_set: Option<Vec<Expression>> = block
+        .can_accept(Clause::GroupBy)
+        .then(|| {
+            requalify_visible(
+                grouping
+                    .iter()
+                    .chain(rewritten_aggregates.iter())
+                    .chain(having_spliced.iter()),
+                &block,
+                input,
+            )
+        })
+        .flatten();
+    let merge = merge_set.is_some();
 
     // ADR-023 tier 2: activate the wrap-boundary reprojection only when the
     // wrapped child's output has a duplicate name — the one class
@@ -962,23 +988,29 @@ fn build_aggregate(
     // resolved bare at analysis time, so every branch below passes the
     // expression through unchanged.
     let uniquified = output_uniquified(input_schema);
-    // Choose the expression set to render from: the originals when merging
-    // (no cosmetic churn), or each reprojected against the PRE-wrap block
-    // when wrapping onto a duplicate-name output — unique-name qualifiers are
-    // already dropped at resolution, so only the duplicate-name wrap case needs
-    // reprojection here; nothing strands in the non-duplicate case.
-    let reproject = |e: &Expression| -> Expression {
-        if merge {
-            e.clone()
-        } else {
-            reproject_or_clone(e, input, &uniquified)
-        }
+    // Choose the expression set to render from: the fused merge-path
+    // rewrite's output when merging (already positionally requalified where
+    // needed, no cosmetic churn otherwise), split back by length — or each
+    // reprojected against the PRE-wrap block when wrapping onto a
+    // duplicate-name output.
+    let (grouping_r, aggregates_r, having_r): (
+        Vec<Expression>,
+        Vec<Expression>,
+        Option<Expression>,
+    ) = if let Some(rewritten) = merge_set {
+        let mut it = rewritten.into_iter();
+        let grouping_r: Vec<Expression> = (&mut it).take(grouping.len()).collect();
+        let aggregates_r: Vec<Expression> = (&mut it).take(rewritten_aggregates.len()).collect();
+        let having_r: Option<Expression> = it.next();
+        (grouping_r, aggregates_r, having_r)
+    } else {
+        let reproject =
+            |e: &Expression| -> Expression { reproject_or_clone(e, input, &uniquified) };
+        let grouping_r = grouping.iter().map(&reproject).collect();
+        let aggregates_r = rewritten_aggregates.iter().map(&reproject).collect();
+        let having_r = having_spliced.as_ref().map(&reproject);
+        (grouping_r, aggregates_r, having_r)
     };
-    let grouping_r: Vec<Expression> = grouping.iter().map(&reproject).collect();
-    let aggregates_r: Vec<Expression> = rewritten_aggregates.iter().map(&reproject).collect();
-    let having_r: Option<Expression> = having
-        .map(|h| with_grouping_id_spliced(h, grouping))
-        .map(|h| reproject(&h));
 
     // Mirror the analyzer's "unfold DataFrame-path grouping" logic — if
     // the aggregates list doesn't already start with the grouping cols'
@@ -1130,11 +1162,10 @@ fn expr_qualifiers<'e>(expr: &'e Expression, out: &mut Vec<&'e str>) {
 /// [`RelScope`] binds must be an alias the block's FROM scope actually
 /// emits. Qualifiers the input scope does NOT know are exempt: they are
 /// correlated outer references (DuckDB's correlated-subquery binder resolves
-/// them OUTWARD, so no inner FROM shape can bind them), struct-column
-/// qualifiers (rendered as struct access, scope-independent), or the
-/// synthetic `__td_jl`/`__td_jr` names (whose exposure the analyzer's
-/// `*_requires_synthetic` flags already guarantee). A failed check falls
-/// back to the wrap path (merging only ever WIDENS what a clause can see).
+/// them OUTWARD, so no inner FROM shape can bind them), or struct-column
+/// qualifiers (rendered as struct access, scope-independent). A failed check
+/// falls back to the wrap path (merging only ever WIDENS what a clause can
+/// see).
 fn exprs_visible_in<'e>(
     exprs: impl IntoIterator<Item = &'e Expression>,
     block: &SelectBlock,
@@ -1157,6 +1188,95 @@ fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
         .aliases
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case(q))
+}
+
+/// Phase 3b shared predicate (H8 boundary): `Some(k)` iff `c.qualifier` is
+/// `None`, `c.ordinal` is `Some(k)` with `k < schema.len()`, and `c.name` is
+/// duplicated (`>=2`, case-insensitive) in `schema` — the exact shape a
+/// bare-ordinal reference must have to be rewritten positionally (the
+/// governing invariant: this shape is produced ONLY by a resolver tier that
+/// stamped `k` against this same `schema`). Shared by [`requalify_visible`]'s
+/// merge-path rewrite and [`reproject_qualifiers`]'s wrap-path ordinal arm —
+/// single authority for the debug_assert guard, so both call sites stay in
+/// lockstep.
+fn bare_dup_ordinal(c: &ColumnReference, schema: &Schema) -> Option<usize> {
+    if c.qualifier.is_some() {
+        return None;
+    }
+    let k = c.ordinal?;
+    if k >= schema.len() {
+        return None;
+    }
+    let name_count = schema
+        .fields
+        .iter()
+        .filter(|f| f.name.eq_ignore_ascii_case(&c.name))
+        .count();
+    if name_count < 2 {
+        return None;
+    }
+    // H8 assert 1 (load-bearing): the ordinal must name the SAME column the
+    // reference carries — a merged-vs-local ordinal mixup would silently
+    // rewrite the wrong physical column.
+    debug_assert!(
+        schema.fields[k].name.eq_ignore_ascii_case(&c.name),
+        "ordinal/name agreement: schema[{k}] ({}) must match reference name ({})",
+        schema.fields[k].name,
+        c.name
+    );
+    Some(k)
+}
+
+/// Merge visibility + ordinal requalification, fused (ADR-023 Phase 3b).
+/// `Some(rewritten)` iff (a) every scope-bound qualifier `exprs` carries is
+/// exposed by `block`'s FROM (the [`exprs_visible_in`] contract) AND (b)
+/// every bare duplicate-name ordinal-carrying reference
+/// ([`bare_dup_ordinal`]) binds through a UNIQUE covering alias
+/// ([`FromScope::unique_binding_alias`]) — rewritten to it. `None` — the
+/// caller wraps — the moment either condition fails for any expression in
+/// the set: a partial rewrite would be unsound (the wrap path re-derives the
+/// whole set from scratch instead).
+///
+/// All other references pass through untouched: `ordinal: None` (correlated
+/// / deferred resolution), a real (non-ordinal-rewritable) qualifier already
+/// binds, or a unique name that resolution already left bare.
+fn requalify_visible<'e>(
+    exprs: impl IntoIterator<Item = &'e Expression>,
+    block: &SelectBlock,
+    input: &TypedAst,
+) -> Option<Vec<Expression>> {
+    let exprs: Vec<&Expression> = exprs.into_iter().collect();
+    if !exprs_visible_in(exprs.iter().copied(), block, &input.scope) {
+        return None;
+    }
+    let scope = FromScope::of(input, block.from_ref());
+    let schema = &input.resolved_schema;
+
+    fn walk(expr: &mut Expression, scope: &FromScope, schema: &Schema) -> bool {
+        match expr {
+            Expression::ColumnReference(c) => match bare_dup_ordinal(c, schema) {
+                None => true,
+                Some(k) => match scope.unique_binding_alias(k, &c.name, schema) {
+                    Some(alias) => {
+                        c.qualifier = Some(alias.to_owned());
+                        true
+                    }
+                    None => false,
+                },
+            },
+            other => other.children_mut().all(|child| walk(child, scope, schema)),
+        }
+    }
+
+    let mut rewritten = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        let mut cloned = e.clone();
+        if !walk(&mut cloned, &scope, schema) {
+            return None;
+        }
+        rewritten.push(cloned);
+    }
+    Some(rewritten)
 }
 
 /// ADR-023 tier 2 activation gate: `schema`'s field names, [`uniquify`]d,
@@ -1232,6 +1352,13 @@ fn reproject_qualifiers(expr: &Expression, input: &TypedAst, uniquified: &[Strin
                 if let Some(pos) = c.qualifier.as_deref().and_then(|q| resolve(q, &c.name)) {
                     c.qualifier = None;
                     c.name = uniquified[pos].clone();
+                } else if c.qualifier.is_none() {
+                    // Phase 3b: a bare duplicate-name ordinal ref binds
+                    // positionally through the reprojected wrap — see
+                    // `bare_dup_ordinal`'s doc for the governing invariant.
+                    if let Some(k) = bare_dup_ordinal(c, schema) {
+                        c.name = uniquified[k].clone();
+                    }
                 }
             }
             Expression::UnresolvedColumn(u) => {
@@ -1372,11 +1499,16 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
         return build_unit(&input.op, &input.resolved_schema);
     }
     let mut block = open_block(input)?;
-    if block.can_accept(Clause::Select) && exprs_visible_in(projections, &block, &input.scope) {
-        let slots_sql =
-            render_project_merge_slots(projections, &input.resolved_schema, block.default_slots())?;
-        block.set_projections(slots_sql);
-        return Ok(block.into());
+    if block.can_accept(Clause::Select) {
+        if let Some(rewritten) = requalify_visible(projections, &block, input) {
+            let slots_sql = render_project_merge_slots(
+                &rewritten,
+                &input.resolved_schema,
+                block.default_slots(),
+            )?;
+            block.set_projections(slots_sql);
+            return Ok(block.into());
+        }
     }
     let uniquified = output_uniquified(&input.resolved_schema);
     let projections: Vec<Expression> = projections
@@ -1394,9 +1526,11 @@ fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit
 
 fn build_filter(input: &TypedAst, condition: &Expression) -> Result<SqlUnit, EmissionError> {
     let mut block = open_block(input)?;
-    if block.can_accept(Clause::Where) && exprs_visible_in([condition], &block, &input.scope) {
-        block.push_where(render_expr(condition, &input.resolved_schema)?);
-        return Ok(block.into());
+    if block.can_accept(Clause::Where) {
+        if let Some(rewritten) = requalify_visible([condition], &block, input) {
+            block.push_where(render_expr(&rewritten[0], &input.resolved_schema)?);
+            return Ok(block.into());
+        }
     }
     let uniquified = output_uniquified(&input.resolved_schema);
     let condition = reproject_or_clone(condition, input, &uniquified);
@@ -1414,25 +1548,31 @@ fn build_sort(
     let mut block = open_block(input)?;
     // Over an occupied SELECT list, only bare output-name references merge:
     // ORDER BY resolves them against the select list's aliases; expression
-    // keys would re-bind against FROM columns and could diverge.
-    let keys_bind = if block.select_free() {
-        exprs_visible_in(
-            order.iter().map(|so| so.expr.as_ref()),
-            &block,
-            &input.scope,
-        )
+    // keys would re-bind against FROM columns and could diverge. Over a
+    // select-free block, the fused merge-path rewrite additionally binds any
+    // bare duplicate-name ordinal key through its unique covering alias.
+    let merged_keys: Option<Vec<Expression>> = if block.select_free() {
+        requalify_visible(order.iter().map(|so| so.expr.as_ref()), &block, input)
     } else {
-        order.iter().all(|so| {
+        let keys_bind = order.iter().all(|so| {
             matches!(so.expr.as_ref(), Expression::ColumnReference(c) if c.qualifier.is_none())
-        })
+        });
+        keys_bind.then(|| order.iter().map(|so| (*so.expr).clone()).collect())
     };
-    if block.can_accept(Clause::OrderBy) && block.distinct_allows_order() && keys_bind {
-        let keys = order
-            .iter()
-            .map(|so| render_sort_key(so, &input.resolved_schema))
-            .collect::<Result<Vec<_>, _>>()?;
-        block.set_order_by(keys, limit, offset);
-        return Ok(block.into());
+    if block.can_accept(Clause::OrderBy) && block.distinct_allows_order() {
+        if let Some(exprs) = merged_keys {
+            let keys = order
+                .iter()
+                .zip(exprs)
+                .map(|(so, expr)| {
+                    let mut reprojected = so.clone();
+                    *reprojected.expr = expr;
+                    render_sort_key(&reprojected, &input.resolved_schema)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            block.set_order_by(keys, limit, offset);
+            return Ok(block.into());
+        }
     }
     let uniquified = output_uniquified(&input.resolved_schema);
     let keys = order
@@ -9480,6 +9620,17 @@ mod tests {
         // demand on the OUTER, not the inner's now-inert own-condition
         // demand). With no buried inner `__td_jr` left to collide with,
         // there is nothing for the duplicate-alias guard to do here.
+        //
+        // Phase 3b delta (D2): the ancestor `Filter`'s plan_id=3 reference
+        // now resolves bare+ordinal (no synthetic `__td_jr` qualifier
+        // stamped at all). `d3` is a bare `Project` with no user alias, so
+        // the analyzer's own `RelScope` has no aliases entry covering its
+        // span — `FromScope::unique_binding_alias` can't find a covering
+        // alias for the merge-path rewrite, and the outer `Filter` falls to
+        // the wrap path: `(…) AS __td_sub(…)` reprojects the 9-field merged
+        // schema (uniquified — `dept_id` collides 3-way), and the filter
+        // binds against the uniquified name for `d3.dept_id`
+        // (`dept_id_2`). Same DATA as before — only the SQL surface changed.
         let inner_join = CommonAst::new(CommonOp::Join {
             left: Box::new(scan("emp")),
             right: Box::new(scan("emp2")),
@@ -9543,34 +9694,35 @@ mod tests {
         let bt = base_types_emp_dept_emp2(&filter);
         let typed = analyze(filter, &bt).expect("analyze join-022 shape");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        // Post-collapse (ADR-023 Phase 2):
-        // "SELECT * FROM emp INNER JOIN emp2 ON (emp.dept_id) = (emp2.dept_id)
-        //  INNER JOIN (SELECT dept_id, dept_name FROM dept) AS __td_jr ON
-        //  (dept_name) = ('Data') WHERE (__td_jr.dept_id) = (20)"
-        // Same DATA as the pre-Phase-2 shape: `emp`/`emp2` bind identically
-        // whether addressed through their own bare table names or through a
-        // buried `__td_jl`/`__td_jr` — only the SQL surface (fewer wraps)
-        // changes; the join-022 self-collision this test used to exercise no
-        // longer arises (there is no buried inner `__td_jr` left to collide
-        // with the outer's contract-demanded one).
+        // Post-Phase-3b (D2 behavior delta — see the comment above): the
+        // inner join still fully inlines and chain-flattens into the outer
+        // FROM, and `d3` still wraps `AS __td_jr` (unchanged from Phase 2),
+        // but the ancestor filter no longer merges — it wraps the whole
+        // chain under a reprojected `__td_sub` and binds against the
+        // uniquified `dept_id_2` instead of a synthetic-qualified ref.
         assert!(
-            sql.starts_with(
+            sql.contains(
                 "SELECT * FROM emp INNER JOIN emp2 ON (emp.dept_id) = (emp2.dept_id) \
-                 INNER JOIN "
+                 INNER JOIN (SELECT dept_id, dept_name FROM dept) AS __td_jr ON \
+                 (dept_name) = ('Data')"
             ),
-            "the inner join must fully inline (no buried __td_jl/__td_jr — its \
-             own condition is no longer a demand) and chain-flatten into the \
-             outer FROM; got: {sql}"
+            "the inner join must fully inline and chain-flatten into the outer \
+             FROM, and the outer right must keep its contract-demanded __td_jr \
+             wrap; got: {sql}"
         );
         assert!(
             sql.contains(
-                "(SELECT dept_id, dept_name FROM dept) AS __td_jr ON (dept_name) = ('Data')"
+                "AS __td_sub(id, name, dept_id, salary, id_1, dept_id_1, country, \
+                 dept_id_2, dept_name)"
             ),
-            "outer right must keep its contract-demanded __td_jr wrap; got: {sql}"
+            "the ancestor filter's plan_id ref has no covering analyzer alias for \
+             d3 (a bare Project, no user alias) so the merge-path rewrite can't \
+             bind it — the filter falls back to the reprojected wrap; got: {sql}"
         );
         assert!(
-            sql.ends_with("WHERE (__td_jr.dept_id) = (20)"),
-            "outer filter must bind against the contract-demanded __td_jr; got: {sql}"
+            sql.ends_with("WHERE (dept_id_2) = (20)"),
+            "outer filter must bind against the uniquified name for d3.dept_id; \
+             got: {sql}"
         );
     }
 
@@ -9661,6 +9813,360 @@ mod tests {
             "no collision remains post-collapse (the buried inner __td_jr is \
              gone), so no rename is needed; got: {sql}"
         );
+    }
+
+    // ── Phase 3b: merge-path fusion (requalify_visible) + wrap-path ordinal
+    // arm (reproject_qualifiers) ───────────────────────────────────────────
+
+    /// A bare plan_id-tagged column reference (the shape `resolve_column`'s
+    /// plan_id arm always produces post-Phase-3b).
+    fn pidcol(name: &str, plan_id: i64) -> Expression {
+        Expression::UnresolvedColumn(crate::transpiler_v2::expression::UnresolvedColumn {
+            name: name.to_owned(),
+            qualifier: None,
+            plan_id: Some(plan_id),
+        })
+    }
+
+    /// Shared shape for the D1 merge tests: `emp JOIN emp2 ON emp.dept_id =
+    /// emp2.dept_id`, both sides bare (no user alias) — `emp`/`emp2` are
+    /// themselves each an unambiguous, uniquely-exposed covering alias in
+    /// `RelScope`, so an ancestor's bare duplicate-name ordinal ref merges
+    /// through `requalify_visible` instead of forcing a wrap.
+    fn emp_join_emp2() -> CommonAst {
+        CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("emp")),
+            right: Box::new(scan("emp2")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(pidcol("dept_id", 1)),
+                right: Box::new(pidcol("dept_id", 2)),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![1],
+            right_plan_ids: vec![2],
+        })
+    }
+
+    #[test]
+    fn d1_ancestor_filter_merges_with_bare_ordinal_bound_to_covering_alias() {
+        let _g = tap_guard();
+        // D1: an ancestor Filter referencing emp2's OWN plan_id lands on a
+        // bare `dept_id` ordinal duplicated in the join's merged schema
+        // (`emp.dept_id` / `emp2.dept_id`); `emp2` is the unique, uniquely-
+        // exposed covering alias for that ordinal, so `requalify_visible`
+        // rewrites it to `emp2.dept_id` and the filter merges into the join
+        // — no `__td_jl`/`__td_jr`/`__td_sub` wrap at all.
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(emp_join_emp2()),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(pidcol("dept_id", 2)),
+                right: Box::new(int_lit(20)),
+            }),
+        });
+        let bt = base_types_emp_dept_emp2(&filter);
+        let typed = analyze(filter, &bt).expect("analyze d1 filter merge");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT * FROM emp INNER JOIN emp2 ON (emp.dept_id) = (emp2.dept_id) \
+             WHERE (emp2.dept_id) = (20)"
+        );
+        assert!(
+            !sql.contains("__td_"),
+            "no wrap of any kind expected; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn d1_ancestor_project_merges_with_bare_ordinals_bound_to_covering_aliases() {
+        let _g = tap_guard();
+        // D1: an ancestor Project referencing emp's `id` (duplicated with
+        // emp2's `id`) and emp2's `dept_id` (duplicated with emp's) both
+        // merge, each rewritten to its own unique covering alias.
+        let plan = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_join_emp2()),
+            projections: vec![pidcol("id", 1), pidcol("dept_id", 2)],
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze d1 project merge");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT emp.id, emp2.dept_id FROM emp INNER JOIN emp2 ON \
+             (emp.dept_id) = (emp2.dept_id)"
+        );
+        assert!(
+            !sql.contains("__td_"),
+            "no wrap of any kind expected; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn d1_ancestor_aggregate_merges_grouping_key_bound_to_covering_alias() {
+        let _g = tap_guard();
+        // D1: an ancestor Aggregate's GROUP BY key is a bare duplicate-name
+        // ordinal (emp's `dept_id`) that merges through the fused
+        // requalify_visible rewrite, same as filter/project.
+        let plan = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(emp_join_emp2()),
+            grouping: vec![pidcol("dept_id", 1)],
+            aggregates: vec![fexpr("max", vec![pidcol("salary", 1)])],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze d1 aggregate merge");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("GROUP BY emp.dept_id"), "got: {sql}");
+        assert!(
+            !sql.contains("__td_"),
+            "no wrap of any kind expected; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn d1_ancestor_sort_merges_key_bound_to_covering_alias() {
+        let _g = tap_guard();
+        // D1: an ancestor Sort's ORDER BY key is a bare duplicate-name
+        // ordinal (emp2's `dept_id`) over a select-free (pure-FROM) block —
+        // merges via `requalify_visible`, same as the other three builders.
+        let plan = CommonAst::new(CommonOp::Sort {
+            input: Box::new(emp_join_emp2()),
+            order: vec![asc_key(pidcol("dept_id", 2))],
+            limit: None,
+            offset: None,
+        });
+        let bt = base_types_emp_dept_emp2(&plan);
+        let typed = analyze(plan, &bt).expect("analyze d1 sort merge");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(sql.contains("ORDER BY emp2.dept_id"), "got: {sql}");
+        assert!(
+            !sql.contains("__td_"),
+            "no wrap of any kind expected; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn d7_homonym_alias_rejects_merge_and_wrap_binds_uniquified_name() {
+        let _g = tap_guard();
+        // D7 / rule (i): `emp` and `emp2` are BOTH user-aliased "m"
+        // (`AliasedRelation` drops the table name, so `m` is each side's
+        // ONLY analyzer-scope alias entry) — a homonym-alias hazard the
+        // per-ref rule's condition (i) must catch (two distinct `RelScope`
+        // aliases entries sharing the same name), even though the ordinal
+        // itself unambiguously falls within ONE side's span. The ancestor
+        // filter's merge attempt must be REJECTED (not silently bind through
+        // the wrong "m"), falling back to the reprojected wrap, where the
+        // duplicate-name output binds the filter positionally instead.
+        let inner_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "m")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(pidcol("dept_id", 1)),
+                right: Box::new(pidcol("dept_id", 2)),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![1],
+            right_plan_ids: vec![2],
+        });
+        let outer_join = CommonAst::new(CommonOp::Join {
+            left: Box::new(inner_join),
+            right: Box::new(aliased_scan("emp2", "m")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(pidcol("dept_id", 2)),
+                right: Box::new(pidcol("dept_id", 3)),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![3],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(outer_join),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(pidcol("dept_id", 3)),
+                right: Box::new(int_lit(20)),
+            }),
+        });
+        let bt = base_types_emp_dept_emp2(&filter);
+        let typed = analyze(filter, &bt).expect("analyze d7 homonym shape");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("__td_sub"),
+            "the homonym alias hazard must reject the merge, falling back to \
+             the reprojected wrap; got: {sql}"
+        );
+        assert!(
+            sql.ends_with("WHERE (dept_id_2) = (20)"),
+            "the filter must bind through the wrap's uniquified name for \
+             emp2.dept_id, positionally, never through either ambiguous `m`; \
+             got: {sql}"
+        );
+    }
+
+    #[test]
+    fn internally_duplicate_span_rejects_merge_rule_iii() {
+        let _g = tap_guard();
+        // Rule (iii): `dup_tbl` has TWO fields both named `dept_id` within
+        // its OWN span — even though it is the sole, uniquely-exposed
+        // covering alias for the ancestor's ordinal (rules (i)/(ii) both
+        // hold), an internally-duplicate span means "the" position within
+        // it is not well-defined by name alone, so the per-ref rule must
+        // still reject the merge (leftmost-binding the wrong physical
+        // column would otherwise be silent and undetectable).
+        let dup_schema = StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("dept_id", DataType::Integer),
+        ]);
+        let other_schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
+        let bt = BaseTypes::build_from_plan(
+            &CommonAst::new(CommonOp::Join {
+                left: Box::new(scan("dup_tbl")),
+                right: Box::new(scan("other")),
+                join_type: JoinType::Inner,
+                condition: Some(Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Eq,
+                    left: Box::new(pidcol("id", 1)),
+                    right: Box::new(pidcol("id", 2)),
+                })),
+                using_columns: vec![],
+                natural: false,
+                lateral: false,
+                left_plan_ids: vec![1],
+                right_plan_ids: vec![2],
+            }),
+            |name| match name {
+                "dup_tbl" => Some(dup_schema.clone()),
+                "other" => Some(other_schema.clone()),
+                _ => None,
+            },
+        );
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(scan("dup_tbl")),
+            right: Box::new(scan("other")),
+            join_type: JoinType::Inner,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(pidcol("id", 1)),
+                right: Box::new(pidcol("id", 2)),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![1],
+            right_plan_ids: vec![2],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(join),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(pidcol("dept_id", 1)),
+                right: Box::new(int_lit(5)),
+            }),
+        });
+        let typed = analyze(filter, &bt).expect("analyze internally-dup-span shape");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert!(
+            sql.contains("__td_sub"),
+            "an internally-duplicate covering span must reject the merge and \
+             fall back to the reprojected wrap; got: {sql}"
+        );
+        assert!(
+            !sql.contains("dup_tbl.dept_id"),
+            "must never bind qualified through a span where the name isn't \
+             unique — that would silently pick the leftmost occurrence; got: \
+             {sql}"
+        );
+    }
+
+    #[test]
+    fn reproject_qualifiers_ordinal_arm_binds_bare_dup_positionally() {
+        let _g = tap_guard();
+        // Direct unit pin for the `reproject_qualifiers` ordinal else-arm: a
+        // bare duplicate-name ordinal ref rewrites to `uniquified[k]`; a
+        // bare UNIQUE-name ref (ordinal Some, but not duplicated) and a bare
+        // ref with `ordinal: None` are both left untouched.
+        let schema = Schema {
+            fields: vec![
+                StructField::not_null("id", DataType::Long),
+                StructField::nullable("dept_id", DataType::Integer),
+                StructField::nullable("dept_id", DataType::Integer),
+                StructField::nullable("name", DataType::String),
+            ],
+        };
+        let uniquified = vec![
+            "id".to_owned(),
+            "dept_id".to_owned(),
+            "dept_id_1".to_owned(),
+            "name".to_owned(),
+        ];
+        let dup = Expression::ColumnReference(ColumnReference {
+            name: "dept_id".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Integer),
+            nullable: Some(true),
+            ordinal: Some(2),
+        });
+        let unique_no_rewrite = Expression::ColumnReference(ColumnReference {
+            name: "id".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Long),
+            nullable: Some(false),
+            ordinal: Some(0),
+        });
+        let deferred_no_ordinal = Expression::ColumnReference(ColumnReference {
+            name: "name".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::String),
+            nullable: Some(true),
+            ordinal: None,
+        });
+        let input = TypedAst::new(
+            TypedOp::TableScan {
+                table: "dup_tbl".to_owned(),
+                alias: None,
+            },
+            schema.clone(),
+        );
+        let rewritten_dup = reproject_qualifiers(&dup, &input, &uniquified);
+        match rewritten_dup {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.qualifier, None);
+                assert_eq!(c.name, "dept_id_1");
+            }
+            other => panic!("expected ColumnReference, got {other:?}"),
+        }
+        let rewritten_unique = reproject_qualifiers(&unique_no_rewrite, &input, &uniquified);
+        match rewritten_unique {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.qualifier, None);
+                assert_eq!(c.name, "id", "a unique-name ordinal ref is untouched");
+            }
+            other => panic!("expected ColumnReference, got {other:?}"),
+        }
+        let rewritten_deferred = reproject_qualifiers(&deferred_no_ordinal, &input, &uniquified);
+        match rewritten_deferred {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.qualifier, None);
+                assert_eq!(c.name, "name", "an ordinal:None ref is untouched");
+            }
+            other => panic!("expected ColumnReference, got {other:?}"),
+        }
     }
 
     #[test]

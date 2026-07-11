@@ -497,6 +497,28 @@ case("join-023", "join", "F11 DEFERRED — duplicate user alias on both join sid
 # from the bare-name AMBIGUOUS_REFERENCE (42704) class join-023 pins above.
 case("join-024", "join", "self-join same plan_id both sides of own condition (AMBIGUOUS_COLUMN_REFERENCE)", lambda I: I["emp"].join(I["emp"], I["emp"]["id"] == I["emp"]["id"]), expected_error="AMBIGUOUS_COLUMN_REFERENCE")
 
+# join-025/026 (ADR-023 Phase 3b): an ancestor Filter/Project's plan_id-tagged
+# ref lands on a bare duplicate-name column (`salary`, present on both `emp`
+# and `emp2` — unlike `dept_id`, the join key, which is equal on both sides
+# of every matched row and so can never distinguish a wrong-side bind).
+# `emp2`'s single dept_id=10 row (Ivan, salary 91000) matches both of `emp`'s
+# dept_id=10 rows (Alice 95000, Bob 120000) — asymmetric per-side salary
+# values, so a wrong-side bind flips the result (empty vs. non-empty, or the
+# wrong scalar) instead of silently agreeing. Green-by-construction: `emp`
+# and `emp2` are each a unique, uniquely-exposed bare table name, so
+# `requalify_visible`'s per-ref rule merges cleanly (no wrap expected).
+def _join_025(I):
+    joined = I["emp"].join(I["emp2"], I["emp"]["dept_id"] == I["emp2"]["dept_id"])
+    return joined.filter(I["emp2"]["salary"] == 91000.0)
+
+case("join-025", "join", "ancestor filter on above-join dup-name (salary) plan_id ref binds the correct (right) side", _join_025)
+
+def _join_026(I):
+    joined = I["emp"].join(I["emp2"], I["emp"]["dept_id"] == I["emp2"]["dept_id"])
+    return joined.select(I["emp"]["name"], I["emp"]["salary"], I["emp2"]["salary"].alias("emp2_salary"))
+
+case("join-026", "join", "ancestor project on above-join dup-name (salary) plan_id refs bind both sides correctly", _join_026)
+
 # ── 12. Set operations (type widening) ──────────────────────────────────────
 def _emp_proj(I):
     return I["emp"].select("id", "name", "dept_id", "age", "salary")

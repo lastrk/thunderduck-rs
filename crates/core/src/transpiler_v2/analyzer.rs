@@ -1504,15 +1504,54 @@ fn analyze_node(
             order,
             limit,
             offset,
-        } => passthrough_schema_arm(*input, base_types, outer, |mut ti| {
-            let order = analyze_sort(order, &mut ti, base_types, outer)?;
-            Ok(TypedOp::Sort {
-                input: Box::new(ti),
-                order,
-                limit,
-                offset,
-            })
-        }),
+        } => {
+            let mut typed_input = analyze_node(*input, base_types, outer)?;
+            let original_schema = typed_input.resolved_schema.clone();
+            let order = analyze_sort(order, &mut typed_input, base_types, outer)?;
+            let extended_schema = typed_input.resolved_schema.clone();
+            let sort = TypedAst::new(
+                TypedOp::Sort {
+                    input: Box::new(typed_input),
+                    order,
+                    limit,
+                    offset,
+                },
+                extended_schema.clone(),
+            );
+            if extended_schema.len() == original_schema.len() {
+                // No increment-2 promotion (design 023 step 5) — byte-
+                // identical to the pre-increment-2 shape.
+                Ok(sort)
+            } else {
+                // Increment 2 pushed hidden aggregate/projection outputs into
+                // the Sort's child to bind a key that resolves against the
+                // child's own input but matches no existing SELECT-list
+                // entry (Spark `ResolveReferencesInSort`'s trim-`Project`
+                // pattern). LIMIT/OFFSET stay inside the Sort; only the
+                // extra, now-visible trailing columns are trimmed back off.
+                let trim_projections: Vec<Expression> = original_schema
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        Expression::ColumnReference(ColumnReference {
+                            name: f.name.clone(),
+                            qualifier: None,
+                            data_type: Some(f.data_type.clone()),
+                            nullable: Some(f.nullable),
+                            ordinal: Some(i),
+                        })
+                    })
+                    .collect();
+                Ok(TypedAst::new(
+                    TypedOp::Project {
+                        input: Box::new(sort),
+                        projections: trim_projections,
+                    },
+                    original_schema,
+                ))
+            }
+        }
 
         CommonOp::Limit {
             input,
@@ -3540,7 +3579,7 @@ fn resolve_expr_list(
         .collect()
 }
 
-// ── ORDER BY / aggregate-restatement resolution (design 023, increment 1) ──
+// ── ORDER BY / aggregate-restatement resolution (design 023, increments 1+2) ─
 //
 // Mirrors Spark 4.1.1's `ResolveReferencesInSort` (resolve against the Sort's
 // child output first, then — if that fails, or the child is an `Aggregate`
@@ -3549,9 +3588,19 @@ fn resolve_expr_list(
 // input-resolved key back onto a semantically-equal SELECT-list entry by
 // alias-stripped structural equality, excluding nondeterministic functions —
 // Spark's `semanticEquals`). Increment 2 (design 023 step 5) adds the
-// hidden-output/trim-Project path for a key that resolves against the
-// child's input but matches NO existing SELECT-list entry; that path is NOT
-// implemented here — a no-match still surfaces `UnknownColumn`.
+// hidden-output/trim-Project path: when the input-resolved key matches NO
+// existing SELECT-list entry as a WHOLE, [`promote_aggregate_subtree`] /
+// [`promote_project_subtree`] walk it top-down, binding matching subtrees and
+// PROMOTING a remaining aggregate-function or grouping-expression subtree
+// (Aggregate child) or bare input column (Project child) into a brand new,
+// hidden SELECT-list entry — mirroring Spark's own `buildAggExprList` fold.
+// The Sort arm in [`analyze_node`] then wraps the Sort in a trim `Project`
+// restoring the original output schema whenever anything was appended. A
+// leftover bare `ColumnReference` under an `Aggregate` child that is neither
+// an aggregate-function argument nor a grouping expression still surfaces
+// `UnknownColumn` — confirmed against a live Spark 4.1.1 session that this is
+// exactly `UNRESOLVED_COLUMN.WITH_SUGGESTION` (Spark does NOT raise a
+// distinct `MISSING_AGGREGATION`-style error for this shape from `ORDER BY`).
 
 /// Resolve every ORDER BY key of a `Sort` against its child `ti`. Per key:
 /// today's direct resolution (unchanged) when it succeeds and the key does
@@ -3563,7 +3612,7 @@ fn analyze_sort(
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<Vec<SortOrder>, AnalyzerError> {
-    order
+    let resolved = order
         .into_iter()
         .map(|so| {
             let expr = analyze_sort_key(*so.expr, ti, base_types, outer)?;
@@ -3573,7 +3622,20 @@ fn analyze_sort(
                 null_ordering: so.null_ordering,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, AnalyzerError>>()?;
+    // Increment 2 (design 023 step 5) may have appended hidden aggregate /
+    // projection entries — and matching schema fields — to `ti.op` /
+    // `ti.resolved_schema` in place (Vec-append-only) while resolving the
+    // keys above, without re-deriving `ti.scope`. `TypedAst::new` is the
+    // single scope authority (INV2), and the ADR-023 tier-3 `source_quals`
+    // invariant (`source_quals.len() == resolved_schema.len()`) must track
+    // any schema growth — re-stamp unconditionally. Cheap when nothing
+    // changed: `RelScope::of`'s derivation is shallow (reads children's
+    // already-stamped scopes, never re-walks a subtree).
+    let op = std::mem::replace(&mut ti.op, TypedOp::SingleRow);
+    let schema = std::mem::take(&mut ti.resolved_schema);
+    *ti = TypedAst::new(op, schema);
+    Ok(resolved)
 }
 
 /// Resolve one ORDER BY key against the Sort's child `ti`.
@@ -3615,16 +3677,13 @@ fn analyze_sort_key(
     }
 }
 
-/// Steps 3-4 of the fallback (Spark `resolveColWithAgg` + `buildAggExprList`):
+/// Steps 3-5 of the fallback (Spark `resolveColWithAgg` + `buildAggExprList`):
 /// re-resolve `original` against the child's OWN input (`Aggregate.input` /
-/// `Project.input`), then bind it onto a semantically-equal entry in the
-/// child's OWN SELECT list (`Aggregate.aggregates` / `Project.projections`)
-/// via [`semantic_eq`]. On a match at position `k`, rewrites the key to a
-/// bare `ColumnReference` at that position and, if the matched entry is
-/// unaliased, alias-pins it (wraps it as `Alias(entry, name)`) so the
-/// emitted SQL and the rewritten key both bind to the same declared name —
-/// schema-neutral (same name/type/nullable `ti.resolved_schema` already
-/// carries at `k`).
+/// `Project.input`), then either bind it onto a semantically-equal entry in
+/// the child's OWN SELECT list (`Aggregate.aggregates` / `Project.projections`,
+/// increment 1), or — failing that — PROMOTE a subtree of it into a brand
+/// new hidden SELECT-list entry (increment 2, [`promote_aggregate_subtree`] /
+/// [`promote_project_subtree`]).
 ///
 /// Only `TypedOp::Aggregate` / `TypedOp::Project` children define an "own
 /// input" / "own SELECT list" here — any other child (e.g. `Deduplicate`)
@@ -3636,46 +3695,323 @@ fn rebind_sort_key(
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<Expression, AnalyzerError> {
-    let (child_input, child_list): (&TypedAst, &mut Vec<Expression>) = match &mut ti.op {
+    match &mut ti.op {
         TypedOp::Aggregate {
-            input, aggregates, ..
-        } => (input, aggregates),
+            input,
+            grouping,
+            aggregates,
+            ..
+        } => rebind_over_aggregate(
+            original,
+            input,
+            grouping,
+            aggregates,
+            &mut ti.resolved_schema,
+            base_types,
+            outer,
+        ),
         TypedOp::Project {
             input, projections, ..
-        } => (input, projections),
-        _ => return Err(unresolvable_sort_key_error(&original)),
-    };
+        } => rebind_over_project(
+            original,
+            input,
+            projections,
+            &mut ti.resolved_schema,
+            base_types,
+            outer,
+        ),
+        _ => Err(unresolvable_sort_key_error(&original)),
+    }
+}
+
+/// [`rebind_sort_key`]'s `TypedOp::Aggregate` case. `grouping`/`aggregates`
+/// invariant (see [`CommonOp::Aggregate`]): when the grouping keys are NOT
+/// already folded into `aggregates` (DataFrame-style Aggregate), the output
+/// schema is `[grouping fields..., aggregate fields...]` — `offset` accounts
+/// for that prefix so `aggregates[k]` always lines up with
+/// `schema.fields[offset + k]`. A prior version of this bailed whenever
+/// `!already_folded` (comparing `aggregates.len()` directly against
+/// `schema.len()`), which wrongly rejected an otherwise-valid whole-key match
+/// any time the GROUP BY keys were not restated bare in SELECT (tpcds-q085).
+fn rebind_over_aggregate(
+    original: Expression,
+    child_input: &TypedAst,
+    grouping: &[Expression],
+    aggregates: &mut Vec<Expression>,
+    schema: &mut StructType,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<Expression, AnalyzerError> {
+    let already_folded = grouping_already_folded(grouping, aggregates);
+    let offset = if already_folded { 0 } else { grouping.len() };
     // Star projections (and any other schema-expanding rewrite that runs
     // BEFORE `resolve_and_stamp`) break the 1:1 alignment between
-    // `child_list`'s positions and `ti.resolved_schema`'s fields that the
-    // rewrite below depends on — bail rather than mis-index.
-    if child_list.len() != ti.resolved_schema.len() {
+    // `aggregates`' positions and `schema`'s fields that the rewrite below
+    // depends on — bail rather than mis-index.
+    if offset + aggregates.len() != schema.len() {
         return Err(unresolvable_sort_key_error(&original));
     }
     let ctx = ResolveContext::of_input(child_input, base_types, outer);
     let input_resolved = resolve_and_stamp(original.clone(), &ctx)
         .map_err(|_| unresolvable_sort_key_error(&original))?;
-    let Some(k) = child_list
+    // Increment 1: whole-key match.
+    if let Some(k) = aggregates
         .iter()
         .position(|entry| semantic_eq(&input_resolved, entry))
-    else {
+    {
+        return Ok(bind_aggregate_slot(aggregates, schema, offset, k));
+    }
+    // Increment 2 (design 023 step 5): subtree walk-and-promote.
+    let input_schema = &child_input.resolved_schema;
+    promote_aggregate_subtree(
+        input_resolved,
+        aggregates,
+        grouping,
+        schema,
+        offset,
+        input_schema,
+    )
+    .ok_or_else(|| unresolvable_sort_key_error(&original))
+}
+
+/// [`rebind_sort_key`]'s `TypedOp::Project` case. `projections` is always
+/// 1:1 with `schema` here (Star expansion runs before `resolve_and_stamp`,
+/// same guard as the Aggregate case) so no offset is needed.
+fn rebind_over_project(
+    original: Expression,
+    child_input: &TypedAst,
+    projections: &mut Vec<Expression>,
+    schema: &mut StructType,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<Expression, AnalyzerError> {
+    if projections.len() != schema.len() {
         return Err(unresolvable_sort_key_error(&original));
-    };
-    let field = ti.resolved_schema.fields[k].clone();
-    if !matches!(child_list[k], Expression::Alias(_)) {
-        let entry = child_list[k].clone();
-        child_list[k] = Expression::Alias(AliasExpression {
+    }
+    let ctx = ResolveContext::of_input(child_input, base_types, outer);
+    let input_resolved = resolve_and_stamp(original.clone(), &ctx)
+        .map_err(|_| unresolvable_sort_key_error(&original))?;
+    // Increment 1: whole-key match.
+    if let Some(k) = projections
+        .iter()
+        .position(|entry| semantic_eq(&input_resolved, entry))
+    {
+        return Ok(bind_project_slot(projections, schema, k));
+    }
+    // Increment 2 (design 023 step 5): subtree walk-and-promote.
+    let input_schema = &child_input.resolved_schema;
+    promote_project_subtree(input_resolved, projections, schema, input_schema)
+        .ok_or_else(|| unresolvable_sort_key_error(&original))
+}
+
+/// Bind the sort key to the EXISTING `aggregates[k]` entry: alias-pin it
+/// (wrap as `Alias(entry, name)`) if it is not already aliased, so the
+/// emitted SQL and the rewritten key both bind to the same declared name,
+/// then return a bare `ColumnReference` at its schema position
+/// (`offset + k`) — schema-neutral, `schema.fields[offset + k]` already
+/// carries the name/type/nullable the entry produces.
+fn bind_aggregate_slot(
+    aggregates: &mut [Expression],
+    schema: &StructType,
+    offset: usize,
+    k: usize,
+) -> Expression {
+    let field = schema.fields[offset + k].clone();
+    if !matches!(aggregates[k], Expression::Alias(_)) {
+        let entry = aggregates[k].clone();
+        aggregates[k] = Expression::Alias(AliasExpression {
             expr: Box::new(entry),
             alias: field.name.clone(),
         });
     }
-    Ok(Expression::ColumnReference(ColumnReference {
+    Expression::ColumnReference(ColumnReference {
+        name: field.name,
+        qualifier: None,
+        data_type: Some(field.data_type),
+        nullable: Some(field.nullable),
+        ordinal: Some(offset + k),
+    })
+}
+
+/// [`bind_aggregate_slot`]'s `TypedOp::Project` counterpart — `projections`
+/// carries no grouping-prefix offset, so the schema position is `k` itself.
+fn bind_project_slot(projections: &mut [Expression], schema: &StructType, k: usize) -> Expression {
+    let field = schema.fields[k].clone();
+    if !matches!(projections[k], Expression::Alias(_)) {
+        let entry = projections[k].clone();
+        projections[k] = Expression::Alias(AliasExpression {
+            expr: Box::new(entry),
+            alias: field.name.clone(),
+        });
+    }
+    Expression::ColumnReference(ColumnReference {
         name: field.name,
         qualifier: None,
         data_type: Some(field.data_type),
         nullable: Some(field.nullable),
         ordinal: Some(k),
-    }))
+    })
+}
+
+/// `true` for `Expression` variants this fallback treats as an opaque,
+/// non-recursable, non-promotable unit — mirrors `resolve_and_stamp`'s own
+/// opacity list (`Lambda`/`LambdaVariable`/`RawSql`/`Interval`, plus the
+/// subquery variants) PLUS `Window`. `Window` matters specifically: its
+/// `.func` is a structural child (`Expression::children` descends into it,
+/// so [`contains_aggregate_call`] trips on `sum(x) OVER (...)`), but
+/// promoting that INNER aggregate call would replace a window function's own
+/// `.func` with a bare `ColumnReference` — corrupting the window rather than
+/// resolving it. Increment 1 already left this shape as a documented,
+/// harmless bail (whole-key match never finds a literal `Window` entry to
+/// bind onto); this guard preserves that exact behavior under increment 2's
+/// added recursion instead of silently rewriting into an invalid tree.
+fn opaque_to_subtree_promotion(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::Window(_)
+            | Expression::ScalarSubquery(_)
+            | Expression::InSubquery(_)
+            | Expression::ExistsSubquery(_)
+            | Expression::Lambda(_)
+            | Expression::LambdaVariable(_)
+            | Expression::RawSql(_)
+            | Expression::Interval(_)
+    )
+}
+
+/// Increment 2 (design 023 step 5): recursively bind or PROMOTE subtrees of
+/// `expr` (already resolved against the Aggregate's OWN input schema) that
+/// increment 1's whole-key match left unbound. At each node, top-down:
+/// - a subtree that structurally matches (`semantic_eq`) an EXISTING
+///   `aggregates` entry binds to that entry (alias-pinning if unaliased) —
+///   increment 1's match, applied to a subtree instead of the whole key;
+/// - otherwise, a subtree that is itself an aggregate-classifier
+///   `FunctionCall`, or that matches (`semantic_eq`) a `grouping` entry, is
+///   PROMOTED: a fresh `Alias(subtree, name)` entry is appended to
+///   `aggregates` (dedup — a subtree already promoted earlier in the SAME
+///   walk, or by an earlier key in the same `ORDER BY`, is caught by the
+///   whole-entry match above since it is now literally present in
+///   `aggregates`; name-collision-uniquified via
+///   [`unique_hidden_output_name`]) with a matching field appended to
+///   `schema`, then bound to that new entry — Spark
+///   `ResolveAggregateFunctions#buildAggExprList`'s own fold;
+/// - otherwise, recursion continues into its children (unless
+///   [`opaque_to_subtree_promotion`] says the node is an opaque unit);
+/// - a `ColumnReference` LEAF that survives all of the above (neither bound
+///   nor promotable — present in the input, but neither aggregated nor
+///   grouped) is Spark's "cannot be resolved" case: `None`, so the caller
+///   re-raises the ORIGINAL `UnknownColumn` (confirmed against a live Spark
+///   4.1.1 session to be `UNRESOLVED_COLUMN.WITH_SUGGESTION`, the SAME class
+///   an ordinary unresolvable reference gets — there is no distinct
+///   `MISSING_AGGREGATION`-style error for this shape from `ORDER BY`).
+fn promote_aggregate_subtree(
+    expr: Expression,
+    aggregates: &mut Vec<Expression>,
+    grouping: &[Expression],
+    schema: &mut StructType,
+    offset: usize,
+    input_schema: &StructType,
+) -> Option<Expression> {
+    if let Some(k) = aggregates
+        .iter()
+        .position(|entry| semantic_eq(&expr, entry))
+    {
+        return Some(bind_aggregate_slot(aggregates, schema, offset, k));
+    }
+    let is_new_aggregate =
+        matches!(&expr, Expression::FunctionCall(f) if is_aggregate_classifier_name(&f.name));
+    let matches_grouping = grouping.iter().any(|g| semantic_eq(&expr, g));
+    if is_new_aggregate || matches_grouping {
+        let name = unique_hidden_output_name(&expr, aggregates);
+        let field = StructField::new(
+            name.clone(),
+            expr.data_type(input_schema),
+            expr.nullable(input_schema),
+        );
+        aggregates.push(Expression::Alias(AliasExpression {
+            expr: Box::new(expr),
+            alias: name,
+        }));
+        schema.fields.push(field.clone());
+        return Some(Expression::ColumnReference(ColumnReference {
+            name: field.name,
+            qualifier: None,
+            data_type: Some(field.data_type),
+            nullable: Some(field.nullable),
+            ordinal: Some(offset + aggregates.len() - 1),
+        }));
+    }
+    if matches!(expr, Expression::ColumnReference(_)) || opaque_to_subtree_promotion(&expr) {
+        return None;
+    }
+    expr.map_children(|c| {
+        promote_aggregate_subtree(c, aggregates, grouping, schema, offset, input_schema).ok_or(())
+    })
+    .ok()
+}
+
+/// [`promote_aggregate_subtree`]'s `TypedOp::Project` counterpart — there is
+/// no "aggregate function" / "grouping expression" concept for a plain
+/// Project, so the ONLY promotable shape is a bare input `ColumnReference`
+/// leaf: pushed into `projections` verbatim (Spark `ResolveReferencesInSort`
+/// adds the missing ATTRIBUTE, not a computed subexpression).
+fn promote_project_subtree(
+    expr: Expression,
+    projections: &mut Vec<Expression>,
+    schema: &mut StructType,
+    input_schema: &StructType,
+) -> Option<Expression> {
+    if let Some(k) = projections
+        .iter()
+        .position(|entry| semantic_eq(&expr, entry))
+    {
+        return Some(bind_project_slot(projections, schema, k));
+    }
+    if let Expression::ColumnReference(_) = &expr {
+        let field = StructField::new(
+            expression_output_name(&expr),
+            expr.data_type(input_schema),
+            expr.nullable(input_schema),
+        );
+        projections.push(expr);
+        schema.fields.push(field.clone());
+        let k = projections.len() - 1;
+        return Some(Expression::ColumnReference(ColumnReference {
+            name: field.name,
+            qualifier: None,
+            data_type: Some(field.data_type),
+            nullable: Some(field.nullable),
+            ordinal: Some(k),
+        }));
+    }
+    if opaque_to_subtree_promotion(&expr) {
+        return None;
+    }
+    expr.map_children(|c| promote_project_subtree(c, projections, schema, input_schema).ok_or(()))
+        .ok()
+}
+
+/// A hidden-promotion output name, uniquified against `aggregates`' EXISTING
+/// names (case-insensitive, matching [`grouping_already_folded`]'s own name
+/// comparison) so two structurally-different promoted subtrees never
+/// collide on the same schema field name.
+fn unique_hidden_output_name(expr: &Expression, aggregates: &[Expression]) -> String {
+    let base = expression_output_name(expr);
+    let taken: HashSet<String> = aggregates
+        .iter()
+        .map(|e| expression_output_name(e).to_ascii_lowercase())
+        .collect();
+    if !taken.contains(&base.to_ascii_lowercase()) {
+        return base;
+    }
+    let mut n = 2usize;
+    loop {
+        let candidate = format!("{base}_{n}");
+        if !taken.contains(&candidate.to_ascii_lowercase()) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// The catch-all `UnknownColumn` for a sort key the fallback could not bind
@@ -13211,6 +13547,247 @@ mod tests {
                 );
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+    }
+
+    // ── Design 023 increment 2 — subtree promotion + trim Project ────────────
+    // (analyzer.rs `promote_aggregate_subtree` / `promote_project_subtree`;
+    // Sort arm in `analyze_node`). Covers the shapes increment 1's whole-key
+    // match leaves red: a hidden GROUP BY key never restated in SELECT
+    // (tpcds-q098), a Project input column never projected in any form
+    // (tpcds-q078), and the genuine "neither grouped nor aggregated" Spark
+    // error case.
+
+    #[test]
+    fn sort_promotes_missing_grouping_key_and_trims_q098_shape() {
+        // `SELECT name, sum(salary) FROM emp GROUP BY dept_id, name
+        //  ORDER BY dept_id` (tpcds-q098 shape) — `name` is folded/restated
+        // so `grouping_already_folded` is true and the Aggregate's own
+        // schema is exactly `[name, sum(salary)]`; `dept_id` is a SECOND
+        // grouping key never restated anywhere in SELECT. Step 1 fails
+        // (`dept_id` is not an output field); increment 1's whole-key match
+        // also fails (no aggregate entry structurally equals `dept_id`);
+        // increment 2 promotes it — it structurally matches the
+        // Aggregate's OWN `grouping` list — by appending a new hidden
+        // `dept_id` entry to `aggregates` (and a matching field to the
+        // schema), then the Sort arm wraps the result in a trim `Project`
+        // restoring the original 2-column output.
+        let bt = base_types_with_emp_dept();
+        let agg = aggregate(
+            emp_scan(),
+            vec![unresolved_col("dept_id"), unresolved_col("name")],
+            vec![
+                unresolved_col("name"),
+                func("sum", vec![unresolved_col("salary")]),
+            ],
+        );
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(agg),
+            order: vec![asc_key(unresolved_col("dept_id"))],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("missing grouping key must be promoted, not rejected");
+
+        let TypedOp::Project {
+            input: sort_ast,
+            projections,
+        } = &typed.op
+        else {
+            panic!(
+                "expected a trim Project wrapping the Sort, got {:?}",
+                typed.op
+            );
+        };
+        assert_eq!(
+            typed.resolved_schema.field_names(),
+            vec!["name", "sum(salary)"]
+        );
+        assert_eq!(projections.len(), 2);
+        match &projections[0] {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.name, "name");
+                assert_eq!(c.ordinal, Some(0));
+            }
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+        match &projections[1] {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.name, "sum(salary)");
+                assert_eq!(c.ordinal, Some(1));
+            }
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+
+        let TypedOp::Sort {
+            input: agg_ast,
+            order,
+            ..
+        } = &sort_ast.op
+        else {
+            panic!(
+                "expected Sort under the trim Project, got {:?}",
+                sort_ast.op
+            );
+        };
+        // The Sort's OWN schema is the EXTENDED (3-column) shape.
+        assert_eq!(sort_ast.resolved_schema.len(), 3);
+        match order[0].expr.as_ref() {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.name, "dept_id");
+                assert_eq!(c.ordinal, Some(2));
+            }
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+        match &agg_ast.op {
+            TypedOp::Aggregate { aggregates, .. } => {
+                assert_eq!(aggregates.len(), 3);
+                match &aggregates[2] {
+                    Expression::Alias(a) => {
+                        assert_eq!(a.alias, "dept_id");
+                        assert!(matches!(
+                            a.expr.as_ref(),
+                            Expression::ColumnReference(c) if c.name == "dept_id"
+                        ));
+                    }
+                    other => panic!("expected a new hidden dept_id entry, got {other:?}"),
+                }
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_promotes_project_hidden_column_and_trims_q078_shape() {
+        // `SELECT id, name FROM emp ORDER BY salary` (tpcds-q078 shape) —
+        // `salary` is present in the Project's INPUT but not projected in
+        // ANY form (not even renamed). Increment 1's whole-key match fails
+        // (no projection entry structurally equals `salary`); increment 2
+        // promotes it by pushing the bare `ColumnReference` itself onto
+        // `projections`, then the Sort arm wraps the result in a trim
+        // `Project` restoring the original 2-column output.
+        let bt = base_types_with_emp_dept();
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![unresolved_col("id"), unresolved_col("name")],
+        });
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(project),
+            order: vec![asc_key(unresolved_col("salary"))],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("hidden input column must be promoted, not rejected");
+
+        let TypedOp::Project {
+            input: sort_ast,
+            projections,
+        } = &typed.op
+        else {
+            panic!(
+                "expected a trim Project wrapping the Sort, got {:?}",
+                typed.op
+            );
+        };
+        assert_eq!(typed.resolved_schema.field_names(), vec!["id", "name"]);
+        assert_eq!(projections.len(), 2);
+
+        let TypedOp::Sort {
+            input: proj_ast,
+            order,
+            ..
+        } = &sort_ast.op
+        else {
+            panic!(
+                "expected Sort under the trim Project, got {:?}",
+                sort_ast.op
+            );
+        };
+        assert_eq!(sort_ast.resolved_schema.len(), 3);
+        match order[0].expr.as_ref() {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.name, "salary");
+                assert_eq!(c.ordinal, Some(2));
+            }
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+        match &proj_ast.op {
+            TypedOp::Project { projections, .. } => {
+                assert_eq!(projections.len(), 3);
+                match &projections[2] {
+                    Expression::ColumnReference(c) => assert_eq!(c.name, "salary"),
+                    other => panic!("expected a bare hidden salary push-down, got {other:?}"),
+                }
+            }
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_over_aggregate_non_grouping_non_aggregate_leftover_still_errors_unknown_column() {
+        // `SELECT dept_id FROM emp GROUP BY dept_id ORDER BY salary` —
+        // `salary` resolves against the Aggregate's own INPUT but is
+        // neither an aggregate-function argument nor a grouping expression
+        // anywhere; increment 2 must NOT invent a match for it. Confirmed
+        // against a live Spark 4.1.1 session that this shape raises
+        // `UNRESOLVED_COLUMN.WITH_SUGGESTION` — the SAME `UnknownColumn`
+        // class an ordinary unresolvable reference gets, NOT a distinct
+        // `MISSING_AGGREGATION`-style error.
+        let bt = base_types_with_emp_dept();
+        let agg = aggregate(
+            emp_scan(),
+            vec![unresolved_col("dept_id")],
+            vec![unresolved_col("dept_id")],
+        );
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(agg),
+            order: vec![asc_key(unresolved_col("salary"))],
+            limit: None,
+            offset: None,
+        });
+        let err = analyze(ast, &bt)
+            .expect_err("a leftover column neither grouped nor aggregated must still error");
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "salary");
+                assert!(qualifier.is_none());
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_over_deduplicate_wrapping_aggregate_does_not_reach_through_to_grouping_key() {
+        // `Deduplicate` over an `Aggregate` whose OWN grouping key WOULD
+        // satisfy increment 2's subtree promotion if the fallback could
+        // reach through it — proving the barrier holds even when the
+        // nested shape is otherwise a perfect match, not merely when the
+        // column is bogus everywhere (see
+        // `sort_over_deduplicate_does_not_engage_fallback`).
+        let bt = base_types_with_emp_dept();
+        let agg = aggregate(
+            emp_scan(),
+            vec![unresolved_col("dept_id")],
+            vec![unresolved_col("dept_id")],
+        );
+        let dedup = CommonAst::new(CommonOp::Deduplicate {
+            input: Box::new(agg),
+            on_columns: vec![],
+        });
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(dedup),
+            order: vec![asc_key(unresolved_col("salary"))],
+            limit: None,
+            offset: None,
+        });
+        let err =
+            analyze(ast, &bt).expect_err("Deduplicate must block the increment-2 fallback too");
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "salary");
+                assert!(qualifier.is_none());
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
         }
     }
 }

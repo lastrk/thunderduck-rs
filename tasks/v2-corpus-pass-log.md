@@ -1166,3 +1166,42 @@ red in any later pass.
   Cluster-A lone (jn-018/tbl-013/q044/q066), and singletons (Tail, write,
   split_with_limit, json_tuple, alter_table, encode, from_json-DF, empty_array,
   explode_map, combined_sql_df, dl-write-append-002).
+
+## Pass 27 — 2026-07-11 — ORDER BY-over-aggregate resolution, increment 2 (Cluster A)
+
+- **Baseline (post-Pass-26, commit 164bed3):** 1418 passed / 24 failed.
+- **Re-diagnosis of the 6 candidates:** only q078 (Project missing-ref) + q098
+  (grouping col not in SELECT) are genuine increment-2 shapes. q062/q079/q099 =
+  a SEPARATE `substr`→`substring` display-name bug (ORDER BY resolution already
+  correct). q085 = a pre-existing `grouping_already_folded` false-negative when
+  the grouping key appears only NESTED in a SELECT expr (independent of Sort).
+  Both flagged as follow-up tickets.
+- **Fix (analyzer.rs increment 2, extends Pass-22):** when increment-1's
+  whole-key match fails, walk the input-resolved key top-down; promote a matching
+  subtree to the child output column, or append a hidden aggregate/grouping/
+  passthrough output (Alias at END, dedup+uniquify) and synthesize a trailing
+  trim Project restoring the original output columns. `opaque_to_subtree_promotion`
+  guards Window etc. from decomposition; a leftover non-grouped/non-aggregated
+  bare column re-raises UnknownColumn. Also fixed a pre-existing offset/length
+  guard that had unconditionally bailed the fallback on non-folded aggregates.
+- **Review (`rust-reviewer`, no-tree-mutation):** APPROVE-WITH-NITS. Confirmed
+  green byte-identity (fallback only on red-today keys; folded whole-key cases
+  offset==0 byte-identical; no schema growth → Sort returned directly). Medium
+  (DEFERRED — witness-free, NOT a regression, hard-error not wrong-data):
+  a non-folded DataFrame aggregate with a COMPUTED grouping key
+  (`groupBy(a+b).agg(sum).orderBy(a+b)`) would append instead of binding to the
+  grouping-prefix column → column-count desync → downstream error; the shape was
+  already red pre-inc-2 and no corpus case hits it; clean fix = extend the
+  whole-key match to the grouping-prefix output columns. Lows: source_quals lost
+  on re-stamp of an alias-pinned grouping col (inert for emission here).
+- **Gate:** 1418→1420 (**Δ +2, zero regressions**; the coder's own full-corpus
+  run independently showed base 24 → 22, failed-set = base minus q078/q098).
+  SQL corpus 394→396. Newly green: tpcds-q078, tpcds-q098. `cargo test -p
+  thunderduck-core --lib` 1130.
+- **Reflect:** ORDER BY-over-aggregate resolution (Cluster A) now COMPLETE for
+  the corpus (increments 1+2, 11 cases across Passes 22+27); increment 3
+  (ordinals) is error-parity-only, no witness. Remaining 22: substr-naming
+  (q062/q079/q099), grouping-fold-nested (q085), Cluster-A lone (jn-018, tbl-013,
+  q044, q066), and singletons (Tail, write, split_with_limit, json_tuple,
+  alter_table, encode, from_json-DF, empty_array, explode_map, combined_sql_df,
+  dl-write-append-002). Deferred inc-2 Medium + inc-1 follow-ups tracked here.

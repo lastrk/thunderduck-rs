@@ -48,7 +48,7 @@ use super::expression::{
     ColumnReference, Expression, ExtractValueExpression, FunctionCall, Literal, LiteralValue,
     SortOrder, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
-use super::type_inference::TypeInferenceEngine;
+use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
 use crate::bail_boundary_rule;
 use crate::types::{DataType, StructField, StructType};
 
@@ -1504,19 +1504,8 @@ fn analyze_node(
             order,
             limit,
             offset,
-        } => passthrough_schema_arm(*input, base_types, outer, |ti| {
-            let ctx = ResolveContext::of_input(&ti, base_types, outer);
-            let order = order
-                .into_iter()
-                .map(|so| {
-                    let expr = resolve_and_stamp(*so.expr, &ctx)?;
-                    Ok::<SortOrder, AnalyzerError>(SortOrder {
-                        expr: Box::new(expr),
-                        direction: so.direction,
-                        null_ordering: so.null_ordering,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+        } => passthrough_schema_arm(*input, base_types, outer, |mut ti| {
+            let order = analyze_sort(order, &mut ti, base_types, outer)?;
             Ok(TypedOp::Sort {
                 input: Box::new(ti),
                 order,
@@ -3551,6 +3540,325 @@ fn resolve_expr_list(
         .collect()
 }
 
+// ── ORDER BY / aggregate-restatement resolution (design 023, increment 1) ──
+//
+// Mirrors Spark 4.1.1's `ResolveReferencesInSort` (resolve against the Sort's
+// child output first, then — if that fails, or the child is an `Aggregate`
+// and the key restates an aggregate — push resolution down to the child's
+// OWN input) plus `ResolveAggregateFunctions#buildAggExprList` (bind the
+// input-resolved key back onto a semantically-equal SELECT-list entry by
+// alias-stripped structural equality, excluding nondeterministic functions —
+// Spark's `semanticEquals`). Increment 2 (design 023 step 5) adds the
+// hidden-output/trim-Project path for a key that resolves against the
+// child's input but matches NO existing SELECT-list entry; that path is NOT
+// implemented here — a no-match still surfaces `UnknownColumn`.
+
+/// Resolve every ORDER BY key of a `Sort` against its child `ti`. Per key:
+/// today's direct resolution (unchanged) when it succeeds and the key does
+/// not restate an aggregate; otherwise the fallback in
+/// [`rebind_sort_key`].
+fn analyze_sort(
+    order: Vec<SortOrder>,
+    ti: &mut TypedAst,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<Vec<SortOrder>, AnalyzerError> {
+    order
+        .into_iter()
+        .map(|so| {
+            let expr = analyze_sort_key(*so.expr, ti, base_types, outer)?;
+            Ok(SortOrder {
+                expr: Box::new(expr),
+                direction: so.direction,
+                null_ordering: so.null_ordering,
+            })
+        })
+        .collect()
+}
+
+/// Resolve one ORDER BY key against the Sort's child `ti`.
+///
+/// Step 1 (today's behavior, unchanged): resolve against `ti`'s OUTPUT
+/// schema. Success with no aggregate `FunctionCall` in the resolved key →
+/// done, byte-identical to before this pass.
+///
+/// The fallback (steps 3-4, [`rebind_sort_key`]) triggers ONLY when step 1
+/// (i) fails with `UnknownColumn`, or (ii) succeeds but `ti.op` is
+/// `TypedOp::Aggregate` and the resolved key contains an aggregate
+/// `FunctionCall` (that combination always dies at DuckDB's binder today —
+/// e.g. tpcds-q096's `ORDER BY count(1)` over a global aggregate). Any OTHER
+/// step-1 error propagates unchanged. On trigger (i), a fallback failure
+/// re-raises step 1's EXACT `UnknownColumn` (unchanged error text) rather
+/// than whatever [`rebind_sort_key`] itself constructs.
+fn analyze_sort_key(
+    key: Expression,
+    ti: &mut TypedAst,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<Expression, AnalyzerError> {
+    let original = key.clone();
+    let step1 = resolve_and_stamp(key, &ResolveContext::of_input(ti, base_types, outer));
+    match step1 {
+        Ok(resolved) => {
+            let restates_aggregate =
+                matches!(ti.op, TypedOp::Aggregate { .. }) && contains_aggregate_call(&resolved);
+            if !restates_aggregate {
+                return Ok(resolved);
+            }
+            rebind_sort_key(original, ti, base_types, outer)
+        }
+        Err(AnalyzerError::UnknownColumn { name, qualifier }) => {
+            rebind_sort_key(original, ti, base_types, outer)
+                .map_err(|_| AnalyzerError::UnknownColumn { name, qualifier })
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Steps 3-4 of the fallback (Spark `resolveColWithAgg` + `buildAggExprList`):
+/// re-resolve `original` against the child's OWN input (`Aggregate.input` /
+/// `Project.input`), then bind it onto a semantically-equal entry in the
+/// child's OWN SELECT list (`Aggregate.aggregates` / `Project.projections`)
+/// via [`semantic_eq`]. On a match at position `k`, rewrites the key to a
+/// bare `ColumnReference` at that position and, if the matched entry is
+/// unaliased, alias-pins it (wraps it as `Alias(entry, name)`) so the
+/// emitted SQL and the rewritten key both bind to the same declared name —
+/// schema-neutral (same name/type/nullable `ti.resolved_schema` already
+/// carries at `k`).
+///
+/// Only `TypedOp::Aggregate` / `TypedOp::Project` children define an "own
+/// input" / "own SELECT list" here — any other child (e.g. `Deduplicate`)
+/// never engages this fallback, matching Spark's own refusal to push
+/// resolution through a non-Aggregate/Project operator.
+fn rebind_sort_key(
+    original: Expression,
+    ti: &mut TypedAst,
+    base_types: &BaseTypes,
+    outer: Option<OuterScope<'_>>,
+) -> Result<Expression, AnalyzerError> {
+    let (child_input, child_list): (&TypedAst, &mut Vec<Expression>) = match &mut ti.op {
+        TypedOp::Aggregate {
+            input, aggregates, ..
+        } => (input, aggregates),
+        TypedOp::Project {
+            input, projections, ..
+        } => (input, projections),
+        _ => return Err(unresolvable_sort_key_error(&original)),
+    };
+    // Star projections (and any other schema-expanding rewrite that runs
+    // BEFORE `resolve_and_stamp`) break the 1:1 alignment between
+    // `child_list`'s positions and `ti.resolved_schema`'s fields that the
+    // rewrite below depends on — bail rather than mis-index.
+    if child_list.len() != ti.resolved_schema.len() {
+        return Err(unresolvable_sort_key_error(&original));
+    }
+    let ctx = ResolveContext::of_input(child_input, base_types, outer);
+    let input_resolved = resolve_and_stamp(original.clone(), &ctx)
+        .map_err(|_| unresolvable_sort_key_error(&original))?;
+    let Some(k) = child_list
+        .iter()
+        .position(|entry| semantic_eq(&input_resolved, entry))
+    else {
+        return Err(unresolvable_sort_key_error(&original));
+    };
+    let field = ti.resolved_schema.fields[k].clone();
+    if !matches!(child_list[k], Expression::Alias(_)) {
+        let entry = child_list[k].clone();
+        child_list[k] = Expression::Alias(AliasExpression {
+            expr: Box::new(entry),
+            alias: field.name.clone(),
+        });
+    }
+    Ok(Expression::ColumnReference(ColumnReference {
+        name: field.name,
+        qualifier: None,
+        data_type: Some(field.data_type),
+        nullable: Some(field.nullable),
+        ordinal: Some(k),
+    }))
+}
+
+/// The catch-all `UnknownColumn` for a sort key the fallback could not bind
+/// to any child SELECT-list entry (increment 2 handles the hidden-output/
+/// subtree case this leaves red). Named from the ORIGINAL (pre-resolution)
+/// key when it is itself a bare column reference; otherwise from its
+/// output-name rendering, so the error text still names the offending key.
+fn unresolvable_sort_key_error(original: &Expression) -> AnalyzerError {
+    match original {
+        Expression::UnresolvedColumn(u) => AnalyzerError::UnknownColumn {
+            name: u.name.clone(),
+            qualifier: u.qualifier.clone(),
+        },
+        Expression::ColumnReference(c) => AnalyzerError::UnknownColumn {
+            name: c.name.clone(),
+            qualifier: c.qualifier.clone(),
+        },
+        other => AnalyzerError::UnknownColumn {
+            name: expression_output_name(other),
+            qualifier: None,
+        },
+    }
+}
+
+/// `true` iff `expr` contains (anywhere in its tree) a `FunctionCall` whose
+/// name is on the aggregate classifier roster
+/// ([`is_aggregate_classifier_name`]) — used to detect a Sort key that
+/// restates a SELECT-list aggregate (design 023 fallback trigger (ii)).
+///
+/// `Expression::children()` also descends into `WindowFunction.func`, so a
+/// key restating `sum(x) OVER (...)` also trips this — that key was already
+/// red before increment 1 (an aggregate name under `Window` is not a plain
+/// SELECT-list aggregate to rebind onto), and `rebind_sort_key` simply fails
+/// to find a match and re-raises the original `UnknownColumn`, so this is
+/// harmless, not a new failure mode.
+fn contains_aggregate_call(expr: &Expression) -> bool {
+    if let Expression::FunctionCall(f) = expr {
+        if is_aggregate_classifier_name(&f.name) {
+            return true;
+        }
+    }
+    expr.children().any(contains_aggregate_call)
+}
+
+/// Spark 4.1.1 `Nondeterministic`-expression names relevant to sort-key
+/// rebinding: `Rand`/`Randn`/`Uuid`/`Shuffle`/`MonotonicallyIncreasingID`
+/// (confirmed against `randomExpressions.scala` / `misc.scala` /
+/// `collectionOperations.scala` / `MonotonicallyIncreasingID.scala`), plus
+/// `InputFileName` / `SparkPartitionID` (both `Nondeterministic` in
+/// `Expression.scala`'s `misc.scala` neighborhood) and `random`, the
+/// Spark-SQL alias spelling of `rand`. This is the roster relevant to this
+/// fallback, NOT a claim of exhaustive coverage of every `Nondeterministic`
+/// expression in Catalyst. `Expression.semanticEquals` is unconditionally
+/// `false` whenever either side is nondeterministic (`deterministic &&
+/// other.deterministic && ...`, `Analyzer.scala`); [`semantic_eq`] mirrors
+/// that exclusion.
+const NONDETERMINISTIC_FN_NAMES: &[&str] = &[
+    "rand",
+    "random",
+    "randn",
+    "uuid",
+    "shuffle",
+    "monotonically_increasing_id",
+    "input_file_name",
+    "spark_partition_id",
+];
+
+fn contains_nondeterministic_call(expr: &Expression) -> bool {
+    if let Expression::FunctionCall(f) = expr {
+        if NONDETERMINISTIC_FN_NAMES
+            .iter()
+            .any(|n| f.name.eq_ignore_ascii_case(n))
+        {
+            return true;
+        }
+    }
+    expr.children().any(contains_nondeterministic_call)
+}
+
+/// Spark-`semanticEquals`-inspired structural comparison used to bind a
+/// resolved Sort key back onto a matching child SELECT-list entry (Spark
+/// `ResolveAggregateFunctions#buildAggExprList`'s first-match fold over
+/// `agg.aggregateExpressions`). Alias-stripped (mirrors Spark's
+/// `trimAliases`), qualifier-stripped and case-insensitive on column/function
+/// names (the two sides may carry different or absent table qualifiers, and
+/// independently-resolved `data_type`/`nullable` stamps, for the identical
+/// logical column post-resolution). Always `false` when either side contains
+/// a nondeterministic function call.
+///
+/// Both `a` and `b` are always resolved against the SAME child-input schema
+/// here (`rebind_sort_key` re-resolves the sort key against `child_input`,
+/// and `child_list`'s entries were themselves resolved against that same
+/// `child_input` when the Aggregate/Project node was originally analyzed —
+/// see the `CommonOp::Aggregate`/`CommonOp::Project` arms), so a
+/// `ColumnReference::ordinal` is a stable per-input-column identity, the
+/// Spark `exprId` analog for this comparison — needed because plain
+/// qualifier-stripped name equality alone cannot tell `t1.x` from `t2.x`
+/// after a join. NOTE: [`ColumnReference`]'s hand-written `PartialEq`
+/// deliberately EXCLUDES `ordinal` (it is derived data, not part of a
+/// reference's logical identity for every OTHER analyzer equality check), so
+/// the structural `==` below can never see it — [`ordinals_compatible`]
+/// re-walks both (already `==`-confirmed, hence same-shape) canonicalized
+/// trees afterwards to add that check back in specifically for this
+/// comparison.
+fn semantic_eq(a: &Expression, b: &Expression) -> bool {
+    if contains_nondeterministic_call(a) || contains_nondeterministic_call(b) {
+        return false;
+    }
+    let ca = canonicalize_for_semantic_eq(a);
+    let cb = canonicalize_for_semantic_eq(b);
+    ca == cb && ordinals_compatible(&ca, &cb)
+}
+
+/// Walk two expressions already confirmed structurally `==` (hence the same
+/// shape/variant at every level — `==` recurses through `map_children`'s
+/// child slots the same way [`Expression::children`] does) and additionally
+/// require that wherever BOTH sides are a `ColumnReference` carrying a
+/// resolved `ordinal`, those ordinals agree. Closes the gap
+/// `ColumnReference::eq`'s ordinal exclusion leaves open: two different
+/// input columns that happen to share a (qualifier-stripped) name — e.g.
+/// `t1.x` and `t2.x` after a join — canonicalize and `==`-compare IDENTICAL,
+/// so without this pass `semantic_eq` would bind to whichever SELECT-list
+/// entry happens to come first, silently picking the wrong one. When either
+/// side lacks an ordinal (e.g. a correlated outer reference — tier (g) in
+/// [`resolve_column`] never stamps one), the qualifier-stripped name match
+/// `==` already performed is the best identity available; no further
+/// constraint is imposed.
+fn ordinals_compatible(a: &Expression, b: &Expression) -> bool {
+    match (a, b) {
+        (Expression::ColumnReference(ca), Expression::ColumnReference(cb)) => {
+            match (ca.ordinal, cb.ordinal) {
+                (Some(oa), Some(ob)) => oa == ob,
+                _ => true,
+            }
+        }
+        _ => a
+            .children()
+            .zip(b.children())
+            .all(|(x, y)| ordinals_compatible(x, y)),
+    }
+}
+
+/// Recursively strip every `Alias` wrapper and case-fold/qualifier-strip
+/// `ColumnReference` / `UnresolvedColumn` identity, producing the canonical
+/// form [`semantic_eq`] compares with `==` (and then re-walks via
+/// [`ordinals_compatible`]). Uses [`Expression::map_children`] for the
+/// default recursion so every current and future `Expression` variant is
+/// covered without a hand-enumerated match; infallible (`Result<_,
+/// Infallible>`), so the `unwrap_or_else` below can never panic.
+///
+/// `ColumnReference::ordinal` is deliberately PRESERVED (only
+/// qualifier/name-case/type/nullable are normalized away) — [`semantic_eq`]'s
+/// `==` check cannot see it (`ColumnReference::eq` excludes it), but
+/// [`ordinals_compatible`] reads it directly off these canonicalized trees.
+fn canonicalize_for_semantic_eq(expr: &Expression) -> Expression {
+    if let Expression::Alias(a) = expr {
+        return canonicalize_for_semantic_eq(&a.expr);
+    }
+    let normalized = match expr {
+        Expression::ColumnReference(c) => Expression::ColumnReference(ColumnReference {
+            name: c.name.to_ascii_lowercase(),
+            qualifier: None,
+            data_type: None,
+            nullable: None,
+            ordinal: c.ordinal,
+        }),
+        Expression::UnresolvedColumn(u) => Expression::UnresolvedColumn(UnresolvedColumn {
+            name: u.name.to_ascii_lowercase(),
+            qualifier: None,
+            plan_id: None,
+        }),
+        Expression::FunctionCall(f) => Expression::FunctionCall(FunctionCall {
+            name: f.name.to_ascii_lowercase(),
+            args: f.args.clone(),
+            distinct: f.distinct,
+        }),
+        other => other.clone(),
+    };
+    normalized
+        .map_children(|c| Ok::<_, std::convert::Infallible>(canonicalize_for_semantic_eq(&c)))
+        .unwrap_or_else(|e: std::convert::Infallible| match e {})
+}
+
 /// Analyze an embedded subquery's inner plan. Builds an [`OuterScope`] from
 /// the enclosing [`ResolveContext`] so that correlated references to columns
 /// present ONLY in the outer plan's schema resolve correctly (tier (g) in
@@ -5533,8 +5841,8 @@ mod tests {
     use super::super::expression::{
         AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, ExistsSubquery,
         FunctionCall, InSubquery, LambdaExpression, LambdaVariableExpression, Literal,
-        LiteralValue, ScalarSubquery, StarExpression, UnaryExpression, UnaryOp,
-        UnresolvedRegexExpression,
+        LiteralValue, NullOrdering, ScalarSubquery, SortDirection, StarExpression, UnaryExpression,
+        UnaryOp, UnresolvedRegexExpression,
     };
     use super::*;
 
@@ -12531,6 +12839,378 @@ mod tests {
                 assert_eq!(qualifier, Some("__td_jr".to_owned()));
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    // ── Design 023 increment 1 — ORDER BY / aggregate-restatement resolution ──
+    // (analyzer.rs Sort arm; see `analyze_sort` / `rebind_sort_key` /
+    // `semantic_eq`). Covers Cluster A of `.agent-output/022-diagnostic-sql-
+    // corpus-reds.md`: a Sort key that restates a SELECT-list aggregate or
+    // expression, or references a base column the SELECT renamed, must bind
+    // back onto the matching child output rather than fail `UnknownColumn`.
+
+    /// Ascending, nulls-last sort key — the default shape needed by these
+    /// tests (direction/null-ordering are untouched by the fallback).
+    fn asc_key(expr: Expression) -> SortOrder {
+        SortOrder {
+            expr: Box::new(expr),
+            direction: SortDirection::Ascending,
+            null_ordering: NullOrdering::NullsLast,
+        }
+    }
+
+    #[test]
+    fn sort_aggregate_restatement_binds_and_alias_pins() {
+        // `SELECT dept_id, sum(salary) FROM emp GROUP BY dept_id
+        //  ORDER BY sum(salary)` — the ORDER BY key restates the unaliased
+        // aggregate. Step 1 (resolve against the Aggregate's OUTPUT) fails
+        // (`salary` is not an output column); the fallback re-resolves
+        // `sum(salary)` against the Aggregate's INPUT, matches
+        // `aggregates[1]` by `semantic_eq`, rewrites the key to a bare
+        // `ColumnReference("sum(salary)")`, and alias-pins the previously
+        // unaliased aggregate entry so emission binds to the same name.
+        let bt = base_types_with_emp_dept();
+        let sum_salary = || func("sum", vec![unresolved_col("salary")]);
+        let agg = aggregate(
+            emp_scan(),
+            vec![unresolved_col("dept_id")],
+            vec![unresolved_col("dept_id"), sum_salary()],
+        );
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(agg),
+            order: vec![asc_key(sum_salary())],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("aggregate restatement must resolve");
+        let TypedOp::Sort { input, order, .. } = &typed.op else {
+            panic!("expected Sort, got {:?}", typed.op);
+        };
+        match order[0].expr.as_ref() {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.name, "sum(salary)");
+                assert!(c.qualifier.is_none());
+                assert_eq!(c.ordinal, Some(1));
+            }
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+        match &input.op {
+            TypedOp::Aggregate { aggregates, .. } => match &aggregates[1] {
+                Expression::Alias(a) => {
+                    assert_eq!(a.alias, "sum(salary)");
+                    assert!(matches!(
+                        a.expr.as_ref(),
+                        Expression::FunctionCall(f) if f.name.eq_ignore_ascii_case("sum")
+                    ));
+                }
+                other => panic!("expected alias-pinned sum(salary), got {other:?}"),
+            },
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_over_project_binds_renamed_column_alias_stripped() {
+        // `SELECT id AS customer_id FROM emp ORDER BY id` — no aggregate at
+        // all (q084 shape). `id` is not a Project output column (only
+        // `customer_id` is); the fallback resolves `id` against the
+        // Project's input, matches the (already-aliased) projection by
+        // `semantic_eq` (alias-stripped), and rewrites the key onto the
+        // existing alias without re-wrapping it.
+        let bt = base_types_with_emp_dept();
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![alias_expr(unresolved_col("id"), "customer_id")],
+        });
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(project),
+            order: vec![asc_key(unresolved_col("id"))],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("renamed base column must resolve");
+        let TypedOp::Sort { input, order, .. } = &typed.op else {
+            panic!("expected Sort, got {:?}", typed.op);
+        };
+        match order[0].expr.as_ref() {
+            Expression::ColumnReference(c) => assert_eq!(c.name, "customer_id"),
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+        match &input.op {
+            TypedOp::Project { projections, .. } => match &projections[0] {
+                Expression::Alias(a) => assert_eq!(a.alias, "customer_id"),
+                other => panic!("expected unchanged existing alias, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_over_project_binds_whole_expr_and_alias_pins() {
+        // `SELECT substr(name, 1, 3) FROM emp ORDER BY substr(name, 1, 3)`
+        // (q062/q079/q099 shape) — the ORDER BY key restates the whole
+        // unaliased projected expression verbatim. Falls back, resolves
+        // against the Project's input, matches by whole-expression
+        // `semantic_eq`, and alias-pins the projection.
+        let bt = base_types_with_emp_dept();
+        let substr_name = || {
+            func(
+                "substr",
+                vec![unresolved_col("name"), int_lit(1), int_lit(3)],
+            )
+        };
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![substr_name()],
+        });
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(project),
+            order: vec![asc_key(substr_name())],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("whole-expression match must resolve");
+        let TypedOp::Sort { input, order, .. } = &typed.op else {
+            panic!("expected Sort, got {:?}", typed.op);
+        };
+        let expected_name = "substr(name, 1, 3)";
+        match order[0].expr.as_ref() {
+            Expression::ColumnReference(c) => assert_eq!(c.name, expected_name),
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+        match &input.op {
+            TypedOp::Project { projections, .. } => match &projections[0] {
+                Expression::Alias(a) => assert_eq!(a.alias, expected_name),
+                other => panic!("expected alias-pinned substr entry, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_count_star_over_global_aggregate_resolves_q096_shape() {
+        // tpcds-q096 shape: `SELECT count(*) FROM emp ORDER BY count(*)` —
+        // a GLOBAL aggregate (no GROUP BY). Step 1 succeeds (the Sort's
+        // input schema has exactly one column, `count(1)`, and the key
+        // resolves to it structurally) but the resolved key still contains
+        // an aggregate `FunctionCall` over an `Aggregate` child — fallback
+        // trigger (ii) — so it must be rebound to the child's own SELECT
+        // list rather than left as a restated aggregate call (which used to
+        // die at DuckDB's binder: "count(1) must appear in GROUP BY").
+        let bt = base_types_with_emp_dept();
+        let count_star = || {
+            func(
+                "count",
+                vec![Expression::Star(StarExpression { qualifier: None })],
+            )
+        };
+        let agg = aggregate(emp_scan(), vec![], vec![count_star()]);
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(agg),
+            order: vec![asc_key(count_star())],
+            limit: None,
+            offset: None,
+        });
+        let typed =
+            analyze(ast, &bt).expect("count(*) restatement over a global aggregate must resolve");
+        let TypedOp::Sort { input, order, .. } = &typed.op else {
+            panic!("expected Sort, got {:?}", typed.op);
+        };
+        match order[0].expr.as_ref() {
+            Expression::ColumnReference(c) => {
+                assert!(c.qualifier.is_none());
+                assert_eq!(c.ordinal, Some(0));
+            }
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+        match &input.op {
+            TypedOp::Aggregate { aggregates, .. } => {
+                assert!(
+                    matches!(&aggregates[0], Expression::Alias(a) if matches!(a.expr.as_ref(), Expression::FunctionCall(f) if f.name.eq_ignore_ascii_case("count"))),
+                    "expected alias-pinned count(*) entry, got {:?}",
+                    aggregates[0]
+                );
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_by_existing_alias_is_unchanged_direct_path() {
+        // `SELECT sum(salary) AS total FROM emp GROUP BY dept_id ORDER BY
+        // total` — the ORDER BY key is already a plain reference to a
+        // SELECT alias, so step 1 succeeds directly against the Aggregate's
+        // OUTPUT and the key is not an aggregate `FunctionCall` itself
+        // (it's a bare column reference) — the fallback must never engage.
+        let bt = base_types_with_emp_dept();
+        let agg = aggregate(
+            emp_scan(),
+            vec![unresolved_col("dept_id")],
+            vec![
+                unresolved_col("dept_id"),
+                alias_expr(func("sum", vec![unresolved_col("salary")]), "total"),
+            ],
+        );
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(agg),
+            order: vec![asc_key(unresolved_col("total"))],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("ordering by an existing alias must resolve");
+        let TypedOp::Sort { input, order, .. } = &typed.op else {
+            panic!("expected Sort, got {:?}", typed.op);
+        };
+        match order[0].expr.as_ref() {
+            Expression::ColumnReference(c) => assert_eq!(c.name, "total"),
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+        // The aggregate list is untouched — no rewrite ever happens on the
+        // direct path.
+        match &input.op {
+            TypedOp::Aggregate { aggregates, .. } => match &aggregates[1] {
+                Expression::Alias(a) => assert_eq!(a.alias, "total"),
+                other => panic!("expected unchanged existing alias, got {other:?}"),
+            },
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_by_plain_output_column_is_unchanged_direct_path() {
+        // `SELECT id, name FROM emp ORDER BY id` — a plain Project (no
+        // aggregate anywhere), ordering by a column that IS present in the
+        // Project's own output. Step 1 succeeds and the key has no
+        // aggregate `FunctionCall`, so the fallback never engages.
+        let bt = base_types_with_emp_dept();
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![unresolved_col("id"), unresolved_col("name")],
+        });
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(project),
+            order: vec![asc_key(unresolved_col("id"))],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("ordering by a plain output column must resolve");
+        let TypedOp::Sort { order, .. } = &typed.op else {
+            panic!("expected Sort, got {:?}", typed.op);
+        };
+        match order[0].expr.as_ref() {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.name, "id");
+                assert_eq!(c.ordinal, Some(0));
+            }
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_over_deduplicate_does_not_engage_fallback() {
+        // `Deduplicate` is neither `TypedOp::Aggregate` nor `TypedOp::Project`
+        // — `rebind_sort_key` must refuse to push resolution through it
+        // (matching Spark's own refusal to resolve a Sort key against
+        // anything but an Aggregate/Project child), surfacing the ORIGINAL
+        // `UnknownColumn` unchanged rather than silently binding to an
+        // unrelated column.
+        let bt = base_types_with_emp_dept();
+        let dedup = CommonAst::new(CommonOp::Deduplicate {
+            input: Box::new(emp_scan()),
+            on_columns: vec![],
+        });
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(dedup),
+            order: vec![asc_key(unresolved_col("salary_typo"))],
+            limit: None,
+            offset: None,
+        });
+        let err = analyze(ast, &bt).expect_err("unresolvable key over Deduplicate must error");
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "salary_typo");
+                assert!(qualifier.is_none());
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_key_genuinely_unresolvable_still_errors_unknown_column() {
+        // No column of that name exists anywhere in the tree — the fallback
+        // must not conjure a match; the original `UnknownColumn` from step 1
+        // propagates unchanged.
+        let bt = base_types_with_emp_dept();
+        let agg = aggregate(
+            emp_scan(),
+            vec![unresolved_col("dept_id")],
+            vec![
+                unresolved_col("dept_id"),
+                func("sum", vec![unresolved_col("salary")]),
+            ],
+        );
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(agg),
+            order: vec![asc_key(unresolved_col("does_not_exist"))],
+            limit: None,
+            offset: None,
+        });
+        let err = analyze(ast, &bt).expect_err("a genuinely unknown column must still error");
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "does_not_exist");
+                assert!(qualifier.is_none());
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_over_join_same_name_collision_binds_correct_output_column() {
+        // `SELECT e.dept_id AS a, d.dept_id AS b FROM emp e JOIN dept d ON
+        // e.dept_id = d.dept_id ORDER BY d.dept_id` — review HIGH fix
+        // regression guard. Both `emp` and `dept` carry a `dept_id` column;
+        // qualifier-stripped alone, `e.dept_id` and `d.dept_id` canonicalize
+        // identically, so the fallback MUST use the retained `ordinal` (the
+        // exprId analog — both sides resolve against the identical join
+        // schema) to bind `ORDER BY d.dept_id` onto `b`, never onto `a`.
+        let bt = base_types_with_emp_dept();
+        let joined = join(
+            aliased_scan("emp", "e"),
+            aliased_scan("dept", "d"),
+            JoinType::Inner,
+            Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+        );
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(joined),
+            projections: vec![
+                alias_expr(qcol("e", "dept_id"), "a"),
+                alias_expr(qcol("d", "dept_id"), "b"),
+            ],
+        });
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(project),
+            order: vec![asc_key(qcol("d", "dept_id"))],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("d.dept_id must resolve against the join's own input");
+        let TypedOp::Sort { order, .. } = &typed.op else {
+            panic!("expected Sort, got {:?}", typed.op);
+        };
+        match order[0].expr.as_ref() {
+            Expression::ColumnReference(c) => {
+                assert_eq!(
+                    c.name, "b",
+                    "ORDER BY d.dept_id must bind to output column `b` (d.dept_id), \
+                     never `a` (e.dept_id) — a same-ordinal, not same-name, match"
+                );
+            }
+            other => panic!("expected bare ColumnReference, got {other:?}"),
         }
     }
 }

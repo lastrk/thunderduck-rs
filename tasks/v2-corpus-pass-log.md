@@ -998,3 +998,44 @@ red in any later pass.
   Remaining ~50: q066 (decimal typing), from_json DF-API, singletons
   (RelType::Tail, json_tuple, alter_table, Array-type, RelType::Sql, Parser),
   and the residual-naming M1/M2/M3 gaps.
+
+## Pass 22 — 2026-07-11 — ORDER BY-over-aggregate resolution, increment 1 (Cluster A)
+
+- **Baseline (post-Pass-21, commit 0312239):** 1392 passed / 50 failed.
+- **Cluster (diagnosis `.agent-output/022`, design `.agent-output/023`):** 15 SQL
+  corpus reds where ORDER BY re-states an aggregate/expression (not the SELECT
+  alias) — τ resolved sort keys against the Sort INPUT (= Project/Aggregate
+  OUTPUT), so base-column leaves didn't resolve (`UNRESOLVED_COLUMN`); q096
+  resolved then died in DuckDB (`count(1) must appear in GROUP BY`). τ lacked
+  Spark's `ResolveAggregateFunctions`/`ResolveReferencesInSort`.
+- **Fix (analyzer Sort arm, increment 1 of 3):** new `analyze_sort` — step 1 is
+  today's `resolve_and_stamp` (byte-identical); FALLBACK only on
+  `UnknownColumn` OR an aggregate-call key over an Aggregate child (q096) →
+  re-resolve against the child INPUT, `semantic_eq`-match the WHOLE key against
+  the child's aggregates/projections (alias/qualifier-stripped, nondeterministic-
+  excluded), rewrite to a bare ColumnReference on that output column, alias-pin
+  the matched entry if unaliased. Spark 4.1.1 semantics confirmed against the
+  apache/spark v4.1.1 sources (curl). Increment 2 (subtree match + hidden
+  outputs + trim Project) deferred → will flip q098 + the 4 substr cases.
+- **Review (`rust-reviewer`, no-tree-mutation):** APPROVE-WITH-NITS. Confirmed
+  the green-case byte-identical claim (fallback fires only on red-today paths;
+  the +9/zero-regression gate proves it). Caught a HIGH latent silent-wrong-data
+  risk: `canonicalize_for_semantic_eq` stripped qualifier AND ordinal, so
+  same-base-named columns (`t1.x`/`t2.x`) collapsed and matched the first →
+  wrong ORDER BY column. FIXED before commit: added `ordinals_compatible` run
+  after the structural `==` (ColumnReference::PartialEq excludes ordinal by
+  design, so the reviewer's retain-ordinal one-liner was a no-op) — rejects a
+  match when the same name binds to different ordinals, at every nesting depth.
+  +collision regression test. Lows: extended nondeterministic roster
+  (input_file_name/spark_partition_id/random); windowed-agg trigger note.
+- **Gate (re-gate after HIGH fix):** 1392→1401 (**Δ +9, zero regressions**; the
+  hardening held all 9 flips, un-flipped none). SQL corpus 385→394. Newly green:
+  tpcds-q016/q042/q071/q084/q091/q092/q094/q095/q096. `cargo test -p
+  thunderduck-core --lib` 1111.
+- **Reflect:** biggest analyzer feature of the session; the fix-loop caught a
+  genuine silent-wrong-data risk the gate alone would only surface if a target
+  hit the collision (none did) — review earned its keep again. Remaining ~41:
+  increment 2 (q098 + substr cases q062/q079/q085/q099), the 4 Cluster-A lone
+  cases (jn-018 reserved-word quoting, tbl-013 qualified-arg naming, q044
+  subquery-arity, q066 decimal-union), feature-family clusters (array-ordering,
+  date-arith, math, interval), and singletons (RelType::Tail, json_tuple, etc.).

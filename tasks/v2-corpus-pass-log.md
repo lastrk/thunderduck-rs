@@ -1138,3 +1138,31 @@ red in any later pass.
   Cluster-A lone (jn-018/tbl-013/q044/q066), map (explode_map/map_from_arrays),
   singletons (Tail, write, split_with_limit, json_tuple, alter_table, encode,
   from_json-DF, empty_array, dl-write-append-002).
+
+## Pass 26 — 2026-07-11 — map_from_arrays type derivation (explode_map deferred)
+
+- **Baseline (post-Pass-25, commit 1e284ca):** 1416 passed / 26 failed.
+- **Root cause:** `map_from_arrays` was bundled into the hardcoded
+  `Map<String,String,value_nullable=true>` fallback (type_inference.rs:710),
+  regardless of arg types (map/create_map had a dedicated fast path;
+  map_from_arrays didn't). Wrong declared key/value types → schema mismatch.
+- **Fix:** `function_call_data_type` (expression.rs) arm deriving key type from
+  the keys-array element type and value type + valueContainsNull from the
+  values-array element (matches Spark MapFromArrays.dataType, verified live).
+  2 unit tests.
+- **Review:** documented-skip (additive type-derivation, unit-locked, live-Spark-
+  verified). Gate arbitrated.
+- **Gate:** 1416→1418 (**Δ +2, zero regressions**). Newly green:
+  test_map_from_arrays (DataFrame + type_literals). `cargo test` 1126.
+- **STOPPED / deferred: `test_explode_map`** — unaliased `explode(map)` should
+  emit two default-named columns `key`,`value`, but τ's multi-column map-explode
+  expansion (emission.rs:3850, type_inference.rs:829) only fires on an EXPLICIT
+  alias (SQL `AS (k,v)` / DataFrame `.alias(k,v)`). Bare explode(map) falls to
+  the single-col scalar path → `UNRESOLVED_COLUMN cannot resolve key`. Needs a
+  schema-aware Project pre-pass generator expansion (mirror
+  expand_json_tuple/stack_projections, dispatch Array=1col vs Map=2cols) — real
+  generator-machinery work, no corpus witness. Follow-up ticket.
+- **Reflect:** remaining 24: ORDER BY inc-2 (q062/q078/q079/q085/q098/q099),
+  Cluster-A lone (jn-018/tbl-013/q044/q066), and singletons (Tail, write,
+  split_with_limit, json_tuple, alter_table, encode, from_json-DF, empty_array,
+  explode_map, combined_sql_df, dl-write-append-002).

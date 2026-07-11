@@ -707,6 +707,14 @@ impl TypeInferenceEngine {
             // `Map<VARCHAR, VARCHAR>`. Session macro `str_to_map` (see
             // `runtime/session.rs`) provides the DuckDB translation. Corpus:
             // `map2-002`.
+            //
+            // `map`/`create_map` (well-typed, non-empty even arity) and
+            // `map_from_arrays` (arity 2 with resolved `Array` args) are
+            // pre-empted by dedicated fast paths in
+            // `Expression::function_call_data_type` that derive the real
+            // key/value types; this hard-coded `Map<String, String, true>`
+            // is their honest-but-approximate fallback for malformed calls
+            // (and the resolver `map_from_entries` still relies on it).
             "map" | "map_from_arrays" | "create_map" | "map_from_entries" | "str_to_map" => {
                 DataType::Map {
                     key: Box::new(String),

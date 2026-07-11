@@ -1130,6 +1130,29 @@ impl Expression {
                     value_nullable,
                 };
             }
+            // Spark's `map_from_arrays(keys, values)` (`MapFromArrays`) derives
+            // the key type from the KEYS array's element type and the value
+            // type + `valueContainsNull` from the VALUES array's element type
+            // + `containsNull` flag (verified against Spark 4.1.1:
+            // `MapFromArrays.dataType`) — distinct from `map`/`create_map`
+            // above, which alternate key/value args and widen across pairs.
+            // The shared `function_return_type` resolver only sees the first
+            // arg and so hard-codes `Map<String, String, true>`; derive the
+            // real key/value types here where both arg types are available.
+            // A malformed (non-2-arity or non-Array-typed) call falls through
+            // to the shared resolver's honest-but-approximate fallback.
+            // Differential: `test_map_from_arrays`.
+            "map_from_arrays" if f.args.len() == 2 => {
+                if let (DataType::Array(key_ty, _), DataType::Array(val_ty, value_contains_null)) =
+                    (f.args[0].data_type(schema), f.args[1].data_type(schema))
+                {
+                    return DataType::Map {
+                        key: key_ty,
+                        value: val_ty,
+                        value_nullable: value_contains_null,
+                    };
+                }
+            }
             // Spark's `to_number(str, fmt)` / `try_to_number(str, fmt)` return
             // DECIMAL(p, s) derived from the format string. Emission parses
             // the same format literal to build the CAST; mirror the
@@ -1911,6 +1934,50 @@ mod tests {
                 assert!(!value_nullable);
             }
             other => panic!("expected Map<String, Integer>, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_from_arrays_infers_key_and_value_types_from_array_args() {
+        // `map_from_arrays(array('x', 'y'), array(10, 20))` →
+        // Map<String, Integer, valueContainsNull=false> — the KEYS array's
+        // element type for the key, the VALUES array's element type +
+        // `containsNull` for the value, NOT the shared resolver's hard-coded
+        // Map<String, String, true>. Verified against Spark 4.1.1
+        // (differential `test_map_from_arrays`).
+        let keys = fcall("array", vec![str_lit("x"), str_lit("y")]);
+        let values = fcall("array", vec![int_lit(10), int_lit(20)]);
+        let expr = fcall("map_from_arrays", vec![keys, values]);
+        match expr.data_type(&StructType::empty()) {
+            DataType::Map {
+                key,
+                value,
+                value_nullable,
+            } => {
+                assert_eq!(*key, DataType::String);
+                assert_eq!(*value, DataType::Integer);
+                assert!(!value_nullable);
+            }
+            other => panic!("expected Map<String, Integer>, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_from_arrays_value_contains_null_follows_values_array() {
+        // A NULL element in the values array literal flips
+        // `valueContainsNull` to true (Spark's `MapFromArrays.dataType`
+        // reads the VALUES array's `containsNull`, independent of the keys
+        // array).
+        let null_int = Expression::Literal(Literal {
+            value: LiteralValue::Null,
+            data_type: DataType::Null,
+        });
+        let keys = fcall("array", vec![str_lit("x"), str_lit("y")]);
+        let values = fcall("array", vec![int_lit(10), null_int]);
+        let expr = fcall("map_from_arrays", vec![keys, values]);
+        match expr.data_type(&StructType::empty()) {
+            DataType::Map { value_nullable, .. } => assert!(value_nullable),
+            other => panic!("expected Map<..>, got {other:?}"),
         }
     }
 

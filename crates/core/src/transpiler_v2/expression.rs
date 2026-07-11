@@ -913,25 +913,39 @@ impl Expression {
                 _ => {}
             }
         }
-        // Decimal-aware arithmetic.
-        if let (
-            DataType::Decimal {
-                precision: p1,
-                scale: s1,
-            },
-            DataType::Decimal {
-                precision: p2,
-                scale: s2,
-            },
-        ) = (&l, &r)
-        {
+        // Spark `div` (IntegralDivide) is LongType regardless of operand types
+        // (`spark.sql.legacy.integralDivide.returnLong` defaults true). Resolve
+        // it BEFORE the decimal block below, so a decimal operand does not drag
+        // it into the decimal-arithmetic formulas (which would wrongly yield a
+        // Decimal / non-floored value).
+        if b.op == BinaryOp::IntDiv {
+            return DataType::Long;
+        }
+        // Decimal-aware arithmetic. Resolve each side to a `(precision,
+        // scale)` if it is a `Decimal`; if exactly one side is and the other
+        // is integral (a column, an expression, or an integer literal),
+        // coerce that other side to a decimal form too — Spark's
+        // `DecimalPrecision` cast-then-apply-formula rule — rather than
+        // falling through to `promote_numeric`'s union-widening below.
+        let decimal_parts = |dt: &DataType| match dt {
+            DataType::Decimal { precision, scale } => Some((*precision, *scale)),
+            _ => None,
+        };
+        let lp = decimal_parts(&l);
+        let rp = decimal_parts(&r);
+        let (lp, rp) = match (lp, rp) {
+            (Some(lp), None) => (Some(lp), Self::decimalize(b.right.as_ref(), &r)),
+            (None, Some(rp)) => (Self::decimalize(b.left.as_ref(), &l), Some(rp)),
+            (lp, rp) => (lp, rp),
+        };
+        if let (Some((p1, s1)), Some((p2, s2))) = (lp, rp) {
             return match b.op {
                 BinaryOp::Add | BinaryOp::Sub => {
-                    TypeInferenceEngine::decimal_add_type(*p1, *s1, *p2, *s2)
+                    TypeInferenceEngine::decimal_add_type(p1, s1, p2, s2)
                 }
-                BinaryOp::Mul => TypeInferenceEngine::decimal_mul_type(*p1, *s1, *p2, *s2),
-                BinaryOp::Div => TypeInferenceEngine::decimal_div_type(*p1, *s1, *p2, *s2),
-                BinaryOp::Mod => TypeInferenceEngine::decimal_mod_type(*p1, *s1, *p2, *s2),
+                BinaryOp::Mul => TypeInferenceEngine::decimal_mul_type(p1, s1, p2, s2),
+                BinaryOp::Div => TypeInferenceEngine::decimal_div_type(p1, s1, p2, s2),
+                BinaryOp::Mod => TypeInferenceEngine::decimal_mod_type(p1, s1, p2, s2),
                 _ => TypeInferenceEngine::promote_numeric(&l, &r),
             };
         }
@@ -941,10 +955,36 @@ impl Expression {
                 return DataType::Double;
             }
         }
-        if b.op == BinaryOp::IntDiv {
-            return DataType::Long;
-        }
         TypeInferenceEngine::promote_numeric(&l, &r)
+    }
+
+    /// Coerce a decimal-arithmetic operand's expression/type to a
+    /// `(precision, scale)` pair per Spark's `DecimalPrecision` rule: an
+    /// integer-literal operand casts to `DecimalType.fromLiteral`'s minimal
+    /// precision (see [`Self::integer_literal_decimal`]); any other integral
+    /// operand casts to `DecimalType.forType`
+    /// (`TypeInferenceEngine::decimal_form`). Non-integral operands (Float,
+    /// Double, ...) return `None` — those stay on the `promote_numeric` path
+    /// (Spark: decimal ⊗ double → double).
+    fn decimalize(expr: &Expression, dt: &DataType) -> Option<(u8, u8)> {
+        Self::integer_literal_decimal(expr).or_else(|| {
+            if dt.is_integral() {
+                TypeInferenceEngine::decimal_form(dt)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Spark `DecimalType.fromLiteral`'s minimal precision for an integer
+    /// literal expression: `(max(1, digit_count(|value|)), 0)`, capped at 38.
+    /// `digit_count` is computed from the exact integer value (integer→string
+    /// length, never floating-point `log`). Returns `None` for anything but a
+    /// `Literal` with an integral `LiteralValue` (`Byte`/`Short`/`Int`/`Long`).
+    fn integer_literal_decimal(expr: &Expression) -> Option<(u8, u8)> {
+        let value = Self::const_int_index(expr)?;
+        let digits = value.unsigned_abs().to_string().len().clamp(1, 38) as u8;
+        Some((digits, 0))
     }
 
     // ── FunctionCall data-type derivation ────────────────────────────────────
@@ -2875,6 +2915,155 @@ mod tests {
             ],
         );
         assert_eq!(mod_li.data_type(&schema), DataType::Long);
+    }
+
+    // ── Decimal ⊗ integral arithmetic (Spark `DecimalPrecision`) ─────────────
+    // Pass 15: exactly one side Decimal + the other integral must cast the
+    // integral side to a decimal form and apply the arithmetic formula,
+    // rather than falling through to `promote_numeric`'s union-widening.
+
+    fn bin(op: BinaryOp, left: Expression, right: Expression) -> Expression {
+        Expression::Binary(BinaryExpression {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    #[test]
+    fn decimal_mul_long_column_promotes_via_decimal_form() {
+        // Decimal(15,2) * Long column: the Long column casts via
+        // `decimal_form` (Long → (20,0)), then decimal_mul_type(15,2,20,0)
+        // = raw_precision 15+20+1=36, raw_scale 2+0=2 → Decimal(36,2).
+        // (NOT `unify_decimal(15,2,20,0)` = Decimal(22,2), the old
+        // union-widening result.)
+        let schema = StructType::new(vec![
+            StructField::nullable("d", dec(15, 2)),
+            StructField::nullable("n", DataType::Long),
+        ]);
+        let expr = bin(
+            BinaryOp::Mul,
+            ColumnReference::untyped("d"),
+            ColumnReference::untyped("n"),
+        );
+        assert_eq!(expr.data_type(&schema), dec(36, 2));
+    }
+
+    #[test]
+    fn decimal_mul_int_literal_uses_minimal_precision() {
+        // Decimal(7,2) * Int literal 100: the literal uses `fromLiteral`'s
+        // MINIMAL precision (3,0) — the digit count of 100 — NOT
+        // `decimal_form(Integer)` = (10,0). decimal_mul_type(7,2,3,0) =
+        // raw_precision 7+3+1=11, raw_scale 2 → Decimal(11,2).
+        let schema = StructType::new(vec![StructField::nullable("d", dec(7, 2))]);
+        let expr = bin(BinaryOp::Mul, ColumnReference::untyped("d"), int_lit(100));
+        let result = expr.data_type(&schema);
+        assert_eq!(result, dec(11, 2));
+        // Explicitly NOT the `decimal_form(Integer)` = (10,0) result, which
+        // would give decimal_mul_type(7,2,10,0) = Decimal(18,2).
+        assert_ne!(result, dec(18, 2));
+    }
+
+    #[test]
+    fn decimal_add_int_literal() {
+        // Decimal(5,2) + Int literal 3: fromLiteral(3) = (1,0).
+        // decimal_add_type(5,2,1,0): scale=max(2,0)=2,
+        // int_digits=max(3,1)=3, precision=min(3+2+1,38)=6 → Decimal(6,2).
+        let schema = StructType::new(vec![StructField::nullable("d", dec(5, 2))]);
+        let expr = bin(BinaryOp::Add, ColumnReference::untyped("d"), int_lit(3));
+        assert_eq!(expr.data_type(&schema), dec(6, 2));
+    }
+
+    #[test]
+    fn decimal_div_int_literal() {
+        // tpcds-q058 shape: Decimal(19,2) / Int literal 3. fromLiteral(3) =
+        // (1,0). decimal_div_type(19,2,1,0): scale_raw=max(6,2+1+1)=6,
+        // precision_raw=19-2+0+6=23 → Decimal(23,6).
+        let schema = StructType::new(vec![StructField::nullable("d", dec(19, 2))]);
+        let expr = bin(BinaryOp::Div, ColumnReference::untyped("d"), int_lit(3));
+        assert_eq!(expr.data_type(&schema), dec(23, 6));
+    }
+
+    #[test]
+    fn decimal_times_double_stays_promote_numeric() {
+        // Decimal ⊗ Double must NOT be coerced through decimal arithmetic —
+        // Spark: decimal ⊗ double → double, unchanged from before this pass.
+        let schema = StructType::new(vec![
+            StructField::nullable("d", dec(10, 2)),
+            StructField::nullable("f", DataType::Double),
+        ]);
+        let expr = bin(
+            BinaryOp::Mul,
+            ColumnReference::untyped("d"),
+            ColumnReference::untyped("f"),
+        );
+        assert_eq!(expr.data_type(&schema), DataType::Double);
+    }
+
+    #[test]
+    fn int_div_int_still_double() {
+        // Int/Int division still promotes to Double — this pass only
+        // changes decimal ⊗ integral, not integral ⊗ integral.
+        let schema = StructType::empty();
+        let expr = bin(BinaryOp::Div, int_lit(6), int_lit(2));
+        assert_eq!(expr.data_type(&schema), DataType::Double);
+    }
+
+    #[test]
+    fn both_decimal_unchanged() {
+        // Both sides Decimal must still produce exactly today's result —
+        // this path is untouched by this pass.
+        let schema = StructType::new(vec![
+            StructField::nullable("d1", dec(10, 2)),
+            StructField::nullable("d2", dec(6, 3)),
+        ]);
+        let expr = bin(
+            BinaryOp::Mul,
+            ColumnReference::untyped("d1"),
+            ColumnReference::untyped("d2"),
+        );
+        // decimal_mul_type(10,2,6,3): raw_precision=10+6+1=17, raw_scale=5.
+        assert_eq!(expr.data_type(&schema), dec(17, 5));
+    }
+
+    #[test]
+    fn decimal_intdiv_stays_long() {
+        // Spark `div` (IntegralDivide) is LongType regardless of operand types.
+        // A decimal operand must NOT drag IntDiv into the decimal-arithmetic
+        // formulas (regression guard: the decimal-coercion block must not
+        // swallow IntDiv). Covers decimal // integer-literal AND decimal //
+        // decimal (a pre-existing defect this also corrects).
+        let schema = StructType::new(vec![
+            StructField::nullable("d1", dec(10, 2)),
+            StructField::nullable("d2", dec(6, 3)),
+        ]);
+        assert_eq!(
+            bin(BinaryOp::IntDiv, ColumnReference::untyped("d1"), int_lit(3)).data_type(&schema),
+            DataType::Long,
+        );
+        assert_eq!(
+            bin(
+                BinaryOp::IntDiv,
+                ColumnReference::untyped("d1"),
+                ColumnReference::untyped("d2"),
+            )
+            .data_type(&schema),
+            DataType::Long,
+        );
+    }
+
+    #[test]
+    fn int_literal_div_decimal_is_symmetric() {
+        // Decimal on the RIGHT (the `(None, Some)` coercion arm) with a
+        // non-commutative op: the int literal `100` coerces to (3,0) as the
+        // NUMERATOR, the decimal column stays the denominator.
+        let schema = StructType::new(vec![StructField::nullable("d", dec(10, 2))]);
+        let expr = bin(BinaryOp::Div, int_lit(100), ColumnReference::untyped("d"));
+        // decimal_div_type(3,0,10,2) — left/numerator is the coerced literal.
+        assert_eq!(
+            expr.data_type(&schema),
+            TypeInferenceEngine::decimal_div_type(3, 0, 10, 2),
+        );
     }
 
     #[test]

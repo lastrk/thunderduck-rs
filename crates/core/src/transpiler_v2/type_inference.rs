@@ -450,10 +450,12 @@ impl TypeInferenceEngine {
 
     /// Spark's `DecimalType.forType` mapping: the exact-decimal form
     /// `(precision, scale)` of a numeric type — used to implicitly cast a
-    /// 2-arg ceil/floor child to `Decimal` before rounding, and to widen an
-    /// integral operand against a `Decimal` in [`Self::promote_numeric`].
-    /// Non-numeric inputs return `None` (→ `Unresolved`).
-    fn decimal_form(dt: &DataType) -> Option<(u8, u8)> {
+    /// 2-arg ceil/floor child to `Decimal` before rounding, to widen an
+    /// integral operand against a `Decimal` in [`Self::promote_numeric`], and
+    /// (via `expression::binary_data_type`) to cast a non-literal integral
+    /// operand before applying a decimal arithmetic formula. Non-numeric
+    /// inputs return `None` (→ `Unresolved`).
+    pub(crate) fn decimal_form(dt: &DataType) -> Option<(u8, u8)> {
         use DataType::*;
         Some(match dt {
             Decimal { precision, scale } => (*precision, *scale),

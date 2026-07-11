@@ -766,3 +766,52 @@ red in any later pass.
   pinpointed small gap) worked well; one API-error retry cost nothing (no partial
   edits). Note for future: sqlparser 0.61 `CompoundFieldAccess` flattening
   behavior is a useful parser fact.
+
+## Pass 15 — 2026-07-11 — Spark DecimalPrecision for decimal ⊗ integral arithmetic
+
+- **Baseline (post-Pass-14, commit 6978f5c):** 1353 passed / 89 failed / 5 skipped.
+- **Cluster / root cause (ONE):** `binary_data_type` (expression.rs:876) applied
+  Spark's decimal arithmetic formulas ONLY when BOTH operands were `Decimal`.
+  When exactly one was Decimal and the other integral (column/expr or integer
+  literal), it fell through to `promote_numeric`→`unify_decimal` (Spark UNION
+  widening), not Spark's `DecimalPrecision` (cast integral→decimal, then apply
+  the arithmetic formula) → wrong declared precision/scale → differential SCHEMA
+  mismatch (values were correct). Diagnosis: `.agent-output/015-diagnostic-decimal-schema.md`.
+- **Fix:** in `binary_data_type`, for Add/Sub/Mul/Div/Mod, when exactly one
+  operand is Decimal and the other integral, coerce the integral side —
+  integer LITERAL → Spark `fromLiteral` minimal precision `(digits,0)` (exact
+  digit count); else `decimal_form` (Int(10,0)/Long(20,0)/…) — then apply the
+  same `decimal_{add,mul,div,mod}_type`. Float/Double excluded (stay
+  promote_numeric → Double). Both-Decimal & int⊗int paths byte-identical.
+  `decimal_form` bumped to `pub(crate)`. 7 unit tests.
+- **Review (`rust-reviewer`, no-tree-mutation brief):** APPROVE-WITH-NITS.
+  Digit-count/accessor/symmetry/guards verified sound. Caught ONE genuine
+  latent regression (Medium) + 2 Low nits:
+  - **Medium (FIXED post-review):** `decimal // integral` (Spark `div`/
+    IntegralDivide) newly entered the decimal block → `_ => promote_numeric` →
+    Decimal, but Spark's IntegralDivide is Long; before this pass it was Long.
+    Zero corpus exposure (grep confirms NO `div`/IntDiv on decimals in either
+    corpus; only `type-007` uses `div`, on integrals — unaffected), so the gate
+    couldn't catch it. Fixed by hoisting the `IntDiv → Long` guard ABOVE the
+    decimal block (also corrects a pre-existing `decimal // decimal` defect).
+    +2 regression-guard tests (`decimal_intdiv_stays_long`,
+    `int_literal_div_decimal_is_symmetric`). The fix touches only a
+    zero-corpus-exposure path and moves toward Spark, so the gate result below
+    is unchanged by it (verified: full lib suite green + corpus grep empty).
+  - **Low (DEFERRED, documented):** a BARE Byte integer literal gets `(digits,0)`
+    where Spark `fromLiteral` uses `forType(3,0)` — witness-free (SQL has no bare
+    TINYINT literals; casts return None here and correctly fall to `(3,0)`), so
+    not worth variant-matching complexity. Recorded parity gap.
+- **Gate:** 1353→1366 (**Δ +13, zero regressions**). DataFrame corpus **402/402
+  — FULLY GREEN**; SQL corpus 364→373. Newly green (13): tpch-q11, tpcds-q067,
+  q093, q083, q058 (the 5 diagnosed targets) + q012, q014b, q020, q023b, q098
+  (shared the decimal⊗integral typing bug). tpcds-q061's TYPE is now correct but
+  it stays red on a SEPARATE column-name defect (documented in the diagnosis).
+  `cargo test -p thunderduck-core --lib` 1059 green.
+- **Reflect:** highest-cascade analyzer fix — one missing coercion rule produced
+  13 flips. Milestone: **the DataFrame corpus is now 100% green (402/402).** The
+  reviewer catching a zero-corpus-exposure regression validated the "review even
+  when the gate is green" discipline (the gate alone would have shipped the
+  IntDiv defect). Remaining: SQL corpus 31 red + the feature-family "other"
+  bucket (unresolved-type scalar functions, Binder-Error mix, RelType::Tail,
+  singletons) + q061's name defect.

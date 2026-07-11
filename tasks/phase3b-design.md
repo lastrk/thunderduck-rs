@@ -85,3 +85,14 @@ Analyzer changed: adr023_phase1_dup_name_condition_still_wraps (~6335) → quali
 Emission changed: contract_collision_wraps_left_keeps_right_name (9464) → FROM chain unchanged; filter becomes reprojected wrap `… ) AS __td_sub(id, name, dept_id, salary, …, dept_id_3, dept_name) WHERE (dept_id_3) = (20)` (comment: data-identical). ALL Phase-2 condition tests (8939-9360) assert-UNCHANGED.
 Emission new: (1) D1 filter merge WHERE (emp2.dept_id), no __td_jl/jr/sub; (2) D1 project merge SELECT emp.id,…; (3) aggregate merge GROUP BY emp.dept_id; (4) sort merge; (5) D7 homonym rejection → wrap binds uniquified right name; (6) internally-dup span rejection (rule iii); (7) reproject_qualifiers ordinal-arm unit (bare dup ordinal → uniquified[k]; bare unique + ordinal-None untouched).
 Corpus new (green-by-construction, data-level H8): join-025/join-026 — I["emp"].join(I["emp2"], I["emp"]["dept_id"]==I["emp2"]["dept_id"]).filter(I["emp2"]["dept_id"]==20) and a left-side/select variant; asymmetric per-side values so a wrong-side bind flips rows.
+
+---
+
+# Phase 4 charter (prove-dead-then-delete) — PROBE COMPLETE
+Empirical evidence (2026-07-11): build_join_side rung-1 (`requires_synthetic == true`) instrumented to log every fire; full witness gate run (REGRESSIONS 0, 14/14): **ZERO fires** across both corpora. The machinery is dead in production.
+
+DELETE (analyzer.rs): mark_join_alias_requirements + mark_node + synthetic_uses + own_expr_demands + scan_exprs + mark_expr_subplans (the whole post-pass block ~1231-1420; analyze() drops the post-pass call), the two TypedOp::Join fields left_requires_synthetic/right_requires_synthetic (+ every construction site incl. tests), and their field docs. KEEP: is_synthetic_join_qualifier + the F13 unconditional rejection in resolve_column (still guards user-typed __td_jl.x), TD_JOIN_LEFT/RIGHT consts (emission wrap-alias names + F13 spelling check).
+DELETE (emission.rs): build_join_side's requires_synthetic param + rung-1 (the fn's ladder doc renumbers), JoinParts' two flag fields + their wiring (~137-148, 241-242), apply_duplicate_alias_guard's flag params (both sides are now always movable — simplify its arms accordingly), and the *_requires_synthetic mentions in module docs (~25).
+The __td_jl-Star corner resolves by the deletion itself: a user alias literally spelled __td_jl now inlines and binds naturally (no pass reads it).
+Tests: delete/retarget the vestigial-pass witnesses (join_flags_* tests — the flags no longer exist; keep any that pin ancestor-ref bare+ordinal resolution by reasserting on the resolved refs); every TypedOp::Join literal in tests drops the two fields. build_join_side callers in tests update signatures.
+Gate: lib green; witness gate REGRESSIONS 0, 14/14.

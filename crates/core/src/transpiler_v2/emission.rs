@@ -21,10 +21,9 @@
 //!   Block-composable operators build/merge a `sql_block::SelectBlock`
 //!   (merge when the clause ordinal and alias-visibility preconditions
 //!   hold, wrap under `__td_sub` on slot conflict — see `sql_block.rs`);
-//!   the analyzer's per-node `RelScope` stamp and the Join
-//!   `*_requires_synthetic` flags are the scope authority. Self-contained
-//!   generators (Values, FileScan, Pivot, Sample, RecursiveCte, …) render
-//!   via [`legacy_render`] into opaque `Raw` units.
+//!   the analyzer's per-node `RelScope` stamp is the scope authority.
+//!   Self-contained generators (Values, FileScan, Pivot, Sample,
+//!   RecursiveCte, …) render via [`legacy_render`] into opaque `Raw` units.
 //! - [`render_expr`] — exhaustive match over the [`Expression`] enum.
 //! - [`render_cast`] — includes the `try_cast` → `TRY_CAST(...)` branch
 //!   (checklist §4.2 first item).
@@ -134,8 +133,6 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
             condition,
             using_columns,
             lateral,
-            left_requires_synthetic,
-            right_requires_synthetic,
             ..
         } => build_join(JoinParts {
             left,
@@ -144,8 +141,6 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
             condition: condition.as_ref(),
             using_columns,
             lateral: *lateral,
-            left_requires_synthetic: *left_requires_synthetic,
-            right_requires_synthetic: *right_requires_synthetic,
         }),
         TypedOp::Aggregate {
             input,
@@ -238,8 +233,6 @@ struct JoinParts<'a> {
     condition: Option<&'a Expression>,
     using_columns: &'a [String],
     lateral: bool,
-    left_requires_synthetic: bool,
-    right_requires_synthetic: bool,
 }
 
 /// One join side's per-ordinal alias coverage in the enclosing FROM scope,
@@ -560,12 +553,7 @@ fn requalify_column_ref(
 
 /// Lower one join side to a [`FromItem`]. Ladder:
 ///
-/// 1. `requires_synthetic` (analyzer-stamped — the ANCESTOR plan_id
-///    contract; ADR-023 Phase 2 narrowed this to ancestor-only demands, a
-///    join's OWN condition demands are handled at emission time by
-///    [`requalify_join_condition`]) → `(side) AS __td_jl/__td_jr`. Must win
-///    over every hoist.
-/// 2. The side's unit is a pure-FROM block → inline its `FromItem` directly,
+/// 1. The side's unit is a pure-FROM block → inline its `FromItem` directly,
 ///    keeping user aliases / table names visible (subsumes the old
 ///    user-alias hoist, bare-TableScan hoist, and left-spine chain flatten).
 ///    Guarded: a nested `Join` item inlines only on the left side, and only
@@ -583,7 +571,7 @@ fn requalify_column_ref(
 ///    or the side stays wrapped under its synthetic alias instead (see
 ///    [`FromScope::slot_quals`]). `Raw` FROM bodies (lateral-view chains)
 ///    never inline.
-/// 3. Otherwise → `(side) AS __td_jl/__td_jr`.
+/// 2. Otherwise → `(side) AS __td_jl/__td_jr`.
 ///
 /// The duplicate-alias guard runs in [`build_join`] across BOTH lowered
 /// sides (DuckDB rejects `Duplicate alias` in one FROM scope; Spark permits
@@ -591,18 +579,11 @@ fn requalify_column_ref(
 fn build_join_side(
     side: &TypedAst,
     synthetic_alias: &str,
-    requires_synthetic: bool,
     may_inline_nested_join: bool,
     parent_using: &[String],
 ) -> Result<FromItem, EmissionError> {
     let parent_has_using = !parent_using.is_empty();
     let unit = build_unit(&side.op, &side.resolved_schema)?;
-    if requires_synthetic {
-        return Ok(FromItem::Derived {
-            unit: Box::new(unit),
-            alias: synthetic_alias.to_owned(),
-        });
-    }
     let block = match unit {
         SqlUnit::Select(block) => block,
         raw => {
@@ -662,20 +643,10 @@ fn build_join_side(
 /// Duplicate-alias guard (unconditional — runs every fixpoint pass in
 /// [`build_join`], including a no-condition CROSS self-join): DuckDB rejects
 /// two `AS x` in one FROM scope, though Spark permits it. If the two lowered
-/// sides expose a common name (case-insensitive), the MOVABLE side — the
-/// one whose `*_requires_synthetic` is `false`, preferring the right side
-/// when both are movable (today's default) — is rewrapped under the first
-/// fresh name in its own `__td_jl`/`__td_jr` sequence the OTHER side does
-/// not expose (see [`fresh_alias_wrap`]). A side whose alias is
-/// contract-demanded (`*_requires_synthetic`) never moves; the case where
-/// BOTH sides are contract-demanded is a no-op here, since their fixed
-/// `__td_jl`/`__td_jr` aliases can never collide with each other.
-fn apply_duplicate_alias_guard(
-    left_item: FromItem,
-    right_item: FromItem,
-    left_requires_synthetic: bool,
-    right_requires_synthetic: bool,
-) -> (FromItem, FromItem) {
+/// sides expose a common name (case-insensitive), the RIGHT side — always
+/// movable — is rewrapped under the first fresh name in its own `__td_jr`
+/// sequence the LEFT side does not expose (see [`fresh_alias_wrap`]).
+fn apply_duplicate_alias_guard(left_item: FromItem, right_item: FromItem) -> (FromItem, FromItem) {
     let left_names = left_item.exposed();
     let collides = right_item
         .exposed()
@@ -684,16 +655,8 @@ fn apply_duplicate_alias_guard(
     if !collides {
         return (left_item, right_item);
     }
-    if !right_requires_synthetic {
-        let right_item = fresh_alias_wrap(right_item, TD_JOIN_RIGHT, &left_names);
-        (left_item, right_item)
-    } else if !left_requires_synthetic {
-        let right_names = right_item.exposed();
-        let left_item = fresh_alias_wrap(left_item, TD_JOIN_LEFT, &right_names);
-        (left_item, right_item)
-    } else {
-        (left_item, right_item)
-    }
+    let right_item = fresh_alias_wrap(right_item, TD_JOIN_RIGHT, &left_names);
+    (left_item, right_item)
 }
 
 /// Rewrap `item` as `(item) AS <fresh>`, where `<fresh>` is the first name
@@ -723,25 +686,11 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
         condition,
         using_columns,
         lateral,
-        left_requires_synthetic,
-        right_requires_synthetic,
     } = parts;
     let is_semi_or_anti = matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
 
-    let mut left_item = build_join_side(
-        left,
-        TD_JOIN_LEFT,
-        left_requires_synthetic,
-        true,
-        using_columns,
-    )?;
-    let mut right_item = build_join_side(
-        right,
-        TD_JOIN_RIGHT,
-        right_requires_synthetic,
-        false,
-        using_columns,
-    )?;
+    let mut left_item = build_join_side(left, TD_JOIN_LEFT, true, using_columns)?;
+    let mut right_item = build_join_side(right, TD_JOIN_RIGHT, false, using_columns)?;
 
     // Condition types resolve against the concatenated side schemas (the
     // analyzer stamped every reference; the schema feeds type lookups only).
@@ -768,12 +717,7 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
             pass < 2,
             "requalifier + duplicate-alias guard must reach fixpoint in <=2 passes"
         );
-        let (guarded_left, guarded_right) = apply_duplicate_alias_guard(
-            left_item,
-            right_item,
-            left_requires_synthetic,
-            right_requires_synthetic,
-        );
+        let (guarded_left, guarded_right) = apply_duplicate_alias_guard(left_item, right_item);
         left_item = guarded_left;
         right_item = guarded_right;
         let Some(cond) = condition else {
@@ -8453,11 +8397,9 @@ mod tests {
         let _g = tap_guard();
         // Post-collapse (ADR-023 Phase 2): the nested join's OWN condition
         // (plan_id-tagged `dept_id` refs across `emp`/`dept`) is its own
-        // demand only — no ancestor references either of ITS sides — so
-        // `mark_node`'s ancestor-only narrowing no longer stamps the
-        // nested join's own `left_requires_synthetic`/
-        // `right_requires_synthetic`. The nested join's children now
-        // inline bare (`emp INNER JOIN dept ON (emp.dept_id) =
+        // demand only — no ancestor references either of ITS sides. The
+        // nested join's children now inline bare (`emp INNER JOIN dept ON
+        // (emp.dept_id) =
         // (dept.dept_id)`) INSIDE the derived body. The wrap this test
         // pins is now driven by an entirely different mechanism (ADR-023
         // Phase 2.1): the outer parent is `USING (dept_id)`, and
@@ -8509,26 +8451,6 @@ mod tests {
         });
         let bt = base_types_emp_dept_emp2(&outer_using_join);
         let typed = analyze(outer_using_join, &bt).expect("analyze synthetic-scoped side");
-        // Sanity: confirm the nested join's own sides are NOT
-        // synthetic-stamped anymore (Phase 2 premise) — the wrap this test
-        // pins is guard-driven (Phase 2.1), not ancestor/own-condition
-        // driven.
-        let TypedOp::Join { left, .. } = &typed.op else {
-            panic!("expected outer Join, got {:?}", typed.op);
-        };
-        let TypedOp::Join {
-            left_requires_synthetic,
-            right_requires_synthetic,
-            ..
-        } = &left.op
-        else {
-            panic!("expected nested Join, got {:?}", left.op);
-        };
-        assert!(
-            !*left_requires_synthetic && !*right_requires_synthetic,
-            "premise: under Phase 2's ancestor-only narrowing, the nested \
-             join's own condition demand no longer stamps its own sides"
-        );
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(
             sql.contains("AS __td_jl"),
@@ -9037,9 +8959,8 @@ mod tests {
         let _g = tap_guard();
         // DataFrame join-of-join, plan_id-tagged outer condition:
         // `df.join(df2).join(df3, ...)`. Post-collapse (ADR-023 Phase 2):
-        // the OUTER join's own condition is its own demand only (no
-        // ancestor references either side), so `mark_node`'s ancestor-only
-        // narrowing no longer force-wraps the nested LEFT side. The nested
+        // a join's own condition never force-wraps its sides (the demand-flag
+        // machinery is retired), so the nested LEFT side inlines. The nested
         // join (`emp CROSS JOIN dept`) is a plain, bare-aliased chain and
         // fully flattens into the outer FROM. `requalify_join_condition`
         // then resolves `id` positionally: it is duplicated in the FULL
@@ -9448,9 +9369,8 @@ mod tests {
         let _g = tap_guard();
         // `df.alias("e").join(df2.alias("d"), ...)` with a plan_id-tagged
         // (not user-qualified) condition. Post-collapse (ADR-023 Phase 2):
-        // the join's own condition is its own demand only (no ancestor
-        // reference to either side), so `mark_node`'s ancestor-only
-        // narrowing does not force either side to wrap. Both sides are
+        // a join's own condition never force-wraps its sides (the demand-flag
+        // machinery is retired). Both sides are
         // user `AliasedRelation`s and inline directly under their own real
         // aliases (`e`/`d`); `requalify_join_condition` resolves the
         // plan_id-tagged, unqualified `dept_id` refs positionally to those
@@ -9605,21 +9525,18 @@ mod tests {
         let _g = tap_guard();
         // join-022 unit mirror, COLLAPSED under ADR-023 Phase 2. `inner =
         // emp.join(emp2, emp.dept_id == emp2.dept_id)`: the plan_id-tagged
-        // condition is the inner join's OWN demand only (no ancestor
-        // references either of ITS sides) — `mark_node`'s ancestor-only
-        // narrowing means this no longer sets the inner join's flags, so
-        // neither side force-wraps. Both `emp` and `emp2` inline bare, and
+        // condition never force-wraps the inner join's sides (the demand-flag
+        // machinery is retired). Both `emp` and `emp2` inline bare, and
         // `requalify_join_condition` rewrites the condition positionally to
         // `emp.dept_id` / `emp2.dept_id` — no buried inner `__td_jr` exists
         // anymore. The inner join is a plain-ON join, so it inlines as the
         // OUTER left too (F5 chain flatten), producing a natural 3-way FROM
         // chain. `d3 = dept.select("dept_id", "dept_name")` is the outer
-        // RIGHT; an ancestor `Filter` references `d3`'s plan_id (3), so the
-        // OUTER's `right_requires_synthetic` is true and `d3` still wraps
-        // `AS __td_jr` (unaffected — that demand is a genuine ANCESTOR
-        // demand on the OUTER, not the inner's now-inert own-condition
-        // demand). With no buried inner `__td_jr` left to collide with,
-        // there is nothing for the duplicate-alias guard to do here.
+        // RIGHT; it is a bare `Project` (not a pure-FROM item), so
+        // `build_join_side`'s ladder falls through to its `AS __td_jr` wrap
+        // regardless of any ancestor demand. With no buried inner `__td_jr`
+        // left to collide with, there is nothing for the duplicate-alias
+        // guard to do here.
         //
         // Phase 3b delta (D2): the ancestor `Filter`'s plan_id=3 reference
         // now resolves bare+ordinal (no synthetic `__td_jr` qualifier
@@ -9707,8 +9624,8 @@ mod tests {
                  (dept_name) = ('Data')"
             ),
             "the inner join must fully inline and chain-flatten into the outer \
-             FROM, and the outer right must keep its contract-demanded __td_jr \
-             wrap; got: {sql}"
+             FROM, and the outer right (a bare Project, never inlineable) must \
+             keep its __td_jr wrap; got: {sql}"
         );
         assert!(
             sql.contains(
@@ -9730,11 +9647,9 @@ mod tests {
     fn free_collision_renames_right_wrap() {
         let _g = tap_guard();
         // Same shape as `contract_collision_wraps_left_keeps_right_name` but
-        // WITHOUT the ancestor filter: `d3`'s wrap is NOT contract-demanded
-        // on the OUTER join either (`right_requires_synthetic == false`).
-        // Post-collapse (ADR-023 Phase 2): the inner join's own condition no
-        // longer sets ANY flags (`mark_node`'s ancestor-only narrowing), so
-        // `emp`/`emp2` inline bare with no buried `__td_jr` at all. The
+        // WITHOUT the ancestor filter. Post-collapse (ADR-023 Phase 2): the
+        // inner join's own condition is never a wrap demand, so `emp`/`emp2`
+        // inline bare with no buried `__td_jr` at all. The
         // "free" collision this test used to exercise — the inner's buried
         // `__td_jr` colliding with the outer's default `__td_jr` for
         // `d3` — no longer arises, because the buried inner alias it used

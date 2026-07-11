@@ -966,7 +966,7 @@ impl Expression {
     /// (`TypeInferenceEngine::decimal_form`). Non-integral operands (Float,
     /// Double, ...) return `None` — those stay on the `promote_numeric` path
     /// (Spark: decimal ⊗ double → double).
-    fn decimalize(expr: &Expression, dt: &DataType) -> Option<(u8, u8)> {
+    pub(crate) fn decimalize(expr: &Expression, dt: &DataType) -> Option<(u8, u8)> {
         Self::integer_literal_decimal(expr).or_else(|| {
             if dt.is_integral() {
                 TypeInferenceEngine::decimal_form(dt)

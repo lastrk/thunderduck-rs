@@ -5987,20 +5987,50 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
     // precision and violating the projection's declared type. Route to the
     // `thdck_spark_funcs` extension function `spark_decimal_div` which
     // implements Spark's rounding + scale semantics. Corpus: type-005.
+    //
+    // A DECIMAL operand divided by a plain integral one (column, expression,
+    // or integer literal — e.g. `decimal_col / int_col`) is ALSO decimal
+    // division in Spark: `binary_data_type` (this expression's own type
+    // inference) implicitly widens the integral side to `Decimal` via
+    // `Expression::decimalize` before applying `decimal_div_type`, so the
+    // analyzer's declared result type is `Decimal` even though the integral
+    // operand's OWN type is not. Mirror that exact widening here — decimalize
+    // whichever side is not already Decimal — so the routing condition below
+    // fires in lockstep with the analyzer (tpcds-q066: `sum(x)/w_sq_ft`,
+    // DuckDB's native DECIMAL/BIGINT `/` yields DOUBLE where Spark yields
+    // DECIMAL).
     // TODO(ADR-006): decimal divide-by-zero is not yet ANSI-guarded here.
     if matches!(b.op, BinaryOp::Div) {
         let lt = b.left.data_type(schema);
         let rt = b.right.data_type(schema);
-        if let (DataType::Decimal { .. }, DataType::Decimal { .. }) = (&lt, &rt) {
-            // The analyzer types both operands Decimal (Spark parity), but a
-            // DuckDB-native aggregate operand (e.g. `avg` over DECIMAL) is
-            // emitted as DOUBLE, so passing it raw makes the extension reject
-            // DOUBLE args. Cast each operand to its declared DECIMAL(p,s): a
-            // no-op re-cast for a genuine decimal, and a coercion for a
-            // native-double operand — keeping Spark's DECIMAL/DECIMAL
-            // division semantics either way.
-            let lty = render_data_type(&lt);
-            let rty = render_data_type(&rt);
+        let decimal_parts = |dt: &DataType| match dt {
+            DataType::Decimal { precision, scale } => Some((*precision, *scale)),
+            _ => None,
+        };
+        let lp = decimal_parts(&lt);
+        let rp = decimal_parts(&rt);
+        let (lp, rp) = match (lp, rp) {
+            (Some(lp), None) => (Some(lp), Expression::decimalize(&b.right, &rt)),
+            (None, Some(rp)) => (Expression::decimalize(&b.left, &lt), Some(rp)),
+            (lp, rp) => (lp, rp),
+        };
+        if let (Some((lprec, lscale)), Some((rprec, rscale))) = (lp, rp) {
+            // The analyzer types the decimal side Decimal (Spark parity), but
+            // a DuckDB-native aggregate operand (e.g. `avg` over DECIMAL) is
+            // emitted as DOUBLE, and the integral side is not Decimal at all
+            // at the DuckDB level — passing either raw makes the extension
+            // reject non-DECIMAL args. Cast each operand to the DECIMAL(p,s)
+            // the analyzer widened it to: a no-op re-cast for a genuine
+            // decimal, and a coercion for a native-double/integral operand —
+            // keeping Spark's DECIMAL division semantics either way.
+            let lty = render_data_type(&DataType::Decimal {
+                precision: lprec,
+                scale: lscale,
+            });
+            let rty = render_data_type(&DataType::Decimal {
+                precision: rprec,
+                scale: rscale,
+            });
             return Ok(format!(
                 "spark_decimal_div(CAST(({l}) AS {lty}), CAST(({r}) AS {rty}))"
             ));
@@ -14915,6 +14945,38 @@ mod tests {
             sql,
             "spark_decimal_div(CAST((CAST('1.23' AS DECIMAL(10, 2))) AS DECIMAL(10, 2)), \
              CAST((CAST('4.56' AS DECIMAL(6, 3))) AS DECIMAL(6, 3)))"
+        );
+    }
+
+    /// tpcds-q066 — a `Div` with one Decimal operand and one plain integral
+    /// (BIGINT-typed) column operand (`sum(decimal_expr) / w_warehouse_sq_ft`)
+    /// must ALSO route to `spark_decimal_div`. DuckDB's native `DECIMAL /
+    /// BIGINT` yields DOUBLE (unlike `+`/`-`/`*`, which stay DECIMAL),
+    /// diverging from the analyzer's declared Decimal result type (Spark
+    /// widens the integral operand to Decimal before dividing —
+    /// `Expression::decimalize` / `TypeInferenceEngine::decimal_div_type`).
+    /// The integral operand must be CAST to its *decimalized* form
+    /// (`decimal_form`), not passed through raw. Corpus: tpcds-q066.
+    #[test]
+    fn decimal_div_by_integral_column_routes_through_spark_decimal_div() {
+        let l = col_with_type(
+            "jan_sales",
+            DataType::Decimal {
+                precision: 38,
+                scale: 2,
+            },
+        );
+        let r = col_with_type("w_warehouse_sq_ft", DataType::Long);
+        let b = BinaryExpression {
+            op: BinaryOp::Div,
+            left: Box::new(l),
+            right: Box::new(r),
+        };
+        let sql = render_binary(&b, &empty_schema()).expect("render");
+        assert_eq!(
+            sql,
+            "spark_decimal_div(CAST((jan_sales) AS DECIMAL(38, 2)), \
+             CAST((w_warehouse_sq_ft) AS DECIMAL(20, 0)))"
         );
     }
 

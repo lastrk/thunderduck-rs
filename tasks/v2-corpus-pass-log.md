@@ -1316,3 +1316,34 @@ When a pass defers a reviewer finding or STOPs on a sub-case, record it there.
 - **Reflect:** SQL corpus now 402/404 — 2 from 100% (tpcds-q066 decimal-UNION,
   tpcds-q085 grouping-fold-nested/F-groupfold-nested). Remaining 16 total (those
   2 + ~14 feature-family/singletons).
+
+## Pass 32 — 2026-07-11 — decimal/integral division routes to spark_decimal_div (tpcds-q066)
+
+- **Baseline (post-Pass-31, commit f50c195):** 1426 passed / 16 failed.
+- **Root cause:** `sum(jan_sales / w_warehouse_sq_ft)` = `DECIMAL(38,2) / BIGINT`.
+  The analyzer declares Decimal (Pass-15 widening), but `render_binary`'s Div arm
+  routed to `spark_decimal_div` only when BOTH operands were literally Decimal,
+  so it emitted plain `/` → DuckDB DOUBLE (verified: `DECIMAL/BIGINT`→DOUBLE,
+  while +/-/* stay DECIMAL) → schema said decimal, value came back double →
+  PySpark Arrow `isinstance(Decimal)` assertion failed (q066).
+- **Fix:** extend the Div→spark_decimal_div routing in `render_binary` to the
+  decimal⊗integral case using the SAME `decimalize`/`decimal_form` logic the
+  analyzer uses (`emission.rs` mirrors `binary_data_type`): CAST both operands to
+  their widened DECIMAL(p,s) and route through the extension. `decimalize` bumped
+  to `pub(crate)`. No analyzer change (declared type already correct). 1 test.
+- **Review (`rust-reviewer`, no-tree-mutation):** APPROVE. Confirmed the emission
+  routing now mirrors `binary_data_type`'s Decimal inference EXACTLY (fires on
+  the same both-Decimal ∪ one-Decimal-one-integral set; Float/Double stay plain
+  `/`); no green regression (a DOUBLE-emitting decimal/int Div was already
+  schema-red since Spark yields decimal); cast targets + overflow correct. Low
+  (→ ledger F-decimal-div-dup-logic): the widening logic is now duplicated in
+  analyzer + emission and must stay in lockstep — extract a shared helper.
+- **Gate:** 1426→1427 (**Δ +1, zero regressions**; coder's full run corroborated).
+  SQL corpus 402→403. Newly green: tpcds-q066. `cargo test -p thunderduck-core
+  --lib` 1135.
+- **Reflect:** SQL corpus now **403/404** — ONE case (tpcds-q085,
+  F-groupfold-nested) from 100%. Completes the decimal-division-type-coherence
+  arc (Pass 12 cast → Pass 15 typing → Pass 24 date → Pass 32 div-by-integral).
+  Remaining 15: q085 + ~14 feature-family/singletons (Tail, write,
+  split_with_limit, json_tuple, alter_table, encode, from_json-DF, empty_array,
+  explode_map, combined_sql_df, dl-write-append-002).

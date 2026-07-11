@@ -31,6 +31,7 @@ witness-free), `hygiene` (non-functional), `arch` (deferred design decision).
 | F-json-keys-nonobject | P18 | latent | `json_object_keys`→`json_keys` returns `[]` on non-object/non-null JSON where Spark returns NULL (corpus exercises object inputs only). |
 | F-negative-emit | P19 | latent | `negative`/`negate` has a type-inference arm but NO emission arm → would emit invalid DuckDB `negative(x)`. |
 | F-unary-math-nullable | P25 | latent | sqrt/cbrt/sin/cos and the rest of Spark's `UnaryMathExpression` family have the same always-nullable override (empirically) but aren't in `function_call_nullable`'s always-null arm. |
+| F-todf-dupname | P31 | latent | `toDF`/`withColumnsRenamed` over a child with DUPLICATE column names collapses via a last-wins by-name rename map in `analyze_to_df` (analyzer.rs:2184) → e.g. two `x` cols + `toDF(a,b)` maps both to `b`. Pre-existing (emission positional-rename fix didn't introduce it); resolved_schema stays correct. Fix: carry a POSITIONAL name list in analyze_to_df, not a by-name map. |
 | F-sourcequals-restamp | P27 | latent (inert) | `analyze_sort` re-stamps unconditionally after alias-pinning; `source_quals_of` re-derives from bare ColumnReference only, so an alias-pinned passthrough grouping col loses inherited `source_quals`. Inert for current emission (schema/ordinal-driven), differs from committed inc-1 behavior. |
 
 ## Open — hygiene

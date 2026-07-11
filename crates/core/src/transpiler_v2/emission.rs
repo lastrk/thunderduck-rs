@@ -2681,6 +2681,20 @@ fn render_sample_by(
     ))
 }
 
+/// `df.toDF(...)` (via `ToDf`) and `df.withColumnsRenamed(...)` both funnel
+/// here. Renames the child's output POSITIONALLY via DuckDB's native
+/// derived-table column-alias-list syntax (`(<child>) AS __td_wcr(new1,
+/// new2, ...)`) rather than referencing each old column BY NAME (`<old> AS
+/// <new>`). A by-name reference requires the child's ACTUAL emitted SQL
+/// column name to equal τ's tracked (analyzer) name for that field — true
+/// for a bare column, but false for an unaliased COMPOUND expression whose
+/// argument is qualified: an aggregate `count(d.dept_id)` is tracked
+/// Spark-`toPrettySQL`-parity as `count(dept_id)` (qualifier stripped, verified
+/// against live Spark), while DuckDB's own default name for that same
+/// unaliased expression keeps the qualifier (`count(d.dept_id)`). Referencing
+/// it by (τ's) name text then binds to a column DuckDB doesn't have
+/// (tbl-013). Positional renaming sidesteps the mismatch entirely — it never
+/// needs to know the child's actual column names.
 fn build_with_columns_renamed(
     input: &TypedAst,
     renames: &[(String, String)],
@@ -2689,16 +2703,22 @@ fn build_with_columns_renamed(
         .iter()
         .map(|(old, new)| (old.to_lowercase(), new.clone()))
         .collect();
-    let slots = sql_join(input.resolved_schema.fields.iter(), ", ", |f| {
-        let src = quote_ident(&f.name);
-        let dst_name = rename_map
-            .get(&f.name.to_lowercase())
-            .cloned()
-            .unwrap_or_else(|| f.name.clone());
-        let dst = quote_ident(&dst_name);
-        Ok(format!("{src} AS {dst}"))
-    })?;
-    block_with_projections(input, |_| true, |_, _| Ok(slots))
+    let dst_names: Vec<&str> = input
+        .resolved_schema
+        .fields
+        .iter()
+        .map(|f| {
+            rename_map
+                .get(&f.name.to_lowercase())
+                .map(String::as_str)
+                .unwrap_or(f.name.as_str())
+        })
+        .collect();
+    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
+    let cols = sql_join(dst_names, ", ", |n| Ok(quote_ident(n).into_owned()))?;
+    Ok(SqlUnit::Raw(format!(
+        "SELECT * FROM ({child_sql}) AS __td_wcr({cols})"
+    )))
 }
 
 /// Emit a table-valued function. Only `range` is implemented; the analyzer has
@@ -9833,6 +9853,93 @@ mod tests {
         assert!(sql.contains("USING (dept_id)"), "got: {sql}");
         assert!(sql.contains("GROUP BY dept_id"), "got: {sql}");
         assert!(!sql.contains("__td_agg"), "got: {sql}");
+    }
+
+    // ── tbl-013 regression: derived-table column-alias-list over a qualified
+    // aggregate arg (ToDf/WithColumnsRenamed positional rename) ────────────
+
+    #[test]
+    fn render_todf_over_aggregate_with_qualified_agg_arg_renames_positionally() {
+        let _g = tap_guard();
+        // `SELECT b, count(*) AS n FROM (SELECT e.dept_id, count(d.dept_id)
+        //   FROM emp e LEFT OUTER JOIN dept d ON e.dept_id = d.dept_id
+        //   GROUP BY e.dept_id) AS t (a, b) GROUP BY b` (tbl-013).
+        //
+        // The inner aggregate's second output column is UNALIASED and
+        // computed over a QUALIFIED arg: τ's Spark-`toPrettySQL`-parity
+        // tracked name for it is `count(dept_id)` (qualifier stripped — this
+        // matches live Spark 4.1.1's own `df.columns`), but DuckDB's own
+        // default name for that same unaliased expression KEEPS the
+        // qualifier (`count(d.dept_id)`). A by-name `"count(dept_id)" AS b`
+        // reference (the old, broken rewiring) binds to a column DuckDB does
+        // not have. The fix renames the child positionally instead.
+        let join = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Left,
+            condition: Some(Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(qcol("d", "dept_id")),
+            })),
+            using_columns: vec![],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let inner_agg = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(join),
+            grouping: vec![qcol("e", "dept_id")],
+            aggregates: vec![
+                qcol("e", "dept_id"),
+                fexpr("count", vec![qcol("d", "dept_id")]),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let todf = CommonAst::new(CommonOp::ToDf {
+            input: Box::new(inner_agg),
+            column_names: vec!["a".to_owned(), "b".to_owned()],
+        });
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(todf),
+            alias: "t".to_owned(),
+        });
+        let outer_agg = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(aliased),
+            grouping: vec![ucol("b")],
+            aggregates: vec![
+                ucol("b"),
+                Expression::Alias(AliasExpression {
+                    expr: Box::new(fexpr(
+                        "count",
+                        vec![Expression::Star(StarExpression { qualifier: None })],
+                    )),
+                    alias: "n".to_owned(),
+                }),
+            ],
+            grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let bt = base_types_emp_dept(&outer_agg);
+        let typed = analyze(outer_agg, &bt).expect("analyze tbl-013 shape");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        // The rename must reference the wrapped child POSITIONALLY (DuckDB's
+        // native derived-table column-alias-list), never by the qualifier-
+        // stripped tracked name — that name does not exist in the child's
+        // actual (DuckDB-assigned) output.
+        assert!(
+            sql.contains("AS __td_wcr(a, b)") || sql.contains("AS __td_wcr(\"a\", \"b\")"),
+            "expected a positional derived-table column-alias-list rename; got: {sql}"
+        );
+        assert!(
+            !sql.contains("\"count(dept_id)\""),
+            "must not reference the child by its qualifier-stripped tracked \
+             name — DuckDB does not expose a column under that name; got: {sql}"
+        );
     }
 
     #[test]

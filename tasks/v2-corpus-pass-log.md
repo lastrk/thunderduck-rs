@@ -1288,3 +1288,31 @@ When a pass defers a reviewer finding or STOPs on a sub-case, record it there.
   = F-groupfold-nested). Remaining 17 total (those 3 + ~14 feature-family/
   singletons: Tail, write, split_with_limit, json_tuple, alter_table, encode,
   from_json-DF, empty_array, explode_map, combined_sql_df, dl-write-append-002).
+
+## Pass 31 — 2026-07-11 — WithColumnsRenamed positional emission (tbl-013)
+
+- **Baseline (post-Pass-30, commit 203ba54):** 1425 passed / 17 failed.
+- **Root cause:** `build_with_columns_renamed` emitted a BY-NAME rename
+  (`SELECT "<old tracked name>" AS new ...`). For an unaliased `count(d.dept_id)`
+  the inner Aggregate's tracked name is `count(dept_id)` (qualifier-stripped,
+  correct Spark parity), but DuckDB's actual default column name KEEPS the
+  qualifier (`count(d.dept_id)`), so the by-name reference pointed at a
+  nonexistent column → binder error (tbl-013).
+- **Fix:** emit DuckDB's POSITIONAL derived-table column-alias-list
+  `SELECT * FROM (child) AS __td_wcr(new1, …, newN)` (same blessed pattern as
+  `wrap_reprojected`). Sidesteps the whole name-mismatch class for both the SQL
+  `ToDf` (`AS t(a,b)`) and DataFrame `withColumnsRenamed`/`toDF` paths (shared fn).
+  1 regression test.
+- **Review (`rust-reviewer`, no-tree-mutation):** APPROVE. Verified the key risk
+  (subset `withColumnsRenamed` → wrong arity) is NOT a bug: the fn expands the
+  rename map against the child's FULL schema (unmatched fields keep their name),
+  so `dst_names.len() == fields.len()` always; `SELECT *` order/count holds for
+  all block children; `__td_wcr` no collision. Low (pre-existing, NOT introduced,
+  → ledger `F-todf-dupname`): `toDF` over a duplicate-column child collapses via
+  the last-wins by-name map in `analyze_to_df`.
+- **Gate:** 1425→1426 (**Δ +1, zero regressions**; coder verified full sql_v2 +
+  DataFrame corpora). SQL corpus 401→402. Newly green: tbl-013. `cargo test -p
+  thunderduck-core --lib` 1134.
+- **Reflect:** SQL corpus now 402/404 — 2 from 100% (tpcds-q066 decimal-UNION,
+  tpcds-q085 grouping-fold-nested/F-groupfold-nested). Remaining 16 total (those
+  2 + ~14 feature-family/singletons).

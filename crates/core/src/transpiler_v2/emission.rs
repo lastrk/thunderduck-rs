@@ -3936,6 +3936,13 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
         // equivalent that returns Spark-DDL. The `thdck_spark_funcs`
         // extension provides `spark_schema_of_json`. Corpus: `json-006`.
         "schema_of_json" => "spark_schema_of_json",
+        // Spark's `json_object_keys(jsonStr)` returns the top-level object's
+        // keys as `Array<String>` (NULL for a NULL/non-object input).
+        // DuckDB's native `json_keys` already returns `VARCHAR[]` with the
+        // same NULL-in/NULL-out and empty-array-for-non-object shape the
+        // corpus witnesses exercise — a direct rename, no CAST needed.
+        // Corpus: `test_json_object_keys`.
+        "json_object_keys" => "json_keys",
         // Spark's `to_json(col[, options])` runs `JacksonGenerator` with
         // `SQLConf.JSON_GENERATOR_IGNORE_NULL_FIELDS=true` by default, which
         // omits object entries whose value is JSON `null` at every nesting
@@ -5538,6 +5545,12 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         // the sample formula. The ext6 extension provides `spark_skewness`
         // with Spark-parity semantics (checklist §4.1).
         "skewness" => ("spark_skewness", false),
+        // Spark's `max_by(x, y)` / `min_by(x, y)` — DuckDB's native
+        // `arg_max(x, y)` / `arg_min(x, y)` are the same 2-arg shape
+        // (value column, ordering column), so a name rename is the whole
+        // fix — args pass through unchanged via `args_sql` below.
+        "max_by" => ("arg_max", false),
+        "min_by" => ("arg_min", false),
         // Spark's `kurtosis` uses the population formula; DuckDB has
         // `kurtosis_pop` for that (native, not via extension).
         "kurtosis" => ("kurtosis_pop", false),
@@ -11980,6 +11993,14 @@ mod tests {
         assert_eq!(sql, "spark_schema_of_json('{\"a\":1,\"b\":\"x\"}')");
     }
 
+    /// `json_object_keys(...)` is remapped to DuckDB's native `json_keys(...)`
+    /// — same `VARCHAR[]` shape, name rename only (no CAST).
+    #[test]
+    fn render_json_object_keys_remaps_to_json_keys() {
+        let sql = render_fn("json_object_keys", vec![col_ref_expr("json_str")]);
+        assert_eq!(sql, "json_keys(json_str)");
+    }
+
     /// json-008 anchor: `to_csv(struct(a, b, c))` — DuckDB has no `to_csv`
     /// scalar; τ unpacks the struct fields and emits
     /// `concat_ws(',', CAST(a AS VARCHAR), CAST(b AS VARCHAR), CAST(c AS VARCHAR))`.
@@ -14466,6 +14487,35 @@ mod tests {
 
     fn decimal_col(name: &str, precision: u8, scale: u8) -> Expression {
         col_with_type(name, DataType::Decimal { precision, scale })
+    }
+
+    /// `max_by(name, val)` renders to DuckDB's native `arg_max(name, val)` —
+    /// same 2-arg (value, ordering) shape, name rename only.
+    #[test]
+    fn max_by_renders_to_arg_max() {
+        let f = fcall(
+            "max_by",
+            vec![
+                col_with_type("name", DataType::String),
+                col_with_type("val", DataType::Integer),
+            ],
+        );
+        let sql = render_aggregate(&f, &empty_schema()).expect("render max_by");
+        assert_eq!(sql, "arg_max(name, val)");
+    }
+
+    /// `min_by(name, val)` renders to DuckDB's native `arg_min(name, val)`.
+    #[test]
+    fn min_by_renders_to_arg_min() {
+        let f = fcall(
+            "min_by",
+            vec![
+                col_with_type("name", DataType::String),
+                col_with_type("val", DataType::Integer),
+            ],
+        );
+        let sql = render_aggregate(&f, &empty_schema()).expect("render min_by");
+        assert_eq!(sql, "arg_min(name, val)");
     }
 
     /// Pass 13 — `avg`/`mean` over a DECIMAL argument routes through the

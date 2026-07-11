@@ -872,3 +872,27 @@ red in any later pass.
   needed the macro-shadowing root-cause dig — good example of not trusting a
   "trivial" label. Follow-ups banked: array_except NULL parity; dead-macro sweep;
   array_distinct order.
+
+## Pass 18 — 2026-07-11 — scalar-function batch 3: max_by / min_by / json_object_keys
+
+- **Baseline (post-Pass-17, commit 265fd40):** 1372 passed / 70 failed.
+- **Root cause:** these 3 names had NO entry in type_inference.rs → analyzer
+  `unresolved type` boundary (not the Binder error the survey guessed). Survey
+  batch 3.
+- **Fix:** type_inference.rs — AGG_SPECS rows for max_by/min_by
+  (AggRet::ArgType = type of first arg, AlwaysNullable), function_return_type arm
+  json_object_keys → Array(String, nullable). emission.rs — aggregate renames
+  max_by→arg_max, min_by→arg_min (Spark max_by(x,y)=arg_max(x,y), same order,
+  verified native); scalar rename json_object_keys→json_keys (returns VARCHAR[]
+  natively, no CAST). 8 unit tests.
+- **Review:** documented-skip (additive boundary expansion, unit-locked, DuckDB
+  shapes verified empirically against a live duckdb binary). Gate arbitrated.
+- **Gate:** 1372→1375 (**Δ +3, zero regressions**). Newly green: test_max_by,
+  test_min_by, test_json_object_keys. `cargo test -p thunderduck-core --lib` 1078.
+- **Known latent gap (documented, no witness):** json_keys returns [] on a
+  non-object/non-null JSON where Spark returns NULL (corpus exercises object
+  inputs only). Follow-up alongside the array_except NULL gap from Pass 17.
+- **Reflect:** batches 1-3 done (9 scalar functions, +9). Remaining survey
+  batches: 4 (positive, bit_get), 5 (substring_index, count(DISTINCT a,b)),
+  6 (to_char date-form). Then the hard from_json DataFrame-API case + TPC
+  AssertionErrors + singletons (Tail, json_tuple, alter_table, Array type).

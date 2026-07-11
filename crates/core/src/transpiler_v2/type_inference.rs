@@ -897,6 +897,11 @@ impl TypeInferenceEngine {
             // when the argument is a `struct(...)` literal. Nullability
             // follows argument nullability. Corpus: `json-008`.
             "to_csv" => String,
+            // `json_object_keys(jsonStr)` — Spark returns `Array<String>` of
+            // the top-level object's keys (NULL if the input isn't a JSON
+            // object). Emission remaps to DuckDB's native `json_keys`, which
+            // already returns `VARCHAR[]`. Corpus: `test_json_object_keys`.
+            "json_object_keys" => Array(Box::new(String), true),
 
             // ── Aggregate-shaped functions in scalar dispatch ───────────
             // `array_agg` is routed through the aggregate delegation list
@@ -1155,6 +1160,14 @@ const AGG_SPECS: &[AggSpec] = &[
     // Pass 73: `mode` is an aggregate builtin (classifier + delegation) but
     // never had a return-type arm — falls to arg-type (verbatim).
     agg("mode", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    // `max_by(x, y)` / `min_by(x, y)` — the value of `x` at the row where
+    // `y` is max/min. Return type = the type of the FIRST arg (`x`), which
+    // is exactly what `AggRet::ArgType` resolves to via the aggregate
+    // delegation arm's `first_arg_type`. Always-nullable (empty group or an
+    // all-NULL `y` column yields NULL, matching DuckDB's `arg_max`/`arg_min`
+    // which this pair renders to — see `render_aggregate`).
+    agg("max_by", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
+    agg("min_by", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
     // Drift (verbatim): `nth_value` appears ONLY in the always-nullable
     // predicate (its return type resolves via `window_return_type`).
     agg("nth_value", AggRet::ArgType, AggNull::AlwaysNullable, false, false),
@@ -1955,6 +1968,38 @@ mod tests {
             frt("regexp_extract_all", &[DataType::String]),
             DataType::Array(Box::new(DataType::String), true)
         );
+    }
+
+    #[test]
+    fn json_object_keys_returns_array_of_string() {
+        assert_eq!(
+            frt("json_object_keys", &[DataType::String]),
+            DataType::Array(Box::new(DataType::String), true)
+        );
+    }
+
+    #[test]
+    fn max_by_returns_first_arg_type_via_aggregate_delegation() {
+        // Return type = type of `x` (the value column), not `y` (the
+        // ordering column) — mirrors DuckDB's `arg_max(x, y)`.
+        assert_eq!(
+            frt("max_by", &[DataType::String, DataType::Integer]),
+            DataType::String
+        );
+    }
+
+    #[test]
+    fn min_by_returns_first_arg_type_via_aggregate_delegation() {
+        assert_eq!(
+            frt("min_by", &[DataType::String, DataType::Integer]),
+            DataType::String
+        );
+    }
+
+    #[test]
+    fn max_by_min_by_are_always_nullable() {
+        assert!(TypeInferenceEngine::aggregate_is_always_nullable("max_by"));
+        assert!(TypeInferenceEngine::aggregate_is_always_nullable("min_by"));
     }
 
     #[test]

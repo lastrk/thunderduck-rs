@@ -3092,13 +3092,22 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
         }
         // Spark's `SUBSTRING(<expr> FROM <from> [FOR <for>])` special syntax and
         // the `SUBSTR(<expr>, <from>, <for>)` shorthand both parse to
-        // `Expr::Substring`. Lower to `substring(expr, from[, for])` — the
-        // existing `substring` type_inference / emission arms apply. Corpus
-        // witnesses: `fn-003` (SQL syntax), `fn-004` (`substr(...)`).
+        // `Expr::Substring`, distinguished only by sqlparser's `shorthand`
+        // flag (true iff the SQL text used the `SUBSTR` keyword). Preserve
+        // the as-written name on the lowered `FunctionCall` — Spark's
+        // `toPrettySQL` names an unaliased column by the spelling the user
+        // typed, so `substr(...)` and `substring(...)` must produce distinct
+        // output names even though both lower to the same DuckDB-substrate
+        // `substring`/`substr` scalar (emission's `substr` → `substring`
+        // remap keeps the DuckDB side valid). Corpus witnesses: `fn-003`
+        // (SQL `SUBSTRING ... FROM ... FOR ...` syntax), `fn-004`
+        // (`substr(...)`), `tpcds-q062`/`q079`/`q099` (unaliased `substr`
+        // output-name parity).
         Expr::Substring {
             expr,
             substring_from,
             substring_for,
+            shorthand,
             ..
         } => {
             let mut args = vec![lower_expr(*expr, cte_scope)?];
@@ -3108,7 +3117,8 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
             if let Some(for_) = substring_for {
                 args.push(lower_expr(*for_, cte_scope)?);
             }
-            Ok(fn_call("substring", args))
+            let name = if shorthand { "substr" } else { "substring" };
+            Ok(fn_call(name, args))
         }
         // Spark's `TRIM([BOTH | LEADING | TRAILING] [<what> FROM] <expr>)`
         // special syntax. Map the trim side to the DuckDB function name
@@ -7122,9 +7132,14 @@ mod tests {
     }
 
     #[test]
-    fn substr_shorthand_lowers_to_substring() {
+    fn substr_shorthand_lowers_to_substr() {
+        // Spark's `toPrettySQL` names an unaliased column by the spelling
+        // the user typed — `substr(...)` must keep the `substr` name so the
+        // output name matches Spark (tpcds-q062/q079/q099), even though the
+        // DuckDB-substrate emission still remaps it to `substring` (see
+        // `render_function_call`'s `"substr" => "substring"` arm).
         let fc = first_function_call("SELECT substr(name, 2, 3) FROM t");
-        assert_eq!(fc.name, "substring");
+        assert_eq!(fc.name, "substr");
         assert_eq!(fc.args.len(), 3);
     }
 

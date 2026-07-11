@@ -16,7 +16,6 @@ witness-free), `hygiene` (non-functional), `arch` (deferred design decision).
 
 | id | case(s) | source | class | defect / fix sketch |
 |----|---------|--------|-------|---------------------|
-| F-substr-name | tpcds-q062/q079/q099 | P27 | red-case | unaliased `substr(...)` output name renders `substring(...)`; Spark keeps `substr`. **IN PROGRESS (Pass 28).** |
 | F-groupfold-nested | tpcds-q085 | P27 | red-case | `grouping_already_folded` false-NEGATIVE when the GROUP BY key appears only NESTED in a SELECT expr (e.g. `substr(key,1,20)`) → grouping col wrongly prepended → column-count 5 vs 4. Fix: detect a grouping key referenced inside a projection expr, not just bare. Touches the Pass-10 heuristic core. |
 | F-explode-map | test_explode_map | P26 | red-case | unaliased `explode(map)` must emit two default-named cols `key`,`value`; τ's multi-col map-explode expansion (emission.rs:3850, type_inference.rs:829) fires only on an explicit alias. Needs a schema-aware Project pre-pass generator expansion (mirror `expand_json_tuple/stack_projections`, dispatch Array=1col vs Map=2cols). |
 
@@ -49,5 +48,6 @@ witness-free), `hygiene` (non-functional), `arch` (deferred design decision).
 | F-orderby-ordinal | P22/P27 | arch | ORDER BY ordinal parity (`ORDER BY <int>`, `ORDER_BY_POS_OUT_OF_RANGE`) — increment 3 of the ORDER BY design. Error-parity only; no current red witness. |
 
 ## Cleared (fixed by a later pass)
+- `substr(...)` output name rendered `substring(...)` (F-substr-name, P27) → FIXED P28 (preserve sqlparser `shorthand` name; emission rename normalizes DuckDB). q062/q079/q099 green.
 - array_except NULL-element parity (P17 note) → FIXED P23 (null-safe `list_position`).
 - array_distinct hash-reorder (P17 note) → FIXED P23 (order-preserving `list_filter`).

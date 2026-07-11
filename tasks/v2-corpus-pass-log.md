@@ -1210,3 +1210,27 @@ When a pass defers a reviewer finding or STOPs on a sub-case, record it there.
   q044, q066), and singletons (Tail, write, split_with_limit, json_tuple,
   alter_table, encode, from_json-DF, empty_array, explode_map, combined_sql_df,
   dl-write-append-002). Deferred inc-2 Medium + inc-1 follow-ups tracked here.
+
+## Pass 28 — 2026-07-11 — substr shorthand output name (clears F-substr-name)
+
+- **Baseline (post-Pass-27, commit e7e3ab1):** 1420 passed / 22 failed.
+- **Root cause:** `parser_v2/v2_lowering.rs` `Expr::Substring` arm discarded
+  sqlparser's `shorthand: bool` and always named the lowered FunctionCall
+  `"substring"`. τ's naming pass (pretty_name/toPrettySQL) names an unaliased
+  column verbatim by FunctionCall.name → every unaliased `substr(...)` SQL
+  column came out `substring(...)`, mismatching Spark (which names by the typed
+  keyword). This also left emission's `"substr"=>"substring"` rename arm dead.
+- **Fix:** destructure `shorthand`; name the FunctionCall `"substr"` when true,
+  else `"substring"` — emission's existing rename normalizes the DuckDB call.
+  Live Spark confirmed: `substr(...)`→`substr(...)`, `substring(...)`→
+  `substring(...)`, both comma-arg form. One-file change; DataFrame path
+  (verbatim wire name) unaffected. 1 test updated.
+- **Review:** documented-skip (one-line SQL-lowering naming fix, unit-locked,
+  live-Spark-verified; a green case can't rely on the wrong name — that'd be
+  red). Gate arbitrated.
+- **Gate:** 1420→1423 (**Δ +3, zero regressions**). SQL corpus 396→399. Newly
+  green: tpcds-q062, q079, q099. `cargo test -p thunderduck-core --lib` 1130.
+- **Reflect:** clears follow-up `F-substr-name`. Remaining 19: F-groupfold-nested
+  (q085), Cluster-A lone (jn-018, tbl-013, q044, q066), and singletons (Tail,
+  write, split_with_limit, json_tuple, alter_table, encode, from_json-DF,
+  empty_array, explode_map, combined_sql_df, dl-write-append-002).

@@ -5241,16 +5241,59 @@ fn pretty_unary(u: &UnaryExpression) -> String {
 /// Whether the grouping keys are "already folded" into `aggregates` and so
 /// must NOT be re-prepended to the output schema / SELECT list.
 ///
-/// True iff the grouping is empty (global aggregate), OR every grouping key
-/// either name-matches (case-insensitive, via [`expression_output_name`]) or
-/// structurally equals (alias-stripped) some entry in `aggregates`. This is
-/// the single source of truth shared by the analyzer's resolved-schema
-/// construction and emission's SELECT-list rendering — they MUST agree, or the
-/// wire schema desyncs from the emitted column count.
+/// True iff the grouping is empty (global aggregate), OR **at least one**
+/// grouping key either name-matches (case-insensitive, via
+/// [`expression_output_name`]) or structurally equals (alias-stripped) some
+/// entry in `aggregates`. This predicate is shared by the analyzer's
+/// resolved-schema construction and emission's SELECT-list rendering so their
+/// prepend decisions stay in lockstep — a divergence would desync the wire
+/// schema from the emitted column count. Note the two call sites feed
+/// *structurally different* inputs (the analyzer folds over resolved
+/// expressions; emission over reprojected/requalified ones), so identical
+/// verdicts rely on reprojection being name/structure-preserving for the
+/// matched keys — true for every shape the corpora exercise; see the residual
+/// edge below.
+///
+/// # Why `any`, not `all`
+/// The two front-ends populate `aggregates` differently, and an any-match
+/// discriminates between them correctly:
+/// - **SQL path**: the SparkSQL front-end folds the *entire* SELECT
+///   projection list — grouping columns and aggregate calls alike — into
+///   `aggregates` (see the `CommonOp::Aggregate` doc). `aggregates` is
+///   therefore the authoritative, already-complete output list, and a
+///   `GROUP BY` key that is not itself selected (e.g. `GROUP BY a, b` with
+///   `SELECT a, sum(x)`) is normal SQL, not evidence of an unfolded plan. As
+///   long as at least one grouping key shows up in `aggregates`, the plan is
+///   folded; prepending would duplicate the keys that already ARE selected.
+/// - **DataFrame path**: τ's DataFrame converter puts *only* the aggregate
+///   expressions into `aggregates` (grouping columns are never mixed in), so
+///   no grouping key can match and `any` is `false` — the grouping list is
+///   still prepended, matching Spark's `grouping ++ aggExprs` DataFrame
+///   semantics.
+///
+/// # Known residual edge (documented, witness-free)
+/// A DataFrame call of the shape `.groupBy(k1, k2).agg(k1, aggExpr)` — i.e.
+/// re-listing *one* (but not all) grouping keys inside `.agg(...)` — would be
+/// folded here (because `k1` matches) even though Spark still prepends the
+/// full grouping list ahead of `.agg`'s arguments. No corpus case exercises
+/// this shape today, so it is left as a documented gap rather than plumbed
+/// around: the robust fix is to thread an explicit `folded: bool` flag from
+/// each front-end through `CommonOp::Aggregate` (see the TODO on
+/// `CommonOp::Aggregate` at `ast.rs:107`) instead of inferring it
+/// structurally here. Revisit if/when a corpus witness for this DataFrame
+/// shape appears.
+///
+/// A second, narrower corner is newly reachable now that a *partial* match
+/// returns `true`: if an aggregate sits directly over a duplicate-name input
+/// (e.g. a self-join with no intervening projection) and emission's
+/// reprojection renames a matched key, the emission verdict could flip while
+/// the analyzer's stays — a column-count desync surfacing as a hard error, not
+/// silent corruption. No corpus case constructs it; the same front-end `folded`
+/// flag would eliminate it.
 pub(super) fn grouping_already_folded(grouping: &[Expression], aggregates: &[Expression]) -> bool {
     grouping.is_empty() || {
         let agg_names: Vec<String> = aggregates.iter().map(expression_output_name).collect();
-        grouping.iter().all(|gk| {
+        grouping.iter().any(|gk| {
             let name = expression_output_name(gk);
             let name_match = agg_names.iter().any(|an| an.eq_ignore_ascii_case(&name));
             let bare = gk.unaliased();
@@ -8837,6 +8880,56 @@ mod tests {
         );
         assert_eq!(typed.resolved_schema.fields[0].name, "senior");
         assert_eq!(typed.resolved_schema.fields[1].name, "s");
+    }
+
+    #[test]
+    fn partial_grouping_fold_does_not_prepend_or_duplicate() {
+        // q053 shape: `GROUP BY dept_id, salary` with `SELECT dept_id,
+        // avg(salary) AS a` — only ONE of the two grouping keys (`dept_id`)
+        // is re-selected. Under the any-match rule this is still "already
+        // folded" (Spark's SELECT list is the authoritative output), so the
+        // grouping list must NOT be prepended: 2 fields, no duplicate
+        // `dept_id`.
+        let bt = base_types_with_emp_dept();
+        let avg_salary = func("avg", vec![unresolved_col("salary")]);
+        let ast = aggregate(
+            scan("emp"),
+            vec![unresolved_col("dept_id"), unresolved_col("salary")],
+            vec![unresolved_col("dept_id"), alias_expr(avg_salary, "a")],
+        );
+        let typed = analyze(ast, &bt).unwrap();
+        assert_eq!(
+            typed.resolved_schema.fields.len(),
+            2,
+            "partially-selected grouping keys must not be prepended or duplicated"
+        );
+        assert_eq!(typed.resolved_schema.fields[0].name, "dept_id");
+        assert_eq!(typed.resolved_schema.fields[1].name, "a");
+    }
+
+    #[test]
+    fn dataframe_path_grouping_absent_from_aggregates_still_prepends() {
+        // DataFrame path shape: `.groupBy("dept_id", "salary").agg(avg("salary")
+        // as "a")` — the converter puts ONLY the aggregate expression in
+        // `aggregates`, no grouping columns. No grouping key matches, so the
+        // fold verdict is `false` and the grouping list is still prepended
+        // ahead of the aggregates, matching Spark's `grouping ++ aggExprs`.
+        let bt = base_types_with_emp_dept();
+        let avg_salary = func("avg", vec![unresolved_col("salary")]);
+        let ast = aggregate(
+            scan("emp"),
+            vec![unresolved_col("dept_id"), unresolved_col("salary")],
+            vec![alias_expr(avg_salary, "a")],
+        );
+        let typed = analyze(ast, &bt).unwrap();
+        assert_eq!(
+            typed.resolved_schema.fields.len(),
+            3,
+            "grouping keys absent from aggregates must still be prepended"
+        );
+        assert_eq!(typed.resolved_schema.fields[0].name, "dept_id");
+        assert_eq!(typed.resolved_schema.fields[1].name, "salary");
+        assert_eq!(typed.resolved_schema.fields[2].name, "a");
     }
 
     #[test]

@@ -538,3 +538,54 @@ red in any later pass.
   fitness signal" does NOT mean TPC regressions are exempt from the oracle.
   Orchestrator caught it by comparing counts. Noted in
   subagent-improvement-notes.
+
+## Pass 10 — 2026-07-11 — grouping-fold false-positive AMBIGUOUS_REFERENCE (Family A)
+
+- **Baseline (fresh, HEAD c913c33 after 37 commits since pass 9):** 1324 passed
+  / 118 failed / 5 skipped / 1447 total (DF 393/402, SQL 346/404, other 585/641).
+- **Cluster pick:** the AMBIGUOUS_REFERENCE family (highest-cascade coherent
+  τ-error signature). `rust-diagnostician` CORRECTED the noisy stdout-banner
+  attribution and split it into two independent root causes: **Family A** (6
+  cases, τ analyzer FALSE-POSITIVE `[AMBIGUOUS_REFERENCE]`: q046, q053, q063,
+  q068, q079, q098) and **Family B** (3 cases, real DuckDB self-join ambiguity
+  from a bare ORDER BY: q039a/b, q064). One root cause per pass → Family A here,
+  Family B deferred to Pass 11.
+- **Hypothesis (Family A):** a SQL aggregate whose `GROUP BY` contains a key not
+  in the SELECT list makes `grouping_already_folded` (analyzer.rs) return false
+  (it was ALL-or-nothing), so the Aggregate arm prepends the WHOLE grouping list,
+  duplicating already-selected keys → the enclosing ORDER BY/`SELECT *` trips
+  `resolve_column`'s ambiguity scan → false-positive `[AMBIGUOUS_REFERENCE]`.
+  Spark accepts all six → ADR-022 Thunderduck-boundary correctness bug.
+- **Fix (root-cause, single line + doc):** flip `grouping_already_folded` from
+  `grouping.iter().all(..)` to `.any(..)`. The predicate is the shared source of
+  truth for both the analyzer's resolved schema AND emission's SELECT slots, so
+  they flip together (no column-count desync); the GROUP BY body is rendered
+  from the full grouping list independent of the fold verdict. `any` correctly
+  discriminates the SQL path (≥1 selected grouping key present → folded) from the
+  DataFrame path (aggregates = agg exprs only, no grouping key → still prepend).
+  3 unit tests pin both branches + the single-key case.
+- **Review (`rust-reviewer`):** APPROVE-WITH-NITS, 0 Critical/High. Two Mediums,
+  both witness-free and gated by the differential: (1) the DataFrame edge
+  `.groupBy(k1,k2).agg(k1,agg)` folds where Spark prepends — inside an
+  already-approximate heuristic, robust fix = a front-end `folded` flag on
+  `CommonOp::Aggregate` (ast.rs:107 TODO), deferred; (2) a narrower
+  reprojection-asymmetry desync newly reachable under `any` only when an
+  aggregate sits directly over a duplicate-name input — unconstructed, would be
+  a hard error caught by the gate. Doc comment updated to disclose both honestly.
+- **Gate:** 1324→1326 (Δ +2, **zero regressions** vs the c913c33 oracle — full
+  per-case set diff, no green→red). τ-emitted `[AMBIGUOUS_REFERENCE]` token
+  12→0 (the defect is eliminated). Newly green: **tpcds-q046, tpcds-q068** (SQL
+  corpus). The other four Family A cases (q053, q063, q079, q098) stopped
+  emitting the false positive and PROGRESSED to distinct downstream blockers
+  (q053/q063/q098 are window-over-agg; now data/other errors) — separate root
+  causes for future passes, not this one. `cargo test -p thunderduck-core --lib`
+  1039 green.
+- **Reflect:** (1) stdout-banner correlation for case→signature attribution is
+  unreliable (captured-stdout ordering) — the diagnostician re-derived membership
+  from the summary block and corrected a 6-case mis-attribution; trust the
+  diagnostician's confirmed membership over my log forensics. (2) A cluster that
+  looks like one signature (AMBIGUOUS_REFERENCE) can be two root causes at
+  different layers (analyzer fabrication vs emission under-qualification) — split
+  by mechanism, one per pass. (3) "6 cases share a signature" ≠ "6 cases flip";
+  fixing the root cause flipped 2 and advanced 4 to their next blocker, which is
+  honest forward progress. Family B is Pass 11.

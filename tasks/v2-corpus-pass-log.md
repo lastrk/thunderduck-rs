@@ -1267,3 +1267,24 @@ When a pass defers a reviewer finding or STOPs on a sub-case, record it there.
   deferred `F-agg-folded-flag` (front-end folded flag on CommonOp::Aggregate)
   would subsume both cleanly. Remaining 18: q085, Cluster-A lone (jn-018,
   tbl-013, q066), + singletons.
+
+## Pass 30 — 2026-07-11 — reserved-keyword `at` quoting (jn-018)
+
+- **Baseline (post-Pass-29, commit aa9109e):** 1424 passed / 18 failed.
+- **Root cause:** a derived-table alias `at` (a DuckDB `TYPE_FUNC_NAME` reserved
+  keyword) was emitted unquoted → DuckDB Parser Error. The `quote_ident` /
+  `is_safe_identifier` mechanism was already correct (char-shape + reserved-word
+  binary search); the curated `DUCKDB_RESERVED` const was just MISSING `"at"`
+  (its category peers cross/full/inner/join/map/struct were already present) —
+  an isolated omission, not a systemic gap.
+- **Fix:** add `"at"` to `DUCKDB_RESERVED` (sorted position); 1 regression test.
+- **Review:** documented-skip (one-line curated-const addition; quoting a reserved
+  word is always valid — a green case with an unquoted reserved word would be
+  red). Coder verified full sql_v2 (402/405) + DataFrame (402/402) corpora.
+- **Gate:** 1424→1425 (**Δ +1, zero regressions**). SQL corpus 400→401. Newly
+  green: jn-018. `cargo test -p thunderduck-core --lib` 1133.
+- **Reflect:** SQL corpus now 401/404 — 3 lone cases from 100% (tbl-013
+  qualified-arg naming, tpcds-q066 decimal-UNION, tpcds-q085 grouping-fold-nested
+  = F-groupfold-nested). Remaining 17 total (those 3 + ~14 feature-family/
+  singletons: Tail, write, split_with_limit, json_tuple, alter_table, encode,
+  from_json-DF, empty_array, explode_map, combined_sql_df, dl-write-append-002).

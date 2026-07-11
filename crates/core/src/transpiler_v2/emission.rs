@@ -6356,6 +6356,7 @@ const DUCKDB_RESERVED: &[&str] = &[
     "as",
     "asc",
     "asymmetric",
+    "at",
     "both",
     "case",
     "cast",
@@ -11808,6 +11809,21 @@ mod tests {
         let out = quote_ident("select");
         assert!(matches!(out, Cow::Owned(_)));
         assert_eq!(out, "\"select\"");
+    }
+
+    #[test]
+    fn quote_ident_quotes_at_reserved_alias() {
+        // Regression for jn-018: `at` is a DuckDB reserved word (used in
+        // ASOF joins / `AT TIME ZONE`) and must be quoted when emitted as a
+        // derived-table/column alias, even though it is a common Spark
+        // alias name (e.g. from `.alias("at")`).
+        let out = quote_ident("at");
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!(out, "\"at\"");
+
+        // Case-insensitive: `AT` / `At` are reserved too.
+        assert_eq!(quote_ident("AT"), "\"AT\"");
+        assert_eq!(quote_ident("At"), "\"At\"");
     }
 
     #[test]

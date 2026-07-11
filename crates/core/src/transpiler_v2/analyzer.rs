@@ -4230,12 +4230,73 @@ fn analyze_single_column_subquery(
     error_reason: &str,
 ) -> Result<SubqueryPlan, AnalyzerError> {
     let inner = analyze_subquery_plan(plan, ctx)?;
+    let inner = unfold_ungrouped_aggregate_subquery(inner);
     if inner.resolved_schema.fields.len() != 1 {
         return Err(AnalyzerError::Other {
             reason: error_reason.to_owned(),
         });
     }
     Ok(SubqueryPlan::Analyzed(Box::new(inner)))
+}
+
+/// Strip a spuriously-prepended GROUP BY key prefix from a scalar/IN
+/// subquery body whose top-level operator is a `TypedOp::Aggregate`.
+///
+/// `ScalarSubquery`/`InSubquery` are constructed ONLY by the SQL front-end
+/// (`parser_v2::v2_lowering`) — the DataFrame Connect proto path never
+/// builds these expression variants. `lower_aggregate_select`'s documented
+/// invariant (see `CommonOp::Aggregate`) therefore applies unconditionally
+/// here: `aggregates` IS the verbatim SELECT list — the subquery's true and
+/// complete output — whether or not it happens to restate the GROUP BY key
+/// (e.g. `SELECT avg(x) rank_col FROM t GROUP BY k`, a fully legal SQL
+/// subquery whose output is the single column `rank_col`).
+///
+/// The general `Aggregate` output-schema construction (shared with the
+/// DataFrame `.groupBy(k).agg(f(x))` shape, where the grouping key IS a real
+/// extra output column Spark itself prepends) can't tell the two shapes
+/// apart and conservatively prepends `grouping` to the schema whenever
+/// [`grouping_already_folded`] doesn't find positive evidence the key is
+/// already present. Inside a subquery body that prepend is always a
+/// schema-construction artifact, never a genuine output column — dropped
+/// here by wrapping the body in a `Project` over just the trailing
+/// `aggregates.len()` fields, so both the arity check right below and the
+/// SQL this subquery renders (via `dispatch_op` on the wrapping `Project`)
+/// see the correct, Spark-parity output.
+fn unfold_ungrouped_aggregate_subquery(inner: TypedAst) -> TypedAst {
+    let TypedOp::Aggregate {
+        ref grouping,
+        ref aggregates,
+        ..
+    } = inner.op
+    else {
+        return inner;
+    };
+    if grouping.is_empty() || grouping_already_folded(grouping, aggregates) {
+        return inner;
+    }
+    let offset = grouping.len();
+    let tail = &inner.resolved_schema.fields[offset..];
+    let projections: Vec<Expression> = tail
+        .iter()
+        .enumerate()
+        .map(|(k, field)| {
+            Expression::ColumnReference(ColumnReference {
+                name: field.name.clone(),
+                qualifier: None,
+                data_type: Some(field.data_type.clone()),
+                nullable: Some(field.nullable),
+                ordinal: Some(offset + k),
+            })
+        })
+        .collect();
+    let resolved_schema = StructType::new(tail.to_vec());
+    TypedAst::new(
+        TypedOp::Project {
+            input: Box::new(inner),
+            projections,
+        },
+        resolved_schema,
+    )
 }
 
 /// Synthetic qualifier attached to plan_id-tagged column refs during Join
@@ -6173,7 +6234,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::super::analyzer_fixtures;
-    use super::super::ast::CommonAst;
+    use super::super::ast::{CommonAst, GroupingKind};
     use super::super::expression::{
         AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, ExistsSubquery,
         FunctionCall, InSubquery, LambdaExpression, LambdaVariableExpression, Literal,
@@ -7644,6 +7705,84 @@ mod tests {
             },
             other => panic!("expected Project, got {other:?}"),
         }
+    }
+
+    /// tpcds-q044 shape: `(SELECT avg(salary) rank_col FROM emp GROUP BY
+    /// dept_id)` — the GROUP BY key is NOT in the SELECT list, a fully legal
+    /// SQL scalar subquery whose Spark output arity is 1 (`rank_col` only).
+    /// `Aggregate`'s output-schema construction can't tell this SQL shape
+    /// apart from a DataFrame `.groupBy(k).agg(f(x))` (where `k` IS a real
+    /// extra output column) and conservatively prepends `dept_id`, over-
+    /// counting the arity to 2 — a Spark-emulated false positive
+    /// (`unfold_ungrouped_aggregate_subquery` strips it back off).
+    #[test]
+    fn scalar_subquery_grouped_single_column_not_restated_analyzes_ok() {
+        let bt = base_types_with_emp_dept();
+        let inner = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(emp_scan()),
+            grouping: vec![unresolved_col("dept_id")],
+            aggregates: vec![alias_expr(
+                func("avg", vec![unresolved_col("salary")]),
+                "rank_col",
+            )],
+            grouping_kind: GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![Expression::ScalarSubquery(ScalarSubquery {
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+            })],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        match &typed.op {
+            TypedOp::Project { projections, .. } => match &projections[0] {
+                Expression::ScalarSubquery(s) => match &s.subquery {
+                    SubqueryPlan::Analyzed(inner) => {
+                        assert_eq!(inner.resolved_schema.fields.len(), 1);
+                        assert_eq!(inner.resolved_schema.fields[0].name, "rank_col");
+                        assert!(
+                            matches!(inner.op, TypedOp::Project { .. }),
+                            "expected the grouping-key prefix to be stripped via a wrapping Project, got {:?}",
+                            inner.op
+                        );
+                    }
+                    other => panic!("expected Analyzed, got {other:?}"),
+                },
+                other => panic!("expected ScalarSubquery, got {other:?}"),
+            },
+            other => panic!("expected Project, got {other:?}"),
+        }
+    }
+
+    /// A genuine 2-column scalar subquery over a grouped aggregate (the
+    /// GROUP BY key IS separately selected alongside the aggregate) must
+    /// still be rejected — `unfold_ungrouped_aggregate_subquery` must not
+    /// weaken this real Spark-emulated arity error.
+    #[test]
+    fn scalar_subquery_grouped_two_columns_is_still_spark_emulated_error() {
+        let bt = base_types_with_emp_dept();
+        let inner = CommonAst::new(CommonOp::Aggregate {
+            input: Box::new(emp_scan()),
+            grouping: vec![unresolved_col("dept_id")],
+            aggregates: vec![
+                unresolved_col("dept_id"),
+                alias_expr(func("avg", vec![unresolved_col("salary")]), "rank_col"),
+            ],
+            grouping_kind: GroupingKind::GroupBy,
+            grouping_sets: vec![],
+            having: None,
+        });
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![Expression::ScalarSubquery(ScalarSubquery {
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+            })],
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        assert!(matches!(err, AnalyzerError::Other { .. }));
     }
 
     #[test]

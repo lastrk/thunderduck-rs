@@ -1234,3 +1234,36 @@ When a pass defers a reviewer finding or STOPs on a sub-case, record it there.
   (q085), Cluster-A lone (jn-018, tbl-013, q044, q066), and singletons (Tail,
   write, split_with_limit, json_tuple, alter_table, encode, from_json-DF,
   empty_array, explode_map, combined_sql_df, dl-write-append-002).
+
+## Pass 29 — 2026-07-11 — scalar/IN subquery arity false-positive (tpcds-q044)
+
+- **Baseline (post-Pass-28, commit 125ce20):** 1423 passed / 19 failed.
+- **Root cause:** SAME `grouping_already_folded` false-negative as q085
+  (F-groupfold-nested): a subquery body `select avg(x) rank_col ... group by
+  store_sk` (GROUP BY key NOT in SELECT) makes the heuristic guess DataFrame-shape
+  and prepend the grouping key → 2-field schema → `analyze_single_column_subquery`
+  correctly rejects the (wrongly-2-col) subquery as "must return exactly one column".
+- **Fix (scoped, analyzer.rs):** `unfold_ungrouped_aggregate_subquery` — since
+  `ScalarSubquery`/`InSubquery` are built ONLY by the SQL front-end (verified
+  exhaustively; DataFrame subqueries hit a boundary error at conversion), any
+  inner Aggregate is SQL-origin, so a prepended grouping key is always a
+  schema-construction artifact. When the body is an Aggregate with non-empty
+  grouping and !grouping_already_folded, wrap it in a Project selecting the
+  trailing aggregates.len() fields (drop the spurious prefix). No-op otherwise;
+  does NOT touch the global heuristic or its other call sites. 2 tests.
+- **Review (`rust-reviewer`, no-tree-mutation):** APPROVE. Confirmed the
+  SQL-only linchpin (ScalarSubquery/InSubquery constructed only in
+  parser_v2:3196/3203; DataFrame path bails at v2_relation_converter:1128),
+  no-op-except-mis-detected-shape, wrap correctness (drops exactly grouping.len()
+  prefix), genuine-2-col rejection intact (ExistsSubquery doesn't route here),
+  no double-application. Low nit: the 2-col test doesn't isolate the no-op path.
+- **Gate:** 1423→1424 (**Δ +1, zero regressions**; coder's own full run showed
+  18 reds, q044 gone). SQL corpus 399→400. `cargo test -p thunderduck-core --lib`
+  1132.
+- **Reflect:** q044 and q085 (F-groupfold-nested) share the SAME root cause
+  (grouping_already_folded false-negative for a not-restated GROUP BY key). This
+  scoped fix handles the SUBQUERY-arity manifestation; q085's TOP-LEVEL SELECT
+  manifestation (grouping key nested in a projection expr) is still open. The
+  deferred `F-agg-folded-flag` (front-end folded flag on CommonOp::Aggregate)
+  would subsume both cleanly. Remaining 18: q085, Cluster-A lone (jn-018,
+  tbl-013, q066), + singletons.

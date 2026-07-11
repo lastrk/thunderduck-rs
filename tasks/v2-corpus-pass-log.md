@@ -815,3 +815,24 @@ red in any later pass.
   IntDiv defect). Remaining: SQL corpus 31 red + the feature-family "other"
   bucket (unresolved-type scalar functions, Binder-Error mix, RelType::Tail,
   singletons) + q061's name defect.
+
+## Pass 16 — 2026-07-11 — scalar-function batch 1: dayname / monthname / btrim
+
+- **Baseline (post-Pass-15, commit 341fe09):** 1366 passed / 76 failed.
+- **Root cause:** 3 feature-family scalar functions failed `τ boundary:
+  unresolved type` — the analyzer's `function_return_type` had no arm for them.
+  From the batched survey `.agent-output/016-survey-scalar-funcs.md` (batch 1).
+- **Fix:** type_inference.rs `function_return_type` — added `btrim` to the string
+  `String` arm, `dayname`/`monthname` to the date-family `String` arm. emission.rs
+  — one `btrim → trim` rename (Spark btrim(str[,trimStr]) = DuckDB trim(str[,chars]),
+  same order); `dayname`/`monthname` are DuckDB-native and pass through the
+  scalar dispatch's `_ => name` fallback once typed. 7 unit tests. No extension.
+- **Review:** documented-skip (trivial cited + unit-locked boundary expansion:
+  add names to a type table + one rename; structurally cannot regress a green
+  case — these were erroring boundaries). Gate arbitrated.
+- **Gate:** 1366→1369 (**Δ +3, zero regressions**). Newly green: test_dayname,
+  test_monthname, test_btrim. `cargo test -p thunderduck-core --lib` 1066 green.
+- **Reflect:** first batched-tail pass; the survey's mechanism grouping (shared
+  `function_return_type` arm + shared rename locus) held exactly. Next: batch 2
+  (emission renames reverse→list_reverse, size(map)→cardinality,
+  array_except→list_filter lambda).

@@ -3709,6 +3709,11 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             let [needle, haystack] = min_args(f, schema, "`locate` requires at least 2 arguments")?;
             return Ok(format!("strpos({haystack}, {needle})"));
         }
+        // Spark's `btrim(str[, trimStr])` trims characters in `trimStr`
+        // (default: whitespace) from both ends of `str`. DuckDB's `trim`
+        // has the identical signature and semantics — same name, same arg
+        // order; just rename.
+        "btrim" => "trim",
         // Spark's `dayofweek(x)` returns 1..7 (Sunday=1); DuckDB's returns
         // 0..6 (Sunday=0). Add 1 to align with Spark.
         "dayofweek" => {
@@ -12894,6 +12899,30 @@ mod tests {
         assert!(sql.contains("1700000000"));
         assert!(sql.contains(" AS DOUBLE)), replace("));
         assert!(sql.contains("'yyyy/MM/dd'"));
+    }
+
+    #[test]
+    fn render_btrim_one_arg_renames_to_trim() {
+        let sql = render_fn("btrim", vec![col_ref_expr("s")]);
+        assert_eq!(sql, "trim(s)");
+    }
+
+    #[test]
+    fn render_btrim_two_arg_renames_to_trim() {
+        let sql = render_fn("btrim", vec![col_ref_expr("s"), str_lit("xy")]);
+        assert_eq!(sql, "trim(s, 'xy')");
+    }
+
+    #[test]
+    fn render_dayname_passes_through_native() {
+        let sql = render_fn("dayname", vec![col_ref_expr("d")]);
+        assert_eq!(sql, "dayname(d)");
+    }
+
+    #[test]
+    fn render_monthname_passes_through_native() {
+        let sql = render_fn("monthname", vec![col_ref_expr("d")]);
+        assert_eq!(sql, "monthname(d)");
     }
 
     /// Non-struct base is a Spark-emulated error (Spark itself rejects

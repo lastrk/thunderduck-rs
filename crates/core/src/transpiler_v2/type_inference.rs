@@ -546,9 +546,9 @@ impl TypeInferenceEngine {
             // ── String functions ─────────────────────────────────────────
             // Most string functions return String; length family returns
             // Integer; regexp / like family returns Boolean.
-            "concat" | "concat_ws" | "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "substr"
-            | "substring" | "left" | "right" | "lpad" | "rpad" | "replace" | "regexp_replace"
-            | "regexp_extract" | "translate" | "initcap" | "space" | "repeat"
+            "concat" | "concat_ws" | "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "btrim"
+            | "substr" | "substring" | "left" | "right" | "lpad" | "rpad" | "replace"
+            | "regexp_replace" | "regexp_extract" | "translate" | "initcap" | "space" | "repeat"
             | "overlay" | "format_string" | "format_number" | "base64" | "unbase64"
             | "url_encode" | "url_decode" | "encode" | "decode" | "soundex" | "sentences"
             | "split_part" => String,
@@ -664,8 +664,10 @@ impl TypeInferenceEngine {
             // `dt-015`.
             "make_date" => Date,
             // `from_unixtime(secs[, fmt])` returns String in Spark (default
-            // format `yyyy-MM-dd HH:mm:ss`), not Timestamp.
-            "from_unixtime" | "date_format" | "date_part" => String,
+            // format `yyyy-MM-dd HH:mm:ss`), not Timestamp. `dayname`/
+            // `monthname` return the day-of-week / month name as String
+            // (DuckDB-native — emission passes them through unchanged).
+            "from_unixtime" | "date_format" | "date_part" | "dayname" | "monthname" => String,
             // `unix_timestamp` returns Long (BIGINT) in Spark; the other
             // date-field extractors (`year`, `month`, `hour`, …) return
             // Integer. Keep them separate.
@@ -1926,6 +1928,25 @@ mod tests {
     #[test]
     fn split_part_returns_string() {
         assert_eq!(frt("split_part", &[DataType::String]), DataType::String);
+    }
+
+    #[test]
+    fn btrim_returns_string() {
+        assert_eq!(frt("btrim", &[DataType::String]), DataType::String);
+        assert_eq!(
+            frt("btrim", &[DataType::String, DataType::String]),
+            DataType::String
+        );
+    }
+
+    #[test]
+    fn dayname_returns_string() {
+        assert_eq!(frt("dayname", &[DataType::Date]), DataType::String);
+    }
+
+    #[test]
+    fn monthname_returns_string() {
+        assert_eq!(frt("monthname", &[DataType::Date]), DataType::String);
     }
 
     #[test]

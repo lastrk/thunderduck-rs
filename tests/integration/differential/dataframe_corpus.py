@@ -553,6 +553,10 @@ case("ord-009", "ordering", "offset + limit (pagination)", lambda I: I["emp"].or
 case("ord-010", "ordering", "distinct", lambda I: I["emp"].select("dept_id", "active").distinct())
 case("ord-011", "ordering", "dropDuplicates subset", lambda I: I["emp"].dropDuplicates(["dept_id"]))
 case("ord-012", "ordering", "dropDuplicates all columns equivalent", lambda I: I["emp"].select("dept_id", "active").dropDuplicates())
+case("ord-013", "ordering", "orderBy a join-qualified passthrough column while the join's OTHER side carries a same-named column (N8 bare-ref no-pin guard)", lambda I: (I["emp"].alias("e")
+    .join(I["dept"].alias("d"), F.col("e.dept_id") == F.col("d.dept_id"), "inner")
+    .select(F.col("e.dept_id"), F.col("d.dept_name"))
+    .orderBy(F.col("e.dept_id"))))
 
 # ── 14. Complex types: arrays ───────────────────────────────────────────────
 case("arr-001", "array", "array() constructor", lambda I: I["emp"].select(F.array(F.col("age"), F.lit(0)).alias("arr")))

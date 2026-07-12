@@ -45,6 +45,16 @@ impl CommonAst {
 pub enum CommonOp {
     // ── Relational (structured) ──────────────────────────────────────────
     /// `SELECT projections FROM input`.
+    ///
+    /// # N8 — output-list entries are `NamedExpression`s post-analysis
+    ///
+    /// The analyzer's `Project` arm wraps every resolved entry that is not
+    /// already a bare `ColumnReference`, `Star`, or `Alias` in a fresh
+    /// `Alias` carrying its schema output name (Spark `UnresolvedAlias` →
+    /// `Alias` resolution), so `projections` on the ANALYZED (`TypedOp`)
+    /// side is always a list of `NamedExpression`s. `CommonOp::Project`
+    /// itself (pre-analysis) carries no such guarantee — front-ends may
+    /// still hand it bare, unaliased computed expressions.
     Project {
         /// The input relation.
         input: Box<CommonAst>,
@@ -105,6 +115,15 @@ pub enum CommonOp {
     /// construction site builds this list itself; there is no per-front-end
     /// flag and no fold-at-read-time — see [`grouped_aggregate`] for the
     /// DataFrame-shaped constructor.
+    ///
+    /// # N8 — `aggregates` entries are `NamedExpression`s post-analysis
+    ///
+    /// Same wrap the analyzer's `Project` arm applies (see
+    /// [`CommonOp::Project`]'s doc): every resolved `aggregates` entry that
+    /// is not already a bare `ColumnReference`, `Star`, or `Alias` is wrapped
+    /// in a fresh `Alias` carrying its schema output name. `grouping` is
+    /// NOT wrapped — it is the internal GROUP BY key list, not an output
+    /// list; a grouping key restated in `aggregates` gets wrapped there.
     Aggregate {
         /// The input relation.
         input: Box<CommonAst>,

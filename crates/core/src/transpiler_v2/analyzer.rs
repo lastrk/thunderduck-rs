@@ -1456,9 +1456,14 @@ fn analyze_node(
             let projections =
                 expand_lateral_column_aliases(projections, &typed_input.resolved_schema)?;
             let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
+            // N8: every non-Star, non-bare-reference entry is wrapped as a
+            // named `Alias` right after resolution — the Project's output
+            // list becomes a list of `NamedExpression`s by construction, the
+            // same invariant Spark's analyzer enforces via
+            // `UnresolvedAlias` → `Alias` resolution.
             let projections = projections
                 .into_iter()
-                .map(|e| resolve_and_stamp(e, &ctx))
+                .map(|e| resolve_and_stamp(e, &ctx).map(ensure_named))
                 .collect::<Result<Vec<_>, _>>()?;
             // Compute output schema — expand Star; take alias name if present.
             let output_schema = project_output_schema(&projections, &typed_input)?;
@@ -1559,7 +1564,15 @@ fn analyze_node(
             let typed_input = analyze_node(*input, base_types, outer)?;
             let ctx = ResolveContext::of_input(&typed_input, base_types, outer);
             let grouping = resolve_expr_list(grouping, &ctx)?;
-            let aggregates = resolve_expr_list(aggregates, &ctx)?;
+            // N8: `aggregates` IS the complete output list (N7) — wrap every
+            // computed entry as a named `Alias`, same invariant as Project.
+            // `grouping` is NOT wrapped — it is an internal GROUP BY key
+            // list, not an output list (its restated copy inside
+            // `aggregates`, if any, gets wrapped there instead).
+            let aggregates: Vec<Expression> = resolve_expr_list(aggregates, &ctx)?
+                .into_iter()
+                .map(ensure_named)
+                .collect();
             // HAVING resolves against the aggregate INPUT schema (aggregate
             // exprs + grouping keys bind to input columns), with the same
             // boolean-type guard as Filter.
@@ -3796,21 +3809,21 @@ fn rebind_over_project(
 
 /// Bind the sort key to the EXISTING `entries[k]` entry (an Aggregate's
 /// `aggregates` or a Project's `projections` — both are the complete output
-/// list by construction, N7, so no prefix offset is ever needed): alias-pin
-/// it (wrap as `Alias(entry, name)`) if it is not already aliased, so the
-/// emitted SQL and the rewritten key both bind to the same declared name,
-/// then return a bare `ColumnReference` at schema position `k` —
-/// schema-neutral, `schema.fields[k]` already carries the name/type/nullable
-/// the entry produces.
-fn bind_slot(entries: &mut [Expression], schema: &StructType, k: usize) -> Expression {
+/// list by construction, N7, so no prefix offset is ever needed): return a
+/// bare `ColumnReference` at schema position `k` — schema-neutral,
+/// `schema.fields[k]` already carries the name/type/nullable the entry
+/// produces. N8: every output-list entry is already a `NamedExpression`
+/// (bare ref, `Star`, or `Alias`) by construction, so this fn is read-only —
+/// there is no alias to pin.
+fn bind_slot(entries: &[Expression], schema: &StructType, k: usize) -> Expression {
+    debug_assert!(
+        matches!(
+            &entries[k],
+            Expression::ColumnReference(_) | Expression::Star(_) | Expression::Alias(_)
+        ),
+        "N8: output-list entry must be a NamedExpression"
+    );
     let field = schema.fields[k].clone();
-    if !matches!(entries[k], Expression::Alias(_)) {
-        let entry = entries[k].clone();
-        entries[k] = Expression::Alias(AliasExpression {
-            expr: Box::new(entry),
-            alias: field.name.clone(),
-        });
-    }
     Expression::ColumnReference(ColumnReference {
         name: field.name,
         qualifier: None,
@@ -3847,8 +3860,10 @@ fn opaque_to_subtree_promotion(expr: &Expression) -> bool {
 /// `expr` (already resolved against the Aggregate's OWN input schema) that
 /// increment 1's whole-key match left unbound. At each node, top-down:
 /// - a subtree that structurally matches (`semantic_eq`) an EXISTING
-///   `aggregates` entry binds to that entry (alias-pinning if unaliased) —
-///   increment 1's match, applied to a subtree instead of the whole key;
+///   `aggregates` entry binds to that entry (N8: read-only — the entry is
+///   already a `NamedExpression` by construction, so there is no alias to
+///   pin) — increment 1's match, applied to a subtree instead of the whole
+///   key;
 /// - otherwise, a subtree that is itself an aggregate-classifier
 ///   `FunctionCall`, or that matches (`semantic_eq`) a `grouping` entry, is
 ///   PROMOTED: a fresh `Alias(subtree, name)` entry is appended to
@@ -5408,6 +5423,15 @@ fn analyze_pivot(
             derive_implicit_grouping(input_schema, &pivot_column, &aggregates)
         }
     };
+    // N8: wrap every computed grouping entry as a named `Alias`, same
+    // invariant as Project/Aggregate — `grouping` is Pivot's own output-list
+    // prefix (see the schema-stamping doc above). `pivot_column` /
+    // `pivot_values` / `aggregates` are NOT wrapped: they own their naming
+    // (the pivot-value × aggregate loop below derives output names directly
+    // from them; emission consumes `aggregates` via `.unaliased()`).
+    // `derive_implicit_grouping` only ever produces bare `ColumnReference`s,
+    // so wrapping the `Implicit` branch is a no-op.
+    let grouping: Vec<Expression> = grouping.into_iter().map(ensure_named).collect();
     // Pivot values are literals; they only need type resolution against the
     // pivot column (Spark coerces them into that type at read). We defer
     // typing to the emission stage — literals carry their own type already.
@@ -5753,6 +5777,27 @@ fn expression_output_name(expr: &Expression) -> String {
         Expression::FunctionCall(_) => pretty_name(expr),
         Expression::Literal(_) => "col".to_owned(),
         _ => pretty_name(expr),
+    }
+}
+
+/// N8 (Spark `UnresolvedAlias` → `Alias`): carry the schema output name on
+/// the tree itself, so any consumer that walks a Project/Aggregate/Pivot
+/// output list can read the entry's declared name directly instead of
+/// re-deriving it via [`expression_output_name`]. Bare `ColumnReference`s and
+/// `Star` stay bare (Spark parity — a passthrough column has no
+/// `UnresolvedAlias` to resolve); `Alias` is idempotent (already named).
+/// Every other shape is wrapped once, using the same name
+/// [`expression_output_name`] would have produced for it.
+fn ensure_named(expr: Expression) -> Expression {
+    match expr {
+        e @ (Expression::Alias(_) | Expression::ColumnReference(_) | Expression::Star(_)) => e,
+        e => {
+            let alias = expression_output_name(&e);
+            Expression::Alias(AliasExpression {
+                expr: Box::new(e),
+                alias,
+            })
+        }
     }
 }
 
@@ -7531,14 +7576,22 @@ mod tests {
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
         assert!(typed.resolved_schema.fields[0].nullable);
         match &typed.op {
+            // N8: the bare (unaliased) `ScalarSubquery` entry is wrapped as
+            // `Alias(expr, "expr")` — `pretty_name`'s default fallback name.
             TypedOp::Project { projections, .. } => match &projections[0] {
-                Expression::ScalarSubquery(s) => {
-                    assert!(
-                        matches!(s.subquery, SubqueryPlan::Analyzed(_)),
-                        "analyzer must rewrite Unanalyzed → Analyzed"
-                    );
+                Expression::Alias(a) => {
+                    assert_eq!(a.alias, "expr");
+                    match a.expr.as_ref() {
+                        Expression::ScalarSubquery(s) => {
+                            assert!(
+                                matches!(s.subquery, SubqueryPlan::Analyzed(_)),
+                                "analyzer must rewrite Unanalyzed → Analyzed"
+                            );
+                        }
+                        other => panic!("expected ScalarSubquery, got {other:?}"),
+                    }
                 }
-                other => panic!("expected ScalarSubquery, got {other:?}"),
+                other => panic!("expected Alias (N8), got {other:?}"),
             },
             other => panic!("expected Project, got {other:?}"),
         }
@@ -7574,20 +7627,28 @@ mod tests {
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(typed.resolved_schema.fields.len(), 1);
         match &typed.op {
+            // N8: the bare (unaliased) `ScalarSubquery` entry is wrapped as
+            // `Alias(expr, "expr")` — `pretty_name`'s default fallback name.
             TypedOp::Project { projections, .. } => match &projections[0] {
-                Expression::ScalarSubquery(s) => match &s.subquery {
-                    SubqueryPlan::Analyzed(inner) => {
-                        assert_eq!(inner.resolved_schema.fields.len(), 1);
-                        assert_eq!(inner.resolved_schema.fields[0].name, "rank_col");
-                        assert!(
-                            matches!(inner.op, TypedOp::Aggregate { .. }),
-                            "Folded aggregate needs no wrapping Project, got {:?}",
-                            inner.op
-                        );
+                Expression::Alias(a) => {
+                    assert_eq!(a.alias, "expr");
+                    match a.expr.as_ref() {
+                        Expression::ScalarSubquery(s) => match &s.subquery {
+                            SubqueryPlan::Analyzed(inner) => {
+                                assert_eq!(inner.resolved_schema.fields.len(), 1);
+                                assert_eq!(inner.resolved_schema.fields[0].name, "rank_col");
+                                assert!(
+                                    matches!(inner.op, TypedOp::Aggregate { .. }),
+                                    "Folded aggregate needs no wrapping Project, got {:?}",
+                                    inner.op
+                                );
+                            }
+                            other => panic!("expected Analyzed, got {other:?}"),
+                        },
+                        other => panic!("expected ScalarSubquery, got {other:?}"),
                     }
-                    other => panic!("expected Analyzed, got {other:?}"),
-                },
-                other => panic!("expected ScalarSubquery, got {other:?}"),
+                }
+                other => panic!("expected Alias (N8), got {other:?}"),
             },
             other => panic!("expected Project, got {other:?}"),
         }
@@ -10078,8 +10139,16 @@ mod tests {
             other => panic!("expected Project, got {other:?}"),
         };
         assert_eq!(proj.len(), 1, "single projection");
+        // N8: an unaliased computed entry is wrapped as `Alias(expr, name)` —
+        // the pretty name of the leaf `ExtractValue` is its extraction key,
+        // "lat".
+        let wrapped = match &proj[0] {
+            Expression::Alias(a) => a,
+            other => panic!("expected Alias (N8), got {other:?}"),
+        };
+        assert_eq!(wrapped.alias, "lat");
         // Outer ExtractValue(ExtractValue(ColumnReference("address"), "geo"), "lat")
-        let outer = match &proj[0] {
+        let outer = match wrapped.expr.as_ref() {
             Expression::ExtractValue(ev) => ev,
             other => panic!("expected ExtractValue, got {other:?}"),
         };
@@ -13174,15 +13243,18 @@ mod tests {
     }
 
     #[test]
-    fn sort_aggregate_restatement_binds_and_alias_pins() {
+    fn sort_aggregate_restatement_binds_onto_n8_wrapped_entry() {
         // `SELECT dept_id, sum(salary) FROM emp GROUP BY dept_id
         //  ORDER BY sum(salary)` — the ORDER BY key restates the unaliased
-        // aggregate. Step 1 (resolve against the Aggregate's OUTPUT) fails
-        // (`salary` is not an output column); the fallback re-resolves
-        // `sum(salary)` against the Aggregate's INPUT, matches
-        // `aggregates[1]` by `semantic_eq`, rewrites the key to a bare
-        // `ColumnReference("sum(salary)")`, and alias-pins the previously
-        // unaliased aggregate entry so emission binds to the same name.
+        // aggregate. N8 already wrapped the unaliased `aggregates[1]` entry
+        // as `Alias(sum(salary), "sum(salary)")` during the Aggregate arm's
+        // own analysis (before the Sort is even reached). Step 1 (resolve
+        // against the Aggregate's OUTPUT) fails (`salary` is not an output
+        // column); the fallback re-resolves `sum(salary)` against the
+        // Aggregate's INPUT, matches `aggregates[1]` by `semantic_eq`
+        // (alias-stripped), and rewrites the key to a bare
+        // `ColumnReference("sum(salary)")` bound onto that already-named
+        // entry — read-only (N8: `bind_slot` never pins an alias itself).
         let bt = base_types_with_emp_dept();
         let sum_salary = || func("sum", vec![unresolved_col("salary")]);
         let agg = aggregate(
@@ -13217,7 +13289,7 @@ mod tests {
                         Expression::FunctionCall(f) if f.name.eq_ignore_ascii_case("sum")
                     ));
                 }
-                other => panic!("expected alias-pinned sum(salary), got {other:?}"),
+                other => panic!("expected N8-wrapped sum(salary), got {other:?}"),
             },
             other => panic!("expected Aggregate, got {other:?}"),
         }
@@ -13260,12 +13332,15 @@ mod tests {
     }
 
     #[test]
-    fn sort_over_project_binds_whole_expr_and_alias_pins() {
+    fn sort_over_project_binds_whole_expr_onto_n8_wrapped_entry() {
         // `SELECT substr(name, 1, 3) FROM emp ORDER BY substr(name, 1, 3)`
         // (q062/q079/q099 shape) — the ORDER BY key restates the whole
-        // unaliased projected expression verbatim. Falls back, resolves
+        // unaliased projected expression verbatim. N8 already wrapped the
+        // unaliased projection as `Alias(substr(...), "substr(name, 1, 3)")`
+        // during the Project arm's own analysis. Falls back, resolves
         // against the Project's input, matches by whole-expression
-        // `semantic_eq`, and alias-pins the projection.
+        // `semantic_eq` (alias-stripped), and binds onto that already-named
+        // entry — read-only (N8: `bind_slot` never pins an alias itself).
         let bt = base_types_with_emp_dept();
         let substr_name = || {
             func(
@@ -13295,7 +13370,7 @@ mod tests {
         match &input.op {
             TypedOp::Project { projections, .. } => match &projections[0] {
                 Expression::Alias(a) => assert_eq!(a.alias, expected_name),
-                other => panic!("expected alias-pinned substr entry, got {other:?}"),
+                other => panic!("expected N8-wrapped substr entry, got {other:?}"),
             },
             other => panic!("expected Project, got {other:?}"),
         }
@@ -13341,7 +13416,7 @@ mod tests {
             TypedOp::Aggregate { aggregates, .. } => {
                 assert!(
                     matches!(&aggregates[0], Expression::Alias(a) if matches!(a.expr.as_ref(), Expression::FunctionCall(f) if f.name.eq_ignore_ascii_case("count"))),
-                    "expected alias-pinned count(*) entry, got {:?}",
+                    "expected N8-wrapped count(*) entry, got {:?}",
                     aggregates[0]
                 );
             }
@@ -14039,6 +14114,401 @@ mod tests {
         assert!(
             semantic_eq(&materialized, &raw),
             "an implicit N4 Cast must be invisible to semantic_eq, exactly like an Alias"
+        );
+    }
+
+    // ── N8: Project/Aggregate/Pivot output-list entries are `NamedExpression`s ──
+    // (analyzer.rs `ensure_named`, wired into the `Project` / `Aggregate` /
+    // `Pivot` analysis arms; `bind_slot` made read-only). Mirrors Spark's
+    // `UnresolvedAlias` → `Alias` resolution: every non-`Star`, non-bare-ref
+    // output-list entry carries its schema name on the tree itself.
+
+    #[test]
+    fn project_computed_entry_wrapped_named_schema_unchanged() {
+        // `SELECT id, dept_id + 1 FROM emp` — N8 wraps the unaliased Binary
+        // entry in `Alias(_, "(dept_id + 1)")`, the exact name
+        // `expression_output_name` would have produced pre-N8. The wrap must
+        // not perturb the computed schema field at all — same name/type/
+        // nullable as resolving the RAW expression directly would produce.
+        let bt = base_types_with_emp_dept();
+        let computed = || {
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::Add,
+                left: Box::new(unresolved_col("dept_id")),
+                right: Box::new(int_lit(1)),
+            })
+        };
+        // Pre-N8 baseline: the field a direct (unwrapped) resolve-and-stamp
+        // of `computed()` would stamp, independent of the Project arm's wrap.
+        let scanned = analyze(scan("emp"), &bt).expect("scan analyzes");
+        let ctx = ResolveContext::of_input(&scanned, &bt, None);
+        let baseline_resolved = resolve_and_stamp(computed(), &ctx).expect("baseline resolves");
+        let baseline_field = expr_field(&baseline_resolved, &scanned.resolved_schema);
+
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![unresolved_col("id"), computed()],
+        });
+        let typed = analyze(ast, &bt).expect("project analyzes");
+        let TypedOp::Project { projections, .. } = &typed.op else {
+            panic!("expected Project, got {:?}", typed.op);
+        };
+        match &projections[1] {
+            Expression::Alias(a) => assert_eq!(a.alias, "(dept_id + 1)"),
+            other => panic!("expected N8-wrapped computed entry, got {other:?}"),
+        }
+        assert_eq!(
+            typed.resolved_schema.fields[1], baseline_field,
+            "N8's wrap must not perturb the computed schema field"
+        );
+    }
+
+    #[test]
+    fn aggregate_folded_grouping_clone_wrapped_grouping_copy_stays_bare() {
+        // `df.groupBy(F.col("dept_id") + 1).agg(F.avg("salary"))` — N7 folds
+        // the grouping expression into `aggregates[0]` at construction time
+        // (`grouped_aggregate`), cloning the SAME expression into both lists.
+        // N8 wraps the `aggregates` copy (an output-list entry, unaliased)
+        // but must leave the `grouping` copy bare — it is the internal GROUP
+        // BY key list, not an output list.
+        let bt = base_types_with_emp_dept();
+        let bump = || {
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::Add,
+                left: Box::new(unresolved_col("dept_id")),
+                right: Box::new(int_lit(1)),
+            })
+        };
+        let avg_salary = func("avg", vec![unresolved_col("salary")]);
+        let ast = CommonAst::new(grouped_aggregate(
+            emp_scan(),
+            vec![bump()],
+            vec![avg_salary],
+            crate::transpiler_v2::ast::GroupingKind::GroupBy,
+        ));
+        let typed = analyze(ast, &bt).expect("folded grouping aggregate analyzes");
+        let TypedOp::Aggregate {
+            grouping,
+            aggregates,
+            ..
+        } = &typed.op
+        else {
+            panic!("expected Aggregate, got {:?}", typed.op);
+        };
+        match &grouping[0] {
+            Expression::Binary(_) => {}
+            other => panic!("grouping copy must stay bare (unwrapped), got {other:?}"),
+        }
+        match &aggregates[0] {
+            Expression::Alias(a) => {
+                assert_eq!(a.alias, "(dept_id + 1)");
+                assert!(matches!(a.expr.as_ref(), Expression::Binary(_)));
+            }
+            other => {
+                panic!("expected the N8-wrapped folded grouping entry in aggregates, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_named_idempotent_over_alias_bare_ref_and_star() {
+        // N8: `ensure_named` must be a no-op over shapes that are already
+        // `NamedExpression`s — an existing `Alias` (idempotent, never
+        // double-wrapped), a bare (possibly qualified) `ColumnReference`
+        // (Spark parity: a passthrough column has no `UnresolvedAlias` to
+        // resolve), and `Star` (expands later; never itself named).
+        let aliased = Expression::Alias(AliasExpression {
+            expr: Box::new(unresolved_col("id")),
+            alias: "renamed".to_owned(),
+        });
+        assert_eq!(ensure_named(aliased.clone()), aliased);
+
+        let bare_qualified = Expression::ColumnReference(ColumnReference {
+            name: "dept_id".to_owned(),
+            qualifier: Some("e".to_owned()),
+            data_type: Some(DataType::Integer),
+            nullable: Some(true),
+            ordinal: Some(2),
+        });
+        assert_eq!(ensure_named(bare_qualified.clone()), bare_qualified);
+
+        let star = Expression::Star(StarExpression { qualifier: None });
+        assert_eq!(ensure_named(star.clone()), star);
+    }
+
+    #[test]
+    fn ensure_named_implicit_cast_aliased_with_inner_pretty_name() {
+        // N4: an `implicit` Cast is analyzer-materialized (never itself part
+        // of what Spark would name); N8 must alias it using the INNER
+        // expression's pretty name, transparently through the wrapper —
+        // never a `CAST(...)`-shaped name.
+        let inner = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(unresolved_col("age")),
+            right: Box::new(int_lit(1)),
+        });
+        let implicit_cast = Expression::Cast(CastExpression {
+            expr: Box::new(inner.clone()),
+            to_type: DataType::Long,
+            try_cast: false,
+            implicit: true,
+        });
+        let wrapped = ensure_named(implicit_cast.clone());
+        match wrapped {
+            Expression::Alias(a) => {
+                assert_eq!(
+                    a.alias,
+                    pretty_name(&inner),
+                    "must use the inner expression's pretty name, not the Cast's"
+                );
+                assert_eq!(a.alias, "(age + 1)");
+                assert_eq!(
+                    *a.expr, implicit_cast,
+                    "the implicit Cast itself must remain intact under the wrap"
+                );
+            }
+            other => panic!("expected an Alias wrap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sort_rebind_binds_wrapped_entry_and_leaves_bare_entry_unmutated() {
+        // N8's `bind_slot` is READ-ONLY: it never re-aliases an existing
+        // `aggregates` entry to "pin" the sort key's binding, because every
+        // `aggregates` entry is ALREADY a `NamedExpression` by construction
+        // (the Aggregate arm's own N8 wrap runs before the Sort is ever
+        // analyzed).
+        // `SELECT dept_id, avg(salary) FROM emp e GROUP BY dept_id
+        //  ORDER BY e.dept_id, avg(salary)` — two ORDER BY keys:
+        //   - `e.dept_id` (qualified) whole-key-matches the BARE `dept_id`
+        //     restatement (`aggregates[0]`) — must remain a bare
+        //     `ColumnReference` (not wrapped) after the Sort's own analysis.
+        //   - unaliased `avg(salary)` whole-key-matches the entry N8 ALREADY
+        //     wrapped as `Alias(avg(salary), "avg(salary)")` during the
+        //     Aggregate arm's own analysis — `bind_slot` merely reads it.
+        let bt = base_types_with_emp_dept();
+        let avg_salary = || func("avg", vec![unresolved_col("salary")]);
+        let agg = aggregate(
+            aliased_scan("emp", "e"),
+            vec![unresolved_col("dept_id")],
+            vec![unresolved_col("dept_id"), avg_salary()],
+        );
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(agg),
+            order: vec![asc_key(qcol("e", "dept_id")), asc_key(avg_salary())],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("both keys must resolve via the fallback");
+
+        // Cheap ADR-023 tier-3 sanity check (not this test's focus):
+        // lineage tracking must survive the Sort's mandatory re-stamp
+        // (`TypedAst::new` inside `analyze_sort`).
+        assert_eq!(
+            typed.scope.source_quals.len(),
+            typed.resolved_schema.len(),
+            "source_quals must track resolved_schema 1:1 after the Sort re-stamp"
+        );
+
+        let TypedOp::Sort { input, order, .. } = &typed.op else {
+            panic!("expected Sort, got {:?}", typed.op);
+        };
+        match order[0].expr.as_ref() {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.name, "dept_id");
+                assert_eq!(c.ordinal, Some(0));
+            }
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+        match order[1].expr.as_ref() {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.name, "avg(salary)");
+                assert_eq!(c.ordinal, Some(1));
+            }
+            other => panic!("expected bare ColumnReference, got {other:?}"),
+        }
+        match &input.op {
+            TypedOp::Aggregate { aggregates, .. } => {
+                match &aggregates[0] {
+                    Expression::ColumnReference(c) => assert_eq!(c.name, "dept_id"),
+                    other => panic!(
+                        "N8: bind_slot is read-only — the bare restated grouping key \
+                         must NOT be mutated into an Alias, got {other:?}"
+                    ),
+                }
+                match &aggregates[1] {
+                    Expression::Alias(a) => assert_eq!(a.alias, "avg(salary)"),
+                    other => panic!("expected the N8-wrapped avg(salary) entry, got {other:?}"),
+                }
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    /// N8 invariant checker: every `Project`/`Aggregate`/`Pivot`(`grouping`)
+    /// output-list entry must be a `NamedExpression` — a bare
+    /// `ColumnReference`, a `Star`, or an `Alias` whose `alias` matches the
+    /// corresponding schema field's name — recursing into each node's own
+    /// child. Deliberately NOT exhaustive over every `TypedOp` variant (a
+    /// targeted regression guard over representative plans below, not a
+    /// generic tree walker); an unlisted variant is a no-op leaf here.
+    fn assert_n8_output_list_invariant(ti: &TypedAst) {
+        fn assert_entries(entries: &[Expression], schema: &StructType, ctx: &str) {
+            // A `Star` entry expands to a variable number of schema fields —
+            // this checker only enforces the per-entry SHAPE invariant for a
+            // node containing one, skipping the 1:1 positional name check
+            // (none of the representative plans below carry a `Star`).
+            let has_star = entries.iter().any(|e| matches!(e, Expression::Star(_)));
+            for e in entries {
+                match e {
+                    Expression::ColumnReference(_) | Expression::Star(_) | Expression::Alias(_) => {
+                    }
+                    other => {
+                        panic!("{ctx}: entry is neither a bare ref, Star, nor Alias: {other:?}")
+                    }
+                }
+            }
+            if has_star {
+                return;
+            }
+            assert_eq!(
+                entries.len(),
+                schema.len(),
+                "{ctx}: entries/schema length mismatch"
+            );
+            for (entry, field) in entries.iter().zip(schema.fields.iter()) {
+                if let Expression::Alias(a) = entry {
+                    assert_eq!(
+                        a.alias, field.name,
+                        "{ctx}: entry's alias must equal its schema field name"
+                    );
+                }
+            }
+        }
+        match &ti.op {
+            TypedOp::Project {
+                input, projections, ..
+            } => {
+                assert_entries(projections, &ti.resolved_schema, "Project");
+                assert_n8_output_list_invariant(input);
+            }
+            TypedOp::Aggregate {
+                input, aggregates, ..
+            } => {
+                assert_entries(aggregates, &ti.resolved_schema, "Aggregate");
+                assert_n8_output_list_invariant(input);
+            }
+            TypedOp::Pivot {
+                input, grouping, ..
+            } => {
+                // `grouping` is only a PREFIX of the output schema (the
+                // pivot-value columns follow) — check against that prefix.
+                let prefix = StructType::new(ti.resolved_schema.fields[..grouping.len()].to_vec());
+                assert_entries(grouping, &prefix, "Pivot grouping");
+                assert_n8_output_list_invariant(input);
+            }
+            TypedOp::Sort { input, .. } => assert_n8_output_list_invariant(input),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn n8_invariant_holds_over_representative_plans() {
+        let bt = base_types_with_emp_dept();
+
+        // LCA (Lateral Column Alias): every entry already aliased.
+        let raised = alias_expr(
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::Mul,
+                left: Box::new(unresolved_col("salary")),
+                right: Box::new(lit_double(1.1)),
+            }),
+            "raised",
+        );
+        let delta = alias_expr(
+            Expression::Binary(BinaryExpression {
+                op: BinaryOp::Sub,
+                left: Box::new(unresolved_col("raised")),
+                right: Box::new(unresolved_col("salary")),
+            }),
+            "delta",
+        );
+        let lca_ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![raised, delta],
+        });
+        assert_n8_output_list_invariant(&analyze(lca_ast, &bt).expect("LCA analyzes"));
+
+        // `inline(...)` expansion (Pass 90).
+        let inline_ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![
+                unresolved_col("id"),
+                inline_call(false, array_of_struct_name_salary()),
+            ],
+        });
+        assert_n8_output_list_invariant(&analyze(inline_ast, &bt).expect("inline expands"));
+
+        // `json_tuple(...)` expansion (Pass 91).
+        let json_bt = base_types_with_raw();
+        let json_ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("raw")),
+            projections: vec![
+                unresolved_col("id"),
+                json_tuple_call("json_str", &["a", "e"]),
+            ],
+        });
+        assert_n8_output_list_invariant(&analyze(json_ast, &json_bt).expect("json_tuple expands"));
+
+        // `stack(...)` multi-alias expansion (piv-006, Pass 60).
+        let stack_call = func(
+            "stack_multi_alias",
+            vec![
+                func("stack", vec![int_lit(2), int_lit(10), int_lit(20)]),
+                lit_str("x"),
+            ],
+        );
+        let stack_ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![stack_call],
+        });
+        assert_n8_output_list_invariant(&analyze(stack_ast, &bt).expect("stack expands"));
+
+        // Promote-hidden-entry (design 023 increment 2, tpcds-q098 shape):
+        // a Sort promoting a hidden grouping key wraps the Aggregate in a
+        // trim Project.
+        let promote_agg = aggregate(
+            emp_scan(),
+            vec![unresolved_col("dept_id"), unresolved_col("name")],
+            vec![
+                unresolved_col("name"),
+                func("sum", vec![unresolved_col("salary")]),
+            ],
+        );
+        let promote_ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(promote_agg),
+            order: vec![asc_key(unresolved_col("dept_id"))],
+            limit: None,
+            offset: None,
+        });
+        assert_n8_output_list_invariant(
+            &analyze(promote_ast, &bt).expect("hidden grouping key promotes"),
+        );
+
+        // Pivot, explicit (computed) grouping.
+        let pivot_ast = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(emp_scan()),
+            grouping: PivotGrouping::Explicit(vec![Expression::Binary(BinaryExpression {
+                op: BinaryOp::Add,
+                left: Box::new(unresolved_col("dept_id")),
+                right: Box::new(int_lit(1)),
+            })]),
+            pivot_column: unresolved_col("dept_id"),
+            pivot_values: vec![int_lit(10)],
+            aggregates: vec![func("count", vec![int_lit(1)])],
+        });
+        assert_n8_output_list_invariant(
+            &analyze(pivot_ast, &bt).expect("pivot with explicit computed grouping analyzes"),
         );
     }
 }

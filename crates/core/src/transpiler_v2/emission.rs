@@ -10006,17 +10006,25 @@ mod tests {
         let typed = analyze(outer_agg, &bt).expect("analyze tbl-013 shape");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         // The rename must reference the wrapped child POSITIONALLY (DuckDB's
-        // native derived-table column-alias-list), never by the qualifier-
-        // stripped tracked name — that name does not exist in the child's
-        // actual (DuckDB-assigned) output.
+        // native derived-table column-alias-list), never BY NAME through the
+        // qualifier-stripped tracked name.
         assert!(
             sql.contains("AS __td_wcr(a, b)") || sql.contains("AS __td_wcr(\"a\", \"b\")"),
             "expected a positional derived-table column-alias-list rename; got: {sql}"
         );
+        // N8: the inner aggregate's second entry is itself unaliased in the
+        // SOURCE plan, so the analyzer now wraps it as
+        // `Alias(count(d.dept_id), "count(dept_id)")` — the tracked name is
+        // thus explicitly declared on the child (`... AS "count(dept_id)"`),
+        // not merely implied by DuckDB's own (qualifier-keeping) naming. The
+        // OUTER reference must still be positional (`__td_wcr(a, b)`,
+        // asserted above), never a BY-NAME reference to that tracked name —
+        // assert the outer GROUP BY binds through the wrap alias `b`, not
+        // through a bare `"count(dept_id)"` identifier.
         assert!(
-            !sql.contains("\"count(dept_id)\""),
-            "must not reference the child by its qualifier-stripped tracked \
-             name — DuckDB does not expose a column under that name; got: {sql}"
+            !sql.contains("GROUP BY \"count(dept_id)\""),
+            "outer reference must bind through the positional wrap alias `b`, \
+             not by the child's tracked name; got: {sql}"
         );
     }
 

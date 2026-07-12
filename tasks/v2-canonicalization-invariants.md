@@ -196,6 +196,15 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 
 ### N8. Every output-list entry is a NamedExpression (alias-every-entry)
 
+- **Status: ✅ LANDED** (Pass B2): `ensure_named` at exactly 3 op arms (Project, Aggregate
+  aggregates, Pivot grouping); `bind_slot` now READ-ONLY (the last SELECT-list
+  mutation-under-iteration site is gone; N7's lineage MINOR partially resolved — bare
+  entries keep their lineage). Name-neutral by construction (alias minted from the same
+  `expression_output_name` the schema uses): only ONE emission test churned (insertion-only).
+  New witness `ord-013` (qualified passthrough orderBy over same-named join column) guards
+  the bare-ref no-pin decision. Deferred: `__td_wcr` by-name revert (duplicate-name children).
+  Opus review clean (1 MINOR test-name staleness, fixed); full corpora green (DataFrame 404/0,
+  SQL 404/0).
 - **Invariant:** after resolution, every entry of a Project/Aggregate/WithColumns output list
   is either a bare `ColumnReference`/`Star` or an `Alias` whose name equals the schema
   field's name (Spark's `UnresolvedAlias` → `Alias` invariant).

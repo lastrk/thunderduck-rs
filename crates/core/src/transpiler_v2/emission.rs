@@ -3669,6 +3669,35 @@ fn trailing_ignore_nulls_keep_arity(name_lower: &str) -> Option<usize> {
 }
 
 fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
+    let sql = render_function_call_dispatch(f, schema)?;
+    if needs_date_return_cast(f) {
+        return Ok(format!("CAST({sql} AS DATE)"));
+    }
+    Ok(sql)
+}
+
+/// Emission-owned divergence roster: Date-typed Spark functions whose
+/// DuckDB-rendered substrate form natively returns TIMESTAMP (DATE±INTERVAL
+/// promotion / date_trunc). Single home of the corrective cast.
+/// Mechanically gated by `date_typed_functions_return_date_in_duckdb`.
+///
+/// Future-author rule: a NEW Date-returning function is added to
+/// [`TypeInferenceEngine`]'s `DATE_RETURNING_FNS` ALWAYS (the type
+/// authority), and to this roster ONLY when its emitted DuckDB form
+/// diverges from DATE — the audit test fails until the two agree with
+/// reality, so a wrong guess cannot land silently.
+fn needs_date_return_cast(f: &FunctionCall) -> bool {
+    match f.name.to_ascii_lowercase().as_str() {
+        "add_months" | "date_add" | "date_sub" => true,
+        "trunc" => f.args.len() == 2, // 1-arg trunc is not the date form
+        _ => false,
+    }
+}
+
+fn render_function_call_dispatch(
+    f: &FunctionCall,
+    schema: &Schema,
+) -> Result<String, EmissionError> {
     let name_lower = f.name.to_ascii_lowercase();
     // Aggregate-name overlap check — if the analyzer classified a FunctionCall
     // as aggregate, `render_expr` routes to `render_aggregate` before this
@@ -3826,7 +3855,10 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
             return Ok(format!("strftime({d}, {duck_fmt})"));
         }
         // Spark's `trunc(date, format)` → DuckDB `date_trunc(format, date)`.
-        // Spark's arg order is (date, fmt); DuckDB's is (fmt, date).
+        // Spark's arg order is (date, fmt); DuckDB's is (fmt, date). DuckDB's
+        // `date_trunc` natively returns TIMESTAMP; the `render_function_call`
+        // wrapper (via `needs_date_return_cast`) supplies the CAST back to
+        // Spark's DATE return type — no cast here.
         "trunc" if f.args.len() == 2 => {
             let [d, fmt] = rendered_args(f, schema)?;
             return Ok(format!("date_trunc({fmt}, {d})"));
@@ -5175,12 +5207,14 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         "sha" => "sha1",
         // Spark's `add_months(date, n)` — DuckDB uses `date + INTERVAL n MONTH`,
         // but DuckDB promotes `DATE + INTERVAL` to TIMESTAMP. Spark's
-        // `add_months` always returns DATE; CAST back so collected values
-        // come back as date, not datetime. DuckDB's end-of-month clamp
-        // (e.g. Jan 31 + 1 month = Feb 29 in a leap year) survives the CAST.
+        // `add_months` always returns DATE; the `render_function_call`
+        // wrapper (via `needs_date_return_cast`) supplies the CAST back to
+        // DATE so collected values come back as date, not datetime. DuckDB's
+        // end-of-month clamp (e.g. Jan 31 + 1 month = Feb 29 in a leap year)
+        // survives the CAST.
         "add_months" => {
             let [d, n] = exact_args(f, schema, "`add_months` requires exactly 2 arguments")?;
-            return Ok(format!("CAST(({d} + INTERVAL ({n}) MONTH) AS DATE)"));
+            return Ok(format!("({d} + INTERVAL ({n}) MONTH)"));
         }
         // Spark's `datediff(end, start)` (2 args, days-diff) → DuckDB's
         // `datediff('day', start, end)` (3 args, unit-prefixed).
@@ -5240,15 +5274,16 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
             ));
         }
         // DuckDB promotes `DATE + INTERVAL` to TIMESTAMP; Spark's `date_add`
-        // always returns DATE. CAST back to DATE (same rule as `add_months`
-        // above).
+        // always returns DATE. The `render_function_call` wrapper (via
+        // `needs_date_return_cast`) supplies the CAST back to DATE (same
+        // rule as `add_months` above).
         "date_add" => {
             let [d, n] = exact_args(f, schema, "`date_add` requires exactly 2 arguments")?;
-            return Ok(format!("CAST(({d} + INTERVAL ({n}) DAY) AS DATE)"));
+            return Ok(format!("({d} + INTERVAL ({n}) DAY)"));
         }
         "date_sub" => {
             let [d, n] = exact_args(f, schema, "`date_sub` requires exactly 2 arguments")?;
-            return Ok(format!("CAST(({d} - INTERVAL ({n}) DAY) AS DATE)"));
+            return Ok(format!("({d} - INTERVAL ({n}) DAY)"));
         }
         // Spark's `concat(s1, s2, ...)` on strings PROPAGATES NULL:
         // any NULL arg makes the result NULL. DuckDB's `concat` ignores
@@ -15249,6 +15284,164 @@ mod tests {
             sql.starts_with("CAST(") && sql.ends_with("AS DATE)"),
             "expected date_sub to CAST its result to DATE, got: {sql}"
         );
+    }
+
+    // ── trunc(date, fmt) returns DATE (Pass N3) ─────────────────────────
+    //
+    // DuckDB's `date_trunc(fmt, date)` natively returns TIMESTAMP; Spark's
+    // 2-arg `trunc(date, fmt)` always returns DATE. The
+    // `render_function_call` wrapper's `needs_date_return_cast` roster
+    // supplies the corrective CAST — the arm body itself is unchanged.
+
+    #[test]
+    fn trunc_date_casts_result_to_date() {
+        let f = fcall(
+            "trunc",
+            vec![col_with_type("d", DataType::Date), str_lit("month")],
+        );
+        let sql = render_function_call(&f, &empty_schema()).expect("render trunc");
+        assert_eq!(sql, "CAST(date_trunc('month', d) AS DATE)");
+    }
+
+    #[test]
+    fn trunc_one_arg_not_cast() {
+        // 1-arg `trunc` is not the date-truncation form (`needs_date_return_cast`
+        // gates on `f.args.len() == 2`) — must not get the DATE cast.
+        let f = fcall("trunc", vec![col_with_type("d", DataType::Date)]);
+        let sql = render_function_call(&f, &empty_schema()).expect("render trunc");
+        assert!(
+            !sql.contains("AS DATE"),
+            "1-arg trunc must not get the DATE cast, got: {sql}"
+        );
+    }
+
+    /// `last_day` is deliberately excluded from `needs_date_return_cast`'s
+    /// roster: DuckDB's native `last_day(DATE)` already returns DATE (no
+    /// TIMESTAMP promotion to correct for — verified directly against
+    /// DuckDB). Pin the exclusion so a future roster edit doesn't
+    /// double-cast an already-correct result.
+    #[test]
+    fn last_day_passes_through_uncast() {
+        let f = fcall("last_day", vec![col_with_type("d", DataType::Date)]);
+        let sql = render_function_call(&f, &empty_schema()).expect("render last_day");
+        assert_eq!(sql, "last_day(d)");
+    }
+
+    /// The DATE cast supplied by the `render_function_call` wrapper must
+    /// survive when the call is nested inside another expression (not just
+    /// when rendered standalone) — pins the wrapper against a future
+    /// refactor that only casts top-level calls.
+    #[test]
+    fn date_add_nested_in_comparison_keeps_cast() {
+        let date_add_call = fexpr(
+            "date_add",
+            vec![col_with_type("d", DataType::Date), int_lit(5)],
+        );
+        let date_literal = Expression::Literal(Literal {
+            value: LiteralValue::Date(20103),
+            data_type: DataType::Date,
+        });
+        let expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(date_add_call),
+            right: Box::new(date_literal),
+        });
+        let sql = render_expr(&expr, &empty_schema()).expect("render");
+        assert!(
+            sql.contains("CAST((d + INTERVAL (5) DAY) AS DATE)"),
+            "date_add's DATE cast must survive nested inside a comparison, got: {sql}"
+        );
+    }
+
+    // ── DATE_RETURNING_FNS mechanical audit (Pass N3) ────────────────────
+    //
+    // `needs_date_return_cast`'s divergence roster and
+    // `type_inference::DATE_RETURNING_FNS` (the Date-typed function roster)
+    // must agree in substance: every function Spark types as Date must
+    // ALSO render to SQL that DuckDB itself types as DATE — whether via τ's
+    // own corrective CAST, or because the DuckDB-native substrate form
+    // already returns DATE. This test executes the rendered SQL against a
+    // real DuckDB connection (rather than pattern-matching strings), so it
+    // mechanically catches any future roster/emission drift.
+
+    /// One test sample per `DATE_RETURNING_FNS` entry.
+    enum DateReturnSample {
+        /// A scalar `FunctionCall` with literal (self-contained) args —
+        /// render via `render_function_call` and execute
+        /// `SELECT typeof(<sql>)` against a fresh in-memory connection.
+        Expr(FunctionCall),
+        /// A session-registered macro (`runtime::session::NEXT_DAY_MACRO_SQL`)
+        /// that is not visible to a bare `duckdb::Connection` — its
+        /// DATE-return contract is pinned instead by
+        /// `runtime::session::tests::next_day_returns_date_not_timestamp`
+        /// (via `conn_with_next_day`).
+        SessionMacro,
+    }
+
+    fn date_return_sample_for(name: &str) -> Option<DateReturnSample> {
+        let date_lit = || {
+            Expression::Literal(Literal {
+                value: LiteralValue::Date(20103),
+                data_type: DataType::Date,
+            })
+        };
+        match name {
+            "add_months" => Some(DateReturnSample::Expr(fcall(
+                "add_months",
+                vec![date_lit(), int_lit(1)],
+            ))),
+            "current_date" => Some(DateReturnSample::Expr(fcall("current_date", vec![]))),
+            "date_add" => Some(DateReturnSample::Expr(fcall(
+                "date_add",
+                vec![date_lit(), int_lit(5)],
+            ))),
+            "date_sub" => Some(DateReturnSample::Expr(fcall(
+                "date_sub",
+                vec![date_lit(), int_lit(5)],
+            ))),
+            "last_day" => Some(DateReturnSample::Expr(fcall("last_day", vec![date_lit()]))),
+            "make_date" => Some(DateReturnSample::Expr(fcall(
+                "make_date",
+                vec![int_lit(2024), int_lit(1), int_lit(1)],
+            ))),
+            "next_day" => Some(DateReturnSample::SessionMacro),
+            "to_date" => Some(DateReturnSample::Expr(fcall(
+                "to_date",
+                vec![str_lit("2024-01-01")],
+            ))),
+            "trunc" => Some(DateReturnSample::Expr(fcall(
+                "trunc",
+                vec![date_lit(), str_lit("month")],
+            ))),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn date_typed_functions_return_date_in_duckdb() {
+        let conn = duckdb::Connection::open_in_memory().expect("in-memory conn");
+        for &name in crate::transpiler_v2::type_inference::DATE_RETURNING_FNS {
+            // Completeness: every roster entry must have a test sample.
+            let sample = date_return_sample_for(name).unwrap_or_else(|| {
+                panic!(
+                    "DATE_RETURNING_FNS entry {name:?} has no test sample — add one in \
+                     `date_return_sample_for` (emission.rs)"
+                )
+            });
+            let f = match sample {
+                DateReturnSample::SessionMacro => continue,
+                DateReturnSample::Expr(f) => f,
+            };
+            let sql = render_function_call(&f, &empty_schema()).expect("render");
+            let query = format!("SELECT typeof({sql})");
+            let type_name: String = conn
+                .query_row(&query, [], |row| row.get(0))
+                .unwrap_or_else(|e| panic!("query `{query}` failed for {name:?}: {e}"));
+            assert!(
+                type_name.eq_ignore_ascii_case("date"),
+                "{name} rendered SQL `{sql}` must produce DATE in DuckDB, got {type_name}"
+            );
+        }
     }
 
     // ── split(str, pattern[, limit]) limit semantics ────────────────────

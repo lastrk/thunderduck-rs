@@ -5,6 +5,23 @@
 
 use crate::types::{DataType, StructField, StructType};
 
+/// Date-returning Spark functions. Single home of the roster consulted by
+/// [`TypeInferenceEngine::function_return_type`]'s Date guard arm, and by
+/// emission.rs's `date_typed_functions_return_date_in_duckdb` audit test,
+/// which mechanically checks that each of these renders to a DuckDB
+/// expression whose runtime type is DATE.
+pub(crate) const DATE_RETURNING_FNS: &[&str] = &[
+    "add_months",
+    "current_date",
+    "date_add",
+    "date_sub",
+    "last_day",
+    "make_date",
+    "next_day",
+    "to_date",
+    "trunc",
+];
+
 /// τ's Spark-compatible type inference engine.
 ///
 /// Unit struct with associated functions.
@@ -655,10 +672,7 @@ impl TypeInferenceEngine {
             "bit_get" | "getbit" => Byte,
 
             // ── Date/time functions ──────────────────────────────────────
-            "current_date" => Date,
             "current_timestamp" | "now" => Timestamp,
-            "date_add" | "date_sub" | "add_months" | "next_day" | "last_day" | "trunc"
-            | "to_date" => Date,
             // `date_trunc(fmt, ts_or_date)` returns Timestamp when the
             // second arg is Timestamp, Date when the second arg is Date.
             // Without the second arg's type at this call site, default to
@@ -668,10 +682,12 @@ impl TypeInferenceEngine {
             "to_timestamp" | "from_utc_timestamp" | "to_utc_timestamp" | "make_timestamp" => {
                 Timestamp
             }
-            // Spark's `make_date(year, month, day)` returns DATE (not
-            // Timestamp) — three-arg integer form. Corpus witness:
-            // `dt-015`.
-            "make_date" => Date,
+            // Date-returning Spark functions — single-homed in
+            // `DATE_RETURNING_FNS` (also the sample roster for
+            // `date_typed_functions_return_date_in_duckdb` in emission.rs).
+            // Includes `make_date(year, month, day)` (three-arg integer
+            // form; corpus witness: `dt-015`).
+            n if DATE_RETURNING_FNS.contains(&n) => Date,
             // `from_unixtime(secs[, fmt])` returns String in Spark (default
             // format `yyyy-MM-dd HH:mm:ss`), not Timestamp. `dayname`/
             // `monthname` return the day-of-week / month name as String

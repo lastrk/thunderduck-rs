@@ -267,6 +267,13 @@ impl TypeInferenceEngine {
     ///
     /// **Checklist §1.1 (`count_if`)** and **§1.3 (correlation family)** are
     /// enforced here — see the corresponding matches below.
+    ///
+    /// N5 note: the sole production caller (`emission.rs`'s `&f.name`)
+    /// already supplies a canonical lowercase name, but the defensive
+    /// `to_lowercase()` below stays — `count_if_case_insensitive` exercises
+    /// this function directly with mixed-case input, so it is kept for
+    /// direct-call robustness (same rationale as `function_catalog.rs`'s
+    /// Q3 boundary).
     pub fn aggregate_return_type(name: &str, arg_type: &DataType) -> DataType {
         use DataType::*;
         // Names without a spec row echo the argument's type — byte-identical
@@ -324,6 +331,10 @@ impl TypeInferenceEngine {
     /// pre-lowercased name.
     ///
     /// Checklist §1.1 pins `count_if` here alongside `count`.
+    ///
+    /// N5 note: `count_if_case_insensitive` exercises this wrapper with
+    /// `"Count_If"` directly, so the lowercasing stays (test-only
+    /// robustness, not a production N5 site).
     #[cfg(test)]
     pub fn aggregate_is_non_nullable(name: &str) -> bool {
         Self::aggregate_is_non_nullable_lower(&name.to_lowercase())
@@ -351,6 +362,9 @@ impl TypeInferenceEngine {
     ///
     /// Checklist §1.3 pins the full 11-name correlation / covariance /
     /// regression family here.
+    ///
+    /// N5 note: test-only wrapper, kept symmetric with
+    /// [`Self::aggregate_is_non_nullable`]; not a production N5 site.
     #[cfg(test)]
     pub fn aggregate_is_always_nullable(name: &str) -> bool {
         Self::aggregate_is_always_nullable_lower(&name.to_lowercase())
@@ -373,8 +387,12 @@ impl TypeInferenceEngine {
     // ── Window function return types ─────────────────────────────────────────
 
     /// Return type of a window function given the optional argument type.
+    ///
+    /// N5: `name` arrives already canonical lowercase from the sole caller
+    /// (`expression.rs`'s `&f.name`), so this matches directly — no local
+    /// re-lowercasing.
     pub fn window_return_type(name: &str, arg_type: Option<&DataType>) -> DataType {
-        match name.to_lowercase().as_str() {
+        match name {
             "row_number" | "rank" | "dense_rank" | "ntile" => DataType::Integer,
             "percent_rank" | "cume_dist" => DataType::Double,
             "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
@@ -385,9 +403,13 @@ impl TypeInferenceEngine {
     }
 
     /// Is this window function non-nullable (ranking + COUNT).
+    ///
+    /// N5: `name` arrives already canonical lowercase from the sole caller
+    /// (`expression.rs`'s `&f.name`), so this matches directly — no local
+    /// re-lowercasing.
     pub fn window_is_non_nullable(name: &str) -> bool {
         matches!(
-            name.to_lowercase().as_str(),
+            name,
             "row_number"
                 | "rank"
                 | "dense_rank"
@@ -504,6 +526,13 @@ impl TypeInferenceEngine {
     /// aggregate roster does not handle. future τ work grows the scalar arms.
     /// The count / hash / grouping arms that τ's checklist tests
     /// exercise are wired here.
+    ///
+    /// N5 note: the sole production caller (`expression.rs`'s `&f.name`)
+    /// already supplies a canonical lowercase name, but the defensive
+    /// `to_lowercase()` below stays — tests exercise this function directly
+    /// with mixed case (`"Window"`, `"MAKE_DT_INTERVAL"`), so it is kept for
+    /// direct-call robustness (same rationale as `function_catalog.rs`'s
+    /// Q3 boundary).
     pub fn function_return_type(name: &str, arg_types: &[DataType]) -> DataType {
         use DataType::*;
         let first_arg_type = arg_types.first();
@@ -1297,6 +1326,11 @@ fn agg_spec_lower(name_lower: &str) -> Option<&'static AggSpec> {
 /// `is_aggregate_name` to decide whether a bare function name is an
 /// aggregate. Table names are all-lowercase ASCII, so case-insensitive byte
 /// comparison matches without allocating a lowercased `String`.
+///
+/// N5 note: `is_aggregate_function_name`'s `function_call_has_aggregate`
+/// call site runs over the raw pre-lowering `sqlparser` AST (as-written
+/// user casing, not yet N5-canonicalized), so this genuinely stays
+/// case-insensitive — it is not a redundant N5 site.
 pub(crate) fn is_aggregate_classifier_name(name: &str) -> bool {
     AGG_SPECS
         .iter()
@@ -1337,6 +1371,11 @@ const NONDETERMINISTIC_FN_NAMES: &[&str] = &[
 /// Used by `analyzer::contains_nondeterministic_call` to detect a Sort key
 /// (or Sort-key restatement) that calls a nondeterministic function, so it
 /// can be excluded from the `semantic_eq` rebind fallback.
+///
+/// N5 note: the sole production caller (`&f.name`) already supplies a
+/// canonical lowercase name, but `is_nondeterministic_fn_name_membership_and_case_insensitivity`
+/// exercises this function directly with `"RAND"` / `"Random"`, so the
+/// case-insensitive lookup stays for direct-call robustness.
 pub(crate) fn is_nondeterministic_fn_name(name: &str) -> bool {
     NONDETERMINISTIC_FN_NAMES
         .iter()

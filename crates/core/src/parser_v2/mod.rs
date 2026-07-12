@@ -219,9 +219,11 @@ fn wrap_stack_multi_alias(
 ) -> Result<crate::transpiler_v2::Expression, EmissionError> {
     use crate::transpiler_v2::expression::Expression;
 
+    // N5: `inner` came through `parse_expression` → `lower_function`, so the
+    // name is canonical lowercase — exact compare.
     let is_stack = matches!(
         &inner,
-        Expression::FunctionCall(fc) if fc.name.eq_ignore_ascii_case("stack")
+        Expression::FunctionCall(fc) if fc.name == "stack"
     );
     if !is_stack {
         bail_boundary_proto!(

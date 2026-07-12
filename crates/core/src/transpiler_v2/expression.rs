@@ -1021,7 +1021,8 @@ impl Expression {
         // return a `DataType::Struct` whose field names depend on the shape
         // of the argument tree.
         // Symmetric with emission's `struct` / `named_struct` arms.
-        match f.name.to_lowercase().as_str() {
+        // N5: `f.name` is already canonical lowercase — no local re-derivation.
+        match f.name.as_str() {
             "struct" => {
                 let fields: Vec<StructField> = f
                     .args
@@ -1300,7 +1301,11 @@ impl Expression {
     }
 
     fn function_call_nullable(f: &FunctionCall, schema: &StructType) -> bool {
-        let lower = f.name.to_lowercase();
+        // N5: `f.name` is already canonical lowercase; `lower` is kept as an
+        // owned `String` (rather than renamed to a borrow) purely so the
+        // match below, which threads it through several `_lower`-suffixed
+        // fast-path calls, needs no further edits.
+        let lower = f.name.clone();
         if Self::is_non_nullable_function_name_lower(&lower) {
             return false;
         }
@@ -1546,7 +1551,7 @@ impl Expression {
             Expression::FunctionCall(f) => {
                 if TypeInferenceEngine::window_is_non_nullable(&f.name) {
                     false
-                } else if matches!(f.name.to_lowercase().as_str(), "lag" | "lead") {
+                } else if matches!(f.name.as_str(), "lag" | "lead") {
                     // Spark rule: `lag(col, offset, default)` is nullable
                     // iff `col` is nullable OR `default` is nullable. When
                     // `default` is absent (no 3rd arg), the out-of-range

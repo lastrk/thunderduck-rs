@@ -2255,8 +2255,11 @@ fn expr_to_ident_string(expr: &Expr) -> Option<String> {
 /// `TableFactor::TableFunction`, `TableFactor::Function`) so all parse shapes
 /// produce the identical node.
 fn table_function_node(name: String, args: Vec<Expression>, with_ordinality: bool) -> CommonAst {
+    // N5: canonicalize once at the shared construction site so every
+    // consumer (analyzer::analyze_table_function, emission::build_table_function)
+    // can drop its own case-insensitive re-derivation.
     CommonAst::new(CommonOp::TableFunction {
-        name,
+        name: name.to_ascii_lowercase(),
         args,
         with_ordinality,
     })
@@ -2426,10 +2429,9 @@ fn lower_select_item(item: SelectItem, cte_scope: &CteScope) -> Result<Expressio
 /// shape, letting the default name flow from `expression_output_name`.
 fn sparksql_default_select_name(expr: &Expression) -> Option<String> {
     if let Expression::FunctionCall(f) = expr {
-        if f.name.eq_ignore_ascii_case("count")
-            && !f.distinct
-            && matches!(f.args.as_slice(), [Expression::Star(_)])
-        {
+        // N5: `expr` is a lowered expression — the name is canonical
+        // lowercase, exact compare.
+        if f.name == "count" && !f.distinct && matches!(f.args.as_slice(), [Expression::Star(_)]) {
             return Some("count(1)".to_owned());
         }
     }
@@ -3425,7 +3427,10 @@ fn lower_binary_op(op: BinaryOperator) -> Result<BinaryOp, EmissionError> {
 }
 
 fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, EmissionError> {
-    let name = object_name_to_string(&f.name);
+    // N5: FunctionCall.name is the canonical, ASCII-lowercase substrate
+    // identity from this point on — Spark's as-written spelling survives
+    // only via the N8 alias / pretty-name overlay, never in `name` itself.
+    let name = object_name_to_string(&f.name).to_ascii_lowercase();
     // Spark's `timestampadd(unit, quantity, ts)` / `timestampdiff(unit, start,
     // end)` carry the datetime-field UNIT (`MONTH`, `DAY`, …) as their first
     // argument, which sqlparser parses as `Expr::Identifier("MONTH")`. The
@@ -3435,7 +3440,7 @@ fn lower_function(f: Function, cte_scope: &CteScope) -> Result<Expression, Emiss
     // (mirrors the `Expr::Extract` arm) and lower the remaining args through
     // the normal `function_arg_to_expr` path. Neither function takes an
     // `OVER (...)` clause.
-    if name.eq_ignore_ascii_case("timestampadd") || name.eq_ignore_ascii_case("timestampdiff") {
+    if name == "timestampadd" || name == "timestampdiff" {
         if f.over.is_some() {
             bail_boundary_proto!(
                 format!("sql::window::{name}"),

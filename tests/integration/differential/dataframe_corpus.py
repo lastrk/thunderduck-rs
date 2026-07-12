@@ -362,6 +362,13 @@ case("math-014", "math", "factorial", lambda I: I["nums"].select(F.factorial(F.l
 case("math-015", "math", "rand seeded (nondeterministic family, seeded)", lambda I: I["nums"].select(F.rand(42).alias("r")), flags=("nondeterministic",))
 case("math-016", "math", "try_divide -> null on /0 (spark4)", lambda I: I["nums"].select(F.expr("try_divide(a, b)").alias("td")), flags=("spark4",))
 
+# N5 — canonical substrate function names at conversion. Unaliased so
+# Spark's `toPrettySQL` auto-name is the observable column name: `F.ceil`
+# is in the `UnaryMathExpression` roster and auto-names UPPERCASE
+# (`CEIL(x)`) regardless of the DataFrame API call's own (irrelevant here)
+# casing.
+case("math-017", "math", "unaliased F.ceil auto-names uppercase (N5 roster)", lambda I: I["nums"].select(F.ceil("x")))
+
 # ── 7. Date / time functions ───────────────────────────────────────────────
 case("dt-001", "datetime", "current_date / current_timestamp", lambda I: I["emp"].select(F.current_date().alias("cd"), F.current_timestamp().alias("ct")), flags=("nondeterministic",))
 case("dt-002", "datetime", "date_add / date_sub", lambda I: I["emp"].select(F.date_add("hire_date", 30).alias("plus"), F.date_sub("hire_date", 30).alias("minus")))

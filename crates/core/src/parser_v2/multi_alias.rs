@@ -473,8 +473,9 @@ fn dispatch_multi_alias(
 ) -> Result<Vec<Expression>, EmissionError> {
     match &inner {
         Expression::FunctionCall(fc) => {
-            let name_lower = fc.name.to_ascii_lowercase();
-            match name_lower.as_str() {
+            // N5: `fc.name` is already canonical lowercase — no local
+            // re-derivation.
+            match fc.name.as_str() {
                 "stack" => {
                     if aliases.len() < 2 {
                         bail_boundary_proto!(

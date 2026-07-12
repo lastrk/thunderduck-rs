@@ -2582,7 +2582,7 @@ fn build_conditional_aggregate(
     // except as an expression root.  Mirrors Spark's own count(*)→count(1)
     // rewrite (cf. v2_lowering.rs FILTER desugar).  Scoped to unqualified
     // Star only — qualified `tbl.*` has different NULL-skip semantics.
-    let first_arg_sql = if f.name.eq_ignore_ascii_case("count")
+    let first_arg_sql = if f.name == "count"
         && matches!(
             &f.args[0],
             Expression::Star(StarExpression { qualifier: None })
@@ -2603,8 +2603,7 @@ fn build_conditional_aggregate(
     let call = format!("{}({distinct}{arg_list})", f.name);
     // Spark maps empty-bucket COUNT to NULL; DuckDB COUNT returns 0. Wrap
     // COUNT-family calls in NULLIF(..., 0) to match.
-    let name_lower = f.name.to_ascii_lowercase();
-    let is_count = name_lower == "count" || name_lower == "count_if" || name_lower == "count_star";
+    let is_count = f.name == "count" || f.name == "count_if" || f.name == "count_star";
     Ok(if is_count {
         format!("NULLIF({call}, 0)")
     } else {
@@ -2733,8 +2732,10 @@ fn build_table_function(
     _with_ordinality: bool,
     schema: &Schema,
 ) -> Result<SqlUnit, EmissionError> {
-    let name_lower = name.to_ascii_lowercase();
-    match name_lower.as_str() {
+    // N5: `name` arrives already canonical lowercase from
+    // `v2_lowering::table_function_node`, the single construction site — no
+    // per-consumer re-derivation needed.
+    match name {
         "range" => {
             let long_lit = |v: i64| {
                 Expression::Literal(Literal {
@@ -2788,7 +2789,7 @@ fn build_table_function(
                 );
             }
             let fc = FunctionCall {
-                name: name_lower,
+                name: name.to_owned(),
                 args: args.to_vec(),
                 distinct: false,
             };
@@ -3677,7 +3678,7 @@ fn render_function_call(f: &FunctionCall, schema: &Schema) -> Result<String, Emi
 /// diverges from DATE — the audit test fails until the two agree with
 /// reality, so a wrong guess cannot land silently.
 fn needs_date_return_cast(f: &FunctionCall) -> bool {
-    match f.name.to_ascii_lowercase().as_str() {
+    match f.name.as_str() {
         "add_months" | "date_add" | "date_sub" => true,
         "trunc" => f.args.len() == 2, // 1-arg trunc is not the date form
         _ => false,
@@ -3688,7 +3689,11 @@ fn render_function_call_dispatch(
     f: &FunctionCall,
     schema: &Schema,
 ) -> Result<String, EmissionError> {
-    let name_lower = f.name.to_ascii_lowercase();
+    // N5: `f.name` is already canonical lowercase — `name_lower` is kept as
+    // an owned `String` (rather than renamed to a borrow) purely so the
+    // ~1900-line match below, which threads it through several `&name_lower`
+    // / `format!` sites, needs no further edits.
+    let name_lower = f.name.clone();
     // Aggregate-name overlap check — if the analyzer classified a FunctionCall
     // as aggregate, `render_expr` routes to `render_aggregate` before this
     // function; anything reaching here is scalar by construction. Defense in
@@ -4118,13 +4123,12 @@ fn render_function_call_dispatch(
             }
             let struct_args = match &f.args[0] {
                 Expression::FunctionCall(inner)
-                    if inner.name.eq_ignore_ascii_case("struct")
-                        || inner.name.eq_ignore_ascii_case("named_struct") =>
+                    if inner.name == "struct" || inner.name == "named_struct" =>
                 {
                     // For `struct(a, b, c)` every arg is a field value.
                     // For `named_struct(k1, v1, k2, v2, ...)` only the
                     // odd-indexed args (v1, v2, ...) are field values.
-                    if inner.name.eq_ignore_ascii_case("named_struct") {
+                    if inner.name == "named_struct" {
                         inner
                             .args
                             .iter()
@@ -5596,8 +5600,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
 /// `try_avg`, and integer/float `avg` all return `false` here and keep
 /// their existing (unrelated) emission paths.
 fn is_decimal_avg(f: &FunctionCall, schema: &Schema) -> bool {
-    let lower = f.name.to_ascii_lowercase();
-    matches!(lower.as_str(), "avg" | "mean")
+    matches!(f.name.as_str(), "avg" | "mean")
         && f.args.len() == 1
         && matches!(f.args[0].data_type(schema), DataType::Decimal { .. })
 }
@@ -5629,8 +5632,7 @@ fn render_decimal_avg(
         Some(o) => format!("{inner} {o}"),
         None => inner,
     };
-    let ret_type =
-        TypeInferenceEngine::aggregate_return_type(&f.name.to_ascii_lowercase(), &arg_type);
+    let ret_type = TypeInferenceEngine::aggregate_return_type(&f.name, &arg_type);
     Ok(format!("CAST({inner} AS {})", render_data_type(&ret_type)))
 }
 
@@ -5640,7 +5642,11 @@ fn render_decimal_avg(
 /// surface as a `Function`-kinded Thunderduck-boundary
 /// [`EmissionError::Unsupported`] per ADR-022.
 fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
-    let lower = f.name.to_ascii_lowercase();
+    // N5: `f.name` is already canonical lowercase — `lower` is kept as an
+    // owned `String` (not renamed to a borrow) so the rest of this function,
+    // which threads it through several `&lower` / `format!` sites, needs no
+    // further edits.
+    let lower = f.name.clone();
     // Guard-based arms MUST come before the pass-through arm (else the
     // pass-through catches `first`/`last` first and the guard never fires).
     if matches!(
@@ -5879,8 +5885,7 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
 /// `render_aggregate_op` call, not the outer one.
 fn rewrite_grouping_id(expr: &mut Expression, grouping: &[Expression]) {
     if let Expression::FunctionCall(f) = expr {
-        let name_lower = f.name.to_lowercase();
-        if (name_lower == "grouping_id" || name_lower == "grouping")
+        if (f.name == "grouping_id" || f.name == "grouping")
             && f.args.is_empty()
             && !grouping.is_empty()
         {
@@ -6385,9 +6390,10 @@ fn spark_return_cast(expr_sql: String, expr: &Expression, schema: &Schema) -> St
     // array to the Spark-typed element[] shape when the elements would
     // otherwise diverge (heterogeneous numeric literals). Corpus: type-020.
     if let Expression::FunctionCall(fc) = expr {
-        let n = fc.name.to_ascii_lowercase();
-        if matches!(n.as_str(), "array" | "list_value" | "make_array" | "list")
-            && !fc.args.is_empty()
+        if matches!(
+            fc.name.as_str(),
+            "array" | "list_value" | "make_array" | "list"
+        ) && !fc.args.is_empty()
         {
             if let DataType::Array(elem, _) = expr.data_type(schema) {
                 if matches!(
@@ -6423,10 +6429,9 @@ fn spark_return_cast(expr_sql: String, expr: &Expression, schema: &Schema) -> St
 /// **§5.1 anchor.** MUST NOT share body with [`spark_return_cast`].
 #[allow(dead_code)] // §5.1 anchor requires the item; decimal-avg is wired through render_decimal_avg instead.
 fn spark_aggregate_return_cast(agg_sql: String, agg: &FunctionCall, schema: &Schema) -> String {
-    let lower = agg.name.to_lowercase();
     if let Some(arg) = agg.args.first() {
         let arg_type = arg.data_type(schema);
-        match lower.as_str() {
+        match agg.name.as_str() {
             "sum" | "sum_distinct" | "try_sum" if arg_type.is_integral() => {
                 return format!("CAST({agg_sql} AS BIGINT)");
             }

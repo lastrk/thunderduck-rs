@@ -269,6 +269,10 @@ pub const SUPPORTED_FUNCTIONS: &[&str] = &[
 
 /// Returns `true` if `name` is in τ's supported-function roster
 /// (case-insensitive).
+///
+/// N5 note: production callers already pass a canonical lowercase
+/// `FunctionCall.name`, so this lowercasing is a defensive boundary —
+/// inputs are canonical post-N5, kept for direct-call robustness.
 pub fn is_supported_function(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     SUPPORTED_FUNCTIONS

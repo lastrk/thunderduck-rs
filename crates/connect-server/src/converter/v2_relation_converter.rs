@@ -1342,9 +1342,13 @@ impl V2ExpressionConverter {
         &mut self,
         func: &proto::expression::UnresolvedFunction,
     ) -> Result<Expression, EmissionError> {
+        // N5: FunctionCall.name is the canonical, ASCII-lowercase substrate
+        // identity from this point on — Spark's as-written spelling survives
+        // only via the N8 alias / pretty-name overlay, never in `name` itself.
+        let name = func.function_name.to_ascii_lowercase();
         let args = self.convert_all(&func.arguments)?;
         if args.len() == 2 {
-            let op = match func.function_name.as_str() {
+            let op = match name.as_str() {
                 ">" => Some(BinaryOp::Gt),
                 ">=" => Some(BinaryOp::GtEq),
                 "<" => Some(BinaryOp::Lt),
@@ -1372,7 +1376,7 @@ impl V2ExpressionConverter {
             }
         }
         if args.len() == 1 {
-            let op = match func.function_name.as_str() {
+            let op = match name.as_str() {
                 "not" | "!" => Some(UnaryOp::Not),
                 "isnull" => Some(UnaryOp::IsNull),
                 "isnotnull" => Some(UnaryOp::IsNotNull),
@@ -1388,7 +1392,7 @@ impl V2ExpressionConverter {
             }
         }
         // CASE WHEN emitted as function "when" with alternating pairs
-        if func.function_name.eq_ignore_ascii_case("when") && !args.is_empty() {
+        if name == "when" && !args.is_empty() {
             let mut branches: Vec<(Expression, Expression)> = Vec::new();
             let mut iter = args.into_iter();
             let mut else_expr: Option<Box<Expression>> = None;
@@ -1404,7 +1408,7 @@ impl V2ExpressionConverter {
             }));
         }
         // IN list emitted as function "in" with (expr, v1, v2, ...) arguments
-        if func.function_name.eq_ignore_ascii_case("in") && args.len() >= 2 {
+        if name == "in" && args.len() >= 2 {
             let mut args = args;
             let expr = args.remove(0);
             return Ok(Expression::InList(InListExpression {
@@ -1414,7 +1418,7 @@ impl V2ExpressionConverter {
             }));
         }
         Ok(Expression::FunctionCall(FunctionCall {
-            name: func.function_name.clone(),
+            name,
             args,
             distinct: func.is_distinct,
         }))

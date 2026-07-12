@@ -380,6 +380,12 @@ case("agg-023", "aggregate", "aggregate nested in SUBSTRING special form under G
 # Uncovered by TPC-H Q1 (avg_qty/avg_price/avg_disc) after FileScan landed.
 case("agg-024", "aggregate", "avg(DECIMAL) must return decimal DATA, not just decimal schema", "SELECT avg(bonus) AS avg_bonus FROM emp WHERE id IN (2, 4, 8)")
 
+# N5 — canonical substrate function names at conversion. Unaliased so Spark's
+# `toPrettySQL` auto-name is the observable column name: written-case
+# `SUM`/`AvG` both canonicalize to their all-lowercase registry spelling
+# (`sum(salary)` / `avg(salary)`), never echoing the as-written case.
+case("agg-025", "aggregate", "mixed-case aggregate names canonicalize to lowercase pretty names", "SELECT SUM(salary), AvG(salary) FROM emp")
+
 # ── 5. ORDER BY / LIMIT ──────────────────────────────────────────────────────
 case("ord-001", "ordering", "ORDER BY asc (default)", "SELECT * FROM emp ORDER BY salary")
 case("ord-002", "ordering", "ORDER BY DESC", "SELECT * FROM emp ORDER BY salary DESC")
@@ -433,6 +439,22 @@ case("fn-017", "scalar_fn", "round / abs / ceil / floor", "SELECT round(x, 1) r,
 case("fn-018", "scalar_fn", "int/int division -> double (ANSI divide-by-zero)", "SELECT a / b AS dv FROM nums", expected_error="DIVIDE_BY_ZERO")
 case("fn-019", "scalar_fn", "current_date / current_timestamp", "SELECT current_date() cd, current_timestamp() ct FROM emp", flags=("nondeterministic",))
 case("fn-020", "scalar_fn", "binary literal X'..' + hex", "SELECT hex(X'1F2A') AS h, cast(X'41' AS string) AS s FROM emp")
+
+# N5 — canonical substrate function names at conversion. Unaliased so Spark's
+# `toPrettySQL` auto-name is the observable column name: mixed-case
+# `SuBsTr` canonicalizes to lowercase `substr(...)`, and — critically — stays
+# its own alias-family spelling rather than merging into `substring(...)`
+# (emission's substr->substring DuckDB remap is a FUNC_ALIAS rendering
+# choice, not a naming collapse).
+case("fn-021", "scalar_fn", "mixed-case substr/substring stay distinct alias-family pretty names", "SELECT SuBsTr(name,1,3), SUBSTRING(name,1,3) FROM emp")
+
+# N5 — the `UnaryMathExpression` family (`SPARK_UPPER_PRETTY`) auto-names
+# UPPERCASE regardless of written case (`CEIL`/`floor`/`SQRT` all render
+# uppercase), but the `ceiling` ALIAS is not in the roster and keeps its own
+# lowercase pretty spelling. `x` carries a NaN row (nums row 3), so this is
+# schema_only like the sibling numeric-tower cases (num-001/num-002).
+case("fn-022", "scalar_fn", "uppercase math-fn roster + alias stays lowercase", "SELECT CEIL(x), floor(x), SQRT(x), CEILING(x) FROM nums", flags=("schema_only",))
+case("fn-023", "scalar_fn", "inverse-hyperbolic trio names UPPERCASE (review MAJOR)", "SELECT ACOSH(x), asinh(x), atanh(x) FROM nums", flags=("schema_only",))
 
 # ── 8. Subqueries (the headline SQL-only family; ADR-008) ────────────────────
 case("sq-001", "subquery", "scalar subquery in SELECT (uncorrelated)", "SELECT name, salary, (SELECT max(salary) FROM emp) AS gmax FROM emp")

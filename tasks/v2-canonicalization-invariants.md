@@ -234,20 +234,52 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 
 ### N5. Canonical substrate function names at conversion
 
+- **Status: LANDED** (2026-07-12, feat/v2-transpiler). `FunctionCall.name` is now
+  ASCII-lowercased once at construction, at the two front-end entry points
+  (`v2_relation_converter::convert_unresolved_function`,
+  `v2_lowering::lower_function`/`table_function_node`) — never re-derived downstream.
+  `resolve_and_stamp` carries a `debug_assert!` on its `FunctionCall` arm enforcing the
+  invariant mechanically at the one choke point every resolved call passes through.
 - **Invariant:** `FunctionCall.name` is the canonical, lowercase substrate identity; Spark's
-  as-written spelling lives only in the output name (N8's alias).
-- **Today:** ~92 `eq_ignore_ascii_case`/`to_ascii_lowercase` sites across transpiler_v2
-  (analyzer 45, emission 34, …); Pass 28 had to *overload* `name` to preserve the `substr`
-  vs `substring` spelling for output naming, forcing a compensating emission remap.
-- **Deletes:** most case-insensitive compares (arms match on the canonical name); the
-  substr/substring overload + remap.
+  as-written spelling lives only in the output name (N8's alias/pretty-name), plus a small
+  `SPARK_UPPER_PRETTY` roster (`analyzer.rs`) of 30 `UnaryMathExpression`/
+  `BinaryMathExpression` PRIMARY names (`ceil`, `floor`, `sqrt`, `radians`, …) whose Spark
+  `toPrettySQL` auto-name is UPPERCASE regardless of written case — verified against a
+  vendored Spark 4.1.1 session, 2026-07-12. Alias spellings (`ceiling`, `pow`, `sign`,
+  `ucase`, …) are NOT in the roster and keep their own lowercase pretty spelling.
+- **Site-count correction:** the ~92-site estimate mixed function-NAME sites with
+  column/alias/field-name case-insensitive sites. Actual split: only ~35 were genuine
+  `FunctionCall.name` sites; ~130 additional `eq_ignore_ascii_case`/`to_lowercase` sites
+  found during the audit are COLUMN/alias/struct-field-name case-insensitivity (Spark
+  resolver semantics) and are explicitly out of scope for this invariant — left untouched.
+- **What stayed (verified by content, not a violation):** a handful of `type_inference.rs`
+  helpers (`aggregate_return_type`, `aggregate_is_non_nullable`/`aggregate_is_always_nullable`
+  test wrappers, `function_return_type`, `is_aggregate_classifier_name`,
+  `is_nondeterministic_fn_name`) keep a defensive `to_lowercase()`/`eq_ignore_ascii_case`:
+  each has either (a) a caller outside the canonical `FunctionCall` substrate (e.g.
+  `is_aggregate_classifier_name` is also called from `v2_lowering::function_call_has_aggregate`
+  over the raw pre-lowering `sqlparser` AST, genuinely non-canonical), or (b) a dedicated unit
+  test exercising mixed-case input directly (`count_if_case_insensitive`, `frt("Window", ...)`,
+  `is_nondeterministic_fn_name("RAND")`). Same rationale as `function_catalog.rs:273`'s
+  defensive boundary. The `substr`→`substring` DuckDB emission remap also stays — it is
+  FUNC_ALIAS rendering parity (two distinct Spark function names that both lower to one
+  DuckDB builtin), not a naming collapse; N5 does not touch it.
+- **Deletes:** the mechanical case-insensitive compares/re-lowercasing in `analyzer.rs`,
+  `emission.rs`, `expression.rs`, `type_inference.rs` (window family), `multi_alias.rs` whose
+  sole input is already a canonical `FunctionCall.name`; the `canonicalize_for_semantic_eq`
+  `FunctionCall` arm (now redundant — the default clone covers it).
 - **Bug classes closed:** a case-variant or alias spelling slipping past one arm's compare
   but not another's.
 - **How:** lowercase (and alias-normalize where safe) once in the converter/lowering; N8's
-  alias preserves the user-visible spelling for naming.
-- **Cost/gates:** mechanical but wide; lib tests + corpus spot-checks.
+  alias preserves the user-visible spelling for naming; `SPARK_UPPER_PRETTY` covers the one
+  Catalyst family whose auto-name diverges from the lowercased registry key.
+- **Cost/gates:** mechanical but wide; lib tests + corpus spot-checks — landed with 0
+  regressions (1178/1178 `thunderduck-core` lib tests, 132/132 `thunderduck-connect-server`
+  tests, new witnesses `agg-025`/`fn-021`/`fn-022` (SQL corpus) and `math-017` (DataFrame
+  corpus) green).
 - **Depends on:** **N8** (until the output name is stamped, `name` must keep the user's
-  spelling — this is exactly the Pass 28 lesson).
+  spelling — this is exactly the Pass 28 lesson). N8 landed first, so N5 could canonicalize
+  `name` immediately without a compensating remap for aliased output.
 
 ---
 

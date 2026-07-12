@@ -2908,15 +2908,13 @@ fn expand_inline_projections(
         // `.alias("f1","f2",...)` and non-Project contexts are non-goals per
         // the Pass-90 plan §Non-goals — they surface as boundary errors
         // downstream if the corpus ever exercises them).
+        // N5: `f.name` is already canonical lowercase — match directly.
         let (name_lower, args, is_outer) = match proj {
-            Expression::FunctionCall(f) => {
-                let n = f.name.to_ascii_lowercase();
-                match n.as_str() {
-                    "inline" => (n, f.args.clone(), false),
-                    "inline_outer" => (n, f.args.clone(), true),
-                    _ => return Ok(None),
-                }
-            }
+            Expression::FunctionCall(f) => match f.name.as_str() {
+                "inline" => (f.name.clone(), f.args.clone(), false),
+                "inline_outer" => (f.name.clone(), f.args.clone(), true),
+                _ => return Ok(None),
+            },
             _ => return Ok(None),
         };
         if args.len() != 1 {
@@ -3043,9 +3041,7 @@ fn expand_json_tuple_projections(
         // the Pass-91 plan §Non-goals — they surface as boundary errors
         // downstream if the corpus ever exercises them).
         let args = match proj {
-            Expression::FunctionCall(f) if f.name.eq_ignore_ascii_case("json_tuple") => {
-                f.args.clone()
-            }
+            Expression::FunctionCall(f) if f.name == "json_tuple" => f.args.clone(),
             _ => return Ok(None),
         };
         if args.len() < 2 {
@@ -3139,9 +3135,7 @@ fn expand_stack_projections(
         // contexts are Spark-invalid for generator functions and surface
         // as boundary errors downstream.
         let args = match proj {
-            Expression::FunctionCall(f) if f.name.eq_ignore_ascii_case("stack_multi_alias") => {
-                f.args.clone()
-            }
+            Expression::FunctionCall(f) if f.name == "stack_multi_alias" => f.args.clone(),
             _ => return Ok(None),
         };
         // args[0] = inner `stack` FunctionCall, args[1..] = K string-literal
@@ -3174,7 +3168,7 @@ fn expand_stack_projections(
         let k = aliases.len();
 
         let stack_args = match inner {
-            Expression::FunctionCall(fc) if fc.name.eq_ignore_ascii_case("stack") => fc.args,
+            Expression::FunctionCall(fc) if fc.name == "stack" => fc.args,
             other => {
                 bail_boundary_rule!(
                     "stack-multi-alias-expansion",
@@ -3420,8 +3414,10 @@ fn analyze_table_function(
 ) -> Result<TypedAst, AnalyzerError> {
     let empty_schema = StructType::empty();
     let resolved_args = resolve_expr_list(args, &ResolveContext::bare(&empty_schema, base_types))?;
-    let name_lower = name.to_ascii_lowercase();
-    match name_lower.as_str() {
+    // N5: `name` arrives already canonical lowercase from
+    // `v2_lowering::table_function_node`, the single construction site — no
+    // per-consumer re-derivation needed.
+    match name.as_str() {
         "range" if (1..=4).contains(&resolved_args.len()) => Ok(TypedAst::new(
             TypedOp::TableFunction {
                 name,
@@ -3443,7 +3439,7 @@ fn analyze_table_function(
                 return Err(AnalyzerError::PuntedOperator {
                     op: format!("TableFunction[{name}]"),
                     reason: format!(
-                        "bare {name_lower} with non-Array argument type ({arg_type:?}) \
+                        "bare {name} with non-Array argument type ({arg_type:?}) \
                          not implemented in τ"
                     ),
                 });
@@ -3452,7 +3448,7 @@ fn analyze_table_function(
             // nullability via the existing single-homed arms in type_inference.rs
             // and expression.rs (no duplication).
             let fc_expr = Expression::FunctionCall(FunctionCall {
-                name: name_lower.clone(),
+                name: name.clone(),
                 args: resolved_args.clone(),
                 distinct: false,
             });
@@ -3460,7 +3456,7 @@ fn analyze_table_function(
             let nullable = fc_expr.nullable(&empty_schema);
             Ok(TypedAst::new(
                 TypedOp::TableFunction {
-                    name: name_lower,
+                    name,
                     args: resolved_args,
                     with_ordinality,
                 },
@@ -3571,12 +3567,26 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
                 }),
             })
         }
+        // N5: `resolve_and_stamp` is the always-hit choke point every
+        // resolved `FunctionCall` passes through exactly once (unlike
+        // `canonicalize_for_semantic_eq` or emission, which only fire on
+        // some paths) — the cheapest place to mechanically enforce the
+        // invariant that front-end conversion already established. Recursion
+        // is otherwise identical to the default arm below.
+        Expression::FunctionCall(f) => {
+            debug_assert!(
+                !f.name.bytes().any(|b| b.is_ascii_uppercase()),
+                "N5: FunctionCall.name must be canonical lowercase: {}",
+                f.name
+            );
+            Expression::FunctionCall(f).map_children(|e| resolve_and_stamp(e, ctx))
+        }
         // Default recursion: walk every immediate child via the shared
-        // walker. Covers Unary / FunctionCall / Cast (non-implicit) /
-        // CaseWhen / Window / Alias / Between / InList / Like /
-        // IsDistinctFrom / ExtractValue / ArrayLiteral / MapLiteral /
-        // StructLiteral / RowConstructor plus the leaf variants (Literal,
-        // Star) which return themselves unchanged inside `map_children`.
+        // walker. Covers Unary / Cast (non-implicit) / CaseWhen / Window /
+        // Alias / Between / InList / Like / IsDistinctFrom / ExtractValue /
+        // ArrayLiteral / MapLiteral / StructLiteral / RowConstructor plus the
+        // leaf variants (Literal, Star) which return themselves unchanged
+        // inside `map_children`.
         _ => expr.map_children(|e| resolve_and_stamp(e, ctx)),
     }
 }
@@ -4150,11 +4160,9 @@ fn canonicalize_for_semantic_eq(expr: &Expression) -> Expression {
             qualifier: None,
             plan_id: None,
         }),
-        Expression::FunctionCall(f) => Expression::FunctionCall(FunctionCall {
-            name: f.name.to_ascii_lowercase(),
-            args: f.args.clone(),
-            distinct: f.distinct,
-        }),
+        // N5: no dedicated `FunctionCall` arm — `f.name` is already canonical
+        // lowercase from front-end construction, so lowercasing it again
+        // would be a no-op; the default `other.clone()` arm covers it.
         other => other.clone(),
     };
     normalized
@@ -5766,13 +5774,8 @@ fn expression_output_name(expr: &Expression) -> String {
         // functions produce a named STRUCT column whose output name is the bare
         // function name (`window` / `session_window`), NOT `fn(args)`. Every
         // other unaliased function call is named `fn(args)`.
-        Expression::FunctionCall(f)
-            if matches!(
-                f.name.to_ascii_lowercase().as_str(),
-                "window" | "session_window"
-            ) =>
-        {
-            f.name.to_ascii_lowercase()
+        Expression::FunctionCall(f) if matches!(f.name.as_str(), "window" | "session_window") => {
+            f.name.clone()
         }
         Expression::FunctionCall(_) => pretty_name(expr),
         Expression::Literal(_) => "col".to_owned(),
@@ -5828,6 +5831,22 @@ fn pretty_binary_symbol(op: &BinaryOp) -> &'static str {
     }
 }
 
+/// Function names whose Spark `toPrettySQL` auto-name is UPPERCASE
+/// regardless of how the call was written (`ceil(x)` and `CEIL(x)` both
+/// auto-name `"CEIL(x)"`) — the `UnaryMathExpression`/`BinaryMathExpression`
+/// family in Catalyst. Verified empirically against a vendored Spark 4.1.1
+/// session (2026-07-12, `/tmp/n5probe/`); every other function auto-names
+/// from its *lowercased* registry key (`SUM(x)` → `"sum(x)"`), so this is an
+/// explicit exception roster, not a general case-preservation rule. PRIMARY
+/// names only — alias spellings (`ceiling`, `pow`, `sign`, `ucase`) keep
+/// their own lowercase lookup spelling (probe-verified: `ceiling(x)` names
+/// `"ceiling(x)"`, `pow`/`sign`/`ln`/`rint` stay lowercase).
+const SPARK_UPPER_PRETTY: &[&str] = &[
+    "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "cbrt", "ceil", "cos", "cosh",
+    "cot", "csc", "degrees", "e", "exp", "expm1", "floor", "hypot", "log", "log10", "log1p",
+    "log2", "pi", "power", "radians", "sec", "signum", "sin", "sinh", "sqrt", "tan", "tanh",
+];
+
 /// Spark `toPrettySQL`-parity default column name for an unaliased projection
 /// expression (Spark `UnresolvedAlias` → `Column.named` → `toPrettySQL`).
 ///
@@ -5856,7 +5875,14 @@ fn pretty_name(expr: &Expression) -> String {
         Expression::Unary(u) => pretty_unary(u),
         Expression::FunctionCall(f) => {
             let args: Vec<String> = f.args.iter().map(pretty_name).collect();
-            format!("{}({})", f.name, args.join(", "))
+            // N5 uppercase overlay: `f.name` is canonical lowercase substrate
+            // identity; the small `SPARK_UPPER_PRETTY` roster is where Spark
+            // itself renders an UPPERCASE auto-name (see its doc).
+            if SPARK_UPPER_PRETTY.contains(&f.name.as_str()) {
+                format!("{}({})", f.name.to_ascii_uppercase(), args.join(", "))
+            } else {
+                format!("{}({})", f.name, args.join(", "))
+            }
         }
         // N4: an `implicit` Cast is an analyzer-materialized coercion, never
         // part of what Spark itself names — transparent straight to the

@@ -38,7 +38,7 @@
 //!   that signal Thunderduck's incomplete implementation —
 //!   `PuntedOperator`, `UnsupportedRule`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::ast::{
     grouped_aggregate, CommonAst, CommonOp, FileFormat, JoinType, PivotGrouping, UnpivotIds,
@@ -105,7 +105,6 @@ impl TypedAst {
     /// `scope` fields, never re-walks subtrees).
     pub fn new(op: TypedOp, resolved_schema: ResolvedSchema) -> Self {
         let mut scope = RelScope::of(&op, &resolved_schema);
-        scope.source_quals = source_quals_of(&op, &resolved_schema);
         scope.source_quals_tracked = source_quals_tracked_of(&op, &resolved_schema);
         Self {
             op,
@@ -164,30 +163,26 @@ pub struct RelScope {
     /// repeated at multiple NESTING levels on the SAME side (outermost-wins,
     /// see `plan_ids` above) — that case never lands here.
     ambiguous_plan_ids: Vec<i64>,
-    /// ADR-023 tier 3: per-OUTPUT-column source-qualifier lineage (Spark attribute
-    /// lineage). `source_quals[i]` = the set of relation qualifiers output column `i`
-    /// inherits. A passthrough ColumnReference inherits its source column's set; an
-    /// Alias/computed column inherits ∅. Populated by `source_quals_of` in
-    /// `TypedAst::new`; derived, so EXCLUDED from PartialEq. Invariant:
-    /// `source_quals.len() == resolved_schema.len()` for every node.
-    pub source_quals: Vec<std::collections::BTreeSet<String>>,
-    /// ADR-023 3d: `true` iff `source_quals` is AUTHORITATIVE for every output
-    /// column of this node — an empty set then means "created, inherits no
-    /// qualifier" (reject a stranded qualifier). `false` for operators whose
-    /// lineage 3c deferred (USING joins, Star projections, SetOp, WithColumns/
-    /// Renamed/Drop, LateralView, and the terminal sources) — the resolver then
-    /// keeps the legacy name-only fallback for them. Derived; EXCLUDED from
-    /// PartialEq (extend the hand-written impl — do NOT add to the compared
-    /// fields). Populated by `source_quals_tracked_of` in `TypedAst::new`.
+    /// ADR-023 3d: `true` iff this node's per-output-column
+    /// `Attribute::source_quals` lineage (N9 increment 3: intrinsic to
+    /// `Attribute` itself, not a parallel `RelScope` vector) is AUTHORITATIVE
+    /// for every output column — an empty set then means "created, inherits
+    /// no qualifier" (reject a stranded qualifier). `false` for operators
+    /// whose lineage is deferred (USING-projected shapes aside — see
+    /// `source_quals_tracked_of`'s doc — Star projections, SetOp,
+    /// WithColumns/Renamed/Drop, LateralView, and the terminal sources) — the
+    /// resolver then keeps the legacy name-only fallback for them. Derived;
+    /// EXCLUDED from PartialEq (extend the hand-written impl — do NOT add to
+    /// the compared fields). Populated by `source_quals_tracked_of` in
+    /// `TypedAst::new`.
     pub source_quals_tracked: bool,
 }
 
-/// Equality deliberately ignores `source_quals` / `source_quals_tracked`: both
-/// are derived data, fully determined by `(op, resolved_schema)` (via
-/// `source_quals_of` / `source_quals_tracked_of`), and existing scope-equality
-/// tests assert equality over the binding facts (`aliases` / `plan_ids` /
-/// `ambiguous_plan_ids`) only. Mirrors `ColumnReference`'s hand-written
-/// `PartialEq` excluding `ordinal`.
+/// Equality deliberately ignores `source_quals_tracked`: it is derived data,
+/// fully determined by `(op, resolved_schema)` (via `source_quals_tracked_of`),
+/// and existing scope-equality tests assert equality over the binding facts
+/// (`aliases` / `plan_ids` / `ambiguous_plan_ids`) only. Mirrors
+/// `ColumnReference`'s hand-written `PartialEq` excluding `ordinal`.
 impl PartialEq for RelScope {
     fn eq(&self, other: &Self) -> bool {
         self.aliases == other.aliases
@@ -282,9 +277,7 @@ impl RelScope {
                     aliases,
                     plan_ids: Vec::new(),
                     ambiguous_plan_ids: Vec::new(),
-                    // Populated by `source_quals_of` / `source_quals_tracked_of`
-                    // in `TypedAst::new`.
-                    source_quals: Vec::new(),
+                    // Populated by `source_quals_tracked_of` in `TypedAst::new`.
                     source_quals_tracked: false,
                 }
             }
@@ -292,9 +285,7 @@ impl RelScope {
                 aliases: vec![(alias.clone(), 0..resolved_schema.len())],
                 plan_ids: Vec::new(),
                 ambiguous_plan_ids: Vec::new(),
-                // Populated by `source_quals_of` / `source_quals_tracked_of`
-                // in `TypedAst::new`.
-                source_quals: Vec::new(),
+                // Populated by `source_quals_tracked_of` in `TypedAst::new`.
                 source_quals_tracked: false,
             },
             TypedOp::Join {
@@ -365,9 +356,7 @@ impl RelScope {
                     aliases,
                     plan_ids,
                     ambiguous_plan_ids,
-                    // Populated by `source_quals_of` / `source_quals_tracked_of`
-                    // in `TypedAst::new`.
-                    source_quals: Vec::new(),
+                    // Populated by `source_quals_tracked_of` in `TypedAst::new`.
                     source_quals_tracked: false,
                 }
             }
@@ -415,214 +404,15 @@ impl RelScope {
     }
 }
 
-/// ADR-023 tier 3c — derive the per-OUTPUT-column source-qualifier lineage a
-/// just-built operator's schema carries. Shallow, like [`RelScope::of`]:
-/// children are already stamped, so this reads their `scope.source_quals`
-/// and never re-walks a subtree. ADDITIVE-only (this chunk): not yet
-/// consulted by `resolve_column` or emission.
-///
-/// Exhaustively matches `TypedOp` (no `_`) so a new variant is a compile
-/// error here until classified.
-fn source_quals_of(
-    op: &TypedOp,
-    resolved_schema: &ResolvedSchema,
-) -> Vec<std::collections::BTreeSet<String>> {
-    use std::collections::BTreeSet;
-
-    let empty_set = || vec![BTreeSet::new(); resolved_schema.len()];
-
-    let out = match op {
-        TypedOp::TableScan { table, alias } => {
-            let mut quals = BTreeSet::new();
-            quals.insert(table.clone());
-            if let Some(a) = alias {
-                quals.insert(a.clone());
-            }
-            vec![quals; resolved_schema.len()]
-        }
-        TypedOp::AliasedRelation { alias, .. } => {
-            let mut quals = BTreeSet::new();
-            quals.insert(alias.clone());
-            vec![quals; resolved_schema.len()]
-        }
-        scope_passthrough!(input) => input.scope.source_quals.clone(),
-        TypedOp::Project { input, projections } => {
-            if projections
-                .iter()
-                .any(|p| matches!(p, Expression::Star(_)))
-            {
-                // Star note (ADR-023 3c plan): precisely expanding `Star`/
-                // `q.*` to a column count is deferred to 3d/3e. The
-                // size-correct empty fallback keeps the invariant AND stays
-                // corpus-neutral (3d reads ∅ → conservative unknown path).
-                empty_set()
-            } else {
-                let mapped: Vec<BTreeSet<String>> = projections
-                    .iter()
-                    .map(|p| match p {
-                        Expression::ColumnReference(cr) => match cr.ordinal {
-                            Some(k) if k < input.scope.source_quals.len() => {
-                                let mut quals = input.scope.source_quals[k].clone();
-                                if let Some(q) = &cr.qualifier {
-                                    quals.insert(q.clone());
-                                }
-                                quals
-                            }
-                            _ => BTreeSet::new(),
-                        },
-                        // Alias/computed columns are created — no inherited
-                        // lineage. filt-019/F8 hinge.
-                        _ => BTreeSet::new(),
-                    })
-                    .collect();
-                if mapped.len() == resolved_schema.len() {
-                    mapped
-                } else {
-                    // Defensive: projection-list length should always match
-                    // the (non-Star) output schema length; fall back rather
-                    // than mis-align if that invariant is ever violated.
-                    empty_set()
-                }
-            }
-        }
-        TypedOp::Join {
-            using_columns,
-            left,
-            right,
-            join_type,
-            ..
-        } => {
-            if !using_columns.is_empty() {
-                // ADR-023 3e-i: mirror `analyze_join`'s USING output-schema
-                // construction EXACTLY (keys first in `using_columns` order,
-                // then left's non-USING fields, then right's non-USING
-                // fields — right omitted for LeftSemi/LeftAnti) so this
-                // lineage vector aligns 1:1 with `resolved_schema`.
-                let keep_right = !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
-                let using_lower: HashSet<String> =
-                    using_columns.iter().map(|s| s.to_lowercase()).collect();
-                let find_idx = |schema: &ResolvedSchema, name: &str| -> Option<usize> {
-                    schema
-                        .fields
-                        .iter()
-                        .position(|f| f.name.eq_ignore_ascii_case(name))
-                };
-                let mut quals: Vec<BTreeSet<String>> = Vec::with_capacity(resolved_schema.len());
-                // USING keys: union of both sides' lineage for that name — a
-                // USING key is referenceable via either side's qualifier. Push
-                // only when the key resolves on at least one side, mirroring
-                // `build_using_prefix`'s `_ => {}` skip so the length invariant
-                // holds even for a (Spark-invalid) key present in neither side.
-                for k in using_columns {
-                    let mut set = BTreeSet::new();
-                    let mut found = false;
-                    if let Some(i) = find_idx(&left.resolved_schema, k) {
-                        set.extend(left.scope.source_quals[i].iter().cloned());
-                        found = true;
-                    }
-                    if let Some(i) = find_idx(&right.resolved_schema, k) {
-                        set.extend(right.scope.source_quals[i].iter().cloned());
-                        found = true;
-                    }
-                    if found {
-                        quals.push(set);
-                    }
-                }
-                // Left's non-USING fields, in left-schema order.
-                for (i, f) in left.resolved_schema.fields.iter().enumerate() {
-                    if !using_lower.contains(&f.name.to_lowercase()) {
-                        quals.push(left.scope.source_quals[i].clone());
-                    }
-                }
-                // Right's non-USING fields (omitted for LeftSemi/LeftAnti).
-                if keep_right {
-                    for (i, f) in right.resolved_schema.fields.iter().enumerate() {
-                        if !using_lower.contains(&f.name.to_lowercase()) {
-                            quals.push(right.scope.source_quals[i].clone());
-                        }
-                    }
-                }
-                quals
-            } else if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
-                left.scope.source_quals.clone()
-            } else {
-                let mut quals = left.scope.source_quals.clone();
-                quals.extend(right.scope.source_quals.iter().cloned());
-                quals
-            }
-        }
-        TypedOp::Aggregate {
-            input, aggregates, ..
-        } => {
-            // N7: `aggregates` IS the complete output list by construction
-            // (every front-end builds it that way), so lineage is a
-            // straight map over `aggregates` with the identical
-            // passthrough-ColumnReference-inherits-by-ordinal rule the
-            // `Project` arm uses above.
-            let lineage_of = |e: &Expression| -> BTreeSet<String> {
-                match e {
-                    Expression::ColumnReference(cr) => match cr.ordinal {
-                        Some(k) if k < input.scope.source_quals.len() => {
-                            let mut s = input.scope.source_quals[k].clone();
-                            if let Some(q) = &cr.qualifier {
-                                s.insert(q.clone());
-                            }
-                            s
-                        }
-                        _ => BTreeSet::new(),
-                    },
-                    _ => BTreeSet::new(),
-                }
-            };
-            let quals: Vec<BTreeSet<String>> = aggregates.iter().map(&lineage_of).collect();
-            // Kept as a defensive guard (should always hold now that
-            // `aggregates` is the output list by construction).
-            if quals.len() == resolved_schema.len() {
-                quals
-            } else {
-                empty_set()
-            }
-        }
-        // TODO(ADR-023 3d/3e): a set operation's output positionally aligns
-        // with its first child (by construction of the widened schema);
-        // real per-column lineage is deferred — stay neutral for now.
-        TypedOp::SetOp { .. }
-        // TODO(ADR-023 3d/3e): `LateralView`'s input columns are positionally
-        // unchanged (generated columns appended) — real lineage deferred.
-        | TypedOp::LateralView { .. }
-        // TODO(ADR-023 3d/3e): `WithColumns` is positional passthrough for
-        // untouched input columns — real lineage deferred.
-        | TypedOp::WithColumns { .. }
-        // TODO(ADR-023 3d/3e): `WithColumnsRenamed` is a pure positional
-        // passthrough (renames only) — real lineage deferred.
-        | TypedOp::WithColumnsRenamed { .. }
-        // TODO(ADR-023 3d/3e): `DropColumns` is positional passthrough minus
-        // the dropped columns — real lineage deferred.
-        | TypedOp::DropColumns { .. }
-        | TypedOp::SingleRow
-        | TypedOp::Values { .. }
-        | TypedOp::LocalRelation { .. }
-        | TypedOp::FileScan { .. }
-        | TypedOp::TableFunction { .. }
-        | TypedOp::Unnest { .. }
-        | TypedOp::Describe { .. }
-        | TypedOp::Summary { .. }
-        | TypedOp::FreqItems { .. }
-        | TypedOp::Unpivot { .. }
-        | TypedOp::Pivot { .. }
-        | TypedOp::RecursiveCte { .. } => empty_set(),
-    };
-    debug_assert_eq!(out.len(), resolved_schema.len());
-    out
-}
-
-/// ADR-023 tier 3d — `true` iff [`source_quals_of`]'s output for this node is
-/// AUTHORITATIVE (every empty set means "created, no inherited qualifier"),
-/// `false` when 3c deferred the lineage to a size-correct empty fallback (the
-/// resolver then keeps the legacy name-only path for those nodes). A sibling
-/// of `source_quals_of` rather than a shared return value, so each function
-/// stays a single flat match on `op` — kept in lockstep by mirroring its arms
-/// one-for-one; exhaustive (no `_`) for the same reason.
+/// ADR-023 tier 3d — `true` iff every output column's `Attribute::source_quals`
+/// (N9 increment 3: intrinsic to `Attribute`, populated at each column's mint/
+/// clone site rather than derived by a separate whole-schema pass) is
+/// AUTHORITATIVE for this node (an empty set then means "created, no
+/// inherited qualifier"), `false` when the lineage for this operator class is
+/// deferred (Star projections, SetOp, WithColumns/Renamed/Drop, LateralView,
+/// and the terminal sources) — the resolver then keeps the legacy name-only
+/// path for those nodes. Exhaustive (no `_`) so a new `TypedOp` variant is a
+/// compile error here until classified.
 fn source_quals_tracked_of(op: &TypedOp, resolved_schema: &ResolvedSchema) -> bool {
     match op {
         TypedOp::TableScan { .. } | TypedOp::AliasedRelation { .. } => true,
@@ -631,8 +421,8 @@ fn source_quals_tracked_of(op: &TypedOp, resolved_schema: &ResolvedSchema) -> bo
             if projections.iter().any(|p| matches!(p, Expression::Star(_))) {
                 false
             } else {
-                // Mirrors the `mapped.len() == resolved_schema.len()` guard
-                // in `source_quals_of`'s non-Star arm.
+                // Mirrors `project_output_schema`'s non-Star projection-list-
+                // length invariant.
                 input.scope.source_quals_tracked && projections.len() == resolved_schema.len()
             }
         }
@@ -645,7 +435,8 @@ fn source_quals_tracked_of(op: &TypedOp, resolved_schema: &ResolvedSchema) -> bo
             // ADR-023 3e-i: the `left && right` (or `left`-only for
             // SEMI/ANTI) formula is identical whether or not this is a
             // USING join — `using_columns` no longer forces `false` here;
-            // see `source_quals_of`'s USING arm for the lineage itself.
+            // see `build_using_prefix` (`analyze_join`) for the lineage
+            // content itself (the union-both-sides rule).
             if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
                 left.scope.source_quals_tracked
             } else {
@@ -1322,7 +1113,9 @@ pub(super) fn analyzer_error_to_emission_error(e: AnalyzerError) -> EmissionErro
 /// Analyze `input`, clone its resolved schema, and wrap it in a caller-built
 /// [`TypedOp`] variant. The output schema is a straight passthrough — used by
 /// operators that neither add, drop, nor retype columns (Filter, Sort, Limit,
-/// Deduplicate, Sample, SampleBy, NaDrop, NaReplace, AliasedRelation).
+/// Deduplicate, Sample, SampleBy, NaDrop, NaReplace). NOT `AliasedRelation`
+/// (N9 increment 3): it resets lineage to its own alias, so it builds its
+/// typed node directly rather than through this straight-clone helper.
 ///
 /// The `build_op` closure receives the typed input by value so it can move it
 /// into a `Box`; it returns a `Result` so callers may perform failable
@@ -1337,6 +1130,20 @@ fn passthrough_schema_arm(
     let resolved_schema = typed_input.resolved_schema.clone();
     let op = build_op(typed_input)?;
     Ok(TypedAst::new(op, resolved_schema))
+}
+
+/// ADR-023 tier-3 leaf-seed helper: overwrite EVERY field's `source_quals`
+/// with the SAME uniform `quals` set — shared by the `TableScan` and
+/// `AliasedRelation` origination arms, where every output column is equally
+/// "from" the table/alias being scanned or renamed.
+fn seed_source_quals(schema: ResolvedSchema, quals: BTreeSet<String>) -> ResolvedSchema {
+    ResolvedSchema::new(
+        schema
+            .fields
+            .into_iter()
+            .map(|f| f.with_quals(quals.clone()))
+            .collect(),
+    )
 }
 
 fn analyze_node(
@@ -1361,9 +1168,18 @@ fn analyze_node(
             // the alias is preserved on the operator itself. future τ work's
             // renderer handles the alias projection. A `TableScan` is an
             // origination point — mint fresh ids for its columns.
+            //
+            // ADR-023 tier-3 leaf seed: EVERY column of a `TableScan` is
+            // equally "from" the table (and, if present, its alias) — seed
+            // the SAME qualifier set onto every minted attribute.
+            let mut quals = BTreeSet::new();
+            quals.insert(table.clone());
+            if let Some(a) = &alias {
+                quals.insert(a.clone());
+            }
             Ok(TypedAst::new(
                 TypedOp::TableScan { table, alias },
-                ResolvedSchema::minted(schema),
+                seed_source_quals(ResolvedSchema::minted(schema), quals),
             ))
         }
 
@@ -1782,12 +1598,22 @@ fn analyze_node(
 
         // ── AliasedRelation (Spark `df.alias(name)`) ─────────────────────
         CommonOp::AliasedRelation { input, alias } => {
-            passthrough_schema_arm(*input, base_types, outer, |ti| {
-                Ok(TypedOp::AliasedRelation {
-                    input: Box::new(ti),
+            let typed_input = analyze_node(*input, base_types, outer)?;
+            // ADR-023 tier-3 leaf seed: an `AliasedRelation` is a fresh
+            // origination point for lineage purposes — EVERY column is now
+            // "from" `alias` alone, overwriting whatever it inherited below
+            // (emission re-scopes everything under it to `alias`, mirroring
+            // `RelScope::of`'s own AliasedRelation binding rule).
+            let mut quals = BTreeSet::new();
+            quals.insert(alias.clone());
+            let resolved_schema = seed_source_quals(typed_input.resolved_schema.clone(), quals);
+            Ok(TypedAst::new(
+                TypedOp::AliasedRelation {
+                    input: Box::new(typed_input),
                     alias,
-                })
-            })
+                },
+                resolved_schema,
+            ))
         }
 
         // ── WithColumnsRenamed (Spark `df.withColumnsRenamed(...)`) ──────
@@ -2389,24 +2215,38 @@ fn analyze_join(
     // USING donor: same logical column as the chosen donor side —
     // clone-with-mutation (FULL coalesces nullability but KEEPS the left
     // side's id, per N9 INC-1's coalesced-key rule).
+    //
+    // ADR-023 tier-3 (folded in from the deleted `source_quals_of`): a USING
+    // key is referenceable via EITHER side's qualifier, regardless of which
+    // side donates the value/id — so the donor's `source_quals` is
+    // overwritten with the UNION of both sides' lineage (when present),
+    // never just the donor's own inherited set.
     let build_using_prefix = |using: &[String]| -> Vec<Attribute> {
         let mut fields = Vec::with_capacity(using.len());
         for n in using {
             let left_field = derived_left_schema.field_by_name(n);
             let right_field = derived_right_schema.field_by_name(n);
-            match (join_type, left_field, right_field) {
-                (JoinType::Right, _, Some(rf)) => fields.push(rf.clone()),
+            let donor = match (join_type, left_field, right_field) {
+                (JoinType::Right, _, Some(rf)) => rf.clone(),
                 (JoinType::Full, Some(lf), Some(rf)) => {
                     // Non-null iff EITHER side is non-null. Keep the LEFT
                     // side's id — it is the donor of record for FULL/USING.
                     let mut coalesced = lf.clone();
                     coalesced.nullable = lf.nullable && rf.nullable;
-                    fields.push(coalesced);
+                    coalesced
                 }
-                (_, Some(lf), _) => fields.push(lf.clone()),
-                (_, None, Some(rf)) => fields.push(rf.clone()),
-                _ => {}
+                (_, Some(lf), _) => lf.clone(),
+                (_, None, Some(rf)) => rf.clone(),
+                _ => continue,
+            };
+            let mut quals = BTreeSet::new();
+            if let Some(lf) = left_field {
+                quals.extend(lf.source_quals.iter().cloned());
             }
+            if let Some(rf) = right_field {
+                quals.extend(rf.source_quals.iter().cloned());
+            }
+            fields.push(donor.with_quals(quals));
         }
         fields
     };
@@ -3709,15 +3549,40 @@ fn analyze_sort(
     // Increment 2 (design 023 step 5) may have appended hidden aggregate /
     // projection entries — and matching schema fields — to `ti.op` /
     // `ti.resolved_schema` in place (Vec-append-only) while resolving the
-    // keys above, without re-deriving `ti.scope`. `TypedAst::new` is the
-    // single scope authority (INV2), and the ADR-023 tier-3 `source_quals`
-    // invariant (`source_quals.len() == resolved_schema.len()`) must track
-    // any schema growth — re-stamp unconditionally. Cheap when nothing
-    // changed: `RelScope::of`'s derivation is shallow (reads children's
-    // already-stamped scopes, never re-walks a subtree).
-    let op = std::mem::replace(&mut ti.op, TypedOp::SingleRow);
-    let schema = std::mem::take(&mut ti.resolved_schema);
-    *ti = TypedAst::new(op, schema);
+    // keys above, WITHOUT re-deriving `ti.scope`. N9 increment 3 DELETED the
+    // unconditional `mem::replace` + `TypedAst::new` re-stamp this comment
+    // used to justify — it is provably dead weight, not merely "cheap":
+    //
+    //   - The only two ops this fallback ever mutates in place are
+    //     `TypedOp::Aggregate` / `TypedOp::Project`. `RelScope::of`'s arm for
+    //     BOTH is the unconditional `Self::default()` catch-all — it never
+    //     reads `aggregates`/`projections` at all — so growing either Vec
+    //     changes NOTHING about the derived `aliases` / `plan_ids` /
+    //     `ambiguous_plan_ids`.
+    //   - `source_quals_tracked_of`'s Aggregate/Project arms gate on
+    //     `aggregates.len() == resolved_schema.len()` /
+    //     `projections.len() == resolved_schema.len()`. `promote_aggregate_
+    //     subtree` / `promote_project_subtree` push exactly one schema field
+    //     per pushed output-list entry (append-only, 1:1 — see their own
+    //     bodies), so that equality is preserved by growth iff it already
+    //     held before growth.
+    //   - `source_quals` no longer lives in `RelScope` at all (N9 increment
+    //     3 folded it into `Attribute` itself) — there is nothing else
+    //     derived-and-cached here that growth could stale.
+    //
+    // So the re-derived scope is PROVABLY IDENTICAL to what `ti.scope`
+    // already carries; re-stamping buys nothing. Assert the equivalence in
+    // debug builds instead of paying for a live re-derivation in release.
+    debug_assert_eq!(
+        RelScope::of(&ti.op, &ti.resolved_schema),
+        ti.scope,
+        "growth-invariant violated: re-derived scope must equal the carried scope"
+    );
+    debug_assert_eq!(
+        source_quals_tracked_of(&ti.op, &ti.resolved_schema),
+        ti.scope.source_quals_tracked,
+        "growth-invariant violated: re-derived source_quals_tracked must equal the carried value"
+    );
     Ok(resolved)
 }
 
@@ -4443,12 +4308,11 @@ impl<'a> ResolveContext<'a> {
                 ambiguous_plan_ids,
                 // Compile fix only (ADR-023 3c/3d): this synthetic composite
                 // scope is resolution-time-only and never flows through
-                // `TypedAst::new`'s `source_quals_of` / `source_quals_tracked_of`
-                // stamping. `false` keeps it on the legacy fallback (it is
-                // never consulted by tier (f)'s tracked branch anyway — this
-                // scope only backs the synthetic `__td_jl`/`__td_jr` tier and
-                // tier (e), never the qualified-non-synthetic `None` arm).
-                source_quals: Vec::new(),
+                // `TypedAst::new`'s `source_quals_tracked_of` stamping.
+                // `false` keeps it on the legacy fallback (it is never
+                // consulted by tier (f)'s tracked branch anyway — this scope
+                // only backs the synthetic `__td_jl`/`__td_jr` tier and tier
+                // (e), never the qualified-non-synthetic `None` arm).
                 source_quals_tracked: false,
             }),
             base_types,
@@ -4843,19 +4707,18 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                     // Genuinely 0 scope hits for `q`.
                     if ctx.scopes.source_quals_tracked {
                         // ADR-023 3d: authoritative lineage for this node.
-                        // `q` binds no local alias scope, so consult
-                        // per-output-column source_quals instead of falling
+                        // `q` binds no local alias scope, so consult each
+                        // field's own `Attribute::source_quals` (N9 increment
+                        // 3: intrinsic to the attribute) instead of falling
                         // back to a permissive name-only lookup.
                         let hits: Vec<usize> = ctx
                             .schema
                             .fields
                             .iter()
                             .enumerate()
-                            .filter(|(i, f)| {
+                            .filter(|(_, f)| {
                                 f.name.eq_ignore_ascii_case(&u.name)
-                                    && ctx.scopes.source_quals.get(*i).is_some_and(|s| {
-                                        s.iter().any(|qq| qq.eq_ignore_ascii_case(q))
-                                    })
+                                    && f.source_quals.iter().any(|qq| qq.eq_ignore_ascii_case(q))
                             })
                             .map(|(i, _)| i)
                             .collect();
@@ -5026,11 +4889,20 @@ fn schema_has_unresolved(schema: &ResolvedSchema) -> bool {
 /// resolved against `input`.
 ///
 /// N9 INC-1 identity rule: a bare `ColumnReference` whose `ordinal` indexes
-/// an `input` attribute of the SAME name (defensive filter mirroring
-/// `source_quals_of`'s bounds check) COPIES that attribute's `expr_id` — it
-/// is the identical logical column, merely passed through a `SELECT`.
-/// Everything else (`Alias`, computed expressions) MINTS a fresh id — it is
-/// a genuinely new column.
+/// an `input` attribute of the SAME name (defensive filter — `ordinal`-valid
+/// references are expected to always name-match the field they index) COPIES
+/// that attribute's `expr_id` — it is the identical logical column, merely
+/// passed through a `SELECT`. Everything else (`Alias`, computed expressions)
+/// MINTS a fresh id — it is a genuinely new column.
+///
+/// N9 INC-3 lineage rule (ADR-023 tier-3, folded in from the deleted
+/// `source_quals_of`): the COPY branch above additionally clones the source
+/// attribute's `source_quals` (via `src.clone()`) and unions in the
+/// reference's OWN stamped qualifier when present — a qualified passthrough
+/// (`e.dept_id`) is referenceable via either its inherited qualifier(s) or the
+/// one it was just referenced through. The MINT branch's fresh
+/// `Attribute::minted` carries EMPTY lineage — a created column (`Alias`,
+/// computed expression) inherits no qualifier (F8/filt-019 hinge).
 fn output_attribute(e: &Expression, input: &ResolvedSchema) -> Attribute {
     if let Expression::ColumnReference(cr) = e {
         if let Some(k) = cr.ordinal {
@@ -5040,6 +4912,9 @@ fn output_attribute(e: &Expression, input: &ResolvedSchema) -> Attribute {
                     attr.name = expression_output_name(e);
                     attr.data_type = e.data_type(input);
                     attr.nullable = e.nullable(input);
+                    if let Some(q) = &cr.qualifier {
+                        attr.source_quals.insert(q.clone());
+                    }
                     return attr;
                 }
             }
@@ -7293,9 +7168,20 @@ mod tests {
     }
 
     // ── ADR-023 tier 3c — per-output-column source-qualifier lineage ─────
-    // Additive, dormant field: `source_quals_of` stamps `scope.source_quals`
-    // in `TypedAst::new`. Not yet consulted by `resolve_column` or emission
-    // (that is 3d); these tests pin the derivation itself.
+    // N9 increment 3 folded `source_quals` INTO `Attribute` itself (mint/
+    // clone-site propagation) rather than deriving a parallel per-schema
+    // `Vec` in `RelScope`; `quals_of` reads the field-level source of truth
+    // these tests pin.
+
+    /// Read every field's `Attribute::source_quals` in schema order — the
+    /// N9 increment-3 replacement for the deleted `scope.source_quals` Vec.
+    fn quals_of(schema: &ResolvedSchema) -> Vec<BTreeSet<String>> {
+        schema
+            .fields
+            .iter()
+            .map(|f| f.source_quals.clone())
+            .collect()
+    }
 
     #[test]
     fn source_quals_aliased_relation_binds_every_col_to_alias() {
@@ -7306,7 +7192,7 @@ mod tests {
         });
         let typed = analyze(ast, &bt).unwrap();
         let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
-        assert_eq!(typed.scope.source_quals, vec![e; 4]);
+        assert_eq!(quals_of(&typed.resolved_schema), vec![e; 4]);
     }
 
     #[test]
@@ -7323,7 +7209,7 @@ mod tests {
         });
         let typed = analyze(project, &bt).unwrap();
         let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
-        assert_eq!(typed.scope.source_quals, vec![e.clone(), e]);
+        assert_eq!(quals_of(&typed.resolved_schema), vec![e.clone(), e]);
     }
 
     #[test]
@@ -7342,7 +7228,7 @@ mod tests {
             projections: vec![alias_expr(unresolved_col("dept_id"), "k")],
         });
         let typed = analyze(project, &bt).unwrap();
-        assert_eq!(typed.scope.source_quals, vec![BTreeSet::new()]);
+        assert_eq!(quals_of(&typed.resolved_schema), vec![BTreeSet::new()]);
     }
 
     #[test]
@@ -7355,7 +7241,7 @@ mod tests {
         let d: BTreeSet<String> = ["dept".to_owned(), "d".to_owned()].into_iter().collect();
         let mut expected = vec![e; 4];
         expected.extend(vec![d; 2]);
-        assert_eq!(typed.scope.source_quals, expected);
+        assert_eq!(quals_of(&typed.resolved_schema), expected);
     }
 
     #[test]
@@ -7384,7 +7270,7 @@ mod tests {
         let d: BTreeSet<String> = ["dept".to_owned(), "d".to_owned()].into_iter().collect();
         let key: BTreeSet<String> = e.union(&d).cloned().collect();
         assert_eq!(
-            typed.scope.source_quals,
+            quals_of(&typed.resolved_schema),
             vec![key, e.clone(), e.clone(), e, d]
         );
         assert!(typed.scope.source_quals_tracked);
@@ -7405,7 +7291,7 @@ mod tests {
         ));
         let typed = analyze(ast, &bt).unwrap();
         let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
-        assert_eq!(typed.scope.source_quals, vec![emp, BTreeSet::new()]);
+        assert_eq!(quals_of(&typed.resolved_schema), vec![emp, BTreeSet::new()]);
     }
 
     #[test]
@@ -7427,33 +7313,49 @@ mod tests {
         );
         let typed = analyze(ast, &bt).unwrap();
         let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
-        assert_eq!(typed.scope.source_quals, vec![emp, BTreeSet::new()]);
+        assert_eq!(quals_of(&typed.resolved_schema), vec![emp, BTreeSet::new()]);
         assert!(typed.scope.source_quals_tracked);
     }
 
     #[test]
-    fn source_quals_length_invariant_holds_for_star_projection() {
+    fn source_quals_star_projection_is_untracked_but_content_still_carries_through() {
+        // N9 increment 3: `source_quals` no longer lives in a separate
+        // `RelScope` Vec derived by a whole-schema pass with a size-correct
+        // empty fallback for deferred ops — it is now INTRINSIC to each
+        // `Attribute`, propagated by ordinary clone at each construction
+        // site. An unqualified `*` clones the input schema's fields
+        // VERBATIM (`project_output_schema`'s `Star`/`None` arm), so the
+        // bare `emp` scan's real per-column lineage (`{"emp"}`, seeded at
+        // the `TableScan` leaf even without an alias) rides straight
+        // through — unlike the OLD `source_quals_of`, which force-emptied
+        // every Star-projected column regardless of what was beneath it.
+        // `source_quals_tracked` still gates authoritativeness: Star stays
+        // `false`, so the resolver does NOT widen trust in this content —
+        // it keeps the legacy name-only path for Star-projected scopes.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
             projections: vec![Expression::Star(StarExpression { qualifier: None })],
         });
         let typed = analyze(ast, &bt).unwrap();
-        assert_eq!(typed.scope.source_quals.len(), typed.resolved_schema.len());
-        assert!(typed.scope.source_quals.iter().all(BTreeSet::is_empty));
+        let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
+        assert_eq!(quals_of(&typed.resolved_schema), vec![emp; 4]);
+        assert!(!typed.scope.source_quals_tracked);
     }
 
     #[test]
-    fn source_quals_length_invariant_holds_for_using_join() {
-        // ADR-023 3e-i: USING joins are now TRACKED (real lineage, not the
-        // size-correct empty fallback) — the length invariant holds for
-        // BOTH an INNER USING join and a LeftSemi USING join (right's
-        // columns dropped from the output schema entirely).
+    fn source_quals_tracked_true_for_using_join_semi_and_inner_alike() {
+        // ADR-023 3e-i: the `left && right` (`left`-only for SEMI/ANTI)
+        // formula no longer special-cases USING joins — with both sides
+        // AUTHORITATIVE (`TableScan`), the join is TRACKED for both an
+        // INNER and a LeftSemi USING join alike (right's columns dropped
+        // from the output schema entirely for LeftSemi, but that does not
+        // affect trackedness, which reads only `left`).
         let bt = base_types_with_emp_dept();
         for join_type in [JoinType::Inner, JoinType::LeftSemi] {
             let ast = CommonAst::new(CommonOp::Join {
-                left: Box::new(emp_scan()),
-                right: Box::new(scan("dept")),
+                left: Box::new(aliased_scan("emp", "e")),
+                right: Box::new(aliased_scan("dept", "d")),
                 join_type,
                 condition: None,
                 using_columns: vec!["dept_id".to_owned()],
@@ -7463,10 +7365,9 @@ mod tests {
                 right_plan_ids: vec![],
             });
             let typed = analyze(ast, &bt).unwrap();
-            assert_eq!(
-                typed.scope.source_quals.len(),
-                typed.resolved_schema.len(),
-                "length invariant violated for {join_type:?}"
+            assert!(
+                typed.scope.source_quals_tracked,
+                "expected tracked=true for {join_type:?}"
             );
         }
     }
@@ -7637,10 +7538,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_column_using_join_untracked_keeps_legacy_qualified_fallback() {
-        // USING joins keep `source_quals_tracked = false` (3c deferred
-        // their lineage) — a qualified reference must still resolve via the
-        // legacy name-only fallback, NOT raise `UnknownColumn`.
+    fn resolve_column_using_join_qualified_ref_resolves() {
+        // Historical name/claim corrected (review NIT, N9 INC-3): USING joins
+        // over TRACKED (aliased) children are themselves tracked now — this
+        // shape resolves `e.name` via the tracked tier-(f) lineage path, not
+        // the legacy fallback the old test name advertised. The assertion
+        // (qualified ref resolves, no UnknownColumn) is unchanged either way.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Join {
@@ -7710,8 +7613,8 @@ mod tests {
         // The USING arm's tracked formula is `left && right` (SEMI/ANTI:
         // `left` only) — same as the non-USING arm. An untracked child (a
         // Star projection defers its lineage — see
-        // `source_quals_length_invariant_holds_for_star_projection`) keeps
-        // the USING join conservatively untracked too.
+        // `source_quals_star_projection_is_untracked_but_content_still_carries_through`)
+        // keeps the USING join conservatively untracked too.
         let bt = base_types_with_emp_dept();
         let untracked_left = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
@@ -7730,10 +7633,6 @@ mod tests {
         });
         let typed_using = analyze(using_join, &bt).unwrap();
         assert!(!typed_using.scope.source_quals_tracked);
-        assert_eq!(
-            typed_using.scope.source_quals.len(),
-            typed_using.resolved_schema.len()
-        );
     }
 
     // ── Pass 106 — uncorrelated subquery analysis ────────────────────────
@@ -14509,15 +14408,6 @@ mod tests {
         });
         let typed = analyze(ast, &bt).expect("both keys must resolve via the fallback");
 
-        // Cheap ADR-023 tier-3 sanity check (not this test's focus):
-        // lineage tracking must survive the Sort's mandatory re-stamp
-        // (`TypedAst::new` inside `analyze_sort`).
-        assert_eq!(
-            typed.scope.source_quals.len(),
-            typed.resolved_schema.len(),
-            "source_quals must track resolved_schema 1:1 after the Sort re-stamp"
-        );
-
         let TypedOp::Sort { input, order, .. } = &typed.op else {
             panic!("expected Sort, got {:?}", typed.op);
         };
@@ -14922,6 +14812,178 @@ mod tests {
         // carries the SAME ids as the extended schema's prefix.
         assert_eq!(typed.resolved_schema.fields[0].expr_id, scan_id);
         assert_eq!(typed.resolved_schema.fields[1].expr_id, scan_name);
+
+        // N9 increment 3 (NEW test item 1): the SAME growth-through-restamp
+        // path must carry `source_quals` BY VALUE, not just `expr_id`. The
+        // bare `emp` scan (unaliased) seeds `{"emp"}` for every column;
+        // `analyze_sort` no longer rebuilds `ti.resolved_schema` at all (the
+        // unconditional re-stamp is gone, replaced by a `debug_assert_eq!`
+        // proof), so the Sort's OWN schema is bit-for-bit the SAME Vec the
+        // Project analysis produced — including the promoted `salary`
+        // entry, which is `promote_project_subtree`'s bare-`ColumnReference`
+        // COPY branch (clones straight from `input_schema`, same precedent
+        // as `output_attribute`), so it carries the scan's real lineage
+        // forward too, not an empty mint.
+        let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
+        assert_eq!(
+            quals_of(&sort_ast.resolved_schema),
+            vec![emp.clone(), emp.clone(), emp.clone()],
+            "Sort's own extended schema must carry emp/emp/emp through the (deleted) re-stamp"
+        );
+        assert_eq!(
+            quals_of(&typed.resolved_schema),
+            vec![emp.clone(), emp],
+            "trim Project's COPY branch must carry the scan's qualifier through unchanged"
+        );
+    }
+
+    // ── N9 increment 3 — direct `output_attribute` unit tests ────────────
+    // (items 2/3 of the increment's test list): the COPY branch's qualifier
+    // insertion and the MINT branch's empty lineage, pinned directly rather
+    // than only indirectly through a full `analyze()` walk.
+
+    #[test]
+    fn output_attribute_copy_branch_inserts_reference_qualifier() {
+        let bt = base_types_with_emp_dept();
+        let scanned = analyze(scan("emp"), &bt).expect("scan analyzes");
+        // A resolved, ordinal-bound reference to "dept_id" (index 2 in
+        // emp's schema — id, name, dept_id, salary) carrying an explicit
+        // qualifier "e", as `resolve_column` would stamp for `e.dept_id`.
+        let field = scanned
+            .resolved_schema
+            .field_by_name("dept_id")
+            .expect("emp has dept_id");
+        let cr = Expression::ColumnReference(ColumnReference {
+            name: "dept_id".to_owned(),
+            qualifier: Some("e".to_owned()),
+            data_type: Some(field.data_type.clone()),
+            nullable: Some(field.nullable),
+            ordinal: Some(2),
+            expr_id: Some(field.expr_id),
+        });
+        let attr = output_attribute(&cr, &scanned.resolved_schema);
+        // The bare scan already seeds `{"emp"}` (table name, no alias); the
+        // COPY branch additionally INSERTS the reference's own stamped
+        // qualifier alongside it.
+        let expected: BTreeSet<String> = ["emp".to_owned(), "e".to_owned()].into_iter().collect();
+        assert_eq!(attr.source_quals, expected);
+        assert_eq!(
+            attr.expr_id, field.expr_id,
+            "COPY branch must carry the id forward too"
+        );
+    }
+
+    #[test]
+    fn output_attribute_mint_branch_has_empty_quals() {
+        let bt = base_types_with_emp_dept();
+        let scanned = analyze(scan("emp"), &bt).expect("scan analyzes");
+        // A computed expression (not a bare passthrough ColumnReference)
+        // takes the MINT branch — a freshly created column inherits no
+        // lineage at all, matching F8/filt-019.
+        let computed = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(unresolved_col("dept_id")),
+            right: Box::new(int_lit(1)),
+        });
+        let ctx = ResolveContext::of_input(&scanned, &bt, None);
+        let resolved = resolve_and_stamp(computed, &ctx).expect("computed expr resolves");
+        let attr = output_attribute(&resolved, &scanned.resolved_schema);
+        assert!(attr.source_quals.is_empty());
+    }
+
+    #[test]
+    fn source_quals_using_join_right_only_donor_still_unions_both_sides_quals() {
+        // ADR-023 3e-i, RIGHT-donor shape: a RIGHT USING join donates the
+        // KEY's value/id from the RIGHT side (`build_using_prefix`'s
+        // `(JoinType::Right, _, Some(rf)) => rf.clone()` arm) — but the
+        // key's LINEAGE must still be the UNION of both sides (a USING key
+        // is referenceable via either alias), not just the donor side's.
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Join {
+            left: Box::new(aliased_scan("emp", "e")),
+            right: Box::new(aliased_scan("dept", "d")),
+            join_type: JoinType::Right,
+            condition: None,
+            using_columns: vec!["dept_id".to_owned()],
+            natural: false,
+            lateral: false,
+            left_plan_ids: vec![],
+            right_plan_ids: vec![],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        let e: BTreeSet<String> = ["emp".to_owned(), "e".to_owned()].into_iter().collect();
+        let d: BTreeSet<String> = ["dept".to_owned(), "d".to_owned()].into_iter().collect();
+        let key: BTreeSet<String> = e.union(&d).cloned().collect();
+        let field = typed
+            .resolved_schema
+            .field_by_name("dept_id")
+            .expect("USING key must be in the output schema");
+        assert_eq!(
+            field.source_quals, key,
+            "RIGHT-donor USING key must still union BOTH sides' qualifiers"
+        );
+    }
+
+    #[test]
+    fn sort_promotes_missing_grouping_key_mints_empty_lineage_not_inherited() {
+        // N9 increment 3, N7-traceability follow-up (test item 5): sibling
+        // of `sort_promotes_missing_grouping_key_and_trims_q098_shape`. The
+        // promoted `dept_id` entry IS structurally a bare passthrough
+        // `ColumnReference` into the (aliased, tracked) input — a source
+        // that DOES carry real lineage (`{"emp", "e"}`) — yet
+        // `promote_aggregate_subtree` unconditionally MINTS a fresh
+        // `Attribute` for every newly-promoted entry (never clone-derives
+        // from `input_schema`, unlike `output_attribute`'s COPY branch or
+        // `promote_project_subtree`'s bare-ref COPY). Current behavior:
+        // the promoted grouping key's lineage is EMPTY, exactly as if it
+        // had been a freshly created column — NOT inherited from its
+        // source, even though it structurally passes the source through
+        // unmodified. This is the "created, not copied" outcome; documented
+        // here as current behavior rather than changed, since widening
+        // `promote_aggregate_subtree` to COPY is out of this increment's
+        // scope.
+        let bt = base_types_with_emp_dept();
+        let agg = aggregate(
+            aliased_scan("emp", "e"),
+            vec![unresolved_col("dept_id"), unresolved_col("name")],
+            vec![
+                unresolved_col("name"),
+                func("sum", vec![unresolved_col("salary")]),
+            ],
+        );
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(agg),
+            order: vec![asc_key(unresolved_col("dept_id"))],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("missing grouping key must be promoted, not rejected");
+        let TypedOp::Project {
+            input: sort_ast, ..
+        } = &typed.op
+        else {
+            panic!(
+                "expected a trim Project wrapping the Sort, got {:?}",
+                typed.op
+            );
+        };
+        let TypedOp::Sort { input: agg_ast, .. } = &sort_ast.op else {
+            panic!(
+                "expected Sort under the trim Project, got {:?}",
+                sort_ast.op
+            );
+        };
+        let TypedOp::Aggregate { .. } = &agg_ast.op else {
+            panic!("expected Aggregate under the Sort, got {:?}", agg_ast.op);
+        };
+        // The promoted `dept_id` is the THIRD (hidden) schema field.
+        assert_eq!(agg_ast.resolved_schema.len(), 3);
+        assert_eq!(agg_ast.resolved_schema.fields[2].name, "dept_id");
+        assert!(
+            agg_ast.resolved_schema.fields[2].source_quals.is_empty(),
+            "promotion mints a fresh Attribute — current behavior does NOT inherit \
+             the grouping key's source lineage, even though it is a bare passthrough"
+        );
     }
 
     #[test]

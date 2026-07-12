@@ -14,6 +14,7 @@
 //! visible `::minted` call so a reviewer (and a future increment's grep) can
 //! find every place identity is created versus carried.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::{DataType, StructField, StructType};
@@ -52,18 +53,28 @@ pub struct Attribute {
     pub data_type: DataType,
     pub nullable: bool,
     pub expr_id: ExprId,
+    /// ADR-023 tier-3 source-qualifier lineage (Spark attribute lineage) —
+    /// which relation qualifiers (table names / user aliases) this column
+    /// inherits, now intrinsic to `Attribute` rather than a parallel
+    /// per-node `RelScope` vector (N9 increment 3). Empty for a genuinely
+    /// CREATED column (an `Alias` or a computed expression) — see
+    /// [`Attribute::minted`]. Seeded at leaf origination points (`TableScan`,
+    /// `AliasedRelation`) via [`Attribute::with_quals`]; carried through
+    /// every passthrough `.clone()` otherwise.
+    pub source_quals: BTreeSet<String>,
 }
 
 impl Attribute {
-    /// Construct a brand-new attribute with a freshly minted id — use for
-    /// any column that did not exist before this point (a computed
-    /// expression, an `Alias`, a generated/synthesized column, ...).
+    /// Construct a brand-new attribute with a freshly minted id and EMPTY
+    /// lineage — use for any column that did not exist before this point (a
+    /// computed expression, an `Alias`, a generated/synthesized column, ...).
     pub fn minted(name: impl Into<String>, data_type: DataType, nullable: bool) -> Self {
         Self {
             name: name.into(),
             data_type,
             nullable,
             expr_id: ExprId::fresh(),
+            source_quals: BTreeSet::new(),
         }
     }
 
@@ -75,18 +86,30 @@ impl Attribute {
         Self::minted(field.name.clone(), field.data_type.clone(), field.nullable)
     }
 
-    /// Project back down to a plain [`StructField`], dropping the id. This is
-    /// a one-way door — there is no `From<StructField>` and no implicit
-    /// conversion, precisely so every re-mint is a visible `::minted` call.
+    /// Chainable: overwrite `source_quals` — for LEAF mint sites
+    /// (`TableScan`, `AliasedRelation`) that seed lineage at origination.
+    /// Every OTHER production site inherits `source_quals` by cloning an
+    /// existing `Attribute` (never re-derive it) — see the module doc's
+    /// CONVENTION.
+    pub fn with_quals(mut self, quals: BTreeSet<String>) -> Self {
+        self.source_quals = quals;
+        self
+    }
+
+    /// Project back down to a plain [`StructField`], dropping the id AND the
+    /// source-qualifier lineage. This is a one-way door — there is no
+    /// `From<StructField>` and no implicit conversion, precisely so every
+    /// re-mint is a visible `::minted` call.
     pub fn to_field(&self) -> StructField {
         StructField::new(self.name.clone(), self.data_type.clone(), self.nullable)
     }
 }
 
-/// Hand-written `PartialEq` EXCLUDING `expr_id`: the id is derived identity
-/// bookkeeping, not part of the column's logical value — mirrors
-/// `ColumnReference`'s hand-written `PartialEq` excluding `ordinal`
-/// (`expression.rs`, `ColumnReference`) and `TypedAst`/`RelScope`'s
+/// Hand-written `PartialEq` EXCLUDING `expr_id` and `source_quals`: neither
+/// is part of the column's logical value — `expr_id` is derived identity
+/// bookkeeping and `source_quals` is derived lineage bookkeeping (ADR-023
+/// tier-3) — mirrors `ColumnReference`'s hand-written `PartialEq` excluding
+/// `ordinal` (`expression.rs`, `ColumnReference`) and `TypedAst`/`RelScope`'s
 /// derived-data exclusions elsewhere in this module tree. Keeps every
 /// pre-existing schema-equality test (written against `StructField`/
 /// `StructType` semantics) passing unchanged once schemas carry ids.
@@ -303,6 +326,30 @@ mod tests {
         assert!(rs.field_by_name("name").is_some());
         assert!(rs.field_by_name("NAME").is_some());
         assert!(rs.field_by_name("missing").is_none());
+    }
+
+    #[test]
+    fn minted_has_empty_source_quals() {
+        let a = Attribute::minted("x", DataType::Integer, false);
+        assert!(a.source_quals.is_empty());
+    }
+
+    #[test]
+    fn with_quals_overwrites_source_quals_and_keeps_expr_id() {
+        let a = Attribute::minted("x", DataType::Integer, false);
+        let id = a.expr_id;
+        let quals: BTreeSet<String> = ["t".to_owned(), "alias".to_owned()].into_iter().collect();
+        let a = a.with_quals(quals.clone());
+        assert_eq!(a.source_quals, quals);
+        assert_eq!(a.expr_id, id);
+    }
+
+    #[test]
+    fn attribute_eq_excludes_source_quals() {
+        let a = Attribute::minted("x", DataType::Integer, false);
+        let b = Attribute::minted("x", DataType::Integer, false)
+            .with_quals(["t".to_owned()].into_iter().collect());
+        assert_eq!(a, b, "Attribute equality must ignore source_quals");
     }
 
     #[test]

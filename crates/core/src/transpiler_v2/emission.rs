@@ -7202,6 +7202,7 @@ mod tests {
             data_type: Some(dt),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         })
     }
 
@@ -7789,6 +7790,7 @@ mod tests {
                         data_type: Some(DataType::Double),
                         nullable: Some(true),
                         ordinal: None,
+                        expr_id: None,
                     })),
                     right: Box::new(int_lit(1)),
                 }),
@@ -10697,6 +10699,7 @@ mod tests {
             data_type: Some(DataType::Integer),
             nullable: Some(true),
             ordinal: Some(2),
+            expr_id: None,
         });
         let unique_no_rewrite = Expression::ColumnReference(ColumnReference {
             name: "id".to_owned(),
@@ -10704,6 +10707,7 @@ mod tests {
             data_type: Some(DataType::Long),
             nullable: Some(false),
             ordinal: Some(0),
+            expr_id: None,
         });
         let deferred_no_ordinal = Expression::ColumnReference(ColumnReference {
             name: "name".to_owned(),
@@ -10711,6 +10715,7 @@ mod tests {
             data_type: Some(DataType::String),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let input = TypedAst::new(
             TypedOp::TableScan {
@@ -12278,6 +12283,7 @@ mod tests {
             data_type: Some(DataType::Long),
             nullable: Some(false),
             ordinal: None,
+            expr_id: None,
         };
         let sql = render_column_reference(&c).expect("render");
         assert_eq!(sql, "emp.id");
@@ -13145,6 +13151,7 @@ mod tests {
             data_type: Some(DataType::Integer),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let sql =
             super::render_sample_by(&typed_input, &col_ref, &[], None).expect("empty fractions ok");
@@ -13407,6 +13414,7 @@ mod tests {
                     data_type: Some(DataType::Timestamp),
                     nullable: Some(true),
                     ordinal: None,
+                    expr_id: None,
                 }),
                 str_lit("yyyy-MM-dd HH:mm:ss"),
             ],
@@ -13542,6 +13550,7 @@ mod tests {
                 data_type: Some(DataType::String),
                 nullable: Some(true),
                 ordinal: None,
+                expr_id: None,
             })),
             updates: vec![("x".to_owned(), None)],
         });
@@ -13563,6 +13572,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_5".to_owned()],
@@ -13596,6 +13606,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_7".to_owned()],
@@ -13636,6 +13647,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x".to_owned(), "i".to_owned()],
@@ -13689,6 +13701,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x".to_owned()],
@@ -13727,6 +13740,7 @@ mod tests {
                         data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
                         nullable: Some(true),
                         ordinal: None,
+                        expr_id: None,
                     }),
                     Expression::Lambda(LambdaExpression {
                         params: vec!["i".to_owned()],
@@ -13845,6 +13859,7 @@ mod tests {
                     data_type: Some(DataType::Array(Box::new(DataType::String), true)),
                     nullable: Some(true),
                     ordinal: None,
+                    expr_id: None,
                 }),
             ],
         );
@@ -13913,6 +13928,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["x_1".to_owned(), "y_2".to_owned()],
@@ -13961,6 +13977,7 @@ mod tests {
             }),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -13999,6 +14016,7 @@ mod tests {
             }),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -14032,6 +14050,7 @@ mod tests {
             }),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
             params: vec!["k".to_owned(), "v".to_owned()],
@@ -14190,6 +14209,7 @@ mod tests {
             }),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let sql = render_fn("size", vec![map_col]);
         assert_eq!(sql, "CAST(cardinality(attrs) AS BIGINT)");
@@ -14216,6 +14236,7 @@ mod tests {
             )),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let sql = render_fn("flatten", vec![outer]);
         assert!(
@@ -14277,6 +14298,7 @@ mod tests {
                         data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
                         nullable: Some(true),
                         ordinal: None,
+                        expr_id: None,
                     }),
                     Expression::Lambda(LambdaExpression {
                         params: vec!["k".to_owned()],
@@ -14665,6 +14687,7 @@ mod tests {
             }),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("team")]);
         assert_eq!(sql, "element_at(attrs, 'team')[1]");
@@ -14683,6 +14706,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let sql = render_fn(
             "element_at",
@@ -14743,6 +14767,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let sql = render_fn(
             "element_at",
@@ -14775,6 +14800,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let sql = render_fn(
             "try_element_at",
@@ -14809,6 +14835,7 @@ mod tests {
             }),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("missing")]);
         assert_eq!(sql, "element_at(attrs, 'missing')[1]");
@@ -14909,6 +14936,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let sql = render_fn("concat_ws", vec![str_lit(","), arr_col]);
         assert_eq!(sql, "COALESCE(array_to_string(tags, ','), '')");
@@ -15024,6 +15052,7 @@ mod tests {
                 }),
                 nullable: Some(true),
                 ordinal: None,
+                expr_id: None,
             })),
             op: BinaryOp::Div,
             right: Box::new(Expression::ColumnReference(ColumnReference {
@@ -15035,6 +15064,7 @@ mod tests {
                 }),
                 nullable: Some(true),
                 ordinal: None,
+                expr_id: None,
             })),
         });
         let sql = render_expr(&expr, &schema).expect("render decimal div");
@@ -15960,6 +15990,7 @@ mod tests {
                     data_type: Some(DataType::String),
                     nullable: Some(true),
                     ordinal: None,
+                    expr_id: None,
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("qty INT, label STRING, price DOUBLE".to_owned()),
@@ -16022,6 +16053,7 @@ mod tests {
                     data_type: Some(DataType::String),
                     nullable: Some(true),
                     ordinal: None,
+                    expr_id: None,
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("qty INT, label STRING".to_owned()),
@@ -16052,6 +16084,7 @@ mod tests {
                     data_type: Some(DataType::String),
                     nullable: Some(true),
                     ordinal: None,
+                    expr_id: None,
                 }),
                 Expression::Literal(Literal {
                     value: LiteralValue::String("a INT, b STRING".to_owned()),
@@ -16085,6 +16118,7 @@ mod tests {
                     data_type: Some(DataType::String),
                     nullable: Some(true),
                     ordinal: None,
+                    expr_id: None,
                 }),
                 Expression::ColumnReference(ColumnReference {
                     name: "schema_col".to_owned(),
@@ -16092,6 +16126,7 @@ mod tests {
                     data_type: Some(DataType::String),
                     nullable: Some(true),
                     ordinal: None,
+                    expr_id: None,
                 }),
             ],
         );
@@ -16190,6 +16225,7 @@ mod tests {
                 data_type: None,
                 nullable: None,
                 ordinal: None,
+                expr_id: None,
             }),
             str_lit(field),
         ]
@@ -16240,6 +16276,7 @@ mod tests {
                 data_type: None,
                 nullable: None,
                 ordinal: None,
+                expr_id: None,
             })],
         );
         let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
@@ -16275,6 +16312,7 @@ mod tests {
                     data_type: None,
                     nullable: None,
                     ordinal: None,
+                    expr_id: None,
                 }),
                 str_lit("a"),
             ],
@@ -16295,6 +16333,7 @@ mod tests {
                 data_type: None,
                 nullable: None,
                 ordinal: None,
+                expr_id: None,
             })],
         );
         let err = render_function_call(&f, &schema).expect_err("must reject arity != 2");
@@ -16441,6 +16480,7 @@ mod tests {
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         })
     }
 
@@ -16576,6 +16616,7 @@ mod tests {
             data_type: Some(DataType::Long),
             nullable: Some(false),
             ordinal: None,
+            expr_id: None,
         });
         let tag_ref = Expression::ColumnReference(ColumnReference {
             name: "tag".to_owned(),
@@ -16583,6 +16624,7 @@ mod tests {
             data_type: Some(DataType::String),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         });
         let proj = TypedAst::new(
             TypedOp::Project {

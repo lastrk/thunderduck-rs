@@ -75,6 +75,7 @@ mod tests {
             data_type: None,
             nullable: None,
             ordinal: None,
+            expr_id: None,
         })
     }
 

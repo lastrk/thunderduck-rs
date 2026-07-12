@@ -7,7 +7,7 @@
 
 use super::analyzer::TypedAst;
 use super::ast::CommonAst;
-use super::schema::ResolvedSchema;
+use super::schema::{ExprId, ResolvedSchema};
 use super::type_inference::TypeInferenceEngine;
 use crate::types::{DataType, StructField, StructType};
 
@@ -231,13 +231,22 @@ pub struct ColumnReference {
     /// `untyped`, or a tier that resolves by name/outer-scope only).
     /// Derived data — excluded from `PartialEq` (see below).
     pub ordinal: Option<usize>,
+    /// N9 increment 2: the [`super::schema::ExprId`] of the
+    /// [`super::schema::Attribute`] this reference resolved to — the same
+    /// attribute `ordinal` indexes into `ctx.schema`. `None` under the exact
+    /// same conditions as `ordinal` (pre-analysis `untyped`, or a tier that
+    /// does not pin a position — see `ordinal`'s doc). Like `ordinal`, this
+    /// is derived resolution data recording *which* attribute the reference
+    /// bound to, not part of the reference's own logical identity — excluded
+    /// from `PartialEq` (see below).
+    pub expr_id: Option<ExprId>,
 }
 
 impl PartialEq for ColumnReference {
-    /// Excludes `ordinal`: it is derived data recording *where* a column
-    /// resolved, not part of the reference's logical identity. Mirrors
-    /// `TypedAst`'s scope-excluding `Eq` — keeps every pre-existing
-    /// equality-based test unchanged.
+    /// Excludes `ordinal` and `expr_id`: both are derived resolution facts
+    /// recording *where*/*which* a column resolved to, not part of the
+    /// reference's logical identity. Mirrors `TypedAst`'s scope-excluding
+    /// `Eq` — keeps every pre-existing equality-based test unchanged.
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
             && self.qualifier == other.qualifier
@@ -1961,6 +1970,7 @@ impl ColumnReference {
             data_type: None,
             nullable: None,
             ordinal: None,
+            expr_id: None,
         })
     }
 }
@@ -2632,6 +2642,7 @@ mod tests {
             data_type: Some(address_struct_type()),
             nullable: Some(true),
             ordinal: None,
+            expr_id: None,
         })
     }
 

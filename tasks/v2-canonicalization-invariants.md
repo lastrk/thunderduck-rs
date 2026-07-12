@@ -50,6 +50,7 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 
 ### N1. Single opacity authority on `Expression`
 
+- **Status: ✅ LANDED** (Pass A1, `ca23e80`): `is_opaque_unit` + `is_resolve_opaque`; 4/4 sites unified; Opus review clean.
 - **Invariant:** "is this variant an opaque/atomic unit (no recursion into it)?" is answered
   by exactly one method.
 - **Today:** the `Lambda | LambdaVariable | RawSql | Interval [| subqueries | Window]` roster
@@ -66,8 +67,7 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 
 ### N2. One type-inference home receiving full argument types
 
-- **Status/scope correction (2026-07-12, Pass A2):** implemented for `map_from_arrays`
-  (commit follows). Discovery during implementation: the invariant's reach is **type-only
+- **Status: ✅ LANDED** (Pass A2) for `map_from_arrays`; scope-corrected during implementation. Discovery during implementation: the invariant's reach is **type-only
   rules**. Rules needing per-argument *expression-level* facts — `map`/`create_map` and the
   `array` family need `f.args[i].nullable(schema)`; `struct`/`to_number`/`from_json` need
   literal values/shapes — cannot move while the resolver receives only `&[DataType]`
@@ -93,6 +93,7 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 
 ### N3. Type-driven return coercion at ONE choke point
 
+- **Status: ✅ LANDED** (Pass A3, `fb17e8b`), with the architect's sharper design: wrapper at `render_function_call`'s single exit + `needs_date_return_cast` roster + `DATE_RETURNING_FNS` const + a DuckDB-executing audit test (the forgotten-cast class is now mechanically checkable). trunc bug fixed; `last_day` verified cast-free; full corpora green.
 - **Invariant:** "the emitted SQL's type must equal the node's inferred type" is enforced
   once, where the type is read off the node — not remembered per function arm.
 - **Today:** `spark_return_cast` (emission.rs:~6330) IS the choke point but handles only 3
@@ -114,6 +115,7 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 
 ### N4. Implicit coercions materialized as explicit `Cast` nodes at analysis
 
+- **Status: ✅ LANDED** (Pass A4, `800d18c`): `materialize_binary_coercions` in `resolve_and_stamp`'s Binary arm; `implicit: bool` on CastExpression (name- and semantic_eq-transparent); `decimalize` private again; render_binary's two re-derivations deleted; R1-6 deferred onto the `date_like_interval_result` seam (`SEAM(R1-6)`); full corpora green.
 - **Invariant:** if Spark's semantics insert a coercion (decimal widening, Date±Interval →
   the date-typed side), the analyzed tree *contains the `Cast` node*; emission renders what
   it sees and never re-derives a coercion.

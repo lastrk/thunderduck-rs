@@ -50,6 +50,7 @@ use super::expression::{
     CastExpression, ColumnReference, Expression, ExtractValueExpression, FunctionCall, Literal,
     LiteralValue, SortOrder, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
+use super::schema::{Attribute, ResolvedSchema};
 use super::type_inference::{
     is_aggregate_classifier_name, is_nondeterministic_fn_name, TypeInferenceEngine,
 };
@@ -64,8 +65,10 @@ pub use super::ast::SetOpKind;
 pub(super) const DEFAULT_SUMMARY_STATS: &[&str] =
     &["count", "mean", "stddev", "min", "25%", "50%", "75%", "max"];
 
-/// τ's schema type alias — points at the shared `StructType`.
-pub type Schema = StructType;
+/// τ's schema type alias — points at [`ResolvedSchema`] (N9 INC-1). This
+/// auto-flips every `&Schema` reader (emission's 54 params among them) to
+/// `&ResolvedSchema` without touching their bodies.
+pub type Schema = ResolvedSchema;
 
 // ── TypedAst / TypedOp ──────────────────────────────────────────────────────
 
@@ -77,7 +80,7 @@ pub struct TypedAst {
     pub op: TypedOp,
     /// The schema of the relation produced by this node — every field has
     /// a resolved (non-`Unresolved`) [`DataType`] and a known `nullable` flag.
-    pub resolved_schema: StructType,
+    pub resolved_schema: ResolvedSchema,
     /// The alias set this node's output exposes to enclosing clauses —
     /// stamped once at construction by [`TypedAst::new`] and consumed by
     /// both the analyzer's [`ResolveContext`] and emission's block builder.
@@ -100,7 +103,7 @@ impl TypedAst {
     /// Analysis is strictly bottom-up, so every child inside `op` is already
     /// stamped; the scope derivation is therefore shallow (reads children's
     /// `scope` fields, never re-walks subtrees).
-    pub fn new(op: TypedOp, resolved_schema: StructType) -> Self {
+    pub fn new(op: TypedOp, resolved_schema: ResolvedSchema) -> Self {
         let mut scope = RelScope::of(&op, &resolved_schema);
         scope.source_quals = source_quals_of(&op, &resolved_schema);
         scope.source_quals_tracked = source_quals_tracked_of(&op, &resolved_schema);
@@ -267,7 +270,7 @@ impl RelScope {
     ///   `Values` / `LocalRelation` / `TableFunction` / `Pivot` / ...):
     ///   EMPTY — these operators retype or reshuffle columns, so no alias
     ///   binding from further down is valid against the CURRENT schema.
-    fn of(op: &TypedOp, resolved_schema: &StructType) -> Self {
+    fn of(op: &TypedOp, resolved_schema: &ResolvedSchema) -> Self {
         match op {
             TypedOp::TableScan { table, alias } => {
                 let range = 0..resolved_schema.len();
@@ -422,7 +425,7 @@ impl RelScope {
 /// error here until classified.
 fn source_quals_of(
     op: &TypedOp,
-    resolved_schema: &StructType,
+    resolved_schema: &ResolvedSchema,
 ) -> Vec<std::collections::BTreeSet<String>> {
     use std::collections::BTreeSet;
 
@@ -498,7 +501,7 @@ fn source_quals_of(
                 let keep_right = !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
                 let using_lower: HashSet<String> =
                     using_columns.iter().map(|s| s.to_lowercase()).collect();
-                let find_idx = |schema: &StructType, name: &str| -> Option<usize> {
+                let find_idx = |schema: &ResolvedSchema, name: &str| -> Option<usize> {
                     schema
                         .fields
                         .iter()
@@ -620,7 +623,7 @@ fn source_quals_of(
 /// of `source_quals_of` rather than a shared return value, so each function
 /// stays a single flat match on `op` — kept in lockstep by mirroring its arms
 /// one-for-one; exhaustive (no `_`) for the same reason.
-fn source_quals_tracked_of(op: &TypedOp, resolved_schema: &StructType) -> bool {
+fn source_quals_tracked_of(op: &TypedOp, resolved_schema: &ResolvedSchema) -> bool {
     match op {
         TypedOp::TableScan { .. } | TypedOp::AliasedRelation { .. } => true,
         scope_passthrough!(input) => input.scope.source_quals_tracked,
@@ -773,7 +776,7 @@ pub enum TypedOp {
         /// The widened output schema — the analyzer's post-sub-sweep result.
         /// When `allow_missing_columns = true`, this is the ordered union of
         /// column names across all children (LEFT-first, then RIGHT's extras).
-        widened_schema: StructType,
+        widened_schema: ResolvedSchema,
     },
     /// A relation with exactly one row and zero columns.
     SingleRow,
@@ -1343,7 +1346,7 @@ fn analyze_node(
 ) -> Result<TypedAst, AnalyzerError> {
     match ast.op {
         // ── Leaves ────────────────────────────────────────────────────────
-        CommonOp::SingleRow => Ok(TypedAst::new(TypedOp::SingleRow, StructType::empty())),
+        CommonOp::SingleRow => Ok(TypedAst::new(TypedOp::SingleRow, ResolvedSchema::empty())),
 
         CommonOp::TableScan { table, alias } => {
             // resolve: seed schema from base_types.
@@ -1356,12 +1359,18 @@ fn analyze_node(
                     })?;
             // At τ's analyzer, we don't rewrite field qualifiers into names —
             // the alias is preserved on the operator itself. future τ work's
-            // renderer handles the alias projection.
-            Ok(TypedAst::new(TypedOp::TableScan { table, alias }, schema))
+            // renderer handles the alias projection. A `TableScan` is an
+            // origination point — mint fresh ids for its columns.
+            Ok(TypedAst::new(
+                TypedOp::TableScan { table, alias },
+                ResolvedSchema::minted(schema),
+            ))
         }
 
         CommonOp::Values { rows, column_names } => {
-            let schema = infer_values_schema(&rows, &column_names)?;
+            // `infer_values_schema` stays `StructType`-returning (no prior
+            // identity to carry); mint fresh ids for this origination point.
+            let schema = ResolvedSchema::minted(infer_values_schema(&rows, &column_names)?);
             let ctx = ResolveContext::bare(&schema, base_types);
             let typed_rows = rows
                 .into_iter()
@@ -1381,7 +1390,10 @@ fn analyze_node(
                 schema: schema.clone(),
                 rows,
             },
-            schema,
+            // The op's own `schema` field stays a plain `StructType`
+            // (declared-shape value, not an identity carrier); the node's
+            // resolved schema mints fresh ids at this origination point.
+            ResolvedSchema::minted(schema),
         )),
 
         CommonOp::FileScan {
@@ -1397,7 +1409,9 @@ fn analyze_node(
                     schema: s.clone(),
                     options,
                 },
-                s,
+                // Same shape as `LocalRelation` above: op keeps its
+                // `StructType`, node schema mints fresh ids.
+                ResolvedSchema::minted(s),
             )),
             None => Err(AnalyzerError::PuntedOperator {
                 op: "FileScan".to_owned(),
@@ -1582,9 +1596,9 @@ fn analyze_node(
             // N7: `aggregates` IS the complete output list by construction —
             // every front-end builds it that way (see `CommonOp::Aggregate`'s
             // doc), so the output schema is a straight map over `aggregates`.
-            let mut output_fields: Vec<StructField> = aggregates
+            let mut output_fields: Vec<Attribute> = aggregates
                 .iter()
-                .map(|e| expr_field(e, &typed_input.resolved_schema))
+                .map(|e| output_attribute(e, &typed_input.resolved_schema))
                 .collect();
             // Spark's Expand node (ROLLUP / CUBE / GROUPING SETS) inserts
             // NULL into every grouping-column position for super-aggregate
@@ -1610,7 +1624,7 @@ fn analyze_node(
                     }
                 }
             }
-            let output_schema = StructType::new(output_fields);
+            let output_schema = ResolvedSchema::new(output_fields);
             Ok(TypedAst::new(
                 TypedOp::Aggregate {
                     input: Box::new(typed_input),
@@ -1782,17 +1796,19 @@ fn analyze_node(
                 .iter()
                 .map(|(old, new)| (old.to_lowercase(), new.clone()))
                 .collect();
-            let mut output_fields: Vec<StructField> =
+            let mut output_fields: Vec<Attribute> =
                 Vec::with_capacity(typed_input.resolved_schema.fields.len());
             for f in &typed_input.resolved_schema.fields {
                 let new_name = rename_map.get(&f.name.to_lowercase()).cloned();
+                // Rename is a pure name mutation on the SAME logical column —
+                // clone-with-new-name keeps the id.
                 let mut nf = f.clone();
                 if let Some(n) = new_name {
                     nf.name = n;
                 }
                 output_fields.push(nf);
             }
-            let output_schema = StructType::new(output_fields);
+            let output_schema = ResolvedSchema::new(output_fields);
             Ok(TypedAst::new(
                 TypedOp::WithColumnsRenamed {
                     input: Box::new(typed_input),
@@ -1806,14 +1822,15 @@ fn analyze_node(
         CommonOp::DropColumns { input, drop_names } => {
             let typed_input = analyze_node(*input, base_types, outer)?;
             let drop_lower: HashSet<String> = drop_names.iter().map(|s| s.to_lowercase()).collect();
-            let mut output_fields: Vec<StructField> =
+            let mut output_fields: Vec<Attribute> =
                 Vec::with_capacity(typed_input.resolved_schema.fields.len());
             for f in &typed_input.resolved_schema.fields {
                 if !drop_lower.contains(&f.name.to_lowercase()) {
+                    // Filter keeps the surviving columns' ids — clone-filter.
                     output_fields.push(f.clone());
                 }
             }
-            let output_schema = StructType::new(output_fields);
+            let output_schema = ResolvedSchema::new(output_fields);
             Ok(TypedAst::new(
                 TypedOp::DropColumns {
                     input: Box::new(typed_input),
@@ -1921,11 +1938,12 @@ fn analyze_lateral_view(
             Ok((alias, resolved))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let generated_schema = StructType::new(
+    // Every generated column here is brand-new — mint a fresh id per column.
+    let generated_schema = ResolvedSchema::new(
         resolved_columns
             .iter()
             .map(|(alias, expr)| {
-                StructField::new(
+                Attribute::minted(
                     alias.clone(),
                     expr.data_type(input_schema),
                     expr.nullable(input_schema),
@@ -1933,7 +1951,9 @@ fn analyze_lateral_view(
             })
             .collect(),
     );
-    let resolved_schema = StructType::merge(&typed_input.resolved_schema, &generated_schema);
+    // The input side is cloned through (same columns, same ids); only the
+    // generated side mints.
+    let resolved_schema = ResolvedSchema::merge(&typed_input.resolved_schema, &generated_schema);
     Ok(TypedAst::new(
         TypedOp::LateralView {
             input: Box::new(typed_input),
@@ -1966,26 +1986,30 @@ fn analyze_with_columns(
     // matched input fields take the assignment's resolved (type, nullable)
     // in place; net-new assignments append in assignment order.
     let plan = with_columns_plan(input_schema, &resolved_assignments);
-    let mut output_fields: Vec<StructField> =
+    let mut output_fields: Vec<Attribute> =
         Vec::with_capacity(input_schema.fields.len() + resolved_assignments.len());
     for (f, replaced_by) in input_schema.fields.iter().zip(&plan.replaced) {
         if let Some(idx) = replaced_by {
+            // Replaced: this slot's VALUE is a new expression — mint. (Same
+            // name/position, but not the same logical column any more.)
             let (_, expr) = &resolved_assignments[*idx];
             let dt = expr.data_type(input_schema);
             let nullable = expr.nullable(input_schema);
             // Preserve the input field's original casing for the name.
-            output_fields.push(StructField::new(f.name.clone(), dt, nullable));
+            output_fields.push(Attribute::minted(f.name.clone(), dt, nullable));
         } else {
+            // Untouched: same logical column — clone keeps the id.
             output_fields.push(f.clone());
         }
     }
     for &i in &plan.appended {
+        // Net-new trailing column — mint.
         let (name, expr) = &resolved_assignments[i];
         let dt = expr.data_type(input_schema);
         let nullable = expr.nullable(input_schema);
-        output_fields.push(StructField::new(name.clone(), dt, nullable));
+        output_fields.push(Attribute::minted(name.clone(), dt, nullable));
     }
-    let output_schema = StructType::new(output_fields);
+    let output_schema = ResolvedSchema::new(output_fields);
     Ok(TypedAst::new(
         TypedOp::WithColumns {
             input: Box::new(typed_input),
@@ -2022,7 +2046,7 @@ pub(super) struct WithColumnsPlan {
 /// append as trailing columns (map insertion overwrites — long-standing
 /// behavior, preserved verbatim).
 pub(super) fn with_columns_plan(
-    input_schema: &StructType,
+    input_schema: &ResolvedSchema,
     assignments: &[(String, Expression)],
 ) -> WithColumnsPlan {
     let mut assigned_lower: HashMap<String, usize> = HashMap::with_capacity(assignments.len());
@@ -2074,7 +2098,7 @@ pub(super) fn na_fill_compatible(col_type: &DataType, value_type: &DataType) -> 
 pub(super) fn na_fill_value_for<'a>(
     cols: &[String],
     values: &'a [Expression],
-    schema: &StructType,
+    schema: &ResolvedSchema,
     col_name: &str,
     col_type: &DataType,
 ) -> Option<&'a Expression> {
@@ -2119,7 +2143,9 @@ fn analyze_na_fill(
             col_type,
         )
     };
-    let mut output_fields: Vec<StructField> =
+    // NaFill mutates nullability only — same logical columns throughout,
+    // so clone (COPY) every field and adjust `nullable` in place.
+    let mut output_fields: Vec<Attribute> =
         Vec::with_capacity(typed_input.resolved_schema.fields.len());
     for f in &typed_input.resolved_schema.fields {
         let fill_expr = filled(&f.name, &f.data_type);
@@ -2134,7 +2160,7 @@ fn analyze_na_fill(
         }
         output_fields.push(nf);
     }
-    let output_schema = StructType::new(output_fields);
+    let output_schema = ResolvedSchema::new(output_fields);
     Ok(TypedAst::new(
         TypedOp::NaFill {
             input: Box::new(typed_input),
@@ -2162,13 +2188,13 @@ fn analyze_to_df(
             ),
         });
     }
-    let mut output_fields: Vec<StructField> = Vec::with_capacity(input_fields.len());
+    // Rename is a pure name mutation on the SAME logical column —
+    // clone-with-new-name keeps the id (same as WithColumnsRenamed).
+    let mut output_fields: Vec<Attribute> = Vec::with_capacity(input_fields.len());
     for (f, new_name) in input_fields.iter().zip(column_names.iter()) {
-        output_fields.push(StructField::new(
-            new_name.clone(),
-            f.data_type.clone(),
-            f.nullable,
-        ));
+        let mut nf = f.clone();
+        nf.name = new_name.clone();
+        output_fields.push(nf);
     }
     // Convert to WithColumnsRenamed for emission simplicity.
     let renames: Vec<(String, String)> = input_fields
@@ -2176,7 +2202,7 @@ fn analyze_to_df(
         .zip(column_names.iter())
         .map(|(f, n)| (f.name.clone(), n.clone()))
         .collect();
-    let output_schema = StructType::new(output_fields);
+    let output_schema = ResolvedSchema::new(output_fields);
     Ok(TypedAst::new(
         TypedOp::WithColumnsRenamed {
             input: Box::new(typed_input),
@@ -2298,7 +2324,7 @@ fn analyze_join(
 
     // resolve+assign_types: resolve condition against merged schema.
     let combined_input_schema =
-        StructType::merge(&typed_left.resolved_schema, &typed_right.resolved_schema);
+        ResolvedSchema::merge(&typed_left.resolved_schema, &typed_right.resolved_schema);
 
     // Ambiguity is now surfaced centrally by `resolve_column` (see
     // its comment). Any unqualified reference — whether in the join
@@ -2359,7 +2385,10 @@ fn analyze_join(
     //                                 semantics: non-null iff either
     //                                 side is non-null).
     //   CROSS                       → USING never applies.
-    let build_using_prefix = |using: &[String]| -> Vec<StructField> {
+    // USING donor: same logical column as the chosen donor side —
+    // clone-with-mutation (FULL coalesces nullability but KEEPS the left
+    // side's id, per N9 INC-1's coalesced-key rule).
+    let build_using_prefix = |using: &[String]| -> Vec<Attribute> {
         let mut fields = Vec::with_capacity(using.len());
         for n in using {
             let left_field = derived_left_schema.field_by_name(n);
@@ -2367,7 +2396,8 @@ fn analyze_join(
             match (join_type, left_field, right_field) {
                 (JoinType::Right, _, Some(rf)) => fields.push(rf.clone()),
                 (JoinType::Full, Some(lf), Some(rf)) => {
-                    // Non-null iff EITHER side is non-null.
+                    // Non-null iff EITHER side is non-null. Keep the LEFT
+                    // side's id — it is the donor of record for FULL/USING.
                     let mut coalesced = lf.clone();
                     coalesced.nullable = lf.nullable && rf.nullable;
                     fields.push(coalesced);
@@ -2394,11 +2424,11 @@ fn analyze_join(
                 }
             }
         }
-        StructType::new(fields)
+        ResolvedSchema::new(fields)
     } else {
         match join_type {
             JoinType::LeftSemi | JoinType::LeftAnti => derived_left_schema.clone(),
-            _ => StructType::merge(&derived_left_schema, &derived_right_schema),
+            _ => ResolvedSchema::merge(&derived_left_schema, &derived_right_schema),
         }
     };
 
@@ -2440,7 +2470,9 @@ fn analyze_recursive_cte(
     // (a) Analyze anchor.
     let typed_anchor = analyze_node(anchor, base_types, outer)?;
 
-    // (b) Rename anchor schema by column_names (positional).
+    // (b) Rename anchor schema by column_names (positional). Renaming is a
+    // pure name mutation on the SAME logical column — clone-with-new-name
+    // keeps the anchor's ids (same COPY pattern as WithColumnsRenamed).
     let cte_schema = if column_names.is_empty() {
         typed_anchor.resolved_schema.clone()
     } else {
@@ -2460,10 +2492,12 @@ fn analyze_recursive_cte(
             .iter()
             .zip(column_names.iter())
             .map(|(f, col_name)| {
-                StructField::new(col_name.clone(), f.data_type.clone(), f.nullable)
+                let mut attr = f.clone();
+                attr.name = col_name.clone();
+                attr
             })
             .collect();
-        StructType::new(fields)
+        ResolvedSchema::new(fields)
     };
 
     // (c) Reject UNION (without ALL) — Spark's UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE.
@@ -2487,6 +2521,9 @@ fn analyze_recursive_cte(
     // that match case-insensitively but differ in case (e.g. the user wrote
     // `WITH RECURSIVE Chain(...) ... FROM Chain c`), and insert the schema
     // under those exact-case keys too — BaseTypes::lookup is case-sensitive.
+    // `BaseTypes` stores plain `StructType` bookkeeping (out of scope for
+    // this increment) — extract field VALUES per-column rather than calling
+    // the banned bulk `to_struct_type()` door.
     let self_ref_schema = StructType::new(
         cte_schema
             .fields
@@ -2530,12 +2567,14 @@ fn analyze_recursive_cte(
     // (h) Pin recursive term types to anchor (anchor-directional).
     push_setop_casts(&mut typed_recursive, &cte_schema);
 
-    let resolved_schema = StructType::new(
+    // The RecursiveCte's own output is a NEW relation (the fixed-point union,
+    // not simply "the anchor" or "the recursive term") — mint fresh ids.
+    let resolved_schema = ResolvedSchema::new(
         cte_schema
             .fields
             .iter()
             .zip(output_nullable)
-            .map(|(f, nullable)| StructField::new(f.name.clone(), f.data_type.clone(), nullable))
+            .map(|(f, nullable)| Attribute::minted(f.name.clone(), f.data_type.clone(), nullable))
             .collect(),
     );
 
@@ -2684,7 +2723,7 @@ fn analyze_set_op(
 /// with NULL — stronger than the OR rule). In the strict `unionByName` case
 /// (equal name sets, guarded by the caller) the missing-name rule never
 /// fires, so this same fold serves both by-name forms.
-fn widen_by_name(children: &[TypedAst]) -> Result<StructType, AnalyzerError> {
+fn widen_by_name(children: &[TypedAst]) -> Result<ResolvedSchema, AnalyzerError> {
     // Build the ordered union of names across all children.
     // Case-insensitive dedup with first-seen casing preserved
     // (matches `StructType::field_by_name`).
@@ -2698,11 +2737,15 @@ fn widen_by_name(children: &[TypedAst]) -> Result<StructType, AnalyzerError> {
             }
         }
     }
-    let mut widened_fields: Vec<StructField> = Vec::with_capacity(ordered_names.len());
+    let mut widened_fields: Vec<Attribute> = Vec::with_capacity(ordered_names.len());
     for name in &ordered_names {
         let mut widened_type: Option<DataType> = None;
         let mut widened_nullable = false;
         let mut any_child_missing = false;
+        // Identity: the FIRST child to carry this name donates its id —
+        // this is the "same logical column" the widened schema is
+        // standing in for at this name.
+        let mut base_attr: Option<Attribute> = None;
         for child in children {
             if let Some(fk) = child.resolved_schema.field_by_name(name) {
                 widened_type = Some(match widened_type {
@@ -2710,6 +2753,9 @@ fn widen_by_name(children: &[TypedAst]) -> Result<StructType, AnalyzerError> {
                     None => fk.data_type.clone(),
                 });
                 widened_nullable = widened_nullable || fk.nullable;
+                if base_attr.is_none() {
+                    base_attr = Some(fk.clone());
+                }
             } else {
                 any_child_missing = true;
             }
@@ -2723,16 +2769,23 @@ fn widen_by_name(children: &[TypedAst]) -> Result<StructType, AnalyzerError> {
         // unconditionally nullable — the other child pads
         // with NULL. Stronger than the OR rule.
         let nullable = widened_nullable || any_child_missing;
-        widened_fields.push(StructField::new(name.clone(), ty, nullable));
+        let mut attr = base_attr.expect("name came from some child, so base_attr is Some");
+        attr.name = name.clone();
+        attr.data_type = ty;
+        attr.nullable = nullable;
+        widened_fields.push(attr);
     }
-    Ok(StructType::new(widened_fields))
+    Ok(ResolvedSchema::new(widened_fields))
 }
 
 /// Widen a positional (by-index) set-op schema across `children`: verify
 /// arity, unify each column index's type across every child, and fold
 /// nullability per Spark's operator-aware rule. Names and order come from the
 /// first child.
-fn widen_by_position(kind: SetOpKind, children: &[TypedAst]) -> Result<StructType, AnalyzerError> {
+fn widen_by_position(
+    kind: SetOpKind,
+    children: &[TypedAst],
+) -> Result<ResolvedSchema, AnalyzerError> {
     let first_len = children[0].resolved_schema.len();
     for (idx, child) in children.iter().enumerate().skip(1) {
         if child.resolved_schema.len() != first_len {
@@ -2745,7 +2798,7 @@ fn widen_by_position(kind: SetOpKind, children: &[TypedAst]) -> Result<StructTyp
             });
         }
     }
-    let mut widened_fields: Vec<StructField> = Vec::with_capacity(first_len);
+    let mut widened_fields: Vec<Attribute> = Vec::with_capacity(first_len);
     for col_idx in 0..first_len {
         let first_field = &children[0].resolved_schema.fields[col_idx];
         // Type widening (ADR-006) is operator-independent: unify the
@@ -2775,13 +2828,14 @@ fn widen_by_position(kind: SetOpKind, children: &[TypedAst]) -> Result<StructTyp
                 .all(|child| child.resolved_schema.fields[col_idx].nullable),
             SetOpKind::Except => first_field.nullable,
         };
-        widened_fields.push(StructField::new(
-            first_field.name.clone(),
-            widened_type,
-            widened_nullable,
-        ));
+        // Identity: child 0's id at this position — the widened schema's
+        // column at index `col_idx` stands in for child 0's own column.
+        let mut attr = first_field.clone();
+        attr.data_type = widened_type;
+        attr.nullable = widened_nullable;
+        widened_fields.push(attr);
     }
-    Ok(StructType::new(widened_fields))
+    Ok(ResolvedSchema::new(widened_fields))
 }
 
 // ── Expression resolution helpers ───────────────────────────────────────────
@@ -2802,7 +2856,7 @@ fn widen_by_position(kind: SetOpKind, children: &[TypedAst]) -> Result<StructTyp
 /// [`resolve_and_stamp`] so downstream analysis never sees `UnresolvedRegex`.
 fn expand_regex_projections(
     projections: Vec<Expression>,
-    input_schema: &StructType,
+    input_schema: &ResolvedSchema,
 ) -> Result<Vec<Expression>, AnalyzerError> {
     expand_projections(projections, |proj| {
         let r = match proj {
@@ -2900,7 +2954,7 @@ fn aliased_call(name: &str, args: Vec<Expression>, alias: String) -> Expression 
 /// downstream analysis never sees a top-level `inline` / `inline_outer`.
 fn expand_inline_projections(
     projections: Vec<Expression>,
-    input_schema: &StructType,
+    input_schema: &ResolvedSchema,
 ) -> Result<Vec<Expression>, AnalyzerError> {
     expand_projections(projections, |proj| {
         // Only fire on a bare top-level `FunctionCall("inline"|"inline_outer",...)`.
@@ -3065,7 +3119,7 @@ fn expand_json_tuple_projections(
                 other => {
                     return Err(AnalyzerError::TypeMismatch {
                         expected: DataType::String,
-                        actual: other.data_type(&StructType::new(vec![])),
+                        actual: other.data_type(&ResolvedSchema::empty()),
                         context: format!(
                             "`json_tuple` field-name at position {} must be a string literal",
                             i + 1
@@ -3317,7 +3371,7 @@ impl LateralAliasTable {
 /// fully-inlined tree.
 fn expand_lateral_column_aliases(
     projections: Vec<Expression>,
-    input_schema: &StructType,
+    input_schema: &ResolvedSchema,
 ) -> Result<Vec<Expression>, AnalyzerError> {
     let mut table = LateralAliasTable::default();
     let mut out = Vec::with_capacity(projections.len());
@@ -3412,7 +3466,7 @@ fn analyze_table_function(
     with_ordinality: bool,
     base_types: &BaseTypes,
 ) -> Result<TypedAst, AnalyzerError> {
-    let empty_schema = StructType::empty();
+    let empty_schema = ResolvedSchema::empty();
     let resolved_args = resolve_expr_list(args, &ResolveContext::bare(&empty_schema, base_types))?;
     // N5: `name` arrives already canonical lowercase from
     // `v2_lowering::table_function_node`, the single construction site — no
@@ -3424,7 +3478,11 @@ fn analyze_table_function(
                 args: resolved_args,
                 with_ordinality,
             },
-            StructType::new(vec![StructField::new("id", DataType::Long, false)]),
+            ResolvedSchema::minted(StructType::new(vec![StructField::new(
+                "id",
+                DataType::Long,
+                false,
+            )])),
         )),
         // Bare `FROM explode(array(1,2,3))` — uncorrelated generator as a TVF.
         // Derive the output schema from the resolved arg's element type via the
@@ -3460,7 +3518,9 @@ fn analyze_table_function(
                     args: resolved_args,
                     with_ordinality,
                 },
-                StructType::new(vec![StructField::new("col", elem_type, nullable)]),
+                ResolvedSchema::minted(StructType::new(vec![StructField::new(
+                    "col", elem_type, nullable,
+                )])),
             ))
         }
         _ => Err(AnalyzerError::PuntedOperator {
@@ -3760,7 +3820,7 @@ fn rebind_over_aggregate(
     child_input: &TypedAst,
     grouping: &[Expression],
     aggregates: &mut Vec<Expression>,
-    schema: &mut StructType,
+    schema: &mut ResolvedSchema,
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<Expression, AnalyzerError> {
@@ -3794,7 +3854,7 @@ fn rebind_over_project(
     original: Expression,
     child_input: &TypedAst,
     projections: &mut Vec<Expression>,
-    schema: &mut StructType,
+    schema: &mut ResolvedSchema,
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<Expression, AnalyzerError> {
@@ -3825,7 +3885,7 @@ fn rebind_over_project(
 /// produces. N8: every output-list entry is already a `NamedExpression`
 /// (bare ref, `Star`, or `Alias`) by construction, so this fn is read-only —
 /// there is no alias to pin.
-fn bind_slot(entries: &[Expression], schema: &StructType, k: usize) -> Expression {
+fn bind_slot(entries: &[Expression], schema: &ResolvedSchema, k: usize) -> Expression {
     debug_assert!(
         matches!(
             &entries[k],
@@ -3897,8 +3957,8 @@ fn promote_aggregate_subtree(
     expr: Expression,
     aggregates: &mut Vec<Expression>,
     grouping: &[Expression],
-    schema: &mut StructType,
-    input_schema: &StructType,
+    schema: &mut ResolvedSchema,
+    input_schema: &ResolvedSchema,
 ) -> Option<Expression> {
     if let Some(k) = aggregates
         .iter()
@@ -3911,7 +3971,10 @@ fn promote_aggregate_subtree(
     let matches_grouping = grouping.iter().any(|g| semantic_eq(&expr, g));
     if is_new_aggregate || matches_grouping {
         let name = unique_hidden_output_name(&expr, aggregates);
-        let field = StructField::new(
+        // Freshly promoted hidden output column — a brand-new logical
+        // column that did not exist in the output list before this point:
+        // MINT (never clone-derive from `input_schema` here).
+        let field = Attribute::minted(
             name.clone(),
             expr.data_type(input_schema),
             expr.nullable(input_schema),
@@ -3946,8 +4009,8 @@ fn promote_aggregate_subtree(
 fn promote_project_subtree(
     expr: Expression,
     projections: &mut Vec<Expression>,
-    schema: &mut StructType,
-    input_schema: &StructType,
+    schema: &mut ResolvedSchema,
+    input_schema: &ResolvedSchema,
 ) -> Option<Expression> {
     if let Some(k) = projections
         .iter()
@@ -3955,12 +4018,22 @@ fn promote_project_subtree(
     {
         return Some(bind_slot(projections, schema, k));
     }
-    if let Expression::ColumnReference(_) = &expr {
-        let field = StructField::new(
-            expression_output_name(&expr),
-            expr.data_type(input_schema),
-            expr.nullable(input_schema),
-        );
+    if let Expression::ColumnReference(cr) = &expr {
+        // Promoting a bare input `ColumnReference` that passes through
+        // unmodified — COPY its existing identity from `input_schema`
+        // (by ordinal, same precedent as `output_attribute`) rather than
+        // minting a fresh one for what is still the same logical column.
+        let field = cr
+            .ordinal
+            .and_then(|k| input_schema.fields.get(k))
+            .cloned()
+            .unwrap_or_else(|| {
+                Attribute::minted(
+                    expression_output_name(&expr),
+                    expr.data_type(input_schema),
+                    expr.nullable(input_schema),
+                )
+            });
         projections.push(expr);
         schema.fields.push(field.clone());
         let k = projections.len() - 1;
@@ -4246,7 +4319,7 @@ pub(crate) const TD_JOIN_RIGHT: &str = "__td_jr";
 /// unrepresentable by construction.
 #[derive(Debug, Clone, Copy)]
 struct OuterScope<'a> {
-    schema: &'a StructType,
+    schema: &'a ResolvedSchema,
     scopes: &'a RelScope,
 }
 
@@ -4259,7 +4332,7 @@ struct ResolveContext<'a> {
     /// The current operator's resolution schema (already outer-join-flipped
     /// and positionally merged, per [`apply_join_nullability`] /
     /// [`StructType::merge`]).
-    schema: &'a StructType,
+    schema: &'a ResolvedSchema,
     /// Alias/table-name → field-range bindings the current node resolves
     /// against — the input's stamped [`RelScope`], borrowed in the common
     /// case; owned only when composed (join conditions bind both sides plus
@@ -4306,7 +4379,7 @@ impl<'a> ResolveContext<'a> {
     /// regardless of join type (SEMI/ANTI included), since Spark's own
     /// resolution runs the fold over both children irrespective of join type.
     fn for_join_condition(
-        schema: &'a StructType,
+        schema: &'a ResolvedSchema,
         left: &'a TypedAst,
         right: &'a TypedAst,
         left_plan_ids: &[i64],
@@ -4372,7 +4445,7 @@ impl<'a> ResolveContext<'a> {
 
     /// Resolve against a bare schema with no alias-scope structure (e.g.
     /// `Values` rows, table-valued-function args against an empty schema).
-    fn bare(schema: &'a StructType, base_types: &'a BaseTypes) -> Self {
+    fn bare(schema: &'a ResolvedSchema, base_types: &'a BaseTypes) -> Self {
         Self {
             schema,
             scopes: std::borrow::Cow::Owned(RelScope::default()),
@@ -4430,7 +4503,10 @@ impl<'a> ResolveContext<'a> {
 ///   emits correctly as `"qualifier"."name"` in DuckDB)
 /// * `q` names a top-level struct column in `schema` and the dot-separated
 ///   segments of `u.name` traverse a chain of struct fields
-fn try_rewrite_nested_struct_path(u: &UnresolvedColumn, schema: &StructType) -> Option<Expression> {
+fn try_rewrite_nested_struct_path(
+    u: &UnresolvedColumn,
+    schema: &ResolvedSchema,
+) -> Option<Expression> {
     if u.plan_id.is_some() {
         return None;
     }
@@ -4531,7 +4607,7 @@ fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<(Data
 /// [`TypeInferenceEngine::column_info_in`]'s own lookup order — exact name
 /// first, then the struct-qualified first segment for a dotted name — so the
 /// stamped ordinal always agrees with the value actually resolved.
-fn field_index(fields: &[StructField], name: &str) -> Option<usize> {
+fn field_index(fields: &[Attribute], name: &str) -> Option<usize> {
     if let Some(i) = fields
         .iter()
         .position(|f| f.name.eq_ignore_ascii_case(name))
@@ -4631,7 +4707,7 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
             // plan_id unknown in scope map — fall through to legacy
             // resolution (the ref may be unambiguous without it).
         }
-        let matches: Vec<&StructField> = ctx
+        let matches: Vec<&Attribute> = ctx
             .schema
             .fields
             .iter()
@@ -4850,7 +4926,7 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     }))
 }
 
-fn stamp_column_reference(c: ColumnReference, schema: &StructType) -> ColumnReference {
+fn stamp_column_reference(c: ColumnReference, schema: &ResolvedSchema) -> ColumnReference {
     let dt = c.data_type.clone().unwrap_or_else(|| {
         TypeInferenceEngine::qualified_column_type(&c.name, c.qualifier.as_deref(), schema)
     });
@@ -4909,30 +4985,50 @@ fn subquery_plan_is_resolved(plan: &SubqueryPlan) -> bool {
 
 // ── Schema / expression naming ──────────────────────────────────────────────
 
-fn schema_has_unresolved(schema: &StructType) -> bool {
+fn schema_has_unresolved(schema: &ResolvedSchema) -> bool {
     schema
         .fields
         .iter()
         .any(|f| f.data_type.contains_unresolved())
 }
 
-/// Build the output [`StructField`] contributed by a projection-position
+/// Build the output [`Attribute`] contributed by a projection-position
 /// expression: name via [`expression_output_name`], type and nullability
-/// resolved against `schema`.
-fn expr_field(e: &Expression, schema: &StructType) -> StructField {
-    StructField::new(
+/// resolved against `input`.
+///
+/// N9 INC-1 identity rule: a bare `ColumnReference` whose `ordinal` indexes
+/// an `input` attribute of the SAME name (defensive filter mirroring
+/// `source_quals_of`'s bounds check) COPIES that attribute's `expr_id` — it
+/// is the identical logical column, merely passed through a `SELECT`.
+/// Everything else (`Alias`, computed expressions) MINTS a fresh id — it is
+/// a genuinely new column.
+fn output_attribute(e: &Expression, input: &ResolvedSchema) -> Attribute {
+    if let Expression::ColumnReference(cr) = e {
+        if let Some(k) = cr.ordinal {
+            if let Some(src) = input.fields.get(k) {
+                if src.name.eq_ignore_ascii_case(&cr.name) {
+                    let mut attr = src.clone();
+                    attr.name = expression_output_name(e);
+                    attr.data_type = e.data_type(input);
+                    attr.nullable = e.nullable(input);
+                    return attr;
+                }
+            }
+        }
+    }
+    Attribute::minted(
         expression_output_name(e),
-        e.data_type(schema),
-        e.nullable(schema),
+        e.data_type(input),
+        e.nullable(input),
     )
 }
 
 fn project_output_schema(
     projections: &[Expression],
     input: &TypedAst,
-) -> Result<StructType, AnalyzerError> {
+) -> Result<ResolvedSchema, AnalyzerError> {
     let input_schema = &input.resolved_schema;
-    let mut fields: Vec<StructField> = Vec::with_capacity(projections.len());
+    let mut fields: Vec<Attribute> = Vec::with_capacity(projections.len());
     for expr in projections {
         match expr {
             Expression::Star(s) => {
@@ -4941,16 +5037,20 @@ fn project_output_schema(
                 // qualifier match against field name).
                 match &s.qualifier {
                     None => {
+                        // Unqualified `*`: the SAME columns, just re-listed —
+                        // clone carries each attribute's id forward.
                         fields.extend(input_schema.fields.iter().cloned());
                     }
                     Some(q) => {
                         // If the qualifier matches a struct field, expand
-                        // that struct's inner fields.
+                        // that struct's inner fields. These inner fields
+                        // never existed as top-level output columns before —
+                        // mint fresh ids for them.
                         if let Some(f) = input_schema.field_by_name(q) {
                             if let DataType::Struct(st) = &f.data_type {
                                 let base_nullable = f.nullable;
                                 for inner in &st.fields {
-                                    fields.push(StructField::new(
+                                    fields.push(Attribute::minted(
                                         inner.name.clone(),
                                         inner.data_type.clone(),
                                         base_nullable || inner.nullable,
@@ -4972,7 +5072,8 @@ fn project_output_schema(
                         // same range order. USING joins stay excluded
                         // automatically (their RelScope is empty), as are
                         // ambiguous duplicates (`lookup` bails on 2+
-                        // matches).
+                        // matches). These are the SAME columns re-listed —
+                        // clone carries each attribute's id forward.
                         if let Some(range) = input.scope.lookup(q) {
                             debug_assert!(range.end <= input_schema.len());
                             if range.end <= input_schema.len() {
@@ -4991,10 +5092,10 @@ fn project_output_schema(
                     }
                 }
             }
-            other => fields.push(expr_field(other, input_schema)),
+            other => fields.push(output_attribute(other, input_schema)),
         }
     }
-    Ok(StructType::new(fields))
+    Ok(ResolvedSchema::new(fields))
 }
 
 // ── Unpivot analysis ────────────────────────────────────────────────────────
@@ -5022,14 +5123,13 @@ fn analyze_unpivot(
     // identifier semantics). Turns O(V·F) name resolution across the id and
     // value lists — plus the empty-values fallback's O(F·I) filter — into
     // O(F + I + V) total.
-    let field_index: HashMap<String, &StructField> = input_schema
+    let field_index: HashMap<String, &Attribute> = input_schema
         .fields
         .iter()
         .map(|f| (f.name.to_ascii_lowercase(), f))
         .collect();
-    let find_field = |name: &str| -> Option<&StructField> {
-        field_index.get(&name.to_ascii_lowercase()).copied()
-    };
+    let find_field =
+        |name: &str| -> Option<&Attribute> { field_index.get(&name.to_ascii_lowercase()).copied() };
 
     // Reject any unresolvable value column with a Spark-emulated
     // `UnknownColumn`. Runs ONCE per path: the Implicit path validates
@@ -5171,21 +5271,25 @@ fn analyze_unpivot(
     }
 
     // Build output schema: <ids> + variable_col (STRING NOT NULL) + value_col.
-    let mut output_fields: Vec<StructField> = Vec::with_capacity(ids.len() + 2);
+    // The id columns pass through unchanged — COPY their existing identity.
+    // `variable_column_name` / `value_column_name` are brand-new synthetic
+    // columns — MINT fresh ids.
+    let mut output_fields: Vec<Attribute> = Vec::with_capacity(ids.len() + 2);
     for id in &ids {
         let f = find_field(id).expect("id column resolved above");
-        output_fields.push((*f).clone());
+        output_fields.push(f.clone());
     }
-    output_fields.push(StructField::not_null(
+    output_fields.push(Attribute::minted(
         variable_column_name.clone(),
         DataType::String,
+        false,
     ));
-    output_fields.push(StructField::new(
+    output_fields.push(Attribute::minted(
         value_column_name.clone(),
         widened_type,
         widened_nullable,
     ));
-    let output_schema = StructType::new(output_fields);
+    let output_schema = ResolvedSchema::new(output_fields);
 
     Ok(TypedAst::new(
         TypedOp::Unpivot {
@@ -5205,17 +5309,18 @@ fn analyze_unpivot(
 /// STRING NOT NULL column followed by one STRING NULLABLE column per
 /// materialised input col. Per-col stats can produce NULL (`TRY_CAST` on a
 /// non-numeric col returns NULL) so every stat column is nullable.
-fn build_stats_output_schema(cols: &[String]) -> StructType {
-    let mut fields: Vec<StructField> = Vec::with_capacity(cols.len() + 1);
+fn build_stats_output_schema(cols: &[String]) -> ResolvedSchema {
+    let mut fields: Vec<Attribute> = Vec::with_capacity(cols.len() + 1);
     // Spark stamps `summary` as nullable=true even though every value is a
     // string literal — see `Dataset.summary()` output schema. Spark parity
     // (ADR-015: schema oracle wins) requires we match, not the STRING NOT
     // NULL that the emission's `'count'` literal would justify.
-    fields.push(StructField::nullable("summary", DataType::String));
+    // Every column here is a brand-new synthesized output column — MINT.
+    fields.push(Attribute::minted("summary", DataType::String, true));
     for c in cols {
-        fields.push(StructField::nullable(c.clone(), DataType::String));
+        fields.push(Attribute::minted(c.clone(), DataType::String, true));
     }
-    StructType::new(fields)
+    ResolvedSchema::new(fields)
 }
 
 /// Materialise a caller-supplied `cols` list against `input_schema`:
@@ -5225,7 +5330,7 @@ fn build_stats_output_schema(cols: &[String]) -> StructType {
 ///     caller's casing (Spark parity).
 fn materialise_stats_cols(
     cols: Vec<String>,
-    input_schema: &StructType,
+    input_schema: &ResolvedSchema,
 ) -> Result<Vec<String>, AnalyzerError> {
     if cols.is_empty() {
         Ok(input_schema.fields.iter().map(|f| f.name.clone()).collect())
@@ -5332,7 +5437,9 @@ fn analyze_freq_items(
 ) -> Result<TypedAst, AnalyzerError> {
     let typed_input = analyze_node(input, base_types, outer)?;
     let materialised = materialise_stats_cols(cols, &typed_input.resolved_schema)?;
-    let output_fields: Vec<StructField> = materialised
+    // Every output column here is a brand-new synthesized `ARRAY<T>` column
+    // (not the source column itself) — MINT.
+    let output_fields: Vec<Attribute> = materialised
         .iter()
         .map(|c| {
             // `materialise_stats_cols` already validated `c` case-insensitively;
@@ -5349,9 +5456,10 @@ fn analyze_freq_items(
             // (not DuckDB's runtime materialisation). Outer column stays
             // non-nullable: the aggregate always returns a value (empty array
             // when no rows meet the support threshold), never NULL.
-            StructField::not_null(
+            Attribute::minted(
                 format!("{c}_freqItems"),
                 DataType::Array(Box::new(src.data_type.clone()), true),
+                false,
             )
         })
         .collect();
@@ -5361,7 +5469,7 @@ fn analyze_freq_items(
             cols: materialised,
             support,
         },
-        StructType::new(output_fields),
+        ResolvedSchema::new(output_fields),
     ))
 }
 
@@ -5455,8 +5563,8 @@ fn analyze_pivot(
     // `literal_to_pivot_column_name` for the `"null"` naming.
 
     // Build the output schema. Grouping columns come first, verbatim.
-    let mut output_fields: Vec<StructField> = Vec::new();
-    output_fields.extend(grouping.iter().map(|g| expr_field(g, input_schema)));
+    let mut output_fields: Vec<Attribute> = Vec::new();
+    output_fields.extend(grouping.iter().map(|g| output_attribute(g, input_schema)));
 
     // `pivot_values` is non-empty by construction — the punt at the top of
     // this fn rejects an empty list, `resolve_expr_list` preserves length,
@@ -5479,10 +5587,10 @@ fn analyze_pivot(
                 format!("{pv_name}_{agg_name}")
             };
             let dt = a.data_type(input_schema);
-            output_fields.push(StructField::nullable(col_name, dt));
+            output_fields.push(Attribute::minted(col_name, dt, true));
         }
     }
-    let output_schema = StructType::new(output_fields);
+    let output_schema = ResolvedSchema::new(output_fields);
 
     Ok(TypedAst::new(
         TypedOp::Pivot {
@@ -5634,7 +5742,7 @@ pub fn crosstab_to_aggregate(
 /// supplies no grouping list. `count(*)` references no column (its `Star`
 /// argument contributes nothing), so every non-pivot column remains grouped.
 fn derive_implicit_grouping(
-    input_schema: &StructType,
+    input_schema: &ResolvedSchema,
     pivot_column: &Expression,
     aggregates: &[Expression],
 ) -> Vec<Expression> {
@@ -5987,7 +6095,7 @@ fn pretty_unary(u: &UnaryExpression) -> String {
 
 // ── Set-op widening (§5) ─────────────────────────────────────────────────────
 
-fn push_setop_casts(ast: &mut TypedAst, widened_schema: &StructType) {
+fn push_setop_casts(ast: &mut TypedAst, widened_schema: &ResolvedSchema) {
     // Only push CASTs into direct `Project` children whose projection list
     // matches the widened schema column-by-column. Non-Project inputs
     // (TableScan, Values, ...) receive their CAST at emission time.
@@ -6016,7 +6124,20 @@ fn push_setop_casts(ast: &mut TypedAst, widened_schema: &StructType) {
             .then(|| target.data_type.clone());
             align_setop_projection(proj, &target.name, cast_to);
         }
-        ast.resolved_schema = widened_schema.clone();
+        // N9 INC-1: overwrite name/type/nullable from `widened_schema`
+        // POSITIONALLY, but KEEP THIS CHILD'S OWN ids — copying the
+        // widened schema's (child-0-derived) ids into every child would
+        // silently reassign this child's columns' identity to child 0's.
+        for (attr, target) in ast
+            .resolved_schema
+            .fields
+            .iter_mut()
+            .zip(&widened_schema.fields)
+        {
+            attr.name = target.name.clone();
+            attr.data_type = target.data_type.clone();
+            attr.nullable = target.nullable;
+        }
     }
 }
 
@@ -6053,29 +6174,34 @@ fn align_setop_projection(expr: &mut Expression, name: &str, cast_to: Option<Dat
 // ── Join helpers (§6) ────────────────────────────────────────────────────────
 
 fn apply_join_nullability(
-    left: &StructType,
-    right: &StructType,
+    left: &ResolvedSchema,
+    right: &ResolvedSchema,
     join_type: JoinType,
-) -> (StructType, StructType) {
+) -> (ResolvedSchema, ResolvedSchema) {
     match join_type {
         JoinType::Inner | JoinType::Cross => (left.clone(), right.clone()),
         JoinType::Left => (left.clone(), flip_all_nullable(right)),
         JoinType::Right => (flip_all_nullable(left), right.clone()),
         JoinType::Full => (flip_all_nullable(left), flip_all_nullable(right)),
-        JoinType::LeftSemi | JoinType::LeftAnti => (left.clone(), StructType::empty()),
+        JoinType::LeftSemi | JoinType::LeftAnti => (left.clone(), ResolvedSchema::empty()),
     }
 }
 
 /// Copy `schema` with every field forced nullable — outer-join padding
 /// semantics. `pub(super)` so `analyzer_fixtures` builds its expected
-/// join schemas from the same helper.
-pub(super) fn flip_all_nullable(schema: &StructType) -> StructType {
+/// join schemas from the same helper. Clone-mutate: every field is the SAME
+/// logical column, only its nullability changes — ids ride through.
+pub(super) fn flip_all_nullable(schema: &ResolvedSchema) -> ResolvedSchema {
     let fields = schema
         .fields
         .iter()
-        .map(|f| StructField::new(f.name.clone(), f.data_type.clone(), true))
+        .map(|f| {
+            let mut attr = f.clone();
+            attr.nullable = true;
+            attr
+        })
         .collect();
-    StructType::new(fields)
+    ResolvedSchema::new(fields)
 }
 
 // ── Values schema inference ─────────────────────────────────────────────────
@@ -6112,7 +6238,7 @@ fn infer_values_schema(
             ),
         });
     }
-    let empty = StructType::empty();
+    let empty = ResolvedSchema::empty();
     let mut fields: Vec<StructField> = Vec::with_capacity(ncols);
     for col_idx in 0..ncols {
         let mut widened = rows[0][col_idx].data_type(&empty);
@@ -6555,9 +6681,12 @@ mod tests {
         let bt = base_types_with_emp_dept();
         let input = analyze(aliased_scan("emp", "e"), &bt).unwrap();
         let columns = vec![("tag".to_owned(), lit_str("x"))];
-        let merged = StructType::merge(
+        let merged = ResolvedSchema::merge(
             &input.resolved_schema,
-            &StructType::new(vec![StructField::nullable("tag", DataType::String)]),
+            &ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+                "tag",
+                DataType::String,
+            )])),
         );
         let typed = TypedAst::new(
             TypedOp::LateralView {
@@ -6814,7 +6943,7 @@ mod tests {
     }
 
     /// The widened schema of a `SetOp` node.
-    fn widened_of(typed: &TypedAst) -> &StructType {
+    fn widened_of(typed: &TypedAst) -> &ResolvedSchema {
         match &typed.op {
             TypedOp::SetOp { widened_schema, .. } => widened_schema,
             other => panic!("expected SetOp, got {other:?}"),
@@ -8191,7 +8320,7 @@ mod tests {
     fn analyze_emp_dept_join(
         jt: JoinType,
         cond: Option<Expression>,
-    ) -> (StructType, StructType, StructType) {
+    ) -> (ResolvedSchema, ResolvedSchema, ResolvedSchema) {
         let bt = base_types_with_emp_dept();
         let ast = join(scan("emp"), scan("dept"), jt, cond);
         let typed = analyze(ast, &bt).unwrap();
@@ -8199,8 +8328,8 @@ mod tests {
         match &typed.op {
             TypedOp::Join { left, .. } => {
                 let left_len = left.resolved_schema.len();
-                let flipped_left = StructType::new(resolved.fields[..left_len].to_vec());
-                let flipped_right = StructType::new(resolved.fields[left_len..].to_vec());
+                let flipped_left = ResolvedSchema::new(resolved.fields[..left_len].to_vec());
+                let flipped_right = ResolvedSchema::new(resolved.fields[left_len..].to_vec());
                 (flipped_left, flipped_right, resolved)
             }
             _ => panic!("expected Join"),
@@ -9241,17 +9370,23 @@ mod tests {
         // report `has_resolved_schema = false`.
         let unresolved = TypedAst::new(
             TypedOp::SingleRow,
-            StructType::new(vec![StructField::nullable("x", DataType::Unresolved)]),
+            ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+                "x",
+                DataType::Unresolved,
+            )])),
         );
         assert!(!has_resolved_schema(&unresolved));
 
         // Or with a Project whose projection contains an UnresolvedColumn.
         let with_unresolved_expr = TypedAst::new(
             TypedOp::Project {
-                input: Box::new(TypedAst::new(TypedOp::SingleRow, StructType::empty())),
+                input: Box::new(TypedAst::new(TypedOp::SingleRow, ResolvedSchema::empty())),
                 projections: vec![unresolved_col("x")],
             },
-            StructType::new(vec![StructField::nullable("x", DataType::Long)]),
+            ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+                "x",
+                DataType::Long,
+            )])),
         );
         assert!(!has_resolved_schema(&with_unresolved_expr));
     }
@@ -10273,7 +10408,7 @@ mod tests {
         base_types_for(&[("emp", emp_schema())])
     }
 
-    fn assert_stats_output_schema(schema: &StructType, expected_col_names: &[&str]) {
+    fn assert_stats_output_schema(schema: &ResolvedSchema, expected_col_names: &[&str]) {
         assert_eq!(
             schema.fields.len(),
             expected_col_names.len() + 1,
@@ -10661,12 +10796,12 @@ mod tests {
 
     // ── Pass 85 — expand_regex_projections + resolution predicate ────────
 
-    fn regex_test_schema() -> StructType {
-        StructType::new(vec![
+    fn regex_test_schema() -> ResolvedSchema {
+        ResolvedSchema::minted(StructType::new(vec![
             StructField::not_null("customer_id", DataType::Long),
             StructField::nullable("name", DataType::String),
             StructField::nullable("order_id", DataType::Long),
-        ])
+        ]))
     }
 
     #[test]
@@ -10879,7 +11014,10 @@ mod tests {
     fn expand_inline_rejects_non_array_of_struct() {
         // `arr : Array<Integer>` — element is not a struct.
         let bad_arg = func("array", vec![int_lit(1)]);
-        let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
+            "id",
+            DataType::Long,
+        )]));
         let err = expand_inline_projections(vec![inline_call(false, bad_arg)], &schema)
             .expect_err("must reject non-Array<Struct<...>>");
         assert!(matches!(err, AnalyzerError::TypeMismatch { .. }));
@@ -10897,7 +11035,10 @@ mod tests {
         // Reference a column that doesn't exist in the schema — data_type
         // returns `Unresolved`, which we treat as a boundary case.
         let unresolved_arg = unresolved_col("no_such_col");
-        let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
+            "id",
+            DataType::Long,
+        )]));
         let err = expand_inline_projections(vec![inline_call(false, unresolved_arg)], &schema)
             .expect_err("must reject Unresolved arg type");
         match &err {
@@ -10921,7 +11062,10 @@ mod tests {
     #[test]
     fn expand_inline_outer_boundary_rejects_unresolved_element_type_with_tdck_prefix() {
         let unresolved_arg = unresolved_col("no_such_col");
-        let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
+            "id",
+            DataType::Long,
+        )]));
         let err = expand_inline_projections(vec![inline_call(true, unresolved_arg)], &schema)
             .expect_err("must reject Unresolved arg type for inline_outer");
         match &err {
@@ -11694,7 +11838,7 @@ mod tests {
     fn lateral_column_alias_chain_inlines_in_one_pass() {
         // a = salary + 1; b = a + 1 (refs `a`); c = b + 1 (refs `b`) — a
         // three-item chain must fully inline in a single left-to-right pass.
-        let schema = emp_schema();
+        let schema = ResolvedSchema::minted(emp_schema());
         let a = alias_expr(
             Expression::Binary(BinaryExpression {
                 op: BinaryOp::Add,
@@ -11743,7 +11887,7 @@ mod tests {
         // lateral source; a later bare `dept_id` ref must stay untouched
         // (falls through to ordinary resolution against the INPUT column,
         // not the alias expression).
-        let schema = emp_schema();
+        let schema = ResolvedSchema::minted(emp_schema());
         let shadow = alias_expr(unresolved_col("id"), "dept_id");
         let later = unresolved_col("dept_id");
         let expanded = expand_lateral_column_aliases(vec![shadow, later], &schema)
@@ -11758,7 +11902,7 @@ mod tests {
     fn lateral_column_alias_ambiguous_when_referenced() {
         // Two earlier items both alias to `x`; a third item references `x`
         // — Spark's AMBIGUOUS_LATERAL_COLUMN_ALIAS (count = 2).
-        let schema = emp_schema();
+        let schema = ResolvedSchema::minted(emp_schema());
         let x1 = alias_expr(unresolved_col("salary"), "x");
         let x2 = alias_expr(unresolved_col("id"), "x");
         let referencer = alias_expr(unresolved_col("x"), "y");
@@ -11776,7 +11920,7 @@ mod tests {
     fn lateral_column_alias_duplicate_name_without_reference_is_not_an_error() {
         // Two same-named aliases with NO later reference is ordinary, legal
         // SQL (duplicate output column names) — must not error.
-        let schema = emp_schema();
+        let schema = ResolvedSchema::minted(emp_schema());
         let x1 = alias_expr(unresolved_col("salary"), "x");
         let x2 = alias_expr(unresolved_col("id"), "x");
         let expanded = expand_lateral_column_aliases(vec![x1, x2], &schema)
@@ -11786,7 +11930,7 @@ mod tests {
 
     #[test]
     fn lateral_column_alias_substitutes_inside_function_call_and_case_when() {
-        let schema = emp_schema();
+        let schema = ResolvedSchema::minted(emp_schema());
         let raised = alias_expr(
             Expression::Binary(BinaryExpression {
                 op: BinaryOp::Mul,
@@ -11858,10 +12002,10 @@ mod tests {
         // `SELECT 1 AS x, transform(arr, x -> x + 1) AS transformed FROM t`
         // — the lambda's OWN bound parameter `x` must NOT be substituted by
         // the outer lateral alias `x`.
-        let schema = StructType::new(vec![StructField::nullable(
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "arr",
             DataType::Array(Box::new(DataType::Integer), true),
-        )]);
+        )]));
         let outer_x = alias_expr(int_lit(1), "x");
         let lambda_body = Expression::Binary(BinaryExpression {
             op: BinaryOp::Add,
@@ -14018,7 +14162,7 @@ mod tests {
 
     #[test]
     fn pretty_name_transparent_over_materialized_div_widen() {
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable(
                 "sum_x",
                 DataType::Decimal {
@@ -14027,7 +14171,7 @@ mod tests {
                 },
             ),
             StructField::nullable("w_sq_ft", DataType::Integer),
-        ]);
+        ]));
         let raw = Expression::Binary(BinaryExpression {
             op: BinaryOp::Div,
             left: Box::new(ColumnReference::untyped("sum_x")),
@@ -14048,7 +14192,10 @@ mod tests {
 
     #[test]
     fn pretty_name_transparent_over_materialized_date_plus_interval() {
-        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
         let raw = Expression::Binary(BinaryExpression {
             op: BinaryOp::Add,
             left: Box::new(ColumnReference::untyped("d")),
@@ -14071,7 +14218,7 @@ mod tests {
 
     #[test]
     fn semantic_eq_strips_implicit_cast_on_div_widen_shape() {
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable(
                 "d",
                 DataType::Decimal {
@@ -14080,7 +14227,7 @@ mod tests {
                 },
             ),
             StructField::nullable("i", DataType::Integer),
-        ]);
+        ]));
         let raw = Expression::Binary(BinaryExpression {
             op: BinaryOp::Div,
             left: Box::new(ColumnReference::untyped("d")),
@@ -14121,7 +14268,10 @@ mod tests {
 
     #[test]
     fn semantic_eq_strips_implicit_cast_on_date_plus_interval_shape() {
-        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
         let raw = Expression::Binary(BinaryExpression {
             op: BinaryOp::Add,
             left: Box::new(ColumnReference::untyped("d")),
@@ -14169,7 +14319,7 @@ mod tests {
         let scanned = analyze(scan("emp"), &bt).expect("scan analyzes");
         let ctx = ResolveContext::of_input(&scanned, &bt, None);
         let baseline_resolved = resolve_and_stamp(computed(), &ctx).expect("baseline resolves");
-        let baseline_field = expr_field(&baseline_resolved, &scanned.resolved_schema);
+        let baseline_field = output_attribute(&baseline_resolved, &scanned.resolved_schema);
 
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
@@ -14379,7 +14529,7 @@ mod tests {
     /// targeted regression guard over representative plans below, not a
     /// generic tree walker); an unlisted variant is a no-op leaf here.
     fn assert_n8_output_list_invariant(ti: &TypedAst) {
-        fn assert_entries(entries: &[Expression], schema: &StructType, ctx: &str) {
+        fn assert_entries(entries: &[Expression], schema: &ResolvedSchema, ctx: &str) {
             // A `Star` entry expands to a variable number of schema fields —
             // this checker only enforces the per-entry SHAPE invariant for a
             // node containing one, skipping the 1:1 positional name check
@@ -14429,7 +14579,8 @@ mod tests {
             } => {
                 // `grouping` is only a PREFIX of the output schema (the
                 // pivot-value columns follow) — check against that prefix.
-                let prefix = StructType::new(ti.resolved_schema.fields[..grouping.len()].to_vec());
+                let prefix =
+                    ResolvedSchema::new(ti.resolved_schema.fields[..grouping.len()].to_vec());
                 assert_entries(grouping, &prefix, "Pivot grouping");
                 assert_n8_output_list_invariant(input);
             }
@@ -14535,6 +14686,282 @@ mod tests {
         });
         assert_n8_output_list_invariant(
             &analyze(pivot_ast, &bt).expect("pivot with explicit computed grouping analyzes"),
+        );
+    }
+
+    // ── N9 INCREMENT 1 — attribute-identity carriage contracts ──────────
+    // (g) (`Attribute`/`ResolvedSchema` `PartialEq` excludes `expr_id`) lives
+    // in `schema.rs`'s own test module, next to the types it exercises.
+    // These six pin the analyzer-side MINT-vs-COPY/passthrough contracts.
+
+    #[test]
+    fn passthrough_filter_over_scan_preserves_input_attribute_ids() {
+        // (a) A pure passthrough operator (Filter, via `passthrough_schema_arm`)
+        // must carry its input's attribute ids through UNCHANGED — same ids,
+        // same order, zero re-minting.
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(emp_scan()),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Gt,
+                left: Box::new(unresolved_col("salary")),
+                right: Box::new(lit_double(1000.0)),
+            }),
+        });
+        let typed = analyze(ast, &bt).expect("filter over scan analyzes");
+        let TypedOp::Filter { input, .. } = &typed.op else {
+            panic!("expected Filter, got {:?}", typed.op);
+        };
+        assert_eq!(typed.resolved_schema.len(), input.resolved_schema.len());
+        for (outer, inner) in typed
+            .resolved_schema
+            .fields
+            .iter()
+            .zip(input.resolved_schema.fields.iter())
+        {
+            assert_eq!(
+                outer.expr_id, inner.expr_id,
+                "Filter is a pure passthrough — attribute ids must ride through unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn project_bare_ref_copies_id_alias_computed_entry_mints_fresh_id() {
+        // (b) A bare, unaliased `ColumnReference` projection entry COPIES its
+        // source attribute's id (same logical column, merely re-listed); an
+        // `Alias`/computed entry MINTS a fresh one (a genuinely new column) —
+        // see `output_attribute`'s doc comment for the exact rule.
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![
+                unresolved_col("id"), // bare ref -> COPY
+                alias_expr(func("upper", vec![unresolved_col("name")]), "name_upper"), // computed -> MINT
+            ],
+        });
+        let typed = analyze(ast, &bt).expect("project over scan analyzes");
+        let TypedOp::Project { input, .. } = &typed.op else {
+            panic!("expected Project, got {:?}", typed.op);
+        };
+        let input_id_attr = input
+            .resolved_schema
+            .field_by_name("id")
+            .expect("emp schema has an id column");
+        assert_eq!(
+            typed.resolved_schema.fields[0].expr_id, input_id_attr.expr_id,
+            "bare column reference must COPY the source attribute's id"
+        );
+        let all_input_ids: Vec<_> = input
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.expr_id)
+            .collect();
+        assert!(
+            !all_input_ids.contains(&typed.resolved_schema.fields[1].expr_id),
+            "Alias/computed projection entry must MINT a fresh id, not reuse any input id"
+        );
+    }
+
+    #[test]
+    fn inner_join_output_schema_concatenates_both_sides_ids_in_order() {
+        // (c) A plain (non-USING, non-SEMI/ANTI) join's output schema is
+        // `ResolvedSchema::merge(left, right)` — left's ids then right's ids,
+        // in order, through `analyze_join`'s real machinery (not just the
+        // low-level `ResolvedSchema::merge` unit, which `schema.rs` already
+        // covers directly).
+        let bt = base_types_with_emp_dept();
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(qcol("e", "dept_id")),
+            right: Box::new(qcol("d", "dept_id")),
+        });
+        let ast = join(
+            aliased_scan("emp", "e"),
+            aliased_scan("dept", "d"),
+            JoinType::Inner,
+            Some(cond),
+        );
+        let typed = analyze(ast, &bt).expect("inner join analyzes");
+        let TypedOp::Join { left, right, .. } = &typed.op else {
+            panic!("expected Join, got {:?}", typed.op);
+        };
+        let expected_ids: Vec<_> = left
+            .resolved_schema
+            .fields
+            .iter()
+            .chain(right.resolved_schema.fields.iter())
+            .map(|f| f.expr_id)
+            .collect();
+        let actual_ids: Vec<_> = typed
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.expr_id)
+            .collect();
+        assert_eq!(
+            actual_ids, expected_ids,
+            "plain join output is left-then-right concatenation, ids included"
+        );
+    }
+
+    #[test]
+    fn sort_hidden_promotion_q078_shape_preserves_ids_through_restamp_and_trim_project() {
+        // (d) THE ABORT-LANDMINE REGRESSION TEST. Same AST shape as
+        // `sort_promotes_project_hidden_column_and_trims_q078_shape`:
+        // `SELECT id, name FROM emp ORDER BY salary` — `salary` is promoted
+        // (design-023 increment 2, the pre-existing Pass-27 hidden-output
+        // mechanism — not an N9 increment) into the Project's own projections, growing its
+        // schema from 2 to 3 columns; `analyze_sort` then unconditionally
+        // re-stamps `ti` via `mem::replace` + `TypedAst::new` (INV2 scope
+        // re-derivation), and a trim `Project` restores the original
+        // 2-column shape on top.
+        //
+        // The landmine: `mem::replace`-and-reconstruct is exactly the shape
+        // of code that could accidentally re-derive (re-mint) a schema
+        // instead of moving it verbatim. This test proves it does NOT:
+        // the pre-existing `id`/`name` ids survive both the re-stamp AND
+        // the trim-Project's own COPY, unchanged end to end.
+        let bt = base_types_with_emp_dept();
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(emp_scan()),
+            projections: vec![unresolved_col("id"), unresolved_col("name")],
+        });
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(project),
+            order: vec![asc_key(unresolved_col("salary"))],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("hidden input column must be promoted, not rejected");
+
+        let TypedOp::Project {
+            input: sort_ast, ..
+        } = &typed.op
+        else {
+            panic!(
+                "expected a trim Project wrapping the Sort, got {:?}",
+                typed.op
+            );
+        };
+        let TypedOp::Sort {
+            input: proj_ast, ..
+        } = &sort_ast.op
+        else {
+            panic!(
+                "expected Sort under the trim Project, got {:?}",
+                sort_ast.op
+            );
+        };
+        // The extended (3-column) Project's own input (the TableScan) is the
+        // ultimate donor of `id`/`name`'s ids, via bare-ref COPY.
+        let TypedOp::Project {
+            input: scan_ast, ..
+        } = &proj_ast.op
+        else {
+            panic!("expected Project under the Sort, got {:?}", proj_ast.op);
+        };
+        let scan_id = scan_ast
+            .resolved_schema
+            .field_by_name("id")
+            .expect("emp scan has id")
+            .expr_id;
+        let scan_name = scan_ast
+            .resolved_schema
+            .field_by_name("name")
+            .expect("emp scan has name")
+            .expr_id;
+
+        // The extended Project's OWN 3-column schema still carries the
+        // scan's ids for its first two, un-promoted columns.
+        assert_eq!(proj_ast.resolved_schema.fields[0].expr_id, scan_id);
+        assert_eq!(proj_ast.resolved_schema.fields[1].expr_id, scan_name);
+
+        // `analyze_sort`'s `mem::replace` re-stamp only re-derives `scope` —
+        // the Sort node's OWN schema (same 3-column extended shape) must
+        // carry the EXACT SAME ids, unchanged by the re-stamp.
+        assert_eq!(sort_ast.resolved_schema.fields[0].expr_id, scan_id);
+        assert_eq!(sort_ast.resolved_schema.fields[1].expr_id, scan_name);
+
+        // The trim Project's own (outer, 2-column) schema — built from bare
+        // `ColumnReference`s pointing at the extended schema's first two
+        // positions — COPIES those same ids: the trim-Project's prefix
+        // carries the SAME ids as the extended schema's prefix.
+        assert_eq!(typed.resolved_schema.fields[0].expr_id, scan_id);
+        assert_eq!(typed.resolved_schema.fields[1].expr_id, scan_name);
+    }
+
+    #[test]
+    fn push_setop_casts_preserves_childs_own_id_not_the_widened_donor_id() {
+        // (e) `push_setop_casts` overwrites a `Project` child's schema
+        // name/type/nullable POSITIONALLY from the widened schema, but must
+        // KEEP the child's OWN id — copying the widened (child-0-derived)
+        // schema's id into every other child would silently reassign that
+        // child's column identity to child 0's.
+        let input = TypedAst::new(
+            TypedOp::TableScan {
+                table: "dept".to_owned(),
+                alias: None,
+            },
+            ResolvedSchema::new(vec![Attribute::minted("dept_id", DataType::Integer, false)]),
+        );
+        let child_attr = Attribute::minted("id", DataType::Integer, false);
+        let child_id = child_attr.expr_id;
+        let mut child = TypedAst::new(
+            TypedOp::Project {
+                input: Box::new(input),
+                projections: vec![Expression::ColumnReference(ColumnReference {
+                    name: "dept_id".to_owned(),
+                    qualifier: None,
+                    data_type: Some(DataType::Integer),
+                    nullable: Some(false),
+                    ordinal: Some(0),
+                })],
+            },
+            ResolvedSchema::new(vec![child_attr]),
+        );
+
+        let widened_attr = Attribute::minted("id", DataType::Long, false);
+        let widened_id = widened_attr.expr_id;
+        let widened_schema = ResolvedSchema::new(vec![widened_attr]);
+
+        push_setop_casts(&mut child, &widened_schema);
+
+        // Name/type overwritten positionally from the widened schema...
+        assert_eq!(child.resolved_schema.fields[0].data_type, DataType::Long);
+        // ...but the id is UNCHANGED — still this child's OWN id, never the
+        // widened (donor) schema's id.
+        assert_eq!(child.resolved_schema.fields[0].expr_id, child_id);
+        assert_ne!(child.resolved_schema.fields[0].expr_id, widened_id);
+    }
+
+    #[test]
+    fn widen_by_position_output_schema_carries_child_zero_ids() {
+        // (f) The widened schema `analyze_set_op` stamps as the `SetOp`
+        // node's OWN `resolved_schema` carries child 0's ids — child 0 is
+        // the identity donor at every column position (see `widen_by_position`'s
+        // doc comment).
+        let left = TypedAst::new(
+            TypedOp::TableScan {
+                table: "emp".to_owned(),
+                alias: None,
+            },
+            ResolvedSchema::new(vec![Attribute::minted("id", DataType::Long, false)]),
+        );
+        let left_id = left.resolved_schema.fields[0].expr_id;
+        let right = TypedAst::new(
+            TypedOp::TableScan {
+                table: "dept".to_owned(),
+                alias: None,
+            },
+            ResolvedSchema::new(vec![Attribute::minted("id", DataType::Integer, false)]),
+        );
+        let widened = widen_by_position(SetOpKind::Union, &[left, right])
+            .expect("single-column arity matches");
+        assert_eq!(
+            widened.fields[0].expr_id, left_id,
+            "the widened schema's column identity donor is child 0"
         );
     }
 }

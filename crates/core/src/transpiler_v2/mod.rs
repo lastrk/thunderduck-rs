@@ -25,6 +25,7 @@ pub mod function_catalog;
 pub mod invariants;
 pub mod macros;
 pub mod rewrites;
+pub mod schema;
 pub(crate) mod spark_errors;
 pub(crate) mod sql_block;
 pub mod statement;
@@ -38,6 +39,7 @@ pub use ast::{CommonAst, CommonOp};
 pub use base_types::BaseTypes;
 pub use error::EmissionError;
 pub use expression::Expression;
+pub use schema::{Attribute, ExprId, ResolvedSchema};
 pub use statement::{render_ddl, DdlStatement, SqlStatement};
 pub use type_inference::TypeInferenceEngine;
 
@@ -73,7 +75,10 @@ pub fn generate_with_schema(
     let typed = analyzer::analyze(plan.clone(), base_types)
         .map_err(analyzer::analyzer_error_to_emission_error)?;
     let sql = emission::dispatch_op(&typed.op, &typed.resolved_schema)?;
-    Ok((sql, typed.resolved_schema))
+    // One of τ's two sanctioned `to_struct_type()` doors (see
+    // `ResolvedSchema::to_struct_type` doc) — the Arrow-schema-stamp
+    // boundary only needs the value shape, not column identity.
+    Ok((sql, typed.resolved_schema.to_struct_type()))
 }
 
 /// τ's schema-analyze entry point.
@@ -90,7 +95,9 @@ pub fn analyze_schema(
 ) -> Result<crate::types::StructType, EmissionError> {
     let typed = analyzer::analyze(plan.clone(), base_types)
         .map_err(analyzer::analyzer_error_to_emission_error)?;
-    Ok(typed.resolved_schema)
+    // The second of τ's two sanctioned `to_struct_type()` doors — see
+    // `generate_with_schema` above.
+    Ok(typed.resolved_schema.to_struct_type())
 }
 
 #[cfg(test)]

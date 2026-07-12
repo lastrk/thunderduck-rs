@@ -19,6 +19,7 @@ use super::expression::{
     BinaryExpression, BinaryOp, Expression, ExtractValueExpression, Literal, LiteralValue,
     StarExpression, UnresolvedColumn,
 };
+use super::schema::ResolvedSchema;
 use crate::types::{DataType, StructField, StructType};
 
 // ── Input-relation schemas ──────────────────────────────────────────────────
@@ -355,6 +356,13 @@ fn except_widens_short_and_long() -> Fixture {
 
 // ── Outer-join nullability fixtures ─────────────────────────────────────────
 
+/// Test-only bridge: `flip_all_nullable` operates on `ResolvedSchema`, but
+/// these fixtures build their `expected` schema as a plain `StructType`
+/// (per `Fixture`'s shape) — mint, flip, then drop back to `StructType`.
+fn flip_all_nullable_struct(schema: StructType) -> StructType {
+    flip_all_nullable(&ResolvedSchema::minted(schema)).to_struct_type()
+}
+
 fn left_outer_join_flips_right_nullability() -> Fixture {
     let ast = CommonAst::new(CommonOp::Join {
         left: Box::new(table_scan("emp")),
@@ -368,7 +376,7 @@ fn left_outer_join_flips_right_nullability() -> Fixture {
         right_plan_ids: vec![],
     });
     // LEFT: left preserved, right flipped nullable.
-    let expected = StructType::merge(&emp_schema(), &flip_all_nullable(&dept_schema()));
+    let expected = StructType::merge(&emp_schema(), &flip_all_nullable_struct(dept_schema()));
     (
         "left_outer_join_flips_right_nullability",
         ast,
@@ -389,7 +397,7 @@ fn right_outer_join_flips_left_nullability() -> Fixture {
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     });
-    let expected = StructType::merge(&flip_all_nullable(&emp_schema()), &dept_schema());
+    let expected = StructType::merge(&flip_all_nullable_struct(emp_schema()), &dept_schema());
     (
         "right_outer_join_flips_left_nullability",
         ast,
@@ -411,8 +419,8 @@ fn full_outer_join_flips_both_sides() -> Fixture {
         right_plan_ids: vec![],
     });
     let expected = StructType::merge(
-        &flip_all_nullable(&emp_schema()),
-        &flip_all_nullable(&dept_schema()),
+        &flip_all_nullable_struct(emp_schema()),
+        &flip_all_nullable_struct(dept_schema()),
     );
     (
         "full_outer_join_flips_both_sides",

@@ -7,6 +7,7 @@
 
 use super::analyzer::TypedAst;
 use super::ast::CommonAst;
+use super::schema::ResolvedSchema;
 use super::type_inference::TypeInferenceEngine;
 use crate::types::{DataType, StructField, StructType};
 
@@ -628,7 +629,7 @@ impl Expression {
     }
 
     /// The Spark-compatible data type of this expression given the input schema.
-    pub fn data_type(&self, schema: &StructType) -> DataType {
+    pub fn data_type(&self, schema: &ResolvedSchema) -> DataType {
         match self {
             Expression::Literal(l) => l.data_type.clone(),
             Expression::ColumnReference(c) => match &c.data_type {
@@ -730,7 +731,7 @@ impl Expression {
     }
 
     /// Whether this expression can produce NULL values.
-    pub fn nullable(&self, schema: &StructType) -> bool {
+    pub fn nullable(&self, schema: &ResolvedSchema) -> bool {
         match self {
             Expression::Literal(l) => matches!(l.value, LiteralValue::Null),
             Expression::ColumnReference(c) => c
@@ -912,7 +913,7 @@ impl Expression {
 
     // ── Binary data-type derivation ──────────────────────────────────────────
 
-    fn binary_data_type(b: &BinaryExpression, schema: &StructType) -> DataType {
+    fn binary_data_type(b: &BinaryExpression, schema: &ResolvedSchema) -> DataType {
         if b.op.is_boolean_result() {
             return DataType::Boolean;
         }
@@ -1009,7 +1010,7 @@ impl Expression {
 
     // ── FunctionCall data-type derivation ────────────────────────────────────
 
-    fn function_call_data_type(f: &FunctionCall, schema: &StructType) -> DataType {
+    fn function_call_data_type(f: &FunctionCall, schema: &ResolvedSchema) -> DataType {
         // Pre-pass for return types that need the argument EXPRESSIONS —
         // literal schemas, literal scales, struct field naming, per-arg
         // nullability. `TypeInferenceEngine::function_return_type` sees only
@@ -1300,7 +1301,7 @@ impl Expression {
             || matches!(name_lower, "hash" | "murmur3" | "xxhash64")
     }
 
-    fn function_call_nullable(f: &FunctionCall, schema: &StructType) -> bool {
+    fn function_call_nullable(f: &FunctionCall, schema: &ResolvedSchema) -> bool {
         // N5: `f.name` is already canonical lowercase; `lower` is kept as an
         // owned `String` (rather than renamed to a borrow) purely so the
         // match below, which threads it through several `_lower`-suffixed
@@ -1511,7 +1512,7 @@ impl Expression {
 
     // ── CaseWhen data-type unification ───────────────────────────────────────
 
-    fn case_when_data_type(cw: &CaseWhenExpression, schema: &StructType) -> DataType {
+    fn case_when_data_type(cw: &CaseWhenExpression, schema: &ResolvedSchema) -> DataType {
         let mut types_iter = cw
             .branches
             .iter()
@@ -1536,7 +1537,7 @@ impl Expression {
 
     // ── Window data-type derivation ──────────────────────────────────────────
 
-    fn window_data_type(w: &WindowFunction, schema: &StructType) -> DataType {
+    fn window_data_type(w: &WindowFunction, schema: &ResolvedSchema) -> DataType {
         match w.func.as_ref() {
             Expression::FunctionCall(f) => {
                 let first_arg_type = f.args.first().map(|a| a.data_type(schema));
@@ -1546,7 +1547,7 @@ impl Expression {
         }
     }
 
-    fn window_nullable(w: &WindowFunction, schema: &StructType) -> bool {
+    fn window_nullable(w: &WindowFunction, schema: &ResolvedSchema) -> bool {
         match w.func.as_ref() {
             Expression::FunctionCall(f) => {
                 if TypeInferenceEngine::window_is_non_nullable(&f.name) {
@@ -1572,7 +1573,7 @@ impl Expression {
 
     // ── ExtractValue derivations ─────────────────────────────────────────────
 
-    fn extract_value_data_type(ev: &ExtractValueExpression, schema: &StructType) -> DataType {
+    fn extract_value_data_type(ev: &ExtractValueExpression, schema: &ResolvedSchema) -> DataType {
         let base_type = ev.child.data_type(schema);
         let field_name = as_string_literal(ev.extraction.as_ref());
         match (&base_type, field_name) {
@@ -1586,7 +1587,7 @@ impl Expression {
         }
     }
 
-    fn extract_value_nullable(ev: &ExtractValueExpression, schema: &StructType) -> bool {
+    fn extract_value_nullable(ev: &ExtractValueExpression, schema: &ResolvedSchema) -> bool {
         let base_nullable = ev.child.nullable(schema);
         let base_type = ev.child.data_type(schema);
         let field_name = as_string_literal(ev.extraction.as_ref());
@@ -1664,7 +1665,7 @@ impl Expression {
 
     // ── UpdateFields derivation ──────────────────────────────────────────────
 
-    fn update_fields_data_type(u: &UpdateFieldsExpression, schema: &StructType) -> DataType {
+    fn update_fields_data_type(u: &UpdateFieldsExpression, schema: &ResolvedSchema) -> DataType {
         let base = u.struct_expr.data_type(schema);
         let DataType::Struct(mut st) = base else {
             return DataType::Unresolved;
@@ -1807,7 +1808,10 @@ fn cast_impl(expr: Expression, to_type: DataType) -> Expression {
 /// resolved) node — never anywhere else: `semantic_eq` relies on BOTH rebind
 /// sides flowing through `resolve_and_stamp`, so materializing anywhere else
 /// would desync them.
-pub(crate) fn materialize_binary_coercions(expr: Expression, schema: &StructType) -> Expression {
+pub(crate) fn materialize_binary_coercions(
+    expr: Expression,
+    schema: &ResolvedSchema,
+) -> Expression {
     let Expression::Binary(b) = expr else {
         return expr;
     };
@@ -2011,7 +2015,10 @@ mod tests {
 
     #[test]
     fn count_if_function_call_is_non_nullable() {
-        let s = StructType::new(vec![StructField::nullable("active", DataType::Boolean)]);
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "active",
+            DataType::Boolean,
+        )]));
         let expr = fcall("count_if", vec![ColumnReference::untyped("active")]);
         assert!(!expr.nullable(&s));
     }
@@ -2019,7 +2026,10 @@ mod tests {
     /// Sanity anchor — `count` over a nullable column must still be non-null.
     #[test]
     fn count_of_nullable_column_is_non_nullable() {
-        let s = StructType::new(vec![StructField::nullable("id", DataType::Long)]);
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "id",
+            DataType::Long,
+        )]));
         let expr = fcall("count", vec![ColumnReference::untyped("id")]);
         assert!(!expr.nullable(&s));
     }
@@ -2028,7 +2038,10 @@ mod tests {
     /// two non-null branches is non-nullable. Corpus witness: cnd-009.
     #[test]
     fn if_with_nullable_predicate_and_non_null_branches_is_non_nullable() {
-        let s = StructType::new(vec![StructField::nullable("salary", DataType::Long)]);
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "salary",
+            DataType::Long,
+        )]));
         let expr = fcall(
             "if",
             vec![
@@ -2050,7 +2063,10 @@ mod tests {
     /// branches is non-nullable.
     #[test]
     fn iif_with_nullable_predicate_and_non_null_branches_is_non_nullable() {
-        let s = StructType::new(vec![StructField::nullable("salary", DataType::Long)]);
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "salary",
+            DataType::Long,
+        )]));
         let expr = fcall(
             "iif",
             vec![
@@ -2070,7 +2086,10 @@ mod tests {
     /// `if` with a nullable true-branch is nullable regardless of predicate.
     #[test]
     fn if_with_nullable_true_branch_is_nullable() {
-        let s = StructType::new(vec![StructField::nullable("v", DataType::String)]);
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "v",
+            DataType::String,
+        )]));
         let expr = fcall(
             "if",
             vec![
@@ -2095,7 +2114,7 @@ mod tests {
             "map",
             vec![str_lit("a"), int_lit(1), str_lit("b"), int_lit(2)],
         );
-        match expr.data_type(&StructType::empty()) {
+        match expr.data_type(&ResolvedSchema::empty()) {
             DataType::Map {
                 key,
                 value,
@@ -2120,7 +2139,7 @@ mod tests {
         let keys = fcall("array", vec![str_lit("x"), str_lit("y")]);
         let values = fcall("array", vec![int_lit(10), int_lit(20)]);
         let expr = fcall("map_from_arrays", vec![keys, values]);
-        match expr.data_type(&StructType::empty()) {
+        match expr.data_type(&ResolvedSchema::empty()) {
             DataType::Map {
                 key,
                 value,
@@ -2147,7 +2166,7 @@ mod tests {
         let keys = fcall("array", vec![str_lit("x"), str_lit("y")]);
         let values = fcall("array", vec![int_lit(10), null_int]);
         let expr = fcall("map_from_arrays", vec![keys, values]);
-        match expr.data_type(&StructType::empty()) {
+        match expr.data_type(&ResolvedSchema::empty()) {
             DataType::Map { value_nullable, .. } => assert!(value_nullable),
             other => panic!("expected Map<..>, got {other:?}"),
         }
@@ -2161,7 +2180,7 @@ mod tests {
             child: Box::new(map),
             extraction: Box::new(str_lit("a")),
         });
-        assert_eq!(ev.data_type(&StructType::empty()), DataType::Integer);
+        assert_eq!(ev.data_type(&ResolvedSchema::empty()), DataType::Integer);
     }
 
     #[test]
@@ -2173,19 +2192,19 @@ mod tests {
             child: Box::new(arr),
             extraction: Box::new(int_lit(0)),
         });
-        assert_eq!(ev.data_type(&StructType::empty()), DataType::Integer);
-        assert!(!ev.nullable(&StructType::empty()));
+        assert_eq!(ev.data_type(&ResolvedSchema::empty()), DataType::Integer);
+        assert!(!ev.nullable(&ResolvedSchema::empty()));
     }
 
     // ── Checklist §1.2 — hash family FunctionCall nullability ──────────────
 
     #[test]
     fn hash_and_xxhash64_are_non_nullable_regardless_of_args() {
-        let s = StructType::new(vec![
+        let s = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("name", DataType::String),
             StructField::nullable("dept_id", DataType::Integer),
             StructField::nullable("salary", DataType::Double),
-        ]);
+        ]));
         // Sanity: the args ARE nullable — proves the fix (not a default arm)
         // is responsible for the non-null result.
         assert!(ColumnReference::untyped("name").nullable(&s));
@@ -2220,7 +2239,10 @@ mod tests {
     /// place of the retired `AGGREGATE_NAMES` const — same membership.)
     #[test]
     fn function_call_nullable_lists_are_symmetric_with_aggregate_is_non_nullable() {
-        let schema = StructType::new(vec![StructField::nullable("x", DataType::Long)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "x",
+            DataType::Long,
+        )]));
         for name in aggregate_classifier_names() {
             if !TypeInferenceEngine::aggregate_is_non_nullable(name) {
                 continue;
@@ -2242,21 +2264,30 @@ mod tests {
     #[test]
     fn window_function_call_is_never_nullable() {
         // Nullable timestamp arg — struct itself must still be non-null.
-        let schema = StructType::new(vec![StructField::nullable("ts", DataType::Timestamp)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "ts",
+            DataType::Timestamp,
+        )]));
         let expr = fcall(
             "window",
             vec![ColumnReference::untyped("ts"), str_lit("1 day")],
         );
         assert!(!expr.nullable(&schema));
         // Also non-nullable when the timestamp arg is non-null.
-        let schema_nn = StructType::new(vec![StructField::not_null("ts", DataType::Timestamp)]);
+        let schema_nn = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
+            "ts",
+            DataType::Timestamp,
+        )]));
         assert!(!expr.nullable(&schema_nn));
     }
 
     /// §8.3 — the hash family must be in the FunctionCall non-nullable literal list.
     #[test]
     fn hash_family_is_in_function_call_nullable_literal_list() {
-        let schema = StructType::new(vec![StructField::nullable("x", DataType::String)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "x",
+            DataType::String,
+        )]));
         for name in HASH_FAMILY_NAMES {
             let expr = fcall(name, vec![ColumnReference::untyped("x")]);
             assert!(
@@ -2274,7 +2305,10 @@ mod tests {
     /// test_exp / test_log.
     #[test]
     fn math_functions_are_always_nullable_over_non_null_input() {
-        let schema = StructType::new(vec![StructField::not_null("x", DataType::Double)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
+            "x",
+            DataType::Double,
+        )]));
         let unary_cases: &[&str] = &[
             "ceil", "ceiling", "floor", "exp", "ln", "log", "log10", "log2",
         ];
@@ -2304,7 +2338,7 @@ mod tests {
 
     #[test]
     fn literal_data_type_and_nullability() {
-        let s = StructType::empty();
+        let s = ResolvedSchema::empty();
         let lit_int = int_lit(42);
         assert_eq!(lit_int.data_type(&s), DataType::Integer);
         assert!(!lit_int.nullable(&s));
@@ -2318,10 +2352,10 @@ mod tests {
 
     #[test]
     fn binary_eq_is_boolean() {
-        let s = StructType::new(vec![
+        let s = ResolvedSchema::minted(StructType::new(vec![
             StructField::not_null("a", DataType::Integer),
             StructField::not_null("b", DataType::Integer),
-        ]);
+        ]));
         let expr = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
             left: Box::new(ColumnReference::untyped("a")),
@@ -2333,7 +2367,10 @@ mod tests {
 
     #[test]
     fn cast_data_type_is_target_type() {
-        let s = StructType::new(vec![StructField::not_null("x", DataType::Integer)]);
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
+            "x",
+            DataType::Integer,
+        )]));
         let expr = Expression::Cast(CastExpression {
             expr: Box::new(ColumnReference::untyped("x")),
             to_type: DataType::Double,
@@ -2346,7 +2383,10 @@ mod tests {
 
     #[test]
     fn try_cast_is_nullable() {
-        let s = StructType::new(vec![StructField::not_null("x", DataType::Integer)]);
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
+            "x",
+            DataType::Integer,
+        )]));
         let expr = Expression::Cast(CastExpression {
             expr: Box::new(ColumnReference::untyped("x")),
             to_type: DataType::Double,
@@ -2358,7 +2398,10 @@ mod tests {
 
     #[test]
     fn alias_propagates_inner() {
-        let s = StructType::new(vec![StructField::not_null("x", DataType::Long)]);
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
+            "x",
+            DataType::Long,
+        )]));
         let expr = Expression::Alias(AliasExpression {
             expr: Box::new(ColumnReference::untyped("x")),
             alias: "y".to_owned(),
@@ -2398,7 +2441,7 @@ mod tests {
 
     #[test]
     fn unresolved_regex_data_type_is_unresolved_and_nullable_true() {
-        let s = StructType::empty();
+        let s = ResolvedSchema::empty();
         let expr = Expression::UnresolvedRegex(UnresolvedRegexExpression {
             pattern: ".*".to_owned(),
             plan_id: None,
@@ -2436,7 +2479,7 @@ mod tests {
     #[test]
     fn exists_subquery_data_type_boolean() {
         use super::super::ast::{CommonAst, CommonOp};
-        let s = StructType::empty();
+        let s = ResolvedSchema::empty();
         let expr = Expression::ExistsSubquery(ExistsSubquery {
             subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
             negated: false,
@@ -2448,7 +2491,7 @@ mod tests {
     #[test]
     fn in_subquery_is_nullable_three_valued() {
         use super::super::ast::{CommonAst, CommonOp};
-        let s = StructType::empty();
+        let s = ResolvedSchema::empty();
         let expr = Expression::InSubquery(InSubquery {
             expr: Box::new(ColumnReference::untyped("x")),
             subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
@@ -2462,7 +2505,7 @@ mod tests {
     #[test]
     fn scalar_subquery_unanalyzed_data_type_unresolved() {
         use super::super::ast::{CommonAst, CommonOp};
-        let s = StructType::empty();
+        let s = ResolvedSchema::empty();
         let expr = Expression::ScalarSubquery(ScalarSubquery {
             subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
         });
@@ -2473,11 +2516,14 @@ mod tests {
     #[test]
     fn scalar_subquery_analyzed_data_type_from_inner_col() {
         use super::super::analyzer::{TypedAst, TypedOp};
-        let s = StructType::empty();
+        let s = ResolvedSchema::empty();
         // A hand-built analyzed inner plan whose single output column is Long.
         let inner = TypedAst::new(
             TypedOp::SingleRow,
-            StructType::new(vec![StructField::nullable("max_salary", DataType::Long)]),
+            ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+                "max_salary",
+                DataType::Long,
+            )])),
         );
         let expr = Expression::ScalarSubquery(ScalarSubquery {
             subquery: SubqueryPlan::Analyzed(Box::new(inner)),
@@ -2492,10 +2538,10 @@ mod tests {
     /// `DataType::Struct{ name: String, age: Integer }`.
     #[test]
     fn struct_data_type_is_named_struct() {
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("name", DataType::String),
             StructField::not_null("age", DataType::Integer),
-        ]);
+        ]));
         let expr = fcall(
             "struct",
             vec![
@@ -2522,7 +2568,10 @@ mod tests {
     /// §9 test 8 — alias name wins in `struct(...)` field-name derivation.
     #[test]
     fn struct_data_type_alias_wins() {
-        let schema = StructType::new(vec![StructField::nullable("name", DataType::String)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "name",
+            DataType::String,
+        )]));
         let aliased = Expression::Alias(AliasExpression {
             expr: Box::new(ColumnReference::untyped("name")),
             alias: "who".to_owned(),
@@ -2541,10 +2590,10 @@ mod tests {
     /// Companion — `named_struct` fast-path picks up literal keys.
     #[test]
     fn named_struct_data_type_uses_literal_keys() {
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("a", DataType::Integer),
             StructField::nullable("b", DataType::String),
-        ]);
+        ]));
         let expr = fcall(
             "named_struct",
             vec![
@@ -2590,10 +2639,10 @@ mod tests {
     /// list, preserving the existing fields.
     #[test]
     fn update_fields_with_field_adds_new_field() {
-        let schema = StructType::new(vec![StructField::nullable(
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "address",
             address_struct_type(),
-        )]);
+        )]));
         let expr = Expression::UpdateFields(UpdateFieldsExpression {
             struct_expr: Box::new(address_column()),
             updates: vec![("country".to_owned(), Some(str_lit("AT")))],
@@ -2614,10 +2663,10 @@ mod tests {
     /// type/nullability in place.
     #[test]
     fn update_fields_with_field_replaces_existing_field() {
-        let schema = StructType::new(vec![StructField::nullable(
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "address",
             address_struct_type(),
-        )]);
+        )]));
         let expr = Expression::UpdateFields(UpdateFieldsExpression {
             struct_expr: Box::new(address_column()),
             updates: vec![("city".to_owned(), Some(str_lit("Vienna")))],
@@ -2635,10 +2684,10 @@ mod tests {
     /// `dropFields("geo")` removes the named field from the struct.
     #[test]
     fn update_fields_drop_field_removes_field() {
-        let schema = StructType::new(vec![StructField::nullable(
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "address",
             address_struct_type(),
-        )]);
+        )]));
         let expr = Expression::UpdateFields(UpdateFieldsExpression {
             struct_expr: Box::new(address_column()),
             updates: vec![("geo".to_owned(), None)],
@@ -2656,10 +2705,10 @@ mod tests {
     /// `dropFields` is case-insensitive per Spark semantics.
     #[test]
     fn update_fields_drop_field_is_case_insensitive() {
-        let schema = StructType::new(vec![StructField::nullable(
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "address",
             address_struct_type(),
-        )]);
+        )]));
         let expr = Expression::UpdateFields(UpdateFieldsExpression {
             struct_expr: Box::new(address_column()),
             updates: vec![("GEO".to_owned(), None)],
@@ -2678,10 +2727,10 @@ mod tests {
     /// original declared field name `"city"`, matching Spark 4.1.
     #[test]
     fn update_fields_with_field_is_case_insensitive_and_preserves_original_name() {
-        let schema = StructType::new(vec![StructField::nullable(
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "address",
             address_struct_type(),
-        )]);
+        )]));
         let expr = Expression::UpdateFields(UpdateFieldsExpression {
             struct_expr: Box::new(address_column()),
             updates: vec![("CITY".to_owned(), Some(str_lit("Vienna")))],
@@ -2705,10 +2754,10 @@ mod tests {
     /// (`render_update_fields_mixed_case_agrees_with_analyzer`).
     #[test]
     fn update_fields_analyzer_schema_matches_mixed_case_ops() {
-        let schema = StructType::new(vec![StructField::nullable(
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "address",
             address_struct_type(),
-        )]);
+        )]));
         let expr = Expression::UpdateFields(UpdateFieldsExpression {
             struct_expr: Box::new(address_column()),
             updates: vec![
@@ -2729,10 +2778,10 @@ mod tests {
 
     #[test]
     fn corr_family_functioncall_returns_double() {
-        let s = StructType::new(vec![
+        let s = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("a", DataType::Integer),
             StructField::nullable("b", DataType::Integer),
-        ]);
+        ]));
         for name in CORR_FAMILY_NAMES {
             let expr = fcall(
                 name,
@@ -2752,10 +2801,10 @@ mod tests {
     /// because the seed `F.lit("")` is a String literal.
     #[test]
     fn aggregate_hof_returns_seed_type_not_array_type() {
-        let s = StructType::new(vec![StructField::nullable(
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "tags",
             DataType::Array(Box::new(DataType::String), true),
-        )]);
+        )]));
         let expr = fcall(
             "aggregate",
             vec![
@@ -2777,10 +2826,10 @@ mod tests {
     /// Numeric seed → aggregate returns numeric, not array.
     #[test]
     fn aggregate_hof_with_long_seed_returns_long() {
-        let s = StructType::new(vec![StructField::nullable(
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "nums",
             DataType::Array(Box::new(DataType::Long), true),
-        )]);
+        )]));
         let expr = fcall(
             "reduce",
             vec![
@@ -2799,10 +2848,10 @@ mod tests {
     #[test]
     fn aggregate_hof_nullable_with_non_null_array_and_seed() {
         // Non-nullable array column + non-nullable seed → still nullable.
-        let s = StructType::new(vec![StructField::not_null(
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
             "nums",
             DataType::Array(Box::new(DataType::Integer), false),
-        )]);
+        )]));
         for name in ["aggregate", "reduce", "list_reduce"] {
             let expr = fcall(
                 name,
@@ -2822,10 +2871,10 @@ mod tests {
     /// Same as above but with a nullable array column — still always nullable.
     #[test]
     fn aggregate_hof_nullable_with_nullable_array() {
-        let s = StructType::new(vec![StructField::nullable(
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "nums",
             DataType::Array(Box::new(DataType::Long), true),
-        )]);
+        )]));
         let expr = fcall(
             "aggregate",
             vec![
@@ -2844,15 +2893,15 @@ mod tests {
 
     /// Schema holding a single `arr : Array<Struct<name STRING?, age INT?>>`
     /// column — the canonical Pass-90 fixture.
-    fn inline_test_schema(arr_contains_null: bool) -> StructType {
+    fn inline_test_schema(arr_contains_null: bool) -> ResolvedSchema {
         let element = DataType::Struct(StructType::new(vec![
             StructField::nullable("name", DataType::String),
             StructField::nullable("age", DataType::Integer),
         ]));
-        StructType::new(vec![StructField::nullable(
+        ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "arr",
             DataType::Array(Box::new(element), arr_contains_null),
-        )])
+        )]))
     }
 
     fn inline_field_call(arr_col: &str, field: &str, outer: bool) -> Expression {
@@ -2906,10 +2955,10 @@ mod tests {
             StructField::not_null("name", DataType::String),
             StructField::not_null("age", DataType::Integer),
         ]));
-        let s = StructType::new(vec![StructField::not_null(
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
             "arr",
             DataType::Array(Box::new(element), false),
-        )]);
+        )]));
         assert!(inline_field_call("arr", "name", true).nullable(&s));
         assert!(inline_field_call("arr", "age", true).nullable(&s));
     }
@@ -2923,17 +2972,17 @@ mod tests {
             StructField::not_null("name", DataType::String),
             StructField::not_null("age", DataType::Integer),
         ]));
-        let s1 = StructType::new(vec![StructField::not_null(
+        let s1 = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
             "arr",
             DataType::Array(Box::new(element_notnull.clone()), false),
-        )]);
+        )]));
         assert!(!inline_field_call("arr", "name", false).nullable(&s1));
 
         // Case 2: containsNull=true → nullable.
-        let s2 = StructType::new(vec![StructField::not_null(
+        let s2 = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
             "arr",
             DataType::Array(Box::new(element_notnull.clone()), true),
-        )]);
+        )]));
         assert!(inline_field_call("arr", "name", false).nullable(&s2));
 
         // Case 3: struct field itself nullable → nullable.
@@ -2941,18 +2990,18 @@ mod tests {
             StructField::nullable("name", DataType::String),
             StructField::not_null("age", DataType::Integer),
         ]));
-        let s3 = StructType::new(vec![StructField::not_null(
+        let s3 = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
             "arr",
             DataType::Array(Box::new(element_field_null), false),
-        )]);
+        )]));
         assert!(inline_field_call("arr", "name", false).nullable(&s3));
         assert!(!inline_field_call("arr", "age", false).nullable(&s3));
 
         // Case 4: arr nullable → nullable.
-        let s4 = StructType::new(vec![StructField::nullable(
+        let s4 = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
             "arr",
             DataType::Array(Box::new(element_notnull), false),
-        )]);
+        )]));
         assert!(inline_field_call("arr", "name", false).nullable(&s4));
     }
 
@@ -2970,7 +3019,10 @@ mod tests {
     #[test]
     fn json_tuple_field_data_type_is_string() {
         // json_str typed as String, non-null — return type STRING regardless.
-        let s = StructType::new(vec![StructField::not_null("json_str", DataType::String)]);
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
+            "json_str",
+            DataType::String,
+        )]));
         assert_eq!(
             json_tuple_field_call("json_str", "a").data_type(&s),
             DataType::String
@@ -2983,7 +3035,10 @@ mod tests {
     fn json_tuple_field_is_always_nullable() {
         // Even with a non-nullable `json_str`, the field lookup can miss →
         // nullable=true.
-        let s = StructType::new(vec![StructField::not_null("json_str", DataType::String)]);
+        let s = ResolvedSchema::minted(StructType::new(vec![StructField::not_null(
+            "json_str",
+            DataType::String,
+        )]));
         assert!(json_tuple_field_call("json_str", "a").nullable(&s));
     }
 
@@ -3091,7 +3146,8 @@ mod tests {
     /// Resolve `name(args...)` against a single-column schema of `col_type`,
     /// where `args[0]` references that column.
     fn call_type(name: &str, args: Vec<Expression>, col_type: DataType) -> DataType {
-        let schema = StructType::new(vec![StructField::nullable("c", col_type)]);
+        let schema =
+            ResolvedSchema::minted(StructType::new(vec![StructField::nullable("c", col_type)]));
         fcall(name, args).data_type(&schema)
     }
 
@@ -3172,10 +3228,10 @@ mod tests {
     #[test]
     fn mod_pmod_both_decimal_widens() {
         // mod(Decimal(10,2), Decimal(6,3)) → Decimal(6,3) per decimal_mod_type.
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("d1", dec(10, 2)),
             StructField::nullable("d2", dec(6, 3)),
-        ]);
+        ]));
         let expr = fcall(
             "mod",
             vec![
@@ -3190,11 +3246,11 @@ mod tests {
     fn mod_non_decimal_delegates_to_first_arg_resolver() {
         // int/int and bigint/int fall through to function_return_type, which
         // types them via the first (wider) arg — the path that greens today.
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("a", DataType::Integer),
             StructField::nullable("b", DataType::Integer),
             StructField::nullable("lng", DataType::Long),
-        ]);
+        ]));
         let mod_ii = fcall(
             "mod",
             vec![ColumnReference::untyped("a"), ColumnReference::untyped("b")],
@@ -3230,10 +3286,10 @@ mod tests {
         // = raw_precision 15+20+1=36, raw_scale 2+0=2 → Decimal(36,2).
         // (NOT `unify_decimal(15,2,20,0)` = Decimal(22,2), the old
         // union-widening result.)
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("d", dec(15, 2)),
             StructField::nullable("n", DataType::Long),
-        ]);
+        ]));
         let expr = bin(
             BinaryOp::Mul,
             ColumnReference::untyped("d"),
@@ -3248,7 +3304,8 @@ mod tests {
         // MINIMAL precision (3,0) — the digit count of 100 — NOT
         // `decimal_form(Integer)` = (10,0). decimal_mul_type(7,2,3,0) =
         // raw_precision 7+3+1=11, raw_scale 2 → Decimal(11,2).
-        let schema = StructType::new(vec![StructField::nullable("d", dec(7, 2))]);
+        let schema =
+            ResolvedSchema::minted(StructType::new(vec![StructField::nullable("d", dec(7, 2))]));
         let expr = bin(BinaryOp::Mul, ColumnReference::untyped("d"), int_lit(100));
         let result = expr.data_type(&schema);
         assert_eq!(result, dec(11, 2));
@@ -3262,7 +3319,8 @@ mod tests {
         // Decimal(5,2) + Int literal 3: fromLiteral(3) = (1,0).
         // decimal_add_type(5,2,1,0): scale=max(2,0)=2,
         // int_digits=max(3,1)=3, precision=min(3+2+1,38)=6 → Decimal(6,2).
-        let schema = StructType::new(vec![StructField::nullable("d", dec(5, 2))]);
+        let schema =
+            ResolvedSchema::minted(StructType::new(vec![StructField::nullable("d", dec(5, 2))]));
         let expr = bin(BinaryOp::Add, ColumnReference::untyped("d"), int_lit(3));
         assert_eq!(expr.data_type(&schema), dec(6, 2));
     }
@@ -3272,7 +3330,10 @@ mod tests {
         // tpcds-q058 shape: Decimal(19,2) / Int literal 3. fromLiteral(3) =
         // (1,0). decimal_div_type(19,2,1,0): scale_raw=max(6,2+1+1)=6,
         // precision_raw=19-2+0+6=23 → Decimal(23,6).
-        let schema = StructType::new(vec![StructField::nullable("d", dec(19, 2))]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            dec(19, 2),
+        )]));
         let expr = bin(BinaryOp::Div, ColumnReference::untyped("d"), int_lit(3));
         assert_eq!(expr.data_type(&schema), dec(23, 6));
     }
@@ -3281,10 +3342,10 @@ mod tests {
     fn decimal_times_double_stays_promote_numeric() {
         // Decimal ⊗ Double must NOT be coerced through decimal arithmetic —
         // Spark: decimal ⊗ double → double, unchanged from before this pass.
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("d", dec(10, 2)),
             StructField::nullable("f", DataType::Double),
-        ]);
+        ]));
         let expr = bin(
             BinaryOp::Mul,
             ColumnReference::untyped("d"),
@@ -3297,7 +3358,7 @@ mod tests {
     fn int_div_int_still_double() {
         // Int/Int division still promotes to Double — this pass only
         // changes decimal ⊗ integral, not integral ⊗ integral.
-        let schema = StructType::empty();
+        let schema = ResolvedSchema::empty();
         let expr = bin(BinaryOp::Div, int_lit(6), int_lit(2));
         assert_eq!(expr.data_type(&schema), DataType::Double);
     }
@@ -3306,10 +3367,10 @@ mod tests {
     fn both_decimal_unchanged() {
         // Both sides Decimal must still produce exactly today's result —
         // this path is untouched by this pass.
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("d1", dec(10, 2)),
             StructField::nullable("d2", dec(6, 3)),
-        ]);
+        ]));
         let expr = bin(
             BinaryOp::Mul,
             ColumnReference::untyped("d1"),
@@ -3326,10 +3387,10 @@ mod tests {
         // formulas (regression guard: the decimal-coercion block must not
         // swallow IntDiv). Covers decimal // integer-literal AND decimal //
         // decimal (a pre-existing defect this also corrects).
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("d1", dec(10, 2)),
             StructField::nullable("d2", dec(6, 3)),
-        ]);
+        ]));
         assert_eq!(
             bin(BinaryOp::IntDiv, ColumnReference::untyped("d1"), int_lit(3)).data_type(&schema),
             DataType::Long,
@@ -3350,7 +3411,10 @@ mod tests {
         // Decimal on the RIGHT (the `(None, Some)` coercion arm) with a
         // non-commutative op: the int literal `100` coerces to (3,0) as the
         // NUMERATOR, the decimal column stays the denominator.
-        let schema = StructType::new(vec![StructField::nullable("d", dec(10, 2))]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            dec(10, 2),
+        )]));
         let expr = bin(BinaryOp::Div, int_lit(100), ColumnReference::untyped("d"));
         // decimal_div_type(3,0,10,2) — left/numerator is the coerced literal.
         assert_eq!(
@@ -3361,7 +3425,7 @@ mod tests {
 
     #[test]
     fn interval_kind_maps_to_spark_data_type() {
-        let schema = StructType::empty();
+        let schema = ResolvedSchema::empty();
         let with_kind = |kind| {
             Expression::Interval(IntervalExpression {
                 months: 0,
@@ -3386,7 +3450,7 @@ mod tests {
 
     #[test]
     fn interval_literal_is_non_nullable_for_all_kinds() {
-        let schema = StructType::empty();
+        let schema = ResolvedSchema::empty();
         for kind in [
             IntervalKind::YearMonth,
             IntervalKind::DayTime,
@@ -3416,7 +3480,7 @@ mod tests {
 
     #[test]
     fn materialize_non_binary_passes_through_unchanged() {
-        let schema = StructType::empty();
+        let schema = ResolvedSchema::empty();
         let expr = int_lit(1);
         let before = expr.clone();
         assert_eq!(materialize_binary_coercions(expr, &schema), before);
@@ -3427,10 +3491,10 @@ mod tests {
         // `d / i` — Decimal(15,2) ÷ Integer: the integral RIGHT side widens
         // via `decimal_form` (Integer → (10,0)); only that side gets an
         // implicit CAST.
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("d", dec(15, 2)),
             StructField::nullable("i", DataType::Integer),
-        ]);
+        ]));
         let expr_before_type = bin(
             BinaryOp::Div,
             ColumnReference::untyped("d"),
@@ -3468,7 +3532,10 @@ mod tests {
         // `100 / d` — the int-literal LEFT side widens via
         // `DecimalType.fromLiteral` (single-digit → (1,0)), not
         // `decimal_form`.
-        let schema = StructType::new(vec![StructField::nullable("d", dec(15, 2))]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            dec(15, 2),
+        )]));
         let expr = bin(BinaryOp::Div, int_lit(9), ColumnReference::untyped("d"));
         let materialized = materialize_binary_coercions(expr, &schema);
         let Expression::Binary(b) = &materialized else {
@@ -3489,10 +3556,10 @@ mod tests {
     fn materialize_div_decimal_over_decimal_untouched() {
         // Both sides already `Decimal` — no widening, no Cast inserted
         // anywhere.
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("d1", dec(15, 2)),
             StructField::nullable("d2", dec(10, 3)),
-        ]);
+        ]));
         let expr = bin(
             BinaryOp::Div,
             ColumnReference::untyped("d1"),
@@ -3507,10 +3574,10 @@ mod tests {
         // Decimal ÷ Double: `decimalize` returns `None` for a non-integral
         // Double operand (Spark: decimal ⊗ double → double) — the Div rule
         // must not fire.
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("d", dec(15, 2)),
             StructField::nullable("f", DataType::Double),
-        ]);
+        ]));
         let expr = bin(
             BinaryOp::Div,
             ColumnReference::untyped("d"),
@@ -3522,7 +3589,10 @@ mod tests {
 
     #[test]
     fn materialize_date_plus_interval_wraps_whole_node_in_implicit_cast_to_date() {
-        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
         let expr = bin(
             BinaryOp::Add,
             ColumnReference::untyped("d"),
@@ -3543,7 +3613,10 @@ mod tests {
     #[test]
     fn materialize_interval_plus_date_wraps_whole_node_in_implicit_cast_to_date() {
         // Commutative: `INTERVAL + d` must also wrap.
-        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
         let expr = bin(
             BinaryOp::Add,
             calendar_interval(),
@@ -3557,7 +3630,10 @@ mod tests {
 
     #[test]
     fn materialize_date_minus_interval_wraps_whole_node_in_implicit_cast_to_date() {
-        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
         let expr = bin(
             BinaryOp::Sub,
             ColumnReference::untyped("d"),
@@ -3573,7 +3649,10 @@ mod tests {
     fn materialize_timestamp_plus_interval_untouched() {
         // DuckDB already natively preserves `Timestamp ± Interval` as
         // Timestamp — only the Date case needs a corrective CAST.
-        let schema = StructType::new(vec![StructField::nullable("t", DataType::Timestamp)]);
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "t",
+            DataType::Timestamp,
+        )]));
         let expr = bin(
             BinaryOp::Add,
             ColumnReference::untyped("t"),

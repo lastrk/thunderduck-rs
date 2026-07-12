@@ -3,6 +3,7 @@
 //! Owned by τ (INV10: τ imports only `DataType`, `StructField`, `StructType`
 //! from `crate::types`).
 
+use super::schema::{Attribute, ResolvedSchema};
 use crate::types::{DataType, StructField, StructType};
 
 /// Date-returning Spark functions. Single home of the roster consulted by
@@ -35,13 +36,13 @@ impl TypeInferenceEngine {
     ///
     /// Supports dot-notation for struct fields: `"person.name"` resolves
     /// to the `name` field within the `person` struct column.
-    pub fn column_type(name: &str, schema: &StructType) -> DataType {
+    pub fn column_type(name: &str, schema: &ResolvedSchema) -> DataType {
         Self::column_info(name, schema).0
     }
 
     /// Look up the nullability of `name` in `schema` (case-insensitive).
     /// Returns `true` (nullable) if not found — safe default.
-    pub fn column_nullable(name: &str, schema: &StructType) -> bool {
+    pub fn column_nullable(name: &str, schema: &ResolvedSchema) -> bool {
         Self::column_info(name, schema).1
     }
 
@@ -49,7 +50,7 @@ impl TypeInferenceEngine {
     pub fn qualified_column_type(
         name: &str,
         qualifier: Option<&str>,
-        schema: &StructType,
+        schema: &ResolvedSchema,
     ) -> DataType {
         Self::qualified_column_info(name, qualifier, schema).0
     }
@@ -58,7 +59,7 @@ impl TypeInferenceEngine {
     pub fn qualified_column_nullable(
         name: &str,
         qualifier: Option<&str>,
-        schema: &StructType,
+        schema: &ResolvedSchema,
     ) -> bool {
         Self::qualified_column_info(name, qualifier, schema).1
     }
@@ -67,7 +68,7 @@ impl TypeInferenceEngine {
     /// `(data_type, nullable)` of `name` in `schema`. Not found →
     /// `(Unresolved, true)`. Thin wrapper over [`Self::column_info_in`] scoped
     /// to the whole schema.
-    fn column_info(name: &str, schema: &StructType) -> (DataType, bool) {
+    fn column_info(name: &str, schema: &ResolvedSchema) -> (DataType, bool) {
         Self::column_info_in(name, &schema.fields).unwrap_or((DataType::Unresolved, true))
     }
 
@@ -83,7 +84,7 @@ impl TypeInferenceEngine {
     /// [`Self::struct_qualifier_info`]) is the one that recurses. Struct-field
     /// nullability ORs in the parent column's nullability (a NULL struct makes
     /// every field read NULL).
-    pub(super) fn column_info_in(name: &str, fields: &[StructField]) -> Option<(DataType, bool)> {
+    pub(super) fn column_info_in(name: &str, fields: &[Attribute]) -> Option<(DataType, bool)> {
         if let Some(f) = fields.iter().find(|f| f.name.eq_ignore_ascii_case(name)) {
             return Some((f.data_type.clone(), f.nullable));
         }
@@ -116,7 +117,7 @@ impl TypeInferenceEngine {
     pub(super) fn qualified_column_info(
         name: &str,
         qualifier: Option<&str>,
-        schema: &StructType,
+        schema: &ResolvedSchema,
     ) -> (DataType, bool) {
         if let Some(q) = qualifier {
             if let Some(info) = Self::struct_qualifier_info(name, q, schema) {
@@ -135,7 +136,7 @@ impl TypeInferenceEngine {
     pub(super) fn struct_qualifier_info(
         name: &str,
         qualifier: &str,
-        schema: &StructType,
+        schema: &ResolvedSchema,
     ) -> Option<(DataType, bool)> {
         let f = schema.field_by_name(qualifier)?;
         if let DataType::Struct(st) = &f.data_type {
@@ -1688,10 +1689,10 @@ mod tests {
 
     #[test]
     fn column_lookup_case_insensitive() {
-        let schema = StructType::new(vec![
+        let schema = ResolvedSchema::minted(StructType::new(vec![
             StructField::nullable("id", DataType::Long),
             StructField::not_null("code", DataType::String),
-        ]);
+        ]));
         assert_eq!(
             TypeInferenceEngine::column_type("id", &schema),
             DataType::Long

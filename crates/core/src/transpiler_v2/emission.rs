@@ -697,7 +697,7 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
     // Computed ONCE, before the fixpoint below: a fresh wrap changes WHERE a
     // side's fields are addressable FROM, never their ordinal position in
     // this merged schema.
-    let cond_schema = StructType::merge(&left.resolved_schema, &right.resolved_schema);
+    let cond_schema = Schema::merge(&left.resolved_schema, &right.resolved_schema);
 
     // Bounded fixpoint (ADR-023 Phase 2, `<=2` passes, H8 assert 4): the
     // duplicate-alias guard runs unconditionally every pass (DuckDB rejects
@@ -1759,9 +1759,15 @@ fn build_local_relation(
         })?;
         return Ok(SqlUnit::Raw(format!("SELECT {cols} WHERE 1=0")));
     }
+    // `render_expr` needs a `&Schema` (`ResolvedSchema`); `schema_decl` stays a
+    // plain `StructType` (it's the declared row shape, not a resolved
+    // relation), so bridge once here via the sanctioned `minted` door — row
+    // cells are literal expressions that never read column identity, so the
+    // freshly minted ids are inert scratch, not a laundering site.
+    let cell_schema = Schema::minted(schema_decl.clone());
     let rendered_rows = sql_join(rows.iter(), ", ", |row| {
         let cells = sql_join(row.iter().enumerate(), ", ", |(idx, cell)| {
-            let inner = render_expr(cell, schema_decl)?;
+            let inner = render_expr(cell, &cell_schema)?;
             // Ensure each cell carries the declared type — a naked NULL literal
             // would otherwise adopt DuckDB's inferred column type across rows.
             let field = &schema_decl.fields[idx];
@@ -2001,7 +2007,7 @@ fn build_set_op(
     by_name: bool,
     allow_missing_columns: bool,
     children: &[TypedAst],
-    widened_schema: &StructType,
+    widened_schema: &Schema,
 ) -> Result<SqlUnit, EmissionError> {
     use super::ast::SetOpKind;
     if children.is_empty() {
@@ -7073,6 +7079,7 @@ mod tests {
         LambdaVariableExpression, LikeExpression, Literal, LiteralValue, MapLiteralExpression,
         StarExpression, UnaryExpression, UnaryOp, UpdateFieldsExpression,
     };
+    use crate::transpiler_v2::schema::Attribute;
     use crate::transpiler_v2::{analyze, generate, AnalyzerError};
     use crate::types::StructField;
 
@@ -7081,7 +7088,7 @@ mod tests {
     }
 
     fn empty_schema() -> Schema {
-        StructType::empty()
+        Schema::empty()
     }
 
     fn emp_schema() -> StructType {
@@ -7769,7 +7776,7 @@ mod tests {
                 limit: 5,
                 offset: None,
             },
-            emp_schema(),
+            Schema::minted(emp_schema()),
         );
         let filter = TypedAst::new(
             TypedOp::Filter {
@@ -7786,7 +7793,7 @@ mod tests {
                     right: Box::new(int_lit(1)),
                 }),
             },
-            emp_schema(),
+            Schema::minted(emp_schema()),
         );
         let sql = dispatch_op(&filter.op, &filter.resolved_schema).expect("dispatch");
         assert!(
@@ -10672,14 +10679,12 @@ mod tests {
         // bare duplicate-name ordinal ref rewrites to `uniquified[k]`; a
         // bare UNIQUE-name ref (ordinal Some, but not duplicated) and a bare
         // ref with `ordinal: None` are both left untouched.
-        let schema = Schema {
-            fields: vec![
-                StructField::not_null("id", DataType::Long),
-                StructField::nullable("dept_id", DataType::Integer),
-                StructField::nullable("dept_id", DataType::Integer),
-                StructField::nullable("name", DataType::String),
-            ],
-        };
+        let schema = Schema::minted(StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("name", DataType::String),
+        ]));
         let uniquified = vec![
             "id".to_owned(),
             "dept_id".to_owned(),
@@ -13004,7 +13009,7 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             },
-            StructType::empty(),
+            Schema::empty(),
         );
         let err = super::render_freq_items(&typed_input, &[], 0.01).unwrap_err();
         expect_unsupported(err, UnsupportedKind::Op, "FreqItems", &[]);
@@ -13062,7 +13067,7 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             },
-            StructType::empty(),
+            Schema::empty(),
         );
         let err = super::render_sample(&typed_input, 0.0, 0.5, true, Some(11)).unwrap_err();
         expect_unsupported(err, UnsupportedKind::Op, "Sample[with_replacement]", &[]);
@@ -13132,7 +13137,7 @@ mod tests {
                 table: "emp".to_owned(),
                 alias: None,
             },
-            emp_schema(),
+            Schema::minted(emp_schema()),
         );
         let col_ref = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
@@ -13162,7 +13167,10 @@ mod tests {
     }
 
     fn addr_schema() -> Schema {
-        StructType::new(vec![StructField::nullable("address", address_struct_dt())])
+        Schema::minted(StructType::new(vec![StructField::nullable(
+            "address",
+            address_struct_dt(),
+        )]))
     }
 
     /// struct-005 anchor — `withField("country", lit("AT"))` reconstructs the
@@ -13523,7 +13531,10 @@ mod tests {
     /// `withField` on scalar types).
     #[test]
     fn render_update_fields_non_struct_base_is_error() {
-        let schema = StructType::new(vec![StructField::nullable("name", DataType::String)]);
+        let schema = Schema::minted(StructType::new(vec![StructField::nullable(
+            "name",
+            DataType::String,
+        )]));
         let expr = Expression::UpdateFields(UpdateFieldsExpression {
             struct_expr: Box::new(Expression::ColumnReference(ColumnReference {
                 name: "name".to_owned(),
@@ -14987,7 +14998,7 @@ mod tests {
     /// Spark-declared scale. Corpus: type-005.
     #[test]
     fn render_decimal_div_uses_spark_decimal_div() {
-        let schema = StructType::new(vec![
+        let schema = Schema::minted(StructType::new(vec![
             StructField::nullable(
                 "d1",
                 DataType::Decimal {
@@ -15002,7 +15013,7 @@ mod tests {
                     scale: 3,
                 },
             ),
-        ]);
+        ]));
         let expr = Expression::Binary(BinaryExpression {
             left: Box::new(Expression::ColumnReference(ColumnReference {
                 name: "d1".to_owned(),
@@ -15075,7 +15086,7 @@ mod tests {
     /// dropped inner parens around the (no-longer-double-cast) identifier.
     #[test]
     fn decimal_div_by_integral_column_routes_through_spark_decimal_div() {
-        let schema = StructType::new(vec![
+        let schema = Schema::minted(StructType::new(vec![
             StructField::nullable(
                 "jan_sales",
                 DataType::Decimal {
@@ -15084,7 +15095,7 @@ mod tests {
                 },
             ),
             StructField::nullable("w_warehouse_sq_ft", DataType::Long),
-        ]);
+        ]));
         let l = col_with_type(
             "jan_sales",
             DataType::Decimal {
@@ -15276,7 +15287,10 @@ mod tests {
     /// per level, not a redundant double-wrap of either node.
     #[test]
     fn render_binary_date_add_function_plus_interval_composes_n3_and_n4_single_casts_each() {
-        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let schema = Schema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
         let date_add_call = fexpr(
             "date_add",
             vec![col_with_type("d", DataType::Date), int_lit(1)],
@@ -16156,16 +16170,16 @@ mod tests {
 
     /// Schema with an `arr : Array<Struct<name STRING?, dept_id INT?, salary DOUBLE?>>`
     /// column — enough surface to test both plain and sentinel-wrapped forms.
-    fn arr_of_struct_schema() -> StructType {
+    fn arr_of_struct_schema() -> Schema {
         let element = DataType::Struct(StructType::new(vec![
             StructField::nullable("name", DataType::String),
             StructField::nullable("dept_id", DataType::Integer),
             StructField::nullable("salary", DataType::Double),
         ]));
-        StructType::new(vec![
+        Schema::minted(StructType::new(vec![
             StructField::not_null("id", DataType::Long),
             StructField::nullable("arr", DataType::Array(Box::new(element), true)),
-        ])
+        ]))
     }
 
     fn inline_field_args(field: &str) -> Vec<Expression> {
@@ -16239,11 +16253,11 @@ mod tests {
 
     // ── Pass 91 — json_tuple_field emission ─────────────────────────────
 
-    fn json_str_schema() -> StructType {
-        StructType::new(vec![
+    fn json_str_schema() -> Schema {
+        Schema::minted(StructType::new(vec![
             StructField::not_null("id", DataType::Long),
             StructField::nullable("json_str", DataType::String),
-        ])
+        ]))
     }
 
     /// `json_tuple_field(json_str, "a")` renders as
@@ -16416,7 +16430,7 @@ mod tests {
                 table: table.to_owned(),
                 alias: alias.map(|s| s.to_owned()),
             },
-            schema,
+            Schema::minted(schema),
         )
     }
 
@@ -16431,18 +16445,19 @@ mod tests {
     }
 
     fn lateral_view_typed(columns: Vec<(String, Expression)>, input: TypedAst) -> TypedAst {
-        let gen_fields: Vec<StructField> = columns
+        // Freshly generated LateralView output columns — brand-new logical
+        // columns that did not exist before this point: MINT.
+        let gen_fields: Vec<Attribute> = columns
             .iter()
             .map(|(alias, expr)| {
-                StructField::new(
+                Attribute::minted(
                     alias.clone(),
                     expr.data_type(&input.resolved_schema),
                     expr.nullable(&input.resolved_schema),
                 )
             })
             .collect();
-        let resolved_schema =
-            StructType::merge(&input.resolved_schema, &StructType::new(gen_fields));
+        let resolved_schema = Schema::merge(&input.resolved_schema, &Schema::new(gen_fields));
         TypedAst::new(
             TypedOp::LateralView {
                 input: Box::new(input),
@@ -16574,10 +16589,10 @@ mod tests {
                 input: Box::new(lv),
                 projections: vec![id_ref, tag_ref],
             },
-            StructType::new(vec![
+            Schema::minted(StructType::new(vec![
                 StructField::not_null("id", DataType::Long),
                 StructField::nullable("tag", DataType::String),
-            ]),
+            ])),
         );
         let sql = dispatch_op(&proj.op, &proj.resolved_schema).expect("render");
         // The output must NOT wrap in __td_proj — the alias-transparent-from
@@ -16609,7 +16624,10 @@ mod tests {
                 args: vec![int_lit(3)],
                 with_ordinality: false,
             },
-            StructType::new(vec![StructField::not_null("id", DataType::Long)]),
+            Schema::minted(StructType::new(vec![StructField::not_null(
+                "id",
+                DataType::Long,
+            )])),
         );
         let lv = lateral_view_typed(
             vec![(

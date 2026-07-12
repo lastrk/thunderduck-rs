@@ -1166,29 +1166,14 @@ impl Expression {
                     value_nullable,
                 };
             }
-            // Spark's `map_from_arrays(keys, values)` (`MapFromArrays`) derives
-            // the key type from the KEYS array's element type and the value
-            // type + `valueContainsNull` from the VALUES array's element type
-            // + `containsNull` flag (verified against Spark 4.1.1:
-            // `MapFromArrays.dataType`) — distinct from `map`/`create_map`
-            // above, which alternate key/value args and widen across pairs.
-            // The shared `function_return_type` resolver only sees the first
-            // arg and so hard-codes `Map<String, String, true>`; derive the
-            // real key/value types here where both arg types are available.
-            // A malformed (non-2-arity or non-Array-typed) call falls through
-            // to the shared resolver's honest-but-approximate fallback.
-            // Differential: `test_map_from_arrays`.
-            "map_from_arrays" if f.args.len() == 2 => {
-                if let (DataType::Array(key_ty, _), DataType::Array(val_ty, value_contains_null)) =
-                    (f.args[0].data_type(schema), f.args[1].data_type(schema))
-                {
-                    return DataType::Map {
-                        key: key_ty,
-                        value: val_ty,
-                        value_nullable: value_contains_null,
-                    };
-                }
-            }
+            // `map_from_arrays(keys, values)` needs only the two args'
+            // DataTypes (key elem type + value elem type/containsNull all
+            // live inside `DataType::Array`'s own shape) — no per-arg
+            // *expression* nullability is required. That makes
+            // `function_return_type` a sufficient home; the rule now lives
+            // there as the resolver's map arm (N2 single-home). Differential:
+            // `test_map_from_arrays`.
+            //
             // Spark's `to_number(str, fmt)` / `try_to_number(str, fmt)` return
             // DECIMAL(p, s) derived from the format string. Emission parses
             // the same format literal to build the CAST; mirror the

@@ -708,20 +708,52 @@ impl TypeInferenceEngine {
             // `runtime/session.rs`) provides the DuckDB translation. Corpus:
             // `map2-002`.
             //
-            // `map`/`create_map` (well-typed, non-empty even arity) and
-            // `map_from_arrays` (arity 2 with resolved `Array` args) are
-            // pre-empted by dedicated fast paths in
-            // `Expression::function_call_data_type` that derive the real
-            // key/value types; this hard-coded `Map<String, String, true>`
-            // is their honest-but-approximate fallback for malformed calls
-            // (and the resolver `map_from_entries` still relies on it).
-            "map" | "map_from_arrays" | "create_map" | "map_from_entries" | "str_to_map" => {
-                DataType::Map {
+            // `map`/`create_map` (well-typed, non-empty even arity) is still
+            // pre-empted by a dedicated fast path in
+            // `Expression::function_call_data_type` — its `valueContainsNull`
+            // needs each value arg's *expression*-level nullability
+            // (`Expression::nullable`, e.g. a literal NULL vs. a nullable
+            // column), which this resolver's `arg_types: &[DataType]` cannot
+            // carry, so it stays a genuine second home (N2 exception, not
+            // drift). `map_from_entries` has no fast path and always falls
+            // through to this hard-coded `Map<String, String, true>` — its
+            // honest-but-approximate fallback, also used for malformed
+            // `map`/`create_map`/`map_from_arrays` calls (empty/odd-arity, or
+            // non-`Array`-typed `map_from_arrays` args).
+            "map" | "create_map" | "map_from_entries" | "str_to_map" => DataType::Map {
+                key: Box::new(String),
+                value: Box::new(String),
+                value_nullable: true,
+            },
+            // Spark's `map_from_arrays(keys, values)` (`MapFromArrays`)
+            // derives the key type from the KEYS array's element type and
+            // the value type + `valueContainsNull` from the VALUES array's
+            // element type + `containsNull` flag (verified against Spark
+            // 4.1.1: `MapFromArrays.dataType`) — distinct from
+            // `map`/`create_map` above, which alternate key/value args and
+            // widen across pairs. Both operand facts here (elem type +
+            // containsNull) live inside `DataType::Array`'s own shape, so —
+            // unlike `map`/`create_map` — `arg_types` alone is sufficient:
+            // this arm is `map_from_arrays`'s single home (N2). A malformed
+            // (non-2-arity or non-`Array`-typed) call falls through to the
+            // `Map<String, String, true>` default above. Corpus/differential:
+            // `test_map_from_arrays`.
+            "map_from_arrays" => match arg_types {
+                // Exactly two Array args — matching the pre-N2 fast-path's
+                // `f.args.len() == 2` guard; a 3+-arity call is malformed
+                // (Spark rejects it as WRONG_NUM_ARGS) and takes the
+                // fallback below, never a derived type.
+                [Array(key_ty, _), Array(val_ty, value_contains_null)] => DataType::Map {
+                    key: key_ty.clone(),
+                    value: val_ty.clone(),
+                    value_nullable: *value_contains_null,
+                },
+                _ => DataType::Map {
                     key: Box::new(String),
                     value: Box::new(String),
                     value_nullable: true,
-                }
-            }
+                },
+            },
             // `map_concat(m1, m2, ...)` merges maps left-to-right; result
             // type is the (unified) map type of the arguments. τ takes the
             // first-arg type as an approximation — Spark rejects
@@ -1967,6 +1999,68 @@ mod tests {
         assert_eq!(
             frt("array_intersect", &[a]),
             DataType::Array(Box::new(DataType::String), false)
+        );
+    }
+
+    #[test]
+    fn map_from_arrays_derives_key_and_value_types_from_array_args() {
+        // Spark's `MapFromArrays.dataType`: key = keys array's element type,
+        // value + valueContainsNull = values array's element type +
+        // containsNull. N2: this is the resolver's single home for the rule
+        // (differential `test_map_from_arrays`).
+        let keys = DataType::Array(Box::new(DataType::String), false);
+        let values = DataType::Array(Box::new(DataType::Integer), false);
+        assert_eq!(
+            frt("map_from_arrays", &[keys, values]),
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::Integer),
+                value_nullable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn map_from_arrays_value_nullable_follows_values_array_contains_null() {
+        let keys = DataType::Array(Box::new(DataType::String), false);
+        let values = DataType::Array(Box::new(DataType::Integer), true);
+        assert_eq!(
+            frt("map_from_arrays", &[keys, values]),
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::Integer),
+                value_nullable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn map_from_arrays_falls_back_to_string_string_map_without_two_array_args() {
+        // Malformed / non-Array-typed call: honest-but-approximate fallback,
+        // same as the pre-move hard-coded default.
+        assert_eq!(
+            frt("map_from_arrays", &[DataType::String]),
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::String),
+                value_nullable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn map_from_arrays_three_args_is_malformed_and_falls_back() {
+        // Review-pinned arity boundary: 3+ args (Spark WRONG_NUM_ARGS) must
+        // take the fallback, never derive from the first two arrays — the
+        // exact-2 slice pattern mirrors the pre-N2 `f.args.len() == 2` guard.
+        let arr = || DataType::Array(Box::new(DataType::Integer), false);
+        assert_eq!(
+            frt("map_from_arrays", &[arr(), arr(), arr()]),
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::String),
+                value_nullable: true,
+            }
         );
     }
 

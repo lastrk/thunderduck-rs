@@ -20,6 +20,7 @@ These are non-negotiable constraints governing all SQL generation and type handl
 crates/core/                        # Pure translation engine (no gRPC)
   transpiler_v2/                    # τ: CommonAst, analyzer, emission, INV enforcement
     ast.rs                          # CommonAst + CommonOp (shared IR)
+    schema.rs                       # ResolvedSchema/Attribute/ExprId (ADR-024)
     analyzer.rs                     # Resolve + type + nullability → TypedAst
     emission.rs                     # TypedAst → DuckDB SQL
     expression.rs                   # τ Expression enum
@@ -68,7 +69,7 @@ module.
 | **Parser** | `SparkSqlParserV2` | sqlparser-rs based Spark SQL parser (raw SQL path) → `CommonAst` |
 | **IR** | `CommonAst` / `CommonOp` (enum) | Shared IR — same tree fed by both front-ends |
 | **Expression** | τ `Expression` (enum) | τ's Spark-parity expression types with `data_type()` / `nullable()` |
-| **Analyzer** | `analyze()` | `CommonAst` + `BaseTypes` → `TypedAst { op, resolved_schema }` |
+| **Analyzer** | `analyze()` | `CommonAst` + `BaseTypes` → `TypedAst { op, resolved_schema: ResolvedSchema }` — each `Attribute` carries name/type/nullability plus a stable `ExprId` and source-qualifier lineage (ADR-024); `StructType` is produced only at the `mod.rs` wire boundary |
 | **Emission** | `dispatch_op()` / `render_expr()` | Traverses `TypedAst`, produces DuckDB SQL |
 | **Runtime** | `DuckDbSession` | Owns `duckdb::Connection` on its dedicated OS thread |
 | **Types** | `TypeInferenceEngine` | Resolves expression types following Spark semantics |

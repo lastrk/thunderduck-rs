@@ -138,6 +138,8 @@ So the permitted transformations fall in three categories: *expressibility-force
 
 ## ADR-005 — thunderduck owns Spark type and nullability inference (the divergent slice), as a schema-threading analysis over the common AST
 
+> **Amendment (2026-07-12, ADR-024):** the threaded analyzer schema is now the τ-owned `ResolvedSchema(Vec<Attribute>)` — each attribute carries its resolved type, nullability, stable `ExprId`, and source-qualifier lineage. `StructType` remains the wire/value type, produced at τ's public entry points.
+
 **Status:** Proposed
 **Depends on:** ADR-000, ADR-002 (defines the boundary), ADR-003 (the IR it annotates), ADR-004 (must serve both front-ends), ADR-012 (catalog seed)
 **Depended on by:** ADR-006, ADR-007, ADR-009, ADR-010, ADR-012, ADR-014, ADR-015, ADR-017, ADR-018, ADR-023
@@ -160,6 +162,8 @@ So the permitted transformations fall in three categories: *expressibility-force
 ---
 
 ## ADR-006 — The analyzer is a bounded sequence of coordinated passes, not an iterate-to-fixed-point engine
+
+> **Amendment (2026-07-12, ADR-024):** the resolve pass additionally mints/propagates attribute `ExprId`s and stamps them onto resolved references alongside ordinals. The 0/1/2+ match-count error semantics are unchanged.
 
 **Status:** Proposed
 **Depends on:** ADR-000, ADR-005
@@ -632,7 +636,7 @@ Neither category triggers a runtime fallback. Both surface directly to the clien
 
 ## ADR-023 — τ resolves column references to (source-qualifier lineage, ordinal) at analysis time; qualifiers are regenerated at emission
 
-**Status:** Proposed
+**Status:** Superseded by ADR-024 (2026-07-12). ADR-023's decision *outcomes* — F8 (created alias inherits ∅ lineage), F10 (projected-through keeps the qualifier), F11 (ambiguity by match count, incl. plan_id), verbatim duplicate names on the wire, emission-time qualifier regeneration, remaps only at fixed structural points — are carried forward verbatim as ADR-024 must-preserve constraints. What is superseded is the *representation*: the positional `ordinal` as the identity surrogate and the `RelScope.source_quals` parallel-vector lineage are replaced by identity and lineage stored on the schema attribute itself. ADR-023 was Proposed and partially built (tiers 1+2) at supersession — a representation swap before ratification, not a rip-out of shipped design.
 **Depends on:** ADR-005 (schema-threading analysis), ADR-006 (single resolve pass), ADR-021 (τ owns `TypedOp`/`RelScope`), ADR-022 (two error categories — the resolver produces the qualified-reference Spark-emulated errors)
 **Depended on by:** the qualified-resolution slices (F8/F10/F11 closure); retirement of the emission strip machinery (`strip_stranded_qualifiers`, the F5/F9/F12 wrap rewrites, `exprs_visible_in` exemptions, F14 walkers, the `__td_jl`/`__td_jr` synthetic-alias machinery)
 
@@ -660,6 +664,32 @@ Neither category triggers a runtime fallback. Both surface directly to the clien
 - (−) A migration touching `TypedOp`/`RelScope`/the resolver/emission; the per-operator ordinal + lineage derivation must be Spark-exact — a silent wrong-column is the hazard, and ADR-014's differential oracle is the gate.
 
 **Refinement hooks / adoption sequence** (each corpus-gated, zero-regression): substrate-name uniquify → emission ordinal shim → carry the ordinal → ambiguity (F11) + Spark-emulated error surfacing → add `source_quals` lineage → resolver consults lineage (flip F8/F10, preserve USING + correlation) → retire the strip machinery. Evidence gate: the four deferred witnesses (`filt-018`/`filt-019`, `join-023`, `jn-024`) flip; the ten strand witnesses (`join-018..022`, `cx-015/016`, `jn-023`, `agg-025`, `proj-016`) stay green; corpora show zero regressions.
+
+---
+
+## ADR-024 — τ stores attribute identity in the resolved schema; references bind to attributes, not positions
+
+**Status:** Proposed (implemented 2026-07-12 as N9 increments 1–3; see `tasks/v2-canonicalization-invariants.md`)
+**Depends on:** ADR-005 (schema-threading analysis — see its amendment note), ADR-006 (single resolve pass — see its amendment note), ADR-021 (τ owns its substrate), ADR-022 (two error categories)
+**Supersedes:** ADR-023 (representation only; its decision outcomes are must-preserve constraints here)
+**Depended on by:** N10 (bind-by-id emission: unique id-derived aliases retire the positional duplicate-name machinery — `bare_dup_ordinal`, `requalify_column_ref`, `output_uniquified`, `wrap_reprojected`)
+
+**Context.** ADR-023 correctly moved τ off carried string qualifiers, but its representation encoded one fact three ways: `ColumnReference.ordinal` (position as an identity surrogate), `RelScope.source_quals` (an ordinal-indexed parallel vector for lineage, with a hand-maintained `len == schema.len()` invariant and a mirror derivation kept in lockstep), and a structural `semantic_eq` whose ordinal re-walk (`ordinals_compatible`) existed only because `ColumnReference::eq` deliberately excludes `ordinal`. A first attempt to add Spark-style `exprId`s was **aborted** (2026-07-12, `tasks/v2-attribute-identity-unification.md`): deriving ids in `RelScope` re-mints them on every `TypedAst::new` re-derivation — and the sort-rebind path re-stamps mutated Aggregate/Project nodes, so derived ids go stale exactly where identity is consumed. The sound design requires identity to be **stored state that moves by value**.
+
+**Decision.** τ's analyzer output schema is a τ-owned `ResolvedSchema(Vec<Attribute>)` where each `Attribute { name, data_type, nullable, expr_id, source_quals }` carries a stable identity (`ExprId`: globally-unique `AtomicU64` mint — Spark `NamedExpression.curId` precedent) and its own source-qualifier lineage. Identity is minted exactly once — at leaf sources and at computed/aliased output entries — and thereafter moves **by value**: passthrough operators clone attributes; a projected-through bare reference COPIES its target attribute (id and lineage, plus the stamped qualifier — F10); an Alias/computed entry MINTS fresh with ∅ lineage (F8); joins concatenate; USING keys union both donors' lineage onto the donor clone; set-ops keep the first child's ids (Spark `Union.output` precedent); and the sort-rebind's re-stamp is simply **deleted** — append-only promotion provably cannot change the derived scope, and the ids live in the moved schema, not in a derived side-structure. `resolve_column` stamps the matched attribute's `expr_id` onto the reference at exactly the sites that stamp `ordinal` (`Some(ordinal) ⟹ Some(expr_id)`, from the same attribute — a mechanical invariant); semantic equality compares ids where both sides carry them (replacing `ordinals_compatible`); tier-(f) lineage reads come off the attribute (replacing the parallel vector, its mirror derivation, and its length invariant).
+
+**Alternatives considered (and rejected).**
+- *Point-`exprId` only* (id field without the schema change): leaves `ordinal`-as-identity and the `source_quals` machinery standing — a second identity encoding on top of the first, net-negative.
+- *Ids derived in `RelScope`* (like `source_quals` was): re-mints on re-derivation — the verified stale-id landmine; rejected by the abort review.
+- *`expr_id` on the wire `StructField`*: violates INV10's value-type purity, breaks `StructField`'s derived `Eq/Hash` load-bearing uses, and the Arrow boundary drops the field anyway.
+
+**Consequences.**
+- (+) One identity encoding: `ordinals_compatible` deleted; `source_quals_of` (~200 lines), the parallel vector, its length invariant, and the unconditional `analyze_sort` re-stamp deleted; lineage and identity cannot desynchronize from the schema because they are fields *of* the schema.
+- (+) Strengthens INV5: τ's resolved schema is strictly richer than the wire schema. `StructType`/`StructField` remain the value/Arrow-wire types (INV10), converted only at τ's two public entry points (`mod.rs::generate_with_schema` / `analyze_schema`).
+- (+) The N10 substrate is in place: every output attribute and every resolved reference carries an id.
+- (−) `ExprId` values are process-lifetime-unique but **not run-deterministic**; N10's id-derived emission aliases must renumber per query (e.g. dense-rank within the plan) so emitted SQL stays deterministic.
+- (−) Recorded τ divergences from Spark, both currently unobservable and to be re-examined at N10: a column **rename keeps its id** (Spark's Alias-rename mints); the USING coalesced key keeps the **left donor's id** (Spark mints for the Coalesce alias).
+- (−) `ColumnReference.ordinal` and emission's positional machinery survive until N10 — position remains the execution-side currency (as in Spark's own `BindReferences`), identity the analysis-side one.
 
 ---
 
@@ -774,7 +804,7 @@ Properties that span ADRs. Any refinement must preserve all of these; a change t
 
 **INV9 — A writable external relation must have attached-catalog provenance; path-scan provenance is read-only.** (Added with ADR-017; touches ADR-011, ADR-013, ADR-017.) External tables reached by a bare path-scan (`read_parquet` / `delta_scan` / `iceberg_scan`) are read-only by construction; any write (append/insert/delete/merge/CTAS) requires the table to be reached via an attachment (`ATTACH … TYPE delta`/`iceberg`, or `uc_catalog`). This is the rule that keeps the write story consistent across formats: every per-format write ADR (Delta ADR-017; Iceberg ADR-018; and any future format) must route writes through an attachment, never a path-scan. This is reinforced externally: Databricks UC forbids path-based access to managed tables outright (ADR-018), so for UC targets the invariant is enforced by the catalog as well as by thunderduck. **Check:** the overlay's recorded provenance (ADR-012/013) gates whether a write command may be emitted at all.
 
-**INV10 — τ imports only value-level types from outside its own module tree.** (Touches ADR-003, ADR-004, ADR-005, ADR-014, ADR-021.) The `crates/core/src/transpiler_v2/` module tree, `crates/connect-server/src/converter/v2_relation_converter.rs`, and `crates/core/src/parser_v2/` are τ. Behavior-carrying types (`LogicalPlan`, `Expression`, `TypeInferenceEngine`, `SqlGenerator`, `FunctionRegistry`) are τ's own — τ does not import any such type from a non-τ module. Value-level types (`DataType`, `StructType`, `StructField`) live in `crate::types::*` and are used verbatim. This is the *input-side* complement to INV3's *emission-side* single-source-of-truth rule; together INV3 + INV10 bracket τ's substrate boundary. **Check:** `git grep -E 'use crate::(logical|expression|generator|functions)::|use crate::types::TypeInferenceEngine' crates/core/src/transpiler_v2/ crates/connect-server/src/converter/v2_relation_converter.rs crates/core/src/parser_v2/` returns zero. INV10 is checkable regardless of what code lives on the other side of the boundary; when no non-τ modules exist anymore, the grep is trivially satisfied.
+**INV10 — τ imports only value-level types from outside its own module tree.** (Touches ADR-003, ADR-004, ADR-005, ADR-014, ADR-021.) The `crates/core/src/transpiler_v2/` module tree, `crates/connect-server/src/converter/v2_relation_converter.rs`, and `crates/core/src/parser_v2/` are τ. Behavior-carrying types (`LogicalPlan`, `Expression`, `TypeInferenceEngine`, `SqlGenerator`, `FunctionRegistry`) are τ's own — τ does not import any such type from a non-τ module. Value-level types (`DataType`, `StructType`, `StructField`) live in `crate::types::*` and are used verbatim. (Clarification, ADR-024: `Attribute`/`ResolvedSchema`/`ExprId` are τ-owned *analysis* types living in `transpiler_v2`; `StructType`/`StructField` remain the value/Arrow-wire types, converted at τ's `mod.rs` boundary.) This is the *input-side* complement to INV3's *emission-side* single-source-of-truth rule; together INV3 + INV10 bracket τ's substrate boundary. **Check:** `git grep -E 'use crate::(logical|expression|generator|functions)::|use crate::types::TypeInferenceEngine' crates/core/src/transpiler_v2/ crates/connect-server/src/converter/v2_relation_converter.rs crates/core/src/parser_v2/` returns zero. INV10 is checkable regardless of what code lives on the other side of the boundary; when no non-τ modules exist anymore, the grep is trivially satisfied.
 
 ### CV.5.1 — Invariant scoping conventions
 
@@ -800,6 +830,7 @@ Review premise-first, then spine, then substrate, then consequences, then the en
 5. **ADR-016** (version pin — it scopes the coverage claims, so fix it first) then **ADR-014 → 015** (the enabled testing architecture).
 6. **ADR-020** (strict-only extension), **ADR-021** (τ owns substrate), and **ADR-022** (τ is the only path). ADR-020 consolidates the emission target; ADR-021 pins the substrate boundary (τ owns its protobuf converter, Expression, TypeInferenceEngine); ADR-022 pins the runtime position (τ is the only path; two error categories; no fallback). Together with ADR-000's premise, these three shape every implementation slice.
 7. **ADR-023** (ordinal column references) last — it refines ADR-005/006's resolve pass and presupposes ADR-021's substrate ownership and ADR-022's error categories, all ratified in the steps above.
+8. **ADR-024** (stored attribute identity) supersedes ADR-023's representation while preserving its decision outcomes — ratify in ADR-023's slot; ADR-023 needs no separate ratification.
 
 Defer no ADR's *ratification* past the point where something depending on it is ratified — the matrix in CV.2 gives the order. The two highest-value review items are **ADR-000's no-JVM premise** (widest blast radius; if it moves, Alternative 1 deletes ADR-005/006) and **ADR-005's scope together with LB1** (where the implementation cost and risk concentrate).
 

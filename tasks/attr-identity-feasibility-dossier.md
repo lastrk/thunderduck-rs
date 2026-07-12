@@ -75,3 +75,18 @@ contention). A 33.7k-line-module schema-type swap validated only by lib tests is
    the corpus gate is unavailable in this environment and a concurrent session is actively
    landing incremental fixes on the parent branch (`55577ef` retired the fold heuristic
    already).
+
+
+---
+
+## Addendum (2026-07-12, post-N9): landed via the Step-2-first plan
+
+The NO-GO verdict above was environment- and design-scoped, and both blockers were later
+cleared: the corpus harness became reliable (serial runs), and N7/N8 shrank the sort-rebind
+machinery. N9 then landed in four increments on `feat/v2-transpiler` per the revised
+Step-2-first plan — ids as STORED schema state (Claim A's landmine avoided by construction,
+regression-pinned), `ordinals_compatible` and the `source_quals` parallel machinery deleted,
+ADR-024 written. Claim C (Attribute-on-schema does not deliver R2-4) held: the typed
+expression tree remains future work. HEAD blast-radius numbers at landing: 494
+`resolved_schema` touches migrated mechanically; connect-server needed zero changes (wire
+boundary = two `mod.rs` functions).

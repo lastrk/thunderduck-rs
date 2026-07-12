@@ -17,7 +17,7 @@ Project-specific **policy and process** for thunderduck-rs (the Rust port of Thu
 **Two error categories** (ADR-022): (1) **Spark-emulated errors** — inputs Spark itself would reject; τ matches Spark's error semantics. (2) **Thunderduck-boundary errors** — inputs Spark accepts but τ has not implemented; honest "not implemented in Thunderduck."
 
 **Practical implications:**
-- The two corpora are τ's fitness functions — the DataFrame corpus (384 cases) and the SQL corpus (396 cases). TPC-H/TPC-DS live *inside* the corpora as `tpch-*`/`tpcds-*` cases and are held to the same standard as every other case: a red TPC case is a defect to fix, not tolerable background signal. Commands and mechanics: [`docs/context/testing.md`](docs/context/testing.md).
+- The two corpora are τ's fitness functions — the DataFrame corpus (405 cases) and the SQL corpus (408 cases). TPC-H/TPC-DS live *inside* the corpora as `tpch-*`/`tpcds-*` cases and are held to the same standard as every other case: a red TPC case is a defect to fix, not tolerable background signal. Commands and mechanics: [`docs/context/testing.md`](docs/context/testing.md).
 - The v1 transpiler modules (`crates/core/src/{logical,expression,generator,functions,parser}/`) were deleted on 2026-07-05. INV3/INV10 in `crates/core/src/transpiler_v2/invariants.rs` mechanically enforce that τ does not import from those (now-absent) prefixes, nor from `crate::runtime`.
 
 ## Workflow Orchestration
@@ -63,7 +63,7 @@ CLAUDE.md holds only policy and process. Everything factual lives in the docs be
 - [`testing.md`](docs/context/testing.md) — unit + differential test commands, corpus mechanics, TPC clusters, per-worktree isolation, key data paths.
 - [`coding-standards.md`](docs/context/coding-standards.md) — Rust hygiene gates, core stack, code style, commit rule.
 - [`dependencies.md`](docs/context/dependencies.md) — the mandatory `thdck_spark_funcs` extension, version pins, Spark Connect config.
-- [`code-search-tools.md`](docs/context/code-search-tools.md) — codegraph vs semble: which to use when (prefer both over raw grep).
+- [`code-search-tools.md`](docs/context/code-search-tools.md) — **READ THIS ALWAYS** for token-efficient, super-fast and accurate code exploration, code search, code lookup methods using tools other than grep.
 - [`spark-parity-lookup.md`](docs/context/spark-parity-lookup.md) — how to consult Apache Spark 4.1.1 source as the authoritative parity spec.
 - [`delta-cross-repo-dev-loop.md`](docs/context/delta-cross-repo-dev-loop.md) — Delta read/write dev loop across thunderduck ⇄ duckdb-delta ⇄ delta-kernel-rs.
 

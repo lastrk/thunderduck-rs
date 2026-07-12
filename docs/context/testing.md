@@ -1,6 +1,6 @@
 # Testing Guide
 
-> **Scope: τ (the only production path per ADR-022).** The differential oracle validates τ against Apache Spark 4.1.1 as the Spark-parity contract; the two corpora are the fitness functions — the DataFrame corpus (`run-differential-tests.sh core`, 384 cases) and the SQL corpus (`run-differential-tests.sh sql_v2`, 396 cases); `tests/scripts/differential-progress.sh` runs the entire suite and records the progress row. TPC-H/TPC-DS live INSIDE the corpora as `tpch-*`/`tpcds-*` cases (migrated 2026-07-09; the standalone TPC test files are gone).
+> **Scope: τ (the only production path per ADR-022).** The differential oracle validates τ against Apache Spark 4.1.1 as the Spark-parity contract; the two corpora are the fitness functions — the DataFrame corpus (`run-differential-tests.sh core`, 405 cases) and the SQL corpus (`run-differential-tests.sh sql_v2`, 408 cases); `tests/scripts/differential-progress.sh` runs the entire suite and records the progress row. TPC-H/TPC-DS live INSIDE the corpora as `tpch-*`/`tpcds-*` cases (migrated 2026-07-09; the standalone TPC test files are gone).
 
 ## Unit Tests (`cargo test`)
 
@@ -80,8 +80,8 @@ cd tests/integration && python3 -m pytest \
 
 ### Test tiers
 
-- **DataFrame corpus** (`test_dataframe_corpus_differential.py`) — 384 cases (incl. 22 `tpch-*` + 33 `tpcds-*` DataFrame cluster cases); the τ fitness function.
-- **SQL corpus** (`test_sql_corpus_differential.py`) — 396 cases (incl. 22 `tpch-*` + 100 `tpcds-*` SQL cluster cases); the τ SQL front-end fitness function. TPC cases are held to the same standard as every other case — a red TPC case is a defect to fix.
+- **DataFrame corpus** (`test_dataframe_corpus_differential.py`) — 405 cases (incl. 22 `tpch-*` + 33 `tpcds-*` DataFrame cluster cases); the τ fitness function.
+- **SQL corpus** (`test_sql_corpus_differential.py`) — 408 cases (incl. 22 `tpch-*` + 100 `tpcds-*` SQL cluster cases); the τ SQL front-end fitness function. TPC cases are held to the same standard as every other case — a red TPC case is a defect to fix.
 - **Full suite**: `pytest differential/` — both corpora plus the remaining feature-family legacy files (joins, aggregations, window functions, datetime, ...).
 - **TPC clusters**: `run-differential-tests.sh tpch` / `tpcds`.
 - **Single case**: `-k <case-id>` or the explicit `test_case[<id>]` node id.

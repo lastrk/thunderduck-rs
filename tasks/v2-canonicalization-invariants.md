@@ -287,6 +287,15 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 
 ### N9. Attribute identity stored in the schema (`ResolvedSchema(Vec<Attribute>)`)
 
+- **Status: ✅ LANDED** (Pass C1, four increments): INC-1 type swap + id carriage (abort-landmine
+  dead by construction — ids move by value through the re-stamp, regression-pinned); INC-2
+  references stamp ids, id-first `semantic_eq`, `ordinals_compatible` DELETED; INC-3 lineage on
+  the Attribute, `source_quals_of`/parallel vector/length invariant/`analyze_sort` re-stamp
+  DELETED (net −125 production lines); INC-4 ADR-024 written, ADR-023 → Superseded, ADR-005/006
+  amended, INV10 clarified. Every increment full-corpora green (405/0 + 408/0). Recorded τ
+  divergences (rename keeps id; USING keeps left donor id) + the non-deterministic-id/N10
+  alias-renumbering requirement live in ADR-024.
+
 - **Invariant:** every output column is an `Attribute { name, data_type, nullable, expr_id,
   source_quals }` stored in `TypedAst.resolved_schema`; identity/lineage/type ride through
   re-stamps *by value*.

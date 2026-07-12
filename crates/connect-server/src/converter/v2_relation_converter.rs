@@ -601,6 +601,7 @@ impl V2RelationConverter {
                     expr: Box::new(col),
                     to_type: f.data_type.clone(),
                     try_cast: false,
+                    implicit: false,
                 });
                 Expression::Alias(AliasExpression {
                     expr: Box::new(cast),
@@ -1576,6 +1577,7 @@ impl V2ExpressionConverter {
             expr: Box::new(self.convert(inner)?),
             to_type,
             try_cast,
+            implicit: false,
         }))
     }
 }

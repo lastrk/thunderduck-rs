@@ -305,6 +305,9 @@ pub struct CastExpression {
     pub to_type: DataType,
     /// `true` = TRY_CAST (nullable), `false` = CAST.
     pub try_cast: bool,
+    /// analyzer-materialized coercion (N4): transparent to output naming and
+    /// semantic_eq; never set by front-ends.
+    pub implicit: bool,
 }
 
 /// CASE WHEN expression.
@@ -922,19 +925,8 @@ impl Expression {
             return TypeInferenceEngine::promote_numeric(&l, &r);
         }
         // Interval ± Date/Timestamp → preserve the date-like side.
-        if b.op == BinaryOp::Add || b.op == BinaryOp::Sub {
-            match (&l, &r) {
-                (DataType::Date, dt) | (dt, DataType::Date) if dt.is_interval() => {
-                    return DataType::Date
-                }
-                (DataType::Timestamp, dt) | (dt, DataType::Timestamp) if dt.is_interval() => {
-                    return DataType::Timestamp
-                }
-                (DataType::TimestampNtz, dt) | (dt, DataType::TimestampNtz) if dt.is_interval() => {
-                    return DataType::TimestampNtz
-                }
-                _ => {}
-            }
+        if let Some(dt) = date_like_interval_result(&b.op, &l, &r) {
+            return dt;
         }
         // Timestamp − Timestamp → DayTimeInterval (Spark 4.1 parity —
         // corpus intv-005). NTZ mixes coerce to DayTimeInterval too.
@@ -963,17 +955,9 @@ impl Expression {
         // coerce that other side to a decimal form too — Spark's
         // `DecimalPrecision` cast-then-apply-formula rule — rather than
         // falling through to `promote_numeric`'s union-widening below.
-        let decimal_parts = |dt: &DataType| match dt {
-            DataType::Decimal { precision, scale } => Some((*precision, *scale)),
-            _ => None,
-        };
-        let lp = decimal_parts(&l);
-        let rp = decimal_parts(&r);
-        let (lp, rp) = match (lp, rp) {
-            (Some(lp), None) => (Some(lp), Self::decimalize(b.right.as_ref(), &r)),
-            (None, Some(rp)) => (Self::decimalize(b.left.as_ref(), &l), Some(rp)),
-            (lp, rp) => (lp, rp),
-        };
+        let (lop, rop) = decimal_widen_operands(b, &l, &r);
+        let lp = lop.map(DecimalOperand::parts);
+        let rp = rop.map(DecimalOperand::parts);
         if let (Some((p1, s1)), Some((p2, s2))) = (lp, rp) {
             return match b.op {
                 BinaryOp::Add | BinaryOp::Sub => {
@@ -1002,7 +986,7 @@ impl Expression {
     /// (`TypeInferenceEngine::decimal_form`). Non-integral operands (Float,
     /// Double, ...) return `None` — those stay on the `promote_numeric` path
     /// (Spark: decimal ⊗ double → double).
-    pub(crate) fn decimalize(expr: &Expression, dt: &DataType) -> Option<(u8, u8)> {
+    fn decimalize(expr: &Expression, dt: &DataType) -> Option<(u8, u8)> {
         Self::integer_literal_decimal(expr).or_else(|| {
             if dt.is_integral() {
                 TypeInferenceEngine::decimal_form(dt)
@@ -1706,6 +1690,168 @@ impl Expression {
     }
 }
 
+// ── N4: binary-coercion materialization ─────────────────────────────────────
+//
+// `binary_data_type` (above) infers two Spark coercions that are implicit in
+// the *type* it returns but are never inserted into the *tree*: (1) a lone
+// integral Div operand widened to a synthetic decimal form for the
+// arithmetic formula, and (2) `Date ± Interval` staying `Date` (DuckDB
+// natively promotes it to `TIMESTAMP`). Emission used to re-derive both from
+// the tree's declared types at render time (a second, independently
+// maintained copy of this logic); N4 instead materializes them once, as the
+// analyzer resolves a `Binary` node, via [`materialize_binary_coercions`] —
+// see `CastExpression::implicit`'s doc for the naming/semantic_eq
+// transparency contract that makes this safe.
+
+/// The Add/Sub date-preserving match extracted from `binary_data_type`:
+/// `Interval ± Date/Timestamp` preserves the date-like side. Shared by
+/// `binary_data_type`'s own inference and [`materialize_binary_coercions`]'s
+/// Date rule (which fires only on `Some(DataType::Date)` — DuckDB already
+/// natively preserves `Timestamp`/`TimestampNtz` under `±Interval`, so only
+/// the `Date` case needs a corrective CAST).
+fn date_like_interval_result(op: &BinaryOp, l: &DataType, r: &DataType) -> Option<DataType> {
+    if !matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+        return None;
+    }
+    match (l, r) {
+        (DataType::Date, dt) | (dt, DataType::Date) if dt.is_interval() => Some(DataType::Date),
+        (DataType::Timestamp, dt) | (dt, DataType::Timestamp) if dt.is_interval() => {
+            Some(DataType::Timestamp)
+        }
+        (DataType::TimestampNtz, dt) | (dt, DataType::TimestampNtz) if dt.is_interval() => {
+            Some(DataType::TimestampNtz)
+        }
+        _ => None,
+    }
+}
+
+/// Per-side decimal-arithmetic widening classification (Spark's
+/// `DecimalPrecision` rule), shared by `binary_data_type`'s formula
+/// application and [`materialize_binary_coercions`]'s Div-widening CAST
+/// insertion: distinguishes an operand that is ALREADY `Decimal` from one
+/// Spark widens to a synthetic decimal form for the arithmetic formula only
+/// — the latter needs a materialized CAST at emission time so DuckDB sees a
+/// real DECIMAL operand instead of the analyzer's synthetic type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DecimalOperand {
+    /// Operand's own declared type is already `Decimal(p, s)`.
+    Native(u8, u8),
+    /// Operand widened to `Decimal(p, s)` per Spark's `DecimalPrecision` rule
+    /// (the other side is `Decimal`; this side is integral).
+    Widened(u8, u8),
+}
+
+impl DecimalOperand {
+    fn parts(self) -> (u8, u8) {
+        match self {
+            DecimalOperand::Native(p, s) | DecimalOperand::Widened(p, s) => (p, s),
+        }
+    }
+}
+
+/// Classify both operands of a binary op for decimal-arithmetic formula
+/// application: when exactly one side is `Decimal`, the other (if integral)
+/// widens to a synthetic decimal form so the arithmetic formula applies
+/// uniformly (Spark's `DecimalPrecision` cast-then-apply-formula rule).
+/// `None` on a side that neither is, nor widens to, `Decimal` (e.g. a
+/// `Double` operand — Spark: decimal ⊗ double → double, not decimal
+/// arithmetic at all).
+fn decimal_widen_operands(
+    b: &BinaryExpression,
+    l: &DataType,
+    r: &DataType,
+) -> (Option<DecimalOperand>, Option<DecimalOperand>) {
+    let decimal_parts = |dt: &DataType| match dt {
+        DataType::Decimal { precision, scale } => Some((*precision, *scale)),
+        _ => None,
+    };
+    let lp = decimal_parts(l);
+    let rp = decimal_parts(r);
+    match (lp, rp) {
+        (Some((p, s)), None) => (
+            Some(DecimalOperand::Native(p, s)),
+            Expression::decimalize(b.right.as_ref(), r).map(|(p, s)| DecimalOperand::Widened(p, s)),
+        ),
+        (None, Some((p, s))) => (
+            Expression::decimalize(b.left.as_ref(), l).map(|(p, s)| DecimalOperand::Widened(p, s)),
+            Some(DecimalOperand::Native(p, s)),
+        ),
+        (Some((lp, ls)), Some((rp, rs))) => (
+            Some(DecimalOperand::Native(lp, ls)),
+            Some(DecimalOperand::Native(rp, rs)),
+        ),
+        (None, None) => (None, None),
+    }
+}
+
+/// Build a naming/`semantic_eq`-transparent implicit CAST (N4) — see
+/// [`CastExpression::implicit`]'s doc for the transparency contract.
+fn cast_impl(expr: Expression, to_type: DataType) -> Expression {
+    Expression::Cast(CastExpression {
+        expr: Box::new(expr),
+        to_type,
+        try_cast: false,
+        implicit: true,
+    })
+}
+
+/// Materialize the two N4 binary coercions into the tree — see this
+/// section's overview comment. Only `Binary` nodes are rewritten; every
+/// other variant passes through unchanged. Called exactly once, from
+/// `resolve_and_stamp`'s `Binary` arm, on an already-recursed (children
+/// resolved) node — never anywhere else: `semantic_eq` relies on BOTH rebind
+/// sides flowing through `resolve_and_stamp`, so materializing anywhere else
+/// would desync them.
+pub(crate) fn materialize_binary_coercions(expr: Expression, schema: &StructType) -> Expression {
+    let Expression::Binary(b) = expr else {
+        return expr;
+    };
+    let l = b.left.data_type(schema);
+    let r = b.right.data_type(schema);
+    // Date rule: DuckDB promotes `DATE ± INTERVAL` to TIMESTAMP; Spark keeps
+    // it DATE. Wrap the whole node in a corrective, naming-transparent CAST.
+    if date_like_interval_result(&b.op, &l, &r) == Some(DataType::Date) {
+        return cast_impl(Expression::Binary(b), DataType::Date);
+    }
+    // Div rule: Spark's `DecimalPrecision` rule widens a lone integral
+    // operand to a synthetic decimal form for the divide formula
+    // (`binary_data_type`'s own inference); mirror that at the tree level
+    // with an implicit CAST so DuckDB sees a real DECIMAL operand.
+    if b.op == BinaryOp::Div {
+        let (lop, rop) = decimal_widen_operands(&b, &l, &r);
+        match (lop, rop) {
+            (Some(DecimalOperand::Widened(p, s)), Some(DecimalOperand::Native(_, _))) => {
+                return Expression::Binary(BinaryExpression {
+                    op: b.op,
+                    left: Box::new(cast_impl(
+                        *b.left,
+                        DataType::Decimal {
+                            precision: p,
+                            scale: s,
+                        },
+                    )),
+                    right: b.right,
+                });
+            }
+            (Some(DecimalOperand::Native(_, _)), Some(DecimalOperand::Widened(p, s))) => {
+                return Expression::Binary(BinaryExpression {
+                    op: b.op,
+                    left: b.left,
+                    right: Box::new(cast_impl(
+                        *b.right,
+                        DataType::Decimal {
+                            precision: p,
+                            scale: s,
+                        },
+                    )),
+                });
+            }
+            _ => {}
+        }
+    }
+    Expression::Binary(b)
+}
+
 // ── UpdateFields shared classifier ──────────────────────────────────────────
 
 /// Apply Spark `withField` / `dropFields` operations to a caller-owned field
@@ -2187,6 +2333,7 @@ mod tests {
             expr: Box::new(ColumnReference::untyped("x")),
             to_type: DataType::Double,
             try_cast: false,
+            implicit: false,
         });
         assert_eq!(expr.data_type(&s), DataType::Double);
         assert!(!expr.nullable(&s));
@@ -2199,6 +2346,7 @@ mod tests {
             expr: Box::new(ColumnReference::untyped("x")),
             to_type: DataType::Double,
             try_cast: true,
+            implicit: false,
         });
         assert!(expr.nullable(&s));
     }
@@ -3247,5 +3395,186 @@ mod tests {
             });
             assert!(!expr.nullable(&schema));
         }
+    }
+
+    // ── N4: binary-coercion materialization ──────────────────────────────────
+    // `materialize_binary_coercions` — Div-widening + Date±Interval rules.
+
+    fn calendar_interval() -> Expression {
+        Expression::Interval(IntervalExpression {
+            months: 0,
+            days: 1,
+            microseconds: 0,
+            kind: IntervalKind::Calendar,
+        })
+    }
+
+    #[test]
+    fn materialize_non_binary_passes_through_unchanged() {
+        let schema = StructType::empty();
+        let expr = int_lit(1);
+        let before = expr.clone();
+        assert_eq!(materialize_binary_coercions(expr, &schema), before);
+    }
+
+    #[test]
+    fn materialize_div_wraps_integral_right_side_with_decimal_form() {
+        // `d / i` — Decimal(15,2) ÷ Integer: the integral RIGHT side widens
+        // via `decimal_form` (Integer → (10,0)); only that side gets an
+        // implicit CAST.
+        let schema = StructType::new(vec![
+            StructField::nullable("d", dec(15, 2)),
+            StructField::nullable("i", DataType::Integer),
+        ]);
+        let expr_before_type = bin(
+            BinaryOp::Div,
+            ColumnReference::untyped("d"),
+            ColumnReference::untyped("i"),
+        )
+        .data_type(&schema);
+        let expr = bin(
+            BinaryOp::Div,
+            ColumnReference::untyped("d"),
+            ColumnReference::untyped("i"),
+        );
+        let materialized = materialize_binary_coercions(expr, &schema);
+        let Expression::Binary(b) = &materialized else {
+            panic!("expected Binary, got {materialized:?}");
+        };
+        assert!(matches!(b.left.as_ref(), Expression::ColumnReference(c) if c.name == "d"));
+        match b.right.as_ref() {
+            Expression::Cast(c) => {
+                assert!(c.implicit);
+                assert!(!c.try_cast);
+                assert_eq!(c.to_type, dec(10, 0));
+                assert!(
+                    matches!(c.expr.as_ref(), Expression::ColumnReference(inner) if inner.name == "i")
+                );
+            }
+            other => panic!("expected implicit Cast on the widened side, got {other:?}"),
+        }
+        // Wire schema unchanged: the materialized tree's declared type is
+        // exactly what `binary_data_type` already inferred pre-N4.
+        assert_eq!(materialized.data_type(&schema), expr_before_type);
+    }
+
+    #[test]
+    fn materialize_div_wraps_integer_literal_left_side_with_from_literal_precision() {
+        // `100 / d` — the int-literal LEFT side widens via
+        // `DecimalType.fromLiteral` (single-digit → (1,0)), not
+        // `decimal_form`.
+        let schema = StructType::new(vec![StructField::nullable("d", dec(15, 2))]);
+        let expr = bin(BinaryOp::Div, int_lit(9), ColumnReference::untyped("d"));
+        let materialized = materialize_binary_coercions(expr, &schema);
+        let Expression::Binary(b) = &materialized else {
+            panic!("expected Binary, got {materialized:?}");
+        };
+        match b.left.as_ref() {
+            Expression::Cast(c) => {
+                assert!(c.implicit);
+                assert_eq!(c.to_type, dec(1, 0));
+                assert!(matches!(c.expr.as_ref(), Expression::Literal(_)));
+            }
+            other => panic!("expected implicit Cast on the widened side, got {other:?}"),
+        }
+        assert!(matches!(b.right.as_ref(), Expression::ColumnReference(c) if c.name == "d"));
+    }
+
+    #[test]
+    fn materialize_div_decimal_over_decimal_untouched() {
+        // Both sides already `Decimal` — no widening, no Cast inserted
+        // anywhere.
+        let schema = StructType::new(vec![
+            StructField::nullable("d1", dec(15, 2)),
+            StructField::nullable("d2", dec(10, 3)),
+        ]);
+        let expr = bin(
+            BinaryOp::Div,
+            ColumnReference::untyped("d1"),
+            ColumnReference::untyped("d2"),
+        );
+        let before = expr.clone();
+        assert_eq!(materialize_binary_coercions(expr, &schema), before);
+    }
+
+    #[test]
+    fn materialize_div_decimal_over_double_untouched() {
+        // Decimal ÷ Double: `decimalize` returns `None` for a non-integral
+        // Double operand (Spark: decimal ⊗ double → double) — the Div rule
+        // must not fire.
+        let schema = StructType::new(vec![
+            StructField::nullable("d", dec(15, 2)),
+            StructField::nullable("f", DataType::Double),
+        ]);
+        let expr = bin(
+            BinaryOp::Div,
+            ColumnReference::untyped("d"),
+            ColumnReference::untyped("f"),
+        );
+        let before = expr.clone();
+        assert_eq!(materialize_binary_coercions(expr, &schema), before);
+    }
+
+    #[test]
+    fn materialize_date_plus_interval_wraps_whole_node_in_implicit_cast_to_date() {
+        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let expr = bin(
+            BinaryOp::Add,
+            ColumnReference::untyped("d"),
+            calendar_interval(),
+        );
+        let materialized = materialize_binary_coercions(expr.clone(), &schema);
+        match &materialized {
+            Expression::Cast(c) => {
+                assert!(c.implicit);
+                assert!(!c.try_cast);
+                assert_eq!(c.to_type, DataType::Date);
+                assert_eq!(c.expr.as_ref(), &expr);
+            }
+            other => panic!("expected implicit Cast(.. AS Date), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialize_interval_plus_date_wraps_whole_node_in_implicit_cast_to_date() {
+        // Commutative: `INTERVAL + d` must also wrap.
+        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let expr = bin(
+            BinaryOp::Add,
+            calendar_interval(),
+            ColumnReference::untyped("d"),
+        );
+        let materialized = materialize_binary_coercions(expr, &schema);
+        assert!(
+            matches!(&materialized, Expression::Cast(c) if c.implicit && c.to_type == DataType::Date)
+        );
+    }
+
+    #[test]
+    fn materialize_date_minus_interval_wraps_whole_node_in_implicit_cast_to_date() {
+        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let expr = bin(
+            BinaryOp::Sub,
+            ColumnReference::untyped("d"),
+            calendar_interval(),
+        );
+        let materialized = materialize_binary_coercions(expr, &schema);
+        assert!(
+            matches!(&materialized, Expression::Cast(c) if c.implicit && c.to_type == DataType::Date)
+        );
+    }
+
+    #[test]
+    fn materialize_timestamp_plus_interval_untouched() {
+        // DuckDB already natively preserves `Timestamp ± Interval` as
+        // Timestamp — only the Date case needs a corrective CAST.
+        let schema = StructType::new(vec![StructField::nullable("t", DataType::Timestamp)]);
+        let expr = bin(
+            BinaryOp::Add,
+            ColumnReference::untyped("t"),
+            calendar_interval(),
+        );
+        let before = expr.clone();
+        assert_eq!(materialize_binary_coercions(expr, &schema), before);
     }
 }

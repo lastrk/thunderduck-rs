@@ -46,9 +46,9 @@ use super::ast::{
 use super::base_types::BaseTypes;
 use super::error::{EmissionError, UnsupportedKind};
 use super::expression::{
-    AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression, CastExpression,
-    ColumnReference, Expression, ExtractValueExpression, FunctionCall, Literal, LiteralValue,
-    SortOrder, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn,
+    materialize_binary_coercions, AliasExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
+    CastExpression, ColumnReference, Expression, ExtractValueExpression, FunctionCall, Literal,
+    LiteralValue, SortOrder, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
 use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
 use crate::bail_boundary_rule;
@@ -3559,12 +3559,48 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
             }
             Ok(recursed)
         }
+        // N4: recurse first (children fully resolved/typed), then materialize
+        // the binary-arithmetic coercions (decimal-Div widening, Date ±
+        // Interval correction) `binary_data_type`'s own inference implies but
+        // does not insert into the tree. See
+        // [`materialize_binary_coercions`]'s doc for the full contract.
+        Expression::Binary(_) => {
+            let recursed = expr.map_children(|e| resolve_and_stamp(e, ctx))?;
+            Ok(materialize_binary_coercions(recursed, ctx.schema))
+        }
+        // N4 idempotency: an `implicit` Cast can arrive here already
+        // materialized (e.g. re-running `resolve_and_stamp` over a
+        // `semantic_eq` rebind side). Recurse into the child first, then
+        // collapse a redundant nested implicit Cast to the SAME target type
+        // — `Cast_impl(T, Cast_impl(T, x))` → `Cast_impl(T, x)` — so
+        // repeated materialization reaches a fixpoint rather than stacking
+        // CASTs.
+        Expression::Cast(c) if c.implicit => {
+            let CastExpression {
+                expr: inner,
+                to_type,
+                try_cast,
+                implicit,
+            } = c;
+            let resolved_inner = resolve_and_stamp(*inner, ctx)?;
+            Ok(match resolved_inner {
+                Expression::Cast(inner_c) if inner_c.implicit && inner_c.to_type == to_type => {
+                    Expression::Cast(inner_c)
+                }
+                other => Expression::Cast(CastExpression {
+                    expr: Box::new(other),
+                    to_type,
+                    try_cast,
+                    implicit,
+                }),
+            })
+        }
         // Default recursion: walk every immediate child via the shared
-        // walker. Covers Binary / Unary / FunctionCall / Cast / CaseWhen /
-        // Window / Alias / Between / InList / Like / IsDistinctFrom /
-        // ExtractValue / ArrayLiteral / MapLiteral / StructLiteral /
-        // RowConstructor plus the leaf variants (Literal, Star) which return
-        // themselves unchanged inside `map_children`.
+        // walker. Covers Unary / FunctionCall / Cast (non-implicit) /
+        // CaseWhen / Window / Alias / Between / InList / Like /
+        // IsDistinctFrom / ExtractValue / ArrayLiteral / MapLiteral /
+        // StructLiteral / RowConstructor plus the leaf variants (Literal,
+        // Star) which return themselves unchanged inside `map_children`.
         _ => expr.map_children(|e| resolve_and_stamp(e, ctx)),
     }
 }
@@ -4169,10 +4205,12 @@ fn ordinals_compatible(a: &Expression, b: &Expression) -> bool {
     }
 }
 
-/// Recursively strip every `Alias` wrapper and case-fold/qualifier-strip
-/// `ColumnReference` / `UnresolvedColumn` identity, producing the canonical
-/// form [`semantic_eq`] compares with `==` (and then re-walks via
-/// [`ordinals_compatible`]). Uses [`Expression::map_children`] for the
+/// Recursively strip every `Alias` wrapper and `implicit` Cast (N4 —
+/// analyzer-materialized coercions Spark's own `semanticEquals` never sees)
+/// and case-fold/qualifier-strip `ColumnReference` / `UnresolvedColumn`
+/// identity, producing the canonical form [`semantic_eq`] compares with `==`
+/// (and then re-walks via [`ordinals_compatible`]). Uses
+/// [`Expression::map_children`] for the
 /// default recursion so every current and future `Expression` variant is
 /// covered without a hand-enumerated match; infallible (`Result<_,
 /// Infallible>`), so the `unwrap_or_else` below can never panic.
@@ -4184,6 +4222,14 @@ fn ordinals_compatible(a: &Expression, b: &Expression) -> bool {
 fn canonicalize_for_semantic_eq(expr: &Expression) -> Expression {
     if let Expression::Alias(a) = expr {
         return canonicalize_for_semantic_eq(&a.expr);
+    }
+    // N4: an `implicit` Cast is an analyzer-materialized coercion, invisible
+    // to Spark's own semantic-equality notion — strip it exactly like an
+    // `Alias` (see `CastExpression::implicit`'s doc).
+    if let Expression::Cast(c) = expr {
+        if c.implicit {
+            return canonicalize_for_semantic_eq(&c.expr);
+        }
     }
     let normalized = match expr {
         Expression::ColumnReference(c) => Expression::ColumnReference(ColumnReference {
@@ -5594,6 +5640,7 @@ pub fn crosstab_to_aggregate(
                 expr: Box::new(col_ref(col1)),
                 to_type: DataType::String,
                 try_cast: false,
+                implicit: false,
             }))),
         })),
         alias: format!("{col1}_{col2}"),
@@ -5885,6 +5932,10 @@ fn pretty_name(expr: &Expression) -> String {
             let args: Vec<String> = f.args.iter().map(pretty_name).collect();
             format!("{}({})", f.name, args.join(", "))
         }
+        // N4: an `implicit` Cast is an analyzer-materialized coercion, never
+        // part of what Spark itself names — transparent straight to the
+        // inner expression (see `CastExpression::implicit`'s doc).
+        Expression::Cast(c) if c.implicit => pretty_name(&c.expr),
         // Spark's `Cast.sql` / `TryCast.sql` renders `CAST(<child> AS <TYPE>)`
         // / `TRY_CAST(<child> AS <TYPE>)` with the UPPERCASE Catalyst type
         // spelling (`DECIMAL(15,4)`, not DuckDB's `DECIMAL(15, 4)` substrate
@@ -6037,6 +6088,7 @@ fn align_setop_projection(expr: &mut Expression, name: &str, cast_to: Option<Dat
             expr: Box::new(inner),
             to_type,
             try_cast: false,
+            implicit: false,
         }),
         None => inner,
     };
@@ -6136,9 +6188,9 @@ mod tests {
     use super::super::ast::{CommonAst, GroupingKind};
     use super::super::expression::{
         AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, ExistsSubquery,
-        FunctionCall, InSubquery, LambdaExpression, LambdaVariableExpression, Literal,
-        LiteralValue, NullOrdering, ScalarSubquery, SortDirection, StarExpression, UnaryExpression,
-        UnaryOp, UnresolvedRegexExpression,
+        FunctionCall, InSubquery, IntervalExpression, IntervalKind, LambdaExpression,
+        LambdaVariableExpression, Literal, LiteralValue, NullOrdering, ScalarSubquery,
+        SortDirection, StarExpression, UnaryExpression, UnaryOp, UnresolvedRegexExpression,
     };
     use super::*;
 
@@ -11256,6 +11308,7 @@ mod tests {
                 scale: 4,
             },
             try_cast: false,
+            implicit: false,
         });
         assert_eq!(pretty_name(&expr), "CAST(x AS DECIMAL(15,4))");
     }
@@ -11266,6 +11319,7 @@ mod tests {
             expr: Box::new(unresolved_col("x")),
             to_type: DataType::Long,
             try_cast: true,
+            implicit: false,
         });
         assert_eq!(pretty_name(&expr), "TRY_CAST(x AS BIGINT)");
     }
@@ -11283,6 +11337,7 @@ mod tests {
                 expr: Box::new(unresolved_col(col)),
                 to_type: dec.clone(),
                 try_cast: false,
+                implicit: false,
             })
         };
         let div = Expression::Binary(BinaryExpression {
@@ -13851,5 +13906,207 @@ mod tests {
             }
             other => panic!("expected UnknownColumn, got {other:?}"),
         }
+    }
+
+    // ── N4: binary-coercion materialization — `resolve_and_stamp` wiring ──
+    // `materialize_binary_coercions` itself is unit-tested directly in
+    // `expression.rs`; these exercise the `Expression::Binary` /
+    // `Expression::Cast(c) if c.implicit` arms wired into `resolve_and_stamp`
+    // — idempotency (fixpoint on re-resolution), naming transparency, and
+    // `semantic_eq` transparency.
+
+    #[test]
+    fn resolve_and_stamp_div_widen_materialization_is_idempotent() {
+        let bt = base_types_for(&[(
+            "t",
+            StructType::new(vec![
+                StructField::nullable(
+                    "d",
+                    DataType::Decimal {
+                        precision: 15,
+                        scale: 2,
+                    },
+                ),
+                StructField::nullable("i", DataType::Integer),
+            ]),
+        )]);
+        let scanned = analyze(scan("t"), &bt).expect("scan analyzes");
+        let ctx = ResolveContext::of_input(&scanned, &bt, None);
+        let expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Div,
+            left: Box::new(unresolved_col("d")),
+            right: Box::new(unresolved_col("i")),
+        });
+        let once = resolve_and_stamp(expr, &ctx).expect("first resolve");
+        let Expression::Binary(b) = &once else {
+            panic!("expected Binary, got {once:?}");
+        };
+        assert!(
+            matches!(b.right.as_ref(), Expression::Cast(c) if c.implicit),
+            "the integral side must be widened via an implicit Cast: {b:?}"
+        );
+        let twice = resolve_and_stamp(once.clone(), &ctx).expect("second resolve");
+        assert_eq!(
+            once, twice,
+            "re-resolving an already-materialized Div-widen tree must be a fixpoint"
+        );
+    }
+
+    #[test]
+    fn resolve_and_stamp_date_interval_materialization_is_idempotent() {
+        let bt = base_types_for(&[(
+            "t",
+            StructType::new(vec![StructField::nullable("d", DataType::Date)]),
+        )]);
+        let scanned = analyze(scan("t"), &bt).expect("scan analyzes");
+        let ctx = ResolveContext::of_input(&scanned, &bt, None);
+        let expr = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(unresolved_col("d")),
+            right: Box::new(Expression::Interval(IntervalExpression {
+                months: 0,
+                days: 1,
+                microseconds: 0,
+                kind: IntervalKind::Calendar,
+            })),
+        });
+        let once = resolve_and_stamp(expr, &ctx).expect("first resolve");
+        assert!(
+            matches!(&once, Expression::Cast(c) if c.implicit && c.to_type == DataType::Date),
+            "the whole Date + Interval node must be wrapped in an implicit Cast to Date: {once:?}"
+        );
+        let twice = resolve_and_stamp(once.clone(), &ctx).expect("second resolve");
+        assert_eq!(
+            once, twice,
+            "re-resolving an already-materialized Date-preserving cast must be a fixpoint, \
+             not stack another wrapper"
+        );
+    }
+
+    #[test]
+    fn pretty_name_transparent_over_materialized_div_widen() {
+        let schema = StructType::new(vec![
+            StructField::nullable(
+                "sum_x",
+                DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+            ),
+            StructField::nullable("w_sq_ft", DataType::Integer),
+        ]);
+        let raw = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Div,
+            left: Box::new(ColumnReference::untyped("sum_x")),
+            right: Box::new(ColumnReference::untyped("w_sq_ft")),
+        });
+        let pre_name = expression_output_name(&raw);
+        let materialized = materialize_binary_coercions(raw.clone(), &schema);
+        assert_ne!(
+            materialized, raw,
+            "sanity: N4 must actually change the tree in this shape"
+        );
+        assert_eq!(
+            expression_output_name(&materialized),
+            pre_name,
+            "an implicit N4 Cast must not perturb output naming"
+        );
+    }
+
+    #[test]
+    fn pretty_name_transparent_over_materialized_date_plus_interval() {
+        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let raw = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(ColumnReference::untyped("d")),
+            right: Box::new(Expression::Interval(IntervalExpression {
+                months: 0,
+                days: 1,
+                microseconds: 0,
+                kind: IntervalKind::Calendar,
+            })),
+        });
+        let pre_name = expression_output_name(&raw);
+        let materialized = materialize_binary_coercions(raw.clone(), &schema);
+        assert!(matches!(&materialized, Expression::Cast(c) if c.implicit));
+        assert_eq!(
+            expression_output_name(&materialized),
+            pre_name,
+            "an implicit N4 Cast must not perturb output naming"
+        );
+    }
+
+    #[test]
+    fn semantic_eq_strips_implicit_cast_on_div_widen_shape() {
+        let schema = StructType::new(vec![
+            StructField::nullable(
+                "d",
+                DataType::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+            ),
+            StructField::nullable("i", DataType::Integer),
+        ]);
+        let raw = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Div,
+            left: Box::new(ColumnReference::untyped("d")),
+            right: Box::new(ColumnReference::untyped("i")),
+        });
+        let materialized = materialize_binary_coercions(raw.clone(), &schema);
+        assert_ne!(
+            materialized, raw,
+            "sanity: N4 must actually change the tree in this shape"
+        );
+        assert!(
+            semantic_eq(&materialized, &raw),
+            "an implicit N4 Cast must be invisible to semantic_eq, exactly like an Alias"
+        );
+    }
+
+    /// Review-pinned negative guard: a USER-written cast (`implicit: false`)
+    /// must NOT be stripped by `semantic_eq`'s canonicalization — only N4's
+    /// materialized casts are transparent. Guards against a future
+    /// accidental widening of the strip condition.
+    #[test]
+    fn semantic_eq_does_not_strip_user_written_cast() {
+        let bare = ColumnReference::untyped("i");
+        let user_cast = Expression::Cast(CastExpression {
+            expr: Box::new(bare.clone()),
+            to_type: DataType::Decimal {
+                precision: 20,
+                scale: 0,
+            },
+            try_cast: false,
+            implicit: false,
+        });
+        assert!(
+            !semantic_eq(&user_cast, &bare),
+            "a user-written CAST is a semantic operation and must stay distinct"
+        );
+    }
+
+    #[test]
+    fn semantic_eq_strips_implicit_cast_on_date_plus_interval_shape() {
+        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let raw = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(ColumnReference::untyped("d")),
+            right: Box::new(Expression::Interval(IntervalExpression {
+                months: 0,
+                days: 1,
+                microseconds: 0,
+                kind: IntervalKind::Calendar,
+            })),
+        });
+        let materialized = materialize_binary_coercions(raw.clone(), &schema);
+        assert_ne!(
+            materialized, raw,
+            "sanity: N4 must actually change the tree in this shape"
+        );
+        assert!(
+            semantic_eq(&materialized, &raw),
+            "an implicit N4 Cast must be invisible to semantic_eq, exactly like an Alias"
+        );
     }
 }

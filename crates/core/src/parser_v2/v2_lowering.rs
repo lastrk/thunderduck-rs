@@ -2764,6 +2764,7 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
                     })),
                     to_type: DataType::Long,
                     try_cast: false,
+                    implicit: false,
                 }));
             }
             // Spark's null-safe equality `a <=> b` is defined as `NOT DISTINCT
@@ -2812,6 +2813,7 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
                 expr: Box::new(lower_expr(*expr, cte_scope)?),
                 to_type: lower_data_type(data_type)?,
                 try_cast,
+                implicit: false,
             }))
         }
         Expr::Function(f) => lower_function(f, cte_scope),

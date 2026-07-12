@@ -6034,6 +6034,17 @@ fn is_nonzero_literal(e: &Expression) -> bool {
     }
 }
 
+/// `true` when `expr` is a `Cast` node — implicit OR user-written — whose
+/// target is exactly `ty`. Used by [`render_binary`]'s decimal-Div routing
+/// to avoid double-wrapping an operand that is already a `Cast` to this
+/// exact type: N4's materialized widened side
+/// (`materialize_binary_coercions`), or an equivalent user cast. Bare
+/// rendering of either is a genuine `DECIMAL(p, s)`, so skipping the wrap
+/// is safe in both cases; a cast to a DIFFERENT decimal type still wraps.
+fn is_cast_to(expr: &Expression, ty: &DataType) -> bool {
+    matches!(expr, Expression::Cast(c) if &c.to_type == ty)
+}
+
 fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, EmissionError> {
     let l = render_expr(&b.left, schema)?;
     let r = render_expr(&b.right, schema)?;
@@ -6044,52 +6055,58 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
     // `thdck_spark_funcs` extension function `spark_decimal_div` which
     // implements Spark's rounding + scale semantics. Corpus: type-005.
     //
-    // A DECIMAL operand divided by a plain integral one (column, expression,
-    // or integer literal — e.g. `decimal_col / int_col`) is ALSO decimal
-    // division in Spark: `binary_data_type` (this expression's own type
-    // inference) implicitly widens the integral side to `Decimal` via
-    // `Expression::decimalize` before applying `decimal_div_type`, so the
-    // analyzer's declared result type is `Decimal` even though the integral
-    // operand's OWN type is not. Mirror that exact widening here — decimalize
-    // whichever side is not already Decimal — so the routing condition below
-    // fires in lockstep with the analyzer (tpcds-q066: `sum(x)/w_sq_ft`,
-    // DuckDB's native DECIMAL/BIGINT `/` yields DOUBLE where Spark yields
-    // DECIMAL).
+    // A DECIMAL operand divided by a plain integral one (e.g. `decimal_col /
+    // int_col`) is ALSO decimal division in Spark. The analyzer's N4
+    // materialization pass (`materialize_binary_coercions`) inserts an
+    // implicit CAST widening the lone integral side to `Decimal` directly
+    // into the tree, so both operands' own `data_type` already report
+    // `Decimal` in lockstep with the analyzer by the time emission sees this
+    // node (tpcds-q066: `sum(x)/w_sq_ft`, DuckDB's native DECIMAL/BIGINT `/`
+    // yields DOUBLE where Spark yields DECIMAL) — no re-derivation needed
+    // here.
     // TODO(ADR-006): decimal divide-by-zero is not yet ANSI-guarded here.
-    if matches!(b.op, BinaryOp::Div) {
+    if b.op == BinaryOp::Div {
         let lt = b.left.data_type(schema);
         let rt = b.right.data_type(schema);
-        let decimal_parts = |dt: &DataType| match dt {
-            DataType::Decimal { precision, scale } => Some((*precision, *scale)),
-            _ => None,
-        };
-        let lp = decimal_parts(&lt);
-        let rp = decimal_parts(&rt);
-        let (lp, rp) = match (lp, rp) {
-            (Some(lp), None) => (Some(lp), Expression::decimalize(&b.right, &rt)),
-            (None, Some(rp)) => (Expression::decimalize(&b.left, &lt), Some(rp)),
-            (lp, rp) => (lp, rp),
-        };
-        if let (Some((lprec, lscale)), Some((rprec, rscale))) = (lp, rp) {
-            // The analyzer types the decimal side Decimal (Spark parity), but
-            // a DuckDB-native aggregate operand (e.g. `avg` over DECIMAL) is
-            // emitted as DOUBLE, and the integral side is not Decimal at all
-            // at the DuckDB level — passing either raw makes the extension
-            // reject non-DECIMAL args. Cast each operand to the DECIMAL(p,s)
-            // the analyzer widened it to: a no-op re-cast for a genuine
-            // decimal, and a coercion for a native-double/integral operand —
-            // keeping Spark's DECIMAL division semantics either way.
-            let lty = render_data_type(&DataType::Decimal {
+        if let (
+            DataType::Decimal {
                 precision: lprec,
                 scale: lscale,
-            });
-            let rty = render_data_type(&DataType::Decimal {
+            },
+            DataType::Decimal {
                 precision: rprec,
                 scale: rscale,
+            },
+        ) = (&lt, &rt)
+        {
+            // A DuckDB-native aggregate operand (e.g. `avg` over DECIMAL) is
+            // emitted as DOUBLE at the DuckDB level even though it's typed
+            // Decimal here — passing it raw makes the extension reject
+            // non-DECIMAL args. Cast each operand to the DECIMAL(p,s) its own
+            // declared type already is: a no-op re-cast for a genuine decimal
+            // column, and — UNLESS the operand is already a materialized N4
+            // `Cast` to this exact type (the widened side) — a coercion for a
+            // native-double/integral operand. Skipping the re-wrap there
+            // avoids a redundant double CAST around N4's own implicit one.
+            let lty = render_data_type(&DataType::Decimal {
+                precision: *lprec,
+                scale: *lscale,
             });
-            return Ok(format!(
-                "spark_decimal_div(CAST(({l}) AS {lty}), CAST(({r}) AS {rty}))"
-            ));
+            let rty = render_data_type(&DataType::Decimal {
+                precision: *rprec,
+                scale: *rscale,
+            });
+            let lsql = if is_cast_to(&b.left, &lt) {
+                l.clone()
+            } else {
+                format!("CAST(({l}) AS {lty})")
+            };
+            let rsql = if is_cast_to(&b.right, &rt) {
+                r.clone()
+            } else {
+                format!("CAST(({r}) AS {rty})")
+            };
+            return Ok(format!("spark_decimal_div({lsql}, {rsql})"));
         }
     }
     let op = match b.op {
@@ -6114,25 +6131,10 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
     };
     let inner = format!("({l}) {op} ({r})");
     // Date ± Interval: DuckDB promotes `DATE ± INTERVAL` to TIMESTAMP, but
-    // Spark's `Date ± Interval` stays DATE (`binary_data_type` in
-    // expression.rs preserves the date-like side). CAST back to DATE so
-    // collected values come back as date, not datetime. Guarded on the
-    // *inferred* type being Date (not merely one side being Date) so a
-    // Timestamp ± Interval — which correctly infers Timestamp — is left
-    // untouched.
-    let inner = if matches!(b.op, BinaryOp::Add | BinaryOp::Sub) {
-        let lt = b.left.data_type(schema);
-        let rt = b.right.data_type(schema);
-        let is_date_plus_interval = (matches!(lt, DataType::Date) && rt.is_interval())
-            || (matches!(rt, DataType::Date) && lt.is_interval());
-        if is_date_plus_interval {
-            format!("CAST({inner} AS DATE)")
-        } else {
-            inner
-        }
-    } else {
-        inner
-    };
+    // Spark's `Date ± Interval` stays DATE. The analyzer's N4 materialization
+    // pass (`materialize_binary_coercions`) already wraps the whole node in
+    // an implicit `CAST(.. AS DATE)` (rendered by `render_cast`) when this
+    // node's inferred type is Date, so no corrective cast belongs here.
     // ADR-006: guard divide/mod-by-zero with Spark's ANSI error class.
     let guard = match b.op {
         BinaryOp::Div | BinaryOp::IntDiv => Some(super::spark_errors::SparkError::DivideByZero),
@@ -7070,11 +7072,11 @@ mod tests {
     };
     use crate::transpiler_v2::base_types::BaseTypes;
     use crate::transpiler_v2::expression::{
-        AliasExpression, BetweenExpression, BinaryExpression, BinaryOp, CaseWhenExpression,
-        CastExpression, ColumnReference, ExtractValueExpression, FunctionCall, InListExpression,
-        IntervalExpression, IntervalKind, LambdaExpression, LambdaVariableExpression,
-        LikeExpression, Literal, LiteralValue, MapLiteralExpression, StarExpression,
-        UnaryExpression, UnaryOp, UpdateFieldsExpression,
+        materialize_binary_coercions, AliasExpression, BetweenExpression, BinaryExpression,
+        BinaryOp, CaseWhenExpression, CastExpression, ColumnReference, ExtractValueExpression,
+        FunctionCall, InListExpression, IntervalExpression, IntervalKind, LambdaExpression,
+        LambdaVariableExpression, LikeExpression, Literal, LiteralValue, MapLiteralExpression,
+        StarExpression, UnaryExpression, UnaryOp, UpdateFieldsExpression,
     };
     use crate::transpiler_v2::{analyze, generate, AnalyzerError};
     use crate::types::StructField;
@@ -11275,6 +11277,7 @@ mod tests {
                 expr: Box::new(grouping_id_call()),
                 to_type: DataType::Long,
                 try_cast: false,
+                implicit: false,
             })),
             alias: "gid".to_owned(),
         });
@@ -11286,6 +11289,7 @@ mod tests {
                     expr: Box::new(fexpr("grouping_id", vec![ucol("dept_id")])),
                     to_type: DataType::Long,
                     try_cast: false,
+                    implicit: false,
                 })),
                 alias: "gid".to_owned(),
             })
@@ -11756,6 +11760,7 @@ mod tests {
             expr: Box::new(int_lit(1)),
             to_type: DataType::Long,
             try_cast: false,
+            implicit: false,
         };
         let sql = render_cast(&expr, &empty_schema()).expect("render");
         assert_eq!(sql, "CAST(1 AS BIGINT)");
@@ -11768,6 +11773,7 @@ mod tests {
             expr: Box::new(int_lit(1)),
             to_type: DataType::Long,
             try_cast: true,
+            implicit: false,
         };
         let sql = render_cast(&expr, &empty_schema()).expect("render");
         assert_eq!(sql, "TRY_CAST(1 AS BIGINT)");
@@ -13679,6 +13685,7 @@ mod tests {
                         })),
                         to_type: DataType::String,
                         try_cast: false,
+                        implicit: false,
                     }),
                     Expression::Literal(Literal {
                         value: LiteralValue::String(":".to_owned()),
@@ -15101,12 +15108,31 @@ mod tests {
     /// must ALSO route to `spark_decimal_div`. DuckDB's native `DECIMAL /
     /// BIGINT` yields DOUBLE (unlike `+`/`-`/`*`, which stay DECIMAL),
     /// diverging from the analyzer's declared Decimal result type (Spark
-    /// widens the integral operand to Decimal before dividing —
-    /// `Expression::decimalize` / `TypeInferenceEngine::decimal_div_type`).
-    /// The integral operand must be CAST to its *decimalized* form
-    /// (`decimal_form`), not passed through raw. Corpus: tpcds-q066.
+    /// widens the integral operand to Decimal before dividing). N4 moved
+    /// this widening from a `render_binary`-local re-derivation into the
+    /// analyzer's `materialize_binary_coercions` pass, which inserts the
+    /// implicit widening CAST onto the tree itself — mirror that here by
+    /// materializing before rendering (`render_binary`/`render_expr` no
+    /// longer re-derive the widening; they only read operand `data_type`).
+    /// Corpus: tpcds-q066.
+    ///
+    /// Also pins the no-double-cast rule: the widened side is ALREADY a
+    /// materialized `Cast` to its exact declared DECIMAL(p,s), so
+    /// `render_binary`'s decimal-Div routing renders it bare (no outer
+    /// re-wrap) — the only expectation delta from the pre-N4 string is the
+    /// dropped inner parens around the (no-longer-double-cast) identifier.
     #[test]
     fn decimal_div_by_integral_column_routes_through_spark_decimal_div() {
+        let schema = StructType::new(vec![
+            StructField::nullable(
+                "jan_sales",
+                DataType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+            ),
+            StructField::nullable("w_warehouse_sq_ft", DataType::Long),
+        ]);
         let l = col_with_type(
             "jan_sales",
             DataType::Decimal {
@@ -15115,16 +15141,26 @@ mod tests {
             },
         );
         let r = col_with_type("w_warehouse_sq_ft", DataType::Long);
-        let b = BinaryExpression {
+        let expr = Expression::Binary(BinaryExpression {
             op: BinaryOp::Div,
             left: Box::new(l),
             right: Box::new(r),
+        });
+        let materialized = materialize_binary_coercions(expr, &schema);
+        let Expression::Binary(mb) = &materialized else {
+            panic!("expected Binary, got {materialized:?}");
         };
-        let sql = render_binary(&b, &empty_schema()).expect("render");
+        assert!(
+            matches!(mb.right.as_ref(), Expression::Cast(c) if c.implicit),
+            "the integral side must be widened via an implicit N4 Cast: {mb:?}"
+        );
+        let sql = render_expr(&materialized, &schema).expect("render");
         assert_eq!(
             sql,
             "spark_decimal_div(CAST((jan_sales) AS DECIMAL(38, 2)), \
-             CAST((w_warehouse_sq_ft) AS DECIMAL(20, 0)))"
+             CAST(w_warehouse_sq_ft AS DECIMAL(20, 0)))",
+            "the already-materialized side renders bare (no double CAST), \
+             the native side keeps its pre-N4 parenthesization"
         );
     }
 
@@ -15151,9 +15187,14 @@ mod tests {
     //
     // DuckDB promotes `DATE ± INTERVAL` to TIMESTAMP; Spark's Date ± Interval
     // stays DATE (`binary_data_type` in expression.rs preserves the
-    // date-like side). `render_binary` must CAST the result back to DATE —
-    // but ONLY when the inferred type is actually Date, never for a
-    // Timestamp-base interval add (which correctly infers Timestamp).
+    // date-like side). N4 moved the corrective CAST from `render_binary`
+    // itself into the analyzer's `materialize_binary_coercions` pass, which
+    // wraps the WHOLE node in an implicit `Cast` rendered by `render_cast` —
+    // these tests now route the raw `Binary` through the materializer before
+    // rendering (via `render_expr`, the top-level dispatcher), mirroring the
+    // real `resolve_and_stamp` pipeline. Only ever fires when the inferred
+    // type is actually Date, never for a Timestamp-base interval add (which
+    // correctly infers Timestamp).
 
     #[test]
     fn render_binary_date_plus_interval_casts_to_date() {
@@ -15168,7 +15209,8 @@ mod tests {
             left: Box::new(col_with_type("d", DataType::Date)),
             right: Box::new(Expression::Interval(i)),
         };
-        let sql = render_binary(&b, &empty_schema()).expect("render");
+        let materialized = materialize_binary_coercions(Expression::Binary(b), &empty_schema());
+        let sql = render_expr(&materialized, &empty_schema()).expect("render");
         assert!(
             sql.starts_with("CAST(") && sql.ends_with("AS DATE)"),
             "expected a DATE cast wrapping the addition, got: {sql}"
@@ -15189,7 +15231,8 @@ mod tests {
             left: Box::new(Expression::Interval(i)),
             right: Box::new(col_with_type("d", DataType::Date)),
         };
-        let sql = render_binary(&b, &empty_schema()).expect("render");
+        let materialized = materialize_binary_coercions(Expression::Binary(b), &empty_schema());
+        let sql = render_expr(&materialized, &empty_schema()).expect("render");
         assert!(
             sql.starts_with("CAST(") && sql.ends_with("AS DATE)"),
             "expected a DATE cast wrapping the addition, got: {sql}"
@@ -15209,7 +15252,8 @@ mod tests {
             left: Box::new(col_with_type("d", DataType::Date)),
             right: Box::new(Expression::Interval(i)),
         };
-        let sql = render_binary(&b, &empty_schema()).expect("render");
+        let materialized = materialize_binary_coercions(Expression::Binary(b), &empty_schema());
+        let sql = render_expr(&materialized, &empty_schema()).expect("render");
         assert!(
             sql.starts_with("CAST(") && sql.ends_with("AS DATE)"),
             "expected a DATE cast wrapping the subtraction, got: {sql}"
@@ -15219,7 +15263,8 @@ mod tests {
     /// No-regression guard: a Timestamp-base interval add must NOT get the
     /// DATE cast — `binary_data_type` infers `Timestamp` here (not `Date`),
     /// so the currently-GREEN `test_day_time_interval_*` / timestamp-base
-    /// interval corpus cases stay untouched.
+    /// interval corpus cases stay untouched. Routed through the materializer
+    /// too, for parity with the Date-shape tests above — it must be a no-op.
     #[test]
     fn render_binary_timestamp_plus_interval_is_not_cast_to_date() {
         let i = IntervalExpression {
@@ -15233,10 +15278,92 @@ mod tests {
             left: Box::new(ts_col_ref("ts")),
             right: Box::new(Expression::Interval(i)),
         };
-        let sql = render_binary(&b, &empty_schema()).expect("render");
+        let before = Expression::Binary(b.clone());
+        let materialized = materialize_binary_coercions(Expression::Binary(b), &empty_schema());
+        assert_eq!(
+            materialized, before,
+            "a Timestamp-base interval add must not be touched by N4's Date rule"
+        );
+        let sql = render_expr(&materialized, &empty_schema()).expect("render");
         assert!(
             !sql.contains("AS DATE"),
             "Timestamp ± Interval must not be cast to DATE, got: {sql}"
+        );
+    }
+
+    /// N4 byte-identity pin: routing the DATE-cast correction through the
+    /// analyzer's `materialize_binary_coercions` + `render_cast` must
+    /// produce the EXACT same SQL string the old `render_binary`-local guard
+    /// used to build directly (`format!("CAST({inner} AS DATE)")`) — proves
+    /// the migration didn't perturb wire output byte-for-byte.
+    #[test]
+    fn render_binary_date_plus_interval_n4_pipeline_is_byte_identical_to_legacy_guard() {
+        let i = IntervalExpression {
+            months: 0,
+            days: 5,
+            microseconds: 0,
+            kind: IntervalKind::Calendar,
+        };
+        let b = BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(col_with_type("d", DataType::Date)),
+            right: Box::new(Expression::Interval(i)),
+        };
+        let inner = render_binary(&b, &empty_schema()).expect("render inner");
+        let materialized = materialize_binary_coercions(Expression::Binary(b), &empty_schema());
+        let sql = render_expr(&materialized, &empty_schema()).expect("render materialized");
+        assert_eq!(sql, format!("CAST({inner} AS DATE)"));
+    }
+
+    /// N3 ∘ N4 composition: `date_add(d, 1) + INTERVAL '1' DAY` nests an
+    /// N3-typed function (`date_add`, whose own `render_function_call` wrap
+    /// already supplies its OWN corrective `CAST(.. AS DATE)` via
+    /// `needs_date_return_cast`) under an N4 `Binary` (whose LEFT side is
+    /// therefore Date-typed, so the outer Add ALSO needs the Date-preserving
+    /// correction). Both layers' casts are legitimate and independent — one
+    /// per level, not a redundant double-wrap of either node.
+    #[test]
+    fn render_binary_date_add_function_plus_interval_composes_n3_and_n4_single_casts_each() {
+        let schema = StructType::new(vec![StructField::nullable("d", DataType::Date)]);
+        let date_add_call = fexpr(
+            "date_add",
+            vec![col_with_type("d", DataType::Date), int_lit(1)],
+        );
+        let outer = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Add,
+            left: Box::new(date_add_call),
+            right: Box::new(Expression::Interval(IntervalExpression {
+                months: 0,
+                days: 1,
+                microseconds: 0,
+                kind: IntervalKind::Calendar,
+            })),
+        });
+        let materialized = materialize_binary_coercions(outer, &schema);
+        let Expression::Cast(outer_cast) = &materialized else {
+            panic!("expected N4 to wrap the outer Add in an implicit Cast, got {materialized:?}");
+        };
+        assert!(outer_cast.implicit);
+        assert_eq!(outer_cast.to_type, DataType::Date);
+        // N4 must not have touched the inner `date_add(...)` FunctionCall —
+        // it stays exactly as built, opaque to the Binary-only materializer.
+        let Expression::Binary(inner_binary) = outer_cast.expr.as_ref() else {
+            panic!("expected the Cast to wrap the original Binary unchanged");
+        };
+        assert!(matches!(
+            inner_binary.left.as_ref(),
+            Expression::FunctionCall(f) if f.name == "date_add"
+        ));
+        let sql = render_expr(&materialized, &schema).expect("render");
+        assert_eq!(
+            sql.matches("AS DATE)").count(),
+            2,
+            "expected exactly two Date corrections (N3's on date_add, N4's on the outer Add), \
+             got: {sql}"
+        );
+        assert!(
+            !sql.contains("AS DATE) AS DATE)"),
+            "the two corrections must not stack as an adjacent redundant double-cast, got: {sql}"
         );
     }
 

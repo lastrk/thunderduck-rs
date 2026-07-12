@@ -35,8 +35,7 @@ use sqlparser::ast::{
 
 use crate::bail_boundary_proto;
 use crate::transpiler_v2::ast::{
-    AggregateProjection, CommonAst, CommonOp, FileFormat, GroupingKind, JoinType, PivotGrouping,
-    SetOpKind, UnpivotIds,
+    CommonAst, CommonOp, FileFormat, GroupingKind, JoinType, PivotGrouping, SetOpKind, UnpivotIds,
 };
 use crate::transpiler_v2::error::UnsupportedKind;
 use crate::transpiler_v2::expression::{
@@ -1665,11 +1664,10 @@ fn lower_aggregate_select(
     Ok(CommonAst::new(CommonOp::Aggregate {
         input: Box::new(input),
         grouping,
-        aggregates: projections,
         // The SQL front-end folds the entire SELECT list (grouping columns
         // and aggregate calls alike) into `aggregates` above — it IS the
-        // complete, authoritative output list.
-        projection: AggregateProjection::Folded,
+        // complete, authoritative output list (N7).
+        aggregates: projections,
         grouping_kind,
         grouping_sets,
         having,

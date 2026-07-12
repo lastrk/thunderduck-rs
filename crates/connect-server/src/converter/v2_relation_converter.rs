@@ -34,7 +34,7 @@ use arrow::datatypes::{DataType as ArrowDT, Field, IntervalUnit, TimeUnit};
 use arrow_ipc::reader::StreamReader;
 use thunderduck_core::bail_boundary_proto;
 use thunderduck_core::transpiler_v2::ast::{
-    AggregateProjection, CommonAst, CommonOp, FileFormat, JoinType, PivotGrouping, UnpivotIds,
+    grouped_aggregate, CommonAst, CommonOp, FileFormat, JoinType, PivotGrouping, UnpivotIds,
 };
 use thunderduck_core::transpiler_v2::error::UnsupportedKind;
 use thunderduck_core::transpiler_v2::expression::{
@@ -431,15 +431,12 @@ impl V2RelationConverter {
             args: vec![col1, col2],
             distinct: false,
         });
-        Ok(CommonAst::new(CommonOp::Aggregate {
-            input: Box::new(input),
-            grouping: vec![],
-            aggregates: vec![agg_expr],
-            projection: AggregateProjection::Grouped,
-            grouping_kind: thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
-            grouping_sets: vec![],
-            having: None,
-        }))
+        Ok(CommonAst::new(grouped_aggregate(
+            input,
+            vec![],
+            vec![agg_expr],
+            thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
+        )))
     }
 
     /// Convert `proto::StatCorr` (`df.stat.corr(col1, col2)`).
@@ -472,15 +469,12 @@ impl V2RelationConverter {
             args: vec![col1, col2],
             distinct: false,
         });
-        Ok(CommonAst::new(CommonOp::Aggregate {
-            input: Box::new(input),
-            grouping: vec![],
-            aggregates: vec![agg_expr],
-            projection: AggregateProjection::Grouped,
-            grouping_kind: thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
-            grouping_sets: vec![],
-            having: None,
-        }))
+        Ok(CommonAst::new(grouped_aggregate(
+            input,
+            vec![],
+            vec![agg_expr],
+            thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
+        )))
     }
 
     /// Convert `proto::StatApproxQuantile` (`df.stat.approxQuantile(...)`).
@@ -540,15 +534,12 @@ impl V2RelationConverter {
             elements: per_col_arrays,
             element_type: DataType::Array(Box::new(DataType::Double), true),
         });
-        Ok(CommonAst::new(CommonOp::Aggregate {
-            input: Box::new(input),
-            grouping: vec![],
-            aggregates: vec![outer],
-            projection: AggregateProjection::Grouped,
-            grouping_kind: thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
-            grouping_sets: vec![],
-            having: None,
-        }))
+        Ok(CommonAst::new(grouped_aggregate(
+            input,
+            vec![],
+            vec![outer],
+            thunderduck_core::transpiler_v2::ast::GroupingKind::GroupBy,
+        )))
     }
 
     /// Convert `proto::ToSchema` (Spark `df.to(schema)`).
@@ -833,25 +824,19 @@ impl V2RelationConverter {
         };
         let input = self.convert_input(a.input.as_deref(), "Aggregate")?;
         let grouping = self.expr.convert_all(&a.grouping_expressions)?;
-        let aggregates = self.expr.convert_all(&a.aggregate_expressions)?;
-        Ok(CommonAst::new(CommonOp::Aggregate {
-            input: Box::new(input),
+        let agg_exprs = self.expr.convert_all(&a.aggregate_expressions)?;
+        // N7: `grouped_aggregate` builds the output list as `grouping ++
+        // agg_exprs` (Spark's DataFrame `.groupBy(...).agg(...)` semantics)
+        // and always leaves `grouping_sets`/`having` empty — the DataFrame
+        // `groupingSets` path stays a boundary error (ADR-022) and HAVING is
+        // a SparkSQL-only concept (DataFrame post-agg filtering is a
+        // separate Filter over the Aggregate).
+        Ok(CommonAst::new(grouped_aggregate(
+            input,
             grouping,
-            aggregates,
-            // The DataFrame converter puts only the aggregate expressions
-            // into `aggregates` (grouping columns are never mixed in) — the
-            // output is `grouping ++ aggregates`, Spark's DataFrame
-            // `.groupBy(...).agg(...)` semantics.
-            projection: AggregateProjection::Grouped,
+            agg_exprs,
             grouping_kind,
-            // DataFrame `groupingSets` path is not implemented in τ — leave the
-            // per-set membership empty so emission surfaces the boundary error
-            // (ADR-022). The SparkSQL front-end populates this instead.
-            grouping_sets: Vec::new(),
-            // DataFrame path models post-aggregation filtering as a separate
-            // Filter over the Aggregate; HAVING is a SparkSQL-only concept.
-            having: None,
-        }))
+        )))
     }
 
     /// Convert `Aggregate` protos whose `group_type` is `PIVOT` into a

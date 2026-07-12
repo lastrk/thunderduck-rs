@@ -411,6 +411,12 @@ case("agg-024", "aggregate", "aggregate then filter (HAVING analog)", lambda I: 
 # never strips (unlike `build_filter`/`build_sort`), so `e.dept_id` strands
 # under `__td_sub`. Spark succeeds; τ must too.
 case("agg-025", "aggregate", "groupBy alias-qualified key over limit (F9 aggregate strand witness)", lambda I: I["emp"].alias("e").orderBy("id").limit(5).groupBy(F.col("e.dept_id")).count())
+# agg-026 (N7): grouping key restated in agg — RelationalGroupedDataset.toDF's
+# fold layout (`grouping ++ agg_exprs`) means the grouping column and the
+# identical column re-selected inside .agg() both appear in the output,
+# back to back (dept_id twice), ahead of the aggregate. Terminal aggregate,
+# no downstream references, so this whole-matches the folded output list.
+case("agg-026", "aggregate", "grouping key restated in agg", lambda I: I["emp"].groupBy("dept_id").agg(F.col("dept_id"), F.sum("salary").alias("total_salary")))
 
 # ── 9. Grouping extensions (rollup / cube / pivot) ─────────────────────────
 case("grp-001", "grouping", "rollup", lambda I: I["emp"].rollup("dept_id", "active").agg(F.count(F.lit(1)).alias("n")))

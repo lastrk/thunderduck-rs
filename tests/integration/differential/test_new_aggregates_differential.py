@@ -346,6 +346,37 @@ class TestNewAggregates_Differential:
         td = run_test(spark_thunderduck)
         assert_dataframes_equal(ref, td, "min_by", ignore_nullable=True)
 
+    @pytest.mark.timeout(30)
+    @pytest.mark.xfail(
+        # Review finding: max_by/min_by emit DuckDB arg_max/arg_min, which SKIP any row
+        # whose value arg is NULL. Spark returns the value AT the extreme-ordering row
+        # even when that value is NULL. Here max val=92 and min val=40 both have a NULL
+        # name, so Spark yields (NULL, NULL) but arg_max/arg_min return ('Eve','Charlie').
+        # Correct DuckDB targets are arg_max_null / arg_min_null.
+        reason="arg_max/arg_min drop the NULL value at the extreme-ordering row",
+        strict=True,
+    )
+    def test_max_by_min_by_null_value_at_extreme(self, spark_reference, spark_thunderduck):
+        """max_by/min_by must return the value at the max/min ordering row even if NULL."""
+        def run_test(spark):
+            data = [(1, "Alice", 85), (2, None, 92), (3, "Charlie", 78),
+                    (4, None, 40), (5, "Eve", 88)]
+            schema = StructType([
+                StructField("id", IntegerType(), False),
+                StructField("name", StringType(), True),
+                StructField("val", IntegerType(), False),
+            ])
+            spark.createDataFrame(data, schema).createOrReplaceTempView("null_extreme_data")
+            return spark.sql(
+                "SELECT max_by(name, val) AS mx, min_by(name, val) AS mn FROM null_extreme_data"
+            )
+
+        ref = run_test(spark_reference)
+        td = run_test(spark_thunderduck)
+        assert_dataframes_equal(
+            ref, td, "max_by_min_by_null_value_at_extreme", ignore_nullable=True
+        )
+
 
 # =============================================================================
 # Statistical Aggregate Functions

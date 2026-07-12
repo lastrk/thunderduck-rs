@@ -93,29 +93,25 @@ pub enum CommonOp {
     /// `grouping_kind` / `grouping_sets`. Pivot is a separate variant
     /// ([`CommonOp::Pivot`]).
     ///
-    /// # `aggregates` layout — [`AggregateProjection`]
+    /// # N7 — `aggregates` IS the complete output list, by construction
     ///
-    /// Each front-end tells τ, via the `projection` field, whether
-    /// `aggregates` already IS the complete output list ([`AggregateProjection::Folded`]
-    /// — the SparkSQL front-end's `lower_aggregate_select` folds the whole
-    /// SELECT projection list, grouping columns and aggregate calls alike,
-    /// into `aggregates`) or holds only the aggregate expressions
-    /// ([`AggregateProjection::Grouped`] — the DataFrame front-end's
-    /// `.groupBy(...).agg(...)`, whose Spark-parity output is `grouping ++
-    /// aggregates`). The flag is a CONSTANT per front-end, never inferred.
+    /// `aggregates` always carries the full output projection: for the
+    /// SparkSQL front-end (`lower_aggregate_select`) it's the whole SELECT
+    /// list, grouping columns and aggregate calls alike; for the DataFrame
+    /// front-end it's `grouping ++ agg_exprs`, matching Spark's
+    /// `RelationalGroupedDataset.toDF` layout (verified empirically:
+    /// `df.groupBy("k").agg(F.col("k"), F.sum("v"))` yields schema `[k, k,
+    /// sum(v)]` — the grouping key restated, not deduplicated). Every
+    /// construction site builds this list itself; there is no per-front-end
+    /// flag and no fold-at-read-time — see [`grouped_aggregate`] for the
+    /// DataFrame-shaped constructor.
     Aggregate {
         /// The input relation.
         input: Box<CommonAst>,
         /// The grouping expressions (may be empty for global aggregation).
         grouping: Vec<Expression>,
-        /// The aggregate expressions. See variant-level doc — whether this
-        /// is the complete output list or just the aggregate calls is given
-        /// by `projection`.
+        /// The complete output list — see variant-level doc (N7).
         aggregates: Vec<Expression>,
-        /// Whether `aggregates` already carries the full output projection
-        /// (SQL) or only the aggregate expressions (DataFrame). See
-        /// variant-level doc.
-        projection: AggregateProjection,
         /// The grouping kind — GroupBy (default), Rollup, Cube, or
         /// GroupingSets (Pivot lives elsewhere).
         grouping_kind: GroupingKind,
@@ -706,26 +702,37 @@ pub enum GroupingKind {
     GroupingSets,
 }
 
-/// Which layout [`CommonOp::Aggregate`]'s (and [`TypedOp::Aggregate`]'s)
-/// `aggregates` field carries — an explicit, per-front-end CONSTANT (never
-/// inferred) that replaced the `grouping_already_folded` heuristic.
+/// N7: construct a DataFrame-shaped [`CommonOp::Aggregate`] with Spark's
+/// `RelationalGroupedDataset.toDF` layout — the output list is `grouping ++
+/// agg_exprs`, built here so `aggregates` IS the complete output list by
+/// construction (no per-front-end flag, no fold-at-read-time).
 ///
-/// [`TypedOp::Aggregate`]: crate::transpiler_v2::analyzer::TypedOp::Aggregate
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AggregateProjection {
-    /// `aggregates` IS the complete SELECT list (grouping columns and
-    /// aggregate calls alike) — the output schema is `aggregates` as-is,
-    /// never prepended with `grouping`. Set by the SparkSQL front-end
-    /// (`parser_v2::v2_lowering::lower_aggregate_select`), the only SQL
-    /// construction site.
-    Folded,
-    /// `aggregates` holds only the aggregate expressions — the output is
-    /// `grouping ++ aggregates` (Spark's DataFrame `.groupBy(...).agg(...)`
-    /// semantics; a no-op when `grouping` is empty). Set by every DataFrame
-    /// construction site (`v2_relation_converter::convert_aggregate` /
-    /// `convert_cov` / `convert_corr` / `convert_approx_quantile`) and by
-    /// `crosstab_to_aggregate`.
-    Grouped,
+/// Empirically verified against Spark 4.1.1: `df.groupBy("dept_id").agg(F.col("dept_id"),
+/// F.sum("salary"))` yields schema `[dept_id, dept_id, sum(salary)]` — the
+/// grouping key is restated, not deduplicated, when the caller re-selects it
+/// inside `.agg(...)`.
+///
+/// Every DataFrame construction site (`v2_relation_converter::convert_aggregate`
+/// / `convert_cov` / `convert_corr` / `convert_approx_quantile`, and
+/// `analyzer::crosstab_to_aggregate`) routes through this constructor —
+/// `convert_cov`/`convert_corr`/`convert_approx_quantile`/`crosstab_to_aggregate`
+/// pass `grouping: vec![]`, an identity fold.
+pub fn grouped_aggregate(
+    input: CommonAst,
+    grouping: Vec<Expression>,
+    agg_exprs: Vec<Expression>,
+    grouping_kind: GroupingKind,
+) -> CommonOp {
+    let mut aggregates = grouping.clone();
+    aggregates.extend(agg_exprs);
+    CommonOp::Aggregate {
+        input: Box::new(input),
+        grouping,
+        aggregates,
+        grouping_kind,
+        grouping_sets: Vec::new(),
+        having: None,
+    }
 }
 
 /// The join types supported by [`CommonOp::Join`].
@@ -1116,6 +1123,76 @@ mod tests {
                 assert_eq!(format, FileFormat::Parquet);
             }
             _ => panic!("expected FileScan"),
+        }
+    }
+
+    // ── N7: grouped_aggregate fold ───────────────────────────────────────
+
+    #[test]
+    fn grouped_aggregate_folds_grouping_ahead_of_agg_exprs() {
+        use super::super::expression::UnresolvedColumn;
+        let dept_id = || {
+            Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "dept_id".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            })
+        };
+        let count_star = Expression::FunctionCall(super::super::expression::FunctionCall {
+            name: "count".to_owned(),
+            args: vec![],
+            distinct: false,
+        });
+        let op = grouped_aggregate(
+            CommonAst::new(CommonOp::SingleRow),
+            vec![dept_id()],
+            vec![count_star.clone()],
+            GroupingKind::GroupBy,
+        );
+        match op {
+            CommonOp::Aggregate {
+                grouping,
+                aggregates,
+                ..
+            } => {
+                // `aggregates` IS `grouping ++ agg_exprs`, by construction.
+                assert_eq!(aggregates, vec![dept_id(), count_star]);
+                assert_eq!(grouping, vec![dept_id()]);
+            }
+            other => panic!("expected CommonOp::Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grouped_aggregate_empty_grouping_is_identity_fold() {
+        // The `convert_cov`/`convert_corr`/`convert_approx_quantile`/
+        // `crosstab_to_aggregate` shape: `grouping: vec![]` is a no-op fold —
+        // `aggregates` is exactly the `agg_exprs` passed in.
+        let agg_expr = Expression::FunctionCall(super::super::expression::FunctionCall {
+            name: "corr".to_owned(),
+            args: vec![],
+            distinct: false,
+        });
+        let op = grouped_aggregate(
+            CommonAst::new(CommonOp::SingleRow),
+            vec![],
+            vec![agg_expr.clone()],
+            GroupingKind::GroupBy,
+        );
+        match op {
+            CommonOp::Aggregate {
+                grouping,
+                aggregates,
+                grouping_sets,
+                having,
+                ..
+            } => {
+                assert!(grouping.is_empty());
+                assert_eq!(aggregates, vec![agg_expr]);
+                assert!(grouping_sets.is_empty());
+                assert!(having.is_none());
+            }
+            other => panic!("expected CommonOp::Aggregate, got {other:?}"),
         }
     }
 }

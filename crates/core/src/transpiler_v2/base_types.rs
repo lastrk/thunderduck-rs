@@ -369,7 +369,6 @@ mod tests {
             input: Box::new(leaf),
             grouping: vec![],
             aggregates: vec![],
-            projection: crate::transpiler_v2::ast::AggregateProjection::Folded,
             grouping_kind: crate::transpiler_v2::ast::GroupingKind::GroupBy,
             grouping_sets: vec![],
             having: None,

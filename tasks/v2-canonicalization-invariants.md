@@ -164,6 +164,17 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 
 ### N7. Every Aggregate is folded at construction
 
+- **Status: ✅ LANDED** (Pass B1): `ast::grouped_aggregate` (Spark `RelationalGroupedDataset.toDF`
+  verbatim — empirically verified: `groupBy(k).agg(k,…)` yields k TWICE); `AggregateProjection`
+  retired (user-approved); offset arithmetic + `AggregateRebindCtx` + keys-chain deleted;
+  `bind_aggregate_slot`/`bind_project_slot` merged into `bind_slot`. New corpus witness
+  `agg-026` (restated grouping key). Side effect: the review-found ORDER-BY-grouping-expression
+  binder error is FIXED (the sort key now whole-matches the folded entry) — its differential
+  test de-xfailed. Opus review clean; full corpora green (DataFrame 403/0, SQL 404/0).
+  *Traceability note (review MINOR, informational):* when the sort fallback alias-pins a folded
+  passthrough grouping column, its `source_quals` lineage collapses to ∅ (same as the Project
+  and SQL-Folded paths always did; barely reachable — bare columns resolve at step 1; failure
+  mode is the conservative wrap, not a wrong result). Root fix is N8/N9 lineage-through-alias.
 - **Invariant:** `aggregates` IS the complete output list for every Aggregate, from both
   front-ends — the DataFrame converter constructs `grouping ++ aggregates` exactly like
   Spark's `RelationalGroupedDataset.toDF`. The layout fact stops existing.

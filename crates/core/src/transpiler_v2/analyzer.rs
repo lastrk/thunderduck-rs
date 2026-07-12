@@ -3371,20 +3371,24 @@ fn expand_lateral_column_aliases(
 /// SAME fallible-fold primitive `resolve_and_stamp` itself uses, walking
 /// into `FunctionCall` args, `CaseWhen` branches, etc.
 ///
-/// Mirrors `resolve_and_stamp`'s own opaque-arm list: `Lambda`,
-/// `LambdaVariable`, `RawSql`, `Interval`, and `UnresolvedRegex` all pass
-/// through unchanged. A lambda's own bound parameter must never be mistaken
-/// for an outer lateral alias reference (e.g. `SELECT 1 AS x, transform(arr,
-/// x -> x + 1) FROM t` — the lambda's `x` is its own bound variable, not the
-/// outer alias). `InSubquery`/`ExistsSubquery`/`ScalarSubquery` are not
-/// custom-cased here; `expression_children!` already yields no children for
-/// the two Exists/Scalar forms and only the outer probe expression for
-/// `InSubquery`, so the default `map_children` arm below reproduces the same
-/// opacity `resolve_and_stamp` gets from its explicit arm.
+/// Opaque per [`Expression::is_opaque_unit`] (the single opacity authority,
+/// N1), plus `UnresolvedRegex` — a documented pass-through matching
+/// `resolve_and_stamp`'s own extra arm — all pass through unchanged. A
+/// lambda's own bound parameter must never be mistaken for an outer lateral
+/// alias reference (e.g. `SELECT 1 AS x, transform(arr, x -> x + 1) FROM t` —
+/// the lambda's `x` is its own bound variable, not the outer alias).
+/// `InSubquery`/`ExistsSubquery`/`ScalarSubquery` are not custom-cased here;
+/// `expression_children!` already yields no children for the two
+/// Exists/Scalar forms and only the outer probe expression for `InSubquery`,
+/// so the default `map_children` arm below reproduces the same opacity
+/// `resolve_and_stamp` gets from its explicit arm.
 fn substitute_lateral_aliases(
     expr: Expression,
     table: &LateralAliasTable,
 ) -> Result<Expression, AnalyzerError> {
+    if expr.is_resolve_opaque() {
+        return Ok(expr);
+    }
     match expr {
         Expression::UnresolvedColumn(ref u) if u.qualifier.is_none() => {
             let name = u.name.clone();
@@ -3393,11 +3397,6 @@ fn substitute_lateral_aliases(
                 None => Ok(expr),
             }
         }
-        Expression::Lambda(_)
-        | Expression::LambdaVariable(_)
-        | Expression::RawSql(_)
-        | Expression::Interval(_)
-        | Expression::UnresolvedRegex(_) => Ok(expr),
         _ => expr.map_children(|e| substitute_lateral_aliases(e, table)),
     }
 }
@@ -3500,6 +3499,12 @@ fn analyze_table_function(
 }
 
 fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expression, AnalyzerError> {
+    // Opaque to resolution per [`Expression::is_resolve_opaque`] (the single
+    // opacity authority for the two resolution walkers, N1) — see that
+    // method's doc for the per-variant rationale.
+    if expr.is_resolve_opaque() {
+        return Ok(expr);
+    }
     match expr {
         Expression::UnresolvedColumn(u) => resolve_column(u, ctx),
         Expression::ColumnReference(c) => {
@@ -3532,17 +3537,6 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
             e.subquery = SubqueryPlan::Analyzed(Box::new(inner));
             Ok(Expression::ExistsSubquery(e))
         }
-        // τ's analyzer leaves these opaque. Lambda bodies close over lambda
-        // variables and are analyzed lazily by their consumer function; RawSql
-        // and Interval carry their own types. Pass 85's
-        // `expand_regex_projections` rewrites any UnresolvedRegex before it
-        // reaches this walker, so residuals are passed through opaquely
-        // (emission's defensive arm surfaces the error).
-        Expression::Lambda(_)
-        | Expression::LambdaVariable(_)
-        | Expression::RawSql(_)
-        | Expression::Interval(_)
-        | Expression::UnresolvedRegex(_) => Ok(expr),
         // UpdateFields: recurse via the walker, then run Spark 4.1's
         // `dropFields("X")` existence validation. See Catalyst
         // `UpdateFields.scala::checkInputDataTypes`.
@@ -3879,29 +3873,26 @@ fn bind_project_slot(projections: &mut [Expression], schema: &StructType, k: usi
 }
 
 /// `true` for `Expression` variants this fallback treats as an opaque,
-/// non-recursable, non-promotable unit — mirrors `resolve_and_stamp`'s own
-/// opacity list (`Lambda`/`LambdaVariable`/`RawSql`/`Interval`, plus the
-/// subquery variants) PLUS `Window`. `Window` matters specifically: its
-/// `.func` is a structural child (`Expression::children` descends into it,
-/// so [`contains_aggregate_call`] trips on `sum(x) OVER (...)`), but
-/// promoting that INNER aggregate call would replace a window function's own
-/// `.func` with a bare `ColumnReference` — corrupting the window rather than
-/// resolving it. Increment 1 already left this shape as a documented,
-/// harmless bail (whole-key match never finds a literal `Window` entry to
-/// bind onto); this guard preserves that exact behavior under increment 2's
-/// added recursion instead of silently rewriting into an invalid tree.
+/// non-recursable, non-promotable unit — [`Expression::is_opaque_unit`] (the
+/// single opacity authority, N1) PLUS the subquery variants PLUS `Window`.
+/// `Window` matters specifically: its `.func` is a structural child
+/// (`Expression::children` descends into it, so [`contains_aggregate_call`]
+/// trips on `sum(x) OVER (...)`), but promoting that INNER aggregate call
+/// would replace a window function's own `.func` with a bare
+/// `ColumnReference` — corrupting the window rather than resolving it.
+/// Increment 1 already left this shape as a documented, harmless bail
+/// (whole-key match never finds a literal `Window` entry to bind onto); this
+/// guard preserves that exact behavior under increment 2's added recursion
+/// instead of silently rewriting into an invalid tree.
 fn opaque_to_subtree_promotion(expr: &Expression) -> bool {
-    matches!(
-        expr,
-        Expression::Window(_)
-            | Expression::ScalarSubquery(_)
-            | Expression::InSubquery(_)
-            | Expression::ExistsSubquery(_)
-            | Expression::Lambda(_)
-            | Expression::LambdaVariable(_)
-            | Expression::RawSql(_)
-            | Expression::Interval(_)
-    )
+    expr.is_opaque_unit()
+        || matches!(
+            expr,
+            Expression::Window(_)
+                | Expression::ScalarSubquery(_)
+                | Expression::InSubquery(_)
+                | Expression::ExistsSubquery(_)
+        )
 }
 
 /// Increment 2 (design 023 step 5): recursively bind or PROMOTE subtrees of
@@ -4916,6 +4907,15 @@ fn stamp_column_reference(c: ColumnReference, schema: &StructType) -> ColumnRefe
 /// Return `true` iff any `Expression::UnresolvedColumn` remains, or any
 /// `ColumnReference` has `data_type = None` / `nullable = None`.
 fn expression_is_fully_resolved(expr: &Expression) -> bool {
+    // Opaque per [`Expression::is_opaque_unit`] (the single opacity
+    // authority, N1): Lambda / LambdaVariable / RawSql / Interval bodies are
+    // never re-derived by this walker, so they count as trivially resolved.
+    // (`LambdaVariable` was previously handled by the default recursion arm
+    // below — a leaf with no children vacuously satisfies `.all(...)` — so
+    // folding it into this early return changes no behavior.)
+    if expr.is_opaque_unit() {
+        return true;
+    }
     match expr {
         Expression::UnresolvedColumn(_) => false,
         // Pass 85 — pattern-driven column expander; expanded away by
@@ -4930,12 +4930,10 @@ fn expression_is_fully_resolved(expr: &Expression) -> bool {
             expression_is_fully_resolved(&i.expr) && subquery_plan_is_resolved(&i.subquery)
         }
         Expression::ExistsSubquery(e) => subquery_plan_is_resolved(&e.subquery),
-        // Lambda / raw-sql / interval bodies: opaque by τ's walker convention.
-        Expression::Lambda(_) | Expression::RawSql(_) | Expression::Interval(_) => true,
         // Default recursion: all-children-resolved implies self-resolved. See
         // [`Expression::children`] for the walked-child convention. Covers the
-        // leaf variants (Literal, Star, LambdaVariable → no children → true)
-        // and every structural node (Binary, Window, CaseWhen, …).
+        // leaf variants (Literal, Star → no children → true) and every
+        // structural node (Binary, Window, CaseWhen, …).
         _ => expr.children().all(expression_is_fully_resolved),
     }
 }

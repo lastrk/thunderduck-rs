@@ -852,10 +852,10 @@ impl Expression {
     /// docstring for the window-frame + subquery-body conventions).
     ///
     /// Transform walkers built on `map_children` should custom-case
-    /// variants that must be opaque to the transform (τ's
-    /// `resolve_and_stamp`, for example, treats `InSubquery`,
-    /// `ExistsSubquery`, `ScalarSubquery`, `Lambda`, `LambdaVariable`,
-    /// `RawSql`, and `Interval` as passthrough — matching semantics
+    /// variants that must be opaque to the transform: the subquery variants
+    /// (`InSubquery`, `ExistsSubquery`, `ScalarSubquery`) plus whatever
+    /// [`Self::is_opaque_unit`] reports (τ's `resolve_and_stamp`, for
+    /// example, treats all of these as passthrough — matching semantics
     /// preserved when `map_children` is called as the default arm).
     pub fn map_children<E>(
         mut self,
@@ -869,6 +869,42 @@ impl Expression {
             *slot = f(child)?;
         }
         Ok(self)
+    }
+
+    /// **N1 — single opacity authority.** `true` for the variant core every
+    /// resolution walker in the analyzer treats as an opaque, atomic unit
+    /// that must not be recursed into or rewritten in place: `Lambda`
+    /// (analyzed lazily by its consumer function — its body closes over its
+    /// own bound `LambdaVariable`, not the walker's outer scope),
+    /// `LambdaVariable` (a leaf bound by its enclosing `Lambda`, never a
+    /// column reference some other walker should rewrite), `RawSql`, and
+    /// `Interval` (both already carry their own final type, never derived by
+    /// a walker).
+    ///
+    /// This is the shared CORE only. Some walkers are opaque to strictly
+    /// more variants for reasons specific to that walk — the two resolution
+    /// walkers use [`Expression::is_resolve_opaque`] (core +
+    /// `UnresolvedRegex`); `opaque_to_subtree_promotion` ORs on `Window`
+    /// plus the subquery variants at the site, with a comment explaining
+    /// the delta. Never hand-copy the whole roster.
+    pub(crate) fn is_opaque_unit(&self) -> bool {
+        matches!(
+            self,
+            Expression::Lambda(_)
+                | Expression::LambdaVariable(_)
+                | Expression::RawSql(_)
+                | Expression::Interval(_)
+        )
+    }
+
+    /// The opacity set of the two RESOLUTION walkers (`resolve_and_stamp`,
+    /// `substitute_lateral_aliases`): the shared core plus `UnresolvedRegex`,
+    /// which both pass through opaquely (Pass 85's `expand_regex_projections`
+    /// rewrites it before it reaches either walker; residuals surface via
+    /// emission's defensive arm). One authority for the pair so the extra
+    /// cannot drift between them.
+    pub(crate) fn is_resolve_opaque(&self) -> bool {
+        self.is_opaque_unit() || matches!(self, Expression::UnresolvedRegex(_))
     }
 
     // ── Binary data-type derivation ──────────────────────────────────────────

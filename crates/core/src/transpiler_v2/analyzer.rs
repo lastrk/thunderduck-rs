@@ -50,7 +50,9 @@ use super::expression::{
     CastExpression, ColumnReference, Expression, ExtractValueExpression, FunctionCall, Literal,
     LiteralValue, SortOrder, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
-use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
+use super::type_inference::{
+    is_aggregate_classifier_name, is_nondeterministic_fn_name, TypeInferenceEngine,
+};
 use crate::bail_boundary_rule;
 use crate::types::{DataType, StructField, StructType};
 
@@ -4107,35 +4109,15 @@ fn contains_aggregate_call(expr: &Expression) -> bool {
     expr.children().any(contains_aggregate_call)
 }
 
-/// Spark 4.1.1 `Nondeterministic`-expression names relevant to sort-key
-/// rebinding: `Rand`/`Randn`/`Uuid`/`Shuffle`/`MonotonicallyIncreasingID`
-/// (confirmed against `randomExpressions.scala` / `misc.scala` /
-/// `collectionOperations.scala` / `MonotonicallyIncreasingID.scala`), plus
-/// `InputFileName` / `SparkPartitionID` (both `Nondeterministic` in
-/// `Expression.scala`'s `misc.scala` neighborhood) and `random`, the
-/// Spark-SQL alias spelling of `rand`. This is the roster relevant to this
-/// fallback, NOT a claim of exhaustive coverage of every `Nondeterministic`
-/// expression in Catalyst. `Expression.semanticEquals` is unconditionally
-/// `false` whenever either side is nondeterministic (`deterministic &&
-/// other.deterministic && ...`, `Analyzer.scala`); [`semantic_eq`] mirrors
-/// that exclusion.
-const NONDETERMINISTIC_FN_NAMES: &[&str] = &[
-    "rand",
-    "random",
-    "randn",
-    "uuid",
-    "shuffle",
-    "monotonically_increasing_id",
-    "input_file_name",
-    "spark_partition_id",
-];
-
+/// `true` iff `expr` contains (anywhere in its tree) a `FunctionCall` whose
+/// name is on the nondeterministic-function roster
+/// ([`is_nondeterministic_fn_name`]) — used to exclude a Sort key that calls
+/// a nondeterministic function from the [`semantic_eq`] rebind fallback.
+/// The roster is deliberately name-keyed and non-exhaustive; per-instance
+/// nondeterminism identity is N9's deliverable.
 fn contains_nondeterministic_call(expr: &Expression) -> bool {
     if let Expression::FunctionCall(f) = expr {
-        if NONDETERMINISTIC_FN_NAMES
-            .iter()
-            .any(|n| f.name.eq_ignore_ascii_case(n))
-        {
+        if is_nondeterministic_fn_name(&f.name) {
             return true;
         }
     }

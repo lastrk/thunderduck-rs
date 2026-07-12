@@ -135,6 +135,12 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 
 ### N6. `FunctionCall` carries its resolved classification (`FunctionKind`)
 
+- **Status/scope correction (2026-07-12, N6-lite):** the `kind: FunctionKind` field design was
+  evaluated and **deferred into N9**: `kind` is a pure function of `name`, so stamping it
+  duplicates a derivable fact and creates a staleness class; the lambda-body opacity hole (N1)
+  forces a roster fallback regardless, for a net **-3/+80 lines**. Landed instead as
+  **N6-lite**: roster concentration only — `NONDETERMINISTIC_FN_NAMES` moved next to
+  `AGG_SPECS` behind `is_nondeterministic_fn_name`; `contains_nondeterministic_call` calls it.
 - **Invariant:** "is this call an aggregate / window / scalar / nondeterministic?" is stamped
   once at resolution, read thereafter.
 - **Today:** `contains_aggregate_call` re-scans the `AGG_SPECS` roster at every node of every

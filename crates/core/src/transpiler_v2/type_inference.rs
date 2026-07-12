@@ -1310,6 +1310,39 @@ pub(crate) fn aggregate_classifier_names() -> impl Iterator<Item = &'static str>
     AGG_SPECS.iter().filter(|s| s.classifier).map(|s| s.name)
 }
 
+/// Spark 4.1.1 `Nondeterministic`-expression names relevant to sort-key
+/// rebinding: `Rand`/`Randn`/`Uuid`/`Shuffle`/`MonotonicallyIncreasingID`
+/// (confirmed against `randomExpressions.scala` / `misc.scala` /
+/// `collectionOperations.scala` / `MonotonicallyIncreasingID.scala`), plus
+/// `InputFileName` / `SparkPartitionID` (both `Nondeterministic` in
+/// `Expression.scala`'s `misc.scala` neighborhood) and `random`, the
+/// Spark-SQL alias spelling of `rand`. This is the roster relevant to this
+/// fallback, NOT a claim of exhaustive coverage of every `Nondeterministic`
+/// expression in Catalyst. `Expression.semanticEquals` is unconditionally
+/// `false` whenever either side is nondeterministic (`deterministic &&
+/// other.deterministic && ...`, `Analyzer.scala`); `analyzer::semantic_eq`
+/// mirrors that exclusion.
+const NONDETERMINISTIC_FN_NAMES: &[&str] = &[
+    "rand",
+    "random",
+    "randn",
+    "uuid",
+    "shuffle",
+    "monotonically_increasing_id",
+    "input_file_name",
+    "spark_partition_id",
+];
+
+/// Case-insensitive membership test against [`NONDETERMINISTIC_FN_NAMES`].
+/// Used by `analyzer::contains_nondeterministic_call` to detect a Sort key
+/// (or Sort-key restatement) that calls a nondeterministic function, so it
+/// can be excluded from the `semantic_eq` rebind fallback.
+pub(crate) fn is_nondeterministic_fn_name(name: &str) -> bool {
+    NONDETERMINISTIC_FN_NAMES
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
+}
+
 /// The 11-name correlation / covariance / regression family (checklist §1.3).
 #[cfg(test)]
 pub(crate) const CORR_FAMILY_NAMES: &[&str] = &[
@@ -1661,6 +1694,32 @@ mod tests {
             !is_aggregate_classifier_name("try_divide"),
             "classifier roster must NOT contain try_divide (scalar per checklist §4.1)",
         );
+    }
+
+    // ── N6-lite: nondeterministic-fn roster ─────────────────────────────────
+
+    /// No name appears in BOTH the aggregate-classifier roster and the
+    /// nondeterministic roster — the two are disjoint predicate domains, and
+    /// a name in both would make `contains_aggregate_call` /
+    /// `contains_nondeterministic_call` racy about which fallback trigger
+    /// fires first for a given Sort key.
+    #[test]
+    fn aggregate_classifier_and_nondeterministic_rosters_are_disjoint() {
+        for name in aggregate_classifier_names() {
+            assert!(
+                !is_nondeterministic_fn_name(name),
+                "`{name}` is in both the aggregate-classifier roster and the \
+                 nondeterministic roster",
+            );
+        }
+    }
+
+    /// Membership + case-insensitivity for [`is_nondeterministic_fn_name`].
+    #[test]
+    fn is_nondeterministic_fn_name_membership_and_case_insensitivity() {
+        assert!(is_nondeterministic_fn_name("RAND"));
+        assert!(is_nondeterministic_fn_name("Random"));
+        assert!(!is_nondeterministic_fn_name("sum"));
     }
 
     /// `try_sum` return-type must mirror `sum` (Integer → Long, Double → Double,

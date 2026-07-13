@@ -7233,8 +7233,8 @@ mod tests {
         Expression::ColumnReference(ColumnReference {
             name: name.to_owned(),
             qualifier: None,
-            data_type: Some(dt),
-            nullable: Some(true),
+            data_type: dt,
+            nullable: true,
             expr_id: None,
         })
     }
@@ -7820,8 +7820,8 @@ mod tests {
                     left: Box::new(Expression::ColumnReference(ColumnReference {
                         name: "salary".to_owned(),
                         qualifier: Some("outer_e".to_owned()),
-                        data_type: Some(DataType::Double),
-                        nullable: Some(true),
+                        data_type: DataType::Double,
+                        nullable: true,
                         expr_id: None,
                     })),
                     right: Box::new(int_lit(1)),
@@ -10734,22 +10734,22 @@ mod tests {
         let dup = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: Some(dept_id_second),
         });
         let unique_no_rewrite = Expression::ColumnReference(ColumnReference {
             name: "id".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Long),
-            nullable: Some(false),
+            data_type: DataType::Long,
+            nullable: false,
             expr_id: Some(id_col_id),
         });
         let deferred_no_ordinal = Expression::ColumnReference(ColumnReference {
             name: "name".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::String),
-            nullable: Some(true),
+            data_type: DataType::String,
+            nullable: true,
             expr_id: Some(name_col_id),
         });
         let input = TypedAst::new(
@@ -10817,8 +10817,8 @@ mod tests {
         let bare_ref = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: Some(shared_id),
         });
         let input = TypedAst::new(
@@ -10877,8 +10877,8 @@ mod tests {
         let orphaned = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: Some(foreign_id),
         });
         let input = TypedAst::new(
@@ -12431,8 +12431,8 @@ mod tests {
         let c = ColumnReference {
             name: "id".to_owned(),
             qualifier: Some("emp".to_owned()),
-            data_type: Some(DataType::Long),
-            nullable: Some(false),
+            data_type: DataType::Long,
+            nullable: false,
             expr_id: None,
         };
         let sql = render_column_reference(&c).expect("render");
@@ -13298,8 +13298,8 @@ mod tests {
         let col_ref = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: None,
         });
         let sql =
@@ -13560,8 +13560,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "last_login".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::Timestamp),
-                    nullable: Some(true),
+                    data_type: DataType::Timestamp,
+                    nullable: true,
                     expr_id: None,
                 }),
                 str_lit("yyyy-MM-dd HH:mm:ss"),
@@ -13695,8 +13695,8 @@ mod tests {
             struct_expr: Box::new(Expression::ColumnReference(ColumnReference {
                 name: "name".to_owned(),
                 qualifier: None,
-                data_type: Some(DataType::String),
-                nullable: Some(true),
+                data_type: DataType::String,
+                nullable: true,
                 expr_id: None,
             })),
             updates: vec![("x".to_owned(), None)],
@@ -13716,8 +13716,8 @@ mod tests {
         let arr = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13749,8 +13749,8 @@ mod tests {
         let arr = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13789,8 +13789,8 @@ mod tests {
         let arr = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13842,8 +13842,8 @@ mod tests {
         let arr = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13880,8 +13880,8 @@ mod tests {
                     Expression::ColumnReference(ColumnReference {
                         name: "arr".to_owned(),
                         qualifier: None,
-                        data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
-                        nullable: Some(true),
+                        data_type: DataType::Array(Box::new(DataType::Long), true),
+                        nullable: true,
                         expr_id: None,
                     }),
                     Expression::Lambda(LambdaExpression {
@@ -13998,8 +13998,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "tags2".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-                    nullable: Some(true),
+                    data_type: DataType::Array(Box::new(DataType::String), true),
+                    nullable: true,
                     expr_id: None,
                 }),
             ],
@@ -14066,8 +14066,8 @@ mod tests {
         let b = Expression::ColumnReference(ColumnReference {
             name: "tags2".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14110,12 +14110,12 @@ mod tests {
         let m = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14148,12 +14148,12 @@ mod tests {
         let m = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14181,12 +14181,12 @@ mod tests {
         let m = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14339,12 +14339,12 @@ mod tests {
         let map_col = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::Integer),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn("size", vec![map_col]);
@@ -14366,11 +14366,11 @@ mod tests {
         let outer = Expression::ColumnReference(ColumnReference {
             name: "nested".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(
+            data_type: DataType::Array(
                 Box::new(DataType::Array(Box::new(DataType::String), true)),
                 true,
-            )),
-            nullable: Some(true),
+            ),
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn("flatten", vec![outer]);
@@ -14430,8 +14430,8 @@ mod tests {
                     Expression::ColumnReference(ColumnReference {
                         name: "arr".to_owned(),
                         qualifier: None,
-                        data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
-                        nullable: Some(true),
+                        data_type: DataType::Array(Box::new(DataType::Long), true),
+                        nullable: true,
                         expr_id: None,
                     }),
                     Expression::Lambda(LambdaExpression {
@@ -14814,12 +14814,12 @@ mod tests {
         let map_col = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("team")]);
@@ -14836,8 +14836,8 @@ mod tests {
         let arr_col = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn(
@@ -14896,8 +14896,8 @@ mod tests {
         let arr_col = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn(
@@ -14928,8 +14928,8 @@ mod tests {
         let arr_col = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn(
@@ -14958,12 +14958,12 @@ mod tests {
         let map_col = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("missing")]);
@@ -15062,8 +15062,8 @@ mod tests {
         let arr_col = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn("concat_ws", vec![str_lit(","), arr_col]);
@@ -15174,22 +15174,22 @@ mod tests {
             left: Box::new(Expression::ColumnReference(ColumnReference {
                 name: "d1".to_owned(),
                 qualifier: None,
-                data_type: Some(DataType::Decimal {
+                data_type: DataType::Decimal {
                     precision: 10,
                     scale: 2,
-                }),
-                nullable: Some(true),
+                },
+                nullable: true,
                 expr_id: None,
             })),
             op: BinaryOp::Div,
             right: Box::new(Expression::ColumnReference(ColumnReference {
                 name: "d2".to_owned(),
                 qualifier: None,
-                data_type: Some(DataType::Decimal {
+                data_type: DataType::Decimal {
                     precision: 6,
                     scale: 3,
-                }),
-                nullable: Some(true),
+                },
+                nullable: true,
                 expr_id: None,
             })),
         });
@@ -16113,8 +16113,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "csv_str".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::String),
-                    nullable: Some(true),
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
                 Expression::Literal(Literal {
@@ -16175,8 +16175,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "csv_str".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::String),
-                    nullable: Some(true),
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
                 Expression::Literal(Literal {
@@ -16205,8 +16205,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "json_str".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::String),
-                    nullable: Some(true),
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
                 Expression::Literal(Literal {
@@ -16238,15 +16238,15 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "csv_str".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::String),
-                    nullable: Some(true),
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
                 Expression::ColumnReference(ColumnReference {
                     name: "schema_col".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::String),
-                    nullable: Some(true),
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
             ],
@@ -16339,12 +16339,17 @@ mod tests {
     }
 
     fn inline_field_args(field: &str) -> Vec<Expression> {
+        let element = DataType::Struct(StructType::new(vec![
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("salary", DataType::Double),
+        ]));
         vec![
             Expression::ColumnReference(ColumnReference {
                 name: "arr".to_owned(),
                 qualifier: None,
-                data_type: None,
-                nullable: None,
+                data_type: DataType::Array(Box::new(element), true),
+                nullable: true,
                 expr_id: None,
             }),
             str_lit(field),
@@ -16393,8 +16398,9 @@ mod tests {
             vec![Expression::ColumnReference(ColumnReference {
                 name: "arr".to_owned(),
                 qualifier: None,
-                data_type: None,
-                nullable: None,
+                // Arity-rejection twin: the guard never reads the type.
+                data_type: DataType::Unresolved,
+                nullable: true,
                 expr_id: None,
             })],
         );
@@ -16428,8 +16434,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "json_str".to_owned(),
                     qualifier: None,
-                    data_type: None,
-                    nullable: None,
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
                 str_lit("a"),
@@ -16450,8 +16456,9 @@ mod tests {
             vec![Expression::ColumnReference(ColumnReference {
                 name: "json_str".to_owned(),
                 qualifier: None,
-                data_type: None,
-                nullable: None,
+                // Arity-rejection twin: the guard never reads the type.
+                data_type: DataType::String,
+                nullable: true,
                 expr_id: None,
             })],
         );
@@ -16596,8 +16603,8 @@ mod tests {
         Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: Some("e".to_owned()),
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         })
     }
@@ -16731,15 +16738,15 @@ mod tests {
         let id_ref = Expression::ColumnReference(ColumnReference {
             name: "id".to_owned(),
             qualifier: Some("e".to_owned()),
-            data_type: Some(DataType::Long),
-            nullable: Some(false),
+            data_type: DataType::Long,
+            nullable: false,
             expr_id: None,
         });
         let tag_ref = Expression::ColumnReference(ColumnReference {
             name: "tag".to_owned(),
             qualifier: Some("t".to_owned()),
-            data_type: Some(DataType::String),
-            nullable: Some(true),
+            data_type: DataType::String,
+            nullable: true,
             expr_id: None,
         });
         let proj = TypedAst::new(

@@ -219,22 +219,28 @@ pub fn decimal_value_precision_scale(s: &str) -> (u8, u8) {
 }
 
 /// A resolved column reference with schema-recorded type/nullability info.
+///
+/// `data_type`/`nullable` are non-`Option` BY CONSTRUCTION (E4/D3): a
+/// `ColumnReference` exists only once resolution has stamped its schema
+/// facts — there is no unresolved/bare state to represent here. A
+/// pre-analysis name is an [`UnresolvedColumn`], a distinct variant/type
+/// entirely (front-ends emit that; E1.5 deleted the last `ColumnReference`
+/// constructor that could build one ahead of resolution).
 #[derive(Debug, Clone)]
 pub struct ColumnReference {
     pub name: String,
     pub qualifier: Option<String>,
-    pub data_type: Option<DataType>,
-    pub nullable: Option<bool>,
+    pub data_type: DataType,
+    pub nullable: bool,
     /// N9 increment 2 / ADR-024: the [`super::schema::ExprId`] of the
     /// [`super::schema::Attribute`] this reference resolved to — the
     /// PRODUCING node's own output schema for a local reference (`ctx.schema`
     /// at resolution time), or the ENCLOSING plan's output schema for a
     /// correlated outer reference (D2 — `resolve_column`'s tier-(g) arm /
-    /// `resolve_in_outer` in `analyzer.rs`). Production never constructs a
-    /// pre-analysis `ColumnReference` (front-ends emit `UnresolvedColumn`;
-    /// E1.5 deleted the last constructor that could). `None` on a RESOLVED
-    /// (`data_type: Some`) reference only from the analyzer paths left open
-    /// after D2 (`analyzer.rs`):
+    /// `resolve_in_outer` in `analyzer.rs`). Unlike `data_type`/`nullable`
+    /// (stamped on every `ColumnReference` by construction, E4/D3), this
+    /// field stays `Option` — `None` on an otherwise-fully-resolved
+    /// reference from the analyzer paths left open after D2 (`analyzer.rs`):
     /// * tier-(d) in `resolve_column` and its outer twin, the
     ///   struct-qualifier arm of `resolve_in_outer` — a qualifier naming a
     ///   top-level STRUCT column resolves to a nested FIELD's type, which
@@ -255,15 +261,30 @@ pub struct ColumnReference {
 }
 
 impl PartialEq for ColumnReference {
-    /// Excludes `expr_id`: a derived resolution fact recording *which*
-    /// attribute a column resolved to, not part of the reference's logical
-    /// identity. Mirrors `TypedAst`'s scope-excluding `Eq` — keeps every
-    /// pre-existing equality-based test unchanged.
+    /// Excludes `expr_id`, `data_type`, and `nullable`: all three are derived
+    /// resolution facts recording *which* attribute a column resolved to and
+    /// *what the schema says about it*, not part of the reference's logical
+    /// identity (`name` + `qualifier`). Mirrors `TypedAst`'s scope-excluding
+    /// `Eq` — keeps every pre-existing equality-based test unchanged.
+    ///
+    /// **LOUD WARNING:** this means `==` on two `ColumnReference`s (or on any
+    /// `Expression` tree containing one) CANNOT distinguish two references
+    /// that share a name/qualifier but disagree on type or nullability. A
+    /// future test must not rely on `==`/`assert_eq!`/`assert_ne!` to detect
+    /// a type or nullability difference between two `ColumnReference`s —
+    /// compare `.data_type`/`.nullable` directly instead. Production
+    /// consequence: `semantic_eq` over two ID-LESS references (`expr_id:
+    /// None` — tier-(d) struct-field refs and the two documented gaps) now
+    /// matches on canonicalized name alone regardless of type; identity
+    /// discrimination for id-carrying refs is `ids_compatible`'s job. Two
+    /// same-named struct fields of DIFFERENT types through different structs
+    /// can therefore alias in a rebind scan — a pre-existing id-less gap
+    /// (the same-type collision always misbound), widened knowingly and
+    /// consistent with `ids_compatible`'s documented contract; the real fix
+    /// is giving struct access identity (review finding 12, ExtractValue
+    /// unification).
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.qualifier == other.qualifier
-            && self.data_type == other.data_type
-            && self.nullable == other.nullable
+        self.name == other.name && self.qualifier == other.qualifier
     }
 }
 
@@ -667,10 +688,7 @@ impl Expression {
     pub fn data_type(&self, schema: &ResolvedSchema) -> DataType {
         match self {
             Expression::Literal(l) => l.data_type.clone(),
-            Expression::ColumnReference(c) => match &c.data_type {
-                Some(dt) => dt.clone(),
-                None => TypeInferenceEngine::column_type(&c.name, schema),
-            },
+            Expression::ColumnReference(c) => c.data_type.clone(),
             Expression::UnresolvedColumn(u) => {
                 TypeInferenceEngine::qualified_column_type(&u.name, u.qualifier.as_deref(), schema)
             }
@@ -769,9 +787,7 @@ impl Expression {
     pub fn nullable(&self, schema: &ResolvedSchema) -> bool {
         match self {
             Expression::Literal(l) => matches!(l.value, LiteralValue::Null),
-            Expression::ColumnReference(c) => c
-                .nullable
-                .unwrap_or_else(|| TypeInferenceEngine::column_nullable(&c.name, schema)),
+            Expression::ColumnReference(c) => c.nullable,
             Expression::UnresolvedColumn(u) => TypeInferenceEngine::qualified_column_nullable(
                 &u.name,
                 u.qualifier.as_deref(),
@@ -2672,8 +2688,8 @@ mod tests {
         Expression::ColumnReference(ColumnReference {
             name: "address".to_owned(),
             qualifier: None,
-            data_type: Some(address_struct_type()),
-            nullable: Some(true),
+            data_type: address_struct_type(),
+            nullable: true,
             expr_id: None,
         })
     }
@@ -3192,8 +3208,8 @@ mod tests {
         Expression::ColumnReference(ColumnReference {
             name: name.to_owned(),
             qualifier: None,
-            data_type: Some(data_type),
-            nullable: Some(true),
+            data_type,
+            nullable: true,
             expr_id: None,
         })
     }

@@ -72,8 +72,8 @@ mod tests {
         Expression::ColumnReference(ColumnReference {
             name: name.to_owned(),
             qualifier: None,
-            data_type: None,
-            nullable: None,
+            data_type: DataType::String,
+            nullable: true,
             expr_id: None,
         })
     }

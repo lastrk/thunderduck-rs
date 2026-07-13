@@ -1355,8 +1355,8 @@ fn analyze_node(
                         Expression::ColumnReference(ColumnReference {
                             name: f.name.clone(),
                             qualifier: None,
-                            data_type: Some(f.data_type.clone()),
-                            nullable: Some(f.nullable),
+                            data_type: f.data_type.clone(),
+                            nullable: f.nullable,
                             expr_id: Some(f.expr_id),
                         })
                     })
@@ -3383,17 +3383,12 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
         // resolution is therefore always already stamped by one of the
         // analyzer's own construction sites (`resolve_column` and friends) —
         // there is no bare/"already resolved" `ColumnReference` constructor
-        // left to fill in. `expr_id` is NOT asserted here: it legitimately
-        // stays `None` for a tier-(d) struct-qualifier reference (and its
-        // outer twin) — see `ColumnReference::expr_id`'s doc.
-        Expression::ColumnReference(c) => {
-            debug_assert!(
-                c.data_type.is_some() && c.nullable.is_some(),
-                "a ColumnReference reaching resolution must already be stamped \
-                 (front-ends emit UnresolvedColumn; analyzer sites stamp Some)"
-            );
-            Ok(Expression::ColumnReference(c))
-        }
+        // left to fill in, and `data_type`/`nullable` are non-`Option` by
+        // construction (E4/D3), so there is nothing left to assert here —
+        // pure passthrough. `expr_id` legitimately stays `None` for a
+        // tier-(d) struct-qualifier reference (and its outer twin) — see
+        // `ColumnReference::expr_id`'s doc.
+        Expression::ColumnReference(c) => Ok(Expression::ColumnReference(c)),
         // Subqueries: analyze the inner plan with the enclosing context
         // threaded as the outer scope so correlated outer references (e.g.
         // `e.salary` referencing the outer `emp e`) resolve against the
@@ -3773,8 +3768,8 @@ fn bind_slot(entries: &[Expression], schema: &ResolvedSchema, k: usize) -> Expre
     Expression::ColumnReference(ColumnReference {
         name: field.name,
         qualifier: None,
-        data_type: Some(field.data_type),
-        nullable: Some(field.nullable),
+        data_type: field.data_type,
+        nullable: field.nullable,
         expr_id: Some(field.expr_id),
     })
 }
@@ -3863,8 +3858,8 @@ fn promote_aggregate_subtree(
         return Some(Expression::ColumnReference(ColumnReference {
             name: field.name,
             qualifier: None,
-            data_type: Some(field.data_type),
-            nullable: Some(field.nullable),
+            data_type: field.data_type,
+            nullable: field.nullable,
             expr_id: Some(field.expr_id),
         }));
     }
@@ -3907,8 +3902,8 @@ fn promote_project_subtree(
         return Some(Expression::ColumnReference(ColumnReference {
             name: field.name,
             qualifier: None,
-            data_type: Some(field.data_type),
-            nullable: Some(field.nullable),
+            data_type: field.data_type,
+            nullable: field.nullable,
             expr_id: Some(field.expr_id),
         }));
     }
@@ -4079,12 +4074,15 @@ fn ids_compatible(a: &Expression, b: &Expression) -> bool {
 /// Infallible>`), so the `unwrap_or_else` below can never panic.
 ///
 /// `ColumnReference::expr_id` is deliberately PRESERVED (only
-/// qualifier/name-case/type/nullable are normalized away) — [`semantic_eq`]'s
-/// `==` check cannot see it (`ColumnReference::eq` excludes it), but
-/// [`ids_compatible`] reads `expr_id` directly off these canonicalized trees.
-/// Dropping this preservation (e.g. re-normalizing `expr_id` to `None` here)
-/// would silently revert the [`ids_compatible`] check to always-`true` —
-/// `canonicalize_preserves_expr_id` guards against exactly that regression.
+/// qualifier/name-case are normalized away here — `data_type`/`nullable` are
+/// carried through unchanged too, since [`ColumnReference`]'s hand-written
+/// `PartialEq` already excludes them from `==`, D1/E4) — [`semantic_eq`]'s
+/// `==` check cannot see `expr_id` either (`ColumnReference::eq` excludes
+/// it), but [`ids_compatible`] reads `expr_id` directly off these
+/// canonicalized trees. Dropping this preservation (e.g. re-normalizing
+/// `expr_id` to `None` here) would silently revert the [`ids_compatible`]
+/// check to always-`true` — `canonicalize_for_semantic_eq_preserves_expr_id`
+/// guards against exactly that regression.
 fn canonicalize_for_semantic_eq(expr: &Expression) -> Expression {
     if let Expression::Alias(a) = expr {
         return canonicalize_for_semantic_eq(&a.expr);
@@ -4098,11 +4096,16 @@ fn canonicalize_for_semantic_eq(expr: &Expression) -> Expression {
         }
     }
     let normalized = match expr {
+        // D1 (E4) made `PartialEq` exclude `data_type`/`nullable` outright, so
+        // this arm no longer needs to null them out to neutralize `==` — only
+        // `name`/`qualifier` are logical identity and get case-folded/stripped
+        // here. `data_type`/`nullable` are carried through UNCHANGED, same as
+        // `expr_id`.
         Expression::ColumnReference(c) => Expression::ColumnReference(ColumnReference {
             name: c.name.to_ascii_lowercase(),
             qualifier: None,
-            data_type: None,
-            nullable: None,
+            data_type: c.data_type.clone(),
+            nullable: c.nullable,
             expr_id: c.expr_id,
         }),
         Expression::UnresolvedColumn(u) => Expression::UnresolvedColumn(UnresolvedColumn {
@@ -4427,8 +4430,8 @@ fn try_rewrite_nested_struct_path(
     let mut expr = Expression::ColumnReference(ColumnReference {
         name: qualifier.to_owned(),
         qualifier: None,
-        data_type: Some(root_field.data_type.clone()),
-        nullable: Some(root_field.nullable),
+        data_type: root_field.data_type.clone(),
+        nullable: root_field.nullable,
         expr_id: None,
     });
     for seg in &segments {
@@ -4581,8 +4584,8 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                     return Ok(Expression::ColumnReference(ColumnReference {
                         name: u.name,
                         qualifier: None,
-                        data_type: Some(dt),
-                        nullable: Some(nullable),
+                        data_type: dt,
+                        nullable,
                         expr_id,
                     }));
                 }
@@ -4668,8 +4671,8 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                                     name: u.name,
                                     qualifier: None,
                                     expr_id,
-                                    data_type: Some(dt),
-                                    nullable: Some(nullable),
+                                    data_type: dt,
+                                    nullable,
                                 }));
                             }
                             (dt, nullable, expr_id)
@@ -4734,8 +4737,8 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                                     name: u.name,
                                     qualifier: None,
                                     expr_id: Some(f.expr_id),
-                                    data_type: Some(f.data_type.clone()),
-                                    nullable: Some(f.nullable),
+                                    data_type: f.data_type.clone(),
+                                    nullable: f.nullable,
                                 }));
                             }
                             n if n >= 2 => {
@@ -4794,8 +4797,8 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                 return Ok(Expression::ColumnReference(ColumnReference {
                     name: u.name,
                     qualifier: u.qualifier,
-                    data_type: Some(outer_dt),
-                    nullable: Some(outer_nullable),
+                    data_type: outer_dt,
+                    nullable: outer_nullable,
                     // `None` only for the outer struct-qualifier arm — see
                     // `resolve_in_outer`'s doc.
                     expr_id: outer_id,
@@ -4810,14 +4813,17 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     Ok(Expression::ColumnReference(ColumnReference {
         name: u.name,
         qualifier: u.qualifier,
-        data_type: Some(dt),
-        nullable: Some(nullable),
+        data_type: dt,
+        nullable,
         expr_id,
     }))
 }
 
-/// Return `true` iff any `Expression::UnresolvedColumn` remains, or any
-/// `ColumnReference` has `data_type = None` / `nullable = None`.
+/// Return `true` iff any `Expression::UnresolvedColumn` (or
+/// `Expression::UnresolvedRegex`) remains, or an embedded subquery's inner
+/// plan is not yet `Analyzed`. A `ColumnReference` is always fully resolved
+/// by construction (E4/D3: `data_type`/`nullable` are non-`Option`) — it
+/// falls into the default recursion below.
 fn expression_is_fully_resolved(expr: &Expression) -> bool {
     // Opaque per [`Expression::is_opaque_unit`] (the single opacity
     // authority, N1): Lambda / LambdaVariable / RawSql / Interval bodies are
@@ -4834,7 +4840,6 @@ fn expression_is_fully_resolved(expr: &Expression) -> bool {
         // `expand_regex_projections` in the `CommonOp::Project` pre-pass.
         // If it survives to this check, treat it as unresolved.
         Expression::UnresolvedRegex(_) => false,
-        Expression::ColumnReference(c) => c.data_type.is_some() && c.nullable.is_some(),
         // Subquery bodies must be analyzed: the inner plan is fully resolved
         // only once the analyzer has rewritten `Unanalyzed` → `Analyzed`.
         Expression::ScalarSubquery(s) => subquery_plan_is_resolved(&s.subquery),
@@ -4843,9 +4848,11 @@ fn expression_is_fully_resolved(expr: &Expression) -> bool {
         }
         Expression::ExistsSubquery(e) => subquery_plan_is_resolved(&e.subquery),
         // Default recursion: all-children-resolved implies self-resolved. See
-        // [`Expression::children`] for the walked-child convention. Covers the
-        // leaf variants (Literal, Star → no children → true) and every
-        // structural node (Binary, Window, CaseWhen, …).
+        // [`Expression::children`] for the walked-child convention. Covers
+        // the leaf variants — Literal, Star, and ColumnReference (whose
+        // `data_type`/`nullable` are non-`Option` by construction since
+        // E4/D3, so it is vacuously resolved via its empty child set) — and
+        // every structural node (Binary, Window, CaseWhen, …).
         _ => expr.children().all(expression_is_fully_resolved),
     }
 }
@@ -5672,8 +5679,8 @@ fn derive_implicit_grouping(
             Expression::ColumnReference(ColumnReference {
                 name: f.name.clone(),
                 qualifier: None,
-                data_type: Some(f.data_type.clone()),
-                nullable: Some(f.nullable),
+                data_type: f.data_type.clone(),
+                nullable: f.nullable,
                 expr_id: None,
             })
         })
@@ -7551,7 +7558,7 @@ mod tests {
                             Expression::ColumnReference(c) => {
                                 assert_eq!(c.qualifier.as_deref(), Some("e"));
                                 assert_eq!(c.name, "salary");
-                                assert_eq!(c.data_type, Some(DataType::Double));
+                                assert_eq!(c.data_type, DataType::Double);
                             }
                             other => panic!("expected ColumnReference, got {other:?}"),
                         },
@@ -7592,7 +7599,7 @@ mod tests {
             TypedOp::Project { projections, .. } => match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.name, "name");
-                    assert_eq!(c.data_type, Some(DataType::String));
+                    assert_eq!(c.data_type, DataType::String);
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
             },
@@ -8180,7 +8187,7 @@ mod tests {
                     // ADR-023 3d.
                     assert_eq!(
                         c.data_type,
-                        Some(DataType::Long),
+                        DataType::Long,
                         "mismatched qualifier must resolve as a correlated outer reference"
                     );
                 }
@@ -8247,8 +8254,8 @@ mod tests {
         match &typed.op {
             TypedOp::Project { projections, .. } => match &projections[0] {
                 Expression::ColumnReference(c) => {
-                    assert_eq!(c.data_type.as_ref(), Some(&DataType::Long));
-                    assert_eq!(c.nullable, Some(false));
+                    assert_eq!(c.data_type, DataType::Long);
+                    assert!(!c.nullable);
                 }
                 _ => panic!("expected ColumnReference"),
             },
@@ -8624,7 +8631,7 @@ mod tests {
             TypedOp::Project { projections, .. } => match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.name, "salary");
-                    assert_eq!(c.data_type.as_ref(), Some(&DataType::Double));
+                    assert_eq!(c.data_type, DataType::Double);
                 }
                 _ => panic!("expected resolved ColumnReference"),
             },
@@ -9372,8 +9379,8 @@ mod tests {
             TypedOp::Filter { condition, .. } => match condition {
                 Expression::Binary(b) => match b.left.as_ref() {
                     Expression::ColumnReference(c) => {
-                        assert_eq!(c.data_type.as_ref(), Some(&DataType::Double));
-                        assert_eq!(c.nullable, Some(true));
+                        assert_eq!(c.data_type, DataType::Double);
+                        assert!(c.nullable);
                     }
                     _ => panic!("expected ColumnReference"),
                 },
@@ -10717,7 +10724,7 @@ mod tests {
                 match col {
                     Expression::ColumnReference(c) => {
                         assert_eq!(c.name, "dept_id");
-                        assert_eq!(c.data_type.as_ref(), Some(&DataType::Integer));
+                        assert_eq!(c.data_type, DataType::Integer);
                     }
                     other => panic!("expected ColumnReference, got {other:?}"),
                 }
@@ -11712,10 +11719,10 @@ mod tests {
                 ..
             } => match (&*b.left, &*b.right) {
                 (Expression::ColumnReference(l), Expression::ColumnReference(r)) => {
-                    assert_eq!(l.data_type, Some(DataType::Long));
-                    assert_eq!(l.nullable, Some(false));
-                    assert_eq!(r.data_type, Some(DataType::Long));
-                    assert_eq!(r.nullable, Some(true));
+                    assert_eq!(l.data_type, DataType::Long);
+                    assert!(!l.nullable);
+                    assert_eq!(r.data_type, DataType::Long);
+                    assert!(r.nullable);
                 }
                 other => panic!("expected two ColumnReferences, got {other:?}"),
             },
@@ -14361,8 +14368,8 @@ mod tests {
         let bare_qualified = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: Some("e".to_owned()),
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: None,
         });
         assert_eq!(ensure_named(bare_qualified.clone()), bare_qualified);
@@ -14884,8 +14891,8 @@ mod tests {
         let cr = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: Some("e".to_owned()),
-            data_type: Some(field.data_type.clone()),
-            nullable: Some(field.nullable),
+            data_type: field.data_type.clone(),
+            nullable: field.nullable,
             expr_id: Some(field.expr_id),
         });
         let attr = output_attribute(&cr, &scanned.resolved_schema);
@@ -15035,8 +15042,8 @@ mod tests {
                 projections: vec![Expression::ColumnReference(ColumnReference {
                     name: "dept_id".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::Integer),
-                    nullable: Some(false),
+                    data_type: DataType::Integer,
+                    nullable: false,
                     expr_id: None,
                 })],
             },
@@ -15102,15 +15109,15 @@ mod tests {
         let a = Expression::ColumnReference(ColumnReference {
             name: "x".to_owned(),
             qualifier: Some("t1".to_owned()),
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: Some(id_a),
         });
         let b = Expression::ColumnReference(ColumnReference {
             name: "x".to_owned(),
             qualifier: Some("t2".to_owned()),
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: Some(id_b),
         });
         assert!(
@@ -15154,15 +15161,15 @@ mod tests {
             Expression::ColumnReference(ColumnReference {
                 name: e_field.name.clone(),
                 qualifier: None,
-                data_type: Some(e_field.data_type.clone()),
-                nullable: Some(e_field.nullable),
+                data_type: e_field.data_type.clone(),
+                nullable: e_field.nullable,
                 expr_id: Some(e_field.expr_id),
             }),
             Expression::ColumnReference(ColumnReference {
                 name: d_field.name.clone(),
                 qualifier: None,
-                data_type: Some(d_field.data_type.clone()),
-                nullable: Some(d_field.nullable),
+                data_type: d_field.data_type.clone(),
+                nullable: d_field.nullable,
                 expr_id: Some(d_field.expr_id),
             }),
         ];
@@ -15405,8 +15412,8 @@ mod tests {
         let c = Expression::ColumnReference(ColumnReference {
             name: "X".to_owned(),
             qualifier: Some("t".to_owned()),
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: Some(id),
         });
         match canonicalize_for_semantic_eq(&c) {

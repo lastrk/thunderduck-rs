@@ -50,6 +50,7 @@ use super::expression::{
     CastExpression, ColumnReference, Expression, ExtractValueExpression, FunctionCall, Literal,
     LiteralValue, SortOrder, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
+use super::name_fold::{eq_fold, fold_key};
 use super::schema::{Attribute, ExprId, ResolvedSchema};
 use super::type_inference::{
     is_aggregate_classifier_name, is_nondeterministic_fn_name, TypeInferenceEngine,
@@ -201,7 +202,7 @@ impl RelScope {
     fn lookup_all(&self, q: &str) -> Vec<std::ops::Range<usize>> {
         self.aliases
             .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case(q))
+            .filter(|(name, _)| eq_fold(name, q))
             .map(|(_, range)| range.clone())
             .collect()
     }
@@ -1431,10 +1432,7 @@ fn analyze_node(
                 let grouping_names: Vec<String> =
                     grouping.iter().map(expression_output_name).collect();
                 for field in &mut output_fields {
-                    if grouping_names
-                        .iter()
-                        .any(|gn| gn.eq_ignore_ascii_case(&field.name))
-                    {
+                    if grouping_names.iter().any(|gn| eq_fold(gn, &field.name)) {
                         field.nullable = true;
                     }
                 }
@@ -1619,12 +1617,12 @@ fn analyze_node(
             let typed_input = analyze_node(*input, base_types, outer)?;
             let rename_map: HashMap<String, String> = renames
                 .iter()
-                .map(|(old, new)| (old.to_lowercase(), new.clone()))
+                .map(|(old, new)| (fold_key(old), new.clone()))
                 .collect();
             let mut output_fields: Vec<Attribute> =
                 Vec::with_capacity(typed_input.resolved_schema.fields.len());
             for f in &typed_input.resolved_schema.fields {
-                let new_name = rename_map.get(&f.name.to_lowercase()).cloned();
+                let new_name = rename_map.get(&fold_key(&f.name)).cloned();
                 // Rename is a pure name mutation on the SAME logical column —
                 // clone-with-new-name keeps the id.
                 let mut nf = f.clone();
@@ -1645,11 +1643,11 @@ fn analyze_node(
         // ── DropColumns (Spark `df.drop(...)`) ───────────────────────────
         CommonOp::DropColumns { input, drop_names } => {
             let typed_input = analyze_node(*input, base_types, outer)?;
-            let drop_lower: HashSet<String> = drop_names.iter().map(|s| s.to_lowercase()).collect();
+            let drop_lower: HashSet<String> = drop_names.iter().map(|s| fold_key(s)).collect();
             let mut output_fields: Vec<Attribute> =
                 Vec::with_capacity(typed_input.resolved_schema.fields.len());
             for f in &typed_input.resolved_schema.fields {
-                if !drop_lower.contains(&f.name.to_lowercase()) {
+                if !drop_lower.contains(&fold_key(&f.name)) {
                     // Filter keeps the surviving columns' ids — clone-filter.
                     output_fields.push(f.clone());
                 }
@@ -1875,12 +1873,12 @@ pub(super) fn with_columns_plan(
 ) -> WithColumnsPlan {
     let mut assigned_lower: HashMap<String, usize> = HashMap::with_capacity(assignments.len());
     for (i, (name, _)) in assignments.iter().enumerate() {
-        assigned_lower.insert(name.to_lowercase(), i);
+        assigned_lower.insert(fold_key(name), i);
     }
     let mut consumed = vec![false; assignments.len()];
     let mut replaced: Vec<Option<usize>> = Vec::with_capacity(input_schema.fields.len());
     for f in &input_schema.fields {
-        let idx = assigned_lower.get(&f.name.to_lowercase()).copied();
+        let idx = assigned_lower.get(&fold_key(&f.name)).copied();
         if let Some(i) = idx {
             consumed[i] = true;
         }
@@ -1930,7 +1928,7 @@ pub(super) fn na_fill_value_for<'a>(
         // Single fill value: the column is selected either because
         // `cols` is empty ("fill all") or because it names the column;
         // Spark's type-compatibility filter then gates the fill.
-        let selected = cols.is_empty() || cols.iter().any(|c| c.eq_ignore_ascii_case(col_name));
+        let selected = cols.is_empty() || cols.iter().any(|c| eq_fold(c, col_name));
         if selected && na_fill_compatible(col_type, &values[0].data_type(schema)) {
             Some(&values[0])
         } else {
@@ -1938,7 +1936,7 @@ pub(super) fn na_fill_value_for<'a>(
         }
     } else {
         for (c, v) in cols.iter().zip(values.iter()) {
-            if c.eq_ignore_ascii_case(col_name) {
+            if eq_fold(c, col_name) {
                 return Some(v);
             }
         }
@@ -2243,16 +2241,16 @@ fn analyze_join(
         fields
     };
     let output_schema = if !using_columns.is_empty() {
-        let using_lower: HashSet<String> = using_columns.iter().map(|s| s.to_lowercase()).collect();
+        let using_lower: HashSet<String> = using_columns.iter().map(|s| fold_key(s)).collect();
         let mut fields = build_using_prefix(&using_columns);
         for f in &derived_left_schema.fields {
-            if !using_lower.contains(&f.name.to_lowercase()) {
+            if !using_lower.contains(&fold_key(&f.name)) {
                 fields.push(f.clone());
             }
         }
         if !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
             for f in &derived_right_schema.fields {
-                if !using_lower.contains(&f.name.to_lowercase()) {
+                if !using_lower.contains(&fold_key(&f.name)) {
                     fields.push(f.clone());
                 }
             }
@@ -2432,7 +2430,7 @@ fn self_ref_table_names(ast: &CommonAst, cte_name_lower: &str) -> Vec<String> {
 
 fn collect_self_ref_names(ast: &CommonAst, cte_name_lower: &str, out: &mut Vec<String>) {
     if let CommonOp::TableScan { table, .. } = &ast.op {
-        if table.to_lowercase() == cte_name_lower && !out.contains(table) {
+        if fold_key(table) == cte_name_lower && !out.contains(table) {
             out.push(table.clone());
         }
     }
@@ -2491,14 +2489,14 @@ fn analyze_set_op(
                 .resolved_schema
                 .fields
                 .iter()
-                .map(|f| f.name.to_lowercase())
+                .map(|f| fold_key(&f.name))
                 .collect();
             for (idx, child) in typed_children.iter().enumerate().skip(1) {
                 let child_names_lower: HashSet<String> = child
                     .resolved_schema
                     .fields
                     .iter()
-                    .map(|f| f.name.to_lowercase())
+                    .map(|f| fold_key(&f.name))
                     .collect();
                 if child_names_lower != first_names_lower {
                     return Err(AnalyzerError::Other {
@@ -2564,7 +2562,7 @@ fn widen_by_name(children: &[TypedAst]) -> Result<ResolvedSchema, AnalyzerError>
     let mut seen_lower: HashSet<String> = HashSet::new();
     for child in children {
         for f in &child.resolved_schema.fields {
-            let lower = f.name.to_lowercase();
+            let lower = fold_key(&f.name);
             if seen_lower.insert(lower) {
                 ordered_names.push(f.name.clone());
             }
@@ -3171,7 +3169,7 @@ impl LateralAliasTable {
         let mut found: Option<&Expression> = None;
         let mut count = 0usize;
         for (entry_name, expr) in &self.entries {
-            if entry_name.eq_ignore_ascii_case(name) {
+            if eq_fold(entry_name, name) {
                 count += 1;
                 found = Some(expr);
             }
@@ -3698,11 +3696,16 @@ fn rebind_over_aggregate(
     let ctx = ResolveContext::of_input(child_input, base_types, outer);
     let input_resolved = resolve_and_stamp(original.clone(), &ctx)
         .map_err(|_| unresolvable_sort_key_error(&original))?;
-    // Increment 1: whole-key match.
-    if let Some(k) = aggregates
-        .iter()
-        .position(|entry| semantic_eq(&input_resolved, entry))
-    {
+    // Increment 1: whole-key match. Canonicalize the FIXED `input_resolved`
+    // side once; `None` (nondeterministic) short-circuits the loop entirely
+    // rather than re-checking nondeterminism per `aggregates` entry.
+    let ca_input = (!contains_nondeterministic_call(&input_resolved))
+        .then(|| canonicalize_for_semantic_eq(&input_resolved));
+    if let Some(k) = ca_input.as_ref().and_then(|ca| {
+        aggregates
+            .iter()
+            .position(|entry| semantic_eq_against(ca, entry))
+    }) {
         return Ok(bind_slot(aggregates, schema, k));
     }
     // Increment 2 (design 023 step 5): subtree walk-and-promote.
@@ -3728,11 +3731,16 @@ fn rebind_over_project(
     let ctx = ResolveContext::of_input(child_input, base_types, outer);
     let input_resolved = resolve_and_stamp(original.clone(), &ctx)
         .map_err(|_| unresolvable_sort_key_error(&original))?;
-    // Increment 1: whole-key match.
-    if let Some(k) = projections
-        .iter()
-        .position(|entry| semantic_eq(&input_resolved, entry))
-    {
+    // Increment 1: whole-key match. Canonicalize the FIXED `input_resolved`
+    // side once; `None` (nondeterministic) short-circuits the loop entirely
+    // rather than re-checking nondeterminism per `projections` entry.
+    let ca_input = (!contains_nondeterministic_call(&input_resolved))
+        .then(|| canonicalize_for_semantic_eq(&input_resolved));
+    if let Some(k) = ca_input.as_ref().and_then(|ca| {
+        projections
+            .iter()
+            .position(|entry| semantic_eq_against(ca, entry))
+    }) {
         return Ok(bind_slot(projections, schema, k));
     }
     // Increment 2 (design 023 step 5): subtree walk-and-promote.
@@ -3824,15 +3832,24 @@ fn promote_aggregate_subtree(
     schema: &mut ResolvedSchema,
     input_schema: &ResolvedSchema,
 ) -> Option<Expression> {
-    if let Some(k) = aggregates
-        .iter()
-        .position(|entry| semantic_eq(&expr, entry))
-    {
+    // Canonicalize the FIXED `expr` side once for both loops below (the
+    // `aggregates` whole-entry match and the `grouping` match share the same
+    // fixed operand); `None` (nondeterministic) short-circuits both loops
+    // entirely.
+    let ca_expr =
+        (!contains_nondeterministic_call(&expr)).then(|| canonicalize_for_semantic_eq(&expr));
+    if let Some(k) = ca_expr.as_ref().and_then(|ca| {
+        aggregates
+            .iter()
+            .position(|entry| semantic_eq_against(ca, entry))
+    }) {
         return Some(bind_slot(aggregates, schema, k));
     }
     let is_new_aggregate =
         matches!(&expr, Expression::FunctionCall(f) if is_aggregate_classifier_name(&f.name));
-    let matches_grouping = grouping.iter().any(|g| semantic_eq(&expr, g));
+    let matches_grouping = ca_expr
+        .as_ref()
+        .is_some_and(|ca| grouping.iter().any(|g| semantic_eq_against(ca, g)));
     if is_new_aggregate || matches_grouping {
         let name = unique_hidden_output_name(&expr, aggregates);
         // Freshly promoted hidden output column — a brand-new logical
@@ -3876,10 +3893,15 @@ fn promote_project_subtree(
     schema: &mut ResolvedSchema,
     input_schema: &ResolvedSchema,
 ) -> Option<Expression> {
-    if let Some(k) = projections
-        .iter()
-        .position(|entry| semantic_eq(&expr, entry))
-    {
+    // Canonicalize the FIXED `expr` side once; `None` (nondeterministic)
+    // short-circuits the loop entirely.
+    let ca_expr =
+        (!contains_nondeterministic_call(&expr)).then(|| canonicalize_for_semantic_eq(&expr));
+    if let Some(k) = ca_expr.as_ref().and_then(|ca| {
+        projections
+            .iter()
+            .position(|entry| semantic_eq_against(ca, entry))
+    }) {
         return Some(bind_slot(projections, schema, k));
     }
     if matches!(&expr, Expression::ColumnReference(_)) {
@@ -3914,15 +3936,15 @@ fn unique_hidden_output_name(expr: &Expression, aggregates: &[Expression]) -> St
     let base = expression_output_name(expr);
     let taken: HashSet<String> = aggregates
         .iter()
-        .map(|e| expression_output_name(e).to_ascii_lowercase())
+        .map(|e| fold_key(&expression_output_name(e)))
         .collect();
-    if !taken.contains(&base.to_ascii_lowercase()) {
+    if !taken.contains(&fold_key(&base)) {
         return base;
     }
     let mut n = 2usize;
     loop {
         let candidate = format!("{base}_{n}");
-        if !taken.contains(&candidate.to_ascii_lowercase()) {
+        if !taken.contains(&fold_key(&candidate)) {
             return candidate;
         }
         n += 1;
@@ -4016,13 +4038,38 @@ fn contains_nondeterministic_call(expr: &Expression) -> bool {
 /// [`ids_compatible`] re-walks both (already `==`-confirmed, hence
 /// same-shape) canonicalized trees afterwards to add that check back in
 /// specifically for this comparison.
+///
+/// Production call sites (`rebind_over_aggregate`/`rebind_over_project`/
+/// `promote_aggregate_subtree`/`promote_project_subtree`) all compare many
+/// candidates against one fixed operand and so call [`semantic_eq_against`]
+/// directly (hoisting the fixed side's canonicalization out of the loop);
+/// this pairwise form is kept for the single-pair comparisons in this
+/// module's own tests.
+#[cfg(test)]
 fn semantic_eq(a: &Expression, b: &Expression) -> bool {
-    if contains_nondeterministic_call(a) || contains_nondeterministic_call(b) {
+    if contains_nondeterministic_call(a) {
         return false;
     }
     let ca = canonicalize_for_semantic_eq(a);
-    let cb = canonicalize_for_semantic_eq(b);
-    ca == cb && ids_compatible(&ca, &cb)
+    semantic_eq_against(&ca, b)
+}
+
+/// [`semantic_eq`], factored so a loop comparing many `entry` candidates
+/// against one FIXED expression (`rebind_over_aggregate`/`rebind_over_project`/
+/// `promote_aggregate_subtree`/`promote_project_subtree`'s `.position`/`.any`
+/// loops) pays for [`canonicalize_for_semantic_eq`] and the nondeterminism
+/// check on the FIXED side exactly ONCE, not on every iteration — those
+/// callers precompute `ca_fixed` themselves (skipping the call entirely, and
+/// hence the whole loop, when the fixed side is itself nondeterministic; see
+/// each call site) and pass it in here. The `entry` side is still
+/// canonicalized and nondeterminism-checked per call, since it legitimately
+/// differs every iteration.
+fn semantic_eq_against(ca_fixed: &Expression, entry: &Expression) -> bool {
+    if contains_nondeterministic_call(entry) {
+        return false;
+    }
+    let ce = canonicalize_for_semantic_eq(entry);
+    ca_fixed == &ce && ids_compatible(ca_fixed, &ce)
 }
 
 /// Walk two expressions already confirmed structurally `==` (hence the same
@@ -4095,14 +4142,14 @@ fn canonicalize_for_semantic_eq(expr: &Expression) -> Expression {
         // here. `data_type`/`nullable` are carried through UNCHANGED, same as
         // `expr_id`.
         Expression::ColumnReference(c) => Expression::ColumnReference(ColumnReference {
-            name: c.name.to_ascii_lowercase(),
+            name: fold_key(&c.name),
             qualifier: None,
             data_type: c.data_type.clone(),
             nullable: c.nullable,
             expr_id: c.expr_id,
         }),
         Expression::UnresolvedColumn(u) => Expression::UnresolvedColumn(UnresolvedColumn {
-            name: u.name.to_ascii_lowercase(),
+            name: fold_key(&u.name),
             qualifier: None,
             plan_id: None,
         }),
@@ -4494,7 +4541,7 @@ fn resolve_in_outer(
         // Unqualified: exactly-one case-insensitive match in the outer schema.
         let mut found: Option<(DataType, bool, Option<ExprId>)> = None;
         for f in &outer.schema.fields {
-            if f.name.eq_ignore_ascii_case(&u.name) {
+            if eq_fold(&f.name, &u.name) {
                 if found.is_some() {
                     // 2+ matches — ambiguous; do not silently pick one.
                     return None;
@@ -4598,7 +4645,7 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
             .schema
             .fields
             .iter()
-            .filter(|f| f.name.eq_ignore_ascii_case(&u.name))
+            .filter(|f| eq_fold(&f.name, &u.name))
             .collect();
         if matches.len() > 1 {
             let candidates = matches.iter().map(|f| f.name.clone()).collect();
@@ -4659,7 +4706,7 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                                 .schema
                                 .fields
                                 .iter()
-                                .filter(|f| f.name.eq_ignore_ascii_case(&u.name))
+                                .filter(|f| eq_fold(&f.name, &u.name))
                                 .count();
                             if name_count == 1 {
                                 return Ok(Expression::ColumnReference(ColumnReference {
@@ -4714,8 +4761,8 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                             .iter()
                             .enumerate()
                             .filter(|(_, f)| {
-                                f.name.eq_ignore_ascii_case(&u.name)
-                                    && f.source_quals.iter().any(|qq| qq.eq_ignore_ascii_case(q))
+                                eq_fold(&f.name, &u.name)
+                                    && f.source_quals.iter().any(|qq| eq_fold(qq, q))
                             })
                             .map(|(i, _)| i)
                             .collect();
@@ -5029,10 +5076,10 @@ fn analyze_unpivot(
     let field_index: HashMap<String, &Attribute> = input_schema
         .fields
         .iter()
-        .map(|f| (f.name.to_ascii_lowercase(), f))
+        .map(|f| (fold_key(&f.name), f))
         .collect();
     let find_field =
-        |name: &str| -> Option<&Attribute> { field_index.get(&name.to_ascii_lowercase()).copied() };
+        |name: &str| -> Option<&Attribute> { field_index.get(&fold_key(name)).copied() };
 
     // Reject any unresolvable value column with a Spark-emulated
     // `UnknownColumn`. Runs ONCE per path: the Implicit path validates
@@ -5056,7 +5103,7 @@ fn analyze_unpivot(
         input_schema
             .fields
             .iter()
-            .filter(|f| !excluded.contains(&f.name.to_ascii_lowercase()))
+            .filter(|f| !excluded.contains(&fold_key(&f.name)))
             .map(|f| f.name.clone())
             .collect()
     };
@@ -5075,8 +5122,7 @@ fn analyze_unpivot(
             }
             // Validate each value column resolves before deriving ids from it.
             validate_values_resolve(&values)?;
-            let value_set: HashSet<String> =
-                values.iter().map(|v| v.to_ascii_lowercase()).collect();
+            let value_set: HashSet<String> = values.iter().map(|v| fold_key(v)).collect();
             fields_minus(&value_set)
         }
     };
@@ -5093,7 +5139,7 @@ fn analyze_unpivot(
 
     // Materialise `values`: empty ⇒ all non-id input columns (Spark default).
     let materialised_values: Vec<String> = if values.is_empty() {
-        let id_set: HashSet<String> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
+        let id_set: HashSet<String> = ids.iter().map(|id| fold_key(id)).collect();
         fields_minus(&id_set)
     } else {
         // Validate each named value column resolves — the Implicit path
@@ -5120,7 +5166,7 @@ fn analyze_unpivot(
         let mut seen: HashSet<String> =
             HashSet::with_capacity(ids.len() + materialised_values.len());
         for name in ids.iter().chain(materialised_values.iter()) {
-            let key = name.to_ascii_lowercase();
+            let key = fold_key(name);
             if !seen.insert(key) {
                 return Err(AnalyzerError::Other {
                     reason: format!(
@@ -5135,14 +5181,14 @@ fn analyze_unpivot(
     // and any id column (case-insensitive). Otherwise the stamped output
     // schema would carry two fields with the same name — Spark rejects this.
     for id in &ids {
-        if id.eq_ignore_ascii_case(&variable_column_name) {
+        if eq_fold(id, &variable_column_name) {
             return Err(AnalyzerError::Other {
                 reason: format!(
                     "unpivot variable column name '{variable_column_name}' collides with id column '{id}'"
                 ),
             });
         }
-        if id.eq_ignore_ascii_case(&value_column_name) {
+        if eq_fold(id, &value_column_name) {
             return Err(AnalyzerError::Other {
                 reason: format!(
                     "unpivot value column name '{value_column_name}' collides with id column '{id}'"
@@ -5150,7 +5196,7 @@ fn analyze_unpivot(
             });
         }
     }
-    if variable_column_name.eq_ignore_ascii_case(&value_column_name) {
+    if eq_fold(&variable_column_name, &value_column_name) {
         return Err(AnalyzerError::Other {
             reason: format!(
                 "unpivot variable and value column names must differ; both are '{variable_column_name}'"
@@ -5241,10 +5287,10 @@ fn materialise_stats_cols(
         let lowercase_names: HashSet<String> = input_schema
             .fields
             .iter()
-            .map(|f| f.name.to_ascii_lowercase())
+            .map(|f| fold_key(&f.name))
             .collect();
         for c in &cols {
-            if !lowercase_names.contains(&c.to_ascii_lowercase()) {
+            if !lowercase_names.contains(&fold_key(c)) {
                 return Err(AnalyzerError::UnknownColumn {
                     name: c.clone(),
                     qualifier: None,
@@ -5664,7 +5710,7 @@ fn derive_implicit_grouping(
     input_schema
         .fields
         .iter()
-        .filter(|f| !excluded.contains(&f.name.to_ascii_lowercase()))
+        .filter(|f| !excluded.contains(&fold_key(&f.name)))
         .map(|f| {
             // `expr_id`: `f` IS the real input attribute this grouping
             // column names, so its id is stamped directly — carries the
@@ -5704,10 +5750,10 @@ fn derive_implicit_grouping(
 fn collect_referenced_columns(expr: &Expression, acc: &mut HashSet<String>) {
     match expr {
         Expression::ColumnReference(c) => {
-            acc.insert(c.name.to_ascii_lowercase());
+            acc.insert(fold_key(&c.name));
         }
         Expression::UnresolvedColumn(u) => {
-            acc.insert(u.name.to_ascii_lowercase());
+            acc.insert(fold_key(&u.name));
         }
         _ => {
             for child in expr.children() {
@@ -11805,7 +11851,7 @@ mod tests {
     /// assert an earlier alias name has been fully inlined away.
     fn contains_unresolved_ref(expr: &Expression, name: &str) -> bool {
         match expr {
-            Expression::UnresolvedColumn(u) => u.name.eq_ignore_ascii_case(name),
+            Expression::UnresolvedColumn(u) => eq_fold(&u.name, name),
             other => other.children().any(|c| contains_unresolved_ref(c, name)),
         }
     }
@@ -15469,5 +15515,46 @@ mod tests {
             }
             other => panic!("expected ColumnReference, got {other:?}"),
         }
+    }
+
+    // ── name_fold (finding 3, case-folding unification) analyzer parity ──
+
+    /// Schema `{É}`: `select("é")` resolves AND `drop("é")` drops the SAME
+    /// attribute — both `Project`'s unresolved-column lookup and
+    /// `DropColumns`'s key-fold must agree with `eq_fold`/`fold_key`
+    /// (`name_fold`), closing the finding-3 split where `drop` (Unicode
+    /// fold) and `select` (ASCII-only fold) used to disagree on this exact
+    /// column.
+    #[test]
+    fn unicode_column_select_and_drop_agree_via_name_fold() {
+        let bt = base_types_for(&[(
+            "t",
+            StructType::new(vec![StructField::nullable("É", DataType::String)]),
+        )]);
+
+        let select_ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("t")),
+            projections: vec![unresolved_col("é")],
+        });
+        let typed = analyze(select_ast, &bt).expect("select(\"é\") should resolve `É`");
+        assert_eq!(typed.resolved_schema.len(), 1);
+        // `resolve_column`/`expression_output_name` carry the AS-TYPED name
+        // on an unaliased `ColumnReference` (pre-existing, unrelated to this
+        // case-fold unification — every `resolve_column` arm stamps
+        // `name: u.name`), not the schema's declared casing. The identity
+        // proof this test cares about is that `drop("é")` below removes the
+        // SAME physical attribute `select("é")` resolved here.
+        assert_eq!(typed.resolved_schema.fields[0].name, "é");
+
+        let drop_ast = CommonAst::new(CommonOp::DropColumns {
+            input: Box::new(scan("t")),
+            drop_names: vec!["é".to_owned()],
+        });
+        let typed = analyze(drop_ast, &bt).expect("drop(\"é\") should analyze");
+        assert!(
+            typed.resolved_schema.is_empty(),
+            "drop(\"é\") must drop the SAME `É` attribute select(\"é\") resolves, got {:?}",
+            typed.resolved_schema.field_names()
+        );
     }
 }

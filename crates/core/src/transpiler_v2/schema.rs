@@ -19,6 +19,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::{DataType, StructField, StructType};
 
+// τ's ONE case-folding authority for user-identifier (column/qualifier/alias
+// name) comparisons now lives in [`super::name_fold`] — see [`eq_fold`]/
+// [`fold_key`]'s doc there. Every name-lookup site in the resolution
+// substrate (this module's own `field_by_name`/`field_by_id`,
+// `type_inference::resolve_in` and its qualified sibling,
+// `analyzer::resolve_column`'s ambiguity check and correlated-outer arm,
+// `emission`'s name-multiplicity counters, and
+// `analyzer::canonicalize_for_semantic_eq`, plus the broader user-identifier
+// inventory in `analyzer.rs`/`emission.rs`/`expression.rs`) goes through
+// those two functions rather than a locally chosen
+// `eq_ignore_ascii_case`/`to_lowercase`.
+use super::name_fold::eq_fold;
+
 /// A process-unique identifier minted once per logical output column and
 /// carried (cloned) through every operator that merely passes a column
 /// through, so downstream increments can tell "the same column, threaded
@@ -49,9 +62,13 @@ impl ExprId {
 /// unchanged when a `Vec<StructField>` becomes a `Vec<Attribute>`.
 #[derive(Debug, Clone)]
 pub struct Attribute {
+    /// The column's name, as it resolves and renders.
     pub name: String,
+    /// The column's resolved Spark data type.
     pub data_type: DataType,
+    /// Whether the column may hold `NULL`.
     pub nullable: bool,
+    /// This column's stable identity — see [`ExprId`].
     pub expr_id: ExprId,
     /// ADR-023 tier-3 source-qualifier lineage (Spark attribute lineage) —
     /// which relation qualifiers (table names / user aliases) this column
@@ -88,9 +105,15 @@ impl Attribute {
 
     /// Chainable: overwrite `source_quals` — for LEAF mint sites
     /// (`TableScan`, `AliasedRelation`) that seed lineage at origination.
-    /// Every OTHER production site inherits `source_quals` by cloning an
+    /// Every other production site inherits `source_quals` by cloning an
     /// existing `Attribute` (never re-derive it) — see the module doc's
-    /// CONVENTION.
+    /// CONVENTION — with ONE enumerated exception: a USING-join's key-column
+    /// donor (`analyzer.rs`'s `build_using_prefix`) is not a leaf, but IS
+    /// re-derived, because a USING key is referenceable via EITHER side's
+    /// qualifier regardless of which side donates the value/id — the donor
+    /// clone's inherited `source_quals` (only one side's lineage) is
+    /// deliberately overwritten with the UNION of both sides' lineage before
+    /// use.
     pub fn with_quals(mut self, quals: BTreeSet<String>) -> Self {
         self.source_quals = quals;
         self
@@ -149,10 +172,15 @@ impl PartialEq<Attribute> for StructField {
 /// do NOT add a derived/manual `Hash` here.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedSchema {
+    /// The schema's columns, in output order.
     pub fields: Vec<Attribute>,
 }
 
 impl ResolvedSchema {
+    /// Construct a schema directly from already-identified [`Attribute`]s —
+    /// use when every field already carries the right identity (a clone, a
+    /// filter, a concatenation); to mint FRESH identity from a
+    /// [`StructType`], use [`Self::minted`] instead.
     pub fn new(fields: Vec<Attribute>) -> Self {
         Self { fields }
     }
@@ -189,9 +217,7 @@ impl ResolvedSchema {
     /// Lookup a field by name (case-insensitive, matches Spark behaviour;
     /// mirrors `StructType::field_by_name`).
     pub fn field_by_name(&self, name: &str) -> Option<&Attribute> {
-        self.fields
-            .iter()
-            .find(|f| f.name.eq_ignore_ascii_case(name))
+        self.fields.iter().find(|f| eq_fold(&f.name, name))
     }
 
     /// First-occurrence lookup by [`ExprId`] — the single home of the
@@ -219,7 +245,7 @@ impl ResolvedSchema {
             .enumerate()
             .find(|(_, f)| f.expr_id == id)?;
         debug_assert!(
-            f.name.eq_ignore_ascii_case(ref_name),
+            eq_fold(&f.name, ref_name),
             "field_by_id: id-resolved attribute name `{}` must agree with reference name `{}`",
             f.name,
             ref_name
@@ -232,10 +258,12 @@ impl ResolvedSchema {
         self.fields.iter().map(|f| f.name.as_str()).collect()
     }
 
+    /// The number of columns in the schema.
     pub fn len(&self) -> usize {
         self.fields.len()
     }
 
+    /// Whether the schema has zero columns.
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
     }
@@ -392,5 +420,24 @@ mod tests {
         let different_case = StructField::new("name", DataType::String, true);
         assert_eq!(attr, same);
         assert_ne!(attr, different_case);
+    }
+
+    // ── name_fold (finding 3, case-folding unification) ────────────────────
+    // `eq_fold`/`fold_key`'s own unit tests (ASCII/Unicode fold behavior,
+    // the JDK-21 divergence table, the İ residual) live in
+    // `super::name_fold`'s test module; this schema-level test is the
+    // resolution substrate's own intra-τ consistency witness.
+
+    #[test]
+    fn field_by_name_intra_tau_consistency_on_unicode_schema() {
+        // Pins the finding-3 fix: a schema carrying an accented column name
+        // must resolve the SAME way `eq_fold`/`fold_key` say it should —
+        // `field_by_name` is the resolution substrate's own lookup, so this
+        // is the direct intra-τ consistency witness.
+        let st = StructType::new(vec![field("É", DataType::String, true)]);
+        let rs = ResolvedSchema::minted(st);
+        assert!(rs.field_by_name("é").is_some());
+        assert!(rs.field_by_name("É").is_some());
+        assert!(rs.field_by_name("e").is_none());
     }
 }

@@ -7,6 +7,7 @@
 
 use super::analyzer::TypedAst;
 use super::ast::CommonAst;
+use super::name_fold::eq_fold;
 use super::schema::{ExprId, ResolvedSchema};
 use super::type_inference::TypeInferenceEngine;
 use crate::types::{DataType, StructField, StructType};
@@ -974,7 +975,10 @@ impl Expression {
         if b.op.is_bitwise() {
             return TypeInferenceEngine::promote_numeric(&l, &r);
         }
-        // Interval ± Date/Timestamp → preserve the date-like side.
+        // Interval ± Date/Timestamp: see `date_like_interval_result` for the
+        // per-combination result type (R1-6: a Date ± day-time interval
+        // PROMOTES to Timestamp; the other combinations preserve the
+        // date-like side).
         if let Some(dt) = date_like_interval_result(&b.op, &l, &r) {
             return dt;
         }
@@ -1258,7 +1262,7 @@ impl Expression {
                     if let DataType::Array(inner, _) = f.args[0].data_type(schema) {
                         if let DataType::Struct(st) = *inner {
                             for field in &st.fields {
-                                if field.name.eq_ignore_ascii_case(field_name) {
+                                if eq_fold(&field.name, field_name) {
                                     return field.data_type.clone();
                                 }
                             }
@@ -1342,18 +1346,17 @@ impl Expression {
     }
 
     fn function_call_nullable(f: &FunctionCall, schema: &ResolvedSchema) -> bool {
-        // N5: `f.name` is already canonical lowercase; `lower` is kept as an
-        // owned `String` (rather than renamed to a borrow) purely so the
-        // match below, which threads it through several `_lower`-suffixed
-        // fast-path calls, needs no further edits.
-        let lower = f.name.clone();
-        if Self::is_non_nullable_function_name_lower(&lower) {
+        // N5: `f.name` is already canonical lowercase; `lower` borrows it
+        // rather than cloning (post-N5, no re-derivation needed; the match
+        // below only reads it).
+        let lower: &str = f.name.as_str();
+        if Self::is_non_nullable_function_name_lower(lower) {
             return false;
         }
-        if TypeInferenceEngine::aggregate_is_always_nullable_lower(&lower) {
+        if TypeInferenceEngine::aggregate_is_always_nullable_lower(lower) {
             return true;
         }
-        match lower.as_str() {
+        match lower {
             "coalesce" | "ifnull" | "nvl" | "greatest" | "least" => {
                 f.args.iter().all(|a| a.nullable(schema))
             }
@@ -1520,7 +1523,7 @@ impl Expression {
                                 let field_null = st
                                     .fields
                                     .iter()
-                                    .find(|f0| f0.name.eq_ignore_ascii_case(field_name))
+                                    .find(|f0| eq_fold(&f0.name, field_name))
                                     .map(|f0| f0.nullable)
                                     .unwrap_or(true);
                                 (*cn, field_null)
@@ -1938,9 +1941,11 @@ pub(crate) fn materialize_binary_coercions(
 /// Apply Spark `withField` / `dropFields` operations to a caller-owned field
 /// list, preserving Spark 4.1 semantics:
 ///
-/// * Add / replace matches existing fields **case-insensitively** (ASCII);
-///   on match the *original* declared field name is preserved.
-/// * Drop matches existing fields **case-insensitively** (ASCII).
+/// * Add / replace matches existing fields **case-insensitively**
+///   ([`eq_fold`] — the same JDK `equalsIgnoreCase`-shaped fold τ uses for
+///   every user-identifier comparison); on match the *original* declared
+///   field name is preserved.
+/// * Drop matches existing fields **case-insensitively** ([`eq_fold`]).
 /// * A drop target that does not match any current field is **silently
 ///   ignored** here — callers that need Spark-emulated rejection must invoke
 ///   [`validate_update_fields_ops`] first.
@@ -1966,7 +1971,7 @@ pub(super) fn apply_update_fields_ops<T>(
             Some(new_val) => {
                 let existing = fields
                     .iter()
-                    .position(|slot| slot_name(slot).eq_ignore_ascii_case(name));
+                    .position(|slot| eq_fold(slot_name(slot), name));
                 if let Some(idx) = existing {
                     // Preserve the ORIGINAL field name — Spark `withField`
                     // keeps the struct's declared casing.
@@ -1979,7 +1984,7 @@ pub(super) fn apply_update_fields_ops<T>(
             None => {
                 if let Some(idx) = fields
                     .iter()
-                    .position(|slot| slot_name(slot).eq_ignore_ascii_case(name))
+                    .position(|slot| eq_fold(slot_name(slot), name))
                 {
                     fields.remove(idx);
                 }
@@ -2003,7 +2008,7 @@ pub(super) fn validate_update_fields_ops(
     for (name, op) in updates {
         match op {
             Some(_) => {
-                let existing = names.iter().position(|n| n.eq_ignore_ascii_case(name));
+                let existing = names.iter().position(|n| eq_fold(n, name));
                 if existing.is_none() {
                     names.push(name.clone());
                 }
@@ -2013,7 +2018,7 @@ pub(super) fn validate_update_fields_ops(
             None => {
                 let idx = names
                     .iter()
-                    .position(|n| n.eq_ignore_ascii_case(name))
+                    .position(|n| eq_fold(n, name))
                     .ok_or_else(|| name.clone())?;
                 names.remove(idx);
             }
@@ -2773,7 +2778,7 @@ mod tests {
         match expr.data_type(&schema) {
             DataType::Struct(st) => {
                 assert_eq!(st.fields.len(), 2);
-                assert!(!st.fields.iter().any(|f| f.name.eq_ignore_ascii_case("geo")));
+                assert!(!st.fields.iter().any(|f| eq_fold(&f.name, "geo")));
             }
             other => panic!("expected DataType::Struct, got: {other:?}"),
         }

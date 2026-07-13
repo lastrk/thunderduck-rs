@@ -484,3 +484,114 @@ fn inv10_filtered_root_only_walks_named_files() {
         );
     }
 }
+
+// ── Attribute/ResolvedSchema struct-literal ban (finding 13a) ─────────────
+//
+// `schema.rs`'s module doc bans a bare struct-literal construction of
+// `Attribute`/`ResolvedSchema` anywhere else in τ: every production site must
+// go through a constructor (`Attribute::minted` / `Attribute::from_field` /
+// `ResolvedSchema::minted` / `ResolvedSchema::new`) or a `.clone()` of an
+// existing value, never a hand-written literal that would silently mint
+// identity-less or duplicate-identity data bypassing the constructors. The
+// convention was doc-only before this check (zero violations today — this
+// pins it mechanically, reusing INV10's [`WALK_ROOTS`]/walk machinery).
+
+/// A matched needle occurrence on `trimmed` is exempt (not a genuine
+/// construction) when the line is one of three shapes that legitimately
+/// place the type name directly before an opening brace without
+/// constructing a value: a COMMENT or attribute line (doc prose may quote
+/// the banned literal — e.g. this very ban's documentation), a
+/// function/closure signature whose return type is immediately followed by
+/// the body's opening brace (always carries a `->` earlier on the same
+/// line — e.g. `fn f(..) -> ResolvedSchema{ .. }`), or a `struct`/`impl`
+/// header (the type's own definition or an impl block on it). The `->`
+/// exemption is deliberately line-wide and the header checks token-anchored
+/// (`impl `/`impl<`) — a genuine bare construction co-occurring with an
+/// arrow on one rustfmt'd line is implausible, and the residual
+/// false-negative risk is preferred over false positives on signatures.
+/// String literals are NOT skipped — none in the walked tree contains the
+/// needle today, and a message quoting it should use backticks in a comment
+/// instead.
+#[cfg(test)]
+fn is_struct_literal_exception(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("#[")
+        || trimmed.contains("->")
+        || trimmed.starts_with("struct ")
+        || trimmed.starts_with("pub struct ")
+        || trimmed.starts_with("impl ")
+        || trimmed.starts_with("impl<")
+}
+
+/// Whether `line` contains `needle` as a BARE token — i.e. not as the tail of
+/// a longer identifier. Excludes, e.g., the proto `UnresolvedAttribute{`
+/// literal (its character immediately before the match is `d`, a word
+/// character) while still catching a genuine bare construction.
+#[cfg(test)]
+fn contains_bare_needle(line: &str, needle: &str) -> bool {
+    let mut search_from = 0;
+    while let Some(rel_idx) = line[search_from..].find(needle) {
+        let idx = search_from + rel_idx;
+        let is_bare = line[..idx]
+            .chars()
+            .next_back()
+            .map(|c| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(true);
+        if is_bare {
+            return true;
+        }
+        search_from = idx + 1;
+    }
+    false
+}
+
+/// finding 13a: mechanically enforce the `Attribute`/`ResolvedSchema`
+/// struct-literal ban outside `schema.rs`. Walks the same [`WALK_ROOTS`] as
+/// INV10 (τ's substrate + front-ends + dispatch site), skipping `schema.rs`
+/// itself (the ban's one legitimate constructor-and-test home).
+#[test]
+fn attribute_resolved_schema_literal_ban_outside_schema_module() {
+    let root = find_workspace_root().expect("workspace root should be discoverable");
+    // Built at runtime (two literals concatenated), NOT written as one
+    // contiguous literal, so this test's own source text never contains the
+    // substring it scans for (same self-match hazard `inv3_...` avoids by
+    // building its needles via `format!`).
+    let needles = [
+        format!("{}{}", "Attribute", " {"),
+        format!("{}{}", "ResolvedSchema", " {"),
+    ];
+    let mut offenders: Vec<String> = Vec::new();
+    for walk in WALK_ROOTS {
+        let dir = root.join(walk.dir);
+        if !dir.exists() {
+            continue;
+        }
+        for file in collect_files_for_root(&dir, walk) {
+            if file.file_name().and_then(|s| s.to_str()) == Some("schema.rs") {
+                // The ban's one legitimate home: constructors + own tests.
+                continue;
+            }
+            let contents = match std::fs::read_to_string(&file) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for (lineno, line) in contents.lines().enumerate() {
+                let trimmed = line.trim_start();
+                if is_struct_literal_exception(trimmed) {
+                    continue;
+                }
+                for needle in &needles {
+                    if contains_bare_needle(trimmed, needle) {
+                        offenders.push(format!("{}:{}: {}", file.display(), lineno + 1, trimmed));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "Attribute/ResolvedSchema struct-literal ban violated outside schema.rs:\n{}",
+        offenders.join("\n"),
+    );
+}

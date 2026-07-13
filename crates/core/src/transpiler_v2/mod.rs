@@ -24,6 +24,7 @@ pub mod expression;
 pub mod function_catalog;
 pub mod invariants;
 pub mod macros;
+mod name_fold;
 pub mod rewrites;
 pub mod schema;
 pub(crate) mod spark_errors;

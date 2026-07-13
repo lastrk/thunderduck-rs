@@ -49,6 +49,7 @@ use super::expression::{
     LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan,
     UnaryExpression, UnaryOp,
 };
+use super::name_fold::{eq_fold, fold_key};
 use super::sql_block::{Clause, DefaultSlot, DistinctKind, FromItem, SelectBlock, SqlUnit};
 use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
 use crate::types::pyspark_parity::uniquify;
@@ -260,7 +261,7 @@ impl<'a> FromScope<'a> {
         let (name, _) = self.aliases.iter().find(|(_, r)| r.contains(&i))?;
         self.exposed
             .iter()
-            .any(|e| e.eq_ignore_ascii_case(name))
+            .any(|e| eq_fold(e, name))
             .then_some(name.as_str())
     }
 
@@ -279,20 +280,16 @@ impl<'a> FromScope<'a> {
         let alias_entries = self
             .aliases
             .iter()
-            .filter(|(a, _)| a.eq_ignore_ascii_case(alias))
+            .filter(|(a, _)| eq_fold(a, alias))
             .count();
         // (ii) `alias` appears exactly ONCE in the block's exposed FROM
         // aliases — the merge-visibility counterpart of (i).
-        let exposed_count = self
-            .exposed
-            .iter()
-            .filter(|e| e.eq_ignore_ascii_case(alias))
-            .count();
+        let exposed_count = self.exposed.iter().filter(|e| eq_fold(e, alias)).count();
         // (iii) `name` occurs exactly ONCE within the covering span — an
         // internally-dup span would leftmost-bind the wrong physical column.
         let within_span = schema.fields[range.clone()]
             .iter()
-            .filter(|f| f.name.eq_ignore_ascii_case(name))
+            .filter(|f| eq_fold(&f.name, name))
             .count();
         (alias_entries == 1 && exposed_count == 1 && within_span == 1).then_some(alias.as_str())
     }
@@ -315,13 +312,7 @@ impl<'a> FromScope<'a> {
             return (i < self.width).then_some(only.as_str());
         }
         let name = self.covering(i)?;
-        (self
-            .exposed
-            .iter()
-            .filter(|e| e.eq_ignore_ascii_case(name))
-            .count()
-            == 1)
-            .then_some(name)
+        (self.exposed.iter().filter(|e| eq_fold(e, name)).count() == 1).then_some(name)
     }
 
     /// Replaces `scope_covers_fields`.
@@ -358,7 +349,7 @@ fn has_unsafe_qualified_duplicate<'a>(
     mut fields: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> bool {
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    fields.any(|(name, qual)| !seen.insert((qual.to_lowercase(), name.to_lowercase())))
+    fields.any(|(name, qual)| !seen.insert((fold_key(qual), fold_key(name))))
 }
 
 /// True iff any USING-key name in `using` matches **two or more** fields in
@@ -382,7 +373,7 @@ fn using_key_duplicated(schema: &Schema, using: &[String]) -> bool {
         schema
             .fields
             .iter()
-            .filter(|f| f.name.eq_ignore_ascii_case(key))
+            .filter(|f| eq_fold(&f.name, key))
             .count()
             >= 2
     })
@@ -673,7 +664,7 @@ fn apply_duplicate_alias_guard(left_item: FromItem, right_item: FromItem) -> (Fr
     let collides = right_item
         .exposed()
         .iter()
-        .any(|r| left_names.iter().any(|l| l.eq_ignore_ascii_case(r)));
+        .any(|r| left_names.iter().any(|l| eq_fold(l, r)));
     if !collides {
         return (left_item, right_item);
     }
@@ -689,7 +680,7 @@ fn apply_duplicate_alias_guard(left_item: FromItem, right_item: FromItem) -> (Fr
 fn fresh_alias_wrap(item: FromItem, base: &str, other_exposed: &[String]) -> FromItem {
     let alias = std::iter::once(base.to_owned())
         .chain((2..=64).map(|n| format!("{base}_{n}")))
-        .find(|cand| !other_exposed.iter().any(|o| o.eq_ignore_ascii_case(cand)))
+        .find(|cand| !other_exposed.iter().any(|o| eq_fold(o, cand)))
         // Defensive fallback — never observed; avoids an unbounded loop /
         // `unwrap` if all 64 candidates collide.
         .unwrap_or_else(|| format!("{base}_64"));
@@ -811,7 +802,7 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
         } else {
             None
         };
-        let using_lower: HashSet<String> = using_columns.iter().map(|s| s.to_lowercase()).collect();
+        let using_lower: HashSet<String> = using_columns.iter().map(|s| fold_key(s)).collect();
         // Change 3 (F7 round 2): a USING join over a side whose non-USING-key
         // fields would collide under the SAME qualified reference (see
         // [`has_unsafe_qualified_duplicate`]) can build neither a safe
@@ -825,7 +816,7 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
                     .fields
                     .iter()
                     .zip(quals.iter())
-                    .filter(|(f, _)| !using_lower.contains(&f.name.to_lowercase()))
+                    .filter(|(f, _)| !using_lower.contains(&fold_key(&f.name)))
                     .map(|(f, q)| (f.name.as_str(), q.as_str())),
             )
         };
@@ -853,7 +844,7 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
                     })
                     .collect();
                 for (f, qual) in left.resolved_schema.fields.iter().zip(lq.iter()) {
-                    if !using_lower.contains(&f.name.to_lowercase()) {
+                    if !using_lower.contains(&fold_key(&f.name)) {
                         slots.push(DefaultSlot {
                             name: f.name.clone(),
                             sql: format!("{}.{}", quote_ident(qual), quote_ident(&f.name)),
@@ -863,7 +854,7 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
                 if need_right {
                     if let Some(rq) = &rq {
                         for (f, qual) in right.resolved_schema.fields.iter().zip(rq.iter()) {
-                            if !using_lower.contains(&f.name.to_lowercase()) {
+                            if !using_lower.contains(&fold_key(&f.name)) {
                                 slots.push(DefaultSlot {
                                     name: f.name.clone(),
                                     sql: format!("{}.{}", quote_ident(qual), quote_ident(&f.name)),
@@ -1145,10 +1136,7 @@ fn exprs_visible_in<'e>(
 /// Whether the analyzer's stamped scope binds `q` (case-insensitive, any
 /// number of matches — ambiguity is the resolver's concern, not vis's).
 fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
-    scope
-        .aliases
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case(q))
+    scope.aliases.iter().any(|(name, _)| eq_fold(name, q))
 }
 
 /// N10-lite shared predicate (H8 boundary): `Some(k)` iff `c.qualifier` is
@@ -1174,7 +1162,7 @@ fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
     let name_count = schema
         .fields
         .iter()
-        .filter(|f| f.name.eq_ignore_ascii_case(&c.name))
+        .filter(|f| eq_fold(&f.name, &c.name))
         .count();
     if name_count < 2 {
         return None;
@@ -1268,13 +1256,10 @@ fn scope_position(
     name: &str,
     schema: &Schema,
 ) -> Option<usize> {
-    let (_, range) = scope
-        .aliases
-        .iter()
-        .find(|(alias, _)| alias.eq_ignore_ascii_case(q))?;
+    let (_, range) = scope.aliases.iter().find(|(alias, _)| eq_fold(alias, q))?;
     schema.fields[range.clone()]
         .iter()
-        .position(|f| f.name.eq_ignore_ascii_case(name))
+        .position(|f| eq_fold(&f.name, name))
         .map(|offset| range.start + offset)
 }
 
@@ -1438,7 +1423,7 @@ fn expand_stranded_whole_relation_star(
                 .scope
                 .aliases
                 .iter()
-                .filter(|(name, _)| name.eq_ignore_ascii_case(q));
+                .filter(|(name, _)| eq_fold(name, q));
             if let (Some((_, range)), None) = (matching.next(), matching.next()) {
                 if *range == full {
                     return Expression::Star(StarExpression { qualifier: None });
@@ -2094,7 +2079,7 @@ fn build_set_op(
                             .resolved_schema
                             .fields
                             .iter()
-                            .find(|f| f.name.eq_ignore_ascii_case(&widened_field.name))
+                            .find(|f| eq_fold(&f.name, &widened_field.name))
                             .expect("analyzer guaranteed name match"),
                     )
                 } else {
@@ -2183,7 +2168,7 @@ fn build_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<SqlUnit
                 if let Some(slots) = block.default_slots() {
                     let remaining: Vec<&str> = slots
                         .iter()
-                        .filter(|s| !drop_names.iter().any(|d| d.eq_ignore_ascii_case(&s.name)))
+                        .filter(|s| !drop_names.iter().any(|d| eq_fold(d, &s.name)))
                         .map(|s| s.sql.as_str())
                         .collect();
                     if !remaining.is_empty() {
@@ -2287,9 +2272,8 @@ fn build_na_replace(
     replacements: &[(Expression, Expression)],
 ) -> Result<SqlUnit, EmissionError> {
     let input_schema = &input.resolved_schema;
-    let in_subset = |name: &str| -> bool {
-        cols.is_empty() || cols.iter().any(|c| c.eq_ignore_ascii_case(name))
-    };
+    let in_subset =
+        |name: &str| -> bool { cols.is_empty() || cols.iter().any(|c| eq_fold(c, name)) };
     let slots = sql_join(input_schema.fields.iter(), ", ", |f| {
         let name_q = quote_ident(&f.name);
         if in_subset(&f.name) && !replacements.is_empty() {
@@ -3729,11 +3713,10 @@ fn render_function_call_dispatch(
     f: &FunctionCall,
     schema: &Schema,
 ) -> Result<String, EmissionError> {
-    // N5: `f.name` is already canonical lowercase — `name_lower` is kept as
-    // an owned `String` (rather than renamed to a borrow) purely so the
-    // ~1900-line match below, which threads it through several `&name_lower`
-    // / `format!` sites, needs no further edits.
-    let name_lower = f.name.clone();
+    // N5: `f.name` is already canonical lowercase — `name_lower` borrows it
+    // rather than cloning (post-N5, no re-derivation is needed; the ~1900-
+    // line match below reads it, never mutates or moves it).
+    let name_lower: &str = f.name.as_str();
     // Aggregate-name overlap check — if the analyzer classified a FunctionCall
     // as aggregate, `render_expr` routes to `render_aggregate` before this
     // function; anything reaching here is scalar by construction. Defense in
@@ -3745,10 +3728,10 @@ fn render_function_call_dispatch(
     // trailing bool; keep-arity is single-homed in
     // [`trailing_ignore_nulls_keep_arity`]. Anchor: corpus win-006.
     if matches!(
-        name_lower.as_str(),
+        name_lower,
         "nth_value" | "first_value" | "last_value" | "lag" | "lead"
     ) {
-        if let Some(arity_keep) = trailing_ignore_nulls_keep_arity(&name_lower) {
+        if let Some(arity_keep) = trailing_ignore_nulls_keep_arity(name_lower) {
             // Only apply the trim if the extra trailing arg is a boolean literal
             // (Spark's ignoreNulls flag). Never silently drop a real value.
             if f.args.len() > arity_keep {
@@ -3766,7 +3749,7 @@ fn render_function_call_dispatch(
     let args_sql = sql_join(f.args.iter(), ", ", |arg| render_expr(arg, schema))?;
     // Handful of Spark-name → DuckDB-name remappings where the direct
     // pass-through wouldn't work. Everything else passes through unchanged.
-    let duck_name: &str = match name_lower.as_str() {
+    let duck_name: &str = match name_lower {
         // DuckDB parses `not` as a keyword; Spark sends unary NOT as a
         // function. Emit as a keyword expression.
         "not" => {
@@ -4961,7 +4944,7 @@ fn render_function_call_dispatch(
             // Spark `log(x)` is natural log (matches DuckDB `ln`); Spark
             // `log(base, x)` is log-base-b. DuckDB `log(x)` is log10, so
             // remap single-arg `log` → `ln`.
-            let (duck_fn, value_arg_idx) = match (name_lower.as_str(), f.args.len()) {
+            let (duck_fn, value_arg_idx) = match (name_lower, f.args.len()) {
                 ("log", 1) => ("ln", 0),
                 ("log", 2) => ("log", 1),
                 ("ln", _) => ("ln", 0),
@@ -5633,7 +5616,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
                 &call,
             ));
         }
-        _ => &name_lower,
+        _ => name_lower,
     };
     Ok(format!("{duck_name}({args_sql})"))
 }

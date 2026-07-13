@@ -3,6 +3,7 @@
 //! Owned by τ (INV10: τ imports only `DataType`, `StructField`, `StructType`
 //! from `crate::types`).
 
+use super::name_fold::eq_fold;
 use super::schema::{Attribute, ResolvedSchema};
 use crate::types::{DataType, StructField, StructType};
 
@@ -107,16 +108,13 @@ impl TypeInferenceEngine {
         name: &str,
         fields: &'a [Attribute],
     ) -> Option<(DataType, bool, &'a Attribute)> {
-        if let Some(f) = fields.iter().find(|f| f.name.eq_ignore_ascii_case(name)) {
+        if let Some(f) = fields.iter().find(|f| eq_fold(&f.name, name)) {
             return Some((f.data_type.clone(), f.nullable, f));
         }
         if let Some(dot_pos) = name.find('.') {
             let struct_name = &name[..dot_pos];
             let field_name = &name[dot_pos + 1..];
-            if let Some(f) = fields
-                .iter()
-                .find(|f| f.name.eq_ignore_ascii_case(struct_name))
-            {
+            if let Some(f) = fields.iter().find(|f| eq_fold(&f.name, struct_name)) {
                 if let DataType::Struct(st) = &f.data_type {
                     let (dt, field_nullable) = st
                         .field_by_name(field_name)

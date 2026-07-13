@@ -10,9 +10,8 @@ E1/E1.5/E4/E2/E3 review-fix passes). This file holds only what is NOT done and
 judged worth doing. `tasks/v2-corpus-followups.md` remains the live per-pass
 corpus ledger; its open rows are mirrored here (§4) so this file is complete.
 
-In flight at time of writing: Pass E3 (case-folding unification via
-`canon_char`/`eq_fold`/`fold_key`, INV literal-ban check, stale comments,
-hygiene) — not listed below; it lands imminently.
+All seven E-series passes have landed (E1 `cf8ea20`, E1.5 `a4b3c6e`, E4
+`e56072a`, E2 `5dfc097`, E3 `08a3094`); this file is the complete open set.
 
 ---
 

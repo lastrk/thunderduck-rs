@@ -2718,16 +2718,38 @@ fn render_sample_by(
 /// here. Renames the child's output POSITIONALLY via DuckDB's native
 /// derived-table column-alias-list syntax (`(<child>) AS __td_wcr(new1,
 /// new2, ...)`) rather than referencing each old column BY NAME (`<old> AS
-/// <new>`). A by-name reference requires the child's ACTUAL emitted SQL
-/// column name to equal τ's tracked (analyzer) name for that field — true
-/// for a bare column, but false for an unaliased COMPOUND expression whose
-/// argument is qualified: an aggregate `count(d.dept_id)` is tracked
-/// Spark-`toPrettySQL`-parity as `count(dept_id)` (qualifier stripped, verified
-/// against live Spark), while DuckDB's own default name for that same
-/// unaliased expression keeps the qualifier (`count(d.dept_id)`). Referencing
-/// it by (τ's) name text then binds to a column DuckDB doesn't have
-/// (tbl-013). Positional renaming sidesteps the mismatch entirely — it never
-/// needs to know the child's actual column names.
+/// <new>`).
+///
+/// The live reason a by-name rename list is unsafe: the child can have
+/// DUPLICATE column names (Spark allows this — e.g. two `SELECT *`-joined
+/// sides both projecting `id`), and `SELECT old AS new, old AS new2, ...`
+/// is ambiguous SQL once `old` is not unique — DuckDB has no way to tell
+/// which same-named source column each `old AS ...` entry means. DuckDB's
+/// positional derived-table alias list has no such ambiguity: it renames by
+/// ORDINAL, so duplicate input names are a non-issue. Positional renaming
+/// also never needs to know the child's actual emitted SQL column names at
+/// all (N8 — every computed SELECT entry is aliased with τ's tracked name —
+/// makes tracked and emitted names agree globally, but positional renaming
+/// doesn't even lean on that guarantee).
+///
+/// (Historical: before N8 landed, this was ALSO the fix for a
+/// tracked≠emitted mismatch on unaliased compound expressions — tbl-013.
+/// N8 has since closed that gap, but the duplicate-name hazard above is
+/// independent and remains the rationale to keep positional renaming.)
+///
+/// The duplicate-name hazard is not fully closed inside this path either:
+/// THIS function's own `rename_map` (the by-name `HashMap` a few lines
+/// down) collapses duplicate old names last-wins. That is unreachable for
+/// genuine `withColumnsRenamed` (PySpark dict keys are unique, and renaming
+/// every same-named occurrence per entry IS Spark's semantics), but
+/// `toDF(...)`/SQL `AS t(...)` lower positional pairs like
+/// `[("id","a"), ("id","b")]` through here — the map collapses them to
+/// `id→b`, emitting `__td_wcr(b, b)` against a tracked schema of `[a, b]`
+/// (an N8 tracked==emitted violation; masked on terminal collect by the
+/// positional arrow_schema_stamp rewrite, loud DuckDB binder error on any
+/// downstream by-name reference). Tracked as `F-todf-dupname`,
+/// tasks/v2-corpus-followups.md; the fix is a POSITIONAL rename list
+/// through `TypedOp::WithColumnsRenamed`, keyed by index, at this site.
 fn build_with_columns_renamed(
     input: &TypedAst,
     renames: &[(String, String)],

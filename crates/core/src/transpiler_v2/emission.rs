@@ -7111,7 +7111,7 @@ mod tests {
         BinaryOp, CaseWhenExpression, CastExpression, ColumnReference, ExtractValueExpression,
         FunctionCall, InListExpression, IntervalExpression, IntervalKind, LambdaExpression,
         LambdaVariableExpression, LikeExpression, Literal, LiteralValue, MapLiteralExpression,
-        StarExpression, UnaryExpression, UnaryOp, UpdateFieldsExpression,
+        StarExpression, UnaryExpression, UnaryOp, UnresolvedColumn, UpdateFieldsExpression,
     };
     use crate::transpiler_v2::schema::Attribute;
     use crate::transpiler_v2::{analyze, generate, AnalyzerError};
@@ -7360,7 +7360,7 @@ mod tests {
     fn analyzed_select_id_from_emp() -> SubqueryPlan {
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
-            projections: vec![ColumnReference::untyped("id")],
+            projections: vec![UnresolvedColumn::bare("id")],
         });
         let typed = analyze(inner, &base_types_with_emp()).expect("analyze inner");
         SubqueryPlan::Analyzed(Box::new(typed))
@@ -7469,7 +7469,7 @@ mod tests {
         let plan = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::Sort {
                 input: Box::new(aliased_scan("emp", "e")),
-                order: vec![asc_key(ColumnReference::untyped("id"))],
+                order: vec![asc_key(UnresolvedColumn::bare("id"))],
                 limit: Some(5),
                 offset: None,
             })),
@@ -7563,7 +7563,7 @@ mod tests {
         let plan = CommonAst::new(CommonOp::Filter {
             input: Box::new(CommonAst::new(CommonOp::Sort {
                 input: Box::new(aliased_scan("emp", "e")),
-                order: vec![asc_key(ColumnReference::untyped("id"))],
+                order: vec![asc_key(UnresolvedColumn::bare("id"))],
                 limit: Some(5),
                 offset: None,
             })),
@@ -8858,15 +8858,15 @@ mod tests {
         let left_child = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
             projections: vec![
-                ColumnReference::untyped("id"),
-                ColumnReference::untyped("dept_id"),
+                UnresolvedColumn::bare("id"),
+                UnresolvedColumn::bare("dept_id"),
             ],
         });
         let right_child = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("dept")),
             projections: vec![
-                ColumnReference::untyped("dept_id"),
-                ColumnReference::untyped("dept_name"),
+                UnresolvedColumn::bare("dept_id"),
+                UnresolvedColumn::bare("dept_name"),
             ],
         });
         let nested_join = CommonAst::new(CommonOp::Join {
@@ -9234,7 +9234,7 @@ mod tests {
         let plan = CommonAst::new(CommonOp::Aggregate {
             input: Box::new(CommonAst::new(CommonOp::Sort {
                 input: Box::new(aliased_scan("emp", "e")),
-                order: vec![asc_key(ColumnReference::untyped("id"))],
+                order: vec![asc_key(UnresolvedColumn::bare("id"))],
                 limit: Some(5),
                 offset: None,
             })),
@@ -9653,15 +9653,15 @@ mod tests {
         let left_child = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
             projections: vec![
-                ColumnReference::untyped("id"),
-                ColumnReference::untyped("dept_id"),
+                UnresolvedColumn::bare("id"),
+                UnresolvedColumn::bare("dept_id"),
             ],
         });
         let right_child = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("dept")),
             projections: vec![
-                ColumnReference::untyped("dept_id"),
-                ColumnReference::untyped("dept_name"),
+                UnresolvedColumn::bare("dept_id"),
+                UnresolvedColumn::bare("dept_name"),
             ],
         });
         let nested_join = CommonAst::new(CommonOp::Join {

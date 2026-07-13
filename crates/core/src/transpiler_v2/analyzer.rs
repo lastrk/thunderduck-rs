@@ -3379,19 +3379,21 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
     }
     match expr {
         Expression::UnresolvedColumn(u) => resolve_column(u, ctx),
-        // Front-ends emit `UnresolvedColumn`, but `ColumnReference` is also a
-        // bare/"already resolved" AST constructor (e.g. `ColumnReference::
-        // untyped`, used pervasively — including by the analyzer's own unit
-        // tests — to build sort/group/filter keys without going through
-        // `UnresolvedColumn`), so `data_type`/`nullable` are NOT guaranteed
-        // `Some` here: `stamp_column_reference` fills in whichever half is
-        // still `None` by a name/qualifier lookup against `ctx.schema`,
-        // leaving an already-stamped reference untouched. Identity
-        // (`expr_id`) is threaded by `resolve_column` / `output_attribute`
-        // elsewhere and is intentionally left untouched here.
-        Expression::ColumnReference(c) => Ok(Expression::ColumnReference(stamp_column_reference(
-            c, ctx.schema,
-        ))),
+        // Front-ends emit `UnresolvedColumn`; a `ColumnReference` reaching
+        // resolution is therefore always already stamped by one of the
+        // analyzer's own construction sites (`resolve_column` and friends) —
+        // there is no bare/"already resolved" `ColumnReference` constructor
+        // left to fill in. `expr_id` is NOT asserted here: it legitimately
+        // stays `None` for a tier-(d) struct-qualifier reference (and its
+        // outer twin) — see `ColumnReference::expr_id`'s doc.
+        Expression::ColumnReference(c) => {
+            debug_assert!(
+                c.data_type.is_some() && c.nullable.is_some(),
+                "a ColumnReference reaching resolution must already be stamped \
+                 (front-ends emit UnresolvedColumn; analyzer sites stamp Some)"
+            );
+            Ok(Expression::ColumnReference(c))
+        }
         // Subqueries: analyze the inner plan with the enclosing context
         // threaded as the outer scope so correlated outer references (e.g.
         // `e.salary` referencing the outer `emp e`) resolve against the
@@ -4812,26 +4814,6 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         nullable: Some(nullable),
         expr_id,
     }))
-}
-
-/// Fill in whichever of `data_type` / `nullable` is still `None` on a bare
-/// `ColumnReference` by looking it up (by name and qualifier) against
-/// `schema`; a reference that already carries both is returned untouched.
-/// This is the fallback path for `ColumnReference`s that were never routed
-/// through `UnresolvedColumn` (e.g. `ColumnReference::untyped`-built AST
-/// nodes) — see `resolve_and_stamp`'s `ColumnReference` arm.
-fn stamp_column_reference(c: ColumnReference, schema: &ResolvedSchema) -> ColumnReference {
-    let dt = c.data_type.clone().unwrap_or_else(|| {
-        TypeInferenceEngine::qualified_column_type(&c.name, c.qualifier.as_deref(), schema)
-    });
-    let nullable = c.nullable.unwrap_or_else(|| {
-        TypeInferenceEngine::qualified_column_nullable(&c.name, c.qualifier.as_deref(), schema)
-    });
-    ColumnReference {
-        data_type: Some(dt),
-        nullable: Some(nullable),
-        ..c
-    }
 }
 
 /// Return `true` iff any `Expression::UnresolvedColumn` remains, or any
@@ -14151,8 +14133,8 @@ mod tests {
         ]));
         let raw = Expression::Binary(BinaryExpression {
             op: BinaryOp::Div,
-            left: Box::new(ColumnReference::untyped("sum_x")),
-            right: Box::new(ColumnReference::untyped("w_sq_ft")),
+            left: Box::new(UnresolvedColumn::bare("sum_x")),
+            right: Box::new(UnresolvedColumn::bare("w_sq_ft")),
         });
         let pre_name = expression_output_name(&raw);
         let materialized = materialize_binary_coercions(raw.clone(), &schema);
@@ -14175,7 +14157,7 @@ mod tests {
         )]));
         let raw = Expression::Binary(BinaryExpression {
             op: BinaryOp::Add,
-            left: Box::new(ColumnReference::untyped("d")),
+            left: Box::new(UnresolvedColumn::bare("d")),
             right: Box::new(Expression::Interval(IntervalExpression {
                 months: 0,
                 days: 1,
@@ -14207,8 +14189,8 @@ mod tests {
         ]));
         let raw = Expression::Binary(BinaryExpression {
             op: BinaryOp::Div,
-            left: Box::new(ColumnReference::untyped("d")),
-            right: Box::new(ColumnReference::untyped("i")),
+            left: Box::new(UnresolvedColumn::bare("d")),
+            right: Box::new(UnresolvedColumn::bare("i")),
         });
         let materialized = materialize_binary_coercions(raw.clone(), &schema);
         assert_ne!(
@@ -14227,7 +14209,7 @@ mod tests {
     /// accidental widening of the strip condition.
     #[test]
     fn semantic_eq_does_not_strip_user_written_cast() {
-        let bare = ColumnReference::untyped("i");
+        let bare = UnresolvedColumn::bare("i");
         let user_cast = Expression::Cast(CastExpression {
             expr: Box::new(bare.clone()),
             to_type: DataType::Decimal {
@@ -14251,7 +14233,7 @@ mod tests {
         )]));
         let raw = Expression::Binary(BinaryExpression {
             op: BinaryOp::Add,
-            left: Box::new(ColumnReference::untyped("d")),
+            left: Box::new(UnresolvedColumn::bare("d")),
             right: Box::new(Expression::Interval(IntervalExpression {
                 months: 0,
                 days: 1,

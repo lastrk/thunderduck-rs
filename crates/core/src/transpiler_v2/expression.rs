@@ -230,9 +230,11 @@ pub struct ColumnReference {
     /// PRODUCING node's own output schema for a local reference (`ctx.schema`
     /// at resolution time), or the ENCLOSING plan's output schema for a
     /// correlated outer reference (D2 — `resolve_column`'s tier-(g) arm /
-    /// `resolve_in_outer` in `analyzer.rs`). `None` pre-analysis (`untyped`,
-    /// never resolved), and on a RESOLVED (`data_type: Some`) reference only
-    /// from the analyzer paths left open after D2 (`analyzer.rs`):
+    /// `resolve_in_outer` in `analyzer.rs`). Production never constructs a
+    /// pre-analysis `ColumnReference` (front-ends emit `UnresolvedColumn`;
+    /// E1.5 deleted the last constructor that could). `None` on a RESOLVED
+    /// (`data_type: Some`) reference only from the analyzer paths left open
+    /// after D2 (`analyzer.rs`):
     /// * tier-(d) in `resolve_column` and its outer twin, the
     ///   struct-qualifier arm of `resolve_in_outer` — a qualifier naming a
     ///   top-level STRUCT column resolves to a nested FIELD's type, which
@@ -276,6 +278,20 @@ pub struct UnresolvedColumn {
     pub name: String,
     pub qualifier: Option<String>,
     pub plan_id: Option<i64>,
+}
+
+#[cfg(test)]
+impl UnresolvedColumn {
+    /// A bare pre-analysis name (qualifier/plan_id `None`) — what front-ends
+    /// emit. Test-only: production construction always goes through the
+    /// Spark Connect converter or the analyzer's own synthesis sites.
+    pub(crate) fn bare(name: impl Into<String>) -> Expression {
+        Expression::UnresolvedColumn(UnresolvedColumn {
+            name: name.into(),
+            qualifier: None,
+            plan_id: None,
+        })
+    }
 }
 
 /// Pattern-driven column expander (Spark `df.colRegex("`.*_id`")`).
@@ -1992,21 +2008,6 @@ pub(super) fn validate_update_fields_ops(
     Ok(())
 }
 
-// ── Convenience constructors used by tests ───────────────────────────────────
-
-impl ColumnReference {
-    /// Construct an unresolved column reference (no type or nullability hint).
-    pub fn untyped(name: impl Into<String>) -> Expression {
-        Expression::ColumnReference(ColumnReference {
-            name: name.into(),
-            qualifier: None,
-            data_type: None,
-            nullable: None,
-            expr_id: None,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::type_inference::{
@@ -2061,7 +2062,7 @@ mod tests {
             "active",
             DataType::Boolean,
         )]));
-        let expr = fcall("count_if", vec![ColumnReference::untyped("active")]);
+        let expr = fcall("count_if", vec![UnresolvedColumn::bare("active")]);
         assert!(!expr.nullable(&s));
     }
 
@@ -2072,7 +2073,7 @@ mod tests {
             "id",
             DataType::Long,
         )]));
-        let expr = fcall("count", vec![ColumnReference::untyped("id")]);
+        let expr = fcall("count", vec![UnresolvedColumn::bare("id")]);
         assert!(!expr.nullable(&s));
     }
 
@@ -2090,7 +2091,7 @@ mod tests {
                 // nullable predicate (references a nullable column)
                 Expression::Binary(BinaryExpression {
                     op: BinaryOp::Gt,
-                    left: Box::new(ColumnReference::untyped("salary")),
+                    left: Box::new(UnresolvedColumn::bare("salary")),
                     right: Box::new(long_lit(100_000)),
                 }),
                 str_lit("high"),
@@ -2115,7 +2116,7 @@ mod tests {
                 // nullable predicate (references a nullable column)
                 Expression::Binary(BinaryExpression {
                     op: BinaryOp::Gt,
-                    left: Box::new(ColumnReference::untyped("salary")),
+                    left: Box::new(UnresolvedColumn::bare("salary")),
                     right: Box::new(long_lit(100_000)),
                 }),
                 str_lit("high"),
@@ -2138,7 +2139,7 @@ mod tests {
                 // non-null predicate
                 bool_lit(true),
                 // nullable true-branch
-                ColumnReference::untyped("v"),
+                UnresolvedColumn::bare("v"),
                 // non-null false-branch
                 str_lit("low"),
             ],
@@ -2249,11 +2250,11 @@ mod tests {
         ]));
         // Sanity: the args ARE nullable — proves the fix (not a default arm)
         // is responsible for the non-null result.
-        assert!(ColumnReference::untyped("name").nullable(&s));
-        assert!(ColumnReference::untyped("salary").nullable(&s));
+        assert!(UnresolvedColumn::bare("name").nullable(&s));
+        assert!(UnresolvedColumn::bare("salary").nullable(&s));
 
         for name in HASH_FAMILY_NAMES {
-            let single = fcall(name, vec![ColumnReference::untyped("name")]);
+            let single = fcall(name, vec![UnresolvedColumn::bare("name")]);
             assert!(
                 !single.nullable(&s),
                 "{name}(nullable_col) must report nullable=false",
@@ -2262,8 +2263,8 @@ mod tests {
             let multi = fcall(
                 name,
                 vec![
-                    ColumnReference::untyped("name"),
-                    ColumnReference::untyped("salary"),
+                    UnresolvedColumn::bare("name"),
+                    UnresolvedColumn::bare("salary"),
                 ],
             );
             assert!(
@@ -2289,7 +2290,7 @@ mod tests {
             if !TypeInferenceEngine::aggregate_is_non_nullable(name) {
                 continue;
             }
-            let expr = fcall(name, vec![ColumnReference::untyped("x")]);
+            let expr = fcall(name, vec![UnresolvedColumn::bare("x")]);
             assert!(
                 !expr.nullable(&schema),
                 "aggregate `{name}` is aggregate_is_non_nullable but \
@@ -2312,7 +2313,7 @@ mod tests {
         )]));
         let expr = fcall(
             "window",
-            vec![ColumnReference::untyped("ts"), str_lit("1 day")],
+            vec![UnresolvedColumn::bare("ts"), str_lit("1 day")],
         );
         assert!(!expr.nullable(&schema));
         // Also non-nullable when the timestamp arg is non-null.
@@ -2331,7 +2332,7 @@ mod tests {
             DataType::String,
         )]));
         for name in HASH_FAMILY_NAMES {
-            let expr = fcall(name, vec![ColumnReference::untyped("x")]);
+            let expr = fcall(name, vec![UnresolvedColumn::bare("x")]);
             assert!(
                 !expr.nullable(&schema),
                 "hash family `{name}` must report nullable=false",
@@ -2355,21 +2356,21 @@ mod tests {
             "ceil", "ceiling", "floor", "exp", "ln", "log", "log10", "log2",
         ];
         for name in unary_cases {
-            let expr = fcall(name, vec![ColumnReference::untyped("x")]);
+            let expr = fcall(name, vec![UnresolvedColumn::bare("x")]);
             assert!(
                 expr.nullable(&schema),
                 "`{name}` over a non-nullable arg must still report nullable=true",
             );
         }
         for name in ["round", "bround"] {
-            let expr = fcall(name, vec![ColumnReference::untyped("x"), int_lit(2)]);
+            let expr = fcall(name, vec![UnresolvedColumn::bare("x"), int_lit(2)]);
             assert!(
                 expr.nullable(&schema),
                 "`{name}` over a non-nullable arg must still report nullable=true",
             );
         }
         // Two-arg `log(base, x)` form must also stay always-nullable.
-        let expr = fcall("log", vec![int_lit(10), ColumnReference::untyped("x")]);
+        let expr = fcall("log", vec![int_lit(10), UnresolvedColumn::bare("x")]);
         assert!(
             expr.nullable(&schema),
             "`log(base, x)` must be nullable=true"
@@ -2400,8 +2401,8 @@ mod tests {
         ]));
         let expr = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
-            left: Box::new(ColumnReference::untyped("a")),
-            right: Box::new(ColumnReference::untyped("b")),
+            left: Box::new(UnresolvedColumn::bare("a")),
+            right: Box::new(UnresolvedColumn::bare("b")),
         });
         assert_eq!(expr.data_type(&s), DataType::Boolean);
         assert!(!expr.nullable(&s));
@@ -2414,7 +2415,7 @@ mod tests {
             DataType::Integer,
         )]));
         let expr = Expression::Cast(CastExpression {
-            expr: Box::new(ColumnReference::untyped("x")),
+            expr: Box::new(UnresolvedColumn::bare("x")),
             to_type: DataType::Double,
             try_cast: false,
             implicit: false,
@@ -2430,7 +2431,7 @@ mod tests {
             DataType::Integer,
         )]));
         let expr = Expression::Cast(CastExpression {
-            expr: Box::new(ColumnReference::untyped("x")),
+            expr: Box::new(UnresolvedColumn::bare("x")),
             to_type: DataType::Double,
             try_cast: true,
             implicit: false,
@@ -2445,7 +2446,7 @@ mod tests {
             DataType::Long,
         )]));
         let expr = Expression::Alias(AliasExpression {
-            expr: Box::new(ColumnReference::untyped("x")),
+            expr: Box::new(UnresolvedColumn::bare("x")),
             alias: "y".to_owned(),
         });
         assert_eq!(expr.data_type(&s), DataType::Long);
@@ -2510,7 +2511,7 @@ mod tests {
         use super::super::ast::{CommonAst, CommonOp};
         let sub = CommonAst::new(CommonOp::SingleRow);
         let expr = Expression::InSubquery(InSubquery {
-            expr: Box::new(ColumnReference::untyped("x")),
+            expr: Box::new(UnresolvedColumn::bare("x")),
             subquery: SubqueryPlan::Unanalyzed(Box::new(sub)),
             negated: false,
         });
@@ -2535,7 +2536,7 @@ mod tests {
         use super::super::ast::{CommonAst, CommonOp};
         let s = ResolvedSchema::empty();
         let expr = Expression::InSubquery(InSubquery {
-            expr: Box::new(ColumnReference::untyped("x")),
+            expr: Box::new(UnresolvedColumn::bare("x")),
             subquery: SubqueryPlan::Unanalyzed(Box::new(CommonAst::new(CommonOp::SingleRow))),
             negated: true,
         });
@@ -2587,8 +2588,8 @@ mod tests {
         let expr = fcall(
             "struct",
             vec![
-                ColumnReference::untyped("name"),
-                ColumnReference::untyped("age"),
+                UnresolvedColumn::bare("name"),
+                UnresolvedColumn::bare("age"),
             ],
         );
         match expr.data_type(&schema) {
@@ -2615,7 +2616,7 @@ mod tests {
             DataType::String,
         )]));
         let aliased = Expression::Alias(AliasExpression {
-            expr: Box::new(ColumnReference::untyped("name")),
+            expr: Box::new(UnresolvedColumn::bare("name")),
             alias: "who".to_owned(),
         });
         let expr = fcall("struct", vec![aliased]);
@@ -2640,9 +2641,9 @@ mod tests {
             "named_struct",
             vec![
                 str_lit("x"),
-                ColumnReference::untyped("a"),
+                UnresolvedColumn::bare("a"),
                 str_lit("y"),
-                ColumnReference::untyped("b"),
+                UnresolvedColumn::bare("b"),
             ],
         );
         match expr.data_type(&schema) {
@@ -2827,7 +2828,7 @@ mod tests {
         for name in CORR_FAMILY_NAMES {
             let expr = fcall(
                 name,
-                vec![ColumnReference::untyped("a"), ColumnReference::untyped("b")],
+                vec![UnresolvedColumn::bare("a"), UnresolvedColumn::bare("b")],
             );
             assert_eq!(
                 expr.data_type(&s),
@@ -2850,12 +2851,12 @@ mod tests {
         let expr = fcall(
             "aggregate",
             vec![
-                ColumnReference::untyped("tags"),
+                UnresolvedColumn::bare("tags"),
                 str_lit(""),
                 // Real emissions place a Lambda here; the type inference
                 // fast-path reads only args[0..2], so a placeholder col
                 // is sufficient for this test.
-                ColumnReference::untyped("__lambda_placeholder"),
+                UnresolvedColumn::bare("__lambda_placeholder"),
             ],
         );
         assert_eq!(
@@ -2875,9 +2876,9 @@ mod tests {
         let expr = fcall(
             "reduce",
             vec![
-                ColumnReference::untyped("nums"),
+                UnresolvedColumn::bare("nums"),
                 long_lit(0),
-                ColumnReference::untyped("__lambda_placeholder"),
+                UnresolvedColumn::bare("__lambda_placeholder"),
             ],
         );
         assert_eq!(expr.data_type(&s), DataType::Long);
@@ -2898,9 +2899,9 @@ mod tests {
             let expr = fcall(
                 name,
                 vec![
-                    ColumnReference::untyped("nums"),
+                    UnresolvedColumn::bare("nums"),
                     long_lit(0),
-                    ColumnReference::untyped("__lambda_placeholder"),
+                    UnresolvedColumn::bare("__lambda_placeholder"),
                 ],
             );
             assert!(
@@ -2920,9 +2921,9 @@ mod tests {
         let expr = fcall(
             "aggregate",
             vec![
-                ColumnReference::untyped("nums"),
+                UnresolvedColumn::bare("nums"),
                 long_lit(0),
-                ColumnReference::untyped("__lambda_placeholder"),
+                UnresolvedColumn::bare("__lambda_placeholder"),
             ],
         );
         assert!(
@@ -2952,10 +2953,7 @@ mod tests {
         } else {
             "inline_field"
         };
-        fcall(
-            name,
-            vec![ColumnReference::untyped(arr_col), str_lit(field)],
-        )
+        fcall(name, vec![UnresolvedColumn::bare(arr_col), str_lit(field)])
     }
 
     /// `inline_field(arr, "name")` returns the struct field's own type.
@@ -3052,7 +3050,7 @@ mod tests {
     fn json_tuple_field_call(json_col: &str, key: &str) -> Expression {
         fcall(
             "json_tuple_field",
-            vec![ColumnReference::untyped(json_col), str_lit(key)],
+            vec![UnresolvedColumn::bare(json_col), str_lit(key)],
         )
     }
 
@@ -3160,10 +3158,10 @@ mod tests {
     #[test]
     fn window_children_skip_frame_boundary_expressions() {
         let win = Expression::Window(WindowFunction {
-            func: Box::new(ColumnReference::untyped("a")),
-            partition_by: vec![ColumnReference::untyped("b")],
+            func: Box::new(UnresolvedColumn::bare("a")),
+            partition_by: vec![UnresolvedColumn::bare("b")],
             order_by: vec![SortOrder {
-                expr: Box::new(ColumnReference::untyped("c")),
+                expr: Box::new(UnresolvedColumn::bare("c")),
                 direction: SortDirection::Ascending,
                 null_ordering: NullOrdering::NullsLast,
             }],
@@ -3185,6 +3183,21 @@ mod tests {
         DataType::Decimal { precision, scale }
     }
 
+    /// A resolution-time `ColumnReference`, fully stamped (`data_type` /
+    /// `nullable` both `Some`) — the shape `materialize_binary_coercions`
+    /// always sees in production (only ever called AFTER `resolve_and_stamp`
+    /// per its `Expression::Binary` arm), unlike the bare pre-analysis
+    /// `UnresolvedColumn` most tests in this module use.
+    fn stamped_col(name: &str, data_type: DataType) -> Expression {
+        Expression::ColumnReference(ColumnReference {
+            name: name.to_owned(),
+            qualifier: None,
+            data_type: Some(data_type),
+            nullable: Some(true),
+            expr_id: None,
+        })
+    }
+
     /// Resolve `name(args...)` against a single-column schema of `col_type`,
     /// where `args[0]` references that column.
     fn call_type(name: &str, args: Vec<Expression>, col_type: DataType) -> DataType {
@@ -3199,7 +3212,7 @@ mod tests {
         assert_eq!(
             call_type(
                 "round",
-                vec![ColumnReference::untyped("c"), int_lit(1)],
+                vec![UnresolvedColumn::bare("c"), int_lit(1)],
                 dec(10, 2)
             ),
             dec(10, 1)
@@ -3208,7 +3221,7 @@ mod tests {
         assert_eq!(
             call_type(
                 "bround",
-                vec![ColumnReference::untyped("c"), int_lit(2)],
+                vec![UnresolvedColumn::bare("c"), int_lit(2)],
                 dec(6, 3)
             ),
             dec(6, 2)
@@ -3217,7 +3230,7 @@ mod tests {
         assert_eq!(
             call_type(
                 "round",
-                vec![ColumnReference::untyped("c"), int_lit(3)],
+                vec![UnresolvedColumn::bare("c"), int_lit(3)],
                 dec(38, 6)
             ),
             dec(36, 3)
@@ -3230,7 +3243,7 @@ mod tests {
         assert_eq!(
             call_type(
                 "round",
-                vec![ColumnReference::untyped("c"), int_lit(1)],
+                vec![UnresolvedColumn::bare("c"), int_lit(1)],
                 DataType::Double
             ),
             DataType::Double
@@ -3238,7 +3251,7 @@ mod tests {
         assert_eq!(
             call_type(
                 "bround",
-                vec![ColumnReference::untyped("c"), int_lit(2)],
+                vec![UnresolvedColumn::bare("c"), int_lit(2)],
                 DataType::Double
             ),
             DataType::Double
@@ -3249,7 +3262,7 @@ mod tests {
     fn round_one_arg_decimal_uses_scale_zero() {
         // Missing 2nd arg ⇒ scale 0: round(Decimal(10,2)) → Decimal(9,0).
         assert_eq!(
-            call_type("round", vec![ColumnReference::untyped("c")], dec(10, 2)),
+            call_type("round", vec![UnresolvedColumn::bare("c")], dec(10, 2)),
             dec(9, 0)
         );
     }
@@ -3260,7 +3273,7 @@ mod tests {
         assert_eq!(
             call_type(
                 "round",
-                vec![ColumnReference::untyped("c"), ColumnReference::untyped("c"),],
+                vec![UnresolvedColumn::bare("c"), UnresolvedColumn::bare("c"),],
                 dec(10, 2)
             ),
             DataType::Unresolved
@@ -3276,10 +3289,7 @@ mod tests {
         ]));
         let expr = fcall(
             "mod",
-            vec![
-                ColumnReference::untyped("d1"),
-                ColumnReference::untyped("d2"),
-            ],
+            vec![UnresolvedColumn::bare("d1"), UnresolvedColumn::bare("d2")],
         );
         assert_eq!(expr.data_type(&schema), dec(6, 3));
     }
@@ -3295,15 +3305,12 @@ mod tests {
         ]));
         let mod_ii = fcall(
             "mod",
-            vec![ColumnReference::untyped("a"), ColumnReference::untyped("b")],
+            vec![UnresolvedColumn::bare("a"), UnresolvedColumn::bare("b")],
         );
         assert_eq!(mod_ii.data_type(&schema), DataType::Integer);
         let mod_li = fcall(
             "mod",
-            vec![
-                ColumnReference::untyped("lng"),
-                ColumnReference::untyped("a"),
-            ],
+            vec![UnresolvedColumn::bare("lng"), UnresolvedColumn::bare("a")],
         );
         assert_eq!(mod_li.data_type(&schema), DataType::Long);
     }
@@ -3334,8 +3341,8 @@ mod tests {
         ]));
         let expr = bin(
             BinaryOp::Mul,
-            ColumnReference::untyped("d"),
-            ColumnReference::untyped("n"),
+            UnresolvedColumn::bare("d"),
+            UnresolvedColumn::bare("n"),
         );
         assert_eq!(expr.data_type(&schema), dec(36, 2));
     }
@@ -3348,7 +3355,7 @@ mod tests {
         // raw_precision 7+3+1=11, raw_scale 2 → Decimal(11,2).
         let schema =
             ResolvedSchema::minted(StructType::new(vec![StructField::nullable("d", dec(7, 2))]));
-        let expr = bin(BinaryOp::Mul, ColumnReference::untyped("d"), int_lit(100));
+        let expr = bin(BinaryOp::Mul, UnresolvedColumn::bare("d"), int_lit(100));
         let result = expr.data_type(&schema);
         assert_eq!(result, dec(11, 2));
         // Explicitly NOT the `decimal_form(Integer)` = (10,0) result, which
@@ -3363,7 +3370,7 @@ mod tests {
         // int_digits=max(3,1)=3, precision=min(3+2+1,38)=6 → Decimal(6,2).
         let schema =
             ResolvedSchema::minted(StructType::new(vec![StructField::nullable("d", dec(5, 2))]));
-        let expr = bin(BinaryOp::Add, ColumnReference::untyped("d"), int_lit(3));
+        let expr = bin(BinaryOp::Add, UnresolvedColumn::bare("d"), int_lit(3));
         assert_eq!(expr.data_type(&schema), dec(6, 2));
     }
 
@@ -3376,7 +3383,7 @@ mod tests {
             "d",
             dec(19, 2),
         )]));
-        let expr = bin(BinaryOp::Div, ColumnReference::untyped("d"), int_lit(3));
+        let expr = bin(BinaryOp::Div, UnresolvedColumn::bare("d"), int_lit(3));
         assert_eq!(expr.data_type(&schema), dec(23, 6));
     }
 
@@ -3390,8 +3397,8 @@ mod tests {
         ]));
         let expr = bin(
             BinaryOp::Mul,
-            ColumnReference::untyped("d"),
-            ColumnReference::untyped("f"),
+            UnresolvedColumn::bare("d"),
+            UnresolvedColumn::bare("f"),
         );
         assert_eq!(expr.data_type(&schema), DataType::Double);
     }
@@ -3415,8 +3422,8 @@ mod tests {
         ]));
         let expr = bin(
             BinaryOp::Mul,
-            ColumnReference::untyped("d1"),
-            ColumnReference::untyped("d2"),
+            UnresolvedColumn::bare("d1"),
+            UnresolvedColumn::bare("d2"),
         );
         // decimal_mul_type(10,2,6,3): raw_precision=10+6+1=17, raw_scale=5.
         assert_eq!(expr.data_type(&schema), dec(17, 5));
@@ -3434,14 +3441,14 @@ mod tests {
             StructField::nullable("d2", dec(6, 3)),
         ]));
         assert_eq!(
-            bin(BinaryOp::IntDiv, ColumnReference::untyped("d1"), int_lit(3)).data_type(&schema),
+            bin(BinaryOp::IntDiv, UnresolvedColumn::bare("d1"), int_lit(3)).data_type(&schema),
             DataType::Long,
         );
         assert_eq!(
             bin(
                 BinaryOp::IntDiv,
-                ColumnReference::untyped("d1"),
-                ColumnReference::untyped("d2"),
+                UnresolvedColumn::bare("d1"),
+                UnresolvedColumn::bare("d2"),
             )
             .data_type(&schema),
             DataType::Long,
@@ -3457,7 +3464,7 @@ mod tests {
             "d",
             dec(10, 2),
         )]));
-        let expr = bin(BinaryOp::Div, int_lit(100), ColumnReference::untyped("d"));
+        let expr = bin(BinaryOp::Div, int_lit(100), UnresolvedColumn::bare("d"));
         // decimal_div_type(3,0,10,2) — left/numerator is the coerced literal.
         assert_eq!(
             expr.data_type(&schema),
@@ -3557,14 +3564,14 @@ mod tests {
         ]));
         let expr_before_type = bin(
             BinaryOp::Div,
-            ColumnReference::untyped("d"),
-            ColumnReference::untyped("i"),
+            stamped_col("d", dec(15, 2)),
+            stamped_col("i", DataType::Integer),
         )
         .data_type(&schema);
         let expr = bin(
             BinaryOp::Div,
-            ColumnReference::untyped("d"),
-            ColumnReference::untyped("i"),
+            stamped_col("d", dec(15, 2)),
+            stamped_col("i", DataType::Integer),
         );
         let materialized = materialize_binary_coercions(expr, &schema);
         let Expression::Binary(b) = &materialized else {
@@ -3596,7 +3603,7 @@ mod tests {
             "d",
             dec(15, 2),
         )]));
-        let expr = bin(BinaryOp::Div, int_lit(9), ColumnReference::untyped("d"));
+        let expr = bin(BinaryOp::Div, int_lit(9), stamped_col("d", dec(15, 2)));
         let materialized = materialize_binary_coercions(expr, &schema);
         let Expression::Binary(b) = &materialized else {
             panic!("expected Binary, got {materialized:?}");
@@ -3622,8 +3629,8 @@ mod tests {
         ]));
         let expr = bin(
             BinaryOp::Div,
-            ColumnReference::untyped("d1"),
-            ColumnReference::untyped("d2"),
+            UnresolvedColumn::bare("d1"),
+            UnresolvedColumn::bare("d2"),
         );
         let before = expr.clone();
         assert_eq!(materialize_binary_coercions(expr, &schema), before);
@@ -3640,8 +3647,8 @@ mod tests {
         ]));
         let expr = bin(
             BinaryOp::Div,
-            ColumnReference::untyped("d"),
-            ColumnReference::untyped("f"),
+            UnresolvedColumn::bare("d"),
+            UnresolvedColumn::bare("f"),
         );
         let before = expr.clone();
         assert_eq!(materialize_binary_coercions(expr, &schema), before);
@@ -3655,7 +3662,7 @@ mod tests {
         )]));
         let expr = bin(
             BinaryOp::Add,
-            ColumnReference::untyped("d"),
+            UnresolvedColumn::bare("d"),
             calendar_interval(),
         );
         let materialized = materialize_binary_coercions(expr.clone(), &schema);
@@ -3680,7 +3687,7 @@ mod tests {
         let expr = bin(
             BinaryOp::Add,
             calendar_interval(),
-            ColumnReference::untyped("d"),
+            UnresolvedColumn::bare("d"),
         );
         let materialized = materialize_binary_coercions(expr, &schema);
         assert!(
@@ -3696,7 +3703,7 @@ mod tests {
         )]));
         let expr = bin(
             BinaryOp::Sub,
-            ColumnReference::untyped("d"),
+            UnresolvedColumn::bare("d"),
             calendar_interval(),
         );
         let materialized = materialize_binary_coercions(expr, &schema);
@@ -3715,7 +3722,7 @@ mod tests {
         )]));
         let expr = bin(
             BinaryOp::Add,
-            ColumnReference::untyped("d"),
+            UnresolvedColumn::bare("d"),
             day_time_interval(),
         );
         assert_eq!(expr.data_type(&schema), DataType::Timestamp);
@@ -3730,7 +3737,7 @@ mod tests {
         let expr = bin(
             BinaryOp::Add,
             day_time_interval(),
-            ColumnReference::untyped("d"),
+            UnresolvedColumn::bare("d"),
         );
         assert_eq!(expr.data_type(&schema), DataType::Timestamp);
     }
@@ -3743,7 +3750,7 @@ mod tests {
         )]));
         let expr = bin(
             BinaryOp::Sub,
-            ColumnReference::untyped("d"),
+            UnresolvedColumn::bare("d"),
             day_time_interval(),
         );
         assert_eq!(expr.data_type(&schema), DataType::Timestamp);
@@ -3758,7 +3765,7 @@ mod tests {
         )]));
         let expr = bin(
             BinaryOp::Add,
-            ColumnReference::untyped("d"),
+            UnresolvedColumn::bare("d"),
             year_month_interval(),
         );
         assert_eq!(expr.data_type(&schema), DataType::Date);
@@ -3772,7 +3779,7 @@ mod tests {
         )]));
         let expr = bin(
             BinaryOp::Add,
-            ColumnReference::untyped("d"),
+            UnresolvedColumn::bare("d"),
             calendar_interval(),
         );
         assert_eq!(expr.data_type(&schema), DataType::Date);
@@ -3788,7 +3795,7 @@ mod tests {
         )]));
         let expr = bin(
             BinaryOp::Add,
-            ColumnReference::untyped("d"),
+            UnresolvedColumn::bare("d"),
             day_time_interval(),
         );
         let before = expr.clone();
@@ -3807,7 +3814,7 @@ mod tests {
         )]));
         let expr = bin(
             BinaryOp::Add,
-            ColumnReference::untyped("t"),
+            UnresolvedColumn::bare("t"),
             calendar_interval(),
         );
         let before = expr.clone();

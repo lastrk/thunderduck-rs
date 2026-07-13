@@ -1,3 +1,5 @@
+> **RETIRED 2026-07-13** — fully executed/reconciled by the N1–N10 + D1–D4 + E-series passes (`992fca0..HEAD`). Open remainders were folded into [`tasks/v2-open-work.md`](../v2-open-work.md); this copy is historical.
+
 # τ code-review findings — 2026-07-11
 
 **Branch:** `feat/v2-transpiler` · two reviews over the same recent commit range.

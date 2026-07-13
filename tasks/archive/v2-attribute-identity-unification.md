@@ -1,3 +1,5 @@
+> **RETIRED 2026-07-13** — fully executed/reconciled by the N1–N10 + D1–D4 + E-series passes (`992fca0..HEAD`). Open remainders were folded into [`tasks/v2-open-work.md`](../v2-open-work.md); this copy is historical.
+
 # Task: Attribute-identity unification (retire `ordinal` + `source_quals` + the type/identity re-derivations)
 
 **Status:** ⛔ **ABORTED 2026-07-12 (implementation attempt)** — see the addendum at the top; the

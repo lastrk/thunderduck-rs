@@ -108,16 +108,14 @@ sort keys onto the trim Project or re-emit a top-level ORDER BY.
 
 ## 3. Simplification / efficiency (now-unblocked)
 
-### O9. Sort-resolver shrink (R2-2) — the newly unblocked one
-**Size: M–L.** The 2026-07-11 analysis established the ~600-line ORDER-BY
-resolver is the right ALGORITHM (Spark runs the same walk-match-promote-trim)
-but ~2.4× overweight because τ lacked three ambient invariants. All three have
-since landed: N7 (Aggregate folded at construction — no offset/duality), N8
-(alias-every-entry — binding is `entry.toAttribute`-like), N9/E4 (stored ids
-in by-value nodes — no re-stamp hazard, id-first semantic_eq). The predicted
-~600 → ~250-line collapse has never been attempted or re-measured. Absorbs
-07-11 f12's remaining near-duplicate walks (`promote_*_subtree` /
-`rebind_over_*` pairs; `contains_aggregate_call`/`contains_nondeterministic_call`).
+### O9. Sort-resolver shrink (R2-2) — DONE (Pass F1, `62e122e`, 2026-07-13)
+Architect re-measurement found the E-series had already collapsed the bulk
+(~345 code lines, not ~600). F1 landed the remaining genuine dedup: the
+redundant increment-1 whole-key match deleted; `contains_matching_call`,
+`rebind_over_child`/`SortChild`, and `promote_subtree` (mint-vs-copy kept
+explicit in two helpers) merged the three near-duplicate pairs; docs pruned.
+345 → 310 code lines, file net −65; assertion-identical (Opus review: zero
+findings). 07-11 f12's walks absorbed.
 
 ### O10. Array set-ops are O(n²) per row (07-11 f10)
 **Size: S–M, efficiency only.** `order_preserving_distinct`/`array_union`

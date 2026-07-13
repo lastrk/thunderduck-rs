@@ -105,8 +105,7 @@ impl TypedAst {
     /// stamped; the scope derivation is therefore shallow (reads children's
     /// `scope` fields, never re-walks subtrees).
     pub fn new(op: TypedOp, resolved_schema: ResolvedSchema) -> Self {
-        let mut scope = RelScope::of(&op, &resolved_schema);
-        scope.source_quals_tracked = source_quals_tracked_of(&op, &resolved_schema);
+        let scope = RelScope::of(&op, &resolved_schema);
         Self {
             op,
             resolved_schema,
@@ -143,7 +142,7 @@ macro_rules! scope_passthrough {
 ///
 /// Ranges are relative to THIS node's schema (base 0); consumers offset when
 /// composing (a join's right side shifts by the left side's field count).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RelScope {
     /// `(qualifier, field-range)` bindings, in tree order.
     pub aliases: Vec<(String, std::ops::Range<usize>)>,
@@ -165,32 +164,6 @@ pub struct RelScope {
     /// repeated at multiple NESTING levels on the SAME side (outermost-wins,
     /// see `plan_ids` above) — that case never lands here.
     ambiguous_plan_ids: Vec<i64>,
-    /// ADR-023 3d: `true` iff this node's per-output-column
-    /// `Attribute::source_quals` lineage (N9 increment 3: intrinsic to
-    /// `Attribute` itself, not a parallel `RelScope` vector) is AUTHORITATIVE
-    /// for every output column — an empty set then means "created, inherits
-    /// no qualifier" (reject a stranded qualifier). `false` for operators
-    /// whose lineage is deferred (USING-projected shapes aside — see
-    /// `source_quals_tracked_of`'s doc — Star projections, SetOp,
-    /// WithColumns/Renamed/Drop, LateralView, and the terminal sources) — the
-    /// resolver then keeps the legacy name-only fallback for them. Derived;
-    /// EXCLUDED from PartialEq (extend the hand-written impl — do NOT add to
-    /// the compared fields). Populated by `source_quals_tracked_of` in
-    /// `TypedAst::new`.
-    pub source_quals_tracked: bool,
-}
-
-/// Equality deliberately ignores `source_quals_tracked`: it is derived data,
-/// fully determined by `(op, resolved_schema)` (via `source_quals_tracked_of`),
-/// and existing scope-equality tests assert equality over the binding facts
-/// (`aliases` / `plan_ids` / `ambiguous_plan_ids`) only. Mirrors
-/// `ColumnReference`'s hand-written `PartialEq` excluding `expr_id`.
-impl PartialEq for RelScope {
-    fn eq(&self, other: &Self) -> bool {
-        self.aliases == other.aliases
-            && self.plan_ids == other.plan_ids
-            && self.ambiguous_plan_ids == other.ambiguous_plan_ids
-    }
 }
 
 impl RelScope {
@@ -279,16 +252,12 @@ impl RelScope {
                     aliases,
                     plan_ids: Vec::new(),
                     ambiguous_plan_ids: Vec::new(),
-                    // Populated by `source_quals_tracked_of` in `TypedAst::new`.
-                    source_quals_tracked: false,
                 }
             }
             TypedOp::AliasedRelation { alias, .. } => Self {
                 aliases: vec![(alias.clone(), 0..resolved_schema.len())],
                 plan_ids: Vec::new(),
                 ambiguous_plan_ids: Vec::new(),
-                // Populated by `source_quals_tracked_of` in `TypedAst::new`.
-                source_quals_tracked: false,
             },
             TypedOp::Join {
                 using_columns,
@@ -358,8 +327,6 @@ impl RelScope {
                     aliases,
                     plan_ids,
                     ambiguous_plan_ids,
-                    // Populated by `source_quals_tracked_of` in `TypedAst::new`.
-                    source_quals_tracked: false,
                 }
             }
             scope_passthrough!(input) => input.scope.clone(),
@@ -403,71 +370,6 @@ impl RelScope {
             | TypedOp::Pivot { .. }
             | TypedOp::RecursiveCte { .. } => Self::default(),
         }
-    }
-}
-
-/// ADR-023 tier 3d — `true` iff every output column's `Attribute::source_quals`
-/// (N9 increment 3: intrinsic to `Attribute`, populated at each column's mint/
-/// clone site rather than derived by a separate whole-schema pass) is
-/// AUTHORITATIVE for this node (an empty set then means "created, no
-/// inherited qualifier"), `false` when the lineage for this operator class is
-/// deferred (Star projections, SetOp, WithColumns/Renamed/Drop, LateralView,
-/// and the terminal sources) — the resolver then keeps the legacy name-only
-/// path for those nodes. Exhaustive (no `_`) so a new `TypedOp` variant is a
-/// compile error here until classified.
-fn source_quals_tracked_of(op: &TypedOp, resolved_schema: &ResolvedSchema) -> bool {
-    match op {
-        TypedOp::TableScan { .. } | TypedOp::AliasedRelation { .. } => true,
-        scope_passthrough!(input) => input.scope.source_quals_tracked,
-        TypedOp::Project { input, projections } => {
-            if projections.iter().any(|p| matches!(p, Expression::Star(_))) {
-                false
-            } else {
-                // Mirrors `project_output_schema`'s non-Star projection-list-
-                // length invariant.
-                input.scope.source_quals_tracked && projections.len() == resolved_schema.len()
-            }
-        }
-        TypedOp::Join {
-            left,
-            right,
-            join_type,
-            ..
-        } => {
-            // ADR-023 3e-i: the `left && right` (or `left`-only for
-            // SEMI/ANTI) formula is identical whether or not this is a
-            // USING join — `using_columns` no longer forces `false` here;
-            // see `build_using_prefix` (`analyze_join`) for the lineage
-            // content itself (the union-both-sides rule).
-            if matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti) {
-                left.scope.source_quals_tracked
-            } else {
-                left.scope.source_quals_tracked && right.scope.source_quals_tracked
-            }
-        }
-        TypedOp::Aggregate {
-            input, aggregates, ..
-        } => {
-            // N7: `aggregates` IS the complete output list by construction.
-            aggregates.len() == resolved_schema.len() && input.scope.source_quals_tracked
-        }
-        TypedOp::SetOp { .. }
-        | TypedOp::LateralView { .. }
-        | TypedOp::WithColumns { .. }
-        | TypedOp::WithColumnsRenamed { .. }
-        | TypedOp::DropColumns { .. }
-        | TypedOp::SingleRow
-        | TypedOp::Values { .. }
-        | TypedOp::LocalRelation { .. }
-        | TypedOp::FileScan { .. }
-        | TypedOp::TableFunction { .. }
-        | TypedOp::Unnest { .. }
-        | TypedOp::Describe { .. }
-        | TypedOp::Summary { .. }
-        | TypedOp::FreqItems { .. }
-        | TypedOp::Unpivot { .. }
-        | TypedOp::Pivot { .. }
-        | TypedOp::RecursiveCte { .. } => false,
     }
 }
 
@@ -1628,6 +1530,17 @@ fn analyze_node(
                 let mut nf = f.clone();
                 if let Some(n) = new_name {
                     nf.name = n;
+                    // P2 (Pass F3 stage 1, live-Spark-4.1.1-verified): a
+                    // rename severs referenceability via the PRE-rename
+                    // qualifier — `t.alias("t").withColumnRenamed("x",
+                    // "y").select("t.y")` raises UNRESOLVED_COLUMN even
+                    // though "t" still binds this node's alias scope;
+                    // `select("t.other")` (an UNRENAMED slot) resolves.
+                    // Clear only the renamed slot's inherited lineage — the
+                    // id is untouched (ADR-024's rename-keeps-id divergence
+                    // stands; renamed slots are simply not addressable via
+                    // their old qualifier anymore).
+                    nf.source_quals.clear();
                 }
                 output_fields.push(nf);
             }
@@ -3553,11 +3466,6 @@ fn analyze_sort(
         ti.scope,
         "growth-invariant violated: re-derived scope must equal the carried scope"
     );
-    debug_assert_eq!(
-        source_quals_tracked_of(&ti.op, &ti.resolved_schema),
-        ti.scope.source_quals_tracked,
-        "growth-invariant violated: re-derived source_quals_tracked must equal the carried value"
-    );
     Ok(resolved)
 }
 
@@ -4281,14 +4189,6 @@ impl<'a> ResolveContext<'a> {
                 aliases,
                 plan_ids,
                 ambiguous_plan_ids,
-                // Compile fix only (ADR-023 3c/3d): this synthetic composite
-                // scope is resolution-time-only and never flows through
-                // `TypedAst::new`'s `source_quals_tracked_of` stamping.
-                // `false` keeps it on the legacy fallback (it is never
-                // consulted by tier (f)'s tracked branch anyway — this scope
-                // only backs the synthetic `__td_jl`/`__td_jr` tier and tier
-                // (e), never the qualified-non-synthetic `None` arm).
-                source_quals_tracked: false,
             }),
             base_types,
             outer,
@@ -4660,67 +4560,55 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                             candidates,
                         });
                     }
-                    // Genuinely 0 scope hits for `q`.
-                    if ctx.scopes.source_quals_tracked {
-                        // ADR-023 3d: authoritative lineage for this node.
-                        // `q` binds no local alias scope, so consult each
-                        // field's own `Attribute::source_quals` (N9 increment
-                        // 3: intrinsic to the attribute) instead of falling
-                        // back to a permissive name-only lookup.
-                        let hits: Vec<usize> = ctx
-                            .schema
-                            .fields
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, f)| {
-                                eq_fold(&f.name, &u.name)
-                                    && f.source_quals.iter().any(|qq| eq_fold(qq, q))
-                            })
-                            .map(|(i, _)| i)
-                            .collect();
-                        match hits.len() {
-                            1 => {
-                                // Projected-through (F10): resolve by
-                                // attribute identity and DROP the qualifier
-                                // so emission renders the bare column, which
-                                // binds by that identity over any wrapper —
-                                // no strand.
-                                let k = hits[0];
-                                let f = &ctx.schema.fields[k];
-                                return Ok(Expression::ColumnReference(ColumnReference {
-                                    name: u.name,
-                                    qualifier: None,
-                                    expr_id: Some(f.expr_id),
-                                    data_type: f.data_type.clone(),
-                                    nullable: f.nullable,
-                                }));
-                            }
-                            n if n >= 2 => {
-                                return Err(AnalyzerError::AmbiguousColumn {
-                                    name: u.name.clone(),
-                                    candidates: hits
-                                        .iter()
-                                        .map(|&i| ctx.schema.fields[i].name.clone())
-                                        .collect(),
-                                });
-                            }
-                            // 0 hits under authoritative lineage: NOT
-                            // projected-through. Degrade to Unresolved so
-                            // the shared tier-(g) tail below tries the OUTER
-                            // scope (correlation, tbl-005/sq-*) and
-                            // otherwise raises UnknownColumn (F8) — NO
-                            // permissive name-only fallback here.
-                            _ => (DataType::Unresolved, false, None),
+                    // Genuinely 0 scope hits for `q`. Every node's lineage is
+                    // AUTHORITATIVE (tier-3e — the deferred-lineage legacy
+                    // name-only fallback is retired): `q` binds no local
+                    // alias scope, so consult each field's own
+                    // `Attribute::source_quals` (N9 increment 3: intrinsic to
+                    // the attribute) directly.
+                    let hits: Vec<usize> = ctx
+                        .schema
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, f)| {
+                            eq_fold(&f.name, &u.name)
+                                && f.source_quals.iter().any(|qq| eq_fold(qq, q))
+                        })
+                        .map(|(i, _)| i)
+                        .collect();
+                    match hits.len() {
+                        1 => {
+                            // Projected-through (F10): resolve by
+                            // attribute identity and DROP the qualifier
+                            // so emission renders the bare column, which
+                            // binds by that identity over any wrapper —
+                            // no strand.
+                            let k = hits[0];
+                            let f = &ctx.schema.fields[k];
+                            return Ok(Expression::ColumnReference(ColumnReference {
+                                name: u.name,
+                                qualifier: None,
+                                expr_id: Some(f.expr_id),
+                                data_type: f.data_type.clone(),
+                                nullable: f.nullable,
+                            }));
                         }
-                    } else {
-                        // Deferred lineage (USING / Star / SetOp / …): keep
-                        // the legacy name-only fallback so those cases stay
-                        // green (retired in 3e as their lineage is filled in).
-                        let (dt, nullable, attr) =
-                            TypeInferenceEngine::qualified_resolve_in(&u.name, Some(q), ctx.schema);
-                        // ADR-024: same attribute the lookup resolved.
-                        let expr_id = attr.map(|a| a.expr_id);
-                        (dt, nullable, expr_id)
+                        n if n >= 2 => {
+                            return Err(AnalyzerError::AmbiguousColumn {
+                                name: u.name.clone(),
+                                candidates: hits
+                                    .iter()
+                                    .map(|&i| ctx.schema.fields[i].name.clone())
+                                    .collect(),
+                            });
+                        }
+                        // 0 hits: NOT projected-through. Degrade to
+                        // Unresolved so the shared tier-(g) tail below tries
+                        // the OUTER scope (correlation, tbl-005/sq-*) and
+                        // otherwise raises UnknownColumn (F8) — NO
+                        // permissive name-only fallback here.
+                        _ => (DataType::Unresolved, false, None),
                     }
                 }
             }
@@ -7251,7 +7139,6 @@ mod tests {
             quals_of(&typed.resolved_schema),
             vec![key, e.clone(), e.clone(), e, d]
         );
-        assert!(typed.scope.source_quals_tracked);
     }
 
     #[test]
@@ -7278,8 +7165,7 @@ mod tests {
         // GROUP BY dept_id` shape — N7: `aggregates` IS the complete output
         // list by construction, so the output schema is `aggregates` as-is
         // (no grouping prepend). The folded `dept_id` passthrough
-        // column-reference must still inherit its source qualifier lineage,
-        // and the whole node must be TRACKED.
+        // column-reference must still inherit its source qualifier lineage.
         let bt = base_types_with_emp_dept();
         let ast = aggregate(
             scan("emp"),
@@ -7292,11 +7178,10 @@ mod tests {
         let typed = analyze(ast, &bt).unwrap();
         let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
         assert_eq!(quals_of(&typed.resolved_schema), vec![emp, BTreeSet::new()]);
-        assert!(typed.scope.source_quals_tracked);
     }
 
     #[test]
-    fn source_quals_star_projection_is_untracked_but_content_still_carries_through() {
+    fn source_quals_star_projection_content_carries_through_and_is_tracked() {
         // N9 increment 3: `source_quals` no longer lives in a separate
         // `RelScope` Vec derived by a whole-schema pass with a size-correct
         // empty fallback for deferred ops — it is now INTRINSIC to each
@@ -7307,31 +7192,238 @@ mod tests {
         // the `TableScan` leaf even without an alias) rides straight
         // through — unlike the OLD `source_quals_of`, which force-emptied
         // every Star-projected column regardless of what was beneath it.
-        // `source_quals_tracked` still gates authoritativeness: Star stays
-        // `false`, so the resolver does NOT widen trust in this content —
-        // it keeps the legacy name-only path for Star-projected scopes.
+        // Pass F3 Stage 4/5: Star projections were the last special case in
+        // tier-(f)'s authoritative-lineage gate — the gate itself is now
+        // gone (every node's lineage is authoritative), so a qualified
+        // reference over the star-projected scope resolves for real against
+        // the copied lineage rather than any name-only fallback.
         let bt = base_types_with_emp_dept();
-        let ast = CommonAst::new(CommonOp::Project {
+        let star_project = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
             projections: vec![Expression::Star(StarExpression { qualifier: None })],
         });
-        let typed = analyze(ast, &bt).unwrap();
+        let typed = analyze(star_project.clone(), &bt).unwrap();
         let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
         assert_eq!(quals_of(&typed.resolved_schema), vec![emp; 4]);
-        assert!(!typed.scope.source_quals_tracked);
+
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(star_project),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("emp", "id")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        analyze(filter, &bt).expect("qualified reference over the star-projected scope resolves");
     }
 
     #[test]
-    fn source_quals_tracked_true_for_using_join_semi_and_inner_alike() {
+    fn source_quals_with_columns_renamed_clears_lineage_on_renamed_slot_only() {
+        // Pass F3 / P2 (live-Spark-4.1.1-verified): a WithColumnsRenamed
+        // rename severs referenceability via the PRE-rename qualifier — the
+        // renamed slot's inherited `source_quals` lineage is cleared (id
+        // untouched, per ADR-024's rename-keeps-id divergence); an UNRENAMED
+        // slot keeps its lineage unchanged. Pinned directly against the
+        // ATTRIBUTE content — see the dedicated resolution witness below for
+        // the observable resolve/reject behavior this content produces.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "t".to_owned(),
+        });
+        let renamed = CommonAst::new(CommonOp::WithColumnsRenamed {
+            input: Box::new(aliased),
+            renames: vec![("id".to_owned(), "y".to_owned())],
+        });
+        let typed = analyze(renamed, &bt).unwrap();
+        let t: BTreeSet<String> = ["t".to_owned()].into_iter().collect();
+        let renamed_field = typed
+            .resolved_schema
+            .field_by_name("y")
+            .expect("renamed slot present under its new name");
+        assert!(
+            renamed_field.source_quals.is_empty(),
+            "renamed slot must lose its inherited qualifier lineage"
+        );
+        let unrenamed_field = typed
+            .resolved_schema
+            .field_by_name("name")
+            .expect("unrenamed slot present under its original name");
+        assert_eq!(unrenamed_field.source_quals, t);
+    }
+
+    #[test]
+    fn resolve_column_with_columns_renamed_pre_rename_qualifier_rejects_renamed_slot() {
+        // Pass F3 Stage 4 / P2 (live-Spark-4.1.1-verified):
+        // `t.alias("t").withColumnRenamed("id", "y").select("t.y")` raises
+        // UNRESOLVED_COLUMN even though "t" still binds this node's alias
+        // scope — the rename severs referenceability via the PRE-rename
+        // qualifier. `select("t.other")` (an unrenamed slot, "name" here)
+        // resolves.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "t".to_owned(),
+        });
+        let renamed = CommonAst::new(CommonOp::WithColumnsRenamed {
+            input: Box::new(aliased),
+            renames: vec![("id".to_owned(), "y".to_owned())],
+        });
+
+        let filter_unrenamed = CommonAst::new(CommonOp::Filter {
+            input: Box::new(renamed.clone()),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("t", "name")),
+                right: Box::new(lit_str("acme")),
+            }),
+        });
+        analyze(filter_unrenamed, &bt).expect("t.other (unrenamed slot) must resolve");
+
+        let filter_renamed = CommonAst::new(CommonOp::Filter {
+            input: Box::new(renamed),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("t", "y")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let err = analyze(filter_renamed, &bt).unwrap_err();
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "y");
+                assert_eq!(qualifier.as_deref(), Some("t"));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_set_op_first_child_qualifier_resolves_second_child_rejects() {
+        // Pass F3 Stage 4 / P1 (live-Spark-4.1.1-verified):
+        // `df1.alias("a").union(df2.alias("b")).select("a.x")` resolves
+        // (both rows); `select("b.x")` raises UNRESOLVED_COLUMN. τ's
+        // `widen_by_position` clones every output column from `children[0]`
+        // verbatim (id AND `source_quals`), so the set-op's lineage IS the
+        // first child's — never the second's.
+        let bt = base_types_with_emp_dept();
+        let a = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "a".to_owned(),
+        });
+        let b = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "b".to_owned(),
+        });
+        let union = set_op(SetOpKind::Union, true, vec![a, b]);
+
+        let filter_a = CommonAst::new(CommonOp::Filter {
+            input: Box::new(union.clone()),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("a", "id")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        analyze(filter_a, &bt).expect("a.id (first child's qualifier) must resolve");
+
+        let filter_b = CommonAst::new(CommonOp::Filter {
+            input: Box::new(union),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("b", "id")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let err = analyze(filter_b, &bt).unwrap_err();
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "id");
+                assert_eq!(qualifier.as_deref(), Some("b"));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authoritative_lineage_values_rejects_bogus_qualifier() {
+        // Pass F3 Stage 2: `Values`' lineage is AUTHORITATIVE — vacuously,
+        // since every field's lineage is empty by construction (no relation
+        // to inherit a qualifier from). BEFORE this flip, tier (f)'s legacy
+        // name-only fallback (`qualified_resolve_in`) ignored the qualifier
+        // entirely and matched by NAME alone — a bogus qualifier over a bare
+        // `Values` row would have silently resolved. AFTER the flip, 0
+        // lineage hits for the bogus qualifier degrade to Unresolved,
+        // surfacing a loud `UnknownColumn` instead of a silent name-only
+        // bind.
+        let bt = base_types_with_emp_dept();
+        let values = values_row(&[("x", DataType::Integer, LiteralValue::Int(1))]);
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(values),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("v", "x")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "x");
+                assert_eq!(qualifier.as_deref(), Some("v"));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn authoritative_lineage_file_scan_rejects_bogus_qualifier() {
+        // Pass F3 Stage 2: `FileScan` (with a declared schema) has
+        // AUTHORITATIVE lineage for the same vacuous reason as `Values` — a
+        // bogus qualifier over a bare `FileScan` must raise `UnknownColumn`,
+        // not silently bind via the permissive legacy name-only fallback.
+        let bt = base_types_with_emp_dept();
+        let file_scan = CommonAst::new(CommonOp::FileScan {
+            format: FileFormat::Parquet,
+            paths: vec!["/tmp/x.parquet".to_owned()],
+            schema: Some(StructType::new(vec![StructField::nullable(
+                "x",
+                DataType::Integer,
+            )])),
+            options: vec![],
+        });
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(file_scan),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("v", "x")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let err = analyze(ast, &bt).unwrap_err();
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "x");
+                assert_eq!(qualifier.as_deref(), Some("v"));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_using_join_semi_and_inner_alike_left_qualifier_resolves() {
         // ADR-023 3e-i: the `left && right` (`left`-only for SEMI/ANTI)
         // formula no longer special-cases USING joins — with both sides
         // AUTHORITATIVE (`TableScan`), the join is TRACKED for both an
         // INNER and a LeftSemi USING join alike (right's columns dropped
         // from the output schema entirely for LeftSemi, but that does not
-        // affect trackedness, which reads only `left`).
+        // affect trackedness, which reads only `left`). A left-qualified
+        // reference to a surviving column resolves for real (tier-(f)
+        // lineage path) rather than falling back to the legacy name-only
+        // path, for both join kinds.
         let bt = base_types_with_emp_dept();
         for join_type in [JoinType::Inner, JoinType::LeftSemi] {
-            let ast = CommonAst::new(CommonOp::Join {
+            let join = CommonAst::new(CommonOp::Join {
                 left: Box::new(aliased_scan("emp", "e")),
                 right: Box::new(aliased_scan("dept", "d")),
                 join_type,
@@ -7342,18 +7434,24 @@ mod tests {
                 left_plan_ids: vec![],
                 right_plan_ids: vec![],
             });
-            let typed = analyze(ast, &bt).unwrap();
-            assert!(
-                typed.scope.source_quals_tracked,
-                "expected tracked=true for {join_type:?}"
-            );
+            let filter = CommonAst::new(CommonOp::Filter {
+                input: Box::new(join),
+                condition: Expression::Binary(BinaryExpression {
+                    op: BinaryOp::Eq,
+                    left: Box::new(qcol("e", "name")),
+                    right: Box::new(lit_str("acme")),
+                }),
+            });
+            analyze(filter, &bt).unwrap_or_else(|e| {
+                panic!("expected {join_type:?} left qualifier to resolve, got {e:?}")
+            });
         }
     }
 
-    // ── ADR-023 tier 3d — resolver consults source_quals lineage ─────────
-    // The resolver now ACTS on `source_quals` (3d), gated by
-    // `source_quals_tracked` so only nodes with AUTHORITATIVE lineage take
-    // the new path; USING/Star/deferred cases stay on the legacy fallback.
+    // ── ADR-023 tier 3d/3e — resolver consults source_quals lineage ──────
+    // The resolver ACTS on `source_quals` directly for every node (tier-3e
+    // retired the deferred-lineage/legacy-name-only fallback entirely — see
+    // ADR-024's tier-3e amendment).
 
     #[test]
     fn resolve_column_projected_through_qualifier_drops_qualifier() {
@@ -7449,6 +7547,301 @@ mod tests {
             .spark_class(),
             Some("UNRESOLVED_COLUMN.WITH_SUGGESTION")
         );
+    }
+
+    // ── Pass F3 Stage 3 — passthrough-carrying ops flip AUTHORITATIVE ────
+
+    #[test]
+    fn resolve_column_drop_columns_surviving_qualifier_drops_qualifier() {
+        // Pass F3 Stage 3: `DropColumns` is now AUTHORITATIVE (passthrough-
+        // carrying) — a surviving column keeps its inherited lineage, so a
+        // qualified reference to it resolves by attribute identity with the
+        // qualifier dropped, mirroring Project's tier-(f) shape (filt-018).
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let dropped = CommonAst::new(CommonOp::DropColumns {
+            input: Box::new(aliased),
+            drop_names: vec!["salary".to_owned()],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(dropped),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(101)),
+            }),
+        });
+        let typed = analyze(filter, &bt).expect("surviving qualified column must resolve");
+        match &typed.op {
+            TypedOp::Filter {
+                input,
+                condition: Expression::Binary(b),
+            } => match b.left.as_ref() {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(c.qualifier, None);
+                    assert_eq!(
+                        c.expr_id,
+                        Some(
+                            input
+                                .resolved_schema
+                                .field_by_name("dept_id")
+                                .expect("dept_id survives drop")
+                                .expr_id
+                        )
+                    );
+                }
+                other => panic!("expected ColumnReference, got {other:?}"),
+            },
+            other => panic!("expected Filter/Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_with_columns_untouched_qualifier_drops_qualifier() {
+        // Pass F3 Stage 3: `WithColumns` is now AUTHORITATIVE — an untouched
+        // input column keeps its inherited lineage.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let with_active = CommonAst::new(CommonOp::WithColumns {
+            input: Box::new(aliased),
+            assignments: vec![("active".to_owned(), lit_bool(true))],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(with_active),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(101)),
+            }),
+        });
+        let typed = analyze(filter, &bt).expect("untouched qualified column must resolve");
+        match &typed.op {
+            TypedOp::Filter {
+                input,
+                condition: Expression::Binary(b),
+            } => match b.left.as_ref() {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(c.qualifier, None);
+                    assert_eq!(
+                        c.expr_id,
+                        Some(
+                            input
+                                .resolved_schema
+                                .field_by_name("dept_id")
+                                .expect("dept_id untouched by withColumns")
+                                .expr_id
+                        )
+                    );
+                }
+                other => panic!("expected ColumnReference, got {other:?}"),
+            },
+            other => panic!("expected Filter/Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_with_columns_created_qualified_rejects() {
+        // Pass F3 Stage 3: the ASSIGNED column is CREATED (minted, empty
+        // lineage) even though `WithColumns` itself is now AUTHORITATIVE —
+        // tier (f) must reject a qualified reference to it, not fall back to
+        // the permissive legacy name-only lookup.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let with_active = CommonAst::new(CommonOp::WithColumns {
+            input: Box::new(aliased),
+            assignments: vec![("active".to_owned(), lit_bool(true))],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(with_active),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "active")),
+                right: Box::new(lit_bool(true)),
+            }),
+        });
+        let err = analyze(filter, &bt).unwrap_err();
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "active");
+                assert_eq!(qualifier.as_deref(), Some("e"));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_unpivot_id_column_qualifier_drops_qualifier() {
+        // Pass F3 Stage 3: `Unpivot` is now AUTHORITATIVE — a preserved id
+        // column keeps its inherited lineage.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let unpivoted = CommonAst::new(CommonOp::Unpivot {
+            input: Box::new(aliased),
+            ids: UnpivotIds::Explicit(vec!["id".to_owned(), "name".to_owned()]),
+            values: vec!["dept_id".to_owned(), "salary".to_owned()],
+            variable_column_name: "metric".to_owned(),
+            value_column_name: "val".to_owned(),
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(unpivoted),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "id")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let typed = analyze(filter, &bt).expect("id column must resolve via qualifier");
+        match &typed.op {
+            TypedOp::Filter {
+                input,
+                condition: Expression::Binary(b),
+            } => match b.left.as_ref() {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(c.qualifier, None);
+                    assert_eq!(
+                        c.expr_id,
+                        Some(
+                            input
+                                .resolved_schema
+                                .field_by_name("id")
+                                .expect("id preserved by unpivot")
+                                .expr_id
+                        )
+                    );
+                }
+                other => panic!("expected ColumnReference, got {other:?}"),
+            },
+            other => panic!("expected Filter/Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_unpivot_variable_column_qualified_rejects() {
+        // Pass F3 Stage 3: the synthetic variable column is CREATED (minted,
+        // empty lineage) — tier (f) must reject a qualified reference to it.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let unpivoted = CommonAst::new(CommonOp::Unpivot {
+            input: Box::new(aliased),
+            ids: UnpivotIds::Explicit(vec!["id".to_owned(), "name".to_owned()]),
+            values: vec!["dept_id".to_owned(), "salary".to_owned()],
+            variable_column_name: "metric".to_owned(),
+            value_column_name: "val".to_owned(),
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(unpivoted),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "metric")),
+                right: Box::new(lit_str("dept_id")),
+            }),
+        });
+        let err = analyze(filter, &bt).unwrap_err();
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "metric");
+                assert_eq!(qualifier.as_deref(), Some("e"));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_pivot_grouping_column_qualifier_drops_qualifier() {
+        // Pass F3 Stage 3: `Pivot` is now AUTHORITATIVE — a grouping column
+        // keeps its inherited lineage.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let pivoted = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(aliased),
+            grouping: PivotGrouping::Explicit(vec![qcol("e", "dept_id")]),
+            pivot_column: qcol("e", "name"),
+            pivot_values: vec![lit_str("Alice"), lit_str("Bob")],
+            aggregates: vec![alias_expr(func("count", vec![int_lit(1)]), "n")],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(pivoted),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(101)),
+            }),
+        });
+        let typed = analyze(filter, &bt).expect("grouping column must resolve via qualifier");
+        match &typed.op {
+            TypedOp::Filter {
+                input,
+                condition: Expression::Binary(b),
+            } => match b.left.as_ref() {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(c.qualifier, None);
+                    assert_eq!(
+                        c.expr_id,
+                        Some(
+                            input
+                                .resolved_schema
+                                .field_by_name("dept_id")
+                                .expect("dept_id is the grouping column")
+                                .expr_id
+                        )
+                    );
+                }
+                other => panic!("expected ColumnReference, got {other:?}"),
+            },
+            other => panic!("expected Filter/Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_column_pivot_value_column_qualified_rejects() {
+        // Pass F3 Stage 3: a pivoted output column is CREATED (minted, empty
+        // lineage) — tier (f) must reject a qualified reference to it.
+        let bt = base_types_with_emp_dept();
+        let aliased = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(emp_scan()),
+            alias: "e".to_owned(),
+        });
+        let pivoted = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(aliased),
+            grouping: PivotGrouping::Explicit(vec![qcol("e", "dept_id")]),
+            pivot_column: qcol("e", "name"),
+            pivot_values: vec![lit_str("Alice"), lit_str("Bob")],
+            aggregates: vec![alias_expr(func("count", vec![int_lit(1)]), "n")],
+        });
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(pivoted),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "Alice")),
+                right: Box::new(int_lit(1)),
+            }),
+        });
+        let err = analyze(filter, &bt).unwrap_err();
+        match err {
+            AnalyzerError::UnknownColumn { name, qualifier } => {
+                assert_eq!(name, "Alice");
+                assert_eq!(qualifier.as_deref(), Some("e"));
+            }
+            other => panic!("expected UnknownColumn, got {other:?}"),
+        }
     }
 
     #[test]
@@ -7655,7 +8048,11 @@ mod tests {
     }
 
     #[test]
-    fn source_quals_tracked_true_for_project_of_columns() {
+    fn resolve_column_project_of_columns_qualifier_resolves() {
+        // A Project whose projection list is itself a set of qualified
+        // column references is AUTHORITATIVE — each entry COPIES its input
+        // attribute's lineage, so a qualified reference against the
+        // Project's own output resolves for real.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7665,15 +8062,24 @@ mod tests {
             input: Box::new(aliased),
             projections: vec![qcol("e", "dept_id"), qcol("e", "name")],
         });
-        let typed = analyze(project, &bt).unwrap();
-        assert!(typed.scope.source_quals_tracked);
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(project),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "dept_id")),
+                right: Box::new(int_lit(101)),
+            }),
+        });
+        analyze(filter, &bt).expect("projected qualified column must resolve");
     }
 
     #[test]
-    fn source_quals_tracked_true_for_using_join_with_tracked_children() {
+    fn resolve_column_using_join_with_tracked_children_left_qualifier_resolves() {
         // ADR-023 3e-i: `emp e JOIN dept d USING(dept_id)` — both children
         // are TableScan{alias} (authoritative), so the USING join is now
-        // tracked too (formerly hard-coded `false`).
+        // tracked too (formerly hard-coded `false`); a left-qualified
+        // reference to a surviving column resolves via the tier-(f) lineage
+        // path.
         let bt = base_types_with_emp_dept();
         let using_join = CommonAst::new(CommonOp::Join {
             left: Box::new(aliased_scan("emp", "e")),
@@ -7686,35 +8092,15 @@ mod tests {
             left_plan_ids: vec![],
             right_plan_ids: vec![],
         });
-        let typed_using = analyze(using_join, &bt).unwrap();
-        assert!(typed_using.scope.source_quals_tracked);
-    }
-
-    #[test]
-    fn source_quals_tracked_false_for_using_join_over_untracked_child() {
-        // The USING arm's tracked formula is `left && right` (SEMI/ANTI:
-        // `left` only) — same as the non-USING arm. An untracked child (a
-        // Star projection defers its lineage — see
-        // `source_quals_star_projection_is_untracked_but_content_still_carries_through`)
-        // keeps the USING join conservatively untracked too.
-        let bt = base_types_with_emp_dept();
-        let untracked_left = CommonAst::new(CommonOp::Project {
-            input: Box::new(scan("emp")),
-            projections: vec![Expression::Star(StarExpression { qualifier: None })],
+        let filter = CommonAst::new(CommonOp::Filter {
+            input: Box::new(using_join),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("e", "name")),
+                right: Box::new(lit_str("acme")),
+            }),
         });
-        let using_join = CommonAst::new(CommonOp::Join {
-            left: Box::new(untracked_left),
-            right: Box::new(aliased_scan("dept", "d")),
-            join_type: JoinType::Inner,
-            condition: None,
-            using_columns: vec!["dept_id".to_owned()],
-            natural: false,
-            lateral: false,
-            left_plan_ids: vec![],
-            right_plan_ids: vec![],
-        });
-        let typed_using = analyze(using_join, &bt).unwrap();
-        assert!(!typed_using.scope.source_quals_tracked);
+        analyze(filter, &bt).expect("USING join left qualifier must resolve");
     }
 
     // ── Pass 106 — uncorrelated subquery analysis ────────────────────────
@@ -8147,14 +8533,14 @@ mod tests {
     /// name-only fallback — `e.dept_id` inside the inner query, where `e`
     /// binds no inner scope, resolved by bare name against the inner
     /// (`dept`) schema, ignoring the qualifier mismatch entirely, and won
-    /// over the outer type. That is exactly the F8-class bug 3d closes:
-    /// the inner Filter/AliasedRelation(dept,"d") is `source_quals_tracked`
-    /// (AUTHORITATIVE), so tier (f) now correctly finds ZERO lineage hits
-    /// for a qualifier the inner scope never bound, degrades to
-    /// `Unresolved`, and tier (g) resolves `e.dept_id` as a genuine
-    /// correlated OUTER reference — matching real Spark semantics (`e` is
-    /// the outer alias; a coincidental inner name match must not shadow
-    /// it). The outer type (`Long`) now wins, not the inner (`Integer`).
+    /// over the outer type. That is exactly the F8-class bug 3d/3e closes:
+    /// the inner Filter/AliasedRelation(dept,"d")'s lineage is AUTHORITATIVE,
+    /// so tier (f) now correctly finds ZERO lineage hits for a qualifier the
+    /// inner scope never bound, degrades to `Unresolved`, and tier (g)
+    /// resolves `e.dept_id` as a genuine correlated OUTER reference —
+    /// matching real Spark semantics (`e` is the outer alias; a coincidental
+    /// inner name match must not shadow it). The outer type (`Long`) now
+    /// wins, not the inner (`Integer`).
     #[test]
     fn correlated_subquery_mismatched_qualifier_resolves_as_outer_reference() {
         // emp.dept_id = Integer(nullable), dept.dept_id = Integer(not-null).

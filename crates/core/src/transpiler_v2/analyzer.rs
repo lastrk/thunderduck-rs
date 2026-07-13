@@ -3543,32 +3543,11 @@ fn analyze_sort(
         })
         .collect::<Result<Vec<_>, AnalyzerError>>()?;
     // Increment 2 (design 023 step 5) may have appended hidden aggregate /
-    // projection entries — and matching schema fields — to `ti.op` /
-    // `ti.resolved_schema` in place (Vec-append-only) while resolving the
-    // keys above, WITHOUT re-deriving `ti.scope`. N9 increment 3 DELETED the
-    // unconditional `mem::replace` + `TypedAst::new` re-stamp this comment
-    // used to justify — it is provably dead weight, not merely "cheap":
-    //
-    //   - The only two ops this fallback ever mutates in place are
-    //     `TypedOp::Aggregate` / `TypedOp::Project`. `RelScope::of`'s arm for
-    //     BOTH is the unconditional `Self::default()` catch-all — it never
-    //     reads `aggregates`/`projections` at all — so growing either Vec
-    //     changes NOTHING about the derived `aliases` / `plan_ids` /
-    //     `ambiguous_plan_ids`.
-    //   - `source_quals_tracked_of`'s Aggregate/Project arms gate on
-    //     `aggregates.len() == resolved_schema.len()` /
-    //     `projections.len() == resolved_schema.len()`. `promote_aggregate_
-    //     subtree` / `promote_project_subtree` push exactly one schema field
-    //     per pushed output-list entry (append-only, 1:1 — see their own
-    //     bodies), so that equality is preserved by growth iff it already
-    //     held before growth.
-    //   - `source_quals` no longer lives in `RelScope` at all (N9 increment
-    //     3 folded it into `Attribute` itself) — there is nothing else
-    //     derived-and-cached here that growth could stale.
-    //
-    // So the re-derived scope is PROVABLY IDENTICAL to what `ti.scope`
-    // already carries; re-stamping buys nothing. Assert the equivalence in
-    // debug builds instead of paying for a live re-derivation in release.
+    // projection entries to `ti.op` / `ti.resolved_schema` in place while
+    // resolving the keys above; the re-derived scope is provably identical
+    // to the carried `ti.scope` (N9 increment 3's growth-invariant proof,
+    // which replaced the unconditional re-stamp this fn used to perform) —
+    // assert it in debug builds rather than pay for live re-derivation.
     debug_assert_eq!(
         RelScope::of(&ti.op, &ti.resolved_schema),
         ti.scope,
@@ -3606,8 +3585,8 @@ fn analyze_sort_key(
     let step1 = resolve_and_stamp(key, &ResolveContext::of_input(ti, base_types, outer));
     match step1 {
         Ok(resolved) => {
-            let restates_aggregate =
-                matches!(ti.op, TypedOp::Aggregate { .. }) && contains_aggregate_call(&resolved);
+            let restates_aggregate = matches!(ti.op, TypedOp::Aggregate { .. })
+                && contains_matching_call(&resolved, is_aggregate_classifier_name);
             if !restates_aggregate {
                 return Ok(resolved);
             }
@@ -3621,13 +3600,22 @@ fn analyze_sort_key(
     }
 }
 
+/// Which of the two children [`rebind_over_child`] is rebinding against —
+/// carries the one piece of shape-specific data (`Aggregate`'s `grouping`
+/// list) the shared fallback needs on top of the output list every child
+/// variant already provides.
+#[derive(Clone, Copy)]
+enum SortChild<'a> {
+    Aggregate { grouping: &'a [Expression] },
+    Project,
+}
+
 /// Steps 3-5 of the fallback (Spark `resolveColWithAgg` + `buildAggExprList`):
 /// re-resolve `original` against the child's OWN input (`Aggregate.input` /
 /// `Project.input`), then either bind it onto a semantically-equal entry in
 /// the child's OWN SELECT list (`Aggregate.aggregates` / `Project.projections`,
 /// increment 1), or — failing that — PROMOTE a subtree of it into a brand
-/// new hidden SELECT-list entry (increment 2, [`promote_aggregate_subtree`] /
-/// [`promote_project_subtree`]).
+/// new hidden SELECT-list entry (increment 2, [`promote_subtree`]).
 ///
 /// Only `TypedOp::Aggregate` / `TypedOp::Project` children define an "own
 /// input" / "own SELECT list" here — any other child (e.g. `Deduplicate`)
@@ -3645,21 +3633,22 @@ fn rebind_sort_key(
             grouping,
             aggregates,
             ..
-        } => rebind_over_aggregate(
+        } => rebind_over_child(
             original,
             input,
-            grouping,
             aggregates,
+            SortChild::Aggregate { grouping },
             &mut ti.resolved_schema,
             base_types,
             outer,
         ),
         TypedOp::Project {
             input, projections, ..
-        } => rebind_over_project(
+        } => rebind_over_child(
             original,
             input,
             projections,
+            SortChild::Project,
             &mut ti.resolved_schema,
             base_types,
             outer,
@@ -3668,84 +3657,40 @@ fn rebind_sort_key(
     }
 }
 
-/// [`rebind_sort_key`]'s `TypedOp::Aggregate` case. N7: `aggregates` IS the
-/// complete output list by construction (see [`CommonOp::Aggregate`]'s doc),
-/// so `aggregates[k]` always lines up with `schema.fields[k]` directly — no
-/// grouping-prefix offset. A prior version bailed whenever the grouping keys
-/// were not (heuristically) "already folded" (comparing `aggregates.len()`
-/// directly against `schema.len()`), which wrongly rejected an otherwise-valid
-/// whole-key match any time the GROUP BY keys were not restated bare in
-/// SELECT (tpcds-q085); that guard is kept (it still catches Star-expansion
-/// misalignment) but is now a plain length comparison with no offset term.
-fn rebind_over_aggregate(
+/// [`rebind_sort_key`]'s `TypedOp::Aggregate`/`TypedOp::Project` case. N7:
+/// `aggregates`/`projections` IS the complete output list by construction
+/// (see [`CommonOp::Aggregate`]'s doc), so `output_list[k]` always lines up
+/// with `schema.fields[k]` directly — no grouping-prefix offset. A prior
+/// version bailed whenever the grouping keys were not (heuristically)
+/// "already folded" (comparing `aggregates.len()` directly against
+/// `schema.len()`), which wrongly rejected an otherwise-valid whole-key match
+/// any time the GROUP BY keys were not restated bare in SELECT (tpcds-q085);
+/// that guard is kept (it still catches Star-expansion misalignment) but is
+/// now a plain length comparison with no offset term.
+fn rebind_over_child(
     original: Expression,
     child_input: &TypedAst,
-    grouping: &[Expression],
-    aggregates: &mut Vec<Expression>,
+    output_list: &mut Vec<Expression>,
+    kind: SortChild<'_>,
     schema: &mut ResolvedSchema,
     base_types: &BaseTypes,
     outer: Option<OuterScope<'_>>,
 ) -> Result<Expression, AnalyzerError> {
     // Star projections (and any other schema-expanding rewrite that runs
     // BEFORE `resolve_and_stamp`) break the 1:1 alignment between
-    // `aggregates`' positions and `schema`'s fields that the rewrite below
+    // `output_list`'s positions and `schema`'s fields that the rewrite below
     // depends on — bail rather than mis-index.
-    if aggregates.len() != schema.len() {
+    if output_list.len() != schema.len() {
         return Err(unresolvable_sort_key_error(&original));
     }
     let ctx = ResolveContext::of_input(child_input, base_types, outer);
     let input_resolved = resolve_and_stamp(original.clone(), &ctx)
         .map_err(|_| unresolvable_sort_key_error(&original))?;
-    // Increment 1: whole-key match. Canonicalize the FIXED `input_resolved`
-    // side once; `None` (nondeterministic) short-circuits the loop entirely
-    // rather than re-checking nondeterminism per `aggregates` entry.
-    let ca_input = (!contains_nondeterministic_call(&input_resolved))
-        .then(|| canonicalize_for_semantic_eq(&input_resolved));
-    if let Some(k) = ca_input.as_ref().and_then(|ca| {
-        aggregates
-            .iter()
-            .position(|entry| semantic_eq_against(ca, entry))
-    }) {
-        return Ok(bind_slot(aggregates, schema, k));
-    }
-    // Increment 2 (design 023 step 5): subtree walk-and-promote.
+    // Increments 1+2 (design 023 step 5): [`promote_subtree`]'s own top-level
+    // check performs the increment-1 whole-key match itself before falling
+    // into the subtree walk, so there is no separate match here.
     let input_schema = &child_input.resolved_schema;
-    promote_aggregate_subtree(input_resolved, aggregates, grouping, schema, input_schema)
-        .ok_or_else(|| unresolvable_sort_key_error(&original))
-}
-
-/// [`rebind_sort_key`]'s `TypedOp::Project` case. `projections` is always
-/// 1:1 with `schema` here (Star expansion runs before `resolve_and_stamp`,
-/// same guard as the Aggregate case) so no offset is needed.
-fn rebind_over_project(
-    original: Expression,
-    child_input: &TypedAst,
-    projections: &mut Vec<Expression>,
-    schema: &mut ResolvedSchema,
-    base_types: &BaseTypes,
-    outer: Option<OuterScope<'_>>,
-) -> Result<Expression, AnalyzerError> {
-    if projections.len() != schema.len() {
-        return Err(unresolvable_sort_key_error(&original));
-    }
-    let ctx = ResolveContext::of_input(child_input, base_types, outer);
-    let input_resolved = resolve_and_stamp(original.clone(), &ctx)
-        .map_err(|_| unresolvable_sort_key_error(&original))?;
-    // Increment 1: whole-key match. Canonicalize the FIXED `input_resolved`
-    // side once; `None` (nondeterministic) short-circuits the loop entirely
-    // rather than re-checking nondeterminism per `projections` entry.
-    let ca_input = (!contains_nondeterministic_call(&input_resolved))
-        .then(|| canonicalize_for_semantic_eq(&input_resolved));
-    if let Some(k) = ca_input.as_ref().and_then(|ca| {
-        projections
-            .iter()
-            .position(|entry| semantic_eq_against(ca, entry))
-    }) {
-        return Ok(bind_slot(projections, schema, k));
-    }
-    // Increment 2 (design 023 step 5): subtree walk-and-promote.
-    let input_schema = &child_input.resolved_schema;
-    promote_project_subtree(input_resolved, projections, schema, input_schema)
+    promote_subtree(input_resolved, output_list, schema, input_schema, kind)
         .ok_or_else(|| unresolvable_sort_key_error(&original))
 }
 
@@ -3779,10 +3724,11 @@ fn bind_slot(entries: &[Expression], schema: &ResolvedSchema, k: usize) -> Expre
 /// non-recursable, non-promotable unit — [`Expression::is_opaque_unit`] (the
 /// single opacity authority, N1) PLUS the subquery variants PLUS `Window`.
 /// `Window` matters specifically: its `.func` is a structural child
-/// (`Expression::children` descends into it, so [`contains_aggregate_call`]
-/// trips on `sum(x) OVER (...)`), but promoting that INNER aggregate call
-/// would replace a window function's own `.func` with a bare
-/// `ColumnReference` — corrupting the window rather than resolving it.
+/// (`Expression::children` descends into it, so [`contains_matching_call`]
+/// trips on `sum(x) OVER (...)` for the aggregate-classifier predicate), but
+/// promoting that INNER aggregate call would replace a window function's own
+/// `.func` with a bare `ColumnReference` — corrupting the window rather than
+/// resolving it.
 /// Increment 1 already left this shape as a documented, harmless bail
 /// (whole-key match never finds a literal `Window` entry to bind onto); this
 /// guard preserves that exact behavior under increment 2's added recursion
@@ -3799,134 +3745,134 @@ fn opaque_to_subtree_promotion(expr: &Expression) -> bool {
 }
 
 /// Increment 2 (design 023 step 5): recursively bind or PROMOTE subtrees of
-/// `expr` (already resolved against the Aggregate's OWN input schema) that
+/// `expr` (already resolved against the child's OWN input schema) that
 /// increment 1's whole-key match left unbound. At each node, top-down:
 /// - a subtree that structurally matches (`semantic_eq`) an EXISTING
-///   `aggregates` entry binds to that entry (N8: read-only — the entry is
+///   `output_list` entry binds to that entry (N8: read-only — the entry is
 ///   already a `NamedExpression` by construction, so there is no alias to
 ///   pin) — increment 1's match, applied to a subtree instead of the whole
 ///   key;
-/// - otherwise, a subtree that is itself an aggregate-classifier
-///   `FunctionCall`, or that matches (`semantic_eq`) a `grouping` entry, is
-///   PROMOTED: a fresh `Alias(subtree, name)` entry is appended to
-///   `aggregates` (dedup — a subtree already promoted earlier in the SAME
-///   walk, or by an earlier key in the same `ORDER BY`, is caught by the
-///   whole-entry match above since it is now literally present in
-///   `aggregates`; name-collision-uniquified via
-///   [`unique_hidden_output_name`]) with a matching field appended to
-///   `schema`, then bound to that new entry — Spark
-///   `ResolveAggregateFunctions#buildAggExprList`'s own fold;
+/// - otherwise, per `kind`: for [`SortChild::Aggregate`], a subtree that is
+///   itself an aggregate-classifier `FunctionCall`, or that matches
+///   (`semantic_eq`) a `grouping` entry, is PROMOTED via
+///   [`promote_hidden_alias`] (a fresh `Alias(subtree, name)` MINTED onto
+///   `output_list`); for [`SortChild::Project`], a bare `ColumnReference`
+///   subtree is PROMOTED via [`promote_bare_column`] (pushed onto
+///   `output_list` verbatim, COPYING its identity — Spark
+///   `ResolveReferencesInSort`'s "add the missing ATTRIBUTE, not a computed
+///   subexpression"). Either way, dedup (a subtree already promoted earlier
+///   in the SAME walk, or by an earlier key in the same `ORDER BY`, is caught
+///   by the whole-entry match above since it is now literally present in
+///   `output_list`) — Spark `ResolveAggregateFunctions#buildAggExprList`'s
+///   own fold;
 /// - otherwise, recursion continues into its children (unless
 ///   [`opaque_to_subtree_promotion`] says the node is an opaque unit);
 /// - a `ColumnReference` LEAF that survives all of the above (neither bound
-///   nor promotable — present in the input, but neither aggregated nor
-///   grouped) is Spark's "cannot be resolved" case: `None`, so the caller
-///   re-raises the ORIGINAL `UnknownColumn` (confirmed against a live Spark
-///   4.1.1 session to be `UNRESOLVED_COLUMN.WITH_SUGGESTION`, the SAME class
-///   an ordinary unresolvable reference gets — there is no distinct
+///   nor promotable) is Spark's "cannot be resolved" case: `None`, so the
+///   caller re-raises the ORIGINAL `UnknownColumn` (confirmed against a live
+///   Spark 4.1.1 session to be `UNRESOLVED_COLUMN.WITH_SUGGESTION`, the SAME
+///   class an ordinary unresolvable reference gets — there is no distinct
 ///   `MISSING_AGGREGATION`-style error for this shape from `ORDER BY`).
-fn promote_aggregate_subtree(
+fn promote_subtree(
     expr: Expression,
-    aggregates: &mut Vec<Expression>,
-    grouping: &[Expression],
+    output_list: &mut Vec<Expression>,
     schema: &mut ResolvedSchema,
     input_schema: &ResolvedSchema,
+    kind: SortChild<'_>,
 ) -> Option<Expression> {
-    // Canonicalize the FIXED `expr` side once for both loops below (the
-    // `aggregates` whole-entry match and the `grouping` match share the same
-    // fixed operand); `None` (nondeterministic) short-circuits both loops
-    // entirely.
-    let ca_expr =
-        (!contains_nondeterministic_call(&expr)).then(|| canonicalize_for_semantic_eq(&expr));
+    // Canonicalize the FIXED `expr` side once for both the whole-entry match
+    // below and (Aggregate only) the `grouping` match; `None`
+    // (nondeterministic) short-circuits both.
+    let ca_expr = (!contains_matching_call(&expr, is_nondeterministic_fn_name))
+        .then(|| canonicalize_for_semantic_eq(&expr));
     if let Some(k) = ca_expr.as_ref().and_then(|ca| {
-        aggregates
+        output_list
             .iter()
             .position(|entry| semantic_eq_against(ca, entry))
     }) {
-        return Some(bind_slot(aggregates, schema, k));
+        return Some(bind_slot(output_list, schema, k));
     }
-    let is_new_aggregate =
-        matches!(&expr, Expression::FunctionCall(f) if is_aggregate_classifier_name(&f.name));
-    let matches_grouping = ca_expr
-        .as_ref()
-        .is_some_and(|ca| grouping.iter().any(|g| semantic_eq_against(ca, g)));
-    if is_new_aggregate || matches_grouping {
-        let name = unique_hidden_output_name(&expr, aggregates);
-        // Freshly promoted hidden output column — a brand-new logical
-        // column that did not exist in the output list before this point:
-        // MINT (never clone-derive from `input_schema` here).
-        let field = Attribute::minted(
-            name.clone(),
-            expr.data_type(input_schema),
-            expr.nullable(input_schema),
-        );
-        aggregates.push(Expression::Alias(AliasExpression {
-            expr: Box::new(expr),
-            alias: name,
-        }));
-        schema.fields.push(field.clone());
-        return Some(Expression::ColumnReference(ColumnReference {
-            name: field.name,
-            qualifier: None,
-            data_type: field.data_type,
-            nullable: field.nullable,
-            expr_id: Some(field.expr_id),
-        }));
+    match kind {
+        SortChild::Aggregate { grouping } => {
+            let is_new_aggregate = matches!(&expr, Expression::FunctionCall(f) if is_aggregate_classifier_name(&f.name));
+            let matches_grouping = ca_expr
+                .as_ref()
+                .is_some_and(|ca| grouping.iter().any(|g| semantic_eq_against(ca, g)));
+            if is_new_aggregate || matches_grouping {
+                return Some(promote_hidden_alias(
+                    expr,
+                    output_list,
+                    schema,
+                    input_schema,
+                ));
+            }
+        }
+        SortChild::Project => {
+            if matches!(&expr, Expression::ColumnReference(_)) {
+                return Some(promote_bare_column(expr, output_list, schema, input_schema));
+            }
+        }
     }
     if matches!(expr, Expression::ColumnReference(_)) || opaque_to_subtree_promotion(&expr) {
         return None;
     }
-    expr.map_children(|c| {
-        promote_aggregate_subtree(c, aggregates, grouping, schema, input_schema).ok_or(())
-    })
-    .ok()
+    expr.map_children(|c| promote_subtree(c, output_list, schema, input_schema, kind).ok_or(()))
+        .ok()
 }
 
-/// [`promote_aggregate_subtree`]'s `TypedOp::Project` counterpart — there is
-/// no "aggregate function" / "grouping expression" concept for a plain
-/// Project, so the ONLY promotable shape is a bare input `ColumnReference`
-/// leaf: pushed into `projections` verbatim (Spark `ResolveReferencesInSort`
-/// adds the missing ATTRIBUTE, not a computed subexpression).
-fn promote_project_subtree(
+/// [`promote_subtree`]'s `SortChild::Aggregate` promotion: `expr` is either a
+/// fresh aggregate-classifier `FunctionCall` or a computed subexpression
+/// matching a `grouping` entry — either way a brand-new logical column that
+/// did not exist in the output list before this point: MINT (never
+/// clone-derive from `input_schema` here).
+fn promote_hidden_alias(
+    expr: Expression,
+    aggregates: &mut Vec<Expression>,
+    schema: &mut ResolvedSchema,
+    input_schema: &ResolvedSchema,
+) -> Expression {
+    let name = unique_hidden_output_name(&expr, aggregates);
+    let field = Attribute::minted(
+        name.clone(),
+        expr.data_type(input_schema),
+        expr.nullable(input_schema),
+    );
+    aggregates.push(Expression::Alias(AliasExpression {
+        expr: Box::new(expr),
+        alias: name,
+    }));
+    schema.fields.push(field.clone());
+    Expression::ColumnReference(ColumnReference {
+        name: field.name,
+        qualifier: None,
+        data_type: field.data_type,
+        nullable: field.nullable,
+        expr_id: Some(field.expr_id),
+    })
+}
+
+/// [`promote_subtree`]'s `SortChild::Project` promotion: `expr` is a bare
+/// input `ColumnReference` passing through unmodified — COPY its existing
+/// identity from `input_schema` (by attribute id) rather than minting a
+/// fresh one for what is still the same logical column. `output_attribute`
+/// is the shared copy-or-mint home (item 3, N9/ADR-024) — same shape this
+/// arm used to hand-roll.
+fn promote_bare_column(
     expr: Expression,
     projections: &mut Vec<Expression>,
     schema: &mut ResolvedSchema,
     input_schema: &ResolvedSchema,
-) -> Option<Expression> {
-    // Canonicalize the FIXED `expr` side once; `None` (nondeterministic)
-    // short-circuits the loop entirely.
-    let ca_expr =
-        (!contains_nondeterministic_call(&expr)).then(|| canonicalize_for_semantic_eq(&expr));
-    if let Some(k) = ca_expr.as_ref().and_then(|ca| {
-        projections
-            .iter()
-            .position(|entry| semantic_eq_against(ca, entry))
-    }) {
-        return Some(bind_slot(projections, schema, k));
-    }
-    if matches!(&expr, Expression::ColumnReference(_)) {
-        // Promoting a bare input `ColumnReference` that passes through
-        // unmodified — COPY its existing identity from `input_schema` (by
-        // attribute id) rather than minting a fresh one for what is still
-        // the same logical column. `output_attribute` is the shared
-        // copy-or-mint home (item 3, N9/ADR-024) — same shape this arm used
-        // to hand-roll.
-        let field = output_attribute(&expr, input_schema);
-        projections.push(expr);
-        schema.fields.push(field.clone());
-        return Some(Expression::ColumnReference(ColumnReference {
-            name: field.name,
-            qualifier: None,
-            data_type: field.data_type,
-            nullable: field.nullable,
-            expr_id: Some(field.expr_id),
-        }));
-    }
-    if opaque_to_subtree_promotion(&expr) {
-        return None;
-    }
-    expr.map_children(|c| promote_project_subtree(c, projections, schema, input_schema).ok_or(()))
-        .ok()
+) -> Expression {
+    let field = output_attribute(&expr, input_schema);
+    projections.push(expr);
+    schema.fields.push(field.clone());
+    Expression::ColumnReference(ColumnReference {
+        name: field.name,
+        qualifier: None,
+        data_type: field.data_type,
+        nullable: field.nullable,
+        expr_id: Some(field.expr_id),
+    })
 }
 
 /// A hidden-promotion output name, uniquified against `aggregates`' EXISTING
@@ -3974,38 +3920,28 @@ fn unresolvable_sort_key_error(original: &Expression) -> AnalyzerError {
 }
 
 /// `true` iff `expr` contains (anywhere in its tree) a `FunctionCall` whose
-/// name is on the aggregate classifier roster
-/// ([`is_aggregate_classifier_name`]) — used to detect a Sort key that
-/// restates a SELECT-list aggregate (design 023 fallback trigger (ii)).
+/// name satisfies `pred` — the shared walk behind both the aggregate-
+/// classifier check ([`is_aggregate_classifier_name`], used to detect a Sort
+/// key that restates a SELECT-list aggregate, design 023 fallback trigger
+/// (ii)) and the nondeterministic-function check
+/// ([`is_nondeterministic_fn_name`], used to exclude a Sort key that calls a
+/// nondeterministic function from the [`semantic_eq`] rebind fallback). Both
+/// rosters are name-keyed and non-exhaustive; per-instance nondeterminism
+/// identity is N9's deliverable.
 ///
 /// `Expression::children()` also descends into `WindowFunction.func`, so a
-/// key restating `sum(x) OVER (...)` also trips this — that key was already
-/// red before increment 1 (an aggregate name under `Window` is not a plain
-/// SELECT-list aggregate to rebind onto), and `rebind_sort_key` simply fails
-/// to find a match and re-raises the original `UnknownColumn`, so this is
-/// harmless, not a new failure mode.
-fn contains_aggregate_call(expr: &Expression) -> bool {
+/// key restating `sum(x) OVER (...)` also trips the aggregate check — that
+/// key was already red before increment 1 (an aggregate name under `Window`
+/// is not a plain SELECT-list aggregate to rebind onto), and
+/// `rebind_sort_key` simply fails to find a match and re-raises the original
+/// `UnknownColumn`, so this is harmless, not a new failure mode.
+fn contains_matching_call(expr: &Expression, pred: fn(&str) -> bool) -> bool {
     if let Expression::FunctionCall(f) = expr {
-        if is_aggregate_classifier_name(&f.name) {
+        if pred(&f.name) {
             return true;
         }
     }
-    expr.children().any(contains_aggregate_call)
-}
-
-/// `true` iff `expr` contains (anywhere in its tree) a `FunctionCall` whose
-/// name is on the nondeterministic-function roster
-/// ([`is_nondeterministic_fn_name`]) — used to exclude a Sort key that calls
-/// a nondeterministic function from the [`semantic_eq`] rebind fallback.
-/// The roster is deliberately name-keyed and non-exhaustive; per-instance
-/// nondeterminism identity is N9's deliverable.
-fn contains_nondeterministic_call(expr: &Expression) -> bool {
-    if let Expression::FunctionCall(f) = expr {
-        if is_nondeterministic_fn_name(&f.name) {
-            return true;
-        }
-    }
-    expr.children().any(contains_nondeterministic_call)
+    expr.children().any(|c| contains_matching_call(c, pred))
 }
 
 /// Spark-`semanticEquals`-inspired structural comparison used to bind a
@@ -4039,15 +3975,14 @@ fn contains_nondeterministic_call(expr: &Expression) -> bool {
 /// same-shape) canonicalized trees afterwards to add that check back in
 /// specifically for this comparison.
 ///
-/// Production call sites (`rebind_over_aggregate`/`rebind_over_project`/
-/// `promote_aggregate_subtree`/`promote_project_subtree`) all compare many
-/// candidates against one fixed operand and so call [`semantic_eq_against`]
-/// directly (hoisting the fixed side's canonicalization out of the loop);
-/// this pairwise form is kept for the single-pair comparisons in this
-/// module's own tests.
+/// Production call sites (`rebind_over_child`/[`promote_subtree`]) all
+/// compare many candidates against one fixed operand and so call
+/// [`semantic_eq_against`] directly (hoisting the fixed side's
+/// canonicalization out of the loop); this pairwise form is kept for the
+/// single-pair comparisons in this module's own tests.
 #[cfg(test)]
 fn semantic_eq(a: &Expression, b: &Expression) -> bool {
-    if contains_nondeterministic_call(a) {
+    if contains_matching_call(a, is_nondeterministic_fn_name) {
         return false;
     }
     let ca = canonicalize_for_semantic_eq(a);
@@ -4055,17 +3990,17 @@ fn semantic_eq(a: &Expression, b: &Expression) -> bool {
 }
 
 /// [`semantic_eq`], factored so a loop comparing many `entry` candidates
-/// against one FIXED expression (`rebind_over_aggregate`/`rebind_over_project`/
-/// `promote_aggregate_subtree`/`promote_project_subtree`'s `.position`/`.any`
-/// loops) pays for [`canonicalize_for_semantic_eq`] and the nondeterminism
-/// check on the FIXED side exactly ONCE, not on every iteration — those
+/// against one FIXED expression (`rebind_over_child`/[`promote_subtree`]'s
+/// `.position`/`.any` loops) pays for [`canonicalize_for_semantic_eq`] and
+/// the nondeterminism check on the FIXED side exactly ONCE, not on every
+/// iteration — those
 /// callers precompute `ca_fixed` themselves (skipping the call entirely, and
 /// hence the whole loop, when the fixed side is itself nondeterministic; see
 /// each call site) and pass it in here. The `entry` side is still
 /// canonicalized and nondeterminism-checked per call, since it legitimately
 /// differs every iteration.
 fn semantic_eq_against(ca_fixed: &Expression, entry: &Expression) -> bool {
-    if contains_nondeterministic_call(entry) {
+    if contains_matching_call(entry, is_nondeterministic_fn_name) {
         return false;
     }
     let ce = canonicalize_for_semantic_eq(entry);
@@ -4920,9 +4855,8 @@ fn schema_has_unresolved(schema: &ResolvedSchema) -> bool {
 /// Build the output [`Attribute`] contributed by a projection-position
 /// expression: name via [`expression_output_name`], type and nullability
 /// resolved against `input`. The single copy-or-mint home (item 3 of the
-/// N9/ADR-024 consolidation): [`promote_project_subtree`]'s bare
-/// `ColumnReference` arm calls this directly instead of hand-rolling its own
-/// copy of the same shape.
+/// N9/ADR-024 consolidation): [`promote_bare_column`] calls this directly
+/// instead of hand-rolling its own copy of the same shape.
 ///
 /// N9 INC-1 identity rule (ADR-024): a bare `ColumnReference` whose
 /// `expr_id` matches an `input` attribute (first occurrence via
@@ -4941,11 +4875,11 @@ fn schema_has_unresolved(schema: &ResolvedSchema) -> bool {
 /// `Attribute::minted` carries EMPTY lineage — a created column (`Alias`,
 /// computed expression) inherits no qualifier (F8/filt-019 hinge).
 ///
-/// Naming policy (shared with `promote_project_subtree`, verified benign):
-/// the COPY branch always stamps `name` via [`expression_output_name`] — the
+/// Naming policy (shared with [`promote_bare_column`], verified benign): the
+/// COPY branch always stamps `name` via [`expression_output_name`] — the
 /// reference's OWN stamped user-case name — rather than the source
 /// attribute's verbatim name. For a plain SELECT passthrough the two agree
-/// modulo case (by construction). For `promote_project_subtree`'s hidden
+/// modulo case (by construction). For `promote_bare_column`'s hidden
 /// promoted slot the attribute is trimmed away by the wrapping trim-`Project`
 /// (which re-binds by id, not by name or qualifier) immediately after use, so
 /// the case — and the qualifier-union into `source_quals` above — are both
@@ -13827,12 +13761,11 @@ mod tests {
     }
 
     // ── Design 023 increment 2 — subtree promotion + trim Project ────────────
-    // (analyzer.rs `promote_aggregate_subtree` / `promote_project_subtree`;
-    // Sort arm in `analyze_node`). Covers the shapes increment 1's whole-key
-    // match leaves red: a hidden GROUP BY key never restated in SELECT
-    // (tpcds-q098), a Project input column never projected in any form
-    // (tpcds-q078), and the genuine "neither grouped nor aggregated" Spark
-    // error case.
+    // (analyzer.rs `promote_subtree`; Sort arm in `analyze_node`). Covers the
+    // shapes increment 1's whole-key match leaves red: a hidden GROUP BY key
+    // never restated in SELECT (tpcds-q098), a Project input column never
+    // projected in any form (tpcds-q078), and the genuine "neither grouped
+    // nor aggregated" Spark error case.
 
     #[test]
     fn sort_promotes_missing_grouping_key_and_trims_q098_shape() {
@@ -14941,11 +14874,11 @@ mod tests {
         // `analyze_sort` no longer rebuilds `ti.resolved_schema` at all (the
         // unconditional re-stamp is gone, replaced by a `debug_assert_eq!`
         // proof), so the Sort's OWN schema is bit-for-bit the SAME Vec the
-        // Project analysis produced — including the promoted `salary`
-        // entry, which is `promote_project_subtree`'s bare-`ColumnReference`
-        // COPY branch (clones straight from `input_schema`, same precedent
-        // as `output_attribute`), so it carries the scan's real lineage
-        // forward too, not an empty mint.
+        // Project analysis produced — including the promoted `salary` entry,
+        // which is `promote_subtree`'s `SortChild::Project` bare-
+        // `ColumnReference` COPY branch (clones straight from
+        // `input_schema`, same precedent as `output_attribute`), so it
+        // carries the scan's real lineage forward too, not an empty mint.
         let emp: BTreeSet<String> = ["emp".to_owned()].into_iter().collect();
         assert_eq!(
             quals_of(&sort_ast.resolved_schema),
@@ -15052,17 +14985,17 @@ mod tests {
         // promoted `dept_id` entry IS structurally a bare passthrough
         // `ColumnReference` into the (aliased, tracked) input — a source
         // that DOES carry real lineage (`{"emp", "e"}`) — yet
-        // `promote_aggregate_subtree` unconditionally MINTS a fresh
-        // `Attribute` for every newly-promoted entry (never clone-derives
-        // from `input_schema`, unlike `output_attribute`'s COPY branch or
-        // `promote_project_subtree`'s bare-ref COPY). Current behavior:
-        // the promoted grouping key's lineage is EMPTY, exactly as if it
-        // had been a freshly created column — NOT inherited from its
-        // source, even though it structurally passes the source through
-        // unmodified. This is the "created, not copied" outcome; documented
-        // here as current behavior rather than changed, since widening
-        // `promote_aggregate_subtree` to COPY is out of this increment's
-        // scope.
+        // `promote_subtree`'s `SortChild::Aggregate` arm (`promote_hidden_
+        // alias`) unconditionally MINTS a fresh `Attribute` for every
+        // newly-promoted entry (never clone-derives from `input_schema`,
+        // unlike `output_attribute`'s COPY branch or the `SortChild::Project`
+        // arm's bare-ref COPY). Current behavior: the promoted grouping
+        // key's lineage is EMPTY, exactly as if it had been a freshly
+        // created column — NOT inherited from its source, even though it
+        // structurally passes the source through unmodified. This is the
+        // "created, not copied" outcome; documented here as current behavior
+        // rather than changed, since widening the Aggregate arm to COPY is
+        // out of this increment's scope.
         let bt = base_types_with_emp_dept();
         let agg = aggregate(
             aliased_scan("emp", "e"),
@@ -15263,11 +15196,13 @@ mod tests {
         let grouping = aggregates.clone();
         let mut schema = ResolvedSchema::new(vec![e_field.clone(), d_field.clone()]);
 
-        let bound = rebind_over_aggregate(
+        let bound = rebind_over_child(
             qcol("d", "dept_id"),
             &child_input,
-            &grouping,
             &mut aggregates,
+            SortChild::Aggregate {
+                grouping: &grouping,
+            },
             &mut schema,
             &bt,
             None,

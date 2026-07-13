@@ -718,6 +718,12 @@ case("lit-007", "typed_literal", "DECIMAL literal arithmetic", "SELECT 100.25 * 
 case("lit-008", "typed_literal", "timestamp - timestamp -> interval", "SELECT (TIMESTAMP '2026-06-30 00:00:00' - TIMESTAMP '2026-06-01 00:00:00') AS diff_iv")
 case("lit-009", "typed_literal", "string escape literal", "SELECT 'line1\\nline2' AS s, 'tab\\there' AS t")
 case("lit-010", "typed_literal", "INTERVAL arithmetic in WHERE", "SELECT * FROM emp WHERE last_login > current_timestamp() - INTERVAL '30' DAY", flags=("nondeterministic",))
+# lit-011: R1-6 fix witness. Spark promotes DATE +/- a sub-day-field
+# DayTimeIntervalType (HOUR/MINUTE/SECOND) to TIMESTAMP, but keeps DATE for a
+# day-only or YearMonthIntervalType interval (live-probed against Spark
+# 4.1.1 Connect). `hire_date` is DATE-typed on the `emp` fixture (see
+# lit-003).
+case("lit-011", "typed_literal", "DATE +/- sub-day INTERVAL promotes to TIMESTAMP, day/month INTERVAL stays DATE (R1-6)", "SELECT hire_date + INTERVAL '25' HOUR AS promoted_add, hire_date - INTERVAL '25' HOUR AS promoted_sub, hire_date + INTERVAL '1' DAY AS stays_date_day, hire_date + INTERVAL '2' MONTH AS stays_date_month FROM emp")
 
 # ── 18. Numeric tower × non-exotic built-in functions ────────────────────────
 # Each function applied across the supported numeric types (short/int/bigint/

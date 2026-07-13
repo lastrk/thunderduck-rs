@@ -1729,16 +1729,48 @@ impl Expression {
 // transparency contract that makes this safe.
 
 /// The Add/Sub date-preserving match extracted from `binary_data_type`:
-/// `Interval ± Date/Timestamp` preserves the date-like side. Shared by
-/// `binary_data_type`'s own inference and [`materialize_binary_coercions`]'s
-/// Date rule (which fires only on `Some(DataType::Date)` — DuckDB already
-/// natively preserves `Timestamp`/`TimestampNtz` under `±Interval`, so only
-/// the `Date` case needs a corrective CAST).
+/// `Interval ± Date/Timestamp` preserves the date-like side, EXCEPT that
+/// `Date ± DayTimeInterval` *promotes* to `Timestamp` (Spark: `Date +
+/// YearMonthIntervalType` and `Date + CalendarIntervalType` stay `DATE`, but
+/// `Date + DayTimeIntervalType` — any field span containing a sub-day unit —
+/// widens to `TIMESTAMP` per Catalyst's `DateAddInterval`/type-coercion
+/// rules; live-probed against Spark 4.1.1 Connect, findings R1-6). This is
+/// the single home of that rule — `SEAM(R1-6)`, now closed: previously this
+/// function always kept `Date`, silently truncating the time-of-day for
+/// `DATE ± INTERVAL '25' HOUR`-shaped expressions.
+///
+/// τ's `DataType::DayTimeInterval` is field-less (see `types::data_type`), so
+/// it cannot distinguish `DayTimeIntervalType(DAY)` (day-only span, Spark:
+/// stays `DATE`) from `DAY TO SECOND` (Spark: promotes). τ resolves this by
+/// construction: every producer of `Expression::Interval` with
+/// `IntervalKind::DayTime` in τ today is already a full/sub-day span —
+/// `DAY TO SECOND` compound SQL literals and `make_dt_interval(...)` — so
+/// `DayTimeInterval` ⟹ "has a sub-day field" holds for τ's actual inputs. A
+/// single-field `INTERVAL '1' DAY` literal deliberately lowers as
+/// `IntervalKind::Calendar` (not `DayTime`) precisely so it does NOT hit this
+/// promoting arm — see `lower_interval`'s `Slot::Days` comment. One class of
+/// producer the by-construction argument does NOT cover: `DayTimeInterval`
+/// COLUMNS arriving over the wire (Arrow `Duration(Microsecond)` and proto
+/// `DayTimeInterval` schema kinds), whose user-supplied field span is
+/// discarded by τ's field-less type. A day-only such column added to a
+/// `Date` now over-promotes to `Timestamp` (Spark keeps `DATE`) — an
+/// accepted trade-off: the common `datetime.timedelta` column is the full
+/// `DAY TO SECOND` span, which this arm now types correctly and the old
+/// always-`Date` rule silently truncated.
+///
+/// Shared by `binary_data_type`'s own inference and
+/// [`materialize_binary_coercions`]'s Date rule (which fires only on
+/// `Some(DataType::Date)` — DuckDB already natively yields the correct
+/// `TIMESTAMP` value for `DATE ± INTERVAL` with no cast needed, and natively
+/// preserves `Timestamp`/`TimestampNtz` under `±Interval`, so only the
+/// stay-`Date` case needs a corrective CAST).
 fn date_like_interval_result(op: &BinaryOp, l: &DataType, r: &DataType) -> Option<DataType> {
     if !matches!(op, BinaryOp::Add | BinaryOp::Sub) {
         return None;
     }
     match (l, r) {
+        (DataType::Date, DataType::DayTimeInterval)
+        | (DataType::DayTimeInterval, DataType::Date) => Some(DataType::Timestamp),
         (DataType::Date, dt) | (dt, DataType::Date) if dt.is_interval() => Some(DataType::Date),
         (DataType::Timestamp, dt) | (dt, DataType::Timestamp) if dt.is_interval() => {
             Some(DataType::Timestamp)
@@ -3497,6 +3529,24 @@ mod tests {
         })
     }
 
+    fn day_time_interval() -> Expression {
+        Expression::Interval(IntervalExpression {
+            months: 0,
+            days: 0,
+            microseconds: 25 * 3_600 * 1_000_000,
+            kind: IntervalKind::DayTime,
+        })
+    }
+
+    fn year_month_interval() -> Expression {
+        Expression::Interval(IntervalExpression {
+            months: 2,
+            days: 0,
+            microseconds: 0,
+            kind: IntervalKind::YearMonth,
+        })
+    }
+
     #[test]
     fn materialize_non_binary_passes_through_unchanged() {
         let schema = ResolvedSchema::empty();
@@ -3662,6 +3712,98 @@ mod tests {
         assert!(
             matches!(&materialized, Expression::Cast(c) if c.implicit && c.to_type == DataType::Date)
         );
+    }
+
+    #[test]
+    fn date_plus_day_time_interval_infers_timestamp() {
+        // R1-6: `Date + DayTimeInterval` promotes to `Timestamp` — Spark
+        // widens because the interval carries a sub-day field span.
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
+        let expr = bin(
+            BinaryOp::Add,
+            ColumnReference::untyped("d"),
+            day_time_interval(),
+        );
+        assert_eq!(expr.data_type(&schema), DataType::Timestamp);
+    }
+
+    #[test]
+    fn day_time_interval_plus_date_commuted_infers_timestamp() {
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
+        let expr = bin(
+            BinaryOp::Add,
+            day_time_interval(),
+            ColumnReference::untyped("d"),
+        );
+        assert_eq!(expr.data_type(&schema), DataType::Timestamp);
+    }
+
+    #[test]
+    fn date_minus_day_time_interval_infers_timestamp() {
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
+        let expr = bin(
+            BinaryOp::Sub,
+            ColumnReference::untyped("d"),
+            day_time_interval(),
+        );
+        assert_eq!(expr.data_type(&schema), DataType::Timestamp);
+    }
+
+    #[test]
+    fn date_plus_year_month_interval_infers_date() {
+        // R1-6: `Date + YearMonthInterval` stays `Date`, unlike DayTime.
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
+        let expr = bin(
+            BinaryOp::Add,
+            ColumnReference::untyped("d"),
+            year_month_interval(),
+        );
+        assert_eq!(expr.data_type(&schema), DataType::Date);
+    }
+
+    #[test]
+    fn date_plus_calendar_interval_infers_date() {
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
+        let expr = bin(
+            BinaryOp::Add,
+            ColumnReference::untyped("d"),
+            calendar_interval(),
+        );
+        assert_eq!(expr.data_type(&schema), DataType::Date);
+    }
+
+    #[test]
+    fn materialize_date_plus_day_time_interval_promotes_with_no_implicit_cast() {
+        // The promoting shape needs NO corrective CAST: DuckDB's native
+        // `DATE + INTERVAL` already yields the correct TIMESTAMP value.
+        let schema = ResolvedSchema::minted(StructType::new(vec![StructField::nullable(
+            "d",
+            DataType::Date,
+        )]));
+        let expr = bin(
+            BinaryOp::Add,
+            ColumnReference::untyped("d"),
+            day_time_interval(),
+        );
+        let before = expr.clone();
+        let materialized = materialize_binary_coercions(expr, &schema);
+        assert_eq!(materialized, before);
+        assert!(!matches!(materialized, Expression::Cast(_)));
     }
 
     #[test]

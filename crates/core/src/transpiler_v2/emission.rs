@@ -6164,10 +6164,14 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
         BinaryOp::BitXor => "#",
     };
     let inner = format!("({l}) {op} ({r})");
-    // Date ± Interval: DuckDB promotes `DATE ± INTERVAL` to TIMESTAMP, but
-    // Spark's `Date ± Interval` stays DATE. The analyzer's N4 materialization
-    // pass (`materialize_binary_coercions`) already wraps the whole node in
-    // an implicit `CAST(.. AS DATE)` (rendered by `render_cast`) when this
+    // Date ± Interval: DuckDB promotes `DATE ± INTERVAL` to TIMESTAMP, and so
+    // does Spark for a sub-day-field interval (R1-6) — the analyzer's
+    // `date_like_interval_result` seam already resolves that case to
+    // `Timestamp`, matching DuckDB's native output with no cast needed. Only
+    // the day-only/year-month shapes Spark keeps as DATE need a corrective
+    // cast; the analyzer's N4 materialization pass
+    // (`materialize_binary_coercions`) already wraps the whole node in an
+    // implicit `CAST(.. AS DATE)` (rendered by `render_cast`) when this
     // node's inferred type is Date, so no corrective cast belongs here.
     // ADR-006: guard divide/mod-by-zero with Spark's ANSI error class.
     let guard = match b.op {

@@ -3964,26 +3964,46 @@ fn lower_interval(iv: Interval) -> Result<Expression, EmissionError> {
     };
     let ie = match slot {
         // The ×1 MONTH multiply can't overflow, but keep the checked path
-        // for uniformity with YEAR.
+        // for uniformity with YEAR. Spark types single-field YEAR/MONTH
+        // literals as `YearMonthIntervalType`, but `Date ± {YEAR,MONTH}
+        // interval` stays `DATE` either way (see `date_like_interval_result`
+        // — `IntervalKind::YearMonth` and `IntervalKind::Calendar` both hit
+        // its stay-`Date` arm), so re-kinding these to `YearMonth` is out of
+        // scope for the R1-6 fix.
         Slot::Months(factor) => IntervalExpression {
             months: n.checked_mul(factor).ok_or_else(|| overflow(unit))?,
             days: 0,
             microseconds: 0,
             kind: IntervalKind::Calendar,
         },
+        // Single-field DAY deliberately STAYS `Calendar`, not `DayTime`.
+        // Spark types `INTERVAL '1' DAY` as `DayTimeIntervalType(DAY, DAY)`
+        // and keeps `Date + INTERVAL '1' DAY` as `DATE` (live-probed against
+        // Spark 4.1.1 Connect, R1-6). τ's `DataType::DayTimeInterval` is
+        // field-less, so kind=DayTime would wrongly promote this to
+        // `TIMESTAMP` via `date_like_interval_result`'s new promoting arm,
+        // which is calibrated for spans that DO contain a sub-day field
+        // (`DAY TO SECOND` compounds, `make_dt_interval`). Kind=Calendar
+        // correctly routes day-only literals to the stay-`Date` arm.
         Slot::Days => IntervalExpression {
             months: 0,
             days: n,
             microseconds: 0,
             kind: IntervalKind::Calendar,
         },
+        // Single-field HOUR/MINUTE/SECOND are `DayTimeIntervalType` spans
+        // that always contain a sub-day field, so Spark promotes
+        // `Date ± {HOUR,MINUTE,SECOND} interval` to `TIMESTAMP` (R1-6).
+        // Kind=DayTime routes these into `date_like_interval_result`'s
+        // promoting arm; the emitted SQL value is unaffected (`render_interval`
+        // renders months/days/microseconds verbatim, kind-agnostic).
         Slot::Micros(per_unit) => IntervalExpression {
             months: 0,
             days: 0,
             microseconds: i64::from(n)
                 .checked_mul(per_unit)
                 .ok_or_else(|| overflow(unit))?,
-            kind: IntervalKind::Calendar,
+            kind: IntervalKind::DayTime,
         },
     };
     Ok(Expression::Interval(ie))
@@ -6961,8 +6981,10 @@ mod tests {
                 assert_eq!(ie.days, 90);
                 assert_eq!(ie.months, 0);
                 assert_eq!(ie.microseconds, 0);
-                // Scope guard: single-field literals stay generic Calendar
-                // (retyping would regress the green date-arithmetic cases).
+                // Scope guard: single-field DAY stays generic Calendar
+                // deliberately — `Date + INTERVAL '1' DAY` must stay `DATE`
+                // (R1-6), and τ's field-less `DayTimeInterval` type would
+                // wrongly promote it to `TIMESTAMP` if kinded `DayTime`.
                 assert_eq!(ie.kind, IntervalKind::Calendar);
             }
             other => panic!("expected Interval, got {other:?}"),
@@ -6977,6 +6999,18 @@ mod tests {
             Expression::Interval(ie) => ie,
             other => panic!("expected Interval, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn interval_literal_hour_lowers_to_day_time_interval() {
+        // Single-field HOUR/MINUTE/SECOND are always sub-day spans, so they
+        // re-kind to `DayTime` (R1-6): `Date + INTERVAL '25' HOUR` promotes
+        // to `TIMESTAMP` in Spark, unlike day-only `INTERVAL '1' DAY`.
+        let ie = first_interval("SELECT INTERVAL '25' HOUR AS ivl");
+        assert_eq!(ie.months, 0);
+        assert_eq!(ie.days, 0);
+        assert_eq!(ie.microseconds, 25 * 3_600 * 1_000_000);
+        assert_eq!(ie.kind, IntervalKind::DayTime);
     }
 
     #[test]

@@ -791,6 +791,11 @@ case(
     lambda I: I["emp"].select(F.lit("1 day").cast(CalendarIntervalType()).alias("iv")),
     expected_error="UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION",
 )
+# intv-008: R1-6 fix witness. `F.expr(...)` routes the interval literal
+# through the SQL front-end (same lowering as intv-004), so a sub-day-field
+# DayTimeIntervalType (HOURS) promotes DATE to TIMESTAMP while a day-only
+# interval (intv-004's shape) stays DATE. Verified against Spark 4.1.1.
+case("intv-008", "interval", "date + sub-day INTERVAL promotes to TIMESTAMP (R1-6)", lambda I: I["emp"].select((F.col("hire_date") + F.expr("INTERVAL 25 HOURS")).alias("promoted"), (F.col("hire_date") - F.expr("INTERVAL 25 HOURS")).alias("promoted_sub")))
 
 # ── 25. Newer array / map functions ─────────────────────────────────────────
 case("arr2-001", "array_new", "array_append / array_prepend", lambda I: I["emp"].select(F.array_append("tags", "new").alias("ap"), F.array_prepend("tags", "first").alias("pp")))

@@ -240,18 +240,18 @@ pub struct ColumnReference {
     /// correlated outer reference (D2 — `resolve_column`'s tier-(g) arm /
     /// `resolve_in_outer` in `analyzer.rs`). Unlike `data_type`/`nullable`
     /// (stamped on every `ColumnReference` by construction, E4/D3), this
-    /// field stays `Option` — `None` on an otherwise-fully-resolved
-    /// reference only for tier-(d) in `resolve_column` and its outer twin,
-    /// the struct-qualifier arm of `resolve_in_outer` (`analyzer.rs`): a
-    /// qualifier naming a top-level STRUCT column resolves to a nested
-    /// FIELD's type, which has no attribute identity of its own to stamp
-    /// (only the struct COLUMN does; Spark's `ExtractValue` likewise keeps
-    /// the child's `exprId` on the child only). `derive_implicit_grouping`
-    /// (SQL `PIVOT` with no explicit grouping list) and the root reference
-    /// `try_rewrite_nested_struct_path` builds for a multi-level
-    /// nested-struct `ExtractValue` chain both stamp the real top-level
-    /// attribute's id (review finding 11) — the id was trivially available
-    /// at construction in both cases.
+    /// field stays `Option` for representational uniformity (an
+    /// `UnresolvedColumn` truly has none), but Pass F2 (stages 1-3) closed
+    /// every production gap that used to leave a RESOLVED reference
+    /// id-less: qualified struct-field access — local (tier-(d) in
+    /// `resolve_column`) AND correlated-outer (`resolve_in_outer`'s struct
+    /// arm) alike — resolves to an `ExtractValue` chain
+    /// (`analyzer.rs`'s `build_struct_extract_chain`) whose root
+    /// `ColumnReference` is stamped with the struct COLUMN's own real
+    /// attribute id (the LOCAL or OUTER schema's, as appropriate); every
+    /// other resolution tier already stamped a real id before this pass.
+    /// There is no longer a production site that returns a fully-resolved
+    /// `ColumnReference` with `expr_id: None`.
     ///
     /// Derived resolution data recording *which* attribute the reference
     /// bound to, not part of the reference's own logical identity — excluded
@@ -272,16 +272,19 @@ impl PartialEq for ColumnReference {
     /// future test must not rely on `==`/`assert_eq!`/`assert_ne!` to detect
     /// a type or nullability difference between two `ColumnReference`s —
     /// compare `.data_type`/`.nullable` directly instead. Production
-    /// consequence: `semantic_eq` over two ID-LESS references (`expr_id:
-    /// None` — tier-(d) struct-field refs and their outer twin) now
-    /// matches on canonicalized name alone regardless of type; identity
-    /// discrimination for id-carrying refs is `ids_compatible`'s job. Two
-    /// same-named struct fields of DIFFERENT types through different structs
-    /// can therefore alias in a rebind scan — a pre-existing id-less gap
-    /// (the same-type collision always misbound), widened knowingly and
-    /// consistent with `ids_compatible`'s documented contract; the real fix
-    /// is giving struct access identity (review finding 12, ExtractValue
-    /// unification).
+    /// consequence: Pass F2 (stages 1-3) unified BOTH local qualified
+    /// struct-field access (tier-(d) in `resolve_column`) AND its correlated
+    /// OUTER twin (`resolve_in_outer`'s struct arm) onto an `ExtractValue`
+    /// chain whose root `ColumnReference` carries the struct COLUMN's own
+    /// real attribute id — so a same-named struct field reached through a
+    /// DIFFERENT root struct (local or outer) is now discriminated by
+    /// `ids_compatible` on the distinct root ids, not by this id-blind `eq`.
+    /// Every resolved `ColumnReference` now carries a real `expr_id` (see
+    /// this field's own doc above), so the widened same-type-collision gap
+    /// this warning used to describe for id-less struct-field refs no longer
+    /// has a live production instance — a hazard here is now the same
+    /// generic risk `ids_compatible` guards for every OTHER id-carrying
+    /// reference.
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name && self.qualifier == other.qualifier
     }

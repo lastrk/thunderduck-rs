@@ -524,6 +524,14 @@ case("sq-022", "subquery", "de-correlatable avg (TPC-H Q17 shape)", "SELECT sum(
 # unresolvable qualified reference must raise UNRESOLVED_COLUMN instead of
 # silently mis-binding. This case goes green when τ raises the same class.
 case("sq-023", "subquery", "level-skipping correlation must raise UNRESOLVED_COLUMN (Spark parity)", "SELECT e.name FROM emp e WHERE e.salary > (SELECT avg(e2.salary) FROM emp e2 WHERE e2.dept_id <=> e.dept_id AND e2.age > (SELECT min(e3.age) FROM emp e3 WHERE e3.dept_id <=> e.dept_id))", expected_error="UNRESOLVED_COLUMN.WITH_SUGGESTION")
+# Pass F2 stage 3: correlated EXISTS referencing an OUTER struct field BARE
+# (no outer alias qualifier on `address` — it resolves via the outer emp
+# scope's own `address` struct column, not a relation alias). Spark itself
+# accepts this (live-Spark-verified): `address.city` inside the subquery
+# resolves to the outer `emp e` row's struct field, matching rows where
+# `dept.location` equals it (id 1 Alice / Vienna against dept_id 10 or 20,
+# both Vienna).
+case("sq-024", "subquery", "correlated EXISTS referencing outer struct field bare", "SELECT e.name FROM emp e WHERE EXISTS (SELECT 1 FROM dept WHERE dept.location = address.city)")
 
 # ── 9. CTEs (WITH) ───────────────────────────────────────────────────────────
 case("cte-001", "cte", "single CTE", "WITH ds AS (SELECT dept_id, avg(salary) a FROM emp GROUP BY dept_id) SELECT e.name, s.a FROM emp e JOIN ds s ON e.dept_id = s.dept_id")

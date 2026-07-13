@@ -7836,7 +7836,11 @@ mod tests {
     /// Keep-side: a qualifier that resolves as STRUCT-column access
     /// (`resolve_column`'s struct-precedence tier) survives because resolution
     /// never drops a struct qualifier (the struct-precedence tier runs at
-    /// analysis time); the old strip's misread hazard no longer applies.
+    /// analysis time); the old strip's misread hazard no longer applies. Pass
+    /// F2 stage 1: this now resolves to an `ExtractValue` chain rather than a
+    /// qualified `ColumnReference` at all — `(addr).city`, not `addr.city` —
+    /// so the case is even further out of the stranded-qualifier strip's
+    /// reach: there is no qualified reference left for that pass to see.
     #[test]
     fn struct_qualifier_survives_wrap_verbatim() {
         let _g = tap_guard();
@@ -7865,8 +7869,8 @@ mod tests {
         let typed = analyze(plan, &bt).expect("analyze");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(
-            sql.contains("addr.city"),
-            "struct-column access must NOT be stripped, got: {sql}"
+            sql.contains("(addr).city"),
+            "struct-column access must render as an ExtractValue chain, got: {sql}"
         );
     }
 

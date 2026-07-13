@@ -51,7 +51,7 @@ use super::expression::{
     LiteralValue, SortOrder, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
 use super::name_fold::{eq_fold, fold_key};
-use super::schema::{Attribute, ExprId, ResolvedSchema};
+use super::schema::{Attribute, ResolvedSchema};
 use super::type_inference::{
     is_aggregate_classifier_name, is_nondeterministic_fn_name, TypeInferenceEngine,
 };
@@ -4016,13 +4016,11 @@ fn semantic_eq_against(ca_fixed: &Expression, entry: &Expression) -> bool {
 /// input columns that happen to share a (qualifier-stripped) name — e.g.
 /// `t1.x` and `t2.x` after a join — canonicalize and `==`-compare IDENTICAL,
 /// so without this pass `semantic_eq` would bind to whichever SELECT-list
-/// entry happens to come first, silently picking the wrong one. When either
-/// side lacks an `expr_id` (D2: tier (g) in [`resolve_column`] now stamps a
-/// correlated outer reference's id too — the analyzer paths that still
-/// leave one unstamped are enumerated on
-/// [`super::expression::ColumnReference::expr_id`]'s doc), the
-/// qualifier-stripped name match `==` already performed is the best
-/// identity available; no further constraint is imposed.
+/// entry happens to come first, silently picking the wrong one. D2/Pass F2:
+/// every resolved `ColumnReference` now carries a real `expr_id` (see
+/// [`super::expression::ColumnReference::expr_id`]'s doc — no remaining
+/// production site returns one `None`), so the `(None, _) => true` fallback
+/// below is a defensive default rather than a live escape hatch.
 fn ids_compatible(a: &Expression, b: &Expression) -> bool {
     match (a, b) {
         (Expression::ColumnReference(ca), Expression::ColumnReference(cb)) => {
@@ -4343,84 +4341,38 @@ impl<'a> ResolveContext<'a> {
     }
 }
 
-/// Detect multi-level nested-struct field access like `F.col("address.geo.lat")`
-/// and rewrite it as an `ExtractValue` chain rooted at the top-level struct
-/// column. Returns `None` when the input is not a nested-struct path or when
-/// the tail does not resolve against the schema; callers fall back to the
-/// standard column-resolution logic.
+/// Build an `ExtractValue` chain rooted at `root` (the top-level struct
+/// COLUMN's own attribute — the source of the id/type/nullability stamped on
+/// the chain's root `ColumnReference`), walking `field_path`'s dot-separated
+/// segments as successive `ExtractValue` extractions. Shared by tier-(d)'s
+/// single- and (pre-Stage-2) multi-level struct-field resolution and its
+/// outer twin (`resolve_in_outer`'s struct arm, Stage 3) — the one
+/// construction site for "qualifier names a struct column, tail names a
+/// field path inside it".
 ///
-/// Requirements for a rewrite:
-/// * `u.qualifier` is `Some(q)`
-/// * `q` is not a synthetic join qualifier (`__td_jl` / `__td_jr`) and has no
-///   `plan_id` attached (both signal a table-level qualifier, not struct nav)
-/// * `u.name` contains at least one `.` (single-level `qualifier.name` already
-///   emits correctly as `"qualifier"."name"` in DuckDB)
-/// * `q` names a top-level struct column in `schema` and the dot-separated
-///   segments of `u.name` traverse a chain of struct fields
-fn try_rewrite_nested_struct_path(
-    u: &UnresolvedColumn,
-    schema: &ResolvedSchema,
-) -> Option<Expression> {
-    if u.plan_id.is_some() {
-        return None;
-    }
-    if !u.name.contains('.') {
-        return None;
-    }
-    let qualifier = u.qualifier.as_deref()?;
-    if qualifier == TD_JOIN_LEFT || qualifier == TD_JOIN_RIGHT {
-        return None;
-    }
-    let root_field = schema.field_by_name(qualifier)?;
-    let mut current_type = match &root_field.data_type {
-        DataType::Struct(st) => st.clone(),
-        _ => return None,
-    };
-    let segments: Vec<&str> = u.name.split('.').collect();
-    // Validate every intermediate segment is a struct-typed field before
-    // committing to a rewrite. If any segment fails to resolve, return None
-    // and let the standard resolver emit a proper `UnknownColumn` error.
-    for seg in &segments[..segments.len() - 1] {
-        let f = current_type.field_by_name(seg)?;
-        match &f.data_type {
-            DataType::Struct(st) => current_type = st.clone(),
-            _ => return None,
-        }
-    }
-    // Terminal segment must be an existing field on the innermost struct.
-    let last = segments.last()?;
-    current_type.field_by_name(last)?;
-
-    // Build the chain bottom-up starting from a bare ColumnReference to the
-    // top-level struct column, stamped directly with `root_field`'s own
-    // data_type/nullable. (`resolve_and_stamp`'s schema-lookup fallback
-    // would in fact resolve the same top-level column by name — stamping at
-    // construction is simply the clearer, self-contained choice: the ref is
-    // fully resolved the moment it exists, with no reliance on a later walk.)
-    //
-    // `expr_id`: `root_field` IS the real top-level attribute this reference
-    // names, so its id is stamped directly — the ExtractValue chain's root
-    // ref carries the struct COLUMN's own id, matching Spark's
-    // `GetStructField`-child-`exprId` model (the child ref names the whole
-    // column and keeps its identity; only the synthesized `ExtractValue`
-    // nodes above it are id-less, same as `GetStructField` itself).
+/// `expr_id`: `root` IS the real top-level attribute this reference names,
+/// so its id is stamped directly on the chain's root ref — matching Spark's
+/// `GetStructField`-child-`exprId` model (the child ref names the whole
+/// column and keeps its identity; only the synthesized `ExtractValue` nodes
+/// above it are id-less, same as `GetStructField` itself).
+fn build_struct_extract_chain(root: &Attribute, field_path: &str) -> Expression {
     let mut expr = Expression::ColumnReference(ColumnReference {
-        name: qualifier.to_owned(),
+        name: root.name.clone(),
         qualifier: None,
-        data_type: root_field.data_type.clone(),
-        nullable: root_field.nullable,
-        expr_id: Some(root_field.expr_id),
+        data_type: root.data_type.clone(),
+        nullable: root.nullable,
+        expr_id: Some(root.expr_id),
     });
-    for seg in &segments {
+    for seg in field_path.split('.') {
         expr = Expression::ExtractValue(ExtractValueExpression {
             child: Box::new(expr),
             extraction: Box::new(Expression::Literal(Literal {
-                value: LiteralValue::String((*seg).to_owned()),
+                value: LiteralValue::String(seg.to_owned()),
                 data_type: DataType::String,
             })),
         });
     }
-    Some(expr)
+    expr
 }
 
 /// Attempt to resolve an [`UnresolvedColumn`] against the outer (enclosing)
@@ -4434,31 +4386,32 @@ fn try_rewrite_nested_struct_path(
 /// when exactly one case-insensitive match exists across the outer schema's
 /// fields (zero or 2+ matches yield `None`).
 ///
-/// D2: returns the matched OUTER [`super::schema::ExprId`] alongside the
-/// type/nullability — [`resolve_column`]'s tier-(g) arm stamps it onto the
-/// `ColumnReference` verbatim. Global id uniqueness (one process-wide
-/// `AtomicU64`, `schema.rs`) makes this sound: the returned id can only
-/// equal a local (inner-schema) id if it genuinely is that same attribute,
-/// which never happens here by construction (an outer-scope lookup is only
-/// reached after every inner tier already failed to resolve the name).
-/// The id slot is `None` for the struct-qualifier arm only — a nested
-/// struct field carries no attribute identity of its own (ADR-024
-/// identifies whole columns, not sub-paths within one; Spark's
-/// `ExtractValue` likewise keeps the child's `exprId` on the child only),
-/// mirroring the local tier-(d) twin in [`resolve_column`].
-fn resolve_in_outer(
-    u: &UnresolvedColumn,
-    outer: OuterScope<'_>,
-) -> Option<(DataType, bool, Option<ExprId>)> {
+/// Returns the fully-built [`Expression`] on a hit, so [`resolve_column`]'s
+/// tier-(g) arm simply returns it. D2/Pass F2 stage 3: EVERY arm now stamps a
+/// real [`super::schema::ExprId`] — the struct-qualifier arm builds an
+/// `ExtractValue` chain via [`build_struct_extract_chain`] rooted at the
+/// OUTER struct COLUMN's own attribute (mirroring the local tier-(d) twin in
+/// [`resolve_column`], Pass F2 stages 1-2), and the relation-alias/unqualified
+/// arms stamp the matched outer attribute's id directly onto a
+/// [`ColumnReference`] that preserves the original qualifier verbatim (`e.g.`
+/// a correlated `e.salary` renders exactly as written; DuckDB's own
+/// correlated-subquery binder resolves it at runtime — same mechanism the
+/// pre-existing green correlated subquery cases ride). Global id uniqueness
+/// (one process-wide `AtomicU64`, `schema.rs`) makes stamping an OUTER id
+/// sound even though it is compared against LOCAL schemas elsewhere: the
+/// returned id can only equal a local (inner-schema) id if it genuinely is
+/// that same attribute, which never happens here by construction (an
+/// outer-scope lookup is only reached after every inner tier already failed
+/// to resolve the name).
+fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<Expression> {
     if let Some(q) = u.qualifier.as_deref() {
         // Struct-column precedence in the outer schema (matches resolve_column's
-        // existing tier ordering). No id: the reference names the nested
-        // FIELD while the only attribute here is the struct COLUMN —
-        // stamping the column's id would create an (id, name)-disagreeing
-        // reference. Local tier-(d) makes the same choice.
-        if let Some(info) = TypeInferenceEngine::struct_qualifier_info(&u.name, q, outer.schema) {
-            let (dt, nullable) = info;
-            return Some((dt, nullable, None));
+        // existing tier ordering) — same `ExtractValue`-chain construction as
+        // the local tier-(d) twin, rooted at the OUTER struct column's own
+        // attribute.
+        if TypeInferenceEngine::struct_qualifier_info(&u.name, q, outer.schema).is_some() {
+            let root = outer.schema.field_by_name(q)?;
+            return Some(build_struct_extract_chain(root, &u.name));
         }
         // Relation-alias scope in the outer context.
         let range = outer.scopes.lookup(q)?;
@@ -4471,20 +4424,34 @@ fn resolve_in_outer(
         // `attr` borrows directly from `outer.schema.fields` (via `slice`, a
         // sub-slice of it), so its `expr_id` needs no `range.start +`
         // re-basing — it already names the right field wherever it lives.
-        Some((dt, nullable, Some(attr.expr_id)))
+        Some(Expression::ColumnReference(ColumnReference {
+            name: u.name.clone(),
+            qualifier: u.qualifier.clone(),
+            data_type: dt,
+            nullable,
+            expr_id: Some(attr.expr_id),
+        }))
     } else {
         // Unqualified: exactly-one case-insensitive match in the outer schema.
-        let mut found: Option<(DataType, bool, Option<ExprId>)> = None;
+        let mut found: Option<&Attribute> = None;
         for f in &outer.schema.fields {
             if eq_fold(&f.name, &u.name) {
                 if found.is_some() {
                     // 2+ matches — ambiguous; do not silently pick one.
                     return None;
                 }
-                found = Some((f.data_type.clone(), f.nullable, Some(f.expr_id)));
+                found = Some(f);
             }
         }
-        found
+        found.map(|f| {
+            Expression::ColumnReference(ColumnReference {
+                name: u.name.clone(),
+                qualifier: u.qualifier.clone(),
+                data_type: f.data_type.clone(),
+                nullable: f.nullable,
+                expr_id: Some(f.expr_id),
+            })
+        })
     }
 }
 
@@ -4493,13 +4460,13 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     // here as `UnresolvedColumn { qualifier: Some("address"), name: "geo.lat" }`
     // (the Spark Connect converter does a single `splitn(2, '.')`). Emitting
     // this ColumnReference verbatim produces `"address"."geo.lat"` which DuckDB
-    // rejects because it treats `geo.lat` as a single field key. When the
-    // qualifier matches a top-level struct column and the tail is a valid
-    // nested field path, rewrite as an `ExtractValue` chain so emission goes
-    // through the struct-field access path.
-    if let Some(chain) = try_rewrite_nested_struct_path(&u, ctx.schema) {
-        return Ok(chain);
-    }
+    // rejects because it treats `geo.lat` as a single field key. Pass F2 stage
+    // 2: this is no longer a separate rewrite ahead of tier (d) below — a
+    // qualifier naming a top-level struct column resolves through tier (d)'s
+    // `struct_qualifier_info` (single- AND multi-level dotted paths both
+    // resolve there via `resolve_nested_field`) and `build_struct_extract_chain`
+    // handles the ExtractValue chain construction uniformly regardless of
+    // path depth.
     // Unqualified: surface `AmbiguousColumn` whenever more than one field
     // (case-insensitive match, matching `field_by_name`'s Spark-compatible
     // rule) resolves. This is the single, central ambiguity check point —
@@ -4604,12 +4571,22 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         // Qualified, non-synthetic: (d) a qualifier naming a top-level STRUCT
         // column wins over a relation-alias scope — struct-field access takes
         // precedence, matching the pre-existing behavior this pass preserves.
-        // The resolved field lives inside the struct, not at a top-level
-        // position in `ctx.schema` — no attribute identity to stamp.
-        if let Some((dt, nullable)) =
-            TypeInferenceEngine::struct_qualifier_info(&u.name, q, ctx.schema)
-        {
-            (dt, nullable, None)
+        // `struct_qualifier_info` resolves both single-level (`field_by_name`)
+        // and dotted multi-level (`resolve_nested_field`) tails against the
+        // struct; either way this resolves to an `ExtractValue` chain rooted
+        // at the struct COLUMN's own attribute (Pass F2 stages 1-2) rather
+        // than a raw qualified `ColumnReference` — DuckDB rejects
+        // `"address"."geo.lat"` for multi-level paths, and unifying
+        // single-level onto the same chain gives the root ref real attribute
+        // identity instead of an id-less stamp. `q`'s own spelling is
+        // discarded in favor of the schema's canonical `root.name` (DuckDB
+        // identifiers are case-insensitive, so this cannot change emitted
+        // behavior for any case-varying user spelling).
+        if TypeInferenceEngine::struct_qualifier_info(&u.name, q, ctx.schema).is_some() {
+            let root = ctx.schema.field_by_name(q).expect(
+                "struct_qualifier_info matched q as a top-level struct column on this same schema",
+            );
+            return Ok(build_struct_extract_chain(root, &u.name));
         } else {
             match ctx.scoped_range(q) {
                 // (e) qualifier binds exactly one in-bounds relation scope —
@@ -4758,28 +4735,22 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     if matches!(dt, DataType::Unresolved) {
         // (g) Outer-scope fallback: when ALL inner tiers have failed and an
         // enclosing plan's scope is available (inside a subquery), attempt to
-        // resolve the reference against the outer plan's schema. On hit, stamp
-        // the ColumnReference with the outer type/nullability/identity and
-        // preserve the qualifier verbatim — emission renders it as-is, and
-        // DuckDB's own correlated-subquery binder resolves it at runtime
-        // (same mechanism the 13 existing green correlated subquery cases
-        // ride). D2: the stamped `expr_id` is the OUTER attribute's — never
-        // equal to any id in `ctx.schema` (ids are minted from one
-        // process-global counter, so an outer id can only coincide with a
-        // local one if it genuinely IS that same attribute), so every local
-        // consumer that binds by id-in-local-schema still misses exactly as
-        // it did when this arm stamped `None`.
+        // resolve the reference against the outer plan's schema —
+        // `resolve_in_outer` builds the fully-stamped `Expression` itself
+        // (either an `ExtractValue` chain for outer struct-field access, or a
+        // `ColumnReference` preserving the qualifier verbatim so emission
+        // renders it as-is and DuckDB's own correlated-subquery binder
+        // resolves it at runtime — same mechanism the pre-existing green
+        // correlated subquery cases ride). D2/Pass F2 stage 3: every arm's
+        // stamped `expr_id` is the OUTER attribute's — never equal to any id
+        // in `ctx.schema` (ids are minted from one process-global counter, so
+        // an outer id can only coincide with a local one if it genuinely IS
+        // that same attribute), so every local consumer that binds by
+        // id-in-local-schema still misses exactly as it would have missed
+        // before this pass.
         if let Some(outer) = ctx.outer {
-            if let Some((outer_dt, outer_nullable, outer_id)) = resolve_in_outer(&u, outer) {
-                return Ok(Expression::ColumnReference(ColumnReference {
-                    name: u.name,
-                    qualifier: u.qualifier,
-                    data_type: outer_dt,
-                    nullable: outer_nullable,
-                    // `None` only for the outer struct-qualifier arm — see
-                    // `resolve_in_outer`'s doc.
-                    expr_id: outer_id,
-                }));
+            if let Some(expr) = resolve_in_outer(&u, outer) {
+                return Ok(expr);
             }
         }
         return Err(AnalyzerError::UnknownColumn {
@@ -7544,6 +7515,107 @@ mod tests {
                 other => panic!("expected Analyzed subquery, got {other:?}"),
             },
             other => panic!("expected Filter/InSubquery, got {other:?}"),
+        }
+    }
+
+    /// Pass F2 stage 3: a correlated qualifier naming a top-level STRUCT
+    /// column in the OUTER schema — `EXISTS (SELECT ... WHERE dept.location =
+    /// address.city)`, `address` bound only on the OUTER `emp` side — must
+    /// resolve through `resolve_in_outer`'s struct arm to an `ExtractValue`
+    /// chain rooted at the OUTER `address` attribute's own id, mirroring the
+    /// LOCAL tier-(d) twin. Live-Spark-verified shape (orchestrator probe):
+    /// Spark itself accepts this correlated bare-struct-field reference.
+    #[test]
+    fn resolve_in_outer_struct_arm_becomes_extract_value_chain_rooted_at_outer_id() {
+        let addr_ty = DataType::Struct(StructType::new(vec![StructField::nullable(
+            "city",
+            DataType::String,
+        )]));
+        let bt = base_types_for(&[
+            (
+                "emp",
+                StructType::new(vec![
+                    StructField::not_null("id", DataType::Long),
+                    StructField::nullable("address", addr_ty),
+                ]),
+            ),
+            (
+                "dept",
+                StructType::new(vec![
+                    StructField::not_null("dept_id", DataType::Integer),
+                    StructField::nullable("location", DataType::String),
+                ]),
+            ),
+        ]);
+        // SELECT * FROM emp e WHERE EXISTS (
+        //     SELECT * FROM dept WHERE dept.location = address.city
+        // )
+        let inner = CommonAst::new(CommonOp::Filter {
+            input: Box::new(scan("dept")),
+            condition: Expression::Binary(BinaryExpression {
+                op: BinaryOp::Eq,
+                left: Box::new(qcol("dept", "location")),
+                right: Box::new(qcol("address", "city")),
+            }),
+        });
+        let ast = CommonAst::new(CommonOp::Filter {
+            input: Box::new(CommonAst::new(CommonOp::AliasedRelation {
+                input: Box::new(scan("emp")),
+                alias: "e".to_owned(),
+            })),
+            condition: Expression::ExistsSubquery(ExistsSubquery {
+                subquery: SubqueryPlan::Unanalyzed(Box::new(inner)),
+                negated: false,
+            }),
+        });
+        let typed = analyze(ast, &bt).expect("correlated outer struct-field ref must resolve");
+        let outer_address_id = typed
+            .resolved_schema
+            .field_by_name("address")
+            .expect("emp has an address field")
+            .expr_id;
+        match &typed.op {
+            TypedOp::Filter {
+                condition: Expression::ExistsSubquery(e),
+                ..
+            } => match &e.subquery {
+                SubqueryPlan::Analyzed(inner_typed) => match &inner_typed.op {
+                    TypedOp::Filter {
+                        condition: Expression::Binary(b),
+                        ..
+                    } => match b.right.as_ref() {
+                        Expression::ExtractValue(ev) => {
+                            match ev.child.as_ref() {
+                                Expression::ColumnReference(c) => {
+                                    assert_eq!(c.name, "address");
+                                    assert!(c.qualifier.is_none(), "chain root is unqualified");
+                                    assert_eq!(
+                                        c.expr_id,
+                                        Some(outer_address_id),
+                                        "chain root must carry the OUTER address attribute's own id"
+                                    );
+                                }
+                                other => {
+                                    panic!(
+                                        "expected root ColumnReference('address'), got {other:?}"
+                                    )
+                                }
+                            }
+                            match ev.extraction.as_ref() {
+                                Expression::Literal(Literal {
+                                    value: LiteralValue::String(s),
+                                    ..
+                                }) => assert_eq!(s, "city"),
+                                other => panic!("expected String literal 'city', got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected ExtractValue, got {other:?}"),
+                    },
+                    other => panic!("expected inner Filter, got {other:?}"),
+                },
+                other => panic!("expected Analyzed subquery, got {other:?}"),
+            },
+            other => panic!("expected Filter/ExistsSubquery, got {other:?}"),
         }
     }
 
@@ -10330,11 +10402,14 @@ mod tests {
         assert!(typed.resolved_schema.fields[0].nullable);
     }
 
-    /// Single-level dot access (`F.col("address.city")`, struct-002) must
-    /// NOT be rewritten — it already emits correctly as `"address"."city"`
-    /// and we want zero regression on the passing case.
+    /// Single-level dot access (`F.col("address.city")`, struct-002) — Pass
+    /// F2 stage 1 unifies this onto the SAME `ExtractValue` chain shape as
+    /// the multi-level case above, rather than a raw qualified
+    /// `ColumnReference`: the chain's root now carries the struct COLUMN's
+    /// own real attribute id (previously `None` under the discarded
+    /// `(dt, nullable, None)` tuple tier-(d) used to return).
     #[test]
-    fn resolve_single_level_nested_struct_path_stays_as_column_reference() {
+    fn resolve_single_level_nested_struct_path_becomes_extract_value_chain() {
         let bt = base_types_with_nested_struct();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
@@ -10345,13 +10420,131 @@ mod tests {
             TypedOp::Project { projections, .. } => projections,
             other => panic!("expected Project, got {other:?}"),
         };
-        match &proj[0] {
-            Expression::ColumnReference(c) => {
-                assert_eq!(c.name, "city");
-                assert_eq!(c.qualifier.as_deref(), Some("address"));
-            }
-            other => panic!("expected ColumnReference, got {other:?}"),
+        assert_eq!(proj.len(), 1, "single projection");
+        // N8: an unaliased computed entry is wrapped as `Alias(expr, name)` —
+        // the pretty name of the leaf `ExtractValue` is its extraction key,
+        // "city".
+        let wrapped = match &proj[0] {
+            Expression::Alias(a) => a,
+            other => panic!("expected Alias (N8), got {other:?}"),
+        };
+        assert_eq!(wrapped.alias, "city");
+        let ev = match wrapped.expr.as_ref() {
+            Expression::ExtractValue(ev) => ev,
+            other => panic!("expected ExtractValue, got {other:?}"),
+        };
+        match ev.extraction.as_ref() {
+            Expression::Literal(Literal {
+                value: LiteralValue::String(s),
+                ..
+            }) => assert_eq!(s, "city"),
+            other => panic!("expected String literal 'city', got {other:?}"),
         }
+        match ev.child.as_ref() {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.name, "address");
+                assert!(c.qualifier.is_none(), "root ColumnReference is unqualified");
+            }
+            other => panic!("expected root ColumnReference('address'), got {other:?}"),
+        }
+        // Output schema records the leaf field type — nullable String.
+        assert_eq!(typed.resolved_schema.fields.len(), 1);
+        assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::String);
+        assert!(typed.resolved_schema.fields[0].nullable);
+    }
+
+    /// The `ExtractValue` chain's root `ColumnReference` carries the SAME
+    /// `expr_id` as `address`'s own attribute in the input schema — Pass F2
+    /// stage 1's central claim: the struct COLUMN's real identity is now
+    /// stamped on the chain root rather than discarded.
+    #[test]
+    fn resolve_single_level_nested_struct_path_root_carries_column_expr_id() {
+        // Project the raw `address` column ALONGSIDE `address.city` in the
+        // SAME `analyze()` call, so both resolve against the identical
+        // (single) `TableScan`-minted `address` attribute — comparing ids
+        // minted across two SEPARATE `analyze()` calls would be comparing
+        // two different mints, not the same identity.
+        let bt = base_types_with_nested_struct();
+        let ast = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![unresolved_col("address"), qcol("address", "city")],
+        });
+        let typed = analyze(ast, &bt).expect("projections must resolve");
+        let proj = match &typed.op {
+            TypedOp::Project { projections, .. } => projections,
+            other => panic!("expected Project, got {other:?}"),
+        };
+        assert_eq!(proj.len(), 2);
+        let address_id = match &proj[0] {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.name, "address");
+                c.expr_id
+                    .expect("raw address column reference is id-carrying")
+            }
+            other => panic!("expected ColumnReference('address'), got {other:?}"),
+        };
+        let wrapped = match &proj[1] {
+            Expression::Alias(a) => a,
+            other => panic!("expected Alias (N8), got {other:?}"),
+        };
+        let ev = match wrapped.expr.as_ref() {
+            Expression::ExtractValue(ev) => ev,
+            other => panic!("expected ExtractValue, got {other:?}"),
+        };
+        match ev.child.as_ref() {
+            Expression::ColumnReference(c) => {
+                assert_eq!(
+                    c.expr_id,
+                    Some(address_id),
+                    "chain root must carry the SAME id as the raw address column reference"
+                );
+            }
+            other => panic!("expected root ColumnReference('address'), got {other:?}"),
+        }
+    }
+
+    /// Two same-named struct fields (`x`) of DIFFERENT types, reached through
+    /// two DIFFERENT root struct columns, must be DISCRIMINATED by
+    /// `semantic_eq` — Pass F2 stage 1's central claim. Before this pass,
+    /// tier-(d) stamped `expr_id: None` on the chain's root, so
+    /// `ids_compatible`'s `(None, _) => true` escape hatch let the two
+    /// canonicalize-`==` (name/qualifier-only) `ExtractValue` trees collide;
+    /// now the root carries its OWN struct column's real id, so
+    /// `ids_compatible` sees `(Some(id_a), Some(id_b))` and correctly rejects
+    /// the mismatch.
+    #[test]
+    fn semantic_eq_rejects_same_named_struct_field_different_root_ids() {
+        let id_a = ExprId::fresh();
+        let id_b = ExprId::fresh();
+        assert_ne!(id_a, id_b);
+        let extract = |root_name: &str, root_id: ExprId, field_ty: DataType| {
+            Expression::ExtractValue(ExtractValueExpression {
+                child: Box::new(Expression::ColumnReference(ColumnReference {
+                    name: root_name.to_owned(),
+                    qualifier: None,
+                    data_type: DataType::Struct(StructType::new(vec![StructField::nullable(
+                        "x",
+                        field_ty.clone(),
+                    )])),
+                    nullable: true,
+                    expr_id: Some(root_id),
+                })),
+                extraction: Box::new(Expression::Literal(Literal {
+                    value: LiteralValue::String("x".to_owned()),
+                    data_type: DataType::String,
+                })),
+            })
+        };
+        // Same root NAME ("s") on both sides (as would arise from two
+        // differently-scoped occurrences canonicalizing identically), same
+        // field key "x", but DIFFERENT root ids and DIFFERENT field types.
+        let a = extract("s", id_a, DataType::Integer);
+        let b = extract("s", id_b, DataType::String);
+        assert!(
+            !semantic_eq(&a, &b),
+            "same-named struct field through different root columns must not \
+             semantic_eq-collide just because the canonicalized shapes agree"
+        );
     }
 
     /// Unknown nested field on an otherwise valid struct qualifier must

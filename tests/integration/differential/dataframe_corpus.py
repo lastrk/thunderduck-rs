@@ -602,6 +602,7 @@ case("struct-005", "struct", "withField (add/replace nested)", lambda I: I["emp"
 case("struct-006", "struct", "dropFields", lambda I: I["emp"].withColumn("address", F.col("address").dropFields("geo")))
 case("struct-007", "struct", "named_struct of expressions", lambda I: I["emp"].select(F.expr("named_struct('hi', salary > 100000, 'agep1', age + 1)").alias("s")))
 case("struct-008", "struct", "star-expand a struct", lambda I: I["emp"].select("id", "address.*"))
+case("struct-009", "struct", "unaliased single-level dot access (string select)", lambda I: I["emp"].select("address.city"))
 
 # ── 17. Higher-order functions ──────────────────────────────────────────────
 case("hof-001", "hof", "transform (array map)", lambda I: I["emp"].select(F.transform("tags", lambda x: F.upper(x)).alias("up_tags")))

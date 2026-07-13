@@ -2728,9 +2728,10 @@ fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionEr
         Expr::CompoundIdentifier(parts) => {
             // Lower a dotted reference as first-part qualifier / dotted
             // remainder — mirroring the Spark Connect converter's `splitn(2,'.')`
-            // shape the analyzer's nested-struct rewrite (analyzer.rs
-            // `try_rewrite_nested_struct_path`) is written for. A 3-part struct
-            // path `address.geo.lat` becomes `UnresolvedColumn{qualifier:
+            // shape the analyzer's nested-struct resolution (analyzer.rs
+            // `resolve_column`'s tier (d), via `struct_qualifier_info` /
+            // `build_struct_extract_chain`, Pass F2) is written for. A 3-part
+            // struct path `address.geo.lat` becomes `UnresolvedColumn{qualifier:
             // "address", name:"geo.lat"}` so the analyzer can walk the struct;
             // 2-part refs `t.c` are byte-identical to before (parts[0] qualifier,
             // parts[1] name). Corpus witness: cx-004.

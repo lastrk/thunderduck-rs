@@ -400,24 +400,30 @@ struct SideNeedsAlias {
 }
 
 /// Rewrite every join-CONDITION [`ColumnReference`] to the qualifier the
-/// EMITTED sides make true, resolved POSITIONALLY from the reference's
-/// analyzer-stamped `ordinal` (ADR-023 Phase 2/3b, `__td_jl`/`__td_jr`
-/// retirement for condition references): a name unique in `cond_schema`
-/// binds bare (`qualifier = None`); an ambiguous one binds through
-/// [`FromScope::alias_for`] against whichever side the ordinal falls in.
-/// Phase 3b: the analyzer never stamps a synthetic `__td_jl`/`__td_jr`
-/// qualifier anymore (every plan_id-scoped ref resolves bare+ordinal), so
-/// the ordinal's side (`k < left_len`) is the ONLY signal this rewrite ever
-/// consults.
+/// EMITTED sides make true, resolved BY IDENTITY from the reference's
+/// resolver-stamped `expr_id` (N10-lite stage 2; supersedes the
+/// ordinal-keyed ADR-023 Phase 2/3b rewrite, `__td_jl`/`__td_jr` retirement
+/// for condition references): a name unique in `cond_schema` binds bare
+/// (`qualifier = None`); an ambiguous one binds through
+/// [`FromScope::alias_for`] against whichever side the id-resolved slot
+/// falls in. Phase 3b: the analyzer never stamps a synthetic
+/// `__td_jl`/`__td_jr` qualifier anymore (every plan_id-scoped ref resolves
+/// bare+id), so the id-resolved slot's side (`k < left_len`) is the ONLY
+/// signal this rewrite ever consults. Sound only because a join's left and
+/// right sides can never share an `expr_id` — see the disjointness pin
+/// (`self_join_left_right_resolved_schema_ids_are_disjoint`,
+/// `analyzer.rs`) and the `debug_assert` below.
 ///
-/// Left untouched: a reference whose `ordinal` is `None` (correlated /
-/// deferred resolution) and one carrying a real, non-synthetic user-alias
-/// qualifier (already binds — e.g. `e.dept_id`).
+/// Left untouched: a reference whose `expr_id` is `None` (correlated /
+/// deferred resolution) or absent from `cond_schema` (a loud DuckDB binder
+/// error surfaces instead of a silent wrong-column rewrite), and one
+/// carrying a real, non-synthetic user-alias qualifier (already binds —
+/// e.g. `e.dept_id`).
 ///
 /// Returns the rewritten [`Expression`] tree (clone-then-walk via
 /// [`Expression::map_children`], the same fallible-fold primitive the
 /// analyzer's own expression walkers use — see `reproject_qualifiers`).
-/// `Err(SideNeedsAlias)` when a demanded ambiguous ordinal has no
+/// `Err(SideNeedsAlias)` when a demanded ambiguous id-resolved slot has no
 /// unambiguous covering alias on its side; [`build_join`]'s fixpoint then
 /// wraps the flagged side(s) under a fresh alias and retries.
 fn requalify_join_condition(
@@ -431,6 +437,20 @@ fn requalify_join_condition(
     let left_len = left.resolved_schema.len();
     let left_scope = FromScope::of(left, left_item);
     let right_scope = FromScope::of(right, right_item);
+    // N10-lite stage 2 disjointness guard: `requalify_column_ref`'s
+    // `k < left_len` side split is keyed off `expr_id`, so it is sound only
+    // if the two sides' id sets never intersect — mechanically pinned by
+    // `self_join_left_right_resolved_schema_ids_are_disjoint` (analyzer.rs);
+    // this debug_assert catches any future violation of that pin directly
+    // at the point the split is consumed.
+    debug_assert!(
+        left.resolved_schema.fields.iter().all(|lf| right
+            .resolved_schema
+            .fields
+            .iter()
+            .all(|rf| lf.expr_id != rf.expr_id)),
+        "join left/right resolved_schema expr_id sets must be disjoint"
+    );
     let mut needs = SideNeedsAlias::default();
     let rewritten = requalify_expr(
         cond.clone(),
@@ -489,12 +509,14 @@ fn requalify_expr(
     }
 }
 
-/// The rewrite predicate (H8 boundary). `c.ordinal` must be in-bounds in
-/// `cond_schema` AND `c.qualifier` must be `None` with `c.name` ambiguous
-/// (count `>= 2`) in `cond_schema` — otherwise `c` is left untouched
-/// (correlated/deferred, or a real alias that already binds). Phase 3b: the
-/// analyzer never stamps a synthetic `__td_jl`/`__td_jr` qualifier anymore,
-/// so this is the only shape a rewritable reference can take.
+/// The rewrite predicate (H8 boundary), N10-lite stage 2: `c.qualifier`
+/// must be `None` with `c.name` ambiguous (count `>= 2`) in `cond_schema`
+/// AND `c.expr_id` must name a field actually present in `cond_schema` (at
+/// position `k`) — otherwise `c` is left untouched (correlated/deferred, an
+/// id absent from `cond_schema`, or a real alias that already binds).
+/// Phase 3b: the analyzer never stamps a synthetic `__td_jl`/`__td_jr`
+/// qualifier anymore, so this is the only shape a rewritable reference can
+/// take.
 ///
 /// By construction (see `resolve_column`), a bare reference with an
 /// ambiguous name that reaches here is already guaranteed ambiguous in
@@ -508,10 +530,15 @@ fn requalify_column_ref(
     right_scope: &FromScope,
     needs: &mut SideNeedsAlias,
 ) {
-    let Some(k) = c.ordinal else { return };
-    if k >= cond_schema.len() {
-        return;
-    }
+    // ADR-024 transition assert (review NIT — symmetric with
+    // `bare_dup_slot`'s): a resolver tier must never stamp an ordinal
+    // without the matching attribute's expr_id.
+    debug_assert!(
+        c.ordinal.is_none() || c.expr_id.is_some(),
+        "ADR-024: ordinal stamped without expr_id on `{}`",
+        c.name
+    );
+    let Some(id) = c.expr_id else { return };
     let name_count = cond_schema
         .fields
         .iter()
@@ -520,12 +547,15 @@ fn requalify_column_ref(
     if !(c.qualifier.is_none() && name_count >= 2) {
         return;
     }
-    // H8 assert 1 (load-bearing): the ordinal must name the SAME column the
-    // reference carries — a merged-vs-local ordinal mixup would silently
-    // requalify the wrong physical column.
+    let Some(k) = cond_schema.fields.iter().position(|f| f.expr_id == id) else {
+        return;
+    };
+    // H8 assert 1 (load-bearing; now guards resolver stamping bugs): the
+    // id-resolved slot must name the SAME column the reference carries — an
+    // id/name mismatch would silently requalify the wrong physical column.
     debug_assert!(
         cond_schema.fields[k].name.eq_ignore_ascii_case(&c.name),
-        "ordinal/name agreement: cond_schema[{k}] ({}) must match reference name ({})",
+        "id/name agreement: cond_schema[{k}] ({}) must match reference name ({})",
         cond_schema.fields[k].name,
         c.name
     );
@@ -1129,21 +1159,22 @@ fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
         .any(|(name, _)| name.eq_ignore_ascii_case(q))
 }
 
-/// Phase 3b shared predicate (H8 boundary): `Some(k)` iff `c.qualifier` is
-/// `None`, `c.ordinal` is `Some(k)` with `k < schema.len()`, and `c.name` is
-/// duplicated (`>=2`, case-insensitive) in `schema` — the exact shape a
-/// bare-ordinal reference must have to be rewritten positionally (the
-/// governing invariant: this shape is produced ONLY by a resolver tier that
-/// stamped `k` against this same `schema`). Shared by [`requalify_visible`]'s
-/// merge-path rewrite and [`reproject_qualifiers`]'s wrap-path ordinal arm —
-/// single authority for the debug_assert guard, so both call sites stay in
+/// N10-lite shared predicate (H8 boundary): `Some(k)` iff `c.qualifier` is
+/// `None`, `c.name` is duplicated (`>=2`, case-insensitive) in `schema`, AND
+/// `c.expr_id` names a field actually present in `schema` (at position `k`)
+/// — the exact shape a bare duplicate-name reference must have to be
+/// rewritten by identity. The governing invariant: the binding key is the
+/// reference's [`super::schema::ExprId`], not a trusted stamped position —
+/// same id in two slots binds the FIRST occurrence (value-correct: one
+/// schema, one id, one per-row value, regardless of which of its slots is
+/// addressed); an id ABSENT from `schema` leaves the reference untouched,
+/// surfacing as a loud DuckDB binder error rather than a silent
+/// wrong-column rewrite. Shared by [`requalify_visible`]'s merge-path
+/// rewrite and [`reproject_qualifiers`]'s wrap-path ordinal arm — single
+/// authority for the debug_assert guard, so both call sites stay in
 /// lockstep.
-fn bare_dup_ordinal(c: &ColumnReference, schema: &Schema) -> Option<usize> {
+fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
     if c.qualifier.is_some() {
-        return None;
-    }
-    let k = c.ordinal?;
-    if k >= schema.len() {
         return None;
     }
     let name_count = schema
@@ -1154,12 +1185,25 @@ fn bare_dup_ordinal(c: &ColumnReference, schema: &Schema) -> Option<usize> {
     if name_count < 2 {
         return None;
     }
-    // H8 assert 1 (load-bearing): the ordinal must name the SAME column the
-    // reference carries — a merged-vs-local ordinal mixup would silently
-    // rewrite the wrong physical column.
+    // ADR-024 transition assert: polices the `Some(ordinal) ⟹ Some(expr_id)`
+    // stamping obligation at the point emission stops trusting `ordinal` for
+    // duplicate-name binding — a resolver tier that stamps an ordinal
+    // without an id would silently escape the id-keyed rewrite below.
+    debug_assert!(
+        c.ordinal.is_none() || c.expr_id.is_some(),
+        "ADR-024: c.ordinal ({:?}) implies c.expr_id must be Some, but it is None for {}",
+        c.ordinal,
+        c.name
+    );
+    let id = c.expr_id?;
+    let k = schema.fields.iter().position(|f| f.expr_id == id)?;
+    // H8 assert 1 (load-bearing; now guards resolver stamping bugs, not the
+    // rewrite itself): the id-resolved slot must name the SAME column the
+    // reference carries — an id/name mismatch would silently rewrite the
+    // wrong physical column.
     debug_assert!(
         schema.fields[k].name.eq_ignore_ascii_case(&c.name),
-        "ordinal/name agreement: schema[{k}] ({}) must match reference name ({})",
+        "id/name agreement: schema[{k}] ({}) must match reference name ({})",
         schema.fields[k].name,
         c.name
     );
@@ -1169,8 +1213,8 @@ fn bare_dup_ordinal(c: &ColumnReference, schema: &Schema) -> Option<usize> {
 /// Merge visibility + ordinal requalification, fused (ADR-023 Phase 3b).
 /// `Some(rewritten)` iff (a) every scope-bound qualifier `exprs` carries is
 /// exposed by `block`'s FROM (the [`exprs_visible_in`] contract) AND (b)
-/// every bare duplicate-name ordinal-carrying reference
-/// ([`bare_dup_ordinal`]) binds through a UNIQUE covering alias
+/// every bare duplicate-name reference ([`bare_dup_slot`]) binds through a
+/// UNIQUE covering alias
 /// ([`FromScope::unique_binding_alias`]) — rewritten to it. `None` — the
 /// caller wraps — the moment either condition fails for any expression in
 /// the set: a partial rewrite would be unsound (the wrap path re-derives the
@@ -1193,7 +1237,7 @@ fn requalify_visible<'e>(
 
     fn walk(expr: &mut Expression, scope: &FromScope, schema: &Schema) -> bool {
         match expr {
-            Expression::ColumnReference(c) => match bare_dup_ordinal(c, schema) {
+            Expression::ColumnReference(c) => match bare_dup_slot(c, schema) {
                 None => true,
                 Some(k) => match scope.unique_binding_alias(k, &c.name, schema) {
                     Some(alias) => {
@@ -1292,10 +1336,10 @@ fn reproject_qualifiers(expr: &Expression, input: &TypedAst, uniquified: &[Strin
                     c.qualifier = None;
                     c.name = uniquified[pos].clone();
                 } else if c.qualifier.is_none() {
-                    // Phase 3b: a bare duplicate-name ordinal ref binds
-                    // positionally through the reprojected wrap — see
-                    // `bare_dup_ordinal`'s doc for the governing invariant.
-                    if let Some(k) = bare_dup_ordinal(c, schema) {
+                    // N10-lite: a bare duplicate-name ref binds through the
+                    // reprojected wrap by identity — see `bare_dup_slot`'s
+                    // doc for the governing invariant.
+                    if let Some(k) = bare_dup_slot(c, schema) {
                         c.name = uniquified[k].clone();
                     }
                 }
@@ -1497,7 +1541,7 @@ fn build_sort(
             matches!(so.expr.as_ref(),
                 Expression::ColumnReference(c)
                     if c.qualifier.is_none()
-                        && bare_dup_ordinal(c, &input.resolved_schema).is_none())
+                        && bare_dup_slot(c, &input.resolved_schema).is_none())
         });
         keys_bind.then(|| order.iter().map(|so| (*so.expr).clone()).collect())
     };
@@ -10504,7 +10548,7 @@ mod tests {
         // `emp`, `dept_id` from `emp2`) so the Project's own output schema
         // has no duplicate name. The ORDER BY key (`emp2.dept_id`) still
         // resolves through the same tier-(f) source_quals arm to a bare
-        // ordinal ref, but `bare_dup_ordinal` returns `None` (the name is
+        // ordinal ref, but `bare_dup_slot` returns `None` (the name is
         // unique in the schema) — `keys_bind` must stay `true` and the key
         // must still merge into the occupied SELECT block, with NO wrap.
         let project = CommonAst::new(CommonOp::Project {
@@ -10675,18 +10719,24 @@ mod tests {
     }
 
     #[test]
-    fn reproject_qualifiers_ordinal_arm_binds_bare_dup_positionally() {
+    fn reproject_qualifiers_ordinal_arm_binds_bare_dup_by_id() {
         let _g = tap_guard();
-        // Direct unit pin for the `reproject_qualifiers` ordinal else-arm: a
-        // bare duplicate-name ordinal ref rewrites to `uniquified[k]`; a
-        // bare UNIQUE-name ref (ordinal Some, but not duplicated) and a bare
-        // ref with `ordinal: None` are both left untouched.
+        // Direct unit pin for the `reproject_qualifiers` ordinal else-arm
+        // (N10-lite): a bare duplicate-name ref rewrites to `uniquified[k]`
+        // where `k` is found by the reference's `expr_id`, never a trusted
+        // stamped `ordinal` — fixtures stamp REAL ids read off the fixture
+        // schema (not `expr_id: None`). A bare UNIQUE-name ref and a bare
+        // ref with `ordinal: None` (deferred resolution) are both left
+        // untouched regardless.
         let schema = Schema::minted(StructType::new(vec![
             StructField::not_null("id", DataType::Long),
             StructField::nullable("dept_id", DataType::Integer),
             StructField::nullable("dept_id", DataType::Integer),
             StructField::nullable("name", DataType::String),
         ]));
+        let id_col_id = schema.fields[0].expr_id;
+        let dept_id_second = schema.fields[2].expr_id;
+        let name_col_id = schema.fields[3].expr_id;
         let uniquified = vec![
             "id".to_owned(),
             "dept_id".to_owned(),
@@ -10699,7 +10749,7 @@ mod tests {
             data_type: Some(DataType::Integer),
             nullable: Some(true),
             ordinal: Some(2),
-            expr_id: None,
+            expr_id: Some(dept_id_second),
         });
         let unique_no_rewrite = Expression::ColumnReference(ColumnReference {
             name: "id".to_owned(),
@@ -10707,7 +10757,7 @@ mod tests {
             data_type: Some(DataType::Long),
             nullable: Some(false),
             ordinal: Some(0),
-            expr_id: None,
+            expr_id: Some(id_col_id),
         });
         let deferred_no_ordinal = Expression::ColumnReference(ColumnReference {
             name: "name".to_owned(),
@@ -10715,7 +10765,7 @@ mod tests {
             data_type: Some(DataType::String),
             nullable: Some(true),
             ordinal: None,
-            expr_id: None,
+            expr_id: Some(name_col_id),
         });
         let input = TypedAst::new(
             TypedOp::TableScan {
@@ -10736,7 +10786,7 @@ mod tests {
         match rewritten_unique {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.qualifier, None);
-                assert_eq!(c.name, "id", "a unique-name ordinal ref is untouched");
+                assert_eq!(c.name, "id", "a unique-name ref is untouched");
             }
             other => panic!("expected ColumnReference, got {other:?}"),
         }
@@ -10744,7 +10794,176 @@ mod tests {
         match rewritten_deferred {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.qualifier, None);
-                assert_eq!(c.name, "name", "an ordinal:None ref is untouched");
+                assert_eq!(
+                    c.name, "name",
+                    "an ordinal:None ref (unique name) is untouched"
+                );
+            }
+            other => panic!("expected ColumnReference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reproject_qualifiers_same_id_two_slots_binds_first_occurrence() {
+        let _g = tap_guard();
+        // agg-026 shape: a grouping key restated in the aggregate list folds
+        // into TWO output slots that are the SAME projected-through column
+        // — identical `expr_id` at both positions (a clone of one
+        // attribute, not two fresh mints). N10-lite's id-keyed lookup uses
+        // `Iterator::position`'s natural first-match semantics: the same id
+        // in two slots binds the FIRST occurrence — value-correct because
+        // one id means one per-row value within a single schema, regardless
+        // of which of its slots is addressed.
+        let dup_attr = Attribute::minted("dept_id", DataType::Integer, true);
+        let schema = Schema::new(vec![
+            Attribute::minted("id", DataType::Long, false),
+            dup_attr.clone(),
+            dup_attr.clone(),
+            Attribute::minted("total_salary", DataType::Long, true),
+        ]);
+        let shared_id = schema.fields[1].expr_id;
+        assert_eq!(
+            schema.fields[2].expr_id, shared_id,
+            "fixture precondition: both duplicate slots must share one id"
+        );
+        let uniquified = vec![
+            "id".to_owned(),
+            "dept_id".to_owned(),
+            "dept_id_1".to_owned(),
+            "total_salary".to_owned(),
+        ];
+        let bare_ref = Expression::ColumnReference(ColumnReference {
+            name: "dept_id".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Integer),
+            nullable: Some(true),
+            ordinal: Some(2), // stale/irrelevant under id-keyed binding
+            expr_id: Some(shared_id),
+        });
+        let input = TypedAst::new(
+            TypedOp::TableScan {
+                table: "agg026".to_owned(),
+                alias: None,
+            },
+            schema.clone(),
+        );
+        let rewritten = reproject_qualifiers(&bare_ref, &input, &uniquified);
+        match rewritten {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.qualifier, None);
+                assert_eq!(
+                    c.name, "dept_id",
+                    "the same id at two slots must bind the FIRST occurrence"
+                );
+            }
+            other => panic!("expected ColumnReference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reproject_qualifiers_stale_ordinal_id_slot_wins() {
+        let _g = tap_guard();
+        // N10-lite: the binding key is `expr_id`, not the stamped
+        // `ordinal` — a reference whose `ordinal` names the WRONG
+        // same-named slot (simulating a stale/mismatched stamp) must still
+        // bind through its `expr_id`'s slot, never the ordinal's. Silent
+        // wrong-column rewrite under a stale ordinal is exactly the bug
+        // class N10-lite closes.
+        let schema = Schema::minted(StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("name", DataType::String),
+        ]));
+        let correct_id = schema.fields[2].expr_id;
+        let uniquified = vec![
+            "id".to_owned(),
+            "dept_id".to_owned(),
+            "dept_id_1".to_owned(),
+            "name".to_owned(),
+        ];
+        let stale = Expression::ColumnReference(ColumnReference {
+            name: "dept_id".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Integer),
+            nullable: Some(true),
+            ordinal: Some(1),          // WRONG slot: names schema[1]
+            expr_id: Some(correct_id), // RIGHT slot: schema[2]
+        });
+        let input = TypedAst::new(
+            TypedOp::TableScan {
+                table: "dup_tbl".to_owned(),
+                alias: None,
+            },
+            schema.clone(),
+        );
+        let rewritten = reproject_qualifiers(&stale, &input, &uniquified);
+        match rewritten {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.qualifier, None);
+                assert_eq!(
+                    c.name, "dept_id_1",
+                    "the id-resolved slot must win over the stale ordinal"
+                );
+            }
+            other => panic!("expected ColumnReference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reproject_qualifiers_id_absent_from_schema_stays_untouched() {
+        let _g = tap_guard();
+        // N10-lite: an `expr_id` that names no field in the boundary
+        // schema (e.g. stamped against a DIFFERENT schema than the one
+        // reached here) is left completely untouched — no silent
+        // wrong-column rewrite; the unresolved reference surfaces as a
+        // loud DuckDB binder error instead.
+        let schema = Schema::minted(StructType::new(vec![
+            StructField::not_null("id", DataType::Long),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("name", DataType::String),
+        ]));
+        let foreign_schema = Schema::minted(StructType::new(vec![StructField::nullable(
+            "dept_id",
+            DataType::Integer,
+        )]));
+        let foreign_id = foreign_schema.fields[0].expr_id;
+        let uniquified = vec![
+            "id".to_owned(),
+            "dept_id".to_owned(),
+            "dept_id_1".to_owned(),
+            "name".to_owned(),
+        ];
+        let orphaned = Expression::ColumnReference(ColumnReference {
+            name: "dept_id".to_owned(),
+            qualifier: None,
+            data_type: Some(DataType::Integer),
+            nullable: Some(true),
+            // Review-pinned (N10 MINOR): the ordinal points at slot 2, whose
+            // uniquified name ("dept_id_1") DIFFERS from the reference's own
+            // name — so "left untouched" is distinguishable from a
+            // hypothetical positional fallback (which would rewrite to
+            // "dept_id_1" and fail the assertion below).
+            ordinal: Some(2),
+            expr_id: Some(foreign_id),
+        });
+        let input = TypedAst::new(
+            TypedOp::TableScan {
+                table: "dup_tbl".to_owned(),
+                alias: None,
+            },
+            schema.clone(),
+        );
+        let rewritten = reproject_qualifiers(&orphaned, &input, &uniquified);
+        match rewritten {
+            Expression::ColumnReference(c) => {
+                assert_eq!(c.qualifier, None);
+                assert_eq!(
+                    c.name, "dept_id",
+                    "an id absent from the schema must stay untouched, not fall back \
+                     to positional binding"
+                );
             }
             other => panic!("expected ColumnReference, got {other:?}"),
         }

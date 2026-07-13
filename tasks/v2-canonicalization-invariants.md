@@ -314,14 +314,64 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 
 ### N10. Unique emitted aliases / bind-by-id emission
 
+- **Status (2026-07-13, N10-lite stage 1 of 2, LANDED):** the wrap/merge duplicate-name
+  boundary's binding key swapped from a trusted stamped position to `ExprId`:
+  `bare_dup_ordinal` → `bare_dup_slot` (`emission.rs`), plus its callers
+  (`requalify_visible`'s merge-path walk, `reproject_qualifiers`'s wrap-path ordinal arm,
+  `build_sort`'s merge gate) — mechanical renames, unchanged behavior shape. Alias
+  **strings** stay untouched: they remain today's `uniquify(names)` — no id-derived
+  spellings exist yet, so ADR-024's non-determinism obligation ("id-derived aliases must
+  renumber per query") is satisfied *vacuously*. Same-id-in-two-slots (the agg-026
+  restated-grouping-key shape) binds the FIRST occurrence via `Iterator::position`'s
+  natural semantics — value-correct because one id is one per-row value within one
+  schema. An id absent from the boundary schema leaves the reference untouched (a loud
+  DuckDB binder error instead of a silent wrong-column rewrite). New/rewritten unit pins:
+  `reproject_qualifiers_ordinal_arm_binds_bare_dup_by_id` (rewritten with real fixture
+  ids, renamed from `..._positionally`),
+  `reproject_qualifiers_same_id_two_slots_binds_first_occurrence`,
+  `reproject_qualifiers_stale_ordinal_id_slot_wins`,
+  `reproject_qualifiers_id_absent_from_schema_stays_untouched`. Both corpora green
+  (DataFrame 405/0, SQL 408/0), 0 regressions.
+- **Status (2026-07-13, N10-lite stage 2 of 2, LANDED — disjointness pin PASSED):** the
+  gating pin (`self_join_left_right_resolved_schema_ids_are_disjoint`, `analyzer.rs`,
+  join-009 self-join shape) asserts left/right `resolved_schema` id sets are disjoint —
+  it PASSED (each `AliasedRelation`/`TableScan` leaf mints a fresh id per ADR-024, so two
+  independently-scanned sides of one join, even over the identical table, never share an
+  id). The join-condition path's `requalify_column_ref` (`emission.rs:503-552`) is now
+  id-keyed too: `let Some(id) = c.expr_id else { return }`, the name-dup gate unchanged,
+  `k = cond_schema.fields.iter().position(|f| f.expr_id == id)` (untouched on `None`),
+  `is_left = k < left_len` from the id-resolved slot, `alias_for`/`SideNeedsAlias`
+  fixpoint unchanged. `requalify_join_condition` gained a `debug_assert` policing the
+  left/right id-set disjointness the side-split depends on. Both corpora green
+  (DataFrame 405/0, SQL 408/0), 0 regressions. The QUALIFIED arm, `UnresolvedColumn` arm,
+  and star handling are untouched in both stages. ADR-024's "re-examine at N10" note on
+  the two recorded τ divergences (rename-keeps-id, USING-left-donor-id) is now CLOSED —
+  both are benign for id-keyed first-occurrence binding (see ADR-024's amended
+  consequences).
+- **Scope correction (supersedes the "~90+ lines" estimate below):** the estimate
+  conflated "unique-alias machinery" with "positional-trust machinery." SQL is
+  name-addressed, so the alias-list machinery itself — `output_uniquified`'s `uniquify`
+  call and the reprojected-wrap's alias list — is *physical*: some site must still mint a
+  unique alias string per duplicate name and some site must still render it, independent
+  of how the binding key is derived. What N10-lite actually deletes is narrower and
+  different in kind: **trust in the stamped position** — the `bare_dup_ordinal` doc's
+  "this shape is produced ONLY by a resolver tier that stamped `k` against this same
+  schema" comment-enforced lockstep between the stamping tier and its two consumers — is
+  replaced by an identity contract each call site verifies locally
+  (`schema.fields.iter().position(|f| f.expr_id == id)`), independent of which resolver
+  tier stamped what, or whether it stamped an ordinal at all. The alias-string minting is
+  NOT deleted; only the trust-in-position + hand-maintained-lockstep layer is.
 - **Invariant:** every emitted output column carries a unique (id-derived) physical alias;
   references bind by id → alias, so duplicate names cannot be ambiguous at the SQL level.
 - **Today:** emission re-derives uniqueness positionally at 4 wrap sites
-  (`output_uniquified`, `bare_dup_ordinal`, `requalify_column_ref`, `wrap_reprojected`)
-  guarded by load-bearing asserts.
-- **Deletes:** all of the positional duplicate-name machinery (~90+ lines + asserts).
+  (`output_uniquified`, `bare_dup_slot` — id-keyed as of N10-lite stage 1, formerly
+  `bare_dup_ordinal` — `requalify_column_ref` — still ordinal-keyed, stage 2 gated —
+  `wrap_reprojected`) guarded by load-bearing asserts.
+- **Deletes:** the positional-TRUST lockstep contract at the two stage-1 call sites (the
+  alias-list machinery itself is physical and stays — see the scope correction above).
 - **Bug classes closed:** wrong-column binding at wrap/merge boundaries under duplicate
-  names (the self-join class).
+  names (the self-join class) — stage 1 closes this for the wrap/merge paths; stage 2
+  (gated) would close it for join conditions too.
 - **How:** thread an id→alias map through the `SelectBlock` builders; Spark-verbatim names
   remain on the wire via the schema stamp.
 - **Depends on:** N8 (aliasing plumbing) + N9 (the ids).
@@ -350,4 +400,4 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 | N8 | alias-every-entry | bind_*_slot mutation, __td_wcr, name re-derivations | mutation-under-iteration; tracked≠emitted |
 | N5 | canonical substrate names | ~92 case-compares, substr remap | case/alias spelling slip-through |
 | N9 | stored attribute identity | ordinals_compatible, source_quals machinery | wrong-column identity (t1.x/t2.x) |
-| N10 | unique emitted aliases | positional dup-name machinery | wrap-boundary wrong-column |
+| N10-lite | id-keyed dup-boundary binding (stage 1 of 2) | trust-in-stamped-position + the stamping/consumption lockstep contract (NOT the alias-list machinery, which is physical) | wrap/merge-boundary wrong-column (self-join class); stage 2 (join-condition path) gated on a disjointness pin |

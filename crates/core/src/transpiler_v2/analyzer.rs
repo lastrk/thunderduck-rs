@@ -15174,6 +15174,54 @@ mod tests {
     }
 
     #[test]
+    fn self_join_left_right_resolved_schema_ids_are_disjoint() {
+        // N10-lite STAGE 2 disjointness pin (join-009 shape:
+        // `emp.alias("e").join(emp.alias("m"), ...)`) — a self-join over the
+        // SAME underlying table via two DISTINCT aliases. Stage 2's key
+        // swap (`requalify_column_ref` binding by `expr_id` instead of the
+        // stamped ordinal) is sound only if a join's left and right sides
+        // can NEVER share an `expr_id`: each `AliasedRelation`/`TableScan`
+        // leaf mints a FRESH id per ADR-024, so two independently scanned
+        // sides of one join must carry wholly disjoint id sets even when
+        // they scan the identical table. If this pin ever fails, stage 2's
+        // key swap is unsound and must abort (see the task's abort path).
+        let bt = base_types_with_emp_dept();
+        let cond = Expression::Binary(BinaryExpression {
+            op: BinaryOp::Eq,
+            left: Box::new(qcol("e", "dept_id")),
+            right: Box::new(qcol("m", "dept_id")),
+        });
+        let joined_ast = join(
+            aliased_scan("emp", "e"),
+            aliased_scan("emp", "m"),
+            JoinType::Left,
+            Some(cond),
+        );
+        let typed = analyze(joined_ast, &bt).expect("self-join analyzes");
+        let TypedOp::Join { left, right, .. } = &typed.op else {
+            panic!("expected TypedOp::Join, got {:?}", typed.op);
+        };
+        let left_ids: HashSet<_> = left
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.expr_id)
+            .collect();
+        let right_ids: HashSet<_> = right
+            .resolved_schema
+            .fields
+            .iter()
+            .map(|f| f.expr_id)
+            .collect();
+        assert!(
+            left_ids.is_disjoint(&right_ids),
+            "self-join left/right sides must never share an expr_id, even when \
+             scanning the same underlying table through distinct aliases — N10-lite \
+             stage 2's id-keyed join-condition binding depends on this"
+        );
+    }
+
+    #[test]
     fn second_order_by_key_binds_by_id_to_already_promoted_entry_no_duplicate_append() {
         // `SELECT dept_id FROM emp GROUP BY dept_id ORDER BY avg(salary),
         //  avg(salary)` — the FIRST `avg(salary)` key is not in the

@@ -10,6 +10,12 @@
 //! mismatch, ...) with the real Spark error-class token leading the wire
 //! message, so the client sees the same error class Spark itself would
 //! raise. It does not signal a Thunderduck-boundary gap.
+//!
+//! [`EmissionError::Internal`] is a third, narrow category: a τ-internal
+//! invariant violation — a plan-shape guarantee the analyzer is supposed to
+//! establish did not hold at emission time. This is neither an honest
+//! "not yet implemented" boundary gap nor an input Spark itself would
+//! reject; it signals a genuine τ bug and surfaces as `Status::internal`.
 
 /// The categories of errors τ can surface at emission time.
 ///
@@ -19,7 +25,8 @@
 /// emission arm for a Spark function name), and `ProtoShape` (input never
 /// reached [`CommonAst`]). [`EmissionError::SparkEmulated`] carries a
 /// Spark-emulated analyzer error re-surfaced with its Spark class token
-/// (ADR-023 chunk 3b).
+/// (ADR-023 chunk 3b). [`EmissionError::Internal`] carries a τ-internal
+/// invariant-violation message (review finding 5, 2026-07-13).
 ///
 /// [`CommonAst`]: crate::transpiler_v2::ast::CommonAst
 #[derive(thiserror::Error, Debug)]
@@ -57,6 +64,21 @@ pub enum EmissionError {
         /// The human-readable message, without the analyzer's
         /// `[SPARK-EMULATED]` τ-internal prefix (the class token above
         /// replaces it as the leading token).
+        message: String,
+    },
+
+    /// A τ-internal invariant violation — a plan-shape guarantee the
+    /// analyzer is supposed to establish (e.g. join left/right id-set
+    /// disjointness) did not hold at emission time. Unlike
+    /// [`Self::Unsupported`] (an honest "not yet implemented" boundary gap)
+    /// or [`Self::SparkEmulated`] (Spark itself would also reject this
+    /// input), this signals a genuine τ bug: some invariant the analyzer
+    /// promised was broken. Kept ALWAYS-ON rather than a `debug_assert!`
+    /// precisely because its failure mode is silently wrong SQL, not a loud
+    /// crash (review finding 5, `v2-review-findings-2026-07-13.md`).
+    #[error("τ-internal invariant violation: {message}")]
+    Internal {
+        /// Description of the violated invariant and where it fired.
         message: String,
     },
 }
@@ -173,6 +195,25 @@ mod tests {
             e.to_string(),
             "[AMBIGUOUS_REFERENCE] column `id` is ambiguous, candidates: [\"l.id\", \"r.id\"]"
         );
+    }
+
+    #[test]
+    fn internal_display_and_composes_into_thunderduck_error() {
+        let e = EmissionError::Internal {
+            message: "join left/right resolved_schema expr_id sets must be disjoint".to_owned(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "τ-internal invariant violation: join left/right resolved_schema expr_id sets must be disjoint"
+        );
+        let e = EmissionError::Internal {
+            message: "join left/right resolved_schema expr_id sets must be disjoint".to_owned(),
+        };
+        let composed: ThunderduckError = e.into();
+        assert!(matches!(
+            composed,
+            ThunderduckError::TranspilerV2Emission(_)
+        ));
     }
 
     #[test]

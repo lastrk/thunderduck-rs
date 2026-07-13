@@ -179,9 +179,7 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
         ),
         TypedOp::WithColumns { input, assignments } => build_with_columns(input, assignments),
         TypedOp::DropColumns { input, drop_names } => build_drop_columns(input, drop_names),
-        TypedOp::WithColumnsRenamed { input, renames } => {
-            build_with_columns_renamed(input, renames)
-        }
+        TypedOp::WithColumnsRenamed { input } => build_with_columns_renamed(input, schema),
         TypedOp::NaFill {
             input,
             cols,
@@ -399,6 +397,14 @@ struct SideNeedsAlias {
     right: bool,
 }
 
+/// [`requalify_join_condition`]'s outcome: either the rewritten condition, or
+/// the identity-flagged side(s) that need a fresh alias before
+/// [`build_join`]'s bounded fixpoint retries.
+enum RequalifyOutcome {
+    Rewritten(Expression),
+    NeedsAlias(SideNeedsAlias),
+}
+
 /// Rewrite every join-CONDITION [`ColumnReference`] to the qualifier the
 /// EMITTED sides make true, resolved BY IDENTITY from the reference's
 /// resolver-stamped `expr_id` (N10-lite stage 2; supersedes the
@@ -412,7 +418,7 @@ struct SideNeedsAlias {
 /// signal this rewrite ever consults. Sound only because a join's left and
 /// right sides can never share an `expr_id` — see the disjointness pin
 /// (`self_join_left_right_resolved_schema_ids_are_disjoint`,
-/// `analyzer.rs`) and the `debug_assert` below.
+/// `analyzer.rs`) and the always-on invariant check below.
 ///
 /// Left untouched: a reference whose `expr_id` is `None` (deferred
 /// resolution — see [`super::expression::ColumnReference::expr_id`]'s doc
@@ -425,10 +431,13 @@ struct SideNeedsAlias {
 ///
 /// Returns the rewritten [`Expression`] tree (clone-then-walk via
 /// [`Expression::map_children`], the same fallible-fold primitive the
-/// analyzer's own expression walkers use — see `reproject_qualifiers`).
-/// `Err(SideNeedsAlias)` when a demanded ambiguous id-resolved slot has no
-/// unambiguous covering alias on its side; [`build_join`]'s fixpoint then
-/// wraps the flagged side(s) under a fresh alias and retries.
+/// analyzer's own expression walkers use — see `reproject_qualifiers`)
+/// wrapped in [`RequalifyOutcome::Rewritten`], or
+/// [`RequalifyOutcome::NeedsAlias`] when a demanded ambiguous id-resolved
+/// slot has no unambiguous covering alias on its side ([`build_join`]'s
+/// fixpoint then wraps the flagged side(s) under a fresh alias and
+/// retries). `Err(EmissionError::Internal)` if the left/right disjointness
+/// invariant below is violated.
 fn requalify_join_condition(
     cond: &Expression,
     left: &TypedAst,
@@ -436,24 +445,33 @@ fn requalify_join_condition(
     left_item: &FromItem,
     right_item: &FromItem,
     cond_schema: &Schema,
-) -> Result<Expression, SideNeedsAlias> {
+) -> Result<RequalifyOutcome, EmissionError> {
     let left_len = left.resolved_schema.len();
     let left_scope = FromScope::of(left, left_item);
     let right_scope = FromScope::of(right, right_item);
     // N10-lite stage 2 disjointness guard: `requalify_column_ref`'s
     // `k < left_len` side split is keyed off `expr_id`, so it is sound only
     // if the two sides' id sets never intersect — mechanically pinned by
-    // `self_join_left_right_resolved_schema_ids_are_disjoint` (analyzer.rs);
-    // this debug_assert catches any future violation of that pin directly
-    // at the point the split is consumed.
-    debug_assert!(
-        left.resolved_schema.fields.iter().all(|lf| right
+    // `self_join_left_right_resolved_schema_ids_are_disjoint` (analyzer.rs).
+    // ALWAYS-ON (review finding 5, v2-review-findings-2026-07-13.md): a
+    // `debug_assert!` here would compile out of the release builds the
+    // server/harness actually run, and the failure mode on violation is not
+    // a loud crash but SILENTLY WRONG SQL (a condition reference rewritten
+    // to the wrong side) — a future plan-cloning optimization is the
+    // concrete hazard. The nested-any check is O(|left|·|right|) id
+    // compares, run up to twice per join under the NeedsAlias fixpoint —
+    // hundreds of u64 compares at TPC-DS widths, cheap enough for release.
+    if left.resolved_schema.fields.iter().any(|lf| {
+        right
             .resolved_schema
             .fields
             .iter()
-            .all(|rf| lf.expr_id != rf.expr_id)),
-        "join left/right resolved_schema expr_id sets must be disjoint"
-    );
+            .any(|rf| lf.expr_id == rf.expr_id)
+    }) {
+        return Err(EmissionError::Internal {
+            message: "join left/right resolved_schema expr_id sets must be disjoint".to_owned(),
+        });
+    }
     let mut needs = SideNeedsAlias::default();
     let rewritten = requalify_expr(
         cond.clone(),
@@ -464,9 +482,9 @@ fn requalify_join_condition(
         &mut needs,
     );
     if needs.left || needs.right {
-        Err(needs)
+        Ok(RequalifyOutcome::NeedsAlias(needs))
     } else {
-        Ok(rewritten)
+        Ok(RequalifyOutcome::Rewritten(rewritten))
     }
 }
 
@@ -727,9 +745,9 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
         let Some(cond) = condition else {
             break None;
         };
-        match requalify_join_condition(cond, left, right, &left_item, &right_item, &cond_schema) {
-            Ok(expr) => break Some(expr),
-            Err(needs) => {
+        match requalify_join_condition(cond, left, right, &left_item, &right_item, &cond_schema)? {
+            RequalifyOutcome::Rewritten(expr) => break Some(expr),
+            RequalifyOutcome::NeedsAlias(needs) => {
                 if needs.left {
                     let other = right_item.exposed();
                     left_item = fresh_alias_wrap(left_item, TD_JOIN_LEFT, &other);
@@ -2708,40 +2726,30 @@ fn render_sample_by(
 /// N8 has since closed that gap, but the duplicate-name hazard above is
 /// independent and remains the rationale to keep positional renaming.)
 ///
-/// The duplicate-name hazard is not fully closed inside this path either:
-/// THIS function's own `rename_map` (the by-name `HashMap` a few lines
-/// down) collapses duplicate old names last-wins. That is unreachable for
-/// genuine `withColumnsRenamed` (PySpark dict keys are unique, and renaming
-/// every same-named occurrence per entry IS Spark's semantics), but
-/// `toDF(...)`/SQL `AS t(...)` lower positional pairs like
-/// `[("id","a"), ("id","b")]` through here — the map collapses them to
-/// `id→b`, emitting `__td_wcr(b, b)` against a tracked schema of `[a, b]`
-/// (an N8 tracked==emitted violation; masked on terminal collect by the
-/// positional arrow_schema_stamp rewrite, loud DuckDB binder error on any
-/// downstream by-name reference). Tracked as `F-todf-dupname`,
-/// tasks/v2-corpus-followups.md; the fix is a POSITIONAL rename list
-/// through `TypedOp::WithColumnsRenamed`, keyed by index, at this site.
-fn build_with_columns_renamed(
-    input: &TypedAst,
-    renames: &[(String, String)],
-) -> Result<SqlUnit, EmissionError> {
-    let rename_map: std::collections::HashMap<String, String> = renames
-        .iter()
-        .map(|(old, new)| (old.to_lowercase(), new.clone()))
-        .collect();
-    let dst_names: Vec<&str> = input
-        .resolved_schema
-        .fields
-        .iter()
-        .map(|f| {
-            rename_map
-                .get(&f.name.to_lowercase())
-                .map(String::as_str)
-                .unwrap_or(f.name.as_str())
-        })
-        .collect();
+/// FIXED (`F-todf-dupname`, tasks/v2-corpus-followups.md): this function used
+/// to re-derive the by-name `rename_map` from `renames` and apply it against
+/// `input.resolved_schema` (the CHILD's, pre-rename, schema). That map
+/// collapses duplicate old names last-wins, so `toDF(...)`/SQL `AS t(...)`
+/// lowering positional pairs like `[("id","a"), ("id","b")]` produced
+/// `id→b`, emitting `__td_wcr(b, b)` against a tracked schema of `[a, b]` —
+/// an N8 tracked==emitted violation.
+///
+/// The fix needs no rename map at all: `dispatch_op` already resolves the
+/// analyzer's own POSITIONALLY-renamed output — `schema` here IS that output
+/// schema (the `WithColumnsRenamed` node's `resolved_schema`, passed down
+/// from `dispatch_op`'s own `schema` parameter), not the child's. Both
+/// producers of `TypedOp::WithColumnsRenamed` (`analyze_to_df`'s positional
+/// zip, and the genuine `withColumnsRenamed` arm's by-name-but-unique-keys
+/// loop) already stamp the correct renamed name onto each output field in
+/// order — this function just mirrors that tracked schema positionally into
+/// the derived-table alias list. The rename-pair list itself proved
+/// write-only after this fix and was deleted from the TypedOp variant
+/// (review NIT): `resolved_schema` IS the rename.
+fn build_with_columns_renamed(input: &TypedAst, schema: &Schema) -> Result<SqlUnit, EmissionError> {
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let cols = sql_join(dst_names, ", ", |n| Ok(quote_ident(n).into_owned()))?;
+    let cols = sql_join(schema.fields.iter().map(|f| f.name.as_str()), ", ", |n| {
+        Ok(quote_ident(n).into_owned())
+    })?;
     Ok(SqlUnit::Raw(format!(
         "SELECT * FROM ({child_sql}) AS __td_wcr({cols})"
     )))
@@ -5791,12 +5799,18 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         // the sample formula. The ext6 extension provides `spark_skewness`
         // with Spark-parity semantics (checklist §4.1).
         "skewness" => ("spark_skewness", false),
-        // Spark's `max_by(x, y)` / `min_by(x, y)` — DuckDB's native
-        // `arg_max(x, y)` / `arg_min(x, y)` are the same 2-arg shape
-        // (value column, ordering column), so a name rename is the whole
-        // fix — args pass through unchanged via `args_sql` below.
-        "max_by" => ("arg_max", false),
-        "min_by" => ("arg_min", false),
+        // Spark's `max_by(x, y)` / `min_by(x, y)` return the VALUE at the
+        // ordering-extreme row even when that value is NULL. DuckDB's
+        // `arg_max`/`arg_min` instead SKIP rows whose value arg is NULL —
+        // wrong-scalar divergence, not just a naming difference. DuckDB's
+        // `arg_max_null`/`arg_min_null` match Spark's null-at-extreme
+        // semantics exactly (verified empirically: `arg_max_null(name, val)`
+        // over `('a',1),(NULL,5),('c',0),(NULL,-2)` returns NULL — the value
+        // at the max `val` row, which is NULL). Args pass through unchanged
+        // via `args_sql` below (same 2-arg shape: value column, ordering
+        // column).
+        "max_by" => ("arg_max_null", false),
+        "min_by" => ("arg_min_null", false),
         // Spark's `kurtosis` uses the population formula; DuckDB has
         // `kurtosis_pop` for that (native, not via extension).
         "kurtosis" => ("kurtosis_pop", false),
@@ -7302,7 +7316,7 @@ mod tests {
                     );
                 }
             }
-            other @ EmissionError::SparkEmulated { .. } => {
+            other @ (EmissionError::SparkEmulated { .. } | EmissionError::Internal { .. }) => {
                 panic!("expected EmissionError::Unsupported, got: {other:?}")
             }
         }
@@ -15775,10 +15789,11 @@ mod tests {
         col_with_type(name, DataType::Decimal { precision, scale })
     }
 
-    /// `max_by(name, val)` renders to DuckDB's native `arg_max(name, val)` —
-    /// same 2-arg (value, ordering) shape, name rename only.
+    /// `max_by(name, val)` renders to DuckDB's `arg_max_null(name, val)` —
+    /// `arg_max_null` (not `arg_max`) is required for Spark's null-at-extreme
+    /// value semantics (finding 2, v2-review-findings-2026-07-13.md).
     #[test]
-    fn max_by_renders_to_arg_max() {
+    fn max_by_renders_to_arg_max_null() {
         let f = fcall(
             "max_by",
             vec![
@@ -15787,12 +15802,12 @@ mod tests {
             ],
         );
         let sql = render_aggregate(&f, &empty_schema()).expect("render max_by");
-        assert_eq!(sql, "arg_max(name, val)");
+        assert_eq!(sql, "arg_max_null(name, val)");
     }
 
-    /// `min_by(name, val)` renders to DuckDB's native `arg_min(name, val)`.
+    /// `min_by(name, val)` renders to DuckDB's `arg_min_null(name, val)`.
     #[test]
-    fn min_by_renders_to_arg_min() {
+    fn min_by_renders_to_arg_min_null() {
         let f = fcall(
             "min_by",
             vec![
@@ -15801,7 +15816,7 @@ mod tests {
             ],
         );
         let sql = render_aggregate(&f, &empty_schema()).expect("render min_by");
-        assert_eq!(sql, "arg_min(name, val)");
+        assert_eq!(sql, "arg_min_null(name, val)");
     }
 
     /// `test_count_distinct_multiple_columns`: Spark's

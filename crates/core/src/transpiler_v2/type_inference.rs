@@ -1332,9 +1332,10 @@ const AGG_SPECS: &[AggSpec] = &[
     // `max_by(x, y)` / `min_by(x, y)` — the value of `x` at the row where
     // `y` is max/min. Return type = the type of the FIRST arg (`x`), which
     // is exactly what `AggRet::ArgType` resolves to via the aggregate
-    // delegation arm's `first_arg_type`. Always-nullable (empty group or an
-    // all-NULL `y` column yields NULL, matching DuckDB's `arg_max`/`arg_min`
-    // which this pair renders to — see `render_aggregate`).
+    // delegation arm's `first_arg_type`. Always-nullable (empty group, an
+    // all-NULL `y` column, or a NULL `x` at the extreme `y` row all yield
+    // NULL, matching DuckDB's `arg_max_null`/`arg_min_null` which this pair
+    // renders to — see `render_aggregate`).
     agg("max_by", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
     agg("min_by", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
     // Drift (verbatim): `nth_value` appears ONLY in the always-nullable
@@ -2349,7 +2350,7 @@ mod tests {
     #[test]
     fn max_by_returns_first_arg_type_via_aggregate_delegation() {
         // Return type = type of `x` (the value column), not `y` (the
-        // ordering column) — mirrors DuckDB's `arg_max(x, y)`.
+        // ordering column) — mirrors DuckDB's `arg_max_null(x, y)`.
         assert_eq!(
             frt("max_by", &[DataType::String, DataType::Integer]),
             DataType::String

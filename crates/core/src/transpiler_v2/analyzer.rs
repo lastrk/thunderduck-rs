@@ -647,15 +647,14 @@ pub enum TypedOp {
         /// The alias name.
         alias: String,
     },
-    /// `df.withColumnsRenamed({old: new, ...})`. Analyzer computes output
-    /// schema by walking input fields and renaming those whose name matches
-    /// a `old` (case-insensitive) to the corresponding `new`. Missing
-    /// entries are silently ignored per Spark semantics.
+    /// `df.withColumnsRenamed({old: new, ...})` and `df.toDF(...)`. The
+    /// analyzer computes the renamed output schema at construction (walking
+    /// input fields; misses silently ignored per Spark semantics), so the
+    /// node carries NO rename list — `resolved_schema` IS the rename, and
+    /// emission mirrors it positionally (Pass E2, F-todf-dupname fix).
     WithColumnsRenamed {
         /// The input relation.
         input: Box<TypedAst>,
-        /// Old-name → new-name renames.
-        renames: Vec<(String, String)>,
     },
     /// `df.describe(...)`. Analyzer materialises `cols` (empty ⇒ all input
     /// columns in schema order) and stamps the output schema as `summary`
@@ -1638,7 +1637,6 @@ fn analyze_node(
             Ok(TypedAst::new(
                 TypedOp::WithColumnsRenamed {
                     input: Box::new(typed_input),
-                    renames,
                 },
                 output_schema,
             ))
@@ -2022,17 +2020,12 @@ fn analyze_to_df(
         nf.name = new_name.clone();
         output_fields.push(nf);
     }
-    // Convert to WithColumnsRenamed for emission simplicity.
-    let renames: Vec<(String, String)> = input_fields
-        .iter()
-        .zip(column_names.iter())
-        .map(|(f, n)| (f.name.clone(), n.clone()))
-        .collect();
+    // Convert to WithColumnsRenamed for emission simplicity — the renamed
+    // resolved_schema built above IS the rename; no pair list is carried.
     let output_schema = ResolvedSchema::new(output_fields);
     Ok(TypedAst::new(
         TypedOp::WithColumnsRenamed {
             input: Box::new(typed_input),
-            renames,
         },
         output_schema,
     ))
@@ -4423,16 +4416,18 @@ fn try_rewrite_nested_struct_path(
     // construction is simply the clearer, self-contained choice: the ref is
     // fully resolved the moment it exists, with no reliance on a later walk.)
     //
-    // `expr_id` (documented remaining None source, `expression.rs`):
-    // `root_field` IS a real top-level attribute with an id available right
-    // here, but this pre-existing chain does not thread it through — a gap
-    // left open by this pass (D2 scoped to tier-(g) only), not fixed here.
+    // `expr_id`: `root_field` IS the real top-level attribute this reference
+    // names, so its id is stamped directly — the ExtractValue chain's root
+    // ref carries the struct COLUMN's own id, matching Spark's
+    // `GetStructField`-child-`exprId` model (the child ref names the whole
+    // column and keeps its identity; only the synthesized `ExtractValue`
+    // nodes above it are id-less, same as `GetStructField` itself).
     let mut expr = Expression::ColumnReference(ColumnReference {
         name: qualifier.to_owned(),
         qualifier: None,
         data_type: root_field.data_type.clone(),
         nullable: root_field.nullable,
-        expr_id: None,
+        expr_id: Some(root_field.expr_id),
     });
     for seg in &segments {
         expr = Expression::ExtractValue(ExtractValueExpression {
@@ -5671,17 +5666,17 @@ fn derive_implicit_grouping(
         .iter()
         .filter(|f| !excluded.contains(&f.name.to_ascii_lowercase()))
         .map(|f| {
-            // `expr_id` (documented remaining None source, `expression.rs`):
-            // `f` IS the real input attribute with an id available right
-            // here, but this pre-existing derivation does not thread it
-            // through — a gap left open by this pass (D2 scoped to
-            // tier-(g) only), not fixed here.
+            // `expr_id`: `f` IS the real input attribute this grouping
+            // column names, so its id is stamped directly — carries the
+            // implicit-grouping output's lineage through to
+            // `output_attribute`, which now COPIES (id + lineage) instead of
+            // MINTING a fresh identity for these PIVOT grouping outputs.
             Expression::ColumnReference(ColumnReference {
                 name: f.name.clone(),
                 qualifier: None,
                 data_type: f.data_type.clone(),
                 nullable: f.nullable,
-                expr_id: None,
+                expr_id: Some(f.expr_id),
             })
         })
         .collect()
@@ -10126,6 +10121,52 @@ mod tests {
         });
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(pivot_grouping_names(&typed), vec!["id", "name"]);
+    }
+
+    /// Finding 11 (v2-review-findings-2026-07-13.md): `derive_implicit_grouping`
+    /// stamps the source attribute's own `expr_id` on each implicit-grouping
+    /// `ColumnReference`, so the PIVOT's grouping output columns COPY
+    /// (id + lineage) from the underlying scan via `output_attribute` instead
+    /// of MINTING a fresh identity.
+    #[test]
+    fn analyze_pivot_implicit_grouping_output_attribute_carries_input_attribute_id() {
+        let bt = base_types_with_emp_dept();
+        let ast = CommonAst::new(CommonOp::Pivot {
+            input: Box::new(scan("emp")),
+            grouping: PivotGrouping::Implicit,
+            pivot_column: unresolved_col("dept_id"),
+            pivot_values: vec![int_lit(10), int_lit(20)],
+            aggregates: vec![func("avg", vec![unresolved_col("salary")])],
+        });
+        let typed = analyze(ast, &bt).unwrap();
+        let TypedOp::Pivot { input, .. } = &typed.op else {
+            panic!("expected TypedOp::Pivot");
+        };
+        let input_id_field = input
+            .resolved_schema
+            .field_by_name("id")
+            .expect("emp has id");
+        let input_name_field = input
+            .resolved_schema
+            .field_by_name("name")
+            .expect("emp has name");
+        let output_id_field = typed
+            .resolved_schema
+            .field_by_name("id")
+            .expect("id in pivot output");
+        let output_name_field = typed
+            .resolved_schema
+            .field_by_name("name")
+            .expect("name in pivot output");
+        assert_eq!(
+            output_id_field.expr_id, input_id_field.expr_id,
+            "PIVOT implicit-grouping output must COPY the input attribute's id, not mint a fresh one"
+        );
+        assert_eq!(output_name_field.expr_id, input_name_field.expr_id);
+        assert!(
+            !output_id_field.source_quals.is_empty(),
+            "COPY branch must carry lineage forward too"
+        );
     }
 
     /// SQL UNPIVOT lists only value columns; the analyzer derives ids as

@@ -399,6 +399,13 @@ case("ord-009", "ordering", "LIMIT with OFFSET", "SELECT * FROM emp ORDER BY id 
 case("ord-010", "ordering", "OFFSET only", "SELECT * FROM emp ORDER BY id OFFSET 2", flags=("spark4",))
 case("ord-011", "ordering", "SORT BY (Spark per-partition)", "SELECT * FROM emp SORT BY salary DESC", flags=("schema_only",))
 case("ord-012", "ordering", "DISTRIBUTE BY + SORT BY / CLUSTER BY", "SELECT * FROM emp CLUSTER BY dept_id", flags=("schema_only",))
+# ord-014: O6 verify-first witness (07-11 finding 7). The projection RENAMES
+# salary to `id` while ORDER BY references the ORIGINAL unique emp.id — the
+# hidden-column promotion produces projections [salary AS id, id] and a
+# duplicate-named intermediate schema [id, id]. Pre-N10 this was a
+# silently-wrong-pick risk (promoted name not uniquified); post-N10 emission
+# binds duplicates by expr_id. Unique sort key → deterministic total order.
+case("ord-014", "ordering", "ORDER BY original column shadowed by a same-named projection rename (hidden-promotion dup-name)", "SELECT salary AS id FROM emp ORDER BY emp.id")
 
 # ── 6. Conditional / null handling ───────────────────────────────────────────
 case("cnd-001", "conditional", "searched CASE WHEN", "SELECT name, CASE WHEN age >= 40 THEN 'senior' ELSE 'junior' END AS band FROM emp")

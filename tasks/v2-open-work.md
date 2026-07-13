@@ -82,14 +82,14 @@ documented day-only wire-column over-promotion (Date + DayTimeIntervalType
   `INVALID_PARAMETER_VALUE` for `pos<0` or `pos>=bit-width`. Repro:
   `bit_get(1L, 64)`.
 
-### O6. VERIFY-FIRST: promoted hidden sort column name not uniquified (07-11 f7)
-**Size: S (verification), possibly already dead.** `SELECT y AS x FROM t ORDER
-BY t.x` (t has x and y) → projections `[y AS x, x]`, schema `[x, x]` — was a
-silently-wrong-pick risk pre-N10. Post-N10/E1 emission binds duplicate names
-by expr_id and the trim-Project re-binds by id, so the hazard may be
-neutralized. Nobody has re-verified. Write the witness; if green, record as
-closed-by-N10; if red, fix via `unique_hidden_output_name` (the aggregate path
-already does this).
+### O6. Promoted hidden sort column name not uniquified — VERIFIED DEAD (closed-by-N10, 2026-07-13)
+The hypothesized silently-wrong-pick (`SELECT y AS x FROM t ORDER BY t.x` →
+projections `[y AS x, x]`, schema `[x, x]`) is neutralized: post-N10 emission
+binds duplicate names by expr_id and the trim-Project re-binds by id. Witness
+`ord-014` (SQL corpus: `SELECT salary AS id FROM emp ORDER BY emp.id`, unique
+hidden sort key for deterministic order) added and GREEN differentially — it
+now pins the shape permanently. No fix needed; `unique_hidden_output_name`
+stays aggregate-only.
 
 ### O7. Lambda-body coercion gap (finding 4)
 **Size: blocked on O2.** `transform(date_arr, d -> d + INTERVAL '1' MONTH)` →

@@ -73,7 +73,9 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
   literal values/shapes — cannot move while the resolver receives only `&[DataType]`
   (`DataType` carries no scalar nullability). Those remain a *documented, legitimate* second
   home, not drift. Widening the resolver signature to `(DataType, nullable)` pairs is the
-  future completion; `json_tuple_field` (arity-only) is the one cheap remaining move.
+  future completion; `json_tuple_field` (arity-only) was the one cheap remaining move —
+  **done in Pass D4** (moved to `function_return_type` with the exact-2 slice-pattern
+  precedent; effective behavior preserved, arity≠2 → `Unresolved` as before).
 - **Invariant (as achievable today):** every function-return-type rule *derivable from arg
   DataTypes alone* lives in `function_return_type`, which sees all of them; exceptions carry
   a comment naming the expression-level fact that pins them in `function_call_data_type`.
@@ -116,6 +118,7 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 ### N4. Implicit coercions materialized as explicit `Cast` nodes at analysis
 
 - **Status: ✅ LANDED** (Pass A4, `800d18c`): `materialize_binary_coercions` in `resolve_and_stamp`'s Binary arm; `implicit: bool` on CastExpression (name- and semantic_eq-transparent); `decimalize` private again; render_binary's two re-derivations deleted; R1-6 deferred onto the `date_like_interval_result` seam (`SEAM(R1-6)`); full corpora green.
+  **SEAM(R1-6) closed in Pass D3** (`07bfcd2`) — see the D-pass addendum at the end of this file.
 - **Invariant:** if Spark's semantics insert a coercion (decimal widening, Date±Interval →
   the date-typed side), the analyzed tree *contains the `Cast` node*; emission renders what
   it sees and never re-derives a coercion.
@@ -202,7 +205,10 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
   entries keep their lineage). Name-neutral by construction (alias minted from the same
   `expression_output_name` the schema uses): only ONE emission test churned (insertion-only).
   New witness `ord-013` (qualified passthrough orderBy over same-named join column) guards
-  the bare-ref no-pin decision. Deferred: `__td_wcr` by-name revert (duplicate-name children).
+  the bare-ref no-pin decision. The deferred `__td_wcr` by-name revert was resolved
+  **WON'T-DO in Pass D4**: N8 killed the tbl-013 rationale, but duplicate-name children make a
+  by-name rename list ambiguous in SQL regardless — positional is the *correct* mechanism, not
+  a workaround; its doc comment now states the live rationale (D-pass addendum).
   Opus review clean (1 MINOR test-name staleness, fixed); full corpora green (DataFrame 404/0,
   SQL 404/0).
 - **Invariant:** after resolution, every entry of a Project/Aggregate/WithColumns output list
@@ -363,10 +369,10 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
   NOT deleted; only the trust-in-position + hand-maintained-lockstep layer is.
 - **Invariant:** every emitted output column carries a unique (id-derived) physical alias;
   references bind by id → alias, so duplicate names cannot be ambiguous at the SQL level.
-- **Today:** emission re-derives uniqueness positionally at 4 wrap sites
-  (`output_uniquified`, `bare_dup_slot` — id-keyed as of N10-lite stage 1, formerly
-  `bare_dup_ordinal` — `requalify_column_ref` — still ordinal-keyed, stage 2 gated —
-  `wrap_reprojected`) guarded by load-bearing asserts.
+- **Today (updated post-D1):** all duplicate-name binding sites are id-keyed
+  (`bare_dup_slot` and `requalify_column_ref`, N10-lite stages 1+2); Pass D1 then deleted
+  the `ColumnReference.ordinal` field outright, so positional identity is no longer merely
+  untrusted — it is unrepresentable (D-pass addendum).
 - **Deletes:** the positional-TRUST lockstep contract at the two stage-1 call sites (the
   alias-list machinery itself is physical and stays — see the scope correction above).
 - **Bug classes closed:** wrong-column binding at wrap/merge boundaries under duplicate
@@ -401,3 +407,88 @@ Suggested order: N1 → N2 → N3 → N4 → N6 → N7 → N8 → N5 → N9 → 
 | N5 | canonical substrate names | ~92 case-compares, substr remap | case/alias spelling slip-through |
 | N9 | stored attribute identity | ordinals_compatible, source_quals machinery | wrong-column identity (t1.x/t2.x) |
 | N10-lite | id-keyed dup-boundary binding (stage 1 of 2) | trust-in-stamped-position + the stamping/consumption lockstep contract (NOT the alias-list machinery, which is physical) | wrap/merge-boundary wrong-column (self-join class); stage 2 (join-condition path) gated on a disjointness pin |
+
+---
+
+## D-pass addendum (2026-07-13) — the enabled follow-ups, executed
+
+The N-catalog's landings enabled a set of follow-ups recorded across commit messages and
+ADR-024. All five were dispositioned in four passes (architect-free — the designs were
+settled by the N-series; Sonnet coder + independent Opus reviewer per pass, full corpora
+serial per pass, review findings addressed pre-commit).
+
+### D1 — `ColumnReference.ordinal` DELETED (`94b5d24`)
+
+Positional identity is now *unrepresentable*, not merely untrusted: the field, its ADR-023
+doc block, ~12 constructor writes, both ADR-024 transition `debug_assert`s in emission
+(their `Some(ordinal) ⟹ Some(expr_id)` invariant became unstatable), and the two
+defensive name-agreement *gates* in `output_attribute`/`promote_project_subtree` are gone
+(net −103 lines). The resolution tiers still compute the position as a resolution-time
+local (`field_index`) and stamp only the derived id; the two COPY-identity sites switched
+to find-by-`expr_id` first-occurrence with site-tagged name-agreement `debug_assert`s.
+Review verdict: the release-build copy-vs-mint drift question is **unreachable** — every
+lookup site passes the same schema the reference was resolved against, and within one
+schema duplicate ids are clones from duplicated projections. One test deleted as
+unrepresentable (`reproject_qualifiers_stale_ordinal_id_slot_wins` — no id-vs-position
+conflict can exist). Lib 1209/0; corpora 405/0 + 408/0.
+
+### D2 — tier-(g) correlated outer refs carry the outer attribute's id (`aedbe1b`)
+
+`resolve_in_outer` returns `(DataType, bool, Option<ExprId>)`; the tier-(g) arm stamps the
+matched OUTER attribute's id — closing the last routine "resolved but identity-less"
+state. Soundness (review-verified directly): (1) ids mint from one process-global
+`AtomicU64`, so an outer id never coincides with a local one; (2) expression walkers never
+descend into `SubqueryPlan` bodies, so no enclosing id-keyed rewrite reaches a tier-(g)
+ref. Every consumer's present-but-miss path audited ≡ old absence path. The review's one
+design finding, applied pre-commit: the struct-qualifier arm stamps `None` (a nested field
+has no attribute identity; Spark's `ExtractValue` precedent; mirrors local tier-(d)) —
+stamping the struct COLUMN's id would have minted a latent (id, name)-disagreeing node.
+Remaining legitimate `expr_id: None` sources are now enumerated in the field's doc:
+tier-(d)/outer struct-qualifier (semantically id-less) + two pre-existing
+unstamped-but-available gaps (`derive_implicit_grouping`, `try_rewrite_nested_struct_path`
+root) left as a named follow-up. Corpora re-run green on the final tree.
+
+### D3 — SEAM(R1-6) closed: Date ± day-time interval promotes to TIMESTAMP (`07bfcd2`)
+
+Live-Spark-probed rule (keyed on the interval TYPE's field span, not the value): sub-day
+day-time spans promote (add/sub/commuted; even a zero time-of-day `DAY TO SECOND`);
+day-only, year-month, and calendar intervals keep DATE. Fix rides the N4 seam exactly as
+designed: `date_like_interval_result` gained one leading `(Date, DayTimeInterval) →
+Timestamp` arm — the no-cast promote path and the still-cast stay-DATE path both fall out
+automatically. Plus one lowering re-kind: single-field `HOUR`/`MINUTE`/`SECOND` SQL
+literals are `IntervalKind::DayTime` (single-field `DAY` deliberately stays `Calendar` so
+it does not promote — τ's field-less `DayTimeInterval` cannot express a day-only span; the
+accepted over-promotion for wire-schema day-only interval COLUMNS is documented at the
+seam). Review value-verified the promote path against the DuckDB binary. Witnesses:
+SQL `lit-011`, DataFrame `intv-008` (expected-green). Lib 1216/0 (+7); corpora green.
+
+### D4 — `json_tuple_field` fact concentration + `__td_wcr` rationale rewrite
+
+(a) The N2 leftover: the arity-only return-type rule moved from
+`function_call_data_type`'s exception list into `function_return_type` (behavior-identical
+including the arity≠2 → `Unresolved` fall-through); emission's duplicated arity/unsafe-char
+re-validations reduced to `debug_assert`s citing the `expand_json_tuple_projections` choke
+point. (b) `build_with_columns_renamed`'s stale tbl-013 justification replaced by the live
+rationale — **the positional alias-list is the correct mechanism, not a workaround**:
+duplicate-name children make by-name SQL renames ambiguous; positional never needs the
+child's emitted names (adjacent latent issue F-todf-dupname noted as needing MORE
+positional thinking, analyzer-side). The by-name revert is therefore WON'T-DO.
+*Status: LANDED as `6efd192` (a) + `a2d512b` (b). The independent review returned
+CHANGES REQUIRED with a MAJOR that reversed item (a)'s emission plan: the
+"sole construction site" choke-point premise is FALSE — τ forwards unknown
+function names to emission with no allowlist, so a directly-invoked
+`json_tuple_field` would have hit a release-build index panic where a graceful
+boundary error used to be. The runtime guards stayed (comment now states the
+corrected fact); only the type-rule move survived as code motion. The review's
+MINOR also corrected F-todf-dupname's location (emission's rename_map only;
+verified trace in the D4b commit message). Gates: lib 1216/0, connect-server
+132/0, DataFrame corpus green, SQL corpus 409/0 on the final tree.*
+
+### Not taken up (deferred with cause)
+
+- **Typed expression tree (R2-4)** — deferred by explicit decision (2026-07-13); remains
+  the only fix for computed-node type re-derivation. Separate, larger design.
+- **`derive_implicit_grouping` / `try_rewrite_nested_struct_path` id stamping** — the two
+  unstamped-but-available gaps D2's audit named; small, safe, follow-up-sized.
+- **max_by/min_by null-at-extreme** (arg_max) — still xfail-pinned; per-function parity
+  fix, not an invariant.

@@ -50,7 +50,7 @@ use super::expression::{
     CastExpression, ColumnReference, Expression, ExtractValueExpression, FunctionCall, Literal,
     LiteralValue, SortOrder, SubqueryPlan, UnaryExpression, UnaryOp, UnresolvedColumn,
 };
-use super::schema::{Attribute, ResolvedSchema};
+use super::schema::{Attribute, ExprId, ResolvedSchema};
 use super::type_inference::{
     is_aggregate_classifier_name, is_nondeterministic_fn_name, TypeInferenceEngine,
 };
@@ -4053,10 +4053,12 @@ fn semantic_eq(a: &Expression, b: &Expression) -> bool {
 /// `t1.x` and `t2.x` after a join — canonicalize and `==`-compare IDENTICAL,
 /// so without this pass `semantic_eq` would bind to whichever SELECT-list
 /// entry happens to come first, silently picking the wrong one. When either
-/// side lacks an `expr_id` (e.g. a correlated outer reference — tier (g) in
-/// [`resolve_column`] never stamps one), the qualifier-stripped name match
-/// `==` already performed is the best identity available; no further
-/// constraint is imposed.
+/// side lacks an `expr_id` (D2: tier (g) in [`resolve_column`] now stamps a
+/// correlated outer reference's id too — the analyzer paths that still
+/// leave one unstamped are enumerated on
+/// [`super::expression::ColumnReference::expr_id`]'s doc), the
+/// qualifier-stripped name match `==` already performed is the best
+/// identity available; no further constraint is imposed.
 fn ids_compatible(a: &Expression, b: &Expression) -> bool {
     match (a, b) {
         (Expression::ColumnReference(ca), Expression::ColumnReference(cb)) => {
@@ -4423,6 +4425,11 @@ fn try_rewrite_nested_struct_path(
     // the root ColumnReference is fine because we immediately re-run
     // `stamp_column_reference` via the normal walk (the caller path stamps
     // any embedded ColumnReferences on subsequent visits).
+    //
+    // `expr_id` (documented remaining None source, `expression.rs`):
+    // `root_field` IS a real top-level attribute with an id available right
+    // here, but this pre-existing chain does not thread it through — a gap
+    // left open by this pass (D2 scoped to tier-(g) only), not fixed here.
     let mut expr = Expression::ColumnReference(ColumnReference {
         name: qualifier.to_owned(),
         qualifier: None,
@@ -4452,12 +4459,32 @@ fn try_rewrite_nested_struct_path(
 /// first, then relation-alias scope). An unqualified reference resolves only
 /// when exactly one case-insensitive match exists across the outer schema's
 /// fields (zero or 2+ matches yield `None`).
-fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<(DataType, bool)> {
+///
+/// D2: returns the matched OUTER [`super::schema::ExprId`] alongside the
+/// type/nullability — [`resolve_column`]'s tier-(g) arm stamps it onto the
+/// `ColumnReference` verbatim. Global id uniqueness (one process-wide
+/// `AtomicU64`, `schema.rs`) makes this sound: the returned id can only
+/// equal a local (inner-schema) id if it genuinely is that same attribute,
+/// which never happens here by construction (an outer-scope lookup is only
+/// reached after every inner tier already failed to resolve the name).
+/// The id slot is `None` for the struct-qualifier arm only — a nested
+/// struct field carries no attribute identity of its own (ADR-024
+/// identifies whole columns, not sub-paths within one; Spark's
+/// `ExtractValue` likewise keeps the child's `exprId` on the child only),
+/// mirroring the local tier-(d) twin in [`resolve_column`].
+fn resolve_in_outer(
+    u: &UnresolvedColumn,
+    outer: OuterScope<'_>,
+) -> Option<(DataType, bool, Option<ExprId>)> {
     if let Some(q) = u.qualifier.as_deref() {
         // Struct-column precedence in the outer schema (matches resolve_column's
-        // existing tier ordering).
+        // existing tier ordering). No id: the reference names the nested
+        // FIELD while the only attribute here is the struct COLUMN —
+        // stamping the column's id would create an (id, name)-disagreeing
+        // reference. Local tier-(d) makes the same choice.
         if let Some(info) = TypeInferenceEngine::struct_qualifier_info(&u.name, q, outer.schema) {
-            return Some(info);
+            let (dt, nullable) = info;
+            return Some((dt, nullable, None));
         }
         // Relation-alias scope in the outer context.
         let range = outer.scopes.lookup(q)?;
@@ -4465,17 +4492,27 @@ fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<(Data
         if range.end > outer.schema.fields.len() {
             return None;
         }
-        TypeInferenceEngine::column_info_in(&u.name, &outer.schema.fields[range])
+        let slice = &outer.schema.fields[range.clone()];
+        let (dt, nullable) = TypeInferenceEngine::column_info_in(&u.name, slice)?;
+        // `field_index` mirrors `column_info_in`'s own lookup order (exact
+        // name first, then the struct-qualified first segment), so the
+        // derived id always agrees with the value actually resolved.
+        let local = field_index(slice, &u.name)?;
+        Some((
+            dt,
+            nullable,
+            Some(outer.schema.fields[range.start + local].expr_id),
+        ))
     } else {
         // Unqualified: exactly-one case-insensitive match in the outer schema.
-        let mut found: Option<(DataType, bool)> = None;
+        let mut found: Option<(DataType, bool, Option<ExprId>)> = None;
         for f in &outer.schema.fields {
             if f.name.eq_ignore_ascii_case(&u.name) {
                 if found.is_some() {
                     // 2+ matches — ambiguous; do not silently pick one.
                     return None;
                 }
-                found = Some((f.data_type.clone(), f.nullable));
+                found = Some((f.data_type.clone(), f.nullable, Some(f.expr_id)));
             }
         }
         found
@@ -4789,21 +4826,26 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         // (g) Outer-scope fallback: when ALL inner tiers have failed and an
         // enclosing plan's scope is available (inside a subquery), attempt to
         // resolve the reference against the outer plan's schema. On hit, stamp
-        // the ColumnReference with the outer type/nullability and preserve the
-        // qualifier verbatim — emission renders it as-is, and DuckDB's own
-        // correlated-subquery binder resolves it at runtime (same mechanism
-        // the 13 existing green correlated subquery cases ride).
+        // the ColumnReference with the outer type/nullability/identity and
+        // preserve the qualifier verbatim — emission renders it as-is, and
+        // DuckDB's own correlated-subquery binder resolves it at runtime
+        // (same mechanism the 13 existing green correlated subquery cases
+        // ride). D2: the stamped `expr_id` is the OUTER attribute's — never
+        // equal to any id in `ctx.schema` (ids are minted from one
+        // process-global counter, so an outer id can only coincide with a
+        // local one if it genuinely IS that same attribute), so every local
+        // consumer that binds by id-in-local-schema still misses exactly as
+        // it did when this arm stamped `None`.
         if let Some(outer) = ctx.outer {
-            if let Some((outer_dt, outer_nullable)) = resolve_in_outer(&u, outer) {
+            if let Some((outer_dt, outer_nullable, outer_id)) = resolve_in_outer(&u, outer) {
                 return Ok(Expression::ColumnReference(ColumnReference {
                     name: u.name,
                     qualifier: u.qualifier,
                     data_type: Some(outer_dt),
                     nullable: Some(outer_nullable),
-                    // (g) The column is not in `ctx.schema` — its identity
-                    // lives in an enclosing scope; correlated `expr_id`
-                    // handling is a later concern.
-                    expr_id: None,
+                    // `None` only for the outer struct-qualifier arm — see
+                    // `resolve_in_outer`'s doc.
+                    expr_id: outer_id,
                 }));
             }
         }
@@ -5679,6 +5721,11 @@ fn derive_implicit_grouping(
         .iter()
         .filter(|f| !excluded.contains(&f.name.to_ascii_lowercase()))
         .map(|f| {
+            // `expr_id` (documented remaining None source, `expression.rs`):
+            // `f` IS the real input attribute with an id available right
+            // here, but this pre-existing derivation does not thread it
+            // through — a gap left open by this pass (D2 scoped to
+            // tier-(g) only), not fixed here.
             Expression::ColumnReference(ColumnReference {
                 name: f.name.clone(),
                 qualifier: None,
@@ -15323,13 +15370,13 @@ mod tests {
     }
 
     #[test]
-    fn tier_g_correlated_outer_ref_freeze_witness_no_expr_id_stamped() {
-        // N9 increment 2 deliberately does NOT stamp tier-(g) correlated
-        // outer references (see `resolve_column`'s tier-(g) arm) — stamping
-        // them would make `semantic_eq` STRICTER on correlated shapes, a
-        // behavior-changing change deferred to a separate corpus-gated pass.
-        // This pins the freeze: an outer ref still resolves with
-        // `expr_id: None`, unchanged from increment 1.
+    fn tier_g_correlated_outer_ref_stamps_outer_expr_id() {
+        // D2: tier-(g) correlated outer references now stamp the MATCHED
+        // OUTER attribute's `expr_id` (see `resolve_column`'s tier-(g) arm /
+        // `resolve_in_outer`) — the counterpart of N9 increment 2's freeze,
+        // which this test used to pin as `expr_id: None`. Assert the
+        // stamped id equals the outer plan's resolved `salary` attribute's
+        // id, read directly off the outer plan's own resolved schema.
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
@@ -15355,9 +15402,18 @@ mod tests {
             })],
         });
         let typed = analyze(ast, &bt).expect("correlated scalar subquery resolves");
-        let TypedOp::Project { projections, .. } = &typed.op else {
+        let TypedOp::Project {
+            input: outer_input,
+            projections,
+        } = &typed.op
+        else {
             panic!("expected Project, got {:?}", typed.op);
         };
+        let outer_salary_id = outer_input
+            .resolved_schema
+            .field_by_name("salary")
+            .expect("outer plan (alias `e` over `emp`) must resolve a `salary` attribute")
+            .expr_id;
         // A bare scalar subquery projection gets auto-aliased (`AS expr`) by
         // the Project arm — unwrap it to reach the ScalarSubquery itself.
         let unaliased = match &projections[0] {
@@ -15387,8 +15443,9 @@ mod tests {
                 assert_eq!(c.name, "salary");
                 assert_eq!(c.qualifier.as_deref(), Some("e"));
                 assert_eq!(
-                    c.expr_id, None,
-                    "tier-(g) must not stamp an expr_id (behavior freeze)"
+                    c.expr_id,
+                    Some(outer_salary_id),
+                    "tier-(g) must stamp the matched OUTER attribute's expr_id"
                 );
             }
             other => panic!("expected outer ColumnReference, got {other:?}"),

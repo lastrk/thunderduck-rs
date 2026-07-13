@@ -226,13 +226,29 @@ pub struct ColumnReference {
     pub data_type: Option<DataType>,
     pub nullable: Option<bool>,
     /// N9 increment 2 / ADR-024: the [`super::schema::ExprId`] of the
-    /// [`super::schema::Attribute`] this reference resolved to in the
-    /// PRODUCING node's output schema (`ctx.schema` at resolution time).
-    /// `None` when resolution did not pin an attribute (pre-analysis
-    /// `untyped`, or a tier that resolves by name/outer-scope only). Derived
-    /// resolution data recording *which* attribute the reference bound to,
-    /// not part of the reference's own logical identity — excluded from
-    /// `PartialEq` (see below).
+    /// [`super::schema::Attribute`] this reference resolved to — the
+    /// PRODUCING node's own output schema for a local reference (`ctx.schema`
+    /// at resolution time), or the ENCLOSING plan's output schema for a
+    /// correlated outer reference (D2 — `resolve_column`'s tier-(g) arm /
+    /// `resolve_in_outer` in `analyzer.rs`). `None` pre-analysis (`untyped`,
+    /// never resolved), and on a RESOLVED (`data_type: Some`) reference only
+    /// from the analyzer paths left open after D2 (`analyzer.rs`):
+    /// * tier-(d) in `resolve_column` and its outer twin, the
+    ///   struct-qualifier arm of `resolve_in_outer` — a qualifier naming a
+    ///   top-level STRUCT column resolves to a nested FIELD's type, which
+    ///   has no attribute identity of its own to stamp (only the struct
+    ///   COLUMN does; Spark's `ExtractValue` likewise keeps the child's
+    ///   `exprId` on the child only).
+    /// * `derive_implicit_grouping` (SQL `PIVOT` with no explicit grouping
+    ///   list) and the root reference `try_rewrite_nested_struct_path` builds
+    ///   for a multi-level nested-struct `ExtractValue` chain: both DO
+    ///   resolve to a real top-level attribute with an id available at
+    ///   construction, but a pre-existing gap leaves it unstamped — out of
+    ///   this pass's scope, left for a follow-up.
+    ///
+    /// Derived resolution data recording *which* attribute the reference
+    /// bound to, not part of the reference's own logical identity — excluded
+    /// from `PartialEq` (see below).
     pub expr_id: Option<ExprId>,
 }
 

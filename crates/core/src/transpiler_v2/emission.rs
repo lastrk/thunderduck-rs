@@ -414,8 +414,11 @@ struct SideNeedsAlias {
 /// (`self_join_left_right_resolved_schema_ids_are_disjoint`,
 /// `analyzer.rs`) and the `debug_assert` below.
 ///
-/// Left untouched: a reference whose `expr_id` is `None` (correlated /
-/// deferred resolution) or absent from `cond_schema` (a loud DuckDB binder
+/// Left untouched: a reference whose `expr_id` is `None` (deferred
+/// resolution — see [`super::expression::ColumnReference::expr_id`]'s doc
+/// for the analyzer paths that still leave it unstamped) or `Some` but
+/// absent from `cond_schema` (D2: a correlated outer reference's id lives in
+/// the enclosing plan's schema, never this join's — a loud DuckDB binder
 /// error surfaces instead of a silent wrong-column rewrite), and one
 /// carrying a real, non-synthetic user-alias qualifier (already binds —
 /// e.g. `e.dept_id`).
@@ -512,11 +515,11 @@ fn requalify_expr(
 /// The rewrite predicate (H8 boundary), N10-lite stage 2: `c.qualifier`
 /// must be `None` with `c.name` ambiguous (count `>= 2`) in `cond_schema`
 /// AND `c.expr_id` must name a field actually present in `cond_schema` (at
-/// position `k`) — otherwise `c` is left untouched (correlated/deferred, an
-/// id absent from `cond_schema`, or a real alias that already binds).
-/// Phase 3b: the analyzer never stamps a synthetic `__td_jl`/`__td_jr`
-/// qualifier anymore, so this is the only shape a rewritable reference can
-/// take.
+/// position `k`) — otherwise `c` is left untouched (unstamped/deferred, a
+/// correlated outer reference's id absent from `cond_schema` (D2), or a real
+/// alias that already binds). Phase 3b: the analyzer never stamps a
+/// synthetic `__td_jl`/`__td_jr` qualifier anymore, so this is the only
+/// shape a rewritable reference can take.
 ///
 /// By construction (see `resolve_column`), a bare reference with an
 /// ambiguous name that reaches here is already guaranteed ambiguous in
@@ -1202,9 +1205,13 @@ fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
 /// the set: a partial rewrite would be unsound (the wrap path re-derives the
 /// whole set from scratch instead).
 ///
-/// All other references pass through untouched: `expr_id: None` (correlated
-/// / deferred resolution), a real (already-rewritten) qualifier already
-/// binds, or a unique name that resolution already left bare.
+/// All other references pass through untouched: `expr_id: None` (deferred
+/// pre-analysis resolution, or one of the analyzer gaps enumerated on
+/// [`super::expression::ColumnReference::expr_id`]'s doc), `expr_id: Some`
+/// but naming no field in this schema (D2: a correlated outer reference —
+/// its id lives in the enclosing plan's schema, never this one's), a real
+/// (already-rewritten) qualifier already binds, or a unique name that
+/// resolution already left bare.
 fn requalify_visible<'e>(
     exprs: impl IntoIterator<Item = &'e Expression>,
     block: &SelectBlock,
@@ -10841,6 +10848,14 @@ mod tests {
         // reached here) is left completely untouched — no silent
         // wrong-column rewrite; the unresolved reference surfaces as a
         // loud DuckDB binder error instead.
+        //
+        // D2: this is also the exact shape a correlated outer reference now
+        // takes at emission — tier-(g) stamps it with the OUTER plan's
+        // attribute id (`resolve_in_outer`, `analyzer.rs`), which by
+        // construction never appears in THIS (local/inner) schema. The
+        // `foreign_schema`/`foreign_id` fixture below models that: an id
+        // minted from a schema this function never sees, standing in for
+        // the outer plan's schema.
         let schema = Schema::minted(StructType::new(vec![
             StructField::not_null("id", DataType::Long),
             StructField::nullable("dept_id", DataType::Integer),

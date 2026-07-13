@@ -530,14 +530,6 @@ fn requalify_column_ref(
     right_scope: &FromScope,
     needs: &mut SideNeedsAlias,
 ) {
-    // ADR-024 transition assert (review NIT — symmetric with
-    // `bare_dup_slot`'s): a resolver tier must never stamp an ordinal
-    // without the matching attribute's expr_id.
-    debug_assert!(
-        c.ordinal.is_none() || c.expr_id.is_some(),
-        "ADR-024: ordinal stamped without expr_id on `{}`",
-        c.name
-    );
     let Some(id) = c.expr_id else { return };
     let name_count = cond_schema
         .fields
@@ -1170,7 +1162,7 @@ fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
 /// addressed); an id ABSENT from `schema` leaves the reference untouched,
 /// surfacing as a loud DuckDB binder error rather than a silent
 /// wrong-column rewrite. Shared by [`requalify_visible`]'s merge-path
-/// rewrite and [`reproject_qualifiers`]'s wrap-path ordinal arm — single
+/// rewrite and [`reproject_qualifiers`]'s wrap-path bare-dup arm — single
 /// authority for the debug_assert guard, so both call sites stay in
 /// lockstep.
 fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
@@ -1185,16 +1177,6 @@ fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
     if name_count < 2 {
         return None;
     }
-    // ADR-024 transition assert: polices the `Some(ordinal) ⟹ Some(expr_id)`
-    // stamping obligation at the point emission stops trusting `ordinal` for
-    // duplicate-name binding — a resolver tier that stamps an ordinal
-    // without an id would silently escape the id-keyed rewrite below.
-    debug_assert!(
-        c.ordinal.is_none() || c.expr_id.is_some(),
-        "ADR-024: c.ordinal ({:?}) implies c.expr_id must be Some, but it is None for {}",
-        c.ordinal,
-        c.name
-    );
     let id = c.expr_id?;
     let k = schema.fields.iter().position(|f| f.expr_id == id)?;
     // H8 assert 1 (load-bearing; now guards resolver stamping bugs, not the
@@ -1210,7 +1192,7 @@ fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
     Some(k)
 }
 
-/// Merge visibility + ordinal requalification, fused (ADR-023 Phase 3b).
+/// Merge visibility + id-keyed requalification, fused (ADR-023 Phase 3b).
 /// `Some(rewritten)` iff (a) every scope-bound qualifier `exprs` carries is
 /// exposed by `block`'s FROM (the [`exprs_visible_in`] contract) AND (b)
 /// every bare duplicate-name reference ([`bare_dup_slot`]) binds through a
@@ -1220,8 +1202,8 @@ fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
 /// the set: a partial rewrite would be unsound (the wrap path re-derives the
 /// whole set from scratch instead).
 ///
-/// All other references pass through untouched: `ordinal: None` (correlated
-/// / deferred resolution), a real (non-ordinal-rewritable) qualifier already
+/// All other references pass through untouched: `expr_id: None` (correlated
+/// / deferred resolution), a real (already-rewritten) qualifier already
 /// binds, or a unique name that resolution already left bare.
 fn requalify_visible<'e>(
     exprs: impl IntoIterator<Item = &'e Expression>,
@@ -7245,7 +7227,6 @@ mod tests {
             qualifier: None,
             data_type: Some(dt),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         })
     }
@@ -7833,7 +7814,6 @@ mod tests {
                         qualifier: Some("outer_e".to_owned()),
                         data_type: Some(DataType::Double),
                         nullable: Some(true),
-                        ordinal: None,
                         expr_id: None,
                     })),
                     right: Box::new(int_lit(1)),
@@ -10500,10 +10480,11 @@ mod tests {
         // columns. The ORDER BY key sources from `emp2`'s `dept_id`
         // specifically; over the Project (whose own `RelScope` binds no
         // local aliases), `resolve_column`'s tier-(f) source_quals arm
-        // resolves it by ORDINAL and DROPS the qualifier, landing at
-        // emission as a bare `ColumnReference { ordinal: Some(1) }` — and
-        // that ordinal's name IS duplicated in the Project's own
-        // `resolved_schema`. Before this fix, `build_sort`'s `keys_bind`
+        // resolves it by the target attribute's identity and DROPS the
+        // qualifier, landing at emission as a bare `ColumnReference`
+        // carrying that attribute's `expr_id` — and that id's slot (1) IS
+        // duplicated in the Project's own `resolved_schema`. Before this
+        // fix, `build_sort`'s `keys_bind`
         // predicate admitted this bare key and merged it straight into the
         // occupied (duplicate-name) SELECT block, emitting an ambiguous bare
         // `ORDER BY dept_id` DuckDB cannot bind (two same-named SELECT
@@ -10721,13 +10702,12 @@ mod tests {
     #[test]
     fn reproject_qualifiers_ordinal_arm_binds_bare_dup_by_id() {
         let _g = tap_guard();
-        // Direct unit pin for the `reproject_qualifiers` ordinal else-arm
+        // Direct unit pin for the `reproject_qualifiers` bare-dup else-arm
         // (N10-lite): a bare duplicate-name ref rewrites to `uniquified[k]`
-        // where `k` is found by the reference's `expr_id`, never a trusted
-        // stamped `ordinal` — fixtures stamp REAL ids read off the fixture
-        // schema (not `expr_id: None`). A bare UNIQUE-name ref and a bare
-        // ref with `ordinal: None` (deferred resolution) are both left
-        // untouched regardless.
+        // where `k` is found by the reference's `expr_id` — fixtures stamp
+        // REAL ids read off the fixture schema (not `expr_id: None`). A bare
+        // UNIQUE-name ref and a bare ref with `expr_id: None` (deferred
+        // resolution) are both left untouched regardless.
         let schema = Schema::minted(StructType::new(vec![
             StructField::not_null("id", DataType::Long),
             StructField::nullable("dept_id", DataType::Integer),
@@ -10748,7 +10728,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Integer),
             nullable: Some(true),
-            ordinal: Some(2),
             expr_id: Some(dept_id_second),
         });
         let unique_no_rewrite = Expression::ColumnReference(ColumnReference {
@@ -10756,7 +10735,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Long),
             nullable: Some(false),
-            ordinal: Some(0),
             expr_id: Some(id_col_id),
         });
         let deferred_no_ordinal = Expression::ColumnReference(ColumnReference {
@@ -10764,7 +10742,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::String),
             nullable: Some(true),
-            ordinal: None,
             expr_id: Some(name_col_id),
         });
         let input = TypedAst::new(
@@ -10794,10 +10771,7 @@ mod tests {
         match rewritten_deferred {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.qualifier, None);
-                assert_eq!(
-                    c.name, "name",
-                    "an ordinal:None ref (unique name) is untouched"
-                );
+                assert_eq!(c.name, "name", "a bare unique-name ref is untouched");
             }
             other => panic!("expected ColumnReference, got {other:?}"),
         }
@@ -10837,7 +10811,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Integer),
             nullable: Some(true),
-            ordinal: Some(2), // stale/irrelevant under id-keyed binding
             expr_id: Some(shared_id),
         });
         let input = TypedAst::new(
@@ -10854,56 +10827,6 @@ mod tests {
                 assert_eq!(
                     c.name, "dept_id",
                     "the same id at two slots must bind the FIRST occurrence"
-                );
-            }
-            other => panic!("expected ColumnReference, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reproject_qualifiers_stale_ordinal_id_slot_wins() {
-        let _g = tap_guard();
-        // N10-lite: the binding key is `expr_id`, not the stamped
-        // `ordinal` — a reference whose `ordinal` names the WRONG
-        // same-named slot (simulating a stale/mismatched stamp) must still
-        // bind through its `expr_id`'s slot, never the ordinal's. Silent
-        // wrong-column rewrite under a stale ordinal is exactly the bug
-        // class N10-lite closes.
-        let schema = Schema::minted(StructType::new(vec![
-            StructField::not_null("id", DataType::Long),
-            StructField::nullable("dept_id", DataType::Integer),
-            StructField::nullable("dept_id", DataType::Integer),
-            StructField::nullable("name", DataType::String),
-        ]));
-        let correct_id = schema.fields[2].expr_id;
-        let uniquified = vec![
-            "id".to_owned(),
-            "dept_id".to_owned(),
-            "dept_id_1".to_owned(),
-            "name".to_owned(),
-        ];
-        let stale = Expression::ColumnReference(ColumnReference {
-            name: "dept_id".to_owned(),
-            qualifier: None,
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
-            ordinal: Some(1),          // WRONG slot: names schema[1]
-            expr_id: Some(correct_id), // RIGHT slot: schema[2]
-        });
-        let input = TypedAst::new(
-            TypedOp::TableScan {
-                table: "dup_tbl".to_owned(),
-                alias: None,
-            },
-            schema.clone(),
-        );
-        let rewritten = reproject_qualifiers(&stale, &input, &uniquified);
-        match rewritten {
-            Expression::ColumnReference(c) => {
-                assert_eq!(c.qualifier, None);
-                assert_eq!(
-                    c.name, "dept_id_1",
-                    "the id-resolved slot must win over the stale ordinal"
                 );
             }
             other => panic!("expected ColumnReference, got {other:?}"),
@@ -10940,12 +10863,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Integer),
             nullable: Some(true),
-            // Review-pinned (N10 MINOR): the ordinal points at slot 2, whose
-            // uniquified name ("dept_id_1") DIFFERS from the reference's own
-            // name — so "left untouched" is distinguishable from a
-            // hypothetical positional fallback (which would rewrite to
-            // "dept_id_1" and fail the assertion below).
-            ordinal: Some(2),
             expr_id: Some(foreign_id),
         });
         let input = TypedAst::new(
@@ -10961,8 +10878,7 @@ mod tests {
                 assert_eq!(c.qualifier, None);
                 assert_eq!(
                     c.name, "dept_id",
-                    "an id absent from the schema must stay untouched, not fall back \
-                     to positional binding"
+                    "an id absent from the schema must stay untouched"
                 );
             }
             other => panic!("expected ColumnReference, got {other:?}"),
@@ -12501,7 +12417,6 @@ mod tests {
             qualifier: Some("emp".to_owned()),
             data_type: Some(DataType::Long),
             nullable: Some(false),
-            ordinal: None,
             expr_id: None,
         };
         let sql = render_column_reference(&c).expect("render");
@@ -13369,7 +13284,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Integer),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let sql =
@@ -13632,7 +13546,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::Timestamp),
                     nullable: Some(true),
-                    ordinal: None,
                     expr_id: None,
                 }),
                 str_lit("yyyy-MM-dd HH:mm:ss"),
@@ -13768,7 +13681,6 @@ mod tests {
                 qualifier: None,
                 data_type: Some(DataType::String),
                 nullable: Some(true),
-                ordinal: None,
                 expr_id: None,
             })),
             updates: vec![("x".to_owned(), None)],
@@ -13790,7 +13702,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13824,7 +13735,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13865,7 +13775,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13919,7 +13828,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13958,7 +13866,6 @@ mod tests {
                         qualifier: None,
                         data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
                         nullable: Some(true),
-                        ordinal: None,
                         expr_id: None,
                     }),
                     Expression::Lambda(LambdaExpression {
@@ -14077,7 +13984,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::Array(Box::new(DataType::String), true)),
                     nullable: Some(true),
-                    ordinal: None,
                     expr_id: None,
                 }),
             ],
@@ -14146,7 +14052,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14195,7 +14100,6 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14234,7 +14138,6 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14268,7 +14171,6 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14427,7 +14329,6 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let sql = render_fn("size", vec![map_col]);
@@ -14454,7 +14355,6 @@ mod tests {
                 true,
             )),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let sql = render_fn("flatten", vec![outer]);
@@ -14516,7 +14416,6 @@ mod tests {
                         qualifier: None,
                         data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
                         nullable: Some(true),
-                        ordinal: None,
                         expr_id: None,
                     }),
                     Expression::Lambda(LambdaExpression {
@@ -14905,7 +14804,6 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("team")]);
@@ -14924,7 +14822,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let sql = render_fn(
@@ -14985,7 +14882,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let sql = render_fn(
@@ -15018,7 +14914,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let sql = render_fn(
@@ -15053,7 +14948,6 @@ mod tests {
                 value_nullable: true,
             }),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("missing")]);
@@ -15154,7 +15048,6 @@ mod tests {
             qualifier: None,
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let sql = render_fn("concat_ws", vec![str_lit(","), arr_col]);
@@ -15270,7 +15163,6 @@ mod tests {
                     scale: 2,
                 }),
                 nullable: Some(true),
-                ordinal: None,
                 expr_id: None,
             })),
             op: BinaryOp::Div,
@@ -15282,7 +15174,6 @@ mod tests {
                     scale: 3,
                 }),
                 nullable: Some(true),
-                ordinal: None,
                 expr_id: None,
             })),
         });
@@ -16208,7 +16099,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
-                    ordinal: None,
                     expr_id: None,
                 }),
                 Expression::Literal(Literal {
@@ -16271,7 +16161,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
-                    ordinal: None,
                     expr_id: None,
                 }),
                 Expression::Literal(Literal {
@@ -16302,7 +16191,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
-                    ordinal: None,
                     expr_id: None,
                 }),
                 Expression::Literal(Literal {
@@ -16336,7 +16224,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
-                    ordinal: None,
                     expr_id: None,
                 }),
                 Expression::ColumnReference(ColumnReference {
@@ -16344,7 +16231,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::String),
                     nullable: Some(true),
-                    ordinal: None,
                     expr_id: None,
                 }),
             ],
@@ -16443,7 +16329,6 @@ mod tests {
                 qualifier: None,
                 data_type: None,
                 nullable: None,
-                ordinal: None,
                 expr_id: None,
             }),
             str_lit(field),
@@ -16494,7 +16379,6 @@ mod tests {
                 qualifier: None,
                 data_type: None,
                 nullable: None,
-                ordinal: None,
                 expr_id: None,
             })],
         );
@@ -16530,7 +16414,6 @@ mod tests {
                     qualifier: None,
                     data_type: None,
                     nullable: None,
-                    ordinal: None,
                     expr_id: None,
                 }),
                 str_lit("a"),
@@ -16551,7 +16434,6 @@ mod tests {
                 qualifier: None,
                 data_type: None,
                 nullable: None,
-                ordinal: None,
                 expr_id: None,
             })],
         );
@@ -16698,7 +16580,6 @@ mod tests {
             qualifier: Some("e".to_owned()),
             data_type: Some(DataType::Array(Box::new(DataType::String), true)),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         })
     }
@@ -16834,7 +16715,6 @@ mod tests {
             qualifier: Some("e".to_owned()),
             data_type: Some(DataType::Long),
             nullable: Some(false),
-            ordinal: None,
             expr_id: None,
         });
         let tag_ref = Expression::ColumnReference(ColumnReference {
@@ -16842,7 +16722,6 @@ mod tests {
             qualifier: Some("t".to_owned()),
             data_type: Some(DataType::String),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         });
         let proj = TypedAst::new(

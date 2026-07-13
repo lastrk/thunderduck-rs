@@ -225,28 +225,22 @@ pub struct ColumnReference {
     pub qualifier: Option<String>,
     pub data_type: Option<DataType>,
     pub nullable: Option<bool>,
-    /// ADR-023 tier 3: 0-based position of the resolved column in the
+    /// N9 increment 2 / ADR-024: the [`super::schema::ExprId`] of the
+    /// [`super::schema::Attribute`] this reference resolved to in the
     /// PRODUCING node's output schema (`ctx.schema` at resolution time).
-    /// `None` when resolution did not pin a position (pre-analysis
-    /// `untyped`, or a tier that resolves by name/outer-scope only).
-    /// Derived data — excluded from `PartialEq` (see below).
-    pub ordinal: Option<usize>,
-    /// N9 increment 2: the [`super::schema::ExprId`] of the
-    /// [`super::schema::Attribute`] this reference resolved to — the same
-    /// attribute `ordinal` indexes into `ctx.schema`. `None` under the exact
-    /// same conditions as `ordinal` (pre-analysis `untyped`, or a tier that
-    /// does not pin a position — see `ordinal`'s doc). Like `ordinal`, this
-    /// is derived resolution data recording *which* attribute the reference
-    /// bound to, not part of the reference's own logical identity — excluded
-    /// from `PartialEq` (see below).
+    /// `None` when resolution did not pin an attribute (pre-analysis
+    /// `untyped`, or a tier that resolves by name/outer-scope only). Derived
+    /// resolution data recording *which* attribute the reference bound to,
+    /// not part of the reference's own logical identity — excluded from
+    /// `PartialEq` (see below).
     pub expr_id: Option<ExprId>,
 }
 
 impl PartialEq for ColumnReference {
-    /// Excludes `ordinal` and `expr_id`: both are derived resolution facts
-    /// recording *where*/*which* a column resolved to, not part of the
-    /// reference's logical identity. Mirrors `TypedAst`'s scope-excluding
-    /// `Eq` — keeps every pre-existing equality-based test unchanged.
+    /// Excludes `expr_id`: a derived resolution fact recording *which*
+    /// attribute a column resolved to, not part of the reference's logical
+    /// identity. Mirrors `TypedAst`'s scope-excluding `Eq` — keeps every
+    /// pre-existing equality-based test unchanged.
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
             && self.qualifier == other.qualifier
@@ -1969,7 +1963,6 @@ impl ColumnReference {
             qualifier: None,
             data_type: None,
             nullable: None,
-            ordinal: None,
             expr_id: None,
         })
     }
@@ -2641,7 +2634,6 @@ mod tests {
             qualifier: None,
             data_type: Some(address_struct_type()),
             nullable: Some(true),
-            ordinal: None,
             expr_id: None,
         })
     }

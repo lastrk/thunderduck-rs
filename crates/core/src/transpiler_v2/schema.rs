@@ -109,7 +109,7 @@ impl Attribute {
 /// is part of the column's logical value — `expr_id` is derived identity
 /// bookkeeping and `source_quals` is derived lineage bookkeeping (ADR-023
 /// tier-3) — mirrors `ColumnReference`'s hand-written `PartialEq` excluding
-/// `ordinal` (`expression.rs`, `ColumnReference`) and `TypedAst`/`RelScope`'s
+/// `expr_id` (`expression.rs`, `ColumnReference`) and `TypedAst`/`RelScope`'s
 /// derived-data exclusions elsewhere in this module tree. Keeps every
 /// pre-existing schema-equality test (written against `StructField`/
 /// `StructType` semantics) passing unchanged once schemas carry ids.

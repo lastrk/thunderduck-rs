@@ -149,9 +149,10 @@ pub struct RelScope {
     /// `(plan_id, field-range)` bindings, OUTERMOST join first —
     /// [`RelScope::lookup_plan_id`] uses first match, so the nearest
     /// enclosing join's range wins. Phase 3b: no side tag — `resolve_column`
-    /// always binds a plan_id ref bare (qualifier `None`) plus the ordinal
-    /// into the emitting operator's schema; emission derives which side to
-    /// bind against positionally (see the module's governing invariant).
+    /// always binds a plan_id ref bare (qualifier `None`) plus the attribute
+    /// identity (`expr_id`) of the resolved position in the emitting
+    /// operator's schema; emission derives which side to bind against via
+    /// that identity (see the module's governing invariant).
     pub(crate) plan_ids: Vec<(i64, std::ops::Range<usize>)>,
     /// plan_ids bound on BOTH the left AND right side of the SAME join —
     /// the un-realiased self-join `df.join(df, ...)` reusing the identical
@@ -182,7 +183,7 @@ pub struct RelScope {
 /// fully determined by `(op, resolved_schema)` (via `source_quals_tracked_of`),
 /// and existing scope-equality tests assert equality over the binding facts
 /// (`aliases` / `plan_ids` / `ambiguous_plan_ids`) only. Mirrors
-/// `ColumnReference`'s hand-written `PartialEq` excluding `ordinal`.
+/// `ColumnReference`'s hand-written `PartialEq` excluding `expr_id`.
 impl PartialEq for RelScope {
     fn eq(&self, other: &Self) -> bool {
         self.aliases == other.aliases
@@ -1350,14 +1351,12 @@ fn analyze_node(
                 let trim_projections: Vec<Expression> = original_schema
                     .fields
                     .iter()
-                    .enumerate()
-                    .map(|(i, f)| {
+                    .map(|f| {
                         Expression::ColumnReference(ColumnReference {
                             name: f.name.clone(),
                             qualifier: None,
                             data_type: Some(f.data_type.clone()),
                             nullable: Some(f.nullable),
-                            ordinal: Some(i),
                             expr_id: Some(f.expr_id),
                         })
                     })
@@ -3765,7 +3764,6 @@ fn bind_slot(entries: &[Expression], schema: &ResolvedSchema, k: usize) -> Expre
         qualifier: None,
         data_type: Some(field.data_type),
         nullable: Some(field.nullable),
-        ordinal: Some(k),
         expr_id: Some(field.expr_id),
     })
 }
@@ -3856,7 +3854,6 @@ fn promote_aggregate_subtree(
             qualifier: None,
             data_type: Some(field.data_type),
             nullable: Some(field.nullable),
-            ordinal: Some(aggregates.len() - 1),
             expr_id: Some(field.expr_id),
         }));
     }
@@ -3889,28 +3886,35 @@ fn promote_project_subtree(
     if let Expression::ColumnReference(cr) = &expr {
         // Promoting a bare input `ColumnReference` that passes through
         // unmodified — COPY its existing identity from `input_schema`
-        // (by ordinal, same precedent as `output_attribute`) rather than
-        // minting a fresh one for what is still the same logical column.
-        let field = cr
-            .ordinal
-            .and_then(|k| input_schema.fields.get(k))
-            .cloned()
-            .unwrap_or_else(|| {
-                Attribute::minted(
-                    expression_output_name(&expr),
-                    expr.data_type(input_schema),
-                    expr.nullable(input_schema),
-                )
-            });
+        // (by attribute id, same precedent as `output_attribute`) rather
+        // than minting a fresh one for what is still the same logical
+        // column.
+        let found = cr
+            .expr_id
+            .and_then(|id| input_schema.fields.iter().find(|f| f.expr_id == id));
+        if let Some(src) = found {
+            debug_assert!(
+                src.name.eq_ignore_ascii_case(&cr.name),
+                "promote_project_subtree: expr_id-resolved attribute name `{}` must agree \
+                 with the reference's stamped name `{}`",
+                src.name,
+                cr.name
+            );
+        }
+        let field = found.cloned().unwrap_or_else(|| {
+            Attribute::minted(
+                expression_output_name(&expr),
+                expr.data_type(input_schema),
+                expr.nullable(input_schema),
+            )
+        });
         projections.push(expr);
         schema.fields.push(field.clone());
-        let k = projections.len() - 1;
         return Some(Expression::ColumnReference(ColumnReference {
             name: field.name,
             qualifier: None,
             data_type: Some(field.data_type),
             nullable: Some(field.nullable),
-            ordinal: Some(k),
             expr_id: Some(field.expr_id),
         }));
     }
@@ -4078,9 +4082,9 @@ fn ids_compatible(a: &Expression, b: &Expression) -> bool {
 /// covered without a hand-enumerated match; infallible (`Result<_,
 /// Infallible>`), so the `unwrap_or_else` below can never panic.
 ///
-/// `ColumnReference::ordinal` AND `expr_id` are deliberately PRESERVED (only
+/// `ColumnReference::expr_id` is deliberately PRESERVED (only
 /// qualifier/name-case/type/nullable are normalized away) — [`semantic_eq`]'s
-/// `==` check cannot see either (`ColumnReference::eq` excludes both), but
+/// `==` check cannot see it (`ColumnReference::eq` excludes it), but
 /// [`ids_compatible`] reads `expr_id` directly off these canonicalized trees.
 /// Dropping this preservation (e.g. re-normalizing `expr_id` to `None` here)
 /// would silently revert the [`ids_compatible`] check to always-`true` —
@@ -4103,7 +4107,6 @@ fn canonicalize_for_semantic_eq(expr: &Expression) -> Expression {
             qualifier: None,
             data_type: None,
             nullable: None,
-            ordinal: c.ordinal,
             expr_id: c.expr_id,
         }),
         Expression::UnresolvedColumn(u) => Expression::UnresolvedColumn(UnresolvedColumn {
@@ -4425,7 +4428,6 @@ fn try_rewrite_nested_struct_path(
         qualifier: None,
         data_type: Some(root_field.data_type.clone()),
         nullable: Some(root_field.nullable),
-        ordinal: None,
         expr_id: None,
     });
     for seg in &segments {
@@ -4480,11 +4482,13 @@ fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<(Data
     }
 }
 
-/// ADR-023 tier 3: 0-based position of the field that resolves `name` within
-/// `fields` (first case-insensitive match), mirroring
+/// 0-based position of the field that resolves `name` within `fields` (first
+/// case-insensitive match), mirroring
 /// [`TypeInferenceEngine::column_info_in`]'s own lookup order — exact name
 /// first, then the struct-qualified first segment for a dotted name — so the
-/// stamped ordinal always agrees with the value actually resolved.
+/// derived `expr_id` always agrees with the value actually resolved. Used as
+/// a resolution-time-only local (see `resolve_column`); ADR-024 removed the
+/// `ColumnReference::ordinal` field this position used to be stamped into.
 fn field_index(fields: &[Attribute], name: &str) -> Option<usize> {
     if let Some(i) = fields
         .iter()
@@ -4560,22 +4564,23 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                 if let Some((dt, nullable)) = info {
                     let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
                         .map(|i| range.start + i);
-                    // N9 increment 2: same attribute the ordinal indexes —
-                    // `Some(ordinal) ⟹ Some(expr_id)`.
+                    // ADR-024: same attribute the local `field_index`
+                    // position indexes (position dies here; only the id is
+                    // stamped).
                     let expr_id = ordinal.map(|k| ctx.schema.fields[k].expr_id);
                     // Phase 3b (governing invariant): always bare — a
-                    // plan_id-scoped ref binds by ORDINAL into the emitting
-                    // operator's schema, never by a stamped join-side
-                    // qualifier. Emission binds `ColumnReference{qualifier:
-                    // None, ordinal: Some(k)}` positionally against
-                    // `input.resolved_schema.fields[k]`, whether or not the
+                    // plan_id-scoped ref binds into the emitting operator's
+                    // schema by attribute identity, never by a stamped
+                    // join-side qualifier. Emission binds
+                    // `ColumnReference{qualifier: None, expr_id: Some(id)}`
+                    // against the attribute `id` names in
+                    // `input.resolved_schema.fields`, whether or not the
                     // name is duplicated elsewhere in the schema.
                     return Ok(Expression::ColumnReference(ColumnReference {
                         name: u.name,
                         qualifier: None,
                         data_type: Some(dt),
                         nullable: Some(nullable),
-                        ordinal,
                         expr_id,
                     }));
                 }
@@ -4613,16 +4618,16 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
             qualifier: u.qualifier,
         });
     }
-    let (dt, nullable, ordinal, expr_id) = if let Some(q) = u.qualifier.as_deref() {
+    let (dt, nullable, expr_id) = if let Some(q) = u.qualifier.as_deref() {
         // Qualified, non-synthetic: (d) a qualifier naming a top-level STRUCT
         // column wins over a relation-alias scope — struct-field access takes
         // precedence, matching the pre-existing behavior this pass preserves.
         // The resolved field lives inside the struct, not at a top-level
-        // position in `ctx.schema` — no ordinal to stamp.
+        // position in `ctx.schema` — no attribute identity to stamp.
         if let Some((dt, nullable)) =
             TypeInferenceEngine::struct_qualifier_info(&u.name, q, ctx.schema)
         {
-            (dt, nullable, None, None)
+            (dt, nullable, None)
         } else {
             match ctx.scoped_range(q) {
                 // (e) qualifier binds exactly one in-bounds relation scope —
@@ -4639,8 +4644,9 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                         Some((dt, nullable)) => {
                             let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
                                 .map(|i| range.start + i);
-                            // N9 increment 2: same attribute the ordinal
-                            // indexes — `Some(ordinal) ⟹ Some(expr_id)`.
+                            // ADR-024: same attribute the local `field_index`
+                            // position indexes (position dies here; only the
+                            // id is stamped).
                             let expr_id = ordinal.map(|k| ctx.schema.fields[k].expr_id);
                             // ADR-023 3e-ii: a qualifier that binds a local
                             // scope AND resolves to a name UNIQUE in the
@@ -4666,14 +4672,13 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                                     return Ok(Expression::ColumnReference(ColumnReference {
                                         name: u.name,
                                         qualifier: None,
-                                        ordinal: Some(k),
                                         expr_id: Some(f.expr_id),
                                         data_type: Some(f.data_type.clone()),
                                         nullable: Some(f.nullable),
                                     }));
                                 }
                             }
-                            (dt, nullable, ordinal, expr_id)
+                            (dt, nullable, expr_id)
                         }
                         None => {
                             return Err(AnalyzerError::UnknownColumn {
@@ -4725,15 +4730,15 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                         match hits.len() {
                             1 => {
                                 // Projected-through (F10): resolve by
-                                // ORDINAL and DROP the qualifier so emission
-                                // renders the bare column, which binds
-                                // positionally over any wrapper — no strand.
+                                // attribute identity and DROP the qualifier
+                                // so emission renders the bare column, which
+                                // binds by that identity over any wrapper —
+                                // no strand.
                                 let k = hits[0];
                                 let f = &ctx.schema.fields[k];
                                 return Ok(Expression::ColumnReference(ColumnReference {
                                     name: u.name,
                                     qualifier: None,
-                                    ordinal: Some(k),
                                     expr_id: Some(f.expr_id),
                                     data_type: Some(f.data_type.clone()),
                                     nullable: Some(f.nullable),
@@ -4754,7 +4759,7 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                             // scope (correlation, tbl-005/sq-*) and
                             // otherwise raises UnknownColumn (F8) — NO
                             // permissive name-only fallback here.
-                            _ => (DataType::Unresolved, false, None, None),
+                            _ => (DataType::Unresolved, false, None),
                         }
                     } else {
                         // Deferred lineage (USING / Star / SetOp / …): keep
@@ -4766,9 +4771,9 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                             ctx.schema,
                         );
                         let ordinal = field_index(&ctx.schema.fields, &u.name);
-                        // N9 increment 2: same attribute the ordinal indexes.
+                        // ADR-024: same attribute the position indexes.
                         let expr_id = ordinal.map(|k| ctx.schema.fields[k].expr_id);
-                        (dt, nullable, ordinal, expr_id)
+                        (dt, nullable, expr_id)
                     }
                 }
             }
@@ -4776,9 +4781,9 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     } else {
         let (dt, nullable) = TypeInferenceEngine::qualified_column_info(&u.name, None, ctx.schema);
         let ordinal = field_index(&ctx.schema.fields, &u.name);
-        // N9 increment 2: same attribute the ordinal indexes.
+        // ADR-024: same attribute the position indexes.
         let expr_id = ordinal.map(|k| ctx.schema.fields[k].expr_id);
-        (dt, nullable, ordinal, expr_id)
+        (dt, nullable, expr_id)
     };
     if matches!(dt, DataType::Unresolved) {
         // (g) Outer-scope fallback: when ALL inner tiers have failed and an
@@ -4795,10 +4800,9 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                     qualifier: u.qualifier,
                     data_type: Some(outer_dt),
                     nullable: Some(outer_nullable),
-                    // (g) The column is not in `ctx.schema` — its position
-                    // lives in an enclosing scope; correlated ordinal
+                    // (g) The column is not in `ctx.schema` — its identity
+                    // lives in an enclosing scope; correlated `expr_id`
                     // handling is a later concern.
-                    ordinal: None,
                     expr_id: None,
                 }));
             }
@@ -4813,7 +4817,6 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
         qualifier: u.qualifier,
         data_type: Some(dt),
         nullable: Some(nullable),
-        ordinal,
         expr_id,
     }))
 }
@@ -4888,12 +4891,16 @@ fn schema_has_unresolved(schema: &ResolvedSchema) -> bool {
 /// expression: name via [`expression_output_name`], type and nullability
 /// resolved against `input`.
 ///
-/// N9 INC-1 identity rule: a bare `ColumnReference` whose `ordinal` indexes
-/// an `input` attribute of the SAME name (defensive filter — `ordinal`-valid
-/// references are expected to always name-match the field they index) COPIES
-/// that attribute's `expr_id` — it is the identical logical column, merely
-/// passed through a `SELECT`. Everything else (`Alias`, computed expressions)
-/// MINTS a fresh id — it is a genuinely new column.
+/// N9 INC-1 identity rule (ADR-024): a bare `ColumnReference` whose
+/// `expr_id` matches an `input` attribute (first occurrence — duplicate ids
+/// within one schema are clones of the same attribute from a duplicated
+/// projection, so first-match is sound) COPIES that attribute's `expr_id` —
+/// it is the identical logical column, merely passed through a `SELECT`. A
+/// `debug_assert!` checks the found attribute's name agrees with the
+/// reference's stamped name case-insensitively (defensive H8 name-agreement
+/// precedent, same as `bare_dup_slot` in emission.rs — not a runtime gate).
+/// Everything else (`Alias`, computed expressions) MINTS a fresh id — it is
+/// a genuinely new column.
 ///
 /// N9 INC-3 lineage rule (ADR-023 tier-3, folded in from the deleted
 /// `source_quals_of`): the COPY branch above additionally clones the source
@@ -4905,18 +4912,23 @@ fn schema_has_unresolved(schema: &ResolvedSchema) -> bool {
 /// computed expression) inherits no qualifier (F8/filt-019 hinge).
 fn output_attribute(e: &Expression, input: &ResolvedSchema) -> Attribute {
     if let Expression::ColumnReference(cr) = e {
-        if let Some(k) = cr.ordinal {
-            if let Some(src) = input.fields.get(k) {
-                if src.name.eq_ignore_ascii_case(&cr.name) {
-                    let mut attr = src.clone();
-                    attr.name = expression_output_name(e);
-                    attr.data_type = e.data_type(input);
-                    attr.nullable = e.nullable(input);
-                    if let Some(q) = &cr.qualifier {
-                        attr.source_quals.insert(q.clone());
-                    }
-                    return attr;
+        if let Some(id) = cr.expr_id {
+            if let Some(src) = input.fields.iter().find(|f| f.expr_id == id) {
+                debug_assert!(
+                    src.name.eq_ignore_ascii_case(&cr.name),
+                    "output_attribute: expr_id-resolved attribute name `{}` must agree \
+                     with the reference's stamped name `{}`",
+                    src.name,
+                    cr.name
+                );
+                let mut attr = src.clone();
+                attr.name = expression_output_name(e);
+                attr.data_type = e.data_type(input);
+                attr.nullable = e.nullable(input);
+                if let Some(q) = &cr.qualifier {
+                    attr.source_quals.insert(q.clone());
                 }
+                return attr;
             }
         }
     }
@@ -5672,7 +5684,6 @@ fn derive_implicit_grouping(
                 qualifier: None,
                 data_type: Some(f.data_type.clone()),
                 nullable: Some(f.nullable),
-                ordinal: None,
                 expr_id: None,
             })
         })
@@ -6638,9 +6649,26 @@ mod tests {
         })
     }
 
+    /// The [`ExprId`] of the attribute at merged-schema position `k` of a
+    /// resolved `Join` (left schema first, then right, exactly as
+    /// `resolve_column`'s plan_id arm indexes it) — the ADR-024 restatement
+    /// of what these tests used to assert directly via
+    /// `ColumnReference::ordinal`.
+    fn merged_join_expr_id_at(typed: &TypedAst, k: usize) -> ExprId {
+        let TypedOp::Join { left, right, .. } = &typed.op else {
+            panic!("expected Join, got {:?}", typed.op);
+        };
+        let left_len = left.resolved_schema.len();
+        if k < left_len {
+            left.resolved_schema.fields[k].expr_id
+        } else {
+            right.resolved_schema.fields[k - left_len].expr_id
+        }
+    }
+
     /// Pull the `(left, right)` `ColumnReference`s out of a resolved `Join`'s
     /// binary equality condition, for asserting the resolved qualifier /
-    /// ordinal ADR-023 Phase 1 stamps (or drops).
+    /// `expr_id` ADR-023 Phase 1 stamps (or drops).
     fn join_condition_refs(typed: &TypedAst) -> (ColumnReference, ColumnReference) {
         let TypedOp::Join { condition, .. } = &typed.op else {
             panic!("expected Join, got {:?}", typed.op);
@@ -6674,9 +6702,9 @@ mod tests {
         let typed = analyze(plan_id_join(Some(cond)), &bt).unwrap();
         let (l, r) = join_condition_refs(&typed);
         assert_eq!(l.qualifier, None);
-        assert_eq!(l.ordinal, Some(0));
+        assert_eq!(l.expr_id, Some(merged_join_expr_id_at(&typed, 0)));
         assert_eq!(r.qualifier, None);
-        assert_eq!(r.ordinal, Some(5));
+        assert_eq!(r.expr_id, Some(merged_join_expr_id_at(&typed, 5)));
     }
 
     #[test]
@@ -6696,9 +6724,9 @@ mod tests {
         let typed = analyze(plan_id_join(Some(cond)), &bt).unwrap();
         let (l, r) = join_condition_refs(&typed);
         assert_eq!(l.qualifier, None);
-        assert_eq!(l.ordinal, Some(2));
+        assert_eq!(l.expr_id, Some(merged_join_expr_id_at(&typed, 2)));
         assert_eq!(r.qualifier, None);
-        assert_eq!(r.ordinal, Some(4));
+        assert_eq!(r.expr_id, Some(merged_join_expr_id_at(&typed, 4)));
     }
 
     #[test]
@@ -6727,9 +6755,9 @@ mod tests {
         let typed = analyze(joined, &bt).unwrap();
         let (l, r) = join_condition_refs(&typed);
         assert_eq!(l.qualifier, None);
-        assert_eq!(l.ordinal, Some(0));
+        assert_eq!(l.expr_id, Some(merged_join_expr_id_at(&typed, 0)));
         assert_eq!(r.qualifier, None);
-        assert_eq!(r.ordinal, Some(4));
+        assert_eq!(r.expr_id, Some(merged_join_expr_id_at(&typed, 4)));
     }
 
     #[test]
@@ -6763,8 +6791,11 @@ mod tests {
         });
         let typed = analyze(ast, &bt).unwrap();
         // Walk Project → Filter → Join and check the resolved ancestor ref.
-        let TypedOp::Project { projections, .. } = &typed.op else {
+        let TypedOp::Project { input, projections } = &typed.op else {
             panic!("expected Project");
+        };
+        let TypedOp::Filter { input: join, .. } = &input.op else {
+            panic!("expected Filter");
         };
         let Expression::ColumnReference(proj_ref) = &projections[0] else {
             panic!(
@@ -6773,7 +6804,7 @@ mod tests {
             );
         };
         assert_eq!(proj_ref.qualifier, None);
-        assert_eq!(proj_ref.ordinal, Some(2));
+        assert_eq!(proj_ref.expr_id, Some(merged_join_expr_id_at(join, 2)));
     }
 
     #[test]
@@ -6818,14 +6849,18 @@ mod tests {
             }),
         });
         let typed = analyze(filtered, &bt).unwrap();
-        let TypedOp::Filter { condition, .. } = &typed.op else {
+        let TypedOp::Filter {
+            input: outer,
+            condition,
+        } = &typed.op
+        else {
             panic!("expected Filter");
         };
-        // Ancestor ref resolves bare+ordinal (vestigial witness): pid-7's
-        // own range is the whole inner join (0..6), and `dept_id`'s first
-        // occurrence within it is emp's `dept_id` at ordinal 2 — no
-        // synthetic qualifier is ever stamped, regardless of the name being
-        // duplicated elsewhere in the outer schema.
+        // Ancestor ref resolves bare (vestigial witness): pid-7's own range
+        // is the whole inner join (0..6), and `dept_id`'s first occurrence
+        // within it is emp's `dept_id` at position 2 — no synthetic
+        // qualifier is ever stamped, regardless of the name being duplicated
+        // elsewhere in the outer schema.
         let Expression::Binary(BinaryExpression { left, .. }) = condition else {
             panic!("expected Binary condition");
         };
@@ -6833,7 +6868,7 @@ mod tests {
             panic!("expected ColumnReference, got {left:?}");
         };
         assert_eq!(ancestor_ref.qualifier, None);
-        assert_eq!(ancestor_ref.ordinal, Some(2));
+        assert_eq!(ancestor_ref.expr_id, Some(merged_join_expr_id_at(outer, 2)));
     }
 
     // ── shared TypedAst extractors ────────────────────────────────────────
@@ -7076,15 +7111,15 @@ mod tests {
         assert!(matches!(err, AnalyzerError::UnknownColumn { .. }));
     }
 
-    // ── ADR-023 tier 3a — resolved `ordinal` on ColumnReference ──────────
-    // Additive, dormant field: `resolve_column` stamps the 0-based position
-    // of the resolved column within the producing node's `ctx.schema`.
-    // Emission ignores it (dormant until a later ADR-023 sub-chunk); these
-    // tests pin the stamped value against the field's actual index in the
-    // resolved schema.
+    // ── ADR-024 — resolved `expr_id` on ColumnReference ───────────────────
+    // `resolve_column` stamps the attribute identity of the resolved column
+    // within the producing node's `ctx.schema`; these tests pin the stamped
+    // id against the field it actually resolved to (ADR-023 tier 3a's
+    // `ordinal` predecessor pinned the same fact by 0-based position — the
+    // field no longer exists, so identity is now the fact under test).
 
     #[test]
-    fn resolve_column_ordinal_unqualified_matches_schema_index() {
+    fn resolve_column_unqualified_matches_schema_index() {
         let bt = base_types_with_emp_dept();
         let project = CommonAst::new(CommonOp::Project {
             input: Box::new(scan("emp")),
@@ -7092,11 +7127,11 @@ mod tests {
         });
         let typed = analyze(project, &bt).expect("unqualified salary must resolve");
         match &typed.op {
-            TypedOp::Project { projections, .. } => match &projections[0] {
+            TypedOp::Project { input, projections } => match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.name, "salary");
                     // `salary` is the 4th (0-based index 3) field of `emp_schema`.
-                    assert_eq!(c.ordinal, Some(3));
+                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[3].expr_id));
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
             },
@@ -7105,7 +7140,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_column_ordinal_qualified_tier_e_matches_schema_index() {
+    fn resolve_column_qualified_tier_e_matches_schema_index() {
         let bt = base_types_with_emp_dept();
         // SELECT d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.dept_id
         // — tier (e): qualifier `d` binds the join's right-side scope range
@@ -7116,12 +7151,12 @@ mod tests {
         });
         let typed = analyze(project, &bt).expect("d.dept_name must resolve");
         match &typed.op {
-            TypedOp::Project { projections, .. } => match &projections[0] {
+            TypedOp::Project { input, projections } => match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.name, "dept_name");
                     // `dept_name` is dept's 2nd field (offset 1), and dept
                     // starts at absolute index 4 in the merged join schema.
-                    assert_eq!(c.ordinal, Some(5));
+                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[5].expr_id));
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
             },
@@ -7130,12 +7165,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_column_ordinal_plan_id_over_join_matches_correct_side() {
+    fn resolve_column_plan_id_over_join_matches_correct_side() {
         // Self-join `emp(plan_id=1) JOIN emp(plan_id=2)`; a Project above
         // selecting `id` tagged plan_id=2 must resolve to the RIGHT side's
         // `id` — absolute index 4 (0-based) in the merged 8-field schema.
-        // Phase 3b: the condition's own plan_id refs resolve bare+ordinal
-        // too (no synthetic `__td_jl`/`__td_jr` qualifier is ever stamped).
+        // Phase 3b: the condition's own plan_id refs resolve bare too (no
+        // synthetic `__td_jl`/`__td_jr` qualifier is ever stamped).
         let bt = base_types_with_emp_dept();
         let join_cond = Expression::Binary(BinaryExpression {
             left: Box::new(pcol("id", 1)),
@@ -7156,10 +7191,10 @@ mod tests {
         });
         let typed = analyze(project, &bt).expect("plan_id should disambiguate above join");
         match &typed.op {
-            TypedOp::Project { projections, .. } => match &projections[0] {
+            TypedOp::Project { input, projections } => match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.qualifier, None);
-                    assert_eq!(c.ordinal, Some(4));
+                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[4].expr_id));
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
             },
@@ -7378,14 +7413,14 @@ mod tests {
     // the new path; USING/Star/deferred cases stay on the legacy fallback.
 
     #[test]
-    fn resolve_column_projected_through_qualifier_drops_to_ordinal() {
+    fn resolve_column_projected_through_qualifier_drops_qualifier() {
         // filt-018/F10 shape: `emp.alias("e").select("e.dept_id",
         // "e.name").filter(...).filter(e.name==...)`. The SECOND filter
         // resolves `e.name` against the Project's RESET alias scope (no "e"
         // binding survives a Project) — tier (f) must consult
-        // `source_quals` (authoritative here) and resolve by ORDINAL with
-        // the qualifier DROPPED, so emission renders the bare column and it
-        // binds positionally over any wrapper.
+        // `source_quals` (authoritative here) and resolve by ATTRIBUTE
+        // IDENTITY with the qualifier DROPPED, so emission renders the bare
+        // column and it binds by that identity over any wrapper.
         let bt = base_types_with_emp_dept();
         let aliased = CommonAst::new(CommonOp::AliasedRelation {
             input: Box::new(emp_scan()),
@@ -7414,12 +7449,15 @@ mod tests {
         let typed = analyze(filter2, &bt).expect("filt-018 shape must resolve");
         match &typed.op {
             TypedOp::Filter {
+                input,
                 condition: Expression::Binary(b),
-                ..
             } => match b.left.as_ref() {
                 Expression::ColumnReference(c) => {
                     assert_eq!(c.qualifier, None);
-                    assert_eq!(c.ordinal, Some(1));
+                    // position 1 (`name`) of `filter1`'s resolved schema —
+                    // the ADR-024 restatement of the `ordinal` this test
+                    // used to pin directly.
+                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[1].expr_id));
                     assert_eq!(c.name, "name");
                 }
                 other => panic!("expected ColumnReference, got {other:?}"),
@@ -12939,9 +12977,9 @@ mod tests {
         // Self-join `emp(plan_id=1) JOIN emp(plan_id=2)` with a Project
         // above selecting `id` tagged with plan_id=2 — must resolve to the
         // RIGHT side's `id`, not raise AmbiguousColumn. Phase 3b: the
-        // resolved ColumnReference is bare (qualifier `None`) with ordinal 4
-        // (the right side's `id`) — emission binds it positionally instead
-        // of via a stamped join-side qualifier.
+        // resolved ColumnReference is bare (qualifier `None`) identifying
+        // position 4 (the right side's `id`) — emission binds it by that
+        // identity instead of via a stamped join-side qualifier.
         let bt = base_types_with_emp_dept();
         let join_cond = Expression::Binary(BinaryExpression {
             left: Box::new(pcol("id", 1)),
@@ -12964,15 +13002,15 @@ mod tests {
         assert_eq!(typed.resolved_schema.fields.len(), 1);
         assert_eq!(typed.resolved_schema.fields[0].name, "id");
         assert_eq!(typed.resolved_schema.fields[0].data_type, DataType::Long);
-        // Verify the resolved projection is bare+ordinal, positionally bound.
-        if let TypedOp::Project { projections, .. } = &typed.op {
+        // Verify the resolved projection is bare and identity-bound.
+        if let TypedOp::Project { input, projections } = &typed.op {
             match &projections[0] {
                 Expression::ColumnReference(c) => {
                     assert_eq!(
                         c.qualifier, None,
                         "plan_id=2 must resolve bare (Phase 3b: no synthetic qualifier)"
                     );
-                    assert_eq!(c.ordinal, Some(4));
+                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[4].expr_id));
                 }
                 other => panic!("expected ColumnReference, got: {other:?}"),
             }
@@ -12985,7 +13023,7 @@ mod tests {
     fn plan_id_disambiguates_filter_above_join() {
         // Filter above a self-join: `WHERE salary > 5` with plan_id=1 must
         // resolve to the LEFT side without ambiguity error. Phase 3b: bare
-        // qualifier, ordinal 3 (the left side's `salary`).
+        // qualifier, identifying position 3 (the left side's `salary`).
         let bt = base_types_with_emp_dept();
         let join_cond = Expression::Binary(BinaryExpression {
             left: Box::new(pcol("salary", 1)),
@@ -13011,8 +13049,9 @@ mod tests {
         let typed = analyze(filter, &bt).expect("plan_id should disambiguate filter above join");
         // Output schema is the full join (8 fields: 4 left + 4 right).
         assert_eq!(typed.resolved_schema.fields.len(), 8);
-        // Verify the resolved condition's left operand is bare+ordinal.
-        if let TypedOp::Filter { condition, .. } = &typed.op {
+        // Verify the resolved condition's left operand is bare and
+        // identity-bound.
+        if let TypedOp::Filter { input, condition } = &typed.op {
             if let Expression::Binary(b) = condition {
                 match b.left.as_ref() {
                     Expression::ColumnReference(c) => {
@@ -13020,7 +13059,7 @@ mod tests {
                             c.qualifier, None,
                             "plan_id=1 must resolve bare (Phase 3b: no synthetic qualifier)"
                         );
-                        assert_eq!(c.ordinal, Some(3));
+                        assert_eq!(c.expr_id, Some(input.resolved_schema.fields[3].expr_id));
                     }
                     other => panic!("expected ColumnReference, got: {other:?}"),
                 }
@@ -13098,13 +13137,13 @@ mod tests {
         // condition` MUST bind those same own plan_ids into its scope
         // itself, or a plan_id-tagged condition ref against a bare-scan
         // child would fall through to legacy name resolution and never
-        // resolve by ordinal the way this test asserts. Phase 3b: the bind
-        // is bare+ordinal (no synthetic qualifier stamp) — the ordinal
-        // alone (0 vs. 6) is the positional witness that both sides bound
+        // resolve by attribute identity the way this test asserts. Phase 3b:
+        // the bind is bare (no synthetic qualifier stamp) — identifying
+        // position 0 vs. 6 is the positional witness that both sides bound
         // through their OWN plan_ids, not a fallback.
         //
-        // Left schema: 6 fields, `dept_id` first (merged ordinal 0). Right
-        // schema: 1 field, `dept_id` (merged ordinal 6 = left's length).
+        // Left schema: 6 fields, `dept_id` first (merged position 0). Right
+        // schema: 1 field, `dept_id` (merged position 6 = left's length).
         let left_schema = StructType::new(vec![
             StructField::not_null("dept_id", DataType::Integer),
             StructField::not_null("f1", DataType::Integer),
@@ -13132,9 +13171,9 @@ mod tests {
         let typed = analyze(joined, &bt).expect("distinct-pid dept_id condition should resolve");
         let (l, r) = join_condition_refs(&typed);
         assert_eq!(l.qualifier, None);
-        assert_eq!(l.ordinal, Some(0));
+        assert_eq!(l.expr_id, Some(merged_join_expr_id_at(&typed, 0)));
         assert_eq!(r.qualifier, None);
-        assert_eq!(r.ordinal, Some(6));
+        assert_eq!(r.expr_id, Some(merged_join_expr_id_at(&typed, 6)));
     }
 
     #[test]
@@ -13376,7 +13415,7 @@ mod tests {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "sum(salary)");
                 assert!(c.qualifier.is_none());
-                assert_eq!(c.ordinal, Some(1));
+                assert_eq!(c.expr_id, Some(input.resolved_schema.fields[1].expr_id));
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -13508,7 +13547,7 @@ mod tests {
         match order[0].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert!(c.qualifier.is_none());
-                assert_eq!(c.ordinal, Some(0));
+                assert_eq!(c.expr_id, Some(input.resolved_schema.fields[0].expr_id));
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -13583,13 +13622,13 @@ mod tests {
             offset: None,
         });
         let typed = analyze(ast, &bt).expect("ordering by a plain output column must resolve");
-        let TypedOp::Sort { order, .. } = &typed.op else {
+        let TypedOp::Sort { input, order, .. } = &typed.op else {
             panic!("expected Sort, got {:?}", typed.op);
         };
         match order[0].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "id");
-                assert_eq!(c.ordinal, Some(0));
+                assert_eq!(c.expr_id, Some(input.resolved_schema.fields[0].expr_id));
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -13660,9 +13699,9 @@ mod tests {
         // e.dept_id = d.dept_id ORDER BY d.dept_id` — review HIGH fix
         // regression guard. Both `emp` and `dept` carry a `dept_id` column;
         // qualifier-stripped alone, `e.dept_id` and `d.dept_id` canonicalize
-        // identically, so the fallback MUST use the retained `ordinal` (the
-        // exprId analog — both sides resolve against the identical join
-        // schema) to bind `ORDER BY d.dept_id` onto `b`, never onto `a`.
+        // identically, so the fallback MUST use the retained `expr_id` —
+        // both sides resolve against the identical join schema — to bind
+        // `ORDER BY d.dept_id` onto `b`, never onto `a`.
         let bt = base_types_with_emp_dept();
         let joined = join(
             aliased_scan("emp", "e"),
@@ -13696,7 +13735,7 @@ mod tests {
                 assert_eq!(
                     c.name, "b",
                     "ORDER BY d.dept_id must bind to output column `b` (d.dept_id), \
-                     never `a` (e.dept_id) — a same-ordinal, not same-name, match"
+                     never `a` (e.dept_id) — a same-identity, not same-name, match"
                 );
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
@@ -13760,14 +13799,14 @@ mod tests {
         match &projections[0] {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "name");
-                assert_eq!(c.ordinal, Some(0));
+                assert_eq!(c.expr_id, Some(sort_ast.resolved_schema.fields[0].expr_id));
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
         match &projections[1] {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "sum(salary)");
-                assert_eq!(c.ordinal, Some(1));
+                assert_eq!(c.expr_id, Some(sort_ast.resolved_schema.fields[1].expr_id));
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -13788,7 +13827,7 @@ mod tests {
         match order[0].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "dept_id");
-                assert_eq!(c.ordinal, Some(2));
+                assert_eq!(c.expr_id, Some(sort_ast.resolved_schema.fields[2].expr_id));
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -13826,7 +13865,7 @@ mod tests {
         // match (increment 1) succeeds directly — no promoted hidden output,
         // no trim Project: the Sort's Aggregate child schema is UNCHANGED
         // (still 2 fields — the extended schema len equals the original),
-        // and the rewritten key's ordinal is 0.
+        // and the rewritten key binds onto position 0.
         let bt = base_types_with_emp_dept();
         let senior = || {
             Expression::Binary(BinaryExpression {
@@ -13872,8 +13911,8 @@ mod tests {
             Expression::ColumnReference(c) => {
                 assert!(c.qualifier.is_none());
                 assert_eq!(
-                    c.ordinal,
-                    Some(0),
+                    c.expr_id,
+                    Some(input.resolved_schema.fields[0].expr_id),
                     "the folded grouping expression is aggregates[0] by construction"
                 );
             }
@@ -13931,7 +13970,7 @@ mod tests {
         match order[0].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "salary");
-                assert_eq!(c.ordinal, Some(2));
+                assert_eq!(c.expr_id, Some(sort_ast.resolved_schema.fields[2].expr_id));
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -14334,7 +14373,6 @@ mod tests {
             qualifier: Some("e".to_owned()),
             data_type: Some(DataType::Integer),
             nullable: Some(true),
-            ordinal: Some(2),
             expr_id: None,
         });
         assert_eq!(ensure_named(bare_qualified.clone()), bare_qualified);
@@ -14414,14 +14452,14 @@ mod tests {
         match order[0].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "dept_id");
-                assert_eq!(c.ordinal, Some(0));
+                assert_eq!(c.expr_id, Some(input.resolved_schema.fields[0].expr_id));
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
         match order[1].expr.as_ref() {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "avg(salary)");
-                assert_eq!(c.ordinal, Some(1));
+                assert_eq!(c.expr_id, Some(input.resolved_schema.fields[1].expr_id));
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -14846,7 +14884,7 @@ mod tests {
     fn output_attribute_copy_branch_inserts_reference_qualifier() {
         let bt = base_types_with_emp_dept();
         let scanned = analyze(scan("emp"), &bt).expect("scan analyzes");
-        // A resolved, ordinal-bound reference to "dept_id" (index 2 in
+        // A resolved, identity-bound reference to "dept_id" (index 2 in
         // emp's schema — id, name, dept_id, salary) carrying an explicit
         // qualifier "e", as `resolve_column` would stamp for `e.dept_id`.
         let field = scanned
@@ -14858,7 +14896,6 @@ mod tests {
             qualifier: Some("e".to_owned()),
             data_type: Some(field.data_type.clone()),
             nullable: Some(field.nullable),
-            ordinal: Some(2),
             expr_id: Some(field.expr_id),
         });
         let attr = output_attribute(&cr, &scanned.resolved_schema);
@@ -15010,7 +15047,6 @@ mod tests {
                     qualifier: None,
                     data_type: Some(DataType::Integer),
                     nullable: Some(false),
-                    ordinal: Some(0),
                     expr_id: None,
                 })],
             },
@@ -15078,7 +15114,6 @@ mod tests {
             qualifier: Some("t1".to_owned()),
             data_type: Some(DataType::Integer),
             nullable: Some(true),
-            ordinal: Some(0),
             expr_id: Some(id_a),
         });
         let b = Expression::ColumnReference(ColumnReference {
@@ -15086,7 +15121,6 @@ mod tests {
             qualifier: Some("t2".to_owned()),
             data_type: Some(DataType::Integer),
             nullable: Some(true),
-            ordinal: Some(3),
             expr_id: Some(id_b),
         });
         assert!(
@@ -15101,11 +15135,11 @@ mod tests {
         // agg-026-like shape: a self-join (`emp e JOIN emp d`) restates
         // `dept_id` from BOTH sides in the SAME `aggregates` list — two
         // entries that are literally named "dept_id" and canonicalize
-        // IDENTICALLY, distinguished only by `expr_id` (and, incidentally,
-        // by `ordinal` here too — this is a duplicate-name REGRESSION guard,
-        // not the id-is-strictly-necessary witness above). `ORDER BY
-        // d.dept_id`'s rebind must bind onto the `d`-side entry, not
-        // silently fall through to the first same-named `e`-side entry.
+        // IDENTICALLY, distinguished only by `expr_id` — this is a
+        // duplicate-name REGRESSION guard, not the id-is-strictly-necessary
+        // witness above. `ORDER BY d.dept_id`'s rebind must bind onto the
+        // `d`-side entry, not silently fall through to the first same-named
+        // `e`-side entry.
         let bt = base_types_with_emp_dept();
         let cond = Expression::Binary(BinaryExpression {
             op: BinaryOp::Eq,
@@ -15132,7 +15166,6 @@ mod tests {
                 qualifier: None,
                 data_type: Some(e_field.data_type.clone()),
                 nullable: Some(e_field.nullable),
-                ordinal: Some(2),
                 expr_id: Some(e_field.expr_id),
             }),
             Expression::ColumnReference(ColumnReference {
@@ -15140,7 +15173,6 @@ mod tests {
                 qualifier: None,
                 data_type: Some(d_field.data_type.clone()),
                 nullable: Some(d_field.nullable),
-                ordinal: Some(6),
                 expr_id: Some(d_field.expr_id),
             }),
         ];
@@ -15160,12 +15192,11 @@ mod tests {
         match bound {
             Expression::ColumnReference(c) => {
                 assert_eq!(
-                    c.ordinal,
-                    Some(1),
+                    c.expr_id,
+                    Some(d_field.expr_id),
                     "must bind aggregates[1] (the d-side entry), not aggregates[0] \
                      which merely shares the name"
                 );
-                assert_eq!(c.expr_id, Some(d_field.expr_id));
             }
             other => panic!("expected bare ColumnReference, got {other:?}"),
         }
@@ -15280,7 +15311,6 @@ mod tests {
         for (i, so) in order.iter().enumerate() {
             match so.expr.as_ref() {
                 Expression::ColumnReference(c) => {
-                    assert_eq!(c.ordinal, Some(1), "order-by key {i} must bind slot 1");
                     assert_eq!(
                         c.expr_id,
                         Some(promoted_id),
@@ -15299,7 +15329,7 @@ mod tests {
         // them would make `semantic_eq` STRICTER on correlated shapes, a
         // behavior-changing change deferred to a separate corpus-gated pass.
         // This pins the freeze: an outer ref still resolves with
-        // `ordinal: None` AND `expr_id: None`, unchanged from increment 1.
+        // `expr_id: None`, unchanged from increment 1.
         let bt = base_types_for(&[("emp", emp_schema()), ("dept", dept_schema_with_budget())]);
         let inner = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::Filter {
@@ -15356,7 +15386,6 @@ mod tests {
             Expression::ColumnReference(c) => {
                 assert_eq!(c.name, "salary");
                 assert_eq!(c.qualifier.as_deref(), Some("e"));
-                assert_eq!(c.ordinal, None, "tier-(g) must not stamp an ordinal");
                 assert_eq!(
                     c.expr_id, None,
                     "tier-(g) must not stamp an expr_id (behavior freeze)"
@@ -15378,7 +15407,6 @@ mod tests {
             qualifier: Some("t".to_owned()),
             data_type: Some(DataType::Integer),
             nullable: Some(true),
-            ordinal: Some(3),
             expr_id: Some(id),
         });
         match canonicalize_for_semantic_eq(&c) {
@@ -15388,7 +15416,6 @@ mod tests {
                     Some(id),
                     "canonicalize_for_semantic_eq must preserve expr_id"
                 );
-                assert_eq!(cc.ordinal, Some(3), "and must preserve ordinal too");
                 assert_eq!(cc.name, "x", "name must still be case-folded");
                 assert_eq!(cc.qualifier, None, "qualifier must still be stripped");
             }

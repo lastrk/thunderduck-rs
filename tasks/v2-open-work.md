@@ -17,23 +17,20 @@ All seven E-series passes have landed (E1 `cf8ea20`, E1.5 `a4b3c6e`, E4
 
 ## 1. Architectural (the two big levers)
 
-### O1. Complete ADR-024 tier-3e — retire the name-only fallback regime
-**Size: L. The one remaining architectural gap in the identity story.**
-17 op kinds (`SetOp, LateralView, WithColumns, WithColumnsRenamed, DropColumns,
-SingleRow, Values, LocalRelation, FileScan, TableFunction, Unnest, Describe,
-Summary, FreqItems, Unpivot, Pivot, RecursiveCte`) plus Star-Projects and
-length-mismatched Project/Aggregate leave `source_quals_tracked = false`, so
-tier-(f) qualified resolution routes through the legacy permissive name-only
-fallback (`analyzer.rs` ~4801 — "retired in 3e" per its own comment).
-Verified facts (2026-07-13 verifier): SetOp lineage is ALREADY seeded
-(first-child attribute clones carry id+quals — `widen_by_position`/
-`widen_by_name`) and Star-Project clones fields verbatim, so those are
-audit-plus-gate-flips; genuine per-op lineage work remains for the
-WithColumns family / LateralView / Pivot / Unpivot. Completion deletes the
-flag (4 placeholder sites — one non-trivial synthetic-scope site at ~4321),
-`source_quals_tracked_of` (~55 lines), the growth-invariant assert, the
-fallback branch, and a PartialEq carve-out on RelScope. ADR-024 anticipates
-this (lines ~631/679) but does not mandate it as a discrete step.
+### O1. Complete ADR-024 tier-3e — DONE (Pass F3, `f8e4b26`, 2026-07-13)
+Lineage is authoritative for EVERY operator; source_quals_tracked, its
+derivation (~90 lines), the PartialEq carve-out, the four placeholder sites,
+and the tier-(f) name-only fallback are DELETED. Probe-driven: SetOp needed
+NO content edit (Spark resolves first-child qualifiers over unions — τ was
+already faithful, both behaviors pinned); WithColumnsRenamed clears lineage
+on renamed slots (Spark severs pre-rename addressability — probe-verified).
+The join-condition scope's regime change is the F8-class fix. ADR-024
+amendment appended. Opus review: APPROVED (reviewer traced every formerly-
+fallback class end-state clean). NEW grab-bag NIT: unionByName with
+allowMissingColumns — a name present only in a non-first child donates that
+child's quals (b.z would resolve; Spark pads first-child null alias and
+rejects) — narrow, strictly less permissive than the old fallback, optional
+future witness.
 
 ### O2. Typed expression tree (R2-4) — stamped `(DataType, nullable)` on computed nodes
 **Size: XL, needs an ADR. DEFERRED BY EXPLICIT USER DECISION (2026-07-13) —

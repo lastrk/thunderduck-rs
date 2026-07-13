@@ -48,18 +48,17 @@ no coercion rule — old or new — can fire inside HOF bodies.
 
 ## 2. Correctness / parity (medium)
 
-### O3. Single-level struct access via ExtractValue (finding 12)
-**Size: M. Now carries THREE motivations.** Multi-level `a.b.c` already lowers
-to ExtractValue chains; single-level tier-(d) (and its `resolve_in_outer`
-twin) emits an id-less qualified ColumnReference rendered as raw `q.name`.
-Unifying (a) copies the struct COLUMN's real id (Spark GetStructField-child
-model), closing the last semantic "resolved-but-id-less" state; (b) fixes the
-E4-documented equality widening (two same-named struct fields of DIFFERENT
-types through different structs can alias in a rebind scan — see the loud
-warning on `ColumnReference::eq`); (c) unifies two hand-kept-consistent code
-paths. Verified DuckDB-data-equivalent (`(addr).city`); the migration risk is
-OUTPUT NAMING — `render_projection_slot` emits bare exprs without `AS`, so the
-projection needs an explicit alias to keep Spark's `city` column header.
+### O3. Single-level struct access via ExtractValue — DONE (Pass F2, `802b085`, 2026-07-13)
+All struct access is now an ExtractValue chain rooted at the struct COLUMN's
+real expr_id (inner tier-(d) AND the correlated outer twin; live-Spark probe
+verified the correlated shape, witness sq-024 green). try_rewrite_nested_
+struct_path deleted (fixed the latent multi-level+plan_id emission bug).
+NO production site returns a resolved ColumnReference with expr_id: None —
+the identity story is complete; E4's equality-widening residual CLOSED.
+Naming handled by N8's ensure_named (witness struct-009). Opus review: zero
+findings. NEW grab-bag item from the review: StructType::field_by_name (inner
+struct-FIELD lookup, types/struct_type.rs ~53) still folds ASCII-only vs the
+E3 eq_fold authority — narrow non-ASCII field-name divergence, pre-existing.
 
 ### O4. Interval field-span on the type: `DayTimeInterval { start, end }` (finding 15)
 **Size: L, needs an ADR (wire value-type Eq/Hash change, ~42 sites/10 files).**

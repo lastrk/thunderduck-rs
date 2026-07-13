@@ -521,10 +521,11 @@ fn requalify_expr(
 /// synthetic `__td_jl`/`__td_jr` qualifier anymore, so this is the only
 /// shape a rewritable reference can take.
 ///
-/// By construction (see `resolve_column`), a bare reference with an
-/// ambiguous name that reaches here is already guaranteed ambiguous in
-/// `cond_schema` — the `name_count == 1` branch below is a defensive
-/// fallback, not a reachable case today.
+/// This gate is byte-for-byte [`bare_dup_slot`]'s gate (same four checks —
+/// qualifier-none, name-count `>= 2`, id lookup, name-agreement assert —
+/// just evaluated in a different order, which does not change the result
+/// for a pure conjunction of side-effect-free checks), so it is folded into
+/// a direct call rather than re-hand-rolled here.
 fn requalify_column_ref(
     c: &mut ColumnReference,
     cond_schema: &Schema,
@@ -533,27 +534,9 @@ fn requalify_column_ref(
     right_scope: &FromScope,
     needs: &mut SideNeedsAlias,
 ) {
-    let Some(id) = c.expr_id else { return };
-    let name_count = cond_schema
-        .fields
-        .iter()
-        .filter(|f| f.name.eq_ignore_ascii_case(&c.name))
-        .count();
-    if !(c.qualifier.is_none() && name_count >= 2) {
-        return;
-    }
-    let Some(k) = cond_schema.fields.iter().position(|f| f.expr_id == id) else {
+    let Some(k) = bare_dup_slot(c, cond_schema) else {
         return;
     };
-    // H8 assert 1 (load-bearing; now guards resolver stamping bugs): the
-    // id-resolved slot must name the SAME column the reference carries — an
-    // id/name mismatch would silently requalify the wrong physical column.
-    debug_assert!(
-        cond_schema.fields[k].name.eq_ignore_ascii_case(&c.name),
-        "id/name agreement: cond_schema[{k}] ({}) must match reference name ({})",
-        cond_schema.fields[k].name,
-        c.name
-    );
     let is_left = k < left_len;
     let local = if is_left { k } else { k - left_len };
     let scope = if is_left { left_scope } else { right_scope };
@@ -565,10 +548,6 @@ fn requalify_column_ref(
         "local index {local} out of bounds for side width {}",
         scope.width
     );
-    if name_count == 1 {
-        c.qualifier = None;
-        return;
-    }
     match scope.alias_for(local) {
         Some(alias) => c.qualifier = Some(alias.to_owned()),
         None if is_left => needs.left = true,
@@ -1165,9 +1144,11 @@ fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
 /// addressed); an id ABSENT from `schema` leaves the reference untouched,
 /// surfacing as a loud DuckDB binder error rather than a silent
 /// wrong-column rewrite. Shared by [`requalify_visible`]'s merge-path
-/// rewrite and [`reproject_qualifiers`]'s wrap-path bare-dup arm — single
-/// authority for the debug_assert guard, so both call sites stay in
-/// lockstep.
+/// rewrite, [`reproject_qualifiers`]'s wrap-path bare-dup arm, and
+/// [`requalify_column_ref`]'s gate (its exact same shape, folded in) — single
+/// authority for the id-lookup + debug_assert guard
+/// ([`super::schema::ResolvedSchema::field_by_id`]), so all call sites stay
+/// in lockstep.
 fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
     if c.qualifier.is_some() {
         return None;
@@ -1181,17 +1162,7 @@ fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
         return None;
     }
     let id = c.expr_id?;
-    let k = schema.fields.iter().position(|f| f.expr_id == id)?;
-    // H8 assert 1 (load-bearing; now guards resolver stamping bugs, not the
-    // rewrite itself): the id-resolved slot must name the SAME column the
-    // reference carries — an id/name mismatch would silently rewrite the
-    // wrong physical column.
-    debug_assert!(
-        schema.fields[k].name.eq_ignore_ascii_case(&c.name),
-        "id/name agreement: schema[{k}] ({}) must match reference name ({})",
-        schema.fields[k].name,
-        c.name
-    );
+    let (k, _) = schema.field_by_id(id, &c.name)?;
     Some(k)
 }
 

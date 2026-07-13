@@ -3379,10 +3379,19 @@ fn resolve_and_stamp(expr: Expression, ctx: &ResolveContext) -> Result<Expressio
     }
     match expr {
         Expression::UnresolvedColumn(u) => resolve_column(u, ctx),
-        Expression::ColumnReference(c) => {
-            let stamped = stamp_column_reference(c, ctx.schema);
-            Ok(Expression::ColumnReference(stamped))
-        }
+        // Front-ends emit `UnresolvedColumn`, but `ColumnReference` is also a
+        // bare/"already resolved" AST constructor (e.g. `ColumnReference::
+        // untyped`, used pervasively — including by the analyzer's own unit
+        // tests — to build sort/group/filter keys without going through
+        // `UnresolvedColumn`), so `data_type`/`nullable` are NOT guaranteed
+        // `Some` here: `stamp_column_reference` fills in whichever half is
+        // still `None` by a name/qualifier lookup against `ctx.schema`,
+        // leaving an already-stamped reference untouched. Identity
+        // (`expr_id`) is threaded by `resolve_column` / `output_attribute`
+        // elsewhere and is intentionally left untouched here.
+        Expression::ColumnReference(c) => Ok(Expression::ColumnReference(stamp_column_reference(
+            c, ctx.schema,
+        ))),
         // Subqueries: analyze the inner plan with the enclosing context
         // threaded as the outer scope so correlated outer references (e.g.
         // `e.salary` referencing the outer `emp e`) resolve against the
@@ -3883,31 +3892,14 @@ fn promote_project_subtree(
     {
         return Some(bind_slot(projections, schema, k));
     }
-    if let Expression::ColumnReference(cr) = &expr {
+    if matches!(&expr, Expression::ColumnReference(_)) {
         // Promoting a bare input `ColumnReference` that passes through
-        // unmodified — COPY its existing identity from `input_schema`
-        // (by attribute id, same precedent as `output_attribute`) rather
-        // than minting a fresh one for what is still the same logical
-        // column.
-        let found = cr
-            .expr_id
-            .and_then(|id| input_schema.fields.iter().find(|f| f.expr_id == id));
-        if let Some(src) = found {
-            debug_assert!(
-                src.name.eq_ignore_ascii_case(&cr.name),
-                "promote_project_subtree: expr_id-resolved attribute name `{}` must agree \
-                 with the reference's stamped name `{}`",
-                src.name,
-                cr.name
-            );
-        }
-        let field = found.cloned().unwrap_or_else(|| {
-            Attribute::minted(
-                expression_output_name(&expr),
-                expr.data_type(input_schema),
-                expr.nullable(input_schema),
-            )
-        });
+        // unmodified — COPY its existing identity from `input_schema` (by
+        // attribute id) rather than minting a fresh one for what is still
+        // the same logical column. `output_attribute` is the shared
+        // copy-or-mint home (item 3, N9/ADR-024) — same shape this arm used
+        // to hand-roll.
+        let field = output_attribute(&expr, input_schema);
         projections.push(expr);
         schema.fields.push(field.clone());
         return Some(Expression::ColumnReference(ColumnReference {
@@ -4420,11 +4412,11 @@ fn try_rewrite_nested_struct_path(
     current_type.field_by_name(last)?;
 
     // Build the chain bottom-up starting from a bare ColumnReference to the
-    // top-level struct column. Type/nullable are stamped lazily by the
-    // ExtractValue derivations at emission time; leaving them as `None` on
-    // the root ColumnReference is fine because we immediately re-run
-    // `stamp_column_reference` via the normal walk (the caller path stamps
-    // any embedded ColumnReferences on subsequent visits).
+    // top-level struct column, stamped directly with `root_field`'s own
+    // data_type/nullable. (`resolve_and_stamp`'s schema-lookup fallback
+    // would in fact resolve the same top-level column by name — stamping at
+    // construction is simply the clearer, self-contained choice: the ref is
+    // fully resolved the moment it exists, with no reliance on a later walk.)
     //
     // `expr_id` (documented remaining None source, `expression.rs`):
     // `root_field` IS a real top-level attribute with an id available right
@@ -4493,16 +4485,11 @@ fn resolve_in_outer(
             return None;
         }
         let slice = &outer.schema.fields[range.clone()];
-        let (dt, nullable) = TypeInferenceEngine::column_info_in(&u.name, slice)?;
-        // `field_index` mirrors `column_info_in`'s own lookup order (exact
-        // name first, then the struct-qualified first segment), so the
-        // derived id always agrees with the value actually resolved.
-        let local = field_index(slice, &u.name)?;
-        Some((
-            dt,
-            nullable,
-            Some(outer.schema.fields[range.start + local].expr_id),
-        ))
+        let (dt, nullable, attr) = TypeInferenceEngine::resolve_in(&u.name, slice)?;
+        // `attr` borrows directly from `outer.schema.fields` (via `slice`, a
+        // sub-slice of it), so its `expr_id` needs no `range.start +`
+        // re-basing — it already names the right field wherever it lives.
+        Some((dt, nullable, Some(attr.expr_id)))
     } else {
         // Unqualified: exactly-one case-insensitive match in the outer schema.
         let mut found: Option<(DataType, bool, Option<ExprId>)> = None;
@@ -4517,27 +4504,6 @@ fn resolve_in_outer(
         }
         found
     }
-}
-
-/// 0-based position of the field that resolves `name` within `fields` (first
-/// case-insensitive match), mirroring
-/// [`TypeInferenceEngine::column_info_in`]'s own lookup order — exact name
-/// first, then the struct-qualified first segment for a dotted name — so the
-/// derived `expr_id` always agrees with the value actually resolved. Used as
-/// a resolution-time-only local (see `resolve_column`); ADR-024 removed the
-/// `ColumnReference::ordinal` field this position used to be stamped into.
-fn field_index(fields: &[Attribute], name: &str) -> Option<usize> {
-    if let Some(i) = fields
-        .iter()
-        .position(|f| f.name.eq_ignore_ascii_case(name))
-    {
-        return Some(i);
-    }
-    let dot_pos = name.find('.')?;
-    let struct_name = &name[..dot_pos];
-    fields
-        .iter()
-        .position(|f| f.name.eq_ignore_ascii_case(struct_name))
 }
 
 fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expression, AnalyzerError> {
@@ -4596,15 +4562,12 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                 });
             }
             if let Some(range) = ctx.plan_id_lookup(pid) {
-                let info =
-                    TypeInferenceEngine::column_info_in(&u.name, &ctx.schema.fields[range.clone()]);
-                if let Some((dt, nullable)) = info {
-                    let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
-                        .map(|i| range.start + i);
-                    // ADR-024: same attribute the local `field_index`
-                    // position indexes (position dies here; only the id is
-                    // stamped).
-                    let expr_id = ordinal.map(|k| ctx.schema.fields[k].expr_id);
+                let info = TypeInferenceEngine::resolve_in(&u.name, &ctx.schema.fields[range]);
+                if let Some((dt, nullable, attr)) = info {
+                    // ADR-024: `attr` borrows straight from `ctx.schema.fields`
+                    // (via the range sub-slice), so its `expr_id` needs no
+                    // re-basing.
+                    let expr_id = Some(attr.expr_id);
                     // Phase 3b (governing invariant): always bare — a
                     // plan_id-scoped ref binds into the emitting operator's
                     // schema by attribute identity, never by a stamped
@@ -4674,17 +4637,12 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                 // `UnknownColumn` (ADR-022 cat-1), not an opaque DuckDB bind
                 // error.
                 Some(range) => {
-                    match TypeInferenceEngine::column_info_in(
-                        &u.name,
-                        &ctx.schema.fields[range.clone()],
-                    ) {
-                        Some((dt, nullable)) => {
-                            let ordinal = field_index(&ctx.schema.fields[range.clone()], &u.name)
-                                .map(|i| range.start + i);
-                            // ADR-024: same attribute the local `field_index`
-                            // position indexes (position dies here; only the
-                            // id is stamped).
-                            let expr_id = ordinal.map(|k| ctx.schema.fields[k].expr_id);
+                    match TypeInferenceEngine::resolve_in(&u.name, &ctx.schema.fields[range]) {
+                        Some((dt, nullable, attr)) => {
+                            // ADR-024: `attr` borrows straight from
+                            // `ctx.schema.fields` (via the range sub-slice),
+                            // so its `expr_id` needs no re-basing.
+                            let expr_id = Some(attr.expr_id);
                             // ADR-023 3e-ii: a qualifier that binds a local
                             // scope AND resolves to a name UNIQUE in the
                             // output is the projected-through case the (now
@@ -4704,16 +4662,13 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                                 .filter(|f| f.name.eq_ignore_ascii_case(&u.name))
                                 .count();
                             if name_count == 1 {
-                                if let Some(k) = ordinal {
-                                    let f = &ctx.schema.fields[k];
-                                    return Ok(Expression::ColumnReference(ColumnReference {
-                                        name: u.name,
-                                        qualifier: None,
-                                        expr_id: Some(f.expr_id),
-                                        data_type: Some(f.data_type.clone()),
-                                        nullable: Some(f.nullable),
-                                    }));
-                                }
+                                return Ok(Expression::ColumnReference(ColumnReference {
+                                    name: u.name,
+                                    qualifier: None,
+                                    expr_id,
+                                    data_type: Some(dt),
+                                    nullable: Some(nullable),
+                                }));
                             }
                             (dt, nullable, expr_id)
                         }
@@ -4802,24 +4757,20 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                         // Deferred lineage (USING / Star / SetOp / …): keep
                         // the legacy name-only fallback so those cases stay
                         // green (retired in 3e as their lineage is filled in).
-                        let (dt, nullable) = TypeInferenceEngine::qualified_column_info(
-                            &u.name,
-                            Some(q),
-                            ctx.schema,
-                        );
-                        let ordinal = field_index(&ctx.schema.fields, &u.name);
-                        // ADR-024: same attribute the position indexes.
-                        let expr_id = ordinal.map(|k| ctx.schema.fields[k].expr_id);
+                        let (dt, nullable, attr) =
+                            TypeInferenceEngine::qualified_resolve_in(&u.name, Some(q), ctx.schema);
+                        // ADR-024: same attribute the lookup resolved.
+                        let expr_id = attr.map(|a| a.expr_id);
                         (dt, nullable, expr_id)
                     }
                 }
             }
         }
     } else {
-        let (dt, nullable) = TypeInferenceEngine::qualified_column_info(&u.name, None, ctx.schema);
-        let ordinal = field_index(&ctx.schema.fields, &u.name);
-        // ADR-024: same attribute the position indexes.
-        let expr_id = ordinal.map(|k| ctx.schema.fields[k].expr_id);
+        let (dt, nullable, attr) =
+            TypeInferenceEngine::qualified_resolve_in(&u.name, None, ctx.schema);
+        // ADR-024: same attribute the lookup resolved.
+        let expr_id = attr.map(|a| a.expr_id);
         (dt, nullable, expr_id)
     };
     if matches!(dt, DataType::Unresolved) {
@@ -4863,6 +4814,12 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
     }))
 }
 
+/// Fill in whichever of `data_type` / `nullable` is still `None` on a bare
+/// `ColumnReference` by looking it up (by name and qualifier) against
+/// `schema`; a reference that already carries both is returned untouched.
+/// This is the fallback path for `ColumnReference`s that were never routed
+/// through `UnresolvedColumn` (e.g. `ColumnReference::untyped`-built AST
+/// nodes) — see `resolve_and_stamp`'s `ColumnReference` arm.
 fn stamp_column_reference(c: ColumnReference, schema: &ResolvedSchema) -> ColumnReference {
     let dt = c.data_type.clone().unwrap_or_else(|| {
         TypeInferenceEngine::qualified_column_type(&c.name, c.qualifier.as_deref(), schema)
@@ -4931,18 +4888,18 @@ fn schema_has_unresolved(schema: &ResolvedSchema) -> bool {
 
 /// Build the output [`Attribute`] contributed by a projection-position
 /// expression: name via [`expression_output_name`], type and nullability
-/// resolved against `input`.
+/// resolved against `input`. The single copy-or-mint home (item 3 of the
+/// N9/ADR-024 consolidation): [`promote_project_subtree`]'s bare
+/// `ColumnReference` arm calls this directly instead of hand-rolling its own
+/// copy of the same shape.
 ///
 /// N9 INC-1 identity rule (ADR-024): a bare `ColumnReference` whose
-/// `expr_id` matches an `input` attribute (first occurrence — duplicate ids
-/// within one schema are clones of the same attribute from a duplicated
-/// projection, so first-match is sound) COPIES that attribute's `expr_id` —
-/// it is the identical logical column, merely passed through a `SELECT`. A
-/// `debug_assert!` checks the found attribute's name agrees with the
-/// reference's stamped name case-insensitively (defensive H8 name-agreement
-/// precedent, same as `bare_dup_slot` in emission.rs — not a runtime gate).
-/// Everything else (`Alias`, computed expressions) MINTS a fresh id — it is
-/// a genuinely new column.
+/// `expr_id` matches an `input` attribute (first occurrence via
+/// [`ResolvedSchema::field_by_id`] — duplicate ids within one schema are
+/// clones of the same attribute from a duplicated projection, so first-match
+/// is sound) COPIES that attribute's `expr_id` — it is the identical logical
+/// column, merely passed through a `SELECT`. Everything else (`Alias`,
+/// computed expressions) MINTS a fresh id — it is a genuinely new column.
 ///
 /// N9 INC-3 lineage rule (ADR-023 tier-3, folded in from the deleted
 /// `source_quals_of`): the COPY branch above additionally clones the source
@@ -4952,17 +4909,21 @@ fn schema_has_unresolved(schema: &ResolvedSchema) -> bool {
 /// one it was just referenced through. The MINT branch's fresh
 /// `Attribute::minted` carries EMPTY lineage — a created column (`Alias`,
 /// computed expression) inherits no qualifier (F8/filt-019 hinge).
+///
+/// Naming policy (shared with `promote_project_subtree`, verified benign):
+/// the COPY branch always stamps `name` via [`expression_output_name`] — the
+/// reference's OWN stamped user-case name — rather than the source
+/// attribute's verbatim name. For a plain SELECT passthrough the two agree
+/// modulo case (by construction). For `promote_project_subtree`'s hidden
+/// promoted slot the attribute is trimmed away by the wrapping trim-`Project`
+/// (which re-binds by id, not by name or qualifier) immediately after use, so
+/// the case — and the qualifier-union into `source_quals` above — are both
+/// inert there: nothing downstream observes them before the slot is
+/// discarded.
 fn output_attribute(e: &Expression, input: &ResolvedSchema) -> Attribute {
     if let Expression::ColumnReference(cr) = e {
         if let Some(id) = cr.expr_id {
-            if let Some(src) = input.fields.iter().find(|f| f.expr_id == id) {
-                debug_assert!(
-                    src.name.eq_ignore_ascii_case(&cr.name),
-                    "output_attribute: expr_id-resolved attribute name `{}` must agree \
-                     with the reference's stamped name `{}`",
-                    src.name,
-                    cr.name
-                );
+            if let Some((_, src)) = input.field_by_id(id, &cr.name) {
                 let mut attr = src.clone();
                 attr.name = expression_output_name(e);
                 attr.data_type = e.data_type(input);

@@ -75,18 +75,40 @@ impl TypeInferenceEngine {
     /// Slice-scoped sibling of [`Self::column_info`]: look up `name`
     /// case-insensitively within `fields` (rather than a whole [`StructType`]),
     /// returning `None` when not found instead of the `(Unresolved, true)`
-    /// sentinel. Lets callers restrict a name-only lookup to a contiguous
-    /// sub-range of a merged join schema (the alias→field-range map built by
-    /// [`super::analyzer`]'s `QualifierScopes`) while sharing the exact
-    /// dot-notation / nullability-OR semantics `column_info` relies on. The
-    /// dot-notation branch supports exactly ONE level of struct-field nesting
-    /// (no recursion) — the qualified path ([`Self::qualified_column_info`] /
+    /// sentinel. Thin wrapper over [`Self::resolve_in`], discarding the
+    /// resolved attribute — callers that need it (an `ExprId` to stamp) call
+    /// `resolve_in` directly instead of re-walking `fields` a second time.
+    pub(super) fn column_info_in(name: &str, fields: &[Attribute]) -> Option<(DataType, bool)> {
+        Self::resolve_in(name, fields).map(|(dt, nullable, _)| (dt, nullable))
+    }
+
+    /// THE single home of the name-lookup ORDER shared by every
+    /// [`super::analyzer`] resolver tier: exact case-insensitive name match
+    /// first, then (for a dotted `"struct.field"` path) the struct column
+    /// named by the first segment. Returns the matched attribute alongside
+    /// its `(data_type, nullable)` so callers that need identity (an
+    /// `ExprId` to stamp on a `ColumnReference`) get it from the SAME walk
+    /// that produced the type — no paired second lookup, no hand-maintained
+    /// re-basing when `fields` is a sub-slice of a larger schema (the
+    /// returned `&Attribute` borrows from the caller's own backing storage,
+    /// whatever range it was sliced from).
+    ///
+    /// Lets callers restrict a name-only lookup to a contiguous sub-range of
+    /// a merged join schema (the alias→field-range map built by
+    /// [`super::analyzer`]'s `QualifierScopes`). The dot-notation branch
+    /// supports exactly ONE level of struct-field nesting (no recursion) —
+    /// the qualified path ([`Self::qualified_column_info`] /
     /// [`Self::struct_qualifier_info`]) is the one that recurses. Struct-field
     /// nullability ORs in the parent column's nullability (a NULL struct makes
-    /// every field read NULL).
-    pub(super) fn column_info_in(name: &str, fields: &[Attribute]) -> Option<(DataType, bool)> {
+    /// every field read NULL); in the dotted case the returned attribute is
+    /// the struct COLUMN, not the nested field (mirroring the pre-existing
+    /// `field_index` behavior this replaces).
+    pub(super) fn resolve_in<'a>(
+        name: &str,
+        fields: &'a [Attribute],
+    ) -> Option<(DataType, bool, &'a Attribute)> {
         if let Some(f) = fields.iter().find(|f| f.name.eq_ignore_ascii_case(name)) {
-            return Some((f.data_type.clone(), f.nullable));
+            return Some((f.data_type.clone(), f.nullable, f));
         }
         if let Some(dot_pos) = name.find('.') {
             let struct_name = &name[..dot_pos];
@@ -100,7 +122,7 @@ impl TypeInferenceEngine {
                         .field_by_name(field_name)
                         .map(|ff| (ff.data_type.clone(), ff.nullable))
                         .unwrap_or((DataType::Unresolved, true));
-                    return Some((dt, f.nullable || field_nullable));
+                    return Some((dt, f.nullable || field_nullable, f));
                 }
             }
         }
@@ -113,18 +135,40 @@ impl TypeInferenceEngine {
     /// to the unqualified lookup. `pub(super)` so [`super::analyzer`]'s
     /// `resolve_column` can call it once per fallback site instead of the
     /// `qualified_column_type` + `qualified_column_nullable` pair (each of
-    /// which re-runs this same resolution end-to-end).
+    /// which re-runs this same resolution end-to-end). Thin wrapper over
+    /// [`Self::qualified_resolve_in`], discarding the resolved attribute.
     pub(super) fn qualified_column_info(
         name: &str,
         qualifier: Option<&str>,
         schema: &ResolvedSchema,
     ) -> (DataType, bool) {
+        let (dt, nullable, _) = Self::qualified_resolve_in(name, qualifier, schema);
+        (dt, nullable)
+    }
+
+    /// Identity-carrying sibling of [`Self::qualified_column_info`]: same
+    /// struct-precedence-then-fallback resolution, additionally surfacing the
+    /// resolved top-level [`Attribute`] (for its `ExprId`) when the
+    /// UNQUALIFIED fallback is the one that matched. `None` in the third slot
+    /// means either the name was not found at all, OR the struct-qualifier
+    /// arm matched — the resolved field then lives INSIDE a struct column,
+    /// not as its own top-level attribute, so there is no id to stamp
+    /// (matching `resolve_column` tier-(d)'s existing choice to stamp `None`
+    /// in that case).
+    pub(super) fn qualified_resolve_in<'a>(
+        name: &str,
+        qualifier: Option<&str>,
+        schema: &'a ResolvedSchema,
+    ) -> (DataType, bool, Option<&'a Attribute>) {
         if let Some(q) = qualifier {
-            if let Some(info) = Self::struct_qualifier_info(name, q, schema) {
-                return info;
+            if let Some((dt, nullable)) = Self::struct_qualifier_info(name, q, schema) {
+                return (dt, nullable, None);
             }
         }
-        Self::column_info(name, schema)
+        match Self::resolve_in(name, &schema.fields) {
+            Some((dt, nullable, attr)) => (dt, nullable, Some(attr)),
+            None => (DataType::Unresolved, true, None),
+        }
     }
 
     /// The struct-qualifier arm of [`Self::qualified_column_info`], extracted

@@ -194,6 +194,39 @@ impl ResolvedSchema {
             .find(|f| f.name.eq_ignore_ascii_case(name))
     }
 
+    /// First-occurrence lookup by [`ExprId`] — the single home of the
+    /// id-lookup-plus-name-agreement-assert shape that used to be hand-rolled
+    /// at four sites (analyzer.rs's `output_attribute` /
+    /// `promote_project_subtree`, emission.rs's `bare_dup_slot` /
+    /// `requalify_column_ref`). Duplicate ids within one schema are clones of
+    /// the same attribute from a duplicated projection (N10-lite) — first
+    /// match is sound: same id, same per-row value, regardless of which slot
+    /// is addressed. Returns the matched position alongside the attribute so
+    /// callers that need a `usize` (the two emission.rs sites) and callers
+    /// that only need the `&Attribute` (the two analyzer.rs sites) both stay
+    /// single-walk.
+    ///
+    /// `ref_name` is the reference's OWN stamped name, checked
+    /// case-insensitively against the resolved attribute's name via a single
+    /// `debug_assert` (a mismatch signals a resolver stamping bug, not a
+    /// reachable production case) — the per-site prefix each of the four
+    /// call sites used to carry in its own assert message is lost; the
+    /// generic message below is deemed acceptable in trade for one home.
+    pub(crate) fn field_by_id(&self, id: ExprId, ref_name: &str) -> Option<(usize, &Attribute)> {
+        let (k, f) = self
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, f)| f.expr_id == id)?;
+        debug_assert!(
+            f.name.eq_ignore_ascii_case(ref_name),
+            "field_by_id: id-resolved attribute name `{}` must agree with reference name `{}`",
+            f.name,
+            ref_name
+        );
+        Some((k, f))
+    }
+
     /// All field names in order.
     pub fn field_names(&self) -> Vec<&str> {
         self.fields.iter().map(|f| f.name.as_str()).collect()

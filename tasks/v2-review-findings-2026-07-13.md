@@ -87,11 +87,17 @@ schema-lookup fallback arms in Expression::data_type/nullable, `stamp_column_ref
 (finding 8), the is_fully_resolved arm, and shrinks canonicalize — ~30+ production LOC and,
 more importantly, the phantom "partially-stamped" state every reader must reason about.
 
-### 8. stamp_column_reference is a production no-op — delete it, CONFIRMED
-Single caller (analyzer.rs:3383); every reaching ref is already fully stamped. Replace with
-a passthrough + `debug_assert!(data_type.is_some() && nullable.is_some())`. Do NOT assert
-expr_id (legitimate None cases remain) and do NOT add id backfill (verified unreachable).
-Also moots its double-resolution pair-call. −13 LOC + a misleading contract gone.
+### 8. stamp_column_reference is a production no-op — delete it, CONFIRMED with a CORRECTION (implementation-falsified detail)
+Single caller (analyzer.rs:3383); every PRODUCTION reaching ref is already fully stamped.
+**Correction (Pass E1, empirical):** the verifier's "no test feeds an untyped ref through
+the arm" claim was FALSE — 7 emission tests (12 sites) build `ColumnReference::untyped`
+Sort keys/projections and drive them through `analyze()`, where the fallback is
+load-bearing; naive deletion panicked the debug_assert and poison-cascaded 133 failures.
+The deletion is still right, but requires the fixture migration first — staged plan
+recorded (architect, 2026-07-13): migrate the 7 firing + 94 incidental `untyped` fixtures
+to `UnresolvedColumn`, prove the census with a temporary `unreachable!()` gate, THEN
+delete (+ retire `untyped` itself, discharging finding 13b). Do NOT assert expr_id;
+do NOT add id backfill. Moots the double-resolution pair-call.
 
 ### 9. One id-lookup home: `ResolvedSchema::field_by_id` — CONFIRMED, −25..35 LOC
 Four hand-rolled find/position-by-expr_id + near-identical name-agreement debug_asserts

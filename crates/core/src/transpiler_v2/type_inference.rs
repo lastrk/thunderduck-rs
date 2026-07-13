@@ -1010,6 +1010,23 @@ impl TypeInferenceEngine {
             // object). Emission remaps to DuckDB's native `json_keys`, which
             // already returns `VARCHAR[]`. Corpus: `test_json_object_keys`.
             "json_object_keys" => Array(Box::new(String), true),
+            // Pass 91 — synthetic per-key `FunctionCall` produced by the
+            // analyzer's Project pre-pass for `F.json_tuple` (the sole
+            // choke point creating this name: see
+            // `analyzer::expand_json_tuple_projections`, which already
+            // enforces arity ≥ 2 pre-expansion and stamps exactly 2 args
+            // — json expr + one literal key — per expanded call). Return
+            // type is always `String` per Spark's `JsonTuple.elementSchema`
+            // — an arity-only rule (no per-arg *expression* nullability
+            // needed), so its single home is this resolver (N2), not the
+            // `function_call_data_type` pre-pass. The exact-2 slice pattern
+            // mirrors `map_from_arrays`'s arity guard above; anything else
+            // is malformed and falls through to the shared `Unresolved`
+            // default. Corpus: `json-002`.
+            "json_tuple_field" => match arg_types {
+                [_, _] => String,
+                _ => Unresolved,
+            },
 
             // ── Aggregate-shaped functions in scalar dispatch ───────────
             // `array_agg` is routed through the aggregate delegation list

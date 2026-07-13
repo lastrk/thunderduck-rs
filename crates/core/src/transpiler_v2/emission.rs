@@ -4045,6 +4045,15 @@ fn render_function_call_dispatch(
         // key → NULL). Analyzer pre-pass rejects unsafe key chars, so the
         // interpolated key is a safe single-quoted SQL literal. Corpus: json-002.
         "json_tuple_field" => {
+            // These runtime guards are LOAD-BEARING, not duplication of the
+            // `expand_json_tuple_projections` choke point: that pre-pass
+            // covers only the calls IT synthesizes from `json_tuple`.
+            // Nothing stops a user from invoking `json_tuple_field(...)`
+            // directly (τ forwards unknown function names to emission by
+            // design, with no allowlist — SQL front-end and DataFrame
+            // converter alike), so a wrong-arity or unsafe-key call reaches
+            // this arm un-choke-pointed and must get a graceful boundary
+            // error, same as the sibling `inline_field` arms.
             if f.args.len() != 2 {
                 bail_boundary_fn!(
                     f.name.clone(),
@@ -4053,11 +4062,6 @@ fn render_function_call_dispatch(
             }
             let json_sql = render_expr(&f.args[0], schema)?;
             let key = string_literal_arg(f, 1, "`json_tuple_field` second argument")?;
-            // Defense in depth: the analyzer pre-pass has already rejected
-            // any key containing single-quote or path-walk metachars, so the
-            // `escape_sql_string` call below is defensive rather than
-            // load-bearing. Reject at emission on the outside chance a
-            // future refactor drops the analyzer guard.
             if key
                 .chars()
                 .any(|c| matches!(c, '\'' | '"' | '\\' | '.' | '[' | ']') || c.is_ascii_control())
@@ -4066,7 +4070,7 @@ fn render_function_call_dispatch(
                     f.name.clone(),
                     format!(
                         "`json_tuple_field` key `{key}` contains an unsafe character; \
-                         analyzer pre-pass should have rejected it"
+                         it would path-walk or break the SQL literal"
                     ),
                 );
             }
@@ -16441,8 +16445,10 @@ mod tests {
         assert_eq!(sql, "json_extract_string(json_str, '$.a')");
     }
 
-    /// Wrong arity → `UnsupportedFunction` (internal-corruption signal — the
-    /// analyzer's contract is 2 args).
+    /// Wrong arity gets a graceful boundary error, NOT a panic: the name is
+    /// user-invokable directly (τ forwards unknown function names with no
+    /// allowlist), so the `expand_json_tuple_projections` choke point covers
+    /// only the calls it synthesizes — the emission guard is load-bearing.
     #[test]
     fn render_json_tuple_field_rejects_wrong_arity() {
         let schema = json_str_schema();

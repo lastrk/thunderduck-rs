@@ -1237,15 +1237,6 @@ impl Expression {
                 }
                 return DataType::Unresolved;
             }
-            // Pass 91 — synthetic per-key FunctionCall names produced by the
-            // analyzer's Project pre-pass for `F.json_tuple` (see
-            // `analyzer::expand_json_tuple_projections`). `args[0]` is the
-            // JSON string expression; `args[1]` is a `Literal::String`
-            // carrying the target key. Return type is always `String` per
-            // Spark's `JsonTuple.elementSchema`. Corpus: json-002.
-            "json_tuple_field" if f.args.len() == 2 => {
-                return DataType::String;
-            }
             // Spark's 2-arg `ceil(x, t)` / `floor(x, t)` (`RoundCeil`/
             // `RoundFloor`) implicitly cast the child to Decimal and return a
             // scaled Decimal derived from the child type + literal target

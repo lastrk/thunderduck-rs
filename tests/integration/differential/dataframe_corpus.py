@@ -602,6 +602,7 @@ case("struct-005", "struct", "withField (add/replace nested)", lambda I: I["emp"
 case("struct-006", "struct", "dropFields", lambda I: I["emp"].withColumn("address", F.col("address").dropFields("geo")))
 case("struct-007", "struct", "named_struct of expressions", lambda I: I["emp"].select(F.expr("named_struct('hi', salary > 100000, 'agep1', age + 1)").alias("s")))
 case("struct-008", "struct", "star-expand a struct", lambda I: I["emp"].select("id", "address.*"))
+case("struct-009", "struct", "unaliased single-level dot access (string select)", lambda I: I["emp"].select("address.city"))
 
 # ── 17. Higher-order functions ──────────────────────────────────────────────
 case("hof-001", "hof", "transform (array map)", lambda I: I["emp"].select(F.transform("tags", lambda x: F.upper(x)).alias("up_tags")))
@@ -855,6 +856,12 @@ case("struc-003", "structural", "repartitionByRange (cosmetic)", lambda I: I["em
 case("struc-004", "structural", "withMetadata (column metadata, schema-affecting)", lambda I: I["emp"].withMetadata("salary", {"unit": "USD"}), flags=("schema_only",))
 case("struc-005", "structural", "selectExpr with star and exclude-like rebuild", lambda I: I["emp"].selectExpr("id", "name", "age + 1 AS age1", "salary / 1000 AS sal_k"))
 case("struc-006", "structural", "reduce HOF (alias of aggregate, spark4)", lambda I: I["emp"].select(F.expr("reduce(tags, '', (acc, x) -> concat(acc, x))").alias("cat")), flags=("spark4",))
+# F-todf-dupname (v2-corpus-followups.md): toDF's positional rename over a
+# child with DUPLICATE column names (both sides of a self-join project
+# "id"). A by-name rename_map at emission would collapse the positional
+# pairs [("id","a"),("id","b")] last-wins to id->b; the downstream
+# select("a") must resolve to the FIRST "id" (the self-join's "e" side).
+case("struc-007", "structural", "toDF positional rename over dup-named self-join child", lambda I: I["emp"].alias("e").join(I["emp"].alias("m"), F.col("e.manager_id") == F.col("m.id"), "left").select(F.col("e.id"), F.col("m.id")).toDF("a", "b").select("a"))
 
 # ── 32. Time-window aggregate (tumbling) ────────────────────────────────────
 case("win2-002", "window_time", "tumbling time window aggregate", lambda I: I["emp"].filter(F.col("last_login").isNotNull()).groupBy(F.window("last_login", "1 day")).agg(F.count(F.lit(1)).alias("n")))

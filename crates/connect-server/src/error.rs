@@ -23,8 +23,10 @@ pub enum ConnectError {
     /// from server-internal (`Status::internal`) faults. The `SparkEmulated`
     /// variant (ADR-023 chunk 3b) is a Spark-analysis error re-surfaced with
     /// its Spark class token leading the message; it surfaces as
-    /// [`Status::invalid_argument`] — see the `From<ConnectError> for
-    /// Status` mapping below.
+    /// [`Status::invalid_argument`]. The `Internal` variant (review finding
+    /// 5) is a genuine τ-internal invariant violation and surfaces as
+    /// [`Status::internal`] — see the `From<ConnectError> for Status`
+    /// mapping below.
     #[error("τ emission error: {0}")]
     TranspilerV2Emission(#[from] EmissionError),
 }
@@ -51,9 +53,11 @@ impl From<ConnectError> for Status {
             // the real Spark class token (`[{class}] {message}`); surface it
             // verbatim so `spark_error_class` can extract it. Unsupported
             // stays UNIMPLEMENTED — it's still a Thunderduck-boundary gap.
+            // Internal (review finding 5) is a genuine τ bug — INTERNAL.
             ConnectError::TranspilerV2Emission(e) => match &e {
                 EmissionError::SparkEmulated { .. } => Status::invalid_argument(e.to_string()),
                 EmissionError::Unsupported { .. } => Status::unimplemented(e.to_string()),
+                EmissionError::Internal { .. } => Status::internal(e.to_string()),
             },
         }
     }
@@ -104,5 +108,20 @@ mod tests {
         let status: Status = connect_err.into();
 
         assert_eq!(status.code(), tonic::Code::Unimplemented);
+    }
+
+    /// Review finding 5: a τ-internal invariant violation (e.g. the join
+    /// left/right disjointness check) surfaces as `Status::internal`, not
+    /// `Unimplemented`/`InvalidArgument` — it is a genuine τ bug, distinct
+    /// from both other categories.
+    #[test]
+    fn internal_invariant_violation_status_is_internal() {
+        let emission_err = EmissionError::Internal {
+            message: "join left/right resolved_schema expr_id sets must be disjoint".to_owned(),
+        };
+        let connect_err: ConnectError = emission_err.into();
+        let status: Status = connect_err.into();
+
+        assert_eq!(status.code(), tonic::Code::Internal);
     }
 }

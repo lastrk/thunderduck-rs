@@ -3,6 +3,7 @@
 //! Owned by τ (INV10: τ imports only `DataType`, `StructField`, `StructType`
 //! from `crate::types`).
 
+use super::name_fold::eq_fold;
 use super::schema::{Attribute, ResolvedSchema};
 use crate::types::{DataType, StructField, StructType};
 
@@ -107,16 +108,13 @@ impl TypeInferenceEngine {
         name: &str,
         fields: &'a [Attribute],
     ) -> Option<(DataType, bool, &'a Attribute)> {
-        if let Some(f) = fields.iter().find(|f| f.name.eq_ignore_ascii_case(name)) {
+        if let Some(f) = fields.iter().find(|f| eq_fold(&f.name, name)) {
             return Some((f.data_type.clone(), f.nullable, f));
         }
         if let Some(dot_pos) = name.find('.') {
             let struct_name = &name[..dot_pos];
             let field_name = &name[dot_pos + 1..];
-            if let Some(f) = fields
-                .iter()
-                .find(|f| f.name.eq_ignore_ascii_case(struct_name))
-            {
+            if let Some(f) = fields.iter().find(|f| eq_fold(&f.name, struct_name)) {
                 if let DataType::Struct(st) = &f.data_type {
                     let (dt, field_nullable) = st
                         .field_by_name(field_name)
@@ -1332,9 +1330,10 @@ const AGG_SPECS: &[AggSpec] = &[
     // `max_by(x, y)` / `min_by(x, y)` — the value of `x` at the row where
     // `y` is max/min. Return type = the type of the FIRST arg (`x`), which
     // is exactly what `AggRet::ArgType` resolves to via the aggregate
-    // delegation arm's `first_arg_type`. Always-nullable (empty group or an
-    // all-NULL `y` column yields NULL, matching DuckDB's `arg_max`/`arg_min`
-    // which this pair renders to — see `render_aggregate`).
+    // delegation arm's `first_arg_type`. Always-nullable (empty group, an
+    // all-NULL `y` column, or a NULL `x` at the extreme `y` row all yield
+    // NULL, matching DuckDB's `arg_max_null`/`arg_min_null` which this pair
+    // renders to — see `render_aggregate`).
     agg("max_by", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
     agg("min_by", AggRet::ArgType, AggNull::AlwaysNullable, true, true),
     // Drift (verbatim): `nth_value` appears ONLY in the always-nullable
@@ -2349,7 +2348,7 @@ mod tests {
     #[test]
     fn max_by_returns_first_arg_type_via_aggregate_delegation() {
         // Return type = type of `x` (the value column), not `y` (the
-        // ordering column) — mirrors DuckDB's `arg_max(x, y)`.
+        // ordering column) — mirrors DuckDB's `arg_max_null(x, y)`.
         assert_eq!(
             frt("max_by", &[DataType::String, DataType::Integer]),
             DataType::String

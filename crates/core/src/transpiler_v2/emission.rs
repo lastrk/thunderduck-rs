@@ -49,6 +49,7 @@ use super::expression::{
     LiteralValue, NullOrdering, SortDirection, SortOrder, StarExpression, SubqueryPlan,
     UnaryExpression, UnaryOp,
 };
+use super::name_fold::{eq_fold, fold_key};
 use super::sql_block::{Clause, DefaultSlot, DistinctKind, FromItem, SelectBlock, SqlUnit};
 use super::type_inference::{is_aggregate_classifier_name, TypeInferenceEngine};
 use crate::types::pyspark_parity::uniquify;
@@ -179,9 +180,7 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
         ),
         TypedOp::WithColumns { input, assignments } => build_with_columns(input, assignments),
         TypedOp::DropColumns { input, drop_names } => build_drop_columns(input, drop_names),
-        TypedOp::WithColumnsRenamed { input, renames } => {
-            build_with_columns_renamed(input, renames)
-        }
+        TypedOp::WithColumnsRenamed { input } => build_with_columns_renamed(input, schema),
         TypedOp::NaFill {
             input,
             cols,
@@ -262,7 +261,7 @@ impl<'a> FromScope<'a> {
         let (name, _) = self.aliases.iter().find(|(_, r)| r.contains(&i))?;
         self.exposed
             .iter()
-            .any(|e| e.eq_ignore_ascii_case(name))
+            .any(|e| eq_fold(e, name))
             .then_some(name.as_str())
     }
 
@@ -281,20 +280,16 @@ impl<'a> FromScope<'a> {
         let alias_entries = self
             .aliases
             .iter()
-            .filter(|(a, _)| a.eq_ignore_ascii_case(alias))
+            .filter(|(a, _)| eq_fold(a, alias))
             .count();
         // (ii) `alias` appears exactly ONCE in the block's exposed FROM
         // aliases — the merge-visibility counterpart of (i).
-        let exposed_count = self
-            .exposed
-            .iter()
-            .filter(|e| e.eq_ignore_ascii_case(alias))
-            .count();
+        let exposed_count = self.exposed.iter().filter(|e| eq_fold(e, alias)).count();
         // (iii) `name` occurs exactly ONCE within the covering span — an
         // internally-dup span would leftmost-bind the wrong physical column.
         let within_span = schema.fields[range.clone()]
             .iter()
-            .filter(|f| f.name.eq_ignore_ascii_case(name))
+            .filter(|f| eq_fold(&f.name, name))
             .count();
         (alias_entries == 1 && exposed_count == 1 && within_span == 1).then_some(alias.as_str())
     }
@@ -317,13 +312,7 @@ impl<'a> FromScope<'a> {
             return (i < self.width).then_some(only.as_str());
         }
         let name = self.covering(i)?;
-        (self
-            .exposed
-            .iter()
-            .filter(|e| e.eq_ignore_ascii_case(name))
-            .count()
-            == 1)
-            .then_some(name)
+        (self.exposed.iter().filter(|e| eq_fold(e, name)).count() == 1).then_some(name)
     }
 
     /// Replaces `scope_covers_fields`.
@@ -360,7 +349,7 @@ fn has_unsafe_qualified_duplicate<'a>(
     mut fields: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> bool {
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    fields.any(|(name, qual)| !seen.insert((qual.to_lowercase(), name.to_lowercase())))
+    fields.any(|(name, qual)| !seen.insert((fold_key(qual), fold_key(name))))
 }
 
 /// True iff any USING-key name in `using` matches **two or more** fields in
@@ -384,7 +373,7 @@ fn using_key_duplicated(schema: &Schema, using: &[String]) -> bool {
         schema
             .fields
             .iter()
-            .filter(|f| f.name.eq_ignore_ascii_case(key))
+            .filter(|f| eq_fold(&f.name, key))
             .count()
             >= 2
     })
@@ -397,6 +386,14 @@ fn using_key_duplicated(schema: &Schema, using: &[String]) -> bool {
 struct SideNeedsAlias {
     left: bool,
     right: bool,
+}
+
+/// [`requalify_join_condition`]'s outcome: either the rewritten condition, or
+/// the identity-flagged side(s) that need a fresh alias before
+/// [`build_join`]'s bounded fixpoint retries.
+enum RequalifyOutcome {
+    Rewritten(Expression),
+    NeedsAlias(SideNeedsAlias),
 }
 
 /// Rewrite every join-CONDITION [`ColumnReference`] to the qualifier the
@@ -412,7 +409,7 @@ struct SideNeedsAlias {
 /// signal this rewrite ever consults. Sound only because a join's left and
 /// right sides can never share an `expr_id` — see the disjointness pin
 /// (`self_join_left_right_resolved_schema_ids_are_disjoint`,
-/// `analyzer.rs`) and the `debug_assert` below.
+/// `analyzer.rs`) and the always-on invariant check below.
 ///
 /// Left untouched: a reference whose `expr_id` is `None` (deferred
 /// resolution — see [`super::expression::ColumnReference::expr_id`]'s doc
@@ -425,10 +422,13 @@ struct SideNeedsAlias {
 ///
 /// Returns the rewritten [`Expression`] tree (clone-then-walk via
 /// [`Expression::map_children`], the same fallible-fold primitive the
-/// analyzer's own expression walkers use — see `reproject_qualifiers`).
-/// `Err(SideNeedsAlias)` when a demanded ambiguous id-resolved slot has no
-/// unambiguous covering alias on its side; [`build_join`]'s fixpoint then
-/// wraps the flagged side(s) under a fresh alias and retries.
+/// analyzer's own expression walkers use — see `reproject_qualifiers`)
+/// wrapped in [`RequalifyOutcome::Rewritten`], or
+/// [`RequalifyOutcome::NeedsAlias`] when a demanded ambiguous id-resolved
+/// slot has no unambiguous covering alias on its side ([`build_join`]'s
+/// fixpoint then wraps the flagged side(s) under a fresh alias and
+/// retries). `Err(EmissionError::Internal)` if the left/right disjointness
+/// invariant below is violated.
 fn requalify_join_condition(
     cond: &Expression,
     left: &TypedAst,
@@ -436,24 +436,33 @@ fn requalify_join_condition(
     left_item: &FromItem,
     right_item: &FromItem,
     cond_schema: &Schema,
-) -> Result<Expression, SideNeedsAlias> {
+) -> Result<RequalifyOutcome, EmissionError> {
     let left_len = left.resolved_schema.len();
     let left_scope = FromScope::of(left, left_item);
     let right_scope = FromScope::of(right, right_item);
     // N10-lite stage 2 disjointness guard: `requalify_column_ref`'s
     // `k < left_len` side split is keyed off `expr_id`, so it is sound only
     // if the two sides' id sets never intersect — mechanically pinned by
-    // `self_join_left_right_resolved_schema_ids_are_disjoint` (analyzer.rs);
-    // this debug_assert catches any future violation of that pin directly
-    // at the point the split is consumed.
-    debug_assert!(
-        left.resolved_schema.fields.iter().all(|lf| right
+    // `self_join_left_right_resolved_schema_ids_are_disjoint` (analyzer.rs).
+    // ALWAYS-ON (review finding 5, v2-review-findings-2026-07-13.md): a
+    // `debug_assert!` here would compile out of the release builds the
+    // server/harness actually run, and the failure mode on violation is not
+    // a loud crash but SILENTLY WRONG SQL (a condition reference rewritten
+    // to the wrong side) — a future plan-cloning optimization is the
+    // concrete hazard. The nested-any check is O(|left|·|right|) id
+    // compares, run up to twice per join under the NeedsAlias fixpoint —
+    // hundreds of u64 compares at TPC-DS widths, cheap enough for release.
+    if left.resolved_schema.fields.iter().any(|lf| {
+        right
             .resolved_schema
             .fields
             .iter()
-            .all(|rf| lf.expr_id != rf.expr_id)),
-        "join left/right resolved_schema expr_id sets must be disjoint"
-    );
+            .any(|rf| lf.expr_id == rf.expr_id)
+    }) {
+        return Err(EmissionError::Internal {
+            message: "join left/right resolved_schema expr_id sets must be disjoint".to_owned(),
+        });
+    }
     let mut needs = SideNeedsAlias::default();
     let rewritten = requalify_expr(
         cond.clone(),
@@ -464,9 +473,9 @@ fn requalify_join_condition(
         &mut needs,
     );
     if needs.left || needs.right {
-        Err(needs)
+        Ok(RequalifyOutcome::NeedsAlias(needs))
     } else {
-        Ok(rewritten)
+        Ok(RequalifyOutcome::Rewritten(rewritten))
     }
 }
 
@@ -655,7 +664,7 @@ fn apply_duplicate_alias_guard(left_item: FromItem, right_item: FromItem) -> (Fr
     let collides = right_item
         .exposed()
         .iter()
-        .any(|r| left_names.iter().any(|l| l.eq_ignore_ascii_case(r)));
+        .any(|r| left_names.iter().any(|l| eq_fold(l, r)));
     if !collides {
         return (left_item, right_item);
     }
@@ -671,7 +680,7 @@ fn apply_duplicate_alias_guard(left_item: FromItem, right_item: FromItem) -> (Fr
 fn fresh_alias_wrap(item: FromItem, base: &str, other_exposed: &[String]) -> FromItem {
     let alias = std::iter::once(base.to_owned())
         .chain((2..=64).map(|n| format!("{base}_{n}")))
-        .find(|cand| !other_exposed.iter().any(|o| o.eq_ignore_ascii_case(cand)))
+        .find(|cand| !other_exposed.iter().any(|o| eq_fold(o, cand)))
         // Defensive fallback — never observed; avoids an unbounded loop /
         // `unwrap` if all 64 candidates collide.
         .unwrap_or_else(|| format!("{base}_64"));
@@ -727,9 +736,9 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
         let Some(cond) = condition else {
             break None;
         };
-        match requalify_join_condition(cond, left, right, &left_item, &right_item, &cond_schema) {
-            Ok(expr) => break Some(expr),
-            Err(needs) => {
+        match requalify_join_condition(cond, left, right, &left_item, &right_item, &cond_schema)? {
+            RequalifyOutcome::Rewritten(expr) => break Some(expr),
+            RequalifyOutcome::NeedsAlias(needs) => {
                 if needs.left {
                     let other = right_item.exposed();
                     left_item = fresh_alias_wrap(left_item, TD_JOIN_LEFT, &other);
@@ -793,7 +802,7 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
         } else {
             None
         };
-        let using_lower: HashSet<String> = using_columns.iter().map(|s| s.to_lowercase()).collect();
+        let using_lower: HashSet<String> = using_columns.iter().map(|s| fold_key(s)).collect();
         // Change 3 (F7 round 2): a USING join over a side whose non-USING-key
         // fields would collide under the SAME qualified reference (see
         // [`has_unsafe_qualified_duplicate`]) can build neither a safe
@@ -807,7 +816,7 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
                     .fields
                     .iter()
                     .zip(quals.iter())
-                    .filter(|(f, _)| !using_lower.contains(&f.name.to_lowercase()))
+                    .filter(|(f, _)| !using_lower.contains(&fold_key(&f.name)))
                     .map(|(f, q)| (f.name.as_str(), q.as_str())),
             )
         };
@@ -835,7 +844,7 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
                     })
                     .collect();
                 for (f, qual) in left.resolved_schema.fields.iter().zip(lq.iter()) {
-                    if !using_lower.contains(&f.name.to_lowercase()) {
+                    if !using_lower.contains(&fold_key(&f.name)) {
                         slots.push(DefaultSlot {
                             name: f.name.clone(),
                             sql: format!("{}.{}", quote_ident(qual), quote_ident(&f.name)),
@@ -845,7 +854,7 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
                 if need_right {
                     if let Some(rq) = &rq {
                         for (f, qual) in right.resolved_schema.fields.iter().zip(rq.iter()) {
-                            if !using_lower.contains(&f.name.to_lowercase()) {
+                            if !using_lower.contains(&fold_key(&f.name)) {
                                 slots.push(DefaultSlot {
                                     name: f.name.clone(),
                                     sql: format!("{}.{}", quote_ident(qual), quote_ident(&f.name)),
@@ -1127,10 +1136,7 @@ fn exprs_visible_in<'e>(
 /// Whether the analyzer's stamped scope binds `q` (case-insensitive, any
 /// number of matches — ambiguity is the resolver's concern, not vis's).
 fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
-    scope
-        .aliases
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case(q))
+    scope.aliases.iter().any(|(name, _)| eq_fold(name, q))
 }
 
 /// N10-lite shared predicate (H8 boundary): `Some(k)` iff `c.qualifier` is
@@ -1156,7 +1162,7 @@ fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
     let name_count = schema
         .fields
         .iter()
-        .filter(|f| f.name.eq_ignore_ascii_case(&c.name))
+        .filter(|f| eq_fold(&f.name, &c.name))
         .count();
     if name_count < 2 {
         return None;
@@ -1250,13 +1256,10 @@ fn scope_position(
     name: &str,
     schema: &Schema,
 ) -> Option<usize> {
-    let (_, range) = scope
-        .aliases
-        .iter()
-        .find(|(alias, _)| alias.eq_ignore_ascii_case(q))?;
+    let (_, range) = scope.aliases.iter().find(|(alias, _)| eq_fold(alias, q))?;
     schema.fields[range.clone()]
         .iter()
-        .position(|f| f.name.eq_ignore_ascii_case(name))
+        .position(|f| eq_fold(&f.name, name))
         .map(|offset| range.start + offset)
 }
 
@@ -1420,7 +1423,7 @@ fn expand_stranded_whole_relation_star(
                 .scope
                 .aliases
                 .iter()
-                .filter(|(name, _)| name.eq_ignore_ascii_case(q));
+                .filter(|(name, _)| eq_fold(name, q));
             if let (Some((_, range)), None) = (matching.next(), matching.next()) {
                 if *range == full {
                     return Expression::Star(StarExpression { qualifier: None });
@@ -2076,7 +2079,7 @@ fn build_set_op(
                             .resolved_schema
                             .fields
                             .iter()
-                            .find(|f| f.name.eq_ignore_ascii_case(&widened_field.name))
+                            .find(|f| eq_fold(&f.name, &widened_field.name))
                             .expect("analyzer guaranteed name match"),
                     )
                 } else {
@@ -2165,7 +2168,7 @@ fn build_drop_columns(input: &TypedAst, drop_names: &[String]) -> Result<SqlUnit
                 if let Some(slots) = block.default_slots() {
                     let remaining: Vec<&str> = slots
                         .iter()
-                        .filter(|s| !drop_names.iter().any(|d| d.eq_ignore_ascii_case(&s.name)))
+                        .filter(|s| !drop_names.iter().any(|d| eq_fold(d, &s.name)))
                         .map(|s| s.sql.as_str())
                         .collect();
                     if !remaining.is_empty() {
@@ -2269,9 +2272,8 @@ fn build_na_replace(
     replacements: &[(Expression, Expression)],
 ) -> Result<SqlUnit, EmissionError> {
     let input_schema = &input.resolved_schema;
-    let in_subset = |name: &str| -> bool {
-        cols.is_empty() || cols.iter().any(|c| c.eq_ignore_ascii_case(name))
-    };
+    let in_subset =
+        |name: &str| -> bool { cols.is_empty() || cols.iter().any(|c| eq_fold(c, name)) };
     let slots = sql_join(input_schema.fields.iter(), ", ", |f| {
         let name_q = quote_ident(&f.name);
         if in_subset(&f.name) && !replacements.is_empty() {
@@ -2708,40 +2710,30 @@ fn render_sample_by(
 /// N8 has since closed that gap, but the duplicate-name hazard above is
 /// independent and remains the rationale to keep positional renaming.)
 ///
-/// The duplicate-name hazard is not fully closed inside this path either:
-/// THIS function's own `rename_map` (the by-name `HashMap` a few lines
-/// down) collapses duplicate old names last-wins. That is unreachable for
-/// genuine `withColumnsRenamed` (PySpark dict keys are unique, and renaming
-/// every same-named occurrence per entry IS Spark's semantics), but
-/// `toDF(...)`/SQL `AS t(...)` lower positional pairs like
-/// `[("id","a"), ("id","b")]` through here — the map collapses them to
-/// `id→b`, emitting `__td_wcr(b, b)` against a tracked schema of `[a, b]`
-/// (an N8 tracked==emitted violation; masked on terminal collect by the
-/// positional arrow_schema_stamp rewrite, loud DuckDB binder error on any
-/// downstream by-name reference). Tracked as `F-todf-dupname`,
-/// tasks/v2-corpus-followups.md; the fix is a POSITIONAL rename list
-/// through `TypedOp::WithColumnsRenamed`, keyed by index, at this site.
-fn build_with_columns_renamed(
-    input: &TypedAst,
-    renames: &[(String, String)],
-) -> Result<SqlUnit, EmissionError> {
-    let rename_map: std::collections::HashMap<String, String> = renames
-        .iter()
-        .map(|(old, new)| (old.to_lowercase(), new.clone()))
-        .collect();
-    let dst_names: Vec<&str> = input
-        .resolved_schema
-        .fields
-        .iter()
-        .map(|f| {
-            rename_map
-                .get(&f.name.to_lowercase())
-                .map(String::as_str)
-                .unwrap_or(f.name.as_str())
-        })
-        .collect();
+/// FIXED (`F-todf-dupname`, tasks/v2-corpus-followups.md): this function used
+/// to re-derive the by-name `rename_map` from `renames` and apply it against
+/// `input.resolved_schema` (the CHILD's, pre-rename, schema). That map
+/// collapses duplicate old names last-wins, so `toDF(...)`/SQL `AS t(...)`
+/// lowering positional pairs like `[("id","a"), ("id","b")]` produced
+/// `id→b`, emitting `__td_wcr(b, b)` against a tracked schema of `[a, b]` —
+/// an N8 tracked==emitted violation.
+///
+/// The fix needs no rename map at all: `dispatch_op` already resolves the
+/// analyzer's own POSITIONALLY-renamed output — `schema` here IS that output
+/// schema (the `WithColumnsRenamed` node's `resolved_schema`, passed down
+/// from `dispatch_op`'s own `schema` parameter), not the child's. Both
+/// producers of `TypedOp::WithColumnsRenamed` (`analyze_to_df`'s positional
+/// zip, and the genuine `withColumnsRenamed` arm's by-name-but-unique-keys
+/// loop) already stamp the correct renamed name onto each output field in
+/// order — this function just mirrors that tracked schema positionally into
+/// the derived-table alias list. The rename-pair list itself proved
+/// write-only after this fix and was deleted from the TypedOp variant
+/// (review NIT): `resolved_schema` IS the rename.
+fn build_with_columns_renamed(input: &TypedAst, schema: &Schema) -> Result<SqlUnit, EmissionError> {
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    let cols = sql_join(dst_names, ", ", |n| Ok(quote_ident(n).into_owned()))?;
+    let cols = sql_join(schema.fields.iter().map(|f| f.name.as_str()), ", ", |n| {
+        Ok(quote_ident(n).into_owned())
+    })?;
     Ok(SqlUnit::Raw(format!(
         "SELECT * FROM ({child_sql}) AS __td_wcr({cols})"
     )))
@@ -3721,11 +3713,10 @@ fn render_function_call_dispatch(
     f: &FunctionCall,
     schema: &Schema,
 ) -> Result<String, EmissionError> {
-    // N5: `f.name` is already canonical lowercase — `name_lower` is kept as
-    // an owned `String` (rather than renamed to a borrow) purely so the
-    // ~1900-line match below, which threads it through several `&name_lower`
-    // / `format!` sites, needs no further edits.
-    let name_lower = f.name.clone();
+    // N5: `f.name` is already canonical lowercase — `name_lower` borrows it
+    // rather than cloning (post-N5, no re-derivation is needed; the ~1900-
+    // line match below reads it, never mutates or moves it).
+    let name_lower: &str = f.name.as_str();
     // Aggregate-name overlap check — if the analyzer classified a FunctionCall
     // as aggregate, `render_expr` routes to `render_aggregate` before this
     // function; anything reaching here is scalar by construction. Defense in
@@ -3737,10 +3728,10 @@ fn render_function_call_dispatch(
     // trailing bool; keep-arity is single-homed in
     // [`trailing_ignore_nulls_keep_arity`]. Anchor: corpus win-006.
     if matches!(
-        name_lower.as_str(),
+        name_lower,
         "nth_value" | "first_value" | "last_value" | "lag" | "lead"
     ) {
-        if let Some(arity_keep) = trailing_ignore_nulls_keep_arity(&name_lower) {
+        if let Some(arity_keep) = trailing_ignore_nulls_keep_arity(name_lower) {
             // Only apply the trim if the extra trailing arg is a boolean literal
             // (Spark's ignoreNulls flag). Never silently drop a real value.
             if f.args.len() > arity_keep {
@@ -3758,7 +3749,7 @@ fn render_function_call_dispatch(
     let args_sql = sql_join(f.args.iter(), ", ", |arg| render_expr(arg, schema))?;
     // Handful of Spark-name → DuckDB-name remappings where the direct
     // pass-through wouldn't work. Everything else passes through unchanged.
-    let duck_name: &str = match name_lower.as_str() {
+    let duck_name: &str = match name_lower {
         // DuckDB parses `not` as a keyword; Spark sends unary NOT as a
         // function. Emit as a keyword expression.
         "not" => {
@@ -4953,7 +4944,7 @@ fn render_function_call_dispatch(
             // Spark `log(x)` is natural log (matches DuckDB `ln`); Spark
             // `log(base, x)` is log-base-b. DuckDB `log(x)` is log10, so
             // remap single-arg `log` → `ln`.
-            let (duck_fn, value_arg_idx) = match (name_lower.as_str(), f.args.len()) {
+            let (duck_fn, value_arg_idx) = match (name_lower, f.args.len()) {
                 ("log", 1) => ("ln", 0),
                 ("log", 2) => ("log", 1),
                 ("ln", _) => ("ln", 0),
@@ -5625,7 +5616,7 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
                 &call,
             ));
         }
-        _ => &name_lower,
+        _ => name_lower,
     };
     Ok(format!("{duck_name}({args_sql})"))
 }
@@ -5791,12 +5782,18 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
         // the sample formula. The ext6 extension provides `spark_skewness`
         // with Spark-parity semantics (checklist §4.1).
         "skewness" => ("spark_skewness", false),
-        // Spark's `max_by(x, y)` / `min_by(x, y)` — DuckDB's native
-        // `arg_max(x, y)` / `arg_min(x, y)` are the same 2-arg shape
-        // (value column, ordering column), so a name rename is the whole
-        // fix — args pass through unchanged via `args_sql` below.
-        "max_by" => ("arg_max", false),
-        "min_by" => ("arg_min", false),
+        // Spark's `max_by(x, y)` / `min_by(x, y)` return the VALUE at the
+        // ordering-extreme row even when that value is NULL. DuckDB's
+        // `arg_max`/`arg_min` instead SKIP rows whose value arg is NULL —
+        // wrong-scalar divergence, not just a naming difference. DuckDB's
+        // `arg_max_null`/`arg_min_null` match Spark's null-at-extreme
+        // semantics exactly (verified empirically: `arg_max_null(name, val)`
+        // over `('a',1),(NULL,5),('c',0),(NULL,-2)` returns NULL — the value
+        // at the max `val` row, which is NULL). Args pass through unchanged
+        // via `args_sql` below (same 2-arg shape: value column, ordering
+        // column).
+        "max_by" => ("arg_max_null", false),
+        "min_by" => ("arg_min_null", false),
         // Spark's `kurtosis` uses the population formula; DuckDB has
         // `kurtosis_pop` for that (native, not via extension).
         "kurtosis" => ("kurtosis_pop", false),
@@ -7233,8 +7230,8 @@ mod tests {
         Expression::ColumnReference(ColumnReference {
             name: name.to_owned(),
             qualifier: None,
-            data_type: Some(dt),
-            nullable: Some(true),
+            data_type: dt,
+            nullable: true,
             expr_id: None,
         })
     }
@@ -7302,7 +7299,7 @@ mod tests {
                     );
                 }
             }
-            other @ EmissionError::SparkEmulated { .. } => {
+            other @ (EmissionError::SparkEmulated { .. } | EmissionError::Internal { .. }) => {
                 panic!("expected EmissionError::Unsupported, got: {other:?}")
             }
         }
@@ -7820,8 +7817,8 @@ mod tests {
                     left: Box::new(Expression::ColumnReference(ColumnReference {
                         name: "salary".to_owned(),
                         qualifier: Some("outer_e".to_owned()),
-                        data_type: Some(DataType::Double),
-                        nullable: Some(true),
+                        data_type: DataType::Double,
+                        nullable: true,
                         expr_id: None,
                     })),
                     right: Box::new(int_lit(1)),
@@ -7839,7 +7836,11 @@ mod tests {
     /// Keep-side: a qualifier that resolves as STRUCT-column access
     /// (`resolve_column`'s struct-precedence tier) survives because resolution
     /// never drops a struct qualifier (the struct-precedence tier runs at
-    /// analysis time); the old strip's misread hazard no longer applies.
+    /// analysis time); the old strip's misread hazard no longer applies. Pass
+    /// F2 stage 1: this now resolves to an `ExtractValue` chain rather than a
+    /// qualified `ColumnReference` at all — `(addr).city`, not `addr.city` —
+    /// so the case is even further out of the stranded-qualifier strip's
+    /// reach: there is no qualified reference left for that pass to see.
     #[test]
     fn struct_qualifier_survives_wrap_verbatim() {
         let _g = tap_guard();
@@ -7868,8 +7869,8 @@ mod tests {
         let typed = analyze(plan, &bt).expect("analyze");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert!(
-            sql.contains("addr.city"),
-            "struct-column access must NOT be stripped, got: {sql}"
+            sql.contains("(addr).city"),
+            "struct-column access must render as an ExtractValue chain, got: {sql}"
         );
     }
 
@@ -10734,22 +10735,22 @@ mod tests {
         let dup = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: Some(dept_id_second),
         });
         let unique_no_rewrite = Expression::ColumnReference(ColumnReference {
             name: "id".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Long),
-            nullable: Some(false),
+            data_type: DataType::Long,
+            nullable: false,
             expr_id: Some(id_col_id),
         });
         let deferred_no_ordinal = Expression::ColumnReference(ColumnReference {
             name: "name".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::String),
-            nullable: Some(true),
+            data_type: DataType::String,
+            nullable: true,
             expr_id: Some(name_col_id),
         });
         let input = TypedAst::new(
@@ -10817,8 +10818,8 @@ mod tests {
         let bare_ref = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: Some(shared_id),
         });
         let input = TypedAst::new(
@@ -10877,8 +10878,8 @@ mod tests {
         let orphaned = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: Some(foreign_id),
         });
         let input = TypedAst::new(
@@ -12431,8 +12432,8 @@ mod tests {
         let c = ColumnReference {
             name: "id".to_owned(),
             qualifier: Some("emp".to_owned()),
-            data_type: Some(DataType::Long),
-            nullable: Some(false),
+            data_type: DataType::Long,
+            nullable: false,
             expr_id: None,
         };
         let sql = render_column_reference(&c).expect("render");
@@ -13298,8 +13299,8 @@ mod tests {
         let col_ref = Expression::ColumnReference(ColumnReference {
             name: "dept_id".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Integer),
-            nullable: Some(true),
+            data_type: DataType::Integer,
+            nullable: true,
             expr_id: None,
         });
         let sql =
@@ -13560,8 +13561,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "last_login".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::Timestamp),
-                    nullable: Some(true),
+                    data_type: DataType::Timestamp,
+                    nullable: true,
                     expr_id: None,
                 }),
                 str_lit("yyyy-MM-dd HH:mm:ss"),
@@ -13695,8 +13696,8 @@ mod tests {
             struct_expr: Box::new(Expression::ColumnReference(ColumnReference {
                 name: "name".to_owned(),
                 qualifier: None,
-                data_type: Some(DataType::String),
-                nullable: Some(true),
+                data_type: DataType::String,
+                nullable: true,
                 expr_id: None,
             })),
             updates: vec![("x".to_owned(), None)],
@@ -13716,8 +13717,8 @@ mod tests {
         let arr = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13749,8 +13750,8 @@ mod tests {
         let arr = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13789,8 +13790,8 @@ mod tests {
         let arr = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13842,8 +13843,8 @@ mod tests {
         let arr = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -13880,8 +13881,8 @@ mod tests {
                     Expression::ColumnReference(ColumnReference {
                         name: "arr".to_owned(),
                         qualifier: None,
-                        data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
-                        nullable: Some(true),
+                        data_type: DataType::Array(Box::new(DataType::Long), true),
+                        nullable: true,
                         expr_id: None,
                     }),
                     Expression::Lambda(LambdaExpression {
@@ -13998,8 +13999,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "tags2".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-                    nullable: Some(true),
+                    data_type: DataType::Array(Box::new(DataType::String), true),
+                    nullable: true,
                     expr_id: None,
                 }),
             ],
@@ -14066,8 +14067,8 @@ mod tests {
         let b = Expression::ColumnReference(ColumnReference {
             name: "tags2".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14110,12 +14111,12 @@ mod tests {
         let m = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14148,12 +14149,12 @@ mod tests {
         let m = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14181,12 +14182,12 @@ mod tests {
         let m = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let lambda = Expression::Lambda(LambdaExpression {
@@ -14339,12 +14340,12 @@ mod tests {
         let map_col = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::Integer),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn("size", vec![map_col]);
@@ -14366,11 +14367,11 @@ mod tests {
         let outer = Expression::ColumnReference(ColumnReference {
             name: "nested".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(
+            data_type: DataType::Array(
                 Box::new(DataType::Array(Box::new(DataType::String), true)),
                 true,
-            )),
-            nullable: Some(true),
+            ),
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn("flatten", vec![outer]);
@@ -14430,8 +14431,8 @@ mod tests {
                     Expression::ColumnReference(ColumnReference {
                         name: "arr".to_owned(),
                         qualifier: None,
-                        data_type: Some(DataType::Array(Box::new(DataType::Long), true)),
-                        nullable: Some(true),
+                        data_type: DataType::Array(Box::new(DataType::Long), true),
+                        nullable: true,
                         expr_id: None,
                     }),
                     Expression::Lambda(LambdaExpression {
@@ -14814,12 +14815,12 @@ mod tests {
         let map_col = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("team")]);
@@ -14836,8 +14837,8 @@ mod tests {
         let arr_col = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn(
@@ -14896,8 +14897,8 @@ mod tests {
         let arr_col = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn(
@@ -14928,8 +14929,8 @@ mod tests {
         let arr_col = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn(
@@ -14958,12 +14959,12 @@ mod tests {
         let map_col = Expression::ColumnReference(ColumnReference {
             name: "attrs".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Map {
+            data_type: DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),
                 value_nullable: true,
-            }),
-            nullable: Some(true),
+            },
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn("element_at", vec![map_col, str_lit("missing")]);
@@ -15062,8 +15063,8 @@ mod tests {
         let arr_col = Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: None,
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         });
         let sql = render_fn("concat_ws", vec![str_lit(","), arr_col]);
@@ -15174,22 +15175,22 @@ mod tests {
             left: Box::new(Expression::ColumnReference(ColumnReference {
                 name: "d1".to_owned(),
                 qualifier: None,
-                data_type: Some(DataType::Decimal {
+                data_type: DataType::Decimal {
                     precision: 10,
                     scale: 2,
-                }),
-                nullable: Some(true),
+                },
+                nullable: true,
                 expr_id: None,
             })),
             op: BinaryOp::Div,
             right: Box::new(Expression::ColumnReference(ColumnReference {
                 name: "d2".to_owned(),
                 qualifier: None,
-                data_type: Some(DataType::Decimal {
+                data_type: DataType::Decimal {
                     precision: 6,
                     scale: 3,
-                }),
-                nullable: Some(true),
+                },
+                nullable: true,
                 expr_id: None,
             })),
         });
@@ -15775,10 +15776,11 @@ mod tests {
         col_with_type(name, DataType::Decimal { precision, scale })
     }
 
-    /// `max_by(name, val)` renders to DuckDB's native `arg_max(name, val)` —
-    /// same 2-arg (value, ordering) shape, name rename only.
+    /// `max_by(name, val)` renders to DuckDB's `arg_max_null(name, val)` —
+    /// `arg_max_null` (not `arg_max`) is required for Spark's null-at-extreme
+    /// value semantics (finding 2, v2-review-findings-2026-07-13.md).
     #[test]
-    fn max_by_renders_to_arg_max() {
+    fn max_by_renders_to_arg_max_null() {
         let f = fcall(
             "max_by",
             vec![
@@ -15787,12 +15789,12 @@ mod tests {
             ],
         );
         let sql = render_aggregate(&f, &empty_schema()).expect("render max_by");
-        assert_eq!(sql, "arg_max(name, val)");
+        assert_eq!(sql, "arg_max_null(name, val)");
     }
 
-    /// `min_by(name, val)` renders to DuckDB's native `arg_min(name, val)`.
+    /// `min_by(name, val)` renders to DuckDB's `arg_min_null(name, val)`.
     #[test]
-    fn min_by_renders_to_arg_min() {
+    fn min_by_renders_to_arg_min_null() {
         let f = fcall(
             "min_by",
             vec![
@@ -15801,7 +15803,7 @@ mod tests {
             ],
         );
         let sql = render_aggregate(&f, &empty_schema()).expect("render min_by");
-        assert_eq!(sql, "arg_min(name, val)");
+        assert_eq!(sql, "arg_min_null(name, val)");
     }
 
     /// `test_count_distinct_multiple_columns`: Spark's
@@ -16113,8 +16115,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "csv_str".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::String),
-                    nullable: Some(true),
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
                 Expression::Literal(Literal {
@@ -16175,8 +16177,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "csv_str".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::String),
-                    nullable: Some(true),
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
                 Expression::Literal(Literal {
@@ -16205,8 +16207,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "json_str".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::String),
-                    nullable: Some(true),
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
                 Expression::Literal(Literal {
@@ -16238,15 +16240,15 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "csv_str".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::String),
-                    nullable: Some(true),
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
                 Expression::ColumnReference(ColumnReference {
                     name: "schema_col".to_owned(),
                     qualifier: None,
-                    data_type: Some(DataType::String),
-                    nullable: Some(true),
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
             ],
@@ -16339,12 +16341,17 @@ mod tests {
     }
 
     fn inline_field_args(field: &str) -> Vec<Expression> {
+        let element = DataType::Struct(StructType::new(vec![
+            StructField::nullable("name", DataType::String),
+            StructField::nullable("dept_id", DataType::Integer),
+            StructField::nullable("salary", DataType::Double),
+        ]));
         vec![
             Expression::ColumnReference(ColumnReference {
                 name: "arr".to_owned(),
                 qualifier: None,
-                data_type: None,
-                nullable: None,
+                data_type: DataType::Array(Box::new(element), true),
+                nullable: true,
                 expr_id: None,
             }),
             str_lit(field),
@@ -16393,8 +16400,9 @@ mod tests {
             vec![Expression::ColumnReference(ColumnReference {
                 name: "arr".to_owned(),
                 qualifier: None,
-                data_type: None,
-                nullable: None,
+                // Arity-rejection twin: the guard never reads the type.
+                data_type: DataType::Unresolved,
+                nullable: true,
                 expr_id: None,
             })],
         );
@@ -16428,8 +16436,8 @@ mod tests {
                 Expression::ColumnReference(ColumnReference {
                     name: "json_str".to_owned(),
                     qualifier: None,
-                    data_type: None,
-                    nullable: None,
+                    data_type: DataType::String,
+                    nullable: true,
                     expr_id: None,
                 }),
                 str_lit("a"),
@@ -16450,8 +16458,9 @@ mod tests {
             vec![Expression::ColumnReference(ColumnReference {
                 name: "json_str".to_owned(),
                 qualifier: None,
-                data_type: None,
-                nullable: None,
+                // Arity-rejection twin: the guard never reads the type.
+                data_type: DataType::String,
+                nullable: true,
                 expr_id: None,
             })],
         );
@@ -16596,8 +16605,8 @@ mod tests {
         Expression::ColumnReference(ColumnReference {
             name: "tags".to_owned(),
             qualifier: Some("e".to_owned()),
-            data_type: Some(DataType::Array(Box::new(DataType::String), true)),
-            nullable: Some(true),
+            data_type: DataType::Array(Box::new(DataType::String), true),
+            nullable: true,
             expr_id: None,
         })
     }
@@ -16731,15 +16740,15 @@ mod tests {
         let id_ref = Expression::ColumnReference(ColumnReference {
             name: "id".to_owned(),
             qualifier: Some("e".to_owned()),
-            data_type: Some(DataType::Long),
-            nullable: Some(false),
+            data_type: DataType::Long,
+            nullable: false,
             expr_id: None,
         });
         let tag_ref = Expression::ColumnReference(ColumnReference {
             name: "tag".to_owned(),
             qualifier: Some("t".to_owned()),
-            data_type: Some(DataType::String),
-            nullable: Some(true),
+            data_type: DataType::String,
+            nullable: true,
             expr_id: None,
         });
         let proj = TypedAst::new(

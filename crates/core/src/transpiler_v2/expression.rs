@@ -7,6 +7,7 @@
 
 use super::analyzer::TypedAst;
 use super::ast::CommonAst;
+use super::name_fold::eq_fold;
 use super::schema::{ExprId, ResolvedSchema};
 use super::type_inference::TypeInferenceEngine;
 use crate::types::{DataType, StructField, StructType};
@@ -219,34 +220,38 @@ pub fn decimal_value_precision_scale(s: &str) -> (u8, u8) {
 }
 
 /// A resolved column reference with schema-recorded type/nullability info.
+///
+/// `data_type`/`nullable` are non-`Option` BY CONSTRUCTION (E4/D3): a
+/// `ColumnReference` exists only once resolution has stamped its schema
+/// facts — there is no unresolved/bare state to represent here. A
+/// pre-analysis name is an [`UnresolvedColumn`], a distinct variant/type
+/// entirely (front-ends emit that; E1.5 deleted the last `ColumnReference`
+/// constructor that could build one ahead of resolution).
 #[derive(Debug, Clone)]
 pub struct ColumnReference {
     pub name: String,
     pub qualifier: Option<String>,
-    pub data_type: Option<DataType>,
-    pub nullable: Option<bool>,
+    pub data_type: DataType,
+    pub nullable: bool,
     /// N9 increment 2 / ADR-024: the [`super::schema::ExprId`] of the
     /// [`super::schema::Attribute`] this reference resolved to — the
     /// PRODUCING node's own output schema for a local reference (`ctx.schema`
     /// at resolution time), or the ENCLOSING plan's output schema for a
     /// correlated outer reference (D2 — `resolve_column`'s tier-(g) arm /
-    /// `resolve_in_outer` in `analyzer.rs`). Production never constructs a
-    /// pre-analysis `ColumnReference` (front-ends emit `UnresolvedColumn`;
-    /// E1.5 deleted the last constructor that could). `None` on a RESOLVED
-    /// (`data_type: Some`) reference only from the analyzer paths left open
-    /// after D2 (`analyzer.rs`):
-    /// * tier-(d) in `resolve_column` and its outer twin, the
-    ///   struct-qualifier arm of `resolve_in_outer` — a qualifier naming a
-    ///   top-level STRUCT column resolves to a nested FIELD's type, which
-    ///   has no attribute identity of its own to stamp (only the struct
-    ///   COLUMN does; Spark's `ExtractValue` likewise keeps the child's
-    ///   `exprId` on the child only).
-    /// * `derive_implicit_grouping` (SQL `PIVOT` with no explicit grouping
-    ///   list) and the root reference `try_rewrite_nested_struct_path` builds
-    ///   for a multi-level nested-struct `ExtractValue` chain: both DO
-    ///   resolve to a real top-level attribute with an id available at
-    ///   construction, but a pre-existing gap leaves it unstamped — out of
-    ///   this pass's scope, left for a follow-up.
+    /// `resolve_in_outer` in `analyzer.rs`). Unlike `data_type`/`nullable`
+    /// (stamped on every `ColumnReference` by construction, E4/D3), this
+    /// field stays `Option` for representational uniformity (an
+    /// `UnresolvedColumn` truly has none), but Pass F2 (stages 1-3) closed
+    /// every production gap that used to leave a RESOLVED reference
+    /// id-less: qualified struct-field access — local (tier-(d) in
+    /// `resolve_column`) AND correlated-outer (`resolve_in_outer`'s struct
+    /// arm) alike — resolves to an `ExtractValue` chain
+    /// (`analyzer.rs`'s `build_struct_extract_chain`) whose root
+    /// `ColumnReference` is stamped with the struct COLUMN's own real
+    /// attribute id (the LOCAL or OUTER schema's, as appropriate); every
+    /// other resolution tier already stamped a real id before this pass.
+    /// There is no longer a production site that returns a fully-resolved
+    /// `ColumnReference` with `expr_id: None`.
     ///
     /// Derived resolution data recording *which* attribute the reference
     /// bound to, not part of the reference's own logical identity — excluded
@@ -255,15 +260,33 @@ pub struct ColumnReference {
 }
 
 impl PartialEq for ColumnReference {
-    /// Excludes `expr_id`: a derived resolution fact recording *which*
-    /// attribute a column resolved to, not part of the reference's logical
-    /// identity. Mirrors `TypedAst`'s scope-excluding `Eq` — keeps every
-    /// pre-existing equality-based test unchanged.
+    /// Excludes `expr_id`, `data_type`, and `nullable`: all three are derived
+    /// resolution facts recording *which* attribute a column resolved to and
+    /// *what the schema says about it*, not part of the reference's logical
+    /// identity (`name` + `qualifier`). Mirrors `TypedAst`'s scope-excluding
+    /// `Eq` — keeps every pre-existing equality-based test unchanged.
+    ///
+    /// **LOUD WARNING:** this means `==` on two `ColumnReference`s (or on any
+    /// `Expression` tree containing one) CANNOT distinguish two references
+    /// that share a name/qualifier but disagree on type or nullability. A
+    /// future test must not rely on `==`/`assert_eq!`/`assert_ne!` to detect
+    /// a type or nullability difference between two `ColumnReference`s —
+    /// compare `.data_type`/`.nullable` directly instead. Production
+    /// consequence: Pass F2 (stages 1-3) unified BOTH local qualified
+    /// struct-field access (tier-(d) in `resolve_column`) AND its correlated
+    /// OUTER twin (`resolve_in_outer`'s struct arm) onto an `ExtractValue`
+    /// chain whose root `ColumnReference` carries the struct COLUMN's own
+    /// real attribute id — so a same-named struct field reached through a
+    /// DIFFERENT root struct (local or outer) is now discriminated by
+    /// `ids_compatible` on the distinct root ids, not by this id-blind `eq`.
+    /// Every resolved `ColumnReference` now carries a real `expr_id` (see
+    /// this field's own doc above), so the widened same-type-collision gap
+    /// this warning used to describe for id-less struct-field refs no longer
+    /// has a live production instance — a hazard here is now the same
+    /// generic risk `ids_compatible` guards for every OTHER id-carrying
+    /// reference.
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.qualifier == other.qualifier
-            && self.data_type == other.data_type
-            && self.nullable == other.nullable
+        self.name == other.name && self.qualifier == other.qualifier
     }
 }
 
@@ -667,10 +690,7 @@ impl Expression {
     pub fn data_type(&self, schema: &ResolvedSchema) -> DataType {
         match self {
             Expression::Literal(l) => l.data_type.clone(),
-            Expression::ColumnReference(c) => match &c.data_type {
-                Some(dt) => dt.clone(),
-                None => TypeInferenceEngine::column_type(&c.name, schema),
-            },
+            Expression::ColumnReference(c) => c.data_type.clone(),
             Expression::UnresolvedColumn(u) => {
                 TypeInferenceEngine::qualified_column_type(&u.name, u.qualifier.as_deref(), schema)
             }
@@ -769,9 +789,7 @@ impl Expression {
     pub fn nullable(&self, schema: &ResolvedSchema) -> bool {
         match self {
             Expression::Literal(l) => matches!(l.value, LiteralValue::Null),
-            Expression::ColumnReference(c) => c
-                .nullable
-                .unwrap_or_else(|| TypeInferenceEngine::column_nullable(&c.name, schema)),
+            Expression::ColumnReference(c) => c.nullable,
             Expression::UnresolvedColumn(u) => TypeInferenceEngine::qualified_column_nullable(
                 &u.name,
                 u.qualifier.as_deref(),
@@ -960,7 +978,10 @@ impl Expression {
         if b.op.is_bitwise() {
             return TypeInferenceEngine::promote_numeric(&l, &r);
         }
-        // Interval ± Date/Timestamp → preserve the date-like side.
+        // Interval ± Date/Timestamp: see `date_like_interval_result` for the
+        // per-combination result type (R1-6: a Date ± day-time interval
+        // PROMOTES to Timestamp; the other combinations preserve the
+        // date-like side).
         if let Some(dt) = date_like_interval_result(&b.op, &l, &r) {
             return dt;
         }
@@ -1244,7 +1265,7 @@ impl Expression {
                     if let DataType::Array(inner, _) = f.args[0].data_type(schema) {
                         if let DataType::Struct(st) = *inner {
                             for field in &st.fields {
-                                if field.name.eq_ignore_ascii_case(field_name) {
+                                if eq_fold(&field.name, field_name) {
                                     return field.data_type.clone();
                                 }
                             }
@@ -1328,18 +1349,17 @@ impl Expression {
     }
 
     fn function_call_nullable(f: &FunctionCall, schema: &ResolvedSchema) -> bool {
-        // N5: `f.name` is already canonical lowercase; `lower` is kept as an
-        // owned `String` (rather than renamed to a borrow) purely so the
-        // match below, which threads it through several `_lower`-suffixed
-        // fast-path calls, needs no further edits.
-        let lower = f.name.clone();
-        if Self::is_non_nullable_function_name_lower(&lower) {
+        // N5: `f.name` is already canonical lowercase; `lower` borrows it
+        // rather than cloning (post-N5, no re-derivation needed; the match
+        // below only reads it).
+        let lower: &str = f.name.as_str();
+        if Self::is_non_nullable_function_name_lower(lower) {
             return false;
         }
-        if TypeInferenceEngine::aggregate_is_always_nullable_lower(&lower) {
+        if TypeInferenceEngine::aggregate_is_always_nullable_lower(lower) {
             return true;
         }
-        match lower.as_str() {
+        match lower {
             "coalesce" | "ifnull" | "nvl" | "greatest" | "least" => {
                 f.args.iter().all(|a| a.nullable(schema))
             }
@@ -1506,7 +1526,7 @@ impl Expression {
                                 let field_null = st
                                     .fields
                                     .iter()
-                                    .find(|f0| f0.name.eq_ignore_ascii_case(field_name))
+                                    .find(|f0| eq_fold(&f0.name, field_name))
                                     .map(|f0| f0.nullable)
                                     .unwrap_or(true);
                                 (*cn, field_null)
@@ -1924,9 +1944,11 @@ pub(crate) fn materialize_binary_coercions(
 /// Apply Spark `withField` / `dropFields` operations to a caller-owned field
 /// list, preserving Spark 4.1 semantics:
 ///
-/// * Add / replace matches existing fields **case-insensitively** (ASCII);
-///   on match the *original* declared field name is preserved.
-/// * Drop matches existing fields **case-insensitively** (ASCII).
+/// * Add / replace matches existing fields **case-insensitively**
+///   ([`eq_fold`] — the same JDK `equalsIgnoreCase`-shaped fold τ uses for
+///   every user-identifier comparison); on match the *original* declared
+///   field name is preserved.
+/// * Drop matches existing fields **case-insensitively** ([`eq_fold`]).
 /// * A drop target that does not match any current field is **silently
 ///   ignored** here — callers that need Spark-emulated rejection must invoke
 ///   [`validate_update_fields_ops`] first.
@@ -1952,7 +1974,7 @@ pub(super) fn apply_update_fields_ops<T>(
             Some(new_val) => {
                 let existing = fields
                     .iter()
-                    .position(|slot| slot_name(slot).eq_ignore_ascii_case(name));
+                    .position(|slot| eq_fold(slot_name(slot), name));
                 if let Some(idx) = existing {
                     // Preserve the ORIGINAL field name — Spark `withField`
                     // keeps the struct's declared casing.
@@ -1965,7 +1987,7 @@ pub(super) fn apply_update_fields_ops<T>(
             None => {
                 if let Some(idx) = fields
                     .iter()
-                    .position(|slot| slot_name(slot).eq_ignore_ascii_case(name))
+                    .position(|slot| eq_fold(slot_name(slot), name))
                 {
                     fields.remove(idx);
                 }
@@ -1989,7 +2011,7 @@ pub(super) fn validate_update_fields_ops(
     for (name, op) in updates {
         match op {
             Some(_) => {
-                let existing = names.iter().position(|n| n.eq_ignore_ascii_case(name));
+                let existing = names.iter().position(|n| eq_fold(n, name));
                 if existing.is_none() {
                     names.push(name.clone());
                 }
@@ -1999,7 +2021,7 @@ pub(super) fn validate_update_fields_ops(
             None => {
                 let idx = names
                     .iter()
-                    .position(|n| n.eq_ignore_ascii_case(name))
+                    .position(|n| eq_fold(n, name))
                     .ok_or_else(|| name.clone())?;
                 names.remove(idx);
             }
@@ -2672,8 +2694,8 @@ mod tests {
         Expression::ColumnReference(ColumnReference {
             name: "address".to_owned(),
             qualifier: None,
-            data_type: Some(address_struct_type()),
-            nullable: Some(true),
+            data_type: address_struct_type(),
+            nullable: true,
             expr_id: None,
         })
     }
@@ -2759,7 +2781,7 @@ mod tests {
         match expr.data_type(&schema) {
             DataType::Struct(st) => {
                 assert_eq!(st.fields.len(), 2);
-                assert!(!st.fields.iter().any(|f| f.name.eq_ignore_ascii_case("geo")));
+                assert!(!st.fields.iter().any(|f| eq_fold(&f.name, "geo")));
             }
             other => panic!("expected DataType::Struct, got: {other:?}"),
         }
@@ -3192,8 +3214,8 @@ mod tests {
         Expression::ColumnReference(ColumnReference {
             name: name.to_owned(),
             qualifier: None,
-            data_type: Some(data_type),
-            nullable: Some(true),
+            data_type,
+            nullable: true,
             expr_id: None,
         })
     }

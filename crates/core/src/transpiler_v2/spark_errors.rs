@@ -69,6 +69,24 @@ pub(crate) const INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_HEAD: &str = "[INVALID_ARRAY_
 pub(crate) const INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_MID: &str = " is out of bounds. The array has ";
 pub(crate) const INVALID_ARRAY_INDEX_SUBSCRIPT_MSG_TAIL: &str = " elements. Use the SQL function `get()` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003";
 
+// Spark 4.1's `INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE` message
+// (`bit_get`/`getbit(x, pos)` when `pos < 0 || pos >= bit_width(x)`) is
+// runtime-templated on the invalid `pos` value; the bit-width upper bound is
+// baked into HEAD at emission time (it depends only on arg0's static
+// integral type). Shape:
+//
+//   HEAD{upper} || (pos)::VARCHAR || TAIL
+//
+// The message names `bit_get` even when invoked via the `getbit` alias —
+// deliberately not parameterized: the differential oracle compares only the
+// leading `[CLASS]` token, and whether Spark's own message canonicalizes the
+// alias is unverified (probe before "fixing"; a wrong guess would diverge
+// the message body for zero oracle benefit).
+pub(crate) const BIT_POSITION_RANGE_MSG_HEAD_PREFIX: &str =
+    "[INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE] The value of parameter(s) `pos` in `bit_get` is invalid: expects an integer value in [0, ";
+pub(crate) const BIT_POSITION_RANGE_MSG_HEAD_SUFFIX: &str = "), but got ";
+pub(crate) const BIT_POSITION_RANGE_MSG_TAIL: &str = ". SQLSTATE: 22023";
+
 /// Spark ANSI-mode throw classes τ emits at emission time.
 ///
 /// Each variant carries just enough data to synthesise Spark's
@@ -103,6 +121,11 @@ pub(crate) enum SparkError {
     /// runtime-templated on the index value AND the array length, so both
     /// are carried as already-rendered SQL fragments.
     InvalidArrayIndexSubscript { idx_sql: String, arr_sql: String },
+    /// `[INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE]` — Spark ANSI class for
+    /// `bit_get`/`getbit(x, pos)` when `pos < 0` or `pos >= bit_width(x)`.
+    /// `upper` (the type's bit-width: 8/16/32/64) is baked at emission time;
+    /// the bad `pos` value is runtime-interpolated as `(value_sql)::VARCHAR`.
+    BitPositionRange { upper: u32, value_sql: String },
 }
 
 impl SparkError {
@@ -116,6 +139,7 @@ impl SparkError {
             Self::InvalidArrayIndex { .. } => "INVALID_ARRAY_INDEX_IN_ELEMENT_AT",
             Self::InvalidFormatMismatch { .. } => "INVALID_FORMAT.MISMATCH_INPUT",
             Self::InvalidArrayIndexSubscript { .. } => "INVALID_ARRAY_INDEX",
+            Self::BitPositionRange { .. } => "INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE",
         }
     }
 
@@ -171,6 +195,19 @@ impl SparkError {
                     prefix = INVALID_FORMAT_MISMATCH_MSG_HEAD_PREFIX,
                     suffix = INVALID_FORMAT_MISMATCH_MSG_HEAD_SUFFIX,
                     tail = INVALID_FORMAT_MISMATCH_MSG_TAIL,
+                )
+            }
+            Self::BitPositionRange { upper, value_sql } => {
+                // The bit-width upper bound is baked into HEAD at emission
+                // time (backticks are literal inside the single-quoted SQL
+                // string — no apostrophes to escape). The invalid `pos`
+                // value is interpolated at eval time via
+                // `(value_sql)::VARCHAR`.
+                format!(
+                    "error('{prefix}{upper}{suffix}' || ({value_sql})::VARCHAR || '{tail}')",
+                    prefix = BIT_POSITION_RANGE_MSG_HEAD_PREFIX,
+                    suffix = BIT_POSITION_RANGE_MSG_HEAD_SUFFIX,
+                    tail = BIT_POSITION_RANGE_MSG_TAIL,
                 )
             }
         }
@@ -297,6 +334,31 @@ mod tests {
              || ' is out of bounds. The array has ' || len((arr))::VARCHAR \
              || ' elements. Use the SQL function `get()` to tolerate accessing element at invalid index and return NULL instead. SQLSTATE: 22003')"
         );
+    }
+
+    /// `BitPositionRange` throw fragment bakes the type's bit-width into
+    /// HEAD and interpolates the invalid `pos` value at eval time via
+    /// `(value_sql)::VARCHAR`. Matches Spark 4.1's
+    /// `INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE` message shape (probe-
+    /// confirmed leading token, live Spark 4.1.1).
+    #[test]
+    fn bit_position_range_throw_expr_matches_spark_message() {
+        let err = SparkError::BitPositionRange {
+            upper: 64,
+            value_sql: "64".to_owned(),
+        };
+        assert_eq!(err.class(), "INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE");
+        let got = err.throw_expr();
+        assert!(
+            got.starts_with(
+                "error('[INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE] The value of \
+                 parameter(s) `pos` in `bit_get` is invalid: expects an integer value in [0, "
+            ),
+            "got: {got}"
+        );
+        assert!(got.contains("[0, 64)"), "got: {got}");
+        assert!(got.contains("(64)::VARCHAR"), "got: {got}");
+        assert!(got.ends_with("SQLSTATE: 22023')"), "got: {got}");
     }
 
     /// `ansi_throw_if` reproduces the legacy `ansi_zero_guard` shape:

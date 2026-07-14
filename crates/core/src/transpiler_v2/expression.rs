@@ -1444,6 +1444,13 @@ impl Expression {
             // Always nullable — Spark returns NULL for missing key OR JSON
             // null value OR NULL `json_str`. Corpus: json-002.
             | "json_tuple_field"
+            // `json_object_keys(jsonStr)` — always nullable: Spark returns
+            // NULL for a NULL, invalid-JSON, or non-object input (the
+            // `CASE WHEN json_valid(...) AND json_type(...) = 'OBJECT'
+            // THEN json_keys(...) ELSE NULL END` emission wrapper), so the
+            // result is nullable even over a non-nullable literal argument.
+            // Corpus: fn-024, fn-025, fn-026.
+            | "json_object_keys"
             // Spark's `flatten(Array<Array<T>>)` returns NULL if the outer
             // array contains any NULL inner array. Even a non-nullable
             // literal outer array (`F.array(...)`) produces a nullable
@@ -3102,6 +3109,19 @@ mod tests {
             DataType::String,
         )]));
         assert!(json_tuple_field_call("json_str", "a").nullable(&s));
+    }
+
+    /// `json_object_keys(jsonStr)` is always nullable — even over a
+    /// non-nullable STRING literal argument — because the emission wrapper
+    /// (`CASE WHEN json_valid(...) AND json_type(...) = 'OBJECT' THEN
+    /// json_keys(...) ELSE NULL END`) returns NULL for invalid-JSON and
+    /// non-object input regardless of the argument's own nullability.
+    /// Golden-oracle corpus: fn-024/fn-025/fn-026 (strict
+    /// `ignore_nullable=False` schema comparison caught this gap).
+    #[test]
+    fn json_object_keys_is_always_nullable_even_over_non_nullable_literal() {
+        let s = ResolvedSchema::empty();
+        assert!(fcall("json_object_keys", vec![str_lit("{\"a\":1}")]).nullable(&s));
     }
 
     // ── OPP-L — Expression::map_children / children walker ────────────────

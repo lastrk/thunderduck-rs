@@ -463,6 +463,27 @@ case("fn-021", "scalar_fn", "mixed-case substr/substring stay distinct alias-fam
 case("fn-022", "scalar_fn", "uppercase math-fn roster + alias stays lowercase", "SELECT CEIL(x), floor(x), SQRT(x), CEILING(x) FROM nums", flags=("schema_only",))
 case("fn-023", "scalar_fn", "inverse-hyperbolic trio names UPPERCASE (review MAJOR)", "SELECT ACOSH(x), asinh(x), atanh(x) FROM nums", flags=("schema_only",))
 
+# fn-024/025/026 (O5/F4): `json_object_keys` NULL-parity — Spark returns NULL
+# for NULL/invalid-JSON/non-object input, and the top-level keys array only
+# for a genuine object. DuckDB's native `json_keys` diverges on both edge
+# cases (raises on malformed JSON; returns `[]` on non-object), so τ wraps it
+# in a `json_valid`/`json_type = 'OBJECT'` guard. Constant SELECT (no table),
+# mirrors sel-007. fn-026 uses a single-key object to avoid array-order
+# ambiguity in the value diff.
+case("fn-024", "scalar_fn", "json_object_keys: invalid JSON -> NULL", "SELECT json_object_keys('not json') AS k")
+case("fn-025", "scalar_fn", "json_object_keys: non-object (array) JSON -> NULL", "SELECT json_object_keys('[1,2,3]') AS k")
+case("fn-026", "scalar_fn", "json_object_keys: object JSON -> keys array", "SELECT json_object_keys('{\"a\":1}') AS k")
+
+# fn-027/028 (O5/F4): `bit_get`/`getbit(x, pos)` Spark ANSI-mode
+# `INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE` when `pos < 0 || pos >=
+# bit_width(x)` (width by arg0's integral type; `lng` is LongType, width 64).
+# `nums` rows 1-3 have non-null `lng`, so the OOB pos=64 raises on both
+# engines; row 4's `lng` is NULL, which is null-safe (no raise) on both.
+# fn-028 is the in-bounds regression: pos=1 is always in range, so it's a
+# plain value case (row 4's NULL `lng` -> NULL `b`, unaffected by the guard).
+case("fn-027", "scalar_fn", "bit_get pos >= bit-width raises (ANSI)", "SELECT bit_get(lng, 64) AS b FROM nums", expected_error="INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE")
+case("fn-028", "scalar_fn", "bit_get in-bounds (null value -> null)", "SELECT bit_get(lng, 1) AS b FROM nums")
+
 # ── 8. Subqueries (the headline SQL-only family; ADR-008) ────────────────────
 case("sq-001", "subquery", "scalar subquery in SELECT (uncorrelated)", "SELECT name, salary, (SELECT max(salary) FROM emp) AS gmax FROM emp")
 case("sq-002", "subquery", "scalar subquery in WHERE (uncorrelated)", "SELECT * FROM emp WHERE salary > (SELECT avg(salary) FROM emp)")

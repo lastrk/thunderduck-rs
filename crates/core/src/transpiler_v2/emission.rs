@@ -3447,6 +3447,19 @@ fn min_args<const N: usize>(
     rendered_args(f, schema)
 }
 
+/// Bit-width of an integral Spark type (Spark `bit_get` upper bound); `None`
+/// for any non-integral type (Spark would reject that arg0 at analysis — τ
+/// then keeps the un-guarded compute form, unchanged).
+fn integral_bit_width(dt: &DataType) -> Option<u32> {
+    match dt {
+        DataType::Byte => Some(8),
+        DataType::Short => Some(16),
+        DataType::Integer => Some(32),
+        DataType::Long => Some(64),
+        _ => None,
+    }
+}
+
 /// Order-preserving "distinct by first occurrence" over the list-valued SQL
 /// expression `list_sql`, matching Spark's array set-op semantics (a
 /// linked-hash-set scan, not a sort). DuckDB's own `list_distinct` reorders
@@ -3862,16 +3875,34 @@ fn render_function_call_dispatch(
             let duck_fmt = spark_fmt_to_duckdb(&fmt);
             return Ok(format!("strftime({d}, {duck_fmt})"));
         }
-        // Spark's `to_char(x, fmt)` — corpus witness is the DATE form (a
-        // number-format model would need its own translation and is out of
-        // scope here). DuckDB has no native `to_char`; mirror `date_format`
-        // above via `strftime` + the shared Spark→DuckDB token helper.
-        // Corpus: `test_to_char` (test_string_collection_differential).
-        "to_char" if f.args.len() == 2 => {
-            let [d, fmt] = rendered_args(f, schema)?;
-            let duck_fmt = spark_fmt_to_duckdb(&fmt);
-            return Ok(format!("strftime({d}, {duck_fmt})"));
-        }
+        // Spark's `to_char(x, fmt)` has two forms: datetime (mirrors
+        // `date_format`, translated via `strftime` + the shared Spark→DuckDB
+        // token helper) and numeric-picture (`9`/`0`/`.`/`,`/`$`/`S`/`MI`/
+        // `PR`/`L`…, e.g. `to_char(78.12, '99.99')` → `'78.12'`). DuckDB has
+        // neither natively; only the datetime form is implemented — the
+        // numeric-picture form is a genuine ADR-022 Thunderduck-boundary gap
+        // (Spark succeeds; τ honestly does not implement the picture model).
+        // Corpus: `test_to_char` (test_string_collection_differential, DATE
+        // form only — the numeric form cannot be a green corpus case).
+        "to_char" if f.args.len() == 2 => match f.args[0].data_type(schema) {
+            // `Null` rides the datetime arm: Spark returns NULL for
+            // `to_char(NULL, fmt)` in BOTH the datetime and numeric-picture
+            // forms, and `strftime(NULL, …)` is NULL — routing it to the
+            // boundary error would DIVERGE (review MINOR, F4).
+            DataType::Date | DataType::Timestamp | DataType::TimestampNtz | DataType::Null => {
+                let [d, fmt] = rendered_args(f, schema)?;
+                let duck_fmt = spark_fmt_to_duckdb(&fmt);
+                return Ok(format!("strftime({d}, {duck_fmt})"));
+            }
+            _ => {
+                bail_boundary_fn!(
+                    f.name.clone(),
+                    "τ boundary: `to_char`/`to_varchar` numeric-picture format \
+                     (non-datetime first argument) is not implemented — only \
+                     the datetime format form is supported",
+                );
+            }
+        },
         // Spark's `trunc(date, format)` → DuckDB `date_trunc(format, date)`.
         // Spark's arg order is (date, fmt); DuckDB's is (fmt, date). DuckDB's
         // `date_trunc` natively returns TIMESTAMP; the `render_function_call`
@@ -4083,13 +4114,6 @@ fn render_function_call_dispatch(
         // equivalent that returns Spark-DDL. The `thdck_spark_funcs`
         // extension provides `spark_schema_of_json`. Corpus: `json-006`.
         "schema_of_json" => "spark_schema_of_json",
-        // Spark's `json_object_keys(jsonStr)` returns the top-level object's
-        // keys as `Array<String>` (NULL for a NULL/non-object input).
-        // DuckDB's native `json_keys` already returns `VARCHAR[]` with the
-        // same NULL-in/NULL-out and empty-array-for-non-object shape the
-        // corpus witnesses exercise — a direct rename, no CAST needed.
-        // Corpus: `test_json_object_keys`.
-        "json_object_keys" => "json_keys",
         // Spark's `to_json(col[, options])` runs `JacksonGenerator` with
         // `SQLConf.JSON_GENERATOR_IGNORE_NULL_FIELDS=true` by default, which
         // omits object entries whose value is JSON `null` at every nesting
@@ -4126,6 +4150,22 @@ fn render_function_call_dispatch(
                 bail_boundary_fn!(f.name.clone(), "`to_json` requires 1 or 2 arguments");
             }
         },
+        // Spark's `json_object_keys(jsonStr)` returns the top-level object's
+        // keys as `Array<String>`, and NULL for a NULL, invalid-JSON, or
+        // non-object input. DuckDB's native `json_keys` diverges on both
+        // edge cases — it RAISES on malformed JSON and returns `[]` (not
+        // NULL) on a non-object — so a direct rename is not Spark-parity.
+        // Guard both with `json_valid`/`json_type` and only call
+        // `json_keys` on a confirmed OBJECT. (ADR-022 Spark-parity value
+        // fix — not a boundary.) Corpus: `test_json_object_keys`,
+        // `fn-024`/`fn-025`/`fn-026` witnesses (not-json / array / object).
+        "json_object_keys" => {
+            let [j] = exact_args(f, schema, "`json_object_keys` requires exactly 1 argument")?;
+            return Ok(format!(
+                "CASE WHEN json_valid({j}) AND json_type({j}) = 'OBJECT' \
+                 THEN json_keys({j}) ELSE NULL END"
+            ));
+        }
         // Spark's `to_csv(struct)` — DuckDB has no `to_csv` scalar.
         // When the argument is a `struct(...)` (Spark's `F.struct` /
         // Catalyst `CreateStruct`), unpack the fields and emit
@@ -4274,9 +4314,30 @@ fn render_function_call_dispatch(
         // has no integral `bit_get` (`get_bit` only accepts BIT); compose
         // via shift + mask, cast to TINYINT to match type_inference. Corpus:
         // `test_bit_get` (test_math_bitwise_date_differential).
+        //
+        // Spark ANSI-mode raises `INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE`
+        // when `pos < 0 || pos >= bit_width(x)` (width by arg0's INTEGRAL
+        // type: Byte 8 / Short 16 / Integer 32 / Long 64) — guard with the
+        // shared `SparkError`/`ansi_throw_if` machinery. `BitwiseGet` is
+        // null-safe on the VALUE too (a NULL value never raises, even for an
+        // out-of-range pos), so the guard condition requires `x IS NOT NULL`.
+        // A non-integral arg0 is rejected by Spark at analysis, so the
+        // un-guarded compute form is unchanged there. Corpus: `fn-027`
+        // (OOB raise), `fn-028` (in-bounds / null-value regression).
         "bit_get" | "getbit" => {
             let [x, pos] = exact_args(f, schema, "`bit_get` requires exactly 2 arguments")?;
-            return Ok(format!("CAST((({x} >> {pos}) & 1) AS TINYINT)"));
+            let compute = format!("CAST((({x} >> {pos}) & 1) AS TINYINT)");
+            return match integral_bit_width(&f.args[0].data_type(schema)) {
+                Some(w) => {
+                    let cond = format!("({x}) IS NOT NULL AND (({pos}) < 0 OR ({pos}) >= {w})");
+                    let err = super::spark_errors::SparkError::BitPositionRange {
+                        upper: w,
+                        value_sql: pos.clone(),
+                    };
+                    Ok(super::spark_errors::ansi_throw_if(&cond, err, &compute))
+                }
+                None => Ok(compute),
+            };
         }
         // Spark's `make_dt_interval([days[, hours[, mins[, secs]]]])` builds a
         // day-time INTERVAL. DuckDB has no `make_dt_interval` scalar but
@@ -12623,12 +12684,17 @@ mod tests {
         assert_eq!(sql, "spark_schema_of_json('{\"a\":1,\"b\":\"x\"}')");
     }
 
-    /// `json_object_keys(...)` is remapped to DuckDB's native `json_keys(...)`
-    /// — same `VARCHAR[]` shape, name rename only (no CAST).
+    /// `json_object_keys(...)` wraps DuckDB's native `json_keys(...)` in a
+    /// `json_valid`/`json_type = 'OBJECT'` guard so invalid-JSON and
+    /// non-object inputs return NULL (Spark parity) instead of DuckDB's raw
+    /// raise / empty-array behavior.
     #[test]
-    fn render_json_object_keys_remaps_to_json_keys() {
+    fn render_json_object_keys_wraps_valid_object_guard() {
         let sql = render_fn("json_object_keys", vec![col_ref_expr("json_str")]);
-        assert_eq!(sql, "json_keys(json_str)");
+        assert!(sql.contains("json_valid(json_str)"), "sql: {sql}");
+        assert!(sql.contains("json_type(json_str) = 'OBJECT'"), "sql: {sql}");
+        assert!(sql.contains("json_keys(json_str)"), "sql: {sql}");
+        assert!(sql.contains("ELSE NULL END"), "sql: {sql}");
     }
 
     /// json-008 anchor: `to_csv(struct(a, b, c))` — DuckDB has no `to_csv`
@@ -13611,6 +13677,54 @@ mod tests {
         assert!(sql.contains("'%Y'"));
     }
 
+    /// `Timestamp` arg0 is likewise a datetime form — `strftime` accepts it
+    /// directly, a strict improvement over the DATE-only original.
+    #[test]
+    fn render_to_char_timestamp_form_translates_to_strftime() {
+        let sql = render_fn(
+            "to_char",
+            vec![
+                col_with_type("ts", DataType::Timestamp),
+                str_lit("yyyy-MM-dd"),
+            ],
+        );
+        assert!(sql.starts_with("strftime(ts, "), "sql = {sql}");
+    }
+
+    /// `to_char(numeric, picture)` — Spark's numeric-picture format model
+    /// (`9`/`0`/`.`/`,`/`$`/`S`/`MI`/`PR`/`L`…) is not implemented; τ raises
+    /// an honest ADR-022 Thunderduck-boundary error rather than emitting a
+    /// nonsense `strftime` call over a DECIMAL that DuckDB would binder-error
+    /// on. `to_char` succeeds in Spark for this shape (e.g.
+    /// `to_char(78.12, '99.99')` → `'78.12'`), so this can never be a green
+    /// corpus case — unit-test-only witness (ADR-022 §category 2).
+    #[test]
+    fn render_to_char_numeric_form_is_boundary_error() {
+        let err = render_function_call(
+            &fcall(
+                "to_char",
+                vec![
+                    col_with_type(
+                        "n",
+                        DataType::Decimal {
+                            precision: 4,
+                            scale: 2,
+                        },
+                    ),
+                    str_lit("99.99"),
+                ],
+            ),
+            &empty_schema(),
+        )
+        .expect_err("numeric to_char must boundary-error");
+        expect_unsupported(
+            err,
+            UnsupportedKind::Function,
+            "to_char",
+            &["numeric-picture", "not implemented"],
+        );
+    }
+
     #[test]
     fn render_btrim_one_arg_renames_to_trim() {
         let sql = render_fn("btrim", vec![col_ref_expr("s")]);
@@ -14537,6 +14651,41 @@ mod tests {
     fn render_getbit_alias_matches_bit_get() {
         let sql = render_fn("getbit", vec![col_ref_expr("id"), int_lit(2)]);
         assert_eq!(sql, "CAST(((id >> 2) & 1) AS TINYINT)");
+    }
+
+    /// `bit_get` on a statically-integral arg0 (Long, width 64) gets the
+    /// Spark-parity `INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE` ANSI guard:
+    /// null-safe on the value, raises for `pos < 0 || pos >= 64`, else
+    /// computes the same shift/mask/cast as before.
+    #[test]
+    fn render_bit_get_integral_arg0_guards_bit_position_range() {
+        let sql = render_fn(
+            "bit_get",
+            vec![col_with_type("v", DataType::Long), int_lit(64)],
+        );
+        assert_eq!(
+            sql,
+            "CASE WHEN (v) IS NOT NULL AND ((64) < 0 OR (64) >= 64) THEN \
+             error('[INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE] The value of \
+             parameter(s) `pos` in `bit_get` is invalid: expects an integer value \
+             in [0, 64), but got ' || (64)::VARCHAR || '. SQLSTATE: 22023') \
+             ELSE CAST(((v >> 64) & 1) AS TINYINT) END"
+        );
+    }
+
+    /// In-bounds `pos` on an Integer arg0 (width 32): the guard is present
+    /// (never fires) and the ELSE branch computes unchanged.
+    #[test]
+    fn render_bit_get_integer_arg0_in_bounds_uses_32_bit_width() {
+        let sql = render_fn(
+            "bit_get",
+            vec![col_with_type("v", DataType::Integer), int_lit(1)],
+        );
+        assert!(sql.contains("(1) >= 32"), "sql: {sql}");
+        assert!(
+            sql.contains("ELSE CAST(((v >> 1) & 1) AS TINYINT) END"),
+            "sql: {sql}"
+        );
     }
 
     /// `intv-003` regression: `make_dt_interval(1, 2, 30, 0)` — DuckDB has no

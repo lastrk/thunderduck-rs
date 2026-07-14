@@ -1067,12 +1067,14 @@ impl Expression {
     // ── FunctionCall data-type derivation ────────────────────────────────────
 
     fn function_call_data_type(f: &FunctionCall, schema: &ResolvedSchema) -> DataType {
-        // Pre-pass for return types that need the argument EXPRESSIONS —
-        // literal schemas, literal scales, struct field naming, per-arg
-        // nullability. `TypeInferenceEngine::function_return_type` sees only
-        // the argument TYPES, so it cannot express these; derive here where
-        // the full `&FunctionCall` is available. Rules that depend on
-        // argument types alone live in `function_return_type` (single home).
+        // Pre-pass for return types that need the argument EXPRESSIONS
+        // themselves — literal schemas, literal scales, struct field naming.
+        // `TypeInferenceEngine::function_return_type` sees only argument
+        // `(type, nullable)` pairs, so it cannot express these (no literal
+        // value, no expression shape); derive here where the full
+        // `&FunctionCall` is available. Rules that depend on argument types
+        // and/or per-argument nullability alone (including the array/map
+        // constructors — O11) live in `function_return_type` (single home).
         //
         // Struct-constructor fast-paths — Spark's `struct` / `named_struct`
         // return a `DataType::Struct` whose field names depend on the shape
@@ -1153,67 +1155,13 @@ impl Expression {
                 // per input row.
                 return DataType::Array(Box::new(DataType::Struct(StructType::new(fields))), false);
             }
-            // Spark's `array(a, b, ...)` — element type is the least-common
-            // (widening) type of the args. First-arg-only inference misses
-            // the mixed-numeric case (e.g., `array(1, 2.0, 3)` → Double).
-            // Corpus anchor: `type-020`.
-            "array" | "list_value" | "make_array" | "list" if !f.args.is_empty() => {
-                let mut acc = f.args[0].data_type(schema);
-                for a in f.args.iter().skip(1) {
-                    let dt = a.data_type(schema);
-                    // Spark's CreateArray element type = findWiderCommonType
-                    // over the args (τ's `unify_types`), NOT numeric-only
-                    // promotion — so heterogeneous non-numeric args (e.g.
-                    // `array(1, 'x')` → Array<String>) widen correctly.
-                    acc = TypeInferenceEngine::unify_types(&acc, &dt);
-                }
-                // Spark reports the array as `containsNull` = any element
-                // nullable. Result nullability is handled separately in
-                // `function_call_nullable`; here we just carry the flag
-                // conservatively as `true` (any-null-permitted) matching
-                // the shared resolver's behavior.
-                let contains_null = f.args.iter().any(|a| a.nullable(schema));
-                return DataType::Array(Box::new(acc), contains_null);
-            }
-            // Spark's `map(k1, v1, k2, v2, ...)` / `create_map(...)` — key type
-            // is the least-common type of the even-index args, value type the
-            // least-common type of the odd-index args, and `valueContainsNull`
-            // is true iff any value arg is nullable. The shared
-            // `function_return_type` resolver only sees the first arg and so
-            // hard-codes `Map<String, String>`; derive the real key/value types
-            // here where the whole arg list is available. Corpus anchor:
-            // cx-002. An empty or odd-length arg list falls through to the
-            // shared resolver.
-            "map" | "create_map" if !f.args.is_empty() && f.args.len().is_multiple_of(2) => {
-                let mut key_ty = f.args[0].data_type(schema);
-                let mut val_ty = f.args[1].data_type(schema);
-                let mut value_nullable = f.args[1].nullable(schema);
-                let mut i = 2;
-                while i < f.args.len() {
-                    // Spark's CreateMap key/value types = findWiderCommonType
-                    // (τ's `unify_types`), NOT numeric-only promotion — so
-                    // heterogeneous non-numeric args (e.g.
-                    // `map('a', 1, 'b', 'x')` → Map<String, String>) widen
-                    // correctly. The homogeneous cx-002 result is preserved.
-                    key_ty =
-                        TypeInferenceEngine::unify_types(&key_ty, &f.args[i].data_type(schema));
-                    val_ty =
-                        TypeInferenceEngine::unify_types(&val_ty, &f.args[i + 1].data_type(schema));
-                    value_nullable = value_nullable || f.args[i + 1].nullable(schema);
-                    i += 2;
-                }
-                return DataType::Map {
-                    key: Box::new(key_ty),
-                    value: Box::new(val_ty),
-                    value_nullable,
-                };
-            }
-            // `map_from_arrays(keys, values)` needs only the two args'
-            // DataTypes (key elem type + value elem type/containsNull all
-            // live inside `DataType::Array`'s own shape) — no per-arg
-            // *expression* nullability is required. That makes
-            // `function_return_type` a sufficient home; the rule now lives
-            // there as the resolver's map arm (N2 single-home). Differential:
+            // Spark's `array(a, b, ...)` / `map`/`create_map` /
+            // `map_from_arrays` are all single-homed in
+            // `TypeInferenceEngine::function_return_type` (O11 moved
+            // `array`/`map`/`create_map` there too, once the resolver's
+            // signature widened to `(DataType, bool)` pairs so it could read
+            // per-arg nullability without needing the argument
+            // *expressions*). Differentials: `type-020`, `cx-002`,
             // `test_map_from_arrays`.
             //
             // Spark's `to_number(str, fmt)` / `try_to_number(str, fmt)` return
@@ -1318,12 +1266,17 @@ impl Expression {
             }
             _ => {}
         }
-        // All remaining return-type rules depend on argument TYPES alone
-        // (widening folds, arity-branch selection, decimal widening) — the
-        // single home is `TypeInferenceEngine::function_return_type`, which now
-        // receives the full argument-type list.
-        let arg_types: Vec<DataType> = f.args.iter().map(|a| a.data_type(schema)).collect();
-        TypeInferenceEngine::function_return_type(&f.name, &arg_types)
+        // All remaining return-type rules depend on argument types and/or
+        // per-argument nullability alone (widening folds, arity-branch
+        // selection, decimal widening, array/map containsNull widening) —
+        // the single home is `TypeInferenceEngine::function_return_type`,
+        // which receives the full argument `(type, nullable)` pair list.
+        let args: Vec<(DataType, bool)> = f
+            .args
+            .iter()
+            .map(|a| (a.data_type(schema), a.nullable(schema)))
+            .collect();
+        TypeInferenceEngine::function_return_type(&f.name, &args)
     }
 
     // ── FunctionCall nullability ─────────────────────────────────────────────

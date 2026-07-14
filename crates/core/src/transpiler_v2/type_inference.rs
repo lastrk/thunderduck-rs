@@ -553,17 +553,22 @@ impl TypeInferenceEngine {
 
     /// Infer the return type of a scalar/table function.
     ///
-    /// Receives the FULL list of argument types (`arg_types`), so this is the
-    /// single home for every return-type rule that depends on argument types
-    /// alone — including the multi-arg widening folds (`coalesce` / `greatest`
-    /// / `least`), arity-branch selection (`nvl2` / `if` / `iif`,
-    /// `aggregate` / `reduce`), and decimal widening (`mod` / `pmod`). Arms
-    /// that need the argument *expressions* (literal schemas, literal scales,
-    /// struct field naming, per-arg nullability) stay in
-    /// `Expression::function_call_data_type`, which pre-empts this resolver.
+    /// Receives the FULL list of argument `(type, nullable)` pairs (`args`),
+    /// so this is the single home for every return-type rule that depends on
+    /// argument types and/or per-argument nullability alone — including the
+    /// multi-arg widening folds (`coalesce` / `greatest` / `least`),
+    /// arity-branch selection (`nvl2` / `if` / `iif`, `aggregate` / `reduce`),
+    /// decimal widening (`mod` / `pmod`), and the nullability-widening array /
+    /// map constructors (`array`, `map` / `create_map` — O11). Arms that need
+    /// the argument *expressions themselves* (literal schemas, literal
+    /// scales, struct field naming) stay in
+    /// `Expression::function_call_data_type`, which pre-empts this resolver —
+    /// a legitimate second home, not drift, because `(DataType, bool)` pairs
+    /// cannot carry a literal value or an expression shape.
     ///
-    /// Arms that only need the first argument read `arg_types.first()`; arms
-    /// that need nothing at all (hash / grouping) ignore `arg_types`.
+    /// Arms that only need argument TYPES read the derived `arg_types` view;
+    /// arms that only need the first argument read `arg_types.first()`; arms
+    /// that need nothing at all (hash / grouping) ignore `arg_types`/`args`.
     ///
     /// **τ seed:** returns `DataType::Unresolved` for anything the
     /// aggregate roster does not handle. future τ work grows the scalar arms.
@@ -576,8 +581,16 @@ impl TypeInferenceEngine {
     /// with mixed case (`"Window"`, `"MAKE_DT_INTERVAL"`), so it is kept for
     /// direct-call robustness (same rationale as `function_catalog.rs`'s
     /// Q3 boundary).
-    pub fn function_return_type(name: &str, arg_types: &[DataType]) -> DataType {
+    pub fn function_return_type(name: &str, args: &[(DataType, bool)]) -> DataType {
         use DataType::*;
+        // Type-only view: every arm whose return type depends on argument
+        // TYPES alone reads this slice unchanged. The array / map arms below
+        // also read `args` directly for per-argument nullability
+        // (containsNull / valueContainsNull). Plan-time clone only —
+        // negligible next to the `data_type()`/`nullable()` walks that built
+        // `args` in the first place.
+        let arg_types_owned: Vec<DataType> = args.iter().map(|(t, _)| t.clone()).collect();
+        let arg_types: &[DataType] = &arg_types_owned;
         let first_arg_type = arg_types.first();
         // The most common per-arm reduction: the first argument's type, or
         // the arm-specific `default` when the call has no arguments.
@@ -784,30 +797,60 @@ impl TypeInferenceEngine {
             "timestampdiff" => Long,
 
             // ── Array/List constructors and simple operations ───────────
-            // NOTE: the `Some` (non-empty args) path is unreachable from
-            // `Expression::function_call_data_type`, which pre-empts these
-            // names whenever the arg list is non-empty (the widening
-            // `unify_types` fold). Kept defensively — this fn is `pub`.
-            "array" | "list_value" | "make_array" | "list" => {
-                Array(Box::new(first_arg_or(Unresolved)), true)
+            // Spark's `array(a, b, ...)` / `make_array` / `list_value` /
+            // `list` — element type = findWiderCommonType (`unify_types`)
+            // over all args; `containsNull` = any arg nullable. Single home
+            // (moved from `Expression::function_call_data_type`, O11) — the
+            // widened `(DataType, bool)` signature now carries per-arg
+            // nullability, so the expression-level pre-pass fast path is no
+            // longer needed. Empty call → `Array<Unresolved, true>`,
+            // byte-identical to the prior defensive stub. Corpus: `type-020`.
+            "array" | "list_value" | "make_array" | "list" => match args.split_first() {
+                Some(((first_ty, first_null), rest)) => {
+                    let mut elem = first_ty.clone();
+                    let mut contains_null = *first_null;
+                    for (dt, n) in rest {
+                        elem = Self::unify_types(&elem, dt);
+                        contains_null = contains_null || *n;
+                    }
+                    Array(Box::new(elem), contains_null)
+                }
+                None => Array(Box::new(Unresolved), true),
+            },
+            // Spark's `map(k1, v1, ...)` / `create_map` — key/value type =
+            // unify (`unify_types`) over the even/odd-index args;
+            // `value_nullable` = any value arg nullable. Single home (moved
+            // from `Expression::function_call_data_type`, O11). Malformed
+            // (empty / odd arity) falls through to the `Map<String, String,
+            // true>` arm below, identical to the prior pre-pass fallthrough.
+            // Corpus: `cx-002`.
+            "map" | "create_map" if !args.is_empty() && args.len().is_multiple_of(2) => {
+                let mut key_ty = args[0].0.clone();
+                let mut val_ty = args[1].0.clone();
+                let mut value_nullable = args[1].1;
+                let mut i = 2;
+                while i < args.len() {
+                    key_ty = Self::unify_types(&key_ty, &args[i].0);
+                    val_ty = Self::unify_types(&val_ty, &args[i + 1].0);
+                    value_nullable = value_nullable || args[i + 1].1;
+                    i += 2;
+                }
+                DataType::Map {
+                    key: Box::new(key_ty),
+                    value: Box::new(val_ty),
+                    value_nullable,
+                }
             }
             // `str_to_map(str, pair_delim, kv_delim)` returns the same
             // `Map<VARCHAR, VARCHAR>`. Session macro `str_to_map` (see
             // `runtime/session.rs`) provides the DuckDB translation. Corpus:
             // `map2-002`.
             //
-            // `map`/`create_map` (well-typed, non-empty even arity) is still
-            // pre-empted by a dedicated fast path in
-            // `Expression::function_call_data_type` — its `valueContainsNull`
-            // needs each value arg's *expression*-level nullability
-            // (`Expression::nullable`, e.g. a literal NULL vs. a nullable
-            // column), which this resolver's `arg_types: &[DataType]` cannot
-            // carry, so it stays a genuine second home (N2 exception, not
-            // drift). `map_from_entries` has no fast path and always falls
-            // through to this hard-coded `Map<String, String, true>` — its
-            // honest-but-approximate fallback, also used for malformed
-            // `map`/`create_map`/`map_from_arrays` calls (empty/odd-arity, or
-            // non-`Array`-typed `map_from_arrays` args).
+            // `map`/`create_map` are now single-homed above (O11); this
+            // unguarded arm serves only `map_from_entries` (no fast path) and
+            // `str_to_map`, plus malformed `map`/`create_map` calls
+            // (empty/odd-arity) that fall through the guarded arm above —
+            // an honest-but-approximate `Map<String, String, true>` fallback.
             "map" | "create_map" | "map_from_entries" | "str_to_map" => DataType::Map {
                 key: Box::new(String),
                 value: Box::new(String),
@@ -820,9 +863,9 @@ impl TypeInferenceEngine {
             // 4.1.1: `MapFromArrays.dataType`) — distinct from
             // `map`/`create_map` above, which alternate key/value args and
             // widen across pairs. Both operand facts here (elem type +
-            // containsNull) live inside `DataType::Array`'s own shape, so —
-            // unlike `map`/`create_map` — `arg_types` alone is sufficient:
-            // this arm is `map_from_arrays`'s single home (N2). A malformed
+            // containsNull) live inside `DataType::Array`'s own shape, so
+            // `arg_types` alone is sufficient: this arm has been
+            // `map_from_arrays`'s single home since before O11. A malformed
             // (non-2-arity or non-`Array`-typed) call falls through to the
             // `Map<String, String, true>` default above. Corpus/differential:
             // `test_map_from_arrays`.
@@ -1476,8 +1519,18 @@ mod tests {
         }
     }
 
-    /// One-line wrapper for [`TypeInferenceEngine::function_return_type`].
+    /// One-line wrapper for [`TypeInferenceEngine::function_return_type`],
+    /// pairing each type with a conservative `nullable = true` default. Every
+    /// existing call site exercises type-only arms that ignore `.1`, so this
+    /// keeps them unchanged after the O11 signature widen.
     fn frt(name: &str, args: &[DataType]) -> DataType {
+        let pairs: Vec<(DataType, bool)> = args.iter().map(|t| (t.clone(), true)).collect();
+        TypeInferenceEngine::function_return_type(name, &pairs)
+    }
+
+    /// Nullability-sensitive sibling of [`frt`] for the arms that read
+    /// per-argument nullability directly (`array`, `map`/`create_map` — O11).
+    fn frt_n(name: &str, args: &[(DataType, bool)]) -> DataType {
         TypeInferenceEngine::function_return_type(name, args)
     }
 
@@ -2231,6 +2284,146 @@ mod tests {
         let arr = || DataType::Array(Box::new(DataType::Integer), false);
         assert_eq!(
             frt("map_from_arrays", &[arr(), arr(), arr()]),
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::String),
+                value_nullable: true,
+            }
+        );
+    }
+
+    // ── O11: `array` / `map`/`create_map` moved into `function_return_type`
+    // (nullability-widened `(DataType, bool)` signature) ────────────────────
+
+    #[test]
+    fn array_constructor_homogeneous_non_null_args_is_non_nullable() {
+        // `array(1, 2, 3)` with every arg non-nullable → containsNull=false.
+        // Corpus: `type-020`.
+        assert_eq!(
+            frt_n(
+                "array",
+                &[
+                    (DataType::Integer, false),
+                    (DataType::Integer, false),
+                    (DataType::Integer, false),
+                ],
+            ),
+            DataType::Array(Box::new(DataType::Integer), false)
+        );
+    }
+
+    #[test]
+    fn array_constructor_any_nullable_arg_sets_contains_null_true() {
+        assert_eq!(
+            frt_n(
+                "array",
+                &[(DataType::Integer, false), (DataType::Integer, true)],
+            ),
+            DataType::Array(Box::new(DataType::Integer), true)
+        );
+    }
+
+    #[test]
+    fn array_constructor_widens_mixed_numeric_types() {
+        // `array(1, 2.0, 3)` → Array<Double> (findWiderCommonType, not
+        // first-arg-only). Corpus: `type-020`.
+        assert_eq!(
+            frt_n(
+                "array",
+                &[
+                    (DataType::Integer, false),
+                    (DataType::Double, false),
+                    (DataType::Integer, false),
+                ],
+            ),
+            DataType::Array(Box::new(DataType::Double), false)
+        );
+    }
+
+    #[test]
+    fn array_constructor_empty_call_is_unresolved_and_nullable() {
+        assert_eq!(
+            frt_n("array", &[]),
+            DataType::Array(Box::new(DataType::Unresolved), true)
+        );
+    }
+
+    #[test]
+    fn map_constructor_non_null_values_reports_value_nullable_false() {
+        // `map('a', 1, 'b', 2)` — no nullable value arg → value_nullable=false.
+        // Corpus: `cx-002`.
+        assert_eq!(
+            frt_n(
+                "map",
+                &[
+                    (DataType::String, false),
+                    (DataType::Integer, false),
+                    (DataType::String, false),
+                    (DataType::Integer, false),
+                ],
+            ),
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::Integer),
+                value_nullable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn map_constructor_nullable_value_arg_sets_value_nullable_true() {
+        assert_eq!(
+            frt_n(
+                "create_map",
+                &[
+                    (DataType::String, false),
+                    (DataType::Integer, false),
+                    (DataType::String, false),
+                    (DataType::Integer, true),
+                ],
+            ),
+            DataType::Map {
+                key: Box::new(DataType::String),
+                value: Box::new(DataType::Integer),
+                value_nullable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn map_constructor_widens_heterogeneous_key_and_value_types() {
+        assert_eq!(
+            frt_n(
+                "map",
+                &[
+                    (DataType::Integer, false),
+                    (DataType::Integer, false),
+                    (DataType::Long, false),
+                    (DataType::Double, false),
+                ],
+            ),
+            DataType::Map {
+                key: Box::new(DataType::Long),
+                value: Box::new(DataType::Double),
+                value_nullable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn map_constructor_odd_arity_falls_back_to_string_string_map() {
+        // Malformed (odd arity: k1, v1, k2 with no matching v2) falls through
+        // to the hard-coded Map<String, String, true> arm — same fallback as
+        // pre-O11.
+        assert_eq!(
+            frt_n(
+                "map",
+                &[
+                    (DataType::String, false),
+                    (DataType::Integer, false),
+                    (DataType::String, false),
+                ],
+            ),
             DataType::Map {
                 key: Box::new(DataType::String),
                 value: Box::new(DataType::String),

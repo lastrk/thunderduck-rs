@@ -119,12 +119,33 @@ inline `list_concat(a,b)` twice and pay O(len) `list_position` per element.
 Correct output; runtime cost on large arrays. Consider CTE/lateral
 materialization.
 
-### O11. N2 completion — widen the resolver signature
-**Size: S–M.** `function_return_type` receives `&[DataType]`; rules needing
-per-argument nullability (map/create_map, array family) or literal shapes
-(struct/to_number/from_json) remain a documented second home in
-`expression.rs`. Widening to `(DataType, nullable)` pairs moves the
-nullability-dependent rules into the one home (R2-9's残 remainder).
+### O11. N2 completion — widen the resolver signature — DONE (Pass F5)
+`function_return_type` widened to `&[(DataType, bool)]` pairs (plan-time
+type-only view rebuilt internally so all ~30 existing arms stay byte-
+identical). The array-family (`array`/`list_value`/`make_array`/`list`) and
+`map`/`create_map` arms — the only pre-pass rules needing per-argument
+nullability alone, no literal/expression — moved from
+`Expression::function_call_data_type` into `function_return_type`, their
+single home. Literal-shape arms (`struct`, `named_struct`, `arrays_zip`,
+`to_number`/`try_to_number`, `from_json`/`from_csv`, `inline_field`, 2-arg
+`ceil`/`floor`, `round`/`bround`) stay in `expression.rs` — a documented,
+legitimate second home (need the argument expressions themselves, not just
+type+nullable). Behavior-preserving; ground truth pinned by corpus
+`type-020` (array widen + containsNull), `cx-002` (map widen +
+value_nullable), `test_map_from_arrays` (untouched, already single-homed).
+8 new unit tests added (1244 → 1252 passing); zero clippy delta.
+
+**O11-b (follow-up, not done in F5):** the same `(DataType, bool)` widening
+is type-sufficient for nearly all of `expression.rs`'s
+`function_call_nullable` DERIVED-nullability arms (`coalesce`/`ifnull`/`nvl`/
+`greatest`/`least`, `when`, `nvl2`/`if`/`iif`, `explode`/`posexplode_val`,
+`map_explode_val`, the `_ => any(arg.nullable)` default). Move those into a
+new pair-taking `TypeInferenceEngine::function_call_nullable`; `inline_field`
+stays (reads a literal field-name string to look up struct-field
+nullability — same literal-shape pin as its return-type twin). This is a
+parallel refactor of comparable size to O11 (new fn, ~6-arm relocation,
+re-split of the always-nullable/non-nullable rosters, its own test churn) —
+not a "clean bonus" that rides along for free; do it as its own pass.
 
 ---
 

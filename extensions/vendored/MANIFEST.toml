@@ -4,6 +4,7 @@
 # PLAIN (uncompressed), all 4 platforms, exactly ONE version at a time.
 #
 # Regenerate ONLY via:
+#   scripts/dev/adopt-extension-release.sh --from-local <dir>
 #   scripts/dev/adopt-extension-release.sh <release-tag> <duckdb-version>
 # Changes to this file happen only on duckdb crate bumps — the extension's
 # embedded DuckDB version must exactly match the `duckdb` crate version in

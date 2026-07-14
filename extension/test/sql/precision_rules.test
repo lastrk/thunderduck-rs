@@ -1,0 +1,67 @@
+# name: test/sql/precision_rules.test
+# description: Verify Spark 4.1 decimal division type rules
+# group: [sql]
+
+require thdck_spark_funcs
+
+# DECIMAL(10,2) / DECIMAL(10,2) -> DECIMAL(23,13)
+# result_scale = max(6, 2+10+1) = 13
+# result_precision = 10-2+2+13 = 23
+query I
+SELECT typeof(spark_decimal_div(1::DECIMAL(10,2), 1::DECIMAL(10,2)));
+----
+DECIMAL(23,13)
+
+# DECIMAL(10,0) / DECIMAL(3,0) -> DECIMAL(16,6)
+# result_scale = max(6, 0+3+1) = 6
+# result_precision = 10-0+0+6 = 16
+query I
+SELECT typeof(spark_decimal_div(1::DECIMAL(10,0), 1::DECIMAL(3,0)));
+----
+DECIMAL(16,6)
+
+# DECIMAL(5,4) / DECIMAL(3,2) -> DECIMAL(11,8)
+# result_scale = max(6, 4+3+1) = 8
+# result_precision = 5-4+2+8 = 11
+query I
+SELECT typeof(spark_decimal_div(1.0000::DECIMAL(5,4), 1.00::DECIMAL(3,2)));
+----
+DECIMAL(11,8)
+
+# DECIMAL(2,1) / DECIMAL(2,1) -> DECIMAL(8,6)
+# result_scale = max(6, 1+2+1) = 6
+# result_precision = 2-1+1+6 = 8
+query I
+SELECT typeof(spark_decimal_div(1.0::DECIMAL(2,1), 1.0::DECIMAL(2,1)));
+----
+DECIMAL(8,6)
+
+# Overflow adjustment: DECIMAL(38,18) / DECIMAL(38,18) -> DECIMAL(38,6)
+# result_scale_raw = max(6, 18+38+1) = 57
+# result_precision_raw = 38-18+18+57 = 95
+# Overflow: int_digits=38, min_scale=6, adjusted_scale=max(0,6)=6
+query I
+SELECT typeof(spark_decimal_div(1::DECIMAL(38,18), 1::DECIMAL(38,18)));
+----
+DECIMAL(38,6)
+
+# Overflow adjustment: DECIMAL(38,0) / DECIMAL(38,0) -> DECIMAL(38,6)
+# result_scale_raw = max(6, 0+38+1) = 39
+# result_precision_raw = 38-0+0+39 = 77
+# Overflow: int_digits=38, min_scale=6, adjusted_scale=max(0,6)=6
+query I
+SELECT typeof(spark_decimal_div(1::DECIMAL(38,0), 1::DECIMAL(38,0)));
+----
+DECIMAL(38,6)
+
+# Verify value correctness with specific precision
+# DECIMAL(5,4) / DECIMAL(3,2) -> DECIMAL(11,8)
+# scale_adj = 8 - 4 + 2 = 6
+# a=10000 (1.0000), b=100 (1.00)
+# scaled_a = 10000 * 10^6 = 10000000000
+# quotient = 10000000000 / 100 = 100000000
+# result = 100000000 -> 1.00000000
+query I
+SELECT spark_decimal_div(1.0000::DECIMAL(5,4), 1.00::DECIMAL(3,2));
+----
+1.00000000

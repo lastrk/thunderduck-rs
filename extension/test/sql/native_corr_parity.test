@@ -1,0 +1,16 @@
+# name: test/sql/native_corr_parity.test
+# description: spark_corr resolves to native CORR; parity vs Apache Spark 4.1.1.
+# group: [sql]
+
+# Oracle: test/spark_oracle/verify_first.spark.sql (Spark 4.1.1). Corpus: agg-012.
+# Divergence (not corpus-hit): zero-variance -> Spark ANSI DIVIDE_BY_ZERO; DuckDB nan.
+
+query T
+SELECT CAST(round(corr(x,y),10) AS VARCHAR) FROM (VALUES (1.0,2.0),(2,4),(3,5),(4,4),(5,8),(6,7),(7,9),(8,8),(NULL,100),(9,NULL)) p(x,y);
+----
+0.9072647087
+
+query T
+SELECT CAST(round(corr(x,y),10) AS VARCHAR) FROM (VALUES (1.0,2.0)) p(x,y) WHERE x > 100;
+----
+NULL

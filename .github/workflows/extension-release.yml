@@ -1,0 +1,152 @@
+name: Extension release
+
+# Manual only — this workflow builds the thdck_spark_funcs DuckDB extension
+# (in-tree source at extension/, see extension/README.md's Provenance
+# section) for the 4 shipped platforms at the single DuckDB version pinned
+# in extension/BUILD_PINS.toml, then opens a PR checking the resulting
+# binaries into extensions/vendored/ (scripts/dev/adopt-extension-release.sh
+# --from-local). There is no push/tag trigger and no multiversion matrix —
+# local dev builds (scripts/dev/build-extension.sh) and this workflow both
+# build exactly ONE DuckDB version, HOST/native platforms only in dev, all 4
+# shipped platforms here.
+on:
+  workflow_dispatch: {}
+
+# Read-only by default; the `collect` job elevates to contents:write +
+# pull-requests:write (it pushes a branch and opens a PR). The build matrix
+# itself only needs contents:read (verified empirically by the source
+# project's ci.yml, which runs the same reusable workflow read-only).
+permissions:
+  contents: read
+
+concurrency:
+  group: extension-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Single source of truth for the DuckDB version: extension/BUILD_PINS.toml.
+  # Read at runtime rather than hardcoded here so a BUILD_PINS.toml bump alone
+  # (no workflow edit) is enough to move this workflow to a new version.
+  # ---------------------------------------------------------------------------
+  setup:
+    name: Read pinned DuckDB version
+    runs-on: ubuntu-latest
+    outputs:
+      duckdb_version: ${{ steps.pin.outputs.duckdb_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pin
+        run: |
+          version="$(awk -F'"' '/^\[duckdb\]/{f=1; next} /^\[/{f=0} f && /^version = /{print $2; exit}' extension/BUILD_PINS.toml)"
+          if [[ -z "$version" ]]; then
+            echo "::error::could not parse [duckdb].version from extension/BUILD_PINS.toml"
+            exit 1
+          fi
+          echo "Pinned DuckDB version: $version"
+          echo "duckdb_version=$version" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Build. Based on the extension's own (pre-migration) release.yml, which
+  # called DuckDB's reusable `_extension_distribution.yml` once per DuckDB
+  # version in a 2-version matrix; stripped here to the ONE version from
+  # `setup` and the 4 platforms thunderduck-rs ships
+  # (linux_amd64, linux_arm64, osx_amd64, osx_arm64 — via `exclude_archs`,
+  # which excludes every other entry in extension-ci-tools' distribution
+  # matrix: musl/windows/wasm legs).
+  #
+  # `override_ci_tools_repository` / the `bebb406d...` SHA below is UNRELATED
+  # to the `extension/extension-ci-tools` submodule (pinned separately at the
+  # canonical `duckdb/extension-ci-tools@16d89a59...`, see
+  # extension/BUILD_PINS.toml) — it only affects the reusable workflow's own
+  # internal manylinux Docker build legs. It is a single commit on top of a
+  # v1.5.x `duckdb/extension-ci-tools` tag that disables EPEL 8 in the
+  # manylinux_2_28 Dockerfiles, needed because upstream EPEL 8 went EOL.
+  # Tracked upstream as duckdb/extension-ci-tools#374 / PR #375 — once that
+  # lands and is backported to a v1.5.x tag, drop this override and
+  # `ci_tools_version` back to the upstream tag.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (DuckDB ${{ needs.setup.outputs.duckdb_version }})
+    needs: setup
+    uses: lastrk/extension-ci-tools/.github/workflows/_extension_distribution.yml@bebb406d50413c4f4a55a44d9316a69b9d1a0018
+    with:
+      duckdb_version: ${{ needs.setup.outputs.duckdb_version }}
+      ci_tools_version: bebb406d50413c4f4a55a44d9316a69b9d1a0018
+      override_ci_tools_repository: lastrk/extension-ci-tools
+      extension_name: thdck_spark_funcs
+      # This string mirrors the pre-migration release.yml verbatim. It names
+      # linux_amd64_musl but NOT linux_arm64_musl (absent from the fork's
+      # matrix at bebb406d); if a ci-tools bump reintroduces that leg, it
+      # would build a 5th artifact that `collect` silently ignores — add it
+      # here when bumping.
+      exclude_archs: 'linux_amd64_musl;windows_amd64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
+  # ---------------------------------------------------------------------------
+  # Collect the 4 artifacts, adopt them in-tree, and open a reviewable PR
+  # (never push directly — a checked-in binary change always goes through
+  # review).
+  # ---------------------------------------------------------------------------
+  collect:
+    name: Collect artifacts + open PR
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      DUCKDB_VERSION: ${{ needs.setup.outputs.duckdb_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: thdck_spark_funcs-${{ env.DUCKDB_VERSION }}-extension-*
+          path: artifacts
+
+      - name: Arrange binaries for adopt-extension-release.sh --from-local
+        run: |
+          set -euo pipefail
+          mkdir -p local-adopt
+          for dir in artifacts/thdck_spark_funcs-*; do
+            arch="$(basename "$dir" | sed "s/^thdck_spark_funcs-${DUCKDB_VERSION}-extension-//")"
+            cp "$dir/thdck_spark_funcs.duckdb_extension" \
+               "local-adopt/thdck_spark_funcs-${DUCKDB_VERSION}-${arch}.duckdb_extension"
+          done
+          ls -la local-adopt/
+
+      - name: Adopt (regenerate extensions/vendored/MANIFEST.toml)
+        env:
+          BUILT_BY: "github-actions[bot] via ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: scripts/dev/adopt-extension-release.sh --from-local "$PWD/local-adopt"
+
+      - name: Open PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --cached --quiet -- extensions/vendored; then
+            echo "No change to extensions/vendored — nothing to adopt (binaries byte-identical to what's already vendored)."
+            exit 0
+          fi
+
+          BRANCH="extension-release/${DUCKDB_VERSION}-${GITHUB_RUN_ID}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          git checkout -b "$BRANCH"
+          git commit -m "chore(extension): adopt ${DUCKDB_VERSION} build from extension/ @ ${GITHUB_SHA}" \
+            -m "Built by workflow run ${RUN_URL}."
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --base "$BASE_REF" \
+            --head "$BRANCH" \
+            --title "chore(extension): adopt ${DUCKDB_VERSION} vendored binaries" \
+            --body "Automated in-tree extension build (\`.github/workflows/extension-release.yml\`, run ${RUN_URL}). Rebuilds \`extension/\` (source imported from \`nubank/thunderduck-duckdb-extension\`, see \`extension/README.md\`) for all 4 shipped platforms at DuckDB \`${DUCKDB_VERSION}\` and regenerates \`extensions/vendored/MANIFEST.toml\` with the in-tree \`[source]\` block. Review the diff against the previous vendored set before merging."

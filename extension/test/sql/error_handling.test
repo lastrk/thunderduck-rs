@@ -1,0 +1,57 @@
+# name: test/sql/error_handling.test
+# description: Error handling for invalid inputs
+# group: [sql]
+
+require thdck_spark_funcs
+
+# INTEGER arguments are implicitly cast to DECIMAL by DuckDB
+statement ok
+SELECT spark_decimal_div(1, 2);
+
+# VARCHAR arguments should produce an error
+statement error
+SELECT spark_decimal_div('10.5', '3.0');
+----
+spark_decimal_div requires DECIMAL arguments
+
+# DOUBLE arguments should produce an error
+statement error
+SELECT spark_decimal_div(10.5::DOUBLE, 3.0::DOUBLE);
+----
+spark_decimal_div requires DECIMAL arguments
+
+# FLOAT arguments should produce an error
+statement error
+SELECT spark_decimal_div(10.5::FLOAT, 3.0::FLOAT);
+----
+spark_decimal_div requires DECIMAL arguments
+
+# BIGINT arguments are implicitly cast to DECIMAL by DuckDB
+statement ok
+SELECT spark_decimal_div(100::BIGINT, 3::BIGINT);
+
+# Mixed: first arg DECIMAL, second INTEGER - INTEGER is implicitly cast
+statement ok
+SELECT spark_decimal_div(10.00::DECIMAL(4,2), 3);
+
+# Mixed: first arg INTEGER, second DECIMAL - INTEGER is implicitly cast
+statement ok
+SELECT spark_decimal_div(10, 3.00::DECIMAL(4,2));
+
+# Mixed: DECIMAL and DOUBLE
+statement error
+SELECT spark_decimal_div(10.00::DECIMAL(4,2), 3.0::DOUBLE);
+----
+spark_decimal_div requires DECIMAL arguments
+
+# Mixed: DECIMAL and VARCHAR
+statement error
+SELECT spark_decimal_div(10.00::DECIMAL(4,2), '3.0');
+----
+spark_decimal_div requires DECIMAL arguments
+
+# BOOLEAN arguments should produce an error
+statement error
+SELECT spark_decimal_div(true, false);
+----
+spark_decimal_div requires DECIMAL arguments

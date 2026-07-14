@@ -1,0 +1,50 @@
+# name: test/sql/spark_try_sum.test
+# description: spark_try_sum parity vs Apache Spark 4.1.1. Corpus: agg2-004.
+# group: [sql]
+
+# Oracle: test/spark_oracle/try_funcs.spark.sql (Spark 4.1.1):
+#   try_sum(1,2,3 :: bigint)=6 (BIGINT), try_sum(bigint_max,bigint_max)=NULL (overflow),
+#   try_sum(1.5,2.5 dec(3,1))=4.0 DECIMAL(13,1).
+
+require thdck_spark_funcs
+
+# normal integer sum -> BIGINT
+query I
+SELECT spark_try_sum(v) FROM (VALUES (1::BIGINT),(2),(3)) t(v);
+----
+6
+
+# overflow (two BIGINT max) -> NULL  (native SUM would widen to HUGEINT; Spark returns NULL)
+query I
+SELECT spark_try_sum(v) FROM (VALUES (9223372036854775807::BIGINT),(9223372036854775807::BIGINT)) t(v);
+----
+NULL
+
+# NULLs skipped
+query I
+SELECT spark_try_sum(v) FROM (VALUES (1::BIGINT),(NULL),(2)) t(v);
+----
+3
+
+# empty group -> NULL
+query I
+SELECT spark_try_sum(v) FROM (VALUES (1::BIGINT)) t(v) WHERE v > 100;
+----
+NULL
+
+# return type BIGINT for integer input
+query T
+SELECT typeof(spark_try_sum(v)) FROM (VALUES (1::BIGINT)) t(v);
+----
+BIGINT
+
+# DECIMAL sum -> DECIMAL(min(p+10,38), s)
+query I
+SELECT spark_try_sum(v) FROM (VALUES (1.5::DECIMAL(3,1)),(2.5::DECIMAL(3,1))) t(v);
+----
+4.0
+
+query T
+SELECT typeof(spark_try_sum(v)) FROM (VALUES (1.5::DECIMAL(3,1))) t(v);
+----
+DECIMAL(13,1)

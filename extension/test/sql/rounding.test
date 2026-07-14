@@ -1,0 +1,58 @@
+# name: test/sql/rounding.test
+# description: Verify ROUND_HALF_UP rounding behavior
+# group: [sql]
+
+require thdck_spark_funcs
+
+# 2/3 rounds up: 0.666666... -> 0.666667
+# remainder=2, 2*2=4 >= 3 -> round up
+query I
+SELECT spark_decimal_div(2.0::DECIMAL(2,1), 3.0::DECIMAL(2,1));
+----
+0.666667
+
+# 1/3 does NOT round: 0.333333... -> 0.333333
+# remainder=1, 2*1=2 < 3 -> no rounding
+query I
+SELECT spark_decimal_div(1.0::DECIMAL(2,1), 3.0::DECIMAL(2,1));
+----
+0.333333
+
+# 1/6 rounds up: 0.166666... -> 0.166667
+# remainder=40, 2*40=80 >= 60 -> round up
+query I
+SELECT spark_decimal_div(1.0::DECIMAL(2,1), 6.0::DECIMAL(2,1));
+----
+0.166667
+
+# 5/3 rounds up: 1.666666... -> 1.666667
+query I
+SELECT spark_decimal_div(5.0::DECIMAL(2,1), 3.0::DECIMAL(2,1));
+----
+1.666667
+
+# Exact division does not round: 1/2 = 0.500000
+query I
+SELECT spark_decimal_div(1.0::DECIMAL(2,1), 2.0::DECIMAL(2,1));
+----
+0.500000
+
+# Negative ROUND_HALF_UP: rounds away from zero
+# -2/3 = -0.666666... -> -0.666667
+query I
+SELECT spark_decimal_div(-2.0::DECIMAL(2,1), 3.0::DECIMAL(2,1));
+----
+-0.666667
+
+# Negative exact: -1/2 = -0.500000
+query I
+SELECT spark_decimal_div(-1.0::DECIMAL(2,1), 2.0::DECIMAL(2,1));
+----
+-0.500000
+
+# 5/6 rounds up: 0.833333... -> 0.833333
+# remainder=20, 2*20=40 < 60 -> no rounding
+query I
+SELECT spark_decimal_div(5.0::DECIMAL(2,1), 6.0::DECIMAL(2,1));
+----
+0.833333

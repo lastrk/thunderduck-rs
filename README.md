@@ -186,15 +186,21 @@ cargo build -p thunderduck-connect-server
 cargo check
 ```
 
-All 4 platform binaries of the adopted `thdck_spark_funcs` release (currently the
-[`ext6` release](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext6),
-`v1.5.4` set, matching the `duckdb` crate at `1.10504.0`) are vendored — checked
-into git plain under `extensions/vendored/` (see `extensions/vendored/MANIFEST.toml`).
-`build.rs` picks the binary matching the current platform at build time — no
-network access, no download. Adopting a new release (only on `duckdb` crate
-bumps) is done via `scripts/dev/adopt-extension-release.sh`. The extension is
-embedded directly in the binary via `include_bytes!()` and loaded at every
-session's startup.
+All 4 platform binaries of the adopted `thdck_spark_funcs` release (currently
+the `ext6` set, `v1.5.4`, matching the `duckdb` crate at `1.10504.0`) are
+vendored — checked into git plain under `extensions/vendored/` (see
+`extensions/vendored/MANIFEST.toml`). `build.rs` picks the binary matching the
+current platform at build time — no network access, no download. Adopting a
+new release (only on `duckdb` crate bumps) is done via
+`scripts/dev/adopt-extension-release.sh`. The extension is embedded directly
+in the binary via `include_bytes!()` and loaded at every session's startup.
+
+The extension's C++ source now lives in-tree at [`extension/`](extension/)
+(imported from `nubank/thunderduck-duckdb-extension`, now archived — see
+`extension/README.md`'s Provenance section and
+`docs/context/extension-archival-checklist.md`). Local dev builds use
+`scripts/dev/build-extension.sh`; producing new vendored binaries is a
+`workflow_dispatch`-only CI job, `.github/workflows/extension-release.yml`.
 
 ### Start the Server
 

@@ -1,0 +1,41 @@
+# extension/BUILD_PINS.toml
+#
+# Single source of truth for the extension's build-time version pins.
+# scripts/dev/build-extension.sh reads this file (not the other way around)
+# to assert the three-way lock before building:
+#
+#   extension/duckdb submodule checked-out tag
+#     == [duckdb].version below
+#     == the DuckDB version encoded in the `duckdb` crate version pin in the
+#        workspace Cargo.toml (see docs/context/gotchas.md #6 and
+#        docs/context/dependencies.md → Version Pinning)
+#
+# This file is also the input read by .github/workflows/extension-release.yml
+# to pick the single DuckDB version the release matrix builds against — see
+# amendment A1/A2: local dev builds and the CI release matrix both build for
+# exactly ONE DuckDB version, never a multiversion matrix.
+
+[duckdb]
+version = "v1.5.4"
+sha = "08e34c447bae34eaee3723cac61f2878b6bdf787"
+
+[extension_ci_tools]
+# Canonical duckdb/extension-ci-tools, pinned by SHA — this is what the
+# `extension-ci-tools` submodule under extension/ is checked out at.
+sha = "16d89a59ee14904a62383e83c300432b19d29abc"
+# The lastrk fork appears ONLY as the release workflow's
+# `override_ci_tools_repository` input for the manylinux build legs — a
+# single commit on top of a v1.5.x extension-ci-tools tag that disables
+# EPEL 8 in the manylinux_2_28 Dockerfiles. Tracked upstream as
+# duckdb/extension-ci-tools#374 / PR #375: once that lands and is backported
+# to a v1.5.x tag, drop `ci_override` and `override_ci_tools_repository` from
+# the workflow, and point the submodule pin above at the new tag.
+ci_override = "lastrk/extension-ci-tools@bebb406d50413c4f4a55a44d9316a69b9d1a0018"
+
+[provenance]
+# Both archived post-migration; see extension/README.md PROVENANCE section
+# and docs/context/extension-archival-checklist.md for the full record.
+source_repo = "nubank/thunderduck-duckdb-extension"
+source_mirror = "lastrk/thunderduck-duckdb-extension"
+imported_at = "33e8d49"
+vendored_binaries_built_at = "20616b3"

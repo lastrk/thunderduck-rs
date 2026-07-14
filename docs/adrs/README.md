@@ -52,7 +52,7 @@ Authoritative decisions; one line each. Full text (with `Depends on` / `Depended
 | **007** | `τ` layers **A (annotate) / B (tree-rewrite) / C (escape hatch)**; B is retained but minimal (expressibility-forced + SQL desugarings + carve-outs). |
 | **008** | **Correlated subqueries emitted directly** as DuckDB correlated subqueries — no rewrite to lateral. |
 | **009** | The **emission table is declarative data**, keyed on `(op, operand types, mode, nullability)` — simultaneously the input grammar and the coverage denominator. **Compiled dispatch**. |
-| **010** | **Extension functions** (in the C++ `thunderduck-duckdb-extension` project) are a *minimal gap-filler* for value/return-type divergences DuckDB can't match natively. |
+| **010** | **Extension functions** (in the C++ `thunderduck-duckdb-extension` project, now in-tree at [`extension/`](../../extension/)) are a *minimal gap-filler* for value/return-type divergences DuckDB can't match natively. |
 | **011** | The Spark Connect **`Command` arm** is in scope as a separate `emit_command` path; its oracle is **catalog/table state**, not result rows. |
 | **012** | A **narrow catalog overlay** carries Spark types of base relations (+ access provenance/format); commands write it, resolution reads it. |
 | **013** | **External / lakehouse reads** (Hive-Parquet, Delta, Iceberg, Unity Catalog) delegate to DuckDB storage extensions; **read-only** this iteration. |

@@ -62,12 +62,13 @@ CLAUDE.md holds only policy and process. Everything factual lives in the docs be
 - [`build-and-commands.md`](docs/context/build-and-commands.md) — build / check / run / server commands and DuckDB linkage (bundled vs prebuilt).
 - [`testing.md`](docs/context/testing.md) — unit + differential test commands, corpus mechanics, TPC clusters, per-worktree isolation, key data paths.
 - [`coding-standards.md`](docs/context/coding-standards.md) — Rust hygiene gates, core stack, code style, commit rule.
-- [`dependencies.md`](docs/context/dependencies.md) — the mandatory `thdck_spark_funcs` extension, version pins, Spark Connect config.
+- [`dependencies.md`](docs/context/dependencies.md) — the mandatory `thdck_spark_funcs` extension (in-tree C++ source at `extension/`, vendored binaries at `extensions/vendored/`, local builds via `scripts/dev/build-extension.sh`), version pins, Spark Connect config.
 - [`code-search-tools.md`](docs/context/code-search-tools.md) — **READ THIS ALWAYS** for token-efficient, super-fast and accurate code exploration, code search, code lookup methods using tools other than grep.
 - [`spark-parity-lookup.md`](docs/context/spark-parity-lookup.md) — how to consult Apache Spark 4.1.1 source as the authoritative parity spec.
 - [`delta-cross-repo-dev-loop.md`](docs/context/delta-cross-repo-dev-loop.md) — Delta read/write dev loop across thunderduck ⇄ duckdb-delta ⇄ delta-kernel-rs.
 
 **Other**
+- [`extension/CLAUDE.md`](extension/CLAUDE.md) — the in-tree `thdck_spark_funcs` DuckDB extension's own rules (C++11 conventions, quality gate, Spark-parity contract). **Read before touching anything under `extension/`.** Archival of the origin repos: [`docs/context/extension-archival-checklist.md`](docs/context/extension-archival-checklist.md).
 - [`docs/dev-journal-toc.md`](docs/dev-journal-toc.md) + [`docs/dev_journal/`](docs/dev_journal/) — chronological development history.
 - [`docs/dev-cheatsheets/`](docs/dev-cheatsheets/) — portable Rust technique libraries (debugging, implementation, review, perf, architecture), loaded by the language-specialized subagents.
 - [`tasks/`](tasks/) — active work items and `lessons.md`; retired plans under `tasks/archive/`.

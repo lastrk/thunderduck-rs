@@ -1,0 +1,42 @@
+{
+ "id": "math-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "p",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "h",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   0.0,
+   1.0
+  ],
+  [
+   16.0,
+   {
+    "$f": "nan"
+   }
+  ],
+  [
+   4.0,
+   4.031128874149275
+  ],
+  [
+   null,
+   null
+  ]
+ ]
+}

@@ -1,0 +1,56 @@
+{
+ "id": "cx-004",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "lat",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Berlin",
+   52.52
+  ],
+  [
+   "Munich",
+   48.14
+  ],
+  [
+   "Vienna",
+   48.2
+  ],
+  [
+   "Vienna",
+   48.21
+  ],
+  [
+   "Vienna",
+   48.22
+  ],
+  [
+   "Zurich",
+   47.37
+  ],
+  [
+   null,
+   null
+  ],
+  [
+   null,
+   null
+  ]
+ ]
+}

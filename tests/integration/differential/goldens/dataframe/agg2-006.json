@@ -1,0 +1,50 @@
+{
+ "id": "agg2-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "n_high",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "avg_active_sal",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   2,
+   107500.0
+  ],
+  [
+   20,
+   0,
+   64000.0
+  ],
+  [
+   30,
+   1,
+   72000.0
+  ],
+  [
+   null,
+   1,
+   119000.0
+  ]
+ ]
+}

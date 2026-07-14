@@ -1,0 +1,141 @@
+{
+ "id": "ord-011",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "manager_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "age",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "salary",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "bonus",
+    "type": "decimal(9,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "hire_date",
+    "type": "date",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "last_login",
+    "type": "timestamp",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "active",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "score",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "tags",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "attrs",
+    "type": {
+     "type": "map",
+     "keyType": "string",
+     "valueType": "string",
+     "valueContainsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "address",
+    "type": {
+     "type": "struct",
+     "fields": [
+      {
+       "name": "city",
+       "type": "string",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "zip",
+       "type": "string",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "geo",
+       "type": {
+        "type": "struct",
+        "fields": [
+         {
+          "name": "lat",
+          "type": "double",
+          "nullable": true,
+          "metadata": {}
+         },
+         {
+          "name": "lng",
+          "type": "double",
+          "nullable": true,
+          "metadata": {}
+         }
+        ]
+       },
+       "nullable": true,
+       "metadata": {}
+      }
+     ]
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

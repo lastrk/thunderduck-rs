@@ -1,0 +1,78 @@
+{
+ "id": "intv-005",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "zero_iv",
+    "type": "interval day to second",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   {
+    "$td": [
+     0,
+     0,
+     0
+    ]
+   }
+  ],
+  [
+   {
+    "$td": [
+     0,
+     0,
+     0
+    ]
+   }
+  ],
+  [
+   {
+    "$td": [
+     0,
+     0,
+     0
+    ]
+   }
+  ],
+  [
+   {
+    "$td": [
+     0,
+     0,
+     0
+    ]
+   }
+  ],
+  [
+   {
+    "$td": [
+     0,
+     0,
+     0
+    ]
+   }
+  ],
+  [
+   {
+    "$td": [
+     0,
+     0,
+     0
+    ]
+   }
+  ]
+ ]
+}

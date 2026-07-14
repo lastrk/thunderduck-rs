@@ -1,0 +1,40 @@
+{
+ "id": "sq-017",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "top_sal",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Data",
+   78000.0
+  ],
+  [
+   "Infrastructure",
+   120000.0
+  ],
+  [
+   "ML",
+   105000.0
+  ],
+  [
+   "Security",
+   null
+  ]
+ ]
+}

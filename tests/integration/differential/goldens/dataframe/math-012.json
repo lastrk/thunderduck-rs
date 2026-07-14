@@ -1,0 +1,40 @@
+{
+ "id": "math-012",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "and",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "shl",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   0,
+   40
+  ],
+  [
+   2,
+   28
+  ],
+  [
+   5,
+   -12
+  ],
+  [
+   null,
+   0
+  ]
+ ]
+}

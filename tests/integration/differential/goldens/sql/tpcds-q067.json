@@ -1,0 +1,1472 @@
+{
+ "id": "tpcds-q067",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_category",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_class",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_brand",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_product_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d_year",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d_qoy",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d_moy",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_store_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sumsales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "rk",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Books",
+   "arts",
+   "amalgmaxi #12",
+   "antipri",
+   2000,
+   3,
+   9,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "30406.69"
+   },
+   70
+  ],
+  [
+   "Books",
+   "arts",
+   "amalgmaxi #12",
+   "antipri",
+   2000,
+   3,
+   9,
+   null,
+   {
+    "$dec": "30406.69"
+   },
+   70
+  ],
+  [
+   "Books",
+   "arts",
+   "amalgmaxi #12",
+   "antipri",
+   2000,
+   3,
+   null,
+   null,
+   {
+    "$dec": "45532.09"
+   },
+   53
+  ],
+  [
+   "Books",
+   "arts",
+   "amalgmaxi #12",
+   "antipri",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "35160.83"
+   },
+   64
+  ],
+  [
+   "Books",
+   "arts",
+   "amalgmaxi #12",
+   "antipri",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "99269.78"
+   },
+   23
+  ],
+  [
+   "Books",
+   "arts",
+   "amalgmaxi #12",
+   "antipri",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "99269.78"
+   },
+   23
+  ],
+  [
+   "Books",
+   "arts",
+   "amalgmaxi #12",
+   "ationbarought",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "35996.36"
+   },
+   63
+  ],
+  [
+   "Books",
+   "arts",
+   "amalgmaxi #12",
+   "ationbarought",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "81807.48"
+   },
+   40
+  ],
+  [
+   "Books",
+   "arts",
+   "amalgmaxi #12",
+   "ationbarought",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "81807.48"
+   },
+   40
+  ],
+  [
+   "Books",
+   "arts",
+   "amalgmaxi #12",
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "181077.26"
+   },
+   6
+  ],
+  [
+   "Books",
+   "arts",
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "181077.26"
+   },
+   6
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #2",
+   "ationn st",
+   2000,
+   3,
+   null,
+   null,
+   {
+    "$dec": "26403.92"
+   },
+   80
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #2",
+   "ationn st",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "38755.87"
+   },
+   59
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #2",
+   "ationn st",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "86750.10"
+   },
+   33
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #2",
+   "ationn st",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "86750.10"
+   },
+   33
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #2",
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "86750.10"
+   },
+   33
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "ationcally",
+   2000,
+   3,
+   8,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "27943.24"
+   },
+   78
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "ationcally",
+   2000,
+   3,
+   8,
+   null,
+   {
+    "$dec": "27943.24"
+   },
+   78
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "ationcally",
+   2000,
+   3,
+   null,
+   null,
+   {
+    "$dec": "52463.45"
+   },
+   49
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "ationcally",
+   2000,
+   4,
+   11,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "23613.62"
+   },
+   86
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "ationcally",
+   2000,
+   4,
+   11,
+   null,
+   {
+    "$dec": "23613.62"
+   },
+   86
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "ationcally",
+   2000,
+   4,
+   12,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "29979.68"
+   },
+   72
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "ationcally",
+   2000,
+   4,
+   12,
+   null,
+   {
+    "$dec": "29979.68"
+   },
+   72
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "ationcally",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "70459.19"
+   },
+   47
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "ationcally",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "141107.13"
+   },
+   8
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "ationcally",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "141107.13"
+   },
+   8
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "n stpriought",
+   2000,
+   4,
+   12,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "31580.58"
+   },
+   68
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "n stpriought",
+   2000,
+   4,
+   12,
+   null,
+   {
+    "$dec": "31580.58"
+   },
+   68
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "n stpriought",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "52119.42"
+   },
+   50
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "n stpriought",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "103661.95"
+   },
+   21
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   "n stpriought",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "103661.95"
+   },
+   21
+  ],
+  [
+   "Books",
+   "fiction",
+   "scholarunivamalg #8",
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "244769.08"
+   },
+   4
+  ],
+  [
+   "Books",
+   "fiction",
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "331519.18"
+   },
+   2
+  ],
+  [
+   "Books",
+   "mystery",
+   "corpunivamalg #9",
+   "esebarought",
+   2000,
+   3,
+   9,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "24051.70"
+   },
+   84
+  ],
+  [
+   "Books",
+   "mystery",
+   "corpunivamalg #9",
+   "esebarought",
+   2000,
+   3,
+   9,
+   null,
+   {
+    "$dec": "24051.70"
+   },
+   84
+  ],
+  [
+   "Books",
+   "mystery",
+   "corpunivamalg #9",
+   "esebarought",
+   2000,
+   3,
+   null,
+   null,
+   {
+    "$dec": "32528.20"
+   },
+   67
+  ],
+  [
+   "Books",
+   "mystery",
+   "corpunivamalg #9",
+   "esebarought",
+   2000,
+   4,
+   11,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "29458.37"
+   },
+   74
+  ],
+  [
+   "Books",
+   "mystery",
+   "corpunivamalg #9",
+   "esebarought",
+   2000,
+   4,
+   11,
+   null,
+   {
+    "$dec": "29458.37"
+   },
+   74
+  ],
+  [
+   "Books",
+   "mystery",
+   "corpunivamalg #9",
+   "esebarought",
+   2000,
+   4,
+   12,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "25723.92"
+   },
+   81
+  ],
+  [
+   "Books",
+   "mystery",
+   "corpunivamalg #9",
+   "esebarought",
+   2000,
+   4,
+   12,
+   null,
+   {
+    "$dec": "25723.92"
+   },
+   81
+  ],
+  [
+   "Books",
+   "mystery",
+   "corpunivamalg #9",
+   "esebarought",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "69365.81"
+   },
+   48
+  ],
+  [
+   "Books",
+   "mystery",
+   "corpunivamalg #9",
+   "esebarought",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "120430.08"
+   },
+   17
+  ],
+  [
+   "Books",
+   "mystery",
+   "corpunivamalg #9",
+   "esebarought",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "120430.08"
+   },
+   17
+  ],
+  [
+   "Books",
+   "mystery",
+   "corpunivamalg #9",
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "120430.08"
+   },
+   17
+  ],
+  [
+   "Books",
+   "mystery",
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "120430.08"
+   },
+   17
+  ],
+  [
+   "Books",
+   "parenting",
+   "corpmaxi #3",
+   "ableableought",
+   2000,
+   1,
+   null,
+   null,
+   {
+    "$dec": "22053.04"
+   },
+   92
+  ],
+  [
+   "Books",
+   "parenting",
+   "corpmaxi #3",
+   "ableableought",
+   2000,
+   2,
+   null,
+   null,
+   {
+    "$dec": "22043.98"
+   },
+   93
+  ],
+  [
+   "Books",
+   "parenting",
+   "corpmaxi #3",
+   "ableableought",
+   2000,
+   3,
+   9,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "34100.46"
+   },
+   65
+  ],
+  [
+   "Books",
+   "parenting",
+   "corpmaxi #3",
+   "ableableought",
+   2000,
+   3,
+   9,
+   null,
+   {
+    "$dec": "34100.46"
+   },
+   65
+  ],
+  [
+   "Books",
+   "parenting",
+   "corpmaxi #3",
+   "ableableought",
+   2000,
+   3,
+   null,
+   null,
+   {
+    "$dec": "45313.75"
+   },
+   54
+  ],
+  [
+   "Books",
+   "parenting",
+   "corpmaxi #3",
+   "ableableought",
+   2000,
+   4,
+   10,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "21690.97"
+   },
+   94
+  ],
+  [
+   "Books",
+   "parenting",
+   "corpmaxi #3",
+   "ableableought",
+   2000,
+   4,
+   10,
+   null,
+   {
+    "$dec": "21690.97"
+   },
+   94
+  ],
+  [
+   "Books",
+   "parenting",
+   "corpmaxi #3",
+   "ableableought",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "46423.28"
+   },
+   52
+  ],
+  [
+   "Books",
+   "parenting",
+   "corpmaxi #3",
+   "ableableought",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "135834.05"
+   },
+   10
+  ],
+  [
+   "Books",
+   "parenting",
+   "corpmaxi #3",
+   "ableableought",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "135834.05"
+   },
+   10
+  ],
+  [
+   "Books",
+   "parenting",
+   "corpmaxi #3",
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "135834.05"
+   },
+   10
+  ],
+  [
+   "Books",
+   "parenting",
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "135834.05"
+   },
+   10
+  ],
+  [
+   "Books",
+   "reference",
+   "brandmaxi #2",
+   "ationantiought",
+   2000,
+   3,
+   null,
+   null,
+   {
+    "$dec": "22193.14"
+   },
+   91
+  ],
+  [
+   "Books",
+   "reference",
+   "brandmaxi #2",
+   "ationantiought",
+   2000,
+   4,
+   11,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "22351.65"
+   },
+   89
+  ],
+  [
+   "Books",
+   "reference",
+   "brandmaxi #2",
+   "ationantiought",
+   2000,
+   4,
+   11,
+   null,
+   {
+    "$dec": "22351.65"
+   },
+   89
+  ],
+  [
+   "Books",
+   "reference",
+   "brandmaxi #2",
+   "ationantiought",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "37004.33"
+   },
+   60
+  ],
+  [
+   "Books",
+   "reference",
+   "brandmaxi #2",
+   "ationantiought",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "82421.58"
+   },
+   36
+  ],
+  [
+   "Books",
+   "reference",
+   "brandmaxi #2",
+   "ationantiought",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "82421.58"
+   },
+   36
+  ],
+  [
+   "Books",
+   "reference",
+   "brandmaxi #2",
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "82421.58"
+   },
+   36
+  ],
+  [
+   "Books",
+   "reference",
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "82421.58"
+   },
+   36
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #2",
+   "antieseought",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "47127.60"
+   },
+   51
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #2",
+   "antieseought",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "88672.96"
+   },
+   31
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #2",
+   "antieseought",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "88672.96"
+   },
+   31
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #2",
+   "oughtableought",
+   2000,
+   3,
+   null,
+   null,
+   {
+    "$dec": "40117.11"
+   },
+   56
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #2",
+   "oughtableought",
+   2000,
+   4,
+   11,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "20694.18"
+   },
+   96
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #2",
+   "oughtableought",
+   2000,
+   4,
+   11,
+   null,
+   {
+    "$dec": "20694.18"
+   },
+   96
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #2",
+   "oughtableought",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "42931.82"
+   },
+   55
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #2",
+   "oughtableought",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "94326.72"
+   },
+   29
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #2",
+   "oughtableought",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "94326.72"
+   },
+   29
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #2",
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "182999.68"
+   },
+   5
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #6",
+   "ationpriought",
+   2000,
+   1,
+   null,
+   null,
+   {
+    "$dec": "25333.30"
+   },
+   83
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #6",
+   "ationpriought",
+   2000,
+   4,
+   11,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "39105.68"
+   },
+   57
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #6",
+   "ationpriought",
+   2000,
+   4,
+   11,
+   null,
+   {
+    "$dec": "39105.68"
+   },
+   57
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #6",
+   "ationpriought",
+   2000,
+   4,
+   12,
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "28132.89"
+   },
+   76
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #6",
+   "ationpriought",
+   2000,
+   4,
+   12,
+   null,
+   {
+    "$dec": "28132.89"
+   },
+   76
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #6",
+   "ationpriought",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "76901.06"
+   },
+   46
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #6",
+   "ationpriought",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "128964.69"
+   },
+   14
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #6",
+   "ationpriought",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "128964.69"
+   },
+   14
+  ],
+  [
+   "Books",
+   "self-help",
+   "exportiunivamalg #6",
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "128964.69"
+   },
+   14
+  ],
+  [
+   "Books",
+   "self-help",
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "311964.37"
+   },
+   3
+  ],
+  [
+   "Books",
+   "sports",
+   "edu packunivamalg #12",
+   "oughtation",
+   2000,
+   2,
+   null,
+   null,
+   {
+    "$dec": "22998.13"
+   },
+   88
+  ],
+  [
+   "Books",
+   "sports",
+   "edu packunivamalg #12",
+   "oughtation",
+   2000,
+   3,
+   null,
+   null,
+   {
+    "$dec": "36241.67"
+   },
+   62
+  ],
+  [
+   "Books",
+   "sports",
+   "edu packunivamalg #12",
+   "oughtation",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "20440.68"
+   },
+   98
+  ],
+  [
+   "Books",
+   "sports",
+   "edu packunivamalg #12",
+   "oughtation",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "98703.81"
+   },
+   25
+  ],
+  [
+   "Books",
+   "sports",
+   "edu packunivamalg #12",
+   "oughtation",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "98703.81"
+   },
+   25
+  ],
+  [
+   "Books",
+   "sports",
+   "edu packunivamalg #12",
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "98703.81"
+   },
+   25
+  ],
+  [
+   "Books",
+   "sports",
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "98703.81"
+   },
+   25
+  ],
+  [
+   "Books",
+   "travel",
+   "univunivamalg #8",
+   "priese",
+   2000,
+   4,
+   12,
+   null,
+   {
+    "$dec": "20160.11"
+   },
+   99
+  ],
+  [
+   "Books",
+   "travel",
+   "univunivamalg #8",
+   "priese",
+   2000,
+   4,
+   null,
+   null,
+   {
+    "$dec": "36542.64"
+   },
+   61
+  ],
+  [
+   "Books",
+   "travel",
+   "univunivamalg #8",
+   "priese",
+   2000,
+   null,
+   null,
+   null,
+   {
+    "$dec": "76990.88"
+   },
+   42
+  ],
+  [
+   "Books",
+   "travel",
+   "univunivamalg #8",
+   "priese",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "76990.88"
+   },
+   42
+  ],
+  [
+   "Books",
+   "travel",
+   "univunivamalg #8",
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "76990.88"
+   },
+   42
+  ],
+  [
+   "Books",
+   "travel",
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "76990.88"
+   },
+   42
+  ],
+  [
+   "Books",
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "1338941.21"
+   },
+   1
+  ],
+  [
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "10466637.34"
+   },
+   1
+  ]
+ ]
+}

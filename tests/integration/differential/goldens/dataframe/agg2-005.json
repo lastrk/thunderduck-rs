@@ -1,0 +1,36 @@
+{
+ "id": "agg2-005",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "hist",
+    "type": {
+     "type": "array",
+     "elementType": {
+      "type": "struct",
+      "fields": [
+       {
+        "name": "x",
+        "type": "double",
+        "nullable": true,
+        "metadata": {}
+       },
+       {
+        "name": "y",
+        "type": "double",
+        "nullable": true,
+        "metadata": {}
+       }
+      ]
+     },
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

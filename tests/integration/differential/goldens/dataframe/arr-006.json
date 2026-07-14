@@ -1,0 +1,56 @@
+{
+ "id": "arr-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "mx",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "mn",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "java",
+   "java"
+  ],
+  [
+   "python",
+   "python"
+  ],
+  [
+   "rust",
+   "c"
+  ],
+  [
+   "rust",
+   "python"
+  ],
+  [
+   "scala",
+   "scala"
+  ],
+  [
+   null,
+   null
+  ],
+  [
+   null,
+   null
+  ],
+  [
+   null,
+   null
+  ]
+ ]
+}

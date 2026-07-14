@@ -1,0 +1,75 @@
+{
+ "id": "cx-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "ks",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "team",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null,
+   null
+  ],
+  [
+   [
+    "team",
+    "tz"
+   ],
+   "data"
+  ],
+  [
+   [
+    "team",
+    "tz"
+   ],
+   "infra"
+  ],
+  [
+   [
+    "team",
+    "tz"
+   ],
+   "ml"
+  ],
+  [
+   [
+    "team"
+   ],
+   "infra"
+  ],
+  [
+   [
+    "team"
+   ],
+   "ml"
+  ],
+  [
+   [
+    "team"
+   ],
+   null
+  ],
+  [
+   [],
+   null
+  ]
+ ]
+}

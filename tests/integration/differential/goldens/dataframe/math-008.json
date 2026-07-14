@@ -1,0 +1,40 @@
+{
+ "id": "math-008",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "deg",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "rad",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   0.0,
+   0.0
+  ],
+  [
+   114.59155902616465,
+   0.03490658503988659
+  ],
+  [
+   229.1831180523293,
+   0.06981317007977318
+  ],
+  [
+   null,
+   null
+  ]
+ ]
+}

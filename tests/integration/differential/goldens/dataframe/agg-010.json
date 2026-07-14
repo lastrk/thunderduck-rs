@@ -1,0 +1,32 @@
+{
+ "id": "agg-010",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "f",
+    "type": "decimal(9,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "l",
+    "type": "decimal(9,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$dec": "1500.50"
+   },
+   {
+    "$dec": "9999.99"
+   }
+  ]
+ ]
+}

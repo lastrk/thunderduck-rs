@@ -1,0 +1,56 @@
+{
+ "id": "fn-009",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "r",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "f",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Al_c_",
+   "A"
+  ],
+  [
+   "B_b",
+   "B"
+  ],
+  [
+   "C_r_l",
+   "C"
+  ],
+  [
+   "D_n",
+   "D"
+  ],
+  [
+   "Ev_",
+   "E"
+  ],
+  [
+   "Fr_nk",
+   "F"
+  ],
+  [
+   "Gr_c_",
+   "G"
+  ],
+  [
+   "H__d_",
+   "H"
+  ]
+ ]
+}

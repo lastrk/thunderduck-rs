@@ -1,0 +1,34 @@
+{
+ "id": "num-026",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "aa",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "al",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ad1",
+    "type": "decimal(14,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ad2",
+    "type": "decimal(10,7)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

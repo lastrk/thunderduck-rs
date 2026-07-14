@@ -1,0 +1,54 @@
+{
+ "id": "cast-009",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "ll_d",
+    "type": "date",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   {
+    "$date": "2026-05-30"
+   }
+  ],
+  [
+   {
+    "$date": "2026-06-01"
+   }
+  ],
+  [
+   {
+    "$date": "2026-06-01"
+   }
+  ],
+  [
+   {
+    "$date": "2026-06-02"
+   }
+  ],
+  [
+   {
+    "$date": "2026-06-02"
+   }
+  ],
+  [
+   {
+    "$date": "2026-06-03"
+   }
+  ]
+ ]
+}

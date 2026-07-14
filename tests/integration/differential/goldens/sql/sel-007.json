@@ -1,0 +1,35 @@
+{
+ "id": "sel-007",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "one",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "s",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "b",
+    "type": "boolean",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "x",
+   true
+  ]
+ ]
+}

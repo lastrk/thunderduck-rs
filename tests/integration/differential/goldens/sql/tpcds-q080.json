@@ -1,0 +1,432 @@
+{
+ "id": "tpcds-q080",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "channel",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sales",
+    "type": "decimal(27,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "returns",
+    "type": "decimal(32,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "profit",
+    "type": "decimal(33,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAAHCBAAAA",
+   {
+    "$dec": "209.44"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-5017.32"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAABHABAAAA",
+   {
+    "$dec": "6152.40"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "972.90"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAABOPAAAAA",
+   {
+    "$dec": "3207.47"
+   },
+   {
+    "$dec": "537.44"
+   },
+   {
+    "$dec": "-2547.01"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAACNPAAAAA",
+   {
+    "$dec": "2220.63"
+   },
+   {
+    "$dec": "449.10"
+   },
+   {
+    "$dec": "-314.68"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAADMPAAAAA",
+   {
+    "$dec": "2103.75"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "869.85"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAEDABAAAA",
+   {
+    "$dec": "3383.12"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "1440.92"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAEFCBAAAA",
+   {
+    "$dec": "145.53"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-469.63"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAFGABAAAA",
+   {
+    "$dec": "643.20"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "62.10"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAFMPAAAAA",
+   {
+    "$dec": "6528.00"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "2559.36"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAGPPAAAAA",
+   {
+    "$dec": "991.12"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "551.98"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAHCCBAAAA",
+   {
+    "$dec": "162.11"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-2316.41"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAHLCBAAAA",
+   {
+    "$dec": "1105.96"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "423.12"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAJCABAAAA",
+   {
+    "$dec": "4730.40"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "2270.16"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAJPPAAAAA",
+   {
+    "$dec": "859.86"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-340.43"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAKGABAAAA",
+   {
+    "$dec": "132.86"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-771.42"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAALAABAAAA",
+   {
+    "$dec": "23607.20"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "7647.00"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAALNPAAAAA",
+   {
+    "$dec": "1694.20"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-842.54"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAMCABAAAA",
+   {
+    "$dec": "1377.36"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-379.92"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAMOCBAAAA",
+   {
+    "$dec": "4168.42"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "1244.42"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAANAABAAAA",
+   {
+    "$dec": "323.52"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "107.56"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAANDCBAAAA",
+   {
+    "$dec": "749.74"
+   },
+   {
+    "$dec": "591.90"
+   },
+   {
+    "$dec": "-516.53"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAOOPAAAAA",
+   {
+    "$dec": "9870.26"
+   },
+   {
+    "$dec": "8495.92"
+   },
+   {
+    "$dec": "2139.86"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAOPPAAAAA",
+   {
+    "$dec": "2031.48"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "146.52"
+   }
+  ],
+  [
+   "catalog channel",
+   "catalog_pageAAAAAAAAPNCBAAAA",
+   {
+    "$dec": "454.68"
+   },
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "25.92"
+   }
+  ],
+  [
+   "catalog channel",
+   null,
+   {
+    "$dec": "76852.71"
+   },
+   {
+    "$dec": "10074.36"
+   },
+   {
+    "$dec": "6945.78"
+   }
+  ],
+  [
+   "store channel",
+   "storeAAAAAAAABAAAAAAA",
+   {
+    "$dec": "120739.34"
+   },
+   {
+    "$dec": "13753.88"
+   },
+   {
+    "$dec": "-61264.34"
+   }
+  ],
+  [
+   "store channel",
+   null,
+   {
+    "$dec": "120739.34"
+   },
+   {
+    "$dec": "13753.88"
+   },
+   {
+    "$dec": "-61264.34"
+   }
+  ],
+  [
+   "web channel",
+   "web_siteAAAAAAAABAAAAAAA",
+   {
+    "$dec": "25907.01"
+   },
+   {
+    "$dec": "1623.58"
+   },
+   {
+    "$dec": "-15085.56"
+   }
+  ],
+  [
+   "web channel",
+   null,
+   {
+    "$dec": "25907.01"
+   },
+   {
+    "$dec": "1623.58"
+   },
+   {
+    "$dec": "-15085.56"
+   }
+  ],
+  [
+   null,
+   null,
+   {
+    "$dec": "223499.06"
+   },
+   {
+    "$dec": "25451.82"
+   },
+   {
+    "$dec": "-69404.12"
+   }
+  ]
+ ]
+}

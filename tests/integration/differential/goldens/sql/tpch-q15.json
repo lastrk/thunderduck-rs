@@ -1,0 +1,51 @@
+{
+ "id": "tpch-q15",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "s_suppkey",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_address",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_phone",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "total_revenue",
+    "type": "decimal(38,4)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   21,
+   "Supplier#000000021",
+   "TZoQwNFFO i,baXpbpin02,hvuhE,GRVIKm ",
+   "12-253-590-5816",
+   {
+    "$dec": "1161099.4636"
+   }
+  ]
+ ]
+}

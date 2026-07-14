@@ -1,0 +1,23 @@
+{
+ "id": "parse-003b",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "n",
+    "type": "decimal(6,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$dec": "1234.56"
+   }
+  ]
+ ]
+}

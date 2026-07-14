@@ -1,0 +1,56 @@
+{
+ "id": "fn-011",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "si",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ad",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   105000,
+   45.0
+  ],
+  [
+   120000,
+   41.0
+  ],
+  [
+   150000,
+   60.0
+  ],
+  [
+   64000,
+   52.0
+  ],
+  [
+   72000,
+   27.0
+  ],
+  [
+   78000,
+   29.0
+  ],
+  [
+   88000,
+   38.0
+  ],
+  [
+   95000,
+   34.0
+  ]
+ ]
+}

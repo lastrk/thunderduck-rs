@@ -1,0 +1,84 @@
+{
+ "id": "chain-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "band",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "n",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "avg_comp",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Data",
+   "low",
+   1,
+   64500.0
+  ],
+  [
+   "Data",
+   "mid",
+   1,
+   78000.0
+  ],
+  [
+   "Infrastructure",
+   "high",
+   1,
+   123000.0
+  ],
+  [
+   "Infrastructure",
+   "mid",
+   1,
+   96500.5
+  ],
+  [
+   "ML",
+   "high",
+   1,
+   107200.0
+  ],
+  [
+   "ML",
+   "low",
+   1,
+   72000.0
+  ],
+  [
+   null,
+   "high",
+   1,
+   159999.99
+  ],
+  [
+   null,
+   "mid",
+   1,
+   88750.25
+  ]
+ ]
+}

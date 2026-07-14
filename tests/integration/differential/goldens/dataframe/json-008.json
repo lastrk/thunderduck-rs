@@ -1,0 +1,42 @@
+{
+ "id": "json-008",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "c",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "1,Alice,34"
+  ],
+  [
+   "2,Bob,41"
+  ],
+  [
+   "3,Carol,29"
+  ],
+  [
+   "4,Dan,52"
+  ],
+  [
+   "5,Eve,38"
+  ],
+  [
+   "6,Frank,45"
+  ],
+  [
+   "7,Grace,27"
+  ],
+  [
+   "8,Heidi,60"
+  ]
+ ]
+}

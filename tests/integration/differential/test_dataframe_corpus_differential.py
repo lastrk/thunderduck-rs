@@ -29,11 +29,16 @@ import pytest
 
 from utils.dataframe_diff import (
     DataFrameDiff,
+    SideOutcome,
     assert_dataframes_equal,
     capture_outcome,
+    collect_both,
     reconcile_error_parity,
 )
+from utils import golden
 from differential.dataframe_corpus import CASES, Case
+
+CORPUS = "dataframe"
 
 
 def _case_id(case: Case) -> str:
@@ -53,48 +58,93 @@ def _assert_schema_equal(ref_df, td_df, query_name: str) -> None:
         raise AssertionError(f"{query_name} schema mismatch:\n{message}")
 
 
-def _canonicalize_rows(df):
-    """Collect rows and sort by `repr` so unordered cases diff deterministically.
+def _canonical_df(df, rows):
+    """Build a fresh DataFrame from already-collected rows, sorted by `repr`.
 
     PySpark's `Row.__repr__` produces a stable string for nested arrays / maps /
-    structs that `df.orderBy(...)` cannot sort by directly. Returns a fresh
-    DataFrame built from the sorted Python rows, preserving the schema.
+    structs that `df.orderBy(...)` cannot sort by directly. The expensive
+    `collect()` is done by the caller (concurrently, via `collect_both`); this
+    only does the cheap sort + local `createDataFrame`, preserving the schema.
     """
-    rows = sorted(df.collect(), key=repr)
-    return df.sparkSession.createDataFrame(rows, df.schema)
+    return df.sparkSession.createDataFrame(sorted(rows, key=repr), df.schema)
+
+
+def _is_schema_only(case: Case) -> bool:
+    return "schema_only" in case.flags or "nondeterministic" in case.flags
+
+
+def _compare(ref_df, td_df, case: Case) -> None:
+    """Diff a reference DataFrame vs τ's — shared by live and golden modes.
+
+    Schema-only for `schema_only`/`nondeterministic` cases; otherwise collect
+    both concurrently (bounded by DIFFERENTIAL_TIMEOUT — in golden mode `ref_df`
+    is a local relation, so its collect is instant) and row-diff after
+    `repr`-sort canonicalization, honoring the per-case epsilon override.
+    """
+    if _is_schema_only(case):
+        _assert_schema_equal(ref_df, td_df, case.id)
+        return
+    extra = {"epsilon": case.epsilon} if case.epsilon is not None else {}
+    timeout = int(os.environ.get("DIFFERENTIAL_TIMEOUT", "10"))
+    ref_rows, td_rows = collect_both(ref_df, td_df, timeout)
+    assert_dataframes_equal(
+        _canonical_df(ref_df, ref_rows),
+        _canonical_df(td_df, td_rows),
+        query_name=case.id,
+        **extra,
+    )
 
 
 @pytest.mark.differential
 @pytest.mark.parametrize("case", CASES, ids=_case_id)
-def test_case(case: Case, corpus_inputs_reference, corpus_inputs_thunderduck, tpc_view_switcher):
-    """One pytest test per Case in the corpus.
+def test_case(case: Case, request, corpus_inputs_thunderduck, tpc_view_switcher):
+    """One pytest test per Case, under the active oracle mode (see utils.golden).
 
-    Schema is always compared. For `nondeterministic` / `schema_only` cases the
-    row comparison is skipped; everything else is row-compared after
-    `repr`-sort canonicalization.
+    - golden (default): diff τ against the recorded golden — no Spark.
+    - live: diff τ against a live Spark reference.
+    - record: capture the live Spark reference into the golden file.
+
+    Schema is always compared; `nondeterministic`/`schema_only` cases skip the
+    row comparison; everything else is row-compared after `repr`-sort
+    canonicalization.
     """
+    mode = golden.oracle_mode()
+
     # tpch/tpcds cases: re-point the benchmark-colliding temp views (e.g.
-    # `customer` exists in both benchmarks with different schemas). No-op for
-    # every other category and for consecutive same-category cases.
+    # `customer` exists in both benchmarks with different schemas). Golden-safe:
+    # touches the reference session only in live/record. No-op otherwise.
     tpc_view_switcher(case.category)
 
-    ref_df = case.build(corpus_inputs_reference)
     td_df = case.build(corpus_inputs_thunderduck)
 
-    # ── ADR-006 tri-state error-parity branch ──────────────────────────────
-    # For cases that declare an expected Spark error class, collect BOTH sides
-    # independently (the normal path collects Spark first, so a Spark-side throw
-    # would abort before τ is exercised) and reconcile via the tri-state table.
+    # ── record: capture the Spark reference into the golden, then stop ──────
+    if mode == "record":
+        if case.expected_error is not None:
+            return  # error-parity cases carry their expected class in the corpus
+        inputs_ref = request.getfixturevalue("corpus_inputs_reference")
+        ref_df = case.build(inputs_ref)
+        golden.record_reference(CORPUS, case.id, ref_df, schema_only=_is_schema_only(case))
+        return
+
+    # ── ADR-006 tri-state error-parity ─────────────────────────────────────
     if case.expected_error is not None:
-        timeout = int(os.environ.get("DIFFERENTIAL_TIMEOUT", "60"))
-        ref = capture_outcome(ref_df, timeout, "Spark Reference")
+        timeout = int(os.environ.get("DIFFERENTIAL_TIMEOUT", "10"))
         td = capture_outcome(td_df, timeout, "Thunderduck")
-        outcome = reconcile_error_parity(
-            ref, td, case.id, expected_class=case.expected_error
-        )
+        if mode == "live":
+            inputs_ref = request.getfixturevalue("corpus_inputs_reference")
+            ref_df = case.build(inputs_ref)
+            ref = capture_outcome(ref_df, timeout, "Spark Reference")
+        else:  # golden: the reference is "Spark raises the declared class"
+            ref = SideOutcome(
+                error=RuntimeError(f"golden: Spark raises [{case.expected_error}]"),
+                error_class=case.expected_error,
+            )
+        outcome = reconcile_error_parity(ref, td, case.id, expected_class=case.expected_error)
         if outcome is None:
-            return  # both threw a matching class → PASS
-        ref_rows, td_rows = outcome  # both returned values → normal row diff
+            return  # both threw the matching class → PASS
+        # Both returned values → row diff (reachable only in live mode; in golden
+        # mode the reference "threw", so reconcile can only PASS or raise).
+        ref_rows, td_rows = outcome
         assert_dataframes_equal(
             ref_df.sparkSession.createDataFrame(sorted(ref_rows, key=repr), ref_df.schema),
             td_df.sparkSession.createDataFrame(sorted(td_rows, key=repr), td_df.schema),
@@ -102,17 +152,15 @@ def test_case(case: Case, corpus_inputs_reference, corpus_inputs_thunderduck, tp
         )
         return
 
-    schema_only = "schema_only" in case.flags or "nondeterministic" in case.flags
-    if schema_only:
-        _assert_schema_equal(ref_df, td_df, case.id)
-        return
-
-    # Per-case epsilon override (tpch cluster preserves the legacy suite's
-    # 0.01 tolerance on monetary aggregates); None = harness default.
-    extra = {"epsilon": case.epsilon} if case.epsilon is not None else {}
-    assert_dataframes_equal(
-        _canonicalize_rows(ref_df),
-        _canonicalize_rows(td_df),
-        query_name=case.id,
-        **extra,
-    )
+    # ── normal / schema-only ────────────────────────────────────────────────
+    if mode == "live":
+        inputs_ref = request.getfixturevalue("corpus_inputs_reference")
+        ref_df = case.build(inputs_ref)
+        _compare(ref_df, td_df, case)
+    else:  # golden
+        epsilon = case.epsilon if case.epsilon is not None else 1e-6
+        if not golden.assert_golden_match(CORPUS, case.id, td_df, epsilon=epsilon):
+            pytest.fail(
+                f"no golden for {case.id}; record it: "
+                f"tests/scripts/run-differential-tests.sh --record core -k {case.id}"
+            )

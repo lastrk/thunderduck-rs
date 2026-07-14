@@ -1,0 +1,28 @@
+{
+ "id": "misc-001",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "summary",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "age",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "salary",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

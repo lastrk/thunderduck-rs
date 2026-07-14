@@ -1,0 +1,98 @@
+{
+ "id": "struct-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "info",
+    "type": {
+     "type": "struct",
+     "fields": [
+      {
+       "name": "name",
+       "type": "string",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "age",
+       "type": "integer",
+       "nullable": true,
+       "metadata": {}
+      }
+     ]
+    },
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$row": [
+     "Alice",
+     34
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     "Bob",
+     41
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     "Carol",
+     29
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     "Dan",
+     52
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     "Eve",
+     38
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     "Frank",
+     45
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     "Grace",
+     27
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     "Heidi",
+     60
+    ]
+   }
+  ]
+ ]
+}

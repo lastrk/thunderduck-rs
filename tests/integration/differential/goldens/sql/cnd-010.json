@@ -1,0 +1,21 @@
+{
+ "id": "cnd-010",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "avg_active_sal",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   98166.66666666667
+  ]
+ ]
+}

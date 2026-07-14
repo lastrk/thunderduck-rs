@@ -1,0 +1,1263 @@
+{
+ "id": "tpcds-q046",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "c_last_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "c_first_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "bought_city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ss_ticket_number",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "amt",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "profit",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Adams",
+   "Chris",
+   "Spring Hill",
+   "Lakeview",
+   114,
+   {
+    "$dec": "428.59"
+   },
+   {
+    "$dec": "-2260.63"
+   }
+  ],
+  [
+   "Allen",
+   "Richard",
+   "Oak Ridge",
+   "Greenwood",
+   259,
+   {
+    "$dec": "2431.92"
+   },
+   {
+    "$dec": "-19280.56"
+   }
+  ],
+  [
+   "Andrews",
+   "Catherine",
+   "Lincoln",
+   "Deerfield",
+   1846,
+   {
+    "$dec": "6471.59"
+   },
+   {
+    "$dec": "-8070.90"
+   }
+  ],
+  [
+   "Archie",
+   "Geneva",
+   "Enterprise",
+   "Lakeview",
+   89,
+   {
+    "$dec": "2578.22"
+   },
+   {
+    "$dec": "-10494.29"
+   }
+  ],
+  [
+   "Berry",
+   "Nancy",
+   "Pleasant Valley",
+   "Mount Vernon",
+   2352,
+   {
+    "$dec": "2322.97"
+   },
+   {
+    "$dec": "-8819.65"
+   }
+  ],
+  [
+   "Blair",
+   "John",
+   "Spring Valley",
+   "Valley View",
+   654,
+   {
+    "$dec": "899.69"
+   },
+   {
+    "$dec": "-9066.75"
+   }
+  ],
+  [
+   "Bond",
+   "Larry",
+   "Jackson",
+   "Newtown",
+   324,
+   {
+    "$dec": "392.93"
+   },
+   {
+    "$dec": "1.48"
+   }
+  ],
+  [
+   "Bravo",
+   "Paul",
+   "Mount Zion",
+   "Maple Grove",
+   671,
+   {
+    "$dec": "1995.34"
+   },
+   {
+    "$dec": "-1564.30"
+   }
+  ],
+  [
+   "Britt",
+   "Inez",
+   "Edgewood",
+   "Plainview",
+   61,
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-858.82"
+   }
+  ],
+  [
+   "Brown",
+   "Heather",
+   "Riverdale",
+   "Wilson",
+   2393,
+   {
+    "$dec": "123.85"
+   },
+   {
+    "$dec": "-5937.04"
+   }
+  ],
+  [
+   "Buchanan",
+   "Alvin",
+   "Walnut Grove",
+   "Clifton",
+   537,
+   {
+    "$dec": "701.93"
+   },
+   {
+    "$dec": "-19121.18"
+   }
+  ],
+  [
+   "Burns",
+   "Kevin",
+   "Midway",
+   "Glenwood",
+   1069,
+   {
+    "$dec": "3930.91"
+   },
+   {
+    "$dec": "-14558.48"
+   }
+  ],
+  [
+   "Butler",
+   "Claudia",
+   "Five Points",
+   "Forest Hills",
+   205,
+   {
+    "$dec": "2017.72"
+   },
+   {
+    "$dec": "-8097.29"
+   }
+  ],
+  [
+   "Butler",
+   "Rebecca",
+   "Union",
+   "Harmony",
+   2035,
+   {
+    "$dec": "591.02"
+   },
+   {
+    "$dec": "-5611.42"
+   }
+  ],
+  [
+   "Caldwell",
+   "Joseph",
+   "Providence",
+   "Wilson",
+   2069,
+   {
+    "$dec": "1866.90"
+   },
+   {
+    "$dec": "-6056.38"
+   }
+  ],
+  [
+   "Campbell",
+   "Sheila",
+   "Union",
+   "Bethel",
+   1589,
+   {
+    "$dec": "4165.20"
+   },
+   {
+    "$dec": "-17637.25"
+   }
+  ],
+  [
+   "Carl",
+   "Natasha",
+   "Frogtown",
+   "Newport",
+   302,
+   {
+    "$dec": "407.49"
+   },
+   {
+    "$dec": "-2683.64"
+   }
+  ],
+  [
+   "Carroll",
+   "Bryan",
+   "Centerville",
+   "Jamestown",
+   1346,
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-274.31"
+   }
+  ],
+  [
+   "Chambers",
+   "Adam",
+   "Stringtown",
+   "Red Hill",
+   2,
+   {
+    "$dec": "4891.64"
+   },
+   {
+    "$dec": "-28301.55"
+   }
+  ],
+  [
+   "Cowan",
+   "Shawn",
+   "Green Acres",
+   "Woodville",
+   1780,
+   {
+    "$dec": "317.50"
+   },
+   {
+    "$dec": "-3753.04"
+   }
+  ],
+  [
+   "Daniels",
+   "Brandi",
+   "Oakdale",
+   "Highland",
+   1242,
+   {
+    "$dec": "3510.53"
+   },
+   {
+    "$dec": "-13066.68"
+   }
+  ],
+  [
+   "Dawkins",
+   "Steven",
+   "Lakeview",
+   "Macedonia",
+   1081,
+   {
+    "$dec": "135.10"
+   },
+   {
+    "$dec": "-5637.06"
+   }
+  ],
+  [
+   "Dawkins",
+   "Steven",
+   "Lakeview",
+   "Salem",
+   2054,
+   {
+    "$dec": "314.97"
+   },
+   {
+    "$dec": "-8809.77"
+   }
+  ],
+  [
+   "Dudley",
+   "Tonia",
+   "Greenwood",
+   "Newport",
+   142,
+   {
+    "$dec": "1055.09"
+   },
+   {
+    "$dec": "-16700.22"
+   }
+  ],
+  [
+   "Evans",
+   "Eleanor",
+   "Midway",
+   "Lewisburg",
+   1656,
+   {
+    "$dec": "3406.37"
+   },
+   {
+    "$dec": "-26446.06"
+   }
+  ],
+  [
+   "Foster",
+   "Florence",
+   "Sulphur Springs",
+   "Woodland",
+   199,
+   {
+    "$dec": "24.81"
+   },
+   {
+    "$dec": "1337.68"
+   }
+  ],
+  [
+   "Fuller",
+   "Jean",
+   "Union",
+   "Highland Park",
+   1791,
+   {
+    "$dec": "1260.50"
+   },
+   {
+    "$dec": "-3811.61"
+   }
+  ],
+  [
+   "Gilbert",
+   "Karl",
+   "Unionville",
+   "Hartland",
+   1158,
+   {
+    "$dec": "1135.91"
+   },
+   {
+    "$dec": "-1479.70"
+   }
+  ],
+  [
+   "Glaze",
+   null,
+   "Greenwood",
+   "New Hope",
+   2056,
+   {
+    "$dec": "33.28"
+   },
+   {
+    "$dec": "-7415.62"
+   }
+  ],
+  [
+   "Greene",
+   "Jennifer",
+   "Oakdale",
+   "Oakland",
+   1804,
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "1372.88"
+   }
+  ],
+  [
+   "Greene",
+   "Jennifer",
+   "Oakdale",
+   "Riverview",
+   1030,
+   {
+    "$dec": "1185.86"
+   },
+   {
+    "$dec": "-3891.20"
+   }
+  ],
+  [
+   "Grider",
+   "James",
+   "Franklin",
+   "Greenwood",
+   2232,
+   {
+    "$dec": "11869.79"
+   },
+   {
+    "$dec": "-26751.01"
+   }
+  ],
+  [
+   "Harrison",
+   "Bonnie",
+   "Marion",
+   "Newtown",
+   316,
+   {
+    "$dec": "525.42"
+   },
+   {
+    "$dec": "-2535.98"
+   }
+  ],
+  [
+   "Harry",
+   "Paul",
+   "Centerville",
+   "Woodland",
+   1882,
+   {
+    "$dec": "17.63"
+   },
+   {
+    "$dec": "-6969.46"
+   }
+  ],
+  [
+   "Hermann",
+   "Rebecca",
+   "Harmony",
+   "Newtown",
+   570,
+   {
+    "$dec": "3036.52"
+   },
+   {
+    "$dec": "-4033.27"
+   }
+  ],
+  [
+   "Hernandez",
+   "Michael",
+   "Salem",
+   "Harmony",
+   1338,
+   {
+    "$dec": "2421.60"
+   },
+   {
+    "$dec": "-12143.95"
+   }
+  ],
+  [
+   "Hernandez",
+   "Rachel",
+   "Greenwood",
+   "Harmony",
+   1864,
+   {
+    "$dec": "6791.14"
+   },
+   {
+    "$dec": "-11294.62"
+   }
+  ],
+  [
+   "Holloway",
+   "Monica",
+   "Edgewood",
+   "Oakdale",
+   1933,
+   {
+    "$dec": "1476.46"
+   },
+   {
+    "$dec": "-13005.54"
+   }
+  ],
+  [
+   "Hutchins",
+   "Rudolph",
+   "Five Forks",
+   "Spring Hill",
+   1623,
+   {
+    "$dec": "2728.17"
+   },
+   {
+    "$dec": "-1807.56"
+   }
+  ],
+  [
+   "Jackson",
+   "John",
+   "Valley View",
+   "Union Hill",
+   820,
+   {
+    "$dec": "570.84"
+   },
+   {
+    "$dec": "-11833.63"
+   }
+  ],
+  [
+   "Johnson",
+   "Benjamin",
+   "Bethel",
+   "Crossroads",
+   533,
+   {
+    "$dec": "983.56"
+   },
+   {
+    "$dec": "-17753.61"
+   }
+  ],
+  [
+   "Johnson",
+   "Marilyn",
+   "Walnut Grove",
+   "Bunker Hill",
+   752,
+   {
+    "$dec": "2089.47"
+   },
+   {
+    "$dec": "-13690.63"
+   }
+  ],
+  [
+   "Jones",
+   "Renee",
+   "Crossroads",
+   "Salem",
+   113,
+   {
+    "$dec": "851.20"
+   },
+   {
+    "$dec": "-10378.29"
+   }
+  ],
+  [
+   "Katz",
+   "Anderson",
+   "Oak Ridge",
+   "Lakewood",
+   1459,
+   {
+    "$dec": "2905.56"
+   },
+   {
+    "$dec": "-610.21"
+   }
+  ],
+  [
+   "Katz",
+   "Anderson",
+   "Oak Ridge",
+   "Waterloo",
+   1294,
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-2978.28"
+   }
+  ],
+  [
+   "Kuhn",
+   "Annie",
+   "Glendale",
+   "Friendship",
+   1040,
+   {
+    "$dec": "1745.63"
+   },
+   {
+    "$dec": "-8431.53"
+   }
+  ],
+  [
+   "Lanier",
+   "David",
+   "Mountain View",
+   "Edgewood",
+   1213,
+   {
+    "$dec": "1470.41"
+   },
+   {
+    "$dec": "-5566.30"
+   }
+  ],
+  [
+   "Leake",
+   "Matthew",
+   "Midway",
+   "Enterprise",
+   1771,
+   {
+    "$dec": "84.52"
+   },
+   {
+    "$dec": "225.24"
+   }
+  ],
+  [
+   "Lewis",
+   "Brian",
+   "Riverview",
+   "Lakewood",
+   623,
+   {
+    "$dec": "721.19"
+   },
+   {
+    "$dec": "-2893.77"
+   }
+  ],
+  [
+   "Lewis",
+   "Brian",
+   "Riverview",
+   "Union Hill",
+   85,
+   {
+    "$dec": "405.81"
+   },
+   {
+    "$dec": "-1628.53"
+   }
+  ],
+  [
+   "Lloyd",
+   "Douglas",
+   "Springfield",
+   "Concord",
+   265,
+   {
+    "$dec": "5762.93"
+   },
+   {
+    "$dec": "-21807.69"
+   }
+  ],
+  [
+   "Lloyd",
+   "Douglas",
+   "Springfield",
+   "Mount Olive",
+   1209,
+   {
+    "$dec": "1971.22"
+   },
+   {
+    "$dec": "-11919.87"
+   }
+  ],
+  [
+   "Long",
+   "Samantha",
+   "Antioch",
+   "Union Hill",
+   1388,
+   {
+    "$dec": "161.06"
+   },
+   {
+    "$dec": "684.47"
+   }
+  ],
+  [
+   "Lowry",
+   "Craig",
+   "Oakwood",
+   "Newport",
+   57,
+   {
+    "$dec": "138.61"
+   },
+   {
+    "$dec": "-10694.10"
+   }
+  ],
+  [
+   "Malloy",
+   "Penelope",
+   "Oakland",
+   "Pleasant Grove",
+   39,
+   {
+    "$dec": "2846.77"
+   },
+   {
+    "$dec": "-3623.66"
+   }
+  ],
+  [
+   "Marlow",
+   "Polly",
+   "Pine Grove",
+   "Providence",
+   491,
+   {
+    "$dec": "831.42"
+   },
+   {
+    "$dec": "6462.24"
+   }
+  ],
+  [
+   "Mayes",
+   "Archie",
+   "Forest Hills",
+   "Harmony",
+   1139,
+   {
+    "$dec": "4469.46"
+   },
+   {
+    "$dec": "-4074.42"
+   }
+  ],
+  [
+   "Mcclellan",
+   "Steven",
+   "Riverside",
+   "Marion",
+   977,
+   {
+    "$dec": "803.23"
+   },
+   {
+    "$dec": "4035.10"
+   }
+  ],
+  [
+   "Miller",
+   "Christine",
+   "Clinton",
+   "Five Points",
+   44,
+   {
+    "$dec": "3136.33"
+   },
+   {
+    "$dec": "-5911.63"
+   }
+  ],
+  [
+   "Moore",
+   "Steven",
+   "Ashland",
+   "Centerville",
+   2050,
+   {
+    "$dec": "3618.24"
+   },
+   {
+    "$dec": "-4477.63"
+   }
+  ],
+  [
+   "Moore",
+   "Steven",
+   "Ashland",
+   "Lakewood",
+   2072,
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-16703.36"
+   }
+  ],
+  [
+   "Munoz",
+   "Leonard",
+   "Waterloo",
+   "Bunker Hill",
+   1690,
+   {
+    "$dec": "1626.23"
+   },
+   {
+    "$dec": "-11189.98"
+   }
+  ],
+  [
+   "Norris",
+   "Joseph",
+   "Red Hill",
+   "Union Hill",
+   2116,
+   {
+    "$dec": "2411.64"
+   },
+   {
+    "$dec": "-8725.21"
+   }
+  ],
+  [
+   "Numbers",
+   "Michael",
+   "Union Hill",
+   "Oak Hill",
+   2239,
+   {
+    "$dec": "191.57"
+   },
+   {
+    "$dec": "-5036.17"
+   }
+  ],
+  [
+   "Olvera",
+   "Bruce",
+   "Shore Acres",
+   "Pleasant Valley",
+   1023,
+   {
+    "$dec": "2010.20"
+   },
+   {
+    "$dec": "-9959.13"
+   }
+  ],
+  [
+   "Orr",
+   "Jeffrey",
+   "Clifton",
+   "Oakdale",
+   435,
+   {
+    "$dec": "3097.21"
+   },
+   {
+    "$dec": "-10995.97"
+   }
+  ],
+  [
+   "Ortiz",
+   "Terry",
+   "Wright",
+   "Liberty",
+   1663,
+   {
+    "$dec": "326.54"
+   },
+   {
+    "$dec": "-7913.29"
+   }
+  ],
+  [
+   "Perry",
+   "Dustin",
+   "Waterloo",
+   "Lakewood",
+   815,
+   {
+    "$dec": "3834.72"
+   },
+   {
+    "$dec": "-12402.70"
+   }
+  ],
+  [
+   "Peterson",
+   "Marie",
+   "Deerfield",
+   "Highland",
+   1251,
+   {
+    "$dec": "9192.69"
+   },
+   {
+    "$dec": "-25526.63"
+   }
+  ],
+  [
+   "Phillips",
+   "Julia",
+   "Glenwood",
+   "Liberty",
+   2151,
+   {
+    "$dec": "5131.79"
+   },
+   {
+    "$dec": "-7431.33"
+   }
+  ],
+  [
+   "Ramos",
+   "Aline",
+   "Newport",
+   "Enterprise",
+   1776,
+   {
+    "$dec": "2247.16"
+   },
+   {
+    "$dec": "-15606.78"
+   }
+  ],
+  [
+   "Ritchey",
+   "Evelyn",
+   "Plainview",
+   "Clifton",
+   371,
+   {
+    "$dec": "2086.89"
+   },
+   {
+    "$dec": "-1260.05"
+   }
+  ],
+  [
+   "Rutherford",
+   "Adela",
+   "Crossroads",
+   "Belmont",
+   1849,
+   {
+    "$dec": "4867.60"
+   },
+   {
+    "$dec": "-7152.60"
+   }
+  ],
+  [
+   "Schneider",
+   "Dwight",
+   "Walnut Grove",
+   "Pleasant Valley",
+   776,
+   {
+    "$dec": "470.43"
+   },
+   {
+    "$dec": "1242.62"
+   }
+  ],
+  [
+   "Simpson",
+   "Kevin",
+   "Valley View",
+   "Red Hill",
+   2207,
+   {
+    "$dec": "10089.03"
+   },
+   {
+    "$dec": "-15994.53"
+   }
+  ],
+  [
+   "Smith",
+   "Daisy",
+   "Stringtown",
+   "Five Points",
+   124,
+   {
+    "$dec": "758.97"
+   },
+   {
+    "$dec": "-1.27"
+   }
+  ],
+  [
+   "Smith",
+   "Marjorie",
+   "Providence",
+   "Blue Springs",
+   104,
+   {
+    "$dec": "2270.72"
+   },
+   {
+    "$dec": "-17277.06"
+   }
+  ],
+  [
+   "Smith",
+   "Rochel",
+   "Enterprise",
+   "New Hope",
+   1921,
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-13085.27"
+   }
+  ],
+  [
+   "Thompson",
+   "Samuel",
+   "Forest Hills",
+   "Marion",
+   1911,
+   {
+    "$dec": "607.52"
+   },
+   {
+    "$dec": "-8326.91"
+   }
+  ],
+  [
+   "Travers",
+   "Shawn",
+   "Mount Olive",
+   "Franklin",
+   540,
+   {
+    "$dec": "4824.64"
+   },
+   {
+    "$dec": "-22373.02"
+   }
+  ],
+  [
+   "Valdez",
+   "Charles",
+   "Maple Grove",
+   "Five Forks",
+   1399,
+   {
+    "$dec": "733.85"
+   },
+   {
+    "$dec": "-10333.35"
+   }
+  ],
+  [
+   "Villanueva",
+   "Paul",
+   "Mechanicsburg",
+   "Farmington",
+   1077,
+   {
+    "$dec": "954.29"
+   },
+   {
+    "$dec": "-7742.86"
+   }
+  ],
+  [
+   "Walton",
+   "Cedric",
+   "Hamilton",
+   "Mount Olive",
+   164,
+   {
+    "$dec": "1978.62"
+   },
+   {
+    "$dec": "-3569.70"
+   }
+  ],
+  [
+   "Ward",
+   "Scott",
+   "Riverside",
+   "Enterprise",
+   1689,
+   {
+    "$dec": "9046.85"
+   },
+   {
+    "$dec": "-14860.55"
+   }
+  ],
+  [
+   "Watson",
+   "Alfred",
+   "Jamestown",
+   "Union",
+   1186,
+   {
+    "$dec": "2852.45"
+   },
+   {
+    "$dec": "-6438.45"
+   }
+  ],
+  [
+   "Whitaker",
+   "Richard",
+   "Oak Ridge",
+   "Glendale",
+   2158,
+   {
+    "$dec": "2239.93"
+   },
+   {
+    "$dec": "-5532.44"
+   }
+  ],
+  [
+   "Wiles",
+   "Jeffrey",
+   "Cedar Grove",
+   "Bethel",
+   489,
+   {
+    "$dec": "109.44"
+   },
+   {
+    "$dec": "-8395.15"
+   }
+  ],
+  [
+   "Wilson",
+   "Joseph",
+   "Warwick",
+   "Bunker Hill",
+   2083,
+   {
+    "$dec": "128.66"
+   },
+   {
+    "$dec": "-6901.74"
+   }
+  ],
+  [
+   "Woods",
+   null,
+   "Fairfield",
+   "Ashland",
+   1572,
+   {
+    "$dec": "1490.43"
+   },
+   {
+    "$dec": "-4264.59"
+   }
+  ],
+  [
+   "Wynne",
+   "Joanne",
+   "Sugar Hill",
+   "Pleasant Grove",
+   1004,
+   {
+    "$dec": "1490.33"
+   },
+   {
+    "$dec": "-8000.14"
+   }
+  ],
+  [
+   "Young",
+   "Althea",
+   "Jamestown",
+   "Lakeview",
+   634,
+   {
+    "$dec": "2760.16"
+   },
+   {
+    "$dec": "-16172.15"
+   }
+  ],
+  [
+   "Young",
+   "Althea",
+   "Jamestown",
+   "Riverside",
+   1289,
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "-2497.16"
+   }
+  ],
+  [
+   null,
+   "Sean",
+   "Union Hill",
+   "Royal",
+   214,
+   {
+    "$dec": "1950.49"
+   },
+   {
+    "$dec": "-9630.83"
+   }
+  ]
+ ]
+}

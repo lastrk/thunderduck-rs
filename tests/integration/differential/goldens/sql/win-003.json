@@ -1,0 +1,70 @@
+{
+ "id": "win-003",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "pr",
+    "type": "double",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "cd",
+    "type": "double",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   0.5714285714285714,
+   0.625
+  ],
+  [
+   "Bob",
+   0.8571428571428571,
+   0.875
+  ],
+  [
+   "Carol",
+   0.2857142857142857,
+   0.375
+  ],
+  [
+   "Dan",
+   0.0,
+   0.125
+  ],
+  [
+   "Eve",
+   0.42857142857142855,
+   0.5
+  ],
+  [
+   "Frank",
+   0.7142857142857143,
+   0.75
+  ],
+  [
+   "Grace",
+   0.14285714285714285,
+   0.25
+  ],
+  [
+   "Heidi",
+   1.0,
+   1.0
+  ]
+ ]
+}

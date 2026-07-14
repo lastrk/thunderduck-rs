@@ -1,0 +1,42 @@
+{
+ "id": "cast-007",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "bon_d",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   0.0
+  ],
+  [
+   1500.5
+  ],
+  [
+   2200.0
+  ],
+  [
+   3000.0
+  ],
+  [
+   500.0
+  ],
+  [
+   750.25
+  ],
+  [
+   9999.99
+  ],
+  [
+   null
+  ]
+ ]
+}

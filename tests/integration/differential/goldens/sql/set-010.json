@@ -1,0 +1,68 @@
+{
+ "id": "set-010",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "Alice"
+  ],
+  [
+   101,
+   "Ivan"
+  ],
+  [
+   102,
+   "Judy"
+  ],
+  [
+   103,
+   "Mallory"
+  ],
+  [
+   2,
+   "Bob"
+  ],
+  [
+   3,
+   "Carol"
+  ],
+  [
+   4,
+   "Dan"
+  ],
+  [
+   5,
+   "Eve"
+  ],
+  [
+   6,
+   "Frank"
+  ],
+  [
+   7,
+   "Grace"
+  ],
+  [
+   8,
+   "Heidi"
+  ]
+ ]
+}

@@ -1,0 +1,56 @@
+{
+ "id": "win-016",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "comp_sum",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   219500.5
+  ],
+  [
+   "Bob",
+   219500.5
+  ],
+  [
+   "Carol",
+   142500.0
+  ],
+  [
+   "Dan",
+   142500.0
+  ],
+  [
+   "Eve",
+   248750.24
+  ],
+  [
+   "Frank",
+   179200.0
+  ],
+  [
+   "Grace",
+   179200.0
+  ],
+  [
+   "Heidi",
+   248750.24
+  ]
+ ]
+}

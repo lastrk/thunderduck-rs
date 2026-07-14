@@ -1,0 +1,32 @@
+{
+ "id": "tpcds-q006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "state",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cnt",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "NC",
+   11
+  ],
+  [
+   "VA",
+   12
+  ]
+ ]
+}

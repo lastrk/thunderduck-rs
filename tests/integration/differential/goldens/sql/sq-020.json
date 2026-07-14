@@ -1,0 +1,56 @@
+{
+ "id": "sq-020",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "rel",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   "below"
+  ],
+  [
+   "Bob",
+   "above"
+  ],
+  [
+   "Carol",
+   "below"
+  ],
+  [
+   "Dan",
+   "below"
+  ],
+  [
+   "Eve",
+   "below"
+  ],
+  [
+   "Frank",
+   "above"
+  ],
+  [
+   "Grace",
+   "below"
+  ],
+  [
+   "Heidi",
+   "above"
+  ]
+ ]
+}

@@ -1,0 +1,742 @@
+{
+ "id": "tpcds-q022",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_product_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_brand",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_class",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_category",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "qoh",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "ablecally",
+   "edu packcorp #7",
+   "bracelets",
+   "Jewelry",
+   427.734693877551
+  ],
+  [
+   "ablecally",
+   "edu packcorp #7",
+   "bracelets",
+   null,
+   427.734693877551
+  ],
+  [
+   "ablecally",
+   "edu packcorp #7",
+   null,
+   null,
+   427.734693877551
+  ],
+  [
+   "ablecally",
+   null,
+   null,
+   null,
+   427.734693877551
+  ],
+  [
+   "ablepri",
+   "edu packbrand #3",
+   "curtains/drapes",
+   "Home",
+   457.40425531914894
+  ],
+  [
+   "ablepri",
+   "edu packbrand #3",
+   "curtains/drapes",
+   null,
+   457.40425531914894
+  ],
+  [
+   "ablepri",
+   "edu packbrand #3",
+   null,
+   null,
+   457.40425531914894
+  ],
+  [
+   "ablepri",
+   null,
+   null,
+   null,
+   457.40425531914894
+  ],
+  [
+   "antieseought",
+   "exportiunivamalg #2",
+   "self-help",
+   "Books",
+   436.22
+  ],
+  [
+   "antieseought",
+   "exportiunivamalg #2",
+   "self-help",
+   null,
+   436.22
+  ],
+  [
+   "antieseought",
+   "exportiunivamalg #2",
+   null,
+   null,
+   436.22
+  ],
+  [
+   "antieseought",
+   null,
+   null,
+   null,
+   436.22
+  ],
+  [
+   "ation",
+   "amalgexporti #2",
+   "newborn",
+   "Children",
+   451.0204081632653
+  ],
+  [
+   "ation",
+   "amalgexporti #2",
+   "newborn",
+   null,
+   451.0204081632653
+  ],
+  [
+   "ation",
+   "amalgexporti #2",
+   null,
+   null,
+   451.0204081632653
+  ],
+  [
+   "ation",
+   null,
+   null,
+   null,
+   451.0204081632653
+  ],
+  [
+   "ationation",
+   "exportiexporti #2",
+   "toddlers",
+   "Children",
+   476.04347826086956
+  ],
+  [
+   "ationation",
+   "exportiexporti #2",
+   "toddlers",
+   null,
+   476.04347826086956
+  ],
+  [
+   "ationation",
+   "exportiexporti #2",
+   null,
+   null,
+   476.04347826086956
+  ],
+  [
+   "ationation",
+   null,
+   null,
+   null,
+   476.04347826086956
+  ],
+  [
+   "ationcallyought",
+   "exporticorp #8",
+   "gold",
+   "Jewelry",
+   455.0
+  ],
+  [
+   "ationcallyought",
+   "exporticorp #8",
+   "gold",
+   null,
+   455.0
+  ],
+  [
+   "ationcallyought",
+   "exporticorp #8",
+   null,
+   null,
+   455.0
+  ],
+  [
+   "ationcallyought",
+   null,
+   null,
+   null,
+   455.0
+  ],
+  [
+   "ationn st",
+   "scholarunivamalg #2",
+   "fiction",
+   "Books",
+   391.6734693877551
+  ],
+  [
+   "ationn st",
+   "scholarunivamalg #2",
+   "fiction",
+   null,
+   391.6734693877551
+  ],
+  [
+   "ationn st",
+   "scholarunivamalg #2",
+   null,
+   null,
+   391.6734693877551
+  ],
+  [
+   "ationn st",
+   null,
+   null,
+   null,
+   391.6734693877551
+  ],
+  [
+   "baranti",
+   "edu packedu pack #1",
+   "athletic",
+   "Shoes",
+   446.3958333333333
+  ],
+  [
+   "baranti",
+   "edu packedu pack #1",
+   "athletic",
+   null,
+   446.3958333333333
+  ],
+  [
+   "baranti",
+   "edu packedu pack #1",
+   null,
+   null,
+   446.3958333333333
+  ],
+  [
+   "baranti",
+   null,
+   null,
+   null,
+   446.3958333333333
+  ],
+  [
+   "bareing",
+   "exportiedu pack #1",
+   "kids",
+   "Shoes",
+   454.57142857142856
+  ],
+  [
+   "bareing",
+   "exportiedu pack #1",
+   "kids",
+   null,
+   454.57142857142856
+  ],
+  [
+   "bareing",
+   "exportiedu pack #1",
+   null,
+   null,
+   454.57142857142856
+  ],
+  [
+   "bareing",
+   null,
+   null,
+   null,
+   454.57142857142856
+  ],
+  [
+   "bareseought",
+   "importoscholar #1",
+   "country",
+   "Music",
+   440.26
+  ],
+  [
+   "bareseought",
+   "importoscholar #1",
+   "country",
+   null,
+   440.26
+  ],
+  [
+   "bareseought",
+   "importoscholar #1",
+   null,
+   null,
+   440.26
+  ],
+  [
+   "bareseought",
+   null,
+   null,
+   null,
+   440.26
+  ],
+  [
+   "callyanti",
+   "amalgamalgamalg #6",
+   "disk drives",
+   "Electronics",
+   471.42
+  ],
+  [
+   "callyanti",
+   "amalgamalgamalg #6",
+   "disk drives",
+   null,
+   471.42
+  ],
+  [
+   "callyanti",
+   "amalgamalgamalg #6",
+   null,
+   null,
+   471.42
+  ],
+  [
+   "callyanti",
+   null,
+   null,
+   null,
+   471.42
+  ],
+  [
+   "callyoughtought",
+   "brandcorp #5",
+   "pendants",
+   "Jewelry",
+   472.80392156862746
+  ],
+  [
+   "callyoughtought",
+   "brandcorp #5",
+   "pendants",
+   null,
+   472.80392156862746
+  ],
+  [
+   "callyoughtought",
+   "brandcorp #5",
+   null,
+   null,
+   472.80392156862746
+  ],
+  [
+   "callyoughtought",
+   null,
+   null,
+   null,
+   472.80392156862746
+  ],
+  [
+   "n stbarought",
+   "corpbrand #10",
+   "rugs",
+   "Home",
+   479.2040816326531
+  ],
+  [
+   "n stbarought",
+   "corpbrand #10",
+   "rugs",
+   null,
+   479.2040816326531
+  ],
+  [
+   "n stbarought",
+   "corpbrand #10",
+   null,
+   null,
+   479.2040816326531
+  ],
+  [
+   "n stbarought",
+   null,
+   null,
+   null,
+   479.2040816326531
+  ],
+  [
+   "n stcallyought",
+   "amalgbrand #2",
+   "semi-precious",
+   "Jewelry",
+   453.18
+  ],
+  [
+   "n stcallyought",
+   "amalgbrand #2",
+   "semi-precious",
+   null,
+   453.18
+  ],
+  [
+   "n stcallyought",
+   "amalgbrand #2",
+   null,
+   null,
+   453.18
+  ],
+  [
+   "n stcallyought",
+   null,
+   null,
+   null,
+   453.18
+  ],
+  [
+   "n steing",
+   "amalgimporto #2",
+   "accessories",
+   "Men",
+   432.84313725490193
+  ],
+  [
+   "n steing",
+   "amalgimporto #2",
+   "accessories",
+   null,
+   432.84313725490193
+  ],
+  [
+   "n steing",
+   "amalgimporto #2",
+   null,
+   null,
+   432.84313725490193
+  ],
+  [
+   "n steing",
+   null,
+   null,
+   null,
+   432.84313725490193
+  ],
+  [
+   "n stese",
+   "edu packexporti #2",
+   "school-uniforms",
+   "Children",
+   437.54
+  ],
+  [
+   "n stese",
+   "edu packexporti #2",
+   "school-uniforms",
+   null,
+   437.54
+  ],
+  [
+   "n stese",
+   "edu packexporti #2",
+   null,
+   null,
+   437.54
+  ],
+  [
+   "n stese",
+   null,
+   null,
+   null,
+   437.54
+  ],
+  [
+   "n stoughtought",
+   "edu packimporto #2",
+   "sports-apparel",
+   "Men",
+   464.7450980392157
+  ],
+  [
+   "n stoughtought",
+   "edu packimporto #2",
+   "sports-apparel",
+   null,
+   464.7450980392157
+  ],
+  [
+   "n stoughtought",
+   "edu packimporto #2",
+   null,
+   null,
+   464.7450980392157
+  ],
+  [
+   "n stoughtought",
+   null,
+   null,
+   null,
+   464.7450980392157
+  ],
+  [
+   "oughtableought",
+   "exportiunivamalg #2",
+   "self-help",
+   "Books",
+   453.46938775510205
+  ],
+  [
+   "oughtableought",
+   "exportiunivamalg #2",
+   "self-help",
+   null,
+   453.46938775510205
+  ],
+  [
+   "oughtableought",
+   "exportiunivamalg #2",
+   null,
+   null,
+   453.46938775510205
+  ],
+  [
+   "oughtableought",
+   null,
+   null,
+   null,
+   453.46938775510205
+  ],
+  [
+   "oughtn st",
+   "corpunivamalg #7",
+   "musical",
+   "Electronics",
+   435.265306122449
+  ],
+  [
+   "oughtn st",
+   "corpunivamalg #7",
+   "musical",
+   null,
+   435.265306122449
+  ],
+  [
+   "oughtn st",
+   "corpunivamalg #7",
+   null,
+   null,
+   435.265306122449
+  ],
+  [
+   "oughtn st",
+   null,
+   null,
+   null,
+   435.265306122449
+  ],
+  [
+   "oughtpri",
+   "scholarmaxi #2",
+   "fishing",
+   "Sports",
+   454.42857142857144
+  ],
+  [
+   "oughtpri",
+   "scholarmaxi #2",
+   "fishing",
+   null,
+   454.42857142857144
+  ],
+  [
+   "oughtpri",
+   "scholarmaxi #2",
+   null,
+   null,
+   454.42857142857144
+  ],
+  [
+   "oughtpri",
+   null,
+   null,
+   null,
+   454.42857142857144
+  ],
+  [
+   "priation",
+   "exportiamalg #2",
+   "maternity",
+   "Women",
+   455.28
+  ],
+  [
+   "priation",
+   "exportiamalg #2",
+   "maternity",
+   null,
+   455.28
+  ],
+  [
+   "priation",
+   "exportiamalg #2",
+   null,
+   null,
+   455.28
+  ],
+  [
+   "priation",
+   null,
+   null,
+   null,
+   455.28
+  ],
+  [
+   "pricallyought",
+   "edu packimporto #2",
+   "sports-apparel",
+   "Men",
+   457.4901960784314
+  ],
+  [
+   "pricallyought",
+   "edu packimporto #2",
+   "sports-apparel",
+   null,
+   457.4901960784314
+  ],
+  [
+   "pricallyought",
+   "edu packimporto #2",
+   null,
+   null,
+   457.4901960784314
+  ],
+  [
+   "pricallyought",
+   null,
+   null,
+   null,
+   457.4901960784314
+  ],
+  [
+   "prieing",
+   "brandcorp #4",
+   "pendants",
+   "Jewelry",
+   470.11538461538464
+  ],
+  [
+   "prieing",
+   "brandcorp #4",
+   "pendants",
+   null,
+   470.11538461538464
+  ],
+  [
+   "prieing",
+   "brandcorp #4",
+   null,
+   null,
+   470.11538461538464
+  ],
+  [
+   "prieing",
+   null,
+   null,
+   null,
+   470.11538461538464
+  ],
+  [
+   "priought",
+   "importobrand #6",
+   "costume",
+   "Jewelry",
+   474.0
+  ],
+  [
+   "priought",
+   "importobrand #6",
+   "costume",
+   null,
+   474.0
+  ],
+  [
+   "priought",
+   "importobrand #6",
+   null,
+   null,
+   474.0
+  ],
+  [
+   "priought",
+   null,
+   null,
+   null,
+   474.0
+  ],
+  [
+   "prioughtought",
+   "importomaxi #4",
+   "guns",
+   "Sports",
+   465.84
+  ],
+  [
+   "prioughtought",
+   "importomaxi #4",
+   "guns",
+   null,
+   465.84
+  ],
+  [
+   "prioughtought",
+   "importomaxi #4",
+   null,
+   null,
+   465.84
+  ],
+  [
+   "prioughtought",
+   null,
+   null,
+   null,
+   465.84
+  ]
+ ]
+}

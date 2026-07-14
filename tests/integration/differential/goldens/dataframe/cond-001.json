@@ -1,0 +1,42 @@
+{
+ "id": "cond-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "band",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "junior"
+  ],
+  [
+   "junior"
+  ],
+  [
+   "junior"
+  ],
+  [
+   "junior"
+  ],
+  [
+   "senior"
+  ],
+  [
+   "senior"
+  ],
+  [
+   "senior"
+  ],
+  [
+   "senior"
+  ]
+ ]
+}

@@ -1,0 +1,70 @@
+{
+ "id": "str-005",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "t",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "lt",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "rt",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "x",
+   "x",
+   "x"
+  ],
+  [
+   "x",
+   "x",
+   "x"
+  ],
+  [
+   "x",
+   "x",
+   "x"
+  ],
+  [
+   "x",
+   "x",
+   "x"
+  ],
+  [
+   "x",
+   "x",
+   "x"
+  ],
+  [
+   "x",
+   "x",
+   "x"
+  ],
+  [
+   "x",
+   "x",
+   "x"
+  ],
+  [
+   "x",
+   "x",
+   "x"
+  ]
+ ]
+}

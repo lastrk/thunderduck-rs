@@ -1,0 +1,42 @@
+{
+ "id": "json-005",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "j",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "{\"name\":\"Alice\",\"age\":34,\"address\":{\"city\":\"Vienna\",\"zip\":\"1010\",\"geo\":{\"lat\":48.2,\"lng\":16.37}}}"
+  ],
+  [
+   "{\"name\":\"Bob\",\"age\":41,\"address\":{\"city\":\"Berlin\",\"zip\":\"10115\",\"geo\":{\"lat\":52.52,\"lng\":13.4}}}"
+  ],
+  [
+   "{\"name\":\"Carol\",\"age\":29,\"address\":{\"city\":\"Vienna\",\"geo\":{\"lat\":48.21,\"lng\":16.36}}}"
+  ],
+  [
+   "{\"name\":\"Dan\",\"age\":52,\"address\":{\"zip\":\"20095\"}}"
+  ],
+  [
+   "{\"name\":\"Eve\",\"age\":38,\"address\":{\"city\":\"Munich\",\"zip\":\"80331\",\"geo\":{\"lat\":48.14,\"lng\":11.58}}}"
+  ],
+  [
+   "{\"name\":\"Frank\",\"age\":45,\"address\":{\"city\":\"Zurich\",\"zip\":\"8001\",\"geo\":{\"lat\":47.37,\"lng\":8.54}}}"
+  ],
+  [
+   "{\"name\":\"Grace\",\"age\":27,\"address\":{\"city\":\"Vienna\",\"zip\":\"1020\",\"geo\":{\"lat\":48.22,\"lng\":16.4}}}"
+  ],
+  [
+   "{\"name\":\"Heidi\",\"age\":60,\"address\":{}}"
+  ]
+ ]
+}

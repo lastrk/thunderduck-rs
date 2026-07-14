@@ -1,0 +1,354 @@
+{
+ "id": "tpcds-q089",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_category",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_class",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_brand",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_store_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_company_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d_moy",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sum_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_monthly_sales",
+    "type": "decimal(21,6)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Men",
+   "shirts",
+   "importoimporto #1",
+   "ought",
+   "Unknown",
+   1,
+   {
+    "$dec": "250.07"
+   },
+   {
+    "$dec": "189.320000"
+   }
+  ],
+  [
+   "Men",
+   "shirts",
+   "importoimporto #1",
+   "ought",
+   "Unknown",
+   10,
+   {
+    "$dec": "88.76"
+   },
+   {
+    "$dec": "189.320000"
+   }
+  ],
+  [
+   "Men",
+   "shirts",
+   "importoimporto #1",
+   "ought",
+   "Unknown",
+   11,
+   {
+    "$dec": "131.62"
+   },
+   {
+    "$dec": "189.320000"
+   }
+  ],
+  [
+   "Men",
+   "shirts",
+   "importoimporto #1",
+   "ought",
+   "Unknown",
+   12,
+   {
+    "$dec": "301.80"
+   },
+   {
+    "$dec": "189.320000"
+   }
+  ],
+  [
+   "Men",
+   "shirts",
+   "importoimporto #1",
+   "ought",
+   "Unknown",
+   2,
+   {
+    "$dec": "27.33"
+   },
+   {
+    "$dec": "189.320000"
+   }
+  ],
+  [
+   "Men",
+   "shirts",
+   "importoimporto #1",
+   "ought",
+   "Unknown",
+   3,
+   {
+    "$dec": "211.70"
+   },
+   {
+    "$dec": "189.320000"
+   }
+  ],
+  [
+   "Men",
+   "shirts",
+   "importoimporto #1",
+   "ought",
+   "Unknown",
+   5,
+   {
+    "$dec": "124.77"
+   },
+   {
+    "$dec": "189.320000"
+   }
+  ],
+  [
+   "Men",
+   "shirts",
+   "importoimporto #1",
+   "ought",
+   "Unknown",
+   7,
+   {
+    "$dec": "155.97"
+   },
+   {
+    "$dec": "189.320000"
+   }
+  ],
+  [
+   "Men",
+   "shirts",
+   "importoimporto #1",
+   "ought",
+   "Unknown",
+   8,
+   {
+    "$dec": "297.72"
+   },
+   {
+    "$dec": "189.320000"
+   }
+  ],
+  [
+   "Men",
+   "shirts",
+   "importoimporto #1",
+   "ought",
+   "Unknown",
+   9,
+   {
+    "$dec": "291.63"
+   },
+   {
+    "$dec": "189.320000"
+   }
+  ],
+  [
+   "Women",
+   "dresses",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   1,
+   {
+    "$dec": "176.88"
+   },
+   {
+    "$dec": "390.089167"
+   }
+  ],
+  [
+   "Women",
+   "dresses",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   10,
+   {
+    "$dec": "601.92"
+   },
+   {
+    "$dec": "390.089167"
+   }
+  ],
+  [
+   "Women",
+   "dresses",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   11,
+   {
+    "$dec": "790.77"
+   },
+   {
+    "$dec": "390.089167"
+   }
+  ],
+  [
+   "Women",
+   "dresses",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   12,
+   {
+    "$dec": "877.99"
+   },
+   {
+    "$dec": "390.089167"
+   }
+  ],
+  [
+   "Women",
+   "dresses",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   2,
+   {
+    "$dec": "232.97"
+   },
+   {
+    "$dec": "390.089167"
+   }
+  ],
+  [
+   "Women",
+   "dresses",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   3,
+   {
+    "$dec": "267.12"
+   },
+   {
+    "$dec": "390.089167"
+   }
+  ],
+  [
+   "Women",
+   "dresses",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   5,
+   {
+    "$dec": "191.09"
+   },
+   {
+    "$dec": "390.089167"
+   }
+  ],
+  [
+   "Women",
+   "dresses",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   6,
+   {
+    "$dec": "7.23"
+   },
+   {
+    "$dec": "390.089167"
+   }
+  ],
+  [
+   "Women",
+   "dresses",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   7,
+   {
+    "$dec": "236.55"
+   },
+   {
+    "$dec": "390.089167"
+   }
+  ],
+  [
+   "Women",
+   "dresses",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   8,
+   {
+    "$dec": "678.96"
+   },
+   {
+    "$dec": "390.089167"
+   }
+  ],
+  [
+   "Women",
+   "dresses",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   9,
+   {
+    "$dec": "233.11"
+   },
+   {
+    "$dec": "390.089167"
+   }
+  ]
+ ]
+}

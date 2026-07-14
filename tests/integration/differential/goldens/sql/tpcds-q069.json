@@ -1,0 +1,140 @@
+{
+ "id": "tpcds-q069",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "cd_gender",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cd_marital_status",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cd_education_status",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cnt1",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "cd_purchase_estimate",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cnt2",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "cd_credit_rating",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cnt3",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "F",
+   "D",
+   "Advanced Degree",
+   1,
+   4500,
+   1,
+   "Unknown",
+   1
+  ],
+  [
+   "F",
+   "M",
+   "Secondary",
+   1,
+   7000,
+   1,
+   "High Risk",
+   1
+  ],
+  [
+   "F",
+   "M",
+   "Unknown",
+   1,
+   4500,
+   1,
+   "High Risk",
+   1
+  ],
+  [
+   "F",
+   "S",
+   "Advanced Degree",
+   1,
+   6000,
+   1,
+   "Unknown",
+   1
+  ],
+  [
+   "F",
+   "W",
+   "Unknown",
+   1,
+   1000,
+   1,
+   "Unknown",
+   1
+  ],
+  [
+   "M",
+   "M",
+   "Unknown",
+   1,
+   9500,
+   1,
+   "Unknown",
+   1
+  ],
+  [
+   "M",
+   "S",
+   "Unknown",
+   1,
+   3500,
+   1,
+   "High Risk",
+   1
+  ],
+  [
+   "M",
+   "U",
+   "4 yr Degree",
+   1,
+   500,
+   1,
+   "Unknown",
+   1
+  ]
+ ]
+}

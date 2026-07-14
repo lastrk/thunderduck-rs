@@ -1,0 +1,44 @@
+{
+ "id": "set-009",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "v",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   -1.0
+  ],
+  [
+   -3.0
+  ],
+  [
+   0.0
+  ],
+  [
+   10.0
+  ],
+  [
+   2.0
+  ],
+  [
+   3.5
+  ],
+  [
+   7.0
+  ],
+  [
+   {
+    "$f": "nan"
+   }
+  ]
+ ]
+}

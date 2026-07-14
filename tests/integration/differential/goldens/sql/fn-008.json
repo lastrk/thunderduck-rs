@@ -1,0 +1,70 @@
+{
+ "id": "fn-008",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "u",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "l",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ln",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "ALICE",
+   "alice",
+   5
+  ],
+  [
+   "BOB",
+   "bob",
+   3
+  ],
+  [
+   "CAROL",
+   "carol",
+   5
+  ],
+  [
+   "DAN",
+   "dan",
+   3
+  ],
+  [
+   "EVE",
+   "eve",
+   3
+  ],
+  [
+   "FRANK",
+   "frank",
+   5
+  ],
+  [
+   "GRACE",
+   "grace",
+   5
+  ],
+  [
+   "HEIDI",
+   "heidi",
+   5
+  ]
+ ]
+}

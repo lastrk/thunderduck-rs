@@ -1,0 +1,68 @@
+{
+ "id": "tpch-q07",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "supp_nation",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cust_nation",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "l_year",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "revenue",
+    "type": "decimal(38,4)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "FRANCE",
+   "GERMANY",
+   1995,
+   {
+    "$dec": "268068.5774"
+   }
+  ],
+  [
+   "FRANCE",
+   "GERMANY",
+   1996,
+   {
+    "$dec": "303862.2980"
+   }
+  ],
+  [
+   "GERMANY",
+   "FRANCE",
+   1995,
+   {
+    "$dec": "621159.4882"
+   }
+  ],
+  [
+   "GERMANY",
+   "FRANCE",
+   1996,
+   {
+    "$dec": "379095.8854"
+   }
+  ]
+ ]
+}

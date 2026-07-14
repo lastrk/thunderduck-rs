@@ -1,0 +1,234 @@
+{
+ "id": "whr-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "manager_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "age",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "salary",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "bonus",
+    "type": "decimal(9,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "hire_date",
+    "type": "date",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "last_login",
+    "type": "timestamp",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "active",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "score",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "tags",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "attrs",
+    "type": {
+     "type": "map",
+     "keyType": "string",
+     "valueType": "string",
+     "valueContainsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "address",
+    "type": {
+     "type": "struct",
+     "fields": [
+      {
+       "name": "city",
+       "type": "string",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "zip",
+       "type": "string",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "geo",
+       "type": {
+        "type": "struct",
+        "fields": [
+         {
+          "name": "lat",
+          "type": "double",
+          "nullable": true,
+          "metadata": {}
+         },
+         {
+          "name": "lng",
+          "type": "double",
+          "nullable": true,
+          "metadata": {}
+         }
+        ]
+       },
+       "nullable": true,
+       "metadata": {}
+      }
+     ]
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "Alice",
+   10,
+   null,
+   34,
+   95000.0,
+   {
+    "$dec": "1500.50"
+   },
+   {
+    "$date": "2018-03-01"
+   },
+   {
+    "$ts": "2026-06-01T09:15:00"
+   },
+   true,
+   0.91,
+   [
+    "python",
+    "rust"
+   ],
+   {
+    "$map": [
+     [
+      "team",
+      "infra"
+     ],
+     [
+      "tz",
+      "UTC"
+     ]
+    ]
+   },
+   {
+    "$row": [
+     "Vienna",
+     "1010",
+     {
+      "$row": [
+       48.2,
+       16.37
+      ]
+     }
+    ]
+   }
+  ],
+  [
+   2,
+   "Bob",
+   10,
+   1,
+   41,
+   120000.0,
+   {
+    "$dec": "3000.00"
+   },
+   {
+    "$date": "2015-07-12"
+   },
+   {
+    "$ts": "2026-06-02T18:40:00"
+   },
+   true,
+   {
+    "$f": "nan"
+   },
+   [
+    "scala"
+   ],
+   {
+    "$map": [
+     [
+      "team",
+      "infra"
+     ]
+    ]
+   },
+   {
+    "$row": [
+     "Berlin",
+     "10115",
+     {
+      "$row": [
+       52.52,
+       13.4
+      ]
+     }
+    ]
+   }
+  ]
+ ]
+}

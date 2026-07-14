@@ -1,0 +1,30 @@
+{
+ "id": "math-014",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "fact",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   120
+  ],
+  [
+   120
+  ],
+  [
+   120
+  ],
+  [
+   120
+  ]
+ ]
+}

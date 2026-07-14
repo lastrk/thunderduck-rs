@@ -9,6 +9,7 @@ import math
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, List, Optional, Tuple
@@ -53,6 +54,94 @@ def collect_with_timeout(df: DataFrame, timeout: int, name: str) -> list:
         raise exception[0]
 
     return result
+
+
+def collect_both(
+    ref_df: DataFrame,
+    td_df: DataFrame,
+    timeout: int,
+    ref_name: str = "Spark Reference",
+    td_name: str = "Thunderduck",
+) -> tuple[list, list]:
+    """Collect both engines' DataFrames concurrently against one shared deadline.
+
+    The reference and Thunderduck servers are independent processes, so their
+    collects can overlap — running them on two daemon threads makes per-case
+    wall-time ≈ max(ref, td) instead of ref + td. Both threads are started
+    before either is awaited; both are then joined against a single `timeout`
+    budget.
+
+    Returns ``(ref_rows, td_rows)``. Re-raises the reference-side exception first
+    (matching the historical ref-then-td ordering, so a Spark-side throw still
+    surfaces before τ is judged), then the τ-side exception. A side that does not
+    finish within `timeout` raises ``TimeoutError`` naming that side.
+    """
+    results: dict[str, list] = {}
+    errors: dict[str, BaseException] = {}
+
+    def _make(key: str, df: DataFrame):
+        def _run():
+            try:
+                results[key] = df.collect()
+            except Exception as exc:  # noqa: BLE001 — surfaced after join
+                errors[key] = exc
+        return _run
+
+    t_ref = threading.Thread(target=_make("ref", ref_df), daemon=True)
+    t_td = threading.Thread(target=_make("td", td_df), daemon=True)
+    t_ref.start()
+    t_td.start()
+
+    deadline = time.monotonic() + timeout
+    t_ref.join(max(0.0, deadline - time.monotonic()))
+    t_td.join(max(0.0, deadline - time.monotonic()))
+
+    if t_ref.is_alive():
+        raise TimeoutError(f"{ref_name} query execution timed out after {timeout}s")
+    if t_td.is_alive():
+        raise TimeoutError(f"{td_name} query execution timed out after {timeout}s")
+
+    if "ref" in errors:
+        raise errors["ref"]
+    if "td" in errors:
+        raise errors["td"]
+
+    return results["ref"], results["td"]
+
+
+def run_pair(ref_fn, td_fn) -> tuple:
+    """Run two non-raising thunks concurrently and return ``(ref_result, td_result)``.
+
+    For the error-parity path, where each side is evaluated by a callable that
+    captures its own exceptions (e.g. ``capture_outcome`` / ``_sql_outcome``) and
+    self-bounds via ``collect_with_timeout`` — so this runner needs no timeout of
+    its own, it just overlaps the two independent server round-trips. If a thunk
+    unexpectedly raises, that exception is re-raised (reference side first).
+    """
+    results: dict[str, object] = {}
+    errors: dict[str, BaseException] = {}
+
+    def _make(key: str, fn):
+        def _run():
+            try:
+                results[key] = fn()
+            except Exception as exc:  # noqa: BLE001 — surfaced after join
+                errors[key] = exc
+        return _run
+
+    t_ref = threading.Thread(target=_make("ref", ref_fn), daemon=True)
+    t_td = threading.Thread(target=_make("td", td_fn), daemon=True)
+    t_ref.start()
+    t_td.start()
+    t_ref.join()
+    t_td.join()
+
+    if "ref" in errors:
+        raise errors["ref"]
+    if "td" in errors:
+        raise errors["td"]
+
+    return results["ref"], results["td"]
 
 
 # ---------------------------------------------------------------------------

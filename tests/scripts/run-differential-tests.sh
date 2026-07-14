@@ -78,6 +78,25 @@ if [[ "$1" == "--ci" ]]; then
     export COLLECT_TIMEOUT="${COLLECT_TIMEOUT:-30}"
 fi
 
+# Oracle mode (see tests/integration/utils/golden.py):
+#   golden (default) — diff τ against recorded golden files; no Spark started.
+#   live             — diff τ against a live Spark reference (full authority).
+#   record           — run Spark and (over)write the goldens for the selection.
+# --record is shorthand for --oracle record. These may precede the test group.
+while true; do
+    case "$1" in
+        --record) export THUNDERDUCK_ORACLE=record; shift ;;
+        --oracle) export THUNDERDUCK_ORACLE="$2"; shift 2 ;;
+        --oracle=*) export THUNDERDUCK_ORACLE="${1#--oracle=}"; shift ;;
+        *) break ;;
+    esac
+done
+export THUNDERDUCK_ORACLE="${THUNDERDUCK_ORACLE:-golden}"
+if [[ "$THUNDERDUCK_ORACLE" != "golden" && "$THUNDERDUCK_ORACLE" != "live" && "$THUNDERDUCK_ORACLE" != "record" ]]; then
+    echo "ERROR: --oracle must be golden|live|record (got '$THUNDERDUCK_ORACLE')"
+    exit 1
+fi
+
 # Resolve Python interpreter
 VENV_DIR="${THUNDERDUCK_VENV_DIR:-$WORKSPACE_DIR/.venv}"
 if [ -n "$VIRTUAL_ENV" ]; then
@@ -188,12 +207,19 @@ echo ""
 # Check prerequisites
 echo -e "${BLUE}[1/2] Checking prerequisites...${NC}"
 
+# Spark is only required for live/record oracle modes; golden mode never starts
+# it (the reference comes from recorded golden files).
 if [ ! -d "$SPARK_HOME" ] || [ ! -f "$SPARK_HOME/bin/spark-submit" ]; then
-    echo -e "${RED}ERROR: Apache Spark not found at $SPARK_HOME${NC}"
-    echo "Run the setup script first: $SCRIPT_DIR/setup-differential-testing.sh"
-    exit 1
+    if [[ "$THUNDERDUCK_ORACLE" == "golden" ]]; then
+        echo -e "${YELLOW}  Spark not found at $SPARK_HOME — not needed (oracle=golden)${NC}"
+    else
+        echo -e "${RED}ERROR: Apache Spark not found at $SPARK_HOME (required for oracle=$THUNDERDUCK_ORACLE)${NC}"
+        echo "Run the setup script first: $SCRIPT_DIR/setup-differential-testing.sh"
+        exit 1
+    fi
+else
+    echo -e "${GREEN}  Spark found at: $SPARK_HOME${NC}"
 fi
-echo -e "${GREEN}  Spark found at: $SPARK_HOME${NC}"
 
 if [ ! -d "$WORKSPACE_DIR/tests/integration/tpch_sf001" ]; then
     echo -e "${RED}ERROR: TPC-H data not found at $WORKSPACE_DIR/tests/integration/tpch_sf001${NC}"
@@ -235,7 +261,7 @@ echo -e "${GREEN}  Thunderduck binary found: $BINARY_PATH${NC}"
 
 # Parse arguments
 show_help() {
-    echo "Usage: $0 [--ci] [test-group] [pytest-args...]"
+    echo "Usage: $0 [--ci] [--record | --oracle MODE] [test-group] [pytest-args...]"
     echo ""
     echo "Test groups: core core_v2 sql_v2 tpch tpcds functions aggregations window datetime"
     echo "             conditional operations lambda joins statistics types schema all"
@@ -246,6 +272,16 @@ show_help() {
     echo "  tpch     — TPC-H cluster: tpch-* corpus cases (SQL + DataFrame)"
     echo "  tpcds    — TPC-DS cluster: tpcds-* corpus cases (SQL + DataFrame)"
     echo "  all      — everything including core (the comprehensive gate)"
+    echo ""
+    echo "Oracle mode (the two conformance corpora only — core/core_v2/sql_v2):"
+    echo "  --oracle golden   (default) diff τ against recorded golden files; NO Spark."
+    echo "  --oracle live               diff τ against a live Spark reference (authority)."
+    echo "  --oracle record | --record  run Spark and (over)write goldens for the selection."
+    echo ""
+    echo "  Add / change a case, then record + commit its golden:"
+    echo "    $0 --record core -k my-new-case      # writes goldens/dataframe/my-new-case.json"
+    echo "  Refresh everything after an input-fixture or Spark-pin change:"
+    echo "    $0 --record core && $0 --record sql_v2"
     echo ""
     echo "Extra pytest args are forwarded verbatim (quoting preserved), e.g.:"
     echo "  $0 sql_v2 -k 'tpch-q01 or sel-001' --tb=long"
@@ -286,6 +322,7 @@ echo -e "  ${CYAN}Test group:${NC} $TEST_GROUP ($(get_test_description "$TEST_GR
 echo -e "  ${CYAN}Test files:${NC} $TEST_FILES"
 echo ""
 echo -e "  ${CYAN}Configuration:${NC}"
+echo -e "    Oracle:            $THUNDERDUCK_ORACLE"
 echo -e "    Python:            $PYTHON"
 echo -e "    Binary:            $BINARY_PATH"
 echo -e "    Spark port:        ${SPARK_PORT:-auto}"

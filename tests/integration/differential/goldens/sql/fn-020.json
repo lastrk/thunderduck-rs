@@ -1,0 +1,56 @@
+{
+ "id": "fn-020",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "h",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "s",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "1F2A",
+   "A"
+  ],
+  [
+   "1F2A",
+   "A"
+  ],
+  [
+   "1F2A",
+   "A"
+  ],
+  [
+   "1F2A",
+   "A"
+  ],
+  [
+   "1F2A",
+   "A"
+  ],
+  [
+   "1F2A",
+   "A"
+  ],
+  [
+   "1F2A",
+   "A"
+  ],
+  [
+   "1F2A",
+   "A"
+  ]
+ ]
+}

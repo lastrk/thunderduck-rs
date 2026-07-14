@@ -1,0 +1,40 @@
+{
+ "id": "tpch-q12",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "l_shipmode",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "high_line_count",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "low_line_count",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "MAIL",
+   64,
+   86
+  ],
+  [
+   "SHIP",
+   61,
+   96
+  ]
+ ]
+}

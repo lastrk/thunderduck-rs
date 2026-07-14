@@ -30,6 +30,31 @@ The differential suite validates Thunderduck against Apache Spark 4.1.1 by runni
 > ```
 > Do **not** re-run `setup-differential-testing.sh` — Spark is already present.
 
+### Oracle modes — golden by default, live/record on demand
+
+The two conformance corpora (`core`, `sql_v2`) run against a **golden-file
+oracle by default**: each case's reference result was captured once from Apache
+Spark 4.1.1 and is stored per-case at
+`tests/integration/differential/goldens/{dataframe,sql}/<case-id>.json` (checked
+into git). Normal runs execute **only τ** and diff against the golden — **no
+Spark JVM is started**, so `core`/`sql_v2` finish in ~4–5 s each. The golden is a
+*cache* of the ADR-015 reference oracle (not a replacement); `--oracle live`
+remains the authority. Mode is selected by `THUNDERDUCK_ORACLE` (default
+`golden`) or the runner flags:
+
+```bash
+./tests/scripts/run-differential-tests.sh core            # golden (default): τ-only, no Spark
+./tests/scripts/run-differential-tests.sh --oracle live core   # diff τ vs a live Spark reference
+./tests/scripts/run-differential-tests.sh --record core -k my-new-case  # capture Spark → golden
+```
+
+Add or change a case, then `--record -k <id>` and commit the regenerated
+golden. Re-record after any input-fixture or Spark-pin change. Recording a large
+heavy cluster live can hit a cumulative Spark-reference slowdown — record in
+smaller `-k` chunks (fresh Spark session each) if the tail crawls. See
+`tests/integration/utils/golden.py`. (The full `all` suite and the legacy
+feature-family modules still run live Spark; only the two corpora are goldened.)
+
 ### Via run script (preferred — the single entry point)
 
 `run-differential-tests.sh` runs everything (`all`) or a subgroup, and forwards

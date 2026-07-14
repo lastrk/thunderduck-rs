@@ -1,0 +1,184 @@
+{
+ "id": "tpcds-q075",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "prev_year",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "year",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_brand_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_class_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_category_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_manufact_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "prev_yr_cnt",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "curr_yr_cnt",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sales_cnt_diff",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sales_amt_diff",
+    "type": "decimal(19,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   2001,
+   2002,
+   2004001,
+   2,
+   9,
+   368,
+   6207,
+   3939,
+   -2268,
+   {
+    "$dec": "-108734.77"
+   }
+  ],
+  [
+   2001,
+   2002,
+   9007002,
+   7,
+   9,
+   301,
+   6032,
+   3536,
+   -2496,
+   {
+    "$dec": "-135623.55"
+   }
+  ],
+  [
+   2001,
+   2002,
+   9010008,
+   10,
+   9,
+   301,
+   5794,
+   3782,
+   -2012,
+   {
+    "$dec": "-98746.56"
+   }
+  ],
+  [
+   2001,
+   2002,
+   9013002,
+   13,
+   9,
+   296,
+   5075,
+   3315,
+   -1760,
+   {
+    "$dec": "-133976.87"
+   }
+  ],
+  [
+   2001,
+   2002,
+   9015002,
+   15,
+   9,
+   275,
+   5082,
+   3774,
+   -1308,
+   {
+    "$dec": "-14549.37"
+   }
+  ],
+  [
+   2001,
+   2002,
+   9015008,
+   15,
+   9,
+   285,
+   5318,
+   4181,
+   -1137,
+   {
+    "$dec": "-103174.28"
+   }
+  ],
+  [
+   2001,
+   2002,
+   9015008,
+   15,
+   9,
+   384,
+   5819,
+   3024,
+   -2795,
+   {
+    "$dec": "-133143.14"
+   }
+  ],
+  [
+   2001,
+   2002,
+   9015010,
+   2,
+   9,
+   286,
+   5327,
+   4205,
+   -1122,
+   {
+    "$dec": "-16466.70"
+   }
+  ]
+ ]
+}

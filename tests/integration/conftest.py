@@ -195,20 +195,20 @@ from dual_server_manager import DualServerManager
 from port_utils import is_port_listening as _is_port_listening
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def spark_session(spark_thunderduck):
     """
-    Module-scoped alias for spark_thunderduck.
+    Session-scoped alias for spark_thunderduck.
 
     For backward compatibility with tests expecting spark_session.
     """
     return spark_thunderduck
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def spark(spark_thunderduck):
     """
-    Module-scoped alias for spark_thunderduck.
+    Session-scoped alias for spark_thunderduck.
 
     This allows tests written for single-server mode to work
     in the dual-server testing environment.
@@ -451,13 +451,29 @@ def dual_server_manager():
         spark_reference_port=spark_port,
     )
 
+    # Golden-oracle mode runs τ only (the reference comes from recorded golden
+    # files), so there is no reason to pay Spark JVM startup — and it keeps the
+    # Spark reference server, whose long-run degradation motivated the golden
+    # oracle, entirely out of the normal loop. live/record modes need both.
+    import golden as _golden
+    mode = _golden.oracle_mode()
+    spark_needed = mode in ("live", "record")
+
     print("\n" + "="*80)
-    print("Starting DUAL servers for differential testing...")
+    print(f"Starting servers for differential testing (oracle={mode})...")
     print(f"  Thunderduck port: {td_port}")
-    print(f"  Spark Reference port: {spark_port}")
+    if spark_needed:
+        print(f"  Spark Reference port: {spark_port}")
+    else:
+        print("  Spark Reference: SKIPPED (golden oracle — no live Spark)")
     print("="*80)
 
-    spark_ok, thunderduck_ok = manager.start_both(timeout=120)
+    if spark_needed:
+        spark_ok, thunderduck_ok = manager.start_both(timeout=120)
+    else:
+        # τ only; Spark not started (spark_ok=True so the guard below passes).
+        thunderduck_ok = manager.start_thunderduck(timeout=120)
+        spark_ok = True
 
     if not (spark_ok and thunderduck_ok):
         manager.stop_both()
@@ -525,14 +541,21 @@ def orchestrator(dual_server_manager):
     print(orch.timings.get_summary())
 
 
-# Primary session fixtures (module-scoped to reduce session churn)
-@pytest.fixture(scope="module")
+# Primary session fixtures (session-scoped: one pair shared across ALL modules).
+# Safe because no test mutates shared session config (no conf.set / SET), calls
+# .stop(), or switches database; all temp views use createOrReplaceTempView
+# (overwrite). The view-registering fixtures below (corpus_inputs_* /
+# sql_corpus_* / tpc_view_switcher) stay MODULE-scoped so each corpus module
+# re-establishes its own emp/dept/emp2/nums/raw (+ customer) on the shared
+# session at module entry.
+@pytest.fixture(scope="session")
 def spark_reference(orchestrator, dual_server_manager):
     """
-    Module-scoped Spark session connected to Apache Spark Connect (reference).
+    Session-scoped Spark session connected to Apache Spark Connect (reference).
 
     This is the reference implementation (official Apache Spark 4.1.1).
-    One session per test module reduces session creation overhead (143 -> ~36 pairs).
+    One session for the whole run (not per module) eliminates ~38x repeated
+    session creation across the 40-module suite.
     Includes health check with auto-restart before session creation.
     """
     # Health check: verify Spark Reference server is responsive
@@ -550,13 +573,14 @@ def spark_reference(orchestrator, dual_server_manager):
     orchestrator._active_sessions.discard(session)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def spark_thunderduck(orchestrator, dual_server_manager):
     """
-    Module-scoped Spark session connected to Thunderduck Connect (test).
+    Session-scoped Spark session connected to Thunderduck Connect (test).
 
     This is the system under test (Thunderduck implementation).
-    One session per test module reduces session creation overhead.
+    One session for the whole run (not per module) eliminates ~38x repeated
+    session creation across the 40-module suite.
     Includes health check with auto-restart before session creation.
     """
     # Health check: verify Thunderduck server is responsive
@@ -654,27 +678,37 @@ def _register_tpc_views(spark, tpch_data_dir, tpcds_data_dir):
 
 
 @pytest.fixture(scope="module")
-def tpc_view_switcher(spark_reference, spark_thunderduck, tpch_data_dir, tpcds_data_dir):
+def tpc_view_switcher(request, spark_thunderduck, tpch_data_dir, tpcds_data_dir):
     """Re-point the benchmark-colliding temp views for a tpch/tpcds case.
 
-    Called by the SQL-corpus test with the case's category before each case.
+    Called by the corpus tests with the case's category before each case.
     Non-TPC categories are a no-op; consecutive same-category cases are a
     no-op (the corpus lists all tpch cases, then all tpcds cases, so the
     re-registration happens at most twice per engine per run). The τ side is
     tolerant — a registration failure surfaces as that case's own failure
     (unresolved view) rather than an aborting fixture ERROR.
+
+    Golden-safe: the τ side is always re-pointed (τ executes the query); the
+    Spark reference side is touched only in live/record mode (obtained lazily so
+    golden mode never instantiates `spark_reference` and never starts Spark).
     """
+    import golden as _golden
+    _spark_ref_needed = _golden.oracle_mode() in ("live", "record")
     state = {}
 
     def switch(category):
         if category not in ("tpch", "tpcds") or state.get("current") == category:
             return
         data_dir = tpch_data_dir if category == "tpch" else tpcds_data_dir
+        spark_reference = (
+            request.getfixturevalue("spark_reference") if _spark_ref_needed else None
+        )
         for table in TPC_COLLIDING_TABLES:
             parquet_path = data_dir / f"{table}.parquet"
             if not parquet_path.exists():
                 pytest.skip(f"TPC table not found: {parquet_path}")
-            spark_reference.read.parquet(str(parquet_path)).createOrReplaceTempView(table)
+            if spark_reference is not None:
+                spark_reference.read.parquet(str(parquet_path)).createOrReplaceTempView(table)
             try:
                 spark_thunderduck.read.parquet(str(parquet_path)).createOrReplaceTempView(table)
             except Exception:

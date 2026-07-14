@@ -1,0 +1,130 @@
+{
+ "id": "struct-008",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "zip",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "geo",
+    "type": {
+     "type": "struct",
+     "fields": [
+      {
+       "name": "lat",
+       "type": "double",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "lng",
+       "type": "double",
+       "nullable": true,
+       "metadata": {}
+      }
+     ]
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "Vienna",
+   "1010",
+   {
+    "$row": [
+     48.2,
+     16.37
+    ]
+   }
+  ],
+  [
+   2,
+   "Berlin",
+   "10115",
+   {
+    "$row": [
+     52.52,
+     13.4
+    ]
+   }
+  ],
+  [
+   3,
+   "Vienna",
+   null,
+   {
+    "$row": [
+     48.21,
+     16.36
+    ]
+   }
+  ],
+  [
+   4,
+   null,
+   "20095",
+   null
+  ],
+  [
+   5,
+   "Munich",
+   "80331",
+   {
+    "$row": [
+     48.14,
+     11.58
+    ]
+   }
+  ],
+  [
+   6,
+   "Zurich",
+   "8001",
+   {
+    "$row": [
+     47.37,
+     8.54
+    ]
+   }
+  ],
+  [
+   7,
+   "Vienna",
+   "1020",
+   {
+    "$row": [
+     48.22,
+     16.4
+    ]
+   }
+  ],
+  [
+   8,
+   null,
+   null,
+   null
+  ]
+ ]
+}

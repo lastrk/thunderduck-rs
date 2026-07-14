@@ -1,0 +1,27 @@
+{
+ "id": "json-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "a",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "1"
+  ],
+  [
+   "2"
+  ],
+  [
+   null
+  ]
+ ]
+}

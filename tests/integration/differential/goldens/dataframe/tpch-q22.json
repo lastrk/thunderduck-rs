@@ -1,0 +1,79 @@
+{
+ "id": "tpch-q22",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "cntrycode",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "numcust",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "totacctbal",
+    "type": "decimal(25,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "13",
+   10,
+   {
+    "$dec": "75359.29"
+   }
+  ],
+  [
+   "17",
+   8,
+   {
+    "$dec": "62288.98"
+   }
+  ],
+  [
+   "18",
+   14,
+   {
+    "$dec": "111072.45"
+   }
+  ],
+  [
+   "23",
+   5,
+   {
+    "$dec": "40458.86"
+   }
+  ],
+  [
+   "29",
+   11,
+   {
+    "$dec": "88722.85"
+   }
+  ],
+  [
+   "30",
+   17,
+   {
+    "$dec": "122189.33"
+   }
+  ],
+  [
+   "31",
+   8,
+   {
+    "$dec": "66313.16"
+   }
+  ]
+ ]
+}

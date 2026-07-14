@@ -1,0 +1,42 @@
+{
+ "id": "dt-003",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "days",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1033
+  ],
+  [
+   1987
+  ],
+  [
+   2191
+  ],
+  [
+   3043
+  ],
+  [
+   4006
+  ],
+  [
+   5250
+  ],
+  [
+   6081
+  ],
+  [
+   9199
+  ]
+ ]
+}

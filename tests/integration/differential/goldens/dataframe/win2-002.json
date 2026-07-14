@@ -1,0 +1,94 @@
+{
+ "id": "win2-002",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "window",
+    "type": {
+     "type": "struct",
+     "fields": [
+      {
+       "name": "start",
+       "type": "timestamp",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "end",
+       "type": "timestamp",
+       "nullable": true,
+       "metadata": {}
+      }
+     ]
+    },
+    "nullable": false,
+    "metadata": {
+     "spark.timeWindow": true
+    }
+   },
+   {
+    "name": "n",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$row": [
+     {
+      "$ts": "2026-05-30T00:00:00"
+     },
+     {
+      "$ts": "2026-05-31T00:00:00"
+     }
+    ]
+   },
+   1
+  ],
+  [
+   {
+    "$row": [
+     {
+      "$ts": "2026-06-01T00:00:00"
+     },
+     {
+      "$ts": "2026-06-02T00:00:00"
+     }
+    ]
+   },
+   2
+  ],
+  [
+   {
+    "$row": [
+     {
+      "$ts": "2026-06-02T00:00:00"
+     },
+     {
+      "$ts": "2026-06-03T00:00:00"
+     }
+    ]
+   },
+   2
+  ],
+  [
+   {
+    "$row": [
+     {
+      "$ts": "2026-06-03T00:00:00"
+     },
+     {
+      "$ts": "2026-06-04T00:00:00"
+     }
+    ]
+   },
+   1
+  ]
+ ]
+}

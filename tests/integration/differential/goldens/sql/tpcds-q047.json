@@ -1,0 +1,2072 @@
+{
+ "id": "tpcds-q047",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_category",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_brand",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_store_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_company_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d_year",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d_moy",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_monthly_sales",
+    "type": "decimal(21,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sum_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "psum",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "nsum",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Books",
+   "corpunivamalg #9",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "202.245000"
+   },
+   {
+    "$dec": "18.61"
+   },
+   {
+    "$dec": "229.14"
+   },
+   {
+    "$dec": "127.28"
+   }
+  ],
+  [
+   "Books",
+   "corpunivamalg #9",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "202.245000"
+   },
+   {
+    "$dec": "8.02"
+   },
+   {
+    "$dec": "127.28"
+   },
+   {
+    "$dec": "131.03"
+   }
+  ],
+  [
+   "Books",
+   "exportiunivamalg #2",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "336.455000"
+   },
+   {
+    "$dec": "47.26"
+   },
+   {
+    "$dec": "334.99"
+   },
+   {
+    "$dec": "124.85"
+   }
+  ],
+  [
+   "Books",
+   "exportiunivamalg #2",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "336.455000"
+   },
+   {
+    "$dec": "124.85"
+   },
+   {
+    "$dec": "47.26"
+   },
+   {
+    "$dec": "388.34"
+   }
+  ],
+  [
+   "Books",
+   "exportiunivamalg #2",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "336.455000"
+   },
+   {
+    "$dec": "107.07"
+   },
+   {
+    "$dec": "388.34"
+   },
+   {
+    "$dec": "43.07"
+   }
+  ],
+  [
+   "Books",
+   "exportiunivamalg #2",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "336.455000"
+   },
+   {
+    "$dec": "43.07"
+   },
+   {
+    "$dec": "107.07"
+   },
+   {
+    "$dec": "229.95"
+   }
+  ],
+  [
+   "Books",
+   "scholarunivamalg #8",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "383.853333"
+   },
+   {
+    "$dec": "140.99"
+   },
+   {
+    "$dec": "561.90"
+   },
+   {
+    "$dec": "160.05"
+   }
+  ],
+  [
+   "Books",
+   "scholarunivamalg #8",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "383.853333"
+   },
+   {
+    "$dec": "160.05"
+   },
+   {
+    "$dec": "140.99"
+   },
+   {
+    "$dec": "190.87"
+   }
+  ],
+  [
+   "Books",
+   "scholarunivamalg #8",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "383.853333"
+   },
+   {
+    "$dec": "190.87"
+   },
+   {
+    "$dec": "160.05"
+   },
+   {
+    "$dec": "7.95"
+   }
+  ],
+  [
+   "Books",
+   "scholarunivamalg #8",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "383.853333"
+   },
+   {
+    "$dec": "7.95"
+   },
+   {
+    "$dec": "190.87"
+   },
+   {
+    "$dec": "232.19"
+   }
+  ],
+  [
+   "Books",
+   "scholarunivamalg #8",
+   "ought",
+   "Unknown",
+   1999,
+   7,
+   {
+    "$dec": "383.853333"
+   },
+   {
+    "$dec": "213.62"
+   },
+   {
+    "$dec": "232.19"
+   },
+   {
+    "$dec": "256.80"
+   }
+  ],
+  [
+   "Books",
+   "univunivamalg #8",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "199.997273"
+   },
+   {
+    "$dec": "4.78"
+   },
+   {
+    "$dec": "230.21"
+   },
+   {
+    "$dec": "201.85"
+   }
+  ],
+  [
+   "Children",
+   "amalgexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   1,
+   {
+    "$dec": "537.596667"
+   },
+   {
+    "$dec": "269.45"
+   },
+   {
+    "$dec": "1228.72"
+   },
+   {
+    "$dec": "68.95"
+   }
+  ],
+  [
+   "Children",
+   "amalgexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "537.596667"
+   },
+   {
+    "$dec": "68.95"
+   },
+   {
+    "$dec": "269.45"
+   },
+   {
+    "$dec": "279.66"
+   }
+  ],
+  [
+   "Children",
+   "amalgexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "537.596667"
+   },
+   {
+    "$dec": "279.66"
+   },
+   {
+    "$dec": "68.95"
+   },
+   {
+    "$dec": "532.39"
+   }
+  ],
+  [
+   "Children",
+   "amalgexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "537.596667"
+   },
+   {
+    "$dec": "279.03"
+   },
+   {
+    "$dec": "532.39"
+   },
+   {
+    "$dec": "153.48"
+   }
+  ],
+  [
+   "Children",
+   "amalgexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "537.596667"
+   },
+   {
+    "$dec": "153.48"
+   },
+   {
+    "$dec": "279.03"
+   },
+   {
+    "$dec": "262.85"
+   }
+  ],
+  [
+   "Children",
+   "amalgexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   7,
+   {
+    "$dec": "537.596667"
+   },
+   {
+    "$dec": "262.85"
+   },
+   {
+    "$dec": "153.48"
+   },
+   {
+    "$dec": "813.09"
+   }
+  ],
+  [
+   "Children",
+   "edu packexporti #2",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "402.300909"
+   },
+   {
+    "$dec": "136.04"
+   },
+   {
+    "$dec": "249.07"
+   },
+   {
+    "$dec": "212.15"
+   }
+  ],
+  [
+   "Children",
+   "edu packexporti #2",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "402.300909"
+   },
+   {
+    "$dec": "212.15"
+   },
+   {
+    "$dec": "136.04"
+   },
+   {
+    "$dec": "144.07"
+   }
+  ],
+  [
+   "Children",
+   "edu packexporti #2",
+   "ought",
+   "Unknown",
+   1999,
+   7,
+   {
+    "$dec": "402.300909"
+   },
+   {
+    "$dec": "144.07"
+   },
+   {
+    "$dec": "212.15"
+   },
+   {
+    "$dec": "179.49"
+   }
+  ],
+  [
+   "Children",
+   "edu packexporti #2",
+   "ought",
+   "Unknown",
+   1999,
+   8,
+   {
+    "$dec": "402.300909"
+   },
+   {
+    "$dec": "179.49"
+   },
+   {
+    "$dec": "144.07"
+   },
+   {
+    "$dec": "473.57"
+   }
+  ],
+  [
+   "Children",
+   "exportiexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "406.430833"
+   },
+   {
+    "$dec": "100.95"
+   },
+   {
+    "$dec": "394.65"
+   },
+   {
+    "$dec": "328.96"
+   }
+  ],
+  [
+   "Children",
+   "exportiexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "406.430833"
+   },
+   {
+    "$dec": "33.30"
+   },
+   {
+    "$dec": "328.96"
+   },
+   {
+    "$dec": "206.68"
+   }
+  ],
+  [
+   "Children",
+   "exportiexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "406.430833"
+   },
+   {
+    "$dec": "206.68"
+   },
+   {
+    "$dec": "33.30"
+   },
+   {
+    "$dec": "47.16"
+   }
+  ],
+  [
+   "Children",
+   "exportiexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "406.430833"
+   },
+   {
+    "$dec": "47.16"
+   },
+   {
+    "$dec": "206.68"
+   },
+   {
+    "$dec": "417.50"
+   }
+  ],
+  [
+   "Children",
+   "exportiexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   9,
+   {
+    "$dec": "406.430833"
+   },
+   {
+    "$dec": "205.50"
+   },
+   {
+    "$dec": "443.05"
+   },
+   {
+    "$dec": "811.52"
+   }
+  ],
+  [
+   "Children",
+   "importoexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "335.779167"
+   },
+   {
+    "$dec": "163.57"
+   },
+   {
+    "$dec": "189.20"
+   },
+   {
+    "$dec": "166.74"
+   }
+  ],
+  [
+   "Children",
+   "importoexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "335.779167"
+   },
+   {
+    "$dec": "166.74"
+   },
+   {
+    "$dec": "163.57"
+   },
+   {
+    "$dec": "274.51"
+   }
+  ],
+  [
+   "Children",
+   "importoexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "335.779167"
+   },
+   {
+    "$dec": "24.31"
+   },
+   {
+    "$dec": "170.03"
+   },
+   {
+    "$dec": "61.74"
+   }
+  ],
+  [
+   "Children",
+   "importoexporti #1",
+   "ought",
+   "Unknown",
+   1999,
+   7,
+   {
+    "$dec": "335.779167"
+   },
+   {
+    "$dec": "61.74"
+   },
+   {
+    "$dec": "24.31"
+   },
+   {
+    "$dec": "287.41"
+   }
+  ],
+  [
+   "Electronics",
+   "brandunivamalg #1",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "251.165833"
+   },
+   {
+    "$dec": "55.86"
+   },
+   {
+    "$dec": "97.39"
+   },
+   {
+    "$dec": "181.07"
+   }
+  ],
+  [
+   "Electronics",
+   "corpamalgamalg #12",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "193.855000"
+   },
+   {
+    "$dec": "4.69"
+   },
+   {
+    "$dec": "129.91"
+   },
+   {
+    "$dec": "127.90"
+   }
+  ],
+  [
+   "Electronics",
+   "corpunivamalg #11",
+   "ought",
+   "Unknown",
+   1999,
+   8,
+   {
+    "$dec": "208.717500"
+   },
+   {
+    "$dec": "36.27"
+   },
+   {
+    "$dec": "156.22"
+   },
+   {
+    "$dec": "163.72"
+   }
+  ],
+  [
+   "Electronics",
+   "scholarunivamalg #6",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "192.842727"
+   },
+   {
+    "$dec": "20.31"
+   },
+   {
+    "$dec": "164.25"
+   },
+   {
+    "$dec": "128.36"
+   }
+  ],
+  [
+   "Home",
+   "corpbrand #10",
+   "ought",
+   "Unknown",
+   1999,
+   1,
+   {
+    "$dec": "234.845455"
+   },
+   {
+    "$dec": "10.77"
+   },
+   {
+    "$dec": "233.18"
+   },
+   {
+    "$dec": "380.65"
+   }
+  ],
+  [
+   "Home",
+   "corpnameless #6",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "196.006667"
+   },
+   {
+    "$dec": "13.16"
+   },
+   {
+    "$dec": "198.16"
+   },
+   {
+    "$dec": "270.35"
+   }
+  ],
+  [
+   "Home",
+   "edu packbrand #3",
+   "ought",
+   "Unknown",
+   1999,
+   1,
+   {
+    "$dec": "197.393333"
+   },
+   {
+    "$dec": "20.83"
+   },
+   {
+    "$dec": "739.15"
+   },
+   {
+    "$dec": "65.73"
+   }
+  ],
+  [
+   "Home",
+   "edu packbrand #3",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "197.393333"
+   },
+   {
+    "$dec": "25.99"
+   },
+   {
+    "$dec": "64.80"
+   },
+   {
+    "$dec": "211.20"
+   }
+  ],
+  [
+   "Jewelry",
+   "brandcorp #5",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "189.616364"
+   },
+   {
+    "$dec": "4.33"
+   },
+   {
+    "$dec": "139.85"
+   },
+   {
+    "$dec": "90.70"
+   }
+  ],
+  [
+   "Jewelry",
+   "edu packcorp #7",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "193.574167"
+   },
+   {
+    "$dec": "0.53"
+   },
+   {
+    "$dec": "63.03"
+   },
+   {
+    "$dec": "183.70"
+   }
+  ],
+  [
+   "Jewelry",
+   "importobrand #6",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "221.968333"
+   },
+   {
+    "$dec": "5.60"
+   },
+   {
+    "$dec": "100.34"
+   },
+   {
+    "$dec": "9.71"
+   }
+  ],
+  [
+   "Jewelry",
+   "importobrand #6",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "221.968333"
+   },
+   {
+    "$dec": "9.71"
+   },
+   {
+    "$dec": "5.60"
+   },
+   {
+    "$dec": "79.70"
+   }
+  ],
+  [
+   "Jewelry",
+   "importobrand #6",
+   "ought",
+   "Unknown",
+   1999,
+   9,
+   {
+    "$dec": "221.968333"
+   },
+   {
+    "$dec": "29.97"
+   },
+   {
+    "$dec": "61.84"
+   },
+   {
+    "$dec": "435.44"
+   }
+  ],
+  [
+   "Jewelry",
+   "importocorp #7",
+   "ought",
+   "Unknown",
+   1999,
+   1,
+   {
+    "$dec": "290.065455"
+   },
+   {
+    "$dec": "105.93"
+   },
+   {
+    "$dec": "643.46"
+   },
+   {
+    "$dec": "248.19"
+   }
+  ],
+  [
+   "Jewelry",
+   "importocorp #7",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "290.065455"
+   },
+   {
+    "$dec": "50.14"
+   },
+   {
+    "$dec": "288.32"
+   },
+   {
+    "$dec": "242.33"
+   }
+  ],
+  [
+   "Men",
+   "amalgimporto #2",
+   "ought",
+   "Unknown",
+   1999,
+   1,
+   {
+    "$dec": "429.609167"
+   },
+   {
+    "$dec": "211.03"
+   },
+   {
+    "$dec": "611.58"
+   },
+   {
+    "$dec": "263.18"
+   }
+  ],
+  [
+   "Men",
+   "amalgimporto #2",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "429.609167"
+   },
+   {
+    "$dec": "263.18"
+   },
+   {
+    "$dec": "211.03"
+   },
+   {
+    "$dec": "190.98"
+   }
+  ],
+  [
+   "Men",
+   "amalgimporto #2",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "429.609167"
+   },
+   {
+    "$dec": "190.98"
+   },
+   {
+    "$dec": "263.18"
+   },
+   {
+    "$dec": "114.18"
+   }
+  ],
+  [
+   "Men",
+   "amalgimporto #2",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "429.609167"
+   },
+   {
+    "$dec": "114.18"
+   },
+   {
+    "$dec": "190.98"
+   },
+   {
+    "$dec": "150.52"
+   }
+  ],
+  [
+   "Men",
+   "amalgimporto #2",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "429.609167"
+   },
+   {
+    "$dec": "150.52"
+   },
+   {
+    "$dec": "114.18"
+   },
+   {
+    "$dec": "345.39"
+   }
+  ],
+  [
+   "Men",
+   "edu packimporto #1",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "894.001667"
+   },
+   {
+    "$dec": "495.81"
+   },
+   {
+    "$dec": "958.15"
+   },
+   {
+    "$dec": "592.99"
+   }
+  ],
+  [
+   "Men",
+   "edu packimporto #1",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "894.001667"
+   },
+   {
+    "$dec": "592.99"
+   },
+   {
+    "$dec": "495.81"
+   },
+   {
+    "$dec": "357.90"
+   }
+  ],
+  [
+   "Men",
+   "edu packimporto #1",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "894.001667"
+   },
+   {
+    "$dec": "357.90"
+   },
+   {
+    "$dec": "592.99"
+   },
+   {
+    "$dec": "214.31"
+   }
+  ],
+  [
+   "Men",
+   "edu packimporto #1",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "894.001667"
+   },
+   {
+    "$dec": "214.31"
+   },
+   {
+    "$dec": "357.90"
+   },
+   {
+    "$dec": "562.90"
+   }
+  ],
+  [
+   "Men",
+   "edu packimporto #1",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "894.001667"
+   },
+   {
+    "$dec": "562.90"
+   },
+   {
+    "$dec": "214.31"
+   },
+   {
+    "$dec": "620.73"
+   }
+  ],
+  [
+   "Men",
+   "edu packimporto #1",
+   "ought",
+   "Unknown",
+   1999,
+   7,
+   {
+    "$dec": "894.001667"
+   },
+   {
+    "$dec": "620.73"
+   },
+   {
+    "$dec": "562.90"
+   },
+   {
+    "$dec": "1149.11"
+   }
+  ],
+  [
+   "Men",
+   "edu packimporto #2",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "352.024167"
+   },
+   {
+    "$dec": "60.25"
+   },
+   {
+    "$dec": "247.49"
+   },
+   {
+    "$dec": "259.94"
+   }
+  ],
+  [
+   "Men",
+   "edu packimporto #2",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "352.024167"
+   },
+   {
+    "$dec": "53.76"
+   },
+   {
+    "$dec": "213.67"
+   },
+   {
+    "$dec": "82.19"
+   }
+  ],
+  [
+   "Men",
+   "edu packimporto #2",
+   "ought",
+   "Unknown",
+   1999,
+   7,
+   {
+    "$dec": "352.024167"
+   },
+   {
+    "$dec": "82.19"
+   },
+   {
+    "$dec": "53.76"
+   },
+   {
+    "$dec": "551.23"
+   }
+  ],
+  [
+   "Music",
+   "amalgscholar #1",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "353.523333"
+   },
+   {
+    "$dec": "79.13"
+   },
+   {
+    "$dec": "225.48"
+   },
+   {
+    "$dec": "154.66"
+   }
+  ],
+  [
+   "Music",
+   "amalgscholar #1",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "353.523333"
+   },
+   {
+    "$dec": "154.66"
+   },
+   {
+    "$dec": "79.13"
+   },
+   {
+    "$dec": "136.90"
+   }
+  ],
+  [
+   "Music",
+   "amalgscholar #1",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "353.523333"
+   },
+   {
+    "$dec": "136.90"
+   },
+   {
+    "$dec": "154.66"
+   },
+   {
+    "$dec": "174.54"
+   }
+  ],
+  [
+   "Music",
+   "amalgscholar #1",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "353.523333"
+   },
+   {
+    "$dec": "174.54"
+   },
+   {
+    "$dec": "136.90"
+   },
+   {
+    "$dec": "180.25"
+   }
+  ],
+  [
+   "Music",
+   "amalgscholar #1",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "353.523333"
+   },
+   {
+    "$dec": "180.25"
+   },
+   {
+    "$dec": "174.54"
+   },
+   {
+    "$dec": "241.10"
+   }
+  ],
+  [
+   "Music",
+   "exportischolar #2",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "398.870000"
+   },
+   {
+    "$dec": "222.77"
+   },
+   {
+    "$dec": "369.30"
+   },
+   {
+    "$dec": "185.68"
+   }
+  ],
+  [
+   "Music",
+   "exportischolar #2",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "398.870000"
+   },
+   {
+    "$dec": "185.68"
+   },
+   {
+    "$dec": "222.77"
+   },
+   {
+    "$dec": "188.36"
+   }
+  ],
+  [
+   "Music",
+   "exportischolar #2",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "398.870000"
+   },
+   {
+    "$dec": "188.36"
+   },
+   {
+    "$dec": "185.68"
+   },
+   {
+    "$dec": "185.66"
+   }
+  ],
+  [
+   "Music",
+   "exportischolar #2",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "398.870000"
+   },
+   {
+    "$dec": "185.66"
+   },
+   {
+    "$dec": "188.36"
+   },
+   {
+    "$dec": "248.30"
+   }
+  ],
+  [
+   "Shoes",
+   "edu packedu pack #1",
+   "ought",
+   "Unknown",
+   1999,
+   1,
+   {
+    "$dec": "599.835000"
+   },
+   {
+    "$dec": "413.31"
+   },
+   {
+    "$dec": "1216.77"
+   },
+   {
+    "$dec": "442.25"
+   }
+  ],
+  [
+   "Shoes",
+   "edu packedu pack #1",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "599.835000"
+   },
+   {
+    "$dec": "199.22"
+   },
+   {
+    "$dec": "472.58"
+   },
+   {
+    "$dec": "54.02"
+   }
+  ],
+  [
+   "Shoes",
+   "edu packedu pack #1",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "599.835000"
+   },
+   {
+    "$dec": "54.02"
+   },
+   {
+    "$dec": "199.22"
+   },
+   {
+    "$dec": "646.45"
+   }
+  ],
+  [
+   "Shoes",
+   "edu packedu pack #1",
+   "ought",
+   "Unknown",
+   1999,
+   7,
+   {
+    "$dec": "599.835000"
+   },
+   {
+    "$dec": "415.05"
+   },
+   {
+    "$dec": "646.45"
+   },
+   {
+    "$dec": "668.13"
+   }
+  ],
+  [
+   "Shoes",
+   "exportiedu pack #1",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "780.189167"
+   },
+   {
+    "$dec": "457.69"
+   },
+   {
+    "$dec": "649.87"
+   },
+   {
+    "$dec": "526.15"
+   }
+  ],
+  [
+   "Shoes",
+   "exportiedu pack #1",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "780.189167"
+   },
+   {
+    "$dec": "526.15"
+   },
+   {
+    "$dec": "457.69"
+   },
+   {
+    "$dec": "823.83"
+   }
+  ],
+  [
+   "Shoes",
+   "exportiedu pack #1",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "780.189167"
+   },
+   {
+    "$dec": "163.18"
+   },
+   {
+    "$dec": "823.83"
+   },
+   {
+    "$dec": "245.55"
+   }
+  ],
+  [
+   "Shoes",
+   "exportiedu pack #1",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "780.189167"
+   },
+   {
+    "$dec": "245.55"
+   },
+   {
+    "$dec": "163.18"
+   },
+   {
+    "$dec": "612.27"
+   }
+  ],
+  [
+   "Shoes",
+   "exportiedu pack #1",
+   "ought",
+   "Unknown",
+   1999,
+   7,
+   {
+    "$dec": "780.189167"
+   },
+   {
+    "$dec": "612.27"
+   },
+   {
+    "$dec": "245.55"
+   },
+   {
+    "$dec": "1125.36"
+   }
+  ],
+  [
+   "Shoes",
+   "importoedu pack #1",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "177.197500"
+   },
+   {
+    "$dec": "4.51"
+   },
+   {
+    "$dec": "216.44"
+   },
+   {
+    "$dec": "84.30"
+   }
+  ],
+  [
+   "Sports",
+   "brandnameless #5",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "171.692500"
+   },
+   {
+    "$dec": "4.91"
+   },
+   {
+    "$dec": "297.68"
+   },
+   {
+    "$dec": "19.78"
+   }
+  ],
+  [
+   "Sports",
+   "brandnameless #5",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "171.692500"
+   },
+   {
+    "$dec": "3.51"
+   },
+   {
+    "$dec": "99.13"
+   },
+   {
+    "$dec": "79.58"
+   }
+  ],
+  [
+   "Sports",
+   "exportimaxi #1",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "230.985455"
+   },
+   {
+    "$dec": "39.32"
+   },
+   {
+    "$dec": "135.81"
+   },
+   {
+    "$dec": "196.27"
+   }
+  ],
+  [
+   "Sports",
+   "exportimaxi #1",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "230.985455"
+   },
+   {
+    "$dec": "42.46"
+   },
+   {
+    "$dec": "196.27"
+   },
+   {
+    "$dec": "103.28"
+   }
+  ],
+  [
+   "Sports",
+   "maxinameless #3",
+   "ought",
+   "Unknown",
+   1999,
+   7,
+   {
+    "$dec": "225.130833"
+   },
+   {
+    "$dec": "34.68"
+   },
+   {
+    "$dec": "119.62"
+   },
+   {
+    "$dec": "217.50"
+   }
+  ],
+  [
+   "Sports",
+   "maxinameless #5",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "179.164545"
+   },
+   {
+    "$dec": "8.84"
+   },
+   {
+    "$dec": "180.87"
+   },
+   {
+    "$dec": "179.40"
+   }
+  ],
+  [
+   "Sports",
+   "scholarmaxi #1",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "188.184167"
+   },
+   {
+    "$dec": "0.19"
+   },
+   {
+    "$dec": "160.15"
+   },
+   {
+    "$dec": "155.47"
+   }
+  ],
+  [
+   "Sports",
+   "scholarmaxi #2",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "189.227273"
+   },
+   {
+    "$dec": "22.69"
+   },
+   {
+    "$dec": "23.64"
+   },
+   {
+    "$dec": "18.07"
+   }
+  ],
+  [
+   "Sports",
+   "scholarmaxi #2",
+   "ought",
+   "Unknown",
+   1999,
+   7,
+   {
+    "$dec": "189.227273"
+   },
+   {
+    "$dec": "18.07"
+   },
+   {
+    "$dec": "22.69"
+   },
+   {
+    "$dec": "202.72"
+   }
+  ],
+  [
+   "Women",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   1999,
+   1,
+   {
+    "$dec": "390.089167"
+   },
+   {
+    "$dec": "176.88"
+   },
+   {
+    "$dec": "757.54"
+   },
+   {
+    "$dec": "232.97"
+   }
+  ],
+  [
+   "Women",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "390.089167"
+   },
+   {
+    "$dec": "191.09"
+   },
+   {
+    "$dec": "386.48"
+   },
+   {
+    "$dec": "7.23"
+   }
+  ],
+  [
+   "Women",
+   "amalgamalg #1",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "390.089167"
+   },
+   {
+    "$dec": "7.23"
+   },
+   {
+    "$dec": "191.09"
+   },
+   {
+    "$dec": "236.55"
+   }
+  ],
+  [
+   "Women",
+   "edu packamalg #1",
+   "ought",
+   "Unknown",
+   1999,
+   2,
+   {
+    "$dec": "233.256364"
+   },
+   {
+    "$dec": "1.66"
+   },
+   {
+    "$dec": "257.88"
+   },
+   {
+    "$dec": "19.52"
+   }
+  ],
+  [
+   "Women",
+   "edu packamalg #1",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "233.256364"
+   },
+   {
+    "$dec": "19.52"
+   },
+   {
+    "$dec": "1.66"
+   },
+   {
+    "$dec": "144.69"
+   }
+  ],
+  [
+   "Women",
+   "edu packamalg #2",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "360.865833"
+   },
+   {
+    "$dec": "136.72"
+   },
+   {
+    "$dec": "234.52"
+   },
+   {
+    "$dec": "162.25"
+   }
+  ],
+  [
+   "Women",
+   "edu packamalg #2",
+   "ought",
+   "Unknown",
+   1999,
+   4,
+   {
+    "$dec": "360.865833"
+   },
+   {
+    "$dec": "162.25"
+   },
+   {
+    "$dec": "136.72"
+   },
+   {
+    "$dec": "31.70"
+   }
+  ],
+  [
+   "Women",
+   "edu packamalg #2",
+   "ought",
+   "Unknown",
+   1999,
+   5,
+   {
+    "$dec": "360.865833"
+   },
+   {
+    "$dec": "31.70"
+   },
+   {
+    "$dec": "162.25"
+   },
+   {
+    "$dec": "86.64"
+   }
+  ],
+  [
+   "Women",
+   "edu packamalg #2",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "360.865833"
+   },
+   {
+    "$dec": "86.64"
+   },
+   {
+    "$dec": "31.70"
+   },
+   {
+    "$dec": "426.42"
+   }
+  ],
+  [
+   "Women",
+   "importoamalg #1",
+   "ought",
+   "Unknown",
+   1999,
+   1,
+   {
+    "$dec": "420.818333"
+   },
+   {
+    "$dec": "231.77"
+   },
+   {
+    "$dec": "1008.38"
+   },
+   {
+    "$dec": "466.04"
+   }
+  ],
+  [
+   "Women",
+   "importoamalg #1",
+   "ought",
+   "Unknown",
+   1999,
+   3,
+   {
+    "$dec": "420.818333"
+   },
+   {
+    "$dec": "43.68"
+   },
+   {
+    "$dec": "466.04"
+   },
+   {
+    "$dec": "276.89"
+   }
+  ],
+  [
+   "Women",
+   "importoamalg #1",
+   "ought",
+   "Unknown",
+   1999,
+   6,
+   {
+    "$dec": "420.818333"
+   },
+   {
+    "$dec": "221.36"
+   },
+   {
+    "$dec": "274.09"
+   },
+   {
+    "$dec": "330.26"
+   }
+  ]
+ ]
+}

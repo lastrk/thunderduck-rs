@@ -1,0 +1,46 @@
+{
+ "id": "num-007",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "asm",
+    "type": "short",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ai",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "al",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "af",
+    "type": "float",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ax",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ad1",
+    "type": "decimal(10,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

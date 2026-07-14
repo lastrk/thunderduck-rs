@@ -1,0 +1,144 @@
+{
+ "id": "tpcds-q077",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "channel",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sales",
+    "type": "decimal(27,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "returns",
+    "type": "decimal(27,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "profit",
+    "type": "decimal(28,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "catalog channel",
+   1,
+   {
+    "$dec": "717962.77"
+   },
+   {
+    "$dec": "28409.42"
+   },
+   {
+    "$dec": "-68598.03"
+   }
+  ],
+  [
+   "catalog channel",
+   null,
+   {
+    "$dec": "717962.77"
+   },
+   {
+    "$dec": "56818.84"
+   },
+   {
+    "$dec": "-81735.43"
+   }
+  ],
+  [
+   "catalog channel",
+   null,
+   null,
+   {
+    "$dec": "28409.42"
+   },
+   {
+    "$dec": "-13137.40"
+   }
+  ],
+  [
+   "store channel",
+   1,
+   {
+    "$dec": "1358150.54"
+   },
+   {
+    "$dec": "32423.60"
+   },
+   {
+    "$dec": "-592241.61"
+   }
+  ],
+  [
+   "store channel",
+   null,
+   {
+    "$dec": "1358150.54"
+   },
+   {
+    "$dec": "32423.60"
+   },
+   {
+    "$dec": "-592241.61"
+   }
+  ],
+  [
+   "web channel",
+   1,
+   {
+    "$dec": "457729.00"
+   },
+   {
+    "$dec": "17317.16"
+   },
+   {
+    "$dec": "-78102.42"
+   }
+  ],
+  [
+   "web channel",
+   null,
+   {
+    "$dec": "457729.00"
+   },
+   {
+    "$dec": "17317.16"
+   },
+   {
+    "$dec": "-78102.42"
+   }
+  ],
+  [
+   null,
+   null,
+   {
+    "$dec": "2533842.31"
+   },
+   {
+    "$dec": "106559.60"
+   },
+   {
+    "$dec": "-752079.46"
+   }
+  ]
+ ]
+}

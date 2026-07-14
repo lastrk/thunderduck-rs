@@ -1,0 +1,132 @@
+{
+ "id": "tpcds-q060",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "total_sales",
+    "type": "decimal(27,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AAAAAAAAALAAAAAA",
+   {
+    "$dec": "8655.99"
+   }
+  ],
+  [
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "30859.10"
+   }
+  ],
+  [
+   "AAAAAAAACIAAAAAA",
+   {
+    "$dec": "9465.38"
+   }
+  ],
+  [
+   "AAAAAAAACJAAAAAA",
+   {
+    "$dec": "9590.48"
+   }
+  ],
+  [
+   "AAAAAAAACLAAAAAA",
+   {
+    "$dec": "4435.31"
+   }
+  ],
+  [
+   "AAAAAAAAEGAAAAAA",
+   {
+    "$dec": "7309.89"
+   }
+  ],
+  [
+   "AAAAAAAAEHAAAAAA",
+   {
+    "$dec": "12799.56"
+   }
+  ],
+  [
+   "AAAAAAAAGEAAAAAA",
+   {
+    "$dec": "8324.89"
+   }
+  ],
+  [
+   "AAAAAAAAICAAAAAA",
+   {
+    "$dec": "1117.08"
+   }
+  ],
+  [
+   "AAAAAAAAIFAAAAAA",
+   {
+    "$dec": "14560.31"
+   }
+  ],
+  [
+   "AAAAAAAAIJAAAAAA",
+   {
+    "$dec": "1018.92"
+   }
+  ],
+  [
+   "AAAAAAAAKKAAAAAA",
+   {
+    "$dec": "10364.21"
+   }
+  ],
+  [
+   "AAAAAAAAMCAAAAAA",
+   {
+    "$dec": "4771.07"
+   }
+  ],
+  [
+   "AAAAAAAAMIAAAAAA",
+   {
+    "$dec": "10089.60"
+   }
+  ],
+  [
+   "AAAAAAAAOAAAAAAA",
+   {
+    "$dec": "7437.94"
+   }
+  ],
+  [
+   "AAAAAAAAOCAAAAAA",
+   {
+    "$dec": "10343.36"
+   }
+  ],
+  [
+   "AAAAAAAAOFAAAAAA",
+   {
+    "$dec": "1076.30"
+   }
+  ],
+  [
+   "AAAAAAAAPKAAAAAA",
+   {
+    "$dec": "4619.68"
+   }
+  ]
+ ]
+}

@@ -1,0 +1,108 @@
+{
+ "id": "tpch-q02",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "s_acctbal",
+    "type": "decimal(15,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "n_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "p_partkey",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "p_mfgr",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_address",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_phone",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_comment",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$dec": "1687.81"
+   },
+   "Supplier#000000017",
+   "ROMANIA",
+   1634,
+   "Manufacturer#2",
+   "PYN0m9j98GhX42DvBKvURcAd,B",
+   "29-601-884-9219",
+   "se slyly furiously even notornis. furiously regular packa"
+  ],
+  [
+   {
+    "$dec": "1883.37"
+   },
+   "Supplier#000000086",
+   "ROMANIA",
+   1015,
+   "Manufacturer#4",
+   "iZLKKWaQADe",
+   "29-903-665-7065",
+   " foxes boost after the carefully silent asymptotes. slyl"
+  ],
+  [
+   {
+    "$dec": "287.16"
+   },
+   "Supplier#000000052",
+   "ROMANIA",
+   323,
+   "Manufacturer#4",
+   "5oGr3pj2sprZNwho8CFW2haaObd0",
+   "29-974-934-4713",
+   "arefully silent pinto beans use furiously furiously even deposits. regular packages are furious"
+  ],
+  [
+   {
+    "$dec": "4186.95"
+   },
+   "Supplier#000000077",
+   "GERMANY",
+   249,
+   "Manufacturer#4",
+   "w5yO 0yjXou 8I4ffzADq,R8tD06x1vbeMpLJF2",
+   "17-281-345-4863",
+   "ainst the blithely ironic packages poach at the regul"
+  ]
+ ]
+}

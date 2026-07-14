@@ -1,0 +1,36 @@
+{
+ "id": "type-003",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "r",
+    "type": "decimal(12,3)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$dec": "0.001"
+   }
+  ],
+  [
+   {
+    "$dec": "10012.490"
+   }
+  ],
+  [
+   {
+    "$dec": "103.392"
+   }
+  ],
+  [
+   null
+  ]
+ ]
+}

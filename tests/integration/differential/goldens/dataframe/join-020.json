@@ -1,0 +1,316 @@
+{
+ "id": "join-020",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "manager_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "age",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "salary",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "bonus",
+    "type": "decimal(9,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "hire_date",
+    "type": "date",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "last_login",
+    "type": "timestamp",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "active",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "score",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "tags",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "attrs",
+    "type": {
+     "type": "map",
+     "keyType": "string",
+     "valueType": "string",
+     "valueContainsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "address",
+    "type": {
+     "type": "struct",
+     "fields": [
+      {
+       "name": "city",
+       "type": "string",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "zip",
+       "type": "string",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "geo",
+       "type": {
+        "type": "struct",
+        "fields": [
+         {
+          "name": "lat",
+          "type": "double",
+          "nullable": true,
+          "metadata": {}
+         },
+         {
+          "name": "lng",
+          "type": "double",
+          "nullable": true,
+          "metadata": {}
+         }
+        ]
+       },
+       "nullable": true,
+       "metadata": {}
+      }
+     ]
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "a",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "b",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "x",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "y",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d1",
+    "type": "decimal(10,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d2",
+    "type": "decimal(6,3)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "lng",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "age",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "salary",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "country",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "budget",
+    "type": "decimal(12,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "location",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "country",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   7,
+   "Grace",
+   30,
+   6,
+   27,
+   72000.0,
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$date": "2023-09-01"
+   },
+   {
+    "$ts": "2026-06-02T03:30:00"
+   },
+   true,
+   {
+    "$f": "nan"
+   },
+   [
+    "python"
+   ],
+   {
+    "$map": [
+     [
+      "team",
+      "ml"
+     ],
+     [
+      "tz",
+      "UTC"
+     ]
+    ]
+   },
+   {
+    "$row": [
+     "Vienna",
+     "1020",
+     {
+      "$row": [
+       48.22,
+       16.4
+      ]
+     }
+    ]
+   },
+   7,
+   2,
+   3.5,
+   2.0,
+   {
+    "$dec": "100.25"
+   },
+   {
+    "$dec": "3.142"
+   },
+   9000000000,
+   10,
+   101,
+   "Ivan",
+   33,
+   91000.0,
+   "AT",
+   "Infrastructure",
+   {
+    "$dec": "2500000.00"
+   },
+   "Vienna",
+   "AT"
+  ]
+ ]
+}

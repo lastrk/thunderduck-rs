@@ -1,0 +1,81 @@
+{
+ "id": "tpcds-q029",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_item_desc",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_store_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_store_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_sales_quantity",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_returns_quantity",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "catalog_sales_quantity",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AAAAAAAAACAAAAAA",
+   "Ce",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   57,
+   44,
+   71
+  ],
+  [
+   "AAAAAAAACLAAAAAA",
+   "Eyes appreciate political yards. Constant, awful eyes could c",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   64,
+   32,
+   29
+  ],
+  [
+   "AAAAAAAAOGAAAAAA",
+   "Single, possible causes cut more strange, british things; forms create other, loyal thousands. As real scheme",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   47,
+   15,
+   7
+  ]
+ ]
+}

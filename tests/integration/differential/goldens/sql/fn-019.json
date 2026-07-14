@@ -1,0 +1,22 @@
+{
+ "id": "fn-019",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "cd",
+    "type": "date",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "ct",
+    "type": "timestamp",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ }
+}

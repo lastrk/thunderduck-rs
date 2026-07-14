@@ -1,0 +1,132 @@
+{
+ "id": "map-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "m",
+    "type": {
+     "type": "map",
+     "keyType": "string",
+     "valueType": "string",
+     "valueContainsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null
+  ],
+  [
+   {
+    "$map": [
+     [
+      "extra",
+      "1"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      "data"
+     ],
+     [
+      "tz",
+      "CET"
+     ],
+     [
+      "extra",
+      "1"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      "infra"
+     ],
+     [
+      "extra",
+      "1"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      "infra"
+     ],
+     [
+      "tz",
+      "UTC"
+     ],
+     [
+      "extra",
+      "1"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      "ml"
+     ],
+     [
+      "extra",
+      "1"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      "ml"
+     ],
+     [
+      "tz",
+      "UTC"
+     ],
+     [
+      "extra",
+      "1"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      null
+     ],
+     [
+      "extra",
+      "1"
+     ]
+    ]
+   }
+  ]
+ ]
+}

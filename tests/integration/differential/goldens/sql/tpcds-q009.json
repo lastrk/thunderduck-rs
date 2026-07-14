@@ -1,0 +1,59 @@
+{
+ "id": "tpcds-q009",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "bucket1",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "bucket2",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "bucket3",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "bucket4",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "bucket5",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$dec": "363.904925"
+   },
+   {
+    "$dec": "1048.409678"
+   },
+   {
+    "$dec": "1716.686198"
+   },
+   {
+    "$dec": "2354.910353"
+   },
+   {
+    "$dec": "3084.985813"
+   }
+  ]
+ ]
+}

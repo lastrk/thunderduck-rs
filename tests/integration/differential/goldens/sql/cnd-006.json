@@ -1,0 +1,42 @@
+{
+ "id": "cnd-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "age_or_null",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   27
+  ],
+  [
+   29
+  ],
+  [
+   34
+  ],
+  [
+   38
+  ],
+  [
+   41
+  ],
+  [
+   45
+  ],
+  [
+   52
+  ],
+  [
+   null
+  ]
+ ]
+}

@@ -1,0 +1,76 @@
+{
+ "id": "struc-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "d_id",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "d_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d_budget",
+    "type": "decimal(12,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d_loc",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d_country",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   "Infrastructure",
+   {
+    "$dec": "2500000.00"
+   },
+   "Vienna",
+   "AT"
+  ],
+  [
+   20,
+   "Data",
+   {
+    "$dec": "1800000.00"
+   },
+   "Vienna",
+   "AT"
+  ],
+  [
+   30,
+   "ML",
+   {
+    "$dec": "3200000.00"
+   },
+   "Zurich",
+   "CH"
+  ],
+  [
+   40,
+   "Security",
+   null,
+   "Berlin",
+   "DE"
+  ]
+ ]
+}

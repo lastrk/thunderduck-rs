@@ -1,0 +1,120 @@
+{
+ "id": "jn-012",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   "Data"
+  ],
+  [
+   "Alice",
+   "Infrastructure"
+  ],
+  [
+   "Alice",
+   "ML"
+  ],
+  [
+   "Bob",
+   "Data"
+  ],
+  [
+   "Bob",
+   "Infrastructure"
+  ],
+  [
+   "Bob",
+   "ML"
+  ],
+  [
+   "Carol",
+   "Data"
+  ],
+  [
+   "Carol",
+   "Infrastructure"
+  ],
+  [
+   "Carol",
+   "ML"
+  ],
+  [
+   "Dan",
+   "Data"
+  ],
+  [
+   "Dan",
+   "Infrastructure"
+  ],
+  [
+   "Dan",
+   "ML"
+  ],
+  [
+   "Eve",
+   "Data"
+  ],
+  [
+   "Eve",
+   "Infrastructure"
+  ],
+  [
+   "Eve",
+   "ML"
+  ],
+  [
+   "Frank",
+   "Data"
+  ],
+  [
+   "Frank",
+   "Infrastructure"
+  ],
+  [
+   "Frank",
+   "ML"
+  ],
+  [
+   "Grace",
+   "Data"
+  ],
+  [
+   "Grace",
+   "Infrastructure"
+  ],
+  [
+   "Grace",
+   "ML"
+  ],
+  [
+   "Heidi",
+   "Data"
+  ],
+  [
+   "Heidi",
+   "Infrastructure"
+  ],
+  [
+   "Heidi",
+   "ML"
+  ]
+ ]
+}

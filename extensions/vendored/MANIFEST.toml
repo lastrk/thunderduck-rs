@@ -1,0 +1,47 @@
+# extensions/vendored/MANIFEST.toml
+#
+# Vendored thdck_spark_funcs DuckDB extension binaries — checked into git
+# PLAIN (uncompressed), all 4 platforms, exactly ONE version at a time.
+#
+# Regenerate ONLY via:
+#   scripts/dev/adopt-extension-release.sh --from-local <dir>
+#   scripts/dev/adopt-extension-release.sh <release-tag> <duckdb-version>
+# Changes to this file happen only on duckdb crate bumps — the extension's
+# embedded DuckDB version must exactly match the `duckdb` crate version in
+# Cargo.toml (see docs/context/gotchas.md #6).
+#
+# Escape valve: if per-adoption tree cost (~31 MB/version, since old plain
+# binaries stay in git history) becomes a problem, migrate this directory to
+# Git LFS (`git lfs track 'extensions/vendored/*.duckdb_extension'`) rather
+# than reverting to build-time download.
+
+[source]
+repo = "nubank/thunderduck-duckdb-extension"
+release_tag = "ext6"
+duckdb_version = "v1.5.4"
+adopted_at = "2026-07-14T12:30:27Z"
+adopted_by = "Laszlo Toeroek <laszlo.torok@nubank.com.br>"
+
+[[artifact]]
+platform = "linux_amd64"
+file = "thdck_spark_funcs-v1.5.4-linux_amd64.duckdb_extension"
+sha256 = "86b8b1ab296b15aceea9d09aa57b87a9e6f10946fc456d18230e061e0b3ac741"
+size = 10903110
+
+[[artifact]]
+platform = "linux_arm64"
+file = "thdck_spark_funcs-v1.5.4-linux_arm64.duckdb_extension"
+sha256 = "46aa9c3c60fa1d1f61551f94f97f598455c8a3eb77db09a25934e36fe81b96a6"
+size = 9842950
+
+[[artifact]]
+platform = "osx_amd64"
+file = "thdck_spark_funcs-v1.5.4-osx_amd64.duckdb_extension"
+sha256 = "021db2dc9ce6284c344a42b5c02b9222a03b1926196fe0bb6cbdcc32726289a2"
+size = 5348950
+
+[[artifact]]
+platform = "osx_arm64"
+file = "thdck_spark_funcs-v1.5.4-osx_arm64.duckdb_extension"
+sha256 = "8d7e18c9b6ccd8d3ef9c1e33f5425835a8c6e20772fee603035afb2f1f813830"
+size = 5272806

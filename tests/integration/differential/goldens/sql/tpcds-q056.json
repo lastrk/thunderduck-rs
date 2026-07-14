@@ -1,0 +1,42 @@
+{
+ "id": "tpcds-q056",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "total_sales",
+    "type": "decimal(27,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AAAAAAAAGHAAAAAA",
+   {
+    "$dec": "5755.60"
+   }
+  ],
+  [
+   "AAAAAAAAJKAAAAAA",
+   {
+    "$dec": "14024.84"
+   }
+  ],
+  [
+   "AAAAAAAAKJAAAAAA",
+   {
+    "$dec": "10283.78"
+   }
+  ]
+ ]
+}

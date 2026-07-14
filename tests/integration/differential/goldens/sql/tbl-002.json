@@ -1,0 +1,40 @@
+{
+ "id": "tbl-002",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "label",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   "infra"
+  ],
+  [
+   "Bob",
+   "infra"
+  ],
+  [
+   "Carol",
+   "data"
+  ],
+  [
+   "Dan",
+   "data"
+  ]
+ ]
+}

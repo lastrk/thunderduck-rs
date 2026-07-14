@@ -1,0 +1,47 @@
+{
+ "id": "tpcds-q031",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "ca_county",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d_year",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "web_q1_q2_increase",
+    "type": "decimal(37,20)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_q1_q2_increase",
+    "type": "decimal(37,20)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "web_q2_q3_increase",
+    "type": "decimal(37,20)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_q2_q3_increase",
+    "type": "decimal(37,20)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": []
+}

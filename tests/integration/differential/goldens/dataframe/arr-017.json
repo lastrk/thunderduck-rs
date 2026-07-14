@@ -1,0 +1,70 @@
+{
+ "id": "arr-017",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "pos",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "tag",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   0,
+   "python"
+  ],
+  [
+   1,
+   1,
+   "rust"
+  ],
+  [
+   2,
+   0,
+   "scala"
+  ],
+  [
+   5,
+   0,
+   "go"
+  ],
+  [
+   5,
+   1,
+   "c"
+  ],
+  [
+   5,
+   2,
+   "rust"
+  ],
+  [
+   6,
+   0,
+   "java"
+  ],
+  [
+   7,
+   0,
+   "python"
+  ]
+ ]
+}

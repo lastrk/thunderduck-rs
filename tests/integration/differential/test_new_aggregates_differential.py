@@ -346,6 +346,28 @@ class TestNewAggregates_Differential:
         td = run_test(spark_thunderduck)
         assert_dataframes_equal(ref, td, "min_by", ignore_nullable=True)
 
+    @pytest.mark.timeout(30)
+    def test_max_by_min_by_null_value_at_extreme(self, spark_reference, spark_thunderduck):
+        """max_by/min_by must return the value at the max/min ordering row even if NULL."""
+        def run_test(spark):
+            data = [(1, "Alice", 85), (2, None, 92), (3, "Charlie", 78),
+                    (4, None, 40), (5, "Eve", 88)]
+            schema = StructType([
+                StructField("id", IntegerType(), False),
+                StructField("name", StringType(), True),
+                StructField("val", IntegerType(), False),
+            ])
+            spark.createDataFrame(data, schema).createOrReplaceTempView("null_extreme_data")
+            return spark.sql(
+                "SELECT max_by(name, val) AS mx, min_by(name, val) AS mn FROM null_extreme_data"
+            )
+
+        ref = run_test(spark_reference)
+        td = run_test(spark_thunderduck)
+        assert_dataframes_equal(
+            ref, td, "max_by_min_by_null_value_at_extreme", ignore_nullable=True
+        )
+
 
 # =============================================================================
 # Statistical Aggregate Functions
@@ -360,14 +382,8 @@ class TestStatisticalAggregates_Differential:
     def test_kurtosis(self, spark_reference, spark_thunderduck):
         """kurtosis computes the excess kurtosis of a numeric column (requires >= 4 rows).
 
-        Skipped in relaxed/auto mode: DuckDB's built-in kurtosis() uses a different
-        bias-correction formula than Spark — same issue as skewness.
-        In strict mode, spark_kurtosis() extension matches exactly.
+        Routes through spark_kurtosis() extension (KURTOSIS_POP in DuckDB).
         """
-        compat_mode = os.environ.get('THUNDERDUCK_COMPAT_MODE', 'auto').lower()
-        if compat_mode != 'strict':
-            pytest.skip("kurtosis: DuckDB uses different bias-correction formula than Spark (strict mode required)")
-
         def run_test(spark):
             _create_stats_data(spark)
             return spark.sql("SELECT kurtosis(val) as kurt FROM stats_data")
@@ -380,14 +396,8 @@ class TestStatisticalAggregates_Differential:
     def test_skewness(self, spark_reference, spark_thunderduck):
         """skewness computes the skewness of a numeric column (requires >= 3 rows).
 
-        Skipped in relaxed/auto mode: DuckDB's built-in skewness() uses sample
-        bias correction while Spark uses population skewness — different algorithm.
-        In strict mode, spark_skewness() extension matches exactly.
+        Routes through the spark_skewness() extension (population formula).
         """
-        compat_mode = os.environ.get('THUNDERDUCK_COMPAT_MODE', 'auto').lower()
-        if compat_mode != 'strict':
-            pytest.skip("skewness: DuckDB uses sample formula, Spark uses population formula (strict mode required)")
-
         def run_test(spark):
             _create_stats_data(spark)
             return spark.sql("SELECT skewness(val) as skew FROM stats_data")
@@ -592,14 +602,7 @@ class TestGroupedNewAggregates_Differential:
 
     @pytest.mark.timeout(30)
     def test_kurtosis_grouped(self, spark_reference, spark_thunderduck):
-        """kurtosis with GROUP BY computes excess kurtosis per group (requires >= 4 rows per group).
-
-        Skipped in relaxed/auto mode: same formula difference as test_kurtosis.
-        """
-        compat_mode = os.environ.get('THUNDERDUCK_COMPAT_MODE', 'auto').lower()
-        if compat_mode != 'strict':
-            pytest.skip("kurtosis: DuckDB uses different bias-correction formula than Spark (strict mode required)")
-
+        """kurtosis with GROUP BY computes excess kurtosis per group (requires >= 4 rows per group)."""
         def run_test(spark):
             _create_grouped_stats_data(spark)
             return spark.sql(

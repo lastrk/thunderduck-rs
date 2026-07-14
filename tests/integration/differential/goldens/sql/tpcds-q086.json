@@ -1,0 +1,627 @@
+{
+ "id": "tpcds-q086",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "total_sum",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_category",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_class",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "lochierarchy",
+    "type": "byte",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "rank_within_parent",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$dec": "104879.37"
+   },
+   "Children",
+   "toddlers",
+   0,
+   1
+  ],
+  [
+   {
+    "$dec": "105458.38"
+   },
+   "Books",
+   "self-help",
+   0,
+   1
+  ],
+  [
+   {
+    "$dec": "11129.73"
+   },
+   "Sports",
+   "camping",
+   0,
+   6
+  ],
+  [
+   {
+    "$dec": "111666.96"
+   },
+   "Women",
+   "fragrances",
+   0,
+   2
+  ],
+  [
+   {
+    "$dec": "13057.57"
+   },
+   "Books",
+   "sports",
+   0,
+   8
+  ],
+  [
+   {
+    "$dec": "139092.26"
+   },
+   "Music",
+   "pop",
+   0,
+   1
+  ],
+  [
+   {
+    "$dec": "151757.39"
+   },
+   "Shoes",
+   null,
+   1,
+   10
+  ],
+  [
+   {
+    "$dec": "163696.54"
+   },
+   "Men",
+   "accessories",
+   0,
+   2
+  ],
+  [
+   {
+    "$dec": "168760.07"
+   },
+   "Women",
+   "swimwear",
+   0,
+   1
+  ],
+  [
+   {
+    "$dec": "185014.69"
+   },
+   "Sports",
+   null,
+   1,
+   9
+  ],
+  [
+   {
+    "$dec": "18940.97"
+   },
+   "Sports",
+   "guns",
+   0,
+   5
+  ],
+  [
+   {
+    "$dec": "19902.81"
+   },
+   "Books",
+   "travel",
+   0,
+   7
+  ],
+  [
+   {
+    "$dec": "20165.80"
+   },
+   "Men",
+   "shirts",
+   0,
+   4
+  ],
+  [
+   {
+    "$dec": "204045.87"
+   },
+   "Home",
+   null,
+   1,
+   8
+  ],
+  [
+   {
+    "$dec": "20474.28"
+   },
+   "Electronics",
+   "dvd/vcr players",
+   0,
+   8
+  ],
+  [
+   {
+    "$dec": "21241.53"
+   },
+   "Electronics",
+   "memory",
+   0,
+   7
+  ],
+  [
+   {
+    "$dec": "217201.98"
+   },
+   "Children",
+   null,
+   1,
+   7
+  ],
+  [
+   {
+    "$dec": "22632.93"
+   },
+   "Jewelry",
+   "costume",
+   0,
+   8
+  ],
+  [
+   {
+    "$dec": "22815.44"
+   },
+   "Home",
+   "furniture",
+   0,
+   6
+  ],
+  [
+   {
+    "$dec": "231552.05"
+   },
+   "Men",
+   "sports-apparel",
+   0,
+   1
+  ],
+  [
+   {
+    "$dec": "24659.18"
+   },
+   "Electronics",
+   "karoke",
+   0,
+   6
+  ],
+  [
+   {
+    "$dec": "25002.75"
+   },
+   "Sports",
+   "optics",
+   0,
+   4
+  ],
+  [
+   {
+    "$dec": "25019.03"
+   },
+   "Electronics",
+   "disk drives",
+   0,
+   5
+  ],
+  [
+   {
+    "$dec": "25171.01"
+   },
+   "Home",
+   "rugs",
+   0,
+   5
+  ],
+  [
+   {
+    "$dec": "27867.06"
+   },
+   "Books",
+   "reference",
+   0,
+   6
+  ],
+  [
+   {
+    "$dec": "283621.50"
+   },
+   "Electronics",
+   null,
+   1,
+   6
+  ],
+  [
+   {
+    "$dec": "28832.29"
+   },
+   "Men",
+   "pants",
+   0,
+   3
+  ],
+  [
+   {
+    "$dec": "2934539.37"
+   },
+   null,
+   null,
+   2,
+   1
+  ],
+  [
+   {
+    "$dec": "29366.31"
+   },
+   "Jewelry",
+   "jewelry boxes",
+   0,
+   7
+  ],
+  [
+   {
+    "$dec": "301445.05"
+   },
+   "Jewelry",
+   null,
+   1,
+   5
+  ],
+  [
+   {
+    "$dec": "309546.35"
+   },
+   "Music",
+   null,
+   1,
+   4
+  ],
+  [
+   {
+    "$dec": "31291.85"
+   },
+   "Jewelry",
+   "semi-precious",
+   0,
+   6
+  ],
+  [
+   {
+    "$dec": "31310.64"
+   },
+   "Jewelry",
+   "bracelets",
+   0,
+   5
+  ],
+  [
+   {
+    "$dec": "31378.52"
+   },
+   "Sports",
+   "fishing",
+   0,
+   3
+  ],
+  [
+   {
+    "$dec": "31690.30"
+   },
+   "Home",
+   "bedding",
+   0,
+   4
+  ],
+  [
+   {
+    "$dec": "31842.39"
+   },
+   "Shoes",
+   "athletic",
+   0,
+   3
+  ],
+  [
+   {
+    "$dec": "31847.49"
+   },
+   "Books",
+   "mystery",
+   0,
+   5
+  ],
+  [
+   {
+    "$dec": "33405.26"
+   },
+   "Electronics",
+   "televisions",
+   0,
+   4
+  ],
+  [
+   {
+    "$dec": "33778.05"
+   },
+   "Home",
+   "lighting",
+   0,
+   3
+  ],
+  [
+   {
+    "$dec": "35418.56"
+   },
+   "Books",
+   "parenting",
+   0,
+   4
+  ],
+  [
+   {
+    "$dec": "36853.24"
+   },
+   "Electronics",
+   "scanners",
+   0,
+   3
+  ],
+  [
+   {
+    "$dec": "36873.40"
+   },
+   "Electronics",
+   "wireless",
+   0,
+   2
+  ],
+  [
+   {
+    "$dec": "37463.22"
+   },
+   "Jewelry",
+   "diamonds",
+   0,
+   4
+  ],
+  [
+   {
+    "$dec": "38567.89"
+   },
+   "Home",
+   "kids",
+   0,
+   2
+  ],
+  [
+   {
+    "$dec": "400734.88"
+   },
+   "Books",
+   null,
+   1,
+   3
+  ],
+  [
+   {
+    "$dec": "41137.13"
+   },
+   "Music",
+   "country",
+   0,
+   4
+  ],
+  [
+   {
+    "$dec": "41876.10"
+   },
+   "Jewelry",
+   "gold",
+   0,
+   3
+  ],
+  [
+   {
+    "$dec": "43070.83"
+   },
+   "Children",
+   "newborn",
+   0,
+   3
+  ],
+  [
+   {
+    "$dec": "436924.98"
+   },
+   "Women",
+   null,
+   1,
+   2
+  ],
+  [
+   {
+    "$dec": "444246.68"
+   },
+   "Men",
+   null,
+   1,
+   1
+  ],
+  [
+   {
+    "$dec": "45198.01"
+   },
+   "Sports",
+   "outdoor",
+   0,
+   2
+  ],
+  [
+   {
+    "$dec": "46139.99"
+   },
+   "Jewelry",
+   "pendants",
+   0,
+   2
+  ],
+  [
+   {
+    "$dec": "49655.40"
+   },
+   "Shoes",
+   "kids",
+   0,
+   2
+  ],
+  [
+   {
+    "$dec": "52023.18"
+   },
+   "Home",
+   "curtains/drapes",
+   0,
+   1
+  ],
+  [
+   {
+    "$dec": "53106.18"
+   },
+   "Music",
+   "classical",
+   0,
+   3
+  ],
+  [
+   {
+    "$dec": "53364.71"
+   },
+   "Sports",
+   "hockey",
+   0,
+   1
+  ],
+  [
+   {
+    "$dec": "58612.69"
+   },
+   "Women",
+   "dresses",
+   0,
+   4
+  ],
+  [
+   {
+    "$dec": "61364.01"
+   },
+   "Jewelry",
+   "estate",
+   0,
+   1
+  ],
+  [
+   {
+    "$dec": "68225.15"
+   },
+   "Books",
+   "arts",
+   0,
+   3
+  ],
+  [
+   {
+    "$dec": "69251.78"
+   },
+   "Children",
+   "school-uniforms",
+   0,
+   2
+  ],
+  [
+   {
+    "$dec": "70259.60"
+   },
+   "Shoes",
+   "womens",
+   0,
+   1
+  ],
+  [
+   {
+    "$dec": "76210.78"
+   },
+   "Music",
+   "rock",
+   0,
+   2
+  ],
+  [
+   {
+    "$dec": "85095.58"
+   },
+   "Electronics",
+   "musical",
+   0,
+   1
+  ],
+  [
+   {
+    "$dec": "97885.26"
+   },
+   "Women",
+   "maternity",
+   0,
+   3
+  ],
+  [
+   {
+    "$dec": "98957.86"
+   },
+   "Books",
+   "fiction",
+   0,
+   2
+  ]
+ ]
+}

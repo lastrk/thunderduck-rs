@@ -1,0 +1,144 @@
+{
+ "id": "tpcds-q012",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_item_desc",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_category",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_class",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_current_price",
+    "type": "decimal(7,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "itemrevenue",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "revenueratio",
+    "type": "decimal(38,17)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AAAAAAAAAEAAAAAA",
+   "Public, annual h",
+   "Sports",
+   "optics",
+   {
+    "$dec": "2.02"
+   },
+   {
+    "$dec": "2070.60"
+   },
+   {
+    "$dec": "60.51112702193258033"
+   }
+  ],
+  [
+   "AAAAAAAABJAAAAAA",
+   "Prospects know",
+   "Books",
+   "self-help",
+   {
+    "$dec": "59.77"
+   },
+   {
+    "$dec": "4896.54"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAACIAAAAAA",
+   "Final orders give else. International, living personnel may miss significant companies. Black, american numbers put then ",
+   "Sports",
+   "fishing",
+   {
+    "$dec": "1.70"
+   },
+   {
+    "$dec": "137.02"
+   },
+   {
+    "$dec": "11.25448676353421440"
+   }
+  ],
+  [
+   "AAAAAAAALCAAAAAA",
+   "Resources shall not continue thus similar, practical results. Practical words f",
+   "Books",
+   "travel",
+   {
+    "$dec": "6.08"
+   },
+   {
+    "$dec": "2602.74"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAAMFAAAAAA",
+   "New, quick observations merge too worth a children; shares could live there crucial mountains. Simply eastern pounds shall crush immediately married long wives. Corporate, import",
+   "Sports",
+   "optics",
+   {
+    "$dec": "4.48"
+   },
+   {
+    "$dec": "1351.25"
+   },
+   {
+    "$dec": "39.48887297806741967"
+   }
+  ],
+  [
+   "AAAAAAAAPBAAAAAA",
+   "Bright advisers explain i",
+   "Sports",
+   "fishing",
+   {
+    "$dec": "8.48"
+   },
+   {
+    "$dec": "1080.45"
+   },
+   {
+    "$dec": "88.74551323646578560"
+   }
+  ]
+ ]
+}

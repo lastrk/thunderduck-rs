@@ -1,0 +1,57 @@
+{
+ "id": "tpcds-q053",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_manufact_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sum_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_quarterly_sales",
+    "type": "decimal(21,6)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   93,
+   {
+    "$dec": "522.08"
+   },
+   {
+    "$dec": "395.302500"
+   }
+  ],
+  [
+   93,
+   {
+    "$dec": "61.14"
+   },
+   {
+    "$dec": "395.302500"
+   }
+  ],
+  [
+   93,
+   {
+    "$dec": "615.89"
+   },
+   {
+    "$dec": "395.302500"
+   }
+  ]
+ ]
+}

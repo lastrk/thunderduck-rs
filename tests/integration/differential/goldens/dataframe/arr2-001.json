@@ -1,0 +1,104 @@
+{
+ "id": "arr2-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "ap",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "pp",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null,
+   null
+  ],
+  [
+   null,
+   null
+  ],
+  [
+   [
+    "go",
+    "c",
+    "rust",
+    "new"
+   ],
+   [
+    "first",
+    "go",
+    "c",
+    "rust"
+   ]
+  ],
+  [
+   [
+    "java",
+    "new"
+   ],
+   [
+    "first",
+    "java"
+   ]
+  ],
+  [
+   [
+    "new"
+   ],
+   [
+    "first"
+   ]
+  ],
+  [
+   [
+    "python",
+    "new"
+   ],
+   [
+    "first",
+    "python"
+   ]
+  ],
+  [
+   [
+    "python",
+    "rust",
+    "new"
+   ],
+   [
+    "first",
+    "python",
+    "rust"
+   ]
+  ],
+  [
+   [
+    "scala",
+    "new"
+   ],
+   [
+    "first",
+    "scala"
+   ]
+  ]
+ ]
+}

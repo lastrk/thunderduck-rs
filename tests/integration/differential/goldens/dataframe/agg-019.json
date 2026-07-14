@@ -1,0 +1,40 @@
+{
+ "id": "agg-019",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "total_comp",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   219500.5
+  ],
+  [
+   20,
+   142500.0
+  ],
+  [
+   30,
+   179200.0
+  ],
+  [
+   null,
+   248750.24
+  ]
+ ]
+}

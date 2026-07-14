@@ -1,0 +1,316 @@
+{
+ "id": "tpcds-q068",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "c_last_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "c_first_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "bought_city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ss_ticket_number",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "extended_price",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "extended_tax",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "list_price",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Batson",
+   "Gina",
+   "Hopewell",
+   "Rankin",
+   1347,
+   {
+    "$dec": "16088.73"
+   },
+   {
+    "$dec": "493.53"
+   },
+   {
+    "$dec": "34692.87"
+   }
+  ],
+  [
+   "Berry",
+   "Nancy",
+   "Pleasant Valley",
+   "Mount Vernon",
+   2352,
+   {
+    "$dec": "16653.06"
+   },
+   {
+    "$dec": "844.01"
+   },
+   {
+    "$dec": "32011.82"
+   }
+  ],
+  [
+   "Britt",
+   "Inez",
+   "Edgewood",
+   "Plainview",
+   61,
+   {
+    "$dec": "8996.92"
+   },
+   {
+    "$dec": "385.04"
+   },
+   {
+    "$dec": "13384.62"
+   }
+  ],
+  [
+   "Eller",
+   "Christopher",
+   "Flint",
+   "Royal",
+   1192,
+   {
+    "$dec": "17307.90"
+   },
+   {
+    "$dec": "459.09"
+   },
+   {
+    "$dec": "29839.33"
+   }
+  ],
+  [
+   "Foster",
+   null,
+   "Oak Ridge",
+   "Five Forks",
+   1167,
+   {
+    "$dec": "9921.97"
+   },
+   {
+    "$dec": "440.34"
+   },
+   {
+    "$dec": "22954.42"
+   }
+  ],
+  [
+   "Hernandez",
+   "Rachel",
+   "Greenwood",
+   "Harmony",
+   1864,
+   {
+    "$dec": "32529.65"
+   },
+   {
+    "$dec": "1395.73"
+   },
+   {
+    "$dec": "53606.11"
+   }
+  ],
+  [
+   "Jackson",
+   "Jill",
+   "Bunker Hill",
+   "Bridgeport",
+   1605,
+   {
+    "$dec": "39675.78"
+   },
+   {
+    "$dec": "1585.03"
+   },
+   {
+    "$dec": "67339.13"
+   }
+  ],
+  [
+   "Marcum",
+   "Issac",
+   "Green Acres",
+   "Enterprise",
+   2102,
+   {
+    "$dec": "21845.11"
+   },
+   {
+    "$dec": "1284.43"
+   },
+   {
+    "$dec": "47769.79"
+   }
+  ],
+  [
+   "Orr",
+   "Jeffrey",
+   "Clifton",
+   "Oakdale",
+   435,
+   {
+    "$dec": "8721.49"
+   },
+   {
+    "$dec": "171.82"
+   },
+   {
+    "$dec": "30368.34"
+   }
+  ],
+  [
+   "Pierce",
+   "Joshua",
+   "Oakland",
+   "Springfield",
+   1300,
+   {
+    "$dec": "23783.70"
+   },
+   {
+    "$dec": "885.24"
+   },
+   {
+    "$dec": "63651.79"
+   }
+  ],
+  [
+   "Prieto",
+   "Victoria",
+   "Belmont",
+   "Stringtown",
+   2013,
+   {
+    "$dec": "5856.19"
+   },
+   {
+    "$dec": "93.67"
+   },
+   {
+    "$dec": "16524.80"
+   }
+  ],
+  [
+   "Sanderson",
+   "Sean",
+   "Marion",
+   "Spring Valley",
+   2357,
+   {
+    "$dec": "20445.30"
+   },
+   {
+    "$dec": "585.18"
+   },
+   {
+    "$dec": "32711.82"
+   }
+  ],
+  [
+   "Sandlin",
+   "Eduardo",
+   "Pleasant Grove",
+   "Waterloo",
+   794,
+   {
+    "$dec": "20178.98"
+   },
+   {
+    "$dec": "900.99"
+   },
+   {
+    "$dec": "43712.68"
+   }
+  ],
+  [
+   "Spencer",
+   "Stuart",
+   "Centerville",
+   "Highland",
+   70,
+   {
+    "$dec": "15617.02"
+   },
+   {
+    "$dec": "1059.20"
+   },
+   {
+    "$dec": "35200.10"
+   }
+  ],
+  [
+   "Williams",
+   "Betty",
+   "Five Points",
+   "Riverside",
+   858,
+   {
+    "$dec": "32645.01"
+   },
+   {
+    "$dec": "952.68"
+   },
+   {
+    "$dec": "61263.57"
+   }
+  ],
+  [
+   "Young",
+   "Althea",
+   "Jamestown",
+   "Riverside",
+   1289,
+   {
+    "$dec": "17443.04"
+   },
+   {
+    "$dec": "662.34"
+   },
+   {
+    "$dec": "31007.07"
+   }
+  ]
+ ]
+}

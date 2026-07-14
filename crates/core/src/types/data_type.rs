@@ -66,22 +66,12 @@ impl DataType {
         )
     }
 
-    /// Returns true if this is a floating-point type (Float or Double).
-    pub fn is_floating_point(&self) -> bool {
-        matches!(self, DataType::Float | DataType::Double)
-    }
-
     /// Returns true if this is any interval type (generic, year-month, or day-time).
     pub fn is_interval(&self) -> bool {
         matches!(
             self,
             DataType::Interval | DataType::YearMonthInterval | DataType::DayTimeInterval
         )
-    }
-
-    /// Returns true if this is Decimal.
-    pub fn is_decimal(&self) -> bool {
-        matches!(self, DataType::Decimal { .. })
     }
 
     /// Returns true if this type or any nested type is `Unresolved`.
@@ -95,22 +85,6 @@ impl DataType {
             }
             DataType::Struct(s) => s.fields.iter().any(|f| f.data_type.contains_unresolved()),
             _ => false,
-        }
-    }
-}
-
-/// Helper trait for short-circuiting when a type is already resolved.
-/// Returns `self` if resolved, otherwise calls the fallback closure.
-pub(crate) trait PipeIfUnresolved {
-    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self;
-}
-
-impl PipeIfUnresolved for DataType {
-    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self {
-        if self == DataType::Unresolved {
-            f()
-        } else {
-            self
         }
     }
 }

@@ -1,0 +1,42 @@
+{
+ "id": "struc-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "cat",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   ""
+  ],
+  [
+   "gocrust"
+  ],
+  [
+   "java"
+  ],
+  [
+   "python"
+  ],
+  [
+   "pythonrust"
+  ],
+  [
+   "scala"
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ]
+ ]
+}

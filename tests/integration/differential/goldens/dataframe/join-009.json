@@ -1,0 +1,56 @@
+{
+ "id": "join-009",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "emp",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "mgr",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   null
+  ],
+  [
+   "Bob",
+   "Alice"
+  ],
+  [
+   "Carol",
+   "Alice"
+  ],
+  [
+   "Dan",
+   "Carol"
+  ],
+  [
+   "Eve",
+   "Carol"
+  ],
+  [
+   "Frank",
+   "Bob"
+  ],
+  [
+   "Grace",
+   "Frank"
+  ],
+  [
+   "Heidi",
+   null
+  ]
+ ]
+}

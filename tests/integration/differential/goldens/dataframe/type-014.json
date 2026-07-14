@@ -1,0 +1,21 @@
+{
+ "id": "type-014",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "avg_lng",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   2999999986.3333335
+  ]
+ ]
+}

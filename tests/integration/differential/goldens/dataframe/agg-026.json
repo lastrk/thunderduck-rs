@@ -1,0 +1,50 @@
+{
+ "id": "agg-026",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "total_salary",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   10,
+   215000.0
+  ],
+  [
+   20,
+   20,
+   142000.0
+  ],
+  [
+   30,
+   30,
+   177000.0
+  ],
+  [
+   null,
+   null,
+   238000.0
+  ]
+ ]
+}

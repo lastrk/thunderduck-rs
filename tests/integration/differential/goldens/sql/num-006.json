@@ -1,0 +1,22 @@
+{
+ "id": "num-006",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "rs",
+    "type": "short",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "rl",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

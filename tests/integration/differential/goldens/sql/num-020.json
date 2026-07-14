@@ -1,0 +1,34 @@
+{
+ "id": "num-020",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "na",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "nd",
+    "type": "decimal(10,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "nf",
+    "type": "float",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ns",
+    "type": "short",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

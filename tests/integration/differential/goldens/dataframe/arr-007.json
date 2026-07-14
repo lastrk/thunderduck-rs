@@ -1,0 +1,42 @@
+{
+ "id": "arr-007",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "pos",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   0
+  ],
+  [
+   0
+  ],
+  [
+   0
+  ],
+  [
+   0
+  ],
+  [
+   2
+  ],
+  [
+   3
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ]
+ ]
+}

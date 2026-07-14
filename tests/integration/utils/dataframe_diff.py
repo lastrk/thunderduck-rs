@@ -5,12 +5,16 @@ Provides detailed row-by-row comparison of DataFrames from Spark Reference
 and Thunderduck, with clear diff output for mismatches.
 """
 
+import math
 import os
+import re
 import threading
+import time
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, List, Optional, Tuple
 
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, Row
 from pyspark.sql.types import StructType
 
 
@@ -50,6 +54,244 @@ def collect_with_timeout(df: DataFrame, timeout: int, name: str) -> list:
         raise exception[0]
 
     return result
+
+
+def collect_both(
+    ref_df: DataFrame,
+    td_df: DataFrame,
+    timeout: int,
+    ref_name: str = "Spark Reference",
+    td_name: str = "Thunderduck",
+) -> tuple[list, list]:
+    """Collect both engines' DataFrames concurrently against one shared deadline.
+
+    The reference and Thunderduck servers are independent processes, so their
+    collects can overlap — running them on two daemon threads makes per-case
+    wall-time ≈ max(ref, td) instead of ref + td. Both threads are started
+    before either is awaited; both are then joined against a single `timeout`
+    budget.
+
+    Returns ``(ref_rows, td_rows)``. Re-raises the reference-side exception first
+    (matching the historical ref-then-td ordering, so a Spark-side throw still
+    surfaces before τ is judged), then the τ-side exception. A side that does not
+    finish within `timeout` raises ``TimeoutError`` naming that side.
+    """
+    results: dict[str, list] = {}
+    errors: dict[str, BaseException] = {}
+
+    def _make(key: str, df: DataFrame):
+        def _run():
+            try:
+                results[key] = df.collect()
+            except Exception as exc:  # noqa: BLE001 — surfaced after join
+                errors[key] = exc
+        return _run
+
+    t_ref = threading.Thread(target=_make("ref", ref_df), daemon=True)
+    t_td = threading.Thread(target=_make("td", td_df), daemon=True)
+    t_ref.start()
+    t_td.start()
+
+    deadline = time.monotonic() + timeout
+    t_ref.join(max(0.0, deadline - time.monotonic()))
+    t_td.join(max(0.0, deadline - time.monotonic()))
+
+    if t_ref.is_alive():
+        raise TimeoutError(f"{ref_name} query execution timed out after {timeout}s")
+    if t_td.is_alive():
+        raise TimeoutError(f"{td_name} query execution timed out after {timeout}s")
+
+    if "ref" in errors:
+        raise errors["ref"]
+    if "td" in errors:
+        raise errors["td"]
+
+    return results["ref"], results["td"]
+
+
+def run_pair(ref_fn, td_fn) -> tuple:
+    """Run two non-raising thunks concurrently and return ``(ref_result, td_result)``.
+
+    For the error-parity path, where each side is evaluated by a callable that
+    captures its own exceptions (e.g. ``capture_outcome`` / ``_sql_outcome``) and
+    self-bounds via ``collect_with_timeout`` — so this runner needs no timeout of
+    its own, it just overlaps the two independent server round-trips. If a thunk
+    unexpectedly raises, that exception is re-raised (reference side first).
+    """
+    results: dict[str, object] = {}
+    errors: dict[str, BaseException] = {}
+
+    def _make(key: str, fn):
+        def _run():
+            try:
+                results[key] = fn()
+            except Exception as exc:  # noqa: BLE001 — surfaced after join
+                errors[key] = exc
+        return _run
+
+    t_ref = threading.Thread(target=_make("ref", ref_fn), daemon=True)
+    t_td = threading.Thread(target=_make("td", td_fn), daemon=True)
+    t_ref.start()
+    t_td.start()
+    t_ref.join()
+    t_td.join()
+
+    if "ref" in errors:
+        raise errors["ref"]
+    if "td" in errors:
+        raise errors["td"]
+
+    return results["ref"], results["td"]
+
+
+# ---------------------------------------------------------------------------
+# Tri-state error-parity comparator (ADR-006 "Error emulation contract")
+#
+# The differential oracle must compare error paths symmetrically:
+#   both return values, equal            -> PASS (normal row diff)
+#   both throw with matching error class -> PASS
+#   one throws, one returns values       -> FAIL (divergence)
+#   both throw with different classes    -> FAIL (divergence)
+# ---------------------------------------------------------------------------
+
+_ERROR_TOKEN_RE = re.compile(r"^\s*\[([A-Z][A-Z0-9_.]*)\]")
+# Un-anchored variant: a raw gRPC ``_MultiThreadedRendezvous`` repr buries the
+# token on an indented ``details = "[TOKEN] ..."`` line, so a start-anchored
+# match misses it. Used only as the final fallback.
+_ERROR_TOKEN_SEARCH = re.compile(r"\[([A-Z][A-Z0-9_.]*)\]")
+
+
+def spark_error_class(exc: BaseException) -> Optional[str]:
+    """Best-effort Spark error-class token for a PySpark Connect exception.
+
+    Resolution order (first non-empty token wins):
+      1. ``exc.getCondition()`` / ``exc.getErrorClass()`` — PySpark rich
+         exceptions (the Spark reference side).
+      2. ``exc.details()`` — a raw gRPC ``_MultiThreadedRendezvous`` (how τ's
+         re-wrapped runtime error reaches the client); the details string leads
+         with the ``[TOKEN]`` τ emitted.
+      3. regex on ``str(exc)`` — anchored, then un-anchored (the rendezvous repr
+         wraps the token on an indented ``details =`` line).
+
+    Returns ``None`` when no class token can be recovered (e.g. a raw DuckDB
+    error string with no ``[TOKEN]``). ``None`` is a real divergence signal,
+    distinct from an empty string.
+    """
+    for accessor in ("getCondition", "getErrorClass"):
+        fn = getattr(exc, accessor, None)
+        if callable(fn):
+            try:
+                tok = fn()
+            except Exception:
+                tok = None
+            if tok:
+                return str(tok).strip().strip("[]")
+
+    # Raw gRPC rendezvous: details() is the clean server-sent message, which
+    # leads with the [TOKEN] τ emitted.
+    details_fn = getattr(exc, "details", None)
+    if callable(details_fn):
+        try:
+            details = details_fn()
+        except Exception:
+            details = None
+        if details:
+            m = _ERROR_TOKEN_RE.match(str(details))
+            if m:
+                return m.group(1)
+
+    text = str(exc)
+    m = _ERROR_TOKEN_RE.match(text) or _ERROR_TOKEN_SEARCH.search(text)
+    return m.group(1) if m else None
+
+
+@dataclass
+class SideOutcome:
+    """Result of evaluating ONE engine's DataFrame to completion."""
+
+    rows: Optional[List[Row]] = None
+    error: Optional[BaseException] = None
+    error_class: Optional[str] = None
+
+    @property
+    def threw(self) -> bool:
+        return self.error is not None
+
+
+def capture_outcome(df: DataFrame, timeout: int, name: str) -> SideOutcome:
+    """Evaluate one side to either collected rows or a captured exception.
+
+    Reuses :func:`collect_with_timeout` so the daemon-thread timeout budget
+    still applies (a hung engine cannot wedge the suite). ``TimeoutError`` is
+    captured as a throw with no recoverable class, which surfaces as an honest
+    divergence in :func:`reconcile_error_parity`.
+    """
+    try:
+        rows = collect_with_timeout(df, timeout, name)
+        return SideOutcome(rows=rows)
+    except Exception as exc:  # noqa: BLE001 — any collect error becomes an outcome
+        return SideOutcome(error=exc, error_class=spark_error_class(exc))
+
+
+def reconcile_error_parity(
+    ref: SideOutcome,
+    td: SideOutcome,
+    case_id: str,
+    expected_class: Optional[str] = None,
+) -> Optional[Tuple[List[Row], List[Row]]]:
+    """Apply the ADR-006 tri-state table to a pair of :class:`SideOutcome`.
+
+    Returns:
+        ``(ref.rows, td.rows)`` when BOTH sides returned values — the caller
+        performs the normal row comparison.
+        ``None`` when both threw a matching (and, if declared, expected) class
+        — PASS, nothing further to compare.
+
+    Raises:
+        AssertionError: on any divergence.
+    """
+    # 1. both returned VALUES -> hand back to the caller's row-compare
+    if not ref.threw and not td.threw:
+        return (ref.rows, td.rows)
+
+    # 2. exactly one threw -> divergence
+    if ref.threw and not td.threw:
+        raise AssertionError(
+            f"[{case_id}] error-parity divergence: Spark raised "
+            f"{ref.error_class or type(ref.error).__name__}; τ returned "
+            f"{len(td.rows)} rows (expected τ to raise the same Spark error "
+            f"class) — τ ANSI-throw emulation not yet implemented (ADR-006). "
+            f"Spark error: {ref.error}"
+        )
+    if td.threw and not ref.threw:
+        raise AssertionError(
+            f"[{case_id}] error-parity divergence: τ raised "
+            f"{td.error_class or type(td.error).__name__} but Spark returned "
+            f"{len(ref.rows)} rows. τ error: {td.error}"
+        )
+
+    # 3. BOTH threw -> classes must match (and match the declaration, if any)
+    rc, tc = ref.error_class, td.error_class
+    if expected_class is not None:
+        if rc != expected_class:
+            raise AssertionError(
+                f"[{case_id}] reference did not raise the declared class: expected "
+                f"[{expected_class}], Spark raised [{rc}]. Fix the corpus "
+                f"declaration or the Spark pin. Spark error: {ref.error}"
+            )
+        if tc != expected_class:
+            raise AssertionError(
+                f"[{case_id}] error-class divergence: expected [{expected_class}], "
+                f"τ raised [{tc}]. τ error: {td.error}"
+            )
+        return None
+
+    if rc is None or tc is None or rc != tc:
+        raise AssertionError(
+            f"[{case_id}] error-class divergence: Spark raised [{rc}], τ "
+            f"raised [{tc}]. τ error: {td.error}"
+        )
+    return None
 
 
 class DataFrameDiff:
@@ -263,17 +505,27 @@ class DataFrameDiff:
         if ref_val is None or test_val is None:
             return False
 
-        # Handle floats with epsilon
+        # Handle floats with epsilon — NaN-safe (NaN == NaN per numpy/pandas
+        # convention; Spark's differential oracle treats matched NaN as equal).
         if isinstance(ref_val, float) and isinstance(test_val, float):
+            if math.isnan(ref_val) and math.isnan(test_val):
+                return True
+            if math.isnan(ref_val) or math.isnan(test_val):
+                return False
             return abs(ref_val - test_val) < self.epsilon
 
         # Handle Decimal
         if isinstance(ref_val, Decimal) and isinstance(test_val, Decimal):
             return abs(ref_val - test_val) < Decimal(str(self.epsilon))
 
-        # Handle mixed numeric types (int vs float)
+        # Handle mixed numeric types (int vs float) — NaN-safe.
         if isinstance(ref_val, (int, float)) and isinstance(test_val, (int, float)):
-            return abs(float(ref_val) - float(test_val)) < self.epsilon
+            rf, tf = float(ref_val), float(test_val)
+            if math.isnan(rf) and math.isnan(tf):
+                return True
+            if math.isnan(rf) or math.isnan(tf):
+                return False
+            return abs(rf - tf) < self.epsilon
 
         # Exact equality for everything else
         return ref_val == test_val
@@ -292,10 +544,15 @@ class DataFrameDiff:
         if ref_val is None or test_val is None:
             return False
 
-        # Both numeric (int, float, Decimal) — convert to float, compare
+        # Both numeric (int, float, Decimal) — convert to float, compare.
+        # NaN-safe: matched NaN → equal, unmatched NaN → unequal.
         if isinstance(ref_val, (int, float, Decimal)) and isinstance(test_val, (int, float, Decimal)):
             ref_f = float(ref_val)
             test_f = float(test_val)
+            if math.isnan(ref_f) and math.isnan(test_f):
+                return True
+            if math.isnan(ref_f) or math.isnan(test_f):
+                return False
             # For integral values: exact integer comparison first
             if ref_f == int(ref_f) and test_f == int(test_f):
                 return int(ref_f) == int(test_f)
@@ -375,13 +632,8 @@ class DataFrameDiff:
 
 
 def _is_relaxed_mode():
-    """Check if running in relaxed comparison mode.
-
-    Returns True for 'relaxed' and 'auto' modes (without extension, types won't
-    match exactly). Only 'strict' mode uses strict comparison.
-    """
-    mode = os.environ.get('THUNDERDUCK_COMPAT_MODE', 'auto')
-    return mode.lower() in ('relaxed', 'auto')
+    """Always False: strict is the only mode (see rearchitect ADR-020)."""
+    return False
 
 
 # Convenience function for pytest

@@ -1,0 +1,34 @@
+{
+ "id": "num-014",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "g1",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "g2",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "g3",
+    "type": "decimal(12,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "g4",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

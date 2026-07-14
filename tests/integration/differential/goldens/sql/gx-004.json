@@ -1,0 +1,60 @@
+{
+ "id": "gx-004",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "active",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "n",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   null,
+   2
+  ],
+  [
+   20,
+   null,
+   2
+  ],
+  [
+   30,
+   null,
+   2
+  ],
+  [
+   null,
+   false,
+   2
+  ],
+  [
+   null,
+   null,
+   2
+  ],
+  [
+   null,
+   true,
+   6
+  ]
+ ]
+}

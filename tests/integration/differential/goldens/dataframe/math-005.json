@@ -1,0 +1,60 @@
+{
+ "id": "math-005",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "e",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ln",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "l10",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "l2",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1.0,
+   null,
+   null,
+   null
+  ],
+  [
+   54.598150033144236,
+   1.3862943611198906,
+   0.6020599913279624,
+   2.0
+  ],
+  [
+   7.38905609893065,
+   0.6931471805599453,
+   0.3010299956639812,
+   1.0
+  ],
+  [
+   null,
+   null,
+   null,
+   null
+  ]
+ ]
+}

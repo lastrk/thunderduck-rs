@@ -8,7 +8,9 @@ name = "thunderduck-connect-server"
 path = "src/main.rs"
 
 [features]
-bundled-extension = ["thunderduck-core/bundled-extension"]
+# Compile DuckDB from source; off by default (local dev links a shared prebuilt
+# libduckdb — see scripts/dev/). CI / fresh clones: `cargo build --features bundled`.
+bundled = ["thunderduck-core/bundled"]
 
 [dependencies]
 thunderduck-core = { path = "../core" }
@@ -18,10 +20,10 @@ prost-types.workspace = true
 tokio.workspace = true
 arrow-ipc.workspace = true
 arrow.workspace = true
-dashmap.workspace = true
 clap.workspace = true
 uuid.workspace = true
 futures.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

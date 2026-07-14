@@ -1,0 +1,106 @@
+{
+ "id": "tpcds-q040",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "w_state",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sales_before",
+    "type": "decimal(23,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sales_after",
+    "type": "decimal(23,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "TN",
+   "AAAAAAAACAAAAAAA",
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "95.81"
+   }
+  ],
+  [
+   "TN",
+   "AAAAAAAADEAAAAAA",
+   {
+    "$dec": "-71.90"
+   },
+   {
+    "$dec": "173.00"
+   }
+  ],
+  [
+   "TN",
+   "AAAAAAAAHDAAAAAA",
+   {
+    "$dec": "102.18"
+   },
+   {
+    "$dec": "581.24"
+   }
+  ],
+  [
+   "TN",
+   "AAAAAAAAKJAAAAAA",
+   {
+    "$dec": "-16.18"
+   },
+   {
+    "$dec": "179.92"
+   }
+  ],
+  [
+   "TN",
+   "AAAAAAAAMBAAAAAA",
+   {
+    "$dec": "264.10"
+   },
+   {
+    "$dec": "144.88"
+   }
+  ],
+  [
+   "TN",
+   "AAAAAAAAOGAAAAAA",
+   {
+    "$dec": "-1163.62"
+   },
+   {
+    "$dec": "-496.31"
+   }
+  ],
+  [
+   "TN",
+   "AAAAAAAAPKAAAAAA",
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$dec": "238.91"
+   }
+  ]
+ ]
+}

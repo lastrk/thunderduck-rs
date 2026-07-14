@@ -1,0 +1,36 @@
+{
+ "id": "join-013",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_sal",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Data",
+   71000.0
+  ],
+  [
+   "Infrastructure",
+   107500.0
+  ],
+  [
+   "ML",
+   88500.0
+  ]
+ ]
+}

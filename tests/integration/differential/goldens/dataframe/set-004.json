@@ -1,0 +1,136 @@
+{
+ "id": "set-004",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "age",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "salary",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "country",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "Alice",
+   10,
+   34,
+   95000.0,
+   null
+  ],
+  [
+   101,
+   "Ivan",
+   10,
+   33,
+   91000.0,
+   "AT"
+  ],
+  [
+   102,
+   "Judy",
+   40,
+   47,
+   99000.0,
+   "DE"
+  ],
+  [
+   103,
+   "Mallory",
+   null,
+   25,
+   60000.0,
+   null
+  ],
+  [
+   2,
+   "Bob",
+   10,
+   41,
+   120000.0,
+   null
+  ],
+  [
+   3,
+   "Carol",
+   20,
+   29,
+   78000.0,
+   null
+  ],
+  [
+   4,
+   "Dan",
+   20,
+   52,
+   64000.0,
+   null
+  ],
+  [
+   5,
+   "Eve",
+   null,
+   38,
+   88000.0,
+   null
+  ],
+  [
+   6,
+   "Frank",
+   30,
+   45,
+   105000.0,
+   null
+  ],
+  [
+   7,
+   "Grace",
+   30,
+   27,
+   72000.0,
+   null
+  ],
+  [
+   8,
+   "Heidi",
+   null,
+   60,
+   150000.0,
+   null
+  ]
+ ]
+}

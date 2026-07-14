@@ -1,0 +1,304 @@
+{
+ "id": "tpcds-q081",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "c_customer_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "c_salutation",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "c_first_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "c_last_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_street_number",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_street_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_street_type",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_suite_number",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_county",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_state",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_zip",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_country",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_gmt_offset",
+    "type": "decimal(5,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ca_location_type",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ctr_total_return",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AAAAAAAAFDAAAAAA",
+   "Mr.",
+   "Paul",
+   "Higgins",
+   "828",
+   "2nd Miller",
+   "ST",
+   "Suite S",
+   "Mechanicsburg",
+   "Wheeler County",
+   "GA",
+   "32219",
+   "United States",
+   {
+    "$dec": "-5.00"
+   },
+   "apartment",
+   {
+    "$dec": "1510.68"
+   }
+  ],
+  [
+   "AAAAAAAAFDDAAAAA",
+   "Dr.",
+   "Amy",
+   "Joyce",
+   "640",
+   "4th Laurel",
+   "Boulevard",
+   "Suite 340",
+   "Enterprise",
+   "Peach County",
+   "GA",
+   "31757",
+   "United States",
+   {
+    "$dec": "-5.00"
+   },
+   "apartment",
+   {
+    "$dec": "1141.36"
+   }
+  ],
+  [
+   "AAAAAAAAHBCAAAAA",
+   "Dr.",
+   "Vera",
+   "Prewitt",
+   null,
+   null,
+   null,
+   null,
+   "Lakeside",
+   "Washington County",
+   "GA",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "607.00"
+   }
+  ],
+  [
+   "AAAAAAAAHBDAAAAA",
+   null,
+   "Ernestina",
+   null,
+   "939",
+   "Cedar ",
+   "Court",
+   "Suite A",
+   "Mount Pleasant",
+   "Marion County",
+   "GA",
+   "32739",
+   "United States",
+   {
+    "$dec": "-5.00"
+   },
+   "single family",
+   {
+    "$dec": "2412.24"
+   }
+  ],
+  [
+   "AAAAAAAAJJCAAAAA",
+   "Dr.",
+   "Daniel",
+   "Null",
+   "81",
+   "Lee 4th",
+   "RD",
+   "Suite 140",
+   "Centerville",
+   "Coffee County",
+   "GA",
+   "30059",
+   "United States",
+   {
+    "$dec": "-5.00"
+   },
+   "single family",
+   {
+    "$dec": "2541.93"
+   }
+  ],
+  [
+   "AAAAAAAALNDAAAAA",
+   "Mr.",
+   "Todd",
+   "Norris",
+   "498",
+   "Lake ",
+   "Way",
+   "Suite 490",
+   "Spring Valley",
+   "Habersham County",
+   "GA",
+   "36060",
+   "United States",
+   {
+    "$dec": "-5.00"
+   },
+   "single family",
+   {
+    "$dec": "4322.07"
+   }
+  ],
+  [
+   "AAAAAAAAMEDAAAAA",
+   "Ms.",
+   "Michele",
+   "Michael",
+   "986",
+   "West East",
+   "Blvd",
+   "Suite F",
+   "Pleasant Grove",
+   "Coweta County",
+   "GA",
+   "34136",
+   "United States",
+   {
+    "$dec": "-5.00"
+   },
+   "apartment",
+   {
+    "$dec": "3254.91"
+   }
+  ],
+  [
+   "AAAAAAAANACAAAAA",
+   "Miss",
+   "Judith",
+   "Winkler",
+   "52",
+   "6th Park",
+   "Drive",
+   "Suite E",
+   "Farmington",
+   "Johnson County",
+   "GA",
+   "39145",
+   "United States",
+   {
+    "$dec": "-5.00"
+   },
+   "condo",
+   {
+    "$dec": "4180.85"
+   }
+  ],
+  [
+   "AAAAAAAANCAAAAAA",
+   null,
+   null,
+   "Hammonds",
+   "129",
+   "Valley ",
+   "Circle",
+   "Suite 410",
+   "Ashland",
+   "Decatur County",
+   "GA",
+   "34244",
+   "United States",
+   {
+    "$dec": "-5.00"
+   },
+   "single family",
+   {
+    "$dec": "7302.22"
+   }
+  ]
+ ]
+}

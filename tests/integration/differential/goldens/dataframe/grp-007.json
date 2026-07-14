@@ -1,0 +1,102 @@
+{
+ "id": "grp-007",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "active",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "gid1",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "n",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   null,
+   2,
+   2
+  ],
+  [
+   10,
+   true,
+   1,
+   2
+  ],
+  [
+   20,
+   false,
+   1,
+   1
+  ],
+  [
+   20,
+   null,
+   2,
+   2
+  ],
+  [
+   20,
+   true,
+   1,
+   1
+  ],
+  [
+   30,
+   false,
+   1,
+   1
+  ],
+  [
+   30,
+   null,
+   2,
+   2
+  ],
+  [
+   30,
+   true,
+   1,
+   1
+  ],
+  [
+   null,
+   null,
+   2,
+   2
+  ],
+  [
+   null,
+   null,
+   4,
+   8
+  ],
+  [
+   null,
+   true,
+   1,
+   2
+  ]
+ ]
+}

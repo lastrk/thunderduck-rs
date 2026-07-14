@@ -4,6 +4,156 @@ Detailed entries are in [`docs/dev_journal/`](dev_journal/). This file is a chro
 
 ---
 
+## 2026-07-02 — v2 Slice C.1 landing (τ emission substrate + operator arms; C.2/C.3 escalated)
+
+[`dev_journal/2026-07-02-v2-slice-C.md`](dev_journal/2026-07-02-v2-slice-C.md)
+
+**Delta:** 0 → 0 core_v2 (unchanged — HALT-AND-FLAG trigger #2: corpus signal architecturally blocked by Slice E's `execute_streaming_query` stub; τ emits correct SQL for wired arms but harness never reaches DuckDB). C.1 landed as a single pass (architect → coder → reviewer APPROVED with 1 High → fix iteration → perf HAS_OPPORTUNITIES with 1 HIGH + 3 MEDIUM → perf pass). `crates/core/src/transpiler_v2/emission.rs` (~1000 LOC post-perf) + `rewrites.rs` (empty per Decision 6). Approach A hand-written match (ADR-009 + Open Decision 7): 14-arm `dispatch_op` over `TypedOp`, 28-arm `render_expr` over `Expression`. INV2 companion (`EMIT_TAP` + `EMIT_TAP_MUTEX`) + INV3 grep barrier activated. Checklist §-anchors landed in real code: §4.2 (`Cast::try_cast → TRY_CAST`), §5.1 (`spark_return_cast` vs `spark_aggregate_return_cast` as distinct fns), §5.3 (`EMIT_TAP` tap-once), §5.4 (`render_tail` CTE — single `child_sql` embed), §5.6 (`quote_ident` zero-alloc `Cow::Borrowed` fast path, post-perf). Decision 13-A recorded: six unwired renderers (Tail/Distinct/WithColumns/DropColumns/AliasedRelation/Range) landed as `#[allow(dead_code)]` helpers with per-item TODO comments naming owning future slices. Fix pass closed H1 (dead `EmittedSql` newtype deleted), M2 (`DUCKDB_RESERVED` extended with 20 collision-risk keywords), M5 (test rename). Perf pass closed H1 (`quote_ident` fast path truly zero-alloc via byte-level `ascii_ci_cmp`), M1 (`binary_search_by` + invariant guards), M2 (list-building renderers Vec→String buffer), M3 (`is_aggregate_name` `eq_ignore_ascii_case`). Test count 302 → 342 (+40). **Slice C.2 and C.3 REMAIN OPEN** — corpus target requires Slice E execution wiring; user directive terminated Slice C at C.1 only and escalated.
+
+---
+
+## 2026-07-02 — v2 Slice B landing (τ analyzer: typing + nullability + set-op widening + outer-join nullability)
+
+[`dev_journal/2026-07-02-v2-slice-B.md`](dev_journal/2026-07-02-v2-slice-B.md)
+
+**Delta:** 0 → 0 core_v2 (unchanged — analyzer alone doesn't emit; corpus climb requires Slice C emission arms). `crates/core/src/transpiler_v2/analyzer.rs` (~1100 LOC) + `analyzer_fixtures.rs` (~410 LOC, `#[cfg(test)]`); single pass (no B.1/B.2 sub-split) — three conceptual passes fused into one bottom-up traversal. `CommonOp::SetOp { kind, all, by_name, children }` + `SetOpKind` added (additive). `AGGREGATE_NAMES` gains `try_sum` + `try_avg` per checklist §1.4; `try_divide` explicitly NOT added (scalar per §4.1). `AnalyzerError` splits per ADR-022 with `[SPARK-EMULATED]` / `[TDCK-BOUNDARY]` Display prefixes. INV4 + INV5 activated with fixture-iterating bodies (5 input relations + 10 mini-fixtures). Fix pass closed H1 (central projection-ambiguity check in `resolve_column`), H2 (redundant walker deleted), M1 (qualified-Star unknown-qualifier → `UnknownColumn`), M2 (arity mismatches → `Other` variant). Verdict APPROVED. 38+ tests added; total transpiler_v2 tests 65 → 95.
+
+---
+
+## 2026-07-02 — v2 Slice A landing (τ substrate: types + plan + protobuf converter + SparkSQL front-end + dispatch)
+
+[`dev_journal/2026-07-02-v2-slice-A.md`](dev_journal/2026-07-02-v2-slice-A.md)
+
+**Delta:** 153 → 0 core_v2 (designed regression per ADR-022 — τ is the only path and returns `UnsupportedOp` for every input until Slice B/C wire analysis + emission). Three sub-slices landed sequentially. **A.1** — types substrate (τ's `Expression`, `TypeInferenceEngine`, `EmissionError`, INV10 walker) — 5 new files, 41 tests. **A.2** — plan substrate + protobuf converter + SparkSQL front-end (`CommonAst`, `V2RelationConverter` with exhaustive Arrow-value dispatch, `parser_v2/`, `BaseTypes` overlay) — 6 new files + 6 modified, 57 tests. **A.3** — dispatch relocation (`service.rs` funnels every request through τ; `THUNDERDUCK_TRANSPILER` env var deleted; legacy imports gone from dispatch) — 5 modified, 7 tests. Total: 11 new files, 105 tests, 4 INV10 walker scopes active. ADR-021 + ADR-022 fully realized on this branch; Slice K owns legacy source deletion.
+
+---
+
+## 2026-07-01 — v2 Slice D Phase 2 landing (ext6 arms + native-arm gaps + analyzer symmetric-omission fix)
+
+[`dev_journal/2026-07-01-v2-slice-d-phase2.md`](dev_journal/2026-07-01-v2-slice-d-phase2.md)
+
+**Delta:** 152 → 153 core_v2 (+1). 5 of 7 targets GREEN. 2 dormant (`math-016`, `agg2-004`) reassigned to Slice E — dormant-v2-fix pattern instances #3 and #4 after C.3-1 and C.3-6b. Ext arms: `try_divide`/`try_sum`/`try_avg` → `spark_*` (ext6-provided). Native arms: `corr`/`covar_samp`/`regr_slope`/`regr_r2` → uppercase DuckDB. Analyzer fix: extended `aggregate_return_type` `→ Double` arm to cover the correlation/covariance/regression family (unblocked `agg-012`). Verify-native-first validated: 7 of 10 pre-drafted ext5 specs were unnecessary because native DuckDB matched Spark.
+
+---
+
+## 2026-07-01 — v2 Slice B + Slice C.1 + Slice C.2 + Slice D Phase 1 + Slice C.3-4 + Slice C.3-3 + Slice C.3-5 + Slice C.3 remaining (C.3-1 / C.3-2 / C.3-6)
+
+[`dev_journal/2026-07-01-v2-slice-b-analyzer.md`](dev_journal/2026-07-01-v2-slice-b-analyzer.md)
+
+**Slice B**: `CommonAst` grew from unit struct to 15-operator enum + `Punt`. Analyzer substrate:
+`TypedAst`, `TypedAttr`, `AnalyzerError`, sealed `HasSchema`, three bounded passes (`resolve`,
+`assign_types` with `Union` downward sub-sweep, `derive_nullability`), five input-relation
+fixtures + five mini `CommonAst` fixtures, `inference_smoke()`. **INV4** and **INV5** activated.
+
+**Slice C.1** (architect-proposed C.1/C.2 sub-split honored): `lowering.rs`
+(29-variant `LogicalPlan → CommonAst` adapter with `Punt`); `emission.rs` grown into hand-written
+`dispatch_op` `match` + per-op renderers + `EmittedSql` newtype; `mod.rs` `pub fn generate`
+composes `lower → analyze → dispatch`; `service.rs` `TranspilerPath::V2` dispatches with
+`is_v2_fallback_eligible` legacy fallback; `error.rs` `V2Lowering`/`V2Analyzer`/`V2Emission`
+variants. All six Slice-B mediums (M1-M6) closed. **INV2** and **INV3** activated. Two review
+iterations (iteration 1 `NEEDS_CHANGES` — half-declarative `EMISSION_TABLE` scaffolding-without-
+interpreter; iteration 2 `APPROVED` — scaffolding deleted). OPT-M1 (`quote_ident` fast path)
+applied. `SqlGenerator::gen_expr` remains as a documented C.2 seam.
+
+**Slice C.2** (pass 2 of Slice C): Approach A chosen (hand-written per-variant / per-function
+match arms — dead-data lesson applied). `render_expr` became an exhaustive match over all 27
+`Expression` variants; `render_function_call` grew ~130 lowercased-name arms hand-copied from
+`FunctionRegistry`. `SqlGenerator::gen_expr` seam drained (`use crate::generator::SqlGenerator`
+removed; `.with_schema_for_v2(` / `.gen_expr(` / `SqlGenerator::new()` all gone).
+`EmissionError::LegacyRenderFailed` removed; new `UnsupportedExpression` / `UnsupportedFunction`
+variants fallback-eligible. `spark_return_cast` (projection slot) + `spark_aggregate_return_cast`
+(inside `render_aggregate`) handle Spark-parity CASTs. INV3 tightened (8 grep rejections +
+26-entry `REQUIRED_RENDERERS`). M5 closed via module-scoped `EMIT_TAP_MUTEX`; M6 closed via
+`render_tail` CTE rewrite; UpdateFields walking added; Union / Intersect / Except gained
+per-column CAST wrapper. OPT-M2 subsumed by seam drain; OPT-M3 closed via
+`plan_has_empty_scan` short-circuit + `BaseTypes` fallback-only doc contract. Two review
+iterations: iteration 1 `APPROVED` with 2 CLOSE_NOW Mediums (M1 qualified Star drop, M4 aliased
+Div CAST); iteration 2 closed both plus an M2 log correction. Perf `OPTIMIZED` (0 HIGH + 0 MEDIUM);
+seam drain silently absorbed OPT-M2 + L1 wins.
+
+**Slice D Phase 1** (ext4 wiring, partially lands Slice D): Two-file diff (`emission.rs` +
+`invariants.rs`). 6 scalar arms (`crc32`, `hash`, `xxhash64`, `skewness`, `percentile_approx`,
+`median`) + 2 verify-first arms (`kurtosis` → `KURTOSIS_POP`, `count_if` → `COUNT_IF`, both
+native pending scoped-differential confirmation at Phase 1 termination). `render_binary`
+DECIMAL-div branch + `render_spark_decimal_div` helper mirroring legacy
+`gen_strict_decimal_div`. New `spark_aggregate_rewrite` sibling helper rewrites DECIMAL
+`SUM`/`AVG`/`mean` to `spark_sum`/`spark_avg` with widened outer CAST.
+`extension_targets()` populated with 6-entry ext4 allow-list. **INV6** activated over the
+ext4 subset (containment check against `duckdb_functions()` turned green); INV3
+`REQUIRED_RENDERERS` extended with the two new helpers. Up-front audit surfaced `md5`,
+`sha1`/`sha2`, and stddev family were already wired in Slice C.2, collapsing planned
+edit surface from ~14 arms to 8. Review `APPROVED` (5 Mediums: M1 + M5 CLOSE_NOW closed
+via iter 2; M2 scoped-differential at Phase 1 termination; M3 + M4 DEFER). Perf
+`OPTIMIZED` (5 LOWs all deferred). Slice D as a whole does not terminate here — Phase 2
+remains blocked on the ext5 pin.
+
+**Slice C.3-4** (post-Slice-D-Phase-1 halt-and-flag; `/fix-bug` pipeline): the C.3-4
+initial-prompt scope named `emission.rs::render_binary` / `render_spark_decimal_div`, but
+the diagnostician's multi-hypothesis pass overturned the scope. Actual root cause was
+upstream of both transpilers, in `crates/connect-server/src/converter/relation_converter.rs:2513`:
+a silent-NULL catch-all in `local_relation_to_values_sql::val()` mapped every unhandled Arrow
+type (including `Decimal128`) to the SQL literal `"NULL"`, corrupting every DECIMAL cell in
+`createDataFrame` payloads. Fix: added a `Decimal128(p, s)` match arm with a new
+`format_decimal128` helper (renders the scaled literal DuckDB requires — the diagnostician's
+naive `CAST(<unscaled i128> AS DECIMAL(p,s))` prescription would have hit DuckDB's out-of-range
+CAST error) and replaced the catch-all with a loud `Err`. Regression tests: 3 in
+`relation_converter.rs` (Decimal128 round-trip; unhandled-type errors; `format_decimal128`
+padding/zero/negative/scale-0) plus 1 Div-routing invariant lock in `emission.rs`.
+**Progress signal delta: 134 → 149 core_v2 passing (+15)** — far above the +3 minimum
+prediction from `type-003/004/005`; the corpus contained many more silently-NULL'd
+decimal-payload cases than the halt-and-flag audit had visibility into. Legacy TPC-H 51/51
+unregressed. Deferred: M1 (`format_decimal128` negative-scale defense-in-depth), M2 (symmetric
+`Decimal256` arm — no corpus case exercises).
+
+**Slice C.3-3** (post-Slice-C.3-4 follow-up; `/fix-bug` pipeline): closes the
+`count_if` aggregate-context type + nullability gap that C.3-4's decimal
+marshalling fix uncovered as blocking `agg-020` and `agg2-006`. Initial prompt
+speculated the `salary > 90000` predicate was routed as Decimal; corpus-first
+reading (agg-020 uses Boolean column `active`; agg2-006's comparison result is
+Boolean) narrowed to `TypeInferenceEngine::aggregate_return_type` returning the
+argument type via a `_` fall-through. Two-file fix: `types/type_inference.rs`
+(added `count_if` to the `count | count_distinct => Long` alternation and to
+sibling `aggregate_is_non_nullable`) + `expression/mod.rs` (added `count_if`
+to `FunctionCall::nullable`'s non-nullable-aggregate literal list —
+iteration 2, after iter-1's type-only fix left a newly-visible nullability
+mismatch). Symmetric-omission pattern: both files enumerated the count family
+and both omitted `count_if`; C.3-3 closes both. 4 regression tests.
+**Progress signal delta: 149 → 151 core_v2 passing (+2)** — exactly the two
+target unblocks. Legacy TPC-H 51/51 unregressed.
+
+**Slice C.3-5** (post-Slice-C.3-3 follow-up; `/fix-bug` pipeline, **verify-only**):
+diagnostician's "rerun first" preflight caught the case-already-green state — `agg-007`
+was already GREEN on v2 as of C.3-4 + Slice D Phase 1's composition (Decimal128
+`LocalRelation` marshalling + `spark_aggregate_rewrite` routing for DECIMAL SUM/AVG).
+No production code change; 2 regression unit tests added to
+`crates/core/src/transpiler_v2/emission.rs::tests`
+(`sum_of_decimal_routes_through_spark_sum`, `avg_of_decimal_routes_through_spark_avg`)
+locking in the extension-routing + widened-DECIMAL-CAST invariant. Both would have
+failed against pre-Slice-D-Phase-1 emission. **Progress signal delta: +0** (151 → 151;
+`agg-007` was already inside the 151 baseline). Legacy TPC-H 51/51 unregressed.
+
+**Slice C.3 remaining** (C.3-1 / C.3-2 / C.3-6; `/new-feature` pipeline): third Slice-C.3
+pass targeting `hash-002`, `hash-003`, `agg-013`. **C.3-2** landed cleanly (single-file
+extension of `FunctionCall::nullable`'s non-nullable literal list in
+`crates/core/src/expression/mod.rs` to include `hash`/`murmur3`/`xxhash64`; `murmur3`
+bundled in as a Spark synonym) — closes `hash-003`, **+1 delta (151 → 152)**. **C.3-1**
+landed **dormant**: the v2 fix in `emission.rs` (sha arg-strip in the `sha`/`sha1`/`sha2`
+arm) + a regression test committed, but `hash-002` stays RED because the corpus routes
+through the legacy `SqlRelation` fallback (`emp` DataFrame's `spark.createDataFrame(...)`
+plan contains `SqlRelation`, which the v2 analyzer punts) and legacy's `FunctionRegistry`
+maps `sha2 → SHA256` name-only with the same bug; non-goals forbid touching legacy, so the
+v2 fix lights up the moment Slice D/E wires `SqlRelation`. **C.3-6** halted: preflight
+showed `agg-013` RED with `Binder Error: approx_quantile(DOUBLE, DOUBLE)` — DuckDB requires
+FLOAT for the quantile arg but v2 emits `0.5::DOUBLE`; emission-side literal-type-suffix
+bug, out of C.3-6's verify-only scope. Tracked as **C.3-6b** for a follow-up `/fix-bug`.
+Discipline instance: the "dormant v2 fix" shape (land + test + halt without touching
+legacy) is a legitimate outcome recorded in `tasks/lessons.md`. Review APPROVED, 0
+Critical + 0 High.
+
+**Tests**: 278 core + 17 connect-server (+ 2 regression tests from Slice C.3 remaining) · differential 152/324 core_v2 (v2 path) · 51/51 legacy TPC-H
+
+---
+
 ## 2026-04-03 — Array containsNull, HOF Types, CTE Schema Propagation
 
 [`dev_journal/2026-04-03-array-hof-cte-schemas.md`](dev_journal/2026-04-03-array-hof-cte-schemas.md)

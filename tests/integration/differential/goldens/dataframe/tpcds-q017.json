@@ -1,0 +1,64 @@
+{
+ "id": "tpcds-q017",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_item_desc",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_state",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_sales_quantity",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "avg_sr_return_quantity",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_cs_quantity",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AAAAAAAAEDAAAAAA",
+   "Total styles cannot assume companies. Cases may constitute shops. Local years meet still different, superb players. Delicate, peaceful ",
+   "TN",
+   1,
+   2.0,
+   42.0
+  ],
+  [
+   "AAAAAAAAHGAAAAAA",
+   "As short materials might go sometime new, tall skills. M",
+   "TN",
+   1,
+   1.0,
+   31.0
+  ]
+ ]
+}

@@ -24,7 +24,6 @@ class DualServerManager:
         self,
         thunderduck_port: int = 15002,
         spark_reference_port: int = 15003,
-        compat_mode: str | None = None
     ):
         """
         Initialize dual server manager
@@ -32,7 +31,6 @@ class DualServerManager:
         Args:
             thunderduck_port: Port for Thunderduck server (default 15002)
             spark_reference_port: Port for Spark reference server (default 15003)
-            compat_mode: Spark compat mode ("strict", "relaxed", or None for auto)
         """
         self.thunderduck_port = thunderduck_port
         self.spark_reference_port = spark_reference_port
@@ -42,7 +40,6 @@ class DualServerManager:
         self.thunderduck_manager = ServerManager(
             host="localhost",
             port=thunderduck_port,
-            compat_mode=compat_mode
         )
 
         # Spark Connect container name
@@ -54,11 +51,44 @@ class DualServerManager:
         # spark-warehouse/ directory exists from a previous test run.
         self._spark_warehouse_dir = tempfile.mkdtemp(prefix="spark-warehouse-")
 
+    def _spark_env(self) -> dict:
+        """Environment for the Spark start/stop scripts, isolated per worktree.
+
+        Namespaces Spark's PID file, log dir, and ident string so a second
+        worktree's reference server does not collide with Spark's class+instance
+        daemon bookkeeping (which is NOT port-scoped) and logs don't clobber
+        each other. Start and stop must share these so ``stop-connect-server.sh``
+        can find the daemon's PID file. ``THUNDERDUCK_WORKTREE_ID`` is stamped
+        onto the JVM (see the start script) so ownership-verified cleanup can
+        identify this exact server.
+        """
+        import test_env
+        root = test_env.worktree_root()
+        wid = test_env.worktree_id(root)
+        spark_log_dir = self.workspace_dir / "tests/integration/logs" / "spark"
+        spark_pid_dir = spark_log_dir / "pid"
+        spark_log_dir.mkdir(parents=True, exist_ok=True)
+        spark_pid_dir.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        env['SPARK_PORT'] = str(self.spark_reference_port)
+        env['THUNDERDUCK_WORKTREE_ID'] = wid
+        env.setdefault('SPARK_IDENT_STRING', f"td-{wid}")
+        env.setdefault('SPARK_LOG_DIR', str(spark_log_dir))
+        env.setdefault('SPARK_PID_DIR', str(spark_pid_dir))
+        return env
+
     def is_spark_process_running(self) -> bool:
-        """Check if Spark Connect process is running"""
+        """Check if *our* Spark Connect process is running.
+
+        Scoped to this worktree's Spark port so a Spark reference started by a
+        different worktree/session is never mistaken for ours (a host-wide
+        ``pgrep -f SparkConnectServer`` would match every worktree's JVM).
+        """
         try:
             result = subprocess.run(
-                ["pgrep", "-f", "org.apache.spark.sql.connect.service.SparkConnectServer"],
+                ["pgrep", "-f",
+                 f"SparkConnectServer.*binding.port={self.spark_reference_port}"],
                 capture_output=True,
                 text=True
             )
@@ -112,8 +142,7 @@ class DualServerManager:
         print("Starting Spark Connect server...")
         print(f"  Warehouse dir: {self._spark_warehouse_dir}")
         try:
-            env = os.environ.copy()
-            env['SPARK_PORT'] = str(self.spark_reference_port)
+            env = self._spark_env()
             env['SPARK_WAREHOUSE_DIR'] = self._spark_warehouse_dir
             result = subprocess.run(
                 [str(script_path)],
@@ -156,8 +185,9 @@ class DualServerManager:
 
         if script_path.exists():
             try:
-                env = os.environ.copy()
-                env['SPARK_PORT'] = str(self.spark_reference_port)
+                # Same per-worktree env as start, so stop-connect-server.sh can
+                # locate this worktree's daemon PID file.
+                env = self._spark_env()
                 subprocess.run(
                     [str(script_path)],
                     cwd=str(self.workspace_dir),

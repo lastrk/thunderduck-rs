@@ -1,0 +1,48 @@
+{
+ "id": "ord-013",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   "Infrastructure"
+  ],
+  [
+   10,
+   "Infrastructure"
+  ],
+  [
+   20,
+   "Data"
+  ],
+  [
+   20,
+   "Data"
+  ],
+  [
+   30,
+   "ML"
+  ],
+  [
+   30,
+   "ML"
+  ]
+ ]
+}

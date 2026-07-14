@@ -1,0 +1,56 @@
+{
+ "id": "sel-014",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "Vienna"
+  ],
+  [
+   2,
+   "Berlin"
+  ],
+  [
+   3,
+   "Vienna"
+  ],
+  [
+   4,
+   null
+  ],
+  [
+   5,
+   "Munich"
+  ],
+  [
+   6,
+   "Zurich"
+  ],
+  [
+   7,
+   "Vienna"
+  ],
+  [
+   8,
+   null
+  ]
+ ]
+}

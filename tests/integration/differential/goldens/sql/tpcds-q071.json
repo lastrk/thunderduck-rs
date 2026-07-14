@@ -1,0 +1,114 @@
+{
+ "id": "tpcds-q071",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "brand_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "brand",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "t_hour",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "t_minute",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ext_price",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   7008009,
+   "namelessbrand #9",
+   18,
+   3,
+   {
+    "$dec": "5736.05"
+   }
+  ],
+  [
+   7008009,
+   "namelessbrand #9",
+   18,
+   30,
+   {
+    "$dec": "187.85"
+   }
+  ],
+  [
+   7008009,
+   "namelessbrand #9",
+   18,
+   44,
+   {
+    "$dec": "3292.20"
+   }
+  ],
+  [
+   7008009,
+   "namelessbrand #9",
+   19,
+   24,
+   {
+    "$dec": "624.24"
+   }
+  ],
+  [
+   7008009,
+   "namelessbrand #9",
+   19,
+   44,
+   {
+    "$dec": "0.00"
+   }
+  ],
+  [
+   7008009,
+   "namelessbrand #9",
+   6,
+   45,
+   {
+    "$dec": "1094.70"
+   }
+  ],
+  [
+   7008009,
+   "namelessbrand #9",
+   8,
+   40,
+   {
+    "$dec": "769.00"
+   }
+  ],
+  [
+   7008009,
+   "namelessbrand #9",
+   9,
+   19,
+   {
+    "$dec": "11200.32"
+   }
+  ]
+ ]
+}

@@ -1,0 +1,124 @@
+{
+ "id": "tpcds-q062",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "warehouse_name_substr",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sm_type",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "web_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sun_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "mon_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "tue_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "wed_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "thu_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "fri_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sat_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Conventional childr",
+   "EXPRESS",
+   "site_0",
+   {
+    "$dec": "19426.75"
+   },
+   {
+    "$dec": "48560.73"
+   },
+   {
+    "$dec": "19235.15"
+   },
+   {
+    "$dec": "41014.19"
+   },
+   {
+    "$dec": "29037.96"
+   },
+   {
+    "$dec": "5096.66"
+   },
+   {
+    "$dec": "16524.29"
+   }
+  ],
+  [
+   "Conventional childr",
+   "LIBRARY",
+   "site_0",
+   {
+    "$dec": "40442.66"
+   },
+   {
+    "$dec": "17662.27"
+   },
+   {
+    "$dec": "19325.59"
+   },
+   {
+    "$dec": "12111.39"
+   },
+   {
+    "$dec": "30081.24"
+   },
+   {
+    "$dec": "10726.68"
+   },
+   {
+    "$dec": "44356.16"
+   }
+  ]
+ ]
+}

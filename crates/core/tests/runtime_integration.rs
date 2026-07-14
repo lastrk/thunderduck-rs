@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use thunderduck_core::runtime::compat_mode::RuntimeCompatMode;
 use thunderduck_core::runtime::{DuckDbSession, SessionManager, StreamingConfig};
 
 // ── session_round_trip ─────────────────────────────────────────────────────────
@@ -9,12 +8,8 @@ use thunderduck_core::runtime::{DuckDbSession, SessionManager, StreamingConfig};
 #[tokio::test]
 #[ignore]
 async fn session_round_trip() {
-    let session = DuckDbSession::spawn(
-        "test-1",
-        RuntimeCompatMode::Relaxed,
-        &StreamingConfig::default(),
-    )
-    .expect("spawn failed");
+    let session =
+        DuckDbSession::spawn("test-1", &StreamingConfig::default()).expect("spawn failed");
 
     // 1. Create a simple view via range().
     session
@@ -56,7 +51,7 @@ async fn session_round_trip() {
 #[tokio::test]
 #[ignore]
 async fn session_manager_isolation() {
-    let mgr = SessionManager::new(RuntimeCompatMode::Relaxed, StreamingConfig::default());
+    let mgr = SessionManager::new(StreamingConfig::default());
 
     let s1 = mgr
         .get_or_create("session-a")
@@ -80,50 +75,6 @@ async fn session_manager_isolation() {
     );
 }
 
-// ── generator_to_duckdb ────────────────────────────────────────────────────────
-
-/// Full pipeline: LogicalPlan → SQL string (Phase 1) → DuckDB execution → Arrow.
-#[tokio::test]
-#[ignore]
-async fn generator_to_duckdb() {
-    use thunderduck_core::{
-        expression::{Expression, UnresolvedColumn},
-        functions::CompatMode,
-        generator::SqlGenerator,
-        logical::{LogicalPlan, Project, RangeRelation},
-    };
-
-    let plan = LogicalPlan::Project(Project {
-        input: Box::new(LogicalPlan::RangeRelation(RangeRelation {
-            start: 1,
-            end: 4,
-            step: 1,
-            num_partitions: None,
-        })),
-        projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "id".into(),
-            qualifier: None,
-        })],
-    });
-
-    let sql = SqlGenerator::new(CompatMode::Relaxed)
-        .generate(&plan)
-        .expect("SQL generation failed");
-
-    let session = DuckDbSession::spawn(
-        "gen-test",
-        RuntimeCompatMode::Relaxed,
-        &StreamingConfig::default(),
-    )
-    .expect("spawn failed");
-
-    let batches = session.execute(&sql).await.expect("execute failed");
-
-    assert!(!batches.is_empty(), "expected result batches");
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 3, "range(1, 4, 1) should yield 3 rows");
-}
-
 // ── get_or_create_is_race_free (Bug 6: TOCTOU) ────────────────────────────────
 
 /// Demonstrates the TOCTOU race in `SessionManager::get_or_create`.
@@ -139,10 +90,7 @@ async fn generator_to_duckdb() {
 #[ignore]
 async fn get_or_create_is_race_free() {
     const CONCURRENCY: usize = 8;
-    let mgr = Arc::new(SessionManager::new(
-        RuntimeCompatMode::Relaxed,
-        StreamingConfig::default(),
-    ));
+    let mgr = Arc::new(SessionManager::new(StreamingConfig::default()));
     // Barrier ensures all tasks execute get_or_create at the same instant.
     let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
 
@@ -178,12 +126,8 @@ async fn get_or_create_is_race_free() {
 #[tokio::test]
 #[ignore]
 async fn check_parquet_types() {
-    let session = DuckDbSession::spawn(
-        "parquet-type-check",
-        RuntimeCompatMode::Relaxed,
-        &StreamingConfig::default(),
-    )
-    .expect("spawn failed");
+    let session = DuckDbSession::spawn("parquet-type-check", &StreamingConfig::default())
+        .expect("spawn failed");
 
     // Check supplier schema
     let batches = session.execute("DESCRIBE SELECT * FROM read_parquet('/workspace/tests/integration/tpch_sf001/supplier.parquet')").await.expect("failed");
@@ -248,100 +192,4 @@ async fn check_parquet_types() {
             println!("  {}: {:?}", field.name(), field.data_type());
         }
     }
-
-    // Check schema_of (the LIMIT 0 path used by analyze_plan)
-    let q1_sql = "SELECT \"l_returnflag\", \"l_linestatus\", SUM(\"l_extendedprice\" * (1 - \"l_discount\")) AS \"sum_disc_price\" FROM (SELECT * FROM \"lineitem\") GROUP BY \"l_returnflag\", \"l_linestatus\"";
-    let schema = session.schema_of(q1_sql).await.expect("schema_of failed");
-    println!("schema_of (LIMIT 0) result:");
-    for field in schema.fields() {
-        println!("  {}: {:?}", field.name(), field.data_type());
-    }
-}
-
-// ── struct_field_name_case_is_preserved ────────────────────────────────────────
-
-/// Regression: STRUCT field names must round-trip through schema inference
-/// with their original case. The Java reference (commit `e174e6c`) fixed a bug
-/// where `mapDuckDBType` uppercased the full DuckDB type string and then sliced
-/// field identifiers out of it, producing `STREET`/`ZIP` instead of
-/// `street`/`zip`. The Rust port avoids that class of bug by reading the
-/// typed Arrow schema (case-preserving `Field::name()`) instead of parsing
-/// DuckDB's textual type description. This test locks that behaviour in so a
-/// future refactor cannot silently regress it.
-///
-/// Covers the same shapes the Java fix asserted on:
-///   1. flat `STRUCT(street, zip)`
-///   2. `LIST<STRUCT<...>>`
-///   3. `MAP<VARCHAR, STRUCT<...>>`
-///   4. mixed-case identifiers (`Street`, `ZipCode`)
-#[tokio::test]
-async fn struct_field_name_case_is_preserved() {
-    use thunderduck_core::runtime::SchemaInferrer;
-    use thunderduck_core::types::DataType;
-
-    let session = DuckDbSession::spawn(
-        "struct-field-case",
-        RuntimeCompatMode::Relaxed,
-        &StreamingConfig::default(),
-    )
-    .expect("spawn failed");
-
-    let inferrer = SchemaInferrer::new(&session);
-
-    // Helper: pull the innermost STRUCT field names out of a result schema's
-    // single top-level column, walking through LIST / MAP wrappers if needed.
-    fn struct_field_names(dt: &DataType) -> Vec<String> {
-        match dt {
-            DataType::Struct(s) => s.fields.iter().map(|f| f.name.clone()).collect(),
-            DataType::Array(elem, _) => struct_field_names(elem),
-            DataType::Map { value, .. } => struct_field_names(value),
-            other => panic!("expected STRUCT (or LIST/MAP of STRUCT), got {other:?}"),
-        }
-    }
-
-    // 1. Flat STRUCT
-    let schema = inferrer
-        .infer_sql("SELECT {'street': 'Main', 'zip': '01000'} AS addr")
-        .await
-        .expect("infer flat struct");
-    assert_eq!(schema.fields.len(), 1);
-    assert_eq!(schema.fields[0].name, "addr");
-    assert_eq!(
-        struct_field_names(&schema.fields[0].data_type),
-        vec!["street".to_string(), "zip".to_string()],
-        "flat STRUCT field names must preserve case"
-    );
-
-    // 2. LIST<STRUCT>
-    let schema = inferrer
-        .infer_sql("SELECT [{'street': 'A', 'zip': 'Z'}] AS addrs")
-        .await
-        .expect("infer list<struct>");
-    assert_eq!(
-        struct_field_names(&schema.fields[0].data_type),
-        vec!["street".to_string(), "zip".to_string()],
-        "LIST<STRUCT> field names must preserve case"
-    );
-
-    // 3. MAP<VARCHAR, STRUCT>
-    let schema = inferrer
-        .infer_sql("SELECT MAP {'a': {'street': 'A', 'zip': 'Z'}} AS m")
-        .await
-        .expect("infer map<varchar,struct>");
-    assert_eq!(
-        struct_field_names(&schema.fields[0].data_type),
-        vec!["street".to_string(), "zip".to_string()],
-        "MAP<VARCHAR, STRUCT> field names must preserve case"
-    );
-
-    // 4. Mixed-case identifiers — the exact failure shape from the Java bug.
-    let schema = inferrer
-        .infer_sql("SELECT {'Street': 'A', 'ZipCode': 'Z'} AS addr")
-        .await
-        .expect("infer mixed-case struct");
-    assert_eq!(
-        struct_field_names(&schema.fields[0].data_type),
-        vec!["Street".to_string(), "ZipCode".to_string()],
-        "mixed-case STRUCT field names must NOT be upper-cased (Java e174e6c regression guard)"
-    );
 }

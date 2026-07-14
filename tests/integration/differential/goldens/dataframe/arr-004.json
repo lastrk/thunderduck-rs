@@ -1,0 +1,90 @@
+{
+ "id": "arr-004",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "sorted",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "rsorted",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null,
+   null
+  ],
+  [
+   null,
+   null
+  ],
+  [
+   [
+    "c",
+    "go",
+    "rust"
+   ],
+   [
+    "rust",
+    "go",
+    "c"
+   ]
+  ],
+  [
+   [
+    "java"
+   ],
+   [
+    "java"
+   ]
+  ],
+  [
+   [
+    "python",
+    "rust"
+   ],
+   [
+    "rust",
+    "python"
+   ]
+  ],
+  [
+   [
+    "python"
+   ],
+   [
+    "python"
+   ]
+  ],
+  [
+   [
+    "scala"
+   ],
+   [
+    "scala"
+   ]
+  ],
+  [
+   [],
+   []
+  ]
+ ]
+}

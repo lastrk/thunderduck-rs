@@ -546,7 +546,26 @@ class TestOrchestrator:
                 # Use create() instead of getOrCreate() to ensure we get a new session
                 # getOrCreate() can reuse existing sessions, causing both fixtures
                 # to point to the same server
-                result[0] = SparkSession.builder.remote(remote_url).create()
+                session = SparkSession.builder.remote(remote_url).create()
+                # Disable Spark Connect's reattachable-execute path for the
+                # differential harness. Reattachable operations require an
+                # explicit ReleaseExecute RPC (dispatched via a process-global
+                # ThreadPoolExecutor); when the corpus collects the reference and
+                # Thunderduck sides *concurrently* (see dataframe_diff.collect_both),
+                # those releases lag and the server accumulates un-released
+                # operations across a several-hundred-case run — the Spark side
+                # then degrades cumulatively (a fast case crawls to tens of
+                # seconds). Reattach only buys resilience to a dropped stream,
+                # which a localhost test never needs, so disabling it removes the
+                # accumulation, drops the global reattach thread pool, and lets
+                # concurrent collects scale across the whole corpus. Opt back in
+                # with THDCK_REATTACH=1 for debugging.
+                if not os.environ.get("THDCK_REATTACH"):
+                    try:
+                        session.client.disable_reattachable_execute()
+                    except Exception:
+                        pass
+                result[0] = session
             except Exception as e:
                 exception[0] = e
 

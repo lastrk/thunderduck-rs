@@ -1,0 +1,28 @@
+{
+ "id": "tpch-q20",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "s_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_address",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Supplier#000000013",
+   "kgTZjbt4CAa4c3SlirlBLqIL41YbCj"
+  ]
+ ]
+}

@@ -1,0 +1,71 @@
+# Lessons & Gotchas — Legacy v1 transpiler
+
+> **SUPERSEDED — DO NOT USE AS GUIDANCE — HISTORICAL REFERENCE ONLY.**
+> These gotchas were discovered while building and debugging the retired
+> v1 `SqlGenerator` / `LogicalPlan` / `Expression` / `TypeInferenceEngine`
+> / `RelationConverter` stack. The v1 Rust modules were deleted on
+> 2026-07-05. τ (`crates/core/src/transpiler_v2/`) is now the only
+> production path per ADR-022; its live gotchas live in `CLAUDE.md`
+> §"Known Gotchas".
+>
+> Kept here as a historical record of the v1 debugging arc.
+
+## `to_sql()` vs `Display`
+
+**Gotcha**: Expression rendering MUST use `to_sql()`, not `Display` / `Debug`. The `Display` impl is for debug logging only.
+
+**Past bug**: In the Java reference, `FunctionCall.toSQL()` called `Expression::toString` on arguments instead of `Expression::toSQL`, producing incorrect SQL for complex argument expressions (nested functions, casts). This is a recurring bug class — the Rust port must not repeat it.
+
+**Rule**: Any code that converts an `Expression` to a SQL string must call `to_sql()`, never `format!("{}", expr)` or `format!("{:?}", expr)`.
+
+## `duckdb::Connection` is `!Send + !Sync`
+
+**Gotcha**: `duckdb::Connection` cannot cross thread boundaries and cannot be held across `.await` points. Attempting either is a compile error or — worse — a logic bug if smuggled through a wrapper.
+
+**Rule**: Each session owns its `Connection` on a dedicated `std::thread`. The async gRPC handler communicates with the session thread via `tokio::sync::mpsc::Sender<SessionCommand>` and receives results via `tokio::sync::oneshot::Sender<SessionResult>`. Never wrap `Connection` in `Arc<Mutex<…>>` and call it from a tokio task — use the channel model.
+
+## Composite Aggregate Expressions
+
+**Gotcha**: When aggregate expressions contain non-`FunctionCall` variants (e.g., `Binary` wrapping `FunctionCall`s), they can be silently dropped if `RelationConverter::convert_aggregate()` falls through to a default `_` arm.
+
+**Past bug**: The Java reference's `else` branch dropped non-`FunctionCall` expressions inside aggregates.
+
+**Rule**: Both `gen_aggregate()` and `RelationConverter::convert_aggregate()` must handle every expression variant that can appear inside an aggregate. Default `_` arms must explicitly error or warn — never silently drop.
+
+## Semi/Anti Join Dual Path
+
+**Gotcha**: `gen_join()` emits native DuckDB `SEMI JOIN` / `ANTI JOIN`. The flat-chain rendering branch inside `gen_join()` must break at SEMI/ANTI boundaries — folding the chain across a semi/anti would change the tree shape and reorder filtering semantics.
+
+**Rule**: When fixing join SQL generation, always check **both** the primary `gen_join()` body and the flat-chain branch inside it. A change in one without the other is a partial fix.
+
+## DuckDB SEMI JOIN Syntax
+
+**Gotcha**: DuckDB uses `SEMI JOIN` and `ANTI JOIN` (without the `LEFT` prefix). `LEFT SEMI JOIN` is a parser error.
+
+**Rule**: When emitting semi/anti joins, never prefix with `LEFT`.
+
+## Extension Version Pinning
+
+**Gotcha**: The `.duckdb_extension` binary's embedded DuckDB version must exactly match the `duckdb` crate version in `Cargo.toml`. Mismatch causes runtime load failures with cryptic ABI errors.
+
+**Rule**: Currently pinned to the `ext6` release (multi-version: pulls the `v1.5.4` binaries to match the `duckdb` crate at `1.10504.0`). When bumping either the crate or the extension, bump both in lockstep and re-run `cargo build --release` to confirm.
+
+## HUGEINT Overflow on Integer SUM
+
+**Gotcha**: DuckDB `SUM()` of integer columns returns `HUGEINT` (`i128`). Spark returns `BIGINT` (`i64`).
+
+**Rule**: SQL generation must emit an explicit `CAST(... AS BIGINT)` for integer `SUM` to preserve Spark parity. Differential tests catch this — but it's easy to miss when adding a new aggregate path.
+
+## Schema Inference vs DESCRIBE
+
+**Gotcha**: Falling back to `DESCRIBE` queries against DuckDB to learn a plan's schema is slow and round-trips through SQL.
+
+**Rule**: Prefer `plan.infer_schema()` for schema analysis. Only issue `DESCRIBE` when plan-level inference is genuinely impossible (e.g., a `RawSql` node with no upstream type info).
+
+## Loud-Fail on Unhandled Arrow Types in `local_relation_to_values_sql`
+
+**Gotcha**: `crates/connect-server/src/converter/relation_converter.rs::local_relation_to_values_sql::val()` translates each Arrow cell in a `createDataFrame` payload into a SQL literal. Prior to Slice C.3-4 (2026-07-01), an `_ => Ok("NULL".to_string())` catch-all silently mapped every unhandled Arrow type (`Decimal128`, `Decimal256`, `Interval*`, `Duration*`, `Binary`, `Time*`, `Dictionary`, ...) to SQL literal `NULL`. The `SqlRelation` schema was still correct, so DuckDB executed queries where the columns promised DECIMAL but the payload was NULL — producing all-NULL rows for `type-003/004/005` and ~12 other decimal-payload cases while the reference had real values.
+
+**Past bug**: Silent NULL substitution turned a marshalling gap into wrong-answer data corruption for every unhandled Arrow type. The failure was invisible on the differential's row-count / schema check and only surfaced as `None`-valued cells.
+
+**Rule**: The catch-all is now `_ => Err(ConnectError::PlanConversion("unsupported arrow type in LocalRelation payload: {other:?}"))`. Any new Arrow-type payload must land as a real match arm — never `Ok("NULL")`. This posture applies to every encoder in `crates/connect-server/src/converter/` that translates typed data into a downstream SQL/wire representation: no catch-all `Ok` fallbacks for typed dispatch.

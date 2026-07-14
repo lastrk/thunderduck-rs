@@ -1,0 +1,67 @@
+# name: test/sql/spark_try_divide.test
+# description: spark_try_divide parity vs Apache Spark 4.1.1. Corpus: math-016.
+# group: [sql]
+
+# Oracle: test/spark_oracle/try_funcs.spark.sql (Spark 4.1.1):
+#   try_divide(10,2)=5.0 (DOUBLE), try_divide(7,2)=3.5 (DOUBLE),
+#   try_divide(1.5,0.5 dec(3,1))=3.000000 DECIMAL(9,6), x/0 -> NULL, NULL op -> NULL.
+
+require thdck_spark_funcs
+
+# int / int -> DOUBLE (Spark promotes non-decimal division to double)
+query T
+SELECT CAST(spark_try_divide(10, 2) AS VARCHAR);
+----
+5.0
+
+# bigint / bigint -> DOUBLE
+query T
+SELECT CAST(spark_try_divide(7::BIGINT, 2::BIGINT) AS VARCHAR);
+----
+3.5
+
+# divide by zero -> NULL
+query I
+SELECT spark_try_divide(10, 0);
+----
+NULL
+
+# double divide by zero -> NULL (Spark returns NULL, not inf)
+query I
+SELECT spark_try_divide(10.0::DOUBLE, 0.0::DOUBLE);
+----
+NULL
+
+# NULL operands propagate to NULL
+query I
+SELECT spark_try_divide(NULL::INT, 2);
+----
+NULL
+
+query I
+SELECT spark_try_divide(10, NULL::INT);
+----
+NULL
+
+# decimal / decimal -> DECIMAL(9,6), value 3.000000
+query I
+SELECT spark_try_divide(1.5::DECIMAL(3,1), 0.5::DECIMAL(3,1));
+----
+3.000000
+
+# decimal divide by zero -> NULL
+query I
+SELECT spark_try_divide(1.5::DECIMAL(3,1), 0.0::DECIMAL(3,1));
+----
+NULL
+
+# return types
+query T
+SELECT typeof(spark_try_divide(10, 2));
+----
+DOUBLE
+
+query T
+SELECT typeof(spark_try_divide(1.5::DECIMAL(3,1), 0.5::DECIMAL(3,1)));
+----
+DECIMAL(9,6)

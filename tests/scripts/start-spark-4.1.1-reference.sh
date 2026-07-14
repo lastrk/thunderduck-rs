@@ -9,10 +9,26 @@ SPARK_HOME="${SPARK_HOME:-$HOME/spark/current}"
 SPARK_VERSION="4.1.1"
 SPARK_PORT="${SPARK_PORT:-15003}"
 SPARK_WAREHOUSE_DIR="${SPARK_WAREHOUSE_DIR:-}"
+# Per-worktree daemon isolation. Spark's spark-daemon.sh keys its PID file on
+# class + instance (NOT port) and defaults the PID dir to /tmp and the log dir
+# to $SPARK_HOME/logs — both shared across worktrees, so without per-worktree
+# overrides a second worktree's server refuses to start ("already running") and
+# logs clobber each other. THUNDERDUCK_WORKTREE_ID is stamped onto the JVM so
+# ownership-verified cleanup can identify this worktree's server.
+THUNDERDUCK_WORKTREE_ID="${THUNDERDUCK_WORKTREE_ID:-}"
+export SPARK_IDENT_STRING="${SPARK_IDENT_STRING:-td-${THUNDERDUCK_WORKTREE_ID:-default}}"
+export SPARK_PID_DIR="${SPARK_PID_DIR:-/tmp/thunderduck-spark-${SPARK_IDENT_STRING}}"
 SPARK_DRIVER_MEMORY="${SPARK_DRIVER_MEMORY:-4g}"
 SPARK_MASTER="${SPARK_MASTER:-local[*]}"
 SPARK_AQE_ENABLED="${SPARK_AQE_ENABLED:-false}"
 SPARK_BROADCAST_THRESHOLD="${SPARK_BROADCAST_THRESHOLD:--1}"
+# Delta Lake on the reference server: enables read/write `.format("delta")`,
+# `delta.`path`` SQL, and `MERGE INTO` over Spark Connect. delta-spark 4.3.0 is
+# built on Spark 4.1 (Scala 2.13). This is the reference oracle for the Delta
+# corpus (differential/test_delta_corpus_differential.py); the τ-side extension
+# is the separate cross-repo dev loop (docs/context/delta-cross-repo-dev-loop.md).
+# First launch downloads the jars from Maven (network). Override to re-pin.
+DELTA_SPARK_PACKAGE="${DELTA_SPARK_PACKAGE:-io.delta:delta-spark_4.1_2.13:4.3.0}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -39,8 +55,10 @@ if pgrep -f "org.apache.spark.sql.connect.service.SparkConnectServer.*${SPARK_PO
 fi
 
 
-# Create log directory
-SPARK_LOG_DIR="${SPARK_HOME}/work/logs"
+# Create log directory. Honor a caller-provided SPARK_LOG_DIR (per-worktree);
+# fall back to the shared Spark install dir only when unset. Exported so
+# spark-daemon.sh writes the JVM's own log there too.
+export SPARK_LOG_DIR="${SPARK_LOG_DIR:-${SPARK_HOME}/work/logs}"
 mkdir -p "$SPARK_LOG_DIR"
 
 echo -e "${BLUE}Starting Spark Connect server on port ${SPARK_PORT}...${NC}"
@@ -72,9 +90,13 @@ fi
 "$SPARK_HOME/sbin/start-connect-server.sh" \
     --master "${SPARK_MASTER}" \
     --driver-memory ${SPARK_DRIVER_MEMORY} \
+    --packages "${DELTA_SPARK_PACKAGE}" \
+    --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+    --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
     --conf spark.driver.host=localhost \
     --conf spark.driver.bindAddress=127.0.0.1 \
     --conf spark.connect.grpc.binding.port=${SPARK_PORT} \
+    --conf spark.driver.extraJavaOptions=-Dthunderduck.worktree=${THUNDERDUCK_WORKTREE_ID:-default} \
     --conf spark.sql.shuffle.partitions=4 \
     --conf spark.sql.adaptive.enabled=${SPARK_AQE_ENABLED} \
     --conf spark.sql.autoBroadcastJoinThreshold=${SPARK_BROADCAST_THRESHOLD} \

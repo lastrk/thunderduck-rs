@@ -1,0 +1,70 @@
+{
+ "id": "cx-005",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sz",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "has_rust",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   2,
+   true
+  ],
+  [
+   "Bob",
+   1,
+   false
+  ],
+  [
+   "Carol",
+   0,
+   false
+  ],
+  [
+   "Dan",
+   null,
+   null
+  ],
+  [
+   "Eve",
+   3,
+   true
+  ],
+  [
+   "Frank",
+   1,
+   false
+  ],
+  [
+   "Grace",
+   1,
+   false
+  ],
+  [
+   "Heidi",
+   null,
+   null
+  ]
+ ]
+}

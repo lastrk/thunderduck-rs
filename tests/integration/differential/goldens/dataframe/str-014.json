@@ -1,0 +1,56 @@
+{
+ "id": "str-014",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "rep",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "rev",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AliceAlice",
+   "ecilA"
+  ],
+  [
+   "BobBob",
+   "boB"
+  ],
+  [
+   "CarolCarol",
+   "loraC"
+  ],
+  [
+   "DanDan",
+   "naD"
+  ],
+  [
+   "EveEve",
+   "evE"
+  ],
+  [
+   "FrankFrank",
+   "knarF"
+  ],
+  [
+   "GraceGrace",
+   "ecarG"
+  ],
+  [
+   "HeidiHeidi",
+   "idieH"
+  ]
+ ]
+}

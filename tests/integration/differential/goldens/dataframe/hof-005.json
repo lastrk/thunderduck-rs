@@ -1,0 +1,42 @@
+{
+ "id": "hof-005",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "all_nonempty",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   true
+  ],
+  [
+   true
+  ],
+  [
+   true
+  ],
+  [
+   true
+  ],
+  [
+   true
+  ],
+  [
+   true
+  ]
+ ]
+}

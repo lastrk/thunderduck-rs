@@ -1,0 +1,152 @@
+{
+ "id": "jn-018",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   "Data"
+  ],
+  [
+   "Alice",
+   "Infrastructure"
+  ],
+  [
+   "Alice",
+   "ML"
+  ],
+  [
+   "Alice",
+   "Security"
+  ],
+  [
+   "Bob",
+   "Data"
+  ],
+  [
+   "Bob",
+   "Infrastructure"
+  ],
+  [
+   "Bob",
+   "ML"
+  ],
+  [
+   "Bob",
+   "Security"
+  ],
+  [
+   "Carol",
+   "Data"
+  ],
+  [
+   "Carol",
+   "Infrastructure"
+  ],
+  [
+   "Carol",
+   "ML"
+  ],
+  [
+   "Carol",
+   "Security"
+  ],
+  [
+   "Dan",
+   "Data"
+  ],
+  [
+   "Dan",
+   "Infrastructure"
+  ],
+  [
+   "Dan",
+   "ML"
+  ],
+  [
+   "Dan",
+   "Security"
+  ],
+  [
+   "Eve",
+   "Data"
+  ],
+  [
+   "Eve",
+   "Infrastructure"
+  ],
+  [
+   "Eve",
+   "ML"
+  ],
+  [
+   "Eve",
+   "Security"
+  ],
+  [
+   "Frank",
+   "Data"
+  ],
+  [
+   "Frank",
+   "Infrastructure"
+  ],
+  [
+   "Frank",
+   "ML"
+  ],
+  [
+   "Frank",
+   "Security"
+  ],
+  [
+   "Grace",
+   "Data"
+  ],
+  [
+   "Grace",
+   "Infrastructure"
+  ],
+  [
+   "Grace",
+   "ML"
+  ],
+  [
+   "Grace",
+   "Security"
+  ],
+  [
+   "Heidi",
+   "Data"
+  ],
+  [
+   "Heidi",
+   "Infrastructure"
+  ],
+  [
+   "Heidi",
+   "ML"
+  ],
+  [
+   "Heidi",
+   "Security"
+  ]
+ ]
+}

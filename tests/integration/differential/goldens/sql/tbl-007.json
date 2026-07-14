@@ -1,0 +1,27 @@
+{
+ "id": "tbl-007",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "col",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1
+  ],
+  [
+   2
+  ],
+  [
+   3
+  ]
+ ]
+}

@@ -282,3 +282,47 @@ class TestSortingEdgeCases:
         ref = run_test(spark_reference)
         td = run_test(spark_thunderduck)
         assert_dataframes_equal(ref, td, "sort_single_row")
+
+
+# =============================================================================
+# ORDER BY hidden-output resolution (design 023) — review-found regressions
+# =============================================================================
+
+
+@pytest.mark.differential
+class TestOrderByHiddenOutputResolution:
+    """ORDER BY keys that must resolve against an aggregate's own input."""
+
+    @pytest.mark.timeout(30)
+    def test_order_by_grouping_expression_over_multikey_aggregate(
+        self, spark_reference, spark_thunderduck
+    ):
+        """groupBy(a+c, d).agg(sum(b)).orderBy(a+c): the sort key restates a grouping
+        expression absent verbatim from the output; sibling key `d` must survive.
+
+        Was a review-found strict-xfail (grouping-expression promotion flipped the
+        pre-N7 fold heuristic, dropping sibling GROUP BY columns -> DuckDB binder
+        error). Fixed by N7's fold-at-construction: the sort key now whole-matches
+        the folded grouping entry, no promotion occurs. Sort-key values (a+c) are
+        kept unique per group — ORDER BY tie order is engine-arbitrary and not a
+        parity property this test asserts."""
+        def run_test(spark):
+            data = [(1, 2, 10, 100), (3, 1, 20, 100), (1, 4, 30, 200), (2, 6, 40, 200)]
+            schema = StructType([
+                StructField("a", IntegerType(), False),
+                StructField("c", IntegerType(), False),
+                StructField("b", IntegerType(), False),
+                StructField("d", IntegerType(), False),
+            ])
+            df = spark.createDataFrame(data, schema)
+            return (
+                df.groupBy((F.col("a") + F.col("c")), F.col("d"))
+                .agg(F.sum("b"))
+                .orderBy(F.col("a") + F.col("c"))
+            )
+
+        ref = run_test(spark_reference)
+        td = run_test(spark_thunderduck)
+        assert_dataframes_equal(
+            ref, td, "order_by_grouping_expression_over_multikey_aggregate", ignore_nullable=True
+        )

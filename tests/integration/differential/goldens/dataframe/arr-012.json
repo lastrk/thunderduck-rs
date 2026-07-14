@@ -1,0 +1,115 @@
+{
+ "id": "arr-012",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "z",
+    "type": {
+     "type": "array",
+     "elementType": {
+      "type": "struct",
+      "fields": [
+       {
+        "name": "tags",
+        "type": "string",
+        "nullable": true,
+        "metadata": {}
+       },
+       {
+        "name": "tags",
+        "type": "string",
+        "nullable": true,
+        "metadata": {}
+       }
+      ]
+     },
+     "containsNull": false
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   [
+    {
+     "$row": [
+      "go",
+      "go"
+     ]
+    },
+    {
+     "$row": [
+      "c",
+      "c"
+     ]
+    },
+    {
+     "$row": [
+      "rust",
+      "rust"
+     ]
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "$row": [
+      "java",
+      "java"
+     ]
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "$row": [
+      "python",
+      "python"
+     ]
+    },
+    {
+     "$row": [
+      "rust",
+      "rust"
+     ]
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "$row": [
+      "python",
+      "python"
+     ]
+    }
+   ]
+  ],
+  [
+   [
+    {
+     "$row": [
+      "scala",
+      "scala"
+     ]
+    }
+   ]
+  ],
+  [
+   []
+  ]
+ ]
+}

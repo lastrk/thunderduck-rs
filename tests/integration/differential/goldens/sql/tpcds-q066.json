@@ -1,0 +1,394 @@
+{
+ "id": "tpcds-q066",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "w_warehouse_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "w_warehouse_sq_ft",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "w_city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "w_county",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "w_state",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "w_country",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ship_carriers",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "year",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "jan_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "feb_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "mar_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "apr_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "may_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "jun_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "jul_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "aug_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sep_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "oct_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "nov_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dec_sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "jan_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "feb_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "mar_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "apr_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "may_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "jun_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "jul_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "aug_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sep_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "oct_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "nov_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dec_sales_per_sq_foot",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "jan_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "feb_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "mar_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "apr_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "may_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "jun_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "jul_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "aug_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sep_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "oct_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "nov_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dec_net",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Conventional childr",
+   977787,
+   "Midway",
+   "Williamson County",
+   "TN",
+   "United States",
+   "DHL,BARIAN",
+   2001,
+   {
+    "$dec": "73577.59"
+   },
+   {
+    "$dec": "770435.85"
+   },
+   {
+    "$dec": "2869.73"
+   },
+   {
+    "$dec": "1006705.22"
+   },
+   {
+    "$dec": "383807.45"
+   },
+   {
+    "$dec": "29521.55"
+   },
+   {
+    "$dec": "46131.30"
+   },
+   {
+    "$dec": "637320.73"
+   },
+   {
+    "$dec": "1147028.95"
+   },
+   {
+    "$dec": "1273316.78"
+   },
+   {
+    "$dec": "352755.71"
+   },
+   {
+    "$dec": "2947754.57"
+   },
+   {
+    "$dec": "0.075249"
+   },
+   {
+    "$dec": "0.787939"
+   },
+   {
+    "$dec": "0.002935"
+   },
+   {
+    "$dec": "1.029575"
+   },
+   {
+    "$dec": "0.392527"
+   },
+   {
+    "$dec": "0.030192"
+   },
+   {
+    "$dec": "0.047179"
+   },
+   {
+    "$dec": "0.651799"
+   },
+   {
+    "$dec": "1.173086"
+   },
+   {
+    "$dec": "1.302243"
+   },
+   {
+    "$dec": "0.360770"
+   },
+   {
+    "$dec": "3.014721"
+   },
+   {
+    "$dec": "1843219.27"
+   },
+   {
+    "$dec": "1582382.26"
+   },
+   {
+    "$dec": "95844.19"
+   },
+   {
+    "$dec": "3529601.58"
+   },
+   {
+    "$dec": "1341204.58"
+   },
+   {
+    "$dec": "2040444.28"
+   },
+   {
+    "$dec": "1674369.49"
+   },
+   {
+    "$dec": "828824.82"
+   },
+   {
+    "$dec": "3481140.63"
+   },
+   {
+    "$dec": "1899141.62"
+   },
+   {
+    "$dec": "1455888.96"
+   },
+   {
+    "$dec": "2688024.29"
+   }
+  ]
+ ]
+}

@@ -1,0 +1,56 @@
+{
+ "id": "win-007",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "second",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   null
+  ],
+  [
+   "Bob",
+   120000.0
+  ],
+  [
+   "Carol",
+   78000.0
+  ],
+  [
+   "Dan",
+   null
+  ],
+  [
+   "Eve",
+   null
+  ],
+  [
+   "Frank",
+   105000.0
+  ],
+  [
+   "Grace",
+   null
+  ],
+  [
+   "Heidi",
+   150000.0
+  ]
+ ]
+}

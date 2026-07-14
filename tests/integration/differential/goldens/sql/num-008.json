@@ -1,0 +1,34 @@
+{
+ "id": "num-008",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "sg_i",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sg_d",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ng_i",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ng_d",
+    "type": "decimal(10,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

@@ -1,6 +1,6 @@
-pub mod expression_converter;
-pub mod plan_converter;
 pub mod relation_converter;
 pub mod type_converter;
+pub mod v2_relation_converter;
 
-pub use plan_converter::PlanConverter;
+// `relation_converter` retains only `parse_json_schema`, used by
+// `v2_relation_converter` to decode `createDataFrame` schema payloads.

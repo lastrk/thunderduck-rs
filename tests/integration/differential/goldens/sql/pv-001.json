@@ -1,0 +1,50 @@
+{
+ "id": "pv-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "act",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "inact",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   107500.0,
+   null
+  ],
+  [
+   20,
+   64000.0,
+   78000.0
+  ],
+  [
+   30,
+   72000.0,
+   105000.0
+  ],
+  [
+   null,
+   119000.0,
+   null
+  ]
+ ]
+}

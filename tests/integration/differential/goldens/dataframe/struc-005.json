@@ -1,0 +1,84 @@
+{
+ "id": "struc-005",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "age1",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sal_k",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "Alice",
+   35,
+   95.0
+  ],
+  [
+   2,
+   "Bob",
+   42,
+   120.0
+  ],
+  [
+   3,
+   "Carol",
+   30,
+   78.0
+  ],
+  [
+   4,
+   "Dan",
+   53,
+   64.0
+  ],
+  [
+   5,
+   "Eve",
+   39,
+   88.0
+  ],
+  [
+   6,
+   "Frank",
+   46,
+   105.0
+  ],
+  [
+   7,
+   "Grace",
+   28,
+   72.0
+  ],
+  [
+   8,
+   "Heidi",
+   61,
+   150.0
+  ]
+ ]
+}

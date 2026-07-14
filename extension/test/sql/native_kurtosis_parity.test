@@ -1,0 +1,11 @@
+# name: test/sql/native_kurtosis_parity.test
+# description: spark_kurtosis resolves to native KURTOSIS_POP (excess population); parity vs Spark 4.1.1.
+# group: [sql]
+
+# Oracle: Spark 4.1.1 kurtosis() == DuckDB kurtosis_pop(). NOT DuckDB kurtosis() (that is sample). Corpus: agg-009.
+
+query T
+SELECT CAST(round(kurtosis_pop(v),10) AS VARCHAR)
+FROM (VALUES (1.0),(2),(3),(4),(5),(6),(7),(8),(9),(10),(NULL)) s(v);
+----
+-1.2242424242

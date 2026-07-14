@@ -1,0 +1,198 @@
+# name: test/sql/table_operations.test
+# description: Tests with table data and vector processing
+# group: [sql]
+
+require thdck_spark_funcs
+
+# --- Setup: create table with DECIMAL columns ---
+statement ok
+CREATE TABLE decimals (
+    id INTEGER,
+    a DECIMAL(10,2),
+    b DECIMAL(10,2)
+);
+
+# DECIMAL(10,2) / DECIMAL(10,2): result_scale=max(6, 2+10+1)=13, prec=(10-2)+2+13=23
+# Result type: DECIMAL(23,13)
+# scale_adj = 13 - 2 + 2 = 13
+
+statement ok
+INSERT INTO decimals VALUES
+    (1, 10.00, 3.00),
+    (2, 100.00, 4.00),
+    (3, 7.00, 2.00),
+    (4, -10.00, 3.00),
+    (5, 1.00, 7.00);
+
+# Basic multi-row division from table
+query II
+SELECT id, spark_decimal_div(a, b) FROM decimals ORDER BY id;
+----
+1	3.3333333333333
+2	25.0000000000000
+3	3.5000000000000
+4	-3.3333333333333
+5	0.1428571428571
+
+# Verify result type from table columns
+query I
+SELECT typeof(spark_decimal_div(a, b)) FROM decimals LIMIT 1;
+----
+DECIMAL(23,13)
+
+# --- Table with NULL values ---
+statement ok
+CREATE TABLE decimals_with_nulls (
+    id INTEGER,
+    a DECIMAL(10,2),
+    b DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO decimals_with_nulls VALUES
+    (1, 10.00, 3.00),
+    (2, NULL, 5.00),
+    (3, 20.00, NULL),
+    (4, NULL, NULL),
+    (5, 15.00, 0.00),
+    (6, 30.00, 6.00);
+
+# NULLs propagate, division by zero returns NULL
+query II
+SELECT id, spark_decimal_div(a, b) FROM decimals_with_nulls ORDER BY id;
+----
+1	3.3333333333333
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	5.0000000000000
+
+# --- Mixed positive, negative, zero, NULL in a single query ---
+statement ok
+CREATE TABLE mixed_values (
+    id INTEGER,
+    a DECIMAL(8,2),
+    b DECIMAL(8,2)
+);
+
+# DECIMAL(8,2) / DECIMAL(8,2): result_scale=max(6, 2+8+1)=11, prec=(8-2)+2+11=19
+# Result type: DECIMAL(19,11)
+# scale_adj = 11 - 2 + 2 = 11
+
+statement ok
+INSERT INTO mixed_values VALUES
+    (1, 100.00, 3.00),
+    (2, -100.00, 3.00),
+    (3, 100.00, -3.00),
+    (4, -100.00, -3.00),
+    (5, 0.00, 5.00),
+    (6, 50.00, 0.00),
+    (7, NULL, 10.00),
+    (8, 10.00, NULL),
+    (9, 1.00, 3.00),
+    (10, 2.00, 3.00);
+
+query II
+SELECT id, spark_decimal_div(a, b) FROM mixed_values ORDER BY id;
+----
+1	33.33333333333
+2	-33.33333333333
+3	-33.33333333333
+4	33.33333333333
+5	0.00000000000
+6	NULL
+7	NULL
+8	NULL
+9	0.33333333333
+10	0.66666666667
+
+# --- Filtering and aggregation with spark_decimal_div ---
+# Only non-NULL results
+query I
+SELECT COUNT(*) FROM mixed_values WHERE spark_decimal_div(a, b) IS NOT NULL;
+----
+7
+
+# Only NULL results (NULL inputs + division by zero)
+query I
+SELECT COUNT(*) FROM mixed_values WHERE spark_decimal_div(a, b) IS NULL;
+----
+3
+
+# --- Multiple rows with identical values (vector consistency check) ---
+statement ok
+CREATE TABLE uniform_data (
+    a DECIMAL(6,2),
+    b DECIMAL(6,2)
+);
+
+# DECIMAL(6,2) / DECIMAL(6,2): result_scale=max(6, 2+6+1)=9, prec=(6-2)+2+9=15
+# Result type: DECIMAL(15,9)
+# scale_adj = 9 - 2 + 2 = 9
+
+statement ok
+INSERT INTO uniform_data SELECT 10.00, 3.00 FROM range(100);
+
+# All 100 rows should give the same result
+# 10.00 / 3.00: a=1000, b=300, scale_adj=9
+# 1000 * 10^9 / 300 = 1000000000000 / 300 = 3333333333 remainder 100
+# 2*100=200 >= 300? No -> no round
+# 3333333333 as DECIMAL(15,9) = 3.333333333
+query I
+SELECT DISTINCT spark_decimal_div(a, b) FROM uniform_data;
+----
+3.333333333
+
+query I
+SELECT COUNT(DISTINCT spark_decimal_div(a, b)) FROM uniform_data;
+----
+1
+
+# --- Using spark_decimal_div in WHERE clause ---
+query II
+SELECT id, spark_decimal_div(a, b) FROM mixed_values
+WHERE spark_decimal_div(a, b) IS NOT NULL AND spark_decimal_div(a, b) > 0
+ORDER BY id;
+----
+1	33.33333333333
+4	33.33333333333
+9	0.33333333333
+10	0.66666666667
+
+# --- Using spark_decimal_div with JOIN ---
+statement ok
+CREATE TABLE prices (
+    item_id INTEGER,
+    total DECIMAL(10,2),
+    quantity DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO prices VALUES
+    (1, 100.00, 3.00),
+    (2, 50.00, 7.00),
+    (3, 200.00, 6.00);
+
+# DECIMAL(10,2) / DECIMAL(10,2) -> DECIMAL(23,13)
+query II
+SELECT item_id, spark_decimal_div(total, quantity)
+FROM prices
+ORDER BY item_id;
+----
+1	33.3333333333333
+2	7.1428571428571
+3	33.3333333333333
+
+# --- Self-division: every row divided by itself should be 1 ---
+query I
+SELECT DISTINCT spark_decimal_div(total, total) FROM prices WHERE total != 0;
+----
+1.0000000000000
+
+# --- Subquery usage ---
+query I
+SELECT spark_decimal_div(sub.s, 2.00::DECIMAL(10,2))
+FROM (SELECT 10.00::DECIMAL(10,2) AS s) sub;
+----
+5.0000000000000

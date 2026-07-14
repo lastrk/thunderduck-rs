@@ -1,0 +1,136 @@
+{
+ "id": "tpcds-q017",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_item_desc",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_state",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_sales_quantitycount",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "store_sales_quantityave",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_sales_quantitystdev",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_sales_quantitycov",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "as_store_returns_quantitycount",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "as_store_returns_quantityave",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "as_store_returns_quantitystdev",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_returns_quantitycov",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "catalog_sales_quantitycount",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "catalog_sales_quantityave",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "catalog_sales_quantitystdev",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "catalog_sales_quantitycov",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AAAAAAAAEDAAAAAA",
+   "Total styles cannot assume companies. Cases may constitute shops. Local years meet still different, superb players. Delicate, peaceful ",
+   "TN",
+   1,
+   2.0,
+   null,
+   null,
+   1,
+   2.0,
+   null,
+   null,
+   1,
+   42.0,
+   null,
+   null
+  ],
+  [
+   "AAAAAAAAHGAAAAAA",
+   "As short materials might go sometime new, tall skills. M",
+   "TN",
+   1,
+   19.0,
+   null,
+   null,
+   1,
+   1.0,
+   null,
+   null,
+   1,
+   31.0,
+   null,
+   null
+  ]
+ ]
+}

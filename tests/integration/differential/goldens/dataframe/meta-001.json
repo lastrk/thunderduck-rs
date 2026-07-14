@@ -1,0 +1,22 @@
+{
+ "id": "meta-001",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "mid",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ }
+}

@@ -75,6 +75,14 @@ else
 fi
 
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Adopt this worktree's remembered test ports so the playground and the test
+# harness target the same servers, and so ports never clash across worktrees.
+# Falls back to the 15002/15003 defaults above if resolution fails.
+if _td_ports="$(python3 "$PROJECT_ROOT/tests/integration/utils/test_env.py" --export 2>/dev/null)"; then
+    eval "$_td_ports"
+fi
+
 PLAYGROUND_DIR="$SCRIPT_DIR"
 VENV_DIR="$PLAYGROUND_DIR/.venv"
 LOG_DIR="$PLAYGROUND_DIR/logs"
@@ -167,8 +175,14 @@ cleanup() {
         "$PROJECT_ROOT/tests/scripts/stop-spark-4.1.1-reference.sh" 2>/dev/null || true
     fi
 
-    # Force cleanup any remaining processes
-    pkill -9 -f "thunderduck-connect-server" 2>/dev/null || true
+    # Force cleanup anything still on OUR port only. A host-wide
+    # `pkill -f thunderduck-connect-server` would kill other worktrees' servers,
+    # so we scope strictly to this launcher's configured Thunderduck port.
+    if command -v lsof >/dev/null 2>&1; then
+        for pid in $(lsof -ti :"$THUNDERDUCK_PORT" 2>/dev/null); do
+            kill -9 "$pid" 2>/dev/null || true
+        done
+    fi
 
     echo -e "${GREEN}Cleanup complete${NC}"
 }

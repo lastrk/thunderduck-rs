@@ -1,0 +1,66 @@
+{
+ "id": "tpcds-q021",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "w_warehouse_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "inv_before",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "inv_after",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Conventional childr",
+   "AAAAAAAACAAAAAAA",
+   2128,
+   3114
+  ],
+  [
+   "Conventional childr",
+   "AAAAAAAAHDAAAAAA",
+   2669,
+   2348
+  ],
+  [
+   "Conventional childr",
+   "AAAAAAAAKJAAAAAA",
+   2735,
+   2078
+  ],
+  [
+   "Conventional childr",
+   "AAAAAAAAMBAAAAAA",
+   2760,
+   2626
+  ],
+  [
+   "Conventional childr",
+   "AAAAAAAAPKAAAAAA",
+   1839,
+   2093
+  ]
+ ]
+}

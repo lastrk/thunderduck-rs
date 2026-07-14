@@ -1,0 +1,28 @@
+{
+ "id": "num-017",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "si",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sl",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ss",
+    "type": "short",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

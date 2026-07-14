@@ -1,0 +1,110 @@
+{
+ "id": "join-016",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "budget",
+    "type": "decimal(12,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "location",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "country",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   "Infrastructure",
+   {
+    "$dec": "2500000.00"
+   },
+   "Vienna",
+   "AT"
+  ],
+  [
+   10,
+   "Infrastructure",
+   {
+    "$dec": "2500000.00"
+   },
+   "Vienna",
+   "AT"
+  ],
+  [
+   20,
+   "Data",
+   {
+    "$dec": "1800000.00"
+   },
+   "Vienna",
+   "AT"
+  ],
+  [
+   20,
+   "Data",
+   {
+    "$dec": "1800000.00"
+   },
+   "Vienna",
+   "AT"
+  ],
+  [
+   30,
+   "ML",
+   {
+    "$dec": "3200000.00"
+   },
+   "Zurich",
+   "CH"
+  ],
+  [
+   30,
+   "ML",
+   {
+    "$dec": "3200000.00"
+   },
+   "Zurich",
+   "CH"
+  ],
+  [
+   null,
+   null,
+   null,
+   null,
+   null
+  ],
+  [
+   null,
+   null,
+   null,
+   null,
+   null
+  ]
+ ]
+}

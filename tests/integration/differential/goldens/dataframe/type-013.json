@@ -1,0 +1,58 @@
+{
+ "id": "type-013",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "n_nonnull",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "sum_nullable",
+    "type": "decimal(19,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   2,
+   {
+    "$dec": "4500.50"
+   }
+  ],
+  [
+   20,
+   2,
+   {
+    "$dec": "500.00"
+   }
+  ],
+  [
+   30,
+   2,
+   {
+    "$dec": "2200.00"
+   }
+  ],
+  [
+   null,
+   2,
+   {
+    "$dec": "10750.24"
+   }
+  ]
+ ]
+}

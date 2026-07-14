@@ -1,0 +1,16 @@
+# name: test/sql/native_covar_samp_parity.test
+# description: spark_covar_samp resolves to native COVAR_SAMP; parity vs Spark 4.1.1.
+# group: [sql]
+
+# Oracle: Spark 4.1.1. Corpus: agg-012.
+
+query T
+SELECT CAST(round(covar_samp(x,y),10) AS VARCHAR) FROM (VALUES (1.0,2.0),(2,4),(3,5),(4,4),(5,8),(6,7),(7,9),(8,8),(NULL,100),(9,NULL)) p(x,y);
+----
+5.5
+
+# single-row group -> NULL (n-1 = 0), matches Spark
+query T
+SELECT CAST(round(covar_samp(x,y),10) AS VARCHAR) FROM (VALUES (1.0,2.0)) p(x,y);
+----
+NULL

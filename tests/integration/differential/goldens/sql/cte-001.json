@@ -1,0 +1,48 @@
+{
+ "id": "cte-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "a",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   107500.0
+  ],
+  [
+   "Bob",
+   107500.0
+  ],
+  [
+   "Carol",
+   71000.0
+  ],
+  [
+   "Dan",
+   71000.0
+  ],
+  [
+   "Frank",
+   88500.0
+  ],
+  [
+   "Grace",
+   88500.0
+  ]
+ ]
+}

@@ -1,0 +1,72 @@
+{
+ "id": "win-013",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "last_login",
+    "type": "timestamp",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "w",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   {
+    "$ts": "2026-06-01T09:15:00"
+   },
+   1
+  ],
+  [
+   2,
+   {
+    "$ts": "2026-06-02T18:40:00"
+   },
+   3
+  ],
+  [
+   4,
+   {
+    "$ts": "2026-05-30T07:00:00"
+   },
+   1
+  ],
+  [
+   5,
+   {
+    "$ts": "2026-06-03T12:00:00"
+   },
+   2
+  ],
+  [
+   6,
+   {
+    "$ts": "2026-06-01T22:05:00"
+   },
+   2
+  ],
+  [
+   7,
+   {
+    "$ts": "2026-06-02T03:30:00"
+   },
+   3
+  ]
+ ]
+}

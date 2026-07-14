@@ -1,0 +1,369 @@
+{
+ "id": "tpcds-q020",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_item_desc",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_category",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_class",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_current_price",
+    "type": "decimal(7,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "itemrevenue",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "revenueratio",
+    "type": "decimal(38,17)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AAAAAAAAACAAAAAA",
+   "Ce",
+   "Home",
+   "curtains/drapes",
+   {
+    "$dec": "1.77"
+   },
+   {
+    "$dec": "1461.02"
+   },
+   {
+    "$dec": "19.39783878372834369"
+   }
+  ],
+  [
+   "AAAAAAAAAIAAAAAA",
+   "Great, tiny animals adopt then outcomes. Terms sweep less dry, physical signs. National, black terms adapt for a reasons; groups shall ",
+   "Home",
+   "curtains/drapes",
+   {
+    "$dec": "4.06"
+   },
+   {
+    "$dec": "6070.85"
+   },
+   {
+    "$dec": "80.60216121627165631"
+   }
+  ],
+  [
+   "AAAAAAAAAKAAAAAA",
+   "Legs cannot make much across a children. Well industrial ports see so. Equal, full systems rise police. Labour departments will leave. Political, social ",
+   "Sports",
+   "sailing",
+   {
+    "$dec": "1.17"
+   },
+   {
+    "$dec": "111.63"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAABGAAAAAA",
+   "More reg",
+   "Books",
+   "fiction",
+   {
+    "$dec": "57.09"
+   },
+   {
+    "$dec": "34430.20"
+   },
+   {
+    "$dec": "93.93220060614972700"
+   }
+  ],
+  [
+   "AAAAAAAABJAAAAAA",
+   "Prospects know",
+   "Books",
+   "self-help",
+   {
+    "$dec": "59.77"
+   },
+   {
+    "$dec": "31079.94"
+   },
+   {
+    "$dec": "91.24538744574955089"
+   }
+  ],
+  [
+   "AAAAAAAACGAAAAAA",
+   "Years know merely religious reasons. New animals modernise well racial pieces. Various, chi",
+   "Sports",
+   "outdoor",
+   {
+    "$dec": "3.16"
+   },
+   {
+    "$dec": "12406.55"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAACIAAAAAA",
+   "Final orders give else. International, living personnel may miss significant companies. Black, american numbers put then ",
+   "Sports",
+   "fishing",
+   {
+    "$dec": "1.70"
+   },
+   {
+    "$dec": "4372.98"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAADEAAAAAA",
+   "Already ",
+   "Books",
+   "fiction",
+   {
+    "$dec": "1.47"
+   },
+   {
+    "$dec": "2032.33"
+   },
+   {
+    "$dec": "5.54458670753862233"
+   }
+  ],
+  [
+   "AAAAAAAADHAAAAAA",
+   "Policies used to decrease social forms; well massive parts admire lacking, necessary cities. More rational areas deceive therefore only facilities. Yet persist",
+   "Home",
+   "furniture",
+   {
+    "$dec": "2.68"
+   },
+   {
+    "$dec": "403.77"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAAICAAAAAA",
+   "Usually other children must stop shares. Relations",
+   "Home",
+   "lighting",
+   {
+    "$dec": "9.93"
+   },
+   {
+    "$dec": "5373.12"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAAIGAAAAAA",
+   "Connections must constitute only eastern leaves. Primary, elderly times make expectations. Never tory stores build very points.",
+   "Books",
+   "mystery",
+   {
+    "$dec": "2.33"
+   },
+   {
+    "$dec": "3079.57"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAAJHAAAAAA",
+   "However increasing dates meet. Large, ready goals mean now blind structures. Crea",
+   "Books",
+   "self-help",
+   {
+    "$dec": "38.79"
+   },
+   {
+    "$dec": "2981.99"
+   },
+   {
+    "$dec": "8.75461255425044911"
+   }
+  ],
+  [
+   "AAAAAAAAKHAAAAAA",
+   "Well lovely hands know even ",
+   "Books",
+   "parenting",
+   {
+    "$dec": "2.62"
+   },
+   {
+    "$dec": "17975.70"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAALCAAAAAA",
+   "Resources shall not continue thus similar, practical results. Practical words f",
+   "Books",
+   "travel",
+   {
+    "$dec": "6.08"
+   },
+   {
+    "$dec": "6517.20"
+   },
+   {
+    "$dec": "76.73396724924763694"
+   }
+  ],
+  [
+   "AAAAAAAALIAAAAAA",
+   "Lines shall describe explicitly northern, firm systems. Later",
+   "Books",
+   "fiction",
+   {
+    "$dec": "2.99"
+   },
+   {
+    "$dec": "191.78"
+   },
+   {
+    "$dec": "0.52321268631165066"
+   }
+  ],
+  [
+   "AAAAAAAAMEAAAAAA",
+   "Original interests see of course british, important terms. Yet appropriate principles conclude in a arrangements; good countries would get sometimes; ",
+   "Books",
+   "travel",
+   {
+    "$dec": "3.84"
+   },
+   {
+    "$dec": "1976.04"
+   },
+   {
+    "$dec": "23.26603275075236306"
+   }
+  ],
+  [
+   "AAAAAAAAMFAAAAAA",
+   "New, quick observations merge too worth a children; shares could live there crucial mountains. Simply eastern pounds shall crush immediately married long wives. Corporate, import",
+   "Sports",
+   "optics",
+   {
+    "$dec": "4.48"
+   },
+   {
+    "$dec": "9362.43"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAAMKAAAAAA",
+   "Automatic, black developments get thus new profits. Chemicals describe widely similar temperatures. Easy features used to emphasize different ",
+   "Sports",
+   "hockey",
+   {
+    "$dec": "0.83"
+   },
+   {
+    "$dec": "13336.94"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAANGAAAAAA",
+   "Solutions may not go central, interesting sectors. Enterprises resist inte",
+   "Home",
+   "rugs",
+   {
+    "$dec": "9.46"
+   },
+   {
+    "$dec": "4302.58"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAANJAAAAAA",
+   "Recent performances get yet other publications; current patients could not carry comparatively intense, vital times. Wide problems smooth truly. Tomorrow used years catch a",
+   "Books",
+   "reference",
+   {
+    "$dec": "2.21"
+   },
+   {
+    "$dec": "16229.81"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ],
+  [
+   "AAAAAAAAPHAAAAAA",
+   "High, black homes shall not greet also magnificent facts; inc, environmental areas say well howev",
+   "Home",
+   "kids",
+   {
+    "$dec": "3.66"
+   },
+   {
+    "$dec": "13864.98"
+   },
+   {
+    "$dec": "100.00000000000000000"
+   }
+  ]
+ ]
+}

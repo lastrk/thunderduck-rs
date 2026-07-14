@@ -1,0 +1,46 @@
+{
+ "id": "tpcds-q013",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "avg_quantity",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_sales_price",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_discount",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "count_quantity",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   56.0,
+   {
+    "$dec": "4165.280000"
+   },
+   {
+    "$dec": "0.000000"
+   },
+   1
+  ]
+ ]
+}

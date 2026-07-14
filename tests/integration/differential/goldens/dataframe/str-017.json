@@ -1,0 +1,56 @@
+{
+ "id": "str-017",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "asc",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "b64",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   65,
+   "QWxpY2U="
+  ],
+  [
+   66,
+   "Qm9i"
+  ],
+  [
+   67,
+   "Q2Fyb2w="
+  ],
+  [
+   68,
+   "RGFu"
+  ],
+  [
+   69,
+   "RXZl"
+  ],
+  [
+   70,
+   "RnJhbms="
+  ],
+  [
+   71,
+   "R3JhY2U="
+  ],
+  [
+   72,
+   "SGVpZGk="
+  ]
+ ]
+}

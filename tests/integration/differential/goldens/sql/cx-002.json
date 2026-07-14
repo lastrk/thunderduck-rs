@@ -1,0 +1,44 @@
+{
+ "id": "cx-002",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "m",
+    "type": {
+     "type": "map",
+     "keyType": "string",
+     "valueType": "integer",
+     "valueContainsNull": false
+    },
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "av",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$map": [
+     [
+      "a",
+      1
+     ],
+     [
+      "b",
+      2
+     ]
+    ]
+   },
+   1
+  ]
+ ]
+}

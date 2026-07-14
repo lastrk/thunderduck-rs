@@ -15,6 +15,24 @@ from pyspark.sql.window import Window
 from utils.dataframe_diff import assert_dataframes_equal
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _drop_leaked_tables(spark_reference, spark_thunderduck):
+    """Drop the module's catalog tables on teardown.
+
+    These tests create real `employees`/`departments` tables inline without
+    try/finally, so a mid-test failure could otherwise leak them onto the
+    now-session-shared session and perturb later modules (e.g. catalog
+    introspection). Idempotent DROP IF EXISTS on both engines at module exit.
+    """
+    yield
+    for session in (spark_reference, spark_thunderduck):
+        for table in ("employees", "departments"):
+            try:
+                session.sql(f"DROP TABLE IF EXISTS {table}")
+            except Exception:
+                pass
+
+
 @pytest.mark.differential
 class TestDataFrameBasicOperationsDifferential:
     """Differential tests for basic DataFrame operations."""

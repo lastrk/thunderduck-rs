@@ -1,0 +1,47 @@
+{
+ "id": "tpcds-q065",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "s_store_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_item_desc",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "revenue",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_current_price",
+    "type": "decimal(7,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_wholesale_cost",
+    "type": "decimal(7,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_brand",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": []
+}

@@ -1,0 +1,42 @@
+{
+ "id": "set-005",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10
+  ],
+  [
+   10
+  ],
+  [
+   20
+  ],
+  [
+   20
+  ],
+  [
+   30
+  ],
+  [
+   30
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ]
+ ]
+}

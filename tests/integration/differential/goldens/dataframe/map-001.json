@@ -1,0 +1,103 @@
+{
+ "id": "map-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "m",
+    "type": {
+     "type": "map",
+     "keyType": "string",
+     "valueType": "string",
+     "valueContainsNull": true
+    },
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$map": [
+     [
+      "k",
+      "Alice"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "k",
+      "Bob"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "k",
+      "Carol"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "k",
+      "Dan"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "k",
+      "Eve"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "k",
+      "Frank"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "k",
+      "Grace"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "k",
+      "Heidi"
+     ]
+    ]
+   }
+  ]
+ ]
+}

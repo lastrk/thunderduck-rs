@@ -1,0 +1,498 @@
+{
+ "id": "tpcds-q071",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_brand_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_brand",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "t_hour",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "t_minute",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ext_price",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "channel",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1002001,
+   "importoamalg #1",
+   10,
+   36,
+   {
+    "$dec": "1265.67"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   10,
+   43,
+   {
+    "$dec": "1788.40"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   11,
+   10,
+   {
+    "$dec": "3073.18"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   11,
+   10,
+   {
+    "$dec": "608.12"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   11,
+   35,
+   {
+    "$dec": "5644.70"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   12,
+   39,
+   {
+    "$dec": "336.20"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   12,
+   51,
+   {
+    "$dec": "4814.51"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   12,
+   52,
+   {
+    "$dec": "348.16"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   12,
+   58,
+   {
+    "$dec": "874.20"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   12,
+   6,
+   {
+    "$dec": "48.18"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   13,
+   1,
+   {
+    "$dec": "481.40"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   13,
+   16,
+   {
+    "$dec": "2575.21"
+   },
+   "web"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   13,
+   9,
+   {
+    "$dec": "1014.24"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   14,
+   40,
+   {
+    "$dec": "309.72"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   14,
+   53,
+   {
+    "$dec": "836.21"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   17,
+   37,
+   {
+    "$dec": "195.72"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   18,
+   3,
+   {
+    "$dec": "11320.36"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   18,
+   44,
+   {
+    "$dec": "1715.50"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   18,
+   47,
+   {
+    "$dec": "308.16"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   19,
+   44,
+   {
+    "$dec": "2058.60"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   19,
+   7,
+   {
+    "$dec": "671.37"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   20,
+   19,
+   {
+    "$dec": "1905.32"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   20,
+   2,
+   {
+    "$dec": "3885.12"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   20,
+   34,
+   {
+    "$dec": "1588.40"
+   },
+   "web"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   20,
+   40,
+   {
+    "$dec": "11732.12"
+   },
+   "web"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   20,
+   50,
+   {
+    "$dec": "2021.25"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   21,
+   41,
+   {
+    "$dec": "540.02"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   4,
+   46,
+   {
+    "$dec": "9.68"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   5,
+   8,
+   {
+    "$dec": "9530.95"
+   },
+   "web"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   6,
+   33,
+   {
+    "$dec": "3613.80"
+   },
+   "web"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   7,
+   9,
+   {
+    "$dec": "3079.45"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   8,
+   1,
+   {
+    "$dec": "369.55"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   8,
+   40,
+   {
+    "$dec": "1510.64"
+   },
+   "catalog"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   9,
+   28,
+   {
+    "$dec": "1003.92"
+   },
+   "store"
+  ],
+  [
+   1002001,
+   "importoamalg #1",
+   9,
+   29,
+   {
+    "$dec": "1224.50"
+   },
+   "store"
+  ],
+  [
+   5004001,
+   "edu packscholar #1",
+   11,
+   49,
+   {
+    "$dec": "252.16"
+   },
+   "catalog"
+  ],
+  [
+   5004001,
+   "edu packscholar #1",
+   12,
+   58,
+   {
+    "$dec": "8924.63"
+   },
+   "store"
+  ],
+  [
+   5004001,
+   "edu packscholar #1",
+   13,
+   16,
+   {
+    "$dec": "6381.76"
+   },
+   "web"
+  ],
+  [
+   5004001,
+   "edu packscholar #1",
+   13,
+   54,
+   {
+    "$dec": "375.87"
+   },
+   "catalog"
+  ],
+  [
+   5004001,
+   "edu packscholar #1",
+   14,
+   40,
+   {
+    "$dec": "219.48"
+   },
+   "store"
+  ],
+  [
+   5004001,
+   "edu packscholar #1",
+   17,
+   16,
+   {
+    "$dec": "287.28"
+   },
+   "catalog"
+  ],
+  [
+   5004001,
+   "edu packscholar #1",
+   17,
+   30,
+   {
+    "$dec": "5920.64"
+   },
+   "catalog"
+  ],
+  [
+   5004001,
+   "edu packscholar #1",
+   17,
+   37,
+   {
+    "$dec": "124.68"
+   },
+   "store"
+  ],
+  [
+   5004001,
+   "edu packscholar #1",
+   17,
+   4,
+   {
+    "$dec": "11755.29"
+   },
+   "catalog"
+  ],
+  [
+   5004001,
+   "edu packscholar #1",
+   8,
+   1,
+   {
+    "$dec": "41.04"
+   },
+   "store"
+  ]
+ ]
+}

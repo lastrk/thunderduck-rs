@@ -18,10 +18,9 @@ from port_utils import wait_for_port
 class ServerManager:
     """Manages Thunderduck Rust Spark Connect server lifecycle for integration tests"""
 
-    def __init__(self, host: str = "localhost", port: int = 15002, compat_mode: str | None = None):
+    def __init__(self, host: str = "localhost", port: int = 15002):
         self.host = host
         self.port = port
-        self.compat_mode = compat_mode  # "strict", "relaxed", or None (auto)
         self.process: subprocess.Popen | None = None
         self.workspace_dir = Path(__file__).parent.parent.parent.parent
 
@@ -74,14 +73,8 @@ class ServerManager:
             if not self.is_port_available():
                 raise RuntimeError(f"Port {self.port} is still in use after cleanup")
 
-        # Build the command — Rust binary takes port and optional mode flag
+        # Build the command — Rust binary takes the port.
         cmd = [str(self.server_binary), "--port", str(self.port)]
-
-        if self.compat_mode == "strict":
-            cmd.append("--strict")
-        elif self.compat_mode == "relaxed":
-            cmd.append("--relaxed")
-        # None / "auto" → no flag (binary auto-detects based on extension availability)
 
         print(f"Starting Thunderduck server on {self.host}:{self.port}...")
         print(f"Command: {' '.join(cmd)}")
@@ -94,9 +87,6 @@ class ServerManager:
         stderr_file = log_dir / "server_stderr.log"
 
         env = os.environ.copy()
-        # Pass compat mode via environment variable as well (belt and suspenders)
-        if self.compat_mode:
-            env["THUNDERDUCK_COMPAT_MODE"] = self.compat_mode
 
         with open(stdout_file, "w") as stdout, open(stderr_file, "w") as stderr:
             self.process = subprocess.Popen(

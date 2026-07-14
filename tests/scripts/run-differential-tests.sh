@@ -30,7 +30,6 @@
 #   SPARK_PORT=15003                    - Spark reference server port
 #   THUNDERDUCK_PORT=15002              - Thunderduck server port
 #   THUNDERDUCK_BINARY=path/to/binary   - Override Thunderduck binary path
-#   THUNDERDUCK_COMPAT_MODE=strict|relaxed|auto
 #   CONNECT_TIMEOUT=10                  - Session creation timeout (seconds)
 #   COLLECT_TIMEOUT=10                  - Result collection timeout
 #   SERVER_STARTUP_TIMEOUT=60           - Server startup timeout
@@ -58,13 +57,44 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-SPARK_HOME="${SPARK_HOME:-$HOME/spark/current}"
+
+# Source the env file written by setup-differential-testing.sh if present
+# (sets SPARK_HOME, THUNDERDUCK_VENV_DIR, etc. to the vendored install).
+ENV_FILE="$WORKSPACE_DIR/tests/integration/.env"
+if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+fi
+
+# Fall back to the vendored in-tree install, then $HOME/spark/current,
+# before failing in the prerequisite check below.
+SPARK_HOME="${SPARK_HOME:-$WORKSPACE_DIR/.spark/spark-4.1.1}"
+[ -d "$SPARK_HOME" ] || SPARK_HOME="$HOME/spark/current"
 
 # Handle --ci flag
 if [[ "$1" == "--ci" ]]; then
     shift
     export THUNDERDUCK_TEST_SUITE_CONTINUE_ON_ERROR="${THUNDERDUCK_TEST_SUITE_CONTINUE_ON_ERROR:-true}"
     export COLLECT_TIMEOUT="${COLLECT_TIMEOUT:-30}"
+fi
+
+# Oracle mode (see tests/integration/utils/golden.py):
+#   golden (default) — diff τ against recorded golden files; no Spark started.
+#   live             — diff τ against a live Spark reference (full authority).
+#   record           — run Spark and (over)write the goldens for the selection.
+# --record is shorthand for --oracle record. These may precede the test group.
+while true; do
+    case "$1" in
+        --record) export THUNDERDUCK_ORACLE=record; shift ;;
+        --oracle) export THUNDERDUCK_ORACLE="$2"; shift 2 ;;
+        --oracle=*) export THUNDERDUCK_ORACLE="${1#--oracle=}"; shift ;;
+        *) break ;;
+    esac
+done
+export THUNDERDUCK_ORACLE="${THUNDERDUCK_ORACLE:-golden}"
+if [[ "$THUNDERDUCK_ORACLE" != "golden" && "$THUNDERDUCK_ORACLE" != "live" && "$THUNDERDUCK_ORACLE" != "record" ]]; then
+    echo "ERROR: --oracle must be golden|live|record (got '$THUNDERDUCK_ORACLE')"
+    exit 1
 fi
 
 # Resolve Python interpreter
@@ -94,8 +124,9 @@ PYTEST_PID=""
 
 get_test_files() {
     case "$1" in
-        tpch)        echo "differential/test_differential_v2.py differential/test_tpch_differential.py" ;;
-        tpcds)       echo "differential/test_tpcds_differential.py differential/test_tpcds_dataframe_differential.py" ;;
+        core | core_v2) echo "differential/test_dataframe_corpus_differential.py" ;;
+        sql_v2)      echo "differential/test_sql_corpus_differential.py" ;;
+        tpch | tpcds) echo "differential/test_sql_corpus_differential.py differential/test_dataframe_corpus_differential.py" ;;
         functions)   echo "differential/test_dataframe_functions.py" ;;
         aggregations) echo "differential/test_multidim_aggregations.py" ;;
         window)      echo "differential/test_window_functions.py" ;;
@@ -105,7 +136,6 @@ get_test_files() {
         statistics)  echo "differential/test_statistics_differential.py" ;;
         types)       echo "differential/test_complex_types_differential.py differential/test_type_literals_differential.py" ;;
         schema)      echo "differential/test_to_schema_differential.py" ;;
-        dataframe)   echo "differential/test_tpcds_dataframe_differential.py" ;;
         datetime)    echo "differential/test_datetime_functions_differential.py" ;;
         conditional) echo "differential/test_conditional_differential.py" ;;
         all)         echo "differential/" ;;
@@ -113,10 +143,25 @@ get_test_files() {
     esac
 }
 
+# Case-id filter (-k) applied on top of the group's test files. The tpch /
+# tpcds groups select their corpus clusters by case-id prefix across BOTH
+# corpora (SQL + DataFrame) — the clusters live inside the corpus files, so
+# file selection alone would run the whole corpus.
+get_test_filter() {
+    case "$1" in
+        tpch)  echo "tpch-" ;;
+        tpcds) echo "tpcds-" ;;
+        *)     echo "" ;;
+    esac
+}
+
 get_test_description() {
     case "$1" in
-        tpch)        echo "TPC-H SQL and DataFrame tests" ;;
-        tpcds)       echo "TPC-DS SQL and DataFrame tests" ;;
+        core)        echo "Conformance corpus (DataFrame API only, biased to divergence) — τ fitness gate" ;;
+        core_v2)     echo "Alias for 'core' (retained for tooling that references core_v2 by name)" ;;
+        sql_v2)      echo "Spark SQL conformance corpus (spark.sql) — τ SQL front-end gate" ;;
+        tpch)        echo "TPC-H cluster (SQL + DataFrame corpus cases, tpch-* ids)" ;;
+        tpcds)       echo "TPC-DS cluster (SQL + DataFrame corpus cases, tpcds-* ids)" ;;
         functions)   echo "DataFrame function parity tests" ;;
         aggregations) echo "Multi-dimensional aggregation tests" ;;
         window)      echo "Window function tests" ;;
@@ -126,10 +171,9 @@ get_test_description() {
         statistics)  echo "Statistics operations (cov, corr, describe)" ;;
         types)       echo "Complex types and type literals" ;;
         schema)      echo "ToSchema df.to(schema) tests" ;;
-        dataframe)   echo "TPC-DS DataFrame API tests" ;;
         datetime)    echo "Date/time function tests" ;;
         conditional) echo "Conditional expressions (when/otherwise)" ;;
-        all)         echo "All differential tests" ;;
+        all)         echo "All differential tests (includes core)" ;;
         *)           echo "" ;;
     esac
 }
@@ -163,12 +207,19 @@ echo ""
 # Check prerequisites
 echo -e "${BLUE}[1/2] Checking prerequisites...${NC}"
 
+# Spark is only required for live/record oracle modes; golden mode never starts
+# it (the reference comes from recorded golden files).
 if [ ! -d "$SPARK_HOME" ] || [ ! -f "$SPARK_HOME/bin/spark-submit" ]; then
-    echo -e "${RED}ERROR: Apache Spark not found at $SPARK_HOME${NC}"
-    echo "Run the setup script first: $SCRIPT_DIR/setup-differential-testing.sh"
-    exit 1
+    if [[ "$THUNDERDUCK_ORACLE" == "golden" ]]; then
+        echo -e "${YELLOW}  Spark not found at $SPARK_HOME — not needed (oracle=golden)${NC}"
+    else
+        echo -e "${RED}ERROR: Apache Spark not found at $SPARK_HOME (required for oracle=$THUNDERDUCK_ORACLE)${NC}"
+        echo "Run the setup script first: $SCRIPT_DIR/setup-differential-testing.sh"
+        exit 1
+    fi
+else
+    echo -e "${GREEN}  Spark found at: $SPARK_HOME${NC}"
 fi
-echo -e "${GREEN}  Spark found at: $SPARK_HOME${NC}"
 
 if [ ! -d "$WORKSPACE_DIR/tests/integration/tpch_sf001" ]; then
     echo -e "${RED}ERROR: TPC-H data not found at $WORKSPACE_DIR/tests/integration/tpch_sf001${NC}"
@@ -177,43 +228,90 @@ if [ ! -d "$WORKSPACE_DIR/tests/integration/tpch_sf001" ]; then
 fi
 echo -e "${GREEN}  TPC-H data found${NC}"
 
-# Find Thunderduck Rust binary
+# Find Thunderduck Rust binary. ALWAYS build unless the caller supplied an
+# explicit THUNDERDUCK_BINARY: cargo is a fast no-op when the tree is
+# unchanged, and silently running the suite against a stale binary is a
+# false-green machine — the differential gate must test the sources as they
+# stand, not whatever binary happened to exist.
 BINARY_PATH="${THUNDERDUCK_BINARY:-$WORKSPACE_DIR/target/release/thunderduck-connect-server}"
-if [ ! -f "$BINARY_PATH" ]; then
-    echo -e "${YELLOW}  Thunderduck binary not found at $BINARY_PATH. Building...${NC}"
+if [ -z "${THUNDERDUCK_BINARY:-}" ]; then
+    echo -e "${YELLOW}  Building Thunderduck server (no-op when up to date)...${NC}"
     cd "$WORKSPACE_DIR"
-    cargo build --release 2>&1 | tail -20
-    if [ ! -f "$BINARY_PATH" ]; then
+    # DuckDB is non-bundled by default. If no external libduckdb is configured
+    # (DUCKDB_LIB_DIR — set by local dev via scripts/dev/), compile it from
+    # source so fresh clones / CI link successfully.
+    BUILD_FEATURES=""
+    if [ -z "${DUCKDB_LIB_DIR:-}" ]; then
+        echo -e "${YELLOW}  DUCKDB_LIB_DIR unset — compiling DuckDB from source (--features bundled)${NC}"
+        BUILD_FEATURES="--features bundled"
+    fi
+    # Subshell pipefail so the guard tests CARGO's exit status, not tail's
+    # (plain `cmd | tail` under set -e without pipefail always sees tail's 0,
+    # silently gating against a stale binary when the build breaks).
+    if ! (set -o pipefail; cargo build --release $BUILD_FEATURES 2>&1 | tail -20); then
         echo -e "${RED}ERROR: Failed to build Thunderduck server${NC}"
         exit 1
     fi
+fi
+if [ ! -f "$BINARY_PATH" ]; then
+    echo -e "${RED}ERROR: Thunderduck binary not found at $BINARY_PATH${NC}"
+    exit 1
 fi
 echo -e "${GREEN}  Thunderduck binary found: $BINARY_PATH${NC}"
 
 # Parse arguments
 show_help() {
-    echo "Usage: $0 [--ci] [test-group] [pytest-args...]"
+    echo "Usage: $0 [--ci] [--record | --oracle MODE] [test-group] [pytest-args...]"
     echo ""
-    echo "Test groups: tpch tpcds functions aggregations window datetime"
-    echo "             conditional operations lambda joins statistics types schema dataframe all"
+    echo "Test groups: core core_v2 sql_v2 tpch tpcds functions aggregations window datetime"
+    echo "             conditional operations lambda joins statistics types schema all"
+    echo ""
+    echo "  core     — DataFrame-only conformance corpus (τ fitness gate)"
+    echo "  core_v2  — alias for 'core' (retained for tooling that references it by name)"
+    echo "  sql_v2   — Spark SQL conformance corpus (spark.sql), τ SQL front-end gate"
+    echo "  tpch     — TPC-H cluster: tpch-* corpus cases (SQL + DataFrame)"
+    echo "  tpcds    — TPC-DS cluster: tpcds-* corpus cases (SQL + DataFrame)"
+    echo "  all      — everything including core (the comprehensive gate)"
+    echo ""
+    echo "Oracle mode (the two conformance corpora only — core/core_v2/sql_v2):"
+    echo "  --oracle golden   (default) diff τ against recorded golden files; NO Spark."
+    echo "  --oracle live               diff τ against a live Spark reference (authority)."
+    echo "  --oracle record | --record  run Spark and (over)write goldens for the selection."
+    echo ""
+    echo "  Add / change a case, then record + commit its golden:"
+    echo "    $0 --record core -k my-new-case      # writes goldens/dataframe/my-new-case.json"
+    echo "  Refresh everything after an input-fixture or Spark-pin change:"
+    echo "    $0 --record core && $0 --record sql_v2"
+    echo ""
+    echo "Extra pytest args are forwarded verbatim (quoting preserved), e.g.:"
+    echo "  $0 sql_v2 -k 'tpch-q01 or sel-001' --tb=long"
+    echo "NOTE: the tpch/tpcds groups already use -k for cluster selection;"
+    echo "passing another -k there overrides it (pytest keeps the last -k)."
     exit 0
 }
 
 if [[ "$1" == "-h" || "$1" == "--help" ]]; then show_help; fi
 
 TEST_GROUP="${1:-all}"
-PYTEST_ARGS="${@:2}"
+PYTEST_ARGS=("${@:2}")
 
 TEST_FILES="$(get_test_files "$TEST_GROUP")"
 if [ -z "$TEST_FILES" ]; then
     if [[ "$TEST_GROUP" == -* || "$TEST_GROUP" == *.py ]]; then
-        PYTEST_ARGS="$@"
+        PYTEST_ARGS=("$@")
         TEST_GROUP="all"
         TEST_FILES="$(get_test_files "$TEST_GROUP")"
     else
         echo -e "${RED}ERROR: Unknown test group '$TEST_GROUP'${NC}"
         exit 1
     fi
+fi
+
+# Cluster selection for tpch/tpcds (see get_test_filter).
+FILTER_ARGS=()
+TEST_FILTER="$(get_test_filter "$TEST_GROUP")"
+if [ -n "$TEST_FILTER" ]; then
+    FILTER_ARGS=(-k "$TEST_FILTER")
 fi
 
 # Run tests
@@ -224,11 +322,11 @@ echo -e "  ${CYAN}Test group:${NC} $TEST_GROUP ($(get_test_description "$TEST_GR
 echo -e "  ${CYAN}Test files:${NC} $TEST_FILES"
 echo ""
 echo -e "  ${CYAN}Configuration:${NC}"
+echo -e "    Oracle:            $THUNDERDUCK_ORACLE"
 echo -e "    Python:            $PYTHON"
 echo -e "    Binary:            $BINARY_PATH"
 echo -e "    Spark port:        ${SPARK_PORT:-auto}"
 echo -e "    Thunderduck port:  ${THUNDERDUCK_PORT:-auto}"
-echo -e "    Compat mode:       ${THUNDERDUCK_COMPAT_MODE:-auto}"
 echo -e "    Collect timeout:   ${COLLECT_TIMEOUT:-10}s"
 echo -e "    Continue on error: ${THUNDERDUCK_TEST_SUITE_CONTINUE_ON_ERROR:-false}"
 echo ""
@@ -247,8 +345,9 @@ set +e
 # shellcheck disable=SC2086
 $PYTHON -m pytest \
     $TEST_FILES \
+    "${FILTER_ARGS[@]}" \
     $TB_STYLE \
-    $PYTEST_ARGS &
+    "${PYTEST_ARGS[@]}" &
 PYTEST_PID=$!
 wait $PYTEST_PID
 TEST_EXIT_CODE=$?

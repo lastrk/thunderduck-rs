@@ -1,0 +1,59 @@
+{
+ "id": "hof-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "zw",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   [
+    "gogo",
+    "cc",
+    "rustrust"
+   ]
+  ],
+  [
+   [
+    "javajava"
+   ]
+  ],
+  [
+   [
+    "pythonpython",
+    "rustrust"
+   ]
+  ],
+  [
+   [
+    "pythonpython"
+   ]
+  ],
+  [
+   [
+    "scalascala"
+   ]
+  ],
+  [
+   []
+  ]
+ ]
+}

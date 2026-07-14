@@ -1,16 +1,17 @@
 # Build & Commands Reference
 
+> **Scope: τ (the only production path per ADR-022).**
+
 ## Build
 
 ```bash
-# Full build (debug)
+# Full build (debug). Local dev uses the prebuilt libduckdb from
+# scripts/dev/dev-cache-setup.sh; fresh clones / CI need --features bundled.
 cargo build
 
-# Release build (for integration tests)
+# Release build (for integration tests). Embeds the vendored thdck_spark_funcs
+# extension (extensions/vendored/) for the current platform — no download.
 cargo build --release
-
-# Release build WITH strict-mode extension (downloads binary on first run)
-cargo build --release --features bundled-extension
 
 # Build a single crate
 cargo build -p thunderduck-core
@@ -29,24 +30,15 @@ cargo check
 # Custom port
 ./target/release/thunderduck-connect-server --port 15002
 
-# Strict mode (requires bundled-extension build)
-./target/release/thunderduck-connect-server --strict
-
-# Relaxed mode (default)
-./target/release/thunderduck-connect-server --relaxed
-
-# Kill server
-pkill -f thunderduck-connect-server
+# Kill server (worktree-scoped; ownership-verified — never touches other worktrees)
+./tests/scripts/kill-test-servers.sh
 ```
 
 ## Change-and-Test Workflow
 
 ```bash
-pkill -f thunderduck-connect-server 2>/dev/null
+./tests/scripts/kill-test-servers.sh 2>/dev/null
 cargo build --release
-cd tests/integration && python3 -m pytest \
-  "differential/test_differential_v2.py::TestTPCH_AllQueries_Differential[7]" -v --tb=long
-pkill -f thunderduck-connect-server 2>/dev/null
+./tests/scripts/differential-progress.sh   # full suite + progress row (fast iteration: run-differential-tests.sh <group>)
+./tests/scripts/kill-test-servers.sh 2>/dev/null
 ```
-
-For strict-mode iteration, rebuild with `--features bundled-extension` and prefix the pytest invocation with `THUNDERDUCK_COMPAT_MODE=strict`.

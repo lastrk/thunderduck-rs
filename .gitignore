@@ -14,6 +14,11 @@
 **/*.rs.bk
 Cargo.lock
 
+# Per-worktree test environment: remembered server ports (see
+# tests/integration/utils/test_env.py) and per-worktree DuckDB extension dir.
+/.thunderduck-test-env.json
+/.duckdb-ext/
+
 # Python
 __pycache__/
 *.pyc
@@ -24,11 +29,35 @@ tests/integration/tpch_sf001/
 tests/integration/tpcds_sf001/
 tests/integration/.env
 
-# DuckDB extension binaries (downloaded by build.rs on first --features bundled-extension build)
-extensions/
+# DuckDB extension: everything under extensions/ is gitignored EXCEPT the
+# vendored release set (extensions/vendored/), which is checked in per
+# scripts/dev/adopt-extension-release.sh. This keeps the legacy download
+# cache (extensions/ext6/, etc., from pre-vendoring builds or stray local
+# fetches) ignored while tracking the vendored binaries.
+/extensions/*
+!/extensions/vendored/
+
+# Cross-repo Delta dev loop: local checkouts of our forks of duckdb-delta and
+# delta-kernel-rs, materialized + built by scripts/dev/delta-dev-setup.sh.
+# See docs/context/delta-cross-repo-dev-loop.md.
+/.delta-kernel-rs/
+/.duckdb-delta/
+# Userspace gcc toolchain (micromamba + conda-forge) for building the extension
+# on this gcc-11 devcontainer; bootstrapped by scripts/dev/delta-toolchain-setup.sh.
+/.delta-toolchain/
+
+# Vendored Apache Spark reference install (downloaded by setup-differential-testing.sh)
+.spark/
 
 # Downloaded build tools
 .tools/
+
+# Local build-acceleration cache (mold/sccache binaries, shared sccache cache,
+# frozen libduckdb.a). Lives at the main checkout root; see scripts/dev/.
+/.build-cache/
+
+# Build-profiling run artifacts (machine/run-specific); harness + FINDINGS kept.
+tasks/build-profiling/results/
 
 # Playground runtime state and data
 playground/__marimo__/
@@ -44,3 +73,6 @@ playground/logs/
 
 # codegraph index (per-machine, managed by /agentic-dev:setup)
 .codegraph/
+
+# rust-analyzer SCIP snapshot (local code-nav index)
+.scip/

@@ -1,0 +1,50 @@
+{
+ "id": "pv-002",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "t",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "f",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   2,
+   null
+  ],
+  [
+   20,
+   1,
+   1
+  ],
+  [
+   30,
+   1,
+   1
+  ],
+  [
+   null,
+   2,
+   null
+  ]
+ ]
+}

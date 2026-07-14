@@ -1,0 +1,10 @@
+# name: test/sql/native_count_if_parity.test
+# description: spark_count_if resolves to native COUNT_IF; parity vs Spark 4.1.1 (NULL treated as FALSE).
+# group: [sql]
+
+# Oracle: Spark 4.1.1. Corpus: agg2-006.
+
+query I
+SELECT count_if(b) FROM (VALUES (true),(true),(false),(CAST(NULL AS BOOLEAN)),(true)) bb(b);
+----
+3

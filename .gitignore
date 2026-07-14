@@ -76,3 +76,9 @@ playground/logs/
 
 # rust-analyzer SCIP snapshot (local code-nav index)
 .scip/
+
+# extension-release CI shim (root Makefile): the reusable workflow clones
+# extension-ci-tools/ and builds into build/ at the repo root; local
+# simulations of that harness must never commit either.
+/extension-ci-tools/
+/build/

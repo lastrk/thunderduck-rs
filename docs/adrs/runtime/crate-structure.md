@@ -25,7 +25,8 @@ thunderduck-rs/
 │       ├── build.rs            # tonic_build proto compilation
 │       ├── proto/              # Spark Connect .proto files (copied from reference)
 │       └── Cargo.toml
-├── extensions/ext6/            # thdck_spark_funcs binary — downloaded + cached by build.rs (gitignored)
+├── extensions/vendored/         # thdck_spark_funcs binaries (all 4 platforms) — checked into git,
+│                                #   adopted via scripts/dev/adopt-extension-release.sh
 └── tests/
     └── integration/            # Python differential test suite (PySpark ↔ Thunderduck)
 ```

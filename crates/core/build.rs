@@ -1,7 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     link_external_duckdb_runtime();
-    download_extension();
+    embed_vendored_extension();
 }
 
 /// When DuckDB is NOT compiled from source (the `bundled` feature is off), we
@@ -26,57 +26,90 @@ fn link_external_duckdb_runtime() {
     }
 }
 
-fn download_extension() {
-    // The `ext6` release packs binaries for multiple DuckDB versions under a
-    // single tag, with the DuckDB version embedded in each filename. We pick
-    // the one matching the duckdb crate (currently 1.10504.0 → DuckDB 1.5.4).
-    const RELEASE_TAG: &str = "ext6";
-    const EXT_DUCKDB_VERSION: &str = "v1.5.4";
-    const BASE_URL: &str =
-        "https://github.com/nubank/thunderduck-duckdb-extension/releases/download";
+/// Embed the vendored `thdck_spark_funcs` extension binary into the build.
+///
+/// `extensions/vendored/` checks in all 4 platform binaries of exactly one
+/// adopted release (see `scripts/dev/adopt-extension-release.sh` and
+/// `extensions/vendored/MANIFEST.toml`); this just picks the one matching
+/// `TARGET` and copies it to `OUT_DIR` so `include_bytes!` has a stable,
+/// cargo-managed path. No network access — vendoring is a git-tracked,
+/// once-per-adoption step, not a build-time fetch.
+fn embed_vendored_extension() {
+    println!("cargo:rerun-if-env-changed=THUNDERDUCK_EXT_PATH");
 
-    let target = std::env::var("TARGET").expect("TARGET not set by Cargo");
-    let platform = detect_platform(&target);
+    let out_dir = std::env::var("OUT_DIR").unwrap();
+    let dest = std::path::Path::new(&out_dir).join("thdck_spark_funcs.duckdb_extension");
 
-    let filename = format!("thdck_spark_funcs-{EXT_DUCKDB_VERSION}-{platform}.duckdb_extension");
+    // Build-time embed override for extension developers: point straight at a
+    // locally built binary, bypassing the vendored set entirely. This is a
+    // different phase from the runtime `THUNDERDUCK_DELTA_EXT_PATH`
+    // (`crates/core/src/runtime/extension_loader.rs`), which `LOAD`s a second,
+    // *additional* extension at session startup rather than replacing the
+    // embedded bytes at compile time.
+    if let Ok(path) = std::env::var("THUNDERDUCK_EXT_PATH") {
+        let src = std::path::Path::new(&path);
+        println!("cargo:rerun-if-changed={}", src.display());
+        std::fs::copy(src, &dest).unwrap_or_else(|e| {
+            panic!("THUNDERDUCK_EXT_PATH={} set but failed to copy: {e}", path)
+        });
+        println!("cargo:rustc-env=EXTENSION_BIN_PATH={}", dest.display());
+        return;
+    }
 
-    // Persistent cache: {workspace_root}/extensions/{tag}/{filename}
-    // Lives outside Cargo's target/ so it survives `cargo clean`.
+    // crates/core → workspace root → extensions/vendored. build.rs has no
+    // workspace_root() helper, so derive it from CARGO_MANIFEST_DIR directly.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let workspace_root = std::path::Path::new(&manifest_dir)
+    let vendored_dir = std::path::Path::new(&manifest_dir)
         .parent()
         .unwrap()
         .parent()
-        .unwrap();
-    let cache_dir = workspace_root.join("extensions").join(RELEASE_TAG);
-    let cache_path = cache_dir.join(&filename);
+        .unwrap()
+        .join("extensions")
+        .join("vendored");
 
-    if !cache_path.exists() {
-        std::fs::create_dir_all(&cache_dir).expect("failed to create extensions cache directory");
+    let target = std::env::var("TARGET").expect("TARGET not set by Cargo");
+    let platform = detect_platform(&target);
+    let suffix = format!("-{platform}.duckdb_extension");
 
-        let url = format!("{BASE_URL}/{RELEASE_TAG}/{filename}");
-        println!("cargo:warning=Downloading extension from {url}");
+    let entries = std::fs::read_dir(&vendored_dir).unwrap_or_else(|e| {
+        panic!(
+            "Failed to read vendored extension directory {}: {e}\n\
+             Run scripts/dev/adopt-extension-release.sh <release-tag> <duckdb-version> to \
+             vendor a release (or `git lfs pull` if this tree has migrated to LFS).",
+            vendored_dir.display()
+        )
+    });
 
-        let status = std::process::Command::new("curl")
-            .args(["-fL", "--retry", "3", "-o"])
-            .arg(&cache_path)
-            .arg(&url)
-            .status()
-            .expect("failed to run curl — is curl installed?");
+    let mut matches: Vec<std::path::PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("thdck_spark_funcs-") && n.ends_with(&suffix))
+        })
+        .collect();
 
-        if !status.success() {
-            panic!(
-                "Failed to download extension binary from {url}\n\
-                 Check your internet connection or download it manually to:\n  {}",
-                cache_path.display()
-            );
-        }
+    match matches.len() {
+        0 => panic!(
+            "No vendored thdck_spark_funcs extension found for platform {platform} under {}\n\
+             Run scripts/dev/adopt-extension-release.sh <release-tag> <duckdb-version> to vendor \
+             a release for this platform (or `git lfs pull` if this tree has migrated to LFS).",
+            vendored_dir.display()
+        ),
+        1 => {}
+        _ => panic!(
+            "Multiple vendored thdck_spark_funcs extensions match platform {platform} under {}: \
+             {matches:?}\n\
+             Adoption must keep exactly one version vendored at a time — re-run \
+             scripts/dev/adopt-extension-release.sh to reconcile.",
+            vendored_dir.display()
+        ),
     }
 
-    // Copy to OUT_DIR so include_bytes! has a stable, cargo-managed path.
-    let out_dir = std::env::var("OUT_DIR").unwrap();
-    let dest = std::path::Path::new(&out_dir).join("thdck_spark_funcs.duckdb_extension");
-    std::fs::copy(&cache_path, &dest).expect("failed to copy extension to OUT_DIR");
+    let src = matches.remove(0);
+    println!("cargo:rerun-if-changed={}", src.display());
+    std::fs::copy(&src, &dest)
+        .unwrap_or_else(|e| panic!("failed to copy {} to OUT_DIR: {e}", src.display()));
 
     println!("cargo:rustc-env=EXTENSION_BIN_PATH={}", dest.display());
 }

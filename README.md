@@ -113,7 +113,8 @@ thunderduck-rs/
 │       ├── service/               # SparkConnectService (tonic gRPC handlers)
 │       ├── session/               # SessionManager (DashMap + per-session OS threads)
 │       └── converter/             # Protobuf → LogicalPlan (RelationConverter, ExpressionConverter)
-├── extensions/                    # Bundled DuckDB extension binaries (embedded via include_bytes!)
+├── extensions/vendored/            # thdck_spark_funcs binaries, all 4 platforms (checked into git;
+│                                   #   embedded via include_bytes!; see MANIFEST.toml)
 └── tests/
     ├── integration/               # Python differential tests
     │   ├── differential/          # Differential test suites (41 test files)
@@ -185,12 +186,15 @@ cargo build -p thunderduck-connect-server
 cargo check
 ```
 
-The extension binary for the current platform is downloaded by `build.rs` from the
-[`ext4` release](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext4)
-(which bundles binaries for multiple DuckDB versions — we pull the `v1.5.1` set to match the
-`duckdb` crate at `1.10501.0`) and cached under `extensions/ext4/` on first build. Subsequent builds
-reuse the cached file — no re-download. The extension is embedded directly in the binary
-via `include_bytes!()` and loaded at every session's startup.
+All 4 platform binaries of the adopted `thdck_spark_funcs` release (currently the
+[`ext6` release](https://github.com/nubank/thunderduck-duckdb-extension/releases/tag/ext6),
+`v1.5.4` set, matching the `duckdb` crate at `1.10504.0`) are vendored — checked
+into git plain under `extensions/vendored/` (see `extensions/vendored/MANIFEST.toml`).
+`build.rs` picks the binary matching the current platform at build time — no
+network access, no download. Adopting a new release (only on `duckdb` crate
+bumps) is done via `scripts/dev/adopt-extension-release.sh`. The extension is
+embedded directly in the binary via `include_bytes!()` and loaded at every
+session's startup.
 
 ### Start the Server
 

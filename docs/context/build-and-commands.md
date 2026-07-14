@@ -9,8 +9,8 @@
 # scripts/dev/dev-cache-setup.sh; fresh clones / CI need --features bundled.
 cargo build
 
-# Release build (for integration tests). Downloads + embeds the thdck_spark_funcs
-# extension on first run.
+# Release build (for integration tests). Embeds the vendored thdck_spark_funcs
+# extension (extensions/vendored/) for the current platform — no download.
 cargo build --release
 
 # Build a single crate

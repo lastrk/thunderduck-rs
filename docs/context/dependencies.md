@@ -17,7 +17,7 @@ The `.duckdb_extension` binary's embedded DuckDB version must exactly match the 
 - Extension release: `ext6` (multi-version — pulls the `v1.5.4` binaries)
 - `duckdb` crate: `1.10504.0`
 
-On the first build, `build.rs` downloads the correct platform binary from the GitHub releases of `thunderduck-duckdb-extension` and caches it under `extensions/ext6/` (gitignored). The binary is embedded via `include_bytes!()` and loaded at every session's startup; failure to load is a hard error.
+All 4 platform binaries (`linux_amd64`, `linux_arm64`, `osx_amd64`, `osx_arm64`) of the adopted release are vendored — checked into git plain (uncompressed) under `extensions/vendored/` (`MANIFEST.toml` + one `.duckdb_extension` per platform), exactly one version at a time. `build.rs` picks the binary matching `TARGET` at build time and embeds it via `include_bytes!()`; no network access is required to build. Adopting a new release (only on `duckdb` crate bumps) is done via `scripts/dev/adopt-extension-release.sh <release-tag> <duckdb-version>`, which also regenerates the manifest's per-artifact sha256/size and supports a `--verify` mode. The extension is loaded at every session's startup; failure to load is a hard error.
 
 ### `thdck_spark_funcs` Extension Functions
 

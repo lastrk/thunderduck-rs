@@ -16,7 +16,7 @@
 
 5. **DuckDB SEMI JOIN syntax**: DuckDB uses `SEMI JOIN` and `ANTI JOIN` (without `LEFT` prefix). `LEFT SEMI JOIN` is a parser error.
 
-6. **Extension version pinning**: the `.duckdb_extension` binary's DuckDB version must exactly match the `duckdb` crate version, or `LOAD` fails. The full pin matrix (`ext6` → `v1.5.4` binaries → `duckdb` crate `1.10504.0`) lives in `dependencies.md` → Version Pinning.
+6. **Extension version pinning**: the `.duckdb_extension` binary's DuckDB version must exactly match the `duckdb` crate version, or `LOAD` fails. The full pin matrix (`ext6` → `v1.5.4` binaries → `duckdb` crate `1.10504.0`) lives in `extensions/vendored/MANIFEST.toml` (`[source]` block) and `dependencies.md` → Version Pinning.
 
 7. **HUGEINT overflow**: DuckDB `SUM()` of integer columns returns `HUGEINT` (i128). Spark returns `BIGINT` (i64). SQL generation must emit explicit `CAST(... AS BIGINT)` for integer SUM.
 

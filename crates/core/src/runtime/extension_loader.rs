@@ -11,8 +11,10 @@ static LOAD_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Load the bundled `thdck_spark_funcs` extension into `conn`.
 ///
-/// The extension is downloaded at build time (`build.rs`) and embedded in the
-/// binary; loading is mandatory and a hard error on failure.
+/// The extension binary is vendored (checked into git under
+/// `extensions/vendored/`, see `scripts/dev/adopt-extension-release.sh`) and
+/// embedded at build time (`build.rs`) via `include_bytes!`; loading is
+/// mandatory and a hard error on failure.
 pub fn load(conn: &duckdb::Connection) -> Result<()> {
     // Unique per-process, per-call *directory*, keeping the canonical filename:
     // `SessionManager` can create sessions concurrently (two `get_or_create`

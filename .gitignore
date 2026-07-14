@@ -29,8 +29,13 @@ tests/integration/tpch_sf001/
 tests/integration/tpcds_sf001/
 tests/integration/.env
 
-# DuckDB extension binaries (downloaded by build.rs on every fresh build)
-extensions/
+# DuckDB extension: everything under extensions/ is gitignored EXCEPT the
+# vendored release set (extensions/vendored/), which is checked in per
+# scripts/dev/adopt-extension-release.sh. This keeps the legacy download
+# cache (extensions/ext6/, etc., from pre-vendoring builds or stray local
+# fetches) ignored while tracking the vendored binaries.
+/extensions/*
+!/extensions/vendored/
 
 # Cross-repo Delta dev loop: local checkouts of our forks of duckdb-delta and
 # delta-kernel-rs, materialized + built by scripts/dev/delta-dev-setup.sh.

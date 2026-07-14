@@ -32,7 +32,7 @@ thunderduck-rs (this repo)
 
 | Repo | Ref | Reason |
 |------|-----|--------|
-| thunderduck `duckdb` crate | `1.10504.0` | == DuckDB **v1.5.4** (`crates/core/build.rs` `EXT_DUCKDB_VERSION`) |
+| thunderduck `duckdb` crate | `1.10504.0` | == DuckDB **v1.5.4** (`extensions/vendored/MANIFEST.toml` `[source].duckdb_version`) |
 | `.duckdb-delta` branch | `v1.5-variegata` | DuckDB-1.5.x-aligned line ("variegata" = 1.5.x codename) |
 | `.duckdb-delta/duckdb` submodule | tag `v1.5.4` | **must equal** thunderduck's linked libduckdb, or the extension won't `LOAD` |
 | `.delta-kernel-rs` branch | off tag `v0.21.0` | the FFI version the extension's C++ currently compiles against — green baseline |

@@ -40,3 +40,13 @@ TESTS_BASE_DIRECTORY = extension/test/
 ifneq ("${VCPKG_TOOLCHAIN_PATH}", "")
 VCPKG_MANIFEST_FLAGS := -DVCPKG_MANIFEST_DIR='${PROJ_DIR}extension'
 endif
+
+# GitHub's hosted linux_arm64 runners (4 vCPU / 16 GB) OOM-kill an
+# unrestricted cold ninja build of the full DuckDB tree (exit 137, run
+# 29343955829) — ninja defaults to nproc+2 jobs and the heavy TUs stack past
+# 16 GB when ccache is cold. Cap parallelism there; `cmake --build` honors
+# CMAKE_BUILD_PARALLEL_LEVEL. Warm-cache runs are barely slower, cold runs
+# survive. DUCKDB_PLATFORM is set in the reusable workflow's job env.
+ifeq (${DUCKDB_PLATFORM},linux_arm64)
+export CMAKE_BUILD_PARALLEL_LEVEL ?= 3
+endif

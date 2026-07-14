@@ -24,7 +24,13 @@ pub mod expression;
 pub mod function_catalog;
 pub mod invariants;
 pub mod macros;
-mod name_fold;
+/// Re-export, not a module: [`name_fold`](crate::types::name_fold) moved to
+/// `crate::types` (below `transpiler_v2` in the layering; INV10 does not ban
+/// `crate::types::*`) so `types::struct_type::field_by_name` — BELOW
+/// `transpiler_v2` — can use the same single case-folding authority instead
+/// of duplicating `canon_char`. Keeps every existing
+/// `use super::name_fold::{eq_fold, fold_key}` in this subtree unchanged.
+pub(crate) use crate::types::name_fold;
 pub mod rewrites;
 pub mod schema;
 pub(crate) mod spark_errors;

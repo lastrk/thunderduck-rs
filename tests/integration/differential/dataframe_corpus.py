@@ -369,6 +369,14 @@ case("math-016", "math", "try_divide -> null on /0 (spark4)", lambda I: I["nums"
 # casing.
 case("math-017", "math", "unaliased F.ceil auto-names uppercase (N5 roster)", lambda I: I["nums"].select(F.ceil("x")))
 
+# GRAB item 5 (P5 probe, 2026-07-14): the plain `UnaryMathExpression` family
+# (sqrt/sin/cbrt here) reports nullable=True even over a non-nullable input
+# column ("id" is Long, not-null) — live-verified against Apache Spark 4.1.1.
+# schema_only: only the reported nullability is asserted, not values.
+case("math-018", "math", "sqrt over non-nullable column is still nullable=True (P5)", lambda I: I["emp"].select(F.sqrt("id").alias("sq")), flags=("schema_only",))
+case("math-019", "math", "sin over non-nullable column is still nullable=True (P5)", lambda I: I["emp"].select(F.sin("id").alias("si")), flags=("schema_only",))
+case("math-020", "math", "cbrt over non-nullable column is still nullable=True (P5)", lambda I: I["emp"].select(F.cbrt("id").alias("cb")), flags=("schema_only",))
+
 # ── 7. Date / time functions ───────────────────────────────────────────────
 case("dt-001", "datetime", "current_date / current_timestamp", lambda I: I["emp"].select(F.current_date().alias("cd"), F.current_timestamp().alias("ct")), flags=("nondeterministic",))
 case("dt-002", "datetime", "date_add / date_sub", lambda I: I["emp"].select(F.date_add("hire_date", 30).alias("plus"), F.date_sub("hire_date", 30).alias("minus")))
@@ -546,6 +554,14 @@ case("set-007", "setop", "exceptAll", lambda I: _emp_proj(I).exceptAll(_emp_proj
 case("set-008", "setop", "subtract", lambda I: _emp_proj(I).subtract(_emp_proj(I).filter(F.col("dept_id") == 10)))
 case("set-009", "setop", "union with int/double widening", lambda I: I["nums"].select(F.col("a").alias("v")).union(I["nums"].select(F.col("x").alias("v"))))
 case("set-010", "setop", "union then distinct then orderBy", lambda I: _emp_proj(I).union(I["emp2"].select("id", "name", "dept_id", "age", "salary")).distinct().orderBy("id"))
+# F3/O1 (unionByName allowMissingColumns, GRAB item 3): a pad-slot donated by a
+# non-first child (here "country", present only on aliased "b" == emp2) is
+# reachable unqualified — matching live Spark 4.1.1 (verified: the projected
+# schema resolves bare `z`/`country`) — but NOT reachable through the donor's
+# own qualifier, because the first child's null-alias contributes the slot's
+# public identity, not the donor. set-012 pins the negative half (rejected).
+case("set-011", "setop", "unionByName allowMissingColumns — pad-slot column resolves unqualified", lambda I: _emp_proj(I).unionByName(I["emp2"].alias("b"), allowMissingColumns=True).select("country"))
+case("set-012", "setop", "unionByName allowMissingColumns — pad-slot column rejects donor qualifier (Spark UNRESOLVED_COLUMN)", lambda I: _emp_proj(I).unionByName(I["emp2"].alias("b"), allowMissingColumns=True).select("b.country"), expected_error="UNRESOLVED_COLUMN.WITH_SUGGESTION")
 
 # ── 13. Ordering, limit, offset, distinct ───────────────────────────────────
 case("ord-001", "ordering", "orderBy asc", lambda I: I["emp"].orderBy("salary"))

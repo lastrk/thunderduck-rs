@@ -49,11 +49,14 @@ impl StructType {
         }
     }
 
-    /// Lookup a field by name (case-insensitive, matches Spark behaviour).
+    /// Lookup a field by name (case-insensitive, matches Spark behaviour —
+    /// folded via [`super::name_fold::eq_fold`], the same single case-folding
+    /// authority `transpiler_v2` uses for user identifiers, so this and the
+    /// outer name resolution agree on non-ASCII names too).
     pub fn field_by_name(&self, name: &str) -> Option<&StructField> {
         self.fields
             .iter()
-            .find(|f| f.name.eq_ignore_ascii_case(name))
+            .find(|f| super::name_fold::eq_fold(&f.name, name))
     }
 
     /// All field names in order.
@@ -103,6 +106,22 @@ mod tests {
         assert!(s.field_by_name("ID").is_some());
         assert!(s.field_by_name("name").is_some()); // "Name" → found
         assert!(s.field_by_name("missing").is_none());
+    }
+
+    /// Non-ASCII fold agreement (item 2 / E3): `field_by_name` now folds via
+    /// `name_fold::eq_fold` (JDK `equalsIgnoreCase`-shaped), not
+    /// `eq_ignore_ascii_case` — so accented and Kelvin-sign field names
+    /// resolve the same way the analyzer's user-identifier lookups do.
+    #[test]
+    fn field_by_name_non_ascii_fold_matches_jdk_equals_ignore_case() {
+        let s = StructType::new(vec![
+            StructField::nullable("É", DataType::String),
+            StructField::nullable("\u{212A}", DataType::String), // KELVIN SIGN
+        ]);
+        // "É"/"é" — an ASCII-only fold would miss this; JDK-shaped eq_fold matches.
+        assert!(s.field_by_name("é").is_some());
+        // KELVIN SIGN vs plain "k" — from name_fold's DIVERGENCE_TABLE.
+        assert!(s.field_by_name("k").is_some());
     }
 
     #[test]

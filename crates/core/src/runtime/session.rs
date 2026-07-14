@@ -367,7 +367,6 @@ impl DuckDbSession {
                 // Register Spark-compatible SQL macros.
                 // These bridge Spark function names that differ from DuckDB equivalents.
                 let macro_sql = "
-CREATE OR REPLACE MACRO size(x) AS len(x);
 CREATE OR REPLACE MACRO startswith(s, prefix) AS starts_with(s, prefix);
 CREATE OR REPLACE MACRO endswith(s, suffix) AS ends_with(s, suffix);
 CREATE OR REPLACE MACRO get_json_object(j, p) AS json_extract_string(j, p);
@@ -397,19 +396,6 @@ CREATE OR REPLACE MACRO encode(s, charset := 'UTF-8') AS CAST(s AS BLOB);
 -- decode(bytes, charset) → string (UTF-8 assumed)
 CREATE OR REPLACE MACRO decode(b, charset := 'UTF-8') AS CAST(b AS VARCHAR);
 -- isnull and nanvl are handled in τ's emission dispatch (isnull is a reserved word in DuckDB)
--- _spark_reverse(x): polymorphic — LIST_REVERSE for arrays, REVERSE for strings
--- Using underscore prefix to avoid shadowing DuckDB's built-in REVERSE
-CREATE OR REPLACE MACRO _spark_reverse(x) AS
-    CASE WHEN TYPEOF(x) LIKE '%]' THEN LIST_REVERSE(x) ELSE REVERSE(x) END;
--- array_except(a, b): first-occurrence elements in a not in b (order-preserving, deduplicated)
-CREATE OR REPLACE MACRO array_except(a, b) AS
-    list_filter(a, (v, i) -> list_position(a, v) = i AND NOT list_contains(b, v));
--- array_distinct(a): order-preserving deduplication
-CREATE OR REPLACE MACRO array_distinct(a) AS
-    list_filter(a, (v, i) -> list_position(a, v) = i);
--- array_union(a, b): concat then order-preserving dedup
-CREATE OR REPLACE MACRO array_union(a, b) AS
-    list_filter(list_concat(a, b), (v, i) -> list_position(list_concat(a, b), v) = i);
 -- initcap(s): capitalize first letter of each space-separated word (DuckDB 1.5 lacks built-in INITCAP)
 CREATE OR REPLACE MACRO initcap(s) AS
     array_to_string(
@@ -423,8 +409,6 @@ CREATE OR REPLACE MACRO initcap(s) AS
 CREATE OR REPLACE MACRO shiftleft(x, n) AS (x << n);
 CREATE OR REPLACE MACRO shiftright(x, n) AS (x >> n);
 CREATE OR REPLACE MACRO shiftrightunsigned(x, n) AS (x >> n);
-CREATE OR REPLACE MACRO negative(x) AS (-x);
-CREATE OR REPLACE MACRO positive(x) AS (x);
 -- bit_get(x, pos): returns bit value (0 or 1) at position pos (0=LSB)
 CREATE OR REPLACE MACRO bit_get(x, pos) AS ((x::BIGINT >> pos) & 1)::INT;
 -- dayname/monthname: Spark returns 3-letter abbreviations; DuckDB built-ins return full names
@@ -457,11 +441,6 @@ CREATE OR REPLACE MACRO to_char(x, fmt) AS
         x);
 -- next_day(d, day_name) is registered separately below (NEXT_DAY_MACRO_SQL)
 -- so unit tests can pin its DATE-return contract on a plain connection.
--- _spark_size(x): returns size for arrays (LEN) or maps (LEN(MAP_KEYS(x)))
--- Used as fallback when type is unknown at code-gen time.
--- Note: this macro cannot work for maps because DuckDB macros type-check both CASE branches.
--- In practice, τ's emission dispatches size/cardinality straight to LEN before reaching here.
-CREATE OR REPLACE MACRO _spark_size(x) AS LEN(x);
 -- map_from_arrays(keys, vals): Spark alias for DuckDB MAP(keys, vals)
 CREATE OR REPLACE MACRO map_from_arrays(k, v) AS MAP(k, v);
 -- map_from_entries(arr_of_structs): MAP from array of {key, value} structs

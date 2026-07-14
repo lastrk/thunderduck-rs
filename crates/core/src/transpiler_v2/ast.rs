@@ -736,6 +736,15 @@ pub enum GroupingKind {
 /// `analyzer::crosstab_to_aggregate`) routes through this constructor —
 /// `convert_cov`/`convert_corr`/`convert_approx_quantile`/`crosstab_to_aggregate`
 /// pass `grouping: vec![]`, an identity fold.
+///
+/// The SparkSQL front-end has a *sibling* direct `CommonOp::Aggregate`
+/// construction site — `parser_v2::v2_lowering::lower_aggregate_select` —
+/// that satisfies the SAME weak-form contract on `CommonOp::Aggregate`
+/// (`aggregates` IS the complete, authoritative output list) but via a
+/// DIFFERENT fold: SELECT-list order, not `grouping ++ agg_exprs`. The two
+/// must NOT be unified into one constructor — the folds genuinely diverge
+/// (DataFrame restates the grouping keys first; SQL preserves SELECT order
+/// and does not re-prepend grouping keys ahead of it).
 pub fn grouped_aggregate(
     input: CommonAst,
     grouping: Vec<Expression>,

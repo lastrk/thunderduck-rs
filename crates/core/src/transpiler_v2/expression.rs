@@ -1440,7 +1440,20 @@ impl Expression {
             // conversion mean even a non-nullable input can still produce
             // NULL. Verified against Apache Spark 4.1.1.
             // Differential: TestMathFunctions::test_exp, test_log.
-            | "exp" | "ln" | "log" | "log10" | "log2" => true,
+            | "exp" | "ln" | "log" | "log10" | "log2"
+            // GRAB item 5 (P5 probe, 2026-07-14): Spark's `UnaryMathExpression`
+            // family declares `nullable = true` unconditionally, same rule as
+            // `exp`/`ln`/`log`/`log10`/`log2` above (domain guards / NaN-to-NULL
+            // conversion mean even a non-nullable input can still produce
+            // NULL). Live-verified against Apache Spark 4.1.1: all 25 of these
+            // report `nullable=True` over a non-nullable `Double` input column
+            // (`sqrt cbrt sin cos tan asin acos atan sinh cosh tanh asinh
+            // acosh atanh expm1 log1p cot sec csc degrees radians rint signum
+            // sign exp` — `exp` already covered above; the remaining 24 added
+            // here). Corpus: math-018, math-019, math-020.
+            | "sqrt" | "cbrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh"
+            | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "expm1" | "log1p" | "cot"
+            | "sec" | "csc" | "degrees" | "radians" | "rint" | "signum" | "sign" => true,
             // Spark's `If.nullable = trueValue.nullable || falseValue.nullable`
             // — the predicate (args[0]) is excluded. `iif` is a Spark alias for
             // `If`, and `nvl2(cond, ifNotNull, ifNull)` shares the same

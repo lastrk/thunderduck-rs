@@ -1250,6 +1250,34 @@ fn analyze_node(
                 // entry (Spark `ResolveReferencesInSort`'s trim-`Project`
                 // pattern). LIMIT/OFFSET stay inside the Sort; only the
                 // extra, now-visible trailing columns are trimmed back off.
+                //
+                // O8 (design note, no behavior here): the Sort's ORDER BY
+                // (and LIMIT/OFFSET) is kept INSIDE this Sort node — i.e.
+                // inside the child/derived table the trim `Project` below
+                // wraps — ON PURPOSE. The hidden sort keys are addressable
+                // there unambiguously by identity (via `expr_id`); hoisting
+                // the ORDER BY onto the *outer* trim would move it into a
+                // scope where a hidden key's name can shadow a visible
+                // output alias and silently order wrong — the N10 dup-name
+                // hazard, DuckDB-verified on the ord-014 shape
+                // (`SELECT salary AS id FROM emp ORDER BY id` orders by
+                // `salary`, not the original `id`, once `id` is a bare outer
+                // reference). Emission (`build_sort` then `build_project` in
+                // `emission.rs`) renders this as
+                // `SELECT <trim> FROM (… ORDER BY … [LIMIT n]) sub` with no
+                // outer ORDER BY; output row order then relies on DuckDB
+                // preserving a derived table's ORDER BY through an
+                // order-preserving projection (confirmed via `EXPLAIN`: a
+                // `PROJECTION` parent over a pipeline-breaking `ORDER_BY`) —
+                // an execution-model property of the target engine, not a
+                // SQL-standard guarantee. The differential corpora
+                // canonicalize output rows (`sorted(rows, key=repr)`) and so
+                // CANNOT detect a row-order regression here; the guard is
+                // the emission unit tests
+                // `sort_trim_project_orders_by_key_inside_derived_table_q078_shape`
+                // and
+                // `sort_trim_project_keeps_order_by_shadow_safe_ord014_shape`
+                // in `emission.rs`.
                 let trim_projections: Vec<Expression> = original_schema
                     .fields
                     .iter()
@@ -2490,6 +2518,10 @@ fn widen_by_name(children: &[TypedAst]) -> Result<ResolvedSchema, AnalyzerError>
         // this is the "same logical column" the widened schema is
         // standing in for at this name.
         let mut base_attr: Option<Attribute> = None;
+        // Item 3 (F3/O1 NIT): whether the FIRST child (not just the
+        // donating one) carries this name — see the qualifier-clearing
+        // note below.
+        let first_child_has_name = children[0].resolved_schema.field_by_name(name).is_some();
         for child in children {
             if let Some(fk) = child.resolved_schema.field_by_name(name) {
                 widened_type = Some(match widened_type {
@@ -2517,6 +2549,28 @@ fn widen_by_name(children: &[TypedAst]) -> Result<ResolvedSchema, AnalyzerError>
         attr.name = name.clone();
         attr.data_type = ty;
         attr.nullable = nullable;
+        if !first_child_has_name {
+            // `allowMissingColumns` unionByName (Spark's `ResolveUnion`):
+            // when a name is missing from the FIRST child, Spark pads the
+            // FIRST child with a null-literal-aliased column for it — the
+            // union output column has no donor-qualifier addressability,
+            // so e.g. `a.unionByName(b.alias("b"), allowMissingColumns=True)`
+            // REJECTS `b.z` even though bare `z` resolves (live-Spark-
+            // probed, 4.1.1, 2026-07-14). Without this, `base_attr` above
+            // is a `.clone()` of the donating (non-first) child's
+            // `Attribute`, inheriting ITS qualifiers — making `b.z`
+            // resolvable in τ, strictly more permissive than Spark. Clear
+            // the qualifiers so this widened attribute is addressable only
+            // by its bare name, matching Spark's first-child-null-alias
+            // pad slot. The retained expr_id is the DONOR (non-first)
+            // child's — not the first child's, and not a fresh mint;
+            // Spark's pad path mints a fresh null-alias exprId, so the
+            // donor-id retention is a recorded benign divergence (ADR-024
+            // tier-3e amendment). Only qualifier addressability is
+            // dropped. Names present in the first child are untouched
+            // (F3 pinned first-child qualifiers over unions as faithful).
+            attr = attr.with_quals(BTreeSet::new());
+        }
         widened_fields.push(attr);
     }
     Ok(ResolvedSchema::new(widened_fields))
@@ -9647,6 +9701,102 @@ mod tests {
             other => panic!("expected AnalyzerError::Other, got {other:?}"),
         }
         assert!(err.to_string().starts_with("[SPARK-EMULATED]"));
+    }
+
+    /// Item 3 (grab-bag / F3-O1 NIT): `a.unionByName(b.alias("b"),
+    /// allowMissingColumns=True)` where `z` exists ONLY in the aliased
+    /// RIGHT child `b` — Spark pads the FIRST child (`a`) with a null-alias
+    /// column for `z`, so the union output's `z` has no donor-qualifier
+    /// addressability: `b.z` is REJECTED (live-Spark-probed, 4.1.1). Before
+    /// this fix, `widen_by_name` cloned the donating (non-first) child's
+    /// `Attribute` wholesale, inheriting its qualifiers, making `b.z`
+    /// resolvable in τ — strictly more permissive than Spark. Names present
+    /// in the FIRST child (`x`) keep their donor qualifiers untouched (F3).
+    #[test]
+    fn union_by_name_allow_missing_clears_quals_for_name_missing_from_first_child() {
+        let bt = BaseTypes::empty();
+        let left = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(values_row(&[
+                ("x", DataType::Long, LiteralValue::Long(1)),
+                ("y", DataType::Long, LiteralValue::Long(2)),
+            ])),
+            alias: "a".to_owned(),
+        });
+        let right = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(values_row(&[
+                ("x", DataType::Long, LiteralValue::Long(10)),
+                ("y", DataType::Long, LiteralValue::Long(20)),
+                ("z", DataType::Long, LiteralValue::Long(30)),
+            ])),
+            alias: "b".to_owned(),
+        });
+        let ast = union_by_name_allow_missing(vec![left, right]);
+        let typed = analyze(ast, &bt).unwrap();
+        let widened = widened_of(&typed);
+        assert_eq!(widened.field_names(), vec!["x", "y", "z"]);
+        let quals = quals_of(widened);
+        let a: BTreeSet<String> = ["a".to_owned()].into_iter().collect();
+        assert_eq!(
+            quals[0], a,
+            "x is present in the FIRST child; its donor qualifier (`a`) stays addressable"
+        );
+        assert_eq!(
+            quals[1], a,
+            "y is present in the FIRST child; its donor qualifier (`a`) stays addressable"
+        );
+        assert!(
+            quals[2].is_empty(),
+            "z is missing from the FIRST child (padded by Spark's null-alias \
+             rule) — its donor's (`b`'s) qualifier must NOT survive onto the \
+             widened attribute, matching Spark's `b.z` rejection; got: {:?}",
+            quals[2]
+        );
+    }
+
+    /// End-to-end companion to the schema/quals test above: a downstream
+    /// `Project` selecting the padded column bare (`z`) resolves (matches
+    /// Spark), but qualified by the donor's alias (`b.z`) is REJECTED with
+    /// `UnknownColumn` (`UNRESOLVED_COLUMN.WITH_SUGGESTION`, matching Spark
+    /// 4.1.1 live-probed behavior) — never silently resolvable in τ.
+    #[test]
+    fn union_by_name_allow_missing_bare_padded_col_resolves_qualified_rejected() {
+        let bt = BaseTypes::empty();
+        let left = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(values_row(&[
+                ("x", DataType::Long, LiteralValue::Long(1)),
+                ("y", DataType::Long, LiteralValue::Long(2)),
+            ])),
+            alias: "a".to_owned(),
+        });
+        let right = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(values_row(&[
+                ("x", DataType::Long, LiteralValue::Long(10)),
+                ("y", DataType::Long, LiteralValue::Long(20)),
+                ("z", DataType::Long, LiteralValue::Long(30)),
+            ])),
+            alias: "b".to_owned(),
+        });
+        let union = union_by_name_allow_missing(vec![left, right]);
+
+        // Bare `z` resolves.
+        let bare_project = CommonAst::new(CommonOp::Project {
+            input: Box::new(union.clone()),
+            projections: vec![unresolved_col("z")],
+        });
+        analyze(bare_project, &bt).expect("bare padded column `z` must resolve");
+
+        // Qualified `b.z` is REJECTED — `b`'s donor qualifier does not
+        // survive onto the padded slot.
+        let qualified_project = CommonAst::new(CommonOp::Project {
+            input: Box::new(union),
+            projections: vec![qcol("b", "z")],
+        });
+        let err = analyze(qualified_project, &bt).unwrap_err();
+        assert!(
+            matches!(err, AnalyzerError::UnknownColumn { .. }),
+            "expected UnknownColumn, got {err:?}"
+        );
+        assert_eq!(err.spark_class(), Some("UNRESOLVED_COLUMN.WITH_SUGGESTION"));
     }
 
     #[test]

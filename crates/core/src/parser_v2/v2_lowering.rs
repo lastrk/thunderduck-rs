@@ -1650,10 +1650,12 @@ fn lower_aggregate_select(
         .map(|item| lower_select_item(item, cte_scope))
         .collect();
     let projections = projections?;
-    // τ treats the aggregate projection list as the aggregate output list.
-    // This is refined into the {grouping, aggregates} split when the
-    // canonical emission table lands; for now we push everything into
-    // `aggregates` so the round-trip test can inspect the projection list.
+    // This is the legitimate second `CommonOp::Aggregate` construction site
+    // outside `ast::grouped_aggregate`: `aggregates` (below) is the
+    // complete, authoritative output list per the weak-form contract on
+    // `CommonOp::Aggregate` (see `ast::grouped_aggregate`'s doc), but via a
+    // fold that intentionally diverges from the DataFrame fold — SELECT-list
+    // order, not `grouping ++ agg_exprs` — hence no shared constructor.
     // SparkSQL HAVING lowers into the Aggregate's dedicated `having` field —
     // NOT a Filter over the Aggregate. HAVING is post-aggregation group
     // filtering that binds to the aggregate INPUT scope (aggregate exprs +

@@ -1491,6 +1491,10 @@ fn build_sort(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<SqlUnit, EmissionError> {
+    // O8: LIMIT/OFFSET (and, when the analyzer's Sort trim `else` branch
+    // wraps this node, the ORDER BY too) are deliberately set on THIS block,
+    // never hoisted onto the caller's outer trim — see the design note at
+    // `analyzer.rs`'s `CommonOp::Sort` trim `else` branch.
     let mut block = open_block(input)?;
     // Over an occupied SELECT list, only bare output-name references merge:
     // ORDER BY resolves them against the select list's aliases; expression
@@ -4308,6 +4312,18 @@ fn render_function_call_dispatch(
         "positive" => {
             let [a] = exact_args(f, schema, "`positive` requires exactly 1 argument")?;
             return Ok(format!("({a})"));
+        }
+        // Spark's `negative(x)` (`UnaryMinus`) maps to unary minus — DuckDB
+        // has no native `negative` scalar (verified: Catalog Error), so emit
+        // `-(x)` directly rather than relying on the runtime session macro.
+        // `negate` is not a real Spark SQL function (verified: no such
+        // routine in Spark 4.1.1 — `UNRESOLVED_ROUTINE`) but shares the same
+        // arm since `type_inference.rs` already treats it identically and
+        // the emission is harmless either way; no corpus witness for
+        // `negate`, unit test only. Corpus: `num-008`.
+        "negative" | "negate" => {
+            let [a] = exact_args(f, schema, "`negative` requires exactly 1 argument")?;
+            return Ok(format!("(-({a}))"));
         }
         // Spark's `bit_get`/`getbit(x, pos)` return the bit at 0-indexed
         // `pos` (from the LSB) of integral `x`, as a Byte (TINYINT). DuckDB
@@ -10627,6 +10643,133 @@ mod tests {
         );
     }
 
+    // ── O8: Sort-trim ORDER BY placement (design note pinning) ─────────────
+    // See the design comment at `analyzer.rs`'s `CommonOp::Sort` trim `else`
+    // branch: the ORDER BY (and LIMIT/OFFSET) of a hidden-column-promoting
+    // Sort stay INSIDE the derived table the trim `Project` wraps — never
+    // hoisted onto the outer trim — because a hoisted key can shadow a
+    // visible output alias (the N10 dup-name hazard). The differential
+    // corpora canonicalize row order and structurally cannot pin this shape;
+    // these two tests are the guard.
+
+    #[test]
+    fn sort_trim_project_orders_by_key_inside_derived_table_q078_shape() {
+        let _g = tap_guard();
+        // `SELECT id, name FROM emp ORDER BY salary` (tpcds-q078 shape) —
+        // `salary` is promoted into the Sort's child, and the ORDER BY must
+        // stay on the inner derived table; the outer trim renders only the
+        // 2-column `SELECT id, name FROM (...)`, with no outer ORDER BY.
+        let bt = base_types_with_emp();
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "id".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+                Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "name".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                }),
+            ],
+        });
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(project),
+            order: vec![asc_key(Expression::UnresolvedColumn(UnresolvedColumn {
+                name: "salary".to_owned(),
+                qualifier: None,
+                plan_id: None,
+            }))],
+            limit: Some(5),
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("analyze q078 trim shape");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT id, name FROM (SELECT id, name, salary FROM emp ORDER BY \
+             salary ASC NULLS FIRST LIMIT 5) AS __td_sub"
+        );
+        assert_eq!(
+            sql.matches("ORDER BY").count(),
+            1,
+            "exactly one ORDER BY, inside the derived table; got: {sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY salary"),
+            "the ORDER BY must reference the hidden key `salary`; got: {sql}"
+        );
+        assert!(
+            sql.starts_with("SELECT id, name FROM ("),
+            "the top-level output must be the 2-column trim over a derived \
+             table; got: {sql}"
+        );
+        assert!(
+            sql.contains("LIMIT 5) AS"),
+            "LIMIT must stay inside the derived table, before its close; got: {sql}"
+        );
+        assert!(
+            !sql[sql.rfind(')').unwrap_or(0)..].contains("ORDER BY"),
+            "no trailing outer ORDER BY after the derived table closes; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn sort_trim_project_keeps_order_by_shadow_safe_ord014_shape() {
+        let _g = tap_guard();
+        // `SELECT salary AS id FROM emp ORDER BY emp.id` (ord-014 shape) —
+        // the visible output alias `id` collides with the hidden sort key's
+        // ORIGINAL name (`emp.id`). Hoisting the ORDER BY onto the outer
+        // trim (`SELECT salary AS id FROM emp ORDER BY id`) would silently
+        // shadow to the `salary`-valued output alias and order WRONG
+        // (DuckDB-verified). The current shape avoids this entirely by
+        // keeping the ORDER BY inside the derived table, addressing the
+        // hidden key unambiguously — never as a bare outer `id`.
+        let bt = base_types_with_emp();
+        let project = CommonAst::new(CommonOp::Project {
+            input: Box::new(scan("emp")),
+            projections: vec![Expression::Alias(AliasExpression {
+                expr: Box::new(Expression::UnresolvedColumn(UnresolvedColumn {
+                    name: "salary".to_owned(),
+                    qualifier: None,
+                    plan_id: None,
+                })),
+                alias: "id".to_owned(),
+            })],
+        });
+        let ast = CommonAst::new(CommonOp::Sort {
+            input: Box::new(project),
+            order: vec![asc_key(qcol("emp", "id"))],
+            limit: None,
+            offset: None,
+        });
+        let typed = analyze(ast, &bt).expect("analyze ord-014 trim shape");
+        let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
+        assert_eq!(
+            sql,
+            "SELECT id FROM (SELECT * FROM (SELECT salary AS id, id FROM emp) \
+             AS __td_sub(id, id_1) ORDER BY id_1 ASC NULLS FIRST) AS __td_sub(id, id_1)"
+        );
+        assert_eq!(
+            sql.matches("ORDER BY").count(),
+            1,
+            "exactly one ORDER BY, inside the derived table; got: {sql}"
+        );
+        assert!(
+            sql.starts_with("SELECT id FROM ("),
+            "the top-level output must be the 1-column trim over a derived \
+             table; got: {sql}"
+        );
+        assert!(
+            !sql[sql.rfind(')').unwrap_or(0)..].contains("ORDER BY"),
+            "no trailing outer ORDER BY after the derived table closes \
+             (which would shadow to the `salary`-valued `id` output alias); \
+             got: {sql}"
+        );
+    }
+
     #[test]
     fn d7_homonym_alias_rejects_merge_and_wrap_binds_uniquified_name() {
         let _g = tap_guard();
@@ -14635,6 +14778,18 @@ mod tests {
     fn render_positive_is_identity() {
         let sql = render_fn("positive", vec![double_lit(10.5)]);
         assert_eq!(sql, "(CAST(10.5 AS DOUBLE))");
+    }
+
+    /// Item 4 (grab-bag): Spark's `negative(x)`/`negate(x)` (`UnaryMinus`)
+    /// render as unary minus, self-contained in emission (no reliance on
+    /// the runtime session macro). `num-008` covers `negative`'s schema;
+    /// `negate` is not a real Spark SQL function — unit test only.
+    #[test]
+    fn render_negative_and_negate_are_unary_minus() {
+        let sql = render_fn("negative", vec![double_lit(10.5)]);
+        assert_eq!(sql, "(-(CAST(10.5 AS DOUBLE)))");
+        let sql = render_fn("negate", vec![double_lit(10.5)]);
+        assert_eq!(sql, "(-(CAST(10.5 AS DOUBLE)))");
     }
 
     /// `test_bit_get` (test_math_bitwise_date_differential): Spark's

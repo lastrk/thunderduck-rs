@@ -1,0 +1,90 @@
+# τ SQL front-end progress
+
+> **FROZEN 2026-07-09.** The per-corpus recorder `v2-sql-progress.sh` was
+> retired; `tests/scripts/differential-progress.sh` now records the full suite
+> into `differential_progress.md`. Rows below are history.
+
+One row per `tests/scripts/v2-sql-progress.sh` invocation. Each row records the
+`sql_v2` suite (Spark SQL conformance corpus `differential/sql_corpus.py`,
+run through τ) PASSED count at the given commit. The goal is for PASSED to climb
+monotonically toward 262 (the corpus total) as τ grows temp-view
+registration, the catalog bridge, and SQL grammar coverage.
+
+| Timestamp UTC        | Commit  | Passed | Failed | Total | Δ vs prev |
+| -------------------- | ------- | -----: | -----: | ----: | --------: |
+| 2026-07-05T00:25:39Z | 096c55d |      2 |    260 |   262 |       n/a |
+| 2026-07-05T00:51:52Z | c627912 |    108 |    154 |   262 |      +106 |
+| 2026-07-05T01:05:35Z | 0ada44b |    114 |    148 |   262 |        +6 |
+| 2026-07-05T06:09:38Z | c2e2d62 |    132 |    130 |   262 |       +18 |
+| 2026-07-05T06:32:56Z | f85cb0d |    137 |    125 |   262 |        +5 |
+| 2026-07-05T06:55:27Z | 45db517 |    142 |    120 |   262 |        +5 |
+| 2026-07-05T07:12:10Z | 9d0bbfe |    147 |    115 |   262 |        +5 |
+| 2026-07-05T07:23:08Z | 2d3520c |    150 |    112 |   262 |        +3 |
+| 2026-07-05T07:35:18Z | d2b5ec4 |    153 |    109 |   262 |        +3 |
+| 2026-07-05T08:38:54Z | 71e519a |    160 |    102 |   262 |        +7 |
+| 2026-07-05T09:26:16Z | 1e51ece |    164 |     98 |   262 |        +4 |
+| 2026-07-05T09:52:11Z | 598a8cc |    168 |     94 |   262 |        +4 |
+| 2026-07-05T11:07:30Z | bb811d9 |    171 |     91 |   262 |        +2 |
+| 2026-07-05T11:15:21Z | 9b3295a |    172 |     90 |   262 |        +1 |
+| 2026-07-05T11:33:33Z | 80e166e |    173 |     89 |   262 |        +1 |
+| 2026-07-05T23:37:30Z | eacedc5 |    184 |     78 |   262 |       n/a |
+| 2026-07-06T05:16:29Z | a7d01b1 |    188 |     74 |   262 |       n/a |
+| 2026-07-06T05:41:00Z | c8b74ef |    191 |     71 |   262 |       n/a |
+| 2026-07-06T06:01:08Z | 36c69af |    192 |     70 |   262 |       n/a |
+| 2026-07-06T06:25:42Z | 1a993fd |    201 |     61 |   262 |       n/a |
+| 2026-07-06T07:00:12Z | 078a3d1 |    205 |     57 |   262 |       n/a |
+| 2026-07-06T07:41:06Z | c0b7f6a |    210 |     52 |   262 |       n/a |
+| 2026-07-06T08:37:27Z | 446e137 |    213 |     49 |   262 |       n/a |
+| 2026-07-06T09:38:34Z | ab2495c |    215 |     47 |   262 |        +2 |
+| 2026-07-06T10:39:42Z | 1ed05f5 |    219 |     43 |   262 |       n/a |
+| 2026-07-06T11:22:21Z | 06d021a |    220 |     42 |   262 |       n/a |
+| 2026-07-06T11:42:54Z | f0a10a1 |    222 |     40 |   262 |       n/a |
+| 2026-07-06T12:12:13Z | 72f8e71 |    224 |     38 |   262 |       n/a |
+| 2026-07-06T13:10:25Z | eb67131 |    227 |     35 |   262 |       n/a |
+| 2026-07-06T13:32:05Z | 2640667 |    228 |     34 |   262 |       n/a |
+| 2026-07-06T13:54:51Z | 422288a |    229 |     33 |   262 |       n/a |
+| 2026-07-06T14:22:57Z | a433f90 |    230 |     32 |   262 |       n/a |
+| 2026-07-06T15:25:26Z | e920836 |    230 |     32 |   262 |       n/a |
+| 2026-07-06T15:30:58Z | e920836 |    231 |     31 |   262 |       n/a |
+| 2026-07-06T15:59:37Z | 8f3f20b |    232 |     30 |   262 |       n/a |
+| 2026-07-07T10:43:52Z | dfea093 |    234 |     28 |   262 |       n/a |
+| 2026-07-07T11:21:40Z | 4554f66 |    235 |     27 |   262 |       n/a |
+| 2026-07-07T11:31:55Z | e866e2b |    235 |     27 |   262 |       n/a |
+| 2026-07-07T12:14:15Z | a774b7b |    236 |     26 |   262 |       n/a |
+| 2026-07-07T12:47:52Z | 3866767 |    237 |     25 |   262 |       n/a |
+| 2026-07-07T20:31:07Z | fb274d1 |    237 |     25 |   262 |       n/a |
+| 2026-07-07T21:35:22Z | fb274d1 |    237 |     25 |   262 |       n/a |
+| 2026-07-07T22:19:48Z | fb274d1 |    237 |     25 |   262 |       n/a |
+| 2026-07-08T06:26:23Z | fb274d1 |    237 |     25 |   262 |       n/a |
+| 2026-07-08T06:42:02Z | fb274d1 |    237 |     25 |   262 |       n/a |
+| 2026-07-08T11:52:19Z | 1aec6e9 |    240 |     26 |   266 |       n/a |
+| 2026-07-08T11:54:59Z | 1aec6e9 |    241 |     25 |   266 |       n/a |
+| 2026-07-08T12:36:41Z | f4f6ee9 |    241 |     29 |   270 |       n/a |
+| 2026-07-08T13:08:00Z | pass-1   |    242 |     28 |   270 |        +1 |
+| 2026-07-08T13:20:00Z | pass-2   |    244 |     26 |   270 |        +2 |
+| 2026-07-08T13:45:00Z | pass-3   |    246 |     24 |   270 |        +2 |
+| 2026-07-08T15:30:00Z | pass-4   |    247 |     23 |   270 |        +1 |
+| 2026-07-08T16:30:00Z | pass-6   |    250 |     20 |   270 |        +3 |
+| 2026-07-08T17:30:00Z | pass-7   |    251 |     19 |   270 |        +1 |
+| 2026-07-08T18:15:00Z | pass-8   |    253 |     17 |   270 |        +2 |
+| 2026-07-08T19:15:00Z | pass-9   |    254 |     16 |   270 |        +1 |
+| 2026-07-08T21:00:00Z | pass-11  |    257 |     13 |   270 |        +3 |
+| 2026-07-08T22:15:00Z | pass-12  |    258 |     12 |   270 |        +1 |
+| 2026-07-08T23:30:00Z | pass-13  |    260 |     10 |   270 |        +2 |
+| 2026-07-09T00:15:00Z | pass-14  |    261 |      9 |   270 |        +1 |
+| 2026-07-09T01:30:00Z | pass-16  |    262 |      8 |   270 |        +1 |
+| 2026-07-09T03:00:00Z | pass-17  |    263 |      7 |   270 |        +1 |
+| 2026-07-09T02:33:07Z | pass-18  |    265 |      5 |   270 |        +2 |
+| 2026-07-09T06:55:52Z | pass-19  |    269 |      0 |   269 |        +4 |
+| 2026-07-09T07:26:03Z | pass-20  |    269 |      4 |   273 |   +4 red* |
+
+*pass-20: the 4 failures are DELIBERATE red witness cases (agg-024, jn-017,
+tbl-013, sq-023) demonstrating latent τ bugs uncovered when the FileScan fix
+made TPC-H runnable — each passes on the Spark reference and fails on τ. They
+are the fitness signal for the next implementation passes; see
+`.agent-output/unsolvable.md` §"Latent bugs" for minimized root causes.
+
+Note (2026-07-09): totals jump from 273 to 396 — the corpus absorbed the
+TPC-H (22) and TPC-DS (100) SQL clusters from the retired standalone TPC
+test files, plus jn-018 (the migrated q90 at-alias check). Red TPC cases
+are expected fitness signal (ADR-022).

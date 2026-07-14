@@ -1,0 +1,35 @@
+{
+ "id": "tpcds-q095",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "order count",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "total shipping cost",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "total net profit",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   0,
+   null,
+   null
+  ]
+ ]
+}

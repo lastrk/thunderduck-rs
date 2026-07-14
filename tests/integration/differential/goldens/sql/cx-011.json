@@ -1,0 +1,75 @@
+{
+ "id": "cx-011",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "k",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "v",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "team",
+   "infra"
+  ],
+  [
+   1,
+   "tz",
+   "UTC"
+  ],
+  [
+   2,
+   "team",
+   "infra"
+  ],
+  [
+   5,
+   "team",
+   "data"
+  ],
+  [
+   5,
+   "tz",
+   "CET"
+  ],
+  [
+   6,
+   "team",
+   "ml"
+  ],
+  [
+   7,
+   "team",
+   "ml"
+  ],
+  [
+   7,
+   "tz",
+   "UTC"
+  ],
+  [
+   8,
+   "team",
+   null
+  ]
+ ]
+}

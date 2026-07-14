@@ -195,20 +195,20 @@ from dual_server_manager import DualServerManager
 from port_utils import is_port_listening as _is_port_listening
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def spark_session(spark_thunderduck):
     """
-    Module-scoped alias for spark_thunderduck.
+    Session-scoped alias for spark_thunderduck.
 
     For backward compatibility with tests expecting spark_session.
     """
     return spark_thunderduck
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def spark(spark_thunderduck):
     """
-    Module-scoped alias for spark_thunderduck.
+    Session-scoped alias for spark_thunderduck.
 
     This allows tests written for single-server mode to work
     in the dual-server testing environment.
@@ -233,44 +233,9 @@ def tpch_data_dir():
     return data_dir
 
 
-@pytest.fixture(scope="session")
-def tpch_queries_dir():
-    """Path to TPC-H queries directory"""
-    queries_dir = Path(__file__).parent / "sql" / "tpch_queries"
-    if not queries_dir.exists():
-        pytest.skip(f"TPC-H queries not found at {queries_dir}")
-    return queries_dir
-
-
-# Utility functions
-
-def load_query(query_num: int, queries_dir: Path) -> str:
-    """
-    Load a TPC-H query from file
-
-    Args:
-        query_num: Query number (1-22)
-        queries_dir: Path to queries directory
-
-    Returns:
-        Query SQL string
-    """
-    query_file = queries_dir / f"q{query_num}.sql"
-    if not query_file.exists():
-        pytest.skip(f"Query file not found: {query_file}")
-
-    with open(query_file) as f:
-        return f.read()
-
-
-@pytest.fixture
-def load_tpch_query(tpch_queries_dir):
-    """
-    Fixture that returns a function to load TPC-H queries
-    """
-    def _load(query_num: int) -> str:
-        return load_query(query_num, tpch_queries_dir)
-    return _load
+# TPC query loading now happens at corpus import time (sql_corpus.py reads
+# the canonical .sql files directly); the tpch_queries_dir / load_tpch_query
+# fixtures were retired with the legacy TPC test files they served.
 
 
 # Pytest configuration
@@ -308,12 +273,6 @@ def pytest_configure(config):
         "markers", "window: mark test as window function test"
     )
     config.addinivalue_line(
-        "markers", "skip_relaxed: skip test in relaxed compatibility mode"
-    )
-    config.addinivalue_line(
-        "markers", "skip_strict: skip test in strict compatibility mode"
-    )
-    config.addinivalue_line(
         "markers", "conditional: mark test as conditional expression test"
     )
     config.addinivalue_line(
@@ -322,12 +281,14 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "joins: mark test as join test"
     )
+    config.addinivalue_line(
+        "markers",
+        "error_parity: ADR-006 tri-state error-class parity case (declares expected_error)",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
-    """Add markers automatically based on test names and handle mode-specific skipping"""
-    compat_mode = os.environ.get('THUNDERDUCK_COMPAT_MODE', 'auto').lower()
-
+    """Add markers automatically based on test names."""
     for item in items:
         # Add tpch marker to tests with 'tpch' in name
         if 'tpch' in item.nodeid.lower():
@@ -341,18 +302,13 @@ def pytest_collection_modifyitems(config, items):
         if '_sql' in item.nodeid.lower():
             item.add_marker(pytest.mark.sql)
 
-        # Mode-specific skipping
-        if compat_mode in ('relaxed', 'auto'):
-            marker = item.get_closest_marker('skip_relaxed')
-            if marker:
-                reason = marker.kwargs.get('reason', 'Skipped in relaxed mode')
-                item.add_marker(pytest.mark.skip(reason=reason))
-
-        if compat_mode == 'strict':
-            marker = item.get_closest_marker('skip_strict')
-            if marker:
-                reason = marker.kwargs.get('reason', 'Skipped in strict mode')
-                item.add_marker(pytest.mark.skip(reason=reason))
+        # Add error_parity marker to corpus cases that declare an expected
+        # Spark error class, so the tri-state subset is selectable via -m.
+        callspec = getattr(item, "callspec", None)
+        if callspec is not None:
+            case_obj = callspec.params.get("case")
+            if getattr(case_obj, "expected_error", None) is not None:
+                item.add_marker(pytest.mark.error_parity)
 
 
 # TPC-DS Fixtures
@@ -396,30 +352,8 @@ def tpcds_data_dir():
     return data_dir
 
 
-@pytest.fixture(scope="session")
-def tpcds_queries_dir():
-    """Path to TPC-DS queries directory"""
-    queries_dir = Path(__file__).parent / "sql" / "tpcds_queries"
-    if not queries_dir.exists():
-        pytest.skip(f"TPC-DS queries not found at {queries_dir}")
-    return queries_dir
-
-
-@pytest.fixture
-def load_tpcds_query(tpcds_queries_dir):
-    """Load TPC-DS query by number or variant name"""
-    def _load_query(qnum):
-        """
-        Load a TPC-DS query.
-
-        Args:
-            qnum: Query number (1-99) or variant string ('14a', '14b', '23a', etc.)
-        """
-        query_file = tpcds_queries_dir / f"q{qnum}.sql"
-        if not query_file.exists():
-            pytest.skip(f"Query file not found: {query_file}")
-        return query_file.read_text()
-    return _load_query
+# (tpcds_queries_dir / load_tpcds_query retired — see the note at the former
+# tpch_queries_dir site above.)
 
 
 # ============================================================================
@@ -488,9 +422,21 @@ def dual_server_manager():
     # Kill orphan servers from crashed previous runs (reads stale PID file)
     _cleanup_pid_file()
 
-    compat_mode = os.environ.get('THUNDERDUCK_COMPAT_MODE', None)
-    td_port = int(os.environ.get('THUNDERDUCK_PORT', 0)) or _allocate_free_port()
-    spark_port = int(os.environ.get('SPARK_PORT', 0)) or _allocate_free_port()
+    # Resolve deterministic, remembered ports for this worktree. test_env picks
+    # random free ports on first use and persists them to
+    # <worktree_root>/.thunderduck-test-env.json, so runs are repeatable, a
+    # manual PySpark client can reconnect, and cleanup can locate dangling
+    # servers. Explicit THUNDERDUCK_PORT/SPARK_PORT env vars still win.
+    import test_env
+    td_port, spark_port = test_env.resolve_ports()
+
+    # Per-worktree DuckDB extension cache, so concurrent test runs in different
+    # worktrees never race on the shared ~/.duckdb (only matters if an INSTALL
+    # runs, e.g. opt-in S3). Propagates to the server via os.environ.copy().
+    os.environ.setdefault(
+        "THUNDERDUCK_DUCKDB_EXTENSION_DIR",
+        str(test_env.worktree_root() / ".duckdb-ext"),
+    )
 
     # Register ports for signal/atexit cleanup
     _allocated_ports.add(td_port)
@@ -503,16 +449,31 @@ def dual_server_manager():
     manager = DualServerManager(
         thunderduck_port=td_port,
         spark_reference_port=spark_port,
-        compat_mode=compat_mode
     )
 
+    # Golden-oracle mode runs τ only (the reference comes from recorded golden
+    # files), so there is no reason to pay Spark JVM startup — and it keeps the
+    # Spark reference server, whose long-run degradation motivated the golden
+    # oracle, entirely out of the normal loop. live/record modes need both.
+    import golden as _golden
+    mode = _golden.oracle_mode()
+    spark_needed = mode in ("live", "record")
+
     print("\n" + "="*80)
-    print("Starting DUAL servers for differential testing...")
+    print(f"Starting servers for differential testing (oracle={mode})...")
     print(f"  Thunderduck port: {td_port}")
-    print(f"  Spark Reference port: {spark_port}")
+    if spark_needed:
+        print(f"  Spark Reference port: {spark_port}")
+    else:
+        print("  Spark Reference: SKIPPED (golden oracle — no live Spark)")
     print("="*80)
 
-    spark_ok, thunderduck_ok = manager.start_both(timeout=120)
+    if spark_needed:
+        spark_ok, thunderduck_ok = manager.start_both(timeout=120)
+    else:
+        # τ only; Spark not started (spark_ok=True so the guard below passes).
+        thunderduck_ok = manager.start_thunderduck(timeout=120)
+        spark_ok = True
 
     if not (spark_ok and thunderduck_ok):
         manager.stop_both()
@@ -544,16 +505,6 @@ def dual_server_manager():
         pid_entries.append(("spark", spark_port, spark_pid))
     if pid_entries:
         _write_pid_file(pid_entries)
-
-    # Report compatibility mode
-    requested_mode = compat_mode or 'auto'
-    log_file = Path(__file__).parent / "logs" / "server_stderr.log"
-    extension_loaded = False
-    if log_file.exists():
-        log_content = log_file.read_text()
-        extension_loaded = "extension loaded" in log_content.lower()
-    actual_mode = "strict (extension loaded)" if extension_loaded else "relaxed (no extension)"
-    print(f"  Compat mode: requested={requested_mode}, actual={actual_mode}")
 
     yield manager
 
@@ -590,14 +541,21 @@ def orchestrator(dual_server_manager):
     print(orch.timings.get_summary())
 
 
-# Primary session fixtures (module-scoped to reduce session churn)
-@pytest.fixture(scope="module")
+# Primary session fixtures (session-scoped: one pair shared across ALL modules).
+# Safe because no test mutates shared session config (no conf.set / SET), calls
+# .stop(), or switches database; all temp views use createOrReplaceTempView
+# (overwrite). The view-registering fixtures below (corpus_inputs_* /
+# sql_corpus_* / tpc_view_switcher) stay MODULE-scoped so each corpus module
+# re-establishes its own emp/dept/emp2/nums/raw (+ customer) on the shared
+# session at module entry.
+@pytest.fixture(scope="session")
 def spark_reference(orchestrator, dual_server_manager):
     """
-    Module-scoped Spark session connected to Apache Spark Connect (reference).
+    Session-scoped Spark session connected to Apache Spark Connect (reference).
 
     This is the reference implementation (official Apache Spark 4.1.1).
-    One session per test module reduces session creation overhead (143 -> ~36 pairs).
+    One session for the whole run (not per module) eliminates ~38x repeated
+    session creation across the 40-module suite.
     Includes health check with auto-restart before session creation.
     """
     # Health check: verify Spark Reference server is responsive
@@ -615,13 +573,14 @@ def spark_reference(orchestrator, dual_server_manager):
     orchestrator._active_sessions.discard(session)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def spark_thunderduck(orchestrator, dual_server_manager):
     """
-    Module-scoped Spark session connected to Thunderduck Connect (test).
+    Session-scoped Spark session connected to Thunderduck Connect (test).
 
     This is the system under test (Thunderduck implementation).
-    One session per test module reduces session creation overhead.
+    One session for the whole run (not per module) eliminates ~38x repeated
+    session creation across the 40-module suite.
     Includes health check with auto-restart before session creation.
     """
     # Health check: verify Thunderduck server is responsive
@@ -637,6 +596,154 @@ def spark_thunderduck(orchestrator, dual_server_manager):
     yield session
     _release_session_without_shutdown(session)
     orchestrator._active_sessions.discard(session)
+
+
+# Corpus-input fixtures: build the 5 corpus DataFrames once per test module so the
+# 324-case parametrized sweep doesn't `createDataFrame` from scratch on every case.
+# Module-scoped matches `spark_reference` / `spark_thunderduck` and shares one build
+# across the whole corpus test file.
+@pytest.fixture(scope="module")
+def corpus_inputs_reference(spark_reference, tpch_data_dir, tpcds_data_dir):
+    """Build the corpus's 5 input DataFrames once against the Spark reference session.
+
+    Also registers the parquet-backed TPC temp views the corpus's tpch/tpcds
+    clusters resolve via `session.table(...)`.
+    """
+    from differential.dataframe_corpus import build_inputs
+    inputs = build_inputs(spark_reference)
+    _register_tpc_views(spark_reference, tpch_data_dir, tpcds_data_dir)
+    return inputs
+
+
+@pytest.fixture(scope="module")
+def corpus_inputs_thunderduck(spark_thunderduck, tpch_data_dir, tpcds_data_dir):
+    """Build the corpus's 5 input DataFrames once against the Thunderduck session.
+
+    TPC view registration is tolerant on the τ side — a failure surfaces as
+    the affected cases' own failures, not an aborting fixture ERROR.
+    """
+    from differential.dataframe_corpus import build_inputs
+    inputs = build_inputs(spark_thunderduck)
+    try:
+        _register_tpc_views(spark_thunderduck, tpch_data_dir, tpcds_data_dir)
+    except Exception:
+        pass
+    return inputs
+
+
+# SQL-corpus input fixtures: register the SQL corpus's temp views (emp, dept,
+# emp2, nums, raw) once per module so `spark.sql("... FROM emp ...")` resolves
+# them. Mirrors the DataFrame corpus_inputs_* fixtures but for the SQL front-end
+# gate (test_sql_corpus_differential.py). The corpus's tpch/tpcds clusters
+# additionally reference the parquet-backed TPC tables, registered here from
+# the same data dirs the legacy TPC suites used.
+TPCH_TABLES = [
+    'lineitem', 'orders', 'customer', 'part',
+    'supplier', 'partsupp', 'nation', 'region'
+]
+
+TPCDS_TABLES = [
+    'call_center', 'catalog_page', 'catalog_returns', 'catalog_sales',
+    'customer', 'customer_address', 'customer_demographics', 'date_dim',
+    'household_demographics', 'income_band', 'inventory', 'item',
+    'promotion', 'reason', 'ship_mode', 'store', 'store_returns', 'store_sales',
+    'time_dim', 'warehouse', 'web_page', 'web_returns', 'web_sales', 'web_site'
+]
+
+# Table names that exist in BOTH benchmarks with different schemas (TPC-H
+# customer: c_custkey/c_mktsegment/...; TPC-DS customer: c_customer_sk/...).
+# One session namespace cannot hold both at once — these are registered
+# per-category by `tpc_view_switcher`, not at module setup. The legacy suites
+# never collided only because tpch and tpcds tests lived in separate modules.
+TPC_COLLIDING_TABLES = ['customer']
+
+
+def _register_tpc_views(spark, tpch_data_dir, tpcds_data_dir):
+    """Register the TPC-H + TPC-DS parquet-backed temp views on `spark`.
+
+    Registers every non-colliding table from both benchmarks; the colliding
+    ones (see `TPC_COLLIDING_TABLES`) are re-pointed per test category by the
+    `tpc_view_switcher` fixture. Skips the whole module if a parquet file is
+    missing — same behavior as the retired tpch_tables_* / tpcds_tables_*
+    fixtures this replaces.
+    """
+    for data_dir, tables in ((tpch_data_dir, TPCH_TABLES), (tpcds_data_dir, TPCDS_TABLES)):
+        for table in tables:
+            if table in TPC_COLLIDING_TABLES:
+                continue
+            parquet_path = data_dir / f"{table}.parquet"
+            if not parquet_path.exists():
+                pytest.skip(f"TPC table not found: {parquet_path}")
+            spark.read.parquet(str(parquet_path)).createOrReplaceTempView(table)
+
+
+@pytest.fixture(scope="module")
+def tpc_view_switcher(request, spark_thunderduck, tpch_data_dir, tpcds_data_dir):
+    """Re-point the benchmark-colliding temp views for a tpch/tpcds case.
+
+    Called by the corpus tests with the case's category before each case.
+    Non-TPC categories are a no-op; consecutive same-category cases are a
+    no-op (the corpus lists all tpch cases, then all tpcds cases, so the
+    re-registration happens at most twice per engine per run). The τ side is
+    tolerant — a registration failure surfaces as that case's own failure
+    (unresolved view) rather than an aborting fixture ERROR.
+
+    Golden-safe: the τ side is always re-pointed (τ executes the query); the
+    Spark reference side is touched only in live/record mode (obtained lazily so
+    golden mode never instantiates `spark_reference` and never starts Spark).
+    """
+    import golden as _golden
+    _spark_ref_needed = _golden.oracle_mode() in ("live", "record")
+    state = {}
+
+    def switch(category):
+        if category not in ("tpch", "tpcds") or state.get("current") == category:
+            return
+        data_dir = tpch_data_dir if category == "tpch" else tpcds_data_dir
+        spark_reference = (
+            request.getfixturevalue("spark_reference") if _spark_ref_needed else None
+        )
+        for table in TPC_COLLIDING_TABLES:
+            parquet_path = data_dir / f"{table}.parquet"
+            if not parquet_path.exists():
+                pytest.skip(f"TPC table not found: {parquet_path}")
+            if spark_reference is not None:
+                spark_reference.read.parquet(str(parquet_path)).createOrReplaceTempView(table)
+            try:
+                spark_thunderduck.read.parquet(str(parquet_path)).createOrReplaceTempView(table)
+            except Exception:
+                pass
+        state["current"] = category
+
+    return switch
+
+
+@pytest.fixture(scope="module")
+def sql_corpus_reference(spark_reference, tpch_data_dir, tpcds_data_dir):
+    """Register the SQL corpus's temp views on the Spark reference session."""
+    from differential.sql_corpus import build_inputs
+    inputs = build_inputs(spark_reference)
+    _register_tpc_views(spark_reference, tpch_data_dir, tpcds_data_dir)
+    return inputs
+
+
+@pytest.fixture(scope="module")
+def sql_corpus_thunderduck(spark_thunderduck, tpch_data_dir, tpcds_data_dir):
+    """Register the SQL corpus's temp views on the Thunderduck session.
+
+    Tolerant by design: τ's temp-view registration may fail for some inputs, so
+    `build_inputs` may raise. Swallow it here so setup does NOT abort the whole
+    parametrized module with a fixture ERROR — instead each case fails
+    individually when its `spark.sql(...)` can't resolve the (unregistered) view,
+    which keeps `differential-progress.sh`'s pass/fail parse meaningful.
+    """
+    from differential.sql_corpus import build_inputs
+    try:
+        inputs = build_inputs(spark_thunderduck)
+        _register_tpc_views(spark_thunderduck, tpch_data_dir, tpcds_data_dir)
+        return inputs
+    except Exception:
+        return {}
 
 
 # Function-scoped sessions (for tests that need per-test isolation)
@@ -697,101 +804,7 @@ def fresh_thunderduck_server(orchestrator):
     _release_session_without_shutdown(session)
 
 
-# ============================================================================
-# TPC-H Differential Testing Fixtures
-# ============================================================================
-
-@pytest.fixture(scope="module")
-def tpch_tables_reference(spark_reference, tpch_data_dir):
-    """
-    Load TPC-H tables into Spark Reference session (module-scoped).
-    """
-    tables = [
-        'lineitem', 'orders', 'customer', 'part',
-        'supplier', 'partsupp', 'nation', 'region'
-    ]
-
-    print("\nLoading TPC-H tables into Spark Reference...")
-    for table in tables:
-        parquet_path = tpch_data_dir / f"{table}.parquet"
-        if not parquet_path.exists():
-            pytest.skip(f"TPC-H table not found: {parquet_path}")
-
-        df = spark_reference.read.parquet(str(parquet_path))
-        df.createOrReplaceTempView(table)
-
-    print(f"✓ All {len(tables)} TPC-H tables loaded into Spark Reference")
-    return tables
-
-
-@pytest.fixture(scope="module")
-def tpch_tables_thunderduck(spark_thunderduck, tpch_data_dir):
-    """
-    Load TPC-H tables into Thunderduck session (module-scoped).
-    """
-    tables = [
-        'lineitem', 'orders', 'customer', 'part',
-        'supplier', 'partsupp', 'nation', 'region'
-    ]
-
-    print("\nLoading TPC-H tables into Thunderduck...")
-    for table in tables:
-        parquet_path = tpch_data_dir / f"{table}.parquet"
-        if not parquet_path.exists():
-            pytest.skip(f"TPC-H table not found: {parquet_path}")
-
-        df = spark_thunderduck.read.parquet(str(parquet_path))
-        df.createOrReplaceTempView(table)
-
-    print(f"✓ All {len(tables)} TPC-H tables loaded into Thunderduck")
-    return tables
-
-
-# ============================================================================
-# TPC-DS Differential Testing Fixtures
-# ============================================================================
-
-# List of all TPC-DS tables
-TPCDS_TABLES = [
-    'call_center', 'catalog_page', 'catalog_returns', 'catalog_sales',
-    'customer', 'customer_address', 'customer_demographics', 'date_dim',
-    'household_demographics', 'income_band', 'inventory', 'item',
-    'promotion', 'reason', 'ship_mode', 'store', 'store_returns', 'store_sales',
-    'time_dim', 'warehouse', 'web_page', 'web_returns', 'web_sales', 'web_site'
-]
-
-
-@pytest.fixture(scope="module")
-def tpcds_tables_reference(spark_reference, tpcds_data_dir):
-    """
-    Load TPC-DS tables into Spark Reference session (module-scoped).
-    """
-    print(f"\nLoading {len(TPCDS_TABLES)} TPC-DS tables into Spark Reference...")
-    for table in TPCDS_TABLES:
-        parquet_path = tpcds_data_dir / f"{table}.parquet"
-        if not parquet_path.exists():
-            pytest.skip(f"TPC-DS table not found: {parquet_path}")
-
-        df = spark_reference.read.parquet(str(parquet_path))
-        df.createOrReplaceTempView(table)
-
-    print(f"✓ All {len(TPCDS_TABLES)} TPC-DS tables loaded into Spark Reference")
-    return TPCDS_TABLES
-
-
-@pytest.fixture(scope="module")
-def tpcds_tables_thunderduck(spark_thunderduck, tpcds_data_dir):
-    """
-    Load TPC-DS tables into Thunderduck session (module-scoped).
-    """
-    print(f"\nLoading {len(TPCDS_TABLES)} TPC-DS tables into Thunderduck...")
-    for table in TPCDS_TABLES:
-        parquet_path = tpcds_data_dir / f"{table}.parquet"
-        if not parquet_path.exists():
-            pytest.skip(f"TPC-DS table not found: {parquet_path}")
-
-        df = spark_thunderduck.read.parquet(str(parquet_path))
-        df.createOrReplaceTempView(table)
-
-    print(f"✓ All {len(TPCDS_TABLES)} TPC-DS tables loaded into Thunderduck")
-    return TPCDS_TABLES
+# TPC table registration now lives in `_register_tpc_views` /
+# `tpc_view_switcher` above (used by the corpus fixtures) — the legacy
+# tpch_tables_* / tpcds_tables_* module fixtures were retired with the
+# legacy TPC test files they served.

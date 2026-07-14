@@ -1,0 +1,91 @@
+{
+ "id": "tpcds-q043",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "s_store_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_store_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sun_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "mon_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "tue_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "wed_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "thu_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "fri_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sat_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "ought",
+   "AAAAAAAABAAAAAAA",
+   {
+    "$dec": "29773.97"
+   },
+   {
+    "$dec": "31876.40"
+   },
+   {
+    "$dec": "21302.76"
+   },
+   {
+    "$dec": "30214.09"
+   },
+   {
+    "$dec": "27946.55"
+   },
+   {
+    "$dec": "39622.91"
+   },
+   {
+    "$dec": "27299.05"
+   }
+  ]
+ ]
+}

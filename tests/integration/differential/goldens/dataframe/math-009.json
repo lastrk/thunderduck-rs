@@ -1,0 +1,40 @@
+{
+ "id": "math-009",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "g",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "l",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   0
+  ],
+  [
+   4,
+   0
+  ],
+  [
+   5,
+   -3
+  ],
+  [
+   7,
+   2
+  ]
+ ]
+}

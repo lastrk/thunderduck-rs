@@ -1,0 +1,70 @@
+{
+ "id": "hash-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "md5",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sha1",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "crc",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "150c16d9d096e70af3596111d7402397",
+   "6f90f101115140727c43cadee0b9e17881403a63",
+   2885657543
+  ],
+  [
+   "2fc1c0beb992cd7096975cfebf9d5c3b",
+   "da6645f6e22bf5f75974dc7eed5fcd6160d6b51e",
+   3448174496
+  ],
+  [
+   "64489c85dc2fe0787b85cd87214b3810",
+   "35318264c9a98faf79965c270ac80c5606774df1",
+   3863974723
+  ],
+  [
+   "68727d15820a0c2ebc29636a8ba6d666",
+   "01c95267dd2972bc29add243b05a8d514d510d68",
+   3621394423
+  ],
+  [
+   "97c8e6d0d14f4e242c3c37af68cc376c",
+   "60b543bfaaf4e1677077510d003f94bafdf0c999",
+   1581181623
+  ],
+  [
+   "b6ae5b06ecd07ad78d04f3229ed90a24",
+   "428340c29e5e064ad1972f6d91553bf9ac467693",
+   3500172372
+  ],
+  [
+   "d3f791f59cbeff0ec06afb94bb23e772",
+   "9a018ecc48a37a9247a6404fd83e085384b445aa",
+   3450723742
+  ],
+  [
+   "f9dc77cece7fa16f6edd2d1d64853e4b",
+   "0df02da8548eeef2174c97c2ade67b4c5adc3160",
+   3098307853
+  ]
+ ]
+}

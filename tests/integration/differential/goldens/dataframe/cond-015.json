@@ -1,0 +1,400 @@
+{
+ "id": "cond-015",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "manager_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "age",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "salary",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "bonus",
+    "type": "decimal(9,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "hire_date",
+    "type": "date",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "last_login",
+    "type": "timestamp",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "active",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "score",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "tags",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "attrs",
+    "type": {
+     "type": "map",
+     "keyType": "string",
+     "valueType": "string",
+     "valueContainsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "address",
+    "type": {
+     "type": "struct",
+     "fields": [
+      {
+       "name": "city",
+       "type": "string",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "zip",
+       "type": "string",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "geo",
+       "type": {
+        "type": "struct",
+        "fields": [
+         {
+          "name": "lat",
+          "type": "double",
+          "nullable": true,
+          "metadata": {}
+         },
+         {
+          "name": "lng",
+          "type": "double",
+          "nullable": true,
+          "metadata": {}
+         }
+        ]
+       },
+       "nullable": true,
+       "metadata": {}
+      }
+     ]
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "Alice",
+   10,
+   null,
+   34,
+   95000.0,
+   {
+    "$dec": "1500.50"
+   },
+   {
+    "$date": "2018-03-01"
+   },
+   {
+    "$ts": "2026-06-01T09:15:00"
+   },
+   true,
+   0.91,
+   [
+    "python",
+    "rust"
+   ],
+   {
+    "$map": [
+     [
+      "team",
+      "infra"
+     ],
+     [
+      "tz",
+      "UTC"
+     ]
+    ]
+   },
+   {
+    "$row": [
+     "Vienna",
+     "1010",
+     {
+      "$row": [
+       48.2,
+       16.37
+      ]
+     }
+    ]
+   }
+  ],
+  [
+   2,
+   "Bob",
+   10,
+   1,
+   41,
+   120000.0,
+   {
+    "$dec": "3000.00"
+   },
+   {
+    "$date": "2015-07-12"
+   },
+   {
+    "$ts": "2026-06-02T18:40:00"
+   },
+   true,
+   {
+    "$f": "nan"
+   },
+   [
+    "scala"
+   ],
+   {
+    "$map": [
+     [
+      "team",
+      "infra"
+     ]
+    ]
+   },
+   {
+    "$row": [
+     "Berlin",
+     "10115",
+     {
+      "$row": [
+       52.52,
+       13.4
+      ]
+     }
+    ]
+   }
+  ],
+  [
+   4,
+   "Dan",
+   20,
+   3,
+   52,
+   64000.0,
+   {
+    "$dec": "500.00"
+   },
+   {
+    "$date": "2009-11-05"
+   },
+   {
+    "$ts": "2026-05-30T07:00:00"
+   },
+   true,
+   null,
+   null,
+   null,
+   {
+    "$row": [
+     null,
+     "20095",
+     null
+    ]
+   }
+  ],
+  [
+   5,
+   "Eve",
+   null,
+   3,
+   38,
+   88000.0,
+   {
+    "$dec": "750.25"
+   },
+   {
+    "$date": "2020-06-30"
+   },
+   {
+    "$ts": "2026-06-03T12:00:00"
+   },
+   true,
+   0.1,
+   [
+    "go",
+    "c",
+    "rust"
+   ],
+   {
+    "$map": [
+     [
+      "team",
+      "data"
+     ],
+     [
+      "tz",
+      "CET"
+     ]
+    ]
+   },
+   {
+    "$row": [
+     "Munich",
+     "80331",
+     {
+      "$row": [
+       48.14,
+       11.58
+      ]
+     }
+    ]
+   }
+  ],
+  [
+   6,
+   "Frank",
+   30,
+   2,
+   45,
+   105000.0,
+   {
+    "$dec": "2200.00"
+   },
+   {
+    "$date": "2012-02-14"
+   },
+   {
+    "$ts": "2026-06-01T22:05:00"
+   },
+   false,
+   0.73,
+   [
+    "java"
+   ],
+   {
+    "$map": [
+     [
+      "team",
+      "ml"
+     ]
+    ]
+   },
+   {
+    "$row": [
+     "Zurich",
+     "8001",
+     {
+      "$row": [
+       47.37,
+       8.54
+      ]
+     }
+    ]
+   }
+  ],
+  [
+   7,
+   "Grace",
+   30,
+   6,
+   27,
+   72000.0,
+   {
+    "$dec": "0.00"
+   },
+   {
+    "$date": "2023-09-01"
+   },
+   {
+    "$ts": "2026-06-02T03:30:00"
+   },
+   true,
+   {
+    "$f": "nan"
+   },
+   [
+    "python"
+   ],
+   {
+    "$map": [
+     [
+      "team",
+      "ml"
+     ],
+     [
+      "tz",
+      "UTC"
+     ]
+    ]
+   },
+   {
+    "$row": [
+     "Vienna",
+     "1020",
+     {
+      "$row": [
+       48.22,
+       16.4
+      ]
+     }
+    ]
+   }
+  ]
+ ]
+}

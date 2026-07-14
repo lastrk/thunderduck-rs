@@ -1,0 +1,119 @@
+{
+ "id": "tpcds-q050",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "s_store_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_company_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_street_number",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_street_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_street_type",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_suite_number",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_county",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_state",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_zip",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "30 days",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "31-60 days",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "61-90 days",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "91-120 days",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": ">120 days",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "ought",
+   1,
+   "767",
+   "Spring ",
+   "Wy",
+   "Suite 250",
+   "Midway",
+   "Williamson County",
+   "TN",
+   "31904",
+   7,
+   2,
+   2,
+   4,
+   8
+  ]
+ ]
+}

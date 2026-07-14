@@ -1,0 +1,103 @@
+{
+ "id": "hof-010",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "pref_keys",
+    "type": {
+     "type": "map",
+     "keyType": "string",
+     "valueType": "string",
+     "valueContainsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null
+  ],
+  [
+   {
+    "$map": [
+     [
+      "attr_team",
+      "data"
+     ],
+     [
+      "attr_tz",
+      "CET"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "attr_team",
+      "infra"
+     ],
+     [
+      "attr_tz",
+      "UTC"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "attr_team",
+      "infra"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "attr_team",
+      "ml"
+     ],
+     [
+      "attr_tz",
+      "UTC"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "attr_team",
+      "ml"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "attr_team",
+      null
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": []
+   }
+  ]
+ ]
+}

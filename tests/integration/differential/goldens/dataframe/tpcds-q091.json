@@ -1,0 +1,47 @@
+{
+ "id": "tpcds-q091",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "cc_call_center_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cc_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cc_manager",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cd_marital_status",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cd_education_status",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "returns_count",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": []
+}

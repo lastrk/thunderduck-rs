@@ -1,0 +1,136 @@
+{
+ "id": "chain-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "country",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "active",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "gid",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "avg_sal",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "n",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "level",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AT",
+   false,
+   0,
+   78000.0,
+   1,
+   "leaf"
+  ],
+  [
+   "AT",
+   null,
+   1,
+   89250.0,
+   4,
+   "subtotal"
+  ],
+  [
+   "AT",
+   true,
+   0,
+   93000.0,
+   3,
+   "leaf"
+  ],
+  [
+   "CH",
+   false,
+   0,
+   105000.0,
+   1,
+   "leaf"
+  ],
+  [
+   "CH",
+   null,
+   1,
+   88500.0,
+   2,
+   "subtotal"
+  ],
+  [
+   "CH",
+   true,
+   0,
+   72000.0,
+   1,
+   "leaf"
+  ],
+  [
+   null,
+   false,
+   2,
+   91500.0,
+   2,
+   "subtotal"
+  ],
+  [
+   null,
+   null,
+   1,
+   119000.0,
+   2,
+   "subtotal"
+  ],
+  [
+   null,
+   null,
+   3,
+   96500.0,
+   8,
+   "subtotal"
+  ],
+  [
+   null,
+   true,
+   0,
+   119000.0,
+   2,
+   "leaf"
+  ],
+  [
+   null,
+   true,
+   2,
+   98166.66666666667,
+   6,
+   "subtotal"
+  ]
+ ]
+}

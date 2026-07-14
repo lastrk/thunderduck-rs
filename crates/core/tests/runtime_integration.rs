@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use thunderduck_core::runtime::{DuckDbSession, SessionManager, StreamingConfig};
-use thunderduck_core::runtime::compat_mode::RuntimeCompatMode;
 
 // ── session_round_trip ─────────────────────────────────────────────────────────
 
@@ -10,15 +9,11 @@ use thunderduck_core::runtime::compat_mode::RuntimeCompatMode;
 #[ignore]
 async fn session_round_trip() {
     let session =
-        DuckDbSession::spawn("test-1", RuntimeCompatMode::Relaxed, &StreamingConfig::default())
-            .expect("spawn failed");
+        DuckDbSession::spawn("test-1", &StreamingConfig::default()).expect("spawn failed");
 
     // 1. Create a simple view via range().
     session
-        .create_temp_view(
-            "nums",
-            "SELECT \"range\" AS n FROM range(1, 6, 1)",
-        )
+        .create_temp_view("nums", "SELECT \"range\" AS n FROM range(1, 6, 1)")
         .await
         .expect("create_temp_view failed");
 
@@ -56,7 +51,7 @@ async fn session_round_trip() {
 #[tokio::test]
 #[ignore]
 async fn session_manager_isolation() {
-    let mgr = SessionManager::new(RuntimeCompatMode::Relaxed, StreamingConfig::default());
+    let mgr = SessionManager::new(StreamingConfig::default());
 
     let s1 = mgr
         .get_or_create("session-a")
@@ -68,7 +63,9 @@ async fn session_manager_isolation() {
         .expect("get_or_create session-b failed");
 
     // Create a table in session-a.
-    s1.execute("CREATE TABLE t (x INT)").await.expect("CREATE TABLE failed");
+    s1.execute("CREATE TABLE t (x INT)")
+        .await
+        .expect("CREATE TABLE failed");
 
     // session-b must NOT see table t.
     let result = s2.execute("SELECT * FROM t").await;
@@ -76,47 +73,6 @@ async fn session_manager_isolation() {
         result.is_err(),
         "sessions must be isolated: session-b should not see session-a's table t"
     );
-}
-
-// ── generator_to_duckdb ────────────────────────────────────────────────────────
-
-/// Full pipeline: LogicalPlan → SQL string (Phase 1) → DuckDB execution → Arrow.
-#[tokio::test]
-#[ignore]
-async fn generator_to_duckdb() {
-    use thunderduck_core::{
-        expression::{Expression, UnresolvedColumn},
-        functions::CompatMode,
-        generator::SqlGenerator,
-        logical::{LogicalPlan, Project, RangeRelation},
-    };
-
-    let plan = LogicalPlan::Project(Project {
-        input: Box::new(LogicalPlan::RangeRelation(RangeRelation {
-            start: 1,
-            end: 4,
-            step: 1,
-            num_partitions: None,
-        })),
-        projections: vec![Expression::UnresolvedColumn(UnresolvedColumn {
-            name: "id".into(),
-            qualifier: None,
-        })],
-    });
-
-    let sql = SqlGenerator::new(CompatMode::Relaxed)
-        .generate(&plan)
-        .expect("SQL generation failed");
-
-    let session =
-        DuckDbSession::spawn("gen-test", RuntimeCompatMode::Relaxed, &StreamingConfig::default())
-            .expect("spawn failed");
-
-    let batches = session.execute(&sql).await.expect("execute failed");
-
-    assert!(!batches.is_empty(), "expected result batches");
-    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total_rows, 3, "range(1, 4, 1) should yield 3 rows");
 }
 
 // ── get_or_create_is_race_free (Bug 6: TOCTOU) ────────────────────────────────
@@ -134,10 +90,7 @@ async fn generator_to_duckdb() {
 #[ignore]
 async fn get_or_create_is_race_free() {
     const CONCURRENCY: usize = 8;
-    let mgr = Arc::new(SessionManager::new(
-        RuntimeCompatMode::Relaxed,
-        StreamingConfig::default(),
-    ));
+    let mgr = Arc::new(SessionManager::new(StreamingConfig::default()));
     // Barrier ensures all tasks execute get_or_create at the same instant.
     let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
 
@@ -173,7 +126,7 @@ async fn get_or_create_is_race_free() {
 #[tokio::test]
 #[ignore]
 async fn check_parquet_types() {
-    let session = DuckDbSession::spawn("parquet-type-check", RuntimeCompatMode::Relaxed, &StreamingConfig::default())
+    let session = DuckDbSession::spawn("parquet-type-check", &StreamingConfig::default())
         .expect("spawn failed");
 
     // Check supplier schema
@@ -181,24 +134,49 @@ async fn check_parquet_types() {
     println!("Supplier schema:");
     for batch in &batches {
         for row in 0..batch.num_rows() {
-            let name = batch.column(0).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(row);
-            let dtype = batch.column(1).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(row);
+            let name = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<duckdb::arrow::array::StringArray>()
+                .unwrap()
+                .value(row);
+            let dtype = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<duckdb::arrow::array::StringArray>()
+                .unwrap()
+                .value(row);
             println!("  {name}: {dtype}");
         }
     }
-    
+
     // Check arithmetic type (use LIMIT on FROM to avoid GROUP BY requirement)
     let batches = session.execute("SELECT typeof(1 - l_discount) AS t1, typeof(l_extendedprice * (1 - l_discount)) AS t2 FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet') LIMIT 1").await.expect("failed");
     let batches2 = session.execute("SELECT typeof(SUM(l_extendedprice * (1 - l_discount))) AS t3 FROM read_parquet('/workspace/tests/integration/tpch_sf001/lineitem.parquet')").await.expect("failed");
     let batches = batches;
     for batch in &batches {
-        let t1 = batch.column(0).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(0);
-        let t2 = batch.column(1).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(0);
+        let t1 = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<duckdb::arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
+        let t2 = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<duckdb::arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
         println!("1-DECIMAL type: {t1}");
         println!("DECIMAL*DECIMAL type: {t2}");
     }
     for batch in &batches2 {
-        let t3 = batch.column(0).as_any().downcast_ref::<duckdb::arrow::array::StringArray>().unwrap().value(0);
+        let t3 = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<duckdb::arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
         println!("SUM(DECIMAL*DECIMAL) type: {t3}");
     }
 
@@ -213,13 +191,5 @@ async fn check_parquet_types() {
         for field in schema.fields() {
             println!("  {}: {:?}", field.name(), field.data_type());
         }
-    }
-
-    // Check schema_of (the LIMIT 0 path used by analyze_plan)
-    let q1_sql = "SELECT \"l_returnflag\", \"l_linestatus\", SUM(\"l_extendedprice\" * (1 - \"l_discount\")) AS \"sum_disc_price\" FROM (SELECT * FROM \"lineitem\") GROUP BY \"l_returnflag\", \"l_linestatus\"";
-    let schema = session.schema_of(q1_sql).await.expect("schema_of failed");
-    println!("schema_of (LIMIT 0) result:");
-    for field in schema.fields() {
-        println!("  {}: {:?}", field.name(), field.data_type());
     }
 }

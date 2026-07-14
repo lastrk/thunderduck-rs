@@ -1,0 +1,65 @@
+{
+ "id": "map2-002",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "m",
+    "type": {
+     "type": "map",
+     "keyType": "string",
+     "valueType": "string",
+     "valueContainsNull": true
+    },
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$map": [
+     [
+      "a",
+      "1"
+     ],
+     [
+      "b",
+      "2"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "a",
+      "1"
+     ],
+     [
+      "b",
+      "2"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "a",
+      "1"
+     ],
+     [
+      "b",
+      "2"
+     ]
+    ]
+   }
+  ]
+ ]
+}

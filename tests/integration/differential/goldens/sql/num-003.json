@@ -1,0 +1,22 @@
+{
+ "id": "num-003",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "cx2",
+    "type": "decimal(18,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "fd1",
+    "type": "decimal(10,1)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

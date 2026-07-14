@@ -1,0 +1,22 @@
+{
+ "id": "num-029",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "sd",
+    "type": "decimal(20,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "aa",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

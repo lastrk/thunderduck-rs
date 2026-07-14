@@ -1,0 +1,34 @@
+{
+ "id": "num-022",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "ad",
+    "type": "decimal(10,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "fd",
+    "type": "decimal(10,4)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dd",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "db",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

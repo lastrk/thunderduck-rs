@@ -4,7 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-bundled-extension = []
+# Compile DuckDB from source (the upstream `bundled` behavior). Off by default:
+# local dev links a shared prebuilt libduckdb via DUCKDB_LIB_DIR (see scripts/dev/).
+# CI / fresh clones: `cargo build --features bundled`.
+bundled = ["duckdb/bundled"]
 
 [dependencies]
 thiserror.workspace = true
@@ -12,4 +15,6 @@ duckdb.workspace    = true
 dashmap.workspace   = true
 tokio.workspace     = true
 sqlparser.workspace = true
+regex.workspace     = true
+serde_json.workspace = true
 tracing.workspace   = true

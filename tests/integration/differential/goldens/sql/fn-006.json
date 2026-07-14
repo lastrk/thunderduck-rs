@@ -1,0 +1,42 @@
+{
+ "id": "fn-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "p",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   0
+  ],
+  [
+   0
+  ],
+  [
+   0
+  ],
+  [
+   0
+  ],
+  [
+   2
+  ],
+  [
+   2
+  ],
+  [
+   3
+  ],
+  [
+   3
+  ]
+ ]
+}

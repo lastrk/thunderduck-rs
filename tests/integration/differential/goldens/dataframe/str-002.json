@@ -1,0 +1,42 @@
+{
+ "id": "str-002",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "k",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice-10"
+  ],
+  [
+   "Bob-10"
+  ],
+  [
+   "Carol-20"
+  ],
+  [
+   "Dan-20"
+  ],
+  [
+   "Eve"
+  ],
+  [
+   "Frank-30"
+  ],
+  [
+   "Grace-30"
+  ],
+  [
+   "Heidi"
+  ]
+ ]
+}

@@ -1,0 +1,42 @@
+{
+ "id": "arr-003",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "n_tags",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   0
+  ],
+  [
+   1
+  ],
+  [
+   1
+  ],
+  [
+   1
+  ],
+  [
+   2
+  ],
+  [
+   3
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ]
+ ]
+}

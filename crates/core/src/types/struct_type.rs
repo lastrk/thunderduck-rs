@@ -10,7 +10,11 @@ pub struct StructField {
 
 impl StructField {
     pub fn new(name: impl Into<std::string::String>, data_type: DataType, nullable: bool) -> Self {
-        Self { name: name.into(), data_type, nullable }
+        Self {
+            name: name.into(),
+            data_type,
+            nullable,
+        }
     }
 
     pub fn nullable(name: impl Into<std::string::String>, data_type: DataType) -> Self {
@@ -40,17 +44,19 @@ impl StructType {
 
     /// Schema whose single column is the given type — convenience for scalars.
     pub fn single(name: impl Into<std::string::String>, data_type: DataType) -> Self {
-        Self { fields: vec![StructField::nullable(name, data_type)] }
+        Self {
+            fields: vec![StructField::nullable(name, data_type)],
+        }
     }
 
-    /// Lookup a field by name (case-insensitive, matches Spark behaviour).
+    /// Lookup a field by name (case-insensitive, matches Spark behaviour —
+    /// folded via [`super::name_fold::eq_fold`], the same single case-folding
+    /// authority `transpiler_v2` uses for user identifiers, so this and the
+    /// outer name resolution agree on non-ASCII names too).
     pub fn field_by_name(&self, name: &str) -> Option<&StructField> {
-        self.fields.iter().find(|f| f.name.eq_ignore_ascii_case(name))
-    }
-
-    /// Lookup index by name (case-insensitive).
-    pub fn field_index(&self, name: &str) -> Option<usize> {
-        self.fields.iter().position(|f| f.name.eq_ignore_ascii_case(name))
+        self.fields
+            .iter()
+            .find(|f| super::name_fold::eq_fold(&f.name, name))
     }
 
     /// All field names in order.
@@ -83,7 +89,13 @@ mod tests {
         StructType::new(vec![
             StructField::nullable("id", DataType::Long),
             StructField::nullable("Name", DataType::String),
-            StructField::not_null("amount", DataType::Decimal { precision: 10, scale: 2 }),
+            StructField::not_null(
+                "amount",
+                DataType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+            ),
         ])
     }
 
@@ -96,12 +108,20 @@ mod tests {
         assert!(s.field_by_name("missing").is_none());
     }
 
+    /// Non-ASCII fold agreement (item 2 / E3): `field_by_name` now folds via
+    /// `name_fold::eq_fold` (JDK `equalsIgnoreCase`-shaped), not
+    /// `eq_ignore_ascii_case` — so accented and Kelvin-sign field names
+    /// resolve the same way the analyzer's user-identifier lookups do.
     #[test]
-    fn field_index() {
-        let s = schema();
-        assert_eq!(s.field_index("id"), Some(0));
-        assert_eq!(s.field_index("AMOUNT"), Some(2));
-        assert_eq!(s.field_index("x"), None);
+    fn field_by_name_non_ascii_fold_matches_jdk_equals_ignore_case() {
+        let s = StructType::new(vec![
+            StructField::nullable("É", DataType::String),
+            StructField::nullable("\u{212A}", DataType::String), // KELVIN SIGN
+        ]);
+        // "É"/"é" — an ASCII-only fold would miss this; JDK-shaped eq_fold matches.
+        assert!(s.field_by_name("é").is_some());
+        // KELVIN SIGN vs plain "k" — from name_fold's DIVERGENCE_TABLE.
+        assert!(s.field_by_name("k").is_some());
     }
 
     #[test]

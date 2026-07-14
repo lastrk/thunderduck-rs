@@ -12,7 +12,10 @@ pub enum DataType {
     Long,
     Float,
     Double,
-    Decimal { precision: u8, scale: u8 },
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
     String,
     Binary,
     Date,
@@ -20,6 +23,11 @@ pub enum DataType {
     TimestampNtz,
     YearMonthInterval,
     DayTimeInterval,
+    /// Generic interval — used when the sub-kind (year-month vs day-time) is
+    /// not statically known. Produced by `Expression::Interval` (which can
+    /// carry any combination of months/days/microseconds) and by `INTERVAL`
+    /// literals parsed from raw Spark SQL.
+    Interval,
     Null,
     /// Type could not be statically resolved; treated as VARCHAR at generation time.
     Unresolved,
@@ -58,14 +66,12 @@ impl DataType {
         )
     }
 
-    /// Returns true if this is a floating-point type (Float or Double).
-    pub fn is_floating_point(&self) -> bool {
-        matches!(self, DataType::Float | DataType::Double)
-    }
-
-    /// Returns true if this is Decimal.
-    pub fn is_decimal(&self) -> bool {
-        matches!(self, DataType::Decimal { .. })
+    /// Returns true if this is any interval type (generic, year-month, or day-time).
+    pub fn is_interval(&self) -> bool {
+        matches!(
+            self,
+            DataType::Interval | DataType::YearMonthInterval | DataType::DayTimeInterval
+        )
     }
 
     /// Returns true if this type or any nested type is `Unresolved`.
@@ -80,18 +86,6 @@ impl DataType {
             DataType::Struct(s) => s.fields.iter().any(|f| f.data_type.contains_unresolved()),
             _ => false,
         }
-    }
-}
-
-/// Helper trait for short-circuiting when a type is already resolved.
-/// Returns `self` if resolved, otherwise calls the fallback closure.
-pub(crate) trait PipeIfUnresolved {
-    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self;
-}
-
-impl PipeIfUnresolved for DataType {
-    fn pipe_if_unresolved(self, f: impl FnOnce() -> Self) -> Self {
-        if self == DataType::Unresolved { f() } else { self }
     }
 }
 
@@ -113,6 +107,7 @@ impl std::fmt::Display for DataType {
             DataType::TimestampNtz => write!(f, "timestamp_ntz"),
             DataType::YearMonthInterval => write!(f, "year_month_interval"),
             DataType::DayTimeInterval => write!(f, "day_time_interval"),
+            DataType::Interval => write!(f, "interval"),
             DataType::Null => write!(f, "null"),
             DataType::Unresolved => write!(f, "unresolved"),
             DataType::Array(elem, _) => write!(f, "array<{elem}>"),
@@ -130,7 +125,11 @@ mod tests {
     fn numeric_classification() {
         assert!(DataType::Integer.is_numeric());
         assert!(DataType::Double.is_numeric());
-        assert!(DataType::Decimal { precision: 10, scale: 2 }.is_numeric());
+        assert!(DataType::Decimal {
+            precision: 10,
+            scale: 2
+        }
+        .is_numeric());
         assert!(!DataType::String.is_numeric());
         assert!(!DataType::Boolean.is_numeric());
     }
@@ -138,7 +137,17 @@ mod tests {
     #[test]
     fn display() {
         assert_eq!(DataType::Long.to_string(), "long");
-        assert_eq!(DataType::Decimal { precision: 18, scale: 4 }.to_string(), "decimal(18,4)");
-        assert_eq!(DataType::Array(Box::new(DataType::Integer), true).to_string(), "array<integer>");
+        assert_eq!(
+            DataType::Decimal {
+                precision: 18,
+                scale: 4
+            }
+            .to_string(),
+            "decimal(18,4)"
+        );
+        assert_eq!(
+            DataType::Array(Box::new(DataType::Integer), true).to_string(),
+            "array<integer>"
+        );
     }
 }

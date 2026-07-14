@@ -1,0 +1,152 @@
+{
+ "id": "tpcds-q028",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "B1_LP",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "B1_CNT",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "B1_CNTD",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "B2_LP",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "B2_CNT",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "B2_CNTD",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "B3_LP",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "B3_CNT",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "B3_CNTD",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "B4_LP",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "B4_CNT",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "B4_CNTD",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "B5_LP",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "B5_CNT",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "B5_CNTD",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "B6_LP",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "B6_CNT",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "B6_CNTD",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$dec": "75.268911"
+   },
+   395,
+   385,
+   {
+    "$dec": "70.654744"
+   },
+   352,
+   340,
+   {
+    "$dec": "134.253525"
+   },
+   261,
+   257,
+   {
+    "$dec": "82.918459"
+   },
+   305,
+   300,
+   {
+    "$dec": "56.956554"
+   },
+   354,
+   345,
+   {
+    "$dec": "39.211000"
+   },
+   300,
+   293
+  ]
+ ]
+}

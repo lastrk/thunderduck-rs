@@ -1,0 +1,59 @@
+# name: test/sql/basic_division.test
+# description: Basic spark_decimal_div functionality
+# group: [sql]
+
+require thdck_spark_funcs
+
+# Simple division: 10 / 3
+query I
+SELECT spark_decimal_div(10.00::DECIMAL(4,2), 3.0::DECIMAL(3,1));
+----
+3.333333
+
+# Verify result type for above
+query I
+SELECT typeof(spark_decimal_div(10.00::DECIMAL(4,2), 3.0::DECIMAL(3,1)));
+----
+DECIMAL(9,6)
+
+# Exact division: 7 / 2 = 3.5
+query I
+SELECT spark_decimal_div(7.0::DECIMAL(2,1), 2.0::DECIMAL(2,1));
+----
+3.500000
+
+# Division resulting in integer: 100 / 4 = 25
+query I
+SELECT spark_decimal_div(100.0::DECIMAL(4,1), 4.0::DECIMAL(2,1));
+----
+25.000000
+
+# Division of equal values: a / a = 1
+query I
+SELECT spark_decimal_div(5.0::DECIMAL(2,1), 5.0::DECIMAL(2,1));
+----
+1.000000
+
+# Small dividend, large divisor
+query I
+SELECT spark_decimal_div(1.0::DECIMAL(2,1), 100.0::DECIMAL(4,1));
+----
+0.010000
+
+# Negative dividend
+query I
+SELECT spark_decimal_div(-10.0::DECIMAL(3,1), 3.0::DECIMAL(2,1));
+----
+-3.333333
+
+# Negative divisor
+query I
+SELECT spark_decimal_div(10.0::DECIMAL(3,1), -3.0::DECIMAL(2,1));
+----
+-3.333333
+
+# Both negative
+query I
+SELECT spark_decimal_div(-10.0::DECIMAL(3,1), -3.0::DECIMAL(2,1));
+----
+3.333333

@@ -1,4 +1,6 @@
-# Thunderduck Rust — Architecture Decisions
+# Thunderduck Rust — Architecture Decisions (SUPERSEDED)
+
+> **SUPERSEDED — HISTORICAL REFERENCE ONLY.** This document describes the retired legacy v1 transpiler stack. The Rust modules it describes (`crates/core/src/{logical,expression,generator,functions,parser}/`) were deleted on 2026-07-05. The authoritative architecture for τ (the only production transpiler per ADR-022) is [`thunderduck-rearchitect-ADRs.md`](thunderduck-rearchitect-ADRs.md) (ADR-000 → ADR-022 + Cross-Validation). For the current codebase overview see [`context/architecture.md`](context/architecture.md).
 
 **Thunderduck** is a Rust-native Spark Connect server that translates Spark DataFrame/SQL operations to DuckDB SQL and streams Arrow results back to clients. Goals: identical Spark API compatibility as the Java reference, plus fast startup and minimal memory footprint by eliminating the JVM.
 
@@ -20,14 +22,14 @@ PySpark / Spark Client
 ┌─────────────────────────────────────────────────────┐
 │                 core crate                          │
 │  SqlGenerator  FunctionRegistry  TypeInferenceEngine│
-│  preprocess_spark_sql (Spark→DuckDB dialect rewrite)│
+│  + transpiler_v2 (v2 path, behind --transpiler flag)│
 └─────────────────────┬───────────────────────────────┘
                       │  DuckDB SQL string
                       ▼
 ┌─────────────────────────────────────────────────────┐
 │        DuckDB Execution + Arrow Streaming           │
 │  duckdb-rs  →  Arrow RecordBatch (zero-copy)        │
-│  thdck_spark_funcs extension (strict mode)          │
+│  thdck_spark_funcs extension (mandatory)            │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -35,31 +37,42 @@ PySpark / Spark Client
 
 ## Architecture Decision Records
 
-All architectural decisions are documented as individual ADRs. Each entry below links to the full decision document with context, options examined, and rationale.
+The full ADR index and an agent-context router live in **[`adrs/README.md`](adrs/README.md)**. The existing-implementation decisions are grouped below; the authoritative v2 decisions are in [`thunderduck-rearchitect-ADRs.md`](thunderduck-rearchitect-ADRs.md).
 
-| ADR | Title | Decision Summary | File |
-|-----|-------|-----------------|------|
-| ADR-01 | gRPC Framework | `tonic` + `prost` | [adr-01](adrs/adr-01-grpc-framework.md) |
-| ADR-02 | Async Runtime | `tokio` multi-thread scheduler | [adr-02](adrs/adr-02-async-runtime.md) |
-| ADR-03 | DuckDB Bindings | `duckdb` crate with `arrow` feature; version-pinned to 1.5.0 | [adr-03](adrs/adr-03-duckdb-bindings.md) |
-| ADR-04 | Arrow Library | `arrow` crate (apache/arrow-rs); same dep as duckdb-rs | [adr-04](adrs/adr-04-arrow-library.md) |
-| ADR-05 | DuckDB Threading Model | Dedicated OS thread per session; `mpsc` channel to async handler | [adr-05](adrs/adr-05-duckdb-threading-model.md) |
-| ADR-06 | Logical Plan Representation | Rust `enum` — 36 variants, exhaustive `match` enforced at compile time | [adr-06](adrs/adr-06-logical-plan-representation.md) |
-| ADR-07 | Expression System | Rust `enum` (not `Box<dyn Trait>`) — zero-allocation, exhaustively matchable | [adr-07](adrs/adr-07-expression-system.md) |
-| ADR-08 | Type System | `DataType` enum mirroring Spark's type hierarchy; `TypeInferenceEngine` centralises promotions | [adr-08](adrs/adr-08-type-system.md) |
-| ADR-09 | SQL Generator | `SqlGenerator` struct with `match`-based dispatch; `gen_*` naming; dual join path rule | [adr-09](adrs/adr-09-sql-generator.md) |
-| ADR-10 | SparkSQL Raw SQL Path | ~~`preprocess_spark_sql` 13-phase text rewrite~~ — **superseded by ADR-21** | [adr-10](adrs/adr-10-sparksql-raw-sql-path.md) |
-| ADR-11 | Protobuf Plan Conversion | Two-module converter: `RelationConverter` + `ExpressionConverter` | [adr-11](adrs/adr-11-protobuf-plan-conversion.md) |
-| ADR-12 | Function Registry | `LazyLock<FunctionRegistry>` with 500+ Spark→DuckDB mappings; strict/relaxed routing | [adr-12](adrs/adr-12-function-registry.md) |
-| ADR-13 | DuckDB Extension Loading | Embed platform binaries via `include_bytes!`; extract to temp file and `LOAD` at runtime | [adr-13](adrs/adr-13-duckdb-extension-loading.md) |
-| ADR-14 | Session Management | `DashMap<String, Arc<SessionHandle>>`; named in-memory DuckDB databases per session | [adr-14](adrs/adr-14-session-management.md) |
-| ADR-15 | Compatibility Modes | `CompatMode` enum: Strict / Relaxed / Auto; CLI flags and env var | [adr-15](adrs/adr-15-compatibility-modes.md) |
-| ADR-16 | Crate Structure | Cargo workspace: `core` (pure translation) + `connect-server` (gRPC binary) | [adr-16](adrs/adr-16-crate-structure.md) |
-| ADR-17 | Arrow ↔ DuckDB Zero-Copy Exchange | `query_arrow()` → Arrow IPC → tonic streaming; no data copies on hot path | [adr-17](adrs/adr-17-arrow-duckdb-zero-copy-exchange.md) |
-| ADR-18 | Error Handling | `thiserror` in `core`; `anyhow` in `connect-server`; maps to `tonic::Status` | [adr-18](adrs/adr-18-error-handling.md) |
-| ADR-19 | SQL Generation Correctness Rules | 5 non-negotiable invariants: AST-only SQL, no post-processing, `to_sql()` not Display, sealed enums, centralised type inference | [adr-19](adrs/adr-19-sql-generation-correctness-rules.md) |
-| ADR-20 | Testing Strategy | Rust unit tests per module + Python differential tests (670 passing) against release binary | [adr-20](adrs/adr-20-testing-strategy.md) |
-| ADR-21 | SparkSQL Parser Strategy | `sqlparser-rs` + custom `SparkDialect` (Tier 1); `chumsky` upgrade path (Tier 2); demand-driven coverage | [adr-21](adrs/adr-21-sparksql-parser-strategy.md) |
+### Runtime & serving substrate ([`adrs/runtime/`](adrs/runtime/))
+
+Apply to both transpiler paths; not superseded by the rearchitecture.
+
+| Decision | Summary |
+|---|---|
+| [gRPC Framework](adrs/runtime/grpc-framework.md) | `tonic` + `prost` |
+| [Async Runtime](adrs/runtime/async-runtime.md) | `tokio` multi-thread scheduler |
+| [DuckDB Bindings](adrs/runtime/duckdb-bindings.md) | `duckdb` crate (`arrow` feature); pinned to the `ext6` extension binary |
+| [Arrow Library](adrs/runtime/arrow-library.md) | `arrow` crate (apache/arrow-rs); same dep as duckdb-rs |
+| [DuckDB Threading Model](adrs/runtime/threading-model.md) | Dedicated OS thread per session; `mpsc` channel to async handler |
+| [Session Management](adrs/runtime/session-management.md) | `DashMap<String, Arc<SessionHandle>>`; named in-memory DuckDB per session |
+| [Crate Structure](adrs/runtime/crate-structure.md) | Workspace: `core` (translation) + `connect-server` (gRPC); `transpiler_v2` module |
+| [Arrow ↔ DuckDB Zero-Copy](adrs/runtime/arrow-duckdb-zero-copy.md) | `query_arrow()` → Arrow IPC → tonic streaming; no copies on hot path |
+| [DuckDB Extension Loading](adrs/runtime/extension-loading.md) | Bundle `thdck_spark_funcs` via `include_bytes!`; `LOAD` per session (mandatory) |
+| [Error Handling](adrs/runtime/error-handling.md) | `thiserror` in `core`; `anyhow` in `connect-server`; maps to `tonic::Status` |
+
+### Legacy transpiler ([`adrs/legacy-transpiler/`](adrs/legacy-transpiler/)) — runs behind `--transpiler legacy`
+
+Superseded where it conflicts with the rearchitecture; both paths coexist.
+
+| Decision | Summary | v2 successor |
+|---|---|---|
+| [Logical Plan](adrs/legacy-transpiler/logical-plan.md) | Rust `enum`, compiler-exhaustive `match` | ADR-003 / ADR-021 |
+| [Expression System](adrs/legacy-transpiler/expression-system.md) | Rust `enum` (not `Box<dyn Trait>`) | ADR-003 / ADR-021 |
+| [Type System](adrs/legacy-transpiler/type-system.md) | `DataType` enum + `TypeInferenceEngine` | ADR-005 / ADR-006 (`DataType` shared) |
+| [SQL Generator](adrs/legacy-transpiler/sql-generator.md) | `match`-based dispatch; `gen_*`; dual join path | ADR-009 / ADR-007 |
+| [Protobuf Plan Conversion](adrs/legacy-transpiler/plan-converter.md) | `RelationConverter` + `ExpressionConverter` | ADR-004 / ADR-021 |
+| [Function Registry](adrs/legacy-transpiler/function-registry.md) | 500+ Spark→DuckDB mappings | ADR-009 / ADR-010 |
+| [Correctness Rules](adrs/legacy-transpiler/correctness-rules.md) | 5 SQL-generation invariants (still current) | §CV INV1–INV10 |
+| [Testing Strategy](adrs/legacy-transpiler/testing-strategy.md) | Unit + Python differential tests | ADR-014 / ADR-015 |
+| [SparkSQL Parser Strategy](adrs/legacy-transpiler/sparksql-parser.md) | `sqlparser-rs` + `SparkDialect` (T1); `chumsky` (T2) | complements ADR-004 |
+
+> **Removed (superseded):** the former *SparkSQL Raw SQL Path* (`preprocess_spark_sql` text rewrite → rearchitect ADR-004) and *Compatibility Modes* (Strict/Relaxed/Auto → rearchitect ADR-020). See [`adrs/README.md`](adrs/README.md#superseded--removed).
 
 ---
 
@@ -74,4 +87,4 @@ All architectural decisions are documented as individual ADRs. Each entry below 
 | Memory baseline | ~500MB (JVM heap + metaspace) | ~30MB |
 | GC pauses | Yes (G1GC configured) | None |
 | Arrow JVM flags | `--add-opens` required | Not needed |
-| SQL parser | ANTLR4 (Spark grammar) | Preprocessing pass (see ADR-10); full parser deferred |
+| SQL parser | ANTLR4 (Spark grammar) | `sqlparser-rs` + custom `SparkDialect`; raw SQL parsed to the common AST (rearchitect ADR-004) |

@@ -1,0 +1,170 @@
+{
+ "id": "tpcds-q043",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "s_store_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_store_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "d_day_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sun_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "mon_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "tue_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "wed_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "thu_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "fri_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sat_sales",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "ought",
+   "AAAAAAAABAAAAAAA",
+   "Friday",
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "39622.91"
+   },
+   null
+  ],
+  [
+   "ought",
+   "AAAAAAAABAAAAAAA",
+   "Monday",
+   null,
+   {
+    "$dec": "31876.40"
+   },
+   null,
+   null,
+   null,
+   null,
+   null
+  ],
+  [
+   "ought",
+   "AAAAAAAABAAAAAAA",
+   "Saturday",
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "27299.05"
+   }
+  ],
+  [
+   "ought",
+   "AAAAAAAABAAAAAAA",
+   "Sunday",
+   {
+    "$dec": "29773.97"
+   },
+   null,
+   null,
+   null,
+   null,
+   null,
+   null
+  ],
+  [
+   "ought",
+   "AAAAAAAABAAAAAAA",
+   "Thursday",
+   null,
+   null,
+   null,
+   null,
+   {
+    "$dec": "27946.55"
+   },
+   null,
+   null
+  ],
+  [
+   "ought",
+   "AAAAAAAABAAAAAAA",
+   "Tuesday",
+   null,
+   null,
+   {
+    "$dec": "21302.76"
+   },
+   null,
+   null,
+   null,
+   null
+  ],
+  [
+   "ought",
+   "AAAAAAAABAAAAAAA",
+   "Wednesday",
+   null,
+   null,
+   null,
+   {
+    "$dec": "30214.09"
+   },
+   null,
+   null,
+   null
+  ]
+ ]
+}

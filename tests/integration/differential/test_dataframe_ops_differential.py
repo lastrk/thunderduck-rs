@@ -78,17 +78,12 @@ class TestColumnOperations_Differential:
         assert_dataframes_equal(ref_result, test_result, "with_column_renamed")
 
     @pytest.mark.timeout(30)
-    def test_with_column_decimal_strict_mode(self, spark_reference, spark_thunderduck, tpch_data_dir):
-        """In strict mode, withColumn DECIMAL arithmetic must return DECIMAL (not DOUBLE).
+    def test_with_column_decimal(self, spark_reference, spark_thunderduck, tpch_data_dir):
+        """withColumn DECIMAL arithmetic must return DECIMAL (not DOUBLE).
 
         lineitem has l_extendedprice DECIMAL(15,2) and l_discount DECIMAL(15,2).
-        Multiplying them should return a DECIMAL result in both Spark and strict-mode
-        Thunderduck.  In relaxed mode the column type may differ so the test is skipped.
+        Multiplying them should return a DECIMAL result in both Spark and Thunderduck.
         """
-        compat_mode = os.environ.get("THUNDERDUCK_COMPAT_MODE", "auto").lower()
-        if compat_mode != "strict":
-            pytest.skip("strict mode required for exact DECIMAL type matching")
-
         def run_test(spark):
             df = spark.read.parquet(str(tpch_data_dir / "lineitem.parquet"))
             return (

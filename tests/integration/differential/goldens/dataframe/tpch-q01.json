@@ -1,0 +1,176 @@
+{
+ "id": "tpch-q01",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "l_returnflag",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "l_linestatus",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sum_qty",
+    "type": "decimal(25,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sum_base_price",
+    "type": "decimal(25,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sum_disc_price",
+    "type": "decimal(38,4)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sum_charge",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_qty",
+    "type": "decimal(19,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_price",
+    "type": "decimal(19,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_disc",
+    "type": "decimal(19,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "count_order",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "A",
+   "F",
+   {
+    "$dec": "380456.00"
+   },
+   {
+    "$dec": "532348211.65"
+   },
+   {
+    "$dec": "505822441.4861"
+   },
+   {
+    "$dec": "526165934.000839"
+   },
+   {
+    "$dec": "25.575155"
+   },
+   {
+    "$dec": "35785.709307"
+   },
+   {
+    "$dec": "0.050081"
+   },
+   14876
+  ],
+  [
+   "N",
+   "F",
+   {
+    "$dec": "8971.00"
+   },
+   {
+    "$dec": "12384801.37"
+   },
+   {
+    "$dec": "11798257.2080"
+   },
+   {
+    "$dec": "12282485.056933"
+   },
+   {
+    "$dec": "25.778736"
+   },
+   {
+    "$dec": "35588.509684"
+   },
+   {
+    "$dec": "0.047759"
+   },
+   348
+  ],
+  [
+   "N",
+   "O",
+   {
+    "$dec": "742802.00"
+   },
+   {
+    "$dec": "1041502841.45"
+   },
+   {
+    "$dec": "989737518.6346"
+   },
+   {
+    "$dec": "1029418531.523350"
+   },
+   {
+    "$dec": "25.454988"
+   },
+   {
+    "$dec": "35691.129209"
+   },
+   {
+    "$dec": "0.049931"
+   },
+   29181
+  ],
+  [
+   "R",
+   "F",
+   {
+    "$dec": "381449.00"
+   },
+   {
+    "$dec": "534594445.35"
+   },
+   {
+    "$dec": "507996454.4067"
+   },
+   {
+    "$dec": "528524219.358903"
+   },
+   {
+    "$dec": "25.597168"
+   },
+   {
+    "$dec": "35874.006533"
+   },
+   {
+    "$dec": "0.049828"
+   },
+   14902
+  ]
+ ]
+}

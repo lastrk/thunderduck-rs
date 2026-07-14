@@ -1,0 +1,51 @@
+{
+ "id": "set-011",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "country",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AT"
+  ],
+  [
+   "DE"
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ]
+ ]
+}

@@ -1,0 +1,64 @@
+{
+ "id": "cx-014",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "r_tags",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "has_rust",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null,
+   null
+  ],
+  [
+   null,
+   null
+  ],
+  [
+   [
+    "rust"
+   ],
+   true
+  ],
+  [
+   [
+    "rust"
+   ],
+   true
+  ],
+  [
+   [],
+   false
+  ],
+  [
+   [],
+   false
+  ],
+  [
+   [],
+   false
+  ],
+  [
+   [],
+   false
+  ]
+ ]
+}

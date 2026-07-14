@@ -1,0 +1,52 @@
+{
+ "id": "jn-004",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   "Infrastructure"
+  ],
+  [
+   "Bob",
+   "Infrastructure"
+  ],
+  [
+   "Carol",
+   "Data"
+  ],
+  [
+   "Dan",
+   "Data"
+  ],
+  [
+   "Frank",
+   "ML"
+  ],
+  [
+   "Grace",
+   "ML"
+  ],
+  [
+   null,
+   "Security"
+  ]
+ ]
+}

@@ -8,7 +8,13 @@ edition = "2021"
 
 [workspace.dependencies]
 thiserror  = "2"
-duckdb     = { version = "1.10501.0", features = ["bundled"] }
+# DuckDB linkage is selected by Cargo feature (libduckdb-sys has no env switch):
+#   * default (no feature): link an EXTERNAL libduckdb (set DUCKDB_LIB_DIR /
+#     DUCKDB_STATIC). Local dev uses a shared prebuilt static lib — see
+#     scripts/dev/. Avoids recompiling the ~2 GB C++ amalgamation per worktree.
+#   * `bundled` feature (enabled by the workspace `bundled` feature): compile
+#     DuckDB from source as before. CI / fresh clones build with `--features bundled`.
+duckdb     = { version = "1.10504.0", default-features = false, features = ["vscalar"] }
 arrow      = "58"
 arrow-ipc  = "58"
 dashmap    = "6"
@@ -21,6 +27,11 @@ clap       = { version = "4", features = ["derive"] }
 uuid       = { version = "1", features = ["v4"] }
 futures    = "0.3"
 sqlparser  = "0.61"
+regex      = "1"
+# `preserve_order` uses `IndexMap` for `serde_json::Map`, matching Spark's
+# struct field-order semantics. Required by the `json_strip_nulls` UDF that
+# powers `to_json`'s `ignoreNullFields=true` default (Pass 89, `json-005`).
+serde_json = { version = "1", features = ["preserve_order"] }
 tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

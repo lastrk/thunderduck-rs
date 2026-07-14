@@ -1,0 +1,59 @@
+{
+ "id": "tpcds-q083",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sr_item_qty",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sr_dev",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cr_item_qty",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cr_dev",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "wr_item_qty",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "wr_dev",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "average",
+    "type": "decimal(27,6)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": []
+}

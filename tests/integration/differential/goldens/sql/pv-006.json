@@ -1,0 +1,110 @@
+{
+ "id": "pv-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "metric",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "value",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "age",
+   34.0
+  ],
+  [
+   1,
+   "salary",
+   95000.0
+  ],
+  [
+   2,
+   "age",
+   41.0
+  ],
+  [
+   2,
+   "salary",
+   120000.0
+  ],
+  [
+   3,
+   "age",
+   29.0
+  ],
+  [
+   3,
+   "salary",
+   78000.0
+  ],
+  [
+   4,
+   "age",
+   52.0
+  ],
+  [
+   4,
+   "salary",
+   64000.0
+  ],
+  [
+   5,
+   "age",
+   38.0
+  ],
+  [
+   5,
+   "salary",
+   88000.0
+  ],
+  [
+   6,
+   "age",
+   45.0
+  ],
+  [
+   6,
+   "salary",
+   105000.0
+  ],
+  [
+   7,
+   "age",
+   27.0
+  ],
+  [
+   7,
+   "salary",
+   72000.0
+  ],
+  [
+   8,
+   "age",
+   60.0
+  ],
+  [
+   8,
+   "salary",
+   150000.0
+  ]
+ ]
+}

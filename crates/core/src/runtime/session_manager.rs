@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 
 use crate::error::Result;
-use crate::runtime::compat_mode::RuntimeCompatMode;
 use crate::runtime::config::StreamingConfig;
 use crate::runtime::session::DuckDbSession;
 
@@ -15,15 +14,13 @@ use crate::runtime::session::DuckDbSession;
 pub struct SessionManager {
     sessions: DashMap<String, Arc<DuckDbSession>>,
     config: Arc<StreamingConfig>,
-    mode: RuntimeCompatMode,
 }
 
 impl SessionManager {
-    pub fn new(mode: RuntimeCompatMode, config: StreamingConfig) -> Self {
+    pub fn new(config: StreamingConfig) -> Self {
         Self {
             sessions: DashMap::new(),
             config: Arc::new(config),
-            mode,
         }
     }
 
@@ -35,7 +32,7 @@ impl SessionManager {
         match self.sessions.entry(session_id.to_string()) {
             Entry::Occupied(e) => Ok(Arc::clone(e.get())),
             Entry::Vacant(e) => {
-                let session = Arc::new(DuckDbSession::spawn(session_id, self.mode, &self.config)?);
+                let session = Arc::new(DuckDbSession::spawn(session_id, &self.config)?);
                 e.insert(Arc::clone(&session));
                 Ok(session)
             }
@@ -49,5 +46,4 @@ impl SessionManager {
     pub fn release(&self, session_id: &str) {
         self.sessions.remove(session_id);
     }
-
 }

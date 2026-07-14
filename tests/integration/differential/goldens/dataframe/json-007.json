@@ -1,0 +1,61 @@
+{
+ "id": "json-007",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "rec",
+    "type": {
+     "type": "struct",
+     "fields": [
+      {
+       "name": "qty",
+       "type": "integer",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "label",
+       "type": "string",
+       "nullable": true,
+       "metadata": {}
+      },
+      {
+       "name": "price",
+       "type": "double",
+       "nullable": true,
+       "metadata": {}
+      }
+     ]
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null
+  ],
+  [
+   {
+    "$row": [
+     10,
+     "foo",
+     2.5
+    ]
+   }
+  ],
+  [
+   {
+    "$row": [
+     20,
+     "bar",
+     null
+    ]
+   }
+  ]
+ ]
+}

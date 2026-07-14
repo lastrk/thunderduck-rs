@@ -6,7 +6,7 @@
 
 > **Alpha Software**: Despite extensive test coverage, Thunderduck is currently alpha quality software and will undergo extensive testing with real-world workloads before production readiness.
 
-**Thunderduck** is an embedded execution engine that translates Spark operations to DuckDB SQL, providing fast single-node query execution as a drop-in replacement for Apache Spark. This is the Rust port: same Spark API compatibility, ~50ms startup (vs ~10s JVM), and ~45MB baseline memory (vs ~500MB JVM). Both relaxed and strict compatibility modes achieve **100% pass rate** on the 835-test differential suite against Apache Spark 4.1.1.
+**Thunderduck** is an embedded execution engine that translates Spark operations to DuckDB SQL, providing fast single-node query execution as a drop-in replacement for Apache Spark. This is the Rust port: same Spark API compatibility, ~50ms startup (vs ~10s JVM), and ~45MB baseline memory (vs ~500MB JVM). Achieves **100% pass rate** on the 835-test differential suite against Apache Spark 4.1.1.
 
 ### Key Features
 
@@ -18,7 +18,7 @@
 - **Arrow-native data interchange** with DuckDB's vectorized engine
 - **Format support**: Parquet, Delta Lake (PLANNED), Iceberg (PLANNED)
 - **835 differential tests** against Spark 4.1.1 — TPC-H (100%), TPC-DS (100%), functions, joins, window, aggregations, lambdas, complex types
-- **Two compatibility modes**: Relaxed (vanilla DuckDB, best-effort type matching) and Strict (DuckDB extension, exact Spark type parity)
+- **Exact Spark type parity** via the bundled `thdck_spark_funcs` DuckDB extension
 - **Query plan introspection** via EXPLAIN statements
 
 ### Why Thunderduck?
@@ -45,12 +45,17 @@ Thunderduck supports **x86_64** (Intel/AMD) and **ARM64** (AWS Graviton, Apple S
 git clone https://github.com/lastrk/thunderduck-rs.git
 cd thunderduck-rs
 
-# Build the release binary
-cargo build --release
+# Build the release binary (--features bundled compiles DuckDB from source)
+cargo build --release --features bundled
 
 # Start the Spark Connect server (default port 15002)
 ./target/release/thunderduck-connect-server
 ```
+
+> **DuckDB linkage:** DuckDB is non-bundled by default, so a fresh clone builds with `--features bundled`
+> (compiles DuckDB from source). Inside the devcontainer you can instead run
+> `scripts/dev/dev-cache-setup.sh` once to link a shared prebuilt libduckdb — then `--features bundled`
+> is no longer needed. See [`scripts/dev/README.md`](scripts/dev/README.md).
 
 Connect with PySpark:
 
@@ -108,7 +113,8 @@ thunderduck-rs/
 │       ├── service/               # SparkConnectService (tonic gRPC handlers)
 │       ├── session/               # SessionManager (DashMap + per-session OS threads)
 │       └── converter/             # Protobuf → LogicalPlan (RelationConverter, ExpressionConverter)
-├── extensions/                    # Bundled DuckDB extension binaries (embedded via include_bytes!)
+├── extensions/vendored/            # thdck_spark_funcs binaries, all 4 platforms (checked into git;
+│                                   #   embedded via include_bytes!; see MANIFEST.toml)
 └── tests/
     ├── integration/               # Python differential tests
     │   ├── differential/          # Differential test suites (41 test files)
@@ -144,7 +150,7 @@ session thread → oneshot::Sender<SessionResult> → tokio task → gRPC stream
 
 - **Rust** 1.75+ (`rustup` recommended)
 - **protoc** — Protocol Buffers compiler
-- **curl** (optional — required to download the extension for strict Spark type parity)
+- **curl** — required by `build.rs` to download the mandatory `thdck_spark_funcs` extension binary on first build
 
 ```bash
 # Install Rust
@@ -157,13 +163,19 @@ brew install protobuf
 apt-get install -y protobuf-compiler
 ```
 
-### Build (relaxed mode — default)
+### Build
+
+> DuckDB is non-bundled by default. The commands below need an external libduckdb: either run
+> `scripts/dev/dev-cache-setup.sh` once (devcontainer — links a shared prebuilt lib), **or** append
+> `--features bundled` to compile DuckDB from source (fresh clones / CI). `--features bundled` applies
+> equally to `build`, `test`, `check`, and `clippy`.
 
 ```bash
-# Full build (debug)
+# Full build (debug) — add `--features bundled` on a fresh clone / CI
 cargo build
 
-# Release build (required for integration/differential tests)
+# Release build (required for integration/differential tests).
+# Downloads and embeds the thdck_spark_funcs extension automatically.
 cargo build --release
 
 # Build a single crate
@@ -174,58 +186,53 @@ cargo build -p thunderduck-connect-server
 cargo check
 ```
 
-### Build with Spark Compatibility Extension (strict mode)
+All 4 platform binaries of the adopted `thdck_spark_funcs` release (currently
+the `ext6` set, `v1.5.4`, matching the `duckdb` crate at `1.10504.0`) are
+vendored — checked into git plain under `extensions/vendored/` (see
+`extensions/vendored/MANIFEST.toml`). `build.rs` picks the binary matching the
+current platform at build time — no network access, no download. Adopting a
+new release (only on `duckdb` crate bumps) is done via
+`scripts/dev/adopt-extension-release.sh`. The extension is embedded directly
+in the binary via `include_bytes!()` and loaded at every session's startup.
 
-```bash
-cargo build --release --features bundled-extension
-```
-
-The extension binary for the current platform is automatically downloaded from the
-[`duckdb1.5.1-ext3` release](https://github.com/lastrk/thunderduck-duckdb-extension/releases/tag/duckdb1.5.1-ext3)
-and cached under `extensions/` on first build. Subsequent builds reuse the cached file — no
-re-download. The extension is then embedded directly in the binary via `include_bytes!()`.
+The extension's C++ source now lives in-tree at [`extension/`](extension/)
+(imported from `nubank/thunderduck-duckdb-extension`, now archived — see
+`extension/README.md`'s Provenance section and
+`docs/context/extension-archival-checklist.md`). Local dev builds use
+`scripts/dev/build-extension.sh`; producing new vendored binaries is a
+`workflow_dispatch`-only CI job, `.github/workflows/extension-release.yml`.
 
 ### Start the Server
 
 ```bash
-# Default (relaxed mode, port 15002)
+# Default
 ./target/release/thunderduck-connect-server
 
 # Custom port
 ./target/release/thunderduck-connect-server --port 15002
 
-# Strict mode (exact Spark type parity via bundled extension)
-./target/release/thunderduck-connect-server --strict
-
-# Relaxed mode (vanilla DuckDB, best-effort types — default)
-./target/release/thunderduck-connect-server --relaxed
-
-# Kill the server
-pkill -f thunderduck-connect-server
+# Kill the server (worktree-scoped — never touches other worktrees' servers)
+./tests/scripts/kill-test-servers.sh
 ```
 
-## Compatibility Modes
+## Spark Compatibility Extension
 
-Thunderduck supports two compatibility modes:
-
-| Mode | Extension | Type Accuracy | Performance |
-|------|-----------|---------------|-------------|
-| **Relaxed** (default) | Not loaded | ~95% — value-equivalent, may differ in output types | Maximum |
-| **Strict** | Embedded at build time | 100% — exact Spark type parity | Near-maximum |
-
-The `thdck_spark_funcs` DuckDB extension implements Spark-precise numerical semantics:
+Spark parity is the only emission target. The `thdck_spark_funcs` DuckDB extension is mandatory and bundled into every build (see [rearchitect ADR-020](docs/thunderduck-rearchitect-ADRs.md)). It implements Spark-precise numerical semantics:
+- `spark_hash(c1, ..., cN)` — Spark `hash()` (Murmur3-32, signed INT, seed 42)
+- `spark_xxhash64(c1, ..., cN)` — Spark `xxhash64()` (xxHash64, signed BIGINT, seed 42)
 - `spark_decimal_div(a, b)` — decimal division with `ROUND_HALF_UP`
 - `spark_sum(col)` — Spark-compatible SUM return types
 - `spark_avg(col)` — Spark-compatible AVG return types
 - `spark_skewness(col)` — population skewness (Spark's formula, no bias correction)
-
-Strict mode requires building with `--features bundled-extension` (see [Build with Extension](#build-with-spark-compatibility-extension-strict-mode)). The extension is embedded in the binary at compile time and loaded at startup.
 
 ## Testing
 
 Assumes the project is already built (see [Building from Source](#building-from-source)). **Always use a release build for differential tests** — test servers launch `./target/release/thunderduck-connect-server`.
 
 ### Unit Tests
+
+> Same DuckDB linkage rule as Build: works as-is with the devcontainer prebuilt lib; on a fresh clone / CI
+> add `--features bundled` (e.g. `cargo test --features bundled`).
 
 ```bash
 # All unit tests
@@ -241,7 +248,7 @@ cargo test -p thunderduck-core -- generator::tests::test_project_to_sql
 cargo test -- --nocapture
 ```
 
-### Differential Tests — Relaxed Mode
+### Differential Tests
 
 ```bash
 # Full suite (all 41 test files: TPC-H, TPC-DS, joins, window, aggregations, etc.)
@@ -249,14 +256,6 @@ cargo test -- --nocapture
 
 # Quick check: TPC-H only
 ./tests/scripts/run-differential-tests.sh tpch
-```
-
-### Differential Tests — Strict Mode
-
-Requires a binary built with `--features bundled-extension` (see above).
-
-```bash
-THUNDERDUCK_COMPAT_MODE=strict ./tests/scripts/run-differential-tests.sh tpch
 ```
 
 The run script handles virtualenv setup, server lifecycle, and cleanup automatically.
@@ -290,10 +289,9 @@ cd tests/integration && python3 -m pytest \
 
 ## Documentation
 
-- **[Architecture](docs/architecture.md)**: All architectural decisions (ADRs 1–21)
-- **[Implementation Plan](docs/implementation-plan.md)**: Phased delivery plan
+- **[Rearchitecture ADRs](docs/thunderduck-rearchitect-ADRs.md)**: Authoritative architecture for the transpiler redesign (ADR-000 → ADR-019)
+- **[Architecture](docs/architecture.md)**: Architectural decisions for the existing implementation (ADRs 1–21)
 - **[Dev Journal](docs/dev-journal-toc.md)**: Chronological development history
-- **[Test Tracker](docs/reference-gap-analysis.md)**: Differential test status and remaining items
 
 ## Contributing
 

@@ -1,0 +1,42 @@
+{
+ "id": "str-015",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "fs",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice=34"
+  ],
+  [
+   "Bob=41"
+  ],
+  [
+   "Carol=29"
+  ],
+  [
+   "Dan=52"
+  ],
+  [
+   "Eve=38"
+  ],
+  [
+   "Frank=45"
+  ],
+  [
+   "Grace=27"
+  ],
+  [
+   "Heidi=60"
+  ]
+ ]
+}

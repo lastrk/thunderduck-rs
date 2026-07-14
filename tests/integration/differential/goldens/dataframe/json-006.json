@@ -1,0 +1,27 @@
+{
+ "id": "json-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "schema",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "STRUCT<a: BIGINT, b: STRING>"
+  ],
+  [
+   "STRUCT<a: BIGINT, b: STRING>"
+  ],
+  [
+   "STRUCT<a: BIGINT, b: STRING>"
+  ]
+ ]
+}

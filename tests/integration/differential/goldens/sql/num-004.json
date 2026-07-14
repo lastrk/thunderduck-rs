@@ -1,0 +1,28 @@
+{
+ "id": "num-004",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "ra",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "rf",
+    "type": "float",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "rx",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

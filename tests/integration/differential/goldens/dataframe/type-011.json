@@ -1,0 +1,116 @@
+{
+ "id": "type-011",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "budget",
+    "type": "decimal(12,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "location",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "country",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "eid",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   "Infrastructure",
+   {
+    "$dec": "2500000.00"
+   },
+   "Vienna",
+   "AT",
+   1
+  ],
+  [
+   10,
+   "Infrastructure",
+   {
+    "$dec": "2500000.00"
+   },
+   "Vienna",
+   "AT",
+   2
+  ],
+  [
+   20,
+   "Data",
+   {
+    "$dec": "1800000.00"
+   },
+   "Vienna",
+   "AT",
+   3
+  ],
+  [
+   20,
+   "Data",
+   {
+    "$dec": "1800000.00"
+   },
+   "Vienna",
+   "AT",
+   4
+  ],
+  [
+   30,
+   "ML",
+   {
+    "$dec": "3200000.00"
+   },
+   "Zurich",
+   "CH",
+   6
+  ],
+  [
+   30,
+   "ML",
+   {
+    "$dec": "3200000.00"
+   },
+   "Zurich",
+   "CH",
+   7
+  ],
+  [
+   40,
+   "Security",
+   null,
+   "Berlin",
+   "DE",
+   null
+  ]
+ ]
+}

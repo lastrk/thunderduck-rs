@@ -1,0 +1,60 @@
+{
+ "id": "cte-007",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "salary",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "rn",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Bob",
+   10,
+   120000.0,
+   1
+  ],
+  [
+   "Carol",
+   20,
+   78000.0,
+   1
+  ],
+  [
+   "Frank",
+   30,
+   105000.0,
+   1
+  ],
+  [
+   "Heidi",
+   null,
+   150000.0,
+   1
+  ]
+ ]
+}

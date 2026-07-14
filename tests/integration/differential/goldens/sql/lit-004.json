@@ -1,0 +1,16 @@
+{
+ "id": "lit-004",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "ym",
+    "type": "interval year to month",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ }
+}

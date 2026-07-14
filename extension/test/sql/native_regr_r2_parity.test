@@ -1,0 +1,10 @@
+# name: test/sql/native_regr_r2_parity.test
+# description: spark_regr_r2 resolves to native REGR_R2; parity vs Spark 4.1.1. Arg order (y,x).
+# group: [sql]
+
+# Oracle: Spark 4.1.1. Corpus: agg2-003.
+
+query T
+SELECT CAST(round(regr_r2(y,x),10) AS VARCHAR) FROM (VALUES (1.0,2.0),(2,4),(3,5),(4,4),(5,8),(6,7),(7,9),(8,8),(NULL,100),(9,NULL)) p(x,y);
+----
+0.8231292517

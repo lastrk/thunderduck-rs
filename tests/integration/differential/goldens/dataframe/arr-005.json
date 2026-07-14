@@ -1,0 +1,24 @@
+{
+ "id": "arr-005",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "d",
+    "type": {
+     "type": "array",
+     "elementType": {
+      "type": "array",
+      "elementType": "string",
+      "containsNull": true
+     },
+     "containsNull": true
+    },
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ }
+}

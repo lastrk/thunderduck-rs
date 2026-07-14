@@ -1,0 +1,288 @@
+{
+ "id": "tpcds-q029",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "i_item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_item_desc",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_store_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_store_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_sales_quantity",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_returns_quantity",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "catalog_sales_quantity",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "AAAAAAAAACAAAAAA",
+   "Ce",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   6864,
+   3822,
+   7912
+  ],
+  [
+   "AAAAAAAAAEAAAAAA",
+   "Public, annual h",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   2337,
+   1353,
+   2626
+  ],
+  [
+   "AAAAAAAAALAAAAAA",
+   "Days might not attend in a aspects. American members ought to continue near seats. Islamic, dramatic spirits will not take yet for a horses. Alone, other parties coul",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   2277,
+   693,
+   4974
+  ],
+  [
+   "AAAAAAAABAAAAAAA",
+   "Powers will not get influences. Electoral ports should show low, annual chains. Now young visitors may pose now however final pages. Bitterly right children suit increasing, leading el",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   2760,
+   2622,
+   7018
+  ],
+  [
+   "AAAAAAAABDAAAAAA",
+   "Tonnes alter. Towns get schools",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   7776,
+   3888,
+   3958
+  ],
+  [
+   "AAAAAAAACFAAAAAA",
+   "Relative members keep today games. Computers improve here by a costs. Living evenings can rise. Lines sha",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   627,
+   396,
+   1292
+  ],
+  [
+   "AAAAAAAACJAAAAAA",
+   "Normal things beat also general agents. Other patients must not restore mu",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   4641,
+   546,
+   4384
+  ],
+  [
+   "AAAAAAAACLAAAAAA",
+   "Eyes appreciate political yards. Constant, awful eyes could c",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   4847,
+   1184,
+   3772
+  ],
+  [
+   "AAAAAAAADEAAAAAA",
+   "Already ",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   8216,
+   6448,
+   5475
+  ],
+  [
+   "AAAAAAAADKAAAAAA",
+   "Windows report easily; diplomatic years use",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   11570,
+   4940,
+   6886
+  ],
+  [
+   "AAAAAAAAEBAAAAAA",
+   "Extremely working exercises meet only managers. Choices might leave. Years could not tell later on a doctors. Ethnic, present surveys alienate already splendid claims. Major, violent records wil",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   672,
+   288,
+   5109
+  ],
+  [
+   "AAAAAAAAGCAAAAAA",
+   "International, substantial schools mean effectively. Users put then in a operations. Particul",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   968,
+   968,
+   4405
+  ],
+  [
+   "AAAAAAAAGKAAAAAA",
+   "Different, simple letters will damage ",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   2800,
+   1400,
+   2078
+  ],
+  [
+   "AAAAAAAAHGAAAAAA",
+   "As short materials might go sometime new, tall skills. M",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   12882,
+   5650,
+   11400
+  ],
+  [
+   "AAAAAAAAHJAAAAAA",
+   "Roman, determined details cannot teach only then high supplies. External, central books think never. No doubt large years become both enthusiastic examples. Benefits could",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   8436,
+   5439,
+   6042
+  ],
+  [
+   "AAAAAAAAIFAAAAAA",
+   "Nearly unlikely months use reasonable, ideological things. Certain, common books must think; democrats take in the companies. Bright, like ord",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   858,
+   273,
+   2033
+  ],
+  [
+   "AAAAAAAAIIAAAAAA",
+   "Courses love perhaps for a countries; practically possible interests see never aware groups. Criteria should lead close shares. Only major thin",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   1911,
+   624,
+   2217
+  ],
+  [
+   "AAAAAAAAJBAAAAAA",
+   "Married, european goods help as also full arts. Local seconds used to d",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   2090,
+   1900,
+   5104
+  ],
+  [
+   "AAAAAAAAJHAAAAAA",
+   "However increasing dates meet. Large, ready goals mean now blind structures. Crea",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   1944,
+   1836,
+   5522
+  ],
+  [
+   "AAAAAAAAKDAAAAAA",
+   "British units must not leave quick in a questions. Tasks terminate supreme departments. So significant families will not",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   3800,
+   3680,
+   1952
+  ],
+  [
+   "AAAAAAAAKKAAAAAA",
+   "Important, glad rights change however. Only regular arms ought to operate in a minutes. Units fail quite like a centuries. Simply safe branches accompany major tenants; ",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   1968,
+   738,
+   3743
+  ],
+  [
+   "AAAAAAAAMCAAAAAA",
+   "So general leaves discover clinical things. Sales get ",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   2376,
+   1296,
+   3627
+  ],
+  [
+   "AAAAAAAAMIAAAAAA",
+   "Well famous pubs use so accounts. Losses should not generate certain stars. Positive blues pro",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   6474,
+   1992,
+   4130
+  ],
+  [
+   "AAAAAAAANAAAAAAA",
+   "Groups join only most likely funds. Good",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   6477,
+   5588,
+   6211
+  ],
+  [
+   "AAAAAAAANJAAAAAA",
+   "Recent performances get yet other publications; current patients could not carry comparatively intense, vital times. Wide problems smooth truly. Tomorrow used years catch a",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   2232,
+   1240,
+   6091
+  ],
+  [
+   "AAAAAAAAOGAAAAAA",
+   "Single, possible causes cut more strange, british things; forms create other, loyal thousands. As real scheme",
+   "AAAAAAAABAAAAAAA",
+   "ought",
+   4324,
+   1380,
+   4811
+  ]
+ ]
+}

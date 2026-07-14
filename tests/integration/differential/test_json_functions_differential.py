@@ -184,7 +184,6 @@ class TestJsonConversion_Differential:
         td = run_test(spark_thunderduck)
         assert_dataframes_equal(ref, td, "to_json", ignore_nullable=True)
 
-    @pytest.mark.skip_relaxed(reason="schema_of_json format differs in relaxed mode; strict mode uses spark_schema_of_json extension")
     @pytest.mark.timeout(30)
     def test_schema_of_json(self, spark_reference, spark_thunderduck):
         """Test schema_of_json inferring schema from a JSON string literal."""

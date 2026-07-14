@@ -1,0 +1,91 @@
+{
+ "id": "hof-008",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "only_team",
+    "type": {
+     "type": "map",
+     "keyType": "string",
+     "valueType": "string",
+     "valueContainsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      "data"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      "infra"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      "infra"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      "ml"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      "ml"
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": [
+     [
+      "team",
+      null
+     ]
+    ]
+   }
+  ],
+  [
+   {
+    "$map": []
+   }
+  ]
+ ]
+}

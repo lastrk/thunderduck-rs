@@ -1,0 +1,34 @@
+{
+ "id": "num-019",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "s",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "p",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "q",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "df",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

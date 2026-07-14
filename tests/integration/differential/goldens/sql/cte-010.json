@@ -1,0 +1,84 @@
+{
+ "id": "cte-010",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "manager_id",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "lvl",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "Alice",
+   null,
+   0
+  ],
+  [
+   2,
+   "Bob",
+   1,
+   1
+  ],
+  [
+   3,
+   "Carol",
+   1,
+   1
+  ],
+  [
+   4,
+   "Dan",
+   3,
+   2
+  ],
+  [
+   5,
+   "Eve",
+   3,
+   2
+  ],
+  [
+   6,
+   "Frank",
+   2,
+   2
+  ],
+  [
+   7,
+   "Grace",
+   6,
+   3
+  ],
+  [
+   8,
+   "Heidi",
+   null,
+   0
+  ]
+ ]
+}

@@ -1,0 +1,56 @@
+{
+ "id": "sel-012",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "is_high",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   false
+  ],
+  [
+   "Bob",
+   true
+  ],
+  [
+   "Carol",
+   false
+  ],
+  [
+   "Dan",
+   false
+  ],
+  [
+   "Eve",
+   false
+  ],
+  [
+   "Frank",
+   true
+  ],
+  [
+   "Grace",
+   false
+  ],
+  [
+   "Heidi",
+   true
+  ]
+ ]
+}

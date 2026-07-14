@@ -1,0 +1,56 @@
+{
+ "id": "cnd-002",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "nm",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   "infra"
+  ],
+  [
+   10,
+   "infra"
+  ],
+  [
+   20,
+   "data"
+  ],
+  [
+   20,
+   "data"
+  ],
+  [
+   30,
+   "other"
+  ],
+  [
+   30,
+   "other"
+  ],
+  [
+   null,
+   "other"
+  ],
+  [
+   null,
+   "other"
+  ]
+ ]
+}

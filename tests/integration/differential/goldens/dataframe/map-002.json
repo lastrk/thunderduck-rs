@@ -1,0 +1,94 @@
+{
+ "id": "map-002",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "ks",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "vs",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null,
+   null
+  ],
+  [
+   [
+    "team",
+    "tz"
+   ],
+   [
+    "data",
+    "CET"
+   ]
+  ],
+  [
+   [
+    "team",
+    "tz"
+   ],
+   [
+    "infra",
+    "UTC"
+   ]
+  ],
+  [
+   [
+    "team",
+    "tz"
+   ],
+   [
+    "ml",
+    "UTC"
+   ]
+  ],
+  [
+   [
+    "team"
+   ],
+   [
+    "infra"
+   ]
+  ],
+  [
+   [
+    "team"
+   ],
+   [
+    "ml"
+   ]
+  ],
+  [
+   [
+    "team"
+   ],
+   [
+    null
+   ]
+  ],
+  [
+   [],
+   []
+  ]
+ ]
+}

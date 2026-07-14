@@ -1,0 +1,35 @@
+# name: test/sql/native_try_cast_parity.test
+# description: spark_try_cast resolves to native TRY_CAST; parity vs Spark 4.1.1. Corpus: cast-012.
+# group: [sql]
+
+# Oracle: Spark 4.1.1: bad string / overflow / malformed date / NULL -> NULL; valid -> value.
+
+query I
+SELECT try_cast('abc' AS INTEGER);
+----
+NULL
+
+query I
+SELECT try_cast('123' AS INTEGER);
+----
+123
+
+query I
+SELECT try_cast(CAST(NULL AS VARCHAR) AS INTEGER);
+----
+NULL
+
+query I
+SELECT try_cast(10000000000 AS INTEGER);
+----
+NULL
+
+query I
+SELECT try_cast('not-a-date' AS DATE);
+----
+NULL
+
+query I
+SELECT try_cast('1e100' AS INTEGER);
+----
+NULL

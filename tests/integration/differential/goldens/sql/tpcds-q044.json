@@ -1,0 +1,29 @@
+{
+ "id": "tpcds-q044",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "rnk",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "best_performing",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "worst_performing",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": []
+}

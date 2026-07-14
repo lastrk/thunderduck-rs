@@ -1,0 +1,29 @@
+{
+ "id": "tpcds-q023b",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "c_last_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "c_first_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sales",
+    "type": "decimal(38,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": []
+}

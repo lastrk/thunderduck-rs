@@ -1,0 +1,67 @@
+{
+ "id": "arr-013",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "fl",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   [
+    "go",
+    "c",
+    "rust",
+    "go",
+    "c",
+    "rust"
+   ]
+  ],
+  [
+   [
+    "java",
+    "java"
+   ]
+  ],
+  [
+   [
+    "python",
+    "python"
+   ]
+  ],
+  [
+   [
+    "python",
+    "rust",
+    "python",
+    "rust"
+   ]
+  ],
+  [
+   [
+    "scala",
+    "scala"
+   ]
+  ],
+  [
+   []
+  ]
+ ]
+}

@@ -1,0 +1,32 @@
+{
+ "id": "agg-017",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "senior",
+    "type": "boolean",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_sal",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   false,
+   83250.0
+  ],
+  [
+   true,
+   109750.0
+  ]
+ ]
+}

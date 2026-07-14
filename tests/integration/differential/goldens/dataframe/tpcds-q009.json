@@ -1,0 +1,37 @@
+{
+ "id": "tpcds-q009",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "bucket1",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "cnt1",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "avg1",
+    "type": "decimal(11,6)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   5454,
+   {
+    "$dec": "37.788631"
+   }
+  ]
+ ]
+}

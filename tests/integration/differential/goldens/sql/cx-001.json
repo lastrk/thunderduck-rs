@@ -1,0 +1,36 @@
+{
+ "id": "cx-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "arr",
+    "type": {
+     "type": "array",
+     "elementType": "integer",
+     "containsNull": false
+    },
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "first",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   [
+    1,
+    2,
+    3
+   ],
+   1
+  ]
+ ]
+}

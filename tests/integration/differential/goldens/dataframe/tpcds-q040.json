@@ -1,0 +1,35 @@
+{
+ "id": "tpcds-q040",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "w_state",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "i_item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sales_before",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sales_after",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": []
+}

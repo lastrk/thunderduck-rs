@@ -1,0 +1,72 @@
+{
+ "id": "chain-002",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "null",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "java",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "python",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "rust",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "scala",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Data",
+   2,
+   0,
+   0,
+   0,
+   0
+  ],
+  [
+   "Infrastructure",
+   0,
+   0,
+   1,
+   1,
+   1
+  ],
+  [
+   "ML",
+   0,
+   1,
+   1,
+   0,
+   0
+  ]
+ ]
+}

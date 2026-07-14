@@ -1,4 +1,9 @@
 /// Controls how many rows each Arrow RecordBatch contains.
+///
+/// NOTE: currently inert — it is threaded through `SessionManager::new` /
+/// `DuckDbSession::spawn` signatures but never read (`spawn` ignores it, and
+/// the streaming batch size is passed separately per call). De-threading it
+/// is deferred: removing the parameter is cross-crate signature churn.
 #[derive(Debug, Clone)]
 pub struct StreamingConfig {
     /// Number of rows per batch. Default 8192, clamped to [1024, 65536].
@@ -8,18 +13,6 @@ pub struct StreamingConfig {
 impl Default for StreamingConfig {
     fn default() -> Self {
         Self { batch_size: 8192 }
-    }
-}
-
-impl StreamingConfig {
-    /// Reads `THUNDERDUCK_BATCH_SIZE` from the environment; falls back to default.
-    pub fn from_env() -> Self {
-        let batch_size = std::env::var("THUNDERDUCK_BATCH_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8192)
-            .clamp(1024, 65536);
-        Self { batch_size }
     }
 }
 
@@ -37,7 +30,10 @@ impl HardwareProfile {
             .map(|n| n.get())
             .unwrap_or(1);
         let memory_limit_gb = Self::detect_memory_gb();
-        Self { cpu_threads, memory_limit_gb }
+        Self {
+            cpu_threads,
+            memory_limit_gb,
+        }
     }
 
     #[cfg(target_os = "linux")]

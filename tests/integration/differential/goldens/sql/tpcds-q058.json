@@ -1,0 +1,59 @@
+{
+ "id": "tpcds-q058",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "item_id",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ss_item_rev",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ss_dev",
+    "type": "decimal(38,17)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cs_item_rev",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cs_dev",
+    "type": "decimal(38,17)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ws_item_rev",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "ws_dev",
+    "type": "decimal(38,17)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "average",
+    "type": "decimal(23,6)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": []
+}

@@ -1,0 +1,262 @@
+# name: test/sql/spark_hash.test
+# description: Bit-parity tests for spark_hash (Spark's MurmurHash3_x86_32 variant).
+# group: [sql]
+
+#              Parity oracle: hash('Spark', array(123), 2) = -1321691492 from the
+#              official Spark function docs. Note: Spark's hashUnsafeBytes processes
+#              the tail bytes ONE AT A TIME through mixK1/mixH1 — this is NOT the
+#              canonical MurmurHash3 tail behavior. Lengths 1, 5, 7, 33 below
+#              exercise that tail path.
+
+require thdck_spark_funcs
+
+# -----------------------------------------------------------------------------
+# Return type and seed semantics
+# -----------------------------------------------------------------------------
+
+query I
+SELECT typeof(spark_hash(1::INTEGER));
+----
+INTEGER
+
+# Zero args returns the initial seed (42)
+query I
+SELECT spark_hash();
+----
+42
+
+# NULL skip: a NULL leaves the seed unchanged
+query I
+SELECT spark_hash(NULL::INTEGER);
+----
+42
+
+query I
+SELECT spark_hash(NULL::BIGINT, NULL::VARCHAR, NULL::DOUBLE);
+----
+42
+
+# NULL columns are SKIPPED, not propagated.
+query I
+SELECT spark_hash(1::INTEGER, NULL::INTEGER, 2::INTEGER) = spark_hash(1::INTEGER, 2::INTEGER);
+----
+true
+
+# -----------------------------------------------------------------------------
+# Spark documentation golden — primary parity oracle
+# https://spark.apache.org/docs/latest/api/sql/index.html#hash
+# -----------------------------------------------------------------------------
+
+query I
+SELECT spark_hash('Spark', [123]::INTEGER[], 2::INTEGER);
+----
+-1321691492
+
+# -----------------------------------------------------------------------------
+# Per-type goldens
+# -----------------------------------------------------------------------------
+
+query I
+SELECT spark_hash(TRUE);
+----
+-559580957
+
+query I
+SELECT spark_hash(FALSE);
+----
+933211791
+
+# Cross-type invariants
+query II
+SELECT spark_hash(TRUE) = spark_hash(1::INTEGER),
+       spark_hash(1::INTEGER) = spark_hash(1::TINYINT);
+----
+true	true
+
+query III
+SELECT spark_hash(FALSE) = spark_hash(0::INTEGER),
+       spark_hash(0::INTEGER) = spark_hash(0.0::FLOAT),
+       spark_hash(0::INTEGER) = spark_hash(DATE '1970-01-01');
+----
+true	true	true
+
+query I
+SELECT spark_hash(0::INTEGER);
+----
+933211791
+
+query I
+SELECT spark_hash(1::INTEGER);
+----
+-559580957
+
+query I
+SELECT spark_hash((-1)::INTEGER);
+----
+-1604776387
+
+# SMALLINT -1 sign-extends to INTEGER -1
+query I
+SELECT spark_hash((-1)::SMALLINT) = spark_hash((-1)::INTEGER);
+----
+true
+
+query I
+SELECT spark_hash(1::BIGINT);
+----
+-1712319331
+
+query I
+SELECT spark_hash((-1)::BIGINT);
+----
+-939490007
+
+# NaN canonicalization
+query I
+SELECT spark_hash('nan'::FLOAT);
+----
+-349261430
+
+query I
+SELECT spark_hash('nan'::DOUBLE);
+----
+-1281358385
+
+query I
+SELECT spark_hash(1.5::DOUBLE);
+----
+1290763749
+
+# Strings — note in particular lengths 1 and 5 (1 tail byte), 7 (3 tail bytes),
+# 32 (no tail), 33 (1 tail byte): these exercise the Spark-specific
+# per-byte tail behavior in Murmur3.hashUnsafeBytes.
+query I
+SELECT spark_hash('');
+----
+142593372
+
+query I
+SELECT spark_hash('a');
+----
+1485273170
+
+query I
+SELECT spark_hash('hello');
+----
+-1008564952
+
+query I
+SELECT spark_hash('abcdefghijklmnopqrstuvwxyz012345');
+----
+-1762287540
+
+query I
+SELECT spark_hash('abcdefghijklmnopqrstuvwxyz0123456');
+----
+1330158035
+
+query I
+SELECT spark_hash(TIMESTAMP '1970-01-01 00:00:00') = spark_hash(0::BIGINT);
+----
+true
+
+# Decimal
+query I
+SELECT spark_hash(123.45::DECIMAL(5,2));
+----
+1416086240
+
+query I
+SELECT spark_hash(123456789012345.6789::DECIMAL(38,4));
+----
+-285683440
+
+# -----------------------------------------------------------------------------
+# Nested types
+# -----------------------------------------------------------------------------
+
+# Spark invariant: array(1, 2) folds the same as columns (1, 2)
+query I
+SELECT spark_hash([1, 2]::INTEGER[]) = spark_hash(1::INTEGER, 2::INTEGER);
+----
+true
+
+query I
+SELECT spark_hash([1, 2, 3]::INTEGER[]);
+----
+-912918097
+
+# NULL list elements are skipped
+query I
+SELECT spark_hash([1, NULL, 2]::INTEGER[]) = spark_hash([1, 2]::INTEGER[]);
+----
+true
+
+query I
+SELECT spark_hash([]::INTEGER[]);
+----
+42
+
+query I
+SELECT spark_hash(NULL::INTEGER[]);
+----
+42
+
+query I
+SELECT spark_hash({'a': 1::INTEGER, 'b': 'hello'});
+----
+-1505279299
+
+query I
+SELECT spark_hash(MAP {1::INTEGER: 'a', 2::INTEGER: 'b'});
+----
+-1706464220
+
+# -----------------------------------------------------------------------------
+# Multi-column seed chaining
+# -----------------------------------------------------------------------------
+
+query I
+SELECT spark_hash(1::INTEGER, 2::BIGINT, 'hello');
+----
+948072272
+
+# -----------------------------------------------------------------------------
+# Vectorized batch
+# -----------------------------------------------------------------------------
+
+query II
+SELECT i, spark_hash(i::BIGINT) FROM range(3) t(i);
+----
+0	-1670924195
+1	-1712319331
+2	-797927272
+
+# -----------------------------------------------------------------------------
+# Unsupported types throw at bind time
+# -----------------------------------------------------------------------------
+
+statement error
+SELECT spark_hash(1::UTINYINT);
+----
+no Spark equivalent
+
+statement error
+SELECT spark_hash(NULL::UBIGINT);
+----
+no Spark equivalent
+
+statement error
+SELECT spark_hash(NULL::HUGEINT);
+----
+no Spark equivalent
+
+statement error
+SELECT spark_hash(NULL::TIME);
+----
+no Spark equivalent
+
+statement error
+SELECT spark_hash([1]::UTINYINT[]);
+----
+no Spark equivalent

@@ -1,0 +1,137 @@
+{
+ "id": "tpcds-q064",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "product_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "store_zip",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "b_street_number",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "b_streen_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "b_city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "b_zip",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "c_street_number",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "c_street_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "c_city",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "c_zip",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "syear",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cnt",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "s1",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s2",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s3",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s1",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s2",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s3",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "syear",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cnt",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": []
+}

@@ -313,12 +313,21 @@ RUN apt-get update && apt-get install -y \
 # npm config set prefix: Tells npm to install global packages to ~/.npm-global
 RUN su vscode -c "mkdir -p ~/.npm-global && npm config set prefix ~/.npm-global"
 
-# PATH Environment Variable: Add NPM global bin directory
-# Purpose: Makes globally installed npm packages executable from command line
-# Why necessary: Without this, 'claude-code' command wouldn't be found after npm install -g
+# PATH Environment Variable: Add NPM global bin and uv tool bin directories
+# Purpose: Makes globally installed npm packages and uv tool-installed binaries executable
+# Why necessary:
+#   - /home/vscode/.npm-global/bin: where `npm install -g <pkg>` puts binaries (e.g. claude-code)
+#   - /home/vscode/.local/bin: where `uv tool install <pkg>` puts binaries
 # ${PATH}: Preserves existing PATH entries (system binaries, etc.)
-# Security: Only adds vscode user's directory, not system-wide writable paths
-ENV PATH="/home/vscode/.npm-global/bin:${PATH}"
+# Security: Only adds vscode user's directories, not system-wide writable paths
+ENV PATH="/home/vscode/.local/bin:/home/vscode/.npm-global/bin:${PATH}"
+
+# uv (Python Package and Tool Manager)
+# Purpose: Fast, isolated Python tool installer — kept available unconditionally so users
+#          can `uv tool install <any-python-cli>` on demand inside the container
+# Why system-wide via pip3: makes `uv` available to all users on PATH (/usr/local/bin/uv)
+# Security: pip3 install runs as root but uv itself runs as the invoking user afterwards
+RUN pip3 install --no-cache-dir uv
 
 # Git Safe Directory Configuration
 # Purpose: Mark /workspace as safe to prevent "dubious ownership" errors

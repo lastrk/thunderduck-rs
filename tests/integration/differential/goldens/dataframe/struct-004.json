@@ -1,0 +1,42 @@
+{
+ "id": "struct-004",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "lat",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   47.37
+  ],
+  [
+   48.14
+  ],
+  [
+   48.2
+  ],
+  [
+   48.21
+  ],
+  [
+   48.22
+  ],
+  [
+   52.52
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ]
+ ]
+}

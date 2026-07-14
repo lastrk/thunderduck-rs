@@ -1,0 +1,22 @@
+{
+ "id": "lit-006",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "iv",
+    "type": "interval",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "dti",
+    "type": "interval day to second",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ }
+}

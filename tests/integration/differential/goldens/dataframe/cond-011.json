@@ -1,0 +1,42 @@
+{
+ "id": "cond-011",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "score_clean",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   0.0
+  ],
+  [
+   0.0
+  ],
+  [
+   0.1
+  ],
+  [
+   0.55
+  ],
+  [
+   0.73
+  ],
+  [
+   0.91
+  ],
+  [
+   1.0
+  ],
+  [
+   null
+  ]
+ ]
+}

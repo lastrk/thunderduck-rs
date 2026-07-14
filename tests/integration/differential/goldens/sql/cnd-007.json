@@ -1,0 +1,56 @@
+{
+ "id": "cnd-007",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "a",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "b",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   -1,
+   "has"
+  ],
+  [
+   -1,
+   "has"
+  ],
+  [
+   10,
+   "has"
+  ],
+  [
+   10,
+   "has"
+  ],
+  [
+   20,
+   "has"
+  ],
+  [
+   20,
+   "none"
+  ],
+  [
+   30,
+   "has"
+  ],
+  [
+   30,
+   "has"
+  ]
+ ]
+}

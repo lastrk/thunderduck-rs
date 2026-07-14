@@ -1,0 +1,42 @@
+{
+ "id": "str-009",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "rr",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Al_c_"
+  ],
+  [
+   "B_b"
+  ],
+  [
+   "C_r_l"
+  ],
+  [
+   "D_n"
+  ],
+  [
+   "Ev_"
+  ],
+  [
+   "Fr_nk"
+  ],
+  [
+   "Gr_c_"
+  ],
+  [
+   "H__d_"
+  ]
+ ]
+}

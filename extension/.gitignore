@@ -1,0 +1,17 @@
+# CMake build artifacts
+build/
+
+# Test temp files
+duckdb_unittest_tempdir/
+
+# agentic-dev pipeline scratch and per-machine indexes
+.agent-output/
+.gitworktrees/
+.codegraph/
+
+# Spark oracle byproducts (spark-sql local metastore)
+derby.log
+metastore_db/
+
+# clangd index cache (local tooling artifact, not part of origin's .gitignore)
+.cache/

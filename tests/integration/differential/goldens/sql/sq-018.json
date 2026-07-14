@@ -1,0 +1,56 @@
+{
+ "id": "sq-018",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   "Infrastructure"
+  ],
+  [
+   "Bob",
+   "Infrastructure"
+  ],
+  [
+   "Carol",
+   "Data"
+  ],
+  [
+   "Dan",
+   "Data"
+  ],
+  [
+   "Eve",
+   "UNASSIGNED"
+  ],
+  [
+   "Frank",
+   "ML"
+  ],
+  [
+   "Grace",
+   "ML"
+  ],
+  [
+   "Heidi",
+   "UNASSIGNED"
+  ]
+ ]
+}

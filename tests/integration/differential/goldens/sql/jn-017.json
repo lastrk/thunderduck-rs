@@ -1,0 +1,48 @@
+{
+ "id": "jn-017",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dept_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Data",
+   "Data"
+  ],
+  [
+   "Data",
+   "Data"
+  ],
+  [
+   "Infrastructure",
+   "Infrastructure"
+  ],
+  [
+   "Infrastructure",
+   "Infrastructure"
+  ],
+  [
+   "ML",
+   "ML"
+  ],
+  [
+   "ML",
+   "ML"
+  ]
+ ]
+}

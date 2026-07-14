@@ -1,0 +1,27 @@
+{
+ "id": "parse-004",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "n",
+    "type": "decimal(5,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   null
+  ],
+  [
+   null
+  ],
+  [
+   null
+  ]
+ ]
+}

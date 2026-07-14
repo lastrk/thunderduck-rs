@@ -1,0 +1,124 @@
+{
+ "id": "tpcds-q099",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "warehouse_substr",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sm_type",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "cc_name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sun_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "mon_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "tue_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "wed_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "thu_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "fri_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "sat_sales",
+    "type": "decimal(22,2)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Conventional childr",
+   "EXPRESS",
+   "NY Metro",
+   {
+    "$dec": "1539.48"
+   },
+   {
+    "$dec": "1421.20"
+   },
+   {
+    "$dec": "1711.13"
+   },
+   {
+    "$dec": "1305.67"
+   },
+   {
+    "$dec": "1417.16"
+   },
+   {
+    "$dec": "1464.68"
+   },
+   {
+    "$dec": "1321.95"
+   }
+  ],
+  [
+   "Conventional childr",
+   "LIBRARY",
+   "NY Metro",
+   {
+    "$dec": "1275.02"
+   },
+   {
+    "$dec": "1433.61"
+   },
+   {
+    "$dec": "1217.10"
+   },
+   {
+    "$dec": "1400.12"
+   },
+   {
+    "$dec": "1152.08"
+   },
+   {
+    "$dec": "1376.96"
+   },
+   {
+    "$dec": "1638.19"
+   }
+  ]
+ ]
+}

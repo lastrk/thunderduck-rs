@@ -1,0 +1,80 @@
+{
+ "id": "str-020",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": " all_lc",
+    "type": {
+     "type": "array",
+     "elementType": "string",
+     "containsNull": true
+    },
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   [
+    "a",
+    "n"
+   ]
+  ],
+  [
+   [
+    "a",
+    "r",
+    "o",
+    "l"
+   ]
+  ],
+  [
+   [
+    "e",
+    "i",
+    "d",
+    "i"
+   ]
+  ],
+  [
+   [
+    "l",
+    "i",
+    "c",
+    "e"
+   ]
+  ],
+  [
+   [
+    "o",
+    "b"
+   ]
+  ],
+  [
+   [
+    "r",
+    "a",
+    "c",
+    "e"
+   ]
+  ],
+  [
+   [
+    "r",
+    "a",
+    "n",
+    "k"
+   ]
+  ],
+  [
+   [
+    "v",
+    "e"
+   ]
+  ]
+ ]
+}

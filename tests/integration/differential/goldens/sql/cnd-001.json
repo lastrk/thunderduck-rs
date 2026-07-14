@@ -1,0 +1,56 @@
+{
+ "id": "cnd-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "band",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "Alice",
+   "junior"
+  ],
+  [
+   "Bob",
+   "senior"
+  ],
+  [
+   "Carol",
+   "junior"
+  ],
+  [
+   "Dan",
+   "senior"
+  ],
+  [
+   "Eve",
+   "junior"
+  ],
+  [
+   "Frank",
+   "senior"
+  ],
+  [
+   "Grace",
+   "junior"
+  ],
+  [
+   "Heidi",
+   "senior"
+  ]
+ ]
+}

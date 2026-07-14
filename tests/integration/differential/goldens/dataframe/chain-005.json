@@ -1,0 +1,60 @@
+{
+ "id": "chain-005",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dept_id",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "avg_tenure",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "max_sal",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "n",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   10,
+   9.649555099247092,
+   120000.0,
+   2
+  ],
+  [
+   20,
+   11.044490075290895,
+   78000.0,
+   2
+  ],
+  [
+   30,
+   8.600958247775496,
+   105000.0,
+   2
+  ],
+  [
+   null,
+   15.592060232717316,
+   150000.0,
+   2
+  ]
+ ]
+}

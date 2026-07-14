@@ -1,0 +1,56 @@
+{
+ "id": "str-006",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "lp",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "rp",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   "*****Bob",
+   "Bob....."
+  ],
+  [
+   "*****Dan",
+   "Dan....."
+  ],
+  [
+   "*****Eve",
+   "Eve....."
+  ],
+  [
+   "***Alice",
+   "Alice..."
+  ],
+  [
+   "***Carol",
+   "Carol..."
+  ],
+  [
+   "***Frank",
+   "Frank..."
+  ],
+  [
+   "***Grace",
+   "Grace..."
+  ],
+  [
+   "***Heidi",
+   "Heidi..."
+  ]
+ ]
+}

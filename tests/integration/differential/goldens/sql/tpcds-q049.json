@@ -1,0 +1,41 @@
+{
+ "id": "tpcds-q049",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "channel",
+    "type": "string",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "item",
+    "type": "long",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "return_ratio",
+    "type": "decimal(35,20)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "return_rank",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "currency_rank",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": []
+}

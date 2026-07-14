@@ -1,0 +1,36 @@
+{
+ "id": "tpch-q08",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "o_year",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "mkt_share",
+    "type": "decimal(38,6)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1995,
+   {
+    "$dec": "0.000000"
+   }
+  ],
+  [
+   1996,
+   {
+    "$dec": "0.000000"
+   }
+  ]
+ ]
+}

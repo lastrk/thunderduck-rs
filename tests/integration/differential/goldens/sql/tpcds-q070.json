@@ -1,0 +1,69 @@
+{
+ "id": "tpcds-q070",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "total_sum",
+    "type": "decimal(17,2)",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_state",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "s_county",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "lochierarchy",
+    "type": "byte",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "rank_within_parent",
+    "type": "integer",
+    "nullable": false,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   {
+    "$dec": "-4669375.41"
+   },
+   "TN",
+   "Williamson County",
+   0,
+   1
+  ],
+  [
+   {
+    "$dec": "-4669375.41"
+   },
+   "TN",
+   null,
+   1,
+   1
+  ],
+  [
+   {
+    "$dec": "-4669375.41"
+   },
+   null,
+   null,
+   2,
+   1
+  ]
+ ]
+}

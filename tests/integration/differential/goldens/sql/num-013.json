@@ -1,0 +1,28 @@
+{
+ "id": "num-013",
+ "spark_version": "4.1.1",
+ "kind": "schema_only",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "m_f",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "m_x",
+    "type": "double",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "m_d",
+    "type": "decimal(6,3)",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ }
+}

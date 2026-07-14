@@ -1,0 +1,70 @@
+{
+ "id": "dt-007",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "dw",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "dy",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   },
+   {
+    "name": "woy",
+    "type": "integer",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   193,
+   28
+  ],
+  [
+   2,
+   113,
+   17
+  ],
+  [
+   3,
+   182,
+   27
+  ],
+  [
+   3,
+   45,
+   7
+  ],
+  [
+   4,
+   20,
+   3
+  ],
+  [
+   5,
+   309,
+   45
+  ],
+  [
+   5,
+   60,
+   9
+  ],
+  [
+   6,
+   244,
+   35
+  ]
+ ]
+}

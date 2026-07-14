@@ -18,7 +18,9 @@ else
 fi
 WORKSPACE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SPARK_VERSION="4.1.1"
-SPARK_INSTALL_DIR="${SPARK_INSTALL_DIR:-$HOME/spark}"
+# Vendor Spark inside the workspace under .spark/ (gitignored) so the install is
+# self-contained and reproducible per-checkout. Override via SPARK_INSTALL_DIR.
+SPARK_INSTALL_DIR="${SPARK_INSTALL_DIR:-$WORKSPACE_DIR/.spark}"
 SPARK_HOME="$SPARK_INSTALL_DIR/spark-$SPARK_VERSION"
 
 # Colors for output
@@ -39,7 +41,7 @@ VENV_DIR="${THUNDERDUCK_VENV_DIR:-$WORKSPACE_DIR/.venv}"
 # ------------------------------------------------------------------------------
 # Step 1: Check Java
 # ------------------------------------------------------------------------------
-echo -e "${BLUE}[1/6] Checking Java...${NC}"
+echo -e "${BLUE}[1/5] Checking Java...${NC}"
 
 if ! command -v java &> /dev/null; then
     echo -e "${RED}ERROR: Java is not installed${NC}"
@@ -64,7 +66,7 @@ fi
 # ------------------------------------------------------------------------------
 # Step 2: Check Python and pip
 # ------------------------------------------------------------------------------
-echo -e "${BLUE}[2/6] Checking Python and pip...${NC}"
+echo -e "${BLUE}[2/5] Checking Python and pip...${NC}"
 
 if ! command -v python3 &> /dev/null; then
     echo -e "${RED}ERROR: Python 3 is not installed${NC}"
@@ -90,7 +92,7 @@ echo -e "${GREEN}  pip version: $PIP_VERSION${NC}"
 # ------------------------------------------------------------------------------
 # Step 3: Create/reuse virtualenv
 # ------------------------------------------------------------------------------
-echo -e "${BLUE}[3/6] Setting up virtualenv at $VENV_DIR...${NC}"
+echo -e "${BLUE}[3/5] Setting up virtualenv at $VENV_DIR...${NC}"
 
 if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/python3" ]; then
     echo -e "${GREEN}  Existing venv found, reusing${NC}"
@@ -103,7 +105,7 @@ fi
 # ------------------------------------------------------------------------------
 # Step 4: Install Python dependencies into venv
 # ------------------------------------------------------------------------------
-echo -e "${BLUE}[4/6] Installing Python dependencies into venv...${NC}"
+echo -e "${BLUE}[4/5] Installing Python dependencies into venv...${NC}"
 
 REQUIREMENTS_FILE="$WORKSPACE_DIR/tests/integration/requirements.txt"
 if [ ! -f "$REQUIREMENTS_FILE" ]; then
@@ -115,18 +117,20 @@ echo "  Installing from requirements.txt..."
 "$VENV_DIR/bin/python3" -m pip install --quiet --upgrade pip
 "$VENV_DIR/bin/python3" -m pip install --quiet -r "$REQUIREMENTS_FILE"
 
-# Verify PySpark installation
-PYSPARK_INSTALLED=$("$VENV_DIR/bin/python3" -m pip show pyspark 2>/dev/null | grep Version | awk '{print $2}')
+# Verify pyspark-client install (provides the `pyspark` Python module the diff
+# tests import) by importing it from the venv.
+PYSPARK_INSTALLED=$("$VENV_DIR/bin/python3" -c \
+    'import pyspark; print(pyspark.__version__)' 2>/dev/null)
 if [ -z "$PYSPARK_INSTALLED" ]; then
-    echo -e "${RED}ERROR: PySpark installation failed${NC}"
+    echo -e "${RED}ERROR: pyspark-client installation failed (cannot import pyspark)${NC}"
     exit 1
 fi
-echo -e "${GREEN}  PySpark version: $PYSPARK_INSTALLED${NC}"
+echo -e "${GREEN}  pyspark module version: $PYSPARK_INSTALLED${NC}"
 
 # ------------------------------------------------------------------------------
 # Step 5: Download and Install Apache Spark
 # ------------------------------------------------------------------------------
-echo -e "${BLUE}[5/6] Setting up Apache Spark ${SPARK_VERSION}...${NC}"
+echo -e "${BLUE}[5/5] Setting up Apache Spark ${SPARK_VERSION}...${NC}"
 
 if [ -d "$SPARK_HOME" ] && [ -f "$SPARK_HOME/bin/spark-submit" ]; then
     echo -e "${GREEN}  Spark already installed at: $SPARK_HOME${NC}"
@@ -135,23 +139,34 @@ else
 
     mkdir -p "$SPARK_INSTALL_DIR"
     SPARK_TARBALL="spark-${SPARK_VERSION}-bin-hadoop3.tgz"
-    SPARK_URL="https://dlcdn.apache.org/spark/spark-${SPARK_VERSION}/${SPARK_TARBALL}"
+    # Try the current-release mirror first; fall back to the archive for older releases.
+    SPARK_URL_PRIMARY="https://dlcdn.apache.org/spark/spark-${SPARK_VERSION}/${SPARK_TARBALL}"
+    SPARK_URL_ARCHIVE="https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/${SPARK_TARBALL}"
 
     # Download to temp directory
     TEMP_DIR=$(mktemp -d)
     cd "$TEMP_DIR"
 
-    if ! curl -fsSL "$SPARK_URL" -o "$SPARK_TARBALL"; then
-        echo -e "${RED}ERROR: Failed to download Spark from $SPARK_URL${NC}"
-        rm -rf "$TEMP_DIR"
-        exit 1
+    if ! curl -fsSL "$SPARK_URL_PRIMARY" -o "$SPARK_TARBALL"; then
+        echo "  Primary mirror missing ${SPARK_VERSION}, trying archive…"
+        if ! curl -fsSL "$SPARK_URL_ARCHIVE" -o "$SPARK_TARBALL"; then
+            echo -e "${RED}ERROR: Failed to download Spark from either mirror${NC}"
+            echo "  Tried:"
+            echo "    $SPARK_URL_PRIMARY"
+            echo "    $SPARK_URL_ARCHIVE"
+            rm -rf "$TEMP_DIR"
+            exit 1
+        fi
     fi
 
     echo "  Extracting Spark..."
     tar -xzf "$SPARK_TARBALL"
     mv "spark-${SPARK_VERSION}-bin-hadoop3" "$SPARK_HOME"
 
-    # Cleanup
+    # Cleanup. Leave the deleted temp dir before removing it — otherwise the
+    # shell's cwd points at a nonexistent directory and subsequent commands
+    # (notably `spark-submit`, which resolves relative paths internally) fail.
+    cd "$WORKSPACE_DIR"
     rm -rf "$TEMP_DIR"
 
     echo -e "${GREEN}  Spark installed at: $SPARK_HOME${NC}"
@@ -169,36 +184,10 @@ fi
 echo -e "${GREEN}  Spark version: $("$SPARK_HOME/bin/spark-submit" --version 2>&1 | grep -i version | head -1)${NC}"
 
 # ------------------------------------------------------------------------------
-# Step 6: Build Thunderduck
-# ------------------------------------------------------------------------------
-echo -e "${BLUE}[6/6] Building Thunderduck...${NC}"
-
-cd "$WORKSPACE_DIR"
-
-if [ ! -f "pom.xml" ]; then
-    echo -e "${RED}ERROR: Not in Thunderduck workspace (pom.xml not found)${NC}"
-    exit 1
-fi
-
-if ! command -v mvn &> /dev/null; then
-    echo -e "${RED}ERROR: Maven is not installed${NC}"
-    echo "Please install Maven first"
-    exit 1
-fi
-
-echo "  Running: mvn clean package -DskipTests"
-mvn clean package -DskipTests -q
-
-if [ ! -f "$WORKSPACE_DIR/connect-server/target/thunderduck-connect-server-"*".jar" ]; then
-    echo -e "${RED}ERROR: Thunderduck build failed - JAR not found${NC}"
-    exit 1
-fi
-
-echo -e "${GREEN}  Thunderduck built successfully${NC}"
-
-# ------------------------------------------------------------------------------
 # Write environment configuration
 # ------------------------------------------------------------------------------
+# Building Thunderduck is the developer's job (`cargo build --release`); this
+# script is environment setup only.
 ENV_FILE="$WORKSPACE_DIR/tests/integration/.env"
 cat > "$ENV_FILE" << EOF
 # Differential Testing V2 Environment Configuration
@@ -221,12 +210,13 @@ echo -e "Virtualenv: ${BLUE}$VENV_DIR${NC}"
 echo ""
 echo -e "${YELLOW}To run differential tests:${NC}"
 echo ""
-echo "  # Run script auto-detects the venv (no manual activation needed):"
-echo "  $SCRIPT_DIR/run-differential-tests-v2.sh"
+echo "  # Build the Rust release binary first:"
+echo "  cargo build --release"
 echo ""
-echo "  # Or activate manually and run pytest directly:"
-echo "  source $VENV_DIR/bin/activate"
-echo "  cd $WORKSPACE_DIR/tests/integration"
-echo "  python3 -m pytest differential/ -v"
+echo "  # Cargo test target (one #[test] per suite, all #[ignore]):"
+echo "  cargo test -p thunderduck-connect-server --test differential -- --ignored --nocapture"
+echo ""
+echo "  # Or call the bash runner directly:"
+echo "  $SCRIPT_DIR/run-differential-tests.sh tpch"
 echo ""
 echo -e "${GREEN}================================================================${NC}"

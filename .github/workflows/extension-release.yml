@@ -124,27 +124,87 @@ jobs:
           BUILT_BY: "github-actions[bot] via ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: scripts/dev/adopt-extension-release.sh --from-local "$PWD/local-adopt"
 
+      # The commit is created through the GitHub Git Data API (not `git commit`
+      # + `git push`) so that GitHub GPG-signs it server-side with GITHUB_TOKEN
+      # and marks it Verified. The main-branch ruleset requires a verified
+      # signature on every commit in a PR; a local `git commit` here has no
+      # signing key and produces an unsigned commit that blocks the PR at merge.
+      - name: Check for changes
+        run: |
+          set -euo pipefail
+          if git diff --cached --quiet -- extensions/vendored; then
+            echo "No change to extensions/vendored — nothing to adopt (binaries byte-identical to what's already vendored)."
+            echo "skip=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "BRANCH=extension-release/${DUCKDB_VERSION}-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+
+      - name: Create signed commit via API
+        if: env.skip != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const fs = require('fs');
+            const branch = process.env.BRANCH;
+            const duckdbVersion = process.env.DUCKDB_VERSION;
+            const baseSha = context.sha;
+            const { owner, repo } = context.repo;
+
+            // --name-status (not --name-only) so staged deletions from a
+            // version bump — the adopt script `git rm`s the prior set — become
+            // tree removals (sha: null) instead of crashing readFileSync.
+            // --no-renames keeps every change a clean A/M/D single-path entry.
+            const changes = execSync(
+              'git diff --cached --no-renames --name-status -- extensions/vendored',
+              { encoding: 'utf8' },
+            ).trim().split('\n').filter(Boolean);
+
+            const { data: baseCommit } = await github.rest.git.getCommit({
+              owner, repo, commit_sha: baseSha,
+            });
+
+            const tree = [];
+            for (const line of changes) {
+              const [status, path] = line.split('\t');
+              if (status === 'D') {
+                tree.push({ path, mode: '100644', type: 'blob', sha: null });
+                continue;
+              }
+              const { data: blob } = await github.rest.git.createBlob({
+                owner, repo,
+                content: fs.readFileSync(path).toString('base64'),
+                encoding: 'base64',
+              });
+              tree.push({ path, mode: '100644', type: 'blob', sha: blob.sha });
+            }
+
+            const { data: newTree } = await github.rest.git.createTree({
+              owner, repo, base_tree: baseCommit.tree.sha, tree,
+            });
+
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const { data: commit } = await github.rest.git.createCommit({
+              owner, repo,
+              message: `chore(extension): adopt ${duckdbVersion} build from extension/ @ ${baseSha}\n\nBuilt by workflow run ${runUrl}.`,
+              tree: newTree.sha,
+              parents: [baseSha],
+            });
+
+            await github.rest.git.createRef({
+              owner, repo, ref: `refs/heads/${branch}`, sha: commit.sha,
+            });
+
+            console.log(`Created signed commit ${commit.sha} on ${branch}`);
+
       - name: Open PR
+        if: env.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           BASE_REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if git diff --cached --quiet -- extensions/vendored; then
-            echo "No change to extensions/vendored — nothing to adopt (binaries byte-identical to what's already vendored)."
-            exit 0
-          fi
-
-          BRANCH="extension-release/${DUCKDB_VERSION}-${GITHUB_RUN_ID}"
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          git checkout -b "$BRANCH"
-          git commit -m "chore(extension): adopt ${DUCKDB_VERSION} build from extension/ @ ${GITHUB_SHA}" \
-            -m "Built by workflow run ${RUN_URL}."
-          git push origin "$BRANCH"
-
           gh pr create \
             --base "$BASE_REF" \
             --head "$BRANCH" \

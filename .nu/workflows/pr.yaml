@@ -19,8 +19,7 @@ spec:
         - uses: checkout
         - image: rust:1.85-bookworm
           run: |
-            rustfmt --version
-            cargo clippy -V
+            rustup component add rustfmt clippy
             cargo fmt --all -- --check
             cargo clippy --workspace --all-targets --features bundled -- -D warnings
             cargo test --workspace --features bundled

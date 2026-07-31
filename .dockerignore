@@ -1,11 +1,20 @@
-# The devcontainer Dockerfile (.devcontainer/Dockerfile) does not COPY or
-# ADD anything from the project root. devcontainer.json sets the build
-# context to ".." (project root) so the context would otherwise include
-# multi-GB directories (target/, .claude/worktrees/, test parquet data),
-# which Podman streams into /var/tmp on the VM and runs out of space.
+# This context is shared by two Dockerfiles:
+#   - .devcontainer/Dockerfile (devcontainer.json sets context to "..",
+#     i.e. the project root) — does not COPY or ADD anything.
+#   - the root Dockerfile (release image) — `COPY . .` for
+#     `cargo build --features bundled -p thunderduck-connect-server`.
 #
-# Excluding everything keeps the build context essentially empty, which is
-# correct given the Dockerfile's actual needs. If you ever add a COPY or
-# ADD to the Dockerfile, whitelist the specific path here with `!path`.
+# Without this file the context would include multi-GB directories
+# (target/, .claude/worktrees/, test parquet data), which Podman streams
+# into /var/tmp on the VM and runs out of space.
+#
+# Default-deny, then allowlist exactly what the release Dockerfile's cargo
+# build needs. If you add a COPY/ADD elsewhere, whitelist the new path here.
 
 *
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/**
+!extensions/vendored/
+!extensions/vendored/**

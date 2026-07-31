@@ -1,0 +1,30 @@
+apiVersion: workflows.dev/v1alpha1
+kind: Workflow
+metadata:
+  namespace: pipelines
+spec:
+  owner:
+    name: "Batch Compute Team"
+    contact: "#batch-compute-team"
+  events:
+    - push
+  branches:
+    - "$(workflow.repo.default-branch)"
+  tasks:
+    build-and-publish:
+      serviceAccount: ecr-write
+      resources:
+        cpu: 4
+        memory: 8Gi
+      steps:
+        - uses: checkout
+        - uses: buildkit
+          name: build-push-thunderduck-rs-image
+          options:
+            ecrLogin: true
+            destination:
+              - 193814090748.dkr.ecr.us-east-1.amazonaws.com/di-art/thunderduck-rs:$(workflow.head-commit)
+              - 193814090748.dkr.ecr.us-east-1.amazonaws.com/di-art/thunderduck-rs:latest
+            platform:
+              - linux/amd64
+              - linux/arm64

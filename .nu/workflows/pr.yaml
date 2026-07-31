@@ -1,0 +1,25 @@
+apiVersion: workflows.dev/v1alpha1
+kind: Workflow
+metadata:
+  namespace: pipelines
+spec:
+  owner:
+    name: "Batch Compute Team"
+    contact: "#batch-compute-team"
+  events:
+    - push
+  branches:
+    - "!$(workflow.repo.default-branch)"
+  tasks:
+    check:
+      resources:
+        cpu: 2
+        memory: 4Gi
+      steps:
+        - uses: checkout
+        - image: rust:1.85-bookworm
+          run: |
+            rustup component add rustfmt clippy
+            cargo fmt --all -- --check
+            cargo clippy --workspace --all-targets --features bundled -- -D warnings
+            cargo test --workspace --features bundled

@@ -10,11 +10,43 @@ Once `extension/` is the only source of truth, keeping the origin repos live inv
 
 All six must be green before archiving. Each corresponds to a stage of the phase-2 absorption; re-run the cited command if you're not looking at a fresh gate result.
 
-1. **Import fidelity.** `extension/` is content-identical to the origin repo at the commit it was imported from, modulo the deliberate deltas — the authoritative list is `extension/README.md`'s Provenance section ("Deliberate deltas vs the import HEAD") — and the `.claude/`/`.github/`/`.nu/`/submodule-content exclusions.
+1. **Import fidelity — against BOTH repos, not just the origin.** `extension/` is
+   content-identical to the origin repo at the commit it was imported from, modulo the
+   recorded deltas and the `.claude/`/`.github/`/`.nu/`/submodule-content exclusions.
+   Three authoritative lists in `extension/README.md`'s Provenance section together
+   explain every expected difference — check a diff hunk against all three before
+   treating it as drift:
+   - "Deliberate deltas vs the import HEAD" — re-hosting edits,
+   - "Ported from the MIRROR after the import" — the 4 files carried only on the mirror,
+   - "Fixed in-tree after the mirror port" — fixes present in **neither** upstream repo
+     (also enumerated in `extension/BUILD_PINS.toml`'s `fixed_in_tree_after_port`).
+
+   > **The origin and the mirror have DIVERGENT history — not fast-forward.** `nubank/main`
+   > (`33e8d49`, the import HEAD) is **not** an ancestor of `lastrk/main` (`a175a6b`). The
+   > mirror carried April 2026 work that never landed on the internal `main`: an
+   > aggregate-state alignment fix, a signed-shift UB fix, a numerically stable
+   > `spark_skewness`, and two test files. An earlier version of this gate diffed **only**
+   > against the origin, so it passed green while `extension/` was missing all of it — that
+   > port landed separately (see `extension/README.md`'s "Ported from the mirror"). Diffing
+   > one side is not sufficient; diff **both**.
+
    ```bash
+   # a. vs the ORIGIN checkout (nubank/thunderduck-duckdb-extension @ 33e8d49)
    diff -rq --exclude='.git*' --exclude='duckdb' --exclude='extension-ci-tools' --exclude='.claude' --exclude='.nu' --exclude='.github' /path/to/origin/checkout extension/
+
+   # b. vs the MIRROR checkout (lastrk/thunderduck-duckdb-extension @ a175a6b)
+   diff -rq --exclude='.git*' --exclude='duckdb' --exclude='extension-ci-tools' --exclude='.claude' --exclude='.nu' --exclude='.github' /path/to/mirror/checkout extension/
+
+   # c. and confirm nothing else diverges between the two remotes' src/ and test/
+   #    (in a checkout with both remotes added):
+   #      git remote add public https://github.com/lastrk/thunderduck-duckdb-extension.git
+   git diff origin/main public/main -- src/ test/
    ```
-   Expect empty output outside the recorded deltas.
+   Expect empty output from (a) and (b) outside the recorded deltas, and from (c) only
+   changes already reflected in `extension/`. Note (a) and (b) will BOTH report
+   `src/include/spark_aggregates.hpp`, `src/include/spark_try_aggregates.hpp`,
+   `test/sql/skewness.test` and `test/sql/decimal_state_alignment.test` — those are the
+   `fixed_in_tree_after_port` entries and are expected.
 
 2. **Submodules build both ways.** `extension/duckdb` and `extension/extension-ci-tools` are root-level submodules (`.gitmodules`), not fetch-scripted and not checked in as content. Prove the Rust build is unaffected by their presence *or* absence:
    ```bash

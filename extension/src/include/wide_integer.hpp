@@ -10,7 +10,8 @@ namespace duckdb {
 // ---------------------------------------------------------------------------
 
 inline __int128 HugeintToInt128(const hugeint_t &h) {
-	return (static_cast<__int128>(h.upper) << 64) | h.lower;
+	unsigned __int128 result = (static_cast<unsigned __int128>(static_cast<uint64_t>(h.upper)) << 64) | h.lower;
+	return static_cast<__int128>(result);
 }
 
 inline hugeint_t Int128ToHugeint(__int128 v) {

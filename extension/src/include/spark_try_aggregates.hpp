@@ -39,6 +39,7 @@ struct SparkTrySumIntegerState {
 		}
 	}
 };
+SPARK_ASSERT_STATE_ALIGNMENT(SparkTrySumIntegerState);
 
 struct SparkTrySumIntegerOperation {
 	template <class STATE>
@@ -89,7 +90,8 @@ struct SparkTrySumIntegerOperation {
 	}
 };
 
-// ---- DECIMAL path (accumulate __int128, NULL if it exceeds 10^result_precision) ----
+// ---- DECIMAL path (hugeint_t state, __int128 arithmetic; NULL if it exceeds
+//      10^result_precision) ----
 struct SparkTrySumDecimalBindData : public FunctionData {
 	uint8_t result_precision;
 
@@ -103,13 +105,18 @@ struct SparkTrySumDecimalBindData : public FunctionData {
 	}
 };
 
+// Stores hugeint_t, not a raw __int128, and converts only for stack-local
+// arithmetic — see SPARK_ASSERT_STATE_ALIGNMENT in spark_aggregates.hpp for why
+// (DuckDB aligns aggregate states to 8 bytes; a 16-byte-aligned member is UB).
+// Note in particular that the previous form passed `&state.value` — a misaligned
+// __int128* — straight into __builtin_add_overflow.
 struct SparkTrySumDecimalState {
-	__int128 value;
+	hugeint_t value;
 	bool isset;
 	bool overflow;
 
 	void Initialize() {
-		value = 0;
+		value = hugeint_t(0, 0);
 		isset = false;
 		overflow = false;
 	}
@@ -118,11 +125,16 @@ struct SparkTrySumDecimalState {
 			return;
 		}
 		isset = true;
-		if (overflow || other.overflow || __builtin_add_overflow(value, other.value, &value)) {
+		__int128 sum;
+		if (overflow || other.overflow ||
+		    __builtin_add_overflow(HugeintToInt128(value), HugeintToInt128(other.value), &sum)) {
 			overflow = true;
+			return;
 		}
+		value = Int128ToHugeint(sum);
 	}
 };
+SPARK_ASSERT_STATE_ALIGNMENT(SparkTrySumDecimalState);
 
 template <typename RESULT_TYPE>
 struct SparkTrySumDecimalOperation {
@@ -138,9 +150,12 @@ struct SparkTrySumDecimalOperation {
 			return;
 		}
 		__int128 input_val = HugeintToInt128(input);
-		if (__builtin_add_overflow(state.value, input_val, &state.value)) {
+		__int128 sum;
+		if (__builtin_add_overflow(HugeintToInt128(state.value), input_val, &sum)) {
 			state.overflow = true;
+			return;
 		}
+		state.value = Int128ToHugeint(sum);
 	}
 
 	template <class INPUT_TYPE, class STATE, class OP>
@@ -151,10 +166,13 @@ struct SparkTrySumDecimalOperation {
 		}
 		__int128 input_val = HugeintToInt128(input);
 		__int128 mul;
+		__int128 sum;
 		if (__builtin_mul_overflow(input_val, static_cast<__int128>(count), &mul) ||
-		    __builtin_add_overflow(state.value, mul, &state.value)) {
+		    __builtin_add_overflow(HugeintToInt128(state.value), mul, &sum)) {
 			state.overflow = true;
+			return;
 		}
+		state.value = Int128ToHugeint(sum);
 	}
 	template <class STATE, class OP>
 	static void Combine(const STATE &source, STATE &target, AggregateInputData &) {
@@ -169,11 +187,12 @@ struct SparkTrySumDecimalOperation {
 		}
 		auto &bind_data = finalize_data.input.bind_data->Cast<SparkTrySumDecimalBindData>();
 		unsigned __int128 limit = Pow10_128(bind_data.result_precision);
-		if (Abs128(state.value) >= limit) {
+		__int128 value = HugeintToInt128(state.value);
+		if (Abs128(value) >= limit) {
 			finalize_data.ReturnNull(); // Spark: overflow beyond result precision -> NULL
 			return;
 		}
-		WriteAggResult(target, state.value);
+		WriteAggResult(target, value);
 	}
 
 	static bool IgnoreNull() {
@@ -297,6 +316,7 @@ struct SparkTryAvgDoubleState {
 		count += other.count;
 	}
 };
+SPARK_ASSERT_STATE_ALIGNMENT(SparkTryAvgDoubleState);
 
 struct SparkTryAvgDoubleOperation {
 	template <class STATE>

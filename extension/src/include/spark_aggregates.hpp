@@ -10,25 +10,41 @@
 #include <cmath>
 
 // ============================================================================
-// Aggregate-state alignment invariant
+// Aggregate-state layout invariants
 //
-// DuckDB lays aggregate states out inside its row format and aligns their
-// offsets with AlignValue<T, val=8> — that is, to 8 bytes ONLY (see
-// duckdb/src/common/types/row/tuple_data_layout.cpp and
-// duckdb/src/include/duckdb/common/helper.hpp). A state that requires stronger
-// alignment therefore lands at a misaligned address in practice (observed at
-// addr % 16 == 8 for a plain GROUP BY over DECIMAL), and every access to an
-// over-aligned member is undefined behavior.
+// DuckDB stores aggregate states inline in its row format. Two properties of a
+// state type must hold, and NEITHER is checked by anything downstream in a
+// release build:
 //
-// Consequence: an aggregate state must never contain a raw `__int128` (alignof
-// 16). Store `hugeint_t` (alignof 8) and convert to `__int128` only for
-// stack-local arithmetic, via HugeintToInt128 / Int128ToHugeint.
+// 1. alignof(STATE) <= 8. State offsets are aligned with AlignValue<T, val=8> —
+//    8 bytes ONLY (duckdb/src/common/types/row/tuple_data_layout.cpp:109,128 and
+//    duckdb/src/include/duckdb/common/helper.hpp:186). A state needing stronger
+//    alignment lands at a misaligned address in practice (observed at
+//    addr % 16 == 8 for a plain GROUP BY over DECIMAL), and every access to an
+//    over-aligned member is undefined behavior. So an aggregate state must never
+//    contain a raw `__int128` (alignof 16): store `hugeint_t` (alignof 8) and
+//    convert to `__int128` only for stack-local arithmetic, via
+//    HugeintToInt128 / Int128ToHugeint.
 //
-// SPARK_ASSERT_STATE_ALIGNMENT below makes this mechanical, which matters
-// because no runtime test can be relied on to catch a regression: the symptom is
-// optimizer- and ISA-dependent (aarch64 LDP/STP and x86 movdqu tolerate 8-byte
-// alignment, so misaligned code can still produce correct results). Note the
-// check is opt-in per state — a NEW aggregate state must add its own invocation.
+// 2. sizeof(STATE) % 8 == 0. `sizeof(STATE)` becomes the row layout's
+//    payload_size (AggregateFunction::StateSize<STATE>,
+//    duckdb/src/include/duckdb/function/aggregate_function.hpp:350), and
+//    row_width advances by it. An oddly-sized state is fine itself but pushes the
+//    NEXT aggregate's state — and every state in every later row — to a
+//    misaligned offset, i.e. it corrupts a neighbour rather than itself. DuckDB
+//    only D_ASSERTs this (tuple_data_layout.cpp:120), and D_ASSERT is plain
+//    `assert` (common/assert.hpp:27), a no-op under NDEBUG — so shipped release
+//    builds check nothing.
+//
+// Neither violation is reliably observable at runtime: the symptom is optimizer-
+// and ISA-dependent (aarch64 LDP/STP and x86 movdqu tolerate 8-byte alignment),
+// so misaligned code can still produce correct results and no test can be relied
+// on to catch a regression. These compile-time checks are the real guard.
+//
+// Register every Spark aggregate through SparkUnaryAggregate() below rather than
+// AggregateFunction::UnaryAggregate() directly, so the checks cannot be skipped
+// by forgetting a separate line. SPARK_ASSERT_STATE_ALIGNMENT is also applied at
+// each state definition, for a diagnostic that points at the struct itself.
 // ============================================================================
 
 #define SPARK_ASSERT_STATE_ALIGNMENT(STATE_TYPE)                                                                       \
@@ -38,6 +54,23 @@
 	                                                    "hugeint_t and convert for arithmetic instead.")
 
 namespace duckdb {
+
+// Wrapper around AggregateFunction::UnaryAggregate that enforces the two state
+// layout invariants documented above. Deliberately does not forward
+// UnaryAggregate's optional null_handling / destructor_type parameters: no Spark
+// aggregate uses them, and leaving them off keeps the invariants unbypassable at
+// the one place a new function gets copied from.
+template <class STATE, class INPUT_TYPE, class RESULT_TYPE, class OP>
+static AggregateFunction SparkUnaryAggregate(const LogicalType &input_type, LogicalType return_type) {
+	static_assert(alignof(STATE) <= 8, "aggregate state must not require >8-byte alignment: DuckDB aligns aggregate "
+	                                   "states to 8 bytes, so an over-aligned member (e.g. a raw __int128) is "
+	                                   "undefined behavior. Store hugeint_t and convert for arithmetic instead.");
+	static_assert(sizeof(STATE) % 8 == 0, "aggregate state size must be a multiple of 8: DuckDB advances the row "
+	                                      "layout by sizeof(state), so an odd size misaligns the FOLLOWING state. "
+	                                      "DuckDB only D_ASSERTs this, which is a no-op in release builds.");
+	// The one intentional direct call to the DuckDB API in this extension.
+	return AggregateFunction::UnaryAggregate<STATE, INPUT_TYPE, RESULT_TYPE, OP>(input_type, return_type);
+}
 
 // ============================================================================
 // Bind data for spark_sum and spark_avg (stores the input scale for finalize)
@@ -147,9 +180,8 @@ struct SparkSumDecimalOperation {
 // Helper: create a SparkSumDecimal AggregateFunction for a specific result physical type
 template <typename RESULT_TYPE>
 static AggregateFunction GetSparkSumDecimalFunction() {
-	return AggregateFunction::UnaryAggregate<SparkSumDecimalState, hugeint_t, RESULT_TYPE,
-	                                         SparkSumDecimalOperation<RESULT_TYPE>>(LogicalType::DECIMAL(38, 0),
-	                                                                                LogicalType::DECIMAL(38, 0));
+	return SparkUnaryAggregate<SparkSumDecimalState, hugeint_t, RESULT_TYPE, SparkSumDecimalOperation<RESULT_TYPE>>(
+	    LogicalType::DECIMAL(38, 0), LogicalType::DECIMAL(38, 0));
 }
 
 // Helper: look up the SparkSumDecimal function for a given physical type
@@ -338,9 +370,8 @@ struct SparkAvgDecimalOperation {
 // Helper: create a SparkAvgDecimal AggregateFunction for a specific result physical type
 template <typename RESULT_TYPE>
 static AggregateFunction GetSparkAvgDecimalFunction() {
-	return AggregateFunction::UnaryAggregate<SparkAvgDecimalState, hugeint_t, RESULT_TYPE,
-	                                         SparkAvgDecimalOperation<RESULT_TYPE>>(LogicalType::DECIMAL(38, 0),
-	                                                                                LogicalType::DECIMAL(38, 0));
+	return SparkUnaryAggregate<SparkAvgDecimalState, hugeint_t, RESULT_TYPE, SparkAvgDecimalOperation<RESULT_TYPE>>(
+	    LogicalType::DECIMAL(38, 0), LogicalType::DECIMAL(38, 0));
 }
 
 // Helper: look up the SparkAvgDecimal function for a given physical type
@@ -406,29 +437,26 @@ inline AggregateFunctionSet CreateSparkSumFunctionSet() {
 
 	// Integer overloads: all return BIGINT (Spark semantics)
 	// TINYINT
-	auto tinyint_func =
-	    AggregateFunction::UnaryAggregate<SparkSumIntegerState, int8_t, int64_t, SparkSumIntegerOperation>(
-	        LogicalType::TINYINT, LogicalType::BIGINT);
+	auto tinyint_func = SparkUnaryAggregate<SparkSumIntegerState, int8_t, int64_t, SparkSumIntegerOperation>(
+	    LogicalType::TINYINT, LogicalType::BIGINT);
 	tinyint_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	set.AddFunction(tinyint_func);
 
 	// SMALLINT
-	auto smallint_func =
-	    AggregateFunction::UnaryAggregate<SparkSumIntegerState, int16_t, int64_t, SparkSumIntegerOperation>(
-	        LogicalType::SMALLINT, LogicalType::BIGINT);
+	auto smallint_func = SparkUnaryAggregate<SparkSumIntegerState, int16_t, int64_t, SparkSumIntegerOperation>(
+	    LogicalType::SMALLINT, LogicalType::BIGINT);
 	smallint_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	set.AddFunction(smallint_func);
 
 	// INTEGER
-	auto int_func = AggregateFunction::UnaryAggregate<SparkSumIntegerState, int32_t, int64_t, SparkSumIntegerOperation>(
+	auto int_func = SparkUnaryAggregate<SparkSumIntegerState, int32_t, int64_t, SparkSumIntegerOperation>(
 	    LogicalType::INTEGER, LogicalType::BIGINT);
 	int_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	set.AddFunction(int_func);
 
 	// BIGINT
-	auto bigint_func =
-	    AggregateFunction::UnaryAggregate<SparkSumIntegerState, int64_t, int64_t, SparkSumIntegerOperation>(
-	        LogicalType::BIGINT, LogicalType::BIGINT);
+	auto bigint_func = SparkUnaryAggregate<SparkSumIntegerState, int64_t, int64_t, SparkSumIntegerOperation>(
+	    LogicalType::BIGINT, LogicalType::BIGINT);
 	bigint_func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	set.AddFunction(bigint_func);
 
@@ -616,8 +644,8 @@ struct SparkSkewnessOperation {
 };
 
 inline AggregateFunction CreateSparkSkewnessFunction() {
-	auto func = AggregateFunction::UnaryAggregate<SparkSkewState, double, double, SparkSkewnessOperation>(
-	    LogicalType::DOUBLE, LogicalType::DOUBLE);
+	auto func = SparkUnaryAggregate<SparkSkewState, double, double, SparkSkewnessOperation>(LogicalType::DOUBLE,
+	                                                                                        LogicalType::DOUBLE);
 	func.name = "spark_skewness";
 	func.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	return func;

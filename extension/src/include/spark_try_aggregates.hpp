@@ -202,9 +202,9 @@ struct SparkTrySumDecimalOperation {
 
 template <typename RESULT_TYPE>
 static AggregateFunction GetSparkTrySumDecimalFunction() {
-	return AggregateFunction::UnaryAggregate<SparkTrySumDecimalState, hugeint_t, RESULT_TYPE,
-	                                         SparkTrySumDecimalOperation<RESULT_TYPE>>(LogicalType::DECIMAL(38, 0),
-	                                                                                   LogicalType::DECIMAL(38, 0));
+	return SparkUnaryAggregate<SparkTrySumDecimalState, hugeint_t, RESULT_TYPE,
+	                           SparkTrySumDecimalOperation<RESULT_TYPE>>(LogicalType::DECIMAL(38, 0),
+	                                                                     LogicalType::DECIMAL(38, 0));
 }
 
 static AggregateFunction GetSparkTrySumByPhysicalType(PhysicalType pt) {
@@ -254,38 +254,33 @@ inline AggregateFunctionSet CreateSparkTrySumFunctionSet() {
 	set.AddFunction(decimal_func);
 
 	auto add_int = [&](const LogicalType &in) {
-		auto f =
-		    AggregateFunction::UnaryAggregate<SparkTrySumIntegerState, int64_t, int64_t, SparkTrySumIntegerOperation>(
-		        in, LogicalType::BIGINT);
+		auto f = SparkUnaryAggregate<SparkTrySumIntegerState, int64_t, int64_t, SparkTrySumIntegerOperation>(
+		    in, LogicalType::BIGINT);
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	};
 	// One OP works for all widths (input is cast to int64_t in Operation).
 	{
-		auto f =
-		    AggregateFunction::UnaryAggregate<SparkTrySumIntegerState, int8_t, int64_t, SparkTrySumIntegerOperation>(
-		        LogicalType::TINYINT, LogicalType::BIGINT);
+		auto f = SparkUnaryAggregate<SparkTrySumIntegerState, int8_t, int64_t, SparkTrySumIntegerOperation>(
+		    LogicalType::TINYINT, LogicalType::BIGINT);
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	}
 	{
-		auto f =
-		    AggregateFunction::UnaryAggregate<SparkTrySumIntegerState, int16_t, int64_t, SparkTrySumIntegerOperation>(
-		        LogicalType::SMALLINT, LogicalType::BIGINT);
+		auto f = SparkUnaryAggregate<SparkTrySumIntegerState, int16_t, int64_t, SparkTrySumIntegerOperation>(
+		    LogicalType::SMALLINT, LogicalType::BIGINT);
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	}
 	{
-		auto f =
-		    AggregateFunction::UnaryAggregate<SparkTrySumIntegerState, int32_t, int64_t, SparkTrySumIntegerOperation>(
-		        LogicalType::INTEGER, LogicalType::BIGINT);
+		auto f = SparkUnaryAggregate<SparkTrySumIntegerState, int32_t, int64_t, SparkTrySumIntegerOperation>(
+		    LogicalType::INTEGER, LogicalType::BIGINT);
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	}
 	{
-		auto f =
-		    AggregateFunction::UnaryAggregate<SparkTrySumIntegerState, int64_t, int64_t, SparkTrySumIntegerOperation>(
-		        LogicalType::BIGINT, LogicalType::BIGINT);
+		auto f = SparkUnaryAggregate<SparkTrySumIntegerState, int64_t, int64_t, SparkTrySumIntegerOperation>(
+		    LogicalType::BIGINT, LogicalType::BIGINT);
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	}
@@ -371,37 +366,37 @@ inline AggregateFunctionSet CreateSparkTryAvgFunctionSet() {
 	};
 	(void)add_double;
 	{
-		auto f = AggregateFunction::UnaryAggregate<SparkTryAvgDoubleState, int8_t, double, SparkTryAvgDoubleOperation>(
+		auto f = SparkUnaryAggregate<SparkTryAvgDoubleState, int8_t, double, SparkTryAvgDoubleOperation>(
 		    LogicalType::TINYINT, LogicalType::DOUBLE);
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	}
 	{
-		auto f = AggregateFunction::UnaryAggregate<SparkTryAvgDoubleState, int16_t, double, SparkTryAvgDoubleOperation>(
+		auto f = SparkUnaryAggregate<SparkTryAvgDoubleState, int16_t, double, SparkTryAvgDoubleOperation>(
 		    LogicalType::SMALLINT, LogicalType::DOUBLE);
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	}
 	{
-		auto f = AggregateFunction::UnaryAggregate<SparkTryAvgDoubleState, int32_t, double, SparkTryAvgDoubleOperation>(
+		auto f = SparkUnaryAggregate<SparkTryAvgDoubleState, int32_t, double, SparkTryAvgDoubleOperation>(
 		    LogicalType::INTEGER, LogicalType::DOUBLE);
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	}
 	{
-		auto f = AggregateFunction::UnaryAggregate<SparkTryAvgDoubleState, int64_t, double, SparkTryAvgDoubleOperation>(
+		auto f = SparkUnaryAggregate<SparkTryAvgDoubleState, int64_t, double, SparkTryAvgDoubleOperation>(
 		    LogicalType::BIGINT, LogicalType::DOUBLE);
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	}
 	{
-		auto f = AggregateFunction::UnaryAggregate<SparkTryAvgDoubleState, float, double, SparkTryAvgDoubleOperation>(
+		auto f = SparkUnaryAggregate<SparkTryAvgDoubleState, float, double, SparkTryAvgDoubleOperation>(
 		    LogicalType::FLOAT, LogicalType::DOUBLE);
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);
 	}
 	{
-		auto f = AggregateFunction::UnaryAggregate<SparkTryAvgDoubleState, double, double, SparkTryAvgDoubleOperation>(
+		auto f = SparkUnaryAggregate<SparkTryAvgDoubleState, double, double, SparkTryAvgDoubleOperation>(
 		    LogicalType::DOUBLE, LogicalType::DOUBLE);
 		f.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 		set.AddFunction(f);

@@ -2,7 +2,10 @@ pytest>=8.0.0
 pytest-timeout>=2.1.0
 pyspark-client==4.1.1
 pandas>=2.0.0
-pyarrow>=11.0.0
+# Upper bound is REQUIRED: pyarrow >=18 (e.g. 25.x) is ABI-incompatible with
+# pyspark-client 4.1.1's Arrow serialization (_serialize_table) and segfaults
+# the client mid-run on aarch64. Keep <18 until the pyspark pin moves.
+pyarrow>=11.0.0,<18
 grpcio>=1.48.1
 grpcio-status>=1.48.1
 googleapis-common-protos>=1.56.4

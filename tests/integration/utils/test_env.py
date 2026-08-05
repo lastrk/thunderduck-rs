@@ -67,16 +67,16 @@ def worktree_root(cwd: str | os.PathLike | None = None) -> Path:
     """
     override = os.environ.get("THUNDERDUCK_WORKTREE_ROOT")
     if override:
-        return Path(override)
+        return Path(override).expanduser().resolve()
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             cwd=str(cwd) if cwd else None,
             capture_output=True, text=True, check=True,
         )
-        return Path(out.stdout.strip())
+        return Path(out.stdout.strip()).resolve()
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return Path(cwd) if cwd else Path.cwd()
+        return (Path(cwd) if cwd else Path.cwd()).resolve()
 
 
 def worktree_id(root: Path) -> str:

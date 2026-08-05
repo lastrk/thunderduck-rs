@@ -38,4 +38,39 @@ ci_override = "lastrk/extension-ci-tools@bebb406d50413c4f4a55a44d9316a69b9d1a001
 source_repo = "nubank/thunderduck-duckdb-extension"
 source_mirror = "lastrk/thunderduck-duckdb-extension"
 imported_at = "33e8d49"
-vendored_binaries_built_at = "20616b3"
+
+# The origin and the mirror have DIVERGENT history: imported_at (33e8d49, origin
+# main) is NOT an ancestor of the mirror's main (a175a6b). Three commits existed
+# only on the MIRROR and were ported in separately, on top of the import:
+#   50874da (2026-04-02) aggregate-state alignment fix + HugeintToInt128 signed-shift UB fix
+#   97940a9 (2026-04-05) spark_skewness rewritten on Pebay's online algorithm (+ skewness.test)
+#   8fd5498 (2026-04-02) test/sql/window_aggregates.test
+# Anything comparing extension/ against a single upstream checkout must diff
+# BOTH remotes — see docs/context/extension-archival-checklist.md gate 1.
+ported_from_mirror = ["50874da", "97940a9", "8fd5498"]
+
+# Changes made in-tree AFTER the mirror port, present in NEITHER upstream repo.
+# These are the authoritative explanation for the remaining diff hunks when
+# running the import-fidelity gate. See extension/README.md's Provenance section
+# ("Fixed in-tree after the mirror port") for the full rationale.
+#   - spark_try_aggregates.hpp: SparkTrySumDecimalState had the same raw-__int128
+#     alignment defect; the mirror fix missed it (that file is not one of the
+#     mirror port's 4 files).
+#   - spark_aggregates.hpp: SPARK_ASSERT_STATE_ALIGNMENT static_assert for all 7
+#     aggregate states; spark_skewness Finalize now uses sqrt((m2*m2)*m2) like
+#     Spark instead of pow(m2, 1.5), and propagates NaN instead of throwing.
+#   - test/sql/skewness.test revised; test/sql/decimal_state_alignment.test added.
+fixed_in_tree_after_port = [
+    "src/include/spark_aggregates.hpp",
+    "src/include/spark_try_aggregates.hpp",
+    "test/sql/skewness.test",
+    "test/sql/decimal_state_alignment.test",
+]
+
+# Commit the checked-in extensions/vendored/ binaries were BUILT from. This is a
+# thunderduck-rs commit (built in-tree by this repo's own CI), not an
+# extension-repo commit; the authoritative record is
+# extensions/vendored/MANIFEST.toml's [source].build_sha.
+# STALE: predates the ported_from_mirror commits above -> re-vendor via
+# .github/workflows/extension-release.yml before relying on these binaries.
+vendored_binaries_built_at = "74e9413"

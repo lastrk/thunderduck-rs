@@ -82,3 +82,8 @@ playground/logs/
 # simulations of that harness must never commit either.
 /extension-ci-tools/
 /build/
+
+# Spark's embedded Derby metastore, created in the CWD by any local spark-sql /
+# pyspark run (the differential harness and ad-hoc Spark-parity checks both do).
+/derby.log
+/metastore_db/

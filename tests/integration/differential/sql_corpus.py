@@ -310,13 +310,12 @@ case("jn-022", "join", "both sides qualified star", "SELECT e.*, d.* FROM emp e 
 # raw `*` keeps the USING key at its natural position — silent positional
 # mislabeling vs Spark's key-hoisted schema. Born red by design.
 case("jn-023", "join", "multi-slot star over USING join (star-order witness)", "SELECT *, 1 AS one FROM emp JOIN dept USING (dept_id)")
-# jn-024 (F11): DEFERRED — the SAME alias `x` on BOTH join sides. Spark ERRORS
-# AMBIGUOUS_REFERENCE (`x.id` could be x.id or x.id) even in the ON clause,
-# because the qualifier binds both scopes. τ resolves first-match (left) and
-# silently returns left-side data. SQL analog of DataFrame join-023; shares
-# the tier-(e)/(f) qualified-resolution path with F8/F10, gated by the ADR-023
-# lineage fix. Born red, NOT in the witness-progress baseline.
-case("jn-024", "join", "F11 DEFERRED — duplicate alias both join sides (Spark AMBIGUOUS_REFERENCE; τ binds left)", "SELECT x.salary FROM emp x JOIN emp2 x ON x.id = x.id", expected_error="AMBIGUOUS_REFERENCE")
+# jn-024 (F11): the SAME alias `x` on BOTH join sides. Spark ERRORS
+# AMBIGUOUS_REFERENCE (`x.id` could be either side) even in the ON clause,
+# because the qualifier binds both scopes. SQL analog of DataFrame join-023;
+# previously deferred (τ resolved first-match/left), LANDED via ADR-024
+# tier-3e (Pass F3) — τ now matches Spark's error. Part of the baseline oracle.
+case("jn-024", "join", "F11 — duplicate alias both join sides (Spark & τ error AMBIGUOUS_REFERENCE; landed via ADR-024 tier-3e)", "SELECT x.salary FROM emp x JOIN emp2 x ON x.id = x.id", expected_error="AMBIGUOUS_REFERENCE")
 # NOTE (F8/F10 have NO faithful SQL witness): F8's DataFrame plan is a filter
 # ABOVE a projection that created the alias; the only SQL form with that plan
 # is a derived table (`... FROM (SELECT dept_id AS k FROM emp) e WHERE e.k=101`),

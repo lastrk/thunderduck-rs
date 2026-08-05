@@ -10,7 +10,7 @@ empirically re-verify all 5 against live Spark: 4 had a semantically-faithful, S
 rewrite that still exercises genuinely distinct τ machinery (not near-duplicates of existing
 coverage), and 1 (sq-013) had no useful rewrite and was deleted. All 4 rewrites pass τ with
 zero new implementation work — see `tasks/v2-corpus-pass-log.md` pass 19 and
-`.agent-output/unsolvable.md` for full live-verification detail and exact rewritten SQL.
+`tasks/unsolvable.md` for full live-verification detail and exact rewritten SQL.
 
 ## Trajectory (passes 4→18, this pipeline invocation)
 

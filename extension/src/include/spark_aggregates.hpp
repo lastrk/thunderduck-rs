@@ -41,33 +41,49 @@
 // so misaligned code can still produce correct results and no test can be relied
 // on to catch a regression. These compile-time checks are the real guard.
 //
-// Register every Spark aggregate through SparkUnaryAggregate() below rather than
-// AggregateFunction::UnaryAggregate() directly, so the checks cannot be skipped
-// by forgetting a separate line. SPARK_ASSERT_STATE_ALIGNMENT is also applied at
-// each state definition, for a diagnostic that points at the struct itself.
+// Both invariants live in ONE place: duckdb::SparkStateLayout below. They are
+// checked in two ways, and BOTH cover BOTH invariants:
+//   * SparkUnaryAggregate() — register every Spark aggregate through it rather
+//     than AggregateFunction::UnaryAggregate() directly. This is the enforcing
+//     check: it cannot be skipped by forgetting a separate line.
+//   * SPARK_ASSERT_STATE_LAYOUT(State) at each state definition — redundant with
+//     the above, but points the diagnostic at the offending struct instead of at
+//     a SparkUnaryAggregate<...> instantiation. That matters most for the size
+//     invariant, whose victim is the NEXT state rather than the struct itself.
 // ============================================================================
 
-#define SPARK_ASSERT_STATE_ALIGNMENT(STATE_TYPE)                                                                       \
-	static_assert(alignof(STATE_TYPE) <= 8, #STATE_TYPE " must not require >8-byte alignment: DuckDB aligns "          \
-	                                                    "aggregate states to 8 bytes, so an over-aligned member "      \
-	                                                    "(e.g. a raw __int128) is undefined behavior. Store "          \
-	                                                    "hugeint_t and convert for arithmetic instead.")
+// Expands to a check on duckdb::SparkStateLayout, defined just inside the
+// namespace below. Deliberately declared outside `namespace duckdb` — the
+// preprocessor has no notion of namespaces, and defining it inside would only
+// mislead.
+#define SPARK_ASSERT_STATE_LAYOUT(STATE_TYPE)                                                                          \
+	static_assert(duckdb::SparkStateLayout<STATE_TYPE>::ok,                                                            \
+	              #STATE_TYPE " violates the DuckDB aggregate-state layout invariants; see SparkStateLayout")
 
 namespace duckdb {
 
-// Wrapper around AggregateFunction::UnaryAggregate that enforces the two state
-// layout invariants documented above. Deliberately does not forward
-// UnaryAggregate's optional null_handling / destructor_type parameters: no Spark
-// aggregate uses them, and leaving them off keeps the invariants unbypassable at
-// the one place a new function gets copied from.
-template <class STATE, class INPUT_TYPE, class RESULT_TYPE, class OP>
-static AggregateFunction SparkUnaryAggregate(const LogicalType &input_type, LogicalType return_type) {
+// The single definition of the two invariants. Instantiating it checks them, so
+// both the macro and SparkUnaryAggregate() below route through here rather than
+// repeating the conditions or the messages.
+template <class STATE>
+struct SparkStateLayout {
 	static_assert(alignof(STATE) <= 8, "aggregate state must not require >8-byte alignment: DuckDB aligns aggregate "
 	                                   "states to 8 bytes, so an over-aligned member (e.g. a raw __int128) is "
 	                                   "undefined behavior. Store hugeint_t and convert for arithmetic instead.");
 	static_assert(sizeof(STATE) % 8 == 0, "aggregate state size must be a multiple of 8: DuckDB advances the row "
 	                                      "layout by sizeof(state), so an odd size misaligns the FOLLOWING state. "
 	                                      "DuckDB only D_ASSERTs this, which is a no-op in release builds.");
+	static const bool ok = true;
+};
+
+// Wrapper around AggregateFunction::UnaryAggregate that enforces the state layout
+// invariants. Deliberately does not forward UnaryAggregate's optional
+// null_handling / destructor_type parameters: no Spark aggregate uses them, and
+// leaving them off keeps the invariants unbypassable at the one place a new
+// function gets copied from.
+template <class STATE, class INPUT_TYPE, class RESULT_TYPE, class OP>
+static AggregateFunction SparkUnaryAggregate(const LogicalType &input_type, LogicalType return_type) {
+	static_assert(SparkStateLayout<STATE>::ok, "aggregate state violates the DuckDB layout invariants");
 	// The one intentional direct call to the DuckDB API in this extension.
 	return AggregateFunction::UnaryAggregate<STATE, INPUT_TYPE, RESULT_TYPE, OP>(input_type, return_type);
 }
@@ -112,7 +128,7 @@ inline void WriteAggResult<hugeint_t>(hugeint_t &target, __int128 val) {
 // spark_sum: DECIMAL path
 //
 // Accumulates into a hugeint_t state, converting to __int128 only for
-// stack-local arithmetic (see the alignment invariant at the top of this file).
+// stack-local arithmetic (see the layout invariants at the top of this file).
 // Input is promoted to DECIMAL(38, s) by DuckDB's implicit cast.
 // Returns DECIMAL(min(p+10, 38), s) per Spark rules.
 // ============================================================================
@@ -134,7 +150,7 @@ struct SparkSumDecimalState {
 		}
 	}
 };
-SPARK_ASSERT_STATE_ALIGNMENT(SparkSumDecimalState);
+SPARK_ASSERT_STATE_LAYOUT(SparkSumDecimalState);
 
 // Templatized operation so Finalize can target different physical types
 template <typename RESULT_TYPE>
@@ -251,7 +267,7 @@ struct SparkSumIntegerState {
 		}
 	}
 };
-SPARK_ASSERT_STATE_ALIGNMENT(SparkSumIntegerState);
+SPARK_ASSERT_STATE_LAYOUT(SparkSumIntegerState);
 
 struct SparkSumIntegerOperation {
 	template <class STATE>
@@ -294,7 +310,7 @@ struct SparkSumIntegerOperation {
 // spark_avg: DECIMAL path
 //
 // Accumulates sum (hugeint_t state, converted to __int128 only for stack-local
-// arithmetic — see the alignment invariant at the top of this file) and count.
+// arithmetic — see the layout invariants at the top of this file) and count.
 // At finalize, divides sum/count using SparkDecimalDivide with ROUND_HALF_UP.
 // Returns DECIMAL(min(p+4, 38), min(s+4, 18)) per Spark rules.
 // ============================================================================
@@ -314,7 +330,7 @@ struct SparkAvgDecimalState {
 		sum = Int128ToHugeint(result);
 	}
 };
-SPARK_ASSERT_STATE_ALIGNMENT(SparkAvgDecimalState);
+SPARK_ASSERT_STATE_LAYOUT(SparkAvgDecimalState);
 
 // Templatized so Finalize can target different physical result types
 template <typename RESULT_TYPE>
@@ -546,7 +562,7 @@ struct SparkSkewState {
 	double m2;
 	double m3;
 };
-SPARK_ASSERT_STATE_ALIGNMENT(SparkSkewState);
+SPARK_ASSERT_STATE_LAYOUT(SparkSkewState);
 
 struct SparkSkewnessOperation {
 	template <class STATE>

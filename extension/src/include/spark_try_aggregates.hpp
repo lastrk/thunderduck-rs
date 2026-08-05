@@ -39,7 +39,7 @@ struct SparkTrySumIntegerState {
 		}
 	}
 };
-SPARK_ASSERT_STATE_ALIGNMENT(SparkTrySumIntegerState);
+SPARK_ASSERT_STATE_LAYOUT(SparkTrySumIntegerState);
 
 struct SparkTrySumIntegerOperation {
 	template <class STATE>
@@ -106,7 +106,7 @@ struct SparkTrySumDecimalBindData : public FunctionData {
 };
 
 // Stores hugeint_t, not a raw __int128, and converts only for stack-local
-// arithmetic — see SPARK_ASSERT_STATE_ALIGNMENT in spark_aggregates.hpp for why
+// arithmetic — see SPARK_ASSERT_STATE_LAYOUT in spark_aggregates.hpp for why
 // (DuckDB aligns aggregate states to 8 bytes; a 16-byte-aligned member is UB).
 // Note in particular that the previous form passed `&state.value` — a misaligned
 // __int128* — straight into __builtin_add_overflow.
@@ -134,7 +134,7 @@ struct SparkTrySumDecimalState {
 		value = Int128ToHugeint(sum);
 	}
 };
-SPARK_ASSERT_STATE_ALIGNMENT(SparkTrySumDecimalState);
+SPARK_ASSERT_STATE_LAYOUT(SparkTrySumDecimalState);
 
 template <typename RESULT_TYPE>
 struct SparkTrySumDecimalOperation {
@@ -311,7 +311,7 @@ struct SparkTryAvgDoubleState {
 		count += other.count;
 	}
 };
-SPARK_ASSERT_STATE_ALIGNMENT(SparkTryAvgDoubleState);
+SPARK_ASSERT_STATE_LAYOUT(SparkTryAvgDoubleState);
 
 struct SparkTryAvgDoubleOperation {
 	template <class STATE>

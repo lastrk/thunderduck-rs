@@ -5766,9 +5766,9 @@ const SPARK_UPPER_PRETTY: &[&str] = &[
 /// value-aware — a literal renders its value, not its type — and recursive
 /// over the structural variants Spark inlines into a pretty name.
 ///
-/// Variants Spark renders in a shape τ does not yet match exactly (`CaseWhen`,
-/// windows, subqueries, complex-type literals, …) keep the Thunderduck-
-/// boundary fallback name `"expr"`.
+/// Variants Spark renders in a shape τ does not yet match exactly (windows,
+/// subqueries, complex-type literals, …) keep the Thunderduck-boundary
+/// fallback name `"expr"`.
 fn pretty_name(expr: &Expression) -> String {
     match expr {
         Expression::ColumnReference(c) => c.name.clone(),
@@ -5822,6 +5822,24 @@ fn pretty_name(expr: &Expression) -> String {
             }) => field.clone(),
             _ => "expr".to_owned(),
         },
+        // Spark `CaseWhen.sql`: `CASE WHEN <cond> THEN <val> [WHEN …] [ELSE <e>] END`,
+        // each child rendered through `pretty_name` (binary conditions get their
+        // parens from the `Binary` arm, bare boolean columns stay unparenthesized).
+        Expression::CaseWhen(cw) => {
+            let mut s = "CASE".to_owned();
+            for (cond, val) in &cw.branches {
+                s.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    pretty_name(cond),
+                    pretty_name(val)
+                ));
+            }
+            if let Some(e) = &cw.else_expr {
+                s.push_str(&format!(" ELSE {}", pretty_name(e)));
+            }
+            s.push_str(" END");
+            s
+        }
         _ => "expr".to_owned(),
     }
 }
@@ -12180,6 +12198,57 @@ mod tests {
             pretty_name(&expr),
             "((CAST(promotions AS DECIMAL(15,4)) / CAST(total AS DECIMAL(15,4))) * 100)"
         );
+    }
+
+    #[test]
+    fn pretty_name_case_when_matches_spark_pretty_sql() {
+        let single = Expression::CaseWhen(CaseWhenExpression {
+            branches: vec![(
+                Expression::Binary(BinaryExpression {
+                    op: BinaryOp::GtEq,
+                    left: Box::new(unresolved_col("age")),
+                    right: Box::new(int_lit(40)),
+                }),
+                int_lit(1),
+            )],
+            else_expr: Some(Box::new(int_lit(0))),
+        });
+        assert_eq!(
+            pretty_name(&single),
+            "CASE WHEN (age >= 40) THEN 1 ELSE 0 END"
+        );
+
+        let multi = Expression::CaseWhen(CaseWhenExpression {
+            branches: vec![
+                (
+                    Expression::Binary(BinaryExpression {
+                        op: BinaryOp::Lt,
+                        left: Box::new(unresolved_col("age")),
+                        right: Box::new(int_lit(30)),
+                    }),
+                    int_lit(0),
+                ),
+                (
+                    Expression::Binary(BinaryExpression {
+                        op: BinaryOp::Lt,
+                        left: Box::new(unresolved_col("age")),
+                        right: Box::new(int_lit(45)),
+                    }),
+                    int_lit(1),
+                ),
+            ],
+            else_expr: Some(Box::new(int_lit(2))),
+        });
+        assert_eq!(
+            pretty_name(&multi),
+            "CASE WHEN (age < 30) THEN 0 WHEN (age < 45) THEN 1 ELSE 2 END"
+        );
+
+        let no_else = Expression::CaseWhen(CaseWhenExpression {
+            branches: vec![(unresolved_col("active"), unresolved_col("salary"))],
+            else_expr: None,
+        });
+        assert_eq!(pretty_name(&no_else), "CASE WHEN active THEN salary END");
     }
 
     #[test]

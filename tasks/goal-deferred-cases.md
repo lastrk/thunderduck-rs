@@ -28,20 +28,19 @@ flags the column-name mismatch.
 
 | id | witness / case | class | source | defect / fix sketch |
 |----|----------------|-------|--------|---------------------|
-| prettyname-001 | `select(when(age>=40,1).otherwise(0))` | red-case (deferred) | pretty-name doc | `CaseWhen` hits `pretty_name` `_ => "expr"`; Spark `CASE WHEN (age >= 40) THEN 1 ELSE 0 END`. Add a `CaseWhen` arm. |
-| prettyname-002 | chained `when…when…otherwise` | red-case (deferred) | pretty-name doc | same `CaseWhen` fallback (chained). |
-| prettyname-003 | `when` WITHOUT `otherwise` (nullable) | red-case (deferred) | pretty-name doc | same `CaseWhen` fallback; `CASE WHEN active THEN salary END`. |
+| ~~prettyname-001~~ | ~~`select(when(age>=40,1).otherwise(0))`~~ | ~~red-case~~ | pretty-name doc | Fixed: `CaseWhen` arm added in `analyzer::pretty_name`. |
+| ~~prettyname-002~~ | ~~chained `when…when…otherwise`~~ | ~~red-case~~ | pretty-name doc | Fixed: same `CaseWhen` arm covers chained form. |
+| ~~prettyname-003~~ | ~~`when` WITHOUT `otherwise` (nullable)~~ | ~~red-case~~ | pretty-name doc | Fixed: same `CaseWhen` arm covers nullable form. |
 | prettyname-004 | `select(row_number().over(W.orderBy("id")))` | red-case (deferred) | pretty-name doc | `Window` hits the same `_ => "expr"` arm; Spark `row_number() OVER (…)`. Add a `Window` arm. |
 | F-count-distinct-name | — (latent) | latent | P21 (M1) | `pretty_name` ignores `FunctionCall.distinct`: unaliased `count(DISTINCT x)` → `count(x)` vs Spark `count(DISTINCT x)`. Render DISTINCT. |
 | F-countstar-name | — (latent) | latent | P21 (M2) | DataFrame `F.count("*")` → `count(*)` vs Spark `count(1)`. DataFrame path lacks the SQL path's `sparksql_default_select_name` normalization. |
 | F-upper-fn-name | — (latent) | latent | P21 (M3) | SQL uppercase calls (`SUM(x)`) keep verbatim name → `SUM(x)` vs Spark lowercase `sum(x)`. Lowercase in `lower_function` (`v2_lowering.rs:3413`) or at naming. |
 
-**Acceptance:** `pretty_name` gets real arms for `CaseWhen`, `Window`
+**Acceptance:** `pretty_name` gets real arms for `Window`
 (and, ideally, subqueries / complex-type literals it still falls back on);
 DISTINCT and `count(*)`/uppercase-fn naming normalized on the DataFrame path.
-prettyname-001..004 flip green **after golden re-record** (their column-name
-field is hand-authored; see below). Add witnesses for the three latent naming
-gaps as part of the pass.
+prettyname-001..003 are now green (CaseWhen arm landed in this PR); prettyname-004 flips green **after golden re-record** once a `Window` arm is added.
+Add witnesses for the three latent naming gaps as part of the pass.
 
 ## Cluster 2 — Nested `RelType::Sql` leaf routing (`sqlwrap`)
 

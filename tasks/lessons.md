@@ -72,12 +72,15 @@ generalizing. Terse; one bullet per lesson; cite the concrete instance.
   accessor — unless the copied surface would grow unbounded or the accessor's maintenance
   surface would demonstrably be smaller.
 
-- **The `spark_return_cast` / `spark_aggregate_return_cast` separation prevents double-cast.**
+- **Keeping the projection-level and aggregate-level return casts separate prevents double-cast.**
   In the emission work, projection-level and aggregate-level return-type parity live in different
   renderers (`render_projection_slot` vs. `render_aggregate`). Sharing a single
   `spark_return_cast` helper across both would double-cast aggregate output. Rule: the CAST
   that pins Spark's return type belongs at exactly one call site per emission decision. If a
   helper needs to cover multiple emission contexts, split it by context; do not chain.
+  (2026-08: the aggregate-side twin `spark_aggregate_return_cast` was deleted — it was never
+  wired. The live aggregate cast site is `render_decimal_avg`; the rule above is what keeps it
+  from being folded back into `spark_return_cast`.)
 
 - **Silently absorbed performance wins are a real refactoring pattern.** The emission work's
   `SqlGenerator::gen_expr` seam drain (an architectural change) eliminated the earlier emission

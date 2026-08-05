@@ -4,23 +4,21 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
 use crate::error::Result;
-use crate::runtime::config::StreamingConfig;
 use crate::runtime::session::DuckDbSession;
 
 /// Manages a pool of `DuckDbSession` instances, one per logical Spark session.
 ///
 /// Each session owns a dedicated OS thread with its own in-memory DuckDB database,
 /// providing full isolation between sessions.
+#[derive(Default)]
 pub struct SessionManager {
     sessions: DashMap<String, Arc<DuckDbSession>>,
-    config: Arc<StreamingConfig>,
 }
 
 impl SessionManager {
-    pub fn new(config: StreamingConfig) -> Self {
+    pub fn new() -> Self {
         Self {
             sessions: DashMap::new(),
-            config: Arc::new(config),
         }
     }
 
@@ -32,7 +30,7 @@ impl SessionManager {
         match self.sessions.entry(session_id.to_string()) {
             Entry::Occupied(e) => Ok(Arc::clone(e.get())),
             Entry::Vacant(e) => {
-                let session = Arc::new(DuckDbSession::spawn(session_id, &self.config)?);
+                let session = Arc::new(DuckDbSession::spawn(session_id)?);
                 e.insert(Arc::clone(&session));
                 Ok(session)
             }

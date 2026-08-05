@@ -462,8 +462,8 @@ impl V2RelationConverter {
             }
         }
         let input = self.convert_input(c.input.as_deref(), "StatCorr")?;
-        let col1 = unresolved_col(&c.col1);
-        let col2 = unresolved_col(&c.col2);
+        let col1 = UnresolvedColumn::bare(&c.col1);
+        let col2 = UnresolvedColumn::bare(&c.col2);
         let agg_expr = Expression::FunctionCall(FunctionCall {
             name: "corr".to_owned(),
             args: vec![col1, col2],
@@ -516,7 +516,7 @@ impl V2RelationConverter {
                         Expression::FunctionCall(FunctionCall {
                             name: "percentile_approx".to_owned(),
                             args: vec![
-                                unresolved_col(col_name),
+                                UnresolvedColumn::bare(col_name),
                                 lit(LiteralValue::Double(prob), DataType::Double),
                             ],
                             distinct: false,
@@ -878,7 +878,6 @@ impl V2RelationConverter {
         match &r.read_type {
             Some(ReadType::NamedTable(nt)) => Ok(CommonAst::new(CommonOp::TableScan {
                 table: nt.unparsed_identifier.clone(),
-                alias: None,
             })),
             Some(ReadType::DataSource(ds)) => {
                 if ds.paths.is_empty() {
@@ -1585,15 +1584,6 @@ fn extract_column_name(expr: &proto::Expression) -> Option<String> {
     }
 }
 
-/// Construct an [`Expression::UnresolvedColumn`] from a bare column name.
-fn unresolved_col(name: &str) -> Expression {
-    Expression::UnresolvedColumn(UnresolvedColumn {
-        name: name.to_owned(),
-        qualifier: None,
-        plan_id: None,
-    })
-}
-
 /// Wrap a column reference in `COALESCE(col, 0)` — fills NULLs with zero.
 ///
 /// Used by [`V2RelationConverter::convert_cov`] to match Spark's
@@ -1603,7 +1593,7 @@ fn coalesce_zero(col_name: &str) -> Expression {
     Expression::FunctionCall(FunctionCall {
         name: "coalesce".to_owned(),
         args: vec![
-            unresolved_col(col_name),
+            UnresolvedColumn::bare(col_name),
             lit(LiteralValue::Long(0), DataType::Long),
         ],
         distinct: false,
@@ -1859,7 +1849,7 @@ fn parse_type_str_to_struct(s: &str) -> StructType {
     // PySpark sends the LocalRelation `schema` field as a JSON-serialized
     // Spark type when the client calls `createDataFrame(rows, schema)` —
     // `_schema.json()` emits `{"type":"struct","fields":[…]}`. Delegate JSON
-    // parsing to the shared helper in `relation_converter`. This path
+    // parsing to the shared helper in `json_schema`. This path
     // preserves duplicate struct field names (`Struct<tags, tags>` from
     // `arrays_zip`), which the Arrow-IPC-derived schema lacks because
     // PySpark's client dedups struct field names before wire serialization.
@@ -1870,7 +1860,7 @@ fn parse_type_str_to_struct(s: &str) -> StructType {
         // empty struct), so a JSON-shaped string never falls through to the
         // DDL parser below. Returning the (possibly empty) result verbatim
         // preserves that long-standing behavior.
-        return super::relation_converter::parse_json_schema(trimmed);
+        return super::json_schema::parse_json_schema(trimmed);
     }
     // Fallback: Spark DDL schema parser — accepts both the `struct<...>`
     // wrapper form (`struct<id:bigint,name:string>`) and the bare field-list

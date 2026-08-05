@@ -8,7 +8,7 @@
 use super::analyzer::TypedAst;
 use super::ast::CommonAst;
 use super::name_fold::eq_fold;
-use super::schema::{ExprId, ResolvedSchema};
+use super::schema::{Attribute, ExprId, ResolvedSchema};
 use super::type_inference::TypeInferenceEngine;
 use crate::types::{DataType, StructField, StructType};
 
@@ -259,6 +259,40 @@ pub struct ColumnReference {
     pub expr_id: Option<ExprId>,
 }
 
+impl From<Attribute> for ColumnReference {
+    /// THE door from a resolved [`Attribute`] to the reference naming it:
+    /// COPY the attribute's identity, never mint a fresh one (the same
+    /// named-constructor discipline `schema.rs` imposes on `Attribute`, so no
+    /// arm can quietly write `expr_id: None` and produce a reference
+    /// `emission::bare_dup_slot` declines to bind). `qualifier` is `None`:
+    /// emission renders the bare column so that id-keyed rewrite applies.
+    /// NOT for struct-field resolution — there type/nullability come from the
+    /// nested field, only the id from the column. Borrow sites use
+    /// [`ColumnReference::from_attr`].
+    fn from(attr: Attribute) -> Self {
+        Self {
+            name: attr.name,
+            qualifier: None,
+            data_type: attr.data_type,
+            nullable: attr.nullable,
+            expr_id: Some(attr.expr_id),
+        }
+    }
+}
+
+impl ColumnReference {
+    /// Borrowing twin of [`From<Attribute>`](ColumnReference::from).
+    pub fn from_attr(attr: &Attribute) -> Self {
+        Self {
+            name: attr.name.clone(),
+            qualifier: None,
+            data_type: attr.data_type.clone(),
+            nullable: attr.nullable,
+            expr_id: Some(attr.expr_id),
+        }
+    }
+}
+
 impl PartialEq for ColumnReference {
     /// Excludes `expr_id`, `data_type`, and `nullable`: all three are derived
     /// resolution facts recording *which* attribute a column resolved to and
@@ -303,12 +337,13 @@ pub struct UnresolvedColumn {
     pub plan_id: Option<i64>,
 }
 
-#[cfg(test)]
 impl UnresolvedColumn {
-    /// A bare pre-analysis name (qualifier/plan_id `None`) — what front-ends
-    /// emit. Test-only: production construction always goes through the
-    /// Spark Connect converter or the analyzer's own synthesis sites.
-    pub(crate) fn bare(name: impl Into<String>) -> Expression {
+    /// A bare pre-analysis name (qualifier/plan_id `None`) — the shape both
+    /// front-ends emit for an undotted identifier. NOT for dotted references:
+    /// `v2_lowering`'s `Expr::CompoundIdentifier` arm keeps its own literal,
+    /// since routing it here would drop the leading part instead of binding it
+    /// as the qualifier (corpus witness: cx-004).
+    pub fn bare(name: impl Into<String>) -> Expression {
         Expression::UnresolvedColumn(UnresolvedColumn {
             name: name.into(),
             qualifier: None,

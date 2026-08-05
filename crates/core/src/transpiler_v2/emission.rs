@@ -28,10 +28,11 @@
 //! - [`render_cast`] — includes the `try_cast` → `TRY_CAST(...)` branch
 //!   (checklist §4.2 first item).
 //! - [`quote_ident`] — `Cow`-returning fast path (§5.6).
-//! - The one still-unwired helper under Decision 13-A (`render_tail`) —
-//!   private, marked `#[allow(dead_code)]`, kept for its §5.4 CTE anchor test.
-//! - [`spark_return_cast`] (§5.1) and `spark_aggregate_return_cast` (§5.1,
-//!   `#[allow(dead_code)]` — wired by C.3) — two distinct `fn` items.
+//! - [`spark_return_cast`] (§5.1) — the scalar / projection-slot Spark-parity
+//!   return cast. The aggregate side is NOT a twin helper: decimal `avg`
+//!   carries its own outer cast in [`render_decimal_avg`] (ADR-020) and every
+//!   other aggregate's declared type comes straight from
+//!   `TypeInferenceEngine::aggregate_return_type`.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -93,10 +94,10 @@ pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionErro
 /// decision site of the SELECT-block builder (see `sql_block.rs`).
 fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
     match op {
-        TypedOp::TableScan { table, alias } => {
+        TypedOp::TableScan { table } => {
             Ok(SqlUnit::from(SelectBlock::from_item(FromItem::Relation {
                 base: table.clone(),
-                alias: alias.clone(),
+                alias: None,
             })))
         }
         TypedOp::Values { rows, column_names } => build_values(rows, column_names, schema),
@@ -196,7 +197,19 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
             cols,
             replacements,
         } => build_na_replace(input, cols, replacements),
-        other => legacy_render(other, schema).map(SqlUnit::Raw),
+        // Statement-shaped operators (plus the defensive `Unnest` reject) still
+        // render to an opaque `Raw` unit. Named explicitly, not caught by `_`,
+        // so THIS match is where a new `TypedOp` variant is a compile error.
+        TypedOp::SingleRow
+        | TypedOp::Unpivot { .. }
+        | TypedOp::Describe { .. }
+        | TypedOp::Summary { .. }
+        | TypedOp::FreqItems { .. }
+        | TypedOp::Pivot { .. }
+        | TypedOp::Sample { .. }
+        | TypedOp::SampleBy { .. }
+        | TypedOp::RecursiveCte { .. }
+        | TypedOp::Unnest { .. } => legacy_render(op, schema).map(SqlUnit::Raw),
     }
 }
 
@@ -1580,7 +1593,7 @@ fn build_aliased_relation(input: &TypedAst, alias: &str) -> Result<SqlUnit, Emis
     // anything else becomes a derived table under the user alias. Either
     // way the alias is the block's whole scope — the analyzer's RelScope
     // for AliasedRelation binds exactly this alias.
-    let item = if let TypedOp::TableScan { table, alias: None } = &input.op {
+    let item = if let TypedOp::TableScan { table } = &input.op {
         FromItem::Relation {
             base: table.clone(),
             alias: Some(alias.to_owned()),
@@ -1595,8 +1608,11 @@ fn build_aliased_relation(input: &TypedAst, alias: &str) -> Result<SqlUnit, Emis
 }
 
 /// The pre-SELECT-block string renderers, one arm per not-yet-converted
-/// operator. Arms migrate from here into [`build_unit`] phase by phase;
-/// the match stays exhaustive so a new `TypedOp` variant is a compile error.
+/// operator. Arms migrate from here into [`build_unit`] phase by phase.
+///
+/// Reached only from [`build_unit`]'s explicit legacy-variant arm, which owns
+/// exhaustiveness over `TypedOp` — so this match ends in a `_` rather than
+/// restating every block-composable name.
 fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError> {
     let result: Result<String, EmissionError> = match op {
         // ── C.1 wired ────────────────────────────────────────────────────
@@ -1662,29 +1678,7 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
 
         // Converted to the SELECT-block builder — reaching a legacy arm for
         // these is a `build_unit` dispatch bug.
-        TypedOp::Values { .. }
-        | TypedOp::LocalRelation { .. }
-        | TypedOp::FileScan { .. }
-        | TypedOp::TableFunction { .. }
-        | TypedOp::TableScan { .. }
-        | TypedOp::Project { .. }
-        | TypedOp::Filter { .. }
-        | TypedOp::Sort { .. }
-        | TypedOp::Limit { .. }
-        | TypedOp::Deduplicate { .. }
-        | TypedOp::AliasedRelation { .. }
-        | TypedOp::Join { .. }
-        | TypedOp::Aggregate { .. }
-        | TypedOp::LateralView { .. }
-        | TypedOp::SetOp { .. }
-        | TypedOp::WithColumns { .. }
-        | TypedOp::DropColumns { .. }
-        | TypedOp::WithColumnsRenamed { .. }
-        | TypedOp::NaFill { .. }
-        | TypedOp::NaDrop { .. }
-        | TypedOp::NaReplace { .. } => {
-            unreachable!("block-composable operator routed to legacy_render: {op:?}")
-        }
+        _ => unreachable!("block-composable operator routed to legacy_render: {op:?}"),
     };
     result
 }
@@ -1961,26 +1955,6 @@ fn render_sort_key(so: &SortOrder, schema: &Schema) -> Result<String, EmissionEr
         NullOrdering::NullsLast => "NULLS LAST",
     };
     Ok(format!("{expr_sql} {dir} {nulls}"))
-}
-
-// ── Unwired renderer (Decision 13-A) ─────────────────────────────────────────
-//
-// `render_tail` is the one remaining renderer without a `TypedOp` sink in τ's
-// analyzer substrate. It exists so the §5.4 CTE anchor test lives in code
-// today; its former Decision 13-A siblings are all wired via `dispatch_op`.
-
-/// **§5.4 CTE rewrite.** DuckDB has no native TAIL operator; we synthesize it
-/// via `ROW_NUMBER() OVER ()` and select rows past `total_rows − n`. The child
-/// SQL is materialized once inside a `WITH` binding so it is not double-embedded.
-#[allow(dead_code)] // wired when TypedOp::Tail lands (Decision 13-A)
-fn render_tail(input: &TypedAst, n: i64) -> Result<String, EmissionError> {
-    let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
-    Ok(format!(
-        "WITH __td_child AS ({child_sql}) \
-         SELECT * EXCLUDE (__td_row_num__) \
-         FROM (SELECT *, ROW_NUMBER() OVER () AS __td_row_num__ FROM __td_child) \
-         WHERE __td_row_num__ > (SELECT COUNT(*) FROM __td_child) - {n}"
-    ))
 }
 
 /// Render a `RecursiveCte`:
@@ -5741,10 +5715,11 @@ fn render_decimal_avg(
 }
 
 /// Render an aggregate function call. Primitives (`count`, `sum`, `avg`,
-/// `min`, `max`, `count_distinct`) pass through with Spark-parity CASTs
-/// applied by [`spark_aggregate_return_cast`]. Unknown aggregate names
-/// surface as a `Function`-kinded Thunderduck-boundary
-/// [`EmissionError::Unsupported`] per ADR-022.
+/// `min`, `max`, `count_distinct`) pass through unwrapped — DuckDB's native
+/// return types already match Spark's for these, and the one shape that does
+/// not (decimal `avg`) routes through [`render_decimal_avg`], which applies
+/// its own outer CAST. Unknown aggregate names surface as a `Function`-kinded
+/// Thunderduck-boundary [`EmissionError::Unsupported`] per ADR-022.
 fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, EmissionError> {
     // N5: `f.name` is already canonical lowercase — `lower` is kept as an
     // owned `String` (not renamed to a borrow) so the rest of this function,
@@ -6528,36 +6503,6 @@ fn spark_return_cast(expr_sql: String, expr: &Expression, schema: &Schema) -> St
     expr_sql
 }
 
-/// Aggregate Spark-parity return-type CAST.
-///
-/// Handles integer SUM/AVG widening (BIGINT), decimal aggregate widening, etc.
-/// In practice τ's decimal `avg`/`mean` delegates to the `thdck_spark_funcs`
-/// extension's `spark_avg` in a dedicated [`render_decimal_avg`] (own outer
-/// CAST, per rearchitect ADR-020); `sum` stays on DuckDB's native pass-through
-/// (already value- and scale-exact over DECIMAL — only Arrow-wire precision
-/// differs, which is harness-invisible). So this function is currently
-/// unwired — but the §5.1 anchor test
-/// (`spark_return_cast_and_spark_aggregate_return_cast_are_distinct`) requires
-/// it to exist as a distinct `fn` item from `spark_return_cast`.
-///
-/// **§5.1 anchor.** MUST NOT share body with [`spark_return_cast`].
-#[allow(dead_code)] // §5.1 anchor requires the item; decimal-avg is wired through render_decimal_avg instead.
-fn spark_aggregate_return_cast(agg_sql: String, agg: &FunctionCall, schema: &Schema) -> String {
-    if let Some(arg) = agg.args.first() {
-        let arg_type = arg.data_type(schema);
-        match agg.name.as_str() {
-            "sum" | "sum_distinct" | "try_sum" if arg_type.is_integral() => {
-                return format!("CAST({agg_sql} AS BIGINT)");
-            }
-            "avg" | "mean" | "try_avg" if arg_type.is_integral() => {
-                return format!("CAST({agg_sql} AS DOUBLE)");
-            }
-            _ => {}
-        }
-    }
-    agg_sql
-}
-
 // ── Identifier quoting (§5.6) ────────────────────────────────────────────────
 
 /// DuckDB reserved words that force quoting even when the identifier matches
@@ -7324,7 +7269,6 @@ mod tests {
     fn scan(table: &str) -> CommonAst {
         CommonAst::new(CommonOp::TableScan {
             table: table.to_owned(),
-            alias: None,
         })
     }
 
@@ -8036,11 +7980,13 @@ mod tests {
     fn dispatch_op_table_scan_with_alias_emits_alias() {
         let _g = tap_guard();
         let bt = base_types_with_emp();
-        let ast = CommonAst::new(CommonOp::TableScan {
-            table: "emp".to_owned(),
-            alias: Some("e".to_owned()),
+        let ast = CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: "emp".to_owned(),
+            })),
+            alias: "e".to_owned(),
         });
-        let typed = analyze(ast, &bt).expect("analyze TableScan alias");
+        let typed = analyze(ast, &bt).expect("analyze aliased TableScan");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert_eq!(sql, "SELECT * FROM emp AS e");
     }
@@ -10960,7 +10906,6 @@ mod tests {
         let input = TypedAst::new(
             TypedOp::TableScan {
                 table: "dup_tbl".to_owned(),
-                alias: None,
             },
             schema.clone(),
         );
@@ -11029,7 +10974,6 @@ mod tests {
         let input = TypedAst::new(
             TypedOp::TableScan {
                 table: "agg026".to_owned(),
-                alias: None,
             },
             schema.clone(),
         );
@@ -11089,7 +11033,6 @@ mod tests {
         let input = TypedAst::new(
             TypedOp::TableScan {
                 table: "dup_tbl".to_owned(),
-                alias: None,
             },
             schema.clone(),
         );
@@ -12513,41 +12456,14 @@ mod tests {
         }
     }
 
-    // ── 30. §5.4 — render_tail uses CTE ──────────────────────────────────
-
-    #[test]
-    fn render_tail_uses_cte_not_double_embed() {
-        // §5.4 anchor. render_tail is unwired under Decision 13-A; we invoke
-        // the helper directly with a synthesized child TypedAst.
-        let bt = base_types_with_emp();
-        let ast = scan("emp");
-        let typed = analyze(ast, &bt).expect("analyze");
-        let sql = render_tail(&typed, 3).expect("render_tail");
-        assert!(sql.contains("WITH __td_child AS"), "got: {sql}");
-        // Child SQL string appears exactly ONCE in the output (INV: no double
-        // embedding of child SQL).
-        let child_marker = "SELECT * FROM emp";
-        let occurrences = sql.matches(child_marker).count();
-        assert_eq!(
-            occurrences, 1,
-            "child SQL must appear exactly once (CTE); got {occurrences} in: {sql}",
-        );
-    }
-
-    // ── 31. §5.1 — return-cast helpers are distinct ─────────────────────
-
-    #[test]
-    fn spark_return_cast_and_aggregate_return_cast_are_distinct_fns() {
-        // §5.1 anchor — the two helpers must be two `fn` items with distinct
-        // function pointers. Rust's `#[allow(dead_code)]` on the aggregate
-        // helper does not merge the item.
-        let f1: fn(String, &Expression, &Schema) -> String = spark_return_cast;
-        let f2: fn(String, &FunctionCall, &Schema) -> String = spark_aggregate_return_cast;
-        // Cast to raw pointers for identity comparison.
-        let p1 = f1 as *const ();
-        let p2 = f2 as *const ();
-        assert_ne!(p1, p2, "helpers must be distinct fn items");
-    }
+    // ── 30/31. §5.4 and §5.1 anchors — re-pointed at live code ───────────
+    //
+    // Both were pinned by `#[allow(dead_code)]` helpers no production path
+    // reached (`render_tail`, `spark_aggregate_return_cast`). They now ride on
+    // wired code: §5.4 (CTE, no double-embed) on
+    // `render_freq_items_single_col_wraps_child_in_materialized_cte_with_list_having`;
+    // §5.1 (the aggregate return cast is not a twin of the scalar one) on
+    // `avg_of_decimal_routes_through_spark_avg` plus `avg_of_{integer,double}_stays_native`.
 
     // ── 32. extension_targets is empty at C.1 ────────────────────────────
 
@@ -13344,6 +13260,14 @@ mod tests {
             "got: {sql}"
         );
         assert!(sql.contains("AS dept_id_freqItems"), "got: {sql}");
+        // §5.4 anchor (re-pointed): the child SQL is bound ONCE in the
+        // MATERIALIZED CTE and referenced by name thereafter — never
+        // re-embedded per correlated subquery.
+        assert_eq!(
+            sql.matches("SELECT * FROM emp").count(),
+            1,
+            "child SQL must appear exactly once (CTE); got: {sql}",
+        );
     }
 
     #[test]
@@ -13373,7 +13297,6 @@ mod tests {
         let typed_input = TypedAst::new(
             TypedOp::TableScan {
                 table: "emp".to_owned(),
-                alias: None,
             },
             Schema::empty(),
         );
@@ -13431,7 +13354,6 @@ mod tests {
         let typed_input = TypedAst::new(
             TypedOp::TableScan {
                 table: "emp".to_owned(),
-                alias: None,
             },
             Schema::empty(),
         );
@@ -13501,7 +13423,6 @@ mod tests {
         let typed_input = TypedAst::new(
             TypedOp::TableScan {
                 table: "emp".to_owned(),
-                alias: None,
             },
             Schema::minted(emp_schema()),
         );
@@ -16895,14 +16816,25 @@ mod tests {
         ])
     }
 
+    /// A resolved scan of `table`, optionally under the `AliasedRelation`
+    /// wrapper that now owns aliases (collapsed back to `FROM t AS a`).
     fn typed_table_scan(table: &str, alias: Option<&str>, schema: StructType) -> TypedAst {
-        TypedAst::new(
+        let scan = TypedAst::new(
             TypedOp::TableScan {
                 table: table.to_owned(),
-                alias: alias.map(|s| s.to_owned()),
             },
-            Schema::minted(schema),
-        )
+            Schema::minted(schema.clone()),
+        );
+        match alias {
+            None => scan,
+            Some(a) => TypedAst::new(
+                TypedOp::AliasedRelation {
+                    input: Box::new(scan),
+                    alias: a.to_owned(),
+                },
+                Schema::minted(schema),
+            ),
+        }
     }
 
     fn tags_col_ref() -> Expression {

@@ -12,7 +12,7 @@ use duckdb::vtab::arrow::WritableVector;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Result, ThunderduckError};
-use crate::runtime::config::{HardwareProfile, StreamingConfig};
+use crate::runtime::config::HardwareProfile;
 use crate::runtime::extension_loader;
 use crate::types::StructType;
 
@@ -298,7 +298,7 @@ impl DuckDbSession {
     ///
     /// This function blocks until the thread is ready (connection opened, settings
     /// applied, `thdck_spark_funcs` extension loaded).
-    pub fn spawn(session_id: &str, _config: &StreamingConfig) -> Result<Self> {
+    pub fn spawn(session_id: &str) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>(32);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel::<Result<()>>(1);
 

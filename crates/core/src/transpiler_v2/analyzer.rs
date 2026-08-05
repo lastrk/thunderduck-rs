@@ -217,8 +217,7 @@ impl RelScope {
     /// ranges — it never re-walks a subtree.
     ///
     /// Binding rules (formerly `collect_qualifier_bindings`):
-    /// - `TableScan{table, alias}`: bind `table` (and `alias`, if present) to
-    ///   the full range.
+    /// - `TableScan{table}`: bind `table` to the full range.
     /// - `AliasedRelation{alias}`: bind `alias` to the full range; the child's
     ///   scope is dropped — emission re-scopes everything under it to `alias`.
     /// - `Join` with non-empty `using_columns`: EMPTY. USING output reorders
@@ -242,18 +241,11 @@ impl RelScope {
     ///   binding from further down is valid against the CURRENT schema.
     fn of(op: &TypedOp, resolved_schema: &ResolvedSchema) -> Self {
         match op {
-            TypedOp::TableScan { table, alias } => {
-                let range = 0..resolved_schema.len();
-                let mut aliases = vec![(table.clone(), range.clone())];
-                if let Some(a) = alias {
-                    aliases.push((a.clone(), range));
-                }
-                Self {
-                    aliases,
-                    plan_ids: Vec::new(),
-                    ambiguous_plan_ids: Vec::new(),
-                }
-            }
+            TypedOp::TableScan { table } => Self {
+                aliases: vec![(table.clone(), 0..resolved_schema.len())],
+                plan_ids: Vec::new(),
+                ambiguous_plan_ids: Vec::new(),
+            },
             TypedOp::AliasedRelation { alias, .. } => Self {
                 aliases: vec![(alias.clone(), 0..resolved_schema.len())],
                 plan_ids: Vec::new(),
@@ -268,66 +260,19 @@ impl RelScope {
                 right_plan_ids,
                 ..
             } => {
+                // The USING gate stays HERE, not inside `merge_join_scopes`:
+                // it is a property of the join's OUTPUT schema (reordered and
+                // deduped, so no contiguous-range invariant holds), whereas a
+                // USING join's *condition* still resolves against the plain
+                // merged schema via `for_join_condition`.
                 if !using_columns.is_empty() {
                     return Self::default();
                 }
-                let left_len = left.resolved_schema.len();
-                let left_range = 0..left_len;
-                let right_range = left_len..left_len + right.resolved_schema.len();
-                let keep_right = !matches!(join_type, JoinType::LeftSemi | JoinType::LeftAnti);
-
-                // ADR-023 3b-i: a plan_id present in BOTH this join's OWN
-                // left and right sides is the un-realiased self-join
-                // `df.join(df, ...)` — genuinely ambiguous (Spark cannot
-                // tell which side is meant). When the right side is dropped
-                // (LeftSemi/LeftAnti) it contributes no output columns, so
-                // there is no ambiguity to raise.
-                let own_ambiguous: Vec<i64> = if keep_right {
-                    left_plan_ids
-                        .iter()
-                        .filter(|pid| right_plan_ids.contains(pid))
-                        .copied()
-                        .collect()
-                } else {
-                    Vec::new()
+                let right_side = match join_type {
+                    JoinType::LeftSemi | JoinType::LeftAnti => RightSide::Drop,
+                    _ => RightSide::Keep,
                 };
-
-                let mut plan_ids = Vec::new();
-                for &pid in left_plan_ids {
-                    plan_ids.push((pid, left_range.clone()));
-                }
-                if keep_right {
-                    for &pid in right_plan_ids {
-                        plan_ids.push((pid, right_range.clone()));
-                    }
-                }
-                plan_ids.extend(left.scope.plan_ids.iter().cloned());
-                let mut ambiguous_plan_ids = own_ambiguous;
-                ambiguous_plan_ids.extend(left.scope.ambiguous_plan_ids.iter().copied());
-                let mut aliases = left.scope.aliases.clone();
-                if keep_right {
-                    let offset = |r: &std::ops::Range<usize>| r.start + left_len..r.end + left_len;
-                    plan_ids.extend(
-                        right
-                            .scope
-                            .plan_ids
-                            .iter()
-                            .map(|(pid, r)| (*pid, offset(r))),
-                    );
-                    ambiguous_plan_ids.extend(right.scope.ambiguous_plan_ids.iter().copied());
-                    aliases.extend(
-                        right
-                            .scope
-                            .aliases
-                            .iter()
-                            .map(|(name, r)| (name.clone(), offset(r))),
-                    );
-                }
-                Self {
-                    aliases,
-                    plan_ids,
-                    ambiguous_plan_ids,
-                }
+                merge_join_scopes(left, right, left_plan_ids, right_plan_ids, right_side)
             }
             scope_passthrough!(input) => input.scope.clone(),
             // LateralView appends generated columns after the input. Keep the
@@ -370,6 +315,88 @@ impl RelScope {
             | TypedOp::Pivot { .. }
             | TypedOp::RecursiveCte { .. } => Self::default(),
         }
+    }
+}
+
+/// Whether a join's RIGHT side contributes columns to the merged range space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RightSide {
+    /// Bind the right side's own plan_ids and offset-merge its child scope.
+    Keep,
+    /// `LeftSemi` / `LeftAnti` output: the right side contributes no columns,
+    /// so nothing from it binds — and a plan_id on both sides is NOT
+    /// ambiguous, since only the left occurrence is reachable.
+    Drop,
+}
+
+/// Offset-merge two already-stamped child scopes into the single range space a
+/// `left ⋈ right` schema exposes — the one home of the join
+/// scope-composition rules, shared by [`RelScope::of`]'s Join arm and
+/// [`ResolveContext::for_join_condition`].
+///
+/// Push ORDER is contractual, not incidental: `lookup` / `lookup_plan_id` take
+/// the first match, so this join's OWN plan_id entries must precede the
+/// children's (nearest enclosing join wins) and left must precede right.
+fn merge_join_scopes(
+    left: &TypedAst,
+    right: &TypedAst,
+    left_plan_ids: &[i64],
+    right_plan_ids: &[i64],
+    right_side: RightSide,
+) -> RelScope {
+    let keep_right = right_side == RightSide::Keep;
+    let left_len = left.resolved_schema.len();
+    let left_range = 0..left_len;
+    let right_range = left_len..left_len + right.resolved_schema.len();
+    let offset = |r: &std::ops::Range<usize>| r.start + left_len..r.end + left_len;
+
+    // ADR-023 3b-i: a plan_id present in BOTH this join's OWN left and right
+    // sides is the un-realiased self-join `df.join(df, ...)` — genuinely
+    // ambiguous (Spark cannot tell which side is meant).
+    let own_ambiguous: Vec<i64> = if keep_right {
+        left_plan_ids
+            .iter()
+            .filter(|pid| right_plan_ids.contains(pid))
+            .copied()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut plan_ids = Vec::new();
+    for &pid in left_plan_ids {
+        plan_ids.push((pid, left_range.clone()));
+    }
+    if keep_right {
+        for &pid in right_plan_ids {
+            plan_ids.push((pid, right_range.clone()));
+        }
+    }
+    plan_ids.extend(left.scope.plan_ids.iter().cloned());
+    let mut ambiguous_plan_ids = own_ambiguous;
+    ambiguous_plan_ids.extend(left.scope.ambiguous_plan_ids.iter().copied());
+    let mut aliases = left.scope.aliases.clone();
+    if keep_right {
+        plan_ids.extend(
+            right
+                .scope
+                .plan_ids
+                .iter()
+                .map(|(pid, r)| (*pid, offset(r))),
+        );
+        ambiguous_plan_ids.extend(right.scope.ambiguous_plan_ids.iter().copied());
+        aliases.extend(
+            right
+                .scope
+                .aliases
+                .iter()
+                .map(|(name, r)| (name.clone(), offset(r))),
+        );
+    }
+    RelScope {
+        aliases,
+        plan_ids,
+        ambiguous_plan_ids,
     }
 }
 
@@ -475,12 +502,11 @@ pub enum TypedOp {
     },
     /// A relation with exactly one row and zero columns.
     SingleRow,
-    /// A named table scan.
+    /// A named table scan. Aliases live on an enclosing `AliasedRelation`
+    /// (see [`CommonOp::TableScan`]).
     TableScan {
         /// The table name.
         table: String,
-        /// Optional alias.
-        alias: Option<String>,
     },
     /// An in-line `VALUES` relation.
     Values {
@@ -1058,7 +1084,7 @@ fn analyze_node(
         // ── Leaves ────────────────────────────────────────────────────────
         CommonOp::SingleRow => Ok(TypedAst::new(TypedOp::SingleRow, ResolvedSchema::empty())),
 
-        CommonOp::TableScan { table, alias } => {
+        CommonOp::TableScan { table } => {
             // resolve: seed schema from base_types.
             let schema =
                 base_types
@@ -1067,21 +1093,18 @@ fn analyze_node(
                     .ok_or_else(|| AnalyzerError::UnknownTable {
                         name: table.clone(),
                     })?;
-            // At τ's analyzer, we don't rewrite field qualifiers into names —
-            // the alias is preserved on the operator itself. future τ work's
-            // renderer handles the alias projection. A `TableScan` is an
-            // origination point — mint fresh ids for its columns.
+            // A `TableScan` is an origination point — mint fresh ids for its
+            // columns. An alias, if any, sits on an enclosing
+            // `AliasedRelation`, which overwrites both the scope binding and
+            // the lineage below it (Spark shadowing).
             //
             // ADR-023 tier-3 leaf seed: EVERY column of a `TableScan` is
-            // equally "from" the table (and, if present, its alias) — seed
-            // the SAME qualifier set onto every minted attribute.
+            // equally "from" the table — seed the SAME qualifier set onto
+            // every minted attribute.
             let mut quals = BTreeSet::new();
             quals.insert(table.clone());
-            if let Some(a) = &alias {
-                quals.insert(a.clone());
-            }
             Ok(TypedAst::new(
-                TypedOp::TableScan { table, alias },
+                TypedOp::TableScan { table },
                 seed_source_quals(ResolvedSchema::minted(schema), quals),
             ))
         }
@@ -1281,15 +1304,7 @@ fn analyze_node(
                 let trim_projections: Vec<Expression> = original_schema
                     .fields
                     .iter()
-                    .map(|f| {
-                        Expression::ColumnReference(ColumnReference {
-                            name: f.name.clone(),
-                            qualifier: None,
-                            data_type: f.data_type.clone(),
-                            nullable: f.nullable,
-                            expr_id: Some(f.expr_id),
-                        })
-                    })
+                    .map(|f| Expression::ColumnReference(ColumnReference::from_attr(f)))
                     .collect();
                 Ok(TypedAst::new(
                     TypedOp::Project {
@@ -3672,14 +3687,7 @@ fn bind_slot(entries: &[Expression], schema: &ResolvedSchema, k: usize) -> Expre
         ),
         "N8: output-list entry must be a NamedExpression"
     );
-    let field = schema.fields[k].clone();
-    Expression::ColumnReference(ColumnReference {
-        name: field.name,
-        qualifier: None,
-        data_type: field.data_type,
-        nullable: field.nullable,
-        expr_id: Some(field.expr_id),
-    })
+    Expression::ColumnReference(ColumnReference::from_attr(&schema.fields[k]))
 }
 
 /// `true` for `Expression` variants this fallback treats as an opaque,
@@ -3804,13 +3812,7 @@ fn promote_hidden_alias(
         alias: name,
     }));
     schema.fields.push(field.clone());
-    Expression::ColumnReference(ColumnReference {
-        name: field.name,
-        qualifier: None,
-        data_type: field.data_type,
-        nullable: field.nullable,
-        expr_id: Some(field.expr_id),
-    })
+    Expression::ColumnReference(ColumnReference::from(field))
 }
 
 /// [`promote_subtree`]'s `SortChild::Project` promotion: `expr` is a bare
@@ -3828,13 +3830,7 @@ fn promote_bare_column(
     let field = output_attribute(&expr, input_schema);
     projections.push(expr);
     schema.fields.push(field.clone());
-    Expression::ColumnReference(ColumnReference {
-        name: field.name,
-        qualifier: None,
-        data_type: field.data_type,
-        nullable: field.nullable,
-        expr_id: Some(field.expr_id),
-    })
+    Expression::ColumnReference(ColumnReference::from(field))
 }
 
 /// A hidden-promotion output name, uniquified against `aggregates`' EXISTING
@@ -4111,7 +4107,7 @@ pub(crate) const TD_JOIN_RIGHT: &str = "__td_jr";
 // ── Alias-aware qualified-column resolution over joins ─────────────────────
 //
 // A relation alias (`d` in `... CROSS JOIN dept d`) is not a schema field —
-// the merged join schema (built by `StructType::merge`, a positional
+// the merged join schema (built by `ResolvedSchema::merge`, a positional
 // concatenation) carries no per-field qualifier metadata. But `merge` and
 // `apply_join_nullability` both preserve field count and order, so each
 // source relation occupies a CONTIGUOUS range of the CURRENT resolution
@@ -4146,7 +4142,7 @@ struct OuterScope<'a> {
 struct ResolveContext<'a> {
     /// The current operator's resolution schema (already outer-join-flipped
     /// and positionally merged, per [`apply_join_nullability`] /
-    /// [`StructType::merge`]).
+    /// [`ResolvedSchema::merge`]).
     schema: &'a ResolvedSchema,
     /// Alias/table-name → field-range bindings the current node resolves
     /// against — the input's stamped [`RelScope`], borrowed in the common
@@ -4180,19 +4176,18 @@ impl<'a> ResolveContext<'a> {
     }
 
     /// Resolve a join condition against the merged `left ⋈ right` schema.
-    /// Binds the join's OWN `left_plan_ids`/`right_plan_ids` first (mirroring
-    /// [`RelScope::of`]'s Join arm so lookup's first-match picks the nearest
-    /// side), then both children's alias/plan_id scopes at their positional
-    /// offsets. Phase 3b: no synthetic `__td_jl`/`__td_jr` whole-side aliases
-    /// are pushed anymore — this composite scope exists only to offset-merge
-    /// the two sides' own aliases/plan_ids into one range space; a plan_id
-    /// ref resolves bare+ordinal via [`resolve_column`]'s plan_id arm exactly
-    /// as it would above the join.
+    /// Composition is [`merge_join_scopes`] — the same rules (and the same
+    /// contractual push order) [`RelScope::of`]'s Join arm uses. Phase 3b: no
+    /// synthetic `__td_jl`/`__td_jr` whole-side aliases are pushed anymore —
+    /// this composite scope exists only to offset-merge the two sides' own
+    /// aliases/plan_ids into one range space; a plan_id ref resolves
+    /// bare+ordinal via [`resolve_column`]'s plan_id arm exactly as it would
+    /// above the join.
     ///
-    /// Deliberately diverges from [`RelScope::of`]: there is NO `keep_right`
-    /// gate here — the condition resolves against the full merged schema
-    /// regardless of join type (SEMI/ANTI included), since Spark's own
-    /// resolution runs the fold over both children irrespective of join type.
+    /// Always [`RightSide::Keep`], unlike [`RelScope::of`]: the condition
+    /// resolves against the full merged schema regardless of join type
+    /// (SEMI/ANTI included), since Spark's own resolution runs the fold over
+    /// both children irrespective of join type.
     fn for_join_condition(
         schema: &'a ResolvedSchema,
         left: &'a TypedAst,
@@ -4202,48 +4197,15 @@ impl<'a> ResolveContext<'a> {
         base_types: &'a BaseTypes,
         outer: Option<OuterScope<'a>>,
     ) -> Self {
-        let left_len = left.resolved_schema.len();
-        let right_len = right.resolved_schema.len();
-        let offset = |r: &std::ops::Range<usize>| r.start + left_len..r.end + left_len;
-        let mut aliases = left.scope.aliases.clone();
-        aliases.extend(
-            right
-                .scope
-                .aliases
-                .iter()
-                .map(|(name, r)| (name.clone(), offset(r))),
-        );
-        let left_range = 0..left_len;
-        let right_range = left_len..left_len + right_len;
-        let mut plan_ids = Vec::new();
-        for &pid in left_plan_ids {
-            plan_ids.push((pid, left_range.clone()));
-        }
-        for &pid in right_plan_ids {
-            plan_ids.push((pid, right_range.clone()));
-        }
-        plan_ids.extend(left.scope.plan_ids.iter().cloned());
-        plan_ids.extend(
-            right
-                .scope
-                .plan_ids
-                .iter()
-                .map(|(pid, r)| (*pid, offset(r))),
-        );
-        let mut ambiguous_plan_ids: Vec<i64> = left_plan_ids
-            .iter()
-            .filter(|p| right_plan_ids.contains(p))
-            .copied()
-            .collect();
-        ambiguous_plan_ids.extend(left.scope.ambiguous_plan_ids.iter().copied());
-        ambiguous_plan_ids.extend(right.scope.ambiguous_plan_ids.iter().copied());
         Self {
             schema,
-            scopes: std::borrow::Cow::Owned(RelScope {
-                aliases,
-                plan_ids,
-                ambiguous_plan_ids,
-            }),
+            scopes: std::borrow::Cow::Owned(merge_join_scopes(
+                left,
+                right,
+                left_plan_ids,
+                right_plan_ids,
+                RightSide::Keep,
+            )),
             base_types,
             outer,
         }
@@ -4310,13 +4272,7 @@ impl<'a> ResolveContext<'a> {
 /// column and keeps its identity; only the synthesized `ExtractValue` nodes
 /// above it are id-less, same as `GetStructField` itself).
 fn build_struct_extract_chain(root: &Attribute, field_path: &str) -> Expression {
-    let mut expr = Expression::ColumnReference(ColumnReference {
-        name: root.name.clone(),
-        qualifier: None,
-        data_type: root.data_type.clone(),
-        nullable: root.nullable,
-        expr_id: Some(root.expr_id),
-    });
+    let mut expr = Expression::ColumnReference(ColumnReference::from_attr(root));
     for seg in field_path.split('.') {
         expr = Expression::ExtractValue(ExtractValueExpression {
             child: Box::new(expr),
@@ -4398,12 +4354,13 @@ fn resolve_in_outer(u: &UnresolvedColumn, outer: OuterScope<'_>) -> Option<Expre
             }
         }
         found.map(|f| {
+            // `name`/`qualifier` come from the REFERENCE, not the attribute:
+            // the match was case-insensitive, so the user's spelling is what
+            // must reach emission.
             Expression::ColumnReference(ColumnReference {
                 name: u.name.clone(),
                 qualifier: u.qualifier.clone(),
-                data_type: f.data_type.clone(),
-                nullable: f.nullable,
-                expr_id: Some(f.expr_id),
+                ..ColumnReference::from_attr(f)
             })
         })
     }
@@ -4639,13 +4596,12 @@ fn resolve_column(u: UnresolvedColumn, ctx: &ResolveContext) -> Result<Expressio
                             // binds by that identity over any wrapper —
                             // no strand.
                             let k = hits[0];
-                            let f = &ctx.schema.fields[k];
+                            // `name` from the REFERENCE (the `source_quals`
+                            // match was case-insensitive); everything else
+                            // copied from the resolved attribute.
                             return Ok(Expression::ColumnReference(ColumnReference {
                                 name: u.name,
-                                qualifier: None,
-                                expr_id: Some(f.expr_id),
-                                data_type: f.data_type.clone(),
-                                nullable: f.nullable,
+                                ..ColumnReference::from_attr(&ctx.schema.fields[k])
                             }));
                         }
                         n if n >= 2 => {
@@ -4928,16 +4884,16 @@ fn analyze_unpivot(
     let find_field =
         |name: &str| -> Option<&Attribute> { field_index.get(&fold_key(name)).copied() };
 
-    // Reject any unresolvable value column with a Spark-emulated
-    // `UnknownColumn`. Runs ONCE per path: the Implicit path validates
-    // BEFORE deriving ids from the value set; the Explicit path validates
-    // after id validation (error ordering preserved — an unresolvable id
-    // must win over an unresolvable value there).
-    let validate_values_resolve = |vals: &[String]| -> Result<(), AnalyzerError> {
-        for v in vals {
-            if find_field(v).is_none() {
+    // Reject any unresolvable column name with a Spark-emulated
+    // `UnknownColumn`. Call ORDER carries the Spark error precedence: the
+    // Implicit path validates the values BEFORE deriving ids from them; the
+    // Explicit path validates the ids first, so an unresolvable id wins over
+    // an unresolvable value there.
+    let validate_names_resolve = |names: &[String]| -> Result<(), AnalyzerError> {
+        for n in names {
+            if find_field(n).is_none() {
                 return Err(AnalyzerError::UnknownColumn {
-                    name: v.clone(),
+                    name: n.clone(),
                     qualifier: None,
                 });
             }
@@ -4968,21 +4924,14 @@ fn analyze_unpivot(
                 });
             }
             // Validate each value column resolves before deriving ids from it.
-            validate_values_resolve(&values)?;
+            validate_names_resolve(&values)?;
             let value_set: HashSet<String> = values.iter().map(|v| fold_key(v)).collect();
             fields_minus(&value_set)
         }
     };
 
     // Validate every id column resolves.
-    for id in &ids {
-        if find_field(id).is_none() {
-            return Err(AnalyzerError::UnknownColumn {
-                name: id.clone(),
-                qualifier: None,
-            });
-        }
-    }
+    validate_names_resolve(&ids)?;
 
     // Materialise `values`: empty ⇒ all non-id input columns (Spark default).
     let materialised_values: Vec<String> = if values.is_empty() {
@@ -4992,7 +4941,7 @@ fn analyze_unpivot(
         // Validate each named value column resolves — the Implicit path
         // already did (see above), so only the Explicit path checks here.
         if !ids_are_implicit {
-            validate_values_resolve(&values)?;
+            validate_names_resolve(&values)?;
         }
         values
     };
@@ -5564,13 +5513,7 @@ fn derive_implicit_grouping(
             // implicit-grouping output's lineage through to
             // `output_attribute`, which now COPIES (id + lineage) instead of
             // MINTING a fresh identity for these PIVOT grouping outputs.
-            Expression::ColumnReference(ColumnReference {
-                name: f.name.clone(),
-                qualifier: None,
-                data_type: f.data_type.clone(),
-                nullable: f.nullable,
-                expr_id: Some(f.expr_id),
-            })
+            Expression::ColumnReference(ColumnReference::from_attr(f))
         })
         .collect()
 }
@@ -6114,7 +6057,6 @@ mod tests {
     fn scan(name: &str) -> CommonAst {
         CommonAst::new(CommonOp::TableScan {
             table: name.to_owned(),
-            alias: None,
         })
     }
 
@@ -6309,22 +6251,25 @@ mod tests {
     // Direct parity tests for the stamped scope (formerly the recursive
     // `collect_qualifier_bindings` walk): binding rules per operator class.
 
-    /// `TableScan` over `table` with an explicit alias.
+    /// `table` under an explicit alias — an `AliasedRelation` wrapper, the
+    /// shape both front-ends produce for `FROM table AS alias`.
     fn aliased_scan(table: &str, alias: &str) -> CommonAst {
-        CommonAst::new(CommonOp::TableScan {
-            table: table.to_owned(),
-            alias: Some(alias.to_owned()),
+        CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: table.to_owned(),
+            })),
+            alias: alias.to_owned(),
         })
     }
 
+    /// An alias SHADOWS the base table name (Spark parity): `FROM emp AS e`
+    /// binds `e` only, never `emp`. `AliasedRelation`'s scope arm drops the
+    /// child's bindings and rebinds the whole range to the alias.
     #[test]
-    fn rel_scope_table_scan_binds_table_and_alias() {
+    fn rel_scope_aliased_scan_binds_alias_only_shadowing_table_name() {
         let bt = base_types_with_emp_dept();
         let typed = analyze(aliased_scan("emp", "e"), &bt).unwrap();
-        assert_eq!(
-            typed.scope.aliases,
-            vec![("emp".to_owned(), 0..4), ("e".to_owned(), 0..4)]
-        );
+        assert_eq!(typed.scope.aliases, vec![("e".to_owned(), 0..4)]);
         assert!(typed.scope.plan_ids.is_empty());
     }
 
@@ -6357,12 +6302,7 @@ mod tests {
         let typed = analyze(ast, &bt).unwrap();
         assert_eq!(
             typed.scope.aliases,
-            vec![
-                ("emp".to_owned(), 0..4),
-                ("e".to_owned(), 0..4),
-                ("dept".to_owned(), 4..6),
-                ("d".to_owned(), 4..6),
-            ]
+            vec![("e".to_owned(), 0..4), ("d".to_owned(), 4..6)]
         );
     }
 
@@ -6381,10 +6321,7 @@ mod tests {
             Some(cond),
         );
         let typed = analyze(ast, &bt).unwrap();
-        assert_eq!(
-            typed.scope.aliases,
-            vec![("emp".to_owned(), 0..4), ("e".to_owned(), 0..4)]
-        );
+        assert_eq!(typed.scope.aliases, vec![("e".to_owned(), 0..4)]);
     }
 
     #[test]
@@ -6435,7 +6372,7 @@ mod tests {
             other => panic!("expected Filter, got {other:?}"),
         };
         assert_eq!(typed.scope, inner_scope);
-        assert_eq!(typed.scope.aliases.len(), 4);
+        assert_eq!(typed.scope.aliases.len(), 2);
     }
 
     #[test]
@@ -6518,11 +6455,7 @@ mod tests {
         );
         assert_eq!(
             typed.scope.aliases,
-            vec![
-                ("emp".to_owned(), 0..4),
-                ("e".to_owned(), 0..4),
-                ("t".to_owned(), 4..5),
-            ]
+            vec![("e".to_owned(), 0..4), ("t".to_owned(), 4..5)]
         );
     }
 
@@ -7171,12 +7104,13 @@ mod tests {
 
     #[test]
     fn source_quals_plain_join_composes_left_and_right() {
-        // emp e JOIN dept d ON e.dept_id = d.dept_id — TableScan{alias}'s
-        // rule binds BOTH the table name and the alias to every column.
+        // emp e JOIN dept d ON e.dept_id = d.dept_id. `AliasedRelation`
+        // OVERWRITES the lineage below it, so each column's only qualifier is
+        // its side's alias — the base table name is shadowed, per Spark.
         let bt = base_types_with_emp_dept();
         let typed = analyze(emp_dept_aliased_join(), &bt).unwrap();
-        let e: BTreeSet<String> = ["emp".to_owned(), "e".to_owned()].into_iter().collect();
-        let d: BTreeSet<String> = ["dept".to_owned(), "d".to_owned()].into_iter().collect();
+        let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
+        let d: BTreeSet<String> = ["d".to_owned()].into_iter().collect();
         let mut expected = vec![e; 4];
         expected.extend(vec![d; 2]);
         assert_eq!(quals_of(&typed.resolved_schema), expected);
@@ -7204,8 +7138,8 @@ mod tests {
             right_plan_ids: vec![],
         });
         let typed = analyze(ast, &bt).unwrap();
-        let e: BTreeSet<String> = ["emp".to_owned(), "e".to_owned()].into_iter().collect();
-        let d: BTreeSet<String> = ["dept".to_owned(), "d".to_owned()].into_iter().collect();
+        let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
+        let d: BTreeSet<String> = ["d".to_owned()].into_iter().collect();
         let key: BTreeSet<String> = e.union(&d).cloned().collect();
         assert_eq!(
             quals_of(&typed.resolved_schema),
@@ -12354,12 +12288,13 @@ mod tests {
     // tests cover the error paths and precedence rules that the fixture
     // registry deliberately excludes (see its module doc).
 
-    /// `TableScan` with an explicit alias — the shape both front-ends
-    /// produce for `FROM table AS alias`.
+    /// `table` under an explicit alias (an `AliasedRelation` wrapper).
     fn aliased(table: &str, alias: &str) -> CommonAst {
-        CommonAst::new(CommonOp::TableScan {
-            table: table.to_owned(),
-            alias: Some(alias.to_owned()),
+        CommonAst::new(CommonOp::AliasedRelation {
+            input: Box::new(CommonAst::new(CommonOp::TableScan {
+                table: table.to_owned(),
+            })),
+            alias: alias.to_owned(),
         })
     }
 
@@ -12408,31 +12343,18 @@ mod tests {
     }
 
     #[test]
-    fn self_join_duplicate_alias_binding_falls_back_to_legacy_no_panic() {
+    fn self_join_referenced_by_shadowed_table_name_is_unresolved() {
         // `emp AS e1 JOIN emp AS e2`, referenced by the bare TABLE NAME
-        // `emp` (not either alias): the `TableScan` scope arm binds the bare
-        // table name `emp` on BOTH sides (once per side), so the qualifier
-        // `emp` binds 2+ ranges. ADR-023 3b-i: this is exactly the qualifier
-        // 2+ case — `resolve_column` now raises `AmbiguousColumn` here
-        // instead of silently falling back to the legacy first-match path
-        // (this test's name predates that fix; a rename is deliberately
-        // deferred to the next chunk that touches this test's other
-        // assertions, to keep this diff to the ambiguity-discipline change).
+        // `emp` (not either alias).
         //
-        // Empirically (probed against Spark 4.1.1 via
-        // `differential.dataframe_corpus.build_inputs`), Spark's real error
-        // class for THIS exact shape is `UNRESOLVED_COLUMN.WITH_SUGGESTION`,
-        // not `AMBIGUOUS_REFERENCE`: once a relation is aliased, Spark's
-        // analyzer treats the base table name as shadowed/unresolvable
-        // entirely (even for a single, non-duplicated alias), so `emp` never
-        // reaches ambiguity-checking in Spark at all. τ's `RelScope`
-        // TableScan arm does not implement that alias-shadowing (a
-        // pre-existing, separate divergence out of scope for this chunk) —
-        // it still binds both the table name and the alias unconditionally,
-        // which is what surfaces the qualifier-2+ ambiguity fixed here.
-        // `AmbiguousColumn` is still the strictly better outcome versus the
-        // previous silent first-match fallback, so we pin it rather than
-        // leave the divergence undocumented.
+        // Spark parity, probed against Spark 4.1.1 via
+        // `differential.dataframe_corpus.build_inputs`: Spark raises
+        // `UNRESOLVED_COLUMN.WITH_SUGGESTION` here, NOT `AMBIGUOUS_REFERENCE`
+        // — once a relation is aliased the base table name is shadowed
+        // outright, so `emp` never reaches ambiguity-checking. τ used to
+        // deviate (`TableScan` carried its own `alias` and bound BOTH names,
+        // so `emp` bound two ranges → `AmbiguousColumn`); deleting that field
+        // closed the deviation.
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(join(
@@ -12445,14 +12367,14 @@ mod tests {
         });
         let err = analyze(ast, &bt).unwrap_err();
         match err {
-            AnalyzerError::AmbiguousColumn {
+            AnalyzerError::UnknownColumn {
                 ref name,
-                ref candidates,
+                ref qualifier,
             } => {
                 assert_eq!(name, "id");
-                assert_eq!(candidates.len(), 2);
+                assert_eq!(qualifier.as_deref(), Some("emp"));
             }
-            other => panic!("expected AmbiguousColumn, got {other:?}"),
+            other => panic!("expected UnknownColumn, got {other:?}"),
         }
     }
 
@@ -12843,10 +12765,7 @@ mod tests {
     /// given generator columns under table alias `t`.
     fn lateral_view_plan(columns: Vec<(String, Expression)>) -> CommonAst {
         CommonAst::new(CommonOp::LateralView {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: Some("e".to_owned()),
-            })),
+            input: Box::new(aliased("emp", "e")),
             table_alias: "t".to_owned(),
             columns,
         })
@@ -12985,10 +12904,7 @@ mod tests {
             StructField::not_null("tags", DataType::Array(Box::new(DataType::String), false)),
         ]);
         let plan = CommonAst::new(CommonOp::LateralView {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: Some("e".to_owned()),
-            })),
+            input: Box::new(aliased("emp", "e")),
             table_alias: "t".to_owned(),
             columns: vec![("tag".to_owned(), explode_outer_call(qcol("e", "tags")))],
         });
@@ -13005,10 +12921,7 @@ mod tests {
     #[test]
     fn lateral_view_posexplode_pos_not_nullable() {
         let plan = CommonAst::new(CommonOp::LateralView {
-            input: Box::new(CommonAst::new(CommonOp::TableScan {
-                table: "emp".to_owned(),
-                alias: Some("e".to_owned()),
-            })),
+            input: Box::new(aliased("emp", "e")),
             table_alias: "t".to_owned(),
             columns: vec![
                 (
@@ -15767,8 +15680,8 @@ mod tests {
             right_plan_ids: vec![],
         });
         let typed = analyze(ast, &bt).unwrap();
-        let e: BTreeSet<String> = ["emp".to_owned(), "e".to_owned()].into_iter().collect();
-        let d: BTreeSet<String> = ["dept".to_owned(), "d".to_owned()].into_iter().collect();
+        let e: BTreeSet<String> = ["e".to_owned()].into_iter().collect();
+        let d: BTreeSet<String> = ["d".to_owned()].into_iter().collect();
         let key: BTreeSet<String> = e.union(&d).cloned().collect();
         let field = typed
             .resolved_schema
@@ -15852,7 +15765,6 @@ mod tests {
         let input = TypedAst::new(
             TypedOp::TableScan {
                 table: "dept".to_owned(),
-                alias: None,
             },
             ResolvedSchema::new(vec![Attribute::minted("dept_id", DataType::Integer, false)]),
         );
@@ -15895,7 +15807,6 @@ mod tests {
         let left = TypedAst::new(
             TypedOp::TableScan {
                 table: "emp".to_owned(),
-                alias: None,
             },
             ResolvedSchema::new(vec![Attribute::minted("id", DataType::Long, false)]),
         );
@@ -15903,7 +15814,6 @@ mod tests {
         let right = TypedAst::new(
             TypedOp::TableScan {
                 table: "dept".to_owned(),
-                alias: None,
             },
             ResolvedSchema::new(vec![Attribute::minted("id", DataType::Integer, false)]),
         );

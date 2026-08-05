@@ -295,7 +295,6 @@ mod tests {
     fn table_scan(name: &str) -> CommonAst {
         CommonAst::new(CommonOp::TableScan {
             table: name.to_owned(),
-            alias: None,
         })
     }
 

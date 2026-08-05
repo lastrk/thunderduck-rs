@@ -253,7 +253,10 @@ impl ResolvedSchema {
         Some((k, f))
     }
 
-    /// All field names in order.
+    /// All field names in order. Assertion-only — production readers walk
+    /// `fields` directly (unlike `StructType::field_names`, which `DataType`'s
+    /// Display does use).
+    #[cfg(test)]
     pub fn field_names(&self) -> Vec<&str> {
         self.fields.iter().map(|f| f.name.as_str()).collect()
     }

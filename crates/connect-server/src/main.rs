@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use thunderduck_core::runtime::{SessionManager, StreamingConfig};
+use thunderduck_core::runtime::SessionManager;
 use tonic::transport::Server;
 
 use crate::proto::spark::connect::spark_connect_service_server::SparkConnectServiceServer;
@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Starting Thunderduck Connect Server on {}", bind);
 
-    let mgr = Arc::new(SessionManager::new(StreamingConfig::default()));
+    let mgr = Arc::new(SessionManager::new());
     let svc = ThunderduckService::new(mgr);
 
     Server::builder()

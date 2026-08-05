@@ -422,9 +422,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn table_exists_false_for_nonexistent() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let session = session_manager
             .get_or_create("catalog-test-table-exists")
             .await
@@ -446,9 +444,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn drop_temp_view_nonexistent_returns_false() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let session = session_manager
             .get_or_create("catalog-test-drop-nonexistent")
             .await
@@ -470,9 +466,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn drop_temp_view_existing_returns_true() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let session = session_manager
             .get_or_create("catalog-test-drop-existing")
             .await
@@ -499,9 +493,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn table_exists_true_for_created_view() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let session = session_manager
             .get_or_create("catalog-test-table-exists-view")
             .await
@@ -527,9 +519,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_catalog_relation_returns_none_for_non_catalog() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let session = session_manager
             .get_or_create("catalog-test-non-catalog")
             .await
@@ -549,9 +539,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_catalog_relation_unimplemented_for_list_tables() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let session = session_manager
             .get_or_create("catalog-test-list-tables")
             .await

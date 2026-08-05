@@ -6,11 +6,12 @@
 //! NOT NULL stripping, unknown → `Unresolved`) and emission's
 //! `spark_ddl_type_to_core_data_type` (uppercase tokens, STRUCT / ARRAY,
 //! unknown → `None`). This module is the union of BOTH grammars behind two
-//! entry points that differ only in unknown-token handling:
-//!
-//! - [`parse_spark_type_strict`] — unknown → `None` (emission behavior)
-//! - [`parse_spark_type_lenient`] — unknown → [`DataType::Unresolved`]
-//!   (connect-server behavior)
+//! entry points that differ only in unknown-token handling: strict (unknown →
+//! `None`, emission behavior) and [`parse_spark_type_lenient`] (unknown →
+//! [`DataType::Unresolved`], connect-server behavior). Only the lenient *type*
+//! entry point and the schema entry point ([`parse_spark_schema`], which routes
+//! through strict parsing internally) are public; strict type parsing is
+//! reachable through `parse_type(s, false)`.
 //!
 //! The union is strictly additive over each legacy parser: every input either
 //! legacy parser accepted parses here to the SAME type; each entry point
@@ -20,26 +21,6 @@
 //! `runtime` (INV10-adjacent layering — `types/` sits below τ).
 
 use super::{DataType, StructField, StructType};
-
-/// Parse a Spark type string strictly: unknown / untranslatable input
-/// returns `None` (callers convert that to a Thunderduck-boundary error).
-///
-/// Grammar = the union of emission's legacy `spark_ddl_type_to_core_data_type`
-/// and connect-server's legacy `parse_type_str`. Relative to the legacy strict
-/// parser, acceptance is widened strictly additively by the union: `decimal`
-/// (with the legacy lenient defaults), interval types, `null` / `void`, the
-/// extra primitive aliases (`str`, `char`, `text`, `bytes`, `int8`..`int64`,
-/// `float32`, `float64`), and trailing `NOT NULL` / `NULL` qualifiers. Nothing
-/// the legacy strict parser accepted parses differently.
-///
-/// NOTE: production code currently consumes only the lenient entry point
-/// ([`parse_spark_type_lenient`]) and the schema entry point
-/// ([`parse_spark_schema`], which routes through strict parsing internally).
-/// This function stays as the documented strict *type* entry point of the
-/// module's two-mode grammar.
-pub fn parse_spark_type_strict(s: &str) -> Option<DataType> {
-    parse_type(s, false)
-}
 
 /// Parse a Spark type string leniently: unknown input returns
 /// [`DataType::Unresolved`] (the legacy `parse_type_str` contract).
@@ -298,7 +279,7 @@ mod tests {
     use super::*;
 
     fn strict(s: &str) -> Option<DataType> {
-        parse_spark_type_strict(s)
+        parse_type(s, false)
     }
 
     fn lenient(s: &str) -> DataType {

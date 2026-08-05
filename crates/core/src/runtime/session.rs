@@ -956,10 +956,7 @@ fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>
                                 view_schemas.insert(name.to_lowercase(), schema);
                             }
                             SchemaCacheEffect::CacheIfAbsent { name, schema } => {
-                                let key = name.to_lowercase();
-                                if !view_schemas.contains_key(&key) {
-                                    view_schemas.insert(key, schema);
-                                }
+                                view_schemas.entry(name.to_lowercase()).or_insert(schema);
                             }
                             SchemaCacheEffect::Evict { name } => {
                                 view_schemas.remove(&name.to_lowercase());
@@ -1410,10 +1407,7 @@ mod tests {
                 cache.insert(name.to_lowercase(), schema);
             }
             SchemaCacheEffect::CacheIfAbsent { name, schema } => {
-                let key = name.to_lowercase();
-                if !cache.contains_key(&key) {
-                    cache.insert(key, schema);
-                }
+                cache.entry(name.to_lowercase()).or_insert(schema);
             }
             SchemaCacheEffect::Evict { name } => {
                 cache.remove(&name.to_lowercase());
@@ -1496,6 +1490,6 @@ mod tests {
             },
         );
 
-        assert!(cache.get("t").is_none());
+        assert!(!cache.contains_key("t"));
     }
 }

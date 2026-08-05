@@ -13867,18 +13867,20 @@ mod tests {
         assert_eq!(typed.resolved_schema.fields.len(), 8);
         // Verify the resolved condition's left operand is bare and
         // identity-bound.
-        if let TypedOp::Filter { input, condition } = &typed.op {
-            if let Expression::Binary(b) = condition {
-                match b.left.as_ref() {
-                    Expression::ColumnReference(c) => {
-                        assert_eq!(
-                            c.qualifier, None,
-                            "plan_id=1 must resolve bare (Phase 3b: no synthetic qualifier)"
-                        );
-                        assert_eq!(c.expr_id, Some(input.resolved_schema.fields[3].expr_id));
-                    }
-                    other => panic!("expected ColumnReference, got: {other:?}"),
+        if let TypedOp::Filter {
+            input,
+            condition: Expression::Binary(b),
+        } = &typed.op
+        {
+            match b.left.as_ref() {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(
+                        c.qualifier, None,
+                        "plan_id=1 must resolve bare (Phase 3b: no synthetic qualifier)"
+                    );
+                    assert_eq!(c.expr_id, Some(input.resolved_schema.fields[3].expr_id));
                 }
+                other => panic!("expected ColumnReference, got: {other:?}"),
             }
         }
     }
@@ -14070,17 +14072,19 @@ mod tests {
             }),
         });
         let typed = analyze(filter, &bt).expect("unique column should resolve without qualifier");
-        if let TypedOp::Filter { condition, .. } = &typed.op {
-            if let Expression::Binary(b) = condition {
-                match b.left.as_ref() {
-                    Expression::ColumnReference(c) => {
-                        assert_eq!(
-                            c.qualifier, None,
-                            "unique column 'salary' must NOT carry a synthetic qualifier"
-                        );
-                    }
-                    other => panic!("expected ColumnReference, got: {other:?}"),
+        if let TypedOp::Filter {
+            condition: Expression::Binary(b),
+            ..
+        } = &typed.op
+        {
+            match b.left.as_ref() {
+                Expression::ColumnReference(c) => {
+                    assert_eq!(
+                        c.qualifier, None,
+                        "unique column 'salary' must NOT carry a synthetic qualifier"
+                    );
                 }
+                other => panic!("expected ColumnReference, got: {other:?}"),
             }
         }
     }

@@ -1194,6 +1194,12 @@ fn map_ddl_error(
 
 /// Handle a pure-query `SqlCommand` — echo the relation as a
 /// `SqlCommandResult` so the client can re-send it as a `Root` plan.
+// `Status` is the standard gRPC error channel used across this whole file
+// (39 signatures return `Result<_, Status>`); this handler is infallible today
+// but keeps the fallible shape shared by its sibling `handle_sql_*` handlers so
+// the dispatch match stays uniform. Boxing it here alone would be inconsistent
+// with the rest of the layer.
+#[allow(clippy::result_large_err)]
 fn handle_sql_command_echo(
     session_id: &str,
     operation_id: &str,
@@ -1221,15 +1227,13 @@ async fn handle_sql_create_temp_view(
     // If `OR REPLACE` is false and the view exists, match Spark's error.
     // (IF NOT EXISTS is unreachable for temp views — Spark rejects it at
     // parse time and τ mirrors that rejection in lower_statement_or_ddl.)
-    if !or_replace {
-        if session.get_view_schema(name).await.is_some() {
-            return Err(Status::already_exists(format!(
-                "[TEMP_TABLE_OR_VIEW_ALREADY_EXISTS] Cannot create the temporary \
-                 view `{name}` because it already exists. Choose a different name, \
-                 drop or replace the existing view, or add the IF NOT EXISTS clause \
-                 to tolerate a pre-existing view.",
-            )));
-        }
+    if !or_replace && session.get_view_schema(name).await.is_some() {
+        return Err(Status::already_exists(format!(
+            "[TEMP_TABLE_OR_VIEW_ALREADY_EXISTS] Cannot create the temporary \
+             view `{name}` because it already exists. Choose a different name, \
+             drop or replace the existing view, or add the IF NOT EXISTS clause \
+             to tolerate a pre-existing view.",
+        )));
     }
 
     // Finalize the body to get DuckDB SQL + resolved schema.

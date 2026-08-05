@@ -182,7 +182,7 @@ Must match the pre-pass baseline or be lower.
 ## Pass log
 
 Each pass appends to a rolling pass log
-`tasks/v2-corpus-driven-pass-log.md`:
+`tasks/v2-corpus-pass-log.md`:
 
 ```markdown
 ## Pass N — YYYY-MM-DDTHH:MMZ

@@ -53,6 +53,6 @@ The current corpus-driven pipeline lives at:
 
 - `tasks/goal-corpus-to-100.md` — active `/goal` (drive corpus to 100%).
 - `tasks/v2-corpus-driven-goal-prompt-template.md` — prior `/goal` template.
-- `tasks/v2-corpus-driven-pass-log.md` — authoritative pass log.
+- `tasks/v2-corpus-pass-log.md` — authoritative pass log.
 - `tasks/v3-corpus-driven-goal-prompt-template.md` — v3 pipeline template.
 - `tasks/lessons.md` — lessons learned.

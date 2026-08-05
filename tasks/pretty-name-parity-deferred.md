@@ -124,9 +124,7 @@ documented `pretty_name` `_ => "expr"` gap, red for the right reason. (Row order
 is immaterial: the differential compares row multisets order-insensitively, so a
 no-`orderBy` window/CASE case is red purely on the column name.)
 
-## Acceptance gate (the fix — out of scope here; do NOT implement)
+## Acceptance gate
 
-Give `pretty_name` real arms for `CaseWhen` (`CASE WHEN <c> THEN <v> … [ELSE
-<e>] END`), `Window` (`<fn>(<args>) OVER (<spec>)`), and the other
-currently-`expr` shapes, matching Spark's `toPrettySQL`. When that lands, all
-four `prettyname-*` cases flip green (after the golden re-record).
+- Landed: `pretty_name` now renders `CaseWhen` as `CASE WHEN <cond> THEN <val> … [ELSE <e>] END`, matching Spark's `toPrettySQL` (so `prettyname-001..003` should flip green).
+- Remaining: add `pretty_name` arms for `Window` (`<fn>(<args>) OVER (<spec>)`) and other currently-`expr` shapes (subqueries, complex-type literals, …) so the remaining witnesses (e.g. `prettyname-004`) can flip green.

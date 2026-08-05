@@ -906,12 +906,9 @@ case("win2-002", "window_time", "tumbling time window aggregate", lambda I: I["e
 # through parser_v2 (the acceptance gate). They are NOT in
 # select_block_corpus_baseline.txt, so their redness is not a regression; they
 # are pinned in sql_wrap_witness_manifest.json ("deferred": true). Goldens were
-# authored from the known `emp` inputs + the Spark-authoritative schema already
-# recorded in proj-001's golden (id: long non-null, name: string nullable); the
-# task doc records that they MUST be re-recorded via
-# `run-differential-tests.sh --record core -k sqlwrap-<nnn>` in the Linux
-# devcontainer (this analysis ran on a macOS host with no runnable τ/Spark) to
-# become authoritative once the fix lands.
+# RE-RECORDED from live Apache Spark 4.1.1 (2026-07-15, Linux devcontainer) and
+# are authoritative. Regenerate via:
+# `THUNDERDUCK_WORKTREE_ROOT=/workspace ./tests/scripts/run-differential-tests.sh --record core -k sqlwrap`.
 
 def _sqlwrap(sql, wrap):
     """Build closure: register I['emp'] as a temp view, run raw `spark.sql(sql)`,

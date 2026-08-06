@@ -1,7 +1,7 @@
 # τ Architecture Review — Work Checklist
 
-Working branch: `refactor/tau-architecture-review` (worktree `thunderduck-rs-wt3`, based on
-`main` @ `118499c`).
+Working branch: `refactor/tau-architecture-review` (worktree `thunderduck-rs-wt3`, rebased onto
+`main` @ `cc94673`).
 
 Findings and full rationale: [`tau-architecture-review-2026-08.md`](tau-architecture-review-2026-08.md).
 **Read the target entry there before starting an item** — each carries file:line evidence, the

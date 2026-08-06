@@ -152,6 +152,11 @@ fn function_columns() -> Vec<String> {
 
 /// `getFunction(name)` — returns a single-row function metadata AST, or a
 /// Spark-emulated `UNRESOLVED_ROUTINE` error if the function is unknown.
+// `Status` is the gRPC error channel mandated by the `SparkConnectService` trait
+// and used across this crate (39 signatures return `Result<_, Status>`); boxing
+// it here alone would be inconsistent with the layer and force an unbox at every
+// trait boundary, buying one allocation on the reject path.
+#[allow(clippy::result_large_err)]
 fn resolve_get_function(name: &str) -> Result<CommonAst, Status> {
     if !function_catalog::is_supported_function(name) {
         // Spark 4.1.1 raises:

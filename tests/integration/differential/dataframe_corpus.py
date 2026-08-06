@@ -270,25 +270,21 @@ case("filt-015", "filter", "filter on computed column", lambda I: I["emp"].withC
 # fitness signal item 3 is gated on (ADR-022).
 case("filt-016", "filter", "alias-qualified filter above limit (strand witness)", lambda I: I["emp"].alias("e").orderBy("id").limit(5).filter(F.col("e.salary") > 60000))
 case("filt-017", "filter", "alias-qualified filter above distinct (strand witness)", lambda I: I["emp"].alias("e").select("e.dept_id", "e.active").distinct().filter(F.col("e.dept_id") == 101))
-# DEFERRED witnesses — attribute-lineage / qualified-resolution cluster
-# (findings F8, F10 in tasks/select-block-review-findings.md; the ADR-023
-# lineage fix is their acceptance gate). Born RED against τ and expected to
-# STAY red until that work lands — they are NOT in the witness-progress
-# baseline. See select_block_witness_manifest.json ("deferred": true).
+# Attribute-lineage / qualified-resolution cluster (findings F8, F10 in
+# tasks/select-block-review-findings.md). Previously deferred pending ADR-023;
+# LANDED via ADR-024 tier-3e (Pass F3, 2026-07-13) — now GREEN and part of the
+# select_block_corpus_baseline.txt regression oracle.
 #
 # filt-018 (F10): a dead alias `e` projected THROUGH to two original columns,
-# then filtered twice. The second filter merges WHERE-onto-WHERE onto an
-# already-wrapped block (no wrap ⇒ no strip), so `e.name` strands over
-# __td_sub → τ binder error. Spark SUCCEEDS (0 rows over struct<dept_id,name>
-# is a valid empty result) because the projected-through column keeps a live
-# binding. Opposite horn of filt-019 (F8) from the SAME analyzer input.
-case("filt-018", "filter", "F10 DEFERRED — dead-alias projected-through column, double filter (Spark succeeds empty; τ strands e over __td_sub)", lambda I: I["emp"].alias("e").select("e.dept_id", "e.name").distinct().filter(F.col("e.dept_id") == 101).filter(F.col("e.name") == "x"))
-# filt-019 (F8): a dead alias `e` qualifying a select-CREATED alias `k`.
-# Spark ERRORS UNRESOLVED_COLUMN.WITH_SUGGESTION (a select-created alias
-# carries no source qualifier, so `e.k` resolves nothing). τ's over-permissive
-# tier-(f) name-only fallback strips the bogus qualifier and silently returns
-# rows — the exact divergence F8 documents.
-case("filt-019", "filter", "F8 DEFERRED — dead-alias qualifying a select-created alias (Spark UNRESOLVED_COLUMN; τ silently returns rows)", lambda I: I["emp"].alias("e").select(F.col("dept_id").alias("k")).filter(F.col("e.k") == 101), expected_error="UNRESOLVED_COLUMN.WITH_SUGGESTION")
+# then filtered twice. The projected-through column keeps a live binding, so
+# both Spark and τ SUCCEED with an empty result (0 rows over
+# struct<dept_id,name>). Opposite horn of filt-019 (F8) from the SAME input.
+case("filt-018", "filter", "F10 — dead-alias projected-through column, double filter (Spark & τ succeed empty; landed via ADR-024 tier-3e)", lambda I: I["emp"].alias("e").select("e.dept_id", "e.name").distinct().filter(F.col("e.dept_id") == 101).filter(F.col("e.name") == "x"))
+# filt-019 (F8): a dead alias `e` qualifying a select-CREATED alias `k`. A
+# select-created alias carries no source qualifier, so `e.k` resolves nothing
+# and both Spark and τ ERROR UNRESOLVED_COLUMN.WITH_SUGGESTION (τ's tier-(f)
+# name-only fallback was deleted by ADR-024 tier-3e, closing the F8 divergence).
+case("filt-019", "filter", "F8 — dead-alias qualifying a select-created alias (Spark & τ error UNRESOLVED_COLUMN; landed via ADR-024 tier-3e)", lambda I: I["emp"].alias("e").select(F.col("dept_id").alias("k")).filter(F.col("e.k") == 101), expected_error="UNRESOLVED_COLUMN.WITH_SUGGESTION")
 
 # ── 3. Literals, typed columns & casts (type-source stress) ─────────────────
 case("cast-001", "cast", "lit int / string / bool / double", lambda I: I["emp"].select(F.lit(1).alias("i"), F.lit("x").alias("s"), F.lit(True).alias("b"), F.lit(3.14).alias("d")))
@@ -503,14 +499,13 @@ case("join-019", "join", "multi-slot star over USING join (star-order witness)",
 case("join-020", "join", "nested USING join as re-wrapped join side (hoisted-slot drop witness)", lambda I: I["emp"].alias("a").join(I["nums"].alias("n"), F.col("a.id") == F.col("n.a")).join(I["emp2"].join(I["dept"], on="dept_id"), F.col("dept_name") == F.lit("Infrastructure")))
 case("join-021", "join", "user alias buried under USING parent (vis-exemption strand witness)", lambda I: I["emp"].alias("e").join(I["nums"].alias("n"), F.col("e.id") == F.col("n.a")).join(I["dept"], on="dept_id").select("e.name"))
 case("join-022", "join", "duplicate synthetic join alias (__td_jr collision witness)", _join_022)
-# join-023 (F11): DEFERRED — the SAME user alias `x` on BOTH join sides.
-# Spark ERRORS AMBIGUOUS_REFERENCE (`x.id` could be x.id or x.id) — it rejects
-# the qualified ref, even in the ON clause, when the qualifier binds both
-# sides. τ's dup-alias guard re-wraps the right side, so `x.salary` binds the
-# LEFT first-match and silently returns left-side data. Shares the tier-(e)/(f)
-# qualified-resolution path with F8/F10; gated by the ADR-023 lineage fix.
-# NOT in the witness-progress baseline (born red, stays red until then).
-case("join-023", "join", "F11 DEFERRED — duplicate user alias on both join sides (Spark AMBIGUOUS_REFERENCE; τ silently binds left)", lambda I: I["emp"].alias("x").join(I["emp2"].alias("x"), F.col("x.id") == F.col("x.id")).select("x.salary"), expected_error="AMBIGUOUS_REFERENCE")
+# join-023 (F11): the SAME user alias `x` on BOTH join sides. Spark ERRORS
+# AMBIGUOUS_REFERENCE (`x.id` could be either side) — it rejects the qualified
+# ref, even in the ON clause, when the qualifier binds both sides. Previously
+# deferred (τ bound the left first-match); LANDED via ADR-024 tier-3e (Pass F3)
+# — τ now matches Spark's error. Shares the qualified-resolution path with
+# F8/F10; part of the baseline regression oracle.
+case("join-023", "join", "F11 — duplicate user alias on both join sides (Spark & τ error AMBIGUOUS_REFERENCE; landed via ADR-024 tier-3e)", lambda I: I["emp"].alias("x").join(I["emp2"].alias("x"), F.col("x.id") == F.col("x.id")).select("x.salary"), expected_error="AMBIGUOUS_REFERENCE")
 # join-024 (Phase 3a): the un-realiased self-join `df.join(df, ...)` — the
 # SAME plan_id tagged on BOTH sides of the join's OWN condition. Spark Connect
 # resolves both refs depth-0 against the same plan_id and the merge fold
@@ -881,6 +876,98 @@ case("struc-007", "structural", "toDF positional rename over dup-named self-join
 
 # ── 32. Time-window aggregate (tumbling) ────────────────────────────────────
 case("win2-002", "window_time", "tumbling time window aggregate", lambda I: I["emp"].filter(F.col("last_login").isNotNull()).groupBy(F.window("last_login", "1 day")).agg(F.count(F.lit(1)).alias("n")))
+
+
+# ── 32b. Raw SQL wrapped by DataFrame ops — DEFERRED (transpiler hardening) ──
+#
+# tasks/transpiler-hardening-deferred.md. These pin a Thunderduck-boundary gap
+# derived from the last 25 commits of the JVM Thunderduck (nubank/thunderduck),
+# where a cluster of fixes hardened the `spark.sql(...)`-wrapped-by-DataFrame-op
+# path: PR #58 (backtick leak under LIMIT/OFFSET), PR #60 (duplicate CTE render
+# when WithCTE is nested under Limit), and PR #59/#61/#62 (DESCRIBE/SHOW NPE
+# under Limit/Offset). In the JVM those were distinct symptoms of one root
+# cause: the plan-deserialization branch that handles `spark.sql(...)` wrapped
+# by DataFrame ops did not route the raw SQL through the SparkSQL parser.
+#
+# τ has the SAME root cause but a WIDER blast radius. `service.rs`
+# `relation_to_common_ast` dispatches on the ROOT relation only: a top-level
+# `RelType::Sql` goes to parser_v2, everything else to V2RelationConverter. The
+# instant `spark.sql(...)` is wrapped by ANY DataFrame op the root becomes a
+# structured relation (Limit / Offset / Filter / ... -> Sql), so the converter
+# runs; it recurses (`convert_limit`/`convert_offset`/`convert_filter` all call
+# `convert_input`) down to the nested `RelType::Sql` leaf and bails with a
+# Thunderduck-boundary error ("SQL text is owned by parser_v2, not
+# V2RelationConverter"). Spark accepts every one of these; τ never reaches the
+# parser that would normalize backticks / frame the CTE / pass the metadata
+# statement through. So the whole shape — not just the three JVM symptoms —
+# regresses.
+#
+# Born RED against τ and expected to STAY red until τ routes nested SQL leaves
+# through parser_v2 (the acceptance gate). They are NOT in
+# select_block_corpus_baseline.txt, so their redness is not a regression; they
+# are pinned in sql_wrap_witness_manifest.json ("deferred": true). Goldens were
+# RE-RECORDED from live Apache Spark 4.1.1 (2026-07-15, Linux devcontainer) and
+# are authoritative. Regenerate via:
+# `THUNDERDUCK_WORKTREE_ROOT=/workspace ./tests/scripts/run-differential-tests.sh --record core -k sqlwrap`.
+
+def _sqlwrap(sql, wrap):
+    """Build closure: register I['emp'] as a temp view, run raw `spark.sql(sql)`,
+    then apply DataFrame wrapper `wrap` (e.g. `lambda df: df.limit(3)`). The
+    wrapper makes the plan root a structured relation over a nested
+    `RelType::Sql` leaf — the shape τ does not route to parser_v2. Reaches the
+    session via `I['emp'].sparkSession`, like `_session_case`."""
+    def build(I):
+        session = I["emp"].sparkSession
+        I["emp"].createOrReplaceTempView("sqlwrap_emp")
+        return wrap(session.sql(sql))
+    return build
+
+case("sqlwrap-001", "sql_wrap", "DEFERRED — plain SELECT wrapped by .limit (nested RelType::Sql boundary gap; Spark ok, τ boundary-errors)", _sqlwrap("SELECT id, name FROM sqlwrap_emp ORDER BY id", lambda df: df.limit(3)))
+case("sqlwrap-002", "sql_wrap", "DEFERRED — backtick-quoted identifiers under .limit (mirrors JVM PR#58 backtick leak; τ never reaches the parser that strips backticks)", _sqlwrap("SELECT `id`, `name` FROM `sqlwrap_emp` ORDER BY `id`", lambda df: df.limit(3)))
+case("sqlwrap-003", "sql_wrap", "DEFERRED — WITH CTE under .limit (mirrors JVM PR#60 duplicate-CTE render; τ boundary-errors before any generation)", _sqlwrap("WITH c AS (SELECT id, name FROM sqlwrap_emp) SELECT id, name FROM c ORDER BY id", lambda df: df.limit(3)))
+case("sqlwrap-004", "sql_wrap", "DEFERRED — SELECT wrapped by .filter (gap is not limit-specific; any DataFrame op over a nested SQL leaf)", _sqlwrap("SELECT id, name FROM sqlwrap_emp", lambda df: df.filter(F.col("id") <= 3)))
+case("sqlwrap-005", "sql_wrap", "DEFERRED — SELECT under .offset+.limit pagination (Root->Limit->Offset->Sql, the JVM PR#59/#62 plan shape)", _sqlwrap("SELECT id, name FROM sqlwrap_emp ORDER BY id", lambda df: df.offset(2).limit(2)), flags=("spark4",))
+
+
+# ── 32c. Unaliased projection auto-naming (toPrettySQL parity) — DEFERRED ────
+#
+# tasks/pretty-name-parity-deferred.md. Derived from the SAME last-25-commits
+# analysis of the JVM Thunderduck (nubank/thunderduck) that produced the
+# sqlwrap cluster above — specifically the neighbourhood of PR #55
+# (092a616a35, "Preserve source column name for bare Cast(col(c), T)
+# projections"). That JVM fix is a *deliberate divergence FROM Spark*: it
+# renames a bare `col(c).cast(T)` to `c` instead of Spark's auto-name
+# `CAST(c AS T)`. τ does NOT reproduce that bug — τ's `analyzer::pretty_name`
+# already matches Spark's `toPrettySQL` exactly for a bare Cast
+# (`CAST(c AS BIGINT)`) and `ensure_named` forces that alias into emission, so
+# a bare-cast projection is GREEN against the Spark oracle (no witness needed).
+#
+# But analyzing PR #55 surfaced a REAL adjacent gap in the same
+# unaliased-projection auto-naming family. `analyzer::pretty_name` carries an
+# explicit Thunderduck-boundary fallback — its own doc-comment states that the
+# shapes Spark renders in a form τ "does not yet match exactly (`CaseWhen`,
+# windows, subqueries, complex-type literals, …) keep the Thunderduck-boundary
+# fallback name `expr`." Every existing `cond-*` / `win-*` corpus case aliases
+# its projection (`.alias(...)` / `withColumn(name, ...)`), so this unaliased
+# auto-naming path is UNTESTED. When such a projection is unaliased, τ names
+# the output column `expr` while Spark's `toPrettySQL` names it
+# `CASE WHEN ... END` / `row_number() OVER (...)`; the differential
+# `_compare_schemas` flags the column-NAME mismatch → red.
+#
+# Born RED against τ and expected to STAY red until `pretty_name` renders these
+# shapes with Spark parity (the acceptance gate). They are NOT in
+# select_block_corpus_baseline.txt, so their redness is not a regression; they
+# are pinned in pretty_name_witness_manifest.json ("deferred": true). Goldens
+# were hand-authored from the known `emp` inputs; the column NAME (the field
+# that diverges) MUST be re-recorded via
+# `run-differential-tests.sh --record core -k prettyname-<nnn>` in the Linux
+# devcontainer to become authoritative (this analysis ran on a host with no
+# runnable τ/Spark). The born-red status does not depend on the exact name — τ
+# emits `expr`, which Spark never produces for these shapes.
+case("prettyname-001", "pretty_name", "DEFERRED — unaliased when/otherwise (τ names col 'expr'; Spark 'CASE WHEN (age >= 40) THEN 1 ELSE 0 END')", lambda I: I["emp"].select(F.when(F.col("age") >= 40, 1).otherwise(0)))
+case("prettyname-002", "pretty_name", "DEFERRED — unaliased chained when (τ 'expr'; Spark 'CASE WHEN (age < 30) THEN 0 WHEN (age < 45) THEN 1 ELSE 2 END')", lambda I: I["emp"].select(F.when(F.col("age") < 30, 0).when(F.col("age") < 45, 1).otherwise(2)))
+case("prettyname-003", "pretty_name", "DEFERRED — unaliased when WITHOUT otherwise, nullable (τ 'expr'; Spark 'CASE WHEN active THEN salary END')", lambda I: I["emp"].select(F.when(F.col("active"), F.col("salary"))))
+case("prettyname-004", "pretty_name", "DEFERRED — unaliased window row_number (τ 'expr'; Spark 'row_number() OVER (...)') — second fallback shape (windows) from the same pretty_name boundary", lambda I: I["emp"].select(F.row_number().over(W.orderBy("id"))))
 
 
 # ── 33. TPC-H / TPC-DS clusters (migrated from the legacy differential files) ─

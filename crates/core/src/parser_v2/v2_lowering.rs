@@ -89,28 +89,11 @@ pub fn lower_statement_or_ddl(
             Ok(SqlStatement::Query(ast))
         }
         // ── CREATE [OR REPLACE] TEMP[ORARY] VIEW ──────────────────────────
-        Statement::CreateView(CreateView {
-            temporary: true,
-            name,
-            query,
-            or_replace,
-            if_not_exists,
-            columns,
-            comment,
-            options,
-            cluster_by,
-            with_no_schema_binding,
-            materialized,
-            to,
-            params,
-            or_alter,
-            secure,
-            name_before_not_exists: _,
-        }) => {
+        Statement::CreateView(cv) if cv.temporary => {
             // Spark-emulated parse errors (match Spark 4.1.1 ParseException
             // wording exactly). These fire before unsupported-clause guards
             // because Spark itself rejects these at parse time.
-            if or_replace && if_not_exists {
+            if cv.or_replace && cv.if_not_exists {
                 return Err(EmissionError::Unsupported {
                     kind: UnsupportedKind::ProtoShape,
                     name: "sql::parse_error".to_owned(),
@@ -119,7 +102,7 @@ pub fn lower_statement_or_ddl(
                         .to_owned(),
                 });
             }
-            if if_not_exists {
+            if cv.if_not_exists {
                 return Err(EmissionError::Unsupported {
                     kind: UnsupportedKind::ProtoShape,
                     name: "sql::parse_error".to_owned(),
@@ -128,18 +111,13 @@ pub fn lower_statement_or_ddl(
                         .to_owned(),
                 });
             }
-            reject_unsupported_view_clauses(
-                &columns,
-                &comment,
-                &options,
-                &cluster_by,
-                with_no_schema_binding,
-                materialized,
-                &to,
-                &params,
-                or_alter,
-                secure,
-            )?;
+            reject_unsupported_view_clauses(&cv)?;
+            let CreateView {
+                name,
+                query,
+                or_replace,
+                ..
+            } = cv;
             let view_name = extract_simple_name(&name, "sql::create_view::name")?;
             let body_ast = lower_query(*query, &CteScope::new())?;
             Ok(SqlStatement::Ddl(DdlStatement::CreateTempView {
@@ -159,36 +137,14 @@ pub fn lower_statement_or_ddl(
                     .to_owned(),
             })
         }
-        Statement::CreateView(CreateView {
-            temporary: false,
-            name,
-            query,
-            or_replace,
-            if_not_exists: _,
-            columns,
-            comment,
-            options,
-            cluster_by,
-            with_no_schema_binding,
-            materialized,
-            to,
-            params,
-            or_alter,
-            secure,
-            name_before_not_exists: _,
-        }) => {
-            reject_unsupported_view_clauses(
-                &columns,
-                &comment,
-                &options,
-                &cluster_by,
-                with_no_schema_binding,
-                materialized,
-                &to,
-                &params,
-                or_alter,
-                secure,
-            )?;
+        Statement::CreateView(cv) if !cv.temporary => {
+            reject_unsupported_view_clauses(&cv)?;
+            let CreateView {
+                name,
+                query,
+                or_replace,
+                ..
+            } = cv;
             let view_name = extract_simple_name(&name, "sql::create_view::name")?;
             let body_ast = lower_query(*query, &CteScope::new())?;
             Ok(SqlStatement::Ddl(DdlStatement::CreateView {
@@ -922,73 +878,68 @@ pub fn lower_statement_or_ddl(
 }
 
 /// Reject unsupported clauses common to both temp and non-temp CREATE VIEW.
-fn reject_unsupported_view_clauses(
-    columns: &[sqlparser::ast::ViewColumnDef],
-    comment: &Option<String>,
-    options: &sqlparser::ast::CreateTableOptions,
-    cluster_by: &[sqlparser::ast::Ident],
-    with_no_schema_binding: bool,
-    materialized: bool,
-    to: &Option<ObjectName>,
-    params: &Option<sqlparser::ast::CreateViewParams>,
-    or_alter: bool,
-    secure: bool,
-) -> Result<(), EmissionError> {
-    if !columns.is_empty() {
+///
+/// Takes the whole [`sqlparser::ast::CreateView`] rather than its individual
+/// clause fields: eight of the ten are same-typed `bool`/`Option`, so a
+/// positional argument list was a silent-transposition hazard (only one of the
+/// twelve rejection branches below has a test). Named field reads make a
+/// mis-wire a compile error instead.
+fn reject_unsupported_view_clauses(cv: &sqlparser::ast::CreateView) -> Result<(), EmissionError> {
+    if !cv.columns.is_empty() {
         bail_boundary_proto!(
             "sql::create_view::column_list",
             "column alias list on CREATE VIEW is not implemented in τ"
         );
     }
-    if comment.is_some() {
+    if cv.comment.is_some() {
         bail_boundary_proto!(
             "sql::create_view::comment",
             "COMMENT on CREATE VIEW is not implemented in τ"
         );
     }
-    if !matches!(options, sqlparser::ast::CreateTableOptions::None) {
+    if !matches!(&cv.options, sqlparser::ast::CreateTableOptions::None) {
         bail_boundary_proto!(
             "sql::create_view::options",
             "OPTIONS / WITH on CREATE VIEW is not implemented in τ"
         );
     }
-    if !cluster_by.is_empty() {
+    if !cv.cluster_by.is_empty() {
         bail_boundary_proto!(
             "sql::create_view::cluster_by",
             "CLUSTER BY on CREATE VIEW is not implemented in τ"
         );
     }
-    if with_no_schema_binding {
+    if cv.with_no_schema_binding {
         bail_boundary_proto!(
             "sql::create_view::no_schema_binding",
             "WITH NO SCHEMA BINDING on CREATE VIEW is not implemented in τ"
         );
     }
-    if materialized {
+    if cv.materialized {
         bail_boundary_proto!(
             "sql::create_view::materialized",
             "CREATE MATERIALIZED VIEW is not implemented in τ"
         );
     }
-    if to.is_some() {
+    if cv.to.is_some() {
         bail_boundary_proto!(
             "sql::create_view::to",
             "TO clause on CREATE VIEW is not implemented in τ"
         );
     }
-    if params.is_some() {
+    if cv.params.is_some() {
         bail_boundary_proto!(
             "sql::create_view::params",
             "algorithm/security params on CREATE VIEW is not implemented in τ"
         );
     }
-    if or_alter {
+    if cv.or_alter {
         bail_boundary_proto!(
             "sql::create_view::or_alter",
             "CREATE OR ALTER VIEW is not implemented in τ"
         );
     }
-    if secure {
+    if cv.secure {
         bail_boundary_proto!(
             "sql::create_view::secure",
             "CREATE SECURE VIEW is not implemented in τ"

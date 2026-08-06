@@ -1,0 +1,9 @@
+{
+  "description": "Witness cases for tasks/pretty-name-parity-deferred.md. CaseWhen pretty-name parity for unaliased projections (prettyname-001..003) landed; prettyname-004 remains deferred until Window pretty-name rendering matches Spark's toPrettySQL.",
+  "witnesses": [
+    { "case": "prettyname-001", "corpus": "dataframe", "source": "nubank/thunderduck PR#55 neighbourhood (092a616a35) — adjacent gap", "pins": "unaliased when/otherwise — Spark name 'CASE WHEN (age >= 40) THEN 1 ELSE 0 END'" },
+    { "case": "prettyname-002", "corpus": "dataframe", "source": "nubank/thunderduck PR#55 neighbourhood — adjacent gap", "pins": "unaliased chained when — Spark name 'CASE WHEN (age < 30) THEN 0 WHEN (age < 45) THEN 1 ELSE 2 END'" },
+    { "case": "prettyname-003", "corpus": "dataframe", "source": "nubank/thunderduck PR#55 neighbourhood — adjacent gap", "pins": "unaliased when WITHOUT otherwise (nullable) — Spark name 'CASE WHEN active THEN salary END'" },
+    { "case": "prettyname-004", "corpus": "dataframe", "source": "nubank/thunderduck PR#55 neighbourhood — adjacent gap", "deferred": true, "pins": "unaliased window row_number — τ 'expr'; Spark 'row_number() OVER (...)' — Window pretty-name fallback" }
+  ]
+}

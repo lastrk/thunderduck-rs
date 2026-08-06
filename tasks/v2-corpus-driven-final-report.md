@@ -9,8 +9,8 @@ reaching 265/270 with 5 cases documented as confirmed-invalid Spark SQL on the p
 empirically re-verify all 5 against live Spark: 4 had a semantically-faithful, Spark-valid
 rewrite that still exercises genuinely distinct τ machinery (not near-duplicates of existing
 coverage), and 1 (sq-013) had no useful rewrite and was deleted. All 4 rewrites pass τ with
-zero new implementation work — see `tasks/v2-corpus-driven-pass-log.md` pass 19 and
-`.agent-output/unsolvable.md` for full live-verification detail and exact rewritten SQL.
+zero new implementation work — see `tasks/v2-corpus-pass-log.md` pass 19 and
+`tasks/unsolvable.md` for full live-verification detail and exact rewritten SQL.
 
 ## Trajectory (passes 4→18, this pipeline invocation)
 
@@ -33,7 +33,7 @@ zero new implementation work — see `tasks/v2-corpus-driven-pass-log.md` pass 1
 | 18 | cte-009, cte-010 (WITH RECURSIVE) | +2 | 263 → 265 |
 | 19 | corpus correction: sq-011/012/016, pv-006 rewritten; sq-013 deleted | +4 / −1 total | 265 → 269 (269 total) |
 
-Full per-pass root cause / fix / ADR citations in `tasks/v2-corpus-driven-pass-log.md`.
+Full per-pass root cause / fix / ADR citations in `tasks/v2-corpus-pass-log.md`.
 Every pass ran the complete diagnostician → architect → coder → reviewer → perf-reviewer
 loop with zero DEFERred Medium/Low findings, and zero regressions on either corpus
 (`sql_v2` or the 329-case DataFrame `core_v2` corpus) at every step.
@@ -70,7 +70,7 @@ All 4 rewrites were verified live against Spark 4.1.1 (non-degenerate row counts
 vacuously-true/false predicates) before being committed to `sql_corpus.py`, and all 4 pass τ
 with **zero new implementation work** — confirming they test real, already-covered machinery
 rather than exposing new gaps. Full live-verification transcripts and exact SQL in
-`.agent-output/unsolvable.md` (gitignored) and `tasks/v2-corpus-driven-pass-log.md` pass 19.
+`.agent-output/unsolvable.md` (gitignored) and `tasks/v2-corpus-pass-log.md` pass 19.
 
 ## Headline mechanisms built this pipeline
 

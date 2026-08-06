@@ -181,7 +181,7 @@ diagnostic hypothesis is wrong; re-run step 2 with fresh instrumentation.
 **Design authority:** `docs/thunderduck-rearchitect-ADRs.md` (ADR-000..ADR-022). Every fix cites applicable ADR.
 **Open decisions:** `tasks/v2-restart-open-decisions.md` — 13 RESOLVED. New gaps → Decision 14+ (HALT-AND-FLAG-3).
 **Inheritance checklist:** `tasks/v2-restart-inheritance-checklist.md` — every applicable item present by termination.
-**Pass log:** `tasks/v2-corpus-driven-pass-log.md` (append one entry per pass).
+**Pass log:** `tasks/v2-corpus-pass-log.md` (append one entry per pass).
 
 **Baseline:** current git HEAD; run `v2-progress.sh` at start; record.
 

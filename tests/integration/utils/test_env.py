@@ -55,13 +55,28 @@ WORKTREE_JVM_PROP = "-Dthunderduck.worktree="
 # ── worktree identity ────────────────────────────────────────────────────────
 
 def worktree_root(cwd: str | os.PathLike | None = None) -> Path:
-    """Return the git worktree root (``git rev-parse --show-toplevel``)."""
-    out = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=str(cwd) if cwd else None,
-        capture_output=True, text=True, check=True,
-    )
-    return Path(out.stdout.strip())
+    """Return the git worktree root (``git rev-parse --show-toplevel``).
+
+    Falls back gracefully when git cannot answer — e.g. a relocated worktree
+    whose ``.git`` gitfile points at a main repo not present on this host
+    (common in devcontainers/CI where the checkout was moved). Behaviour is
+    unchanged whenever git works. Otherwise an explicit
+    ``THUNDERDUCK_WORKTREE_ROOT`` wins; failing that, the given cwd (or the
+    process cwd) is used. Port isolation only needs a stable per-checkout path,
+    so any of these is sufficient.
+    """
+    override = os.environ.get("THUNDERDUCK_WORKTREE_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(cwd) if cwd else None,
+            capture_output=True, text=True, check=True,
+        )
+        return Path(out.stdout.strip()).resolve()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return (Path(cwd) if cwd else Path.cwd()).resolve()
 
 
 def worktree_id(root: Path) -> str:

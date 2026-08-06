@@ -1,0 +1,36 @@
+{
+ "id": "sqlwrap-001",
+ "spark_version": "4.1.1",
+ "kind": "rows",
+ "schema": {
+  "type": "struct",
+  "fields": [
+   {
+    "name": "id",
+    "type": "long",
+    "nullable": false,
+    "metadata": {}
+   },
+   {
+    "name": "name",
+    "type": "string",
+    "nullable": true,
+    "metadata": {}
+   }
+  ]
+ },
+ "rows": [
+  [
+   1,
+   "Alice"
+  ],
+  [
+   2,
+   "Bob"
+  ],
+  [
+   3,
+   "Carol"
+  ]
+ ]
+}

@@ -55,7 +55,7 @@ instead of inventing a token — it still exits `INVALID_ARGUMENT`, because the
 
 ## Classification of the production sites
 
-**Assigned a real, observed token (18):**
+**Assigned a real, observed token (17):**
 
 | Trigger | Spark 4.1.1 class |
 |---|---|
@@ -73,7 +73,6 @@ instead of inventing a token — it still exits `INVALID_ARGUMENT`, because the
 | scalar subquery returning >1 column | `INVALID_SUBQUERY_EXPRESSION.SCALAR_SUBQUERY_RETURN_MORE_THAN_ONE_OUTPUT_COLUMN` |
 | unpivot with no value columns | `UNPIVOT_REQUIRES_VALUE_COLUMNS` |
 | ragged / mismatched `VALUES` | `INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH` (2 sites) |
-| SQL `UNPIVOT` with an empty value list | `PARSE_SYNTAX_ERROR` (see note) |
 
 **Left classless — `Other`, correctly (4):** Spark raises a bare
 `IllegalArgumentException` with no condition attached.
@@ -84,21 +83,42 @@ instead of inventing a token — it still exits `INVALID_ARGUMENT`, because the
 - `allowMissingColumns` without by-name matching, and set-op with <1 child —
   not reachable from the public API (defensive against a malformed proto).
 
-**Reclassified as τ-internal → `Status::internal` (3):**
+**Reclassified as τ-internal → `Status::internal` (4):**
 
 - `union-of-names produced orphan name` — a broken analyzer invariant.
 - `stack_multi_alias` alias slots not string literals — `stack_multi_alias` is a
   τ *synthetic*; Spark has no such function, so no Spark class can exist.
 - empty `VALUES` — unreachable from SQL (no syntax yields zero rows).
+- SQL `UNPIVOT` with an empty value list — **unreachable, verified**.
+  `UnpivotIds::Implicit` is produced only by `v2_lowering::lower_table_factor`
+  (the DataFrame converter always emits `Explicit`), and sqlparser parses the
+  `IN` list with `allow_empty: false`, so `UNPIVOT (v FOR k IN ())` dies at
+  parse time with `Expected: an expression, found: )`. Reaching the guard means
+  a τ invariant broke, so blaming the client would be wrong.
 
-### Notes on two judgment calls
+### Note on one judgment call
 
 - **`_LEGACY_ERROR_TEMP_1201`** is emulated verbatim per an explicit decision.
   It is one of Spark's own un-migrated placeholders and will break if Spark
   renames the condition — revisit when the Spark pin moves.
-- **`PARSE_SYNTAX_ERROR`** for empty-`IN` SQL `UNPIVOT` is a class from Spark's
-  *parser*, surfaced here from the analyzer because `sqlparser` accepts the
-  shape Spark's grammar rejects. Class-correct, layer-odd.
+
+## Open follow-up: A1's twin in the parser layer
+
+Every `sqlparser` failure becomes
+`EmissionError::Unsupported { kind: ProtoShape, name: "sql::parse_error" }`
+(`parser_v2/mod.rs:56`, `:103`, `v2_lowering.rs:4789`) → gRPC **UNIMPLEMENTED**.
+For SQL that Spark *also* rejects, that is the same miscategorisation A1 just
+fixed one layer up: Spark answers `PARSE_SYNTAX_ERROR` / INVALID_ARGUMENT.
+
+It is **not** safe to blanket-map, which is presumably why the current code
+chose `ProtoShape`. A parse failure has two indistinguishable causes:
+
+1. the SQL is genuinely invalid — Spark rejects it too → `PARSE_SYNTAX_ERROR`;
+2. the SQL is valid Spark that `sqlparser` does not support → an honest τ gap,
+   where UNIMPLEMENTED is correct.
+
+Telling them apart needs a positive signal (a grammar-coverage list, or
+consulting Spark), so this stays open rather than being papered over.
 
 ## Bonus finding — 5 sites where τ was over-strict (all fixed)
 

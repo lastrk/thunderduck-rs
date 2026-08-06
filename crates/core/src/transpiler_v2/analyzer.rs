@@ -5030,9 +5030,20 @@ fn analyze_unpivot(
         UnpivotIds::Explicit(v) => v,
         UnpivotIds::Implicit => {
             if values.is_empty() {
-                return Err(AnalyzerError::SparkEmulated {
-                    class: "PARSE_SYNTAX_ERROR",
-                    reason: "SQL UNPIVOT requires at least one value column".to_owned(),
+                // Defensive only — unreachable through either front end.
+                // `UnpivotIds::Implicit` is produced solely by the SQL path
+                // (`v2_lowering::lower_table_factor`); the DataFrame converter
+                // always emits `Explicit`. And sqlparser's
+                // `parse_unpivot_table_factor` parses the IN list with
+                // `allow_empty: false`, so `UNPIVOT (v FOR k IN ())` is
+                // rejected at parse time ("Expected: an expression, found: )")
+                // and `values` can never arrive empty. Reaching here means a
+                // τ invariant broke, not that the user sent bad SQL — hence
+                // Internal, not Spark-emulated.
+                return Err(AnalyzerError::Internal {
+                    reason: "unpivot with implicit ids reached the analyzer with an empty \
+                             value list; the SQL parser should have rejected it"
+                        .to_owned(),
                 });
             }
             // Validate each value column resolves before deriving ids from it.
@@ -11008,9 +11019,16 @@ mod tests {
     }
 
     /// `UnpivotIds::Implicit` with an empty value list is nonsensical (both
-    /// axes implicit) — the analyzer rejects it.
+    /// axes implicit) — the analyzer rejects it as a τ-INTERNAL invariant
+    /// break, not as a Spark-emulated error.
+    ///
+    /// It is unreachable in production and can only be built by constructing
+    /// the `CommonAst` directly, as this test does: `Implicit` comes only from
+    /// the SQL path, and sqlparser parses the UNPIVOT `IN` list with
+    /// `allow_empty: false`, so `UNPIVOT (v FOR k IN ())` dies at parse time.
+    /// Blaming the client for reaching it would be wrong.
     #[test]
-    fn analyze_unpivot_implicit_ids_empty_values_rejected() {
+    fn analyze_unpivot_implicit_ids_empty_values_is_internal_error() {
         let bt = base_types_with_emp_dept();
         let ast = CommonAst::new(CommonOp::Unpivot {
             input: Box::new(scan("emp")),
@@ -11020,13 +11038,15 @@ mod tests {
             value_column_name: "val".to_owned(),
         });
         match analyze(ast, &bt) {
-            Err(AnalyzerError::SparkEmulated { reason, .. }) => {
-                assert!(
-                    reason.contains("value column"),
-                    "expected value-column reason, got: {reason}"
+            Err(e @ AnalyzerError::Internal { .. }) => {
+                assert_eq!(e.category(), ErrorCategory::Internal);
+                assert_eq!(
+                    e.spark_class(),
+                    None,
+                    "a τ-internal break must not claim a Spark class"
                 );
             }
-            other => panic!("expected AnalyzerError::Other, got {other:?}"),
+            other => panic!("expected AnalyzerError::Internal, got {other:?}"),
         }
     }
 

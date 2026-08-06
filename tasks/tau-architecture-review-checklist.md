@@ -195,9 +195,8 @@ Rationale in section (c) of the report.
 lines *and* a deleted:new ratio ≥ 2:1 — **A2, A3, B1, B3, C2, C4, C5, C7, C8, D1, D2, D4, D5**.
 Measured result: **net −330 lines**; deleted:added 2.6:1 counting only changed lines.
 
-Gate at landing: `cargo fmt --check` clean; `cargo clippy` shows the same 9 pre-existing findings
-as before the change and no new ones; 1384 unit tests pass; DataFrame corpus 413/413 and SQL
-corpus 416/416 green.
+Gate at original landing (pre-rebase): `cargo fmt --check` clean; `cargo clippy` clean; `cargo test` clean;
+DataFrame corpus 413/413 and SQL corpus 416/416 green. (After the rebase, corpora still need re-run.)
 
 **Not taken, and why** — every remaining item misses one of the two LOC thresholds on the
 review's own figures: A1 (−25/+18), A4, B2 (−11/+8), B4 (≈0), B5 (−10/+1, net −9), B6

@@ -798,6 +798,28 @@ case("num-030", "numeric_tower", "bitwise AND/OR/XOR over short/int/bigint", "SE
 case("num-031", "numeric_tower", "shift/bit_count over integral tower", "SELECT shiftleft(a, 2) shl, shiftright(lng, 1) shr, bit_count(a) bc FROM nums", flags=("schema_only",))
 case("num-032", "numeric_tower", "hex/bin over int vs bigint", "SELECT hex(a) ha, hex(lng) hl, bin(a) ba FROM nums", flags=("schema_only",))
 
+# ── Review A1 witnesses (SQL front end) ─────────────────────────────────────
+# These three sites used to carry their Spark class as PROSE inside an
+# `AnalyzerError::Other` message, e.g.
+# "UNSUPPORTED_FEATURE: LATERAL join with NATURAL join". The oracle recovers a
+# class with `^\s*\[([A-Z][A-Z0-9_.]*)\]`, which cannot see a prose token — and
+# because `Other` bridged to a τ-boundary `Unsupported`, the wire message led
+# with "τ emission error:" and exited as gRPC UNIMPLEMENTED. So these could
+# only ever report error_class=None and were structurally unable to pass,
+# independent of being red.
+#
+# Two of the three prose tokens were also simply WRONG. Every class below was
+# observed against live Spark 4.1.1 and checked against the 1244-condition
+# catalogue in spark-common-utils_2.13-4.1.1.jar:
+#   * LATERAL+NATURAL is INCOMPATIBLE_JOIN_TYPES, not UNSUPPORTED_FEATURE —
+#     no UNSUPPORTED_FEATURE subclass for natural joins exists at all.
+#   * LATERAL+USING is the UNSUPPORTED_FEATURE.LATERAL_JOIN_USING *subclass*;
+#     the prose carried only the bare base class.
+case("errcls-101", "error_class", "A1 — recursive CTE with UNION (not ALL)", "WITH RECURSIVE seq(n) AS (SELECT 1 UNION SELECT n + 1 FROM seq WHERE n < 5) SELECT * FROM seq", flags=("spark4",), expected_error="UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE")
+case("errcls-102", "error_class", "A1 — LATERAL join with NATURAL join", "SELECT * FROM emp NATURAL JOIN LATERAL (SELECT 1 AS id)", expected_error="INCOMPATIBLE_JOIN_TYPES")
+case("errcls-103", "error_class", "A1 — LATERAL join with USING", "SELECT * FROM emp JOIN LATERAL (SELECT 1 AS id) USING (id)", expected_error="UNSUPPORTED_FEATURE.LATERAL_JOIN_USING")
+case("errcls-104", "error_class", "A1 — ragged VALUES rows", "SELECT * FROM VALUES (1, 2), (3) AS t(a, b)", expected_error="INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH")
+
 
 # ── 19. TPC-H / TPC-DS clusters (migrated from the legacy differential files) ─
 #

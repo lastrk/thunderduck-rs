@@ -142,11 +142,34 @@ Fixed with one unconditional clear (`toDF` renames every column). The SQL
 pinned by a dedicated ordering test so the clear can never be hoisted above the
 seed.
 
+## Third gap, surfaced while building the witnesses
+
+`pretty_name` has no `UpdateFields` arm, so an unaliased `dropFields(...)`
+projection is auto-named `expr` where Spark names it
+`update_fields(s, dropfield())`. Data matches; only the generated column name
+diverges. This is the same family as the already-deferred `prettyname-004`
+(Window arm) and the `CaseWhen` arm that landed in PR #25 — it was invisible
+before because τ *rejected* these projections outright, so no case could reach
+the naming path.
+
+Carried as `errcls-006`, **deferred** and not in the baseline. `errcls-004`
+carries an explicit alias so the over-strictness fix is witnessed independently.
+
 ## Verification
 
-`cargo fmt` clean; `cargo clippy --workspace --all-targets -- -D warnings` zero;
-`cargo test --workspace` green. The two C1 behavioural tests were confirmed to
-**fail** with the fix reverted (the ordering test passes either way by design —
-it guards a future regression, not this one).
+- `cargo fmt` clean; `cargo clippy --workspace --all-targets -- -D warnings`
+  zero; `cargo test --workspace` 1391 passed / 0 failed. The two C1 behavioural
+  tests were confirmed to **fail** with the fix reverted (the ordering test
+  passes either way by design — it guards a future regression, not this one).
+- **DataFrame corpus: 421 passed / 7 failed.** All 7 are documented deferrals —
+  `sqlwrap-001..005` and `prettyname-004` (both pre-existing, from PR #25) plus
+  the new `errcls-006`. **Zero regressions.**
+- **SQL corpus: 420 passed / 0 failed** — fully green, including the 4 new
+  witnesses.
+- Reference side: all 9 witnesses' expected classes were observed against live
+  Spark 4.1.1 before being declared; the two acceptance cases were confirmed to
+  return rows. τ side verified through the real Connect server via the golden
+  oracle. Goldens for `errcls-004`/`005`/`006` recorded with
+  `run-differential-tests.sh --record core`.
 
-Corpus witness status is tracked in `tests/integration/error_class_witness_manifest.json`.
+Witness index: `tests/integration/error_class_witness_manifest.json`.

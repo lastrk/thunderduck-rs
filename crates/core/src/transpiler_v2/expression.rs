@@ -1725,10 +1725,9 @@ impl Expression {
             return DataType::Unresolved;
         };
         // Delegate to the shared classifier so analyzer + emission cannot
-        // drift. `data_type()` is infallible — a missing drop target here
-        // silently leaves the struct unchanged. `resolve_and_stamp` runs
-        // `validate_update_fields_ops` earlier and rejects such inputs with
-        // an [`AnalyzerError::Other`] (Spark-emulated).
+        // drift. `data_type()` is infallible, and a missing drop target
+        // silently leaves the struct unchanged — which is exactly what Spark
+        // 4.1.1 does (verified in the review A1 audit; τ used to reject it).
         apply_update_fields_ops(
             &mut st.fields,
             &u.updates,
@@ -1959,7 +1958,8 @@ pub(crate) fn materialize_binary_coercions(
 /// * Drop matches existing fields **case-insensitively** ([`eq_fold`]).
 /// * A drop target that does not match any current field is **silently
 ///   ignored** here — callers that need Spark-emulated rejection must invoke
-///   [`validate_update_fields_ops`] first.
+///   Spark itself tolerates a missing drop target, so a silent ignore here
+///   is the correct Spark-parity behaviour, not a latent bug.
 ///
 /// The callbacks let the caller decide the payload type `T`:
 ///
@@ -2002,40 +2002,6 @@ pub(super) fn apply_update_fields_ops<T>(
             }
         }
     }
-}
-
-/// Validate a Spark `UpdateFields` op list against a base struct's declared
-/// field names. Returns the first drop target that does not resolve
-/// (case-insensitive), which the analyzer surfaces as a Spark-emulated error.
-///
-/// Ordering: `updates` are applied left to right, so a drop-then-add sequence
-/// on the same name is legal (the add would append). We walk a virtual
-/// projected field-name list and check drops against it.
-pub(super) fn validate_update_fields_ops(
-    base_field_names: &[String],
-    updates: &[(String, Option<Expression>)],
-) -> Result<(), String> {
-    let mut names: Vec<String> = base_field_names.to_vec();
-    for (name, op) in updates {
-        match op {
-            Some(_) => {
-                let existing = names.iter().position(|n| eq_fold(n, name));
-                if existing.is_none() {
-                    names.push(name.clone());
-                }
-                // In-place replace preserves the declared name — no
-                // change to the `names` vector.
-            }
-            None => {
-                let idx = names
-                    .iter()
-                    .position(|n| eq_fold(n, name))
-                    .ok_or_else(|| name.clone())?;
-                names.remove(idx);
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

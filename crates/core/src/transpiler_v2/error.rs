@@ -56,14 +56,22 @@ pub enum EmissionError {
     /// gap: `class` is the real Spark error-class token (e.g.
     /// `"AMBIGUOUS_REFERENCE"`) so the client-side differential harness can
     /// key off it exactly as it would for Spark itself.
-    #[error("[{class}] {message}")]
+    #[error("{}{message}", class.map(|c| format!("[{c}] ")).unwrap_or_default())]
     SparkEmulated {
         /// The Spark error-class token (e.g. `"AMBIGUOUS_REFERENCE"`,
-        /// `"UNRESOLVED_COLUMN"`).
-        class: &'static str,
+        /// `"UNRESOLVED_COLUMN"`), when it has been established.
+        ///
+        /// `None` means "Spark rejects this input too, but τ has not
+        /// established which class it raises" (review A1). A classless
+        /// Spark-emulated error renders a clean prefix-free message — it must
+        /// NOT invent a token, because the differential oracle keys on the
+        /// leading `[TOKEN]` and a fabricated one would silently compare as a
+        /// real class. Such errors still exit as `invalid_argument`: the
+        /// category is what determines the status, not the presence of a class.
+        class: Option<&'static str>,
         /// The human-readable message, without the analyzer's
         /// `[SPARK-EMULATED]` τ-internal prefix (the class token above
-        /// replaces it as the leading token).
+        /// replaces it as the leading token when present).
         message: String,
     },
 
@@ -173,7 +181,7 @@ mod tests {
     #[test]
     fn spark_emulated_display_leads_with_class_token() {
         let e = EmissionError::SparkEmulated {
-            class: "AMBIGUOUS_REFERENCE",
+            class: Some("AMBIGUOUS_REFERENCE"),
             message: "column `id` is ambiguous, candidates: [\"l.id\", \"r.id\"]".to_owned(),
         };
         assert_eq!(

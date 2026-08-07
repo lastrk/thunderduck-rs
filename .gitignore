@@ -12,7 +12,11 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS committed. This workspace ships a binary (the Spark Connect
+# server) and a Docker image, so builds must be reproducible: without the lock
+# in the repo, every CI checkout re-resolves the dependency graph and can break
+# from an unrelated upstream publish. That is not hypothetical — it is exactly
+# how the Tekton build broke on 2026-08-07 (see the commit that added this).
 
 # Per-worktree test environment: remembered server ports (see
 # tests/integration/utils/test_env.py) and per-worktree DuckDB extension dir.

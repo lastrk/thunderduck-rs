@@ -21,5 +21,9 @@ spec:
           run: |
             rustup component add rustfmt clippy
             cargo fmt --all -- --check
-            cargo clippy --workspace --all-targets --features bundled -- -D warnings
-            cargo test --workspace --features bundled
+            # `--locked` keeps CI on the committed Cargo.lock. Without it a
+            # checkout re-resolves the graph and can pull a dependency whose
+            # MSRV exceeds this image's rustc — how this workflow broke on
+            # 2026-08-07 (ar_archive_writer 0.5.3 requires rustc 1.88).
+            cargo clippy --locked --workspace --all-targets --features bundled -- -D warnings
+            cargo test --locked --workspace --features bundled

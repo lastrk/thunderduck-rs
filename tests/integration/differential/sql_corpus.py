@@ -844,7 +844,7 @@ case("parseerr-005", "error_class", "empty UNPIVOT IN list — expression requir
 # invalid. Kept red on purpose; it will go green for free if sqlparser ever grows
 # those constructs, shrinking the ambiguous set. See
 # docs/future_work/adr-022-strict-rejection-enforcement.md.
-case("parseerr-001", "error_class", "DEFERRED — keyword typo; error shape is indistinguishable from a τ grammar gap", "SELECT * FRM emp", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-001", "error_class", "keyword typo; error shape is indistinguishable from a τ grammar gap", "SELECT * FRM emp", flags=("deferred",), expected_error="PARSE_SYNTAX_ERROR")
 #
 # GROUP 2 — the COUNTER-EXAMPLE, and the reason a blanket
 # sql::parse_error -> PARSE_SYNTAX_ERROR mapping is UNSAFE. sqlparser rejects
@@ -861,7 +861,7 @@ case("parseerr-001", "error_class", "DEFERRED — keyword typo; error shape is i
 # tasks/tau-error-class-audit-2026-08.md rather than as corpus cases, because
 # TRANSFORM spawns an external process and CREATE TABLE mutates catalog state,
 # neither of which belongs in the corpus.
-case("parseerr-101", "error_class", "DEFERRED counter-example — time travel: τ says sql::parse_error, Spark says UNSUPPORTED_FEATURE.TIME_TRAVEL (must NOT become PARSE_SYNTAX_ERROR)", "SELECT * FROM emp VERSION AS OF 1", expected_error="UNSUPPORTED_FEATURE.TIME_TRAVEL")
+case("parseerr-101", "error_class", "counter-example — time travel: τ says sql::parse_error, Spark says UNSUPPORTED_FEATURE.TIME_TRAVEL (must NOT become PARSE_SYNTAX_ERROR)", "SELECT * FROM emp VERSION AS OF 1", flags=("deferred",), expected_error="UNSUPPORTED_FEATURE.TIME_TRAVEL")
 
 
 # ── 19. TPC-H / TPC-DS clusters (migrated from the legacy differential files) ─

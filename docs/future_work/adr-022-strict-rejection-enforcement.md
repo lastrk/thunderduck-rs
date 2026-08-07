@@ -43,9 +43,13 @@ That is a Thunderduck-boundary error, i.e. "τ has not implemented this". The
 input is not unimplemented — it is malformed, and τ rejects it on purpose. The
 category is wrong in exactly the way ADR-022 Amendment 1 exists to fix.
 
-The cause is that all three parse-failure sites flatten every `sqlparser` error
-into one boundary error, with no way to distinguish a registered malformation
-from a genuine grammar gap:
+Since 2026-08-07 the parse sites route through `classify_parse_failure`, which
+upgrades *provably malformed* input to a Spark-emulated `PARSE_SYNTAX_ERROR`
+(ADR-022 **category 1**). That is a different axis from the problem here:
+category 1 is "Spark rejects this too". A **category 3** strict rejection is
+"Spark ACCEPTS this and τ refuses anyway", and `classify_parse_failure`
+deliberately has no signal for it — register entry #1 falls into the untouched
+default branch below:
 
 ```rust
 // parser_v2/mod.rs:56, parser_v2/mod.rs:103, v2_lowering.rs:4789
@@ -139,16 +143,17 @@ normal diff), so the change is symmetric across
 
 ## Verification sketch (when implemented)
 
-- Unit: `classify_parse_failure` upgrades entry #1 and — more importantly —
-  **does not** upgrade the negative cases: trailing `GROUP BY`, keyword typo,
-  unbalanced paren, unterminated string, empty `UNPIVOT (… IN ())`.
-- **Critical interaction:** `parseerr-001..005` in `sql_corpus.py` are
-  *category-1* witnesses expecting `PARSE_SYNTAX_ERROR`. The detector must not
-  capture any of them, or it silently converts documented category-1 cases into
-  category-3 ones. Re-run `-k parseerr` and confirm all five still fail for
-  their original reason.
-- Both corpora, no previously-green regression. Baselines at the time of
-  writing: DataFrame 421 passed / 7 failed, SQL 420 passed / 6 failed (all
-  documented deferrals).
+- Unit: a category-3 detector fires for register entry #1 and for nothing else.
+  In particular it must not disturb `classify_parse_failure`'s category-1
+  signals (lexical failure, unbalanced delimiters, empty expression slot).
+- **Critical interaction:** `parseerr-002..005` in `sql_corpus.py` are
+  *category-1* witnesses, **currently green**, expecting `PARSE_SYNTAX_ERROR`. A
+  category-3 detector must not capture them, or it silently reclassifies them
+  and they go red. `parseerr-001` and `parseerr-101` are deferred and must stay
+  red for their own documented reasons — 001's error shape is indistinguishable
+  from a τ grammar gap, and 101 is the guardrail against mapping the whole parse
+  category. Re-run `-k parseerr` and confirm 4 green / 2 red.
+- Both corpora, no previously-green regression. Baselines as of 2026-08-07:
+  DataFrame 421 passed / 7 failed, SQL 424 passed / 2 failed.
 - Disable the detector once and confirm the divergent case goes red. A flag that
   cannot fail is worthless.

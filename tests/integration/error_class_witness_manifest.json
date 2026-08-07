@@ -77,22 +77,29 @@
       "born_red_as": "error-class divergence \u2014 \u03c4 raised [None]"
     },
     {
-      "case": "parseerr-001..005",
+      "case": "parseerr-002..005",
       "corpus": "sql",
       "finding": "A1-twin (parser layer)",
-      "deferred": true,
-      "pins": "The five surveyed cases where BOTH engines reject and Spark's class really is PARSE_SYNTAX_ERROR (keyword typo, unbalanced paren, dangling GROUP BY, unterminated string, empty UNPIVOT IN list). \u03c4 answers gRPC UNIMPLEMENTED with class None. These are what a parse-layer fix must turn green.",
-      "born_red_as": "error-class divergence \u2014 expected [PARSE_SYNTAX_ERROR], \u03c4 raised [None]",
-      "not_a_regression": "not in the baseline; measures a known-open gap"
+      "pins": "Four of the five surveyed cases where BOTH engines reject and Spark's class is PARSE_SYNTAX_ERROR. GREEN since classify_parse_failure (parser_v2/mod.rs) upgrades the provably-malformed subset: 002 unbalanced delimiters, 003 expression required but input ended, 004 lexical failure, 005 expression required but slot empty. The three signals hold regardless of sqlparser's grammar coverage, which is why they cannot slander valid Spark.",
+      "born_red_as": "error-class divergence \u2014 expected [PARSE_SYNTAX_ERROR], \u03c4 raised [None]; now green"
     },
     {
       "case": "parseerr-101",
       "corpus": "sql",
       "finding": "A1-twin GUARDRAIL",
       "deferred": true,
-      "pins": "SELECT * FROM emp VERSION AS OF 1 \u2014 \u03c4 fails at PARSE (sql::parse_error) but Spark parses it fine and fails in ANALYSIS with UNSUPPORTED_FEATURE.TIME_TRAVEL. Proves a blanket sql::parse_error -> PARSE_SYNTAX_ERROR mapping would emit the WRONG class, swapping one miscategorisation for another. Must fail loudly if anyone maps the category wholesale.",
+      "pins": "SELECT * FROM emp VERSION AS OF 1 \u2014 \u03c4 fails at PARSE (sql::parse_error) but Spark parses it fine and fails in ANALYSIS with UNSUPPORTED_FEATURE.TIME_TRAVEL. Proves a blanket sql::parse_error -> PARSE_SYNTAX_ERROR mapping would emit the WRONG class, swapping one miscategorisation for another. Must fail loudly if anyone maps the category wholesale. Remains RED by design: under the classifier it correctly stays UNIMPLEMENTED, which is \u03c4's honest answer since \u03c4 does not implement time travel at all. Making it green would require emitting UNSUPPORTED_FEATURE.TIME_TRAVEL, which is only Spark's answer for a temp view \u2014 on a Delta table Spark supports time travel and returns rows.",
       "born_red_as": "error-class divergence \u2014 expected [UNSUPPORTED_FEATURE.TIME_TRAVEL], \u03c4 raised [None]",
       "not_a_regression": "not in the baseline; guardrail for an open finding"
+    },
+    {
+      "case": "parseerr-001",
+      "corpus": "sql",
+      "finding": "A1-twin (parser layer) \u2014 provably unfixable",
+      "deferred": true,
+      "pins": "`SELECT * FRM emp` IS malformed, but sqlparser reports `Expected: end of statement, found: FRM`, byte-identical in form to the shape produced by genuine \u03c4 grammar gaps (TRANSFORM -> `found: 'cat'`, VERSION AS OF -> `found: AS`, CREATE TABLE ... USING -> `found: USING`) \u2014 all of which Spark ACCEPTS. The shape carries no information, so no classifier can separate them without a Spark-grammar oracle.",
+      "born_red_as": "error-class divergence \u2014 expected [PARSE_SYNTAX_ERROR], \u03c4 raised [None]",
+      "not_a_regression": "not in the baseline; kept red deliberately. Will go green for free if sqlparser grows the missing constructs, shrinking the ambiguous set."
     }
   ],
   "parse_layer_survey": "36 cases run against both \u03c4 and live Spark 4.1.1 (2026-08-07). Key counter-examples where sqlparser rejects but Spark ACCEPTS: HiveQL TRANSFORM, and CREATE TABLE ... USING parquet \u2014 recorded in tasks/tau-error-class-audit-2026-08.md rather than as corpus cases (TRANSFORM spawns a process; CREATE TABLE mutates catalog state). Survey also found Spark is permissive where one would not expect: 'SELECT * FROM emp WHERE' is ACCEPTED (WHERE parsed as a table alias), and 'SELECT id, FROM emp' raises TRAILING_COMMA_IN_SELECT rather than PARSE_SYNTAX_ERROR."

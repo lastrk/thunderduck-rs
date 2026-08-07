@@ -821,19 +821,30 @@ case("errcls-103", "error_class", "A1 — LATERAL join with USING", "SELECT * FR
 case("errcls-104", "error_class", "A1 — ragged VALUES rows", "SELECT * FROM VALUES (1, 2), (3) AS t(a, b)", expected_error="INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH")
 
 # ── Parse-error emulation witnesses (A1's twin, one layer up) ───────────────
-# Every sqlparser failure becomes Unsupported{ProtoShape, "sql::parse_error"}
-# -> gRPC UNIMPLEMENTED with no recoverable class, exactly the miscategorisation
-# A1 fixed in the analyzer. These cases MEASURE that gap so any future fix has a
-# fitness gate instead of a guess. All DEFERRED and out of the baseline: they
-# are born red and stay red until the parse layer is addressed.
+# Every sqlparser failure used to become Unsupported{ProtoShape,
+# "sql::parse_error"} -> gRPC UNIMPLEMENTED with no recoverable class, exactly
+# the miscategorisation A1 fixed in the analyzer. `classify_parse_failure`
+# (parser_v2/mod.rs) now upgrades the provably-malformed subset to a
+# Spark-emulated PARSE_SYNTAX_ERROR, using three signals that hold regardless of
+# grammar coverage: a lexical failure, unbalanced delimiters, or an EMPTY slot
+# where an expression is required.
 #
-# GROUP 1 — both engines reject AND Spark's class is PARSE_SYNTAX_ERROR. These
-# are the cases a fix must turn green. Verified against live Spark 4.1.1.
-case("parseerr-001", "error_class", "DEFERRED — keyword typo (Spark: PARSE_SYNTAX_ERROR)", "SELECT * FRM emp", expected_error="PARSE_SYNTAX_ERROR")
-case("parseerr-002", "error_class", "DEFERRED — unbalanced paren (Spark: PARSE_SYNTAX_ERROR)", "SELECT (1 FROM emp", expected_error="PARSE_SYNTAX_ERROR")
-case("parseerr-003", "error_class", "DEFERRED — dangling GROUP BY (Spark: PARSE_SYNTAX_ERROR)", "SELECT * FROM emp GROUP BY", expected_error="PARSE_SYNTAX_ERROR")
-case("parseerr-004", "error_class", "DEFERRED — unterminated string (Spark: PARSE_SYNTAX_ERROR)", "SELECT 'abc FROM emp", expected_error="PARSE_SYNTAX_ERROR")
-case("parseerr-005", "error_class", "DEFERRED — empty UNPIVOT IN list (Spark: PARSE_SYNTAX_ERROR)", "SELECT * FROM emp UNPIVOT (v FOR k IN ())", expected_error="PARSE_SYNTAX_ERROR")
+# GROUP 1 — both engines reject AND Spark's class is PARSE_SYNTAX_ERROR.
+# 002-005 are GREEN: each is caught by one of the three signals.
+case("parseerr-002", "error_class", "unbalanced paren — malformed by delimiter count", "SELECT (1 FROM emp", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-003", "error_class", "dangling GROUP BY — expression required, input ended", "SELECT * FROM emp GROUP BY", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-004", "error_class", "unterminated string — lexical failure", "SELECT 'abc FROM emp", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-005", "error_class", "empty UNPIVOT IN list — expression required, slot empty", "SELECT * FROM emp UNPIVOT (v FOR k IN ())", expected_error="PARSE_SYNTAX_ERROR")
+# parseerr-001 is DEFERRED and provably unfixable without a Spark-grammar
+# oracle. `SELECT * FRM emp` IS malformed, but sqlparser reports
+# `Expected: end of statement, found: FRM` — byte-identical in form to the shape
+# produced by genuine τ grammar gaps (HiveQL TRANSFORM -> `found: 'cat'`,
+# VERSION AS OF -> `found: AS`, CREATE TABLE ... USING -> `found: USING`), all of
+# which Spark ACCEPTS. Upgrading this shape would tell users their valid Spark is
+# invalid. Kept red on purpose; it will go green for free if sqlparser ever grows
+# those constructs, shrinking the ambiguous set. See
+# docs/future_work/adr-022-strict-rejection-enforcement.md.
+case("parseerr-001", "error_class", "DEFERRED — keyword typo; error shape is indistinguishable from a τ grammar gap", "SELECT * FRM emp", expected_error="PARSE_SYNTAX_ERROR")
 #
 # GROUP 2 — the COUNTER-EXAMPLE, and the reason a blanket
 # sql::parse_error -> PARSE_SYNTAX_ERROR mapping is UNSAFE. sqlparser rejects

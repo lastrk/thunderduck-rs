@@ -102,7 +102,7 @@ instead of inventing a token — it still exits `INVALID_ARGUMENT`, because the
   It is one of Spark's own un-migrated placeholders and will break if Spark
   renames the condition — revisit when the Spark pin moves.
 
-## A1's twin in the parser layer — surveyed, witnessed, NOT fixed
+## A1's twin in the parser layer — surveyed, witnessed, PARTIALLY fixed
 
 Every `sqlparser` failure becomes
 `EmissionError::Unsupported { kind: ProtoShape, name: "sql::parse_error" }`
@@ -143,14 +143,32 @@ So τ cannot infer the class from "sqlparser failed" in either direction.
 A real fix needs a positive signal — a curated grammar-coverage list, or
 consulting Spark — and that is why this stays open.
 
-**Witnesses.** `parseerr-001..005` pin the five cases where both engines reject
-*and* Spark's class really is `PARSE_SYNTAX_ERROR`; they are what a fix must
-turn green. `parseerr-101` is the guardrail: it must report
-`UNSUPPORTED_FEATURE.TIME_TRAVEL`, so it fails loudly if someone maps the whole
-category. All six are DEFERRED and out of the baseline — born red, staying red
-until the parse layer is addressed. The two "Spark accepts outright" shapes are
-recorded here rather than as cases, because TRANSFORM spawns an external
-process and CREATE TABLE mutates catalog state.
+**The fix that landed (2026-08-07).** `classify_parse_failure`
+(`parser_v2/mod.rs`) keeps the boundary error as the DEFAULT and upgrades to a
+Spark-emulated `PARSE_SYNTAX_ERROR` only on evidence that holds *regardless of
+grammar coverage*: (1) a lexical failure, (2) unbalanced delimiters counted over
+the token stream, (3) an **empty** slot where an expression is required
+(`found: EOF` or `found: )`) — nothing is there, so nothing can be *unsupported*
+syntax. `parseerr-002..005` are now green.
+
+**What could not be fixed, and why.** `parseerr-001` (`SELECT * FRM emp`) stays
+red permanently. It is genuinely malformed, but sqlparser reports
+`Expected: end of statement, found: FRM` — the *same shape* it reports for all
+three known τ grammar gaps (`found: 'cat'`, `found: AS`, `found: USING`), every
+one of which Spark accepts. The shape carries no information; separating them
+needs a Spark-grammar oracle τ does not have. It will go green for free if
+sqlparser grows those constructs.
+
+`parseerr-101` also stays red, as the guardrail. Under the classifier it
+correctly remains UNIMPLEMENTED — τ's honest answer, since τ implements no time
+travel at all. Turning it green would mean emitting
+`UNSUPPORTED_FEATURE.TIME_TRAVEL`, which is only Spark's answer for a *temp
+view*; on a Delta table Spark supports time travel and returns rows, so τ would
+be claiming a Spark class for an input Spark handles successfully.
+
+The two "Spark accepts outright" shapes are recorded here rather than as cases,
+because TRANSFORM spawns an external process and CREATE TABLE mutates catalog
+state.
 
 ## Bonus finding — 5 sites where τ was over-strict (all fixed)
 

@@ -1,0 +1,26 @@
+# Single source of truth for the Rust toolchain.
+#
+# rustup honours this file for every cargo/rustc invocation inside the repo, so
+# a local build, a devcontainer build and a CI build all use the SAME compiler
+# — no more "compiles on my machine, E0658 in CI". Before this file existed the
+# devcontainer installed a floating `stable` while CI pinned an image tag, and
+# the two drifted six releases apart without anything noticing.
+#
+# Keep `channel` in step with the image tag in `Dockerfile` and
+# `.nu/workflows/pr.yaml`. When they agree, rustup finds the toolchain already
+# installed and downloads nothing. When they disagree the pin still wins —
+# rustup fetches it — which is correct but slower, and a signal the tags need
+# updating. `rust:1.97.1-bookworm` is a fully-qualified tag, so it cannot move
+# under us the way a `1.97-bookworm` tag would.
+#
+# FLOOR IS 1.88 — do not lower past it. `ar_archive_writer` (a transitive
+# build-dependency of psm via stacker/recursive/sqlparser) uses let-chains,
+# stable only since 1.88. It declares `edition = "2024"` but NO `rust-version`,
+# so cargo cannot reject it up front; the failure surfaces as a bare E0658 from
+# rustc partway through the build. That is what broke Tekton on 2026-08-07.
+#
+# `components` is deliberately omitted: the official rust images ship a minimal
+# profile, so listing rustfmt/clippy here would make the RELEASE image download
+# them on every build for no reason. CI adds them explicitly in pr.yaml.
+[toolchain]
+channel = "1.97.1"

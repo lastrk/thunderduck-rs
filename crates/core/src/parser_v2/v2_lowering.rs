@@ -2492,18 +2492,8 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         Expr::Between {
             expr, low, high, ..
         } => expr_has_aggregate(expr) || expr_has_aggregate(low) || expr_has_aggregate(high),
-        Expr::Like {
-            expr,
-            pattern,
-            any: _,
-            ..
-        }
-        | Expr::ILike {
-            expr,
-            pattern,
-            any: _,
-            ..
-        }
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
         | Expr::SimilarTo { expr, pattern, .. }
         | Expr::RLike { expr, pattern, .. } => {
             expr_has_aggregate(expr) || expr_has_aggregate(pattern)
@@ -3747,18 +3737,8 @@ fn resolve_named_windows_in_expr(
             resolve_named_windows_in_expr(low, defs)?;
             resolve_named_windows_in_expr(high, defs)?;
         }
-        Expr::Like {
-            expr,
-            pattern,
-            any: _,
-            ..
-        }
-        | Expr::ILike {
-            expr,
-            pattern,
-            any: _,
-            ..
-        }
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
         | Expr::SimilarTo { expr, pattern, .. }
         | Expr::RLike { expr, pattern, .. } => {
             resolve_named_windows_in_expr(expr, defs)?;

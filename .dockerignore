@@ -14,6 +14,10 @@
 *
 !Cargo.toml
 !Cargo.lock
+# Must be re-included: this file is default-deny, so without this line the
+# toolchain pin would never reach the build context and the release image
+# would quietly compile with whatever rustc its base tag happens to ship.
+!rust-toolchain.toml
 !crates/
 !crates/**
 !extensions/vendored/

@@ -1177,10 +1177,10 @@ fn map_ddl_error(
                 return table_or_view_not_found(name);
             }
         }
-        DdlStatement::InsertValues { table, .. } | DdlStatement::InsertSelect { table, .. } => {
-            if duckdb_says_missing(&msg) {
-                return table_or_view_not_found(table);
-            }
+        DdlStatement::InsertValues { table, .. } | DdlStatement::InsertSelect { table, .. }
+            if duckdb_says_missing(&msg) =>
+        {
+            return table_or_view_not_found(table);
         }
         _ => {}
     }

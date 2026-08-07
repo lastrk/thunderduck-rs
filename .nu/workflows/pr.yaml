@@ -17,7 +17,9 @@ spec:
         memory: 4Gi
       steps:
         - uses: checkout
-        - image: rust:1.85-bookworm
+        # Must match the release Dockerfile's builder image, so a PR cannot
+        # go green on a different compiler than the one that ships the artifact.
+        - image: rust:1.97.1-bookworm
           run: |
             rustup component add rustfmt clippy
             cargo fmt --all -- --check

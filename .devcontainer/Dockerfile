@@ -179,7 +179,13 @@ RUN su vscode -c 'curl -fsSL https://pkgx.sh | sh' && \
 # Rust versions: stable, beta, nightly, or specific versions (e.g., 1.70.0)
 # Switching versions: rustup default stable|beta|nightly|1.70.0
 # ------------------------------------------------------------------------------
-RUN su vscode -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y' && \
+# `--default-toolchain` is pinned to match `rust-toolchain.toml` at the repo
+# root. Without it the installer takes whatever `stable` happened to be on the
+# day the image was built, which is how this container silently sat on 1.94.0
+# while CI ran 1.85 — nine releases apart, and nothing noticed until a
+# dependency needed 1.88. The repo pin is authoritative either way; matching it
+# here just means rustup has the toolchain already and downloads nothing.
+RUN su vscode -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.97.1' && \
      echo 'source $HOME/.cargo/env' >> /home/vscode/.bashrc
 #
 # # Install additional Rust components (optional)

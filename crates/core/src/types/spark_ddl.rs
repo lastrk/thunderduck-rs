@@ -226,13 +226,14 @@ fn split_field_name_type(field: &str) -> Option<(&str, &str)> {
                 sep_len = 1;
                 break;
             }
-            c if depth == 0 && c.is_whitespace() => {
-                if sep_idx.is_none() {
-                    sep_idx = Some(i);
-                    sep_len = c.len_utf8();
-                    // Don't `break` on whitespace — we still prefer a
-                    // colon if one appears later at depth 0.
-                }
+            // Only the FIRST depth-0 whitespace is a candidate separator, and
+            // we deliberately do NOT `break` — a colon appearing later at
+            // depth 0 still wins. Once `sep_idx` is set the guard stops
+            // matching, which falls through to the no-op arm exactly as the
+            // previous inner `if` did.
+            c if depth == 0 && c.is_whitespace() && sep_idx.is_none() => {
+                sep_idx = Some(i);
+                sep_len = c.len_utf8();
             }
             _ => {}
         }

@@ -1,5 +1,10 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.85-bookworm AS builder
+# Keep the `-bookworm` variant: the runtime stage below is debian:bookworm-slim,
+# and a builder on a newer Debian would link against a glibc the runtime does
+# not have — that fails at container START, not at build time.
+# Must stay >= 1.88 (ar_archive_writer uses let-chains) and in step with
+# rust-toolchain.toml, which is authoritative.
+FROM rust:1.97.1-bookworm AS builder
 WORKDIR /app
 COPY . .
 # `--locked` is load-bearing: it makes the build use the committed Cargo.lock

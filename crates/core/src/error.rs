@@ -11,9 +11,6 @@ pub enum ThunderduckError {
     /// error and the differential oracle can key on the leading token.
     #[error("{message}")]
     SparkRuntime { class: String, message: String },
-
-    #[error("τ emission error: {0}")]
-    TranspilerV2Emission(#[from] crate::transpiler_v2::EmissionError),
 }
 
 impl From<duckdb::Error> for ThunderduckError {

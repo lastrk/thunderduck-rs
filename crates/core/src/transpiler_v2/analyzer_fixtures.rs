@@ -153,7 +153,6 @@ pub(crate) fn base_types_all_inputs() -> BaseTypes {
 fn table_scan(name: &str) -> CommonAst {
     CommonAst::new(CommonOp::TableScan {
         table: name.to_owned(),
-        alias: None,
     })
 }
 
@@ -363,6 +362,14 @@ fn flip_all_nullable_struct(schema: StructType) -> StructType {
     flip_all_nullable(&ResolvedSchema::minted(schema)).to_struct_type()
 }
 
+/// Positional concatenation — a join's expected output shape. Production
+/// widening is `ResolvedSchema::merge`; fixtures need the id-free form.
+fn merge(left: &StructType, right: &StructType) -> StructType {
+    let mut fields = left.fields.clone();
+    fields.extend(right.fields.clone());
+    StructType { fields }
+}
+
 fn left_outer_join_flips_right_nullability() -> Fixture {
     let ast = CommonAst::new(CommonOp::Join {
         left: Box::new(table_scan("emp")),
@@ -376,7 +383,7 @@ fn left_outer_join_flips_right_nullability() -> Fixture {
         right_plan_ids: vec![],
     });
     // LEFT: left preserved, right flipped nullable.
-    let expected = StructType::merge(&emp_schema(), &flip_all_nullable_struct(dept_schema()));
+    let expected = merge(&emp_schema(), &flip_all_nullable_struct(dept_schema()));
     (
         "left_outer_join_flips_right_nullability",
         ast,
@@ -397,7 +404,7 @@ fn right_outer_join_flips_left_nullability() -> Fixture {
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     });
-    let expected = StructType::merge(&flip_all_nullable_struct(emp_schema()), &dept_schema());
+    let expected = merge(&flip_all_nullable_struct(emp_schema()), &dept_schema());
     (
         "right_outer_join_flips_left_nullability",
         ast,
@@ -418,7 +425,7 @@ fn full_outer_join_flips_both_sides() -> Fixture {
         left_plan_ids: vec![],
         right_plan_ids: vec![],
     });
-    let expected = StructType::merge(
+    let expected = merge(
         &flip_all_nullable_struct(emp_schema()),
         &flip_all_nullable_struct(dept_schema()),
     );
@@ -489,14 +496,8 @@ fn plan_id_disambiguates_self_join() -> Fixture {
         })),
     });
     let ast = CommonAst::new(CommonOp::Join {
-        left: Box::new(CommonAst::new(CommonOp::TableScan {
-            table: "emp".to_owned(),
-            alias: Some("e1".to_owned()),
-        })),
-        right: Box::new(CommonAst::new(CommonOp::TableScan {
-            table: "emp".to_owned(),
-            alias: Some("e2".to_owned()),
-        })),
+        left: Box::new(aliased_scan("emp", "e1")),
+        right: Box::new(aliased_scan("emp", "e2")),
         join_type: JoinType::Inner,
         condition: Some(cond),
         using_columns: vec![],
@@ -506,7 +507,7 @@ fn plan_id_disambiguates_self_join() -> Fixture {
         right_plan_ids: vec![2],
     });
     // Inner join over emp × emp: both sides preserve full schema.
-    let expected = StructType::merge(&emp_schema(), &emp_schema());
+    let expected = merge(&emp_schema(), &emp_schema());
     (
         "plan_id_disambiguates_self_join",
         ast,
@@ -567,9 +568,11 @@ fn sparksql_no_plan_id_resolves_by_qualifier() -> Fixture {
 // schema-verbatim passthroughs and join nesting.
 
 fn aliased_scan(table: &str, alias: &str) -> CommonAst {
-    CommonAst::new(CommonOp::TableScan {
-        table: table.to_owned(),
-        alias: Some(alias.to_owned()),
+    CommonAst::new(CommonOp::AliasedRelation {
+        input: Box::new(CommonAst::new(CommonOp::TableScan {
+            table: table.to_owned(),
+        })),
+        alias: alias.to_owned(),
     })
 }
 

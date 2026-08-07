@@ -1117,6 +1117,24 @@ async fn handle_sql_ddl(
     }
 }
 
+/// True when a DuckDB error string reports a missing catalog object — DuckDB
+/// spells it two ways depending on which binder raised it.
+fn duckdb_says_missing(msg: &str) -> bool {
+    msg.contains("does not exist") || msg.contains("not found")
+}
+
+/// Spark's verbatim `TABLE_OR_VIEW_NOT_FOUND` status for `name`.
+fn table_or_view_not_found(name: &str) -> Status {
+    Status::not_found(format!(
+        "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{name}` \
+         cannot be found. Verify the spelling and correctness of \
+         the schema and catalog.\n\
+         If you did not qualify the name with a schema, verify the \
+         current_schema() output, or qualify the name with the \
+         correct schema and catalog."
+    ))
+}
+
 /// Map a DuckDB catalog error from a DDL statement to a Spark error class.
 ///
 /// DuckDB's error messages for catalog conflicts are recognizable by
@@ -1148,41 +1166,20 @@ fn map_ddl_error(
         DdlStatement::DropTable {
             name, if_exists, ..
         } => {
-            if !if_exists && (msg.contains("does not exist") || msg.contains("not found")) {
-                return Status::not_found(format!(
-                    "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{name}` \
-                     cannot be found. Verify the spelling and correctness of \
-                     the schema and catalog.\n\
-                     If you did not qualify the name with a schema, verify the \
-                     current_schema() output, or qualify the name with the \
-                     correct schema and catalog."
-                ));
+            if !if_exists && duckdb_says_missing(&msg) {
+                return table_or_view_not_found(name);
             }
         }
         DdlStatement::DropView {
             name, if_exists, ..
         } => {
-            if !if_exists && (msg.contains("does not exist") || msg.contains("not found")) {
-                return Status::not_found(format!(
-                    "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{name}` \
-                     cannot be found. Verify the spelling and correctness of \
-                     the schema and catalog.\n\
-                     If you did not qualify the name with a schema, verify the \
-                     current_schema() output, or qualify the name with the \
-                     correct schema and catalog."
-                ));
+            if !if_exists && duckdb_says_missing(&msg) {
+                return table_or_view_not_found(name);
             }
         }
         DdlStatement::InsertValues { table, .. } | DdlStatement::InsertSelect { table, .. } => {
-            if msg.contains("does not exist") || msg.contains("not found") {
-                return Status::not_found(format!(
-                    "[TABLE_OR_VIEW_NOT_FOUND] The table or view `{table}` \
-                     cannot be found. Verify the spelling and correctness of \
-                     the schema and catalog.\n\
-                     If you did not qualify the name with a schema, verify the \
-                     current_schema() output, or qualify the name with the \
-                     correct schema and catalog."
-                ));
+            if duckdb_says_missing(&msg) {
+                return table_or_view_not_found(table);
             }
         }
         _ => {}
@@ -1523,9 +1520,7 @@ mod tests {
     /// tests. INV10 forbids `use thunderduck_core::runtime::` in this file, so
     /// the paths are fully qualified inline.
     async fn test_session(session_id: &str) -> Arc<thunderduck_core::runtime::DuckDbSession> {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         session_manager
             .get_or_create(session_id)
             .await
@@ -1882,9 +1877,7 @@ mod tests {
         // as `crates/core/tests/runtime_integration.rs`). Inline paths for
         // `thunderduck_core::runtime::*` — INV10 forbids `use
         // thunderduck_core::runtime::` inside `service.rs`.
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let svc = ThunderduckService::new(session_manager);
 
         let plan = proto::Plan {
@@ -1952,9 +1945,7 @@ mod tests {
     /// The command arm echoes the input relation verbatim.
     #[tokio::test(flavor = "multi_thread")]
     async fn sql_command_select_literals_returns_echoed_relation() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let svc = ThunderduckService::new(session_manager);
 
         let query = "SELECT 1 AS one, 'x' AS s, true AS b";
@@ -2018,9 +2009,7 @@ mod tests {
     /// synthesizes a `RelType::Sql` relation and echoes it.
     #[tokio::test(flavor = "multi_thread")]
     async fn sql_command_deprecated_text_synthesizes_sql_relation() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let svc = ThunderduckService::new(session_manager);
 
         #[allow(deprecated)]
@@ -2141,9 +2130,7 @@ mod tests {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
         use thunderduck_core::transpiler_v2::expression::FunctionCall;
 
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let session = session_manager
             .get_or_create("pivot-discovery-session")
             .await
@@ -2217,9 +2204,7 @@ mod tests {
     async fn resolve_implicit_pivots_desugars_crosstab_end_to_end() {
         use thunderduck_core::transpiler_v2::ast::CommonOp;
 
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let session = session_manager
             .get_or_create("crosstab-desugar-session")
             .await
@@ -2325,9 +2310,7 @@ mod tests {
         use std::io::Cursor;
         use thunderduck_core::types::StructField;
 
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let session = session_manager
             .get_or_create("catalog-bridge-session")
             .await
@@ -2385,9 +2368,7 @@ mod tests {
     /// `ResultComplete`; a subsequent `SELECT` then resolves it.
     #[tokio::test(flavor = "multi_thread")]
     async fn create_view_command_returns_result_complete() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let svc = ThunderduckService::new(Arc::clone(&session_manager));
 
         // A light view body (`SELECT 1 AS id`) — Project over SingleRow, no
@@ -2450,9 +2431,7 @@ mod tests {
     /// `BaseTypes::empty()` with zero session round-trips.
     #[tokio::test(flavor = "multi_thread")]
     async fn select_literal_makes_no_catalog_call_short_circuit() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let svc = ThunderduckService::new(session_manager);
         let req = proto::ExecutePlanRequest {
             session_id: "short-circuit-session".to_owned(),
@@ -2508,9 +2487,7 @@ mod tests {
     /// and the subsequent SELECT resolves it. End-to-end through `SqlCommand`.
     #[tokio::test(flavor = "multi_thread")]
     async fn sql_create_temp_view_then_select() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let svc = ThunderduckService::new(Arc::clone(&session_manager));
         let session_id = "sql-create-temp-view-session";
 
@@ -2551,9 +2528,7 @@ mod tests {
     /// view without error.
     #[tokio::test(flavor = "multi_thread")]
     async fn sql_create_or_replace_temp_view_overwrites() {
-        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new(
-            thunderduck_core::runtime::StreamingConfig::default(),
-        ));
+        let session_manager = Arc::new(thunderduck_core::runtime::SessionManager::new());
         let svc = ThunderduckService::new(Arc::clone(&session_manager));
         let session_id = "sql-replace-view-session";
 

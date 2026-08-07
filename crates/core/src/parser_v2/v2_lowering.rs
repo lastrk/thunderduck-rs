@@ -1929,14 +1929,14 @@ fn lower_table_factor(
                     }))
                 } else {
                     // Normalize an aliased bare table to
-                    // `AliasedRelation { TableScan { alias: None }, alias }`,
-                    // matching the DataFrame front-end (`df.alias("e")`) so both
-                    // front-ends produce the same CommonAST node for the same
-                    // meaning (INV7, ADR-004). Emission's alias-hoisting
-                    // recognizes `AliasedRelation`; the old `TableScan { alias:
+                    // `AliasedRelation { TableScan, alias }`, matching the
+                    // DataFrame front-end (`df.alias("e")`) so both front-ends
+                    // produce the same CommonAST node for the same meaning
+                    // (INV7, ADR-004). Emission's alias-hoisting recognizes
+                    // `AliasedRelation`; the retired `TableScan { alias:
                     // Some(..) }` form buried the user alias inside a synthetic
                     // subquery. Mirrors the CTE branch above.
-                    let scan = CommonAst::new(CommonOp::TableScan { table, alias: None });
+                    let scan = CommonAst::new(CommonOp::TableScan { table });
                     match alias {
                         Some(a) => Ok(CommonAst::new(CommonOp::AliasedRelation {
                             input: Box::new(scan),
@@ -2673,11 +2673,7 @@ fn is_distinct(left: Expression, right: Expression, negated: bool) -> Expression
 
 fn lower_expr(expr: Expr, cte_scope: &CteScope) -> Result<Expression, EmissionError> {
     match expr {
-        Expr::Identifier(ident) => Ok(Expression::UnresolvedColumn(UnresolvedColumn {
-            name: ident.value,
-            qualifier: None,
-            plan_id: None,
-        })),
+        Expr::Identifier(ident) => Ok(UnresolvedColumn::bare(ident.value)),
         Expr::CompoundIdentifier(parts) => {
             // Lower a dotted reference as first-part qualifier / dotted
             // remainder — mirroring the Spark Connect converter's `splitn(2,'.')`
@@ -6200,16 +6196,17 @@ mod tests {
     fn parse_aliased_bare_table_yields_aliased_relation() {
         // INV7 (ADR-004): an aliased bare table (`emp e`) lowers to the same
         // node the DataFrame front-end produces for `df.alias("e")` —
-        // `AliasedRelation { input: TableScan { alias: None }, alias: "e" }` —
-        // not the old `TableScan { alias: Some("e") }`.
+        // `AliasedRelation { input: TableScan { table: "emp" }, alias: "e" }`.
+        // Aliases are represented by `AliasedRelation`; `TableScan` has no
+        // `alias` field.
         let plan = parse("SELECT e.id FROM emp e").expect("should parse");
         let scan = expect_aliased(project_input(plan), "e");
         assert!(
             matches!(
                 scan.op,
-                CommonOp::TableScan { ref table, alias: None } if table == "emp"
+                CommonOp::TableScan { ref table } if table == "emp"
             ),
-            "expected TableScan {{ table: emp, alias: None }} under the \
+            "expected TableScan {{ table: \"emp\" }} under the \
              AliasedRelation, got {:?}",
             scan.op
         );
@@ -6224,7 +6221,7 @@ mod tests {
         assert!(
             matches!(
                 input.op,
-                CommonOp::TableScan { ref table, alias: None } if table == "emp"
+                CommonOp::TableScan { ref table } if table == "emp"
             ),
             "expected bare TableScan, got {:?}",
             input.op

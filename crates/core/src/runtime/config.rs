@@ -1,21 +1,3 @@
-/// Controls how many rows each Arrow RecordBatch contains.
-///
-/// NOTE: currently inert — it is threaded through `SessionManager::new` /
-/// `DuckDbSession::spawn` signatures but never read (`spawn` ignores it, and
-/// the streaming batch size is passed separately per call). De-threading it
-/// is deferred: removing the parameter is cross-crate signature churn.
-#[derive(Debug, Clone)]
-pub struct StreamingConfig {
-    /// Number of rows per batch. Default 8192, clamped to [1024, 65536].
-    pub batch_size: usize,
-}
-
-impl Default for StreamingConfig {
-    fn default() -> Self {
-        Self { batch_size: 8192 }
-    }
-}
-
 /// Hardware profile used to configure DuckDB's resource limits.
 pub struct HardwareProfile {
     /// Number of OS threads available for DuckDB parallelism.

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use thunderduck_core::runtime::{DuckDbSession, SessionManager, StreamingConfig};
+use thunderduck_core::runtime::{DuckDbSession, SessionManager};
 
 // ── session_round_trip ─────────────────────────────────────────────────────────
 
@@ -8,8 +8,7 @@ use thunderduck_core::runtime::{DuckDbSession, SessionManager, StreamingConfig};
 #[tokio::test]
 #[ignore]
 async fn session_round_trip() {
-    let session =
-        DuckDbSession::spawn("test-1", &StreamingConfig::default()).expect("spawn failed");
+    let session = DuckDbSession::spawn("test-1").expect("spawn failed");
 
     // 1. Create a simple view via range().
     session
@@ -51,7 +50,7 @@ async fn session_round_trip() {
 #[tokio::test]
 #[ignore]
 async fn session_manager_isolation() {
-    let mgr = SessionManager::new(StreamingConfig::default());
+    let mgr = SessionManager::new();
 
     let s1 = mgr
         .get_or_create("session-a")
@@ -90,7 +89,7 @@ async fn session_manager_isolation() {
 #[ignore]
 async fn get_or_create_is_race_free() {
     const CONCURRENCY: usize = 8;
-    let mgr = Arc::new(SessionManager::new(StreamingConfig::default()));
+    let mgr = Arc::new(SessionManager::new());
     // Barrier ensures all tasks execute get_or_create at the same instant.
     let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENCY));
 
@@ -126,8 +125,7 @@ async fn get_or_create_is_race_free() {
 #[tokio::test]
 #[ignore]
 async fn check_parquet_types() {
-    let session = DuckDbSession::spawn("parquet-type-check", &StreamingConfig::default())
-        .expect("spawn failed");
+    let session = DuckDbSession::spawn("parquet-type-check").expect("spawn failed");
 
     // Check supplier schema
     let batches = session.execute("DESCRIBE SELECT * FROM read_parquet('/workspace/tests/integration/tpch_sf001/supplier.parquet')").await.expect("failed");

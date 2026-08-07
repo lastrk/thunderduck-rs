@@ -155,11 +155,14 @@ pub enum CommonOp {
     SingleRow,
 
     /// A named table scan (`SELECT * FROM table`).
+    ///
+    /// Carries no alias: `FROM t AS x` normalises to
+    /// `AliasedRelation { TableScan { table }, alias }` in BOTH front-ends
+    /// (INV7 / ADR-004), which is also what Spark does — an alias shadows the
+    /// base table name rather than adding a second binding.
     TableScan {
         /// The table name (as written by the caller).
         table: String,
-        /// Optional alias (e.g. `FROM t AS x`).
-        alias: Option<String>,
     },
 
     /// An in-line `VALUES (...) AS t(col_names)` relation.
@@ -844,7 +847,7 @@ mod tests {
     fn common_op_local_relation_carries_expression_literals() {
         // Anti-SQL anchor (§2.1): LocalRelation rows are Expression::Literal,
         // never raw SQL text.
-        let schema = StructType::single("x", DataType::Integer);
+        let schema = StructType::new(vec![StructField::nullable("x", DataType::Integer)]);
         let row = vec![Expression::Literal(Literal {
             value: LiteralValue::Int(1),
             data_type: DataType::Integer,

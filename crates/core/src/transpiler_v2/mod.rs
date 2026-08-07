@@ -15,7 +15,7 @@
 
 pub mod analyzer;
 #[cfg(test)]
-pub(super) mod analyzer_fixtures;
+mod analyzer_fixtures;
 pub mod ast;
 pub mod base_types;
 pub mod emission;
@@ -133,7 +133,6 @@ mod tests {
         // (`TABLE_OR_VIEW_NOT_FOUND`).
         let plan = CommonAst::new(CommonOp::TableScan {
             table: "no_such_table".to_owned(),
-            alias: None,
         });
         let base_types = BaseTypes::empty();
         let result = generate(&plan, &base_types);
@@ -180,7 +179,6 @@ mod tests {
         let scan = |table: &str| {
             CommonAst::new(CommonOp::TableScan {
                 table: table.to_owned(),
-                alias: None,
             })
         };
         // `dept_id` is present on both sides of the join — unqualified

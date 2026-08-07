@@ -117,7 +117,6 @@ impl UnsupportedKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ThunderduckError;
 
     #[test]
     fn unsupported_op_display() {
@@ -172,20 +171,6 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_proto_shape_composes_into_thunderduck_error() {
-        let e = EmissionError::Unsupported {
-            kind: UnsupportedKind::ProtoShape,
-            name: "arrow_value::Decimal256".to_owned(),
-            reason: "no dispatch arm".to_owned(),
-        };
-        let composed: ThunderduckError = e.into();
-        assert!(matches!(
-            composed,
-            ThunderduckError::TranspilerV2Emission(_)
-        ));
-    }
-
-    #[test]
     fn spark_emulated_display_leads_with_class_token() {
         let e = EmissionError::SparkEmulated {
             class: "AMBIGUOUS_REFERENCE",
@@ -198,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_display_and_composes_into_thunderduck_error() {
+    fn internal_display() {
         let e = EmissionError::Internal {
             message: "join left/right resolved_schema expr_id sets must be disjoint".to_owned(),
         };
@@ -206,27 +191,5 @@ mod tests {
             e.to_string(),
             "τ-internal invariant violation: join left/right resolved_schema expr_id sets must be disjoint"
         );
-        let e = EmissionError::Internal {
-            message: "join left/right resolved_schema expr_id sets must be disjoint".to_owned(),
-        };
-        let composed: ThunderduckError = e.into();
-        assert!(matches!(
-            composed,
-            ThunderduckError::TranspilerV2Emission(_)
-        ));
-    }
-
-    #[test]
-    fn emission_error_from_composes_into_thunderduck_error() {
-        let e = EmissionError::Unsupported {
-            kind: UnsupportedKind::Op,
-            name: "Project".to_owned(),
-            reason: "not seeded".to_owned(),
-        };
-        let composed: ThunderduckError = e.into();
-        assert!(matches!(
-            composed,
-            ThunderduckError::TranspilerV2Emission(_)
-        ));
     }
 }

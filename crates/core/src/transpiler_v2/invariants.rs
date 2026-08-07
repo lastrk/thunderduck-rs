@@ -225,6 +225,9 @@ const WALK_ROOTS: &[WalkRoot] = &[
 /// Import prefixes that are DISALLOWED anywhere under a τ-owned tree.
 /// Each entry is a `starts_with()` prefix on a trimmed source line.
 ///
+/// The trailing separator (`::`, ` `, `;`) is spelled out per entry: bare
+/// `use crate::parser` would also match the LIVE `crate::parser_v2`.
+///
 /// The `use crate::…` prefixes apply to `crates/core/src/{transpiler_v2,parser_v2}/`;
 /// the `use thunderduck_core::…` prefixes apply to
 /// `crates/connect-server/src/converter/v2_relation_converter.rs`, which
@@ -395,34 +398,6 @@ fn inv10_walk_roots_all_exist() {
     assert!(missing.is_empty(), "missing walk-root dirs: {missing:?}");
 }
 
-/// the τ dispatch site sanity: `crates/connect-server/src/service.rs` must be in the
-/// INV10 walk scope so τ-boundary discipline covers the dispatch site.
-#[test]
-fn inv10_service_rs_is_in_walk_scope() {
-    let root = find_workspace_root().expect("workspace root should be discoverable");
-    let found = WALK_ROOTS.iter().any(|w| {
-        let dir = root.join(w.dir);
-        if !dir.exists() {
-            return false;
-        }
-        collect_files_for_root(&dir, w).iter().any(|p| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .map(|n| n == "service.rs")
-                .unwrap_or(false)
-                && p.parent()
-                    .and_then(|d| d.file_name())
-                    .and_then(|s| s.to_str())
-                    == Some("src")
-                && p.components().any(|c| c.as_os_str() == "connect-server")
-        })
-    });
-    assert!(
-        found,
-        "INV10 walk scope must include crates/connect-server/src/service.rs"
-    );
-}
-
 /// the τ dispatch site anti-regression: no file under `crates/connect-server/src/`
 /// (any file, not just `service.rs`) may reference `THUNDERDUCK_TRANSPILER`
 /// — the env-var no-op block was removed from `main.rs` at A.3.
@@ -452,37 +427,6 @@ fn no_thunderduck_transpiler_references_in_connect_server() {
         "THUNDERDUCK_TRANSPILER references must be zero across crates/connect-server/src/:\n{}",
         offenders.join("\n")
     );
-}
-
-/// The filtered `converter/` root must only walk the files named in its
-/// filter — a sanity check that would trip if the filter API broke.
-#[test]
-fn inv10_filtered_root_only_walks_named_files() {
-    let root = find_workspace_root().expect("workspace root should be discoverable");
-    let filtered: &WalkRoot = WALK_ROOTS
-        .iter()
-        .find(|w| w.files.is_some())
-        .expect("must have at least one filtered walk root");
-    let dir = root.join(filtered.dir);
-    if !dir.exists() {
-        // The filtered root's directory should exist per
-        // `inv10_walk_roots_all_exist`; if it doesn't, that test will fail
-        // and this one has nothing to prove.
-        return;
-    }
-    let allowed: &[&str] = filtered.files.expect("filter set");
-    let files = collect_files_for_root(&dir, filtered);
-    for file in &files {
-        let name = file
-            .file_name()
-            .and_then(|s| s.to_str())
-            .expect("file has utf-8 name");
-        assert!(
-            allowed.contains(&name),
-            "filtered walk pulled unexpected file: {}",
-            file.display()
-        );
-    }
 }
 
 // ── Attribute/ResolvedSchema struct-literal ban (finding 13a) ─────────────

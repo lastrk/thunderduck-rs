@@ -149,11 +149,12 @@ pub fn parse_type_str(s: &str) -> DataType {
     thunderduck_core::types::spark_ddl::parse_spark_type_lenient(s)
 }
 
-/// Convert proto struct fields to a `StructType` (used by both `proto_to_data_type` and callers).
+/// Convert proto struct fields to a `StructType` — the nested-struct arm of
+/// [`proto_to_data_type`].
 ///
 /// Total, like [`proto_to_data_type`]: a missing field type maps to
 /// [`DataType::Unresolved`].
-pub fn proto_struct_to_struct_type(s: &proto::data_type::Struct) -> StructType {
+fn proto_struct_to_struct_type(s: &proto::data_type::Struct) -> StructType {
     let fields = s
         .fields
         .iter()

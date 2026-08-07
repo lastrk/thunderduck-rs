@@ -42,13 +42,6 @@ impl StructType {
         Self { fields: vec![] }
     }
 
-    /// Schema whose single column is the given type — convenience for scalars.
-    pub fn single(name: impl Into<std::string::String>, data_type: DataType) -> Self {
-        Self {
-            fields: vec![StructField::nullable(name, data_type)],
-        }
-    }
-
     /// Lookup a field by name (case-insensitive, matches Spark behaviour —
     /// folded via [`super::name_fold::eq_fold`], the same single case-folding
     /// authority `transpiler_v2` uses for user identifiers, so this and the
@@ -70,14 +63,6 @@ impl StructType {
 
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
-    }
-
-    /// Merge two schemas (used for JOIN output: left fields then right fields).
-    /// Duplicate names are kept — callers must qualify with table aliases.
-    pub fn merge(left: &StructType, right: &StructType) -> StructType {
-        let mut fields = left.fields.clone();
-        fields.extend(right.fields.clone());
-        StructType { fields }
     }
 }
 
@@ -122,15 +107,5 @@ mod tests {
         assert!(s.field_by_name("é").is_some());
         // KELVIN SIGN vs plain "k" — from name_fold's DIVERGENCE_TABLE.
         assert!(s.field_by_name("k").is_some());
-    }
-
-    #[test]
-    fn merge() {
-        let left = StructType::new(vec![StructField::nullable("a", DataType::Integer)]);
-        let right = StructType::new(vec![StructField::nullable("b", DataType::String)]);
-        let merged = StructType::merge(&left, &right);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged.fields[0].name, "a");
-        assert_eq!(merged.fields[1].name, "b");
     }
 }

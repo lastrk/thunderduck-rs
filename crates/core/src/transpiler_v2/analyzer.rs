@@ -960,17 +960,31 @@ impl AnalyzerError {
     }
 }
 
-/// ADR-022's two error categories, plus the τ-internal third that is neither.
+/// Which wire shape — and therefore which gRPC status — an [`AnalyzerError`]
+/// takes. Used by [`analyzer_error_to_emission_error`].
 ///
-/// Used by [`analyzer_error_to_emission_error`] to pick the wire shape — and
-/// therefore the gRPC status — for an [`AnalyzerError`].
+/// Maps to ADR-022's categories 1 and 2, plus a τ-internal variant that is
+/// **neither** ADR-022 category (the client did nothing wrong and τ is not
+/// missing a feature — τ broke its own promise).
+///
+/// Note the numbering does not line up with the ADR: ADR-022's Amendment 1
+/// added a *category 3* — "strict rejections", inputs Spark accepts that τ
+/// deliberately rejects as malformed. That is a distinct concept from
+/// [`Self::Internal`] and has **no variant here yet**, because no analyzer
+/// error currently implements it (the sole register entry is rejected at the
+/// parse stage, before this enum is reachable). Add a variant when the first
+/// analyzer-stage strict rejection lands — do not overload `Internal` for it,
+/// which would report a deliberate policy decision as a τ bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
-    /// Spark itself would reject this input → `Status::invalid_argument`.
+    /// ADR-022 category 1 — Spark itself would reject this input →
+    /// `Status::invalid_argument`.
     SparkEmulated,
-    /// τ has not implemented this shape → `Status::unimplemented`.
+    /// ADR-022 category 2 — τ has not implemented this shape →
+    /// `Status::unimplemented`.
     ThunderduckBoundary,
-    /// τ broke its own invariant → `Status::internal`.
+    /// Not an ADR-022 category — τ broke its own invariant →
+    /// `Status::internal`.
     Internal,
 }
 

@@ -102,23 +102,55 @@ instead of inventing a token — it still exits `INVALID_ARGUMENT`, because the
   It is one of Spark's own un-migrated placeholders and will break if Spark
   renames the condition — revisit when the Spark pin moves.
 
-## Open follow-up: A1's twin in the parser layer
+## A1's twin in the parser layer — surveyed, witnessed, NOT fixed
 
 Every `sqlparser` failure becomes
 `EmissionError::Unsupported { kind: ProtoShape, name: "sql::parse_error" }`
-(`parser_v2/mod.rs:56`, `:103`, `v2_lowering.rs:4789`) → gRPC **UNIMPLEMENTED**.
-For SQL that Spark *also* rejects, that is the same miscategorisation A1 just
-fixed one layer up: Spark answers `PARSE_SYNTAX_ERROR` / INVALID_ARGUMENT.
+(`parser_v2/mod.rs:56`, `:103`, `v2_lowering.rs:4789`) → gRPC **UNIMPLEMENTED**
+with no recoverable class. For SQL Spark also rejects, that is exactly the
+miscategorisation A1 fixed one layer up.
 
-It is **not** safe to blanket-map, which is presumably why the current code
-chose `ProtoShape`. A parse failure has two indistinguishable causes:
+The obvious fix — map the category to `PARSE_SYNTAX_ERROR` — is **unsafe**, and
+a 36-case survey against live Spark 4.1.1 proves it rather than assuming it.
+Both sides of the same case list were run: τ via `SparkSqlParserV2`, Spark via
+`spark.sql()`.
 
-1. the SQL is genuinely invalid — Spark rejects it too → `PARSE_SYNTAX_ERROR`;
-2. the SQL is valid Spark that `sqlparser` does not support → an honest τ gap,
-   where UNIMPLEMENTED is correct.
+**Finding 1 — sqlparser rejects things Spark accepts.** Three constructs
+produced `sql::parse_error` from τ while Spark was happy:
 
-Telling them apart needs a positive signal (a grammar-coverage list, or
-consulting Spark), so this stays open rather than being papered over.
+| Construct | τ | Spark 4.1.1 |
+|---|---|---|
+| `SELECT TRANSFORM(id, name) USING 'cat' AS (x, y) FROM emp` | `sql::parse_error` | **ACCEPTED** |
+| `CREATE TABLE t (a INT) USING parquet` | `sql::parse_error` | **ACCEPTED** |
+| `SELECT * FROM emp VERSION AS OF 1` | `sql::parse_error` | `UNSUPPORTED_FEATURE.TIME_TRAVEL` (analysis, not parse) |
+
+Mapping the category wholesale would tell a user "your SQL is invalid" about
+SQL Spark runs — worse than today's error, which at least honestly says
+"not implemented in Thunderduck". The third row is subtler and just as fatal:
+both engines reject, but the correct class is not a parse class at all.
+
+**Finding 2 — even genuinely invalid SQL is often not `PARSE_SYNTAX_ERROR`.**
+Spark's grammar is permissive in places one would not guess:
+
+| Input | Spark's actual answer |
+|---|---|
+| `SELECT FROM emp` | `UNRESOLVED_COLUMN.WITHOUT_SUGGESTION` (parses `FROM` as an alias) |
+| `SELECT * FROM emp WHERE` | **ACCEPTED** (`WHERE` becomes a table alias) |
+| `SELECT id, FROM emp` | `TRAILING_COMMA_IN_SELECT` — its own class |
+| `SELECT id + FROM emp` | `UNRESOLVED_COLUMN.WITHOUT_SUGGESTION`; **τ ACCEPTS it at parse** |
+
+So τ cannot infer the class from "sqlparser failed" in either direction.
+A real fix needs a positive signal — a curated grammar-coverage list, or
+consulting Spark — and that is why this stays open.
+
+**Witnesses.** `parseerr-001..005` pin the five cases where both engines reject
+*and* Spark's class really is `PARSE_SYNTAX_ERROR`; they are what a fix must
+turn green. `parseerr-101` is the guardrail: it must report
+`UNSUPPORTED_FEATURE.TIME_TRAVEL`, so it fails loudly if someone maps the whole
+category. All six are DEFERRED and out of the baseline — born red, staying red
+until the parse layer is addressed. The two "Spark accepts outright" shapes are
+recorded here rather than as cases, because TRANSFORM spawns an external
+process and CREATE TABLE mutates catalog state.
 
 ## Bonus finding — 5 sites where τ was over-strict (all fixed)
 

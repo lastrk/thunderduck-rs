@@ -820,6 +820,38 @@ case("errcls-102", "error_class", "A1 — LATERAL join with NATURAL join", "SELE
 case("errcls-103", "error_class", "A1 — LATERAL join with USING", "SELECT * FROM emp JOIN LATERAL (SELECT 1 AS id) USING (id)", expected_error="UNSUPPORTED_FEATURE.LATERAL_JOIN_USING")
 case("errcls-104", "error_class", "A1 — ragged VALUES rows", "SELECT * FROM VALUES (1, 2), (3) AS t(a, b)", expected_error="INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH")
 
+# ── Parse-error emulation witnesses (A1's twin, one layer up) ───────────────
+# Every sqlparser failure becomes Unsupported{ProtoShape, "sql::parse_error"}
+# -> gRPC UNIMPLEMENTED with no recoverable class, exactly the miscategorisation
+# A1 fixed in the analyzer. These cases MEASURE that gap so any future fix has a
+# fitness gate instead of a guess. All DEFERRED and out of the baseline: they
+# are born red and stay red until the parse layer is addressed.
+#
+# GROUP 1 — both engines reject AND Spark's class is PARSE_SYNTAX_ERROR. These
+# are the cases a fix must turn green. Verified against live Spark 4.1.1.
+case("parseerr-001", "error_class", "DEFERRED — keyword typo (Spark: PARSE_SYNTAX_ERROR)", "SELECT * FRM emp", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-002", "error_class", "DEFERRED — unbalanced paren (Spark: PARSE_SYNTAX_ERROR)", "SELECT (1 FROM emp", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-003", "error_class", "DEFERRED — dangling GROUP BY (Spark: PARSE_SYNTAX_ERROR)", "SELECT * FROM emp GROUP BY", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-004", "error_class", "DEFERRED — unterminated string (Spark: PARSE_SYNTAX_ERROR)", "SELECT 'abc FROM emp", expected_error="PARSE_SYNTAX_ERROR")
+case("parseerr-005", "error_class", "DEFERRED — empty UNPIVOT IN list (Spark: PARSE_SYNTAX_ERROR)", "SELECT * FROM emp UNPIVOT (v FOR k IN ())", expected_error="PARSE_SYNTAX_ERROR")
+#
+# GROUP 2 — the COUNTER-EXAMPLE, and the reason a blanket
+# sql::parse_error -> PARSE_SYNTAX_ERROR mapping is UNSAFE. sqlparser rejects
+# this at parse time, but Spark parses it fine and fails later in ANALYSIS with
+# a completely different class. Mapping the whole sql::parse_error category to
+# PARSE_SYNTAX_ERROR would therefore emit the WRONG class here, replacing one
+# miscategorisation with another. A fix must make this case report
+# UNSUPPORTED_FEATURE.TIME_TRAVEL (or stay UNIMPLEMENTED) — never
+# PARSE_SYNTAX_ERROR. This is the guardrail against over-mapping.
+#
+# The survey also found two shapes Spark ACCEPTS OUTRIGHT while sqlparser
+# rejects them (HiveQL TRANSFORM; CREATE TABLE ... USING parquet) — the same
+# hazard in its starkest form. They are recorded in
+# tasks/tau-error-class-audit-2026-08.md rather than as corpus cases, because
+# TRANSFORM spawns an external process and CREATE TABLE mutates catalog state,
+# neither of which belongs in the corpus.
+case("parseerr-101", "error_class", "DEFERRED counter-example — time travel: τ says sql::parse_error, Spark says UNSUPPORTED_FEATURE.TIME_TRAVEL (must NOT become PARSE_SYNTAX_ERROR)", "SELECT * FROM emp VERSION AS OF 1", expected_error="UNSUPPORTED_FEATURE.TIME_TRAVEL")
+
 
 # ── 19. TPC-H / TPC-DS clusters (migrated from the legacy differential files) ─
 #

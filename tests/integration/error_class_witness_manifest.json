@@ -1,80 +1,99 @@
 {
-  "description": "Witness cases for tasks/tau-error-class-audit-2026-08.md (τ architecture review A1 + C1). A1: Spark-emulated analyzer errors exited as gRPC UNIMPLEMENTED with their Spark class buried in prose, so the oracle's ^\\s*\\[([A-Z][A-Z0-9_.]*)\\] regex could only ever recover error_class=None — these cases were structurally unable to pass an error-class comparison, not merely red. C1: analyze_to_df omitted the source_quals clear its WithColumnsRenamed sibling performs, so τ resolved a qualified reference Spark rejects. Bonus: the audit also found τ rejecting five shapes Spark accepts.",
+  "description": "Witness cases for tasks/tau-error-class-audit-2026-08.md (\u03c4 architecture review A1 + C1). A1: Spark-emulated analyzer errors exited as gRPC UNIMPLEMENTED with their Spark class buried in prose, so the oracle's ^\\s*\\[([A-Z][A-Z0-9_.]*)\\] regex could only ever recover error_class=None \u2014 these cases were structurally unable to pass an error-class comparison, not merely red. C1: analyze_to_df omitted the source_quals clear its WithColumnsRenamed sibling performs, so \u03c4 resolved a qualified reference Spark rejects. Bonus: the audit also found \u03c4 rejecting five shapes Spark accepts.",
   "spark_reference": "Apache Spark 4.1.1, local[1], spark.sql.ansi.enabled=true",
   "class_catalogue": "1244 conditions from error/error-conditions.json in .spark/spark-4.1.1/jars/spark-common-utils_2.13-4.1.1.jar",
-  "reference_side_validated": "2026-08-06 — every expected_error below was OBSERVED via getCondition() against live Spark, and every no-error case was confirmed to return rows. No token in this manifest was inferred from source reading alone.",
+  "reference_side_validated": "2026-08-06 \u2014 every expected_error below was OBSERVED via getCondition() against live Spark, and every no-error case was confirmed to return rows. No token in this manifest was inferred from source reading alone.",
   "witnesses": [
     {
       "case": "errcls-001",
       "corpus": "dataframe",
       "finding": "C1",
-      "pins": "df.select(..).alias('t').toDF('a','b').select('t.a') — the pre-rename qualifier is dead. Spark: UNRESOLVED_COLUMN.WITH_SUGGESTION; τ used to RESOLVE it (leniency divergence).",
-      "born_red_as": "error-parity divergence — Spark raised, τ returned rows"
+      "pins": "df.select(..).alias('t').toDF('a','b').select('t.a') \u2014 the pre-rename qualifier is dead. Spark: UNRESOLVED_COLUMN.WITH_SUGGESTION; \u03c4 used to RESOLVE it (leniency divergence).",
+      "born_red_as": "error-parity divergence \u2014 Spark raised, \u03c4 returned rows"
     },
     {
       "case": "errcls-002",
       "corpus": "dataframe",
       "finding": "A1",
       "pins": "union() arity mismatch now carries NUM_COLUMNS_MISMATCH instead of exiting UNIMPLEMENTED with no recoverable class.",
-      "born_red_as": "error-class divergence — τ raised [None]"
+      "born_red_as": "error-class divergence \u2014 \u03c4 raised [None]"
     },
     {
       "case": "errcls-003",
       "corpus": "dataframe",
       "finding": "A1",
       "pins": "toDF() arity mismatch carries ASSIGNMENT_ARITY_MISMATCH (not a toDF-specific class, which is why it had to be observed).",
-      "born_red_as": "error-class divergence — τ raised [None]"
+      "born_red_as": "error-class divergence \u2014 \u03c4 raised [None]"
     },
     {
       "case": "errcls-004",
       "corpus": "dataframe",
       "finding": "A1-bonus (over-strictness)",
-      "pins": "dropFields('nope') on a struct lacking it is a NO-OP in Spark — struct returned unchanged. τ used to reject, citing UpdateFields.scala::checkInputDataTypes; that reading was wrong.",
-      "born_red_as": "error-parity divergence — τ raised, Spark returned rows"
+      "pins": "dropFields('nope') on a struct lacking it is a NO-OP in Spark \u2014 struct returned unchanged. \u03c4 used to reject, citing UpdateFields.scala::checkInputDataTypes; that reading was wrong.",
+      "born_red_as": "error-parity divergence \u2014 \u03c4 raised, Spark returned rows"
     },
     {
       "case": "errcls-006",
       "corpus": "dataframe",
       "finding": "A1-adjacent (third gap, found while building errcls-004)",
       "deferred": true,
-      "pins": "UNALIASED dropFields projection. Data matches; only the auto-generated column name diverges — Spark names it 'update_fields(s, dropfield())', τ names it 'expr' because pretty_name has no UpdateFields arm. Same family as prettyname-004 (Window arm). errcls-004 carries an explicit alias so the over-strictness fix is tested independently of this.",
-      "born_red_as": "schema mismatch — Column 0 name: Reference='update_fields(s, dropfield())', Test='expr'",
+      "pins": "UNALIASED dropFields projection. Data matches; only the auto-generated column name diverges \u2014 Spark names it 'update_fields(s, dropfield())', \u03c4 names it 'expr' because pretty_name has no UpdateFields arm. Same family as prettyname-004 (Window arm). errcls-004 carries an explicit alias so the over-strictness fix is tested independently of this.",
+      "born_red_as": "schema mismatch \u2014 Column 0 name: Reference='update_fields(s, dropfield())', Test='expr'",
       "not_a_regression": "not in select_block_corpus_baseline.txt; documents a pre-existing pretty_name gap that this change surfaced rather than caused"
     },
     {
       "case": "errcls-005",
       "corpus": "dataframe",
       "finding": "A1-bonus (over-strictness)",
-      "pins": "unpivot variable name colliding with an id column is accepted by Spark, producing a DUPLICATE-named schema (id:bigint, id:string, v:double). Spark rejects ambiguous references, never duplicate names in a schema — τ's guard comment claimed the opposite.",
-      "born_red_as": "error-parity divergence — τ raised, Spark returned rows"
+      "pins": "unpivot variable name colliding with an id column is accepted by Spark, producing a DUPLICATE-named schema (id:bigint, id:string, v:double). Spark rejects ambiguous references, never duplicate names in a schema \u2014 \u03c4's guard comment claimed the opposite.",
+      "born_red_as": "error-parity divergence \u2014 \u03c4 raised, Spark returned rows"
     },
     {
       "case": "errcls-101",
       "corpus": "sql",
       "finding": "A1",
-      "pins": "recursive CTE with UNION (not ALL) → UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE. The only one of the three prose pseudo-classes whose token was correct; it was still unrecoverable because it sat in the message rather than a leading [TOKEN].",
-      "born_red_as": "error-class divergence — τ raised [None]"
+      "pins": "recursive CTE with UNION (not ALL) \u2192 UNION_NOT_SUPPORTED_IN_RECURSIVE_CTE. The only one of the three prose pseudo-classes whose token was correct; it was still unrecoverable because it sat in the message rather than a leading [TOKEN].",
+      "born_red_as": "error-class divergence \u2014 \u03c4 raised [None]"
     },
     {
       "case": "errcls-102",
       "corpus": "sql",
       "finding": "A1",
-      "pins": "LATERAL + NATURAL join → INCOMPATIBLE_JOIN_TYPES. The prose token said UNSUPPORTED_FEATURE, which is WRONG — no UNSUPPORTED_FEATURE subclass for natural joins exists among the 1244 conditions.",
-      "born_red_as": "error-class divergence — τ raised [None]"
+      "pins": "LATERAL + NATURAL join \u2192 INCOMPATIBLE_JOIN_TYPES. The prose token said UNSUPPORTED_FEATURE, which is WRONG \u2014 no UNSUPPORTED_FEATURE subclass for natural joins exists among the 1244 conditions.",
+      "born_red_as": "error-class divergence \u2014 \u03c4 raised [None]"
     },
     {
       "case": "errcls-103",
       "corpus": "sql",
       "finding": "A1",
-      "pins": "LATERAL + USING → the UNSUPPORTED_FEATURE.LATERAL_JOIN_USING SUBCLASS. The prose token carried only the bare base class, so even the 'right' one was incomplete.",
-      "born_red_as": "error-class divergence — τ raised [None]"
+      "pins": "LATERAL + USING \u2192 the UNSUPPORTED_FEATURE.LATERAL_JOIN_USING SUBCLASS. The prose token carried only the bare base class, so even the 'right' one was incomplete.",
+      "born_red_as": "error-class divergence \u2014 \u03c4 raised [None]"
     },
     {
       "case": "errcls-104",
       "corpus": "sql",
       "finding": "A1",
-      "pins": "ragged VALUES rows → INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH.",
-      "born_red_as": "error-class divergence — τ raised [None]"
+      "pins": "ragged VALUES rows \u2192 INVALID_INLINE_TABLE.NUM_COLUMNS_MISMATCH.",
+      "born_red_as": "error-class divergence \u2014 \u03c4 raised [None]"
+    },
+    {
+      "case": "parseerr-001..005",
+      "corpus": "sql",
+      "finding": "A1-twin (parser layer)",
+      "deferred": true,
+      "pins": "The five surveyed cases where BOTH engines reject and Spark's class really is PARSE_SYNTAX_ERROR (keyword typo, unbalanced paren, dangling GROUP BY, unterminated string, empty UNPIVOT IN list). \u03c4 answers gRPC UNIMPLEMENTED with class None. These are what a parse-layer fix must turn green.",
+      "born_red_as": "error-class divergence \u2014 expected [PARSE_SYNTAX_ERROR], \u03c4 raised [None]",
+      "not_a_regression": "not in the baseline; measures a known-open gap"
+    },
+    {
+      "case": "parseerr-101",
+      "corpus": "sql",
+      "finding": "A1-twin GUARDRAIL",
+      "deferred": true,
+      "pins": "SELECT * FROM emp VERSION AS OF 1 \u2014 \u03c4 fails at PARSE (sql::parse_error) but Spark parses it fine and fails in ANALYSIS with UNSUPPORTED_FEATURE.TIME_TRAVEL. Proves a blanket sql::parse_error -> PARSE_SYNTAX_ERROR mapping would emit the WRONG class, swapping one miscategorisation for another. Must fail loudly if anyone maps the category wholesale.",
+      "born_red_as": "error-class divergence \u2014 expected [UNSUPPORTED_FEATURE.TIME_TRAVEL], \u03c4 raised [None]",
+      "not_a_regression": "not in the baseline; guardrail for an open finding"
     }
-  ]
+  ],
+  "parse_layer_survey": "36 cases run against both \u03c4 and live Spark 4.1.1 (2026-08-07). Key counter-examples where sqlparser rejects but Spark ACCEPTS: HiveQL TRANSFORM, and CREATE TABLE ... USING parquet \u2014 recorded in tasks/tau-error-class-audit-2026-08.md rather than as corpus cases (TRANSFORM spawns a process; CREATE TABLE mutates catalog state). Survey also found Spark is permissive where one would not expect: 'SELECT * FROM emp WHERE' is ACCEPTED (WHERE parsed as a table alias), and 'SELECT id, FROM emp' raises TRAILING_COMMA_IN_SELECT rather than PARSE_SYNTAX_ERROR."
 }

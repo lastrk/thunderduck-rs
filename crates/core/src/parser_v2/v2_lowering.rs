@@ -6196,8 +6196,9 @@ mod tests {
     fn parse_aliased_bare_table_yields_aliased_relation() {
         // INV7 (ADR-004): an aliased bare table (`emp e`) lowers to the same
         // node the DataFrame front-end produces for `df.alias("e")` —
-        // `AliasedRelation { input: TableScan { alias: None }, alias: "e" }` —
-        // not the old `TableScan { alias: Some("e") }`.
+        // `AliasedRelation { input: TableScan { table: "emp" }, alias: "e" }`.
+        // Aliases are represented by `AliasedRelation`; `TableScan` has no
+        // `alias` field.
         let plan = parse("SELECT e.id FROM emp e").expect("should parse");
         let scan = expect_aliased(project_input(plan), "e");
         assert!(
@@ -6205,7 +6206,7 @@ mod tests {
                 scan.op,
                 CommonOp::TableScan { ref table } if table == "emp"
             ),
-            "expected TableScan {{ table: emp, alias: None }} under the \
+            "expected TableScan {{ table: \"emp\" }} under the \
              AliasedRelation, got {:?}",
             scan.op
         );

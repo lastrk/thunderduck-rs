@@ -2,17 +2,9 @@
 //! `resolved_schema` view. Data buffers unchanged — this is a metadata-only
 //! swap at the ExecutePlan response boundary.
 //!
-//! Motivation (arr-012, diagnostic pass 88): τ's analyzer records
-//! `Struct<tags, tags>` for `arrays_zip("tags", "tags")` (duplicates legal in
-//! Spark's `StructType`), but DuckDB rejects every duplicate-struct-field
-//! substrate — `CAST(... AS STRUCT("tags" VARCHAR, "tags" VARCHAR))` and
-//! `{tags:'a', tags:'b'}` both raise `Binder Error: Duplicate STRUCT type
-//! argument name`. τ's emission consequently falls back to positional field
-//! names (`struct_pack("0" := …, "1" := …)`) — correct data buffers, but the
-//! resulting Arrow schema disagrees with τ's `resolved_schema`. PySpark's
-//! `createDataFrame(rows, schema)` then invents disambiguated names
-//! (`tags_0`, `tags_1`). The stamp reconciles both views once, at the wire
-//! boundary.
+//! Spark permits duplicate struct names in its logical schema while Arrow wire
+//! schemas require disambiguated names. The stamp reconciles these views at the
+//! response boundary without copying data buffers.
 //!
 //! **Bijection contract.** τ's `resolved_schema` and DuckDB's Arrow schema
 //! MUST have structurally identical shape (same primitives at same tree
@@ -99,9 +91,6 @@ fn rewrite_top_schema(arrow: &Schema, tdck: &TdckStruct) -> Result<Schema, Schem
             arrow: format!("<{} columns>", arrow_fields.len()),
         });
     }
-    // PySpark-parity dedup: `ArrowTableToRowsConversion.convert` looks up
-    // struct field values by `_dedup_names(schema.names)`, so the Arrow-wire
-    // names MUST be dedup'd at every struct level (top-level Schema included).
     let tdck_names: Vec<&str> = tdck.fields.iter().map(|f| f.name.as_str()).collect();
     let wire_names = dedup_names(&tdck_names);
     let mut new_fields: Vec<Arc<Field>> = Vec::with_capacity(arrow_fields.len());
@@ -148,9 +137,6 @@ fn rewrite_data_type(
     tdck: &TdckDt,
 ) -> Result<ArrowDt, SchemaShapeMismatch> {
     match tdck {
-        // Primitives — no structural recursion, preserve Arrow's data type
-        // verbatim (buffer layout must not change). The rename happens on
-        // the enclosing Field (see `rewrite_field`).
         TdckDt::Boolean
         | TdckDt::Byte
         | TdckDt::Short
@@ -166,12 +152,6 @@ fn rewrite_data_type(
         | TdckDt::TimestampNtz
         | TdckDt::Null => Ok(arrow.clone()),
 
-        // ── Interval semantics ───────────────────────────────────────────
-        // The `arrow_interval_transcode` module runs BEFORE the stamp; by
-        // the time we get here, `DayTimeInterval` columns have already been
-        // rewritten to `Duration(Microsecond)`. Non-streaming callers (tests,
-        // future DDL paths) may hand us the pre-transcode `Interval(MonthDayNano)`
-        // shape — accept both to keep those paths working.
         TdckDt::DayTimeInterval => {
             if is_arrow_duration_micros(arrow) || is_arrow_interval_month_day_nano(arrow) {
                 Ok(arrow.clone())
@@ -194,9 +174,6 @@ fn rewrite_data_type(
                 })
             }
         }
-        // YearMonthInterval passes through as `Interval(MonthDayNano)` from
-        // DuckDB; the client re-raises `UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION`
-        // mirroring Spark's reference behavior (intv-002).
         TdckDt::YearMonthInterval => {
             if is_arrow_interval_month_day_nano(arrow) {
                 Ok(arrow.clone())
@@ -209,10 +186,6 @@ fn rewrite_data_type(
             }
         }
 
-        // `Unresolved` should never survive to the response path — the
-        // AnalyzePlan boundary guard at `service.rs` already rejects it. If
-        // we see one here, τ's analyzer skipped a resolution step: treat as
-        // a shape mismatch (soft-fallback in release, panic in debug).
         TdckDt::Unresolved => Err(SchemaShapeMismatch {
             path: path.to_owned(),
             tdck: "Unresolved".to_owned(),
@@ -306,12 +279,6 @@ fn rewrite_data_type(
                         arrow: format!("Struct<{} fields>", arrow_fields.len()),
                     });
                 }
-                // Dedup nested struct field names for wire parity with Spark
-                // (see module doc). PyArrow's `Array.to_pylist()` and
-                // `StructScalar.as_py()` refuse duplicate field names; the
-                // Spark-visible duplicates live only in `df.schema` via
-                // AnalyzePlan, and PySpark's `ArrowTableToRowsConversion`
-                // pairs `_dedup_names(schema.names)` against the wire dict.
                 let tdck_names: Vec<&str> = inner_struct
                     .fields
                     .iter()
@@ -352,12 +319,6 @@ mod tests {
     use arrow::record_batch::{RecordBatch, RecordBatchOptions};
     use thunderduck_core::types::StructField as TdckField;
 
-    /// Test-local stand-in for the retired production batch-stamping wrapper:
-    /// build the stamped schema once from the first batch (via the live
-    /// [`build_stamped_schema`]), then rebuild every batch against it with
-    /// `RecordBatch::try_new_with_options` — exactly the shape the streaming
-    /// path in `service.rs` uses inline. On any failure, fall back to the
-    /// input batches unchanged (the soft-fallback contract the tests pin).
     fn stamp_batch_schemas(
         batches: Vec<RecordBatch>,
         resolved_schema: &TdckStruct,
@@ -402,8 +363,6 @@ mod tests {
         RecordBatch::try_new(schema, vec![column]).expect("test batch construction must succeed")
     }
 
-    // ── 1. Primitive passthrough ────────────────────────────────────────────
-
     #[test]
     fn stamp_primitive_column_is_identity() {
         let arrow_schema = Arc::new(Schema::new(vec![Field::new("x", ArrowDt::Int64, true)]));
@@ -415,7 +374,6 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].schema().as_ref(), arrow_schema.as_ref());
-        // Data preserved.
         let col_out = out[0]
             .column(0)
             .as_any()
@@ -424,11 +382,8 @@ mod tests {
         assert_eq!(col_out.values(), &[1, 2, 3]);
     }
 
-    // ── 2. Struct field rename ──────────────────────────────────────────────
-
     #[test]
     fn stamp_renames_struct_children_from_positional_to_named() {
-        // Arrow: {out: Struct<0: Int64, 1: Int64>} — DuckDB's substrate view.
         let inner_arrow = Fields::from(vec![
             Arc::new(Field::new("0", ArrowDt::Int64, true)),
             Arc::new(Field::new("1", ArrowDt::Int64, true)),
@@ -449,7 +404,6 @@ mod tests {
         .expect("StructArray");
         let input = batch_of(Arc::clone(&arrow_schema), Arc::new(struct_arr));
 
-        // τ: {out: Struct<a: Long, b: Long>} — Spark-visible view.
         let tdck = tdck_struct(vec![(
             "out",
             TdckDt::Struct(tdck_struct(vec![
@@ -471,11 +425,8 @@ mod tests {
         }
     }
 
-    // ── 3. Duplicate struct field names (the arr-012 shape) ─────────────────
-
     #[test]
     fn stamp_supports_duplicate_struct_field_names_arr012_shape() {
-        // Arrow: {z: List<Struct<0: Utf8, 1: Utf8>>} — DuckDB's arrays_zip output.
         let struct_fields = Fields::from(vec![
             Arc::new(Field::new("0", ArrowDt::Utf8, true)),
             Arc::new(Field::new("1", ArrowDt::Utf8, true)),
@@ -487,8 +438,6 @@ mod tests {
         ));
         let arrow_schema = Arc::new(Schema::new(vec![Field::new_list("z", list_inner, true)]));
 
-        // Build a minimal one-row List<Struct> value: outer offset [0, 1],
-        // inner struct with one row of ("a", "b").
         let struct_arr = StructArray::try_new(
             struct_fields,
             vec![
@@ -507,7 +456,6 @@ mod tests {
         let list_arr = ListArray::new(list_field, offsets, Arc::new(struct_arr), None);
         let input = batch_of(Arc::clone(&arrow_schema), Arc::new(list_arr));
 
-        // τ: {z: Array<Struct<tags: String, tags: String>>} — duplicates legal.
         let tdck = tdck_struct(vec![(
             "z",
             TdckDt::Array(
@@ -528,8 +476,6 @@ mod tests {
             ArrowDt::List(inner) => inner.data_type(),
             other => panic!("expected List, got {other:?}"),
         };
-        // Wire names are dedup'd (`tags_0`, `tags_1`) — Spark's Arrow-wire
-        // contract. `df.schema` (from AnalyzePlan) retains the duplicates.
         match inner_dt {
             ArrowDt::Struct(fields) => {
                 assert_eq!(fields[0].name(), "tags_0");
@@ -539,11 +485,8 @@ mod tests {
         }
     }
 
-    // ── 4. Nested List<Struct<List<Struct>>> ────────────────────────────────
-
     #[test]
     fn stamp_recurses_through_nested_list_of_struct_of_list_of_struct() {
-        // Build the innermost Struct<0: Int64> Arrow shape.
         let inner_struct_fields =
             Fields::from(vec![Arc::new(Field::new("0", ArrowDt::Int64, true))]);
         let inner_list_field = Arc::new(Field::new(
@@ -567,9 +510,6 @@ mod tests {
             true,
         )]));
 
-        // Build a minimal single-row nested batch. Innermost struct has one
-        // row {0: 7}; wrap as List(len=1), then Struct{0: List(...)},
-        // then List(len=1).
         let innermost_struct = StructArray::try_new(
             inner_struct_fields,
             vec![Arc::new(Int64Array::from(vec![7])) as ArrayRef],
@@ -598,7 +538,6 @@ mod tests {
         );
         let input = batch_of(Arc::clone(&arrow_schema), Arc::new(outer_list));
 
-        // τ: {root: Array<Struct<mid: Array<Struct<inner: Long>>>>}
         let tdck = tdck_struct(vec![(
             "root",
             TdckDt::Array(
@@ -644,11 +583,8 @@ mod tests {
         }
     }
 
-    // ── 5. Map traversal ────────────────────────────────────────────────────
-
     #[test]
     fn stamp_renames_inside_map_value_struct() {
-        // Arrow: {m: Map<key: Utf8, value: Struct<0: Int64>>}
         let val_struct_fields = Fields::from(vec![Arc::new(Field::new("0", ArrowDt::Int64, true))]);
         let entries_fields = Fields::from(vec![
             Arc::new(Field::new("key", ArrowDt::Utf8, false)),
@@ -669,7 +605,6 @@ mod tests {
             true,
         )]));
 
-        // τ: {m: Map<String, Struct<a: Long>>}
         let tdck = tdck_struct(vec![(
             "m",
             TdckDt::Map {
@@ -680,8 +615,6 @@ mod tests {
             true,
         )]);
 
-        // Only exercise the schema-rewrite path (no data buffer needed here —
-        // the paired data-buffer test lives in test #7).
         let rebuilt = rewrite_top_schema(arrow_schema.as_ref(), &tdck)
             .expect("map schema rewrite must succeed");
         let map_dt = rebuilt.field(0).data_type();
@@ -691,7 +624,6 @@ mod tests {
         };
         match entries {
             ArrowDt::Struct(entry_fields) => {
-                // Arrow key/value wrapper names are preserved by convention.
                 assert_eq!(entry_fields[0].name(), "key");
                 assert_eq!(entry_fields[1].name(), "value");
                 match entry_fields[1].data_type() {
@@ -705,8 +637,6 @@ mod tests {
         }
     }
 
-    // ── 6. Structural mismatch → soft-fallback (Err from rewrite_top_schema) ─
-
     #[test]
     fn rewrite_top_schema_returns_err_on_length_mismatch() {
         let arrow_schema = Schema::new(vec![Field::new("x", ArrowDt::Int64, true)]);
@@ -718,7 +648,6 @@ mod tests {
 
     #[test]
     fn rewrite_top_schema_returns_err_on_compound_vs_primitive() {
-        // τ says Struct at position "out", Arrow has a primitive Int64.
         let arrow_schema = Schema::new(vec![Field::new("out", ArrowDt::Int64, true)]);
         let tdck = tdck_struct(vec![(
             "out",
@@ -735,21 +664,15 @@ mod tests {
         assert!(err.tdck.contains("Struct"));
     }
 
-    /// In debug builds, `stamp_batch_schemas` must trip a `debug_assert!` on
-    /// structural mismatch so τ analyzer bugs surface during `cargo test` —
-    /// pins the loud-fail contract from the architecture plan.
     #[test]
     #[should_panic(expected = "shape mismatch")]
     fn stamp_debug_asserts_on_structural_mismatch() {
         let arrow_schema = Arc::new(Schema::new(vec![Field::new("x", ArrowDt::Int64, true)]));
         let col: ArrayRef = Arc::new(Int64Array::from(vec![1]));
         let input = batch_of(arrow_schema, col);
-        // Extra tdck field vs. Arrow — forces the top-schema length check.
         let tdck = tdck_struct(vec![("x", TdckDt::Long, true), ("y", TdckDt::Long, true)]);
         let _ = stamp_batch_schemas(vec![input], &tdck);
     }
-
-    // ── 7. Data buffer preservation ─────────────────────────────────────────
 
     #[test]
     fn stamp_preserves_data_buffers() {
@@ -757,7 +680,6 @@ mod tests {
         let col: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5]));
         let input = batch_of(Arc::clone(&arrow_schema), Arc::clone(&col));
 
-        // Rename x → renamed_x via τ.
         let tdck = tdck_struct(vec![("renamed_x", TdckDt::Long, true)]);
         let out = stamp_batch_schemas(vec![input.clone()], &tdck);
 
@@ -768,14 +690,11 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("Int64 column preserved");
         assert_eq!(col_out.values(), &[1, 2, 3, 4, 5]);
-        // Buffer identity: the column pointer is the same Arc (no clone-copy).
         assert!(
             Arc::ptr_eq(&col, &out[0].column(0).clone()),
             "stamp must be a metadata-only swap — column Arc identity preserved"
         );
     }
-
-    // ── Empty-input sanity ───────────────────────────────────────────────────
 
     #[test]
     fn stamp_empty_batch_list_is_noop() {
@@ -783,8 +702,6 @@ mod tests {
         let out = stamp_batch_schemas(vec![], &tdck);
         assert!(out.is_empty());
     }
-
-    // ── Interval semantics (intv-001/003/005 substrate) ─────────────────────
 
     /// Post-transcode DayTimeInterval column is `Duration(Microsecond)`; the
     /// stamp must accept it and rename the top-level field only.

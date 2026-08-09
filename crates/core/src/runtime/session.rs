@@ -27,8 +27,6 @@ pub enum StreamBatch {
     Error(String),
 }
 
-// ── Timezone detection ─────────────────────────────────────────────────────────
-
 /// Detect the system local timezone string.
 ///
 /// Resolution order:
@@ -56,8 +54,6 @@ fn detect_timezone() -> String {
     // 3. Fall back to UTC
     "UTC".to_string()
 }
-
-// ── Extension directory & S3 credential chain ─────────────────────────────────
 
 /// Redirect DuckDB's extension install directory when
 /// `THUNDERDUCK_DUCKDB_EXTENSION_DIR` is set.
@@ -123,8 +119,6 @@ fn configure_s3_credential_chain(conn: &duckdb::Connection, enabled: Option<Stri
     tracing::info!("S3 credential_chain configured — AWS credentials resolved automatically");
 }
 
-// ── Channel types ──────────────────────────────────────────────────────────────
-
 pub(crate) enum SessionCommand {
     Execute {
         sql: String,
@@ -189,8 +183,6 @@ pub(crate) enum SessionResult {
     Error(ThunderduckError),
 }
 
-// ── json_strip_nulls UDF ───────────────────────────────────────────────────────
-
 /// DuckDB scalar UDF that drops object keys whose value is JSON `null`,
 /// recursively, matching Spark's `to_json` default
 /// (`SQLConf.JSON_GENERATOR_IGNORE_NULL_FIELDS=true`).
@@ -213,8 +205,8 @@ pub(crate) enum SessionResult {
 ///
 /// Field order is preserved via `serde_json`'s `preserve_order` feature
 /// (backing map is `IndexMap`, not `BTreeMap`), so the output field order
-/// matches DuckDB's `to_json(struct_pack(...))` insertion order — which in
-/// turn matches Spark's struct field order. Pass 89: `json-005`.
+/// matches DuckDB's `to_json(struct_pack(...))` insertion order and Spark's
+/// struct field order.
 struct JsonStripNulls;
 
 impl VScalar for JsonStripNulls {
@@ -282,8 +274,6 @@ pub(crate) fn strip_nulls(v: serde_json::Value) -> serde_json::Value {
         other => other,
     }
 }
-
-// ── DuckDbSession ──────────────────────────────────────────────────────────────
 
 /// An async handle to a DuckDB session running on a dedicated OS thread.
 ///
@@ -370,7 +360,7 @@ impl DuckDbSession {
 CREATE OR REPLACE MACRO get_json_object(j, p) AS json_extract_string(j, p);
 -- json_strip_nulls(j) is registered by the Rust UDF below; see the
 -- `JsonStripNulls` VScalar impl. Spark to_json defaults to
--- ignoreNullFields=true, and DuckDB v1.5.1 has no native equivalent. Pass 89.
+-- ignoreNullFields=true, and DuckDB v1.5.1 has no native equivalent.
 CREATE OR REPLACE MACRO array_remove(arr, elem) AS
     list_filter(arr, x -> x IS DISTINCT FROM elem);
 CREATE OR REPLACE MACRO array_compact(arr) AS
@@ -495,8 +485,7 @@ CREATE OR REPLACE MACRO str_to_map(s, pair_delim, kv_delim) AS
                 // UDF that powers Spark's `to_json` default
                 // (`ignoreNullFields=true`). DuckDB v1.5.1's JSON extension
                 // has no native equivalent; τ wraps every `to_json(x)`
-                // emission with `json_strip_nulls(to_json(x))`. Pass 89:
-                // `json-005`.
+                // emission with `json_strip_nulls(to_json(x))`.
                 if let Err(e) =
                     conn.register_scalar_function::<JsonStripNulls>("json_strip_nulls")
                 {
@@ -855,8 +844,6 @@ impl Drop for DuckDbSession {
     }
 }
 
-// ── Session thread ─────────────────────────────────────────────────────────────
-
 fn session_loop(conn: duckdb::Connection, mut rx: mpsc::Receiver<SessionCommand>) {
     let mut view_schemas: HashMap<String, StructType> = HashMap::new();
 
@@ -1056,8 +1043,8 @@ mod tests {
         conn
     }
 
-    /// Root cause 026: DuckDB promotes `DATE + (n * INTERVAL 1 DAY)` to
-    /// TIMESTAMP. `next_day` must return DATE (Spark parity) — pin both the
+    /// DuckDB promotes `DATE + (n * INTERVAL 1 DAY)` to TIMESTAMP.
+    /// `next_day` must return DATE (Spark parity) — pin both the
     /// result value and its runtime type.
     #[test]
     fn next_day_returns_date_not_timestamp() {
@@ -1148,7 +1135,6 @@ mod tests {
         configure_s3_credential_chain(&conn, None);
     }
 
-    // ── Q3 (interval-transcode plan) — DuckDB's MonthDayNano layout ─────
     //
     // The interval-column Arrow transcoder in `crates/connect-server` maps
     // DuckDB's `Interval(MonthDayNano)` output to Spark's
@@ -1277,8 +1263,6 @@ mod tests {
         configure_s3_credential_chain(&conn, Some("True".into()));
     }
 
-    // ── json_strip_nulls UDF semantics (Pass 89, json-005) ─────────────
-
     use super::strip_nulls;
 
     fn strip_str(s: &str) -> String {
@@ -1330,10 +1314,9 @@ mod tests {
         );
     }
 
-    /// Regression against the earlier regex-based prototype: a string value
-    /// that contains an escaped `"` followed by `:null` MUST NOT be
+    /// A string value containing an escaped `"` followed by `:null` MUST NOT be
     /// corrupted. `serde_json`'s tokenizer treats the escape correctly, so
-    /// the raw string content is preserved intact. Pass 89 review-fix pin.
+    /// the raw string content is preserved intact.
     #[test]
     fn json_strip_nulls_preserves_string_values_with_embedded_quote_and_null_token() {
         // The JSON source literal is `{"raw":"foo\":null,bar","b":1}`. The
@@ -1353,8 +1336,6 @@ mod tests {
         assert_eq!(strip_str(r#""hello""#), r#""hello""#);
         assert_eq!(strip_str("true"), "true");
     }
-
-    // ── SchemaCacheEffect unit tests ────────────────────────────────────
 
     use super::SchemaCacheEffect;
     use crate::types::{DataType, StructField, StructType};

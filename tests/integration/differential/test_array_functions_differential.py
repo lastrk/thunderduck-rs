@@ -263,7 +263,6 @@ class TestArrayFunctionsDifferential:
         spark_df = spark_reference.createDataFrame(data, ["dept", "name"])
         td_df = spark_thunderduck.createDataFrame(data, ["dept", "name"])
 
-        # Create temp views for SQL
         spark_df.createOrReplaceTempView("staff_spark")
         td_df.createOrReplaceTempView("staff_td")
 
@@ -295,7 +294,6 @@ class TestArrayFunctionsDifferential:
             td_names = set(td_row['names'])
             assert spark_names == td_names, f"Names mismatch for dept {spark_row['dept']}: {spark_names} != {td_names}"
 
-        # Cleanup
         spark_reference.catalog.dropTempView("staff_spark")
         spark_thunderduck.catalog.dropTempView("staff_td")
 
@@ -310,7 +308,6 @@ class TestArrayFunctionsDifferential:
         spark_df = spark_reference.createDataFrame(data, ["id", "tags"])
         td_df = spark_thunderduck.createDataFrame(data, ["id", "tags"])
 
-        # Create temp views
         spark_df.createOrReplaceTempView("items_spark")
         td_df.createOrReplaceTempView("items_td")
 
@@ -335,7 +332,6 @@ class TestArrayFunctionsDifferential:
             ignore_nullable=True
         )
 
-        # Cleanup
         spark_reference.catalog.dropTempView("items_spark")
         spark_thunderduck.catalog.dropTempView("items_td")
 

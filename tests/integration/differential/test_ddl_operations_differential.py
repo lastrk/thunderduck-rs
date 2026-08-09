@@ -42,7 +42,6 @@ class TestInsertDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="INSERT single row")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE test_insert_single")
         spark_thunderduck.sql("DROP TABLE test_insert_single")
 
@@ -62,7 +61,6 @@ class TestInsertDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="INSERT multiple rows")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE test_insert_multi")
         spark_thunderduck.sql("DROP TABLE test_insert_multi")
 
@@ -87,7 +85,6 @@ class TestInsertDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="INSERT...SELECT")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE source_diff")
         spark_reference.sql("DROP TABLE target_diff")
         spark_thunderduck.sql("DROP TABLE source_diff")
@@ -109,7 +106,6 @@ class TestInsertDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="INSERT with NULLs")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE test_null_diff")
         spark_thunderduck.sql("DROP TABLE test_null_diff")
 
@@ -138,7 +134,6 @@ class TestInsertDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="Multiple INSERTs + aggregate", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE multi_insert_diff")
         spark_thunderduck.sql("DROP TABLE multi_insert_diff")
 
@@ -158,7 +153,6 @@ class TestDDLDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="CREATE TABLE verification", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE test_create_diff")
         spark_thunderduck.sql("DROP TABLE test_create_diff")
 
@@ -205,7 +199,6 @@ class TestDDLDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="CREATE IF NOT EXISTS", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE test_idempotent_diff")
         spark_thunderduck.sql("DROP TABLE test_idempotent_diff")
 
@@ -259,7 +252,6 @@ class TestDDLDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="TRUNCATE TABLE", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE test_truncate_diff")
         spark_thunderduck.sql("DROP TABLE test_truncate_diff")
 
@@ -277,13 +269,12 @@ class TestDDLDifferential:
         spark_reference.sql("ALTER TABLE test_alter_diff ADD COLUMN name VARCHAR(100)")
         spark_thunderduck.sql("ALTER TABLE test_alter_diff ADD COLUMN name VARCHAR(100)")
 
-        # Query the table (new column should be NULL for existing rows)
+        # The new column should be NULL for existing rows.
         spark_result = spark_reference.sql("SELECT * FROM test_alter_diff ORDER BY id")
         td_result = spark_thunderduck.sql("SELECT * FROM test_alter_diff ORDER BY id")
 
         assert_dataframes_equal(spark_result, td_result, query_name="ALTER TABLE ADD COLUMN")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE test_alter_diff")
         spark_thunderduck.sql("DROP TABLE test_alter_diff")
 
@@ -307,7 +298,6 @@ class TestWorkflowDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="CREATE→INSERT→SELECT workflow")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE workflow_diff")
         spark_thunderduck.sql("DROP TABLE workflow_diff")
 
@@ -376,7 +366,6 @@ class TestErrorHandlingDifferential:
         assert spark_error is not None, "Spark should error on duplicate table"
         assert td_error is not None, "Thunderduck should error on duplicate table"
 
-        # Cleanup
         spark_reference.sql("DROP TABLE test_duplicate_diff")
         spark_thunderduck.sql("DROP TABLE test_duplicate_diff")
 
@@ -403,7 +392,6 @@ class TestErrorHandlingDifferential:
         assert spark_error is not None, "Spark should error on type mismatch"
         assert td_error is not None, "Thunderduck should error on type mismatch"
 
-        # Cleanup
         spark_reference.sql("DROP TABLE test_type_diff")
         spark_thunderduck.sql("DROP TABLE test_type_diff")
 

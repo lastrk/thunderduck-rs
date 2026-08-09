@@ -23,7 +23,6 @@ SPARK_VERSION="4.1.1"
 SPARK_INSTALL_DIR="${SPARK_INSTALL_DIR:-$WORKSPACE_DIR/.spark}"
 SPARK_HOME="$SPARK_INSTALL_DIR/spark-$SPARK_VERSION"
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -38,9 +37,6 @@ echo ""
 # Venv configuration
 VENV_DIR="${THUNDERDUCK_VENV_DIR:-$WORKSPACE_DIR/.venv}"
 
-# ------------------------------------------------------------------------------
-# Step 1: Check Java
-# ------------------------------------------------------------------------------
 echo -e "${BLUE}[1/5] Checking Java...${NC}"
 
 if ! command -v java &> /dev/null; then
@@ -63,9 +59,6 @@ if [ "$JAVA_VERSION" -lt 17 ] 2>/dev/null; then
     echo -e "${YELLOW}  WARNING: Java 17+ recommended, found version $JAVA_VERSION${NC}"
 fi
 
-# ------------------------------------------------------------------------------
-# Step 2: Check Python and pip
-# ------------------------------------------------------------------------------
 echo -e "${BLUE}[2/5] Checking Python and pip...${NC}"
 
 if ! command -v python3 &> /dev/null; then
@@ -89,9 +82,6 @@ fi
 PIP_VERSION=$(python3 -m pip --version 2>/dev/null | awk '{print $2}')
 echo -e "${GREEN}  pip version: $PIP_VERSION${NC}"
 
-# ------------------------------------------------------------------------------
-# Step 3: Create/reuse virtualenv
-# ------------------------------------------------------------------------------
 echo -e "${BLUE}[3/5] Setting up virtualenv at $VENV_DIR...${NC}"
 
 if [ -d "$VENV_DIR" ] && [ -f "$VENV_DIR/bin/python3" ]; then
@@ -102,9 +92,6 @@ else
     echo -e "${GREEN}  Virtualenv created${NC}"
 fi
 
-# ------------------------------------------------------------------------------
-# Step 4: Install Python dependencies into venv
-# ------------------------------------------------------------------------------
 echo -e "${BLUE}[4/5] Installing Python dependencies into venv...${NC}"
 
 REQUIREMENTS_FILE="$WORKSPACE_DIR/tests/integration/requirements.txt"
@@ -127,9 +114,6 @@ if [ -z "$PYSPARK_INSTALLED" ]; then
 fi
 echo -e "${GREEN}  pyspark module version: $PYSPARK_INSTALLED${NC}"
 
-# ------------------------------------------------------------------------------
-# Step 5: Download and Install Apache Spark
-# ------------------------------------------------------------------------------
 echo -e "${BLUE}[5/5] Setting up Apache Spark ${SPARK_VERSION}...${NC}"
 
 if [ -d "$SPARK_HOME" ] && [ -f "$SPARK_HOME/bin/spark-submit" ]; then
@@ -172,10 +156,8 @@ else
     echo -e "${GREEN}  Spark installed at: $SPARK_HOME${NC}"
 fi
 
-# Create symlink for convenience
 ln -sfn "$SPARK_HOME" "$SPARK_INSTALL_DIR/current"
 
-# Verify Spark installation
 if ! "$SPARK_HOME/bin/spark-submit" --version &>/dev/null; then
     echo -e "${RED}ERROR: Spark installation verification failed${NC}"
     exit 1
@@ -183,9 +165,6 @@ fi
 
 echo -e "${GREEN}  Spark version: $("$SPARK_HOME/bin/spark-submit" --version 2>&1 | grep -i version | head -1)${NC}"
 
-# ------------------------------------------------------------------------------
-# Write environment configuration
-# ------------------------------------------------------------------------------
 # Building Thunderduck is the developer's job (`cargo build --release`); this
 # script is environment setup only.
 ENV_FILE="$WORKSPACE_DIR/tests/integration/.env"

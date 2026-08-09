@@ -52,7 +52,6 @@ PORT_MAX = 18999
 WORKTREE_JVM_PROP = "-Dthunderduck.worktree="
 
 
-# ── worktree identity ────────────────────────────────────────────────────────
 
 def worktree_root(cwd: str | os.PathLike | None = None) -> Path:
     """Return the git worktree root (``git rev-parse --show-toplevel``).
@@ -99,7 +98,6 @@ def env_file(root: Path) -> Path:
     return root / ENV_FILENAME
 
 
-# ── port helpers ─────────────────────────────────────────────────────────────
 
 def _is_free(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -165,7 +163,6 @@ def _pid_ppid(pid: int) -> int | None:
         return None
 
 
-# ── ownership proof ──────────────────────────────────────────────────────────
 
 def owns_listener(port: int, root: Path, wid: str) -> tuple[int | None, str | None]:
     """Classify the listener on ``port`` relative to worktree ``root``.
@@ -190,7 +187,6 @@ def owns_listener(port: int, root: Path, wid: str) -> tuple[int | None, str | No
     return pid, None
 
 
-# ── env-file persistence ─────────────────────────────────────────────────────
 
 def read_env(root: Path) -> dict | None:
     path = env_file(root)
@@ -264,7 +260,6 @@ def resolve_ports(root: Path | None = None) -> tuple[int, int]:
     return td, sp
 
 
-# ── cleanup ──────────────────────────────────────────────────────────────────
 
 def _kill(pid: int) -> None:
     """SIGTERM→SIGKILL the process group of ``pid`` (mirrors the managers)."""
@@ -342,7 +337,6 @@ def _fmt_status(root: Path) -> str:
     return "\n".join(lines)
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Per-worktree test server ports & cleanup")

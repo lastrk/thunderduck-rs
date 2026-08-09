@@ -18,7 +18,6 @@
 # Idempotent: safe to re-run. See docs/context/delta-cross-repo-dev-loop.md.
 set -euo pipefail
 
-# ---- config ---------------------------------------------------------------
 KERNEL_FORK="lastrk/delta-kernel-rs"
 KERNEL_UPSTREAM="delta-io/delta-kernel-rs"
 KERNEL_BASE_TAG="v0.21.0"
@@ -30,14 +29,12 @@ DELTA_BASE_BRANCH="v1.5-variegata"
 DUCKDB_ABI_TAG="v1.5.4"        # must match thunderduck's duckdb crate (1.10504.0)
 WORK_BRANCH="thunderduck-delta-dev"
 
-# ---- locate repo root -----------------------------------------------------
 ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 KERNEL_DIR="$ROOT/.delta-kernel-rs"
 DELTA_DIR="$ROOT/.duckdb-delta"
 
 log() { printf '\033[1;34m[delta-setup]\033[0m %s\n' "$*"; }
 
-# ---- 1. delta-kernel-rs ---------------------------------------------------
 if [[ ! -d "$KERNEL_DIR/.git" ]]; then
   log "cloning $KERNEL_FORK -> .delta-kernel-rs"
   gh repo clone "$KERNEL_FORK" "$KERNEL_DIR" -- -q
@@ -55,7 +52,6 @@ else
   git -C "$KERNEL_DIR" checkout -q -b "$WORK_BRANCH" "$KERNEL_BASE_TAG"
 fi
 
-# ---- 2. duckdb-delta ------------------------------------------------------
 if [[ ! -d "$DELTA_DIR/.git" ]]; then
   log "cloning $DELTA_FORK -> .duckdb-delta"
   gh repo clone "$DELTA_FORK" "$DELTA_DIR" -- -q
@@ -73,7 +69,6 @@ else
   git -C "$DELTA_DIR" checkout -q -b "$WORK_BRANCH" "upstream/$DELTA_BASE_BRANCH"
 fi
 
-# ---- 3. submodules + pin duckdb to the ABI tag ----------------------------
 log "init submodule: extension-ci-tools"
 git -C "$DELTA_DIR" submodule update --quiet --init extension-ci-tools
 log "init submodule: duckdb"
@@ -84,7 +79,6 @@ git -C "$DELTA_DIR/duckdb" checkout -q "$DUCKDB_ABI_TAG"
 log "init duckdb's own submodules (recursive)"
 git -C "$DELTA_DIR/duckdb" submodule update --quiet --init --recursive
 
-# ---- 4. patch CMakeLists for the local-kernel override --------------------
 CMAKE="$DELTA_DIR/CMakeLists.txt"
 if grep -q "DELTA_KERNEL_LOCAL_DIR" "$CMAKE"; then
   log "CMakeLists already carries the local-kernel override"
@@ -98,13 +92,13 @@ s = open(p).read()
 OLD_PATH = "${CMAKE_BINARY_DIR}/rust/src/delta_kernel"
 NEW_PATH = "${DELTA_KERNEL_SRC_DIR}"
 
-# 1. Repoint every hardcoded kernel source/target/header path at a variable.
-#    Done BEFORE inserting the default definition so that literal is preserved.
+# Repoint hardcoded kernel source/target/header paths at variables before adding
+# the default definition so that the original literal is preserved.
 if OLD_PATH not in s:
     sys.exit("expected kernel source path not found; upstream CMakeLists changed")
 s = s.replace(OLD_PATH, NEW_PATH)
 
-# 2. Define DELTA_KERNEL_SRC_DIR + git-vs-local args after KERNEL_NAME is set.
+# Define DELTA_KERNEL_SRC_DIR and git-vs-local args after KERNEL_NAME is set.
 anchor = "set(KERNEL_NAME delta_kernel)\n"
 if anchor not in s:
     sys.exit("KERNEL_NAME anchor not found; upstream CMakeLists changed")
@@ -127,7 +121,7 @@ endif()
 '''
 s = s.replace(anchor, block, 1)
 
-# 3. Swap the hardcoded git clone args in ExternalProject_Add for our variables.
+# Swap the hardcoded git clone args in ExternalProject_Add for these variables.
 old_ep = (
     "  ${KERNEL_NAME}\n"
     '  GIT_REPOSITORY "https://github.com/delta-io/delta-kernel-rs"\n'
@@ -147,7 +141,6 @@ print("patched", p)
 PY
 fi
 
-# ---- 5. userspace gcc toolchain (gcc 11 here can't compile the extension) ----
 log "bootstrapping userspace build toolchain"
 "$(dirname "${BASH_SOURCE[0]}")/delta-toolchain-setup.sh"
 

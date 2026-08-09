@@ -1,37 +1,12 @@
-//! τ's emission substrate.
+//! τ's emission substrate. ADR-009/021/022 make this hand-written match
+//! dispatcher the sole production path and assign SQL-substrate ownership to
+//! τ.
 //!
-//! ADR-009 (Approach A hand-written match arms, permanent per Open Decision 7),
-//! ADR-021 (τ owns substrate), ADR-022 (τ is the only path; two error
-//! categories).
+//! **INV3:** this file must not import the deleted v1 modules; see
+//! `inv3_no_forbidden_use_in_emission`.
 //!
-//! **INV3 grep barrier:** no imports from the retired v1 modules
-//! (generator / functions / logical / parser) are permitted inside this
-//! file. The modules were deleted 2026-07-05; the barrier prevents
-//! re-introduction. See `inv3_no_forbidden_use_in_emission` for the check.
-//!
-//! **INV10:** imports only τ-internal modules + `crate::types::{DataType,
-//! StructField, StructType}`.
-//!
-//! # What lives here
-//!
-//! - [`dispatch_op`] — the single top-level operator dispatcher: it renders
-//!   [`build_unit`]'s [`SqlUnit`] once per `Ok`.
-//! - [`build_unit`] — one hand-written match arm per [`TypedOp`] variant.
-//!   Block-composable operators build/merge a `sql_block::SelectBlock`
-//!   (merge when the clause ordinal and alias-visibility preconditions
-//!   hold, wrap under `__td_sub` on slot conflict — see `sql_block.rs`);
-//!   the analyzer's per-node `RelScope` stamp is the scope authority.
-//!   Self-contained generators (Values, FileScan, Pivot, Sample,
-//!   RecursiveCte, …) render via [`legacy_render`] into opaque `Raw` units.
-//! - [`render_expr`] — exhaustive match over the [`Expression`] enum.
-//! - [`render_cast`] — includes the `try_cast` → `TRY_CAST(...)` branch
-//!   (checklist §4.2 first item).
-//! - [`quote_ident`] — `Cow`-returning fast path (§5.6).
-//! - [`spark_return_cast`] (§5.1) — the scalar / projection-slot Spark-parity
-//!   return cast. The aggregate side is NOT a twin helper: decimal `avg`
-//!   carries its own outer cast in [`render_decimal_avg`] (ADR-020) and every
-//!   other aggregate's declared type comes straight from
-//!   `TypeInferenceEngine::aggregate_return_type`.
+//! **INV10:** imports are limited to τ-internal modules and the permitted
+//! `crate::types` definitions.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -54,19 +29,15 @@ use crate::types::pyspark_parity::uniquify;
 use crate::types::{DataType, StructType};
 use crate::{bail_boundary_expr, bail_boundary_fn, bail_boundary_op};
 
-// ── Dispatch (Approach A — hand-written match) ───────────────────────────────
-
 /// Top-level dispatch.
 ///
-/// One hand-written match arm per [`TypedOp`] variant. No table interpreter.
+/// Dispatches every [`TypedOp`] variant through the hand-written match.
 pub fn dispatch_op(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError> {
     build_unit(op, schema).map(|unit| unit.to_sql())
 }
 
-/// Build the [`SqlUnit`] for `op`: an open [`SelectBlock`] for the
-/// block-composable operators, or a `Raw` string from the legacy renderers
-/// for everything not yet converted. This is the per-operator merge/wrap
-/// decision site of the SELECT-block builder (see `sql_block.rs`).
+/// Builds an open [`SelectBlock`] where operators can compose, or an opaque
+/// `Raw` unit for self-contained renderers.
 fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
     match op {
         TypedOp::TableScan { table } => {
@@ -172,9 +143,8 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
             cols,
             replacements,
         } => build_na_replace(input, cols, replacements),
-        // Statement-shaped operators still
-        // render to an opaque `Raw` unit. Named explicitly, not caught by `_`,
-        // so THIS match is where a new `TypedOp` variant is a compile error.
+        // Keep this arm explicit so adding a `TypedOp` variant is a compile
+        // error until its emission path is chosen.
         TypedOp::SingleRow
         | TypedOp::Unpivot { .. }
         | TypedOp::Describe { .. }
@@ -187,14 +157,9 @@ fn build_unit(op: &TypedOp, schema: &Schema) -> Result<SqlUnit, EmissionError> {
     }
 }
 
-/// Fill a SELECT slot list over `input`'s open block: merge when the Select
-/// ordinal is free and `vis` holds, else wrap. Shared by every
-/// projection-shaped operator (WithColumns[Renamed], DropColumns, NaFill,
-/// NaReplace). The `slots` closure receives the PRE-wrap block plus whether
-/// the wrap fallback was taken; a stranded qualifier on a wrapped
-/// expression needs no rewrite here — ADR-023 tier 3e-ii/iii already dropped
-/// it at resolution time — so today only [`build_drop_columns`]'s `* EXCLUDE`
-/// choice reads the flag.
+/// Fill a SELECT slot list, merging into `input` when the block can accept it
+/// and wrapping otherwise. The closure sees the pre-wrap block and whether a
+/// wrap was required.
 fn block_with_projections(
     input: &TypedAst,
     vis: impl FnOnce(&SelectBlock) -> bool,
@@ -210,8 +175,6 @@ fn block_with_projections(
     Ok(block.into())
 }
 
-/// The `TypedOp::Join` fields [`build_join`] consumes (destructured into a
-/// struct to stay within the parameter-count guideline).
 struct JoinParts<'a> {
     left: &'a TypedAst,
     right: &'a TypedAst,
@@ -221,12 +184,7 @@ struct JoinParts<'a> {
     lateral: bool,
 }
 
-/// One join side's per-ordinal alias coverage in the enclosing FROM scope,
-/// from `side.scope.aliases` ∩ `item.exposed()`. Phase 0 (ADR-023 __td_jl/jr
-/// retirement, neutral groundwork): preserves the pre-existing `covering_alias`
-/// algorithm byte-for-byte. Phase 1 will re-source spans from the ITEM TREE
-/// (a `Derived` wrap's own alias covering its range) — a behavior change that
-/// flips `using_parent_with_synthetic_scoped_side_stays_wrapped`, NOT done here.
+/// Alias coverage for a join side's output ordinals in the emitted FROM item.
 struct FromScope<'a> {
     aliases: &'a [(String, std::ops::Range<usize>)],
     exposed: Vec<String>,
@@ -242,8 +200,7 @@ impl<'a> FromScope<'a> {
         }
     }
 
-    /// Exact legacy `covering_alias` semantics (first covering range, gated by
-    /// exposed, NO dup guard). Backs the two neutral accessors.
+    /// Return the first exposed alias whose scope range contains `i`.
     fn covering(&self, i: usize) -> Option<&str> {
         let (name, _) = self.aliases.iter().find(|(_, r)| r.contains(&i))?;
         self.exposed
@@ -252,28 +209,20 @@ impl<'a> FromScope<'a> {
             .then_some(name.as_str())
     }
 
-    /// Phase 3b merge-path binding for ordinal `i` of a bare duplicate
-    /// `name`: the covering alias iff it is the unique aliases-entry for its
-    /// name, uniquely exposed, and `name` is unique within its span.
-    /// Deliberately NOT [`Self::alias_for`]: no single-exposed fast path (an
-    /// internally-dup span must reject), and analyzer-binding uniqueness is
-    /// required, not just exposure.
+    /// Return an alias only when it uniquely binds `name` within its covered
+    /// span. Duplicate aliases or duplicate names are rejected.
     fn unique_binding_alias(&self, i: usize, name: &str, schema: &Schema) -> Option<&str> {
         let (alias, range) = self.aliases.iter().find(|(_, r)| r.contains(&i))?;
-        // (i) `alias` names exactly ONE aliases entry (ci) — homonym-alias
-        // hazard (H8-2): two distinct scope entries sharing the same alias
-        // text make "the" covering alias ambiguous even though `i` itself
-        // falls in only one of their ranges.
+        // Distinct scope entries may share an alias text, making the covering
+        // alias ambiguous even when this ordinal lies in only one range.
         let alias_entries = self
             .aliases
             .iter()
             .filter(|(a, _)| eq_fold(a, alias))
             .count();
-        // (ii) `alias` appears exactly ONCE in the block's exposed FROM
-        // aliases — the merge-visibility counterpart of (i).
+        // The alias must also occur once in the emitted FROM scope.
         let exposed_count = self.exposed.iter().filter(|e| eq_fold(e, alias)).count();
-        // (iii) `name` occurs exactly ONCE within the covering span — an
-        // internally-dup span would leftmost-bind the wrong physical column.
+        // A duplicate name in the span would bind the wrong physical column.
         let within_span = schema.fields[range.clone()]
             .iter()
             .filter(|f| eq_fold(&f.name, name))
@@ -281,20 +230,10 @@ impl<'a> FromScope<'a> {
         (alias_entries == 1 && exposed_count == 1 && within_span == 1).then_some(alias.as_str())
     }
 
-    /// Canonical per-ordinal accessor: unambiguous exposed alias for `i`, else
-    /// None (uncovered OR covering alias exposed >1). Phase 2 (ADR-023
-    /// `__td_jl`/`__td_jr` retirement) entry point: backs
-    /// [`requalify_join_condition`]'s per-ordinal target lookup.
+    /// Return the unambiguous exposed alias for ordinal `i`.
     fn alias_for(&self, i: usize) -> Option<&str> {
-        // Single-exposed fast path (NARROW upgrade — checked before the
-        // covering-span lookup, which never sees a fresh/synthetic wrap
-        // alias absent from the analyzer's logical `scope.aliases`): a lone
-        // exposed item (a `Derived` wrap, including a synthetic/fresh wrap)
-        // is addressable only by that one alias covering its WHOLE width —
-        // so any in-bounds ordinal binds through it unambiguously, with no
-        // span lookup needed. Multi-exposed items keep the exact legacy
-        // per-ordinal-span lookup below; `covers_all`/`slot_quals` and the
-        // item-tree itself are untouched by this fast path.
+        // A single exposed item covers its full width, including synthetic
+        // wraps whose alias is absent from the analyzer's logical scope.
         if let [only] = self.exposed.as_slice() {
             return (i < self.width).then_some(only.as_str());
         }
@@ -302,12 +241,10 @@ impl<'a> FromScope<'a> {
         (self.exposed.iter().filter(|e| eq_fold(e, name)).count() == 1).then_some(name)
     }
 
-    /// Replaces `scope_covers_fields`.
     fn covers_all(&self) -> bool {
         (0..self.width).all(|i| self.covering(i).is_some())
     }
 
-    /// Replaces `side_slot_quals`: single-exposed fast path, else per-field covering.
     fn slot_quals(&self) -> Option<Vec<String>> {
         if let [only] = self.exposed.as_slice() {
             return Some(vec![only.clone(); self.width]);
@@ -318,20 +255,9 @@ impl<'a> FromScope<'a> {
     }
 }
 
-/// Whether `fields` (a `(name, qualifier)` sequence — one entry per hoisted
-/// slot a join side would contribute) contains two entries that resolve to
-/// the SAME qualified reference (`qualifier.name`, case-insensitive) — e.g.
-/// a single-alias synthetic wrap over `emp JOIN emp2`, where both sides' `id`
-/// end up qualified by the same `__td_jl` and the hoisted list would emit
-/// `__td_jl.id` twice, silently dropping the second column's data (join-022
-/// round-1). A multi-alias inlined side (F5) never collides this way even
-/// when the raw schema repeats a name: each same-named field carries its OWN
-/// covering alias (`e.dept_id` vs `d.dept_id`), so the qualified references
-/// stay distinct. [`build_join`]'s Change 3 guard uses this — keyed on the
-/// qualified pair, not the raw name alone, and over only the NON-USING-key
-/// fields (the ones a side actually contributes a qualified slot for) — to
-/// decide whether a USING join over a duplicate-name side is genuinely
-/// unsafe to hoist.
+/// Whether two hoisted fields resolve to the same qualified reference. A
+/// duplicate would bind the first physical column twice and silently lose
+/// data, so USING joins reject that shape instead of hoisting it.
 fn has_unsafe_qualified_duplicate<'a>(
     mut fields: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> bool {
@@ -339,22 +265,10 @@ fn has_unsafe_qualified_duplicate<'a>(
     fields.any(|(name, qual)| !seen.insert((fold_key(qual), fold_key(name))))
 }
 
-/// True iff any USING-key name in `using` matches **two or more** fields in
-/// `schema` (case-insensitive) — a duplicated USING-key name anywhere in an
-/// otherwise-inlinable join side's FLATTENED output (`schema` is that side's
-/// full `resolved_schema`, so this catches a dup key nested arbitrarily deep,
-/// not just in a direct child).
-///
-/// Verified live against DuckDB 1.5.0 (ADR-023 Phase 2.1 probe): a flat
-/// chain — `emp INNER JOIN dept ON (emp.dept_id) = (dept.dept_id) INNER JOIN
-/// emp2 USING (dept_id)` — Binder-errors ("Ambiguous reference `dept_id`")
-/// even with real user aliases present, because the key resolves across TWO
-/// SIBLING FROM bindings in one flat scope; the SAME key is fine resolved
-/// INSIDE a single wrapped input (`(SELECT * FROM emp JOIN dept ON …) AS
-/// __td_jl INNER JOIN emp2 USING (dept_id)` prepares OK). The guard is
-/// key-specific — a USING key that is unique in the nested side (e.g. `id`)
-/// still inlines — so it only trips the flat-chain hazard, never a false
-/// positive on an unambiguous key.
+/// Whether a USING key is duplicated in the flattened side schema. Flattening
+/// such a side into a parent USING join makes DuckDB resolve the key across
+/// sibling FROM bindings and report an ambiguous reference; wrapping it keeps
+/// the key in its own scope.
 fn using_key_duplicated(schema: &Schema, using: &[String]) -> bool {
     using.iter().any(|key| {
         schema
@@ -366,56 +280,29 @@ fn using_key_duplicated(schema: &Schema, using: &[String]) -> bool {
     })
 }
 
-/// The result of a failed [`requalify_join_condition`] rewrite: which
-/// side(s) need a fresh alias before the condition can bind unambiguously.
-/// Never both-`false` — that outcome is `Ok`, not `Err`.
+/// Sides that need a fresh alias before a join condition can bind.
 #[derive(Debug, Default)]
 struct SideNeedsAlias {
     left: bool,
     right: bool,
 }
 
-/// [`requalify_join_condition`]'s outcome: either the rewritten condition, or
-/// the identity-flagged side(s) that need a fresh alias before
-/// [`build_join`]'s bounded fixpoint retries.
+/// Result of requalifying a join condition, including sides needing aliases.
 enum RequalifyOutcome {
     Rewritten(Expression),
     NeedsAlias(SideNeedsAlias),
 }
 
-/// Rewrite every join-CONDITION [`ColumnReference`] to the qualifier the
-/// EMITTED sides make true, resolved BY IDENTITY from the reference's
-/// resolver-stamped `expr_id` (N10-lite stage 2; supersedes the
-/// ordinal-keyed ADR-023 Phase 2/3b rewrite, `__td_jl`/`__td_jr` retirement
-/// for condition references): a name unique in `cond_schema` binds bare
-/// (`qualifier = None`); an ambiguous one binds through
-/// [`FromScope::alias_for`] against whichever side the id-resolved slot
-/// falls in. Phase 3b: the analyzer never stamps a synthetic
-/// `__td_jl`/`__td_jr` qualifier anymore (every plan_id-scoped ref resolves
-/// bare+id), so the id-resolved slot's side (`k < left_len`) is the ONLY
-/// signal this rewrite ever consults. Sound only because a join's left and
-/// right sides can never share an `expr_id` — see the disjointness pin
-/// (`self_join_left_right_resolved_schema_ids_are_disjoint`,
-/// `analyzer.rs`) and the always-on invariant check below.
+/// Rewrite ambiguous join-condition references to aliases exposed by the
+/// emitted sides. Identity (`expr_id`) selects the side; unique names remain
+/// bare. The side split is sound only because left and right schemas have
+/// disjoint expression IDs, checked below.
 ///
-/// Left untouched: a reference whose `expr_id` is `None` (deferred
-/// resolution — see [`super::expression::ColumnReference::expr_id`]'s doc
-/// for the analyzer paths that still leave it unstamped) or `Some` but
-/// absent from `cond_schema` (D2: a correlated outer reference's id lives in
-/// the enclosing plan's schema, never this join's — a loud DuckDB binder
-/// error surfaces instead of a silent wrong-column rewrite), and one
-/// carrying a real, non-synthetic user-alias qualifier (already binds —
-/// e.g. `e.dept_id`).
+/// Deferred or correlated references, and references carrying a real user
+/// alias, are left untouched.
 ///
-/// Returns the rewritten [`Expression`] tree (clone-then-walk via
-/// [`Expression::map_children`], the same fallible-fold primitive the
-/// analyzer's own expression walkers use — see `reproject_qualifiers`)
-/// wrapped in [`RequalifyOutcome::Rewritten`], or
-/// [`RequalifyOutcome::NeedsAlias`] when a demanded ambiguous id-resolved
-/// slot has no unambiguous covering alias on its side ([`build_join`]'s
-/// fixpoint then wraps the flagged side(s) under a fresh alias and
-/// retries). `Err(EmissionError::Internal)` if the left/right disjointness
-/// invariant below is violated.
+/// Returns the rewritten tree, or the sides that must be wrapped under a
+/// fresh alias. An expression-ID overlap is an internal error.
 fn requalify_join_condition(
     cond: &Expression,
     left: &TypedAst,
@@ -427,18 +314,8 @@ fn requalify_join_condition(
     let left_len = left.resolved_schema.len();
     let left_scope = FromScope::of(left, left_item);
     let right_scope = FromScope::of(right, right_item);
-    // N10-lite stage 2 disjointness guard: `requalify_column_ref`'s
-    // `k < left_len` side split is keyed off `expr_id`, so it is sound only
-    // if the two sides' id sets never intersect — mechanically pinned by
-    // `self_join_left_right_resolved_schema_ids_are_disjoint` (analyzer.rs).
-    // ALWAYS-ON (review finding 5, v2-review-findings-2026-07-13.md): a
-    // `debug_assert!` here would compile out of the release builds the
-    // server/harness actually run, and the failure mode on violation is not
-    // a loud crash but SILENTLY WRONG SQL (a condition reference rewritten
-    // to the wrong side) — a future plan-cloning optimization is the
-    // concrete hazard. The nested-any check is O(|left|·|right|) id
-    // compares, run up to twice per join under the NeedsAlias fixpoint —
-    // hundreds of u64 compares at TPC-DS widths, cheap enough for release.
+    // Keep this check enabled in release builds: an ID overlap would rewrite
+    // a condition to the wrong side and silently produce incorrect SQL.
     if left.resolved_schema.fields.iter().any(|lf| {
         right
             .resolved_schema
@@ -466,13 +343,8 @@ fn requalify_join_condition(
     }
 }
 
-/// Structural recursion for [`requalify_join_condition`]: rewrite an
-/// immediate [`Expression::ColumnReference`], else recurse into children
-/// (subquery bodies excluded per τ's walker convention — see
-/// [`Expression::map_children`]/`expression_children!`). Infallible:
-/// failures are recorded into `needs` rather than short-circuiting the
-/// walk, so a single pass can flag BOTH sides at once (the `<=2`-pass
-/// fixpoint bound in [`build_join`] depends on this).
+/// Rewrite column references recursively, recording both sides needing an
+/// alias rather than stopping at the first one.
 fn requalify_expr(
     expr: Expression,
     cond_schema: &Schema,
@@ -508,20 +380,8 @@ fn requalify_expr(
     }
 }
 
-/// The rewrite predicate (H8 boundary), N10-lite stage 2: `c.qualifier`
-/// must be `None` with `c.name` ambiguous (count `>= 2`) in `cond_schema`
-/// AND `c.expr_id` must name a field actually present in `cond_schema` (at
-/// position `k`) — otherwise `c` is left untouched (unstamped/deferred, a
-/// correlated outer reference's id absent from `cond_schema` (D2), or a real
-/// alias that already binds). Phase 3b: the analyzer never stamps a
-/// synthetic `__td_jl`/`__td_jr` qualifier anymore, so this is the only
-/// shape a rewritable reference can take.
-///
-/// This gate is byte-for-byte [`bare_dup_slot`]'s gate (same four checks —
-/// qualifier-none, name-count `>= 2`, id lookup, name-agreement assert —
-/// just evaluated in a different order, which does not change the result
-/// for a pure conjunction of side-effect-free checks), so it is folded into
-/// a direct call rather than re-hand-rolled here.
+/// Return the schema position of a bare, ambiguous reference whose
+/// expression ID is present; all other references remain unchanged.
 fn requalify_column_ref(
     c: &mut ColumnReference,
     cond_schema: &Schema,
@@ -536,9 +396,7 @@ fn requalify_column_ref(
     let is_left = k < left_len;
     let local = if is_left { k } else { k - left_len };
     let scope = if is_left { left_scope } else { right_scope };
-    // H8 assert 3: the local index must be in-bounds for its own side —
-    // guards the exact `alias_for`/`i < width` boundary the single-exposed
-    // fast path relies on.
+    // The side-local index must remain within the exposed side's width.
     debug_assert!(
         local < scope.width,
         "local index {local} out of bounds for side width {}",
@@ -551,31 +409,11 @@ fn requalify_column_ref(
     }
 }
 
-/// Lower one join side to a [`FromItem`]. Ladder:
-///
-/// 1. The side's unit is a pure-FROM block → inline its `FromItem` directly,
-///    keeping user aliases / table names visible (subsumes the old
-///    user-alias hoist, bare-TableScan hoist, and left-spine chain flatten).
-///    Guarded: a nested `Join` item inlines only on the left side, and only
-///    when the nested join itself is a plain ON/CROSS join (CLAUDE.md
-///    gotcha 4 — never fold across semi/anti; lateral correlation must stay
-///    isolated). Under a non-USING parent this is unconditional; under a
-///    USING parent (F5, widened by Phase 2.1) it additionally requires
-///    [`FromScope::covers_all`] to hold for the nested side AND no parent
-///    USING-key name to be duplicated in it ([`using_key_duplicated`] — a
-///    live-DuckDB-validated guard: a duplicated USING-key name resolves fine
-///    INSIDE the nested side's own wrap, but a flat chain binding it across
-///    two sibling FROM bindings in one scope is a DuckDB Binder Error) — the
-///    USING parent's own hoisted-slot qualifiers must be derivable per field
-///    from an alias the nested join's emitted `FromItem` actually exposes,
-///    or the side stays wrapped under its synthetic alias instead (see
-///    [`FromScope::slot_quals`]). `Raw` FROM bodies (lateral-view chains)
-///    never inline.
-/// 2. Otherwise → `(side) AS __td_jl/__td_jr`.
-///
-/// The duplicate-alias guard runs in [`build_join`] across BOTH lowered
-/// sides (DuckDB rejects `Duplicate alias` in one FROM scope; Spark permits
-/// it) — on collision the offending side falls back to its synthetic wrap.
+/// Lower a join side to a FROM item. Plain FROM blocks may be inlined, but
+/// nested semi/anti joins and lateral bodies stay wrapped. A USING parent
+/// additionally requires complete alias coverage and unique USING keys;
+/// otherwise DuckDB can bind a key across sibling FROM items ambiguously.
+/// Duplicate aliases are handled by [`apply_duplicate_alias_guard`].
 fn build_join_side(
     side: &TypedAst,
     synthetic_alias: &str,
@@ -593,10 +431,8 @@ fn build_join_side(
             })
         }
     };
-    // Peek eligibility on the block's FROM item BEFORE consuming it — a
-    // block that does not inline still needs its defaults intact for the
-    // wrap path below (F2: the former `SelectBlock::from_item(item)` rebuild
-    // silently discarded the join builder's hoisted slot list).
+    // Inspect eligibility before consuming the block so the wrap path keeps
+    // its default projections.
     let inline_ok = block.pure_from()
         && match block.from_ref() {
             FromItem::Relation { .. } | FromItem::Derived { .. } => true,
@@ -623,8 +459,8 @@ fn build_join_side(
             FromItem::Raw { .. } => false,
         };
     if inline_ok {
-        // `pure_from()` above already established this cannot fail; the Err
-        // arm is a defensive fallback, never a panic path.
+        // Preserve a derived wrapper if the block changes between the
+        // eligibility check and extraction.
         match block.into_pure_from() {
             Ok(item) => Ok(item),
             Err(block) => Ok(FromItem::Derived {
@@ -640,12 +476,8 @@ fn build_join_side(
     }
 }
 
-/// Duplicate-alias guard (unconditional — runs every fixpoint pass in
-/// [`build_join`], including a no-condition CROSS self-join): DuckDB rejects
-/// two `AS x` in one FROM scope, though Spark permits it. If the two lowered
-/// sides expose a common name (case-insensitive), the RIGHT side — always
-/// movable — is rewrapped under the first fresh name in its own `__td_jr`
-/// sequence the LEFT side does not expose (see [`fresh_alias_wrap`]).
+/// Rewrap the right side when both join inputs expose the same alias. DuckDB
+/// rejects duplicate aliases in one FROM scope, although Spark permits them.
 fn apply_duplicate_alias_guard(left_item: FromItem, right_item: FromItem) -> (FromItem, FromItem) {
     let left_names = left_item.exposed();
     let collides = right_item
@@ -659,17 +491,14 @@ fn apply_duplicate_alias_guard(left_item: FromItem, right_item: FromItem) -> (Fr
     (left_item, right_item)
 }
 
-/// Rewrap `item` as `(item) AS <fresh>`, where `<fresh>` is the first name
-/// in the sequence `base`, `base_2`, `base_3`, … (`base` = `__td_jl` or
-/// `__td_jr`) that `other_exposed` does not contain (case-insensitive) — the
-/// shared fresh-alias rewrap both [`apply_duplicate_alias_guard`] and a
-/// [`SideNeedsAlias`] retry in [`build_join`] use.
+/// Wrap `item` under the first unused alias in the `base`, `base_2`, …
+/// sequence.
 fn fresh_alias_wrap(item: FromItem, base: &str, other_exposed: &[String]) -> FromItem {
     let alias = std::iter::once(base.to_owned())
         .chain((2..=64).map(|n| format!("{base}_{n}")))
         .find(|cand| !other_exposed.iter().any(|o| eq_fold(o, cand)))
-        // Defensive fallback — never observed; avoids an unbounded loop /
-        // `unwrap` if all 64 candidates collide.
+        // Keep the candidate search bounded even if every generated alias is
+        // occupied.
         .unwrap_or_else(|| format!("{base}_64"));
     FromItem::Derived {
         unit: Box::new(SqlUnit::from(SelectBlock::from_item(item))),
@@ -692,25 +521,12 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
     let mut left_item = build_join_side(left, TD_JOIN_LEFT, true, using_columns)?;
     let mut right_item = build_join_side(right, TD_JOIN_RIGHT, false, using_columns)?;
 
-    // Condition types resolve against the concatenated side schemas (the
-    // analyzer stamped every reference; the schema feeds type lookups only).
-    // Computed ONCE, before the fixpoint below: a fresh wrap changes WHERE a
-    // side's fields are addressable FROM, never their ordinal position in
-    // this merged schema.
+    // Wrapping changes FROM visibility, not the ordinal schema used to
+    // resolve condition types.
     let cond_schema = Schema::merge(&left.resolved_schema, &right.resolved_schema);
 
-    // Bounded fixpoint (ADR-023 Phase 2, `<=2` passes, H8 assert 4): the
-    // duplicate-alias guard runs unconditionally every pass (DuckDB rejects
-    // two `AS x` in one FROM scope; Spark permits it — this also covers a
-    // no-condition CROSS self-join, where the requalifier below never runs).
-    // When an ON condition is present, `requalify_join_condition` then
-    // rewrites it to each emitted side's real alias, wrapping the flagged
-    // side(s) under a fresh alias and retrying on failure. A fresh wrap
-    // makes a side single-exposed, which `FromScope::alias_for`'s fast path
-    // covers unconditionally, so a wrapped side is never re-flagged —
-    // termination is guaranteed well inside the bound; the assert below is
-    // the review-time safety net documenting it, not a load-bearing runtime
-    // guard (release builds skip it, per Rust convention).
+    // Guard aliases on every pass, then requalify ON references. A fresh wrap
+    // exposes one alias for the side, so the bounded fixpoint terminates.
     let mut pass = 0usize;
     let rewritten_condition = loop {
         debug_assert!(
@@ -741,48 +557,17 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
     let condition_for_clause = rewritten_condition.as_ref().or(condition);
     let clause = render_join_clause(join_type, condition_for_clause, using_columns, &cond_schema)?;
 
-    // Hoisted slot list mirroring the analyzer's output-schema order (USING
-    // cols first, then left non-USING, then right non-USING; right side
-    // suppressed for semi/anti).
+    // USING joins need explicit slots in the analyzer's key-first order;
+    // other joins can rely on DuckDB's positional `*` expansion.
     let need_right = !is_semi_or_anti;
     let default_slots = if using_columns.is_empty() {
-        // Non-USING joins NEVER build a default slot list (F7 round 2,
-        // Change 2). DuckDB expands bare `SELECT *` over a plain
-        // ON/CROSS/semi/anti join left-then-right in natural order — exactly
-        // the analyzer's resolved-schema order — so a hoisted list adds
-        // nothing here. Worse, a single-alias side over a DUPLICATE-name
-        // schema (e.g. an inlined `emp JOIN emp2` wrapped as one `__td_jl` /
-        // `__td_jr`, per [`build_join_side`]'s ladder) made the OLD
-        // name-based slot list emit e.g. `__td_jl.id` twice, double-binding
-        // the first `id` — silent corruption (join-022 round-1 residual).
-        // `*` is positional and never double-binds. The hoisted list stays a
-        // USING-only device below: it alone enforces Spark's key-first
-        // output order, which DuckDB's `*` breaks for USING joins.
+        // DuckDB's positional expansion matches the analyzer for non-USING
+        // joins. Name-based hoisting could bind duplicate columns twice.
         None
     } else {
-        // USING joins (F5): per-field qualifiers from the RelScope stamp,
-        // rather than a single alias per side — this is what lets a
-        // multi-alias inlined nested-join side (change 2's
-        // `FromScope::covers_all` gate) hoist its slots under a USING parent
-        // instead of staying buried under a synthetic wrap alias. Honestly
-        // stated (fix round 1): `FromScope::slot_quals` requires every covering
-        // RelScope alias to ALSO be one `left_item`/`right_item` actually
-        // exposes — a covering alias RelScope reports but the emitted item
-        // does not expose (e.g. a nested-join side whose own children are
-        // synthetic-wrapped, rendering under `__td_jl`/`__td_jr` instead of
-        // their logical aliases) does not count. `build_join_side`'s
-        // `inline_ok` gates on that SAME exposure-aware
-        // `FromScope::of(side, &item).covers_all()` predicate, against the SAME
-        // item, before ever inlining a multi-alias side under a USING
-        // parent — so `FromScope::of(left, &left_item).slot_quals()` is guaranteed
-        // `Some` for every inlined multi-alias left side by construction.
-        // The right side is never inlined under USING
-        // (`may_inline_nested_join` is always `false` for it in
-        // `build_join_side`), so it stays single-alias and hits the
-        // `item.exposed()` fast path in `FromScope::slot_quals` unconditionally.
-        // If either is ever `None` here regardless, fall back to bare `*`
-        // rather than panic — this function only consumes that guarantee,
-        // it does not reprove it locally.
+        // USING slots use each field's exposed qualifier. Inlining is guarded
+        // by the same coverage check in `build_join_side`; if the guarantee
+        // ever fails, bare `*` is a safe fallback.
         let left_quals = FromScope::of(left, &left_item).slot_quals();
         let right_quals = if need_right {
             FromScope::of(right, &right_item).slot_quals()
@@ -790,13 +575,8 @@ fn build_join(parts: JoinParts<'_>) -> Result<SqlUnit, EmissionError> {
             None
         };
         let using_lower: HashSet<String> = using_columns.iter().map(|s| fold_key(s)).collect();
-        // Change 3 (F7 round 2): a USING join over a side whose non-USING-key
-        // fields would collide under the SAME qualified reference (see
-        // [`has_unsafe_qualified_duplicate`]) can build neither a safe
-        // per-field-qualified slot list (double-binds the duplicate) NOR
-        // bare `*` (breaks USING's key-first output order) — an honest
-        // Thunderduck-boundary error (ADR-022) is the correct interim. No
-        // baseline-green corpus case exercises this shape.
+        // Neither qualified slots nor bare `*` is safe when a non-USING field
+        // would bind the same qualified reference twice.
         let side_unsafe = |schema: &Schema, quals: &[String]| {
             has_unsafe_qualified_duplicate(
                 schema
@@ -879,9 +659,7 @@ fn build_aggregate(
     having: Option<&Expression>,
 ) -> Result<SqlUnit, EmissionError> {
     use super::ast::GroupingKind;
-    // The SparkSQL front-end populates `grouping_sets` with per-set membership
-    // (indices into `grouping`). The DataFrame `groupingSets` path leaves it
-    // empty, so it stays a Thunderduck-boundary error (ADR-022).
+    // SQL input supplies grouping-set membership; the DataFrame path does not.
     if matches!(grouping_kind, GroupingKind::GroupingSets) && grouping_sets.is_empty() {
         bail_boundary_op!(
             "Aggregate[GroupingSets]",
@@ -889,26 +667,18 @@ fn build_aggregate(
         );
     }
     let input_schema = &input.resolved_schema;
-    // Rewrite any no-arg `grouping_id()`/`grouping()` calls to pass the
-    // grouping columns explicitly — DuckDB has no zero-arg form. Splice
-    // against the ORIGINAL `grouping`; the wrap-path reprojection below
-    // then walks into the spliced args the same way it walks the flat
-    // GROUP BY list, so the two stay textually consistent regardless of
-    // splice-then-reproject vs reproject-then-splice ordering.
+    // DuckDB has no zero-argument grouping functions, so splice the original
+    // grouping expressions into those calls before any reprojection.
     let rewritten_aggregates: Vec<Expression> = aggregates
         .iter()
         .map(|a| with_grouping_id_spliced(a, grouping))
         .collect();
-    // Splice BEFORE the merge decision (not just before rendering) — the
-    // fused merge-path rewrite below must see the SAME having expression the
-    // render path later uses, so a bare duplicate-name ordinal inside a
-    // spliced `grouping_id()` call is visible to the rewrite too.
+    // Splice before the merge decision so duplicate-name references in the
+    // generated arguments participate in visibility rewriting.
     let having_spliced: Option<Expression> = having.map(|h| with_grouping_id_spliced(h, grouping));
 
-    // Open the child block and decide merge-vs-wrap BEFORE rendering — the
-    // fused visibility+rewrite check must run over the ORIGINAL (pre-wrap)
-    // expressions against the pre-wrap block, exactly like
-    // `build_filter`/`build_sort`.
+    // Decide merge versus wrap before rendering so visibility checks inspect
+    // the original expressions and FROM scope.
     let mut block = open_block(input)?;
     let merge_set: Option<Vec<Expression>> = block
         .can_accept(Clause::GroupBy)
@@ -925,18 +695,11 @@ fn build_aggregate(
         .flatten();
     let merge = merge_set.is_some();
 
-    // ADR-023 tier 2: activate the wrap-boundary reprojection only when the
-    // wrapped child's output has a duplicate name — the one class
-    // resolution's unique-name qualifier drop (tier 3e-ii/iii) cannot cover.
-    // `None` on the common (already-unique) case means the reference already
-    // resolved bare at analysis time, so every branch below passes the
-    // expression through unchanged.
+    // Reproject only when wrapping a duplicate-name output; unique names were
+    // already made bare during resolution.
     let uniquified = output_uniquified(input_schema);
-    // Choose the expression set to render from: the fused merge-path
-    // rewrite's output when merging (already positionally requalified where
-    // needed, no cosmetic churn otherwise), split back by length — or each
-    // reprojected against the PRE-wrap block when wrapping onto a
-    // duplicate-name output.
+    // Use the fused rewrite on the merge path, or reproject against the
+    // pre-wrap block when wrapping a duplicate-name output.
     let (grouping_r, aggregates_r, having_r): (
         Vec<Expression>,
         Vec<Expression>,
@@ -956,10 +719,8 @@ fn build_aggregate(
         (grouping_r, aggregates_r, having_r)
     };
 
-    // N7: `aggregates` IS the complete output list by construction (every
-    // front-end builds it that way — see `CommonOp::Aggregate`'s doc), so
-    // the SELECT slots are a straight render over `aggregates_r`; `grouping_r`
-    // is rendered separately below, for GROUP BY only.
+    // `aggregates` is the complete output list; grouping expressions render
+    // separately for GROUP BY.
     let slots = sql_join(aggregates_r.iter(), ", ", |e| {
         render_projection_slot(e, input_schema)
     })?;
@@ -967,10 +728,8 @@ fn build_aggregate(
         .as_ref()
         .map(|h| render_expr(h, input_schema))
         .transpose()?;
-    // Emit a GROUP BY whenever there are flat grouping columns, OR when this
-    // is a GROUPING SETS aggregate with at least one set — the all-empty
-    // `GROUP BY GROUPING SETS ((), ())` case still produces one grand-total
-    // row PER SET, so dropping the clause would be a silent wrong row-count.
+    // Empty grouping sets still produce one grand-total row per set, so retain
+    // GROUP BY when set metadata is present.
     let emit_group_by = !grouping_r.is_empty()
         || (matches!(grouping_kind, GroupingKind::GroupingSets) && !grouping_sets.is_empty());
     let group_body = if emit_group_by {
@@ -1022,8 +781,8 @@ fn build_lateral_view(
         Ok(format!("{expr_sql} AS {}", quote_ident(alias)))
     })?;
     let mut block = open_block(input)?;
-    // The generator expressions reference the input's FROM scope; extending
-    // is sound only on a pure-FROM block whose scope satisfies them.
+    // Generator expressions reference the input FROM scope, so extension is
+    // safe only for a pure-FROM block that preserves that scope.
     let vis = exprs_visible_in(columns.iter().map(|(_, e)| e), &block, &input.scope);
     if !(block.pure_from() && vis) {
         block = SelectBlock::wrap(block.into());
@@ -1035,12 +794,8 @@ fn build_lateral_view(
         ),
         vec![table_alias.to_owned()],
     );
-    // F3: a merged (not wrapped) block's hoisted default slot list must
-    // widen to include the LATERAL VIEW's generated columns, or a
-    // downstream merging Project that renders the bare-star default would
-    // never see them. A no-op when there are no defaults to extend (a fresh
-    // wrap, or a plain-scan child, keeps rendering `*`, which already covers
-    // the newly appended FROM columns — cx-007..009 shape unchanged).
+    // A merged block's default slots must include generated lateral-view
+    // columns; a wrapped or slot-less block needs no widening.
     let ta_q = quote_ident(table_alias);
     block.extend_default_projections(
         columns
@@ -1057,9 +812,7 @@ fn build_lateral_view(
     Ok(block.into())
 }
 
-/// Build the child's unit and open it as a block: a `Select` unit is
-/// returned as-is (merge candidate); a `Raw` unit is wrapped as
-/// `(…) AS __td_sub`.
+/// Open the child's block, wrapping an opaque `Raw` unit as `(…) AS __td_sub`.
 fn open_block(child: &TypedAst) -> Result<SelectBlock, EmissionError> {
     Ok(match build_unit(&child.op, &child.resolved_schema)? {
         SqlUnit::Select(block) => *block,
@@ -1067,11 +820,8 @@ fn open_block(child: &TypedAst) -> Result<SelectBlock, EmissionError> {
     })
 }
 
-/// Collect the qualifiers of every analyzer-stamped column reference in
-/// `expr` into `out` (immediate tree only — `Expression::children` excludes
-/// subquery bodies by the τ walker convention, which is exactly the merge
-/// visibility contract: correlated inner refs bind against whatever FROM
-/// aliases the enclosing block keeps visible, same as today's shapes).
+/// Collect qualifiers from the immediate expression tree. Subquery bodies are
+/// intentionally opaque: correlated references bind in the enclosing scope.
 fn expr_qualifiers<'e>(expr: &'e Expression, out: &mut Vec<&'e str>) {
     match expr {
         Expression::ColumnReference(c) => {
@@ -1097,14 +847,9 @@ fn expr_qualifiers<'e>(expr: &'e Expression, out: &mut Vec<&'e str>) {
     }
 }
 
-/// Merge visibility: every qualifier stamped on `exprs` that the input's own
-/// [`RelScope`] binds must be an alias the block's FROM scope actually
-/// emits. Qualifiers the input scope does NOT know are exempt: they are
-/// correlated outer references (DuckDB's correlated-subquery binder resolves
-/// them OUTWARD, so no inner FROM shape can bind them), or struct-column
-/// qualifiers (rendered as struct access, scope-independent). A failed check
-/// falls back to the wrap path (merging only ever WIDENS what a clause can
-/// see).
+/// A merge is visible only when every input-bound qualifier is exposed by the
+/// block's FROM scope. Unknown qualifiers are correlated outer references or
+/// struct access and remain valid; failure falls back to wrapping.
 fn exprs_visible_in<'e>(
     exprs: impl IntoIterator<Item = &'e Expression>,
     block: &SelectBlock,
@@ -1120,8 +865,7 @@ fn exprs_visible_in<'e>(
         .all(|q| block.exposes(q))
 }
 
-/// Whether the analyzer's stamped scope binds `q` (case-insensitive, any
-/// number of matches — ambiguity is the resolver's concern, not vis's).
+/// Whether the analyzer's stamped scope binds `q` case-insensitively.
 fn scope_binds(scope: &super::analyzer::RelScope, q: &str) -> bool {
     scope.aliases.iter().any(|(name, _)| eq_fold(name, q))
 }
@@ -1159,7 +903,7 @@ fn bare_dup_slot(c: &ColumnReference, schema: &Schema) -> Option<usize> {
     Some(k)
 }
 
-/// Merge visibility + id-keyed requalification, fused (ADR-023 Phase 3b).
+/// Merge visibility + id-keyed requalification, fused (ADR-023b).
 /// `Some(rewritten)` iff (a) every scope-bound qualifier `exprs` carries is
 /// exposed by `block`'s FROM (the [`exprs_visible_in`] contract) AND (b)
 /// every bare duplicate-name reference ([`bare_dup_slot`]) binds through a
@@ -1250,23 +994,9 @@ fn scope_position(
         .map(|offset| range.start + offset)
 }
 
-/// ADR-023 tier 2: the duplicate-output-name counterpart of the
-/// resolution-time unique-name qualifier drop (tier 3e-ii/iii), paired with
-/// [`SelectBlock::wrap_reprojected`]. That wrap re-exposes the wrapped
-/// child's columns under `uniquified`'s names, positionally — so, unlike a
-/// unique-name reference (which resolution already leaves bare and needs no
-/// rewrite here), this rewrite is always safe for any qualifier
-/// `input.scope` resolves: `q.name` becomes the bare `uniquified[pos]` at
-/// `name`'s resolved position, which the reprojected wrap guarantees is
-/// bindable.
-///
-/// A qualifier `input.scope` does NOT bind (the F10 dead-alias class) is
-/// left untouched — Tier 3's job — as is a `q` that doubles as a struct
-/// column access on the input schema (mirrors resolution's own
-/// struct-precedence guard: struct access survives a wrap as
-/// column-dot-field syntax and needs no rewrite). Qualified stars are not
-/// rewritten, and subquery bodies are opaque `CommonAst` plans (not
-/// expression children per the τ walker convention).
+/// Reproject qualifiers when a wrap renames duplicate output columns. Dead
+/// aliases, struct access, qualified stars, and subquery bodies remain
+/// untouched because their bindings are outside this output scope.
 fn reproject_qualifiers(expr: &Expression, input: &TypedAst, uniquified: &[String]) -> Expression {
     fn walk(
         expr: &mut Expression,
@@ -1286,9 +1016,8 @@ fn reproject_qualifiers(expr: &Expression, input: &TypedAst, uniquified: &[Strin
                     c.qualifier = None;
                     c.name = uniquified[pos].clone();
                 } else if c.qualifier.is_none() {
-                    // N10-lite: a bare duplicate-name ref binds through the
-                    // reprojected wrap by identity — see `bare_dup_slot`'s
-                    // doc for the governing invariant.
+                    // Bare duplicate names use their expression ID to select
+                    // the corresponding reprojected output.
                     if let Some(k) = bare_dup_slot(c, schema) {
                         c.name = uniquified[k].clone();
                     }
@@ -1317,10 +1046,7 @@ fn reproject_qualifiers(expr: &Expression, input: &TypedAst, uniquified: &[Strin
     rewritten
 }
 
-/// Reproject `expr`'s qualifiers against the pre-wrap `input` when the wrap
-/// boundary reshaped output names (`Some`), else clone it unchanged (`None`) —
-/// the shared body of every wrap-path expression rewrite
-/// (`build_project`/`build_filter`/`build_sort`/`build_aggregate`).
+/// Reproject `expr` when wrapping reshapes output names; otherwise clone it.
 fn reproject_or_clone(
     expr: &Expression,
     input: &TypedAst,
@@ -1332,9 +1058,7 @@ fn reproject_or_clone(
     }
 }
 
-/// Wrap `unit` as `(…) AS __td_sub`: the reprojected (column-aliased) wrap
-/// when the output has a duplicate name (`Some`), the plain wrap otherwise
-/// (`None`). The wrap-site counterpart of [`reproject_or_clone`].
+/// Wrap `unit`, re-aliasing duplicate output names when needed.
 fn wrap_maybe_reprojected(unit: SqlUnit, uniquified: &Option<Vec<String>>) -> SelectBlock {
     match uniquified {
         Some(u) => SelectBlock::wrap_reprojected(unit, u),
@@ -1342,14 +1066,8 @@ fn wrap_maybe_reprojected(unit: SqlUnit, uniquified: &Option<Vec<String>>) -> Se
     }
 }
 
-/// Render `build_project`'s merge-path SELECT list: identical to
-/// [`render_projection_slots`] EXCEPT a bare unqualified `Star` expands to
-/// the merged-into block's hoisted default slot list (F4) instead of a
-/// literal `*` — a raw `*` sitting inside a multi-slot list shadows the join
-/// builder's hoisted USING-key ordering, the same shadowing `* EXCLUDE`
-/// suffers without the F1 fix. A no-op (falls through to
-/// `render_projection_slots` verbatim) when there are no default slots to
-/// substitute, or no bare star to substitute them for.
+/// Render a merge-path projection, expanding a bare `*` to hoisted default
+/// slots so USING joins retain Spark's key-first ordering.
 fn render_project_merge_slots(
     projections: &[Expression],
     input_schema: &Schema,
@@ -1375,29 +1093,10 @@ fn render_project_merge_slots(
     })
 }
 
-/// Wrap-boundary star rewrite (F12): a `Star` (`q.*`) has no bare-name
-/// equivalent for a reshaped output, so neither the resolution-time
-/// unique-name qualifier drop nor `reproject_qualifiers` ever touches one —
-/// a stranded relation-qualified star sails through untouched and
-/// `render_star` emits `q.*` verbatim over `__td_sub` — a qualifier DuckDB
-/// can no longer bind once the wrap buries the pre-wrap block's own FROM
-/// alias (`Referenced table "q" not found`). The strand precondition: the
-/// PRE-wrap `block` must actually expose `q` (`block.exposes(q)`) — that is
-/// precisely what the wrap is about to bury; a `q` the pre-wrap block does
-/// NOT expose is a correlated OUTER reference (resolved outward through the
-/// wrap by DuckDB's correlated binder) and must stay qualified verbatim.
-///
-/// Given the strand precondition holds, the rewrite itself is safe only when
-/// `q` covers the WHOLE input relation — exactly one
-/// [`RelScope`](super::analyzer::RelScope) alias entry named `q`, spanning
-/// the full `0..input.resolved_schema.len()` range — because then the wrap's
-/// output IS exactly that input's columns, positionally: `q.*` is
-/// semantically the bare `*` over `__td_sub`. `q` binding a PARTIAL range
-/// (one side of a join) is left untouched: expanding it to bare names could
-/// collide with the other side's duplicate names under the wrap (documented
-/// residual, un-witnessed — a join side's own alias usually stays exposed
-/// through the wrap and so rarely strands here at all). `q` binding 2+
-/// ranges is ambiguous and is likewise left untouched.
+/// Rewrite a stranded `q.*` only when `q` uniquely covers the whole input.
+/// A partial or ambiguous range stays qualified: expanding it could collide
+/// with another join side after wrapping. Correlated outer stars also stay
+/// qualified because the enclosing scope still owns their binding.
 fn expand_stranded_whole_relation_star(
     expr: &Expression,
     block: &SelectBlock,
@@ -1422,12 +1121,8 @@ fn expand_stranded_whole_relation_star(
 }
 
 fn build_project(input: &TypedAst, projections: &[Expression]) -> Result<SqlUnit, EmissionError> {
-    // A lone unqualified `*` is a pure identity projection: return the child
-    // unit verbatim (ADR-001 cosmetic "SELECT * over SELECT *" collapse).
-    // This subsumes the former USING-join delegate branch — a `*` over a
-    // USING join yields the join renderer's explicit hoisted slot list,
-    // which is exactly the column order the resolved schema declares; plain
-    // ON/CROSS joins expand `*` left-then-right, which already matches.
+    // A lone unqualified `*` is an identity projection. The child already
+    // owns USING ordering and DuckDB's positional expansion for other joins.
     if is_unqualified_star_only(projections) {
         return build_unit(&input.op, &input.resolved_schema);
     }
@@ -1478,16 +1173,11 @@ fn build_sort(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<SqlUnit, EmissionError> {
-    // O8: LIMIT/OFFSET (and, when the analyzer's Sort trim `else` branch
-    // wraps this node, the ORDER BY too) are deliberately set on THIS block,
-    // never hoisted onto the caller's outer trim — see the design note at
-    // `analyzer.rs`'s `CommonOp::Sort` trim `else` branch.
+    // Keep LIMIT/OFFSET (and any retained ORDER BY) on this block rather than
+    // hoisting them onto an outer trim.
     let mut block = open_block(input)?;
-    // Over an occupied SELECT list, only bare output-name references merge:
-    // ORDER BY resolves them against the select list's aliases; expression
-    // keys would re-bind against FROM columns and could diverge. Over a
-    // select-free block, the fused merge-path rewrite additionally binds any
-    // bare duplicate-name ordinal key through its unique covering alias.
+    // Over an occupied SELECT list, only bare output names merge because
+    // ORDER BY resolves them against select aliases, not FROM expressions.
     let merged_keys: Option<Vec<Expression>> = if block.select_free() {
         requalify_visible(order.iter().map(|so| so.expr.as_ref()), &block, input)
     } else {
@@ -1550,10 +1240,7 @@ fn build_deduplicate(input: &TypedAst, on_columns: &[String]) -> Result<SqlUnit,
         block.set_distinct(DistinctKind::Distinct);
     } else {
         let cols = sql_join(on_columns.iter(), ", ", |c| Ok(quote_ident(c).into_owned()))?;
-        // DISTINCT ON picks an arbitrary representative row per key; it only
-        // merges into a star block (no computed select list, no prior
-        // DISTINCT) so the row-choice surface stays identical to today's
-        // wrapped form.
+        // DISTINCT ON merges only into a star block, preserving row choice.
         if !(block.can_accept(Clause::Distinct) && block.select_free()) {
             block = SelectBlock::wrap(block.into());
         }
@@ -1563,10 +1250,8 @@ fn build_deduplicate(input: &TypedAst, on_columns: &[String]) -> Result<SqlUnit,
 }
 
 fn build_aliased_relation(input: &TypedAst, alias: &str) -> Result<SqlUnit, EmissionError> {
-    // `df.alias("e")` over a bare table scan collapses to `FROM emp AS e`;
-    // anything else becomes a derived table under the user alias. Either
-    // way the alias is the block's whole scope — the analyzer's RelScope
-    // for AliasedRelation binds exactly this alias.
+    // A bare scan keeps its relation shape; other inputs become a derived
+    // table under the user alias.
     let item = if let TypedOp::TableScan { table } = &input.op {
         FromItem::Relation {
             base: table.clone(),
@@ -1581,15 +1266,10 @@ fn build_aliased_relation(input: &TypedAst, alias: &str) -> Result<SqlUnit, Emis
     Ok(SqlUnit::from(SelectBlock::from_item(item)))
 }
 
-/// The pre-SELECT-block string renderers, one arm per not-yet-converted
-/// operator. Arms migrate from here into [`build_unit`] phase by phase.
-///
-/// Reached only from [`build_unit`]'s explicit legacy-variant arm, which owns
-/// exhaustiveness over `TypedOp` — so this match ends in a `_` rather than
-/// restating every block-composable name.
+/// Render operators that do not yet use the SELECT-block builder. The caller
+/// owns exhaustiveness over `TypedOp`, so this match handles only those arms.
 fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError> {
     let result: Result<String, EmissionError> = match op {
-        // ── C.1 wired ────────────────────────────────────────────────────
         TypedOp::SingleRow => render_single_row(),
         TypedOp::Unpivot {
             input,
@@ -1643,20 +1323,12 @@ fn legacy_render(op: &TypedOp, schema: &Schema) -> Result<String, EmissionError>
             recursive_term,
         } => render_recursive_cte(name, anchor, recursive_term, schema),
 
-        // Converted to the SELECT-block builder — reaching a legacy arm for
-        // these is a `build_unit` dispatch bug.
         _ => unreachable!("block-composable operator routed to legacy_render: {op:?}"),
     };
     result
 }
 
-// ── Operator renderers ───────────────────────────────────────────────────────
-
-/// Render each item with `f` and join the results with `sep`. Fallible
-/// equivalent of `Itertools::join` — replaces the hand-rolled
-/// `if i > 0 { push_str(sep) }` loops throughout this file. Output is
-/// byte-identical to those loops (`Vec::join` inserts `sep` between elements
-/// only).
+/// Render each item with `f` and join the results with `sep`.
 fn sql_join<T>(
     items: impl IntoIterator<Item = T>,
     sep: &str,
@@ -1670,13 +1342,8 @@ fn sql_join<T>(
 }
 
 fn render_single_row() -> Result<String, EmissionError> {
-    // DuckDB requires a subquery to have a projection list — bare `SELECT`
-    // parses at top-level but fails inside `FROM (...)`. Emit `SELECT 1` so
-    // `SingleRow` is subquery-safe under `Project` (which wraps the Raw unit
-    // as `SELECT expr FROM (<child>) AS __td_sub` — the placeholder column is
-    // unused because Project provides its own SELECT list). The analyzer
-    // stamps SingleRow with an empty schema; no legitimate operator resolves
-    // the placeholder column from downstream code, so its presence is inert.
+    // DuckDB requires a projection in a subquery; the placeholder is hidden
+    // by the parent projection and never enters the analyzed schema.
     Ok("SELECT 1".to_owned())
 }
 
@@ -1815,10 +1482,7 @@ fn build_file_scan(
     options: &[(String, String)],
 ) -> Result<SqlUnit, EmissionError> {
     let reader_call = build_file_reader_sql(format, paths, options)?;
-    // The reader call is a FROM-item generator: parents merge onto it
-    // (`SELECT cols FROM read_parquet(…) WHERE …`) instead of wrapping.
-    // No alias is exposed — a FileScan's RelScope is empty; nothing
-    // qualifies through it.
+    // Parents can merge onto the reader call. FileScan exposes no alias.
     Ok(SelectBlock::from_item(FromItem::Raw {
         sql: reader_call,
         exposed: Vec::new(),
@@ -2310,7 +1974,7 @@ fn render_summary(
 ///   ...
 /// ```
 ///
-/// The `AS MATERIALIZED` CTE prevents multi-scan of the child (Pass 80 lesson).
+/// The `AS MATERIALIZED` CTE prevents repeated scans of the child.
 fn render_freq_items(
     input: &TypedAst,
     cols: &[String],
@@ -2386,7 +2050,7 @@ fn render_stats_union(
 /// Percentile stats emit `quantile_disc(TRY_CAST(col AS DOUBLE), frac)`
 /// (function-call form) instead of `PERCENTILE_DISC WITHIN GROUP (ORDER BY
 /// ...)` — same DuckDB function chosen for τ's `percentile_approx` at
-/// Pass 74 (`emission.rs::render_function_call`).
+/// This is the same discrete quantile used by `percentile_approx`.
 ///
 /// Uses `TRY_CAST(col AS DOUBLE)` for numeric aggregates so that non-numeric
 /// columns return NULL instead of erroring (matches Spark's behaviour).
@@ -2455,8 +2119,8 @@ fn render_pivot(
             "pivot without explicit values requires eager DISTINCT query",
         );
     }
-    // Pass 60 M1: output column names for the (pivot_value × aggregate) pairs
-    // are stamped by the analyzer into `output_schema.fields[grouping.len()..]`.
+    // Output names for the (pivot_value × aggregate) pairs are stamped by the
+    // analyzer into `output_schema.fields[grouping.len()..]`.
     // Emission reads them from the schema rather than re-deriving from the
     // pivot literals — the two derivations MUST stay in lockstep for Spark
     // parity (float `1.0` → `"1.0"`, null rejection, etc.). Single source of
@@ -2650,30 +2314,9 @@ fn render_sample_by(
 /// makes tracked and emitted names agree globally, but positional renaming
 /// doesn't even lean on that guarantee).
 ///
-/// (Historical: before N8 landed, this was ALSO the fix for a
-/// tracked≠emitted mismatch on unaliased compound expressions — tbl-013.
-/// N8 has since closed that gap, but the duplicate-name hazard above is
-/// independent and remains the rationale to keep positional renaming.)
-///
-/// FIXED (`F-todf-dupname`, tasks/v2-corpus-followups.md): this function used
-/// to re-derive the by-name `rename_map` from `renames` and apply it against
-/// `input.resolved_schema` (the CHILD's, pre-rename, schema). That map
-/// collapses duplicate old names last-wins, so `toDF(...)`/SQL `AS t(...)`
-/// lowering positional pairs like `[("id","a"), ("id","b")]` produced
-/// `id→b`, emitting `__td_wcr(b, b)` against a tracked schema of `[a, b]` —
-/// an N8 tracked==emitted violation.
-///
-/// The fix needs no rename map at all: `dispatch_op` already resolves the
-/// analyzer's own POSITIONALLY-renamed output — `schema` here IS that output
-/// schema (the `WithColumnsRenamed` node's `resolved_schema`, passed down
-/// from `dispatch_op`'s own `schema` parameter), not the child's. Both
-/// producers of `TypedOp::WithColumnsRenamed` (`analyze_to_df`'s positional
-/// zip, and the genuine `withColumnsRenamed` arm's by-name-but-unique-keys
-/// loop) already stamp the correct renamed name onto each output field in
-/// order — this function just mirrors that tracked schema positionally into
-/// the derived-table alias list. The rename-pair list itself proved
-/// write-only after this fix and was deleted from the TypedOp variant
-/// (review NIT): `resolved_schema` IS the rename.
+/// Positional renaming is also safe when the child has duplicate names:
+/// `schema` is the analyzer's already-renamed output, so no by-name map is
+/// needed and duplicate names cannot collapse to a last-wins entry.
 fn build_with_columns_renamed(input: &TypedAst, schema: &Schema) -> Result<SqlUnit, EmissionError> {
     let child_sql = dispatch_op(&input.op, &input.resolved_schema)?;
     let cols = sql_join(schema.fields.iter().map(|f| f.name.as_str()), ", ", |n| {
@@ -2774,8 +2417,6 @@ fn build_table_function(
         ),
     }
 }
-
-// ── Expression rendering ─────────────────────────────────────────────────────
 
 /// Render a subquery's inner plan to a bare `SELECT …` string. The plan must
 /// be `Analyzed` — a stray `Unanalyzed` means the analyzer pass did not run
@@ -3187,11 +2828,8 @@ fn substitute_index_var(body: &Expression, index_var: &str) -> Expression {
 /// Nested `Lambda` expressions that re-bind `var_name` shadow the outer
 /// binding — descent stops for the shadowed subtree.
 ///
-/// Traversal is structural via [`Expression::map_children`], so every
-/// composite variant recurses (the previous hand walker's catch-all silently
-/// skipped `MapLiteral`, `StructLiteral`, `UpdateFields` —
-/// leaving lambda variables unsubstituted there). Subqueries and `Window`
-/// stay opaque; see the explicit arms.
+/// Traversal is structural via [`Expression::map_children`], covering all
+/// composite variants. Subqueries and `Window` stay opaque by design.
 fn substitute_lambda_var(
     body: &Expression,
     var_name: &str,
@@ -3206,7 +2844,7 @@ fn substitute_lambda_var(
         // Opacity: the hand walker never descended into subqueries or window
         // expressions (they fell to its catch-all). A subquery or window
         // inside a HOF lambda body is pathological — DuckDB cannot evaluate
-        // either per-element — so preserve the historical skip exactly rather
+        // either per-element — preserve the skip
         // than adopt `map_children`'s child set there (it would visit
         // `InSubquery`'s LHS and `Window`'s func/partition/order children).
         Expression::InSubquery(_)
@@ -3560,7 +3198,7 @@ fn spark_diff_sql(
 /// type equals `resolved_schema`.
 ///
 /// - **Long** (integral / float / double, 1-arg): NaN-guarded `CAST(.. AS
-///   BIGINT)` — byte-identical to the historical emission (math-003 pin).
+///   BIGINT)` — byte-identical to the expected Spark-parity emission.
 /// - **Decimal, 1-arg**: `CAST(fn(a) AS DECIMAL(p, s))` (a DECIMAL can never be
 ///   NaN, so no guard).
 /// - **Decimal, 2-arg, t >= 0**: `CAST(fn((a) * 10^t) / 10^t AS DECIMAL(p, s))`.
@@ -3675,7 +3313,6 @@ fn render_function_call_dispatch(
     // as aggregate, `render_expr` routes to `render_aggregate` before this
     // function; anything reaching here is scalar by construction. Defense in
     // depth: any name in the classifier roster should never be seen here.
-    //
     // Window-only functions with a trailing `ignoreNulls` argument that PySpark
     // serializes verbatim — DuckDB's `nth_value(col, n)` / `lag`/`lead`/
     // `first_value`/`last_value` do not accept the boolean flag. Drop the
@@ -3749,7 +3386,6 @@ fn render_function_call_dispatch(
         // `col{i+1}` fallback is Spark's documented behavior, not a
         // silent NULL. Zero-arg `struct()` is valid: emits
         // `struct_pack()`.
-        //
         // Aliased arguments (`col.alias("x")`) contribute their alias to
         // the field name but must NOT render as `expr AS x` inside the
         // function-argument list — DuckDB rejects SELECT-list `AS` syntax
@@ -3829,7 +3465,7 @@ fn render_function_call_dispatch(
             // `Null` rides the datetime arm: Spark returns NULL for
             // `to_char(NULL, fmt)` in BOTH the datetime and numeric-picture
             // forms, and `strftime(NULL, …)` is NULL — routing it to the
-            // boundary error would DIVERGE (review MINOR, F4).
+            // boundary error would DIVERGE (implementation constraint).
             DataType::Date | DataType::Timestamp | DataType::TimestampNtz | DataType::Null => {
                 let [d, fmt] = rendered_args(f, schema)?;
                 let duck_fmt = spark_fmt_to_duckdb(&fmt);
@@ -3908,8 +3544,7 @@ fn render_function_call_dispatch(
         // values for one output column; emission emits
         // `UNNEST([v1, v2, ..., vN])`. Sibling `stack_col` UNNESTs in a
         // SELECT list co-multiply row-aligned, matching the `inline_field`
-        // consolidation observed in Pass 90 smoke tests.
-        //
+        // consolidation verified by the corresponding emission tests.
         // Type coercion across rows is Spark's job (`Stack.checkInputDataTypes`
         // requires the K expressions per column to share a type; users write
         // explicit `CAST` in the fragment). DuckDB's list-literal element
@@ -3926,13 +3561,13 @@ fn render_function_call_dispatch(
             let items = sql_join(f.args.iter(), ", ", |a| render_expr(a, schema))?;
             return Ok(format!("UNNEST([{items}])"));
         }
-        // Pass 90 — synthetic FunctionCall names produced by the analyzer's
+        // synthetic FunctionCall names produced by the analyzer's
         // Project pre-pass (`expand_inline_projections`) when it fans
         // `F.inline(arr)` / `F.inline_outer(arr)` out into N per-struct-field
         // projections. Args: `(arr : Array<Struct<...>>, field_name : STRING)`.
         // Sibling `UNNEST(<arr>)` calls in a SELECT are consolidated by
         // DuckDB into a single row-multiplication (empirically verified —
-        // see Pass 90 smoke). Corpus: inl-001, inl-002.
+        // See the corresponding emission tests. Corpus: inl-001, inl-002.
         "inline_field" => {
             if f.args.len() != 2 {
                 bail_boundary_fn!(
@@ -3991,7 +3626,7 @@ fn render_function_call_dispatch(
                 "UNNEST(CASE WHEN {arr_sql} IS NULL OR len({arr_sql}) = 0 THEN [{sentinel}] ELSE {arr_sql} END).{field_q}"
             ));
         }
-        // Pass 91 — synthetic FunctionCall produced by the analyzer's Project
+        // synthetic FunctionCall produced by the analyzer's Project
         // pre-pass (`expand_json_tuple_projections`) when it fans
         // `F.json_tuple(json, k1, ..., kN)` out into N per-key projections.
         // Args: `(json_expr, key : STRING literal)`. Emit
@@ -4114,7 +3749,6 @@ fn render_function_call_dispatch(
         // anything else (an already-typed struct column, etc.), we cannot
         // enumerate the fields at emission time — return a honest
         // Thunderduck-boundary error. Corpus: `json-008`.
-        //
         // KNOWN DEVIATION (τ-boundary, Spark-parity gap):
         // Spark's `to_csv` follows RFC-4180 escaping — fields containing `,` or `"`
         // are quoted, and embedded `"` becomes `""`. This mapping to
@@ -4227,7 +3861,6 @@ fn render_function_call_dispatch(
         "substr" => "substring",
         // Spark ceil/floor return Long; DuckDB returns Double. Cast to
         // BIGINT so schema matches type_inference.
-        //
         // Spark's semantics on non-finite Double: `ceil(NaN) = 0`,
         // `floor(NaN) = 0` (Spark casts the Double result to Long via
         // `(long) NaN` which the JVM defines as `0`). NULL propagates as
@@ -4267,7 +3900,6 @@ fn render_function_call_dispatch(
         // has no integral `bit_get` (`get_bit` only accepts BIT); compose
         // via shift + mask, cast to TINYINT to match type_inference. Corpus:
         // `test_bit_get` (test_math_bitwise_date_differential).
-        //
         // Spark ANSI-mode raises `INVALID_PARAMETER_VALUE.BIT_POSITION_RANGE`
         // when `pos < 0 || pos >= bit_width(x)` (width by arg0's INTEGRAL
         // type: Byte 8 / Short 16 / Integer 32 / Long 64) — guard with the
@@ -4335,7 +3967,6 @@ fn render_function_call_dispatch(
         // DuckDB `struct_pack` over `time_bucket` (unix-epoch aligned origin
         // matches Spark's `TimeWindow` default for tumbling `slide == window`,
         // `startTime == 0`). Corpus anchor: `win2-002`.
-        //
         // Scope (2-arg tumbling only):
         //  - `args[1]` MUST be `Expression::Literal(String("N unit"))`; parsed
         //    via [`parse_window_duration_literal`].
@@ -4343,7 +3974,6 @@ fn render_function_call_dispatch(
         //    (`"1 day 3 hours"`), month/year (variable-length buckets diverge
         //    from `time_bucket`'s fixed-width semantics), signed / fractional /
         //    empty / unknown unit → boundary reject with `[TDCK-BOUNDARY]`.
-        //
         // `"end"` is a DuckDB reserved keyword — quoted via `quote_ident`,
         // proven-safe idiom (same pattern as `named_struct` at ~L3667).
         "window" => {
@@ -4529,7 +4159,6 @@ fn render_function_call_dispatch(
         // with an initial value. DuckDB's `list_reduce(list, lambda)` has
         // no init parameter — it uses the first element as init. Prepend
         // init to the list to simulate.
-        //
         // NULL-propagation: Spark returns NULL when the input array is NULL.
         // DuckDB's `list_prepend(init, NULL)` returns `[init]`, which then
         // folds to `init` — masking the NULL. Guard with a CASE that
@@ -5026,7 +4655,6 @@ fn render_function_call_dispatch(
             //   floor(x * 10^n + 0.5) / 10^n     — for x > 0
             // biased +½ for standard rounding; then adjust the exact-half
             // case toward even. This is Spark's ROUND_HALF_EVEN semantics.
-            //
             //   scale := 10^n
             //   scaled := x * scale
             //   nearest := round(scaled)          -- DuckDB default HALF_AWAY
@@ -5074,9 +4702,8 @@ fn render_function_call_dispatch(
             // `hex` on BIGINT emit the two's-complement (unsigned) bytes,
             // matching Spark. For other to_base values, boundary-error.
             // Corpus witness: `math-013` uses to_base ∈ {2}.
-            //
             // DEVIATION: `int_literal_value` maps an i32-overflowing Long
-            // to `None` (boundary error) where the old inline match wrapped
+            // to `None` (boundary error) where the prior inline match wrapped
             // with `as i32` — a pathological, corpus-unwitnessed input.
             let to_base_lit = int_literal_value(&f.args[2]);
             match to_base_lit {
@@ -5428,7 +5055,6 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // rejected explicitly by the `!= 2` guard below — otherwise it
         // would silently pass through as literal `from_csv(...)` and
         // DuckDB would raise an opaque scalar-not-found error.
-        //
         // KNOWN DEVIATION: this manual split ignores CSV quoting rules
         // (embedded commas, quoted strings, escapes). The corpus witness
         // uses simple unquoted values; documenting the gap for future work.
@@ -5549,7 +5175,6 @@ ELSE list_slice({full}, 1, ({c}) - 1) || [array_to_string(list_slice({full}, ({c
         // Spark returns NULL when the requested component is absent, but
         // DuckDB's `regexp_extract` returns an empty string on no-match;
         // wrap with `NULLIF(..., '')` to align.
-        //
         // Requires the second arg to be a STRING literal (the part name).
         // For QUERY-with-key, a third STRING literal is required.
         // Anchor: corpus parse-001.
@@ -5656,10 +5281,8 @@ fn is_decimal_avg(f: &FunctionCall, schema: &Schema) -> bool {
 /// The outer CAST targets the aggregate's Spark-analyzer-declared return
 /// type (`TypeInferenceEngine::aggregate_return_type`'s `AvgLike` formula —
 /// the same source [`render_projection_slot`]/[`spark_return_cast`] use for
-/// their Spark-parity casts). The shipped `spark_avg` already returns this
-/// exact `(precision, scale)` for the corpus's decimal shapes (pass-13
-/// probe), so the CAST is idempotent there; it stays for correctness on any
-/// other precision/scale and to make the emitted type explicit.
+/// their Spark-parity casts). It preserves the analyzed precision and scale
+/// for every decimal shape and makes the emitted type explicit.
 fn render_decimal_avg(
     f: &FunctionCall,
     over: Option<&str>,
@@ -5919,18 +5542,10 @@ fn render_aggregate(f: &FunctionCall, schema: &Schema) -> Result<String, Emissio
 
 /// Rewrite no-arg `grouping_id()` / `grouping()` anywhere in an aggregate
 /// slot to `grouping_id(<grouping cols>)` — DuckDB has no zero-arg form
-/// (it is a parse error). Also applied to the HAVING predicate, which can
-/// legally carry these grouping functions over ROLLUP/CUBE/GROUPING SETS.
-/// Uses a generic `children_mut` walk to reach nested occurrences (pass-3
-/// kept this narrow pending a corpus witness; `grouping_id() + 1` via
-/// `Binary` is that witness — see tasks/v2-simplification-pass-log.md flag
-/// #6). Widening is safe: an unrewritten zero-arg call is a guaranteed
-/// whole-query DuckDB parse error, so the walk only converts errors into
-/// the Spark-intended emission — it cannot change working output.
-/// Subquery bodies stay opaque per the `children`/`children_mut` walker
-/// convention, which is the correct scoping here: an inner aggregate's
-/// `grouping_id()` binds to the inner GROUP BY via its own
-/// `render_aggregate_op` call, not the outer one.
+/// (it is a parse error). Also apply the rewrite to HAVING, which can legally
+/// carry these grouping functions over ROLLUP/CUBE/GROUPING SETS.
+/// A `children_mut` walk reaches nested expressions while leaving subquery
+/// bodies opaque, so each inner aggregate resolves its own grouping columns.
 fn rewrite_grouping_id(expr: &mut Expression, grouping: &[Expression]) {
     if let Expression::FunctionCall(f) = expr {
         if (f.name == "grouping_id" || f.name == "grouping")
@@ -5955,8 +5570,6 @@ fn with_grouping_id_spliced(expr: &Expression, grouping: &[Expression]) -> Expre
     rewrite_grouping_id(&mut e, grouping);
     e
 }
-
-// ── Literal / atomic expression renderers ────────────────────────────────────
 
 fn render_literal(lit: &Literal) -> Result<String, EmissionError> {
     match &lit.value {
@@ -6035,8 +5648,6 @@ fn render_column_reference(c: &ColumnReference) -> Result<String, EmissionError>
     }
 }
 
-// ── ADR-006 ANSI divide/mod-by-zero guards ──────────────────────────────────
-//
 // Spark (ANSI, the corpus reference default) THROWS on divide/mod-by-zero;
 // DuckDB returns NULL/inf. τ wraps the emitted operator so a zero divisor
 // raises Spark's error class via DuckDB's `error()` scalar. The runtime layer
@@ -6044,18 +5655,14 @@ fn render_column_reference(c: &ColumnReference) -> Result<String, EmissionError>
 // differential harness keys on the leading `[TOKEN]`. The message text is
 // copied verbatim from Spark 4.1 so τ's error is byte-identical, not merely
 // class-identical.
-//
 // NOTE (ADR-006 follow-up): the architecturally cleaner home for these throws
 // is a `thdck_spark_funcs` extension function (`spark_div`/`spark_pmod`) that
 // raises with the class at the throw site, mirroring `spark_decimal_div` — it
 // avoids CASE-wrapping every division. The emitted-SQL guard below is the
 // in-repo interim; migrate when the extension gains those functions.
-// Pass 10 (OPP-C): the `array_index_error_expr` and `ansi_zero_guard` free
-// helpers were unified with [`super::spark_errors::SparkError`] +
-// [`super::spark_errors::ansi_throw_if`]. Call sites migrated inline; see
-// `render_element_at` (InvalidArrayIndex) and `render_binary` / pmod-mod
-// arm in `render_scalar_function_call` (DivideByZero / RemainderByZero).
-// Pass 11 (OPP-J) relocated the message-text consts into `spark_errors.rs`.
+// Shared zero-division guards and Spark message templates live in
+// `spark_errors.rs`; call sites combine its `ansi_throw_if` helper with the
+// appropriate `SparkError` variant so classes stay consistent across operators.
 
 /// True when `e` is a numeric literal that is provably non-zero, so the ANSI
 /// zero-guard can be skipped (the divisor can never be 0).
@@ -6097,7 +5704,6 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
     // precision and violating the projection's declared type. Route to the
     // `thdck_spark_funcs` extension function `spark_decimal_div` which
     // implements Spark's rounding + scale semantics. Corpus: type-005.
-    //
     // A DECIMAL operand divided by a plain integral one (e.g. `decimal_col /
     // int_col`) is ALSO decimal division in Spark. The analyzer's N4
     // materialization pass (`materialize_binary_coercions`) inserts an
@@ -6178,7 +5784,7 @@ fn render_binary(b: &BinaryExpression, schema: &Schema) -> Result<String, Emissi
     // `date_like_interval_result` seam already resolves that case to
     // `Timestamp`, matching DuckDB's native output with no cast needed. Only
     // the day-only/year-month shapes Spark keeps as DATE need a corrective
-    // cast; the analyzer's N4 materialization pass
+    // cast; the analyzer's materialization step
     // (`materialize_binary_coercions`) already wraps the whole node in an
     // implicit `CAST(.. AS DATE)` (rendered by `render_cast`) when this
     // node's inferred type is Date, so no corrective cast belongs here.
@@ -6246,8 +5852,6 @@ fn render_interval(i: &IntervalExpression) -> Result<String, EmissionError> {
     ))
 }
 
-// ── CAST rendering (§4.2 first item) ─────────────────────────────────────────
-
 /// Render a CAST or TRY_CAST expression. `c.try_cast == true` emits
 /// `TRY_CAST(expr AS ty)`; `false` emits `CAST(expr AS ty)` (**§4.2 first item
 /// anchor**).
@@ -6277,8 +5881,6 @@ pub(crate) fn render_cast(c: &CastExpression, schema: &Schema) -> Result<String,
     }
 }
 
-// ── Complex-type literal renderers ───────────────────────────────────────────
-//
 // Minimal support required to serialize `LocalRelation` payloads whose schema
 // carries `ArrayType` / `MapType` / `StructType` fields. Emitted SQL uses
 // DuckDB's native literal syntaxes:
@@ -6329,7 +5931,7 @@ fn render_update_fields(
 ) -> Result<String, EmissionError> {
     // Resolve the input struct's field list at emission time. The analyzer
     // stamps ColumnReference types, so `data_type(schema)` returns a real
-    // `DataType::Struct(_)` here (Pass 57 makes struct types visible).
+    // `DataType::Struct(_)` here because struct types are visible at emission.
     let base_type = u.struct_expr.data_type(schema);
     let DataType::Struct(base_struct) = base_type else {
         bail_boundary_expr!(
@@ -6345,7 +5947,7 @@ fn render_update_fields(
     //     preserves the original declared field name on replace.
     //   * drop: case-insensitive match against current fields.
     // A missing drop target is silently ignored (the struct comes through
-    // unchanged). That is Spark 4.1.1's own behaviour — verified in the review
+    // unchanged). That is Spark 4.1.1's behaviour.
     // A1 audit, which is why the analyzer no longer rejects it.
     let mut fields: Vec<(String, FieldSource)> = base_struct
         .fields
@@ -6400,8 +6002,6 @@ fn render_struct_literal(
     })?;
     Ok(format!("{{{fields}}}"))
 }
-
-// ── Return-type CAST helpers (§5.1 — SEPARATE `fn` items) ────────────────────
 
 /// Projection-slot Spark-parity return-type CAST.
 ///
@@ -6465,8 +6065,6 @@ fn spark_return_cast(expr_sql: String, expr: &Expression, schema: &Schema) -> St
     }
     expr_sql
 }
-
-// ── Identifier quoting (§5.6) ────────────────────────────────────────────────
 
 /// DuckDB reserved words that force quoting even when the identifier matches
 /// `[A-Za-z_][A-Za-z0-9_]*`. Seed list drawn from DuckDB's parser keyword set;
@@ -6628,8 +6226,6 @@ fn ascii_ci_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
-// ── SQL string escaping helpers ──────────────────────────────────────────────
-
 /// Escape embedded single quotes (`'` → `''`) for interpolation into a
 /// DuckDB single-quoted string literal. The canonical escape helper for τ —
 /// `pub(super)` so sibling modules (`spark_errors`) reuse it instead of
@@ -6681,7 +6277,7 @@ fn string_literal_arg_or(
 /// (unrecognised key, non-string literal value, multi-entry map, or a
 /// non-`MapLiteral` expression). Case-sensitive to match Spark's
 /// `JSONOptions` parsing. Callers surface `None` as a Thunderduck-boundary
-/// error (ADR-022). Pass 89 witness: `json-005`.
+/// error (ADR-022); the `json-005` shape exercises this boundary.
 fn parse_to_json_ignore_null_fields(e: &Expression) -> Option<bool> {
     let m = match e {
         Expression::MapLiteral(m) => m,
@@ -6708,7 +6304,7 @@ fn parse_to_json_ignore_null_fields(e: &Expression) -> Option<bool> {
 /// single `.` (e.g. `"999.99"` → `(5, 2)`). Returns `None` for any format
 /// that carries grouping / sign / currency markers.
 ///
-/// Pass 76: corpus witness `parse-004`.
+/// The `parse-004` shape exercises this accepted digit-template form.
 pub(crate) fn parse_number_format_for_type_inference(fmt: &str) -> Option<(u8, u8)> {
     parse_number_format(fmt)
 }
@@ -6760,18 +6356,13 @@ pub(crate) fn parse_window_duration_literal(s: &str) -> Option<(u64, &'static st
 }
 
 /// Parse a Spark DDL schema string (field list, e.g. `"a INT, b
-/// ARRAY<STRING>"`, or `struct<...>` wrapper) into a [`StructType`] using the
-/// shared strict Spark-DDL parser ([`crate::types::spark_ddl`] — pass-2
-/// simplification consolidated the two legacy grammars there). Returns
-/// `None` when τ cannot translate the DDL — the caller then falls back
-/// to the shared type-inference default. Pass 76 witnesses: `json-003`,
-/// `json-004`.
+/// ARRAY<STRING>"`, or `struct<...>` wrapper) into a [`StructType`] with the
+/// shared strict Spark-DDL parser. Returns `None` when τ cannot translate the
+/// DDL, allowing callers to report the unsupported schema at the boundary.
 ///
-/// Acceptance is strictly-additively wider than the legacy emission-local
-/// parser (union grammar: decimal, intervals, null/void, extra primitive
-/// aliases, NOT NULL qualifiers, `struct<...>` wrapper form); everything the
-/// legacy parser accepted parses identically, and unknown types still yield
-/// `None` → the same boundary error.
+/// The grammar covers decimal, interval, null/void, primitive aliases, NOT
+/// NULL qualifiers, and the `struct<...>` wrapper form; unknown types still
+/// yield `None` so callers can report the unsupported schema at the boundary.
 pub(crate) fn from_json_ddl_to_struct_for_type_inference(ddl: &str) -> Option<StructType> {
     crate::types::spark_ddl::parse_spark_schema(ddl)
 }
@@ -6780,7 +6371,7 @@ pub(crate) fn from_json_ddl_to_struct_for_type_inference(ddl: &str) -> Option<St
 /// `from_csv` accepts only flat primitive schemas (no nested STRUCT / ARRAY
 /// / MAP) — this helper enforces that narrower surface so we fail loud on
 /// shapes Spark itself would reject. Returns `None` when τ cannot translate
-/// the DDL. Pass 87 witness: `json-007`.
+/// the DDL. The `json-007` shape exercises this path.
 pub(crate) fn from_csv_ddl_to_struct(ddl: &str) -> Option<StructType> {
     let st = crate::types::spark_ddl::parse_spark_schema(ddl)?;
     // from_csv is flat-only: reject nested/composite types (Spark
@@ -6813,19 +6404,19 @@ pub(crate) fn from_csv_ddl_to_struct(ddl: &str) -> Option<StructType> {
 ///   - `ARRAY<T>` → `T[]` where `T` is any supported primitive.
 ///   - `STRUCT<f1:T1, f2:T2, ...>` → nested JSON object.
 ///
-/// Pass 76 witnesses: `json-003`, `json-004`.
+/// The `json-003` and `json-004` shapes exercise this path.
 ///
 /// Parses ONCE via the typed DDL parser
 /// ([`from_json_ddl_to_struct_for_type_inference`], the same grammar the
 /// type-inference side uses) and renders the JSON schema from the resulting
-/// [`StructType`] — the old parallel string-walking grammar is gone.
+/// [`StructType`] directly.
 fn spark_ddl_schema_to_duckdb_json(ddl: &str) -> Option<String> {
     let st = from_json_ddl_to_struct_for_type_inference(ddl)?;
     struct_type_to_duckdb_json(&st)
 }
 
 /// Render a parsed [`StructType`] as DuckDB's JSON-schema object literal.
-/// An empty field list renders as `{}` (matching the historical walker).
+/// An empty field list renders as `{}`.
 fn struct_type_to_duckdb_json(st: &StructType) -> Option<String> {
     let mut out = String::from("{");
     for (i, field) in st.fields.iter().enumerate() {
@@ -6849,7 +6440,7 @@ fn data_type_to_duckdb_json_value(dt: &DataType) -> Option<String> {
         // ARRAY<T> → "<duckdb_T>[]". The typed parser accepts
         // `ARRAY<STRUCT<...>>` / nested arrays, but DuckDB's JSON-schema
         // shape has no spelling for those — keep rejecting non-primitive
-        // element types (matches the historical walker).
+        // element types.
         DataType::Array(elem, _) => {
             let name = duckdb_primitive_name(elem)?;
             Some(format!("\"{name}[]\""))
@@ -6994,8 +6585,6 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
-// ── DataType → DuckDB SQL type-string ────────────────────────────────────────
-
 /// Render a [`DataType`] as its DuckDB SQL type-string (`BIGINT`, `VARCHAR`,
 /// `DECIMAL(p,s)`, `TIMESTAMP`, ...).
 pub(crate) fn render_data_type(dt: &DataType) -> String {
@@ -7068,8 +6657,6 @@ fn dedup_struct_field_names(names: &[&str]) -> Vec<String> {
     crate::types::pyspark_parity::dedup_names(names)
 }
 
-// ── Extension allow-list (§4.1 stub — populated by τ's extension-target wiring) ──────────────────
-
 /// The set of DuckDB extension function names τ emits. Currently empty; τ's
 /// extension-target wiring will populate this with the ext6 allow-list and
 /// activate INV6 (`transpiler_v2/invariants.rs::inv6_extension_targets_exist`,
@@ -7078,8 +6665,6 @@ fn dedup_struct_field_names(names: &[&str]) -> Vec<String> {
 pub(crate) fn extension_targets() -> HashSet<&'static str> {
     HashSet::new()
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -7112,7 +6697,6 @@ mod tests {
         ])
     }
 
-    // ── timestampadd / timestampdiff emission (intv-006) ───────────────────
     // Pure helpers — no schema or analyzer state.
 
     #[test]
@@ -7285,8 +6869,6 @@ mod tests {
         }
     }
 
-    // ── ceil/floor emission (num-001/002/003) ────────────────────────────
-
     #[test]
     fn ceil_1arg_long_is_bigint_nan_guard() {
         // Integer input → Long → the NaN-guarded BIGINT shape (math-003 pin).
@@ -7327,8 +6909,6 @@ mod tests {
             }
         ));
     }
-
-    // ── Pass 106 — uncorrelated subquery emission ────────────────────────
 
     fn analyzed_select_id_from_emp() -> SubqueryPlan {
         let inner = CommonAst::new(CommonOp::Project {
@@ -7419,8 +6999,6 @@ mod tests {
         );
     }
 
-    // ── ADR-023 tier 2: wrap-boundary re-projection over duplicate names ──
-    //
     // `output_uniquified` gates every wrap site's pass-through vs.
     // `reproject_qualifiers` choice on whether the wrapped child's output
     // has a duplicate name. The common (unique) case renders the expression
@@ -7503,8 +7081,6 @@ mod tests {
         );
     }
 
-    // ── Wrap-boundary qualifier rewriting (strand-class retirement) ──────
-    //
     // filt-016/filt-017 witness class: a qualified reference above a
     // slot-conflict wrap resolves to its bare output name at RESOLUTION
     // time (ADR-023 tier 3e-ii/iii) instead of stranding the alias behind
@@ -7755,8 +7331,7 @@ mod tests {
     ///
     /// ADR-023 3d: `analyze()` itself now correctly REJECTS `outer_e.salary`
     /// at the top level (there is no real outer scope here to resolve it
-    /// against — the old pass permissively resolved it by bare name alone,
-    /// which is exactly the F8-class bug 3d closes). This test is
+    /// against. This test is
     /// EMISSION-only in that it hand-stamps a resolved TypedAst (a correlated
     /// qualifier the resolver kept) and checks emission renders it verbatim.
     /// The wrap/strip logic no longer exists.
@@ -7798,11 +7373,8 @@ mod tests {
     /// Keep-side: a qualifier that resolves as STRUCT-column access
     /// (`resolve_column`'s struct-precedence tier) survives because resolution
     /// never drops a struct qualifier (the struct-precedence tier runs at
-    /// analysis time); the old strip's misread hazard no longer applies. Pass
-    /// F2 stage 1: this now resolves to an `ExtractValue` chain rather than a
-    /// qualified `ColumnReference` at all — `(addr).city`, not `addr.city` —
-    /// so the case is even further out of the stranded-qualifier strip's
-    /// reach: there is no qualified reference left for that pass to see.
+    /// analysis time); this resolves to an `ExtractValue` chain rather than a
+    /// qualified `ColumnReference` — `(addr).city`, not `addr.city`.
     #[test]
     fn struct_qualifier_survives_wrap_verbatim() {
         let plan = CommonAst::new(CommonOp::Filter {
@@ -7885,8 +7457,6 @@ mod tests {
         ));
     }
 
-    // ── 1. dispatch_op — SingleRow ───────────────────────────────────────
-
     #[test]
     fn dispatch_op_single_row_emits_subquery_safe_select() {
         let ast = CommonAst::new(CommonOp::SingleRow);
@@ -7898,8 +7468,6 @@ mod tests {
         // its own SELECT list when wrapping.
         assert_eq!(sql, "SELECT 1");
     }
-
-    // ── 2-3. dispatch_op — TableScan ─────────────────────────────────────
 
     #[test]
     fn dispatch_op_table_scan_emits_select_star_from_table() {
@@ -7923,8 +7491,6 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert_eq!(sql, "SELECT * FROM emp AS e");
     }
-
-    // ── TableFunction (range) — pass-141 ─────────────────────────────────
 
     /// Build `range(<args>)`, analyze, and emit — exercises the whole
     /// L2-analyzer + L3-emission path for the TVF node.
@@ -7977,7 +7543,7 @@ mod tests {
         // Full `SELECT id FROM range(5)` — the range TVF is a FROM-item leaf
         // block whose DEFAULT projection performs the `id` bind; a merging
         // Project overwrites it and MUST still see the renamed column
-        // (tbl-006; tasks/select-block-follow-ups.md item 1 pin: merge, not
+        // (tbl-006: merge, not
         // wrap — the `AS __td_range(id)` rename is part of the FROM item).
         let ast = CommonAst::new(CommonOp::Project {
             input: Box::new(CommonAst::new(CommonOp::TableFunction {
@@ -8019,8 +7585,6 @@ mod tests {
         );
     }
 
-    // ── TableFunction (explode) — pass-13 ──────────────────────────────
-
     /// Build `explode(<args>)` or `explode_outer(<args>)`, analyze, and emit.
     fn emit_explode_tvf(name: &str, args: Vec<Expression>) -> String {
         let ast = CommonAst::new(CommonOp::TableFunction {
@@ -8032,7 +7596,7 @@ mod tests {
         dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch explode TVF")
     }
 
-    /// Pass 13 — tbl-007: `SELECT * FROM explode(array(1,2,3))` → SQL
+    /// tbl-007: `SELECT * FROM explode(array(1,2,3))` → SQL
     /// contains `UNNEST` and emits the column as `col`.
     #[test]
     fn dispatch_explode_tvf_emits_unnest_as_col() {
@@ -8045,7 +7609,7 @@ mod tests {
         assert_eq!(sql, "SELECT UNNEST(list_value(1, 2, 3)) AS col");
     }
 
-    /// Pass 13 — explode_outer as TVF wraps with the CASE/NULL sentinel.
+    /// explode_outer as TVF wraps with the CASE/NULL sentinel.
     #[test]
     fn dispatch_explode_outer_tvf_emits_case_wrapper() {
         let arr = Expression::FunctionCall(FunctionCall {
@@ -8063,8 +7627,6 @@ mod tests {
             "output column must be named 'col'; got: {sql}"
         );
     }
-
-    // ── 4-6. render_project ──────────────────────────────────────────────
 
     #[test]
     fn render_literal_binary_emits_duckdb_blob_escape() {
@@ -8115,8 +7677,8 @@ mod tests {
         });
         let typed = analyze(ast, &bt).expect("analyze");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        // Project over a bare TableScan inlines `FROM emp` (Fix B, pass 126) —
-        // no `__td_proj` wrap.
+        // Project over a bare TableScan inlines `FROM emp`, avoiding an
+        // unnecessary `__td_proj` wrapper.
         assert_eq!(sql, "SELECT id FROM emp");
     }
 
@@ -8140,8 +7702,6 @@ mod tests {
         assert_eq!(sql, "SELECT id FROM emp");
         assert!(!sql.contains("__td_proj"), "got: {sql}");
     }
-
-    // ── Aliased-join inlining (jn-001/002/003 root fix) ──────────────────
 
     fn dept_schema() -> StructType {
         StructType::new(vec![
@@ -8174,8 +7734,6 @@ mod tests {
             plan_id: None,
         })
     }
-
-    // ── FromScope (Phase 0, ADR-023 __td_jl/jr retirement groundwork) ───────
 
     /// Placeholder `SqlUnit` for a `FromItem::Derived` wrap in tests that
     /// only exercise `FromScope`'s alias bookkeeping, never render this unit.
@@ -8215,7 +7773,7 @@ mod tests {
             alias: "__td_jl".to_owned(),
         };
         let fs = FromScope::of(&typed, &item);
-        // ADR-023 Phase 2: `alias_for`'s single-exposed fast path now
+        // ADR-023: `alias_for`'s single-exposed fast path now
         // resolves this to the item's own (sole) exposed alias, regardless
         // of the analyzer's logical `e` alias.
         assert_eq!(fs.alias_for(0), Some("__td_jl"));
@@ -8334,11 +7892,9 @@ mod tests {
         assert_eq!(typed.resolved_schema.fields[0].name, "dept_id");
     }
 
-    // ── Plan 006 F1-F4: structured hoisted-slot-list pins ────────────────
-
     #[test]
     fn drop_over_using_join_renders_hoisted_slots() {
-        // F1 regression pin (review findings #1): `emp.join(dept,
+        // Regression pin (implementation constraint): `emp.join(dept,
         // on='dept_id').drop('dept_name')` must keep the join builder's
         // USING-key-first hoisted slot list — a bare `* EXCLUDE (dept_name)`
         // would let DuckDB's `*` place `dept_id` at its natural (dept-side)
@@ -8397,7 +7953,7 @@ mod tests {
 
     #[test]
     fn multi_slot_star_over_using_join_expands_hoisted_slots() {
-        // F4 regression pin: a bare `*` mixed into a multi-slot projection
+        // Regression pin: a bare `*` mixed into a multi-slot projection
         // list must expand to the join builder's hoisted slot list, not
         // render a raw `*` token that shadows the USING-key-first order
         // (the same shadowing `* EXCLUDE` suffers without the F1 fix).
@@ -8438,7 +7994,7 @@ mod tests {
 
     #[test]
     fn using_join_side_wrap_preserves_hoisted_slots() {
-        // F2 regression pin (review findings #2): the RIGHT side of an
+        // Regression pin (implementation constraint): the RIGHT side of an
         // outer ON join is itself a USING join (`dept JOIN emp2 USING
         // (dept_id)`). The right side never inlines (`may_inline_nested_join`
         // is always false for the right side), so it always wraps — the wrap
@@ -8491,12 +8047,9 @@ mod tests {
         );
     }
 
-    // ── Plan 007 F5: inline under USING parents; RelScope-qualified
-    // hoisted slots ───────────────────────────────────────────────────────
-
     #[test]
     fn alias_ref_above_using_parent_inlines_and_binds() {
-        // join-021 (F5 regression pin): a plain-ON nested join (`emp e JOIN
+        // join-021 (Regression pin): a plain-ON nested join (`emp e JOIN
         // dept d ON e.dept_id = d.dept_id`) is the LEFT side of an outer
         // USING(dept_id) join against `emp2`. Before F5, the USING parent's
         // `parent_has_using` guard unconditionally refused to inline the
@@ -8506,8 +8059,7 @@ mod tests {
         // unbindable `e.name`. F5 widened the guard to inline whenever the
         // nested join's own `RelScope` covers every field (it does here:
         // `e` covers 0..4, `d` covers 4..6).
-        //
-        // ADR-023 Phase 2.1: `dept_id` is ALSO the nested join's own join
+        // ADR-023: `dept_id` is ALSO the nested join's own join
         // key (`emp.dept_id` / `dept.dept_id`), so it is duplicated in the
         // nested side's flattened `resolved_schema` — `using_key_duplicated`
         // now refuses the flat inline under this USING parent (a live
@@ -8567,7 +8119,7 @@ mod tests {
             sql.contains("SELECT name") && !sql.contains("e.name"),
             "projection must resolve projected-through to bare `name`; got: {sql}"
         );
-        // ADR-023 Phase 2.1: `dept_id` is duplicated in the nested side's
+        // ADR-023: `dept_id` is duplicated in the nested side's
         // flattened schema (emp.dept_id / dept.dept_id) — `using_key_duplicated`
         // refuses the flat inline under this USING parent, so the side wraps.
         assert!(
@@ -8580,10 +8132,10 @@ mod tests {
 
     #[test]
     fn using_parent_hoisted_slots_qualify_by_covering_alias() {
-        // Retargeted (ADR-023 Phase 2.1) to a non-duplicated USING key: the
+        // Retargeted (ADR-023) to a non-duplicated USING key: the
         // outer parent USES `USING (id)` rather than `USING (dept_id)`.
         // `id` is unique to `emp` within the nested side's flattened
-        // schema, so `using_key_duplicated` does not trip the Phase 2.1
+        // schema, so `using_key_duplicated` does not trip the nested-join
         // guard, and — since the nested join's own `FromScope` fully
         // covers both `e` and `d` — the left side inlines. The join
         // builder's own hoisted default-slot list must qualify each
@@ -8591,7 +8143,7 @@ mod tests {
         // it: `dept_id` is duplicated between `e` and `d` (both a real,
         // DuckDB-bindable relation in the flattened FROM), so both
         // `e.dept_id` and `d.dept_id` appear, distinctly qualified. (The
-        // old `USING (dept_id)` shape this test used to exercise is now a
+        // sibling `USING (dept_id)` shape is now a
         // dup-key WRAP case — see the sibling
         // `using_parent_hoisted_slots_dup_key_still_wraps` below.)
         let nested_on_join = CommonAst::new(CommonOp::Join {
@@ -8642,12 +8194,12 @@ mod tests {
 
     #[test]
     fn using_parent_hoisted_slots_dup_key_still_wraps() {
-        // The OLD shape `using_parent_hoisted_slots_qualify_by_covering_alias`
+        // This shape `using_parent_hoisted_slots_qualify_by_covering_alias`
         // used to exercise: outer `USING (dept_id)` parent over the LEFT
         // nested ON-join `emp e JOIN dept d ON e.dept_id = d.dept_id`.
         // `dept_id` is duplicated in the nested side's OWN flattened
         // schema (both `e.dept_id` and `d.dept_id`), which DuckDB's binder
-        // rejects for a `USING` key (live-validated, ADR-023 Phase 2.1):
+        // rejects for a `USING` key (live-validated, ADR-023):
         // `using_key_duplicated` now trips the guard even though
         // `FromScope::covers_all()` succeeds, forcing the left side to
         // wrap under `AS __td_jl` instead of inlining a DuckDB-invalid
@@ -8695,7 +8247,7 @@ mod tests {
 
     #[test]
     fn using_parent_over_transitive_dup_key_ancestor_still_wraps() {
-        // Phase 2.1 transitive-case witness: THREE levels — a USING parent
+        // nested-join guard transitive-case witness: THREE levels — a USING parent
         // (outer) whose left is a plain ON-join (middle), whose OWN left is
         // a further-nested dup-key ON-join (innermost: `e.dept_id =
         // d.dept_id`, duplicating `dept_id` two levels down). Every level
@@ -8839,14 +8391,14 @@ mod tests {
 
     #[test]
     fn using_parent_with_synthetic_scoped_side_stays_wrapped() {
-        // Post-collapse (ADR-023 Phase 2): the nested join's OWN condition
+        // Post-collapse (ADR-023): the nested join's OWN condition
         // (plan_id-tagged `dept_id` refs across `emp`/`dept`) is its own
         // demand only — no ancestor references either of ITS sides. The
         // nested join's children now inline bare (`emp INNER JOIN dept ON
         // (emp.dept_id) =
         // (dept.dept_id)`) INSIDE the derived body. The wrap this test
         // pins is now driven by an entirely different mechanism (ADR-023
-        // Phase 2.1): the outer parent is `USING (dept_id)`, and
+        // nested-join guard): the outer parent is `USING (dept_id)`, and
         // `dept_id` is duplicated in the nested side's own flattened
         // schema (`emp.dept_id` and `dept.dept_id`) — DuckDB rejects a
         // duplicated USING key, so `using_key_duplicated` trips the guard
@@ -9043,9 +8595,6 @@ mod tests {
         assert!(!sql.contains("__td_agg"), "got: {sql}");
     }
 
-    // ── Pass 6: alias-transparent FROM for aggregate inputs & nested join
-    // sides (jn-013/jn-015/sq-015) ────────────────────────────────────────
-
     /// Third table for three-way-join / nested-join-side tests — `emp2` in
     /// the diagnostic's jn-013 shape.
     fn emp2_schema() -> StructType {
@@ -9185,7 +8734,7 @@ mod tests {
         assert!(!sql.contains("e.dept_id"), "got: {sql}");
     }
 
-    /// Merge-path regression pin: the same `emp e` groupBy `e.dept_id` shape
+    /// Merge-path Regression pin: the same `emp e` groupBy `e.dept_id` shape
     /// with NO occupied clause above it merges into a single SELECT — the
     /// reorder must not perturb this common case (alias stays exposed, no
     /// `__td_sub`).
@@ -9326,12 +8875,11 @@ mod tests {
 
     #[test]
     fn render_project_over_nested_join_duplicate_alias_refuses_flatten() {
-        // Reviewer pass-6 Medium: a nested join whose flattened chain would
-        // reuse a user alias must NOT flatten, or DuckDB rejects the FROM with
+        // A nested join whose flattened chain would reuse a user alias must
+        // not flatten, or DuckDB rejects the FROM with
         // "Duplicate alias". Here the inner join's left is `emp m` and the
         // OUTER right is `emp2 m` — flattening would put two `AS m` in one FROM
         // scope.
-        //
         // ADR-023 3b-i: the OUTER join's own condition (`d.dept_id ==
         // m.dept_id`) resolves `m` against the outer join's combined scope,
         // where `m` is now bound TWICE (once via the inner join's `emp AS m`
@@ -9390,7 +8938,7 @@ mod tests {
     #[test]
     fn render_join_from_dataframe_plan_id_contract_flattens_and_binds_positionally() {
         // DataFrame join-of-join, plan_id-tagged outer condition:
-        // `df.join(df2).join(df3, ...)`. Post-collapse (ADR-023 Phase 2):
+        // `df.join(df2).join(df3, ...)`. Post-collapse (ADR-023):
         // a join's own condition never force-wraps its sides (the demand-flag
         // machinery is retired), so the nested LEFT side inlines. The nested
         // join (`emp CROSS JOIN dept`) is a plain, bare-aliased chain and
@@ -9400,7 +8948,7 @@ mod tests {
         // LEFT side's own `FromScope`, `emp` is the sole exposed relation
         // covering that ordinal, so the qualifier resolves to the real
         // table name `emp` — no synthetic wrap is needed at all. This test
-        // was originally named/written to pin the OLD wrapped,
+        // was originally named/written to pin the prior wrapped,
         // non-flattened shape (`keeps_td_jl_no_flatten`); it is renamed
         // here to describe the new, collapsed behavior it now
         // demonstrates. Same DATA as before: `emp CROSS JOIN dept` then
@@ -9458,7 +9006,7 @@ mod tests {
         let bt = base_types_emp_dept_emp2(&plan);
         let typed = analyze(plan, &bt).expect("analyze DataFrame join-of-join");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        // ADR-023 Phase 2: the nested join fully flattens (no ancestor
+        // ADR-023: the nested join fully flattens (no ancestor
         // demand forces either side to wrap), and `id`'s ordinal resolves
         // positionally to the real table name `emp` (the sole exposed
         // relation covering that column within the LEFT side's own
@@ -9646,7 +9194,7 @@ mod tests {
 
     #[test]
     fn adr023_phase1_unique_name_plan_id_condition_inlines_both_sides() {
-        // ADR-023 Phase 1: `id` (emp-only) and `dept_name` (dept-only) are
+        // ADR-023: `id` (emp-only) and `dept_name` (dept-only) are
         // each unique in the merged emp⋈dept condition schema, so the
         // resolved condition drops its synthetic qualifier and neither join
         // side needs a __td_jl/__td_jr wrap — both inline directly into a
@@ -9695,7 +9243,7 @@ mod tests {
 
     #[test]
     fn asymmetric_schema_left_heavier_binds_correct_side() {
-        // ADR-023 Phase 2, H8 hiding places 1+2 (merged-vs-local ordinal
+        // ADR-023, H8 hiding places 1+2 (merged-vs-local ordinal
         // confusion; ordinal/name drift): LEFT (`emp`, 4 cols: id, name,
         // dept_id, salary) is WIDER than RIGHT (`dept`, 2 cols: dept_id,
         // dept_name). `dept_id`'s merged ordinal on the left is 2
@@ -9794,14 +9342,14 @@ mod tests {
     #[test]
     fn render_join_side_plan_id_condition_overrides_aliased_relation_hoist() {
         // `df.alias("e").join(df2.alias("d"), ...)` with a plan_id-tagged
-        // (not user-qualified) condition. Post-collapse (ADR-023 Phase 2):
+        // (not user-qualified) condition. Post-collapse (ADR-023):
         // a join's own condition never force-wraps its sides (the demand-flag
         // machinery is retired). Both sides are
         // user `AliasedRelation`s and inline directly under their own real
         // aliases (`e`/`d`); `requalify_join_condition` resolves the
         // plan_id-tagged, unqualified `dept_id` refs positionally to those
         // same real aliases — no synthetic `__td_jl`/`__td_jr` wrap is
-        // needed at all. (This test previously pinned the OLD behavior,
+        // needed at all. (This test also covers the prior behavior,
         // where the plan_id contract forced both sides to wrap under
         // synthetic aliases even though real user aliases were available
         // and sufficient.)
@@ -9851,7 +9399,7 @@ mod tests {
 
     #[test]
     fn render_aggregate_over_join_using_inlines_from_no_td_agg() {
-        // USING-under-aggregate regression pin: a direct (non-nested) USING
+        // USING-under-aggregate Regression pin: a direct (non-nested) USING
         // join under Aggregate still inlines through
         // `render_alias_transparent_from` (no `__td_agg`); USING's own
         // column-order semantics are unaffected (join_chain_flattenable only
@@ -9892,15 +9440,11 @@ mod tests {
         assert!(!sql.contains("__td_agg"), "got: {sql}");
     }
 
-    // ── tbl-013 regression: derived-table column-alias-list over a qualified
-    // aggregate arg (ToDf/WithColumnsRenamed positional rename) ────────────
-
     #[test]
     fn render_todf_over_aggregate_with_qualified_agg_arg_renames_positionally() {
         // `SELECT b, count(*) AS n FROM (SELECT e.dept_id, count(d.dept_id)
         //   FROM emp e LEFT OUTER JOIN dept d ON e.dept_id = d.dept_id
         //   GROUP BY e.dept_id) AS t (a, b) GROUP BY b` (tbl-013).
-        //
         // The inner aggregate's second output column is UNALIASED and
         // computed over a QUALIFIED arg: τ's Spark-`toPrettySQL`-parity
         // tracked name for it is `count(dept_id)` (qualifier stripped — this
@@ -9988,7 +9532,7 @@ mod tests {
 
     #[test]
     fn render_project_over_nested_semi_join_side_breaks_chain_flatten() {
-        // SEMI/ANTI-break regression pin: an inner SEMI JOIN, as the left
+        // SEMI/ANTI-break Regression pin: an inner SEMI JOIN, as the left
         // side of an outer join, must not flatten into the outer join's
         // chained FROM (CLAUDE.md gotcha 4) — `join_chain_flattenable`
         // rejects LeftSemi/LeftAnti, so it keeps its own generic
@@ -10036,11 +9580,9 @@ mod tests {
         assert!(sql.contains("emp2 AS m ON "), "got: {sql}");
     }
 
-    // ── F7 round 2: duplicate `__td_jr` join-side alias collision ───────────
-
     #[test]
     fn contract_collision_wraps_left_keeps_right_name() {
-        // join-022 unit mirror, COLLAPSED under ADR-023 Phase 2. `inner =
+        // join-022 unit mirror, COLLAPSED under ADR-023. `inner =
         // emp.join(emp2, emp.dept_id == emp2.dept_id)`: the plan_id-tagged
         // condition never force-wraps the inner join's sides (the demand-flag
         // machinery is retired). Both `emp` and `emp2` inline bare, and
@@ -10054,8 +9596,7 @@ mod tests {
         // regardless of any ancestor demand. With no buried inner `__td_jr`
         // left to collide with, there is nothing for the duplicate-alias
         // guard to do here.
-        //
-        // Phase 3b delta (D2): the ancestor `Filter`'s plan_id=3 reference
+        // id-keyed delta (D2): the ancestor `Filter`'s plan_id=3 reference
         // now resolves bare+ordinal (no synthetic `__td_jr` qualifier
         // stamped at all). `d3` is a bare `Project` with no user alias, so
         // the analyzer's own `RelScope` has no aliases entry covering its
@@ -10128,9 +9669,9 @@ mod tests {
         let bt = base_types_emp_dept_emp2(&filter);
         let typed = analyze(filter, &bt).expect("analyze join-022 shape");
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
-        // Post-Phase-3b (D2 behavior delta — see the comment above): the
+        // With id-keyed resolution: the
         // inner join still fully inlines and chain-flattens into the outer
-        // FROM, and `d3` still wraps `AS __td_jr` (unchanged from Phase 2),
+        // FROM, and `d3` still wraps `AS __td_jr` (unchanged from join flattening),
         // but the ancestor filter no longer merges — it wraps the whole
         // chain under a reprojected `__td_sub` and binds against the
         // uniquified `dept_id_2` instead of a synthetic-qualified ref.
@@ -10163,7 +9704,7 @@ mod tests {
     #[test]
     fn free_collision_renames_right_wrap() {
         // Same shape as `contract_collision_wraps_left_keeps_right_name` but
-        // WITHOUT the ancestor filter. Post-collapse (ADR-023 Phase 2): the
+        // WITHOUT the ancestor filter. Post-collapse (ADR-023): the
         // inner join's own condition is never a wrap demand, so `emp`/`emp2`
         // inline bare with no buried `__td_jr` at all. The
         // "free" collision this test used to exercise — the inner's buried
@@ -10246,11 +9787,8 @@ mod tests {
         );
     }
 
-    // ── Phase 3b: merge-path fusion (requalify_visible) + wrap-path ordinal
-    // arm (reproject_qualifiers) ───────────────────────────────────────────
-
     /// A bare plan_id-tagged column reference (the shape `resolve_column`'s
-    /// plan_id arm always produces post-Phase-3b).
+    /// plan_id arm always produces a bare, ID-keyed reference).
     fn pidcol(name: &str, plan_id: i64) -> Expression {
         Expression::UnresolvedColumn(crate::transpiler_v2::expression::UnresolvedColumn {
             name: name.to_owned(),
@@ -10468,7 +10006,6 @@ mod tests {
         );
     }
 
-    // ── O8: Sort-trim ORDER BY placement (design note pinning) ─────────────
     // See the design comment at `analyzer.rs`'s `CommonOp::Sort` trim `else`
     // branch: the ORDER BY (and LIMIT/OFFSET) of a hidden-column-promoting
     // Sort stay INSIDE the derived table the trim `Project` wraps — never
@@ -10870,7 +10407,6 @@ mod tests {
         // reached here) is left completely untouched — no silent
         // wrong-column rewrite; the unresolved reference surfaces as a
         // loud DuckDB binder error instead.
-        //
         // D2: this is also the exact shape a correlated outer reference now
         // takes at emission — tier-(g) stamps it with the OUTER plan's
         // attribute id (`resolve_in_outer`, `analyzer.rs`), which by
@@ -10927,7 +10463,7 @@ mod tests {
         // resolved_schema has duplicate names (`id`, `dept_id` both appear
         // twice in `emp JOIN emp2`) sits as the RIGHT side of a plain-ON
         // outer join — the right side never inlines, so it always wraps as
-        // ONE alias, `__td_jr`, over the duplicate-name schema. Change 2
+        // ONE alias, `__td_jr`, over the duplicate-name schema. the alias-coverage guard
         // (non-USING joins never build a default slot list) must render bare
         // `*` here, never a name-qualified list that would double-bind
         // `__td_jr.id` / `__td_jr.dept_id`.
@@ -10976,7 +10512,7 @@ mod tests {
 
     #[test]
     fn using_join_over_dup_name_side_is_boundary_error() {
-        // Change 3: a USING(dept_id) parent's RIGHT side is NEVER inlined
+        // the duplicate-reference guard: a USING(dept_id) parent's RIGHT side is NEVER inlined
         // (`may_inline_nested_join` is hardcoded `false` for the right in
         // `build_join_side`), so a nested `emp JOIN emp2` there always wraps
         // as ONE alias (`__td_jr`) regardless of any analyzer contract —
@@ -11124,8 +10660,7 @@ mod tests {
         );
     }
 
-    /// N7 (formerly the Design-035 `Folded`/`Grouped` pair, now collapsed to
-    /// one test): `CommonOp::Aggregate` built directly (as the SQL front-end
+    /// `CommonOp::Aggregate` built directly (as the SQL front-end
     /// does) never auto-prepends the grouping key — `aggregates` IS the
     /// complete SELECT list by construction. `dept_id` appears once, from
     /// `GROUP BY` only. The DataFrame-shaped prepend behavior lives in the
@@ -11306,7 +10841,6 @@ mod tests {
         expect_unsupported(err, UnsupportedKind::Op, "Aggregate[GroupingSets]", &[]);
     }
 
-    // ── rewrite_grouping_id widening (finding 6) ────────────────────────────
     // `rewrite_grouping_id` splices no-arg `grouping_id()`/`grouping()` calls
     // with the ambient grouping columns anywhere in an aggregate slot — not
     // just the 4 originally-hand-enumerated containers (FunctionCall args /
@@ -11533,8 +11067,6 @@ mod tests {
         );
     }
 
-    // ── 7. render_filter ─────────────────────────────────────────────────
-
     #[test]
     fn render_filter_composes_where_clause() {
         let bt = base_types_with_emp();
@@ -11566,8 +11098,6 @@ mod tests {
             "got: {sql}"
         );
     }
-
-    // ── 8-9. render_sort ─────────────────────────────────────────────────
 
     #[test]
     fn render_sort_asc_desc_nulls_first_last() {
@@ -11633,8 +11163,6 @@ mod tests {
         assert!(sql.contains("OFFSET 5"), "got: {sql}");
     }
 
-    // ── 10. render_limit ─────────────────────────────────────────────────
-
     #[test]
     fn render_limit_emits_limit_offset() {
         let bt = base_types_with_emp();
@@ -11649,8 +11177,6 @@ mod tests {
         assert!(sql.contains("OFFSET 3"), "got: {sql}");
     }
 
-    // ── 11. render_values ────────────────────────────────────────────────
-
     #[test]
     fn render_values_emits_values_alias() {
         let row = vec![int_lit(1), int_lit(2)];
@@ -11663,8 +11189,6 @@ mod tests {
         assert!(sql.contains("VALUES"), "got: {sql}");
         assert!(sql.contains("__td_values(a, b)"), "got: {sql}");
     }
-
-    // ── 12. render_local_relation ────────────────────────────────────────
 
     #[test]
     fn render_local_relation_emits_values_from_literals() {
@@ -11690,8 +11214,6 @@ mod tests {
         assert!(sql.contains("'x'"), "got: {sql}");
         assert!(sql.contains("__td_local(a, b)"), "got: {sql}");
     }
-
-    // ── 12b. render_data_type — Struct with duplicate field names ────────
 
     /// arr-012 boundary hygiene: `render_data_type` on
     /// `Struct<tags, tags>` MUST dedup the substrate field names because
@@ -11760,8 +11282,6 @@ mod tests {
         );
     }
 
-    // ── 13. render_file_scan ─────────────────────────────────────────────
-
     #[test]
     fn render_file_scan_parquet_emits_read_parquet() {
         let schema = StructType::new(vec![StructField::not_null("id", DataType::Long)]);
@@ -11775,8 +11295,6 @@ mod tests {
         let sql = dispatch_op(&typed.op, &typed.resolved_schema).expect("dispatch");
         assert_eq!(sql, "SELECT * FROM read_parquet('/tmp/x.parquet')");
     }
-
-    // ── build_file_reader_sql (shared helper) ───────────────────────────
 
     #[test]
     fn build_file_reader_sql_parquet_single_path() {
@@ -11864,8 +11382,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── 14-15. render_cast (§4.2 first item) ─────────────────────────────
-
     #[test]
     fn render_cast_emits_cast() {
         let expr = CastExpression {
@@ -11891,8 +11407,6 @@ mod tests {
         assert_eq!(sql, "TRY_CAST(1 AS BIGINT)");
     }
 
-    // ── 16-17. render_binary ─────────────────────────────────────────────
-
     #[test]
     fn render_binary_add_int_int() {
         let b = BinaryExpression {
@@ -11914,8 +11428,6 @@ mod tests {
         let sql = render_binary(&b, &empty_schema()).expect("render");
         assert_eq!(sql, "(3) = (3)");
     }
-
-    // ── ADR-006 ANSI divide/mod-by-zero guards (math-010/011) ────────────
 
     #[test]
     fn render_binary_div_column_divisor_guards_divide_by_zero() {
@@ -11968,8 +11480,6 @@ mod tests {
         assert!(sql.ends_with("ELSE pmod(a, b) END"), "got: {sql}");
     }
 
-    // ── 18. render_unary ─────────────────────────────────────────────────
-
     #[test]
     fn render_unary_not_isnull() {
         let u = UnaryExpression {
@@ -11990,8 +11500,6 @@ mod tests {
         assert_eq!(sql2, "NOT (TRUE)");
     }
 
-    // ── 19. render_case_when ─────────────────────────────────────────────
-
     #[test]
     fn render_case_when_with_else() {
         let cw = CaseWhenExpression {
@@ -12007,8 +11515,6 @@ mod tests {
         let sql = render_case_when(&cw, &empty_schema()).expect("render");
         assert_eq!(sql, "CASE WHEN TRUE THEN 1 ELSE 2 END");
     }
-
-    // ── 20. Between + InList ─────────────────────────────────────────────
 
     #[test]
     fn render_between_and_inlist() {
@@ -12029,8 +11535,6 @@ mod tests {
         let sql = render_expr(&in_list, &empty_schema()).expect("render");
         assert_eq!(sql, "(1) NOT IN (1, 2, 3)");
     }
-
-    // ── 21. Like / ILike ─────────────────────────────────────────────────
 
     #[test]
     fn render_like_ilike_variants() {
@@ -12064,8 +11568,6 @@ mod tests {
         assert!(sql.contains("ILIKE"), "got: {sql}");
     }
 
-    // ── 22. Star + qualified star ────────────────────────────────────────
-
     #[test]
     fn render_star_and_qualified_star() {
         let star = StarExpression { qualifier: None };
@@ -12075,8 +11577,6 @@ mod tests {
         };
         assert_eq!(render_star(&qstar).expect("render"), "t.*");
     }
-
-    // ── Pass 85 — defensive UnresolvedRegex arm ─────────────────────────
 
     #[test]
     fn render_expr_on_unresolved_regex_returns_unsupported_expression() {
@@ -12088,8 +11588,6 @@ mod tests {
         let err = render_expr(&expr, &empty_schema()).unwrap_err();
         expect_unsupported(err, UnsupportedKind::Expression, "UnresolvedRegex", &[]);
     }
-
-    // ── ExtractValue emission dispatches on child data_type (cx-001/002) ──
 
     fn extract_value(child: Expression, extraction: Expression) -> Expression {
         Expression::ExtractValue(ExtractValueExpression {
@@ -12172,7 +11670,6 @@ mod tests {
         assert_eq!(sql, "element_at((m), ('a'))[1]");
     }
 
-    // ── DUCKDB_RESERVED invariants — required by the binary_search shape
     // inside `is_safe_identifier`. If either invariant regresses the linear
     // fallback via `.iter().any(|r| r.eq_ignore_ascii_case(name))` remains
     // semantically correct, but the O(log n) fast path silently returns
@@ -12196,8 +11693,6 @@ mod tests {
             );
         }
     }
-
-    // ── 25-27. quote_ident (§5.6) ────────────────────────────────────────
 
     #[test]
     fn quote_ident_fast_path_returns_borrowed_for_unquoted_safe() {
@@ -12240,8 +11735,6 @@ mod tests {
         assert_eq!(out2, "\"a\"\"b\"");
     }
 
-    // ── 28. INV3 — no forbidden `use` inside emission.rs ─────────────────
-
     #[test]
     fn inv3_no_forbidden_use_in_emission() {
         // Only scan the non-test region of emission.rs; the tests themselves
@@ -12274,14 +11767,12 @@ mod tests {
         }
     }
 
-    // ── 29. INV10 positive — emission.rs imports are typed ───────────────
-
     #[test]
     fn inv10_emission_imports_are_typed() {
         // Positive shape check: the non-test region of emission.rs may only
         // `use crate::...` from `crate::types::{DataType, StructField,
         // StructType}` — value-level types — or from the τ-owned
-        // `bail_boundary_*!` boundary-error macros (Pass 7 / OPP-D). Both are
+        // `bail_boundary_*!` boundary-error macros. Both are
         // INV10-safe: the τ macros expand to `EmissionError::Unsupported*`
         // constructors, which is exactly what the manual `Err(EmissionError::
         // ...)` sites they replace did. The `#[cfg(test)]` tests below
@@ -12307,8 +11798,6 @@ mod tests {
         }
     }
 
-    // ── 30/31. §5.4 and §5.1 anchors — re-pointed at live code ───────────
-    //
     // Both were pinned by `#[allow(dead_code)]` helpers no production path
     // reached (`render_tail`, `spark_aggregate_return_cast`). They now ride on
     // wired code: §5.4 (CTE, no double-embed) on
@@ -12316,14 +11805,10 @@ mod tests {
     // §5.1 (the aggregate return cast is not a twin of the scalar one) on
     // `avg_of_decimal_routes_through_spark_avg` plus `avg_of_{integer,double}_stays_native`.
 
-    // ── 32. extension_targets is empty at C.1 ────────────────────────────
-
     #[test]
     fn extension_targets_is_empty_by_default() {
         assert!(extension_targets().is_empty());
     }
-
-    // ── Additional coverage: Interval literal ───────────────────────────
 
     #[test]
     fn render_interval_emits_interval_literal() {
@@ -12374,9 +11859,7 @@ mod tests {
         assert_eq!(sql, "emp.id");
     }
 
-    // ── Spark `struct(...)` → DuckDB `struct_pack(name := expr, ...)` ────
-    //
-    // Regression tests for corpus case `struct-001`. The old emission
+    // Regression tests for corpus case `struct-001`. The prior emission
     // remapped `struct` → `row`, which produced anonymous fields and broke
     // PySpark Arrow decoding (empty string keys collide). The current arm
     // derives Spark-parity field names per argument.
@@ -12439,8 +11922,6 @@ mod tests {
         let sql = render_fn("struct", vec![]);
         assert_eq!(sql, "struct_pack()");
     }
-
-    // ── JSON / CSV cluster (Pass 62) ────────────────────────────────────
 
     /// json-005 anchor: 1-arg `to_json(struct(...))` wraps DuckDB's native
     /// `to_json` with `json_strip_nulls` so Spark's default
@@ -12625,8 +12106,6 @@ mod tests {
         expect_unsupported(err, UnsupportedKind::Function, "to_csv", &["struct"]);
     }
 
-    // ── Math domain-guard wrappers (Pass 63) ────────────────────────────
-
     /// `math-005` anchor: `log(y)` with y=0 must return NULL under Spark
     /// non-ANSI semantics, not raise DuckDB "cannot take logarithm of zero".
     /// τ wraps the call in a CASE that guards `> 0`.
@@ -12675,7 +12154,7 @@ mod tests {
         assert_eq!(sql, "(a * (1::BIGINT << (2)))");
     }
 
-    /// Pass 73: `hypot(a, b)` — DuckDB has no `hypot` scalar; τ emits the
+    /// `hypot(a, b)` — DuckDB has no `hypot` scalar; τ emits the
     /// inline form `sqrt(a*a + b*b)` with explicit DOUBLE casts.
     #[test]
     fn render_hypot_emits_inline_sqrt_form() {
@@ -12685,7 +12164,7 @@ mod tests {
         assert!(sql.contains("CAST(y AS DOUBLE)"));
     }
 
-    /// Pass 73: `format_string(fmt, args...)` remaps to DuckDB's `printf`.
+    /// `format_string(fmt, args...)` remaps to DuckDB's `printf`.
     #[test]
     fn render_format_string_remaps_to_printf() {
         let sql = render_fn(
@@ -12702,7 +12181,7 @@ mod tests {
         assert!(sql.starts_with("printf("));
     }
 
-    /// Pass 73: `bround(x, n)` — Spark's banker's rounding. Emit a
+    /// `bround(x, n)` — Spark's banker's rounding. Emit a
     /// half-even CASE around `round(x * 10^n)`.
     #[test]
     fn render_bround_emits_half_even_case() {
@@ -12760,10 +12239,8 @@ mod tests {
         assert_eq!(sql, "nth_value(salary, 2, 99)");
     }
 
-    // ── Unpivot emission ────────────────────────────────────────────────
-
     /// grp-004 shape — emits conditional-aggregate SQL that matches Spark's
-    /// PIVOT semantics (empty COUNT buckets → NULL, not 0). Pass 60 anchor.
+    /// PIVOT semantics (empty COUNT buckets → NULL, not 0).
     #[test]
     fn render_pivot_explicit_values_emits_conditional_aggregate_shape() {
         let bt = base_types_with_emp();
@@ -12865,8 +12342,8 @@ mod tests {
         assert!(sql.contains(" AS \"1_c\""), "got: {sql}");
     }
 
-    /// G3 (pass 107): an Alias-wrapped pivot value (SQL `IN (1 AS one)`) must
-    /// have its alias stripped inside the CASE comparison — the alias only
+    /// An Alias-wrapped pivot value (SQL `IN (1 AS one)`) must have its alias
+    /// stripped inside the CASE comparison — the alias only
     /// names the output column (`AS "one"`), it must not leak into the CASE.
     #[test]
     fn render_pivot_strips_alias_from_pivot_value_in_case() {
@@ -12975,8 +12452,6 @@ mod tests {
         assert!(sql.contains("__td_unpivot_src"), "got: {sql}");
     }
 
-    // ── Describe / Summary emission (Pass 80) ────────────────────────────
-
     #[test]
     fn render_describe_wraps_child_in_cte_and_emits_union_all_rows() {
         let bt = base_types_with_emp();
@@ -13031,8 +12506,6 @@ mod tests {
         );
         assert!(sql.contains("'75%' AS summary"), "got: {sql}");
     }
-
-    // ── FreqItems emission (Pass 82) ─────────────────────────────────────
 
     #[test]
     fn render_freq_items_single_col_wraps_child_in_materialized_cte_with_list_having() {
@@ -13108,8 +12581,6 @@ mod tests {
         let err = super::render_freq_items(&typed_input, &[], 0.01).unwrap_err();
         expect_unsupported(err, UnsupportedKind::Op, "FreqItems", &[]);
     }
-
-    // ── Sample / SampleBy emission (Pass 83) ─────────────────────────────
 
     #[test]
     fn render_sample_emits_tablesample_bernoulli_with_percent() {
@@ -13238,8 +12709,6 @@ mod tests {
         assert!(sql.contains("WHERE FALSE"), "got: {sql}");
         assert!(sql.contains("__td_sample_by"), "got: {sql}");
     }
-
-    // ── UpdateFields emission (Pass 61 — struct-005 / struct-006) ────────
 
     fn address_struct_dt() -> DataType {
         DataType::Struct(StructType::new(vec![
@@ -13393,8 +12862,6 @@ mod tests {
         }
     }
 
-    // ── Pass 66: date/time function emission ─────────────────────────────
-    //
     // Regression tests for `to_date(str, fmt)`, `to_timestamp(str, fmt)`,
     // `unix_timestamp(col[, fmt])`, `from_unixtime(secs[, fmt])`. All rely
     // on the shared `spark_fmt_to_duckdb` helper.
@@ -13422,7 +12889,7 @@ mod tests {
     fn render_to_date_two_arg_uses_strptime_with_translated_format() {
         // dt-009 regression: `F.to_date(F.lit("15/01/2026"), "dd/MM/yyyy")`
         // must emit `CAST(strptime(..., translated_fmt) AS DATE)` — NOT the
-        // pre-Pass-66 UnsupportedFunction error.
+        // prior UnsupportedFunction error.
         let sql = render_fn(
             "to_date",
             vec![str_lit("15/01/2026"), str_lit("dd/MM/yyyy")],
@@ -13460,7 +12927,7 @@ mod tests {
     #[test]
     fn render_unix_timestamp_one_arg_casts_epoch_to_bigint() {
         // dt-014 regression #1: `F.unix_timestamp("last_login")` must emit
-        // `CAST(epoch(last_login) AS BIGINT)`. Pre-Pass-66 emission was just
+        // `CAST(epoch(last_login) AS BIGINT)`. Prior emission was just
         // `epoch(last_login)` which DuckDB accepts but with wrong Spark-parity
         // return type (Double vs Long) and TZ column shape mismatch.
         let sql = render_fn("unix_timestamp", vec![col_ref_expr("last_login")]);
@@ -13684,8 +13151,6 @@ mod tests {
         expect_unsupported(err, UnsupportedKind::Expression, "UpdateFields", &[]);
     }
 
-    // ── Pass 67: HOF fixes — exists / forall / transform-with-index ─────
-
     /// Corpus hof-004: `F.exists(tags, x -> x == 'rust')` must NOT emit the
     /// non-existent DuckDB `list_any`. Expand to
     /// `list_bool_or(list_transform(...))` with Spark-parity NULL/empty
@@ -13897,8 +13362,6 @@ mod tests {
         }
     }
 
-    // ── Explode / posexplode generators (Pass 68) ──────────────────────
-    //
     // `explode` / `explode_outer` / `posexplode_val` / `posexplode_pos`
     // land in the SELECT list; DuckDB expands `UNNEST(list)` to one row
     // per element when it appears in a SELECT projection. See
@@ -13952,7 +13415,7 @@ mod tests {
         assert_eq!(sql, "UNNEST(tags)");
     }
 
-    /// Pass 76 — Synthetic `map_explode_key(m)` / `map_explode_val(m)`
+    /// Synthetic `map_explode_key(m)` / `map_explode_val(m)`
     /// (produced by the v2 converter when it splits
     /// `F.explode(map_col).alias("k", "v")` into two projections) emit
     /// co-UNNESTed `map_keys` / `map_values` so DuckDB row-aligns the
@@ -14453,8 +13916,6 @@ mod tests {
         }
     }
 
-    // ── Pass 70: ceil/floor NaN safety, tz conversion, interval builders ──
-
     /// `math-003` regression: `ceil(x)` on a DOUBLE column that may contain
     /// NaN must not raise a DuckDB conversion error. Spark's semantics on
     /// non-finite Double are `ceil(NaN) = 0` (JVM `(long) NaN → 0`);
@@ -14611,8 +14072,6 @@ mod tests {
         let sql = render_fn("make_ym_interval", vec![int_lit(1), int_lit(6)]);
         assert_eq!(sql, "(INTERVAL (1) YEAR + INTERVAL (6) MONTH)");
     }
-
-    // ── `F.window(ts, "N unit")` — tumbling time-window (win2-002) ──────
 
     /// Duration parser — accepts every {second,minute,hour,day,week} form.
     #[test]
@@ -14826,10 +14285,8 @@ mod tests {
         );
     }
 
-    // ── Pass 72: element_at Map/Array split, typeof lower, map_concat NULL
     //             propagation, array_append/prepend NULL guard, create_map
     //             → map(list_value(...), list_value(...))
-    // ────────────────────────────────────────────────────────────────────
 
     /// `map-004` regression — `element_at(MAP, key)` unwraps the 1-element
     /// list DuckDB returns.
@@ -14852,7 +14309,7 @@ mod tests {
         assert_eq!(sql, "element_at(attrs, 'team')[1]");
     }
 
-    /// Pass 95 (`arr-008` ANSI throw) — `element_at(ARRAY, i)` wraps the
+    /// `element_at(ARRAY, i)` wraps the
     /// underlying `list_extract` in a CASE that raises Spark's
     /// `INVALID_ARRAY_INDEX_IN_ELEMENT_AT` on OOB / index-0. The message
     /// must be byte-identical to Spark 4.1's runtime template (with
@@ -14913,7 +14370,7 @@ mod tests {
         );
     }
 
-    /// Pass 95 — a positive integer literal is NOT provably in-bounds
+    /// a positive integer literal is NOT provably in-bounds
     /// because the array length is only known at runtime (`tags` is a
     /// column, not an ArrayLiteral). The guard must still fire; do not
     /// short-circuit on `is_nonzero_literal`-style predicates.
@@ -14946,7 +14403,7 @@ mod tests {
         );
     }
 
-    /// Pass 95 — `try_element_at(arr, k)` is the never-throw alias; it
+    /// `try_element_at(arr, k)` is the never-throw alias; it
     /// emits bare `list_extract` without the ANSI guard so DuckDB's
     /// silent-NULL semantics for OOB propagate to the caller.
     #[test]
@@ -14975,7 +14432,7 @@ mod tests {
         );
     }
 
-    /// Pass 95 — the Map arm of `element_at` is untouched: it still emits
+    /// the Map arm of `element_at` is untouched: it still emits
     /// the singleton-unwrap `element_at(MAP, key)[1]`. Spark does not throw
     /// on missing map keys (returns NULL); the ANSI OOB guard applies only
     /// to Array collections.
@@ -15046,7 +14503,7 @@ mod tests {
         assert_eq!(sql, "map(list_value('a', 'b'), list_value('1', '2'))");
     }
 
-    /// Pass 74 (`parse-005`) — Spark's `find_in_set(needle, csv)` returns
+    /// Spark's `find_in_set(needle, csv)` returns
     /// the 1-based position of `needle` in `csv`, or 0 if not found.
     /// DuckDB has no `find_in_set`; emit
     /// `COALESCE(list_position(string_split(csv, ','), needle), 0)`.
@@ -15059,7 +14516,7 @@ mod tests {
         );
     }
 
-    /// Pass 74 (`parse-007`) — Spark's `elt(idx, s1, s2, ...)` is
+    /// Spark's `elt(idx, s1, s2, ...)` is
     /// 1-based array indexing. Emit `([s1, s2, ...])[idx]` using DuckDB's
     /// 1-based list-literal indexing.
     #[test]
@@ -15071,7 +14528,7 @@ mod tests {
         assert_eq!(sql, "(['a', 'b', 'c'])[2]");
     }
 
-    /// Pass 74 (`cond-010`) — Spark's `isnan(x)` schema is BOOLEAN
+    /// Spark's `isnan(x)` schema is BOOLEAN
     /// non-nullable; DuckDB's `isnan(NULL)` returns NULL. Wrap in
     /// `COALESCE(..., FALSE)` to preserve the non-null semantics.
     #[test]
@@ -15080,7 +14537,7 @@ mod tests {
         assert_eq!(sql, "COALESCE(isnan(score), FALSE)");
     }
 
-    /// Pass 74 (`str-011`) — Spark's `concat_ws(sep, arr)` on a NULL
+    /// Spark's `concat_ws(sep, arr)` on a NULL
     /// array returns "" (not NULL). DuckDB's `array_to_string(NULL, ',')`
     /// returns NULL; τ wraps the emission in `COALESCE(..., '')`.
     #[test]
@@ -15096,7 +14553,7 @@ mod tests {
         assert_eq!(sql, "COALESCE(array_to_string(tags, ','), '')");
     }
 
-    /// Pass 74 (`type-015`) — Spark's `concat(s1, s2)` on strings
+    /// Spark's `concat(s1, s2)` on strings
     /// propagates NULL: any NULL arg yields NULL. DuckDB's `concat`
     /// silently drops NULL args. τ wraps in a CASE null-guard.
     #[test]
@@ -15120,7 +14577,7 @@ mod tests {
         );
     }
 
-    /// Pass 75 — `parse_url(url, 'HOST')` rewrites to a `regexp_extract`
+    /// `parse_url(url, 'HOST')` rewrites to a `regexp_extract`
     /// with a HOST pattern, wrapped in `NULLIF(..., '')` so Spark's NULL
     /// semantics for missing components match. Corpus: parse-001.
     #[test]
@@ -15139,7 +14596,7 @@ mod tests {
         );
     }
 
-    /// Pass 75 — `parse_url(url, 'QUERY', 'q')` builds a keyed-query
+    /// `parse_url(url, 'QUERY', 'q')` builds a keyed-query
     /// regex that captures the value for key `q`. Regex-escapes the key so
     /// e.g. `.` in a key name doesn't match any character. Corpus: parse-001.
     #[test]
@@ -15159,7 +14616,7 @@ mod tests {
         assert!(sql.contains(r"q\.k="), "expected escaped key, got: {sql}");
     }
 
-    /// Pass 75 — Spark's `Literal(Double)` must render with an explicit
+    /// Spark's `Literal(Double)` must render with an explicit
     /// `CAST(... AS DOUBLE)`; DuckDB parses bare `3.14` as DECIMAL and the
     /// Spark schema would then mismatch. Corpus: cast-001.
     #[test]
@@ -15175,7 +14632,7 @@ mod tests {
         );
     }
 
-    /// Pass 75 — DECIMAL / DECIMAL division routes to `spark_decimal_div`
+    /// DECIMAL / DECIMAL division routes to `spark_decimal_div`
     /// (extension) instead of the native `/`, which yields DOUBLE and loses
     /// Spark-declared scale. Corpus: type-005.
     #[test]
@@ -15226,7 +14683,7 @@ mod tests {
         );
     }
 
-    /// Pass 12 — `spark_decimal_div` operands must be CAST to their declared
+    /// `spark_decimal_div` operands must be CAST to their declared
     /// `DECIMAL(p,s)`: the analyzer types both operands Decimal, but a
     /// DuckDB-native aggregate (e.g. windowed `avg` over DECIMAL) emits
     /// DOUBLE at runtime, and the extension rejects DOUBLE args. Corpus:
@@ -15309,7 +14766,7 @@ mod tests {
         );
     }
 
-    /// Pass 12 — a `Div` whose operands are not both analyzer-Decimal must
+    /// a `Div` whose operands are not both analyzer-Decimal must
     /// NOT be routed to `spark_decimal_div`; it renders the plain operator
     /// (with the existing ANSI divide-by-zero guard, skipped here since the
     /// divisor is a nonzero literal). Guards against over-routing.
@@ -15328,8 +14785,6 @@ mod tests {
         assert_eq!(sql, "(CAST(6.0 AS DOUBLE)) / (CAST(2.0 AS DOUBLE))");
     }
 
-    // ── Date ± Interval arithmetic returns DATE (root cause: 026) ──────────
-    //
     // DuckDB promotes `DATE ± INTERVAL` to TIMESTAMP; Spark's Date ± Interval
     // stays DATE (`binary_data_type` in expression.rs preserves the
     // date-like side). N4 moved the corrective CAST from `render_binary`
@@ -15438,9 +14893,8 @@ mod tests {
 
     /// N4 byte-identity pin: routing the DATE-cast correction through the
     /// analyzer's `materialize_binary_coercions` + `render_cast` must
-    /// produce the EXACT same SQL string the old `render_binary`-local guard
-    /// used to build directly (`format!("CAST({inner} AS DATE)")`) — proves
-    /// the migration didn't perturb wire output byte-for-byte.
+    /// produce the exact SQL string required by the DATE-preserving guard
+    /// (`format!("CAST({inner} AS DATE)")`).
     #[test]
     fn render_binary_date_plus_interval_n4_pipeline_is_byte_identical_to_legacy_guard() {
         let i = IntervalExpression {
@@ -15515,8 +14969,6 @@ mod tests {
         );
     }
 
-    // ── add_months / date_add / date_sub return DATE (root cause: 026) ─────
-    //
     // DuckDB's `DATE + INTERVAL n MONTH|DAY` promotes to TIMESTAMP; Spark's
     // `add_months`/`date_add`/`date_sub` always return DATE. Corpus:
     // test_date_add, test_date_sub, test_add_months.
@@ -15561,8 +15013,6 @@ mod tests {
         );
     }
 
-    // ── trunc(date, fmt) returns DATE (Pass N3) ─────────────────────────
-    //
     // DuckDB's `date_trunc(fmt, date)` natively returns TIMESTAMP; Spark's
     // 2-arg `trunc(date, fmt)` always returns DATE. The
     // `render_function_call` wrapper's `needs_date_return_cast` roster
@@ -15628,8 +15078,6 @@ mod tests {
         );
     }
 
-    // ── DATE_RETURNING_FNS mechanical audit (Pass N3) ────────────────────
-    //
     // `needs_date_return_cast`'s divergence roster and
     // `type_inference::DATE_RETURNING_FNS` (the Date-typed function roster)
     // must agree in substance: every function Spark types as Date must
@@ -15719,8 +15167,6 @@ mod tests {
         }
     }
 
-    // ── split(str, pattern[, limit]) limit semantics ────────────────────
-    //
     // Spark's 3-arg `split` caps the result at `limit` elements (limit > 0)
     // or behaves unlimited (limit <= 0). Verified live against Spark 4.1.1
     // and DuckDB (`split`/`list_slice`/`array_to_string`). Corpus:
@@ -15803,7 +15249,7 @@ mod tests {
 
     /// `max_by(name, val)` renders to DuckDB's `arg_max_null(name, val)` —
     /// `arg_max_null` (not `arg_max`) is required for Spark's null-at-extreme
-    /// value semantics (finding 2, v2-review-findings-2026-07-13.md).
+    /// value semantics.
     #[test]
     fn max_by_renders_to_arg_max_null() {
         let f = fcall(
@@ -15869,7 +15315,7 @@ mod tests {
         assert_eq!(sql, "count(DISTINCT value)");
     }
 
-    /// Pass 13 — `avg`/`mean` over a DECIMAL argument routes through the
+    /// `avg`/`mean` over a DECIMAL argument routes through the
     /// ext6 extension's `spark_avg` (native DECIMAL) instead of DuckDB's
     /// native `avg` (widens DECIMAL to DOUBLE), wrapped in the Spark-parity
     /// outer CAST to the analyzer-declared `AvgLike` type — DECIMAL(9,2) →
@@ -15888,7 +15334,7 @@ mod tests {
         );
     }
 
-    /// Pass 13 — `mean` is Spark's alias for `avg`; same decimal routing.
+    /// `mean` is Spark's alias for `avg`; same decimal routing.
     #[test]
     fn mean_of_decimal_routes_through_spark_avg() {
         let f = fcall("mean", vec![decimal_col("bonus", 9, 2)]);
@@ -15903,7 +15349,7 @@ mod tests {
         );
     }
 
-    /// Pass 13 — windowed decimal `avg` must wrap the WHOLE `spark_avg(...)
+    /// windowed decimal `avg` must wrap the WHOLE `spark_avg(...)
     /// OVER (...)` expression in the outer CAST (`CAST(...) OVER (...)` is
     /// invalid SQL), unlike the generic window path which appends OVER
     /// after an already-rendered function.
@@ -15926,7 +15372,7 @@ mod tests {
         );
     }
 
-    /// Pass 13 — `avg(DISTINCT d)` must propagate `DISTINCT` into
+    /// `avg(DISTINCT d)` must propagate `DISTINCT` into
     /// `spark_avg(DISTINCT ...)`, not drop it.
     #[test]
     fn distinct_decimal_avg_propagates_distinct() {
@@ -15939,7 +15385,7 @@ mod tests {
         );
     }
 
-    /// Pass 13 (negative) — `avg` over a non-DECIMAL (DOUBLE) argument must
+    /// `avg` over a non-DECIMAL (DOUBLE) argument must
     /// stay on DuckDB's native `avg`, guarding the decimal-only routing
     /// predicate against over-firing on integer/float `avg`.
     #[test]
@@ -15953,7 +15399,7 @@ mod tests {
         assert_eq!(sql, "avg(salary)");
     }
 
-    /// Pass 13 (negative) — `avg` over an INTEGER argument must also stay on
+    /// `avg` over an INTEGER argument must also stay on
     /// DuckDB's native `avg` (Spark's AvgLike over a non-decimal is DOUBLE,
     /// which DuckDB `avg` already yields): the decimal-only predicate must not
     /// fire on integer `avg`.
@@ -15968,7 +15414,7 @@ mod tests {
         assert_eq!(sql, "avg(cnt)");
     }
 
-    /// Pass 74 (`agg-013`) — Spark's `percentile_approx(col, q)` returns
+    /// Spark's `percentile_approx(col, q)` returns
     /// a discrete value from the sample; τ uses DuckDB's `quantile_disc`
     /// (not `approx_quantile`, which linearly interpolates).
     #[test]
@@ -15989,7 +15435,7 @@ mod tests {
         );
     }
 
-    /// Pass 124 — Spark's `percentile(col, p)` is the exact CONTINUOUS
+    /// Spark's `percentile(col, p)` is the exact CONTINUOUS
     /// (linear-interpolation) quantile → DuckDB `quantile_cont`, distinct
     /// from `percentile_approx` (discrete `quantile_disc`). Corpus: agg-019.
     #[test]
@@ -16014,7 +15460,7 @@ mod tests {
         );
     }
 
-    /// Pass 124 — `collect_list` passes through verbatim to the session
+    /// `collect_list` passes through verbatim to the session
     /// macro (`LIST(x) FILTER (WHERE x IS NOT NULL)`). Corpus: agg-018.
     #[test]
     fn render_collect_list_passes_through() {
@@ -16026,7 +15472,7 @@ mod tests {
         );
     }
 
-    /// Pass 124 — `collect_set` passes through verbatim; the DISTINCT lives
+    /// `collect_set` passes through verbatim; the DISTINCT lives
     /// inside the session macro, so the emitted SQL carries no DISTINCT
     /// token itself. Corpus: agg-018.
     #[test]
@@ -16043,7 +15489,7 @@ mod tests {
         );
     }
 
-    /// Pass 76 — Spark's `url_encode(s)` uses form-urlencoded (spaces → `+`),
+    /// Spark's `url_encode(s)` uses form-urlencoded (spaces → `+`),
     /// but DuckDB's `url_encode(s)` emits `%20`. τ post-substitutes so the
     /// bytes match Spark. Corpus witness: `parse-002`.
     #[test]
@@ -16062,7 +15508,7 @@ mod tests {
         );
     }
 
-    /// Pass 76 — `url_decode(s)` must first substitute `+ → %20` to match
+    /// `url_decode(s)` must first substitute `+ → %20` to match
     /// Spark's form-urlencoded decoding.
     #[test]
     fn render_url_decode_pre_substitutes_plus() {
@@ -16077,7 +15523,7 @@ mod tests {
         assert!(sql.contains("'+'") && sql.contains("'%20'"), "got: {sql}");
     }
 
-    /// Pass 76 — `try_to_number(str, '999.99')` derives `DECIMAL(5, 2)` from
+    /// `try_to_number(str, '999.99')` derives `DECIMAL(5, 2)` from
     /// the literal format template and emits `try_cast(... AS DECIMAL(5, 2))`.
     /// Corpus witness: `parse-004`.
     #[test]
@@ -16096,7 +15542,7 @@ mod tests {
         assert!(sql.contains("DECIMAL(5, 2)"), "got: {sql}");
     }
 
-    /// Pass 76 — Spark DDL `"a INT, b ARRAY<STRING>, c STRUCT<d:BOOLEAN>"`
+    /// Spark DDL `"a INT, b ARRAY<STRING>, c STRUCT<d:BOOLEAN>"`
     /// translates to DuckDB's JSON schema shape. Corpus witnesses:
     /// `json-003`, `json-004`.
     #[test]
@@ -16128,7 +15574,7 @@ mod tests {
         }
     }
 
-    /// Pass 87 — `from_csv(csv_str, "qty INT, label STRING, price DOUBLE")`
+    /// `from_csv(csv_str, "qty INT, label STRING, price DOUBLE")`
     /// emits a per-field `split_part` synthesis wrapped in a NULL guard so
     /// a NULL input yields a NULL struct (not a struct-of-NULLs).
     /// Corpus witness: `json-007`.
@@ -16170,7 +15616,7 @@ mod tests {
         );
     }
 
-    /// Pass 87 — DDL parsed into a flat `StructType` for τ's projection
+    /// DDL parsed into a flat `StructType` for τ's projection
     /// schema inference. Nested composite types are rejected (Spark's own
     /// `from_csv` accepts only flat primitives).
     #[test]
@@ -16188,7 +15634,7 @@ mod tests {
         assert!(from_csv_ddl_to_struct("a ARRAY<INT>").is_none());
     }
 
-    /// Pass 87 review M2 — Spark's `from_csv(csv_str, schema_ddl, options_map)`
+    /// Spark's `from_csv(csv_str, schema_ddl, options_map)`
     /// three-arg options form is a Thunderduck-boundary error. Prior to the
     /// fix, the arm's `if f.args.len() == 2` guard silently declined to match
     /// and DuckDB got literal `from_csv(...)` back, producing an opaque
@@ -16220,7 +15666,7 @@ mod tests {
         expect_unsupported(err, UnsupportedKind::Function, "from_csv", &["options-map"]);
     }
 
-    /// Pass 87 review M2 — Spark's `from_json(json_str, schema_ddl, options_map)`
+    /// Spark's `from_json(json_str, schema_ddl, options_map)`
     /// three-arg options form is likewise a Thunderduck-boundary error. The
     /// `!= 2` arm intercepts before the fallthrough could hand DuckDB a
     /// literal `from_json(...)` with an unrecognized options arg.
@@ -16255,7 +15701,7 @@ mod tests {
         );
     }
 
-    /// Pass 87 — a non-literal schema argument is a Thunderduck-boundary
+    /// a non-literal schema argument is a Thunderduck-boundary
     /// error, mirroring `from_json`'s behavior.
     #[test]
     fn render_from_csv_non_literal_schema_is_boundary_error() {
@@ -16282,7 +15728,7 @@ mod tests {
         expect_unsupported(err, UnsupportedKind::Function, "from_csv", &[]);
     }
 
-    /// Pass 77 — `unionByName(allowMissingColumns=True)` emits padded
+    /// `unionByName(allowMissingColumns=True)` emits padded
     /// child SELECTs (`CAST(NULL AS ty) AS name` for absent columns) and a
     /// plain `UNION [ALL]` combinator instead of `UNION BY NAME` — the
     /// aligned projections make the two forms equivalent, and plain UNION
@@ -16345,8 +15791,6 @@ mod tests {
             "expected UNION ALL combinator, got: {sql}"
         );
     }
-
-    // ── Pass 90 — inline_field / inline_outer_field emission ────────────
 
     /// Schema with an `arr : Array<Struct<name STRING?, dept_id INT?, salary DOUBLE?>>`
     /// column — enough surface to test both plain and sentinel-wrapped forms.
@@ -16437,8 +15881,6 @@ mod tests {
         );
     }
 
-    // ── Pass 91 — json_tuple_field emission ─────────────────────────────
-
     fn json_str_schema() -> Schema {
         Schema::minted(StructType::new(vec![
             StructField::not_null("id", DataType::Long),
@@ -16495,7 +15937,7 @@ mod tests {
         );
     }
 
-    /// Pass 76 — `parse_number_format` recognizes digit templates.
+    /// `parse_number_format` recognizes digit templates.
     #[test]
     fn parse_number_format_digit_template() {
         assert_eq!(parse_number_format("999.99"), Some((5, 2)));
@@ -16545,8 +15987,6 @@ mod tests {
         assert!(sql.contains("IS NOT NULL"), "got: {sql}");
     }
 
-    // ── render_na_fill — chain-002 regression ─────────────────────────────
-    //
     // `.na.fill(0)` (single value, no subset) sends `NAFill.cols=[]` from the
     // PySpark client. Spark's `DataFrameNaFunctions.fillValue` silently skips
     // columns whose type does not match the fill value's type; τ must too, or
@@ -16598,8 +16038,6 @@ mod tests {
         assert!(sql.contains("SELECT s,"), "got: {sql}");
         assert!(sql.contains(", b FROM"), "got: {sql}");
     }
-
-    // ── LATERAL VIEW emission tests (cx-007/cx-008/cx-009) ──────────────
 
     /// Build a `TypedOp::LateralView` with a TableScan("emp") aliased "e"
     /// and an `ARRAY<STRING>` tags column. Returns the TypedAst for the
@@ -16804,11 +16242,9 @@ mod tests {
         );
     }
 
-    // ── Plan 006 F3: LateralView default-slot widening pins ─────────────
-
     #[test]
     fn lateral_view_over_range_appends_generated_column() {
-        // F3 regression pin (review findings #3): `range(3)`'s FROM-item
+        // Regression pin (implementation constraint): `range(3)`'s FROM-item
         // leaf carries a default `id` bind (tbl-006); a merged LateralView
         // must widen that default list to include its own generated column
         // too, or a downstream bare-star consumer would never see it.
@@ -16864,8 +16300,6 @@ mod tests {
             "LateralView over a plain scan must still render SELECT *; got: {sql}"
         );
     }
-
-    // ── Pass-17: LATERAL derived-table join emission ────────────────────
 
     /// E2E analyze + emit of the tbl-005 shape: the SQL must contain
     /// `CROSS JOIN LATERAL` and NOT contain `__td_jl`.
@@ -17076,8 +16510,6 @@ mod tests {
             "must contain LATERAL keyword, got: {sql}"
         );
     }
-
-    // ── Pass 18: RecursiveCte emission tests ──────────────────────────────
 
     /// Full pipeline (lower→analyze→dispatch) for cte-009.
     #[test]

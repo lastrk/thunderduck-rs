@@ -4,31 +4,28 @@
 
 require thdck_spark_funcs
 
-# NULL dividend -> NULL
+# NULL operands and zero divisors return NULL; a zero numerator remains a typed
+# zero when the divisor is non-zero.
 query I
 SELECT spark_decimal_div(NULL::DECIMAL(4,2), 3.0::DECIMAL(3,1));
 ----
 NULL
 
-# NULL divisor -> NULL
 query I
 SELECT spark_decimal_div(10.00::DECIMAL(4,2), NULL::DECIMAL(3,1));
 ----
 NULL
 
-# Both NULL -> NULL
 query I
 SELECT spark_decimal_div(NULL::DECIMAL(4,2), NULL::DECIMAL(3,1));
 ----
 NULL
 
-# Division by zero -> NULL
 query I
 SELECT spark_decimal_div(10.00::DECIMAL(4,2), 0.0::DECIMAL(3,1));
 ----
 NULL
 
-# Division of zero by nonzero -> 0
 query I
 SELECT spark_decimal_div(0.00::DECIMAL(4,2), 3.0::DECIMAL(3,1));
 ----

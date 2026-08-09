@@ -71,7 +71,6 @@ fi
 SPARK_HOME="${SPARK_HOME:-$WORKSPACE_DIR/.spark/spark-4.1.1}"
 [ -d "$SPARK_HOME" ] || SPARK_HOME="$HOME/spark/current"
 
-# Handle --ci flag
 if [[ "$1" == "--ci" ]]; then
     shift
     export THUNDERDUCK_TEST_SUITE_CONTINUE_ON_ERROR="${THUNDERDUCK_TEST_SUITE_CONTINUE_ON_ERROR:-true}"
@@ -111,7 +110,6 @@ else
     exit 1
 fi
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -204,7 +202,6 @@ echo -e "${BLUE}Differential Tests: Apache Spark 4.1.1 vs Thunderduck (Rust)${NC
 echo -e "${BLUE}================================================================${NC}"
 echo ""
 
-# Check prerequisites
 echo -e "${BLUE}[1/2] Checking prerequisites...${NC}"
 
 # Spark is only required for live/record oracle modes; golden mode never starts
@@ -259,7 +256,6 @@ if [ ! -f "$BINARY_PATH" ]; then
 fi
 echo -e "${GREEN}  Thunderduck binary found: $BINARY_PATH${NC}"
 
-# Parse arguments
 show_help() {
     echo "Usage: $0 [--ci] [--record | --oracle MODE] [test-group] [pytest-args...]"
     echo ""
@@ -314,7 +310,6 @@ if [ -n "$TEST_FILTER" ]; then
     FILTER_ARGS=(-k "$TEST_FILTER")
 fi
 
-# Run tests
 echo ""
 echo -e "${BLUE}[2/2] Running tests...${NC}"
 echo ""

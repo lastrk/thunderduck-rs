@@ -37,11 +37,9 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Determine output directory
     if args.output:
         output_dir = Path(args.output)
     else:
-        # Default output path based on scale factor
         sf_str = str(args.sf).replace(".", "")
         output_dir = Path(f"/workspace/data/tpcds_sf{sf_str}")
 
@@ -51,7 +49,6 @@ def main():
     print(f"Scale Factor: {args.sf}")
     print(f"Output Directory: {output_dir}")
 
-    # Create DuckDB connection
     conn = duckdb.connect(':memory:')
 
     # Install and load TPC-DS extension
@@ -78,7 +75,6 @@ def main():
         count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         print(f"     - {table}: {count:,} rows")
 
-    # Export to Parquet
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n4. Exporting to Parquet ({output_dir})...")

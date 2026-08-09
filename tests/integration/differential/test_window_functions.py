@@ -23,9 +23,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.dataframe_diff import assert_dataframes_equal
 
 
-# ============================================================================
-# Test Data Fixtures
-# ============================================================================
 
 @pytest.fixture(scope="class")
 def employee_data(spark_reference, spark_thunderduck):
@@ -112,9 +109,7 @@ def stock_data(spark_reference, spark_thunderduck):
     return df_ref, df_td
 
 
-# ============================================================================
 # Ranking Function Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -242,9 +237,7 @@ class TestRankingFunctions:
         assert_dataframes_equal(result_ref, result_td, "multiple_ranking")
 
 
-# ============================================================================
 # Analytic Function Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -422,9 +415,7 @@ class TestAnalyticFunctions:
         assert_dataframes_equal(result_ref, result_td, "lag_lead_combined")
 
 
-# ============================================================================
 # Frame Specification Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -562,9 +553,7 @@ class TestFrameSpecifications:
         assert_dataframes_equal(result_ref, result_td, "range_nearby", epsilon=1e-6)
 
 
-# ============================================================================
 # Aggregate Window Function Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions
@@ -673,9 +662,7 @@ class TestAggregateWindowFunctions:
         assert_dataframes_equal(result_ref, result_td, "ratio_to_partition", epsilon=1e-10)
 
 
-# ============================================================================
 # Advanced/Combined Tests
-# ============================================================================
 
 @pytest.mark.differential
 @pytest.mark.functions

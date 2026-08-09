@@ -419,7 +419,6 @@ class TpcdsDataFrameQueries:
 
         return result
 
-    # Continue with remaining compatible queries...
     # For brevity, I'll add just the query signatures and you can implement them similarly
 
     @staticmethod
@@ -1370,7 +1369,6 @@ class TpcdsDataFrameQueries:
 # Dictionary of compatible queries (Q72 excluded - causes Spark OOM)
 COMPATIBLE_QUERIES = [3, 7, 9, 12, 13, 15, 17, 19, 20, 25, 26, 29, 32, 37, 40, 41, 42, 43, 45, 48, 50, 52, 55, 62, 71, 82, 84, 85, 91, 92, 96, 98, 99]
 
-# Query implementations mapping
 QUERY_IMPLEMENTATIONS: dict[int, Callable] = {
     3: TpcdsDataFrameQueries.q3,
     7: TpcdsDataFrameQueries.q7,

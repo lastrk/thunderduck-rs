@@ -17,8 +17,6 @@ use tonic::Status;
 
 use crate::proto::spark::connect as proto;
 
-// ── Public entry point ────────────────────────────────────────────────────────
-
 /// Attempt to resolve a root `Relation { Catalog(..) }` into a `CommonAst`.
 ///
 /// Returns:
@@ -56,7 +54,6 @@ pub(crate) async fn resolve_catalog_relation(
         CatType::TableExists(te) => resolve_table_exists(&te.table_name, session).await?,
         CatType::DropTempView(dtv) => resolve_drop_temp_view(&dtv.view_name, session).await?,
 
-        // ── Out-of-scope variants → honest Thunderduck-boundary error ─────
         other => {
             let variant_name = cat_type_variant_name(other);
             return Err(Status::unimplemented(format!(
@@ -66,8 +63,6 @@ pub(crate) async fn resolve_catalog_relation(
     };
     Ok(Some(ast))
 }
-
-// ── Scalar helpers ────────────────────────────────────────────────────────────
 
 /// Build a 1-row, 1-column `Values` AST with a string literal.
 fn values_string(col: &str, value: &str) -> CommonAst {
@@ -107,26 +102,8 @@ fn null_lit(data_type: DataType) -> Expression {
     })
 }
 
-// ── Function metadata ─────────────────────────────────────────────────────────
-
-/// Spark probe finding (Spark 4.1.1 local, `spark.catalog.getFunction("abs")`):
-///   name='abs', catalog=None, namespace=None,
-///   description='abs(expr) - Returns the absolute value of ...',
-///   className='org.apache.spark.sql.catalyst.expressions.Abs',
-///   isTemporary=True
-///
-/// PySpark Connect client unpacks columns positionally:
-///   table[0]=name, table[1]=catalog, table[2]=namespace,
-///   table[3]=description, table[4]=className, table[5]=isTemporary
-///
-/// Thunderduck mirrors:
-///   - catalog → NULL (typed NULL, String)
-///   - namespace → NULL (typed NULL, Array<String>)
-///   - description → NULL (typed NULL, String) — mirroring the full
-///     description string per-function is not cheap; NULL is safe because
-///     the differential tests do not assert on description content.
-///   - className → NULL (typed NULL, String) — same rationale.
-///   - isTemporary → true (builtins are temporary in Spark)
+/// Build Spark's positional function-metadata row. Descriptions and class names
+/// are unavailable, so they remain typed NULLs.
 fn function_row(name: &str) -> Vec<Expression> {
     vec![
         string_lit(name),
@@ -152,17 +129,9 @@ fn function_columns() -> Vec<String> {
 
 /// `getFunction(name)` — returns a single-row function metadata AST, or a
 /// Spark-emulated `UNRESOLVED_ROUTINE` error if the function is unknown.
-// `Status` is the gRPC error channel mandated by the `SparkConnectService` trait
-// and used across this crate (39 signatures return `Result<_, Status>`); boxing
-// it here alone would be inconsistent with the layer and force an unbox at every
-// trait boundary, buying one allocation on the reject path.
 #[allow(clippy::result_large_err)]
 fn resolve_get_function(name: &str) -> Result<CommonAst, Status> {
     if !function_catalog::is_supported_function(name) {
-        // Spark 4.1.1 raises:
-        //   [UNRESOLVED_ROUTINE] Cannot resolve function `<name>` ...
-        // The PySpark Connect client raises AnalysisException on the gRPC
-        // internal error path, so Status::internal is the correct channel.
         return Err(Status::internal(format!(
             "[UNRESOLVED_ROUTINE] Cannot resolve function `{name}` on search path"
         )));
@@ -186,15 +155,12 @@ fn resolve_list_functions() -> CommonAst {
     })
 }
 
-// ── Session-backed ops ────────────────────────────────────────────────────────
-
 /// `tableExists(name)` — query the live DuckDB session for tables and views.
 async fn resolve_table_exists(
     name: &str,
     session: &Arc<DuckDbSession>,
 ) -> Result<CommonAst, Status> {
-    // DuckDB system tables: duckdb_tables() for tables, duckdb_views() for views.
-    // Escape single quotes in the name to prevent SQL injection.
+    // Escape single quotes in the name before embedding it in SQL.
     let escaped = name.replace('\'', "''");
     let sql = format!(
         "SELECT EXISTS(\
@@ -217,7 +183,6 @@ async fn resolve_drop_temp_view(
     name: &str,
     session: &Arc<DuckDbSession>,
 ) -> Result<CommonAst, Status> {
-    // Step 1: check if the view exists as a temporary view.
     let escaped = name.replace('\'', "''");
     let check_sql = format!(
         "SELECT EXISTS(\
@@ -232,7 +197,6 @@ async fn resolve_drop_temp_view(
     let existed = extract_bool_scalar(&batches);
 
     if existed {
-        // Step 2: drop it. Use quote_ident-style escaping for the identifier.
         let ident = format!("\"{}\"", name.replace('"', "\"\""));
         let drop_sql = format!("DROP VIEW IF EXISTS {ident}");
         session
@@ -265,8 +229,6 @@ fn extract_bool_scalar(batches: &[arrow::array::RecordBatch]) -> bool {
     }
     false
 }
-
-// ── Variant name helper ───────────────────────────────────────────────────────
 
 /// Human-readable name of a `CatType` variant for error messages.
 fn cat_type_variant_name(cat: &proto::catalog::CatType) -> &'static str {
@@ -304,8 +266,6 @@ fn cat_type_variant_name(cat: &proto::catalog::CatType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Unit tests for AST shape ──────────────────────────────────────────
 
     #[test]
     fn values_string_produces_single_row_single_col() {
@@ -353,7 +313,6 @@ mod tests {
                 assert_eq!(column_names[5], "isTemporary");
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].len(), 6);
-                // name column is "abs"
                 match &rows[0][0] {
                     Expression::Literal(Literal {
                         value: LiteralValue::String(s),
@@ -361,7 +320,6 @@ mod tests {
                     }) => assert_eq!(s, "abs"),
                     other => panic!("expected string 'abs', got: {other:?}"),
                 }
-                // namespace is typed NULL (Array<String>)
                 match &rows[0][2] {
                     Expression::Literal(Literal {
                         value: LiteralValue::Null,
@@ -392,13 +350,11 @@ mod tests {
         match &ast.op {
             CommonOp::Values { rows, column_names } => {
                 assert_eq!(column_names.len(), 6);
-                // Should have rows for every supported function
                 assert_eq!(
                     rows.len(),
                     function_catalog::SUPPORTED_FUNCTIONS.len(),
                     "row count must match SUPPORTED_FUNCTIONS length"
                 );
-                // First row name should be the first sorted function
                 match &rows[0][0] {
                     Expression::Literal(Literal {
                         value: LiteralValue::String(s),
@@ -413,12 +369,9 @@ mod tests {
 
     #[test]
     fn cat_type_variant_name_covers_all() {
-        // Smoke test: at least the 8 supported variants have names
         let current_db = proto::catalog::CatType::CurrentDatabase(proto::CurrentDatabase {});
         assert_eq!(cat_type_variant_name(&current_db), "CurrentDatabase");
     }
-
-    // ── Session-backed tests (tokio) ──────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread")]
     async fn table_exists_false_for_nonexistent() {
@@ -471,7 +424,6 @@ mod tests {
             .get_or_create("catalog-test-drop-existing")
             .await
             .expect("session");
-        // Create a temp view first
         session
             .create_temp_view("catalog_drop_test_view", "SELECT 1 AS id")
             .await

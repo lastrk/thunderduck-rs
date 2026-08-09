@@ -53,7 +53,6 @@ class TestDataFrameBasicOperationsDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="select_columns")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
@@ -91,13 +90,11 @@ class TestDataFrameBasicOperationsDifferential:
         ).orderBy("id")
         assert_dataframes_equal(spark_result3, td_result3, query_name="filter_or")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_groupby_aggregation(self, spark_reference, spark_thunderduck):
         """Test group by with various aggregations - exact parity check."""
-        # Create test table on both systems
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 90000, 'Sales')")
@@ -124,13 +121,11 @@ class TestDataFrameBasicOperationsDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="groupby_aggregation", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_join_operations(self, spark_reference, spark_thunderduck):
         """Test various join types - exact parity check."""
-        # Create test tables on both systems
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 90000, 'Sales')")
@@ -165,7 +160,6 @@ class TestDataFrameBasicOperationsDifferential:
         td_right_count = emp_td.join(dept_td, emp_td.department == dept_td.name, "right").agg(F.count("*").alias("cnt"))
         assert_dataframes_equal(spark_right_count, td_right_count, query_name="join_right", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_reference.sql("DROP TABLE departments")
         spark_thunderduck.sql("DROP TABLE employees")
@@ -173,7 +167,6 @@ class TestDataFrameBasicOperationsDifferential:
 
     def test_window_functions(self, spark_reference, spark_thunderduck):
         """Test window functions - exact parity check."""
-        # Create test table on both systems
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 90000, 'Sales')")
@@ -202,13 +195,11 @@ class TestDataFrameBasicOperationsDifferential:
 
         assert_dataframes_equal(spark_result, td_result, query_name="window_functions", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_pivot_operations(self, spark_reference, spark_thunderduck):
         """Test pivot operations - exact parity check."""
-        # Create sales data to pivot: month, product, sales
         sales_data = [
             Row(month="Jan", product="A", sales=100),
             Row(month="Jan", product="B", sales=150),
@@ -229,7 +220,6 @@ class TestDataFrameBasicOperationsDifferential:
 
     def test_union_operations(self, spark_reference, spark_thunderduck):
         """Test union operations - exact parity check."""
-        # Create test table on both systems
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 90000, 'Sales')")
@@ -254,13 +244,11 @@ class TestDataFrameBasicOperationsDifferential:
         td_union_distinct = td_df1.union(td_df2).distinct().orderBy("id")
         assert_dataframes_equal(spark_union_distinct, td_union_distinct, query_name="union_distinct")
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")
 
     def test_null_handling(self, spark_reference, spark_thunderduck):
         """Test NULL value handling - exact parity check."""
-        # Create data with NULLs
         data = [
             (1, 'A', 100),
             (2, None, 200),
@@ -271,19 +259,16 @@ class TestDataFrameBasicOperationsDifferential:
         spark_df = spark_reference.createDataFrame(data, ["id", "name", "value"])
         td_df = spark_thunderduck.createDataFrame(data, ["id", "name", "value"])
 
-        # Test NULL filtering
         spark_not_null = spark_df.filter(F.col("name").isNotNull()).orderBy("id")
         td_not_null = td_df.filter(F.col("name").isNotNull()).orderBy("id")
         assert_dataframes_equal(spark_not_null, td_not_null, query_name="null_filter")
 
-        # Test NULL in aggregations
         spark_avg = spark_df.agg(F.avg("value").alias("avg"))
         td_avg = td_df.agg(F.avg("value").alias("avg"))
         assert_dataframes_equal(spark_avg, td_avg, query_name="null_aggregation", ignore_nullable=True)
 
     def test_distinct_operations(self, spark_reference, spark_thunderduck):
         """Test distinct operations - exact parity check."""
-        # Create test table on both systems
         spark_reference.sql("DROP TABLE IF EXISTS employees")
         spark_reference.sql("CREATE TABLE employees (id INT, name STRING, salary INT, department STRING)")
         spark_reference.sql("INSERT INTO employees VALUES (1, 'Alice', 50000, 'HR'), (2, 'Bob', 80000, 'Engineering'), (3, 'Charlie', 70000, 'Engineering'), (4, 'Diana', 75000, 'Engineering'), (5, 'Eve', 90000, 'Sales')")
@@ -306,6 +291,5 @@ class TestDataFrameBasicOperationsDifferential:
         )
         assert_dataframes_equal(spark_count_distinct, td_count_distinct, query_name="count_distinct", ignore_nullable=True)
 
-        # Cleanup
         spark_reference.sql("DROP TABLE employees")
         spark_thunderduck.sql("DROP TABLE employees")

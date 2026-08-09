@@ -25,9 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.dataframe_diff import assert_dataframes_equal
 
 
-# =============================================================================
 # Union Operations
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -116,9 +114,7 @@ class TestUnionOperations:
         assert_dataframes_equal(ref, td, "union_by_name")
 
 
-# =============================================================================
 # Intersect Operations
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -186,9 +182,7 @@ class TestIntersectOperations:
         assert_dataframes_equal(ref, td, "intersect_no_overlap")
 
 
-# =============================================================================
 # Except Operations
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -258,9 +252,7 @@ class TestExceptOperations:
         assert_dataframes_equal(ref, td, "subtract")
 
 
-# =============================================================================
 # Edge Cases
-# =============================================================================
 
 
 @pytest.mark.differential
@@ -346,9 +338,7 @@ class TestSetOperationEdgeCases:
         assert_dataframes_equal(ref, td, "except_all_rows_removed")
 
 
-# =============================================================================
 # Union Type Coercion
-# =============================================================================
 
 
 @pytest.mark.differential

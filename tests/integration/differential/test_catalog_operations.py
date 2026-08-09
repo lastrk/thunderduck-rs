@@ -41,7 +41,6 @@ class TestDropTempView:
 
     def test_drop_existing_temp_view(self, spark_reference, spark_thunderduck):
         """Dropping existing temp view should return True on both systems."""
-        # Create temp views on both
         ref_df = spark_reference.range(10)
         ref_df.createOrReplaceTempView("temp_view_to_drop_test")
 
@@ -104,7 +103,6 @@ class TestListFunctions:
         td_functions = spark_thunderduck.catalog.listFunctions()
         td_names = [f.name.lower() for f in td_functions]
 
-        # Check common functions exist in both
         common_funcs = ['abs', 'sum', 'count', 'max', 'min', 'avg', 'concat', 'length']
         for func in common_funcs:
             assert func in ref_names, f"Spark should include '{func}' function"
@@ -130,26 +128,22 @@ class TestTempViewDifferential:
 
     def test_temp_view_appears_in_table_exists(self, spark_reference, spark_thunderduck):
         """Temp view created should be found by tableExists on both systems."""
-        # Create temp views on both
         ref_df = spark_reference.range(5)
         ref_df.createOrReplaceTempView("diff_temp_view_test")
 
         td_df = spark_thunderduck.range(5)
         td_df.createOrReplaceTempView("diff_temp_view_test")
 
-        # Check existence on both
         ref_exists = spark_reference.catalog.tableExists("diff_temp_view_test")
         td_exists = spark_thunderduck.catalog.tableExists("diff_temp_view_test")
 
         assert ref_exists is True and td_exists is True, f"Temp view exists mismatch: Spark={ref_exists}, TD={td_exists}"
 
-        # Cleanup
         spark_reference.catalog.dropTempView("diff_temp_view_test")
         spark_thunderduck.catalog.dropTempView("diff_temp_view_test")
 
     def test_temp_view_not_found_after_drop(self, spark_reference, spark_thunderduck):
         """After dropping, temp view should not be found on both systems."""
-        # Create and drop on both
         spark_reference.range(3).createOrReplaceTempView("temp_view_lifecycle_test")
         spark_thunderduck.range(3).createOrReplaceTempView("temp_view_lifecycle_test")
 

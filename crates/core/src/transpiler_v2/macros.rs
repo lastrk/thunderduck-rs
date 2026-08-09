@@ -1,6 +1,5 @@
 //! τ boundary-error bail macros — thin `return Err(EmissionError::*)`
-//! constructors used at ~200 sites across `emission`, `parser_v2`, and the
-//! connect-server converter.
+//! constructors shared by the parser, emitter, and Connect converter.
 //!
 //! Each macro expands to a `return Err(...)` of the shared
 //! [`crate::transpiler_v2::error::EmissionError::Unsupported`] variant tagged
@@ -8,9 +7,8 @@
 //! [`crate::transpiler_v2::error::UnsupportedKind`] (or, for the `rule!`
 //! macro, [`crate::transpiler_v2::analyzer::AnalyzerError::UnsupportedRule`])
 //! with the canonical field shape (`{ kind, name: String, reason: String }`).
-//! Wire `Display` output is byte-identical to the hand-written struct
-//! literals they replace — every argument is coerced via `.to_owned()` so
-//! callers can pass `&str`, `String`, `&String`, `format!(...)`, etc.
+//! Arguments are coerced via `.to_owned()` so callers can pass borrowed or
+//! owned strings.
 //!
 //! # Design notes
 //!
@@ -22,7 +20,7 @@
 //! - `.ok_or_else(|| ...)` / `.map_err(|e| ...)` closure sites do NOT use
 //!   these macros — a `return` inside the closure would return from the
 //!   closure, not from the enclosing function. Those sites are covered
-//!   separately by OPP-HHH (`ProtoFieldExt::require_proto`, Pass 8).
+//!   closure; use `ProtoFieldExt::require_proto` at those sites.
 //! - `#[macro_export]` puts each macro at the crate root of
 //!   `thunderduck_core`. Downstream crates (e.g. `thunderduck-connect-server`)
 //!   invoke them as `thunderduck_core::bail_boundary_*!(...)`.

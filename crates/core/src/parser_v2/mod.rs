@@ -1,13 +1,8 @@
 //! τ's SparkSQL front-end — parses raw Spark SQL into [`CommonAst`].
 //!
-//! Owns the SQL text path in the τ substrate (Open Decision 1 Option 1b):
-//! `V2RelationConverter` refuses `RelType::Sql` with
-//! [`EmissionError::Unsupported`] (`kind: ProtoShape`); dispatch routes
-//! `Sql` here instead.
-//!
-//! **INV10:** this file imports ONLY value-level types from `crate::types`
-//! plus intra-τ modules. No `crate::parser`, `crate::logical`,
-//! `crate::expression`, `crate::generator`.
+//! Raw Spark SQL is tokenized and lowered into [`CommonAst`] before analysis.
+//! The parser uses only value-level types from `crate::types` and intra-τ
+//! modules.
 
 mod dialect;
 mod multi_alias;
@@ -44,9 +39,7 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 /// produced by both malformed input (`SELECT * FRM emp`, `SELECT * FROM emp FROM
 /// dept`) and genuine τ grammar gaps (HiveQL `TRANSFORM`, `VERSION AS OF`,
 /// `CREATE TABLE … USING parquet`). It carries no information, and treating it
-/// as malformed would slander valid Spark. Cases stranded by this are tracked as
-/// deferred witnesses (`parseerr-001`) and in
-/// `docs/future_work/adr-022-strict-rejection-enforcement.md`.
+/// as malformed would misclassify valid Spark SQL.
 fn classify_parse_failure(parsed_sql: &str, e: &ParserError) -> EmissionError {
     if is_definitely_malformed(parsed_sql, e) {
         // Spark raises PARSE_SYNTAX_ERROR for these, so this is ADR-022
@@ -119,11 +112,6 @@ pub struct SparkSqlParserV2;
 impl SparkSqlParserV2 {
     /// Parse a raw Spark SQL string into a [`CommonAst`].
     ///
-    /// τ scope: `SELECT` queries with `FROM`, `WHERE`, `GROUP BY`,
-    /// `ORDER BY`, `LIMIT/OFFSET`, joins, and subqueries in `FROM`.
-    /// Everything else surfaces as
-    /// [`EmissionError::Unsupported`] with `kind: ProtoShape`.
-    ///
     /// Before handing SQL to `sqlparser-rs`, a token-level pre-pass rewrites
     /// any depth-0 `AS (ident, ident+)` multi-column aliases (which sqlparser
     /// cannot parse) into sentinel single-identifier aliases. After lowering,
@@ -133,7 +121,6 @@ impl SparkSqlParserV2 {
     pub fn parse(sql: &str) -> Result<CommonAst, EmissionError> {
         use sqlparser::parser::Parser;
 
-        // Step 1: token-level rewrite of multi-column aliases.
         let (rewritten_sql, alias_lists) = multi_alias::rewrite_multi_aliases(sql)?;
         let parse_input = if alias_lists.is_empty() {
             sql
@@ -142,7 +129,7 @@ impl SparkSqlParserV2 {
         };
 
         let dialect = SparkDialect;
-        // A sqlparser failure is a boundary error by DEFAULT — the input never
+        // A sqlparser failure is a boundary error by default — the input never
         // reached `CommonAst`, so `ProtoShape` (input τ can't ingest), not `Op`
         // (emission arm not implemented). `classify_parse_failure` upgrades the
         // provably-malformed subset to a Spark-emulated PARSE_SYNTAX_ERROR.
@@ -156,7 +143,6 @@ impl SparkSqlParserV2 {
         }
         let mut ast = v2_lowering::lower_statement(stmts.remove(0))?;
 
-        // Step 2: post-lowering splice of sentinel-aliased projections.
         if !alias_lists.is_empty() {
             multi_alias::splice_multi_aliases(&mut ast, &alias_lists)?;
         }
@@ -166,10 +152,8 @@ impl SparkSqlParserV2 {
 
     /// Parse a raw Spark SQL string into a [`SqlStatement`].
     ///
-    /// Unlike [`parse`] (which only accepts `SELECT` queries), this entry
-    /// point also recognises DDL statements (`CREATE TEMP VIEW …`).
-    /// Non-temporary `CREATE VIEW`, `CREATE TABLE`, and every other
-    /// statement kind surface as Thunderduck-boundary errors.
+    /// This entry point also recognises the supported DDL/DML statement forms.
+    /// Unsupported statement features surface as Thunderduck-boundary errors.
     ///
     /// Used by the `SqlCommand` dispatch path in `connect-server::service`
     /// so that `spark.sql("CREATE TEMP VIEW v AS SELECT …")` can be
@@ -178,8 +162,6 @@ impl SparkSqlParserV2 {
         use crate::transpiler_v2::SqlStatement;
         use sqlparser::parser::Parser;
 
-        // Step 1: token-level rewrite of multi-column aliases (shared
-        // with the SELECT-only path).
         let (rewritten_sql, alias_lists) = multi_alias::rewrite_multi_aliases(sql)?;
         let parse_input = if alias_lists.is_empty() {
             sql
@@ -198,8 +180,6 @@ impl SparkSqlParserV2 {
         }
         let mut result = v2_lowering::lower_statement_or_ddl(stmts.remove(0))?;
 
-        // Step 2: post-lowering splice of sentinel-aliased projections
-        // (only applicable to Query variants).
         if !alias_lists.is_empty() {
             if let SqlStatement::Query(ref mut ast) = result {
                 multi_alias::splice_multi_aliases(ast, &alias_lists)?;
@@ -209,12 +189,10 @@ impl SparkSqlParserV2 {
         Ok(result)
     }
 
-    /// Parse a SparkSQL expression FRAGMENT (e.g. `age + 1`, `upper(name)`)
+    /// Parse a SparkSQL expression fragment (e.g. `age + 1`, `upper(name)`)
     /// into a single [`crate::transpiler_v2::Expression`]. Used by the
     /// protobuf front-end for `Expression::ExpressionString` — Spark's
-    /// `F.expr("...")` / `df.selectExpr("...")`. Implemented by wrapping the
-    /// fragment as `SELECT (<expr>) AS __td_expr` and extracting the single
-    /// projection.
+    /// `F.expr("...")` / `df.selectExpr("...")`.
     pub fn parse_expression(
         expr_sql: &str,
     ) -> Result<crate::transpiler_v2::Expression, EmissionError> {
@@ -252,8 +230,8 @@ impl SparkSqlParserV2 {
             } if projections.len() == 1 => Ok(v2_lowering::strip_synthetic_default_name(
                 projections.remove(0),
             )),
-            // Pass 71: when the fragment is a bare aggregate call
-            // (e.g. `try_sum(lng)`, `every(active)`), `lower_select`
+            // When the fragment is a bare aggregate call (e.g. `try_sum(lng)`,
+            // `every(active)`), `lower_select`
             // routes it through `lower_aggregate_select` and produces
             // `Aggregate { input: SingleRow, grouping: [], aggregates:
             // [<expr>], .. }`. Extract the single aggregate expression
@@ -286,14 +264,14 @@ impl SparkSqlParserV2 {
 }
 
 /// Wrap a parsed generator-call `Expression` in a synthetic
-/// `stack_multi_alias(<inner>, "<a1>", ..., "<aK>")` FunctionCall so
+/// `stack_multi_alias(<inner>, "<a1>", ..., "<aK>")` function call so
 /// [`crate::transpiler_v2::analyzer`]'s Project pre-pass can splice the
 /// K-alias list into K per-column projections.
 ///
-/// Only accepts an inner `stack` call (piv-006 scope) — other generator
+/// Only accepts an inner `stack` call — other generator
 /// functions (`posexplode`, `explode(map)`, `inline`, `json_tuple`) with a
 /// multi-alias on the `F.expr()` SQL fragment path surface as a
-/// Thunderduck-boundary error and remain a follow-up.
+/// Thunderduck-boundary error.
 ///
 /// Delegates to [`multi_alias::build_stack_multi_alias`] for the actual
 /// construction (single source of truth shared with the full-SQL path).
@@ -304,8 +282,6 @@ fn wrap_stack_multi_alias(
 ) -> Result<crate::transpiler_v2::Expression, EmissionError> {
     use crate::transpiler_v2::expression::Expression;
 
-    // N5: `inner` came through `parse_expression` → `lower_function`, so the
-    // name is canonical lowercase — exact compare.
     let is_stack = matches!(
         &inner,
         Expression::FunctionCall(fc) if fc.name == "stack"
@@ -338,7 +314,7 @@ mod tests {
     /// These tests double as the canary for a `sqlparser` bump: signal (3)
     /// matches on the parser's error *wording*, so if that wording changes the
     /// upgrade silently stops firing. A failure here means re-derive the
-    /// prefixes, not delete the test.
+    /// error prefixes must be updated if the dependency changes.
     mod parse_failure_classification {
         use super::SparkSqlParserV2;
         use crate::transpiler_v2::EmissionError;
@@ -369,14 +345,12 @@ mod tests {
             }
         }
 
-        // ── Signal 1: lexical failure ───────────────────────────────────────
         #[test]
         fn unterminated_string_is_spark_emulated() {
             // A tokenizer error. No grammar gap can make a literal terminate.
             assert_spark_emulated_syntax_error("SELECT 'abc FROM emp");
         }
 
-        // ── Signal 2: unbalanced delimiters ─────────────────────────────────
         #[test]
         fn unclosed_paren_is_spark_emulated() {
             assert_spark_emulated_syntax_error("SELECT (1 FROM emp");
@@ -395,7 +369,6 @@ mod tests {
                 .expect("a paren inside a string literal is not a delimiter");
         }
 
-        // ── Signal 3: an EMPTY slot where an expression is required ─────────
         #[test]
         fn expression_required_but_input_ended_is_spark_emulated() {
             assert_spark_emulated_syntax_error("SELECT * FROM emp GROUP BY");
@@ -406,7 +379,6 @@ mod tests {
             assert_spark_emulated_syntax_error("SELECT * FROM emp UNPIVOT (v FOR k IN ())");
         }
 
-        // ── The NEGATIVE half: these must stay Thunderduck-boundary ─────────
         // `Expected: end of statement, found: X` is produced by BOTH malformed
         // input and genuine τ grammar gaps, so it must never be upgraded.
         // Getting this wrong tells users their valid Spark is invalid, which is
@@ -437,9 +409,7 @@ mod tests {
             // `SELECT * FRM emp` IS malformed, but its error shape
             // (`Expected: end of statement, found: FRM`) is byte-identical in
             // form to the three τ gaps above. Upgrading it would upgrade them
-            // too. Deliberately left as a boundary error and tracked by the
-            // deferred witness parseerr-001 — see
-            // docs/future_work/adr-022-strict-rejection-enforcement.md.
+            // too, so it remains a boundary error.
             assert_boundary_error("SELECT * FRM emp");
         }
     }
@@ -493,8 +463,6 @@ mod tests {
             );
         }
     }
-
-    // ── Pass 71: bare aggregate fragments ────────────────────────────────
 
     #[test]
     fn parse_expression_bare_try_sum() {
@@ -565,13 +533,10 @@ mod tests {
         }
     }
 
-    // ── piv-006: `stack(...) AS (a, b, ...)` multi-column alias ────────────
-
     #[test]
     fn parse_expression_stack_multi_alias_lowers_to_wrapper() {
-        // piv-006 witness: `F.expr("stack(2, 'age', CAST(age AS DOUBLE),
-        // 'salary', salary) as (metric, value)")`. Before the fix,
-        // sqlparser-rs 0.61 hard-fails at the `(` after `AS`. After the fix,
+        // `F.expr("stack(2, 'age', CAST(age AS DOUBLE),
+        // 'salary', salary) as (metric, value)")` uses the multi-alias path:
         // the multi-alias stripper strips the trailing alias list and the
         // parser wraps the parsed `stack(...)` call in a synthetic
         // `stack_multi_alias(<stack>, "metric", "value")` FunctionCall the
@@ -617,8 +582,6 @@ mod tests {
         }
         assert_eq!(alias_slots, vec!["metric", "value"]);
     }
-
-    // ── Full-SQL multi-alias (cx-011, pv-006) ────────────────────────────────
 
     #[test]
     fn parse_cx011_explode_map_multi_alias_produces_key_val_pair() {
@@ -803,8 +766,6 @@ mod tests {
         }
     }
 
-    // ── Convergence: SQL-path explode pair == DataFrame-path shape ───────────
-
     #[test]
     fn sql_path_explode_pair_matches_dataframe_path_shape() {
         // The SQL path's spliced explode pair (from splice_multi_aliases) must
@@ -859,8 +820,6 @@ mod tests {
             "SQL-path val projection must match DataFrame-path shape"
         );
     }
-
-    // ── parse_statement tests ───────────────────────────────────────────
 
     mod parse_statement_tests {
         use super::*;
@@ -1027,8 +986,6 @@ mod tests {
             }
         }
 
-        // ── CREATE TABLE tests ──────────────────────────────────────────
-
         #[test]
         fn create_table_parses() {
             let result = SparkSqlParserV2::parse_statement("CREATE TABLE t (id INT, name STRING)")
@@ -1085,8 +1042,6 @@ mod tests {
             }
         }
 
-        // ── DROP TABLE / VIEW tests ───────────────────────────────────────
-
         #[test]
         fn drop_table_parses() {
             let result =
@@ -1137,8 +1092,6 @@ mod tests {
             }
         }
 
-        // ── INSERT tests ──────────────────────────────────────────────────
-
         #[test]
         fn insert_values_parses() {
             let result =
@@ -1178,8 +1131,6 @@ mod tests {
             }
         }
 
-        // ── TRUNCATE TABLE tests ──────────────────────────────────────────
-
         #[test]
         fn truncate_table_parses() {
             let result = SparkSqlParserV2::parse_statement("TRUNCATE TABLE t")
@@ -1191,8 +1142,6 @@ mod tests {
                 other => panic!("expected TruncateTable, got {other:?}"),
             }
         }
-
-        // ── CREATE VIEW (non-temp) tests ──────────────────────────────────
 
         #[test]
         fn persistent_create_view_parses() {
